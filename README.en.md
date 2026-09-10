@@ -95,7 +95,7 @@ performance.
         - [x] Distributed Operator Support List
         - [x] Custom Distributed Operator Registration (YAML registry + Python impl)
         - [x] Custom Shard
-        - [x] DFunction (custom distributed autograd functions)
+        - [x] DFunction (Torch custom distributed autograd functions)
         - [x] Loss Parallel (TP training loss parallelism)
         - TP Styles
             - [x] ColwiseParallel / RowwiseParallel / SequenceParallel
@@ -240,7 +240,6 @@ SHMEM dependency and therefore has no separate SHMEM build option.
 | Argument       | Default                         | Values     | Description                                      |
 |----------------|---------------------------------|------------|--------------------------------------------------|
 | `--multicore`  | `on`                            | `on`, `off` | Build the Torch Multicore component and SHMEM.   |
-| `--custom-ops` | `on`                            | `on`, `off` | Build MindSpore custom ops.                      |
 | `--soc-list`   | `ascend910b,ascend910_93`       | SoC list   | Select the Multicore kernel targets.             |
 | `--strict`     | `off`                           | `on`, `off` | Stop if a selected optional component fails.     |
 | `--jobs`       | `nproc`                         | Integer    | Set native compilation parallelism.              |
@@ -248,7 +247,7 @@ SHMEM dependency and therefore has no separate SHMEM build option.
 
 ```bash
 ./build.sh --help
-./build.sh --multicore on --custom-ops on --soc-list ascend910b,ascend910_93
+./build.sh --multicore on --soc-list ascend910b,ascend910_93
 ./build.sh --strict on --jobs 24
 pip install /absolute/path/to/the-built-wheel.whl
 ```

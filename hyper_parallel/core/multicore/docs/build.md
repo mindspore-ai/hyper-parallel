@@ -9,7 +9,7 @@ pybind11、CMake >= 3.18、GCC/G++、GNU Make、Git。先激活所选 CANN 环�
 
 ```bash
 source /path/to/cann/set_env.sh
-bash build.sh --multicore on --custom-ops off --strict on --jobs 24
+bash build.sh --multicore on --strict on --jobs 24
 ```
 
 Multicore 只有 `--multicore on|off` 开关，默认 on。SHMEM 是内部组件，随 Multicore

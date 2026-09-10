@@ -63,7 +63,7 @@ git push upstream vX.Y.Z
 ```bash
 # 外部构建工程先选择 CANN 环境；统一入口完成依赖准备、native 编译和 wheel 打包
 source /usr/local/Ascend/cann/set_env.sh
-bash build.sh --multicore on --custom-ops on --strict on --jobs 24
+bash build.sh --multicore on --strict on --jobs 24
 
 # 每个 Python ABI/host 架构一个 wheel，例如：
 # hyper_parallel-0.1.0-cp310-cp310-linux_aarch64.whl

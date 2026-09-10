@@ -122,7 +122,6 @@ Dockerfile 支持以下构建参数：
 ```text
 BUILD_MULTICORE_EXTENSION=off|mindspore|torch|all
 BUILD_SHMEM_EXTENSION=off|mindspore|torch|all
-BUILD_CUSTOM_OPS_EXTENSION=off|on
 HYPER_PARALLEL_BUILD_STRICT=off|on
 ```
 

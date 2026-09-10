@@ -35,7 +35,7 @@ pip install -e .
 
 # native 本地开发；先 source 用户选择的 CANN 官方环境
 source /usr/local/Ascend/cann/set_env.sh
-./build.sh --multicore on --custom-ops on --soc-list ascend910b,ascend910_93
+./build.sh --multicore on --soc-list ascend910b,ascend910_93
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
 python your_program.py

@@ -2,8 +2,8 @@
 
 HyperParallel provides `DFunction`, a base class for writing custom distributed
 functions that integrate seamlessly with the DTensor dispatch system.  Users
-subclass `DFunction` (which inherits from the platform's autograd `Function`)
-and implement `forward` / `backward` as plain local-tensor operations.  When the
+subclass `DFunction` (which inherits from `torch.autograd.Function`) and
+implement `forward` / `backward` as plain local-tensor operations.  When the
 inputs are `DTensor`s, the dispatch system transparently handles layout inference,
 local-tensor extraction, and output wrapping — no changes to user code are needed
 for the multi-card path.
@@ -15,7 +15,7 @@ for the multi-card path.
 Base class for user-defined distributed autograd functions.
 
 ```python
-class DFunction(platform.Function):
+class DFunction(torch.autograd.Function):
     _op_name: str = None          # Set this to the registered DistributedOp name
 
     @staticmethod
@@ -32,7 +32,7 @@ class DFunction(platform.Function):
 
 | Input type | Route |
 |-----------|-------|
-| Plain `Tensor` | `super().apply()` — platform autograd, single-device path |
+| Plain `Tensor` | `super().apply()` — Torch autograd, single-device path |
 | At least one `DTensor` | `dispatch()` — layout inference + DTensor wrapping |
 
 **`_op_name`** must be set when DTensor inputs are expected.  It must match the
@@ -44,9 +44,8 @@ path is taken, the dispatcher extracts the local shard from each input `DTensor`
 and passes it here.  Non-tensor positional arguments are forwarded to `forward`
 unchanged (see `DistributedOp.preprocess`).
 
-**`backward(ctx, *grad_outputs)`** likewise operates on local tensors.  It is
-identical to a standard `torch.autograd.Function.backward` or MindSpore's
-`_Function.backward`.
+**`backward(ctx, *grad_outputs)`** likewise operates on local tensors. It follows
+the standard `torch.autograd.Function.backward` contract.
 
 ---
 
@@ -337,7 +336,7 @@ dispatch(local_callable, args, kwargs)
        │
        └─ local_callable(*local_args)
             │  no DTensor input
-            └─ super().apply(*local_args)   ← platform autograd, no recursion
+            └─ super().apply(*local_args)   ← Torch autograd, no recursion
                  └─ MyFunc.forward(ctx, local_tensor1, ...)
 ```
 
@@ -357,15 +356,8 @@ dispatch(local_callable, args, kwargs)
 
 ---
 
-## Platform Support
+## Framework Support
 
-`DFunction` is platform-agnostic.  It inherits from `platform.Function` which
-resolves to the correct base class at import time.
-
-| Platform | `platform.Function` | `forward` / `backward` tensor type |
-|----------|--------------------|------------------------------------|
-| PyTorch (GPU / NPU) | `torch.autograd.Function` | `torch.Tensor` |
-| MindSpore (Ascend NPU) | `mindspore._Function` | `mindspore.Tensor` |
-
-Cross-platform code runs identically on both backends.  The `ctx.save_for_backward`
-/ `ctx.saved_tensors` contract is uniform across platforms.
+`DFunction` is Torch-only. It inherits directly from `torch.autograd.Function`
+and its `forward` / `backward` methods operate on `torch.Tensor` local shards.
+MindSpore is not supported.

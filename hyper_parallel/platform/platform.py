@@ -160,20 +160,6 @@ class Platform:
     post_grad_handle_process = None
     grad_sync_stream = None
 
-    @property
-    def custom_ops(self):
-        """Return the platform-specific custom ops interface.
-
-        Subclasses MUST override this property to return an object that
-        exposes the platform-specific custom operator implementations.
-
-        Returns:
-            object: Platform-specific custom ops class instance.
-        """
-        raise NotImplementedError(
-            "Platform subclasses must implement custom_ops"
-        )
-
     @staticmethod
     def get_swap_optimizer():
         """Return the active backend's optimizer-state swap wrapper class."""

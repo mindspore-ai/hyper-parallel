@@ -15,36 +15,37 @@
 """Custom distributed autograd function base class."""
 from __future__ import annotations
 
-from hyper_parallel.platform import get_platform
+from typing import Any, Callable
+
+import torch
+
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
 
-platform = get_platform()
-
 
 class _LocalCallable:
-    """Named callable wrapper that exposes the op name to both platform dispatchers.
+    """Named callable wrapper that exposes the op name to Torch dispatch.
 
-    PyTorch's ``get_op_name`` inspects ``__name__``; MindSpore's inspects ``.name``.
-    Setting both attributes here lets ``_OP_DISPATCHER`` look up the correct
-    ``DistributedOp`` without modifying either platform implementation.
+    Torch operation-name resolution inspects ``__name__``. Setting it here lets
+    ``_OP_DISPATCHER`` look up the matching ``DistributedOp``.
 
     Args:
         fn: The underlying callable to invoke.
         op_name: Canonical op name matching the registered ``DistributedOp``.
     """
 
-    def __init__(self, fn: callable, op_name: str) -> None:
+    def __init__(self, fn: Callable, op_name: str) -> None:
+        """Initialize the wrapper with a callable and its registered op name."""
         self._fn = fn
         self.__name__ = op_name
-        self.name = op_name
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Forward arguments to the wrapped callable."""
         return self._fn(*args, **kwargs)
 
 
-class DFunction(platform.Function):
-    """Base class for user-defined distributed autograd functions.
+class DFunction(torch.autograd.Function):
+    """Torch base class for user-defined distributed autograd functions.
 
     Subclass this class and implement ``forward`` and ``backward`` as
     ``@staticmethod`` methods that operate on **local** tensors.  To enable
@@ -54,7 +55,7 @@ class DFunction(platform.Function):
     Dispatch behaviour:
 
     * **No DTensor inputs** — calls ``super().apply()`` directly, going straight
-      into the platform autograd mechanism (single-device path).
+      into Torch autograd (single-device path).
     * **DTensor inputs + ``_op_name`` set** — delegates to
       ``_OP_DISPATCHER.dispatch``.  The dispatcher extracts local tensors, calls
       ``DistributedOp.infer_layout`` to derive the output layout, invokes the
@@ -97,17 +98,17 @@ class DFunction(platform.Function):
     _op_name: str = None
 
     @staticmethod
-    def forward(ctx, *args, **kwargs):
+    def forward(ctx: Any, *args: Any, **kwargs: Any) -> Any:
         """Override in subclass to define the forward computation on local tensors."""
         raise NotImplementedError("Subclasses must implement forward()")
 
     @staticmethod
-    def backward(ctx, *grad_outputs):
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
         """Override in subclass to define the backward computation on local tensors."""
         raise NotImplementedError("Subclasses must implement backward()")
 
     @classmethod
-    def apply(cls, *args, **kwargs):
+    def apply(cls, *args: Any, **kwargs: Any) -> Any:
         """Execute the function, routing to distributed dispatch when DTensor inputs are present.
 
         Args:
@@ -143,9 +144,9 @@ class DFunction(platform.Function):
         ``cls.__dict__`` to avoid repeated object creation.
 
         Returns:
-            A ``_LocalCallable`` whose ``__name__`` and ``.name`` equal
-            ``cls._op_name``, enabling ``platform.get_op_name`` to resolve the
-            correct ``DistributedOp``.
+            A ``_LocalCallable`` whose ``__name__`` equals ``cls._op_name``,
+            enabling Torch operation-name resolution to find the correct
+            ``DistributedOp``.
         """
         if '_local_callable' not in cls.__dict__:
             def _local_fn(*a, **kw):

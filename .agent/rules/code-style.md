@@ -50,6 +50,8 @@ Use these rules as the default coding style and convention set for HyperParallel
   The component root may export its business APIs; the HyperParallel root must not export them.
   Do not implement lazy framework dispatch. Native-library
   initialization may still be deferred until an operation needs the activated payload.
+- **Torch-only DFunction** (`hyper_parallel/core/shard/dfunction.py`): import Torch at module scope
+  and inherit directly from `torch.autograd.Function`; do not add Platform dispatch or MindSpore support.
 - **Other exceptions** (outside platform backends; each should include a brief comment explaining why):
   - Import-time circular dependency that cannot be fixed by restructuring.
   - Optional dependencies that may be missing at runtime.

@@ -12,14 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""
-Unit tests for OpDispatcher with custom distributed ops (e.g., StackExt).
-"""
+"""Unit tests for OpDispatcher."""
 import importlib
 import os
-import sys
 import unittest
-from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -33,139 +30,6 @@ from hyper_parallel.core.dtensor.device_mesh import (
 
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 from hyper_parallel.core.shard._op_dispatch import LayoutCacheKey
-
-_TEST_FILE_DIR = Path(__file__).resolve().parent
-_TESTS_ROOT_DIR = _TEST_FILE_DIR.parent.parent.parent.parent
-_CUSTOM_OPS_DIR = _TESTS_ROOT_DIR / "tests" / "ut" / "core" / "shard" / "custom_parallel_ops"
-
-HYPER_PARALLEL_OPS_YAML_DIR = str(_CUSTOM_OPS_DIR)
-HYPER_PARALLEL_OPS_PYTHON_PATH = str(_CUSTOM_OPS_DIR)
-
-
-def _reload_op_dispatch_with_env_str(yaml_dir: str, python_path: str):
-    """
-    Reload OpDispatcher module with custom environment variables.
-
-    Args:
-        yaml_dir (str): Path to the directory containing op dispatch YAML files.
-        python_path (str): Path to the directory containing custom op implementations.
-
-    Returns:
-        module: The reloaded OpDispatcher module.
-    """
-    os.environ["HYPER_PARALLEL_OPS_YAML_DIR"] = yaml_dir
-    os.environ["HYPER_PARALLEL_OPS_PYTHON_PATH"] = python_path
-
-    target_mod = "hyper_parallel.core.shard._op_dispatch"
-    if target_mod in sys.modules:
-        del sys.modules[target_mod]
-
-    mod = importlib.import_module(target_mod)
-    mod = importlib.reload(mod)
-    return mod
-
-
-class TestStackExtDispatch(unittest.TestCase):
-    """
-    Feature: StackExt Dispatch and Layout Cache
-    Description: Test StackExt distributed operator dispatch and layout caching.
-    Expectation: dispatch should return correct DTensor output with proper layout,
-                 and layout cache should work correctly.
-    """
-
-    def setUp(self):
-        EXISTING_COMM_GROUPS.clear()
-        _DEVICE_MESH_MAP.clear()
-
-    def tearDown(self):
-        EXISTING_COMM_GROUPS.clear()
-        _DEVICE_MESH_MAP.clear()
-
-    def _make_mesh(self, mock_platform, mesh_shape, mesh_dim_names):
-        """Create a device mesh for testing."""
-        EXISTING_COMM_GROUPS.clear()
-        _DEVICE_MESH_MAP.clear()
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = np.prod(mesh_shape)
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
-        return init_device_mesh(
-            device_type="npu",
-            mesh_shape=mesh_shape,
-            mesh_dim_names=mesh_dim_names,
-            init_backend=False,
-        )
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_stack_ext_dispatch_and_layout(self, mock_platform):
-        """Test StackExt dispatch and layout cache with two input DTensors."""
-        op_dispatch = _reload_op_dispatch_with_env_str(
-            HYPER_PARALLEL_OPS_YAML_DIR, HYPER_PARALLEL_OPS_PYTHON_PATH
-        )
-
-        mesh = self._make_mesh(mock_platform, (1, 1, 1), ("dp", "cp", "mp"))
-        base_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 2)
-
-        from hyper_parallel.core.shard._op_dispatch import LayoutCacheManager
-
-        dist_op = LayoutCacheManager.get_instance().distributed_op("StackExt")
-
-        np_obj = np
-        local_tensor0 = np_obj.arange(6).reshape(2, 3).astype(np_obj.int32)
-        local_tensor1 = np_obj.arange(6, 12).reshape(2, 3).astype(np_obj.int32)
-
-        d0 = MagicMock(spec=DTensor)
-        d0._local_tensor = local_tensor0
-        d0.layout = base_layout
-        d0._layout = base_layout
-        d0.to_local.return_value = local_tensor0
-
-        d1 = MagicMock(spec=DTensor)
-        d1._local_tensor = local_tensor1
-        d1.layout = base_layout
-        d1._layout = base_layout
-        d1.to_local.return_value = local_tensor1
-
-        output_layouts, _ = dist_op.infer_layout([(d0.layout, d1.layout), 0])
-        output_layout = output_layouts[0]
-
-        assert output_layout is not None
-        assert tuple(output_layout.to_dict()["tensor_map"]) == (-1, -1, -1)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_stack_ext_layout_cache(self, mock_platform):
-        """Test StackExt layout cache with multiple input layouts."""
-        op_dispatch = _reload_op_dispatch_with_env_str(
-            HYPER_PARALLEL_OPS_YAML_DIR, HYPER_PARALLEL_OPS_PYTHON_PATH
-        )
-
-        mesh = self._make_mesh(mock_platform, (1, 1, 1), ("dp", "cp", "mp"))
-        base_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 2)
-
-        from hyper_parallel.core.shard._op_dispatch import LayoutCacheManager
-
-        dist_op = LayoutCacheManager.get_instance().distributed_op("StackExt")
-
-        np_obj = np
-        local_tensor0 = np_obj.arange(6).reshape(2, 3).astype(np_obj.int32)
-        local_tensor1 = np_obj.arange(6, 12).reshape(2, 3).astype(np_obj.int32)
-
-        d0 = MagicMock(spec=DTensor)
-        d0._local_tensor = local_tensor0
-        d0.layout = base_layout
-        d0._layout = base_layout
-
-        d1 = MagicMock(spec=DTensor)
-        d1._local_tensor = local_tensor1
-        d1.layout = base_layout
-        d1._layout = base_layout
-
-        output_layouts, _ = dist_op.infer_layout([(d0.layout, d1.layout), 0])
-        output_layout = output_layouts[0]
-
-        assert output_layout is not None
-        assert tuple(output_layout.to_dict()["tensor_map"]) == (-1, -1, -1)
 
 
 class TestNewDispatchFlow(unittest.TestCase):
@@ -572,50 +436,24 @@ class TestOpDispatchSimpleFunctions(unittest.TestCase):
             cache[key] = {}
 
 
-class TestOpDispatcherSetupYamlDir(unittest.TestCase):
-    """
-    Feature: OpDispatcher._setup_yaml_dir absolute path branch.
-    Description: When env_yaml_dir is an absolute path, work_dir is set to ''.
-    Expectation: yaml_dir = absolute path, work_dir = ''.
-    """
+class TestOpDispatcherYamlDir(unittest.TestCase):
+    """Verify that OpDispatcher always loads package-owned YAML files."""
 
-    def test_absolute_path_sets_work_dir_empty(self):
-        """_setup_yaml_dir with absolute path sets work_dir='' and yaml_dir=path."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+    @patch.dict(os.environ, {
+        "HYPER_PARALLEL_OPS_YAML_DIR": "/tmp/untrusted_yaml",
+        "HYPER_PARALLEL_OPS_PYTHON_PATH": "/tmp/untrusted_python",
+    })
+    def test_environment_does_not_override_packaged_yaml(self):
+        """Legacy environment variables cannot redirect YAML or module loading."""
+        from hyper_parallel.core.shard._op_dispatch import (  # pylint: disable=import-outside-toplevel
+            OpDispatcher,
+            _DISTRIBUTED_OPS_YAML_DIR,
+        )
 
-        class _Stub:
-            yaml_dir = ""
-            work_dir = ""
+        with patch.object(OpDispatcher, "safe_load_yaml_from_dir", return_value={}):
+            dispatcher = OpDispatcher()
 
-        stub = _Stub()
-        OpDispatcher._setup_yaml_dir(stub, "/absolute/path/to/yaml")
-        self.assertEqual(stub.yaml_dir, "/absolute/path/to/yaml")
-        self.assertEqual(stub.work_dir, "")
-
-    def test_relative_path_sets_work_dir(self):
-        """_setup_yaml_dir with relative path sets work_dir from __file__."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        class _Stub:
-            yaml_dir = ""
-            work_dir = ""
-
-        stub = _Stub()
-        OpDispatcher._setup_yaml_dir(stub, "relative/yaml")
-        self.assertEqual(stub.yaml_dir, "relative/yaml")
-        self.assertNotEqual(stub.work_dir, "")
-
-    def test_none_path_sets_default_yaml_dir(self):
-        """_setup_yaml_dir with None uses default 'shard/ops/yaml'."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        class _Stub:
-            yaml_dir = ""
-            work_dir = ""
-
-        stub = _Stub()
-        OpDispatcher._setup_yaml_dir(stub, None)
-        self.assertEqual(stub.yaml_dir, "shard/ops/yaml")
+        self.assertEqual(dispatcher.yaml_dir, _DISTRIBUTED_OPS_YAML_DIR)
 
 
 class TestDispatchLayoutInfer(unittest.TestCase):
@@ -714,9 +552,7 @@ class TestLookupOrInferLayout(unittest.TestCase):
     def test_lookup_cache_hit_path(self, mock_platform, mock_cache_cls):
         """Cache hit: infer_layout NOT called; cached op_impl and infer_result used."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-        # LayoutCacheKey is re-imported here because _reload_op_dispatch_with_env_str may have
-        # reloaded the module, making the module-level LayoutCacheKey a stale class definition
-        # that no longer matches what OpDispatcher uses internally.
+        # Import the key next to the dispatcher under test to keep the cache setup explicit.
         from hyper_parallel.core.shard._op_dispatch import LayoutCacheKey  # pylint: disable=W0404,W0621
 
         mock_platform.get_op_name.return_value = "CachedOp"
@@ -1019,50 +855,101 @@ class TestDispatchRandomInplaceReturnsSelf(unittest.TestCase):
 class TestRegisterSingleDistributedOp(unittest.TestCase):
     """
     Feature: OpDispatcher._register_single_distributed_op branching.
-    Description: Cover the distributed_op_module fast path and the re-raise path.
-    Expectation: Module imported and class instantiated; ImportError re-raised when
-                 no fallback python path is configured.
+    Description: Verify that only package-owned DistributedOp implementations are loaded.
+    Expectation: Untrusted module declarations are rejected before import.
     """
 
-    def _make_stub(self, env_python_path=""):
+    @staticmethod
+    def _make_stub():
         """Return a minimal OpDispatcher-like stub."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-        stub = object.__new__(OpDispatcher)
-        stub._env_python_path = env_python_path
-        return stub
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher  # pylint: disable=import-outside-toplevel
+        return object.__new__(OpDispatcher)
 
-    def test_distributed_op_module_fast_path(self):
-        """When config has 'distributed_op_module', it imports and instantiates the class."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
+    def test_distributed_op_module_is_rejected(self):
+        """A fully qualified module supplied by YAML is rejected before import."""
         stub = self._make_stub()
         config = {
             "distributed_op_module": "some.module",
             "distributed_op_class": "SomeClass",
         }
 
-        mock_cls = MagicMock()
-        mock_module = MagicMock(spec=["SomeClass"])
-        mock_module.SomeClass = mock_cls
+        with patch.object(importlib, "import_module") as mock_import:
+            with self.assertRaisesRegex(ValueError, "distributed_op_module"):
+                stub._register_single_distributed_op("TestOp", config)  # pylint: disable=protected-access
+        mock_import.assert_not_called()
 
-        with patch.object(importlib, "import_module", return_value=mock_module):
-            OpDispatcher._register_single_distributed_op(stub, "TestOp", config)
-
-        mock_cls.assert_called_once_with("TestOp")
-
-    def test_reraise_when_no_env_python_path(self):
-        """ImportError is re-raised when _env_python_path is empty."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        stub = self._make_stub(env_python_path="")
+    def test_dotted_module_file_is_rejected(self):
+        """A dotted module name cannot escape the built-in ops package."""
+        stub = self._make_stub()
         config = {
-            "distributed_op_file": "nonexistent_module",
+            "distributed_op_file": "external.module",
             "distributed_op_class": "SomeClass",
         }
 
-        with patch.object(importlib, "import_module", side_effect=ModuleNotFoundError("no module")):
-            with self.assertRaises(ModuleNotFoundError):
-                OpDispatcher._register_single_distributed_op(stub, "TestOp", config)
+        with patch.object(importlib, "import_module") as mock_import:
+            with self.assertRaisesRegex(ValueError, "module name"):
+                stub._register_single_distributed_op("TestOp", config)  # pylint: disable=protected-access
+        mock_import.assert_not_called()
+
+    def test_untrusted_module_origin_is_rejected(self):
+        """A module spec outside the package ops directory is rejected before import."""
+        stub = self._make_stub()
+        config = {
+            "distributed_op_file": "parallel_external",
+            "distributed_op_class": "SomeClass",
+        }
+
+        with patch.object(importlib.util, "find_spec", return_value=SimpleNamespace(origin="/tmp/external.py")):
+            with patch.object(importlib, "import_module") as mock_import:
+                with self.assertRaisesRegex(ImportError, "untrusted source"):
+                    stub._register_single_distributed_op("TestOp", config)  # pylint: disable=protected-access
+        mock_import.assert_not_called()
+
+    def test_non_distributed_op_class_is_rejected(self):
+        """A trusted module cannot expose an arbitrary callable as an op class."""
+        from hyper_parallel.core.shard._op_dispatch import (  # pylint: disable=import-outside-toplevel
+            _DISTRIBUTED_OPS_DIR,
+        )
+
+        stub = self._make_stub()
+        config = {
+            "distributed_op_file": "parallel_invalid",
+            "distributed_op_class": "SomeClass",
+        }
+        trusted_origin = os.path.join(_DISTRIBUTED_OPS_DIR, "parallel_invalid.py")
+        mock_module = SimpleNamespace(SomeClass=object)
+
+        with patch.object(importlib.util, "find_spec", return_value=SimpleNamespace(origin=trusted_origin)):
+            with patch.object(importlib, "import_module", return_value=mock_module):
+                with self.assertRaisesRegex(TypeError, "must inherit DistributedOp"):
+                    stub._register_single_distributed_op("TestOp", config)  # pylint: disable=protected-access
+
+    def test_trusted_distributed_op_is_registered(self):
+        """A package-owned DistributedOp subclass remains supported."""
+        from hyper_parallel.core.shard._op_dispatch import (  # pylint: disable=import-outside-toplevel
+            _DISTRIBUTED_OPS_DIR,
+        )
+        from hyper_parallel.core.shard.ops.parallel_ops import (  # pylint: disable=import-outside-toplevel
+            DistributedOp,
+        )
+
+        class TrustedDistributedOp(DistributedOp):
+            """Test-only trusted distributed operator."""
+
+        stub = self._make_stub()
+        config = {
+            "distributed_op_file": "parallel_trusted",
+            "distributed_op_class": "TrustedDistributedOp",
+        }
+        trusted_origin = os.path.join(_DISTRIBUTED_OPS_DIR, "parallel_trusted.py")
+        mock_module = SimpleNamespace(TrustedDistributedOp=TrustedDistributedOp)
+
+        with patch.object(importlib.util, "find_spec", return_value=SimpleNamespace(origin=trusted_origin)):
+            with patch.object(importlib, "import_module", return_value=mock_module):
+                with patch.object(TrustedDistributedOp, "__init__", return_value=None) as mock_init:
+                    stub._register_single_distributed_op("TestOp", config)  # pylint: disable=protected-access
+
+        mock_init.assert_called_once_with("TestOp")
 
 
 class TestLoadYamlDictErrors(unittest.TestCase):
@@ -1072,11 +959,11 @@ class TestLoadYamlDictErrors(unittest.TestCase):
     Expectation: ValueError raised for bad path; ValueError raised for duplicate keys.
     """
 
-    def _make_stub(self, yaml_dir, work_dir=""):
+    @staticmethod
+    def _make_stub(yaml_dir):
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
         stub = object.__new__(OpDispatcher)
         stub.yaml_dir = yaml_dir
-        stub.work_dir = work_dir
         return stub
 
     def test_invalid_yaml_dir_raises(self):

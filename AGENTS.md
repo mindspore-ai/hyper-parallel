@@ -36,9 +36,11 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 ## Env Gotchas / Do Not
 
 - **Editable must track this tree.** If `pip show hyper_parallel` shows another path (e.g. a deleted `.worktrees/...`), re-run `pip install -e .` from repo root. Do not rely on `PYTHONPATH` alone.
-- **Never** `import torch` / `import mindspore` in platform-agnostic `core/` code — use `get_platform()`.
+- **Core default:** platform-agnostic `core/` code uses `get_platform()` during the staged Platform retirement.
 - **Multicore exception:** `core/multicore/` is an explicit Torch-only component. Use direct, module-level
   Torch imports there; do not add Platform dispatch or MindSpore implementations.
+- **DFunction exception:** `core/shard/dfunction.py` is Torch-only and inherits directly from
+  `torch.autograd.Function`; do not reintroduce Platform dispatch or MindSpore support.
 - **Never** invent Jenkins build numbers or force-push shared branches in agent workflows.
 - Hard distributed rules (canonical): `.agent/rules/project-overview.md` + `.agent/rules/distributed.md` — do not restate long-form elsewhere; link instead.
 

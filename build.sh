@@ -16,7 +16,6 @@ NATIVE_ROOT="${PROJECT_ROOT}/build/native"
 PAYLOAD_ROOT="${NATIVE_ROOT}/payload/hyper_parallel"
 PAYLOAD_STAGING_ROOT="${NATIVE_ROOT}/payload-staging/full-build.$$"
 MULTICORE_VALUE=on
-CUSTOM_OPS_VALUE=on
 STRICT_VALUE=off
 SOC_LIST_VALUE="ascend910b,ascend910_93"
 NATIVE_JOBS="$(nproc)"
@@ -31,7 +30,6 @@ function show_help() {
     cat <<EOF
 Usage: bash build.sh [OPTIONS]
   --multicore on|off   Build Multicore, including private SHMEM. Default: on.
-  --custom-ops on|off  Build MindSpore custom ops. Default: on.
   --soc-list VALUE    Multicore targets. Default: ascend910b,ascend910_93.
   --jobs VALUE        Parallel build jobs. Default: nproc.
   --strict on|off     Stop on optional component failure. Default: off.
@@ -52,7 +50,7 @@ function normalize_on_off() {
 while [[ $# -gt 0 ]]; do
     option=${1%%=*}
     case "${option}" in
-        --multicore|--custom-ops|--strict|--soc-list|--jobs)
+        --multicore|--strict|--soc-list|--jobs)
             if [[ "$1" == *=* ]]; then
                 value=${1#*=}
                 shift
@@ -64,7 +62,6 @@ while [[ $# -gt 0 ]]; do
             [[ -n "${value}" ]] || die "${option} requires a value."
             case "${option}" in
                 --multicore) MULTICORE_VALUE=$(normalize_on_off "${value}") ;;
-                --custom-ops) CUSTOM_OPS_VALUE=$(normalize_on_off "${value}") ;;
                 --strict) STRICT_VALUE=$(normalize_on_off "${value}") ;;
                 --soc-list) SOC_LIST_VALUE=${value} ;;
                 --jobs) NATIVE_JOBS=${value} ;;
@@ -78,7 +75,7 @@ done
 [[ "${NATIVE_JOBS}" =~ ^[1-9][0-9]*$ ]] || die "--jobs must be a positive integer."
 PYTHON_BIN=$(command -v python) || die "Python is unavailable in the active PATH."
 
-if [[ "${MULTICORE_VALUE}" == on || "${CUSTOM_OPS_VALUE}" == on ]] && \
+if [[ "${MULTICORE_VALUE}" == on ]] && \
         [[ -z "${ASCEND_HOME_PATH:-}" && -f /usr/local/Ascend/cann/set_env.sh ]]; then
     set +u
     source /usr/local/Ascend/cann/set_env.sh
@@ -118,14 +115,6 @@ if [[ "${MULTICORE_VALUE}" == on ]]; then
         result=$?
         # Component-owned option errors are user input failures, not optional build failures.
         [[ ${result} -ne 2 && ${result} -ne 10 ]] || exit "${result}"
-        [[ "${STRICT_VALUE}" == off ]] || exit "${result}"
-    fi
-fi
-if [[ "${CUSTOM_OPS_VALUE}" == on ]]; then
-    if run_component custom_ops hyper_parallel/platform/mindspore/custom_ops/build.sh --jobs "${NATIVE_JOBS}"; then
-        :
-    else
-        result=$?
         [[ "${STRICT_VALUE}" == off ]] || exit "${result}"
     fi
 fi

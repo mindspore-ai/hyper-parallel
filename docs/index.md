@@ -29,7 +29,7 @@
 | 文档 | 说明 |
 |------|------|
 | [API Reference](./api/api_reference.md) | 按特性模块组织的完整接口说明 |
-| [DFunction](./api/dfunction.md) | 自定义分布式 autograd 函数详细文档 |
+| [DFunction](./api/dfunction.md) | Torch 自定义分布式 autograd 函数详细文档 |
 
 ## FAQ 与故障排查
 
