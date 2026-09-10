@@ -19,21 +19,24 @@
 import copy
 import warnings
 
-from typing import Tuple, Optional
-from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import (  # pylint: disable=C0415
-    _get_lb_override,
-)
+from typing import Any, Tuple, Optional
 from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.shard.utils import get_lb_override
 from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
-from hyper_parallel.platform import get_platform
-
-platform = get_platform()
-Tensor = platform.Tensor
 
 
 def _normalize_sdpa_args(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
                          enable_gqa=False):
     return (query, key, value, attn_mask, dropout_p, is_causal, scale), {'enable_gqa': enable_gqa}
+
+
+def _get_torch_rank() -> int:
+    """Return the current torch distributed rank, or 0 before distributed init."""
+    import torch  # pylint: disable=import-outside-toplevel
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
 
 
 class ScaledDotProductAttentionDistributedOp(DistributedOp):
@@ -166,7 +169,7 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
             return 0
 
         if isinstance(dim_map, str):
-            rank = platform.get_rank()
+            rank = _get_torch_rank()
             rank_list = layout.mesh.get_rank_list_along_axis(dim_map)
             if rank in rank_list:
                 return rank_list.index(rank)
@@ -184,7 +187,7 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
                     f"Using the last axis for split_id calculation."
                 )
             axis_name = non_none_axes[-1]
-            rank = platform.get_rank()
+            rank = _get_torch_rank()
             rank_list = layout.mesh.get_rank_list_along_axis(axis_name)
             if rank in rank_list:
                 return rank_list.index(rank)
@@ -241,7 +244,7 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
         kv_len: int,
         split_id: int,
         device,
-    ) -> Tensor:
+    ) -> Any:
         """Build causal attention mask for a local Q chunk.
 
         For global Q position (split_id * local_q_len + i), causal mask allows
@@ -257,17 +260,17 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
 
     def _adjust_attn_mask_for_sp(
         self,
-        attn_mask: Optional[Tensor],
+        attn_mask: Optional[Any],
         is_causal: bool,
-        key: Tensor,
-        value: Tensor,
+        key: Any,
+        value: Any,
         split_id: int,
         local_q_len: int,
         seq_split_num: int,
         global_kv_len: int,
         seq_dim: int,
         device,
-    ) -> Tuple[Optional[Tensor], bool, Tensor, Tensor]:
+    ) -> Tuple[Optional[Any], bool, Any, Any]:
         """Adjust attn_mask, is_causal, and KV tensors for sequence parallelism.
 
         For is_causal=True: truncates KV to the causally relevant range via
@@ -537,7 +540,7 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
             split_info = self._get_split_info(query_layout, dims)
             seq_split_num = split_info["seq"]
 
-            lb_split_id, lb_split_num = _get_lb_override()
+            lb_split_id, lb_split_num = get_lb_override()
 
             adjusted_attn_mask = attn_mask
             adjusted_is_causal = is_causal

@@ -1,0 +1,4 @@
+embedding:
+  dist_op_name: _torch_embedding_dist_op
+  distributed_op_class: EmbeddingDistributedOp
+  distributed_op_file: parallel_embedding

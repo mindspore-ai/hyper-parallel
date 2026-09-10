@@ -1,9 +1,0 @@
-sort:
-  dist_op_name: _torch_sort_dist_op
-  distributed_op_class: SortDistributedOp
-  distributed_op_file: parallel_sort
-
-SortExt:
-  dist_op_name: _sort_ext_dist_op
-  distributed_op_class: SortDistributedOp
-  distributed_op_file: parallel_sort

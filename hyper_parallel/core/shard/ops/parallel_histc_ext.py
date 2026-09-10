@@ -19,10 +19,7 @@ Distributed implementation for HistcExt operator.
 from typing import Tuple
 
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
-
-platform = get_platform()
 
 
 def _normalize_histc_args(x, bins=100, min_val=0, max_val=0):

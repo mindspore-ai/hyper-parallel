@@ -37,7 +37,7 @@ class ShardingPlan:
 
     Example:
         >>> from hyper_parallel import DeviceMesh, Layout, ShardingPlan, shard_module
-        >>> mesh = DeviceMesh("npu", (2, 2), nesh_dim_names=("dp", "tp"))
+        >>> mesh = DeviceMesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
         >>> sharding_plan = ShardingPlan(
         ...     plan={"weight": (Replicate(), Shard(1))},
         ...     input_plan={"input": (Shard(0), Replicate()), "relu.input": (Shard(0), Replicate())},

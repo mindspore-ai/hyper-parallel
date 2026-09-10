@@ -15,19 +15,17 @@
 """Custom distributed autograd function base class."""
 from __future__ import annotations
 
-from hyper_parallel.platform import get_platform
+import torch
+
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
 
-platform = get_platform()
-
 
 class _LocalCallable:
-    """Named callable wrapper that exposes the op name to both platform dispatchers.
+    """Named callable wrapper that exposes the op name to the dispatcher.
 
-    PyTorch's ``get_op_name`` inspects ``__name__``; MindSpore's inspects ``.name``.
-    Setting both attributes here lets ``_OP_DISPATCHER`` look up the correct
-    ``DistributedOp`` without modifying either platform implementation.
+    The Torch dispatcher inspects ``__name__`` to look up the matching
+    ``DistributedOp``.
 
     Args:
         fn: The underlying callable to invoke.
@@ -43,7 +41,7 @@ class _LocalCallable:
         return self._fn(*args, **kwargs)
 
 
-class DFunction(platform.Function):
+class DFunction(torch.autograd.Function):
     """Base class for user-defined distributed autograd functions.
 
     Subclass this class and implement ``forward`` and ``backward`` as
@@ -54,7 +52,7 @@ class DFunction(platform.Function):
     Dispatch behaviour:
 
     * **No DTensor inputs** — calls ``super().apply()`` directly, going straight
-      into the platform autograd mechanism (single-device path).
+      into Torch autograd (single-device path).
     * **DTensor inputs + ``_op_name`` set** — delegates to
       ``_OP_DISPATCHER.dispatch``.  The dispatcher extracts local tensors, calls
       ``DistributedOp.infer_layout`` to derive the output layout, invokes the
@@ -144,7 +142,7 @@ class DFunction(platform.Function):
 
         Returns:
             A ``_LocalCallable`` whose ``__name__`` and ``.name`` equal
-            ``cls._op_name``, enabling ``platform.get_op_name`` to resolve the
+            ``cls._op_name``, enabling the dispatcher to resolve the
             correct ``DistributedOp``.
         """
         if '_local_callable' not in cls.__dict__:

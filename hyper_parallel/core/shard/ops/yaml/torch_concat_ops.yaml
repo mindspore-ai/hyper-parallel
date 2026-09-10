@@ -1,0 +1,9 @@
+cat:
+  dist_op_name: _torch_cat_dist_op
+  distributed_op_class: ConcatDistributedOp
+  distributed_op_file: parallel_concat
+
+concat:
+  dist_op_name: _torch_concat_dist_op
+  distributed_op_class: ConcatDistributedOp
+  distributed_op_file: parallel_concat

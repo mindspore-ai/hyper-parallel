@@ -18,9 +18,21 @@ Distributed implementation for Gather operator.
 
 from typing import Tuple
 
+import torch
+
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
+
+
+def _get_torch_group_local_rank(group=None) -> int:
+    """Return local rank in a torch process group, or 0 before distributed init."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0
+    if group is None:
+        return torch.distributed.get_rank()
+    if hasattr(group, "rank"):
+        return group.rank()
+    return torch.distributed.get_group_rank(group, torch.distributed.get_rank())
 
 
 def _normalize_index_select_args(input_tensor, dim, index):
@@ -149,7 +161,6 @@ class IndexSelectDistributedOp(DistributedOp):
         # If the axis IS sharded, return a custom function with Masking ONLY.
         # The explicit AllReduce is completely removed.
         def expand_impl(input_tensor, dim, index, **kwargs):
-            platform = get_platform()
             mesh = p_layout.mesh
 
             # Fetch the communication group for the sharded mesh dimension
@@ -162,7 +173,7 @@ class IndexSelectDistributedOp(DistributedOp):
             group = comm_group_info.group if hasattr(comm_group_info, 'group') else comm_group_info
 
             # Get the rank of the current device within this specific communication group
-            group_rank = platform.get_group_local_rank(group=group)
+            group_rank = _get_torch_group_local_rank(group)
 
             # Calculate global index boundaries for the local chunk
             local_dim_size = input_tensor.shape[dim]

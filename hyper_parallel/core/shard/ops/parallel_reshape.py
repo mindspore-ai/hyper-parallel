@@ -18,11 +18,10 @@ Distributed implementation for Reshape operator.
 
 from typing import Callable, Optional, Tuple
 
+import torch
+
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
-platform = get_platform()
-Tensor = platform.Tensor
 
 
 def _normalize_reshape_args(x, *shape, **kwargs):
@@ -171,7 +170,7 @@ class ReshapeDistributedOp(DistributedOp):
 
     def _normalize_shape(self, dst_shape):
         """Normalize dst_shape to list format."""
-        if isinstance(dst_shape, Tensor):
+        if isinstance(dst_shape, torch.Tensor):
             dst_shape = dst_shape.tolist()
         if not isinstance(dst_shape, (list, tuple)):
             raise ValueError("Shape should be a tensor or a tuple or a list.")

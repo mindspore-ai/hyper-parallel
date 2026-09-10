@@ -863,12 +863,10 @@ class TestSdpaHelperMethods(unittest.TestCase):
         self.assertEqual(adj_mask.shape[2], local_q_len)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.shard.ops.parallel_scaled_dot_product_attention.platform")
-    def test_expanded_impl_with_sequence_parallelism(self, mock_sdpa_platform, mock_mesh_platform):
+    def test_expanded_impl_with_sequence_parallelism(self, mock_mesh_platform):
         """expanded_impl with SP active calls _adjust_attn_mask_for_sp and then func."""
         import torch
         self._setup_mock_platform(mock_mesh_platform, world_size=8)
-        mock_sdpa_platform.get_rank.return_value = 0
         mesh = init_device_mesh(
             device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("sp", "mp")
         )
