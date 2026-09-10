@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
@@ -86,6 +87,7 @@ from hyper_parallel.trainer.runtime.device import (  # pylint: disable=syntax-er
 )
 
 from hyper_parallel.trainer.callbacks import (
+    Callback,
     EnvironMeterCallback,
     EvaluateCallback,
     GarbageCollectionCallback,
@@ -93,6 +95,7 @@ from hyper_parallel.trainer.callbacks import (
     ProfilingCallback,
     TqdmCallback,
     CheckpointerCallback,
+    ThroughputMFUCallback,
     TrainerState,
 )
 
@@ -460,6 +463,22 @@ class BaseTrainer(Stateful, ABC):
                 "Checkpointing is inactive (save_ckpt=false, restore_from=None); "
                 "no checkpoint callback registered."
             )
+        # Optional standalone throughput/MFU probe (off by default).
+        if os.environ.get("HP_THROUGHPUT_MFU", "0") == "1":
+            self.add_callback(ThroughputMFUCallback(self))
+
+    def add_callback(self, callback: Callback) -> None:
+        """Register an extra ``Callback`` to receive every lifecycle event.
+
+        Use this to plug domain-specific monitors (custom metric sinks,
+        in-house experiment trackers) without editing the trainer. Built-in
+        callbacks always run first; user callbacks run in registration order.
+
+        Args:
+            callback: Callback instance to append to the dispatch list.
+        """
+        self._callbacks.append(callback)
+        logger.info("User callback registered: %s", type(callback).__name__)
 
     def on_train_begin(self) -> None:
         """Run all registered callbacks at the start of training."""
@@ -492,7 +511,13 @@ class BaseTrainer(Stateful, ABC):
         loss_dict: Optional[Dict[str, Any]] = None,
         grad_norm: Optional[float] = None,
     ) -> None:
-        """Run all registered callbacks at the end of a training step."""
+        """Run all registered callbacks at the end of a training step.
+
+        Args:
+            loss: Reduced total loss for the step, when available.
+            loss_dict: Per-component loss values for the step.
+            grad_norm: Global gradient norm for the step, when available.
+        """
         for callback in self._callbacks:
             callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
@@ -503,6 +528,12 @@ class BaseTrainer(Stateful, ABC):
         (e.g. ``multimodal_metadata`` emitted by ``PackingCollator``) are
         recursed so inner tensor values land on the device too; Python ints
         / lists / etc. pass through unchanged.
+
+        Args:
+            micro_batch: Micro-batch mapping as produced by the dataloader.
+
+        Returns:
+            The same mapping with tensors placed on ``self.device``.
         """
 
         def _to_device(v: Any) -> Any:
@@ -522,7 +553,15 @@ class BaseTrainer(Stateful, ABC):
     def postforward(
             self, outputs: ModelOutput, labels: Optional[torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Postprocess model outputs after forward pass."""
+        """Postprocess model outputs after forward pass.
+
+        Args:
+            outputs: Raw model output of the micro-batch forward pass.
+            labels: Target labels for the loss computation.
+
+        Returns:
+            Tuple of the local loss tensor and the per-component loss dict.
+        """
         local_loss = self.loss_fn(model_output=outputs, labels=labels)
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             local_loss,
@@ -605,7 +644,12 @@ class BaseTrainer(Stateful, ABC):
             return loss, loss_dict
 
     def model_reshard(self, micro_step: int, num_micro_steps: int) -> None:
-        """Reshard model after backward pass; policy lives in ``runtime/fsdp.py``."""
+        """Reshard model after backward pass; policy lives in ``runtime/fsdp.py``.
+
+        Args:
+            micro_step: Index of the micro-step that just finished backward.
+            num_micro_steps: Total micro-steps in the current optimizer step.
+        """
         fsdp_runtime.model_reshard(self.hsdp_model_parts, self.config.fsdp_config, micro_step, num_micro_steps)
 
     def _configure_fsdp_gradient_sync(self, micro_step: int, num_micro_steps: int):
@@ -619,14 +663,26 @@ class BaseTrainer(Stateful, ABC):
         )
 
     def configure_fsdp_gradient_sync(self, micro_step: int, num_micro_steps: int) -> None:
-        """Configure FSDP gradient synchronization for an external training loop."""
+        """Configure FSDP gradient synchronization for an external training loop.
+
+        Args:
+            micro_step: Index of the micro-step about to run backward.
+            num_micro_steps: Total micro-steps in the current optimizer step.
+        """
         self._configure_fsdp_gradient_sync(micro_step, num_micro_steps)
 
     def train_step(
             self,
             data_iterator: Any,
     ) -> Dict[str, float]:
-        """Execute one optimizer update from the next dataloader batch."""
+        """Execute one optimizer update from the next dataloader batch.
+
+        Args:
+            data_iterator: Iterator yielding micro-batch lists for one step.
+
+        Returns:
+            Scalar training metrics of the step (loss values and grad norm).
+        """
         config = self.config
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)

@@ -47,6 +47,13 @@ class TrainingConfig:
     eval_steps: int = 0
     eval_epochs: int = 0
     logging_steps: int = 1
+    # Per-device peak dense throughput in TFLOPS (e.g. 376.0 for Ascend 910B
+    # BF16). Never guessed — MFU stays unreported while unset. FLOPs per
+    # token are not configured here; they are derived from the model config
+    # by ``hyper_parallel.models.flops`` (a model's own ``hp_flops_per_token``
+    # wins when present). Recompute from activation checkpointing is not
+    # counted as useful FLOPs.
+    peak_tflops: Optional[float] = None
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
 
 
