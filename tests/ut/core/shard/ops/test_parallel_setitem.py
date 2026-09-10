@@ -43,6 +43,12 @@ class TestSetItemDistributedOp(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -56,9 +62,6 @@ class TestSetItemDistributedOp(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2 (dp, mp) mesh."""
@@ -75,7 +78,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
 
     # ===== infer_layout tests (success) =====
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_setitem_scalar_replicated(self, mock_platform):
         """
         Feature: setitem with scalar value on replicated tensor.
@@ -95,7 +98,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
         out_layout = result[0][0]
         self.assertIs(out_layout, self_layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_setitem_tensor_replicated(self, mock_platform):
         """
         Feature: setitem with plain tensor value on replicated tensor.
@@ -116,7 +119,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
         out_layout = result[0][0]
         self.assertIs(out_layout, self_layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_setitem_shard_kept_dim(self, mock_platform):
         """
         Feature: setitem with DTensor value on sharded dim that is NOT indexed.
@@ -139,7 +142,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
         out_layout = result[0][0]
         self.assertIs(out_layout, self_layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_setitem_advanced_single_list(self, mock_platform):
         """
         Feature: setitem with advanced list index and DTensor value.
@@ -161,7 +164,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
         out_layout = result[0][0]
         self.assertIs(out_layout, self_layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_setitem_inplace_view_propagation(self, mock_platform):
         """
         Feature: setitem value layout must match getitem output layout.
@@ -188,7 +191,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
 
     # ===== Error cases =====
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.ops.parallel_setitem.platform")
     def test_setitem_bool_mask(self, mock_op_platform, mock_dt_platform):
         """
@@ -209,7 +212,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
             setitem_op.infer_layout(cache_values)
         self.assertIn("boolean-mask", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.ops.parallel_setitem.platform")
     def test_setitem_shard_dim_write(self, mock_op_platform, mock_dt_platform):
         """
@@ -230,7 +233,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
             setitem_op.infer_layout(cache_values)
         self.assertIn("non-replicate dim 0", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.ops.parallel_setitem.platform")
     def test_setitem_value_layout_mismatch(self, mock_op_platform, mock_dt_platform):
         """
@@ -253,7 +256,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
             setitem_op.infer_layout(cache_values)
         self.assertIn("value layout mismatch", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.ops.parallel_setitem.platform")
     def test_setitem_value_shape_mismatch(self, mock_op_platform, mock_dt_platform):
         """

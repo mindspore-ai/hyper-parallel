@@ -66,11 +66,11 @@ def _make_layout_with_mock(mesh_shape, alias_name, rank_list=None):
 
 
 class _MockedLayoutTestCase(unittest.TestCase):
-    """Base class that patches the device_mesh platform for all tests."""
+    """Base class that patches the device_mesh distributed backend for all tests."""
 
     def setUp(self):
         """Set up test fixtures."""
-        patcher_dm = patch("hyper_parallel.core.dtensor.device_mesh.platform")
+        patcher_dm = patch("hyper_parallel.core.dtensor.device_mesh.dist", MagicMock())
         patcher_tensor = patch("hyper_parallel.core.dtensor.device_mesh.Tensor", torch.Tensor)
         self.mock_dm_platform = patcher_dm.start()
         patcher_tensor.start()
@@ -231,7 +231,7 @@ class TestGetDimSplitNum(_MockedLayoutTestCase):
 
 class TestGetSplitId(_MockedLayoutTestCase):
     """Tests for GetSplitId."""
-    @patch("hyper_parallel.core.dtensor.layout.platform")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
     def test_single_axis(self, mock_layout_platform):
         """Test single axis."""
         mock_layout_platform.get_rank.return_value = 0
@@ -240,7 +240,7 @@ class TestGetSplitId(_MockedLayoutTestCase):
         result = layout.get_split_id(0)
         self.assertIsInstance(result, int)
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
     def test_tuple_axis(self, mock_layout_platform):
         """Test tuple axis."""
         mock_layout_platform.get_rank.return_value = 0
@@ -249,7 +249,7 @@ class TestGetSplitId(_MockedLayoutTestCase):
         result = layout.get_split_id(0)
         self.assertIsInstance(result, int)
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
     def test_none_mapping(self, mock_layout_platform):
         """Test none mapping."""
         mock_layout_platform.get_rank.return_value = 0
@@ -257,7 +257,7 @@ class TestGetSplitId(_MockedLayoutTestCase):
         layout._alias_tensor_map = ("None",)
         self.assertEqual(layout.get_split_id(0), 0)
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
     def test_no_alias_tensor_map(self, mock_layout_platform):
         """Test no alias tensor map."""
         mock_layout_platform.get_rank.return_value = 0

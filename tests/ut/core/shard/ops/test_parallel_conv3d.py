@@ -48,6 +48,12 @@ class TestParallelConv3D(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         self.platform = get_platform()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -80,9 +86,6 @@ class TestParallelConv3D(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform, mesh_dim_names=("dp", "sp")):
         """Set up mock and return a standard 2x4 mesh via init_device_mesh."""
@@ -99,7 +102,7 @@ class TestParallelConv3D(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=world_size)
         return init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=mesh_dim_names)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_preprocess_returns_local_args_and_cache_values(self, mock_platform):
         """
         Feature: New dispatch preprocessing
@@ -130,7 +133,7 @@ class TestParallelConv3D(unittest.TestCase):
         self.assertEqual(local_kwargs, {})
         self.assertEqual(cache_values, [in_layout, w_layout, b_layout, 2, 1, 1, 1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_data_and_spatial_parallelism(self, mock_platform):
         """
         Feature: Data Parallelism and Spatial Parallelism
@@ -157,7 +160,7 @@ class TestParallelConv3D(unittest.TestCase):
             f"DP + SP failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_column_parallelism(self, mock_platform):
         """
         Feature: Tensor Column Parallelism (sharded on output channel C_out)
@@ -188,7 +191,7 @@ class TestParallelConv3D(unittest.TestCase):
             f"Column Parallelism failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_row_parallelism_partial_output(self, mock_platform):
         """
         Feature: Tensor Row Parallelism (sharded on input channel C_in)
@@ -220,7 +223,7 @@ class TestParallelConv3D(unittest.TestCase):
             f"Row parallelism failed to set partial status. Got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_invalid_row_parallelism_axis_mismatch(self, mock_platform):
         """
         Feature: Invalid Row Parallelism validation
@@ -240,7 +243,7 @@ class TestParallelConv3D(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Input C_in and Weight C_in must be sharded on the same axis."):
             op.infer_layout(self._cache_values((in_layout, w_layout), default_extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_invalid_column_parallelism_bias_mismatch(self, mock_platform):
         """
         Feature: Invalid Column Parallelism validation
@@ -263,7 +266,7 @@ class TestParallelConv3D(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Weight C_out and Bias C_out must be sharded on the same axis."):
             op.infer_layout(self._cache_values((in_layout, w_layout, b_layout), default_extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_invalid_groups_with_sharded_c_in(self, mock_platform):
         """
         Feature: Grouped convolution constraint
@@ -284,7 +287,7 @@ class TestParallelConv3D(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Sharding on C_in with groups > 1 is not supported."):
             op.infer_layout(self._cache_values((in_layout, w_layout), extra_args_with_groups))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_invalid_dimension_count(self, mock_platform):
         """
         Feature: Dimension validation
@@ -304,7 +307,7 @@ class TestParallelConv3D(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Input and weight must be 5D."):
             op.infer_layout(self._cache_values((in_layout, w_layout), default_extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_missing_required_layouts(self, mock_platform):
         """
         Feature: Input arguments validation
@@ -319,7 +322,7 @@ class TestParallelConv3D(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Requires at least input and weight layouts."):
             op.infer_layout(self._cache_values((in_layout,), default_extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_pure_data_parallelism(self, mock_platform):
         """
         Feature: Pure Data Parallelism
@@ -348,7 +351,7 @@ class TestParallelConv3D(unittest.TestCase):
             f"Pure DP failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_spatial_parallelism_hw(self, mock_platform):
         """
         Feature: Spatial Parallelism on Height and Width
@@ -374,7 +377,7 @@ class TestParallelConv3D(unittest.TestCase):
             f"SP on H and W failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_column_parallelism_no_bias(self, mock_platform):
         """
         Feature: Column Parallelism without Bias
@@ -400,7 +403,7 @@ class TestParallelConv3D(unittest.TestCase):
             f"Column Parallelism without bias failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_grouped_column_parallelism(self, mock_platform):
         """
         Feature: Grouped Convolution with Column Parallelism
@@ -427,7 +430,7 @@ class TestParallelConv3D(unittest.TestCase):
             f"Grouped Column Parallelism failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_hybrid_dp_tp_sp(self, mock_platform):
         """
         Feature: 3D Hybrid Parallelism (DP + TP + SP)
@@ -453,7 +456,7 @@ class TestParallelConv3D(unittest.TestCase):
             f"3D Hybrid Parallelism failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_rejects_partial_inputs(self, mock_platform):
         """
         Feature: Rejection of Partial Inputs
@@ -473,7 +476,7 @@ class TestParallelConv3D(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status which is not allowed"):
             op.infer_layout(self._cache_values((in_layout, w_layout), default_extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_fully_replicated(self, mock_platform):
         """
         Feature: Fully Replicated Execution
@@ -497,7 +500,7 @@ class TestParallelConv3D(unittest.TestCase):
         )
 
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_spatial_parallelism_depth(self, mock_platform):
         """
         Feature: Spatial Parallelism on Depth
@@ -523,7 +526,7 @@ class TestParallelConv3D(unittest.TestCase):
             f"SP on Depth failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_spatial_parallelism_width(self, mock_platform):
         """
         Feature: Spatial Parallelism on Width
@@ -543,7 +546,7 @@ class TestParallelConv3D(unittest.TestCase):
         expected_map = (-1, -1, -1, -1, 0)
         self.assertEqual(output_layout.to_dict()["tensor_map"], expected_map)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_spatial_parallelism_d_h_w(self, mock_platform):
         """
         Feature: 3D Spatial Parallelism
@@ -565,7 +568,7 @@ class TestParallelConv3D(unittest.TestCase):
         expected_map = (-1, -1, 2, 1, 0)
         self.assertEqual(output_layout.to_dict()["tensor_map"], expected_map)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_hybrid_dp_cp(self, mock_platform):
         """
         Feature: Hybrid Data Parallelism and Column Parallelism
@@ -588,7 +591,7 @@ class TestParallelConv3D(unittest.TestCase):
         expected_map = (1, 0, -1, -1, -1)
         self.assertEqual(output_layout.to_dict()["tensor_map"], expected_map)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_hybrid_dp_rp(self, mock_platform):
         """
         Feature: Hybrid Data Parallelism and Row Parallelism
@@ -612,7 +615,7 @@ class TestParallelConv3D(unittest.TestCase):
         self.assertEqual(output_layout.to_dict()["tensor_map"], expected_map)
         self.assertEqual(output_layout.partial, [None, "sum"])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_row_parallelism_with_bias(self, mock_platform):
         """
         Feature: Row Parallelism with Replicated Bias
@@ -636,7 +639,7 @@ class TestParallelConv3D(unittest.TestCase):
         self.assertEqual(output_layout.to_dict()["tensor_map"], expected_map)
         self.assertEqual(output_layout.partial, ["sum"])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_column_parallelism_1d_mesh(self, mock_platform):
         """
         Feature: Column Parallelism on a 1D Mesh
@@ -657,7 +660,7 @@ class TestParallelConv3D(unittest.TestCase):
         expected_map = (-1, 0, -1, -1, -1)
         self.assertEqual(output_layout.to_dict()["tensor_map"], expected_map)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_conv3d_invalid_bias_sharding(self, mock_platform):
         """
         Feature: Invalid Bias Sharding Validation

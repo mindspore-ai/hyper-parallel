@@ -42,6 +42,12 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -55,9 +61,6 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, sp, mp) mesh via init_device_mesh."""
@@ -104,7 +107,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
             f"Expected {expected_out_map}, got {attention_out_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_no_parallel_1(self, mock_platform):
         """
         Feature: Layout inference with no parallelism.
@@ -126,7 +129,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (-1, -1, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_data_parallel_2(self, mock_platform):
         """
         Feature: Layout inference with data parallelism.
@@ -148,7 +151,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (2, -1, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_head_parallel_3(self, mock_platform):
         """
         Feature: Layout inference with head parallelism.
@@ -170,7 +173,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (-1, -1, 0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_sequence_parallel_4(self, mock_platform):
         """
         Feature: Layout inference with sequence parallelism.
@@ -195,7 +198,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
 
 
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_kv_different_layout_7(self, mock_platform):
         """
         Feature: Layout inference with different KV sharding.
@@ -216,7 +219,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
             op.infer_layout(cache_values)
 
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_sbh_layout_9(self, mock_platform):
         """
         Feature: Layout inference for SBH input layout.
@@ -238,7 +241,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (-1, -1, 0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_bsnd_layout_10(self, mock_platform):
         """
         Feature: Layout inference for BSND input layout.
@@ -261,7 +264,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         assert output_layouts[0].to_dict()["tensor_map"] == (1, -1, 0, -1)
 
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_sparse_mode_2_15(self, mock_platform):
         """
         Feature: Layout inference with sparse_mode=2 and sequence parallelism.
@@ -284,7 +287,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (-1, 0, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_multiple_inputs_same_layout_16(self, mock_platform):
         """
         Feature: Layout inference returns 4 output layouts.
@@ -308,7 +311,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         assert len(output_layouts) == 4, "Should return 4 output layouts"
         assert output_layouts[0].to_dict()["tensor_map"] == (2, -1, 0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_output_layouts_bsh_17(self, mock_platform):
         """
         Feature: All 4 output layouts for BSH with dp+mp.
@@ -339,7 +342,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         assert softmax_sum.to_dict()["tensor_map"] == (1, 0, -1, -1)
         assert softmax_out.to_dict()["tensor_map"] == (-1,)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_multi_dimensional_mesh_18(self, mock_platform):
         """
         Feature: Layout inference with 3D device mesh.
@@ -361,7 +364,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (2, 1, 0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_single_device_19(self, mock_platform):
         """
         Feature: Layout inference with single device mesh.
@@ -384,7 +387,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (-1, -1, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_large_world_size_20(self, mock_platform):
         """
         Feature: Layout inference with large world size.
@@ -407,7 +410,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (3, 2, 1, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_output_layouts_bnsd_21(self, mock_platform):
         """
         Feature: Softmax output layouts for BNSD input.
@@ -434,7 +437,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         assert softmax_max.to_dict()["tensor_map"] == (1, 0, -1, -1)
         assert softmax_sum.to_dict()["tensor_map"] == (1, 0, -1, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_output_layouts_sbh_22(self, mock_platform):
         """
         Feature: Softmax output layouts for SBH input.
@@ -461,7 +464,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         assert softmax_max.to_dict()["tensor_map"] == (1, 0, -1, -1)
         assert softmax_sum.to_dict()["tensor_map"] == (1, 0, -1, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_output_layouts_tnd_23(self, mock_platform):
         """
         Feature: Softmax output layouts for TND input.
@@ -488,7 +491,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         assert softmax_max.to_dict()["tensor_map"] == (1, 0, -1)
         assert softmax_sum.to_dict()["tensor_map"] == (1, 0, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_output_layouts_mixed_parallel_24(self, mock_platform):
         """
         Feature: Softmax output layouts with full DP + SP + MP parallelism.
@@ -516,7 +519,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         assert softmax_max.to_dict()["tensor_map"] == (2, 0, 1, -1)
         assert softmax_sum.to_dict()["tensor_map"] == (2, 0, 1, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_softmax_no_sharding_25(self, mock_platform):
         """
         Feature: Softmax output layouts with no sharding.
@@ -546,7 +549,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
 
 
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_bsnd_sp_31(self, mock_platform):
         """
         Feature: Layout inference for BSND with sequence parallelism.
@@ -569,7 +572,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (2, 1, 0, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_bnsd_sp_32(self, mock_platform):
         """
         Feature: Layout inference for BNSD with sequence parallelism.
@@ -592,7 +595,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (2, 0, 1, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_ring_attention_33(self, mock_platform):
         """
         Feature: Layout inference with both Q and KV sequence-sharded.
@@ -614,7 +617,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (1, 0, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_sparse_mode_3_sp_34(self, mock_platform):
         """
         Feature: Layout inference with sparse_mode=3 (rightDownToLeftUp) and SP.
@@ -637,7 +640,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (-1, 0, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_sparse_mode_4_band_35(self, mock_platform):
         """
         Feature: Layout inference with sparse_mode=4 (band) and DP.
@@ -659,7 +662,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (0, -1, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_invalid_input_layout_36(self, mock_platform):
         """
         Feature: Error handling for invalid input_layout string.
@@ -676,7 +679,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
             cache_values = [q_layout, k_layout, v_layout, "INVALID"]
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_missing_extra_args_37(self, mock_platform):
         """
         Feature: Error handling for missing extra_args.
@@ -693,7 +696,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
             cache_values = [q_layout, k_layout, v_layout]
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_ndim_mismatch_layout_38(self, mock_platform):
         """
         Feature: Graceful handling for tensor ndim vs input_layout mismatch.
@@ -717,7 +720,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         assert len(attention_out_layout.to_dict()["tensor_map"]) == 3
 
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_dp_only_no_mp_no_sp_40(self, mock_platform):
         """
         Feature: Layout inference with pure DP on a single-axis mesh.
@@ -739,7 +742,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (0, -1, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_mp_only_no_dp_no_sp_41(self, mock_platform):
         """
         Feature: Layout inference with pure MP on a single-axis mesh.
@@ -761,7 +764,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (-1, -1, 0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_sbh_sp_42(self, mock_platform):
         """
         Feature: Layout inference for SBH with sequence parallelism.
@@ -785,7 +788,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         # Verify get_expand_impl returns callable for this operator
         assert output_layouts[0].to_dict()["tensor_map"] == (1, -1, 0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_tnd_softmax_output_sp_43(self, mock_platform):
         """
         Feature: Softmax output layouts for TND with sequence parallelism.
@@ -880,7 +883,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         result = NPUFlashAttentionScoreDistributedOp._truncate_result(42)
         assert result == 42, f"Expected 42, got {result}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_create_default_softmax_layout(self, mock_platform):
         """_create_default_softmax_layout: returns all-replicated 4D layout."""
         mesh = self._make_4x2_mesh(mock_platform)
@@ -897,7 +900,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
     # Batch 2: _validate_input_layouts error paths
     # ========================================================================
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_validate_input_layouts_query_none(self, mock_platform):
         """_validate_input_layouts: query_layout=None raises ValueError."""
         mesh = self._make_4x2_mesh(mock_platform)
@@ -910,7 +913,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
                 None, k_layout, v_layout, "BSH", layout_dims, "npu_fusion_attention"
             )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_validate_input_layouts_kv_mismatch(self, mock_platform):
         """_validate_input_layouts: K/V tensor_map mismatch raises ValueError."""
         mesh = self._make_4x2_mesh(mock_platform)
@@ -923,7 +926,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
                 q_layout, k_layout, v_layout, "BSH", layout_dims, "npu_fusion_attention"
             )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_validate_input_layouts_valid(self, mock_platform):
         """_validate_input_layouts: valid layouts pass without error."""
         mesh = self._make_4x2_mesh(mock_platform)
@@ -942,7 +945,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
     # Batch 3: Sharding consistency error branches
     # ========================================================================
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_validate_sharding_consistency_key_none(self, mock_platform):
         """_validate_sharding_consistency: key_layout=None returns early."""
         mesh = self._make_4x2_mesh(mock_platform)
@@ -953,7 +956,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
             q_layout, None, "BSH", layout_dims, "npu_fusion_attention"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_validate_sharding_consistency_batch_mismatch(self, mock_platform):
         """_validate_sharding_consistency: Q/K batch sharding mismatch raises ValueError."""
         mesh = self._make_4x2_mesh(mock_platform)
@@ -966,7 +969,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
                 q_layout, k_layout, "BSH", layout_dims, "npu_fusion_attention"
             )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_validate_sharding_consistency_hidden_mismatch(self, mock_platform):
         """_validate_sharding_consistency: Q/K hidden sharding mismatch raises ValueError."""
         mesh = self._make_4x2_mesh(mock_platform)
@@ -979,7 +982,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
                 q_layout, k_layout, "BSH", layout_dims, "npu_fusion_attention"
             )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_validate_sharding_consistency_dim_mismatch(self, mock_platform):
         """_validate_sharding_consistency: BNSD Q/K dim sharding mismatch raises ValueError."""
         mesh = self._make_4x2_mesh(mock_platform)
@@ -1065,14 +1068,14 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
     # Batch 5: _check_seq_sharding_compatibility and _compute_sparse_params
     # ========================================================================
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_check_seq_sharding_key_none(self, mock_platform):
         """_check_seq_sharding_compatibility: key_layout=None returns early."""
         mesh = self._make_4x2_mesh(mock_platform)
         q_layout = _build_layout(mesh, (Shard(0), Shard(1)), 3)
         op._check_seq_sharding_compatibility(q_layout, None, "BSH", 1, 2, 1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_check_seq_sharding_non_tnd_kv_seq_split(self, mock_platform):
         """_check_seq_sharding_compatibility: non-TND + kv_seq_split_num>1 -> NotImplementedError."""
         mesh = self._make_4x2_mesh(mock_platform)
@@ -1081,7 +1084,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             op._check_seq_sharding_compatibility(q_layout, k_layout, "BSH", 1, 2, 2)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_check_seq_sharding_diff_kv_split_error(self, mock_platform):
         """_check_seq_sharding_compatibility: different Q/K seq shard with kv_split>1 raises."""
         mesh = self._make_4x2_mesh(mock_platform)
@@ -1137,7 +1140,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
     # Batch 6: infer_layout error paths
     # ========================================================================
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_non_string_input_layout(self, mock_platform):
         """infer_layout: non-string input_layout raises ValueError."""
         mesh = self._make_4x2_mesh(mock_platform)
@@ -1150,7 +1153,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         with self.assertRaises(ValueError):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_partial_input_rejected(self, mock_platform):
         """infer_layout: Partial input layout raises ValueError via _check_partial_inputs."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -1164,7 +1167,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         with self.assertRaises(ValueError):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_flash_attention_tnd_softmax_wrap_output_rank_match(self, mock_platform):
         """Verify TND softmax outputs remain rank-consistent after wrapping."""
         self._setup_mock_platform(mock_platform, world_size=8)

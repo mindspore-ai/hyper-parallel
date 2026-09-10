@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,6 +41,12 @@ class TestParallelIsin(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -60,9 +66,6 @@ class TestParallelIsin(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -74,7 +77,7 @@ class TestParallelIsin(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=24)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 3, 4), mesh_dim_names=("dp", "tp", "mp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_isin_layout_data_parallel(self, mock_platform):
         """
         Feature: Isin data parallel
@@ -105,7 +108,7 @@ class TestParallelIsin(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_isin_layout_mixed_parallel(self, mock_platform):
         """
         Feature: Isin mixed parallel
@@ -130,7 +133,7 @@ class TestParallelIsin(unittest.TestCase):
         )
         # No need to verify get_expand_impl here - already verified in test_isin_layout_data_parallel
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_isin_layout_invalid_test_elements_sharded(self, mock_platform):
         """
         Feature: Isin with test_elements sharded on dim0
@@ -147,7 +150,7 @@ class TestParallelIsin(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "'test_elements' must be unsharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_isin_layout_missing_elements(self, mock_platform):
         """
         Feature: Isin without elements layout
@@ -160,7 +163,7 @@ class TestParallelIsin(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "'elements' requires a valid tensor layout"):
             op.infer_layout([None, None])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_isin_preprocess(self, mock_platform):
         """
         Feature: IsinDistributedOp preprocess routes keyword-only params into local_kwargs.
@@ -203,7 +206,7 @@ class TestParallelIsin(unittest.TestCase):
             f"cache_values[1] should be test_elements_layout, got {cache_values[1]}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_isin_preprocess_custom_kwargs(self, mock_platform):
         """
         Feature: IsinDistributedOp preprocess forwards custom assume_unique and invert.

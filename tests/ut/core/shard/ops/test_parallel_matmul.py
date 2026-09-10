@@ -48,6 +48,12 @@ class TestParallelMatMul(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -67,9 +73,6 @@ class TestParallelMatMul(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -81,7 +84,7 @@ class TestParallelMatMul(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "tp", "mp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_layout_data_parallel(self, mock_platform):
         """
         Feature: MatMul data parallel
@@ -108,7 +111,7 @@ class TestParallelMatMul(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_layout_hybrid_parallel(self, mock_platform):
         """
         Feature: MatMul hybrid parallel
@@ -128,7 +131,7 @@ class TestParallelMatMul(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_layout_tensor_parallel(self, mock_platform):
         """
         Feature: MatMul tensor parallel
@@ -148,7 +151,7 @@ class TestParallelMatMul(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_layout_hybrid_tensor_parallel(self, mock_platform):
         """
         Feature: MatMul hybrid tensor parallel
@@ -168,7 +171,7 @@ class TestParallelMatMul(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_layout_multi_shard_tensor_parallel(self, mock_platform):
         """
         Feature: MatMul multi shard tensor parallel
@@ -192,7 +195,7 @@ class TestParallelMatMul(unittest.TestCase):
         """Create a MatMulExtDistributedOp instance."""
         return MatMulExtDistributedOp("MatMulExt")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_ext_partial_x_propagated(self, mock_platform):
         """
         Feature: MatMulExtDistributedOp propagates Partial from input x.
@@ -214,7 +217,7 @@ class TestParallelMatMul(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_ext_partial_w_propagated(self, mock_platform):
         """
         Feature: MatMulExtDistributedOp propagates Partial from input w.
@@ -236,7 +239,7 @@ class TestParallelMatMul(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_ext_partial_both_different_axes(self, mock_platform):
         """
         Feature: MatMulExtDistributedOp propagates Partial from both inputs on different axes.
@@ -259,7 +262,7 @@ class TestParallelMatMul(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_ext_partial_both_same_axis_different_op_raises(self, mock_platform):
         """
         Feature: MatMulExtDistributedOp rejects both inputs Partial on same axis with different ops.
@@ -277,7 +280,7 @@ class TestParallelMatMul(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial on the same axis"):
             op_ext.infer_layout([x_layout, w_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_ext_partial_x_plus_contract_dim_same_axis_not_conflict(self, mock_platform):
         """
         Feature: MatMulExtDistributedOp with x Partial and contract dim sharded on same axis.
@@ -301,7 +304,7 @@ class TestParallelMatMul(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_ext_partial_x_plus_contract_dim_different_axes(self, mock_platform):
         """
         Feature: MatMulExtDistributedOp with x Partial on dp and contract dim sharded on mp.
@@ -323,7 +326,7 @@ class TestParallelMatMul(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_ext_partial_without_contract_sharding(self, mock_platform):
         """
         Feature: MatMulExtDistributedOp with Partial x but contract dim not sharded.
@@ -346,7 +349,7 @@ class TestParallelMatMul(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_ext_partial_x_shard_w_same_axis_output_dim_raises(self, mock_platform):
         """
         Feature: MatMulExtDistributedOp rejects Partial x + Shard w on same axis in output dim.
@@ -364,7 +367,7 @@ class TestParallelMatMul(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial dim must be replicate"):
             op_ext.infer_layout([x_layout, w_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_distributed_partial_x_propagated(self, mock_platform):
         """
         Feature: MatMulDistributedOp propagates Partial from input x with transpose.
@@ -387,7 +390,7 @@ class TestParallelMatMul(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_matmul_distributed_partial_w_propagated(self, mock_platform):
         """
         Feature: MatMulDistributedOp propagates Partial from input w.
@@ -418,6 +421,12 @@ class TestParallelLinear(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Restore global cache state after each test."""
@@ -429,9 +438,6 @@ class TestParallelLinear(unittest.TestCase):
         """Mock a 2x4 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         mock_platform.platform_type = MagicMock()
         return init_device_mesh(
             device_type="cpu",
@@ -440,7 +446,7 @@ class TestParallelLinear(unittest.TestCase):
             init_backend=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_linear_layout_data_parallel(self, mock_platform):
         """
         Feature: LinearDistributedOp layout inference with data parallel sharding.
@@ -465,7 +471,7 @@ class TestParallelLinear(unittest.TestCase):
             f"got {linear_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_linear_layout_hybrid_parallel(self, mock_platform):
         """
         Feature: LinearDistributedOp layout inference with hybrid parallel (DP + TP on output dim).
@@ -491,7 +497,7 @@ class TestParallelLinear(unittest.TestCase):
             f"got {linear_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_linear_layout_hybrid_tensor_parallel(self, mock_platform):
         """
         Feature: LinearDistributedOp layout inference with tensor parallel on the contract dim.
@@ -516,7 +522,7 @@ class TestParallelLinear(unittest.TestCase):
             f"got {linear_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_linear_layout_hybrid_tensor_parallel_with_bias_mismatch(self, mock_platform):
         """
         Feature: LinearDistributedOp error handling for mismatched bias sharding.
@@ -531,7 +537,7 @@ class TestParallelLinear(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bias output dim sharding must match"):
             _ = linear_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_linear_layout_partial_with_sharded_contract_dim(self, mock_platform):
         """
         Feature: LinearDistributedOp sets Partial status when contracting dimension is sharded.
@@ -556,7 +562,7 @@ class TestParallelLinear(unittest.TestCase):
             f"got {linear_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_linear_layout_partial_without_sharded_contract_dim(self, mock_platform):
         """
         Feature: LinearDistributedOp produces no Partial status when contract dim is replicated.
@@ -580,7 +586,7 @@ class TestParallelLinear(unittest.TestCase):
             f"got {linear_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_linear_get_expand_impl_with_bias_and_sharded_contract_dim(self, mock_platform):
         """
         Feature: LinearDistributedOp get_expand_impl returns callable when bias scaling is needed.
@@ -599,7 +605,7 @@ class TestParallelLinear(unittest.TestCase):
             f"and bias is present, got {type(impl)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_linear_partial_input_propagated(self, mock_platform):
         """
         Feature: LinearDistributedOp propagates Partial from input x.
@@ -621,7 +627,7 @@ class TestParallelLinear(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_linear_weight_not_2d_raises_error(self, mock_platform):
         """
         Feature: LinearDistributedOp validates weight dimensionality.
@@ -635,7 +641,7 @@ class TestParallelLinear(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "weight should be 2D"):
             linear_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_linear_mismatched_mesh_raises_error(self, mock_platform):
         """
         Feature: LinearDistributedOp validates that x and weight share the same mesh.
@@ -644,9 +650,6 @@ class TestParallelLinear(unittest.TestCase):
         """
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         mock_platform.platform_type = MagicMock()
         mesh_2x2 = init_device_mesh(device_type="cpu", mesh_shape=(2, 2),
                                     mesh_dim_names=("dp", "mp"), init_backend=False)
@@ -671,6 +674,12 @@ class TestParallelBatchMatMul(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -690,9 +699,6 @@ class TestParallelBatchMatMul(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, cp, mp) mesh via init_device_mesh."""
@@ -716,7 +722,7 @@ class TestParallelBatchMatMul(unittest.TestCase):
             f"got {bmm_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_tensor_parallel(self, mock_platform):
         """
         Feature: Tensor parallel in python shard.
@@ -730,7 +736,7 @@ class TestParallelBatchMatMul(unittest.TestCase):
         bmm_op = BatchMatMulDistributedOp("BatchMatMul")
         self._run_scenario(bmm_op, x_layout, w_layout, expected_map=(2, -1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_transpose_tensor_parallel(self, mock_platform):
         """
         Feature: Tensor parallel in python shard.
@@ -749,7 +755,7 @@ class TestParallelBatchMatMul(unittest.TestCase):
             transpose_b=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_partial_x_propagated(self, mock_platform):
         """
         Feature: BatchMatMulDistributedOp propagates Partial from input x.
@@ -773,7 +779,7 @@ class TestParallelBatchMatMul(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_partial_x_plus_contract_dim_sharded(self, mock_platform):
         """
         Feature: BatchMatMulDistributedOp with x Partial on cp and contract dim sharded on mp.
@@ -797,7 +803,7 @@ class TestParallelBatchMatMul(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_partial_x_transpose_a_propagated(self, mock_platform):
         """
         Feature: BatchMatMulDistributedOp with transpose propagates Partial from x.
@@ -827,6 +833,12 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -840,9 +852,6 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, cp, mp) mesh via init_device_mesh."""
@@ -864,7 +873,7 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
             f"got {bmm_ext_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_ext_data_parallel(self, mock_platform):
         """
         Feature: Data parallel in python shard.
@@ -877,7 +886,7 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
 
         self._run_scenario(x_layout, w_layout, expected_map=(2, -1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_ext_model_parallel(self, mock_platform):
         """
         Feature: Model parallel in python shard.
@@ -890,7 +899,7 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
 
         self._run_scenario(x_layout, w_layout, expected_map=(-1, -1, 0))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_ext_hybrid_parallel(self, mock_platform):
         """
         Feature: Hybrid parallel in python shard.
@@ -903,7 +912,7 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
 
         self._run_scenario(x_layout, w_layout, expected_map=(2, 1, 0))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_ext_tensor_parallel(self, mock_platform):
         """
         Feature: Tensor parallel in python shard.
@@ -916,7 +925,7 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
 
         self._run_scenario(x_layout, w_layout, expected_map=(2, -1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_ext_hybrid_tensor_parallel(self, mock_platform):
         """
         Feature: Tensor parallel in python shard.
@@ -929,7 +938,7 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
 
         self._run_scenario(x_layout, w_layout, expected_map=(2, 1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_ext_multi_shard_tensor_parallel(self, mock_platform):
         """
         Feature: Multi shard tensor parallel in python shard.
@@ -942,7 +951,7 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
 
         self._run_scenario(x_layout, w_layout, expected_map=(2, -1, 1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_ext_partial_x_propagated(self, mock_platform):
         """
         Feature: BatchMatMulExtDistributedOp propagates Partial from input x.
@@ -963,7 +972,7 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_ext_partial_w_propagated(self, mock_platform):
         """
         Feature: BatchMatMulExtDistributedOp propagates Partial from input w.
@@ -984,7 +993,7 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_ext_partial_x_plus_contract_sharding(self, mock_platform):
         """
         Feature: BatchMatMulExtDistributedOp with x Partial on cp and contract dim sharded on mp.
@@ -1007,7 +1016,7 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bmm_ext_partial_x_shard_w_same_output_axis_raises(self, mock_platform):
         """
         Feature: BatchMatMulExtDistributedOp rejects Partial x + Shard w on same axis in output dim.

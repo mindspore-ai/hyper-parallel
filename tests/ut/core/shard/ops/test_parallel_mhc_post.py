@@ -39,6 +39,12 @@ class TestNpuMhcPost(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clear global state after each test."""
@@ -104,7 +110,7 @@ class TestNpuMhcPost(unittest.TestCase):
     # preprocess
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_ms_path_3(self, mock_platform):
         """
         Feature: preprocess extracts local tensors on MindSpore path.
@@ -136,7 +142,7 @@ class TestNpuMhcPost(unittest.TestCase):
     # infer_layout — success cases
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_all_replicated_4(self, mock_platform):
         """
         Feature: infer_layout with fully replicated inputs.
@@ -172,7 +178,7 @@ class TestNpuMhcPost(unittest.TestCase):
             f"got {op.get_expand_impl(None, (out_layouts, extra), [x_layout])}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_data_parallel_5(self, mock_platform):
         """
         Feature: infer_layout with B-dim sharded (data parallel).
@@ -212,7 +218,7 @@ class TestNpuMhcPost(unittest.TestCase):
     # infer_layout — error cases
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_partial_input_raises_6(self, mock_platform):
         """
         Feature: infer_layout rejects inputs in Partial state.
@@ -228,7 +234,7 @@ class TestNpuMhcPost(unittest.TestCase):
         with self.assertRaises(ValueError):
             op.infer_layout([x_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_sharded_n_dim_raises_7(self, mock_platform):
         """
         Feature: infer_layout rejects N-dimension sharding.
@@ -250,7 +256,7 @@ class TestNpuMhcPost(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "N dimension"):
             op.infer_layout([x_layout, h_res_layout, h_out_layout, h_post_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_tnd_replicated_10(self, mock_platform):
         """
         Feature: infer_layout with TND format (3D inputs), all replicated.
@@ -281,7 +287,7 @@ class TestNpuMhcPost(unittest.TestCase):
         )
         assert extra is None, f"Expected extra=None, got {extra}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_tnd_data_parallel_11(self, mock_platform):
         """
         Feature: infer_layout with TND format, T-dim data parallel.
@@ -312,7 +318,7 @@ class TestNpuMhcPost(unittest.TestCase):
         )
         assert extra is None, f"Expected extra=None, got {extra}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_tnd_n_axis_raises_12(self, mock_platform):
         """
         Feature: infer_layout rejects N-axis sharding on TND format.
@@ -334,7 +340,7 @@ class TestNpuMhcPost(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "N dimension"):
             op.infer_layout([x_layout, h_res_layout, h_out_layout, h_post_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_tnd_h_res_wrong_ndim_13(self, mock_platform):
         """
         Feature: infer_layout rejects TND h_res with wrong number of dimensions.
@@ -355,7 +361,7 @@ class TestNpuMhcPost(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "h_res tensor should have 3 dimensions"):
             op.infer_layout([x_layout, h_res_layout, h_out_layout, h_post_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_sharded_d_dim_raises_14(self, mock_platform):
         """
         Feature: infer_layout rejects D-dimension sharding for BSND format.

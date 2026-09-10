@@ -17,13 +17,12 @@ from math import prod
 from typing import NamedTuple, Optional, Sequence
 
 import numpy as np
+import torch
 
 from hyper_parallel.core.dtensor._collective_utils import mesh_scatter_ragged
 from hyper_parallel.core.dtensor.layout import Layout, RaggedShardInfo
-from hyper_parallel.platform import get_platform
 
-platform = get_platform()
-Tensor = platform.Tensor
+Tensor = torch.Tensor
 
 
 def _layout_has_ragged_shard(layout: object) -> bool:
@@ -199,7 +198,7 @@ def _scatter_ragged_tensor(
     info = layout.ragged_shard
     ragged_slice = _compute_ragged_slice(tuple(tensor.shape), layout)
     flat_tensor = tensor.reshape((-1,))
-    output = platform.empty(
+    output = torch.empty(
         (ragged_slice.local_numel,),
         dtype=tensor.dtype,
         device=getattr(tensor, "device", None),

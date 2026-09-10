@@ -23,11 +23,14 @@ Public API mirrors ``torch.distributed.tensor.debug.CommDebugMode``:
     generate_comm_debug_tracing_table(noise_level)
     log_comm_debug_tracing_table_to_file(file_name, noise_level)
 """
+# pylint: disable=C9006,C9007
 import json
 import logging
 import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
+
+import torch
 
 from hyper_parallel.core.dtensor.debug._call_records import (
     AnnotateCall,
@@ -38,14 +41,12 @@ from hyper_parallel.core.dtensor.debug._call_records import (
 )
 from hyper_parallel.core.dtensor.debug._collective_tracer import CollectiveTracer
 from hyper_parallel.core.dtensor.debug._module_tracker import ModuleTracker
-from hyper_parallel.platform import get_platform
 
 logger = logging.getLogger(__name__)
-platform = get_platform()
-Tensor = platform.Tensor
+Tensor = torch.Tensor
 
 # Argument index of the process group for each traced collective method.
-# Derived from the platform method signatures:
+# Derived from the ``_utils`` function signatures:
 #   differentiable_all_gather_concat(data, group, concat_size, concat_dim, ...)
 #   differentiable_all_to_all(input_data, output_shape, group)
 #   differentiable_all_reduce(data, op, group)

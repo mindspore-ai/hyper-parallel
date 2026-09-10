@@ -36,6 +36,12 @@ class TestParallelSwiGLU(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -54,9 +60,6 @@ class TestParallelSwiGLU(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -78,7 +81,7 @@ class TestParallelSwiGLU(unittest.TestCase):
             init_backend=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_data_parallel_success(self, mock_platform):
         """
         Feature: SwiGLU data parallel
@@ -106,7 +109,7 @@ class TestParallelSwiGLU(unittest.TestCase):
             f"got {op.get_expand_impl(None, ((output_layout,), None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_model_parallel_success(self, mock_platform):
         """
         Feature: SwiGLU model parallel
@@ -127,7 +130,7 @@ class TestParallelSwiGLU(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_hybrid_parallel_success(self, mock_platform):
         """
         Feature: SwiGLU hybrid parallel
@@ -148,7 +151,7 @@ class TestParallelSwiGLU(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_all_replicated(self, mock_platform):
         """
         Feature: SwiGLU all replicated
@@ -169,7 +172,7 @@ class TestParallelSwiGLU(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_negative_dim(self, mock_platform):
         """
         Feature: SwiGLU negative dimension index
@@ -190,7 +193,7 @@ class TestParallelSwiGLU(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_split_axis_sharded_success(self, mock_platform):
         """
         Feature: SwiGLU split axis sharded
@@ -209,7 +212,7 @@ class TestParallelSwiGLU(unittest.TestCase):
             f"expected={x_layout}, got={result[0][0]}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_model_parallel_on_split_axis_success(self, mock_platform):
         """
         Feature: SwiGLU model parallel on split axis
@@ -228,7 +231,7 @@ class TestParallelSwiGLU(unittest.TestCase):
             f"expected={x_layout}, got={result[0][0]}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_split_axis_odd_size_failure(self, mock_platform):
         """
         Feature: SwiGLU split axis odd size
@@ -243,7 +246,7 @@ class TestParallelSwiGLU(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "even size"):
             op.infer_layout([x_layout, 1, (4, 7)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_invalid_axis_type(self, mock_platform):
         """
         Feature: SwiGLU invalid axis type
@@ -258,7 +261,7 @@ class TestParallelSwiGLU(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "should be int"):
             op.infer_layout([x_layout, "invalid", (4, 8)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_axis_out_of_range_failure(self, mock_platform):
         """
         Feature: SwiGLU axis out of range
@@ -273,7 +276,7 @@ class TestParallelSwiGLU(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "axis out of range"):
             op.infer_layout([x_layout, 3, (4, 8)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_partial_input(self, mock_platform):
         """
         Feature: SwiGLU with partial input
@@ -289,7 +292,7 @@ class TestParallelSwiGLU(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
             op.infer_layout([x_layout, 1, (4, 8)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_preprocess(self, mock_platform):
         """
         Feature: SwiGLU preprocess
@@ -318,7 +321,7 @@ class TestParallelSwiGLU(unittest.TestCase):
             f"Expected cache_values=[layout, 1, (4, 8)], got {cache_values}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_swiglu_3d_tensor(self, mock_platform):
         """
         Feature: SwiGLU on 3D tensor

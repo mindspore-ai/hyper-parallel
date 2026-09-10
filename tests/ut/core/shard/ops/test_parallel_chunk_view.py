@@ -14,7 +14,7 @@
 # ============================================================================
 """parallel_chunk_view test"""
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -40,6 +40,12 @@ class TestParallelChunkView(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         self.chunk_view_op = ChunkViewDistributedOp("chunk_view")
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -53,9 +59,6 @@ class TestParallelChunkView(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, mp, cp) mesh."""
@@ -77,7 +80,7 @@ class TestParallelChunkView(unittest.TestCase):
             init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_data_parallel_success(self, mock_platform):
         """
         Feature: ChunkView operator layout inference with data parallel
@@ -110,7 +113,7 @@ class TestParallelChunkView(unittest.TestCase):
             "get_expand_impl should return None",
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_model_parallel_success(self, mock_platform):
         """
         Feature: ChunkView operator layout inference with model parallel
@@ -136,7 +139,7 @@ class TestParallelChunkView(unittest.TestCase):
             for layout in output_layouts
         ), "Output layouts should have same alias_tensor_map as input"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_hybrid_parallel_success(self, mock_platform):
         """
         Feature: ChunkView operator layout inference with hybrid parallel
@@ -162,7 +165,7 @@ class TestParallelChunkView(unittest.TestCase):
             for layout in output_layouts
         ), "Output layouts should have same alias_tensor_map as input"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_all_replicated(self, mock_platform):
         """
         Feature: ChunkView operator layout inference with all replicated
@@ -188,7 +191,7 @@ class TestParallelChunkView(unittest.TestCase):
             for layout in output_layouts
         ), "Output layouts should have same alias_tensor_map as input"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_negative_dim(self, mock_platform):
         """
         Feature: ChunkView operator layout inference with negative dimension
@@ -214,7 +217,7 @@ class TestParallelChunkView(unittest.TestCase):
             for layout in output_layouts
         ), "Output layouts should have same alias_tensor_map as input"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_sharded_dim_failure(self, mock_platform):
         """
         Feature: ChunkView operator layout inference with sharded dimension
@@ -232,7 +235,7 @@ class TestParallelChunkView(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot split tensor at sharded axis"):
             self.chunk_view_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_dim_out_of_range(self, mock_platform):
         """
         Feature: ChunkView operator layout inference with dimension out of range
@@ -250,7 +253,7 @@ class TestParallelChunkView(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dimension out of range"):
             self.chunk_view_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_invalid_chunks(self, mock_platform):
         """
         Feature: ChunkView operator layout inference with invalid chunks
@@ -268,7 +271,7 @@ class TestParallelChunkView(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "chunks must be greater than 0"):
             self.chunk_view_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_none_input(self, mock_platform):
         """
         Feature: ChunkView operator layout inference with None input
@@ -280,7 +283,7 @@ class TestParallelChunkView(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "input layout should not be None"):
             self.chunk_view_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_invalid_chunks_type(self, mock_platform):
         """
         Feature: ChunkView operator layout inference with invalid chunks type
@@ -298,7 +301,7 @@ class TestParallelChunkView(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "chunks must be an integer"):
             self.chunk_view_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_invalid_dim_type(self, mock_platform):
         """
         Feature: ChunkView operator layout inference with invalid dim type
@@ -316,7 +319,7 @@ class TestParallelChunkView(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "dim must be an integer"):
             self.chunk_view_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_default_dim(self, mock_platform):
         """
         Feature: ChunkView operator layout inference with default dimension

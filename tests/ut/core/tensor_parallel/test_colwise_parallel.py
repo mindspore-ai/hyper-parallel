@@ -122,6 +122,12 @@ class TestColwiseParallelApply(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -145,7 +151,7 @@ class TestColwiseParallelApply(unittest.TestCase):
             init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.tensor_parallel.style.platform")
     def test_apply_linear_calls_distribute_module(self, mock_style_platform, mock_mesh_platform):
         """
@@ -170,7 +176,7 @@ class TestColwiseParallelApply(unittest.TestCase):
             self.assertIs(call_args[0][1], mesh)
             self.assertIs(result, module)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.tensor_parallel.style.platform")
     def test_apply_linear_invokes_distribute_module_callbacks(
         self, mock_style_platform, mock_mesh_platform
@@ -204,7 +210,7 @@ class TestColwiseParallelApply(unittest.TestCase):
             self.assertEqual(inp, "inp")
             self.assertEqual(out, "out")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.tensor_parallel.style.platform")
     def test_apply_embedding_calls_distribute_module(self, mock_style_platform, mock_mesh_platform):
         """
@@ -226,7 +232,7 @@ class TestColwiseParallelApply(unittest.TestCase):
             mock_dist.assert_called_once()
             self.assertIs(result, module)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.tensor_parallel.style.platform")
     def test_apply_embedding_invokes_partition_fn(
         self, mock_style_platform, mock_mesh_platform
@@ -252,7 +258,7 @@ class TestColwiseParallelApply(unittest.TestCase):
             partition_fn("emb", module, mesh)
             mock_partition.assert_called_once_with(module, mesh)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.tensor_parallel.style.platform")
     def test_apply_unsupported_module_raises(self, mock_style_platform, mock_mesh_platform):
         """
@@ -280,6 +286,12 @@ class TestColwiseParallelPartition(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -303,7 +315,7 @@ class TestColwiseParallelPartition(unittest.TestCase):
             init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partition_linear_fn_uses_shard0(self, mock_platform):
         """
         Feature: ColwiseParallel._partition_linear_fn sharding strategy
@@ -328,7 +340,7 @@ class TestColwiseParallelPartition(unittest.TestCase):
             for call in mock_dt.call_args_list:
                 self.assertEqual(call[0][2], [Shard(0)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partition_embedding_fn_uses_shard1(self, mock_platform):
         """
         Feature: ColwiseParallel._partition_embedding_fn sharding strategy
@@ -352,7 +364,7 @@ class TestColwiseParallelPartition(unittest.TestCase):
             for call in mock_dt.call_args_list:
                 self.assertEqual(call[0][2], [Shard(1)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partition_linear_fn_skips_none_param(self, mock_platform):
         """
         Feature: ColwiseParallel._partition_linear_fn skips None parameters
@@ -379,7 +391,7 @@ class TestColwiseParallelPartition(unittest.TestCase):
 
             self.assertEqual(mock_dt.call_count, 1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partition_embedding_fn_skips_none_param(self, mock_platform):
         """
         Feature: ColwiseParallel._partition_embedding_fn skips None parameters

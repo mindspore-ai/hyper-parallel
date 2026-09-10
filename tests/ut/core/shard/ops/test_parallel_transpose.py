@@ -47,6 +47,12 @@ class TestParallelTranspose(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -66,9 +72,6 @@ class TestParallelTranspose(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -86,7 +89,7 @@ class TestParallelTranspose(unittest.TestCase):
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2, 2),
                                 mesh_dim_names=("dp", "mp", "cp", "tp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_basic_transpose_operation(self, mock_platform):
         """
         Feature: Transpose distributed operator basic functionality
@@ -118,7 +121,7 @@ class TestParallelTranspose(unittest.TestCase):
             f"got {op_ms.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_3d_transpose_operation(self, mock_platform):
         """
         Feature: Transpose distributed operator with 3D tensor
@@ -140,7 +143,7 @@ class TestParallelTranspose(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dimension_mismatch_error(self, mock_platform):
         """
         Feature: Transpose distributed operator error handling
@@ -154,7 +157,7 @@ class TestParallelTranspose(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same size"):
             op_ms.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_negative_index_error(self, mock_platform):
         """
         Feature: Transpose distributed operator validation
@@ -168,7 +171,7 @@ class TestParallelTranspose(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid permutation"):
             op_ms.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_duplicate_indices_error(self, mock_platform):
         """
         Feature: Transpose distributed operator uniqueness validation
@@ -182,7 +185,7 @@ class TestParallelTranspose(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid permutation"):
             op_ms.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_permute_3d_basic(self, mock_platform):
         """
         Feature: Permute distributed operator basic functionality (3D)
@@ -203,7 +206,7 @@ class TestParallelTranspose(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_permute_4d_complex(self, mock_platform):
         """
         Feature: Permute distributed operator with 4D tensor
@@ -224,7 +227,7 @@ class TestParallelTranspose(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_transpose_basic(self, mock_platform):
         """
         Feature: Torch Transpose distributed operator basic functionality
@@ -245,7 +248,7 @@ class TestParallelTranspose(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_transpose_negative_indices(self, mock_platform):
         """
         Feature: Torch Transpose negative indices support
@@ -266,7 +269,7 @@ class TestParallelTranspose(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_transpose_out_of_bounds(self, mock_platform):
         """
         Feature: Torch Transpose bounds checking
@@ -280,7 +283,7 @@ class TestParallelTranspose(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "out of bounds"):
             op_torch_transpose.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_transpose_view_3d_basic(self, mock_platform):
         """
         Feature: TransposeView functionality
@@ -301,7 +304,7 @@ class TestParallelTranspose(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_identity_transpose(self, mock_platform):
         """
         Feature: Identity operation
@@ -323,7 +326,7 @@ class TestParallelTranspose(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_axis_based(self, mock_platform):
         """
         Feature: TransposeDistributedOp preprocess for axis-based ops.
@@ -360,7 +363,7 @@ class TestParallelTranspose(unittest.TestCase):
             f"cache_values[1] should be axis, got {cache_values[1]}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_dim_based(self, mock_platform):
         """
         Feature: TransposeDistributedOp preprocess for dim-based ops.
@@ -404,6 +407,12 @@ class TestParallelTransposeExtView(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -417,9 +426,6 @@ class TestParallelTransposeExtView(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, cp, mp) mesh via init_device_mesh."""
@@ -445,7 +451,7 @@ class TestParallelTransposeExtView(unittest.TestCase):
             f"got {ext_view_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_transpose_ext_view_basic_swap_3d_1(self, mock_platform):
         """
         Feature: Basic swap.
@@ -457,7 +463,7 @@ class TestParallelTransposeExtView(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(0, 1, 2), extra_args=(0, 2))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_transpose_ext_view_negative_dims_2(self, mock_platform):
         """
         Feature: Negative dims.
@@ -469,7 +475,7 @@ class TestParallelTransposeExtView(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(0, 1, 2), extra_args=(-1, -3))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_transpose_ext_view_noop_same_dims_3(self, mock_platform):
         """
         Feature: No-op.
@@ -481,7 +487,7 @@ class TestParallelTransposeExtView(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 1, 0), extra_args=(1, 1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_transpose_ext_view_dim_out_of_range_4(self, mock_platform):
         """
         Feature: Error handling.
@@ -500,7 +506,7 @@ class TestParallelTransposeExtView(unittest.TestCase):
         with self.assertRaises(ValueError):
             ext_view_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_transpose_ext_view_dim_type_error_5(self, mock_platform):
         """
         Feature: Error handling.
@@ -519,7 +525,7 @@ class TestParallelTransposeExtView(unittest.TestCase):
         with self.assertRaises(ValueError):
             ext_view_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_transpose_ext_view_extra_args_invalid_6(self, mock_platform):
         """
         Feature: Error handling.

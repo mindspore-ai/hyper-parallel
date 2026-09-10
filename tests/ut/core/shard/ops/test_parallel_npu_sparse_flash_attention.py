@@ -40,6 +40,12 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clear global state after each test."""
@@ -230,7 +236,7 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
     # infer_layout — BSND positive cases
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bsnd_all_replicated_8(self, mock_platform):
         """
         Feature: infer_layout BSND all replicated produces all-(-1) tensor_maps.
@@ -261,7 +267,7 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
             f"got {op.get_expand_impl(None, (attn, smax, ssum), [q, k, v, si, 'BSND'])}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bsnd_dp_success_9(self, mock_platform):
         """
         Feature: infer_layout BSND with B-dim data parallel.
@@ -290,8 +296,8 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
             f"BSND DP get_expand_impl should return None (S1 not sharded), got {impl}"
         ))
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bsnd_cp_success_10(self, mock_mesh_plat, mock_layout_plat):
         """
         Feature: infer_layout BSND with S1-dim context parallel.
@@ -324,8 +330,8 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
             f"BSND CP get_expand_impl should return callable, got {type(impl)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bsnd_dp_cp_success_11(self, mock_mesh_plat, mock_layout_plat):
         """
         Feature: infer_layout BSND with B-dim DP and S1-dim CP.
@@ -360,7 +366,7 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
             f"BSND DP+CP get_expand_impl should return callable, got {type(impl)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_output_independent_copies_12(self, mock_platform):
         """
         Feature: All three output layouts are independent deepcopy objects.
@@ -385,7 +391,7 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
     # infer_layout — TND positive cases
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tnd_all_replicated_13(self, mock_platform):
         """
         Feature: infer_layout TND all replicated produces all-(-1) tensor_maps.
@@ -410,7 +416,7 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
         self.assertEqual(ssum.tensor_map, (-1, -1, -1),
                          msg=f"TND replicated ssum: expected (-1,-1,-1), got {ssum.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tnd_dp_success_14(self, mock_platform):
         """
         Feature: infer_layout TND with T1-dim data parallel.
@@ -434,8 +440,8 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
         self.assertEqual(ssum.tensor_map, (-1, 0, -1),
                          msg=f"TND DP ssum: expected (-1,0,-1), got {ssum.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tnd_cp_expand_impl_callable_15(self, mock_mesh_plat, mock_layout_plat):
         """
         Feature: get_expand_impl returns callable when q T1 sharded more than k (TND+CP).
@@ -457,8 +463,8 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
         self.assertTrue(callable(impl),
                         msg=f"TND+CP get_expand_impl should return callable, got {type(impl)}")
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tnd_dp_cp_2d_mesh_expand_impl_callable_16(self, mock_mesh_plat, mock_layout_plat):
         """
         Feature: get_expand_impl returns callable for TND with 2-D dp+cp mesh.
@@ -502,7 +508,7 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
         self.assertTrue(callable(impl),
                         msg=f"TND dp+cp get_expand_impl should return callable, got {type(impl)}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tnd_no_cp_returns_callable_17(self, mock_platform):
         """
         Feature: get_expand_impl returns callable when q and k equally sharded TND.

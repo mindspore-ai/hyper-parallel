@@ -45,6 +45,12 @@ class TestParallelReduceMax(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -64,9 +70,6 @@ class TestParallelReduceMax(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, cp, mp) mesh via init_device_mesh."""
@@ -77,7 +80,7 @@ class TestParallelReduceMax(unittest.TestCase):
     # ReduceMaxDistributedOp — reduction scenarios
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_reduce_max_data_parallel_1(self, mock_platform):
         """
         Feature: Data parallel.
@@ -102,7 +105,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_reduce_max_model_parallel_2(self, mock_platform):
         """
         Feature: Model parallel.
@@ -122,7 +125,7 @@ class TestParallelReduceMax(unittest.TestCase):
         )
         # get_expand_impl already verified in test_reduce_max_data_parallel_1
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_reduce_max_hybrid_parallel_3(self, mock_platform):
         """
         Feature: Hybrid parallel.
@@ -141,7 +144,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"ReduceMax failed. Expected (2, 0), got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_reduce_max_reduce_multiple_dims_4(self, mock_platform):
         """
         Feature: Reduce over multiple dims.
@@ -160,7 +163,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"ReduceMax failed. Expected (-1, 1, -1), got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_reduce_max_reduce_all_dims_5(self, mock_platform):
         """
         Feature: Reduce over all dims.
@@ -179,7 +182,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"ReduceMax failed. Expected (), got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_reduce_max_negative_dim(self, mock_platform):
         """Reduce with negative dim index — -1 means last axis (mp)."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -195,7 +198,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"ReduceMax failed. Expected (2, 1), got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_reduce_max_dim_as_list(self, mock_platform):
         """Reduce with dim as list — [0, 2], keepdim=True."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -214,7 +217,7 @@ class TestParallelReduceMax(unittest.TestCase):
     # Preprocess tests
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_reduce_max(self, mock_platform):
         """preprocess for ReduceMax builds correct cache_values and local_args."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -246,7 +249,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"Expected keepdim=False in cache_values[2], got {cache_values[2]}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_max_element_wise(self, mock_platform):
         """preprocess for MaxDistributedOp routes element-wise mode correctly."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -272,7 +275,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"Expected two layouts in cache_values, got {cache_values}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_max_reduction(self, mock_platform):
         """preprocess for MaxDistributedOp routes reduction mode correctly."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -294,7 +297,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"Expected [layout, 1, True], got {cache_values}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_maxdim_primitive(self, mock_platform):
         """preprocess for MaxDim routes positional args with empty kwargs."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -316,7 +319,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"MaxDim Primitive should have empty kwargs, got {local_kwargs}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_default_dim(self, mock_platform):
         """preprocess with torch.sum(tensor) — dim defaults to None, keepdim to False."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -341,7 +344,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"Expected keepdim=False in cache_values[2], got {cache_values[2]}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_sum_ext_routes_none_dtype_positional(self, mock_platform):
         """SumExt requires the dtype slot even when dtype is None."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -366,7 +369,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"Expected [layout, None, False], got {cache_values}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_sum_ext_routes_explicit_dtype_positional(self, mock_platform):
         """preprocess routes explicit SumExt dtype as a positional argument."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -392,7 +395,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"Expected [layout, None, False], got {cache_values}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_mean_ext_routes_none_dtype_positional(self, mock_platform):
         """MeanExt requires the dtype slot even when dtype is None."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -417,7 +420,7 @@ class TestParallelReduceMax(unittest.TestCase):
             f"Expected [layout, 1, False], got {cache_values}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_reduce_max_rejects_dtype(self, mock_platform):
         """ReduceMax raises TypeError when dtype argument is provided."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -431,7 +434,7 @@ class TestParallelReduceMax(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "the `dtype` argument is not supported"):
             op.preprocess((mock_tensor, 1, False, None), {})
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_maxdim_rejects_dtype(self, mock_platform):
         """MaxDim raises TypeError when dtype argument is provided."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -445,7 +448,7 @@ class TestParallelReduceMax(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "the `dtype` argument is not supported"):
             op.preprocess((mock_tensor, 1, False, None), {})
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_torch_sum_routes_dtype_keyword(self, mock_platform):
         """preprocess keeps dtype as keyword-only for torch-style reduce ops."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -510,7 +513,7 @@ class TestParallelReduceMax(unittest.TestCase):
     # Error cases
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_invalid_dim_index(self, mock_platform):
         """infer_layout raises ValueError for out-of-range dim."""
         mesh = self._make_2x2x2_mesh(mock_platform)

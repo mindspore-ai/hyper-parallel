@@ -38,6 +38,12 @@ class TestParallelOuter(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -51,16 +57,13 @@ class TestParallelOuter(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, tp) mesh via init_device_mesh."""
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_outer_layout_inference_both_replicated(self, mock_platform):
         """
         Feature: Outer product with fully replicated inputs
@@ -92,7 +95,7 @@ class TestParallelOuter(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_outer_layout_inference_orthogonal_sharding(self, mock_platform):
         """
         Feature: Outer product with orthogonal sharding
@@ -119,7 +122,7 @@ class TestParallelOuter(unittest.TestCase):
         # No need to verify get_expand_impl here - already verified in
         # test_outer_layout_inference_both_replicated
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_outer_layout_inference_partial_sharding(self, mock_platform):
         """
         Feature: Outer product with partial sharding
@@ -144,7 +147,7 @@ class TestParallelOuter(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_outer_layout_invalid_overlapping_sharding(self, mock_platform):
         """
         Feature: Validate overlapping sharding
@@ -161,7 +164,7 @@ class TestParallelOuter(unittest.TestCase):
         ):
             op.infer_layout([layout, layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_outer_layout_invalid_not_1d_tensor(self, mock_platform):
         """
         Feature: Validate input dimensionality
@@ -181,7 +184,7 @@ class TestParallelOuter(unittest.TestCase):
         ):
             op.infer_layout([x1_layout, x2_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_outer_layout_invalid_none_layout(self, mock_platform):
         """
         Feature: Validate non-None layouts
@@ -198,7 +201,7 @@ class TestParallelOuter(unittest.TestCase):
         ):
             op.infer_layout([x1_layout, None])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_outer_layout_invalid_partial_input(self, mock_platform):
         """
         Feature: Validate no Partial inputs
@@ -219,7 +222,7 @@ class TestParallelOuter(unittest.TestCase):
         ):
             op.infer_layout([x1_layout, x2_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_outer_preprocess(self, mock_platform):
         """
         Feature: Preprocess for Outer operator

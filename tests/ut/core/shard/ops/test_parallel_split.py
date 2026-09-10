@@ -48,6 +48,12 @@ class TestParallelSplit(unittest.TestCase):
         self.torch_split_op = SplitDistributedOp("split")
         self.split_with_size_op = SplitWithSizeDistributedOp("split_with_size")
         self.split_tensor_op = SplitTensorDistributedOp("split_tensor")
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -67,9 +73,6 @@ class TestParallelSplit(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, mp, cp) mesh via init_device_mesh."""
@@ -81,7 +84,7 @@ class TestParallelSplit(unittest.TestCase):
             init_backend=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_normal(self, mock_platform):
         """
         Feature: Split operator layout inference under normal conditions
@@ -112,7 +115,7 @@ class TestParallelSplit(unittest.TestCase):
             f"got {self.split_op.get_expand_impl(None, infer_result, cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_invalid_axis(self, mock_platform):
         """
         Feature: Split operator layout inference with invalid axis
@@ -127,7 +130,7 @@ class TestParallelSplit(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "can not split tensor at sharded axis"):
             self.split_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_axis_out_of_range(self, mock_platform):
         """
         Feature: Test axis out of range
@@ -142,7 +145,7 @@ class TestParallelSplit(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dimension should be in range"):
             self.split_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_default_dim(self, mock_platform):
         """
         Feature: Split operator layout inference with default dim
@@ -160,7 +163,7 @@ class TestParallelSplit(unittest.TestCase):
             f"Expected 6 output layouts, got {len(output_layouts)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_with_size(self, mock_platform):
         """
         Feature: Split operator layout inference with sections list
@@ -185,7 +188,7 @@ class TestParallelSplit(unittest.TestCase):
             f"got {[l.tensor_map for l in output_layouts]}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_with_size_invalid_axis(self, mock_platform):
         """
         Feature: Split operator layout inference with invalid axis
@@ -200,7 +203,7 @@ class TestParallelSplit(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "can not split tensor at sharded axis"):
             self.split_with_size_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_split_tensor_infer_layout_with_remainder(self, mock_platform):
         """
         Feature: Split operator layout inference with non-divisible size
@@ -225,7 +228,7 @@ class TestParallelSplit(unittest.TestCase):
             f"got {[l.tensor_map for l in output_layouts]}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_split_tensor_infer_layout_with_remainder_invalid_axis(self, mock_platform):
         """
         Feature: Split operator layout inference with invalid axis
@@ -254,6 +257,12 @@ class TestParallelTensorSplit(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -267,9 +276,6 @@ class TestParallelTensorSplit(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -281,7 +287,7 @@ class TestParallelTensorSplit(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=4)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tensor_split_integer_default_dim(self, mock_platform):
         """
         Feature: Basic tensor_split with integer sections
@@ -314,7 +320,7 @@ class TestParallelTensorSplit(unittest.TestCase):
             f"got {tensor_split_op.get_expand_impl(None, infer_result, cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tensor_split_tuple_specific_dim(self, mock_platform):
         """
         Feature: tensor_split with tuple/list indices and specific dim
@@ -333,7 +339,7 @@ class TestParallelTensorSplit(unittest.TestCase):
             f"Expected 3 output layouts, got {len(output_layouts)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tensor_split_negative_dim(self, mock_platform):
         """
         Feature: tensor_split with negative dimension
@@ -352,7 +358,7 @@ class TestParallelTensorSplit(unittest.TestCase):
             f"Expected 2 output layouts, got {len(output_layouts)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tensor_split_1d_tensor(self, mock_platform):
         """
         Feature: tensor_split with 1D tensor as indices
@@ -371,7 +377,7 @@ class TestParallelTensorSplit(unittest.TestCase):
             f"Expected 5 output layouts, got {len(output_layouts)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tensor_split_sharded_dim_error(self, mock_platform):
         """
         Feature: Error handling for splitting on a sharded dimension
@@ -400,7 +406,7 @@ class TestParallelTensorSplit(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, error_msg):
             tensor_split_op.preprocess((mock_input, "invalid_string"), {})
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tensor_split_out_of_bounds_dim(self, mock_platform):
         """
         Feature: Error handling for out of bounds dimension

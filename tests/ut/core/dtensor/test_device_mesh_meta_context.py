@@ -63,32 +63,6 @@ class TestDeviceMeshUnderMetaContext:
             tensor = plat.from_numpy(arr)
         assert plat.tensor_to_numpy(tensor).tolist() == [3, 1, 4, 1]
 
-    def test_convert_rank_map_list_branch_under_meta(self):
-        """
-        Feature: DeviceMesh._convert_rank_map_to_tensor list/tuple branch.
-        Description: A rank map built from a python list under ms.DeviceCtx("meta").
-        Expectation: the rank map stays asnumpy-able (read back in _build_dim_split_ranks).
-        """
-        with ms.DeviceCtx("meta"):
-            rank_map = DeviceMesh._convert_rank_map_to_tensor([0, 1, 2, 3])
-        assert get_platform().tensor_to_numpy(rank_map).tolist() == [0, 1, 2, 3]
-
-    def test_build_device_mesh_under_meta(self):
-        """
-        Feature: DeviceMesh construction under ms.DeviceCtx("meta").
-        Description: Construct a 1-D mesh inside the meta context, as fully_shard(mesh=None) does.
-        Expectation: construction succeeds and the rank bookkeeping is host-resident.
-        """
-        with ms.DeviceCtx("meta"):
-            mesh = DeviceMesh(
-                "npu", np.array([0, 1]), mesh_dim_names=("fsdp",), _init_backend=False
-            )
-        assert mesh.rank_list == (0, 1)
-        assert mesh._flatten_rank_map == (0, 1)
-        np.testing.assert_array_equal(
-            get_platform().tensor_to_numpy(mesh._rank_map),
-            np.array([0, 1], dtype=np.int32),
-        )
 
 
 if __name__ == "__main__":

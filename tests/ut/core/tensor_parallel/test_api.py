@@ -23,7 +23,7 @@ path matching (fnmatch), single-style root apply, ``src_data_rank``, empty plan,
 import os
 import unittest
 import warnings
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from torch import nn
@@ -97,6 +97,12 @@ class TestParallelizeModule(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -130,7 +136,7 @@ class TestParallelizeModule(unittest.TestCase):
             init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_raises_without_device_mesh(self, mock_platform):
         """
         Feature: parallelize_module validation with missing device_mesh
@@ -143,7 +149,7 @@ class TestParallelizeModule(unittest.TestCase):
             parallelize_module(m, None, RecordingParallelStyle())
         self.assertIn("device mesh", str(ctx.exception).lower())
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_rejects_nd_mesh(self, mock_platform):
         """
         Feature: parallelize_module validation for mesh dimension
@@ -156,7 +162,7 @@ class TestParallelizeModule(unittest.TestCase):
             parallelize_module(m, mesh, RecordingParallelStyle())
         self.assertIn("1D", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_none_plan_warns_and_noop(self, mock_platform):
         """
         Feature: parallelize_module with None parallelize_plan
@@ -173,7 +179,7 @@ class TestParallelizeModule(unittest.TestCase):
         self.assertTrue(any("parallelize_plan" in str(x.message) for x in w))
         self.assertTrue(torch.nn.functional.mse_loss(before, list(m.parameters())[0].data).item() == 0.0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_single_style_applies_to_root(self, mock_platform):
         """
         Feature: parallelize_module with single ParallelStyle
@@ -188,7 +194,7 @@ class TestParallelizeModule(unittest.TestCase):
         self.assertEqual(style.apply_log[0][0], id(m))
         self.assertEqual(style.apply_log[0][1], id(mesh))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_src_data_rank_set_on_style(self, mock_platform):
         """
         Feature: parallelize_module propagates src_data_rank to style
@@ -204,7 +210,7 @@ class TestParallelizeModule(unittest.TestCase):
         parallelize_module(m, mesh, style2, src_data_rank=2)
         self.assertEqual(style2.src_data_rank, 2)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dict_nested_path(self, mock_platform):
         """
         Feature: parallelize_module with dict plan and nested path
@@ -225,7 +231,7 @@ class TestParallelizeModule(unittest.TestCase):
         self.assertEqual(len(style.apply_log), 1)
         self.assertEqual(style.apply_log[0][0], id(target))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_fnmatch_star_like_pytorch(self, mock_platform):
         """
         Feature: parallelize_module with fnmatch wildcard star
@@ -248,7 +254,7 @@ class TestParallelizeModule(unittest.TestCase):
         self.assertEqual(applied_ids, {id(model.net1), id(model.net2)})
         self.assertEqual(len(style.apply_log), 2)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_fnmatch_question_like_pytorch(self, mock_platform):
         """
         Feature: parallelize_module with fnmatch wildcard question mark
@@ -269,7 +275,7 @@ class TestParallelizeModule(unittest.TestCase):
         applied_ids = {mid for mid, _ in style.apply_log}
         self.assertEqual(applied_ids, {id(model.net1), id(model.net2)})
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_fnmatch_bracket_like_pytorch(self, mock_platform):
         """
         Feature: parallelize_module with fnmatch bracket range
@@ -291,7 +297,7 @@ class TestParallelizeModule(unittest.TestCase):
         applied_ids = {mid for mid, _ in style.apply_log}
         self.assertEqual(applied_ids, {id(model.net1), id(model.net2)})
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_multi_wildcard_path_like_pytorch(self, mock_platform):
         """
         Feature: parallelize_module with multi-level wildcard path
@@ -325,7 +331,7 @@ class TestParallelizeModule(unittest.TestCase):
         self.assertEqual({mid for mid, _ in s1.apply_log}, {id(b.net1) for b in model.layers})
         self.assertEqual({mid for mid, _ in s2.apply_log}, {id(b.net2) for b in model.layers})
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_submesh_slice_accepted(self, mock_platform):
         """
         Feature: parallelize_module accepts 1-D submesh sliced from N-D mesh
@@ -340,7 +346,7 @@ class TestParallelizeModule(unittest.TestCase):
         parallelize_module(m, mesh_1d, style)
         self.assertEqual(len(style.apply_log), 1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_bad_parallelize_plan_type(self, mock_platform):
         """
         Feature: parallelize_module validation for parallelize_plan type
@@ -352,7 +358,7 @@ class TestParallelizeModule(unittest.TestCase):
         with self.assertRaises(TypeError):
             parallelize_module(mod, mesh, "not-a-style")  # type: ignore[arg-type]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dict_value_none_raises_type_error(self, mock_platform):
         """
         Feature: parallelize_module validation for dict plan values
@@ -364,7 +370,7 @@ class TestParallelizeModule(unittest.TestCase):
         with self.assertRaises(TypeError):
             parallelize_module(mod, mesh, {"0": None})  # type: ignore[arg-type]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dict_empty_path_raises_value_error(self, mock_platform):
         """
         Feature: parallelize_module validation for empty module path
@@ -377,7 +383,7 @@ class TestParallelizeModule(unittest.TestCase):
         with self.assertRaises(ValueError):
             parallelize_module(mod, mesh, {"": style})
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dict_path_no_match_warns_and_skips(self, mock_platform):
         """
         Feature: parallelize_module observability for unmatched dict path
@@ -393,7 +399,7 @@ class TestParallelizeModule(unittest.TestCase):
         self.assertEqual(len(style.apply_log), 0)
         self.assertTrue(any("has no matches" in str(item.message) for item in caught))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_implicit_mesh_internal_context(self, mock_platform):
         """
         Feature: parallelize_module with implicit mesh via _tensor_parallel_mesh_context
@@ -408,7 +414,7 @@ class TestParallelizeModule(unittest.TestCase):
         self.assertEqual(len(style.apply_log), 1)
         self.assertEqual(style.apply_log[0][1], id(mesh))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_implicit_mesh_with_statement_like_pytorch(self, mock_platform):
         """
         Feature: parallelize_module with implicit mesh via ``with mesh:``

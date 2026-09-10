@@ -39,6 +39,12 @@ class TestParallelSort(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Restore global cache state after each test."""
@@ -50,9 +56,6 @@ class TestParallelSort(unittest.TestCase):
         """Mock a 2x4 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 4),
                                 mesh_dim_names=("dp", "mp"), init_backend=False)
@@ -61,9 +64,6 @@ class TestParallelSort(unittest.TestCase):
         """Mock a 2x2 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 2),
                                 mesh_dim_names=("dp", "tp"), init_backend=False)
@@ -72,14 +72,11 @@ class TestParallelSort(unittest.TestCase):
         """Mock a 2x2x2 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 2, 2),
                                 mesh_dim_names=("dp", "tp", "mp"), init_backend=False)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sort_layout_inference_basic(self, mock_platform):
         """
         Feature: SortDistributedOp layout inference on an unsharded sort dimension.
@@ -116,7 +113,7 @@ class TestParallelSort(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sort_layout_inference_sharded_dim_error(self, mock_platform):
         """
         Feature: SortDistributedOp rejects sorting along a sharded dimension.
@@ -131,7 +128,7 @@ class TestParallelSort(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sharded dimension"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sort_layout_inference_negative_dim(self, mock_platform):
         """
         Feature: SortDistributedOp handles negative dimension index correctly.
@@ -158,7 +155,7 @@ class TestParallelSort(unittest.TestCase):
         )
         assert extra_info is None, f"extra_info should be None, got {extra_info}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sort_layout_inference_preserve_other_dims(self, mock_platform):
         """
         Feature: SortDistributedOp preserves sharding on all non-sorted dimensions.
@@ -185,7 +182,7 @@ class TestParallelSort(unittest.TestCase):
         )
         assert extra_info is None, f"extra_info should be None, got {extra_info}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sort_layout_inference_all_replicate(self, mock_platform):
         """
         Feature: SortDistributedOp layout inference when all placements are Replicate.
@@ -208,7 +205,7 @@ class TestParallelSort(unittest.TestCase):
         )
         assert extra_info is None, f"extra_info should be None, got {extra_info}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sort_partial_input_raises_error(self, mock_platform):
         """
         Feature: SortDistributedOp rejects inputs with Partial status.
@@ -222,7 +219,7 @@ class TestParallelSort(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sort_layout_multiaxis_tuple_sharded_dim_error(self, mock_platform):
         """
         Feature: SortDistributedOp rejects StridedShard multi-axis mapping on sort dim.
@@ -240,7 +237,7 @@ class TestParallelSort(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sharded dimension"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sort_preprocess_torch_stable_in_kwargs(self, mock_platform):
         """
         Feature: SortDistributedOp preprocess routes stable into kwargs for PyTorch.
@@ -267,7 +264,7 @@ class TestParallelSort(unittest.TestCase):
             f"(tensor, dim, descending), got {len(local_args)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sort_preprocess_mindspore_stable_in_args(self, mock_platform):
         """
         Feature: SortDistributedOp preprocess routes stable into positional args for MindSpore Primitive.
