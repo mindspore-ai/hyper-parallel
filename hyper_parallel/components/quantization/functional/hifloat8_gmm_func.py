@@ -17,6 +17,7 @@
 from typing import Optional
 
 import torch  # pylint: disable=forbidden-backend-import
+from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.quantization.functional.npu_hifloat8 import (
     hifloat8_grouped_matmul,
@@ -79,7 +80,6 @@ class _HiFloat8GroupedLinearFunction(torch.autograd.Function):
         ctx: torch.autograd.function.FunctionCtx,
         inputs: torch.Tensor,
         weight: torch.Tensor,
-        group_list: torch.Tensor,
         group_list_type: int,
         grad_output_quantizer: HiFloat8Quantizer,
     ) -> None:
@@ -90,7 +90,6 @@ class _HiFloat8GroupedLinearFunction(torch.autograd.Function):
         ctx.weight_shape = weight.shape
         ctx.weight_dtype = weight.dtype
         ctx.weight_device = weight.device
-        ctx.save_for_backward(group_list)
         ctx.group_list_type = group_list_type
         ctx.grad_output_quantizer = grad_output_quantizer
         ctx.empty_input = inputs.shape[0] == 0
@@ -110,15 +109,29 @@ class _HiFloat8GroupedLinearFunction(torch.autograd.Function):
 
         ``weight`` follows ``[experts, out_features, in_features]``. The GMM
         receives its transposed ``[experts, in_features, out_features]`` view.
+
+        Args:
+            ctx: Autograd context owning the saved quantized operands.
+            inputs: High-precision, expert-major input matrix.
+            weight: High-precision packed expert weights.
+            group_list: Token boundaries or counts, one per expert.
+            input_quantizer: Current-scaling input recipe.
+            weight_quantizer: Current-scaling weight recipe.
+            grad_output_quantizer: Gradient recipe used by backward.
+            group_list_type: Zero for cumulative boundaries, one for counts.
+
+        Returns:
+            Expert-major projection output with the input's logical dtype.
         """
 
         _HiFloat8GroupedLinearFunction._validate_forward_inputs(
             inputs, weight, group_list, group_list_type
         )
         _HiFloat8GroupedLinearFunction._save_forward_context(
-            ctx, inputs, weight, group_list, group_list_type, grad_output_quantizer
+            ctx, inputs, weight, group_list_type, grad_output_quantizer
         )
         if ctx.empty_input:
+            ctx.save_for_backward(group_list, None, None)
             return inputs.new_empty((0, weight.shape[-2]))
 
         needs_grad_input = inputs.requires_grad
@@ -145,13 +158,18 @@ class _HiFloat8GroupedLinearFunction(torch.autograd.Function):
             group_list_type=group_list_type,
             output_dtype=inputs.dtype,
         )
-        ctx.input_quant = input_quant if needs_grad_weight else None
-        ctx.weight_quant = weight_quant if needs_grad_input else None
         input_quant.update_usage(rowwise=False, colwise=needs_grad_weight)
         weight_quant.update_usage(rowwise=needs_grad_input, colwise=False)
+        # Autograd owns their lifetime, including repeated backward with retain_graph.
+        ctx.save_for_backward(
+            group_list,
+            input_quant if needs_grad_weight else None,
+            weight_quant if needs_grad_input else None,
+        )
         return output
 
     @staticmethod
+    @once_differentiable
     def backward(
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
@@ -164,9 +182,17 @@ class _HiFloat8GroupedLinearFunction(torch.autograd.Function):
         None,
         None,
     ]:
-        """Execute HiFloat8 dgrad and wgrad with the gradient role recipe."""
+        """Execute first-order HiFloat8 dgrad and wgrad; higher derivatives are unsupported.
 
-        (group_list,) = ctx.saved_tensors
+        Args:
+            ctx: Autograd context containing saved operands and group metadata.
+            grad_output: High-precision gradient of the projection output.
+
+        Returns:
+            Input and weight gradients; None for grouping and recipe arguments.
+        """
+
+        group_list, input_quant, weight_quant = ctx.saved_tensors
         needs_grad_input = ctx.needs_input_grad[0]
         needs_grad_weight = ctx.needs_input_grad[1]
         if ctx.empty_input:
@@ -202,7 +228,7 @@ class _HiFloat8GroupedLinearFunction(torch.autograd.Function):
         if needs_grad_input:
             grad_input = hifloat8_grouped_matmul(
                 grad_quant,
-                ctx.weight_quant,
+                weight_quant,
                 layout="NT",
                 group_list=group_list,
                 group_type=0,
@@ -211,7 +237,7 @@ class _HiFloat8GroupedLinearFunction(torch.autograd.Function):
             )
         if needs_grad_weight:
             grad_weight_for_gmm = hifloat8_grouped_matmul(
-                ctx.input_quant,
+                input_quant,
                 grad_quant,
                 layout="TN",
                 group_list=group_list,
@@ -221,8 +247,6 @@ class _HiFloat8GroupedLinearFunction(torch.autograd.Function):
             )
             grad_weight = grad_weight_for_gmm.transpose(-2, -1).contiguous()
         grad_quant.update_usage(rowwise=False, colwise=False)
-        ctx.input_quant = None
-        ctx.weight_quant = None
         return grad_input, grad_weight, None, None, None, None, None
 
 
@@ -236,7 +260,20 @@ def hifloat8_grouped_linear(
     *,
     group_list_type: int = 0,
 ) -> torch.Tensor:
-    """Apply one bias-free expert-grouped HiFloat8 projection."""
+    """Apply one bias-free expert-grouped HiFloat8 projection.
+
+    Args:
+        inputs: High-precision, expert-major input matrix.
+        weight: Packed weights in [experts, out_features, in_features] layout.
+        group_list: Token boundaries or counts, one per expert.
+        input_quantizer: Current-scaling input recipe.
+        weight_quantizer: Current-scaling weight recipe.
+        grad_output_quantizer: Gradient recipe used by backward.
+        group_list_type: Zero for cumulative boundaries, one for counts.
+
+    Returns:
+        Expert-major projection output with the input's logical dtype.
+    """
 
     return _HiFloat8GroupedLinearFunction.apply(
         inputs,
