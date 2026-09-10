@@ -79,6 +79,51 @@ class TinyTextDataset(Dataset):
         return {"input_ids": input_ids, "labels": labels}
 
 
+class RebuildableDataLoader:
+    """Recreate a fresh DataLoader iterator for every epoch."""
+
+    def __init__(
+        self,
+        *,
+        dataset: Dataset,
+        collate_fn,
+        batch_sampler=None,
+        batch_size: int = 1,
+        drop_last: bool = False,
+    ) -> None:
+        self.dataset = dataset
+        self.collate_fn = collate_fn
+        self.batch_sampler = batch_sampler
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+
+    def set_epoch(self, epoch: int) -> None:
+        """Forward epoch changes to the batch sampler when it supports them."""
+        if self.batch_sampler is not None and hasattr(self.batch_sampler, "set_epoch"):
+            self.batch_sampler.set_epoch(epoch)
+
+    def _build_loader(self) -> TorchDataLoader:
+        if self.batch_sampler is not None:
+            return TorchDataLoader(
+                self.dataset,
+                batch_sampler=self.batch_sampler,
+                collate_fn=self.collate_fn,
+            )
+        return TorchDataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            collate_fn=self.collate_fn,
+            shuffle=False,
+            drop_last=self.drop_last,
+        )
+
+    def __iter__(self):
+        return iter(self._build_loader())
+
+    def __len__(self) -> int:
+        return len(self._build_loader())
+
+
 def build_tiny_automodel(
     *,
     distributed_setup=None,
@@ -93,7 +138,7 @@ def build_tiny_automodel(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
-        num_hidden_layers=1,
+        num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
         max_position_embeddings=64,
@@ -187,19 +232,13 @@ def build_simple_dataloader(
     drop_last: bool = False,
     use_background_prefetcher: bool = False,
 ) -> TorchDataLoader:
-    """Build a plain PyTorch DataLoader for the graph prototype."""
+    """Build a PyTorch DataLoader wrapper that refreshes iterators per epoch."""
     del dp_world_size, max_seq_len, seed, use_background_prefetcher
-    if batch_sampler is not None:
-        return TorchDataLoader(
-            dataset,
-            batch_sampler=batch_sampler,
-            collate_fn=collate_fn,
-        )
-    return TorchDataLoader(
-        dataset,
-        batch_size=batch_size,
+    return RebuildableDataLoader(
+        dataset=dataset,
         collate_fn=collate_fn,
-        shuffle=False,
+        batch_sampler=batch_sampler,
+        batch_size=batch_size,
         drop_last=drop_last,
     )
 
