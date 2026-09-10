@@ -29,7 +29,7 @@ components/datasets/parallel/batch_parallel.py in stage 6 (05 §11.2).
 """
 
 from collections.abc import Mapping
-from typing import Any, Callable, Optional
+from typing import Any
 import torch
 import torch.distributed as dist
 

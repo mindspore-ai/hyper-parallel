@@ -76,19 +76,18 @@ _DEBUG_RANK_FILTER = _DatasetDebugRankFilter()
 class DatasetLogger(logging.LoggerAdapter):
     """Add an optional rank condition to Dataset DEBUG records."""
 
-    def debug(
-            self, message: object, *args: object, enabled: RankCondition | None = None, **kwargs: Any,
-    ) -> None:
+    def debug(self, msg: object, *args: object, **kwargs: Any) -> None:
         """Log on default ranks, or on ranks selected by ``enabled`` when provided."""
         if not self.isEnabledFor(logging.DEBUG):
             return
+        enabled: RankCondition | None = kwargs.pop("enabled", None)
         if enabled is not None:
             rank_enabled = enabled() if callable(enabled) else enabled
             extra = dict(kwargs.get("extra", {}))
             extra["dataset_rank_enabled"] = rank_enabled
             kwargs["extra"] = extra
         kwargs.setdefault("stacklevel", 2)
-        self.logger.debug(message, *args, **kwargs)
+        self.logger.debug(msg, *args, **kwargs)
 
 
 def get_dataset_logger(name: str) -> DatasetLogger:
