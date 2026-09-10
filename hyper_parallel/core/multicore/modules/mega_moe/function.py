@@ -20,12 +20,12 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.core.multicore.profiler import _prepare_mega_kernel_call
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .plan import MegaMoePlan
 from .route import RouteMetadata
 from .workspace import MegaMoeWorkspace
-
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -115,9 +115,7 @@ def _save_forward_state(
 
 
 # Torch declares variadic autograd hooks; concrete functions use operator-specific signatures.
-class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
-    torch.autograd.Function
-):
+class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
     """Autograd bridge for the in-place forward/backward custom ops."""
 
     @staticmethod
@@ -148,19 +146,24 @@ class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
         metadata = route
         workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
         workspace.claim()
+        profile_call = None
         try:
             dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
             combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
-            events = _workspace_tensor(
+            fallback_events = _workspace_tensor(
                 workspace.forward_event_counters,
                 "forward_event_counters",
             )
-            gmm_workspace = _workspace_tensor(
-                workspace.gmm_workspace, "gmm_workspace"
+            profile_call = _prepare_mega_kernel_call(
+                plan.fwd_runtime,
+                direction="forward",
+                fallback_event_counters=fallback_events,
             )
+            events = profile_call.event_counters
+            gmm_workspace = _workspace_tensor(workspace.gmm_workspace, "gmm_workspace")
             dispatch.zero_()
             combine.zero_()
-            events.zero_()
+            profile_call.clear_event_counters.zero_()
             capacity = workspace.expert_capacity
             up_proj, activation, down_proj = _allocate_forward_intermediates(
                 spec,
@@ -169,7 +172,7 @@ class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
                 dispatch,
             )
             workspace.symmetric_memory.barrier()
-            multicore_ops.mega_moe(
+            multicore_ops._mega_moe_with_profile_buffer(
                 dispatch,
                 metadata.dispatch_target_off * spec.hidden_size,
                 routed_tokens.contiguous(),
@@ -190,14 +193,16 @@ class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
                 plan.up_proj_tiling,
                 plan.swiglu_tiling,
                 plan.down_proj_tiling,
-                plan.fwd_runtime_config,
+                profile_call.runtime_config,
                 events,
+                profile_call.profile_buffer,
                 spec.rank_id,
                 spec.ep_size,
                 spec.num_experts,
                 spec.hidden_size,
                 spec.local_num_tokens,
             )
+            profile_call.complete()
             output = combine.clone()
             _save_forward_state(
                 ctx,
@@ -212,6 +217,8 @@ class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
             )
             return output
         finally:
+            if profile_call is not None:
+                profile_call.cancel()
             workspace.release()
 
     @staticmethod
@@ -243,23 +250,28 @@ class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
             combine_size,
         ) = ctx.saved_tensors
         workspace.claim()
+        profile_call = None
         try:
             dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
             grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
-            events = _workspace_tensor(
+            fallback_events = _workspace_tensor(
                 workspace.backward_event_counters,
                 "backward_event_counters",
             )
-            gmm_workspace = _workspace_tensor(
-                workspace.gmm_workspace, "gmm_workspace"
+            profile_call = _prepare_mega_kernel_call(
+                plan.bwd_runtime,
+                direction="backward",
+                fallback_event_counters=fallback_events,
             )
+            events = profile_call.event_counters
+            gmm_workspace = _workspace_tensor(workspace.gmm_workspace, "gmm_workspace")
             swiglu_workspace = _workspace_tensor(
                 workspace.swiglu_grad_workspace,
                 "swiglu_grad_workspace",
             )
             dispatch.zero_()
             grad_x.zero_()
-            events.zero_()
+            profile_call.clear_event_counters.zero_()
             capacity = workspace.expert_capacity
             (
                 grad_weight1,
@@ -275,7 +287,7 @@ class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
                 weight2,
             )
             workspace.symmetric_memory.barrier()
-            multicore_ops.mega_moe_grad(
+            multicore_ops._mega_moe_grad_with_profile_buffer(
                 dispatch,
                 dispatch_target_off * spec.hidden_size,
                 grad_output.contiguous(),
@@ -303,18 +315,21 @@ class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
                 plan.swiglu_grad_tiling,
                 gmm_workspace,
                 swiglu_workspace,
-                plan.bwd_runtime_config,
+                profile_call.runtime_config,
                 events,
+                profile_call.profile_buffer,
                 spec.rank_id,
                 spec.ep_size,
                 spec.num_experts,
                 spec.hidden_size,
                 spec.local_num_tokens,
             )
+            profile_call.complete()
             return grad_x.clone(), grad_weight1, grad_weight2, None, None, None
         finally:
+            if profile_call is not None:
+                profile_call.cancel()
             workspace.release()
-
 
 
 def execute_mega_moe(

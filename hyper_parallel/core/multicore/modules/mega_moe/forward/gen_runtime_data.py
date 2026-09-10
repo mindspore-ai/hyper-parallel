@@ -46,6 +46,9 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_swiglu_tiling_bytes,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
+from hyper_parallel.core.multicore.modules.mega_moe.profiling import (
+    _configure_mega_moe_profile_metadata,
+)
 
 
 def parse_args():
@@ -95,6 +98,9 @@ def build_config_for_rank(graph, tsv: TaskSplitValue, rank_id: int,
 
     cfg.task_num = task_num_all
     cfg.atomic_add_values[0] = 1
+    _configure_mega_moe_profile_metadata(
+        cfg, tsv, num_cube_cores=num_cube_cores, is_backward=False
+    )
     return cfg
 
 

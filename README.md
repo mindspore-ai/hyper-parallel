@@ -54,6 +54,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 >
 > - **模型切分**：[DTensor](docs/api/api_reference.md#dtensor-分布式张量) · [FSDP/HSDP](docs/guide/fsdp.md) · [TP](docs/guide/tensor_parallel.md)
 > - **并行执行**：[CP](docs/guide/context_parallel.md) · [EP / MoE](docs/guide/expert_parallel.md) · [PP / 集群 MPMD](docs/guide/pipeline_parallel.md) · [多核 MPMD](hyper_parallel/core/multicore/README.md)
+> - **性能诊断**：[MegaKernel Profiling](docs/guide/mega_kernel_profiling.md)
 > - **内存与性能**：[Activation Checkpoint / Swap](docs/guide/activation_checkpoint.md) · [通信与计算重叠](docs/guide/pipeline_parallel_overlap_b_f.md) · [通信融合](docs/guide/fsdp.md#通信融合) · [自动并行](docs/guide/auto_parallel.md)
 > - **训练与状态**：[Optimizer](docs/guide/optimizer.md) · [DCP](docs/guide/distributed_checkpoint.md) · [确定性调试](docs/faq.md#3-确定性模式调试)
 >
