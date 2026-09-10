@@ -25,6 +25,7 @@ from hyper_parallel.models.build_options import CompileConfig, FSDP2Config
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 
 from hyper_parallel.trainer.config.data import DataLoaderConfig, DatasetConfig
+from hyper_parallel.trainer.config.dry_run import DryRunConfig
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,
@@ -79,6 +80,7 @@ class TrainerConfig:
     debug: DebugConfig = field(default_factory=DebugConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+    dry_run: Optional[DryRunConfig] = None
     magi: Optional[Any] = None
     peft: Optional[Any] = None
 

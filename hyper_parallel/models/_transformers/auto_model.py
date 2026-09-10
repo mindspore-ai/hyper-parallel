@@ -34,6 +34,7 @@ from hyper_parallel.models._transformers.model_builder import (
     _init_model,
     apply_model_infrastructure,
     instantiate_infrastructure,
+    is_model_materialization_deferred,
 )
 from hyper_parallel.models._transformers.config_resolver import get_hf_config, get_is_hf_model
 from hyper_parallel.distributed.mesh import DistributedSetup
@@ -251,6 +252,7 @@ class _BaseHyperAutoModelClass:
         # across versions (hence the ImportError fallback).
         # pylint: disable=import-outside-toplevel
         from contextlib import nullcontext
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
         from transformers.modeling_utils import ContextManagers
         try:
             from transformers.modeling_utils import no_init_weights
@@ -263,14 +265,17 @@ class _BaseHyperAutoModelClass:
         # must not import the trainer runtime).
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         is_meta_device = (
-            world_size > 1 or not is_hf_model
+            world_size > 1
+            or not is_hf_model
+            or is_model_materialization_deferred()
         ) and kwargs.get("quantization_config") is None
 
-        init_ctx = (
-            ContextManagers([no_init_weights(), init_empty_weights()])
-            if is_meta_device
-            else nullcontext()
-        )
+        init_contexts = [no_init_weights(), init_empty_weights()]
+        if is_model_materialization_deferred():
+            # init_empty_weights replaces registered Parameters itself; let it
+            # create ordinary meta tensors before FakeTensor handles sharding.
+            init_contexts.insert(0, unset_fake_temporarily())
+        init_ctx = ContextManagers(init_contexts) if is_meta_device else nullcontext()
 
         # Step 2: Build model
         with init_ctx:

@@ -17,6 +17,7 @@
 # ============================================================================
 """HSDP parameter"""
 # pylint: disable=W0212
+import weakref
 from dataclasses import dataclass
 from typing import Callable, List, Optional, cast
 
@@ -45,6 +46,34 @@ from hyper_parallel.core.fully_shard.utils import (
     OffloadPolicy,
     SourceShardMetaInfo,
 )
+
+
+def _register_fake_dtensor_grad_capture(param: DTensor) -> None:
+    """Expose an inner FakeTensor leaf gradient through its DTensor wrapper."""
+    if not getattr(param, "_is_fake_wrapper", False) or not param._local_tensor.requires_grad:
+        return
+    local_tensor = param._local_tensor
+    capture_tensor_ref = getattr(param, "_fake_grad_capture_tensor_ref", None)
+    if capture_tensor_ref is not None and capture_tensor_ref() is local_tensor:
+        return
+    param_ref = weakref.ref(param)
+    local_tensor_ref = weakref.ref(local_tensor)
+
+    def capture_grad(grad: torch.Tensor) -> torch.Tensor:
+        captured_param = param_ref()
+        if captured_param is not None:
+            pending_grad = getattr(captured_param, "_fake_pending_grad", None)
+            captured_param._fake_pending_grad = grad if pending_grad is None else pending_grad + grad
+        return grad
+
+    def clear_inner_grad(_: torch.Tensor) -> None:
+        tensor = local_tensor_ref()
+        if tensor is not None:
+            tensor.grad = None
+
+    local_tensor.register_hook(capture_grad)
+    local_tensor.register_post_accumulate_grad_hook(clear_inner_grad)
+    param._fake_grad_capture_tensor_ref = weakref.ref(local_tensor)
 
 
 def _copy_without_bumping_version(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -742,6 +771,8 @@ class TorchHSDPParamV2(HSDPParamV2):
             unsharded_param,
             requires_grad=self.sharded_param.requires_grad,
         )
+        if isinstance(self._unsharded_param, DTensor):
+            _register_fake_dtensor_grad_capture(self._unsharded_param)
 
     def to_sharded(self) -> None:
         self._setattr_on_modules(self.sharded_param)
@@ -905,6 +936,9 @@ class TorchHSDPParamV2(HSDPParamV2):
         """Return whether communication storage already aliases the local tensor."""
         if not isinstance(self._sharded_param_data, torch.Tensor):
             return False
+        from torch._subclasses.fake_tensor import FakeTensor  # pylint: disable=C0415
+        if isinstance(self._sharded_param_data, FakeTensor):
+            return self._sharded_param_data.untyped_storage() is local_tensor.untyped_storage()
         sharded_data_ptr = self._sharded_param_data.untyped_storage().data_ptr()
         return (
             # Empty shards may have a zero data pointer and must still be rebuilt.
@@ -1005,9 +1039,17 @@ class TorchHSDPParamV2(HSDPParamV2):
     def _update_shardedparam_storage_forcely(self,):
         sharded_param_data = self.sharded_param.data
         local_tensor_data = self.sharded_param._local_tensor.data
+        from torch._subclasses.fake_tensor import FakeTensor  # pylint: disable=C0415
+        if isinstance(sharded_param_data, FakeTensor) and isinstance(local_tensor_data, FakeTensor):
+            storage_changed = (
+                sharded_param_data.untyped_storage()
+                is not local_tensor_data.untyped_storage()
+            )
+        else:
+            storage_changed = sharded_param_data.data_ptr() != local_tensor_data.data_ptr()
         if (
             sharded_param_data.device != local_tensor_data.device
-            or sharded_param_data.data_ptr() != local_tensor_data.data_ptr()
+            or storage_changed
         ):
             local_tensor_data.requires_grad_(self.sharded_param.requires_grad)
             # TensorImpl keeps storage_ptr, storage_offset, sizes, strides, dtype and metadatas

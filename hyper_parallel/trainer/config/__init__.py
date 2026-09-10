@@ -31,6 +31,7 @@ from hyper_parallel.trainer.config.data import (
     DatasetConfig,
     ModelAssetsConfig,
 )
+from hyper_parallel.trainer.config.dry_run import DryRunConfig
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,
@@ -60,6 +61,7 @@ __all__ = [
     "DataLoaderConfig",
     "DatasetConfig",
     "DebugConfig",
+    "DryRunConfig",
     "FSDP2Config",
     "MixedPrecisionConfig",
     "OptimizerConfig",
