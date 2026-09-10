@@ -49,8 +49,6 @@ import struct
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
-from itertools import accumulate
 from types import TracebackType
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import importlib
@@ -422,21 +420,21 @@ class _IndexReader:
         logger.info("Extracting sequence lengths")
         self.sequence_lengths = numpy.frombuffer(
             self._buffer, dtype=numpy.int32, count=self.sequence_count, offset=payload_offset
-        )
+        ).copy()
         logger.info("Extracting sequence pointers")
         self.sequence_pointers = numpy.frombuffer(
             self._buffer,
             dtype=numpy.int64,
             count=self.sequence_count,
             offset=payload_offset + self.sequence_lengths.nbytes,
-        )
+        ).copy()
         logger.info("Extracting document indices")
         self.document_indices = numpy.frombuffer(
             self._buffer,
             dtype=numpy.int64,
             count=self.document_count,
             offset=payload_offset + self.sequence_lengths.nbytes + self.sequence_pointers.nbytes,
-        )
+        ).copy()
 
         self.sequence_modes: Optional[numpy.ndarray] = None
         if multimodal:
@@ -449,7 +447,7 @@ class _IndexReader:
                 + self.sequence_lengths.nbytes
                 + self.sequence_pointers.nbytes
                 + self.document_indices.nbytes,
-            )
+            ).copy()
 
         assert self.sequence_lengths.shape[0] == len(self)
         assert self.sequence_lengths.shape[0] == self.sequence_count
@@ -457,10 +455,27 @@ class _IndexReader:
 
         logger.info("Sequences: %d | Documents: %d", len(self), self.document_indices.shape[0] - 1)
 
+    def close(self) -> None:
+        """Release memory-mapped index resources."""
+        if getattr(self, "_mmap", None) is None:
+            return
+
+        self.sequence_lengths = None
+        self.sequence_pointers = None
+        self.document_indices = None
+        self.sequence_modes = None
+        if getattr(self, "_buffer", None) is not None:
+            self._buffer.release()
+            self._buffer = None
+
+        self._mmap = None
+
     def __del__(self) -> None:
-        """Clean up the object"""
-        self._mmap._mmap.close()
-        del self._mmap
+        """Clean up the object."""
+        try:
+            self.close()
+        except (AttributeError, BufferError, ValueError):
+            pass
 
     def __len__(self) -> int:
         """Get the number of sequences in the dataset
@@ -470,7 +485,6 @@ class _IndexReader:
         """
         return self.sequence_count
 
-    @lru_cache(maxsize=8)
     def __getitem__(self, idx: int) -> Tuple[numpy.int32, numpy.int64, Optional[numpy.int8]]:
         """Return the pointer, length, and mode at the index
 
@@ -538,12 +552,19 @@ class _MMapBinReader(_BinReader):
         """
         return numpy.frombuffer(self._buffer, dtype=dtype, count=count, offset=offset)
 
+    def close(self) -> None:
+        """Close the backing file without invalidating arrays returned from mmap."""
+        file_obj = getattr(self, "_file", None)
+        if file_obj is not None:
+            file_obj.close()
+            self._file = None
+
     def __del__(self) -> None:
-        """Clean up the object"""
-        self._mmap._mmap.close()
-        self._file.close()
-        del self._mmap
-        del self._file
+        """Clean up the object."""
+        try:
+            self.close()
+        except (AttributeError, BufferError, ValueError):
+            pass
 
 
 class _FileBinReader(_BinReader):
@@ -574,7 +595,13 @@ class _FileBinReader(_BinReader):
         out = numpy.empty(count, dtype=dtype)
         with open(self._bin_path, "rb", buffering=0) as f:
             f.seek(offset)
-            f.readinto(out)
+            byte_view = out.view(numpy.uint8)
+            nbytes = f.readinto(byte_view)
+        if nbytes != out.nbytes:
+            raise ValueError(
+                f"Short read from {self._bin_path}: requested {out.nbytes} bytes at offset {offset}, "
+                f"read {nbytes or 0} bytes"
+            )
         return out
 
 
@@ -794,10 +821,11 @@ class IndexedDataset(torch.utils.data.Dataset):
                 raise ValueError("Slices into IndexedDataset must be contiguous (step=1)")
             lengths = self.index.sequence_lengths[idx]
             modes = self.index.sequence_modes[idx] if self.multimodal else None
-            offsets = list(accumulate(lengths))
+            offsets = numpy.cumsum(lengths, dtype=numpy.int64)
+            token_count = int(offsets[-1]) if offsets.size else 0
             buffer = self.bin_reader.read(
                 self.index.dtype,
-                int(sum(lengths)),
+                token_count,
                 int(self.index.sequence_pointers[start]),
             )
             sequences = numpy.split(buffer, offsets[:-1])
