@@ -132,12 +132,18 @@ class TestConvertShardingPlan(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_parameter_placement_tuple_converted(self, mock_platform):
         """Placement tuple in 'parameter' key is converted to Layout."""
         from hyper_parallel.core.dtensor.layout import Layout
@@ -147,7 +153,7 @@ class TestConvertShardingPlan(unittest.TestCase):
         self.assertIn("parameter", result)
         self.assertIsInstance(result["parameter"]["w"], Layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_none_value_preserved(self, mock_platform):
         """None value in plan is kept as None."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -155,7 +161,7 @@ class TestConvertShardingPlan(unittest.TestCase):
         result = shard_api._convert_sharding_plan(plan, mesh)
         self.assertIsNone(result["parameter"]["w"])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_forward_input_wrapped_in_list(self, mock_platform):
         """A single placement tuple under 'forward'/'input' is wrapped in a list."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -166,7 +172,7 @@ class TestConvertShardingPlan(unittest.TestCase):
         self.assertIsInstance(forward["input"], list)
         self.assertEqual(len(forward["input"]), 1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_forward_output_wrapped_in_list(self, mock_platform):
         """A single placement tuple under 'forward'/'output' is wrapped in a list."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -176,7 +182,7 @@ class TestConvertShardingPlan(unittest.TestCase):
         self.assertIn("output", forward)
         self.assertIsInstance(forward["output"], list)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_alias_string_placement_converted(self, mock_platform):
         """Alias string tuple is also converted to Layout."""
         from hyper_parallel.core.dtensor.layout import Layout
@@ -185,7 +191,7 @@ class TestConvertShardingPlan(unittest.TestCase):
         result = shard_api._convert_sharding_plan(plan, mesh)
         self.assertIsInstance(result["parameter"]["w"], Layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_list_of_placements_in_forward_input(self, mock_platform):
         """A list of placement tuples under forward/input is converted element-wise."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -195,7 +201,7 @@ class TestConvertShardingPlan(unittest.TestCase):
         self.assertIsInstance(forward["input"], list)
         self.assertEqual(len(forward["input"]), 2)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dict_format_in_forward_input(self, mock_platform):
         """Dict format for forward/input (kwargs) is converted to dict of Layouts."""
         from hyper_parallel.core.dtensor.layout import Layout
@@ -206,7 +212,7 @@ class TestConvertShardingPlan(unittest.TestCase):
         self.assertIsInstance(forward["input"], dict)
         self.assertIsInstance(forward["input"]["x"], Layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_non_placement_value_returned_as_is(self, mock_platform):
         """A non-placement scalar value is returned unchanged."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -410,6 +416,12 @@ class TestShardModule(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -437,7 +449,7 @@ class TestShardModule(unittest.TestCase):
         with self.assertRaises(TypeError):
             shard_api.shard_module(model, mesh, {"w": (Shard(0),)})
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.api.platform")
     def test_callable_is_wrapped_when_not_module(self, mock_api_platform, mock_mesh_platform):
         """When model is not a Module, _shard_callable wraps it."""
@@ -454,7 +466,7 @@ class TestShardModule(unittest.TestCase):
         result = shard_api.shard_module(my_func, mesh, plan)
         self.assertIs(result, my_func)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.api.platform")
     def test_input_plan_must_be_dict(self, mock_api_platform, mock_mesh_platform):
         """Non-dict input_plan raises TypeError."""
@@ -470,7 +482,7 @@ class TestShardModule(unittest.TestCase):
         with self.assertRaises(TypeError):
             shard_api.shard_module(model, mesh, plan)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.api.platform")
     def test_output_plan_must_be_dict(self, mock_api_platform, mock_mesh_platform):
         """Non-dict output_plan raises TypeError."""
@@ -518,12 +530,18 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_nested_string_tuple_is_valid_placement(self, mock_platform):
         """Nested tuple of strings (multi-axis alias) is a valid placement element."""
         from hyper_parallel.core.dtensor.layout import Layout
@@ -532,7 +550,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         result = shard_api._convert_sharding_plan(plan, mesh)
         self.assertIsInstance(result["parameter"]["w"], Layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_nested_placement_tuple_is_not_placement(self, mock_platform):
         """Tuple of placement tuples is NOT a placement spec — falls to _convert_value tuple branch."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -540,7 +558,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         result = shard_api._convert_sharding_plan(plan, mesh)
         self.assertIsInstance(result["parameter"]["w"], list)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_empty_nested_tuple_makes_outer_not_placement(self, mock_platform):
         """Outer tuple with empty inner tuple is not a placement spec."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -548,7 +566,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         result = shard_api._convert_sharding_plan(plan, mesh)
         self.assertIsInstance(result["parameter"]["w"], list)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_non_placement_item_in_tuple_not_placement(self, mock_platform):
         """Tuple containing non-str/Placement item is not a placement spec."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -556,7 +574,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         result = shard_api._convert_sharding_plan(plan, mesh)
         self.assertIsInstance(result["parameter"]["w"], list)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_convert_value_list_case(self, mock_platform):
         """_convert_value processes list values by recursing on each element."""
         from hyper_parallel.core.dtensor.layout import Layout
@@ -567,7 +585,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         self.assertIsInstance(items, list)
         self.assertIsInstance(items[0], Layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_convert_value_non_placement_tuple_case(self, mock_platform):
         """_convert_value processes tuple-of-tuples by recursing on each element."""
         from hyper_parallel.core.dtensor.layout import Layout
@@ -578,7 +596,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         self.assertIsInstance(items, list)
         self.assertIsInstance(items[0], Layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_convert_forward_plan_none_returns_none(self, mock_platform):
         """_convert_sharding_plan({'forward': None}, mesh) keeps forward as None."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -586,7 +604,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         result = shard_api._convert_sharding_plan(plan, mesh)
         self.assertIsNone(result.get("forward"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_forward_input_value_none_preserved(self, mock_platform):
         """None value for a forward input key is preserved as None."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -594,7 +612,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         result = shard_api._convert_sharding_plan(plan, mesh)
         self.assertIsNone(result["forward"]["input"])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_forward_non_input_output_key_converted(self, mock_platform):
         """A forward key not ending in input/output is converted via _convert_value."""
         from hyper_parallel.core.dtensor.layout import Layout
@@ -603,7 +621,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         result = shard_api._convert_sharding_plan(plan, mesh)
         self.assertIsInstance(result["forward"]["mask"], Layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_top_level_input_key_none(self, mock_platform):
         """Top-level 'input' key with None value is preserved."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -611,7 +629,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         result = shard_api._convert_sharding_plan(plan, mesh)
         self.assertIsNone(result["input"])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_top_level_input_key_placement_tuple(self, mock_platform):
         """Top-level 'input' key with placement tuple is wrapped in a list."""
         from hyper_parallel.core.dtensor.layout import Layout
@@ -621,7 +639,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         self.assertIsInstance(result["input"], list)
         self.assertIsInstance(result["input"][0], Layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_top_level_input_key_dict(self, mock_platform):
         """Top-level 'input' key with dict converts each placement value."""
         from hyper_parallel.core.dtensor.layout import Layout
@@ -631,7 +649,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         self.assertIsInstance(result["input"], dict)
         self.assertIsInstance(result["input"]["x"], Layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_top_level_input_key_list_of_tuples(self, mock_platform):
         """Top-level 'input' key with list of placement tuples converts element-wise."""
         from hyper_parallel.core.dtensor.layout import Layout
@@ -642,7 +660,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
         self.assertEqual(len(result["input"]), 2)
         self.assertIsInstance(result["input"][0], Layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_forward_input_scalar_passes_through(self, mock_platform):
         """Forward input with non-standard scalar uses line 164 path; scalar returned as-is."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -985,12 +1003,18 @@ class TestShardModuleWithPlan(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.api.platform")
     def test_callable_with_full_plan(self, mock_api, mock_mesh):
         """shard_module with plan + input_plan + output_plan + return_local_tensor (callable)."""
@@ -1012,7 +1036,7 @@ class TestShardModuleWithPlan(unittest.TestCase):
         result = shard_api.shard_module(my_func, mesh, plan)
         self.assertTrue(callable(result))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.api.platform")
     @patch("hyper_parallel.core.shard.api.Module", object)
     def test_param_not_found_raises_value_error(self, mock_api, mock_mesh):
@@ -1028,7 +1052,7 @@ class TestShardModuleWithPlan(unittest.TestCase):
         with self.assertRaises(ValueError):
             shard_api.shard_module(model, mesh, plan)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.api.platform")
     @patch("hyper_parallel.core.shard.api.Module", object)
     def test_param_layout_not_layout_raises_value_error(self, mock_api, mock_mesh):
@@ -1043,7 +1067,7 @@ class TestShardModuleWithPlan(unittest.TestCase):
         with self.assertRaises((ValueError, TypeError)):
             shard_api.shard_module(model, mesh, plan)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.api.platform")
     @patch("hyper_parallel.core.shard.api.Module", object)
     def test_param_found_and_applied(self, mock_api, mock_mesh):

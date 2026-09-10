@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,6 +42,12 @@ class TestParallelCumsum(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -61,9 +67,6 @@ class TestParallelCumsum(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -75,7 +78,7 @@ class TestParallelCumsum(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=24)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 3, 4), mesh_dim_names=("dp", "tp", "mp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cumsum_layout_data_parallel(self, mock_platform):
         """
         Feature: Cumsum data parallel
@@ -105,7 +108,7 @@ class TestParallelCumsum(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cumsum_layout_tensor_parallel(self, mock_platform):
         """
         Feature: Cumsum tensor parallel
@@ -127,7 +130,7 @@ class TestParallelCumsum(unittest.TestCase):
         )
         assert extra_info is None, f"Cumsum extra_info should be None, got {extra_info}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cumsum_layout_mixed_parallel(self, mock_platform):
         """
         Feature: Cumsum mixed parallel
@@ -149,7 +152,7 @@ class TestParallelCumsum(unittest.TestCase):
         )
         assert extra_info is None, f"Cumsum extra_info should be None, got {extra_info}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cumsum_layout_negative_dim(self, mock_platform):
         """
         Feature: Cumsum with negative dimension
@@ -171,7 +174,7 @@ class TestParallelCumsum(unittest.TestCase):
         )
         assert extra_info is None, f"Cumsum extra_info should be None, got {extra_info}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cumsum_layout_invalid_sharding_on_cumsum_dim(self, mock_platform):
         """
         Feature: Cumsum on sharded dimension
@@ -185,7 +188,7 @@ class TestParallelCumsum(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sharded dimension"):
             op.infer_layout([x_layout, -1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cumsum_layout_dim_out_of_range_positive(self, mock_platform):
         """
         Feature: Cumsum with invalid positive dimension
@@ -199,7 +202,7 @@ class TestParallelCumsum(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dimension out of range"):
             op.infer_layout([x_layout, 2])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cumsum_layout_missing_dim_parameter(self, mock_platform):
         """
         Feature: Cumsum without dim parameter
@@ -213,7 +216,7 @@ class TestParallelCumsum(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dimension should be int"):
             op.infer_layout([x_layout, None])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cumsum_layout_invalid_dim_type(self, mock_platform):
         """
         Feature: Cumsum with non-integer dim
@@ -227,7 +230,7 @@ class TestParallelCumsum(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dimension should be int"):
             op.infer_layout([x_layout, "invalid"])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cumsum_partial_input_raises_error(self, mock_platform):
         """
         Feature: Cumsum with Partial input
@@ -242,7 +245,7 @@ class TestParallelCumsum(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             op.infer_layout([x_layout, -1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cumsum_preprocess_torch_dtype_in_kwargs(self, mock_platform):
         """
         Feature: Cumsum preprocess for PyTorch
@@ -270,7 +273,7 @@ class TestParallelCumsum(unittest.TestCase):
         )
         assert cache_values == [x_layout, -1], f"Unexpected cache_values: {cache_values}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cumsum_preprocess_mindspore_primitive_in_args(self, mock_platform):
         """
         Feature: Cumsum preprocess for MindSpore Primitive

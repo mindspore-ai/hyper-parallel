@@ -95,6 +95,12 @@ class TestSequenceParallelApply(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -117,7 +123,7 @@ class TestSequenceParallelApply(unittest.TestCase):
             init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_apply_layernorm_calls_distribute_module(self, mock_mesh_platform):
         """
         Feature: SequenceParallel.apply on LayerNorm
@@ -134,7 +140,7 @@ class TestSequenceParallelApply(unittest.TestCase):
             mock_dist.assert_called_once()
             self.assertIs(result, module)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_apply_invokes_distribute_module_callbacks(self, mock_mesh_platform):
         """
         Feature: SequenceParallel.apply registers partition/input/output callbacks

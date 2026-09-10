@@ -15,7 +15,7 @@
 """parallel_one_hot_ext test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
@@ -35,6 +35,12 @@ class TestParallelOneHotExt(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -48,9 +54,6 @@ class TestParallelOneHotExt(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, cp, mp) mesh via init_device_mesh."""
@@ -72,7 +75,7 @@ class TestParallelOneHotExt(unittest.TestCase):
                 expected_placements[mesh_ndim - 1 - tensor_map_value] = Shard(tensor_dim)
         assert output_layout.placements == expected_placements
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_one_hot_ext_1d_axis_minus1_data_parallel_1(self, mock_platform):
         """
         Feature: 1D indices, axis=-1.
@@ -87,7 +90,7 @@ class TestParallelOneHotExt(unittest.TestCase):
             expected_map=(2, -1),
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_one_hot_ext_1d_axis_0_data_parallel_2(self, mock_platform):
         """
         Feature: 1D indices, axis=0.
@@ -102,7 +105,7 @@ class TestParallelOneHotExt(unittest.TestCase):
             expected_map=(-1, 2),
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_one_hot_ext_1d_axis_1_data_parallel_3(self, mock_platform):
         """
         Feature: 1D indices, axis=1.
@@ -117,7 +120,7 @@ class TestParallelOneHotExt(unittest.TestCase):
             expected_map=(2, -1),
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_one_hot_ext_1d_replicate_all_4(self, mock_platform):
         """
         Feature: 1D indices fully replicated.
@@ -132,7 +135,7 @@ class TestParallelOneHotExt(unittest.TestCase):
             expected_map=(-1, -1),
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_one_hot_ext_2d_axis_minus1_data_parallel_5(self, mock_platform):
         """
         Feature: 2D indices, axis=-1.
@@ -147,7 +150,7 @@ class TestParallelOneHotExt(unittest.TestCase):
             expected_map=(2, -1, -1),
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_one_hot_ext_3d_axis_minus1_data_parallel_6(self, mock_platform):
         """
         Feature: 3D indices, axis=-1.
@@ -162,7 +165,7 @@ class TestParallelOneHotExt(unittest.TestCase):
             expected_map=(2, -1, -1, -1),
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_one_hot_ext_2d_axis_not_minus1_should_raise_7(self, mock_platform):
         """
         Feature: Multi-dimensional restriction.
@@ -176,7 +179,7 @@ class TestParallelOneHotExt(unittest.TestCase):
         with self.assertRaises(ValueError):
             op.infer_layout([indices_layout, None, None, 64, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_one_hot_ext_2d_not_data_parallel_should_raise_8(self, mock_platform):
         """
         Feature: Multi-dimensional restriction.
@@ -190,7 +193,7 @@ class TestParallelOneHotExt(unittest.TestCase):
         with self.assertRaises(ValueError):
             op.infer_layout([indices_layout, None, None, 64, -1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_one_hot_ext_axis_out_of_range_should_raise_9(self, mock_platform):
         """
         Feature: Axis validation.
@@ -204,7 +207,7 @@ class TestParallelOneHotExt(unittest.TestCase):
         with self.assertRaises(ValueError):
             op.infer_layout([indices_layout, None, None, 32, 2])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_one_hot_ext_num_classes_invalid_should_raise_10(self, mock_platform):
         """
         Feature: num_classes validation.
@@ -230,6 +233,12 @@ class TestOneHotExtValidationPaths(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -239,9 +248,6 @@ class TestOneHotExtValidationPaths(unittest.TestCase):
     def _setup_mock_platform(self, mock_platform, world_size=8):
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def test_infer_layout_none_indices_layout(self):
         """None as indices layout in cache_values raises ValueError."""
@@ -249,7 +255,7 @@ class TestOneHotExtValidationPaths(unittest.TestCase):
         with self.assertRaises(ValueError):
             op.infer_layout([None, None, None, 32, -1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_partial_index_layout_raises(self, mock_platform):
         """Partial indices layout raises ValueError."""
         self._setup_mock_platform(mock_platform)
@@ -271,7 +277,7 @@ class TestOneHotExtValidationPaths(unittest.TestCase):
         with self.assertRaises(TypeError):
             op._validate_num_classes("not_an_int")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_expand_impl_no_sharding_returns_none(self, mock_platform):
         """get_expand_impl with fully replicated layout returns None."""
         self._setup_mock_platform(mock_platform)
@@ -285,7 +291,7 @@ class TestOneHotExtValidationPaths(unittest.TestCase):
         result = op.get_expand_impl(None, None, cache_values)
         self.assertIsNone(result)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_expand_impl_sharded_returns_callable(self, mock_platform):
         """get_expand_impl with sharded layout returns a callable closure."""
         self._setup_mock_platform(mock_platform)

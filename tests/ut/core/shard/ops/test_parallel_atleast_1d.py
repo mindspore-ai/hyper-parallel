@@ -15,7 +15,7 @@
 """parallel_atleast_1d test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
@@ -40,6 +40,12 @@ class TestParallelAtleast1d(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         self.op = Atleast1DDistributedOp("atleast_1d")
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -59,9 +65,6 @@ class TestParallelAtleast1d(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -73,7 +76,7 @@ class TestParallelAtleast1d(unittest.TestCase):
             init_backend=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_atleast_1d_layout_inference_0d(self, mock_platform):
         """
         Feature: Convert 0D scalar to 1D
@@ -104,7 +107,7 @@ class TestParallelAtleast1d(unittest.TestCase):
             f"got {self.op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_atleast_1d_layout_inference_1d(self, mock_platform):
         """
         Feature: Preserve 1D tensor layout
@@ -128,7 +131,7 @@ class TestParallelAtleast1d(unittest.TestCase):
             f"extra_info should be None, got {extra_info}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_atleast_1d_layout_inference_nd(self, mock_platform):
         """
         Feature: Preserve N-dimensional tensor layout (N > 1)
@@ -152,7 +155,7 @@ class TestParallelAtleast1d(unittest.TestCase):
             f"extra_info should be None, got {extra_info}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_atleast_1d_invalid_partial(self, mock_platform):
         """
         Feature: Reject Partial status

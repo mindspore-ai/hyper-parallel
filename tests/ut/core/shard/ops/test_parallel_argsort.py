@@ -39,6 +39,12 @@ class TestParallelArgsort(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clear global caches after each test."""
@@ -50,9 +56,6 @@ class TestParallelArgsort(unittest.TestCase):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 4),
                                 mesh_dim_names=("dp", "mp"), init_backend=False)
@@ -61,14 +64,11 @@ class TestParallelArgsort(unittest.TestCase):
         """Set up mock and return a standard 2x2x2 (dp, tp, mp) mesh via init_device_mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 2, 2),
                                 mesh_dim_names=("dp", "tp", "mp"), init_backend=False)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_argsort_layout_inference_basic(self, mock_platform):
         """
         Feature: Argsort on an unsharded dimension
@@ -99,7 +99,7 @@ class TestParallelArgsort(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_argsort_layout_inference_specific_dim(self, mock_platform):
         """
         Feature: Argsort on a specific unsharded dimension with extra kwargs
@@ -123,7 +123,7 @@ class TestParallelArgsort(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_argsort_layout_inference_negative_dim(self, mock_platform):
         """
         Feature: Argsort handling of negative dimensions
@@ -148,7 +148,7 @@ class TestParallelArgsort(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_argsort_layout_invalid_sharded_dim(self, mock_platform):
         """
         Feature: Argsort on a sharded dimension
@@ -163,7 +163,7 @@ class TestParallelArgsort(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sharded dimension"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_argsort_layout_invalid_out_of_bounds_dim(self, mock_platform):
         """
         Feature: Argsort with out-of-bounds dimension
@@ -178,7 +178,7 @@ class TestParallelArgsort(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dimension out of range"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_argsort_partial_input_raises_error(self, mock_platform):
         """
         Feature: ArgsortDistributedOp rejects inputs with Partial status.
@@ -194,7 +194,7 @@ class TestParallelArgsort(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_argsort_layout_multiaxis_tuple_sharded_dim_error(self, mock_platform):
         """
         Feature: ArgsortDistributedOp rejects StridedShard multi-axis mapping on sort dim.
@@ -210,7 +210,7 @@ class TestParallelArgsort(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sharded dimension"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_argsort_preprocess_torch_stable_in_kwargs(self, mock_platform):
         """
         Feature: ArgsortDistributedOp preprocess routes stable into kwargs for PyTorch.
@@ -239,7 +239,7 @@ class TestParallelArgsort(unittest.TestCase):
             f"Default dim should be -1, got {cache_values[1]}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_argsort_preprocess_mindspore_stable_in_args(self, mock_platform):
         """
         Feature: ArgsortDistributedOp preprocess routes stable into positional args for MindSpore.

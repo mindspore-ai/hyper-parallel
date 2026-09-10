@@ -259,7 +259,7 @@ class TestDtensorInitHelper(unittest.TestCase):
 
     This test class verifies that the _dtensor_init_helper function correctly
     initializes distributed tensors by computing local shapes, calling the
-    appropriate platform initialization functions (full, ones, zeros, empty),
+    appropriate torch initialization functions (full, ones, zeros, empty),
     and wrapping the results in DTensor objects.
     """
 
@@ -285,7 +285,7 @@ class TestDtensorInitHelper(unittest.TestCase):
         """Test _dtensor_init_helper with full operation (requires fill_value).
 
         Test Scenario:
-            Initialize a DTensor using platform.full with:
+            Initialize a DTensor using torch.full with:
             - Global shape [4, 8, 12]
             - Shard(0) placement across devices
             - fill_value of 3.14
@@ -294,7 +294,7 @@ class TestDtensorInitHelper(unittest.TestCase):
         Expected Behavior:
             - compute_local_shape_and_global_offset is called with size, mesh, placements
             - Local shape is computed as [2, 4, 6] (mocked return)
-            - platform.full is called with local_shape, fill_value, and dtype
+            - torch.full is called with local_shape, fill_value, and dtype
             - DTensor.from_local is called to wrap the local tensor
         """
         # Arrange
@@ -338,7 +338,7 @@ class TestDtensorInitHelper(unittest.TestCase):
         """Test _dtensor_init_helper with ones operation (no fill_value).
 
         Test Scenario:
-            Initialize a DTensor using platform.ones with:
+            Initialize a DTensor using torch.ones with:
             - Global shape [2, 2]
             - Replicate() placement (no sharding)
             - dtype of 'float32'
@@ -346,7 +346,7 @@ class TestDtensorInitHelper(unittest.TestCase):
         Expected Behavior:
             - compute_local_shape_and_global_offset is called with size, mesh, placements
             - Local shape is computed as [2, 2] (same as global for Replicate)
-            - platform.ones is called with local_shape [2, 2] and dtype='float32'
+            - torch.ones is called with local_shape [2, 2] and dtype='float32'
             - No fill_value is passed (ones doesn't need it)
         """
         # Arrange
@@ -378,13 +378,13 @@ class TestOnes(unittest.TestCase):
     """Unit tests for ones function.
 
     This test class verifies that the ones() function correctly delegates
-    to _dtensor_init_helper with the appropriate platform.ones initialization
+    to _dtensor_init_helper with the appropriate torch.ones initialization
     function and parameters.
     """
 
     @patch('hyper_parallel.core.dtensor.dtensor._dtensor_init_helper')
-    @patch('hyper_parallel.core.dtensor.dtensor.platform')
-    def test_ones_calls_helper_correctly(self, mock_platform, mock_helper):
+    @patch('hyper_parallel.core.dtensor.dtensor.torch')
+    def test_ones_calls_helper_correctly(self, mock_torch, mock_helper):
         """Test that ones function calls _dtensor_init_helper with correct parameters.
 
         Test Scenario:
@@ -393,12 +393,12 @@ class TestOnes(unittest.TestCase):
 
         Expected Behavior:
             - _dtensor_init_helper is called exactly once
-            - The helper receives platform.ones as the init_op
+            - The helper receives torch.ones as the init_op
             - size parameter is [4, 8, 12]
             - device_mesh and placements are passed as keyword arguments
         """
         # Arrange
-        mock_platform.ones = MagicMock()
+        mock_torch.ones = MagicMock()
         mock_helper.return_value = MagicMock()
 
         mock_mesh = MagicMock()
@@ -410,7 +410,7 @@ class TestOnes(unittest.TestCase):
 
         # Assert - Check that helper was called with the correct init_op and kwargs
         mock_helper.assert_called_once_with(
-            mock_platform.ones,  # init_op
+            mock_torch.ones,  # init_op
             size,  # size
             device_mesh=mock_mesh,  # device_mesh as keyword arg
             placements=placements,  # placements as keyword arg
@@ -421,13 +421,13 @@ class TestZeros(unittest.TestCase):
     """Unit tests for zeros function.
 
     This test class verifies that the zeros() function correctly delegates
-    to _dtensor_init_helper with the appropriate platform.zeros initialization
+    to _dtensor_init_helper with the appropriate torch.zeros initialization
     function and parameters.
     """
 
     @patch('hyper_parallel.core.dtensor.dtensor._dtensor_init_helper')
-    @patch('hyper_parallel.core.dtensor.dtensor.platform')
-    def test_zeros_calls_helper_correctly(self, mock_platform, mock_helper):
+    @patch('hyper_parallel.core.dtensor.dtensor.torch')
+    def test_zeros_calls_helper_correctly(self, mock_torch, mock_helper):
         """Test that zeros function calls _dtensor_init_helper with correct parameters.
 
         Test Scenario:
@@ -436,12 +436,12 @@ class TestZeros(unittest.TestCase):
 
         Expected Behavior:
             - _dtensor_init_helper is called exactly once
-            - The helper receives platform.zeros as the init_op
+            - The helper receives torch.zeros as the init_op
             - size parameter is [4, 8, 12]
             - device_mesh and placements are passed as keyword arguments
         """
         # Arrange
-        mock_platform.zeros = MagicMock()
+        mock_torch.zeros = MagicMock()
         mock_helper.return_value = MagicMock()
 
         mock_mesh = MagicMock()
@@ -453,7 +453,7 @@ class TestZeros(unittest.TestCase):
 
         # Assert
         mock_helper.assert_called_once_with(
-            mock_platform.zeros,
+            mock_torch.zeros,
             size,
             device_mesh=mock_mesh,
             placements=placements,
@@ -464,14 +464,14 @@ class TestEmpty(unittest.TestCase):
     """Unit tests for empty function.
 
     This test class verifies that the empty() function correctly delegates
-    to _dtensor_init_helper with the appropriate platform.empty initialization
+    to _dtensor_init_helper with the appropriate torch.empty initialization
     function and parameters. The empty() function creates a DTensor with
     uninitialized memory.
     """
 
     @patch('hyper_parallel.core.dtensor.dtensor._dtensor_init_helper')
-    @patch('hyper_parallel.core.dtensor.dtensor.platform')
-    def test_empty_calls_helper_correctly(self, mock_platform, mock_helper):
+    @patch('hyper_parallel.core.dtensor.dtensor.torch')
+    def test_empty_calls_helper_correctly(self, mock_torch, mock_helper):
         """Test that empty function calls _dtensor_init_helper with correct parameters.
 
         Test Scenario:
@@ -480,12 +480,12 @@ class TestEmpty(unittest.TestCase):
 
         Expected Behavior:
             - _dtensor_init_helper is called exactly once
-            - The helper receives platform.empty as the init_op
+            - The helper receives torch.empty as the init_op
             - size parameter is [4, 8, 12]
             - device_mesh and placements are passed as keyword arguments
         """
         # Arrange
-        mock_platform.empty = MagicMock()
+        mock_torch.empty = MagicMock()
         mock_helper.return_value = MagicMock()
 
         mock_mesh = MagicMock()
@@ -497,7 +497,7 @@ class TestEmpty(unittest.TestCase):
 
         # Assert
         mock_helper.assert_called_once_with(
-            mock_platform.empty,
+            mock_torch.empty,
             size,
             device_mesh=mock_mesh,
             placements=placements,
@@ -508,14 +508,14 @@ class TestFull(unittest.TestCase):
     """Unit tests for full function.
 
     This test class verifies that the full() function correctly delegates
-    to _dtensor_init_helper with the appropriate platform.full initialization
+    to _dtensor_init_helper with the appropriate torch.full initialization
     function and parameters. The full() function creates a DTensor filled
     with a specified value.
     """
 
     @patch('hyper_parallel.core.dtensor.dtensor._dtensor_init_helper')
-    @patch('hyper_parallel.core.dtensor.dtensor.platform')
-    def test_full_calls_helper_correctly(self, mock_platform, mock_helper):
+    @patch('hyper_parallel.core.dtensor.dtensor.torch')
+    def test_full_calls_helper_correctly(self, mock_torch, mock_helper):
         """Test that full function calls _dtensor_init_helper with correct parameters.
 
         Test Scenario:
@@ -524,13 +524,13 @@ class TestFull(unittest.TestCase):
 
         Expected Behavior:
             - _dtensor_init_helper is called exactly once
-            - The helper receives platform.full as the init_op
+            - The helper receives torch.full as the init_op
             - size parameter is [4, 8, 12]
             - fill_value is passed as 123.4
             - device_mesh and placements are passed as keyword arguments
         """
         # Arrange
-        mock_platform.full = MagicMock()
+        mock_torch.full = MagicMock()
         mock_helper.return_value = MagicMock()
 
         mock_mesh = MagicMock()
@@ -543,7 +543,7 @@ class TestFull(unittest.TestCase):
 
         # Assert
         mock_helper.assert_called_once_with(
-            mock_platform.full,
+            mock_torch.full,
             size,
             device_mesh=mock_mesh,
             placements=placements,

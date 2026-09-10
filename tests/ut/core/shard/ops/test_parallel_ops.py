@@ -26,14 +26,11 @@ from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
 
-def _make_mesh(mock_platform, mesh_shape, mesh_dim_names):
+def _make_mesh(mock_dist, mesh_shape, mesh_dim_names):
     EXISTING_COMM_GROUPS.clear()
     _DEVICE_MESH_MAP.clear()
-    mock_platform.get_rank.return_value = 0
-    mock_platform.get_world_size.return_value = int(np.prod(mesh_shape))
-    mock_platform.tensor_to_numpy.side_effect = (
-        lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-    )
+    mock_dist.get_rank.return_value = 0
+    mock_dist.get_world_size.return_value = int(np.prod(mesh_shape))
     return init_device_mesh(
         device_type="npu",
         mesh_shape=mesh_shape,
@@ -52,15 +49,21 @@ class TestDistributedOpCheckPartialInputs(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_partial_input_raises_value_error(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_partial_input_raises_value_error(self, mock_dist):
         """Partial layout in inputs raises ValueError."""
-        mesh = _make_mesh(mock_platform, (2,), ("dp",))
+        mesh = _make_mesh(mock_dist, (2,), ("dp",))
         layout = _build_layout(mesh, (Replicate(),), 2)
         layout.set_partial_by_dev_axis("dp", "sum")
 
@@ -69,17 +72,17 @@ class TestDistributedOpCheckPartialInputs(unittest.TestCase):
             op._check_partial_inputs((layout,))
         self.assertIn("Partial status", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_non_partial_input_no_error(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_non_partial_input_no_error(self, mock_dist):
         """Non-partial layout does not raise."""
-        mesh = _make_mesh(mock_platform, (2,), ("dp",))
+        mesh = _make_mesh(mock_dist, (2,), ("dp",))
         layout = _build_layout(mesh, (Replicate(),), 2)
 
         op = DistributedOp("test_no_partial")
         op._check_partial_inputs((layout,))  # should not raise
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_none_layout_skipped(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_none_layout_skipped(self, mock_dist):
         """None layout in inputs is skipped without error."""
         op = DistributedOp("test_none_layout")
         op._check_partial_inputs((None,))  # should not raise
@@ -95,15 +98,21 @@ class TestDistributedOpInferLayout(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_returns_first_layout(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_returns_first_layout(self, mock_dist):
         """Default infer_layout returns (layouts[0],)."""
-        mesh = _make_mesh(mock_platform, (4,), ("tp",))
+        mesh = _make_mesh(mock_dist, (4,), ("tp",))
         layout = _build_layout(mesh, (Replicate(),), 2)
 
         op = DistributedOp("test_infer_first")
@@ -112,17 +121,17 @@ class TestDistributedOpInferLayout(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertIs(result[0], layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_empty_layouts_returns_none(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_empty_layouts_returns_none(self, mock_dist):
         """Empty layouts returns None."""
         op = DistributedOp("test_empty")
         result = op.infer_layout(())
         self.assertIsNone(result)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_partial_input_raises(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_partial_input_raises(self, mock_dist):
         """Partial input layout raises ValueError via _check_partial_inputs."""
-        mesh = _make_mesh(mock_platform, (2,), ("dp",))
+        mesh = _make_mesh(mock_dist, (2,), ("dp",))
         layout = _build_layout(mesh, (Replicate(),), 2)
         layout.set_partial_by_dev_axis("dp", "sum")
 
@@ -130,10 +139,10 @@ class TestDistributedOpInferLayout(unittest.TestCase):
         with self.assertRaises(ValueError):
             op.infer_layout((layout,))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_allow_partial_flag_bypasses_check(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_allow_partial_flag_bypasses_check(self, mock_dist):
         """When _allow_partial_inputs=True, partial inputs are allowed."""
-        mesh = _make_mesh(mock_platform, (2,), ("dp",))
+        mesh = _make_mesh(mock_dist, (2,), ("dp",))
         layout = _build_layout(mesh, (Replicate(),), 2)
         layout.set_partial_by_dev_axis("dp", "sum")
 
@@ -184,21 +193,22 @@ class TestDistributedOpWrapOutput(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.dtensor.dtensor.platform")
-    def test_single_tensor_wrapped_in_dtensor(self, mock_dtensor_platform, mock_mesh_platform):
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_single_tensor_wrapped_in_dtensor(self, mock_mesh_dist):
         """Single local tensor output is wrapped as a DTensor."""
-        mesh = _make_mesh(mock_mesh_platform, (1,), ("dp",))
+        mesh = _make_mesh(mock_mesh_dist, (1,), ("dp",))
         layout = _build_layout(mesh, (Replicate(),), 1)
-
-        mock_dtensor_platform.tensor_to_numpy.side_effect = (
-            lambda t: t if isinstance(t, np.ndarray) else np.array(t)
-        )
 
         local_t = np.array([1.0, 2.0])
         op = DistributedOp("test_wrap")
@@ -208,17 +218,12 @@ class TestDistributedOpWrapOutput(unittest.TestCase):
             mock_from_local.assert_called_once()
             self.assertIsNotNone(result)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.dtensor.dtensor.platform")
-    def test_tuple_output_wraps_each_element(self, mock_dtensor_platform, mock_mesh_platform):
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_tuple_output_wraps_each_element(self, mock_mesh_dist):
         """Tuple of local tensors is wrapped element-wise."""
-        mesh = _make_mesh(mock_mesh_platform, (1,), ("dp",))
+        mesh = _make_mesh(mock_mesh_dist, (1,), ("dp",))
         layout1 = _build_layout(mesh, (Replicate(),), 1)
         layout2 = _build_layout(mesh, (Replicate(),), 1)
-
-        mock_dtensor_platform.tensor_to_numpy.side_effect = (
-            lambda t: t if isinstance(t, np.ndarray) else np.array(t)
-        )
 
         local_t1 = np.array([1.0])
         local_t2 = np.array([2.0])
@@ -229,20 +234,20 @@ class TestDistributedOpWrapOutput(unittest.TestCase):
             self.assertIsInstance(result, tuple)
             self.assertEqual(len(result), 2)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_tuple_output_size_mismatch_raises(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_tuple_output_size_mismatch_raises(self, mock_dist):
         """Output tuple size != layout tuple size raises RuntimeError."""
-        mesh = _make_mesh(mock_platform, (1,), ("dp",))
+        mesh = _make_mesh(mock_dist, (1,), ("dp",))
         layout = _build_layout(mesh, (Replicate(),), 1)
         op = DistributedOp("test_wrap_mismatch")
 
         with self.assertRaises(RuntimeError):
             op.wrap_output((np.array([1.0]), np.array([2.0])), (layout,))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_single_output_with_multiple_layouts_raises(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_single_output_with_multiple_layouts_raises(self, mock_dist):
         """Single (non-tuple) output with multiple layouts raises RuntimeError."""
-        mesh = _make_mesh(mock_platform, (1,), ("dp",))
+        mesh = _make_mesh(mock_dist, (1,), ("dp",))
         layout1 = _build_layout(mesh, (Replicate(),), 1)
         layout2 = _build_layout(mesh, (Replicate(),), 1)
         op = DistributedOp("test_single_multi_layout")

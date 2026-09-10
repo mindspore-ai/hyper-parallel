@@ -118,7 +118,7 @@ class TestDistributeModule(unittest.TestCase):
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor") as mock_dt:
             mock_dt.return_value = fake_dt
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=fake_new_param):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=fake_new_param):
                 out = distribute_module(root, device_mesh=mesh, partition_fn=None)
 
         self.assertIs(out, root)
@@ -148,7 +148,7 @@ class TestDistributeModule(unittest.TestCase):
         fake_dt = MagicMock(spec=DTensorBase)
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=fake_dt):
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=MagicMock()):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=MagicMock()):
                 distribute_module(root, device_mesh=mesh, partition_fn=partition_fn)
 
         self.assertEqual(partition_fn.call_count, 2)
@@ -165,7 +165,7 @@ class TestDistributeModule(unittest.TestCase):
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor") as mock_dt:
             mock_dt.return_value = MagicMock(spec=DTensorBase)
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=MagicMock()):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=MagicMock()):
                 distribute_module(mod, device_mesh=mesh, partition_fn=None)
 
         self.assertEqual(mock_dt.call_count, 1)
@@ -180,7 +180,7 @@ class TestDistributeModule(unittest.TestCase):
         fake_dt = MagicMock(spec=DTensorBase)
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=fake_dt):
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=MagicMock()):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=MagicMock()):
                 distribute_module(mod, device_mesh=mesh, partition_fn=None)
 
         self.assertIs(mod._buffers["running"], fake_dt)
@@ -220,7 +220,7 @@ class TestDistributeModule(unittest.TestCase):
             return inputs
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=MagicMock(spec=DTensorBase)):
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=MagicMock()):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=MagicMock()):
                 distribute_module(mod, device_mesh=mesh, partition_fn=None, input_fn=input_fn)
 
         mod.register_forward_pre_hook.assert_called_once()
@@ -239,7 +239,7 @@ class TestDistributeModule(unittest.TestCase):
             return inputs
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=MagicMock(spec=DTensorBase)):
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=MagicMock()):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=MagicMock()):
                 with warnings.catch_warnings(record=True) as w:
                     warnings.simplefilter("always")
                     distribute_module(mod, device_mesh=mesh, partition_fn=None, input_fn=input_fn)
@@ -254,7 +254,7 @@ class TestDistributeModule(unittest.TestCase):
             return outputs
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=MagicMock(spec=DTensorBase)):
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=MagicMock()):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=MagicMock()):
                 distribute_module(mod, device_mesh=mesh, partition_fn=None, output_fn=output_fn)
 
         mod.register_forward_hook.assert_called_once()
@@ -279,7 +279,7 @@ class TestDistributeModule(unittest.TestCase):
             self.assertIs(dm, mesh)
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=MagicMock(spec=DTensorBase)):
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=MagicMock()):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=MagicMock()):
                 distribute_module(root, device_mesh=mesh, partition_fn=partition_fn)
 
         self.assertEqual(names, ["", "a", "a.b"])
@@ -300,7 +300,7 @@ class TestDistributeModule(unittest.TestCase):
                 self.assertEqual(submod._parameters, {})
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=MagicMock(spec=DTensorBase)):
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=MagicMock()):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=MagicMock()):
                 distribute_module(root, device_mesh=mesh, partition_fn=partition_fn)
 
         self.assertTrue(seen_empty)
@@ -318,7 +318,7 @@ class TestDistributeModule(unittest.TestCase):
         fake_dt = MagicMock(spec=DTensorBase)
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=fake_dt):
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter") as mock_param_cls:
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter") as mock_param_cls:
                 mock_param_cls.return_value = MagicMock()
                 distribute_module(mod, device_mesh=mesh, partition_fn=None)
 
@@ -345,7 +345,7 @@ class TestDistributeModule(unittest.TestCase):
         mesh = self._mock_mesh(1)
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=MagicMock(spec=DTensorBase)):
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=MagicMock()):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=MagicMock()):
                 with self.assertRaisesRegex(
                     TypeError,
                     "distribute_module expects nn.Module-like objects",
@@ -361,7 +361,7 @@ class TestDistributeModule(unittest.TestCase):
             return outputs
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=MagicMock(spec=DTensorBase)):
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=MagicMock()):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=MagicMock()):
                 with warnings.catch_warnings(record=True) as w:
                     warnings.simplefilter("always")
                     distribute_module(mod, device_mesh=mesh, partition_fn=None, output_fn=output_fn)
@@ -381,7 +381,7 @@ class TestDistributeModule(unittest.TestCase):
             return outputs
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=MagicMock(spec=DTensorBase)):
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=MagicMock()):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=MagicMock()):
                 distribute_module(
                     mod,
                     device_mesh=mesh,
@@ -405,7 +405,7 @@ class TestDistributeModule(unittest.TestCase):
             return outputs
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=MagicMock(spec=DTensorBase)):
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter", return_value=MagicMock()):
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter", return_value=MagicMock()):
                 with warnings.catch_warnings(record=True) as w:
                     warnings.simplefilter("always")
                     distribute_module(
@@ -451,10 +451,10 @@ class TestDistributeModule(unittest.TestCase):
                     dist = mock_dt(p_shard.data, dm, [Shard(0)])
                     module.register_parameter(
                         "weight",
-                        _hp_dtensor_mod.platform.Parameter(dist, requires_grad=True),
+                        _hp_dtensor_mod.torch.nn.Parameter(dist, requires_grad=True),
                     )
 
-            with patch("hyper_parallel.core.dtensor.dtensor.platform.Parameter") as mock_param_cls:
+            with patch("hyper_parallel.core.dtensor.dtensor.torch.nn.Parameter") as mock_param_cls:
                 mock_param_cls.side_effect = lambda *args, **kwargs: MagicMock()
                 distribute_module(root, device_mesh=mesh, partition_fn=real_partition_fn)
 

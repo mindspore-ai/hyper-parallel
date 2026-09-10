@@ -37,13 +37,14 @@ from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(name="mock_platform")
-def fixture_mock_platform():
-    """Mock platform to avoid dependency on real distributed environment."""
-    with patch("hyper_parallel.core.dtensor.device_mesh.platform") as platform_mock:
-        platform_mock.get_rank.return_value = 0
-        platform_mock.get_world_size.return_value = 8
-        platform_mock.Tensor = torch.Tensor
+@pytest.fixture(name="mock_utils")
+def fixture_mock_utils():
+    """Mock the ``device_mesh`` distributed backend to avoid a real distributed environment."""
+    with patch("hyper_parallel.core.dtensor.device_mesh._utils") as mock_utils, \
+            patch("hyper_parallel.core.dtensor.device_mesh.dist") as mock_dist:
+        mock_dist.get_rank.return_value = 0
+        mock_dist.get_world_size.return_value = 8
+        mock_dist.get_process_group_ranks.return_value = [0, 1, 2, 3, 4, 5, 6, 7]
 
         mock_group = Mock()
         mock_group.group_name = "mock_group"
@@ -55,19 +56,11 @@ def fixture_mock_platform():
                 EXISTING_COMM_GROUPS[key] = mock_group
             return mock_group
 
-        platform_mock.split_group.side_effect = _split_group_side_effect
-        platform_mock.get_created_group.return_value = None
-        platform_mock.get_process_group_ranks.return_value = [0, 1, 2, 3, 4, 5, 6, 7]
-
-        def mock_tensor_to_numpy(tensor):
-            if isinstance(tensor, torch.Tensor):
-                return tensor.detach().cpu().numpy()
-            return tensor
-
-        platform_mock.tensor_to_numpy.side_effect = mock_tensor_to_numpy
+        mock_utils.split_group.side_effect = _split_group_side_effect
+        mock_utils.get_created_group.return_value = None
 
         with patch("hyper_parallel.core.dtensor.device_mesh.Tensor", torch.Tensor):
-            yield platform_mock
+            yield mock_utils
 
 
 @pytest.fixture(autouse=True)
@@ -81,16 +74,16 @@ def fixture_clear_global_state():
 
 
 @pytest.fixture(name="mesh_2d")
-def fixture_mesh_2d(mock_platform):
+def fixture_mesh_2d(mock_utils):
     """2D mesh: shape=(2, 4), dim_names=("dp", "tp"), ranks=[0..7]."""
-    _ = mock_platform
+    _ = mock_utils
     return init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
 
 
 @pytest.fixture(name="mesh_3d")
-def fixture_mesh_3d(mock_platform):
+def fixture_mesh_3d(mock_utils):
     """3D mesh: shape=(2, 2, 2), dim_names=("dp", "cp", "tp"), ranks=[0..7]."""
-    _ = mock_platform
+    _ = mock_utils
     return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "cp", "tp"))
 
 
@@ -101,8 +94,8 @@ def fixture_mesh_3d(mock_platform):
 class TestDeviceMeshConstruction:
     """Tests for DeviceMesh construction via various input types."""
 
-    def test_construct_with_list(self, mock_platform):
-        _ = mock_platform
+    def test_construct_with_list(self, mock_utils):
+        _ = mock_utils
         dm = DeviceMesh("npu", [[0, 1, 2, 3], [4, 5, 6, 7]], mesh_dim_names=("dp", "tp"))
 
         assert dm.mesh_shape == (2, 4)
@@ -110,60 +103,63 @@ class TestDeviceMeshConstruction:
         assert dm.rank_list == (0, 1, 2, 3, 4, 5, 6, 7)
         assert dm.ndim == 2
 
-    def test_construct_with_tensor(self, mock_platform):
-        _ = mock_platform
+    def test_construct_with_tensor(self, mock_utils):
+        _ = mock_utils
         t = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
         dm = DeviceMesh("npu", t, mesh_dim_names=("dp", "tp"))
 
         assert dm.mesh_shape == (2, 2)
         assert dm.rank_list == (0, 1, 2, 3)
 
-    def test_construct_with_numpy(self, mock_platform):
-        _ = mock_platform
+    def test_construct_with_numpy(self, mock_utils):
+        _ = mock_utils
         arr = np.array([[0, 1], [2, 3]], dtype=np.int64)
         dm = DeviceMesh("npu", arr, mesh_dim_names=("dp", "tp"))
 
         assert dm.mesh_shape == (2, 2)
         assert dm.rank_list == (0, 1, 2, 3)
 
-    def test_construct_with_tuple(self, mock_platform):
-        _ = mock_platform
+    def test_construct_with_tuple(self, mock_utils):
+        _ = mock_utils
         dm = DeviceMesh("npu", (0, 1, 2, 3))
 
         assert dm.mesh_shape == (4,)
         assert dm.rank_list == (0, 1, 2, 3)
         assert dm.ndim == 1
 
-    def test_construct_mesh_none_auto_1d(self, mock_platform):
+    def test_construct_mesh_none_auto_1d(self, mock_utils):
         """mesh=None should auto-generate a 1D mesh of [0..world_size-1]."""
-        _ = mock_platform
+        _ = mock_utils
         dm = DeviceMesh("npu")
 
         assert dm.mesh_shape == (8,)
         assert dm.rank_list == (0, 1, 2, 3, 4, 5, 6, 7)
         assert dm.ndim == 1
 
-    def test_construct_mesh_none_world_size_4(self, mock_platform):
+    def test_construct_mesh_none_world_size_4(self, mock_utils):
         """mesh=None respects the current world_size."""
-        mock_platform.get_world_size.return_value = 4
-        dm = DeviceMesh("npu")
+        _ = mock_utils
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist") as mock_dist:
+            mock_dist.get_world_size.return_value = 4
+            mock_dist.get_rank.return_value = 0
+            dm = DeviceMesh("npu")
 
         assert dm.mesh_shape == (4,)
         assert dm.rank_list == (0, 1, 2, 3)
 
-    def test_construct_preserves_device_type(self, mock_platform):
-        _ = mock_platform
+    def test_construct_preserves_device_type(self, mock_utils):
+        _ = mock_utils
         dm = DeviceMesh("cuda", [0, 1, 2, 3])
         assert dm.device_type == "cuda"
 
-    def test_construct_no_mesh_dim_names(self, mock_platform):
-        _ = mock_platform
+    def test_construct_no_mesh_dim_names(self, mock_utils):
+        _ = mock_utils
         dm = DeviceMesh("npu", [0, 1, 2, 3])
         assert dm.mesh_dim_names is None
 
-    def test_construct_custom_layout(self, mock_platform):
+    def test_construct_custom_layout(self, mock_utils):
         """Non-sequential rank layout is correctly preserved."""
-        _ = mock_platform
+        _ = mock_utils
         dm = DeviceMesh("npu", [[0, 2], [1, 3]], mesh_dim_names=("dp", "tp"))
 
         assert dm.rank_list == (0, 2, 1, 3)
@@ -177,23 +173,23 @@ class TestDeviceMeshConstruction:
 class TestDeviceMeshConstructionValidation:
     """Tests for invalid construction parameters."""
 
-    def test_0d_mesh_raises(self, mock_platform):
-        _ = mock_platform
+    def test_0d_mesh_raises(self, mock_utils):
+        _ = mock_utils
         with pytest.raises(TypeError, match="mesh must be Tensor, list, tuple or numpy array"):
             DeviceMesh("npu", 42)
 
-    def test_mesh_dim_names_length_mismatch(self, mock_platform):
-        _ = mock_platform
+    def test_mesh_dim_names_length_mismatch(self, mock_utils):
+        _ = mock_utils
         with pytest.raises(ValueError, match="mesh dimensions.*should be equal to.*mesh_dim_names length"):
             DeviceMesh("npu", [[0, 1], [2, 3]], mesh_dim_names=("dp",))
 
-    def test_mesh_dim_names_duplicate(self, mock_platform):
-        _ = mock_platform
+    def test_mesh_dim_names_duplicate(self, mock_utils):
+        _ = mock_utils
         with pytest.raises(ValueError, match="Each element of mesh_dim_names.*should be different"):
             DeviceMesh("npu", [[0, 1], [2, 3]], mesh_dim_names=("dp", "dp"))
 
-    def test_interleaved_parallel_must_be_last(self, mock_platform):
-        _ = mock_platform
+    def test_interleaved_parallel_must_be_last(self, mock_utils):
+        _ = mock_utils
         with pytest.raises(ValueError, match="interleaved_parallel.*should be at the last dim"):
             DeviceMesh(
                 "npu",
@@ -201,8 +197,8 @@ class TestDeviceMeshConstructionValidation:
                 mesh_dim_names=("interleaved_parallel", "dp", "tp"),
             )
 
-    def test_invalid_mesh_type(self, mock_platform):
-        _ = mock_platform
+    def test_invalid_mesh_type(self, mock_utils):
+        _ = mock_utils
         with pytest.raises(TypeError, match="mesh must be Tensor, list, tuple or numpy array"):
             DeviceMesh("npu", "invalid")
 
@@ -214,34 +210,34 @@ class TestDeviceMeshConstructionValidation:
 class TestInitDeviceMesh:
     """Tests for the init_device_mesh factory function."""
 
-    def test_basic(self, mock_platform):
-        _ = mock_platform
+    def test_basic(self, mock_utils):
+        _ = mock_utils
         dm = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "tp"))
 
         assert dm.mesh_shape == (2, 4)
         assert dm.mesh_dim_names == ("dp", "tp")
         assert dm.rank_list == (0, 1, 2, 3, 4, 5, 6, 7)
 
-    def test_cache_returns_same_instance(self, mock_platform):
-        _ = mock_platform
+    def test_cache_returns_same_instance(self, mock_utils):
+        _ = mock_utils
         dm1 = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "tp"))
         dm2 = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "tp"))
         assert dm1 is dm2
 
-    def test_explicit_rank_list(self, mock_platform):
-        _ = mock_platform
+    def test_explicit_rank_list(self, mock_utils):
+        _ = mock_utils
         dm = init_device_mesh("npu", (4,), mesh_dim_names=("dp",), rank_list=(4, 5, 6, 7))
 
         assert dm.rank_list == (4, 5, 6, 7)
         assert dm.mesh_shape == (4,)
 
-    def test_rank_list_length_mismatch(self, mock_platform):
-        _ = mock_platform
+    def test_rank_list_length_mismatch(self, mock_utils):
+        _ = mock_utils
         with pytest.raises(ValueError, match="rank_list length.*must equal mesh size"):
             init_device_mesh("npu", (2, 4), rank_list=(0, 1))
 
-    def test_no_mesh_dim_names(self, mock_platform):
-        _ = mock_platform
+    def test_no_mesh_dim_names(self, mock_utils):
+        _ = mock_utils
         dm = init_device_mesh("npu", (2, 4))
         assert dm.mesh_dim_names is None
         assert dm.mesh_shape == (2, 4)
@@ -274,8 +270,8 @@ class TestDeviceMeshProperties:
     def test_root_mesh_is_none_for_top_level(self, mesh_2d):
         assert mesh_2d.root_mesh is None
 
-    def test_sub_mesh_initially_empty(self, mock_platform):
-        _ = mock_platform
+    def test_sub_mesh_initially_empty(self, mock_utils):
+        _ = mock_utils
         dm = DeviceMesh("npu", [0, 1, 2, 3])
         assert not dm.sub_mesh
 
@@ -297,8 +293,8 @@ class TestDeviceMeshProperties:
         assert mesh_2d.shape == mesh_2d.mesh_shape
         assert mesh_3d.shape == mesh_3d.mesh_shape
 
-    def test_shape_1d(self, mock_platform):
-        _ = mock_platform
+    def test_shape_1d(self, mock_utils):
+        _ = mock_utils
         dm = DeviceMesh("npu", [0, 1, 2, 3])
         assert dm.shape == (4,)
 
@@ -348,8 +344,8 @@ class TestDeviceMeshGetItem:
         dp = mesh_2d["dp"]
         assert dp.device_type == "npu"
 
-    def test_no_mesh_dim_names_raises(self, mock_platform):
-        _ = mock_platform
+    def test_no_mesh_dim_names_raises(self, mock_utils):
+        _ = mock_utils
         dm = DeviceMesh("npu", [0, 1, 2, 3])
         with pytest.raises(RuntimeError, match="Cannot slice a DeviceMesh without mesh_dim_names"):
             _ = dm["dp"]
@@ -387,8 +383,8 @@ class TestDeviceMeshGetLocalRank:
             assert mesh_2d.get_local_rank("dp") == 1
             assert mesh_2d.get_local_rank("tp") == 1
 
-    def test_1d_mesh_none_defaults_to_0(self, mock_platform):
-        _ = mock_platform
+    def test_1d_mesh_none_defaults_to_0(self, mock_utils):
+        _ = mock_utils
         dm = DeviceMesh("npu", [0, 1, 2, 3], mesh_dim_names=("dp",))
         assert dm.get_local_rank() == 0
 
@@ -417,8 +413,8 @@ class TestDeviceMeshGetLocalRank:
 class TestDeviceMeshFlatten:
     """Tests for the flatten method."""
 
-    def test_flatten_default_name(self, mesh_3d, mock_platform):
-        _ = mock_platform
+    def test_flatten_default_name(self, mesh_3d, mock_utils):
+        _ = mock_utils
         dp_cp = mesh_3d[("dp", "cp")]
         flat = dp_cp.flatten()
 
@@ -427,15 +423,15 @@ class TestDeviceMeshFlatten:
         assert flat.rank_list == (0, 2, 4, 6)
         assert flat.root_mesh is mesh_3d
 
-    def test_flatten_custom_name(self, mesh_3d, mock_platform):
-        _ = mock_platform
+    def test_flatten_custom_name(self, mesh_3d, mock_utils):
+        _ = mock_utils
         dp_cp = mesh_3d[("dp", "cp")]
         flat = dp_cp.flatten(mesh_dim_name="my_flat")
 
         assert flat.mesh_dim_names == ("my_flat",)
 
-    def test_flatten_accessible_from_root(self, mesh_3d, mock_platform):
-        _ = mock_platform
+    def test_flatten_accessible_from_root(self, mesh_3d, mock_utils):
+        _ = mock_utils
         dp_cp = mesh_3d[("dp", "cp")]
         dp_cp.flatten()
 
@@ -447,20 +443,20 @@ class TestDeviceMeshFlatten:
         result = dp.flatten()
         assert result is dp
 
-    def test_flatten_cached(self, mesh_3d, mock_platform):
-        _ = mock_platform
+    def test_flatten_cached(self, mesh_3d, mock_utils):
+        _ = mock_utils
         dp_cp = mesh_3d[("dp", "cp")]
         f1 = dp_cp.flatten()
         f2 = dp_cp.flatten()
         assert f1 is f2
 
-    def test_flatten_name_conflict_raises(self, mesh_2d, mock_platform):
-        _ = mock_platform
+    def test_flatten_name_conflict_raises(self, mesh_2d, mock_utils):
+        _ = mock_utils
         with pytest.raises(ValueError, match="already exists in the root mesh"):
             mesh_2d.flatten(mesh_dim_name="dp")
 
-    def test_flatten_inherits_device_type(self, mesh_3d, mock_platform):
-        _ = mock_platform
+    def test_flatten_inherits_device_type(self, mesh_3d, mock_utils):
+        _ = mock_utils
         dp_cp = mesh_3d[("dp", "cp")]
         flat = dp_cp.flatten()
         assert flat.device_type == "npu"
@@ -478,8 +474,8 @@ class TestDeviceMeshGetGroup:
         g_idx = mesh_2d.get_group(0)
         assert g_name is g_idx
 
-    def test_1d_mesh_none_returns_group(self, mock_platform):
-        _ = mock_platform
+    def test_1d_mesh_none_returns_group(self, mock_utils):
+        _ = mock_utils
         dm = DeviceMesh("npu", [0, 1, 2, 3], mesh_dim_names=("dp",))
         group = dm.get_group()
         assert group is not None
@@ -488,14 +484,14 @@ class TestDeviceMeshGetGroup:
         with pytest.raises(RuntimeError, match="mesh_dim.*needs to be specified"):
             mesh_2d.get_group()
 
-    def test_no_init_backend_raises(self, mock_platform):
-        _ = mock_platform
+    def test_no_init_backend_raises(self, mock_utils):
+        _ = mock_utils
         dm = DeviceMesh("npu", [0, 1, 2, 3], _init_backend=False)
         with pytest.raises(RuntimeError, match="process groups not initialized"):
             dm.get_group()
 
-    def test_flatten_group_via_root(self, mesh_3d, mock_platform):
-        _ = mock_platform
+    def test_flatten_group_via_root(self, mesh_3d, mock_utils):
+        _ = mock_utils
         dp_cp = mesh_3d[("dp", "cp")]
         dp_cp.flatten()
 
@@ -515,8 +511,8 @@ class TestDeviceMeshGetAllGroups:
         assert isinstance(groups, list)
         assert len(groups) == 2
 
-    def test_1d_mesh(self, mock_platform):
-        _ = mock_platform
+    def test_1d_mesh(self, mock_utils):
+        _ = mock_utils
         dm = DeviceMesh("npu", [0, 1, 2, 3], mesh_dim_names=("dp",))
         groups = dm.get_all_groups()
         assert len(groups) == 1
@@ -530,8 +526,8 @@ class TestDeviceMeshGetAllGroups:
         for i in range(mesh_2d.ndim):
             assert all_groups[i] is mesh_2d.get_group(i)
 
-    def test_no_init_backend_raises(self, mock_platform):
-        _ = mock_platform
+    def test_no_init_backend_raises(self, mock_utils):
+        _ = mock_utils
         dm = DeviceMesh("npu", [0, 1, 2, 3], _init_backend=False)
         with pytest.raises(RuntimeError, match="process groups not initialized"):
             dm.get_all_groups()
@@ -544,11 +540,11 @@ class TestDeviceMeshGetAllGroups:
 class TestDeviceMeshFromGroup:
     """Tests for the from_group static method."""
 
-    def test_1d_from_group(self, mock_platform):  # pylint: disable=C0116
-        _ = mock_platform
+    def test_1d_from_group(self, mock_utils):  # pylint: disable=C0116
+        _ = mock_utils
         group = Mock()
         group.group_name = "test_pg"
-        mock_platform.get_process_group_ranks.return_value = [0, 1, 2, 3]
+        mock_dist.get_process_group_ranks.return_value = [0, 1, 2, 3]
 
         dm = DeviceMesh.from_group(group, "npu", mesh_dim_names=("tp",))
 
@@ -556,8 +552,8 @@ class TestDeviceMeshFromGroup:
         assert dm.rank_list == (0, 1, 2, 3)
         assert dm.mesh_dim_names == ("tp",)
 
-    def test_nd_from_group(self, mock_platform):  # pylint: disable=C0116
-        _ = mock_platform
+    def test_nd_from_group(self, mock_utils):  # pylint: disable=C0116
+        _ = mock_utils
         g1 = Mock()
         g1.group_name = "dp_pg"
         g2 = Mock()
@@ -573,33 +569,33 @@ class TestDeviceMeshFromGroup:
         assert dm.mesh_shape == (2, 4)
         assert dm.mesh_dim_names == ("dp", "tp")
 
-    def test_1d_mesh_mismatch_raises(self, mock_platform):
-        _ = mock_platform
+    def test_1d_mesh_mismatch_raises(self, mock_utils):
+        _ = mock_utils
         group = Mock()
         group.group_name = "test_pg"
-        mock_platform.get_process_group_ranks.return_value = [0, 1, 2, 3]
+        mock_dist.get_process_group_ranks.return_value = [0, 1, 2, 3]
 
         with pytest.raises(ValueError, match="Invalid mesh_shape"):
             DeviceMesh.from_group(group, "npu", mesh=[10, 20, 30, 40])
 
-    def test_nd_no_mesh_raises(self, mock_platform):
-        _ = mock_platform
+    def test_nd_no_mesh_raises(self, mock_utils):
+        _ = mock_utils
         g1 = Mock()
         g1.group_name = "g1"
         with pytest.raises(ValueError, match="mesh_shape is must specified"):
             DeviceMesh.from_group([g1], "npu")
 
-    def test_nd_dim_mismatch_raises(self, mock_platform):
-        _ = mock_platform
+    def test_nd_dim_mismatch_raises(self, mock_utils):
+        _ = mock_utils
         g1 = Mock()
         g1.group_name = "g1"
         with pytest.raises(ValueError, match="mesh dimensions must match group dimensions"):
             DeviceMesh.from_group([g1], "npu", mesh=[[0, 1], [2, 3]])
 
-    def test_1d_string_group(self, mock_platform):
+    def test_1d_string_group(self, mock_utils):
         """MindSpore-style string group names."""
-        _ = mock_platform
-        mock_platform.get_process_group_ranks.return_value = [0, 1]
+        _ = mock_utils
+        mock_dist.get_process_group_ranks.return_value = [0, 1]
 
         dm = DeviceMesh.from_group("my_group_name", "npu", mesh_dim_names=("dp",))
 

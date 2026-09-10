@@ -13,16 +13,18 @@
 # limitations under the License.
 # ============================================================================
 """Utilities for :meth:`DTensor.from_local` with ``run_check=True`` (PyTorch parity)."""
+# pylint: disable=C9006,C9007
 from __future__ import annotations
 
 from typing import Optional, Sequence, Tuple
 
+import torch
+import torch.distributed as dist
+
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Placement
-from hyper_parallel.platform import get_platform
 
-platform = get_platform()
-Tensor = platform.Tensor
+Tensor = torch.Tensor
 
 
 def _ensure_mesh_process_groups(mesh: DeviceMesh) -> None:
@@ -49,7 +51,7 @@ def mesh_broadcast(
         tensor = tensor.contiguous()
     rank_list = mesh.get_rank_list_along_axis(mesh_dim)
     src = rank_list[group_src]
-    platform.broadcast(tensor, src, group=group)
+    dist.broadcast(tensor, src, group=group)
     return tensor
 
 
@@ -75,7 +77,7 @@ def check_tensor_meta(
     """Gather tensor metadata across *group* and verify consistency."""
     local_meta = _tensor_meta(local_tensor, check_shape_stride=check_shape_stride)
     gathered = [None] * group_size
-    platform.all_gather_object(gathered, local_meta, group=group)
+    dist.all_gather_object(gathered, local_meta, group=group)
     if not all(meta == local_meta for meta in gathered if meta is not None):
         raise ValueError(
             "Inconsistent tensor metadata across ranks in from_local(run_check=True): "

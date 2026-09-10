@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,8 +13,10 @@
 # limitations under the License.
 # ============================================================================
 """Tests for CE ops with Shard(-1) logits without loss_parallel context."""
+# pylint: disable=C0415,W0404,W0621,W0611
 
 import os
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -23,6 +25,26 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 class TestCEOpWithoutLossParallelContext:
     """Test that CE ops with Shard(-1) logits raise error outside loss_parallel context."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_dist_backend(self):
+        """Set up mock distributed backend for each test."""
+        from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
+        from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+        _DEVICE_MESH_MAP.clear()
+        EXISTING_COMM_GROUPS.clear()
+        mock_utils = MagicMock()
+        mock_utils.get_created_group.return_value = MagicMock()
+        mock_dist = MagicMock()
+        mock_dist.get_rank.return_value = 0
+        mock_dist.get_world_size.return_value = 1
+        mock_dist.get_process_group_ranks.return_value = [0]
+        with patch("hyper_parallel.core.dtensor.device_mesh._utils", mock_utils), \
+                patch("hyper_parallel.core.dtensor.device_mesh.dist", mock_dist), \
+                patch("hyper_parallel.core.dtensor.tensor_redistribution.dist", mock_dist):
+            yield
+        _DEVICE_MESH_MAP.clear()
+        EXISTING_COMM_GROUPS.clear()
 
     def test_cross_entropy_with_sharded_logits_without_context_raises_error(self):
         """cross_entropy with Shard(-1) logits should raise error outside loss_parallel."""
@@ -147,6 +169,25 @@ class TestCEOpWithoutLossParallelContext:
 
 class TestCEOpCheckLogic:
     """Test the internal check logic."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_dist_backend(self):
+        """Set up mock distributed backend for each test."""
+        from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
+        from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+        _DEVICE_MESH_MAP.clear()
+        EXISTING_COMM_GROUPS.clear()
+        mock_utils = MagicMock()
+        mock_utils.get_created_group.return_value = MagicMock()
+        mock_dist = MagicMock()
+        mock_dist.get_rank.return_value = 0
+        mock_dist.get_world_size.return_value = 1
+        mock_dist.get_process_group_ranks.return_value = [0]
+        with patch("hyper_parallel.core.dtensor.device_mesh._utils", mock_utils), \
+                patch("hyper_parallel.core.dtensor.device_mesh.dist", mock_dist):
+            yield
+        _DEVICE_MESH_MAP.clear()
+        EXISTING_COMM_GROUPS.clear()
 
     def test_check_raises_for_cross_entropy_with_shard_minus1(self):
         """Check should raise for cross_entropy with Shard(-1)."""

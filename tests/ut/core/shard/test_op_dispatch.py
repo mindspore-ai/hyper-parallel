@@ -76,6 +76,12 @@ class TestStackExtDispatch(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -87,9 +93,6 @@ class TestStackExtDispatch(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = np.prod(mesh_shape)
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         return init_device_mesh(
             device_type="npu",
             mesh_shape=mesh_shape,
@@ -97,7 +100,7 @@ class TestStackExtDispatch(unittest.TestCase):
             init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_ext_dispatch_and_layout(self, mock_platform):
         """Test StackExt dispatch and layout cache with two input DTensors."""
         op_dispatch = _reload_op_dispatch_with_env_str(
@@ -133,7 +136,7 @@ class TestStackExtDispatch(unittest.TestCase):
         assert output_layout is not None
         assert tuple(output_layout.to_dict()["tensor_map"]) == (-1, -1, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_ext_layout_cache(self, mock_platform):
         """Test StackExt layout cache with multiple input layouts."""
         op_dispatch = _reload_op_dispatch_with_env_str(
@@ -179,6 +182,12 @@ class TestNewDispatchFlow(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -190,9 +199,6 @@ class TestNewDispatchFlow(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = np.prod(mesh_shape)
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         return init_device_mesh(
                 device_type="npu",
                 mesh_shape=mesh_shape,
@@ -200,7 +206,7 @@ class TestNewDispatchFlow(unittest.TestCase):
                 init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_from_cache_values_with_layout(self, mock_platform):
         """Test that LayoutCacheKey from_cache_values with layout returns correct key."""
         mesh = self._make_mesh(mock_platform, (2, 2), ("dp", "mp"))
@@ -212,7 +218,7 @@ class TestNewDispatchFlow(unittest.TestCase):
             f"Expected {expected}, got {list(key._tuple)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_from_cache_values_consistency(self, mock_platform):
         """Test that LayoutCacheKey from_cache_values is consistent with the same cache_values."""
         mesh = self._make_mesh(mock_platform, (2, 2), ("dp", "mp"))
@@ -224,7 +230,7 @@ class TestNewDispatchFlow(unittest.TestCase):
         assert key1 == key2, f"Keys should be equal: {key1} != {key2}"
         assert hash(key1) == hash(key2), "Hashes should be equal"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_from_cache_values_different_values(self, mock_platform):
         """Test that LayoutCacheKey from_cache_values differs with different values."""
         mesh = self._make_mesh(mock_platform, (2, 2), ("dp", "mp"))
@@ -233,7 +239,7 @@ class TestNewDispatchFlow(unittest.TestCase):
         key2 = LayoutCacheKey.from_cache_values([layout, 0, True])
         assert key1 != key2, "Keys should differ"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_equality_with_legacy_key(self, mock_platform):
         """Test that LayoutCacheKey is equal to legacy key."""
         mesh = self._make_mesh(mock_platform, (2, 2), ("dp", "mp"))
@@ -242,7 +248,7 @@ class TestNewDispatchFlow(unittest.TestCase):
         key_legacy = LayoutCacheKey([str(layout.compact_str), "1", "True"])
         assert key_new == key_legacy, "Keys should be equal"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dispatch_new_flow_with_preprocess(self, mock_platform):
         """Test that dispatch preprocess returns valid local_args, local_kwargs, and cache_values."""
         from hyper_parallel.core.shard.ops.parallel_sort import SortDistributedOp
@@ -264,7 +270,7 @@ class TestNewDispatchFlow(unittest.TestCase):
         assert len(cache_values) == 2, "Expected 2 cache values"
         assert cache_values[0] is layout, "Expected layout in cache_values"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dispatch_new_flow_infer_layout_with_cache_values(self, mock_platform):
         """Test that dispatch infer_layout with cache_values returns correct output layouts."""
         from hyper_parallel.core.shard.ops.parallel_sort import SortDistributedOp
@@ -281,7 +287,7 @@ class TestNewDispatchFlow(unittest.TestCase):
         assert len(output_layouts) == 2, "Expected 2 output layouts"
         assert extra_info is None, "Expected extra_info=None"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dispatch_new_flow_normalizes_args(self, mock_platform):
         """Test that dispatch normalizes args and kwargs."""
         from hyper_parallel.core.shard.ops.parallel_sort import SortDistributedOp
@@ -318,6 +324,12 @@ class TestUnwrapArgsAndKwargs(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -468,7 +480,7 @@ class TestUnwrapArgsAndKwargs(unittest.TestCase):
             "Original dict should not be mutated"
 
     @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dispatch_bypass_unwraps_kwargs(self, mock_device_platform, mock_dispatch_platform):
         """Test dispatch bypass path unwraps kwargs containing DTensors."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher

@@ -14,7 +14,7 @@
 # ============================================================================
 """parallel_scatter_update test"""
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -42,6 +42,12 @@ class TestParallelScatterUpdate(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -55,9 +61,6 @@ class TestParallelScatterUpdate(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, cp, mp) mesh via init_device_mesh."""
@@ -80,7 +83,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
         assert extra_info is None, f"extra_info should be None, got {extra_info}"
         return output_layouts[0]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_data_parallel_1(self, mock_platform):
         """
         Feature: Data parallel on dimension 1.
@@ -107,7 +110,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
             "get_expand_impl should return None",
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_model_parallel_2(self, mock_platform):
         """
         Feature: Model parallel on dimension 2.
@@ -126,7 +129,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
             f"Expected {expected_map}, got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_hybrid_parallel_3(self, mock_platform):
         """
         Feature: Hybrid parallel on dimensions 1 and 2.
@@ -145,7 +148,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
             f"Expected {expected_map}, got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_multi_dim_indices_4(self, mock_platform):
         """
         Feature: Multi-dimensional indices.
@@ -164,7 +167,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
             f"Expected {expected_map}, got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_three_dim_input_5(self, mock_platform):
         """
         Feature: Three-dimensional input with complex sharding.
@@ -185,7 +188,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
             f"Expected {expected_map}, got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_replicate_all_6(self, mock_platform):
         """
         Feature: Full replication.
@@ -204,7 +207,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
             f"Expected {expected_map}, got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_error_input_first_dim_sharded_7(self, mock_platform):
         """
         Feature: Error case - input first dimension sharded.
@@ -220,7 +223,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "first dimension of input cannot be sharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_error_indices_sharded_8(self, mock_platform):
         """
         Feature: Error case - indices sharded.
@@ -236,7 +239,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "indices cannot be sharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_error_updates_prefix_sharded_9(self, mock_platform):
         """
         Feature: Error case - updates prefix sharded.
@@ -252,7 +255,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dimensions of updates cannot be sharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_error_updates_mismatch_10(self, mock_platform):
         """
         Feature: Error case - updates sharding mismatch.
@@ -268,7 +271,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "updates sharding must match input"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_error_updates_rank_mismatch_11(self, mock_platform):
         """
         Feature: Error case - updates rank mismatch.
@@ -284,7 +287,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "updates rank mismatch"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_error_indices_not_dtensor(self, mock_platform):
         """
         Feature: Error case - indices is not a DTensor.
@@ -299,7 +302,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "indices must be a DTensor"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_error_updates_not_dtensor(self, mock_platform):
         """
         Feature: Error case - updates is not a DTensor.
@@ -314,7 +317,7 @@ class TestParallelScatterUpdate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "updates must be a DTensor"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_update_partial_propagation_12(self, mock_platform):
         """
         Feature: Partial status propagation.

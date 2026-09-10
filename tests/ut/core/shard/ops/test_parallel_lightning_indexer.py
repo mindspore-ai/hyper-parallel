@@ -39,6 +39,12 @@ class TestLightningIndexer(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clear global state after each test."""
@@ -136,7 +142,7 @@ class TestLightningIndexer(unittest.TestCase):
     # ------------------------------------------------------------------
 
     @patch("hyper_parallel.core.shard.ops.parallel_lightning_indexer.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_3_positional_args_5(self, mock_mesh_plat, mock_op_plat):
         """
         Feature: preprocess packs q/k/w as positional, rest as kwargs.
@@ -172,7 +178,7 @@ class TestLightningIndexer(unittest.TestCase):
                          msg=f"cache_values[3] should be 'BSND', got {cache_values[3]}")
 
     @patch("hyper_parallel.core.shard.ops.parallel_lightning_indexer.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_torch_3_positional_args_6(self, mock_mesh_plat, mock_op_plat):
         """
         Feature: preprocess puts optional args in kwargs on PyTorch.
@@ -208,7 +214,7 @@ class TestLightningIndexer(unittest.TestCase):
                          msg=f"cache_values[3] should be 'TND', got {cache_values[3]}")
 
     @patch("hyper_parallel.core.shard.ops.parallel_lightning_indexer.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_plain_tensor_seq_lens_passthrough_6b(self, mock_mesh_plat, mock_op_plat):
         """
         Feature: preprocess accepts non-DTensor actual_seq_lengths_query/key.
@@ -252,7 +258,7 @@ class TestLightningIndexer(unittest.TestCase):
     # infer_layout — BSND
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_bsnd_replicated_7(self, mock_platform):
         """
         Feature: infer_layout BSND replicated produces correct output tensor_map.
@@ -273,7 +279,7 @@ class TestLightningIndexer(unittest.TestCase):
         self.assertEqual(result[1].tensor_map, (-1, -1, -1, -1),
                          msg=f"Expected (-1,-1,-1,-1), got {result[1].tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_bsnd_dp_only_8(self, mock_platform):
         """
         Feature: infer_layout BSND with batch-dimension DP.
@@ -297,7 +303,7 @@ class TestLightningIndexer(unittest.TestCase):
         self.assertEqual(result[0].tensor_map[3], -1,
                          msg=f"sparse_count should be replicated, got {result[0].tensor_map[3]}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_bsnd_dp_cp_9(self, mock_platform):
         """
         Feature: infer_layout BSND with dp=2, cp=4.
@@ -318,7 +324,7 @@ class TestLightningIndexer(unittest.TestCase):
         self.assertEqual(result[1].tensor_map, (1, 0, -1, -1),
                          msg=f"Expected (1,0,-1,-1), got {result[1].tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_bsnd_outputs_independent_copies_10(self, mock_platform):
         """
         Feature: Both output layouts are independent deepcopies.
@@ -335,7 +341,7 @@ class TestLightningIndexer(unittest.TestCase):
         self.assertIsNot(result[0], result[1],
                          msg="Both output layouts must be distinct objects (deepcopy)")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_bsnd_output_has_placements_11(self, mock_platform):
         """
         Feature: infer_layout sets placements on output layouts.
@@ -357,7 +363,7 @@ class TestLightningIndexer(unittest.TestCase):
     # infer_layout — TND
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_tnd_replicated_12(self, mock_platform):
         """
         Feature: infer_layout TND replicated produces correct output tensor_map.
@@ -376,7 +382,7 @@ class TestLightningIndexer(unittest.TestCase):
         self.assertEqual(result[0].tensor_map, (-1, -1, -1),
                          msg=f"Replicated TND output should be (-1,-1,-1), got {result[0].tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_tnd_dp_cp_merged_13(self, mock_platform):
         """
         Feature: infer_layout TND with T1 sharded on merged dp_cp axis.
@@ -577,7 +583,7 @@ class TestLightningIndexer(unittest.TestCase):
     # get_expand_impl
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_impl_bsnd_no_cp_returns_none_28(self, mock_platform):
         """
         Feature: get_expand_impl returns None when S1 is not sharded (no CP).
@@ -596,8 +602,8 @@ class TestLightningIndexer(unittest.TestCase):
             "get_expand_impl should return None when S1 is not sharded (no BSND CP)"
         )
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_impl_tnd_no_cp_returns_callable_29(self, mock_mesh_plat, mock_layout_plat):
         """
         Feature: get_expand_impl returns callable for TND even without CP.
@@ -632,8 +638,8 @@ class TestLightningIndexer(unittest.TestCase):
                         msg=f"Expected callable for BSND+CP, got {type(impl)}")
 
     @patch("hyper_parallel.core.shard.ops.parallel_lightning_indexer.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.dtensor.layout.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
     def test_expand_impl_tnd_cp_returns_callable_31(self, mock_layout_plat, mock_mesh_plat, mock_op_plat):
         """
         Feature: get_expand_impl returns callable when q_split > k_split (TND+CP).

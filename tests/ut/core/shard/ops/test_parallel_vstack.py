@@ -43,6 +43,12 @@ class TestVstackDistributedOp(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Restore global cache state after each test."""
@@ -54,9 +60,6 @@ class TestVstackDistributedOp(unittest.TestCase):
         """Configure common mock-platform attributes used across tests."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         mock_platform.platform_type = MagicMock()
 
     def _make_2x2_mesh(self, mock_platform):
@@ -83,7 +86,7 @@ class TestVstackDistributedOp(unittest.TestCase):
 
     # ---- infer_layout success cases ----
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_2d_all_replicated(self, mock_platform):
         """
         Feature: 2D all-replicated inputs on 2x2 mesh.
@@ -97,7 +100,7 @@ class TestVstackDistributedOp(unittest.TestCase):
         self.assertEqual(output_layout.tensor_map, expected_map,
                          f"Expected {expected_map}, got {output_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_2d_non_cat_dim_sharded(self, mock_platform):
         """
         Feature: 2D inputs with non-cat dim sharded.
@@ -111,7 +114,7 @@ class TestVstackDistributedOp(unittest.TestCase):
         self.assertEqual(output_layout.tensor_map, expected_map,
                          f"Expected {expected_map}, got {output_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_3d_mixed(self, mock_platform):
         """
         Feature: 3D inputs on 2x2x2 mesh with mixed sharding.
@@ -125,7 +128,7 @@ class TestVstackDistributedOp(unittest.TestCase):
         self.assertEqual(output_layout.tensor_map, expected_map,
                          f"Expected {expected_map}, got {output_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_0d_scalar(self, mock_platform):
         """
         Feature: 0D scalar inputs promoted to 2D.
@@ -139,7 +142,7 @@ class TestVstackDistributedOp(unittest.TestCase):
         self.assertEqual(output_layout.tensor_map, expected_map,
                          f"Expected {expected_map}, got {output_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_1d_replicated(self, mock_platform):
         """
         Feature: 1D replicated inputs promoted to 2D.
@@ -153,7 +156,7 @@ class TestVstackDistributedOp(unittest.TestCase):
         self.assertEqual(output_layout.tensor_map, expected_map,
                          f"Expected {expected_map}, got {output_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_1d_sharded(self, mock_platform):
         """
         Feature: 1D sharded inputs promoted to 2D.
@@ -167,7 +170,7 @@ class TestVstackDistributedOp(unittest.TestCase):
         self.assertEqual(output_layout.tensor_map, expected_map,
                          f"Expected {expected_map}, got {output_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_0d_plus_2d(self, mock_platform):
         """
         Feature: Mixed 0D + 2D inputs, promoted layouts match.
@@ -182,7 +185,7 @@ class TestVstackDistributedOp(unittest.TestCase):
         self.assertEqual(output_layout.tensor_map, expected_map,
                          f"Expected {expected_map}, got {output_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_1d_plus_2d(self, mock_platform):
         """
         Feature: Mixed 1D + 2D inputs, promoted layouts match.
@@ -197,7 +200,7 @@ class TestVstackDistributedOp(unittest.TestCase):
         self.assertEqual(output_layout.tensor_map, expected_map,
                          f"Expected {expected_map}, got {output_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_single_input(self, mock_platform):
         """
         Feature: Single input is valid.
@@ -211,7 +214,7 @@ class TestVstackDistributedOp(unittest.TestCase):
         self.assertEqual(output_layout.tensor_map, expected_map,
                          f"Expected {expected_map}, got {output_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_multi_input(self, mock_platform):
         """
         Feature: Three inputs with identical layout.
@@ -227,7 +230,7 @@ class TestVstackDistributedOp(unittest.TestCase):
 
     # ---- infer_layout error cases ----
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_error_partial(self, mock_platform):
         """
         Feature: Partial input is rejected before promotion.
@@ -240,7 +243,7 @@ class TestVstackDistributedOp(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             op.infer_layout([layout, layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_error_promoted_mismatch(self, mock_platform):
         """
         Feature: Promoted layouts mismatch.
@@ -255,7 +258,7 @@ class TestVstackDistributedOp(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "input tensors must have the same layout"):
             op.infer_layout([layout_1d, layout_2d])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_error_dim0_sharded(self, mock_platform):
         """
         Feature: dim=0 sharded is rejected.
@@ -269,7 +272,7 @@ class TestVstackDistributedOp(unittest.TestCase):
 
     # ---- preprocess cases ----
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_preprocess_out_not_none(self, mock_platform):
         """
         Feature: out keyword is rejected.
@@ -285,7 +288,7 @@ class TestVstackDistributedOp(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "out keyword is not supported"):
             op.preprocess(((fake_dtensor, fake_dtensor),), {"out": mock_local})
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_preprocess_plain_tensor_rejected(self, mock_platform):
         """
         Feature: Plain Tensor mixed with DTensor is rejected.
@@ -380,7 +383,7 @@ class TestVstackDistributedOp(unittest.TestCase):
 
     # ---- get_expand_impl ----
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_vstack_get_expand_impl_returns_none(self, mock_platform):
         """
         Feature: get_expand_impl returns None.

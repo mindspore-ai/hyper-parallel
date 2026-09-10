@@ -38,6 +38,12 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clear global state after each test."""
@@ -123,7 +129,7 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
     # ------------------------------------------------------------------
 
     @patch("hyper_parallel.core.shard.ops.parallel_mhc_pre_sinkhorn.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_ms_path_4(self, mock_device_platform, mock_op_platform):
         """
         Feature: preprocess builds 9 positional args on MindSpore path.
@@ -159,7 +165,7 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
         assert local_kwargs == {}, f"Expected empty kwargs, got {local_kwargs}"
 
     @patch("hyper_parallel.core.shard.ops.parallel_mhc_pre_sinkhorn.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_torch_path_5(self, mock_device_platform, mock_op_platform):
         """
         Feature: preprocess builds 4 positional + kwargs on PyTorch path.
@@ -199,7 +205,7 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
     # infer_layout — success cases
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_all_replicated_6(self, mock_platform):
         """
         Feature: infer_layout with fully replicated inputs.
@@ -231,7 +237,7 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
             f"got {op.get_expand_impl(None, (out_layouts, extra), [x_layout])}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_data_parallel_7(self, mock_platform):
         """
         Feature: infer_layout with B-dim sharded (data parallel).
@@ -275,7 +281,7 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
                 f"Output {i}: expected tensor_map {exp_tm}, got {actual_tm}"
             )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_dp_cp_tp_mixed_maps_13(self, mock_platform):
         """
         Feature: infer_layout with 3-D mesh (dp, cp, tp).
@@ -328,7 +334,7 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
             )
         assert extra is None, f"Expected extra=None, got {extra}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_partial_input_raises_8(self, mock_platform):
         """
         Feature: infer_layout rejects inputs in Partial state.
@@ -344,7 +350,7 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
         with self.assertRaises(ValueError):
             op.infer_layout([x_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_sharded_n_dim_raises_9(self, mock_platform):
         """
         Feature: infer_layout rejects N-dimension sharding for BSND format.
@@ -365,7 +371,7 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "N dimension"):
             op.infer_layout([x_layout, phi_layout, alpha_layout, bias_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_tnd_replicated_11(self, mock_platform):
         """
         Feature: infer_layout with TND format (3D x), all replicated.
@@ -409,7 +415,7 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
             )
         assert extra is None, f"Expected extra=None, got {extra}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_tnd_n_axis_raises_12(self, mock_platform):
         """
         Feature: infer_layout rejects N-axis sharding on TND format.
@@ -430,7 +436,7 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "N dimension"):
             op.infer_layout([x_layout, phi_layout, alpha_layout, bias_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_bsnd_c_axis_raises_15(self, mock_platform):
         """Test that BSND input cannot shard the C dimension."""
         mesh = self._make_1d_mesh(mock_platform, size=2, name="tp")
@@ -447,7 +453,7 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "C dimension"):
             op.infer_layout([x_layout, phi_layout, alpha_layout, bias_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_tnd_c_axis_raises_16(self, mock_platform):
         """Test that TND input cannot shard the C dimension."""
         mesh = self._make_1d_mesh(mock_platform, size=2, name="tp")
@@ -469,7 +475,7 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
     # clamp variant
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_clamp_infer_layout_9_outputs_14(self, mock_platform):
         """
         Feature: clamp variant infer_layout returns 9 output layouts.

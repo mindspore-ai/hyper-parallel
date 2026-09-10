@@ -39,7 +39,7 @@ class TestPlacementConversion(unittest.TestCase):
         """Patch rank lookup and clear caches before each test."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
-        self.rank_patcher = patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+        self.rank_patcher = patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
         self.rank_patcher.start()
 
     def tearDown(self):
