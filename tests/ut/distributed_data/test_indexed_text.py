@@ -35,7 +35,7 @@ class _StandaloneMesh:
 
 
 class _MetadataDataset:
-    """Provide aligned sidecar metadata through the Dataset protocol."""
+    """Provide aligned metadata through the Dataset protocol."""
 
     requires_distributed_packing = True
 
@@ -58,7 +58,7 @@ class _MetadataDataset:
         return self.samples[index]
 
     def get_sample_metadata(self, index: int) -> SampleMetadata:
-        """Return the sidecar token count without reading the payload."""
+        """Return the metadata token count without reading the payload."""
         self.metadata_reads += 1
         return SampleMetadata(pack_tokens=len(self.samples[index]["input_ids"]), sample_id=index)
 
@@ -91,7 +91,7 @@ class TestIndexedTextConstruction(unittest.TestCase):
         self.assertEqual(batch["cu_seq_lens"].tolist(), [0, 2, 3, 5, 10])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_builder_infers_dataset_sidecar_metadata(self) -> None:
+    def test_builder_infers_dataset_metadata(self) -> None:
         """Feature: Unified distributed DataLoader API.
         Description: Omit metadata arguments for a Dataset exposing get_sample_metadata.
         Expectation: Planning is metadata-first and the selected payloads are read directly.

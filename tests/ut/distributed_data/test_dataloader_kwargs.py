@@ -27,7 +27,7 @@ from hyper_parallel.distributed_data import (
 )
 from hyper_parallel.distributed_data.api import _config_fingerprint, _normalize_dataloader_kwargs
 from hyper_parallel.distributed_data.dataset_reader import DatasetReader
-from hyper_parallel.distributed_data.sidecar import PlannedSampleLoader
+from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
 
 
 class _StandaloneMesh:
@@ -56,7 +56,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
 
     @staticmethod
     def _samples() -> list[dict[str, int]]:
-        """Return a mapping-style, sidecar-compatible test Dataset."""
+        """Return a mapping-style, metadata-compatible test Dataset."""
         return [{"id": 0, "tokens": 4}, {"id": 1, "tokens": 4}]
 
     @staticmethod
@@ -122,12 +122,12 @@ class TestDataLoaderKwargs(unittest.TestCase):
         self.assertIn("collate_fn", forwarded)
         self.assertIn("generator", forwarded)
 
-    def test_sidecar_reader_forwards_execution_options_to_native_dataloader(self) -> None:
-        """Plan-aware sidecar reads should use the same PyTorch worker options."""
+    def test_metadata_reader_forwards_execution_options_to_native_dataloader(self) -> None:
+        """Plan-aware metadata reads should use the same PyTorch worker options."""
         samples = self._samples()
         metadata = [_metadata_fn(sample) for sample in samples]
         supplied = self._execution_options()
-        with patch("hyper_parallel.distributed_data.sidecar.DataLoader") as dataloader_type:
+        with patch("hyper_parallel.distributed_data.metadata.DataLoader") as dataloader_type:
             build_distributed_dataloader(
                 samples,
                 _StandaloneMesh(),
@@ -219,7 +219,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
         common = {
             "dataset_reader_ranks": (0,),
             "planner_rank": 0,
-            "sidecar_mode": False,
+            "metadata_mode": False,
             "communication_device_type": None,
             "uses_default_pack": True,
             "uses_default_collate": True,
@@ -242,6 +242,24 @@ class TestDataLoaderKwargs(unittest.TestCase):
         )
         self.assertNotEqual(string_fingerprint, no_callback_fingerprint)
 
+    def test_metadata_rename_preserves_checkpoint_fingerprints(self) -> None:
+        """Online and metadata modes keep fingerprints recorded before the rename."""
+        config = DistributedDatasetConfig(
+            seq_len=10, local_batch_size=1, buffer_size_multiplier=2.0, shuffle=True,
+        )
+        _, options = _normalize_dataloader_kwargs(config, None)
+        expected_fingerprints = {
+            False: "6215fac83468cbad291e011f",
+            True: "7158276c0d917999d845ce05",
+        }
+        for metadata_mode, expected in expected_fingerprints.items():
+            with self.subTest(metadata_mode=metadata_mode):
+                actual = _config_fingerprint(
+                    config, (0,), 0, dataloader_fingerprint=options, metadata_mode=metadata_mode,
+                    communication_device_type=None, uses_default_pack=True, uses_default_collate=True,
+                )
+                self.assertEqual(actual, expected, f"Checkpoint fingerprint: expected={expected}, actual={actual}")
+
     def test_equivalent_config_and_kwargs_worker_options_share_fingerprint(self) -> None:
         """Only effective worker settings should participate in build compatibility."""
         config_options = {
@@ -259,7 +277,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
         common = {
             "dataset_reader_ranks": (0,),
             "planner_rank": 0,
-            "sidecar_mode": False,
+            "metadata_mode": False,
             "communication_device_type": None,
             "uses_default_pack": True,
             "uses_default_collate": True,

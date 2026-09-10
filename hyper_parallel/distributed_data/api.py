@@ -39,7 +39,7 @@ from hyper_parallel.distributed_data.data_constructor import (
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner, OversizedPolicy
 from hyper_parallel.distributed_data.schema import SampleMetadata
-from hyper_parallel.distributed_data.sidecar import PlannedSampleLoader, SidecarMetadataReader
+from hyper_parallel.distributed_data.metadata import MetadataReader, PlannedSampleLoader
 from hyper_parallel.distributed_data.dataset_reader import DatasetReader, _validate_worker_options
 from hyper_parallel.distributed_data.step_sample_selection import StepSampleSelector
 from hyper_parallel.distributed_data.topology import DataTopology
@@ -90,7 +90,7 @@ class DistributedDatasetConfig:
         local_batch_size: Packed sequences constructed per DP rank and yield.
         dp_dim_names: Named mesh dimensions that define DP coordinates.
         dataset_reader_ranks: Optional Dataset Reader ranks. They read raw
-            samples online or metadata only in sidecar mode. Defaults to the
+            samples online or metadata only in metadata mode. Defaults to the
             Data Constructor ranks.
         dataset_already_sharded: Whether each Dataset Reader receives its own
             rank-local sample stream instead of one shared strided index space.
@@ -106,8 +106,8 @@ class DistributedDatasetConfig:
             packing bin. Only ``True`` is supported in this first version.
         shuffle: Whether Dataset Readers share one deterministic shuffled order.
         seed: Dataset Reader order and worker seed.
-        num_workers: PyTorch workers per online Dataset Reader or sidecar
-            constructor.
+        num_workers: PyTorch workers per online Dataset Reader or plan-aware
+            sample loader in metadata mode.
         pin_memory: Whether sample loader workers pin returned sample memory.
         prefetch_factor: Samples prefetched by each worker.
         persistent_workers: Whether workers persist for the loader lifetime.
@@ -364,7 +364,7 @@ def _config_fingerprint(
         planner_rank: int,
         *,
         dataloader_fingerprint: tuple[tuple[str, Any], ...],
-        sidecar_mode: bool,
+        metadata_mode: bool,
         communication_device_type: str | None,
         uses_default_pack: bool,
         uses_default_collate: bool,
@@ -375,7 +375,8 @@ def _config_fingerprint(
     stable_config["dataloader_options"] = dataloader_fingerprint
     stable_config["dataset_reader_ranks"] = dataset_reader_ranks
     stable_config["planner_rank"] = planner_rank
-    stable_config["sidecar_mode"] = sidecar_mode
+    # Keep the serialized key stable so existing checkpoint fingerprints still match.
+    stable_config["sidecar_mode"] = metadata_mode
     stable_config["communication_device_type"] = communication_device_type
     stable_config["uses_default_pack"] = uses_default_pack
     stable_config["uses_default_collate"] = uses_default_collate
@@ -401,12 +402,12 @@ def _build_fingerprint(topology: DataTopology, config_fingerprint: str) -> str:
 class _BuildState:
     """Rank-local components and partial validation results needed across build stages."""
 
-    sidecar_mode: bool
+    metadata_mode: bool
     topology: DataTopology | None = None
     dataset_reader_ranks: tuple[int, ...] | None = None
     planner_rank: int | None = None
     dataset_reader: DatasetReader | BatchSamplerReader | None = None
-    sidecar_reader: SidecarMetadataReader | BatchSamplerReader | None = None
+    metadata_reader: MetadataReader | BatchSamplerReader | None = None
     direct_sample_loader: PlannedSampleLoader | None = None
     planner: DynamicPackingPlanner | None = None
     step_sample_selector: StepSampleSelector | None = None
@@ -428,7 +429,7 @@ class _BuildState:
 
 
 class _DatasetMetadataView(Sequence[SampleMetadata]):
-    """Expose Dataset-provided sidecar metadata through a sequence contract."""
+    """Expose Dataset-provided metadata through a sequence contract."""
 
     def __init__(self, dataset: Any) -> None:
         """Store a source Dataset with a metadata-only lookup method."""
@@ -448,12 +449,12 @@ def _infer_dataset_metadata(
         metadata_fn: Callable[[Any], SampleMetadata] | None,
         metadata: Sequence[SampleMetadata] | None,
 ) -> Sequence[SampleMetadata] | None:
-    """Use an indexed Dataset sidecar when the caller omits metadata callbacks."""
+    """Use metadata from an indexed Dataset when the caller omits metadata callbacks."""
     if metadata_fn is not None or metadata is not None or dataset is None:
         return metadata
     get_sample_metadata = getattr(dataset, "get_sample_metadata", None)
-    supports_sidecar = bool(getattr(dataset, "requires_distributed_packing", False))
-    if supports_sidecar and callable(get_sample_metadata):
+    supports_metadata = bool(getattr(dataset, "requires_distributed_packing", False))
+    if supports_metadata and callable(get_sample_metadata):
         return _DatasetMetadataView(dataset)
     return None
 
@@ -467,14 +468,14 @@ def _validate_builder_callbacks(
     if metadata_fn is not None and not callable(metadata_fn):
         raise ValueError("metadata_fn must be callable or None.")
     if metadata_fn is not None and metadata is not None:
-        raise ValueError("Provide either online metadata_fn or sidecar metadata, but not both.")
+        raise ValueError("Provide either online metadata_fn or metadata, but not both.")
     if pack_fn is not None and not callable(pack_fn):
         raise ValueError("pack_fn must be callable or None.")
     if collate_fn is not None and not callable(collate_fn):
         raise ValueError("collate_fn must be callable or None.")
 
 
-def _configure_sidecar_reader(
+def _configure_metadata_reader(
         state: _BuildState,
         dataset: Any | None,
         metadata: Sequence[SampleMetadata] | None,
@@ -484,8 +485,8 @@ def _configure_sidecar_reader(
 ) -> None:
     if metadata is None or state.topology is None or state.dataset_reader_ranks is None:
         rank = None if state.topology is None else state.topology.global_rank
-        raise ValueError(f"Sidecar Dataset Reader rank {rank} must provide metadata.")
-    state.sidecar_reader = SidecarMetadataReader(
+        raise ValueError(f"Metadata Dataset Reader rank {rank} must provide metadata.")
+    state.metadata_reader = MetadataReader(
         metadata,
         reader_rank=state.topology.global_rank,
         reader_idx=reader_idx,
@@ -500,13 +501,13 @@ def _configure_sidecar_reader(
         return
     if dataset is None:
         raise ValueError(
-            f"Pre-sharded sidecar Dataset Reader rank {state.topology.global_rank} must provide a Dataset."
+            f"Pre-sharded metadata Dataset Reader rank {state.topology.global_rank} must provide a Dataset."
         )
     state.direct_sample_loader = PlannedSampleLoader(dataset, seed=config.seed, **loader_options)
     state.direct_dataset_size = len(dataset)
     if state.reader_size != state.direct_dataset_size:
         raise ValueError(
-            f"Pre-sharded sidecar metadata length {state.reader_size} does not match local Dataset "
+            f"Pre-sharded metadata length {state.reader_size} does not match local Dataset "
             f"length {state.direct_dataset_size}."
         )
 
@@ -549,19 +550,19 @@ def _configure_local_data_sources(
 ) -> None:
     if state.is_reader:
         reader_idx = state.dataset_reader_ranks.index(state.topology.global_rank)
-        if state.sidecar_mode:
-            _configure_sidecar_reader(state, dataset, metadata, config, reader_idx, loader_options)
+        if state.metadata_mode:
+            _configure_metadata_reader(state, dataset, metadata, config, reader_idx, loader_options)
         else:
             _configure_online_reader(state, dataset, metadata_fn, config, reader_idx, loader_options)
-    if not state.sidecar_mode or config.dataset_already_sharded or not state.topology.is_constructor:
+    if not state.metadata_mode or config.dataset_already_sharded or not state.topology.is_constructor:
         return
     if dataset is None:
-        raise ValueError(f"Sidecar Data Constructor rank {state.topology.global_rank} must provide a Dataset.")
+        raise ValueError(f"Metadata Data Constructor rank {state.topology.global_rank} must provide a Dataset.")
     state.direct_sample_loader = PlannedSampleLoader(dataset, seed=config.seed, **loader_options)
     state.direct_dataset_size = len(dataset)
     if state.reader_size is not None and state.reader_size != state.direct_dataset_size:
         raise ValueError(
-            f"Sidecar metadata length {state.reader_size} does not match Dataset length {state.direct_dataset_size}."
+            f"Metadata length {state.reader_size} does not match Dataset length {state.direct_dataset_size}."
         )
 
 
@@ -592,9 +593,9 @@ def _configure_batch_sampler_sources(
     sample_loader = PlannedSampleLoader(dataset, seed=config.seed, **loader_options)
     sample_loader.set_epoch(batch_sampler.epoch)
     state.reader_size = len(dataset)
-    if state.sidecar_mode:
+    if state.metadata_mode:
         if not callable(getattr(metadata, "__getitem__", None)) or len(metadata) != len(dataset):
-            raise ValueError("Native batch_sampler sidecar metadata must align with the mapping Dataset.")
+            raise ValueError("Native batch_sampler metadata must align with the mapping Dataset.")
         state.direct_sample_loader = sample_loader
         state.direct_dataset_size = len(dataset)
     elif metadata_fn is None:
@@ -603,10 +604,10 @@ def _configure_batch_sampler_sources(
         batch_sampler, reader_rank=state.topology.global_rank,
         policy_fingerprint=sampler_fingerprint,
         metadata=metadata, metadata_fn=metadata_fn,
-        sample_loader=None if state.sidecar_mode else sample_loader,
+        sample_loader=None if state.metadata_mode else sample_loader,
     )
-    if state.sidecar_mode:
-        state.sidecar_reader = reader
+    if state.metadata_mode:
+        state.metadata_reader = reader
     else:
         state.dataset_reader = reader
     return sampler_fingerprint
@@ -675,7 +676,7 @@ def _populate_build_state(
         state.dataset_reader_ranks,
         state.planner_rank,
         dataloader_fingerprint=dataloader_fingerprint,
-        sidecar_mode=state.sidecar_mode,
+        metadata_mode=state.metadata_mode,
         communication_device_type=None if state.communication_device is None else state.communication_device.type,
         uses_default_pack=uses_default_pack,
         uses_default_collate=uses_default_collate,
@@ -690,7 +691,7 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
         build_fingerprint = _build_fingerprint(state.topology, state.config_fingerprint)
     # Invalid configs must still participate in WORLD error synchronization.
     dataset_already_sharded = isinstance(config, DistributedDatasetConfig) and config.dataset_already_sharded
-    is_direct_reader = state.sidecar_mode and state.topology is not None and (
+    is_direct_reader = state.metadata_mode and state.topology is not None and (
         state.is_reader if dataset_already_sharded else state.topology.is_constructor
     )
     synchronize_build_preflight(
@@ -699,7 +700,7 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
         reader_size=state.reader_size,
         is_direct_reader=is_direct_reader,
         direct_dataset_size=state.direct_dataset_size,
-        sidecar_mode=state.sidecar_mode,
+        metadata_mode=state.metadata_mode,
         dataset_already_sharded=dataset_already_sharded,
         local_error=state.local_error,
     )
@@ -738,7 +739,7 @@ def build_distributed_dataloader(
     Both modes first perform Step Sample Selection in deterministic Dataset
     stream order, then balance only that frozen sample set. Online mode uses
     ``metadata_fn`` after a Dataset Reader materializes each sample and routes
-    selected payloads to target Data Constructors. Sidecar mode uses
+    selected payloads to target Data Constructors. Metadata mode uses
     ``metadata`` before any Dataset read. With a shared index space, target
     constructors directly read assigned indices and skip payload A2A. With
     pre-sharded inputs, each Reader reads selected local indices and routes the
@@ -750,15 +751,15 @@ def build_distributed_dataloader(
 
     Args:
         dataset: Online mode requires a mapping or iterable Dataset on Dataset
-            Reader ranks. Shared-index sidecar mode requires a mapping Dataset
-            on Data Constructor ranks; pre-sharded sidecar mode requires one on
+            Reader ranks. Shared-index metadata mode requires a mapping Dataset
+            on Data Constructor ranks; pre-sharded metadata mode requires one on
             Dataset Reader ranks. Other ranks may pass the same object or
             ``None``.
         mesh: Named root HyperParallel or native DeviceMesh.
         config: Dynamic packing, service-rank, and worker configuration.
         metadata_fn: Convert one materialized raw sample to SampleMetadata in
             online mode. Mutually exclusive with ``metadata``.
-        metadata: Optional sidecar sequence on Dataset Reader ranks. Indexed
+        metadata: Optional precomputed metadata sequence on Dataset Reader ranks. Indexed
             source Datasets that implement ``get_sample_metadata`` provide this
             automatically when both metadata arguments are omitted. It is a
             shared global sequence by default and a rank-local sequence when
@@ -781,7 +782,7 @@ def build_distributed_dataloader(
             shuffle, or dynamic selection. Each Dataset output stays whole in
             one bin and goes unchanged to ``collate_fn``. Readers must coincide
             with Constructors, ``drop_last`` must be true, and ``pack_fn`` must
-            be omitted. Sidecar entries must describe these Dataset indices,
+            be omitted. Metadata entries must describe these Dataset indices,
             not underlying document indices. Checkpoint through this loader,
             not through the sampler's speculative prefetch cursor.
 
@@ -792,7 +793,7 @@ def build_distributed_dataloader(
         Checkpoint replay requires a deterministic online stream for a given
         epoch; arbitrary worker-side RNG state is not captured. Unsharded
         Dataset Readers must expose equal logical Dataset or metadata lengths.
-        Pre-sharded sidecar metadata and Dataset lengths must match locally on
+        Pre-sharded metadata and Dataset lengths must match locally on
         each Reader rank.
     """
     return _build_distributed_dataloader_impl(
@@ -822,7 +823,7 @@ def _build_distributed_dataloader_impl(
         communication_device: Any,
         batch_sampler: Any = None,
 ) -> DistributedDataLoader:
-    state = _BuildState(sidecar_mode=metadata_fn is None)
+    state = _BuildState(metadata_mode=metadata_fn is None)
     try:
         _populate_build_state(
             state,
@@ -842,7 +843,7 @@ def _build_distributed_dataloader_impl(
 
     _synchronize_build_state(state, config)
     _require_build_state(state, batch_sampler_mode=batch_sampler is not None)
-    sidecar_payload_exchange = state.sidecar_mode and config.dataset_already_sharded
+    metadata_payload_exchange = state.metadata_mode and config.dataset_already_sharded
     groups = create_data_groups(
         state.topology,
         state.dataset_reader_ranks,
@@ -850,7 +851,7 @@ def _build_distributed_dataloader_impl(
         cpu_backend=config.cpu_backend,
         payload_backend=config.payload_backend,
         communication_device=state.communication_device,
-        enable_payload_exchange=not state.sidecar_mode or sidecar_payload_exchange,
+        enable_payload_exchange=not state.metadata_mode or metadata_payload_exchange,
     )
 
     return DistributedDataLoader(
@@ -859,10 +860,10 @@ def _build_distributed_dataloader_impl(
         topology=state.topology,
         dataset_reader_ranks=state.dataset_reader_ranks,
         dataset_reader=state.dataset_reader,
-        sidecar_reader=state.sidecar_reader,
+        metadata_reader=state.metadata_reader,
         direct_sample_loader=state.direct_sample_loader,
-        sidecar_mode=state.sidecar_mode,
-        sidecar_payload_exchange=sidecar_payload_exchange,
+        metadata_mode=state.metadata_mode,
+        metadata_payload_exchange=metadata_payload_exchange,
         step_sample_selector=state.step_sample_selector,
         planner=state.planner,
         data_constructor=state.constructor,

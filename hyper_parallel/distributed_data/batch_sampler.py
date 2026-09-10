@@ -24,7 +24,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from hyper_parallel.distributed_data.schema import BufferedSampleMetadata, SampleKey, SampleMetadata
-from hyper_parallel.distributed_data.sidecar import PlannedSampleLoader
+from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
 
 
 def _mapping_fingerprint(index_mapping: Any) -> str | None:

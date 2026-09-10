@@ -315,9 +315,9 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             next(loader)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_sidecar_plans_before_direct_reads_and_skips_payload_a2a(self) -> None:
-        """Feature: Direct sidecar reads.
-        Description: Plan from sidecar metadata before materializing Dataset payloads.
+    def test_metadata_plans_before_direct_reads_and_skips_payload_a2a(self) -> None:
+        """Feature: Metadata-guided direct sample reads.
+        Description: Plan from metadata before materializing Dataset payloads.
         Expectation: Only assigned indices are read and payload A2A is skipped.
         """
         read_indices = []
@@ -333,7 +333,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 ]
 
             def __len__(self) -> int:
-                """Return the shared sidecar index-space size."""
+                """Return the shared metadata index-space size."""
                 return len(self.samples)
 
             def __getitem__(self, index: int) -> dict[str, int]:
@@ -370,8 +370,8 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         self.assertEqual(read_indices, planned_indices)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_pre_sharded_sidecar_reads_on_reader_then_uses_payload_exchange(self) -> None:
-        """Feature: Pre-sharded sidecar routing.
+    def test_pre_sharded_metadata_reads_on_reader_then_uses_payload_exchange(self) -> None:
+        """Feature: Pre-sharded metadata routing.
         Description: Plan from local metadata before loading selected payloads.
         Expectation: Selected local payloads pass through the payload exchange path.
         """
@@ -444,9 +444,9 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         self.assertEqual(step_ids(3.0), expected)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_sidecar_and_online_modes_select_the_same_canonical_steps(self) -> None:
+    def test_metadata_and_online_modes_select_the_same_canonical_steps(self) -> None:
         """Feature: Canonical step sample selection.
-        Description: Compare ahead-of-fetch sidecar planning with online planning.
+        Description: Compare ahead-of-fetch metadata planning with online planning.
         Expectation: Both modes produce identical stream step membership.
         """
         samples = [
@@ -471,7 +471,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 sample_id=sample["id"],
             ),
         )
-        sidecar = build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata)
+        metadata_loader = build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata)
 
         def selected_step_ids(loader: DistributedDataLoader) -> list[set[int]]:
             """Return frozen sample IDs from every delivered packing plan."""
@@ -486,11 +486,11 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             return result
 
         self.assertEqual(selected_step_ids(online), [{0, 1, 2}, {3, 4, 5}])
-        self.assertEqual(selected_step_ids(sidecar), [{0, 1, 2}, {3, 4, 5}])
+        self.assertEqual(selected_step_ids(metadata_loader), [{0, 1, 2}, {3, 4, 5}])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_sidecar_checkpoint_replays_metadata_buffer_without_payloads(self) -> None:
-        """Feature: Sidecar checkpoint recovery.
+    def test_metadata_checkpoint_replays_metadata_buffer_without_payloads(self) -> None:
+        """Feature: Metadata checkpoint recovery.
         Description: Restore a metadata buffer without storing raw payloads.
         Expectation: Future plans remain stable and only selected indices are reread.
         """
@@ -511,34 +511,39 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         first_batch = next(baseline)
         self.assertEqual(len(first_batch), 1)
         checkpoint = baseline.state_dict()
+        self.assertNotIn("sidecar_reader", checkpoint)
         self.assertEqual(checkpoint["epoch"], 3)
-        self.assertEqual(checkpoint["sidecar_reader"]["epoch"], 3)
+        self.assertEqual(checkpoint["metadata_reader"]["epoch"], 3)
         self.assertEqual(checkpoint["direct_sample_loader"]["epoch"], 3)
-        buffered_metadata = checkpoint["sidecar_reader"]["buffer"]
+        buffered_metadata = checkpoint["metadata_reader"]["buffer"]
         selected_keys = set(baseline.last_plan.selected_keys)
         self.assertTrue(buffered_metadata)
         self.assertTrue(selected_keys.isdisjoint(item.key for item in buffered_metadata))
         self.assertEqual(min(item.global_sample_position for item in buffered_metadata), len(selected_keys))
         expected_batches, expected_plan_ids = _drain(baseline)
 
-        resumed = build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata)
-        resumed.load_state_dict(checkpoint)
-        actual_batches, actual_plan_ids = _drain(resumed)
+        for reader_key in ("metadata_reader", "sidecar_reader"):
+            with self.subTest(reader_key=reader_key):
+                restored_state = dict(checkpoint)
+                restored_state[reader_key] = restored_state.pop("metadata_reader")
+                resumed = build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata)
+                resumed.load_state_dict(restored_state)
+                actual_batches, actual_plan_ids = _drain(resumed)
 
-        self.assertEqual(actual_batches, expected_batches)
-        self.assertEqual(actual_plan_ids, expected_plan_ids)
+                self.assertEqual(actual_batches, expected_batches)
+                self.assertEqual(actual_plan_ids, expected_plan_ids)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_builder_rejects_ambiguous_or_misaligned_metadata(self) -> None:
         """Feature: Builder metadata validation.
         Description: Provide ambiguous or length-misaligned metadata inputs.
-        Expectation: Online and sidecar modes remain exclusive and index-aligned.
+        Expectation: Online and metadata modes remain exclusive and index-aligned.
         """
         samples = [{"id": 0, "tokens": 4}]
         metadata = [SampleMetadata(pack_tokens=4, sample_id=0)]
         config = DistributedDatasetConfig(seq_len=4, local_batch_size=1)
 
-        with self.assertRaisesRegex(ValueError, "either online metadata_fn or sidecar metadata"):
+        with self.assertRaisesRegex(ValueError, "either online metadata_fn or metadata"):
             build_distributed_dataloader(
                 samples,
                 _StandaloneMesh(),

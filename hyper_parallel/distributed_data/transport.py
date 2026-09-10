@@ -61,7 +61,7 @@ def synchronize_build_preflight(
         reader_size: int | None,
         is_direct_reader: bool,
         direct_dataset_size: int | None,
-        sidecar_mode: bool,
+        metadata_mode: bool,
         dataset_already_sharded: bool,
         local_error: str | None,
 ) -> None:
@@ -72,10 +72,10 @@ def synchronize_build_preflight(
             ``None`` when local validation failed.
         is_reader: Whether this WORLD rank is configured as a Dataset Reader.
         reader_size: Dataset length in online mode or metadata length in
-            sidecar mode on Dataset Reader ranks.
-        is_direct_reader: Whether this rank reads planned sidecar sample IDs.
+            metadata mode on Dataset Reader ranks.
+        is_direct_reader: Whether this rank reads samples selected from metadata.
         direct_dataset_size: Mapping-Dataset length on plan-aware reader ranks.
-        sidecar_mode: Whether metadata is available before sample reads.
+        metadata_mode: Whether metadata is available before sample reads.
         dataset_already_sharded: Whether each Dataset Reader owns an independent
             local sample and metadata stream.
         local_error: Formatted local validation error, if any.
@@ -94,7 +94,7 @@ def synchronize_build_preflight(
         reader_size,
         is_direct_reader,
         direct_dataset_size,
-        sidecar_mode,
+        metadata_mode,
         dataset_already_sharded,
         local_error,
     )
@@ -111,15 +111,15 @@ def synchronize_build_preflight(
     dataset_reader_sizes = [(item[0], item[3]) for item in normalized if item[2]]
     _validate_dataset_reader_sizes(
         dataset_reader_sizes,
-        sidecar_mode=sidecar_mode,
+        metadata_mode=metadata_mode,
         dataset_already_sharded=dataset_already_sharded,
     )
     direct_reader_sizes = [(item[0], item[5]) for item in normalized if item[4]]
     _validate_direct_reader_sizes(direct_reader_sizes, dataset_already_sharded=dataset_already_sharded)
-    _validate_sidecar_size_alignment(
+    _validate_metadata_size_alignment(
         dataset_reader_sizes,
         direct_reader_sizes,
-        sidecar_mode=sidecar_mode,
+        metadata_mode=metadata_mode,
         dataset_already_sharded=dataset_already_sharded,
     )
 
@@ -157,7 +157,7 @@ def _validate_build_modes(normalized: Sequence[tuple[Any, ...]]) -> None:
 def _validate_dataset_reader_sizes(
         dataset_reader_sizes: Sequence[tuple[int, int | None]],
         *,
-        sidecar_mode: bool,
+        metadata_mode: bool,
         dataset_already_sharded: bool,
 ) -> None:
     invalid_dataset_reader_sizes = [
@@ -166,14 +166,14 @@ def _validate_dataset_reader_sizes(
         if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 0)
     ]
     if invalid_dataset_reader_sizes:
-        reader_data_name = "Sidecar metadata" if sidecar_mode else "Dataset"
+        reader_data_name = "Metadata" if metadata_mode else "Dataset"
         raise ValueError(
             f"{reader_data_name} length is invalid on Dataset Reader ranks {invalid_dataset_reader_sizes}."
         )
-    if sidecar_mode and any(size is None for _, size in dataset_reader_sizes):
-        raise ValueError("Sidecar metadata must have a finite length on every Dataset Reader rank.")
+    if metadata_mode and any(size is None for _, size in dataset_reader_sizes):
+        raise ValueError("Metadata must have a finite length on every Dataset Reader rank.")
     if not dataset_already_sharded and len({size for _, size in dataset_reader_sizes}) > 1:
-        reader_data_name = "Sidecar metadata" if sidecar_mode else "Dataset"
+        reader_data_name = "Metadata" if metadata_mode else "Dataset"
         raise ValueError(
             f"{reader_data_name} length mismatch across Dataset Reader ranks: {dataset_reader_sizes}."
         )
@@ -195,14 +195,14 @@ def _validate_direct_reader_sizes(
         raise ValueError(f"Direct-reader Dataset length mismatch across constructor ranks: {direct_reader_sizes}.")
 
 
-def _validate_sidecar_size_alignment(
+def _validate_metadata_size_alignment(
         dataset_reader_sizes: Sequence[tuple[int, int | None]],
         direct_reader_sizes: Sequence[tuple[int, int | None]],
         *,
-        sidecar_mode: bool,
+        metadata_mode: bool,
         dataset_already_sharded: bool,
 ) -> None:
-    if not sidecar_mode:
+    if not metadata_mode:
         return
     if dataset_already_sharded:
         metadata_sizes = dict(dataset_reader_sizes)
@@ -212,7 +212,7 @@ def _validate_sidecar_size_alignment(
         )
         if not aligned:
             raise ValueError(
-                "Pre-sharded sidecar metadata and Dataset lengths must match on each Dataset Reader rank, "
+                "Pre-sharded metadata and Dataset lengths must match on each Dataset Reader rank, "
                 f"but got metadata_readers={dataset_reader_sizes}, sample_readers={direct_reader_sizes}."
             )
         return
@@ -225,7 +225,7 @@ def _validate_sidecar_size_alignment(
     )
     if not aligned:
         raise ValueError(
-            f"Sidecar metadata and direct-reader Dataset lengths must match, but got "
+            f"Metadata and direct-reader Dataset lengths must match, but got "
             f"dataset_readers={dataset_reader_sizes}, direct_readers={direct_reader_sizes}."
         )
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DP2/TP2 native BatchSampler ownership, sidecar, and checkpoint coverage."""
+"""DP2/TP2 native BatchSampler ownership, metadata, and checkpoint coverage."""
 
 from collections import Counter
 from contextlib import nullcontext
@@ -64,7 +64,9 @@ def _gather(value: object) -> list:
     return gathered
 
 
-def _run_case(mesh: object, *, sidecar: bool, double_buffer: bool, sampler_type: str, data_sharding: bool) -> None:
+def _run_case(
+        mesh: object, *, metadata_mode: bool, double_buffer: bool, sampler_type: str, data_sharding: bool,
+) -> None:
     rank = dist.get_rank()
     dataset = _Dataset()
     reference = list(_sampler(sampler_type, data_sharding))
@@ -72,10 +74,10 @@ def _run_case(mesh: object, *, sidecar: bool, double_buffer: bool, sampler_type:
     config = DistributedDatasetConfig(seq_len=8, local_batch_size=2, double_buffer=double_buffer)
     metadata_options = (
         {"metadata": [_metadata({"id": index}) for index in range(len(dataset))]}
-        if sidecar else {"metadata_fn": _metadata}
+        if metadata_mode else {"metadata_fn": _metadata}
     )
-    no_a2a = patch.object(dist, "all_to_all_single", side_effect=AssertionError("sidecar used A2A"))
-    with no_a2a if sidecar else nullcontext():
+    no_a2a = patch.object(dist, "all_to_all_single", side_effect=AssertionError("metadata used A2A"))
+    with no_a2a if metadata_mode else nullcontext():
         loader = build_distributed_dataloader(
             dataset if rank % 2 == 0 else None, mesh, config, batch_sampler=source_sampler, **metadata_options,
         )
@@ -104,7 +106,7 @@ def _run_case(mesh: object, *, sidecar: bool, double_buffer: bool, sampler_type:
             if round_idx == 0:
                 saved_state = loader.state_dict()
                 if rank % 2 == 0:
-                    owner = "sidecar_reader" if sidecar else "dataset_reader"
+                    owner = "metadata_reader" if metadata_mode else "dataset_reader"
                     saved_cursor = saved_state[owner]["sampler"]["consumed_samples"]
                     assert saved_cursor == 4, f"Saved speculative sampler cursor: actual={saved_cursor}, expected=4"
 
@@ -112,8 +114,8 @@ def _run_case(mesh: object, *, sidecar: bool, double_buffer: bool, sampler_type:
         all_reads = _gather(dataset.reads)
         actual_reads = Counter(index for rank_reads in all_reads for index in rank_reads)
         expected_reads = Counter(index for refs in _gather(reference)[::2] for row in refs for index in row)
-        # Checkpointing can replay a prepared sidecar read, but never advances membership.
-        if not (sidecar and double_buffer):
+        # Checkpointing can replay a prepared metadata read, but never advances membership.
+        if not (metadata_mode and double_buffer):
             assert actual_reads == expected_reads, (
                 f"Read coverage differs: actual={actual_reads}, expected={expected_reads}"
             )
@@ -173,10 +175,10 @@ def test_native_batch_sampler_dp2_tp2_gloo() -> None:
     dist.init_process_group("gloo", timeout=timedelta(seconds=60))
     try:
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
-        for sidecar in (False, True):
+        for metadata_mode in (False, True):
             for double_buffer in (False, True):
                 for sampler_type, data_sharding in (("single", False), ("cyclic", False), ("cyclic", True)):
-                    _run_case(mesh, sidecar=sidecar, double_buffer=double_buffer,
+                    _run_case(mesh, metadata_mode=metadata_mode, double_buffer=double_buffer,
                               sampler_type=sampler_type, data_sharding=data_sharding)
         _run_invalid_round(mesh, uneven_exhaustion=False)
         _run_invalid_round(mesh, uneven_exhaustion=True)

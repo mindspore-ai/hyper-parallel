@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Ahead-of-fetch sidecar metadata and plan-aware local sample loading."""
+"""Ahead-of-fetch metadata and plan-aware local sample loading."""
 # This distributed-data package is intentionally PyTorch-only.
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from hyper_parallel.distributed_data.dataset_reader import (
 )
 
 
-class SidecarMetadataReader:
+class MetadataReader:
     """Expose one deterministic reader partition without reading sample payloads."""
 
     VERSION = 3
@@ -62,7 +62,7 @@ class SidecarMetadataReader:
         """Initialize a metadata-only Dataset Reader.
 
         Args:
-            metadata: Shared or rank-local sidecar entries aligned one-to-one
+            metadata: Shared or rank-local metadata entries aligned one-to-one
                 with the corresponding Dataset indices.
             reader_rank: Global rank owning this metadata reader.
             reader_idx: Position in the configured Dataset Reader rank tuple.
@@ -156,7 +156,7 @@ class SidecarMetadataReader:
                 ))
                 self._next_ordinal += 1
         except Exception as exc:  # The collective caller propagates the same failure to every rank.
-            self._error = f"Sidecar Dataset Reader rank {self._reader_rank} failed: {type(exc).__name__}: {exc}"
+            self._error = f"Metadata Dataset Reader rank {self._reader_rank} failed: {type(exc).__name__}: {exc}"
             return self._error
         return None
 
@@ -168,9 +168,9 @@ class SidecarMetadataReader:
         """Remove selected metadata only after construction and delivery succeed.
 
         Args:
-            selected_keys: Successfully consumed sidecar sample keys.
+            selected_keys: Keys of successfully consumed samples.
         """
-        self._buffer = _commit_reader_buffer(self._buffer, selected_keys, owner="sidecar")
+        self._buffer = _commit_reader_buffer(self._buffer, selected_keys, owner="metadata")
 
     def state_dict(self) -> dict[str, Any]:
         """Return the metadata cursor and uncommitted planning buffer."""
@@ -185,10 +185,10 @@ class SidecarMetadataReader:
         try:
             return copy.deepcopy(state)
         except Exception as exc:
-            raise ValueError(f"Sidecar metadata buffer is not checkpointable: {exc}") from exc
+            raise ValueError(f"Metadata buffer is not checkpointable: {exc}") from exc
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
-        """Restore a checkpoint produced on the same sidecar reader rank.
+        """Restore a checkpoint produced on the same metadata reader rank.
 
         Args:
             state_dict: State produced by :meth:`state_dict`.
@@ -196,9 +196,9 @@ class SidecarMetadataReader:
         try:
             state = copy.deepcopy(dict(state_dict))
         except Exception as exc:
-            raise ValueError(f"Sidecar metadata state is not copyable: {exc}") from exc
+            raise ValueError(f"Metadata state is not copyable: {exc}") from exc
         epoch, next_ordinal, exhausted, error, buffer = _validate_reader_checkpoint(
-            state, self._checkpoint_identity(), BufferedSampleMetadata, owner="Sidecar",
+            state, self._checkpoint_identity(), BufferedSampleMetadata, owner="Metadata",
         )
         self._epoch = epoch
         self._next_ordinal = next_ordinal
@@ -226,7 +226,7 @@ class SidecarMetadataReader:
         if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
             raise ValueError(f"epoch must be a non-negative integer, but got {epoch!r}.")
         if self._buffer and not self._exhausted:
-            raise ValueError("Cannot change epoch while an active sidecar metadata buffer is non-empty.")
+            raise ValueError("Cannot change epoch while an active metadata buffer is non-empty.")
         self._buffer.clear()
         self._epoch = epoch
         self._next_ordinal = 0
@@ -280,7 +280,7 @@ class _MutableIndexSampler(Sampler[int]):
 
 
 class PlannedSampleLoader:
-    """Use DataLoader workers to fetch only requested sidecar samples."""
+    """Use DataLoader workers to fetch only samples selected by the plan."""
 
     VERSION = 1
 
@@ -298,7 +298,7 @@ class PlannedSampleLoader:
         """Initialize a reusable plan-aware DataLoader.
 
         Args:
-            dataset: Mapping-style Dataset aligned with the sidecar sequence.
+            dataset: Mapping-style Dataset aligned with the metadata sequence.
             num_workers: Native DataLoader worker count.
             pin_memory: Whether workers pin returned sample memory.
             prefetch_factor: Samples prefetched by each worker.
@@ -308,7 +308,7 @@ class PlannedSampleLoader:
         """
         getitem = getattr(type(dataset), "__getitem__", None)
         if not callable(getitem) or getitem is Dataset.__getitem__ or not hasattr(dataset, "__len__"):
-            raise ValueError("Sidecar planned reads require a mapping-style Dataset with __len__ and __getitem__.")
+            raise ValueError("Planned reads require a mapping-style Dataset with __len__ and __getitem__.")
         self._dataset = dataset
         self._sampler = _MutableIndexSampler()
         self._seed = seed
@@ -361,7 +361,7 @@ class PlannedSampleLoader:
         invalid_indices = [key.dataset_index for key in sample_keys if key.dataset_index >= dataset_size]
         if invalid_indices:
             raise ValueError(
-                f"Sidecar plan references Dataset indices outside [0, {dataset_size}): {invalid_indices}."
+                f"Sample plan references Dataset indices outside [0, {dataset_size}): {invalid_indices}."
             )
         self._sampler.replace(tuple(key.dataset_index for key in sample_keys))
         iterator = iter(self._data_loader)
@@ -428,4 +428,4 @@ class PlannedSampleLoader:
         self._worker_generator.manual_seed(self._seed + epoch)
 
 
-__all__ = ["PlannedSampleLoader", "SidecarMetadataReader"]
+__all__ = ["MetadataReader", "PlannedSampleLoader"]
