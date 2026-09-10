@@ -91,14 +91,14 @@ class TestYamlRegistration(unittest.TestCase):
 
     def test_pascal_case_registration_4(self):
         """
-        Feature: YAML registers RotaryPositionEmbeddingDistributedOp (MindSpore name).
-        Description: Call get_distributed_op with PascalCase op name.
+        Feature: YAML registers RotaryPositionEmbeddingDistributedOp for torch-npu.
+        Description: Call get_distributed_op with torch-npu op name.
         Expectation: Returns a RotaryPositionEmbeddingDistributedOp instance.
         """
-        op = get_distributed_op("RotaryPositionEmbedding")
+        op = get_distributed_op("npu_rotary_mul")
         self.assertIsNotNone(
             op,
-            msg="RotaryPositionEmbedding should be registered via YAML"
+            msg="npu_rotary_mul should be registered via YAML"
         )
         self.assertIsInstance(
             op, RotaryPositionEmbeddingDistributedOp,
@@ -127,7 +127,7 @@ class TestInferLayoutPositive(unittest.TestCase):
 
     @staticmethod
     def _get_op():
-        return get_distributed_op("RotaryPositionEmbedding")
+        return get_distributed_op("npu_rotary_mul")
 
     def _setup_mock_platform(self, mock_platform, world_size=8):
         mock_platform.get_rank.return_value = 0
@@ -412,7 +412,7 @@ class TestInferLayoutNegative(unittest.TestCase):
 
     @staticmethod
     def _get_op():
-        return get_distributed_op("RotaryPositionEmbedding")
+        return get_distributed_op("npu_rotary_mul")
 
     @staticmethod
     def _mock_layout(tensor_map, is_partial=False):
@@ -739,21 +739,6 @@ class TestNpuRotaryMulYamlRegistration(unittest.TestCase):
             msg=(
                 f"Expected RotaryPositionEmbeddingDistributedOp, "
                 f"got {type(op)}"
-            )
-        )
-
-    def test_ms_primitive_op_names_contains_rotary(self):
-        """
-        Feature: _MS_PRIMITIVE_OP_NAMES contains RotaryPositionEmbedding.
-        Description: Read class attribute.
-        Expectation: 'RotaryPositionEmbedding' in _MS_PRIMITIVE_OP_NAMES.
-        """
-        self.assertIn(
-            "RotaryPositionEmbedding",
-            RotaryPositionEmbeddingDistributedOp._MS_PRIMITIVE_OP_NAMES,
-            msg=(
-                "_MS_PRIMITIVE_OP_NAMES should contain 'RotaryPositionEmbedding', "
-                f"got {RotaryPositionEmbeddingDistributedOp._MS_PRIMITIVE_OP_NAMES}"
             )
         )
 

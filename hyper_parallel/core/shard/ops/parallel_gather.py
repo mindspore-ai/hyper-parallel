@@ -19,7 +19,7 @@ Distributed implementation for Gather operator.
 from typing import Tuple
 
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.shard.utils import get_group_local_rank
 from .parallel_ops import DistributedOp
 
 
@@ -149,7 +149,6 @@ class IndexSelectDistributedOp(DistributedOp):
         # If the axis IS sharded, return a custom function with Masking ONLY.
         # The explicit AllReduce is completely removed.
         def expand_impl(input_tensor, dim, index, **kwargs):
-            platform = get_platform()
             mesh = p_layout.mesh
 
             # Fetch the communication group for the sharded mesh dimension
@@ -162,7 +161,7 @@ class IndexSelectDistributedOp(DistributedOp):
             group = comm_group_info.group if hasattr(comm_group_info, 'group') else comm_group_info
 
             # Get the rank of the current device within this specific communication group
-            group_rank = platform.get_group_local_rank(group=group)
+            group_rank = get_group_local_rank(group)
 
             # Calculate global index boundaries for the local chunk
             local_dim_size = input_tensor.shape[dim]

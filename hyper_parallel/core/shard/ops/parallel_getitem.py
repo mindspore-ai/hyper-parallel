@@ -21,14 +21,12 @@ BoolTensor masks are not supported because the output shape is data-dependent.
 """
 from typing import Callable, Optional
 
-from hyper_parallel.platform import get_platform
+import torch
+
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import RaggedShard, Shard, StridedShard
 from .parallel_ops import DistributedOp
-
-platform = get_platform()
-Tensor = platform.Tensor
 
 _BASIC = "basic"
 _ADVANCED = "advanced"
@@ -52,12 +50,12 @@ def _normalize___getitem___args(self_t, key):
 
 def _is_long_tensor(obj) -> bool:
     """Check if obj is a non-bool Tensor (LongTensor or similar)."""
-    return isinstance(obj, Tensor) and not _is_bool_tensor(obj)
+    return isinstance(obj, torch.Tensor) and not _is_bool_tensor(obj)
 
 
 def _is_bool_tensor(obj) -> bool:
     """Check if obj is a BoolTensor."""
-    if not isinstance(obj, Tensor):
+    if not isinstance(obj, torch.Tensor):
         return False
     if not hasattr(obj, 'dtype'):
         return False
@@ -68,7 +66,7 @@ def _is_advanced_elem(k) -> bool:
     """Check if key element triggers advanced indexing."""
     if isinstance(k, list):
         return True
-    if isinstance(k, Tensor):
+    if isinstance(k, torch.Tensor):
         # 0-D long tensor is treated as basic (equivalent to int)
         if k.ndim == 0 and not _is_bool_tensor(k):
             return False
@@ -99,9 +97,9 @@ def _build_key_element_descriptor(k, op_name="__getitem__"):
         return ("slice", k.start, k.stop, k.step)
     if isinstance(k, list):
         return ("idx_list_len", len(k))
-    if isinstance(k, Tensor) and k.ndim == 0 and not _is_bool_tensor(k):
+    if isinstance(k, torch.Tensor) and k.ndim == 0 and not _is_bool_tensor(k):
         return ("int", int(k.item()))
-    if isinstance(k, Tensor):
+    if isinstance(k, torch.Tensor):
         shape = tuple(k.shape)
         if isinstance(k, DTensor):
             alias = tuple(k.layout.alias_tensor_map)
@@ -568,7 +566,7 @@ class GetItemDistributedOp(DistributedOp):
         output_layout = infer_result[0][0]
         owner_rank, local_index, output_global_shape = info
 
-        def ragged_getitem_impl(local_input: Tensor, local_key: object) -> DTensor:
+        def ragged_getitem_impl(local_input: torch.Tensor, local_key: object) -> DTensor:
             """Return the selected owner view or an empty non-owner view."""
             del local_key
             if not local_input.is_contiguous():

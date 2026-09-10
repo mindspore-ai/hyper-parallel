@@ -16,16 +16,21 @@
 import inspect
 from typing import Union, Callable, Dict, List
 from functools import wraps
+
+from torch import nn
+
 from hyper_parallel.core.dtensor.layout import Layout, DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor, _is_alias_placements
 from hyper_parallel.core.dtensor.placement_types import Placement
+from hyper_parallel.core.shard.utils import (
+    get_cell_construct,
+    get_cells_and_names,
+    get_world_size,
+    search_parameter_by_name,
+    set_layout_into_parameter,
+    update_parameter_by_name,
+)
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
-from hyper_parallel.platform import get_platform
-
-platform = get_platform()
-Parameter = platform.Parameter
-Tensor = platform.Tensor
-Module = platform.Module
 
 
 def _has_kwargs(func):
@@ -256,7 +261,7 @@ def _forward_pre_hook(cell, args):
     """_forward_pre_hook"""
     if cell.in_layout is None:
         return args
-    processed_args, _ = _parallel_in(platform.get_cell_construct(cell), args, {}, cell.in_layout)
+    processed_args, _ = _parallel_in(get_cell_construct(cell), args, {}, cell.in_layout)
     return processed_args
 
 
@@ -264,7 +269,7 @@ def _forward_pre_with_kwargs_hook(cell, args, kwargs):
     """_forward_pre_with_kwargs_hook"""
     if cell.in_layout is None:
         return args, kwargs
-    return _parallel_in(platform.get_cell_construct(cell), args, kwargs, cell.in_layout)
+    return _parallel_in(get_cell_construct(cell), args, kwargs, cell.in_layout)
 
 
 def _forward_hook(cell, inputs, outputs):  # pylint: disable=unused-argument
@@ -279,12 +284,12 @@ def _forward_with_kwargs_hook(cell, inputs, kwargs, outputs):  # pylint: disable
     return _forward_hook(cell, inputs, outputs)
 
 
-def _register_hook(model: Module, sharding_plan: Dict):
+def _register_hook(model: nn.Module, sharding_plan: Dict):
     """_register_hook"""
 
     def _register_cell_hook(model, has_inputs_layout, has_outputs_layout):
         """_register_cell_hook"""
-        has_kwargs = _has_kwargs(platform.get_cell_construct(model))
+        has_kwargs = _has_kwargs(get_cell_construct(model))
         pre_hook = _forward_pre_with_kwargs_hook if has_kwargs else _forward_pre_hook
         hook = _forward_with_kwargs_hook if has_kwargs else _forward_hook
         if has_inputs_layout:
@@ -302,7 +307,7 @@ def _register_hook(model: Module, sharding_plan: Dict):
             model.out_layout = layouts
 
     cell_dict = {}
-    for name, cell in platform.get_cells_and_names(model):
+    for name, cell in get_cells_and_names(model):
         cell_dict[name] = cell
 
     valid_suffix = ["input", "output"]
@@ -325,7 +330,7 @@ def _register_hook(model: Module, sharding_plan: Dict):
         _register_cell_hook(register_cell, set_inputs_layout, set_outputs_layout)
 
 
-def _register_local_tensor_hook(cell: Module, return_local_tensor_list: List[str]):
+def _register_local_tensor_hook(cell: nn.Module, return_local_tensor_list: List[str]):
     """_register_local_tensor_hook"""
 
     def hook_func(cell, inputs, outputs):  # pylint: disable=unused-argument
@@ -342,7 +347,7 @@ def _register_local_tensor_hook(cell: Module, return_local_tensor_list: List[str
         return _recursive_to_local(outputs)
 
     cell_dict = {}
-    for name, sub_cell in platform.get_cells_and_names(cell):
+    for name, sub_cell in get_cells_and_names(cell):
         cell_dict[name] = sub_cell
 
     for cell_name in return_local_tensor_list:
@@ -373,7 +378,7 @@ def _shard_callable(func: Callable, sharding_plan: Dict):
     return _shard_wrapper
 
 
-def shard_module(model: Union[Module, Callable], device_mesh: DeviceMesh, sharding_plan: ShardingPlan):
+def shard_module(model: Union[nn.Module, Callable], device_mesh: DeviceMesh, sharding_plan: ShardingPlan):
     """
     Defining the input, output and parameters layouts of this cell or Callable.
 
@@ -413,7 +418,7 @@ def shard_module(model: Union[Module, Callable], device_mesh: DeviceMesh, shardi
         ... )
         >>> model = shard_module(model, mesh, sharding_plan)
     """
-    if platform.get_world_size() == 1:
+    if get_world_size() == 1:
         return None
 
     if not isinstance(sharding_plan, ShardingPlan):
@@ -447,7 +452,7 @@ def shard_module(model: Union[Module, Callable], device_mesh: DeviceMesh, shardi
     # Convert sharding_plan to Layout objects
     converted_plan = _convert_sharding_plan(normalized_plan, device_mesh)
 
-    if not isinstance(model, Module):
+    if not isinstance(model, nn.Module):
         return _shard_callable(model, converted_plan)
 
     param_sharding_plan = converted_plan.get("parameter")
@@ -458,14 +463,14 @@ def shard_module(model: Union[Module, Callable], device_mesh: DeviceMesh, shardi
             if not isinstance(layout, Layout):
                 raise ValueError(f"In python shard_module, the type of setting in parameter_plan must be Layout, "
                                  f"but got type {type(layout)}")
-            result = platform.search_parameter_by_name(model, param_name)
+            result = search_parameter_by_name(model, param_name)
             if not result:
                 raise ValueError(f"{param_name} is configured with a layout, but no instance was found.")
             _, _, param = result
             if layout.tensor_map is None:
                 layout.placement_to_tensor_map(param.dim())
-            param = platform.set_layout_into_parameter(param, layout)
-            platform.update_parameter_by_name(model, result, param)
+            param = set_layout_into_parameter(param, layout)
+            update_parameter_by_name(result, param)
 
     if forward_sharding_plan is not None:
         _register_hook(model, forward_sharding_plan)
@@ -474,117 +479,3 @@ def shard_module(model: Union[Module, Callable], device_mesh: DeviceMesh, shardi
         _register_local_tensor_hook(model, return_local_tensor_list)
 
     return model
-
-
-def parallelize_value_and_grad(fn, weights, sens=None):
-    """
-    A wrapper function to generate the function to calculate forward output and gradient for the parallel scenario.
-
-    Args:
-        fn (Union[Cell, Function]): Function to do grad operation.
-        weights (Union[ParameterTuple, Parameter, list[Parameter]]):
-            The parameters of the training network that need to
-            calculate the gradient. `weights` can be got through `weights = net.trainable_params()` .
-        sens (Union[list(float), tuple(float)], optional): The sensitivity for grad operation. Default: "None".
-            - If the fn only have one output, the sens must be None, and it will be attached automatically.
-            - If the fn have multiple outputs:
-                1) If the sens is None, only handle the first sensitivity, and set the remaining sensitivity to 0.
-                2) If the sens is not None, the lengths of sens and outputs of fn must be equal.
-
-    Returns:
-        Function, the derivative function used to compute the gradient of a given function.
-        For example, as for `out1, out2 = fn(*args)` , gradient function will return outputs like
-        `((out1, out2), gradient)` .
-
-    Raises:
-        TypeError: If type of Args does not belong to required ones.
-
-    Supported Platforms:
-        ``Ascend``
-    """
-    from mindspore import ops  # pylint: disable=import-outside-toplevel
-    grad_fn = ops.GradOperation(get_by_list=True, sens_param=True)
-
-    # use CellWrapper to solve two problems:
-    # 1. avoid running the forward fn or cell twice
-    # 2. if the input of parallize_value_and_grad is cell and it is directly used as the input for grad,
-    #    the operations before and after its __call__ function will not enter the auto-diff process.
-    class CellWrapper(Module):
-        """Cell wrapper."""
-
-        def __init__(self, net):
-            super().__init__(auto_prefix=False)
-            self.network = net
-
-        def construct(self, *args, **kwargs):
-            """Delegate construction to the wrapped network."""
-            return self.network(*args, **kwargs)
-
-        def forward(self, *args, **kwargs):
-            """Execute the wrapped network's forward pass."""
-            return self.network(*args, **kwargs)
-
-    fn = CellWrapper(fn)
-    fn.set_grad()  # avoid running the forward fn or cell twice
-
-    def wrapper(*args, **kwargs):
-        loss_value = fn(*args, **kwargs)
-        p_sens = None
-
-        if isinstance(loss_value, (list, tuple)):
-            # There are multiple outputs, requiring multiple sens
-            p_sens = []
-
-            if sens is None:
-                # if sens is None, only handle the first sens, and set the remaining sens to 0
-                loss_0 = loss_value[0]
-                if isinstance(loss_0, DTensor):
-                    repeat_num = loss_0.layout.repeat_num()
-                    sens_0 = ops.fill(ops.DType()(loss_0), loss_0.local_shape, 1.0 / repeat_num)
-                else:
-                    sens_0 = ops.fill(ops.DType()(loss_0), loss_0.shape, 1.0)
-                p_sens.append(sens_0)
-
-                for i in range(1, len(loss_value)):
-                    loss_i = loss_value[i]
-                    if isinstance(loss_i, DTensor):
-                        sens_i = ops.fill(ops.DType()(loss_i), loss_i.local_shape, 0.0)
-                    else:
-                        sens_i = ops.fill(ops.DType()(loss_i), loss_i.shape, 0.0)
-                    p_sens.append(sens_i)
-
-            else:
-                # sens is not None
-                if not isinstance(sens, list) and not isinstance(sens, tuple):
-                    raise TypeError("if the loss is list or tuple, the sens must be None or list or tuple")
-
-                all_float = all(isinstance(item, float) for item in sens)
-                if not all_float:
-                    raise TypeError("if sens is not None, it should be list of float or tuple of float")
-
-                if len(sens) != len(loss_value):
-                    raise TypeError(f"the len of loss is {len(loss_value)}, but the len of sens is {len(sens)}")
-
-                for _, loss_i in enumerate(loss_value):
-                    if isinstance(loss_i, DTensor):
-                        repeat_num = loss_i.layout.repeat_num()
-                        sens_i = ops.fill(ops.DType()(loss_i), loss_i.local_shape, 1.0 / repeat_num)
-                    else:
-                        sens_i = ops.fill(ops.DType()(loss_i), loss_i.shape, 1.0)
-                    p_sens.append(sens_i)
-
-        else:
-            # loss is tensor
-            if sens is not None:
-                raise TypeError(f"the fn only have one output, the sens must be None, but it is {sens}")
-            if isinstance(loss_value, DTensor):
-                repeat_num = loss_value.layout.repeat_num()
-                p_sens = ops.fill(ops.DType()(loss_value), loss_value.local_shape, 1.0 / repeat_num)
-
-            else:
-                p_sens = ops.fill(ops.DType()(loss_value), loss_value.shape, 1.0)
-
-        grads = grad_fn(fn, weights)(*args, **kwargs, sens=p_sens)
-        return loss_value, grads
-
-    return wrapper

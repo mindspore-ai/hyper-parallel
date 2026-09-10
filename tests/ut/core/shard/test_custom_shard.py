@@ -17,9 +17,10 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import numpy as np
+import torch
 
 from hyper_parallel.core.dtensor.dtensor import DTensor, _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -219,17 +220,15 @@ class TestCustomShardOutputValidation(unittest.TestCase):
         layout = _build_layout(mesh, (Replicate(),), 1)
         dt = _make_dtensor(layout)
 
-        # Patch Tensor to numpy.ndarray so test is platform-agnostic
-        with patch("hyper_parallel.core.shard.custom_shard.Tensor", np.ndarray):
-            local_array = np.array([1.0])
-            wrapped = custom_shard(
-                func=lambda x: local_array,
-                device_mesh=mesh,
-                out_placements=(None,),
-                in_placements=((Replicate(),),),
-            )
-            with self.assertRaises(TypeError):
-                wrapped(dt)
+        local_tensor = torch.tensor([1.0])
+        wrapped = custom_shard(
+            func=lambda x: local_tensor,
+            device_mesh=mesh,
+            out_placements=(None,),
+            in_placements=((Replicate(),),),
+        )
+        with self.assertRaises(TypeError):
+            wrapped(dt)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_non_tensor_output_with_placement_raises(self, mock_platform):
@@ -327,20 +326,20 @@ class TestCustomShardTupleOutput(unittest.TestCase):
         layout = _build_layout(mesh, (Replicate(),), 1)
         dt = _make_dtensor(layout)
 
-        out1 = np.array([1.0])
-        out2 = np.array([2.0])
+        out1 = torch.tensor([1.0])
+        out2 = torch.tensor([2.0])
 
-        with patch("hyper_parallel.core.shard.custom_shard.Tensor", np.ndarray):
-            with patch.object(DTensor, "from_local", return_value=MagicMock(spec=DTensor)):
-                wrapped = custom_shard(
-                    func=lambda x: (out1, out2),
-                    device_mesh=mesh,
-                    out_placements=((Replicate(),), (Replicate(),)),
-                    in_placements=((Replicate(),),),
-                )
-                result = wrapped(dt)
-                self.assertIsInstance(result, tuple)
-                self.assertEqual(len(result), 2)
+        wrapped = custom_shard(
+            func=lambda x: (out1, out2),
+            device_mesh=mesh,
+            out_placements=((Replicate(),), (Replicate(),)),
+            in_placements=((Replicate(),),),
+        )
+        result = wrapped(dt)
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+        self.assertIsInstance(result[0], DTensor)
+        self.assertIsInstance(result[1], DTensor)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_single_tensor_output_returns_dtensor(self, mock_mesh_platform):
@@ -349,18 +348,17 @@ class TestCustomShardTupleOutput(unittest.TestCase):
         layout = _build_layout(mesh, (Replicate(),), 1)
         dt = _make_dtensor(layout)
 
-        local_out = np.array([1.0, 2.0])
+        local_out = torch.tensor([1.0, 2.0])
 
-        with patch("hyper_parallel.core.shard.custom_shard.Tensor", np.ndarray):
-            with patch.object(DTensor, "from_local", return_value=MagicMock(spec=DTensor)):
-                wrapped = custom_shard(
-                    func=lambda x: local_out,
-                    device_mesh=mesh,
-                    out_placements=((Replicate(),),),
-                    in_placements=((Replicate(),),),
-                )
-                result = wrapped(dt)
-                self.assertIsNotNone(result)
+        wrapped = custom_shard(
+            func=lambda x: local_out,
+            device_mesh=mesh,
+            out_placements=((Replicate(),),),
+            in_placements=((Replicate(),),),
+        )
+        result = wrapped(dt)
+        self.assertIsInstance(result, DTensor)
+        self.assertTrue(torch.equal(result.to_local(), local_out))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_non_tensor_output_with_none_placement_passes_through(self, mock_platform):
