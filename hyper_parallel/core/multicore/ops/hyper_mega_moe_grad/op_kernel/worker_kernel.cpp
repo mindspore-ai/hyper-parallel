@@ -25,10 +25,11 @@ using namespace AscendC;
 class KernelWorker : public KernelWorkerBase<KernelWorker> {
  public:
   // input_list layout for hyper_mega_moe_grad (backward):
-  //   [30] = tiling params  [31] = all_event_counters
+  //   [30] = tiling params  [31] = all_event_counters  [32] = profile_buffer
   //   [25] = gmm_workspace  [26] = swi_glu_grad_workspace
   static constexpr uint32_t TILING_IDX              = 30;
   static constexpr uint32_t EVENT_IDX               = 31;
+  static constexpr uint32_t PROFILE_IDX             = 32;
   static constexpr uint32_t WORKSPACE_IDX           = 25;
   static constexpr uint32_t SWIGLU_GRAD_WORKSPACE_IDX = 26;
 
