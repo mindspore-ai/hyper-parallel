@@ -84,14 +84,13 @@ class VLMGetBatch:
             NotImplementedError: If model parallelism or pipeline batch sharing is enabled.
         """
         parallel_sizes = {
-            "tp_size": int(getattr(mesh_context, "tp_size", 1)),
             "cp_size": int(getattr(mesh_context, "cp_size", 1)),
             "pp_size": int(getattr(mesh_context, "pp_size", 1)),
         }
         unsupported_sizes = {name: size for name, size in parallel_sizes.items() if size != 1}
         if unsupported_sizes:
             raise NotImplementedError(
-                "The temporary VLM batch path requires TP=CP=PP=1, but got "
+                "The temporary VLM batch path requires CP=PP=1, but got "
                 + ", ".join(f"{name}={size}" for name, size in unsupported_sizes.items())
             )
         if pp_shared_data:
