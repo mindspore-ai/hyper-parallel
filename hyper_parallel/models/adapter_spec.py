@@ -55,6 +55,8 @@ class ModelAdapterSpec:
             before the default naming rules in Phase 1 (e.g. DeepSeek MLA's
             replicated down-projections). Lives here so the generic planner
             never carries per-family knowledge.
+        loss: provider returning model-family output-loss adapters that must
+            intercept the model before a full terminal output is materialized.
     """
 
     architecture: str
@@ -65,3 +67,4 @@ class ModelAdapterSpec:
     context_parallel: Optional[Callable[..., Any]] = None
     expert_parallel: Optional[Callable[..., Any]] = None
     sharding_rules: Optional[Callable[..., Any]] = None
+    loss: Optional[Callable[..., Any]] = None

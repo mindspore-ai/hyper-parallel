@@ -72,11 +72,21 @@ YAML 解析结果为 `list[PlanOverride]`；Trainer 侧先归一化为替换规�
 self.loss_fn(model_output=outputs, labels=labels)
 ```
 
-因此，自定义 `loss_fn` 只需要满足三个条件：
+普通 post-forward 自定义 `loss_fn` 只需要满足三个条件：
 
 1. `_target_` 构建出的对象是 `torch.nn.Module`。
 2. `forward()` 接受 `model_output` 和 `labels` 两个关键字参数。
 3. `forward()` 返回 `torch.Tensor` 或 `dict[str, torch.Tensor]`。
+
+需要在完整模型输出生成前介入的 loss（例如不生成 full logits 的
+[Chunk Loss](../chunk_loss.md)）还可以实现两个可选生命周期接口：
+
+1. `bind_model(model, distributed_setup)`：Loss 构建后调用一次，用于绑定已完成 FSDP 的模型族
+   adapter；
+2. `prepare_model_inputs(model_inputs, loss_inputs)`：每个 micro-batch 前调用，把 batch adapter
+   产生的独立 loss-only 字段转换为模型内 loss 协议。
+
+普通 loss 不实现这两个方法时，Trainer 行为保持不变。
 
 以下列 `my_project/losses.py` 为例：
 
@@ -153,7 +163,7 @@ optimizer:
 | `dataloader` | [`BaseTrainer._build_dataloader()`](../../../hyper_parallel/trainer/base.py#L354-L370) → [`build_dataloader()`](../../../hyper_parallel/data/batching/build_dataloader.py#L171-L269) | `dataset`、构建后的 `collate_fn`、`batch_sampler`、`batch_size`、`dp_world_size`、`max_seq_len`、`seed` |
 | `optimizer` | [`BaseTrainer._build_optimizer()`](../../../hyper_parallel/trainer/base.py#L405-L414) | `model` |
 | `lr_scheduler` | [`BaseTrainer._build_lr_scheduler()`](../../../hyper_parallel/trainer/base.py#L415-L422) | `optimizer`、`train_iters` |
-| `loss_fn` | [`BaseTrainer._build_loss()`](../../../hyper_parallel/trainer/base.py#L315-L325) | 无 |
+| `loss_fn` | [`BaseTrainer._build_loss()`](../../../hyper_parallel/trainer/base.py#L315-L325) | 构建时无；可选生命周期接收模型、并行配置和 loss inputs |
 
 其他组件的配置与教程见 [AutoModels README](../../../hyper_parallel/models/README.md)。
 

@@ -31,11 +31,27 @@ def count_loss_token(
 
     def _count(obj):
         if isinstance(obj, dict) and not obj.get("padding_flag", False):
-            # Hugging Face causal LM loss predicts labels from position one.
+            # ``shift_labels`` already aligns one target with every local hidden
+            # position. Otherwise align both labels and mask with the causal
+            # next-token prediction before counting.
             labels = obj.get("shift_labels")
+            loss_mask = obj.get("loss_mask")
             if labels is None:
                 labels = obj["labels"][..., 1:]
-            foundation_tokens = torch.sum(labels != IGNORE_INDEX)
+                if loss_mask is not None:
+                    loss_mask = loss_mask[..., 1:]
+            # IGNORE_INDEX and loss_mask are independent exclusion mechanisms;
+            # global loss weighting must count the same intersection as CE.
+            valid_targets = labels != IGNORE_INDEX
+            if loss_mask is not None:
+                if loss_mask.shape != labels.shape:
+                    raise ValueError(
+                        "loss_mask must match the labels after causal alignment, "
+                        f"got labels={tuple(labels.shape)} and "
+                        f"aligned_mask={tuple(loss_mask.shape)}"
+                    )
+                valid_targets = valid_targets & loss_mask.to(torch.bool)
+            foundation_tokens = torch.sum(valid_targets)
             if "foundation_tokens" in token_len:
                 foundation_tokens = token_len["foundation_tokens"] + foundation_tokens
             token_len["foundation_tokens"] = foundation_tokens  # text tokens

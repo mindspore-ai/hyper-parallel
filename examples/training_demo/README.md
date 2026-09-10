@@ -27,8 +27,8 @@ scripts do not override this field, so editing the YAML remains effective.
 - Offline uses the Indexed Dataset format. Its targets are already shifted,
   so `labels_are_shifted: true`; the implicit-mask CP wrapper owns the causal
   mask.
-- Online tokenizes and packs JSONL text at runtime. Its labels are unshifted,
-  and packed document boundaries use a global block mask accepted by
+- Online tokenizes and packs JSONL text at runtime. Its transform emits
+  pre-shifted labels, and packed document boundaries use a global block mask accepted by
   `qwen3_moe_flash_attention_cp_mask_wrapper`.
 
 Both launchers automatically generate small deterministic local datasets when

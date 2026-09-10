@@ -211,7 +211,7 @@ class TextTrainer:
             name: token_count * num_micro_steps
             for name, token_count in self.base.current_token_counts.items()
         }
-        loss, loss_dict = self.base.forward_backward_step(model_inputs)
+        loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
 
         return loss, loss_dict
 

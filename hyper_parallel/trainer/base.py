@@ -322,6 +322,11 @@ class BaseTrainer(Stateful, ABC):
         if not isinstance(loss_fn, torch.nn.Module):
             raise ValueError("config.loss_fn must build a torch.nn.Module")
         self.loss_fn = loss_fn
+        # Model-integrated objectives may need to intercept the model before its
+        # ordinary forward materializes an otherwise avoidable output tensor.
+        loss_model_binding_hook = getattr(self.loss_fn, "bind_model", None)
+        if callable(loss_model_binding_hook):
+            loss_model_binding_hook(self.model, self.distributed_setup)
 
     def _build_model_assets(self) -> None:
         """Require a concrete Trainer to build modality-specific model assets."""
@@ -529,9 +534,20 @@ class BaseTrainer(Stateful, ABC):
         return loss, loss_dict
 
     def forward_backward_step(
-            self, micro_batch: dict[str, torch.Tensor]
+            self,
+            micro_batch: dict[str, torch.Tensor],
+            loss_inputs: Optional[dict[str, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Run forward and backward computation for one micro batch."""
+        """Run forward and backward computation for one micro batch.
+
+        Args:
+            micro_batch: Inputs forwarded to the model.
+            loss_inputs: Loss-only labels and masks from the batch adapter. If
+                omitted, the legacy single-dictionary path is preserved.
+
+        Returns:
+            Backward loss and the named globally aggregated loss mapping.
+        """
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
@@ -540,7 +556,27 @@ class BaseTrainer(Stateful, ABC):
         )
         with micro_step_context:
             micro_batch = self.preforward(micro_batch)
-            labels = micro_batch.get("labels")
+            # TextTrainer passes loss-only fields separately. Keep the legacy
+            # BaseTrainer/VLM one-dictionary call contract working as well.
+            if loss_inputs is None:
+                loss_inputs = {
+                    name: micro_batch[name]
+                    for name in ("labels", "shift_labels", "loss_mask")
+                    if name in micro_batch
+                }
+            else:
+                loss_inputs = self.preforward(loss_inputs)
+            labels = loss_inputs.get("labels", micro_batch.get("labels"))
+
+            # A model-integrated loss can translate the public batch fields into
+            # model-family protocol arguments before the model forward starts.
+            prepare_model_inputs = getattr(
+                self.loss_fn,
+                "prepare_model_inputs",
+                None,
+            )
+            if callable(prepare_model_inputs):
+                micro_batch = prepare_model_inputs(micro_batch, loss_inputs)
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
