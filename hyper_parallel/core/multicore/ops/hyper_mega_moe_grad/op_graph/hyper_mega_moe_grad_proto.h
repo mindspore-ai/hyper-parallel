@@ -48,6 +48,7 @@ REG_OP(HyperMegaMoeGrad)
   .INPUT(swiglu_grad_workspace, TensorType({ge::DT_UINT8, ge::DT_UINT8}))
   .INPUT(runtime_config, TensorType({ge::DT_UINT8, ge::DT_UINT8}))
   .INPUT(all_event_counters, TensorType({ge::DT_UINT8, ge::DT_UINT8}))
+  .INPUT(profile_buffer, TensorType({ge::DT_UINT8, ge::DT_UINT8}))
   .OUTPUT(dispatch_target, TensorType({ge::DT_FLOAT16, ge::DT_BF16}))
   .OUTPUT(hidden_dw, TensorType({ge::DT_FLOAT16, ge::DT_BF16}))
   .OUTPUT(y, TensorType({ge::DT_FLOAT16, ge::DT_BF16}))  // act_grad_y

@@ -47,10 +47,14 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
+from hyper_parallel.core.multicore.profiling import (
+    _PreparedMegaKernelRuntime,
+    _prepare_mega_kernel_runtime_config,
+)
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
+from hyper_parallel.core.multicore.profiler import _enable_runtime_config_tensor
 
 from .spec import MegaMoeSpec
-
 
 
 @dataclass(frozen=True)
@@ -58,16 +62,26 @@ class MegaMoePlan:
     """Rank-local schedules and tiling tensors for forward and backward."""
 
     spec: MegaMoeSpec
-    fwd_runtime_config: Any
+    fwd_runtime: _PreparedMegaKernelRuntime
     up_proj_tiling: Any
     swiglu_tiling: Any
     down_proj_tiling: Any
-    bwd_runtime_config: Any
+    bwd_runtime: _PreparedMegaKernelRuntime
     act_grad_tiling: Any
     gate_grad_tiling: Any
     w1_grad_tiling: Any
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
+
+    @property
+    def fwd_runtime_config(self) -> Any:
+        """Return the disabled forward RuntimeConfig for compatibility."""
+        return self.fwd_runtime.normal_tensor
+
+    @property
+    def bwd_runtime_config(self) -> Any:
+        """Return the disabled backward RuntimeConfig for compatibility."""
+        return self.bwd_runtime.normal_tensor
 
 
 def _tensor_from_bytes(data: bytes, device: Any) -> torch.Tensor:
@@ -162,12 +176,32 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     w1_grad = backward_graph.get_op("w1_grad")
     w2_grad = backward_graph.get_op("w2_grad")
     swiglu_grad = backward_graph.get_op("swiglu_grad")
+    device_id = device.index
+    if device_id is None:
+        device_id = torch.npu.current_device()
+
+    def tensor_factory(data: bytes) -> torch.Tensor:
+        """Copy serialized Host runtime data to the plan's NPU device."""
+        return _tensor_from_bytes(data, device)
+
+    fwd_runtime = _prepare_mega_kernel_runtime_config(
+        forward_data,
+        tensor_factory=tensor_factory,
+        profile_tensor_factory=_enable_runtime_config_tensor,
+        rank=spec.rank_id,
+        device_id=device_id,
+    )
+    bwd_runtime = _prepare_mega_kernel_runtime_config(
+        backward_data,
+        tensor_factory=tensor_factory,
+        profile_tensor_factory=_enable_runtime_config_tensor,
+        rank=spec.rank_id,
+        device_id=device_id,
+    )
     return MegaMoePlan(
         spec=spec,
-        fwd_runtime_config=_tensor_from_bytes(bytes(forward_data), device),
-        up_proj_tiling=_tensor_from_bytes(
-            get_up_proj_tiling_bytes(up_proj.split_value, **gmm_options), device
-        ),
+        fwd_runtime=fwd_runtime,
+        up_proj_tiling=_tensor_from_bytes(get_up_proj_tiling_bytes(up_proj.split_value, **gmm_options), device),
         swiglu_tiling=_tensor_from_bytes(
             _resize_swiglu_tiling(
                 get_swiglu_tiling_bytes(
@@ -178,22 +212,12 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
             ),
             device,
         ),
-        down_proj_tiling=_tensor_from_bytes(
-            get_down_proj_tiling_bytes(down_proj.split_value, **gmm_options), device
-        ),
-        bwd_runtime_config=_tensor_from_bytes(bytes(backward_data), device),
-        act_grad_tiling=_tensor_from_bytes(
-            get_act_grad_tiling_bytes(act_grad.split_value, **gmm_options), device
-        ),
-        gate_grad_tiling=_tensor_from_bytes(
-            get_gate_grad_tiling_bytes(gate_grad.split_value, **gmm_options), device
-        ),
-        w1_grad_tiling=_tensor_from_bytes(
-            get_w1_grad_tiling_bytes(w1_grad.split_value, **gmm_options), device
-        ),
-        w2_grad_tiling=_tensor_from_bytes(
-            get_w2_grad_tiling_bytes(w2_grad.split_value, **gmm_options), device
-        ),
+        down_proj_tiling=_tensor_from_bytes(get_down_proj_tiling_bytes(down_proj.split_value, **gmm_options), device),
+        bwd_runtime=bwd_runtime,
+        act_grad_tiling=_tensor_from_bytes(get_act_grad_tiling_bytes(act_grad.split_value, **gmm_options), device),
+        gate_grad_tiling=_tensor_from_bytes(get_gate_grad_tiling_bytes(gate_grad.split_value, **gmm_options), device),
+        w1_grad_tiling=_tensor_from_bytes(get_w1_grad_tiling_bytes(w1_grad.split_value, **gmm_options), device),
+        w2_grad_tiling=_tensor_from_bytes(get_w2_grad_tiling_bytes(w2_grad.split_value, **gmm_options), device),
         swiglu_grad_tiling=_tensor_from_bytes(
             _resize_swiglu_tiling(
                 get_swiglu_grad_tiling_bytes(
