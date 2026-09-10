@@ -14,7 +14,7 @@
 # ============================================================================
 """Unit tests for swap optimizer public API and Torch backend."""
 
-import importlib
+import contextlib
 import os
 import unittest
 import weakref
@@ -28,22 +28,23 @@ import torch
 
 from hyper_parallel.core.optimizer import SwapOptimizerConfig, swap_optimizer
 from hyper_parallel.core.optimizer.adamw import AdamW as NewAdamW
+from hyper_parallel.core.optimizer import swap_optimizer_base
 from hyper_parallel.core.optimizer.swap_optimizer_base import (
+    OptimizerSwapAdapter,
     PipelineSwapRuntime,
+    SwapOptimizer,
     SwapSlot,
     UpdateUnit,
     _iter_unique_slot_objects,
 )
-from hyper_parallel.platform.platform import PlatformType
-from hyper_parallel.platform.torch.swap_optimizer.swap_optimizer import TorchSwapOptimizer, TorchSwapRuntime
-from hyper_parallel.platform.torch.swap_optimizer import adapters as torch_swap_adapters
-from hyper_parallel.platform.torch.swap_optimizer.adapters import TorchAdamBaseAdapter
-
-swap_optimizer_module = importlib.import_module("hyper_parallel.core.optimizer.swap_optimizer")
 
 
 class _DummyConfig:
     swap_times = 1
+    packed_swap = False
+    min_numel = 0
+    state_keys = None
+
 
 
 def _materialize_adam_state(optimizer, param):
@@ -92,6 +93,16 @@ class _DummySwapRuntime(PipelineSwapRuntime):
         """Synchronous test runtime has no copy stream."""
         return None
 
+    def stream_context(self, stream):
+        """Synchronous test runtime has no device stream to enter."""
+        return contextlib.nullcontext()
+
+    def restore_device_storage(self, slot):
+        """Test slots are plain sentinels, so there is no device storage to restore."""
+
+    def release_device_storage(self, slot):
+        """Test slots are plain sentinels, so there is no device storage to release."""
+
 
 class _DummyPackedRuntime(_DummySwapRuntime):
     """Record the backend-neutral two-staging-buffer schedule."""
@@ -132,50 +143,24 @@ class _DummyPackedRuntime(_DummySwapRuntime):
 class TestSwapOptimizerConfig(unittest.TestCase):
     """Config validation should fail fast for unsupported modes."""
 
-    @mock.patch.object(swap_optimizer_module, "get_platform")
-    def test_packed_swap_default_depends_on_platform(self, mock_get_platform):
-        """Packed staging defaults off on MindSpore and on for PyTorch."""
-        for platform_type, expected in (
-            (PlatformType.MINDSPORE, False),
-            (PlatformType.PYTORCH, True),
-        ):
-            with self.subTest(platform_type=platform_type):
-                mock_get_platform.return_value = SimpleNamespace(platform_type=platform_type)
-                self.assertIs(SwapOptimizerConfig().packed_swap, expected)
-
-    @mock.patch.object(swap_optimizer_module, "get_platform")
-    def test_packed_swap_explicit_value_overrides_platform_default(self, mock_get_platform):
-        """Callers can explicitly override either platform default."""
-        mock_get_platform.return_value = SimpleNamespace(platform_type=PlatformType.MINDSPORE)
-        self.assertTrue(SwapOptimizerConfig(packed_swap=True).packed_swap)
-        mock_get_platform.return_value = SimpleNamespace(platform_type=PlatformType.PYTORCH)
+    def test_packed_swap_defaults_on_and_is_overridable(self):
+        """Swap is Torch-only, so packed staging is the default but stays opt-out."""
+        self.assertTrue(SwapOptimizerConfig().packed_swap)
         self.assertFalse(SwapOptimizerConfig(packed_swap=False).packed_swap)
 
-    @mock.patch.object(swap_optimizer_module, "get_platform")
-    def test_mindformers_adamw_defaults_to_packed_swap(self, mock_get_platform):
-        """MindFormers AdamW opts into packed swap unless the caller overrides it."""
-        optimizer_type = type(
-            "AdamW",
-            (),
-            {"__module__": "mindformers.pynative.optimizer.adamw"},
-        )
-        optimizer = optimizer_type()
-        backend_wrapper = mock.Mock(side_effect=lambda _optimizer, config: config)
-        mock_get_platform.return_value = SimpleNamespace(
-            platform_type=PlatformType.MINDSPORE,
-            get_swap_optimizer=mock.Mock(return_value=backend_wrapper),
-        )
+    def test_swap_optimizer_builds_torch_wrapper_directly(self):
+        """The public factory no longer dispatches through the active platform."""
+        param = torch.nn.Parameter(torch.ones(8))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
 
-        default_config = SwapOptimizerConfig()
-        explicit_config = SwapOptimizerConfig(packed_swap=False)
+        wrapped = swap_optimizer(optimizer, SwapOptimizerConfig(packed_swap=False))
 
-        resolved_default = swap_optimizer(optimizer, default_config)
-        resolved_explicit = swap_optimizer(optimizer, explicit_config)
-        resolved_native = swap_optimizer(object(), default_config)
+        self.assertIsInstance(wrapped, SwapOptimizer)
 
-        self.assertTrue(resolved_default.packed_swap)
-        self.assertFalse(resolved_explicit.packed_swap)
-        self.assertFalse(resolved_native.packed_swap)
+    def test_unsupported_optimizer_type_is_rejected(self):
+        """Only Torch Adam/AdamW variants can be wrapped."""
+        with self.assertRaisesRegex(ValueError, "only supports"):
+            swap_optimizer(object(), SwapOptimizerConfig())
 
     def test_reject_invalid_state_key(self):
         """Only Adam/AdamW logical state keys are accepted."""
@@ -185,7 +170,7 @@ class TestSwapOptimizerConfig(unittest.TestCase):
     def test_prefetch_batches_is_not_configurable(self):
         """The runtime always uses one-batch-ahead prefetch."""
         with self.assertRaisesRegex(TypeError, "prefetch_batches"):
-            SwapOptimizerConfig(prefetch_batches=1)
+            SwapOptimizerConfig(**{"prefetch_batches": 1})  # pylint: disable=unexpected-keyword-arg
 
 
 class TestPipelineSwapRuntime(unittest.TestCase):
@@ -485,7 +470,7 @@ class TestPipelineSwapRuntime(unittest.TestCase):
         self.assertIn("result_alive_at_end:False", runtime.calls)
 
 
-class TestTorchSwapOptimizer(unittest.TestCase):
+class TestSwapOptimizer(unittest.TestCase):
     """Torch backend numerical and checkpoint smoke coverage."""
 
     def test_native_adam_rejects_unsupported_true_flags(self):
@@ -507,8 +492,8 @@ class TestTorchSwapOptimizer(unittest.TestCase):
         """Native AdamW keeps fused execution when its state is updated through swap slots."""
         param = torch.nn.Parameter(torch.ones(8))
         optimizer = torch.optim.AdamW([param], lr=0.01, fused=True)
-        runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=False, min_numel=1024))
-        adapter = torch_swap_adapters.TorchNativeAdamWAdapter(optimizer, runtime.config, runtime)
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=False, min_numel=1024))
+        adapter = swap_optimizer_base.TorchNativeAdamWAdapter(optimizer, runtime.config, runtime)
         state = optimizer.state[param]
         state["step"] = torch.zeros(())
         state["exp_avg"] = torch.zeros_like(param)
@@ -526,17 +511,17 @@ class TestTorchSwapOptimizer(unittest.TestCase):
         param = torch.nn.Parameter(torch.ones(8))
         optimizer = torch.optim.AdamW([param], lr=0.01, fused=True)
 
-        wrapped = TorchSwapOptimizer(optimizer, SwapOptimizerConfig(packed_swap=False))
+        wrapped = SwapOptimizer(optimizer, SwapOptimizerConfig(packed_swap=False))
 
-        self.assertIsInstance(wrapped.adapter, torch_swap_adapters.TorchNativeAdamWAdapter)
+        self.assertIsInstance(wrapped.adapter, swap_optimizer_base.TorchNativeAdamWAdapter)
 
     def test_packed_fused_adamw_initializes_step_on_parameter_device(self):
         """Packed fused AdamW keeps its scalar step beside parameters for the fused kernel."""
         param = torch.nn.Parameter(torch.ones(8, device="meta"))
         optimizer = torch.optim.AdamW([param], lr=0.01, fused=True)
-        runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=True, min_numel=1))
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=True, min_numel=1))
         runtime.is_packable_template = mock.Mock(return_value=False)
-        adapter = torch_swap_adapters.TorchNativeAdamWAdapter(optimizer, runtime.config, runtime)
+        adapter = swap_optimizer_base.TorchNativeAdamWAdapter(optimizer, runtime.config, runtime)
 
         adapter._init_param_state(param, object(), optimizer.param_groups[0])
 
@@ -544,8 +529,8 @@ class TestTorchSwapOptimizer(unittest.TestCase):
 
     def test_packed_swap_config_controls_candidate_path(self):
         """Parameter-specific packed eligibility is deferred to slot and step checks."""
-        packed_runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=True))
-        legacy_runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=False))
+        packed_runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=True))
+        legacy_runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=False))
 
         self.assertTrue(packed_runtime.packed_enabled)
         self.assertFalse(legacy_runtime.packed_enabled)
@@ -560,9 +545,9 @@ class TestTorchSwapOptimizer(unittest.TestCase):
             def to_local(self):
                 return self.local_tensor
 
-        runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=True, min_numel=1))
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=True, min_numel=1))
         param = _DTensorLike(torch.empty(8, device="meta"))
-        adapter = object.__new__(TorchAdamBaseAdapter)
+        adapter = object.__new__(OptimizerSwapAdapter)
         adapter.runtime = runtime
         adapter.config = SimpleNamespace(min_numel=1)
         adapter.optimizer = SimpleNamespace(state={param: {}})
@@ -588,8 +573,8 @@ class TestTorchSwapOptimizer(unittest.TestCase):
 
         param = _DTensorLike(torch.empty(8, device="meta"))
         optimizer = SimpleNamespace(state={param: {}}, param_groups=[{"params": [param]}])
-        runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=True, min_numel=1))
-        adapter = object.__new__(TorchAdamBaseAdapter)
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=True, min_numel=1))
+        adapter = object.__new__(OptimizerSwapAdapter)
         adapter.optimizer = optimizer
         adapter.runtime = runtime
         adapter.config = runtime.config
@@ -624,7 +609,7 @@ class TestTorchSwapOptimizer(unittest.TestCase):
 
     def test_supports_packed_pipeline_makes_final_device_decision(self):
         """The final gate rejects otherwise complete packed slots spanning local devices."""
-        runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=True))
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=True))
         runtime._host_buffers = {torch.float32: torch.empty(2)}
 
         def _unit(index, device, logical_tensor=None):
@@ -644,7 +629,10 @@ class TestTorchSwapOptimizer(unittest.TestCase):
         mixed_devices = [[_unit(0, "meta:0"), _unit(1, "meta:1")]]
 
         self.assertTrue(runtime.supports_packed_pipeline(same_device))
-        self.assertFalse(runtime.supports_packed_pipeline(mixed_devices))
+        # A device mismatch must never fall through to per-tensor swap: the slot
+        # tensors are already CPU host views at this point.
+        with self.assertRaisesRegex(RuntimeError, "cannot fall back to per-tensor swap"):
+            runtime.supports_packed_pipeline(mixed_devices)
 
         mixed_dtensor_devices = [[
             _unit(0, "meta:0", logical_tensor=object()),
@@ -653,9 +641,73 @@ class TestTorchSwapOptimizer(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "cannot fall back to per-tensor swap"):
             runtime.supports_packed_pipeline(mixed_dtensor_devices)
 
+    def test_prepare_packed_host_rejects_multi_device_before_binding(self):
+        """Host packing fails before rebinding state when slots span devices."""
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=True, min_numel=1))
+
+        class _DeviceTemplate:
+            """Stand-in for a state tensor that carries indexed device metadata."""
+
+            def __init__(self, device):
+                self.shape = (4,)
+                self.dtype = torch.float32
+                self.device = torch.device(device)
+
+            def numel(self):
+                return 4
+
+            def element_size(self):
+                return 4
+
+        slots = []
+        for index in range(2):
+            # Metadata is derived from a device-resident template, exactly as
+            # ``_make_slot`` does for a packed slot.  Indexed accelerator devices
+            # keep a distinct index, which ``meta`` does not.
+            slot = SwapSlot(name="exp_avg", tensor=None)
+            runtime.populate_slot_metadata(slot, _DeviceTemplate(f"cuda:{index}"))
+            slot.tensor = torch.empty(4)
+            slot.cpu_tensor = torch.empty(4)
+            slot.swappable = True
+            slot.packed = True
+            slot.state = "host"
+            slots.append(slot)
+
+        with self.assertRaisesRegex(RuntimeError, "single local device"):
+            runtime.prepare_packed_host(slots)
+
+        # The failure must leave every slot untouched, not partially host-packed.
+        self.assertTrue(all(slot.state == "host" for slot in slots))
+        self.assertEqual(runtime._host_buffers, {})
+        self.assertEqual(runtime._host_layout_signature, ())
+
+    def test_multi_device_step_never_enters_legacy_pipeline(self):
+        """run_pipeline must raise instead of silently falling back to legacy swap."""
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=True))
+        runtime._host_buffers = {torch.float32: torch.empty(2)}
+
+        def _unit(index, device):
+            slot = SwapSlot(
+                name="exp_avg",
+                tensor=torch.empty(1, device="cpu"),
+                cpu_tensor=torch.empty(1, device="cpu"),
+                swappable=True,
+                packed=True,
+                dtype=torch.float32,
+                device=torch.device(device),
+            )
+            return UpdateUnit(index, object(), object(), [slot])
+
+        runtime.prefetch = mock.Mock(side_effect=AssertionError("legacy prefetch entered"))
+        batches = [[_unit(0, "meta:0"), _unit(1, "meta:1")]]
+
+        with self.assertRaisesRegex(RuntimeError, "cannot fall back to per-tensor swap"):
+            runtime.run_pipeline(batches, {}, lambda batch, context: None)
+        runtime.prefetch.assert_not_called()
+
     def test_wait_packed_offload_uses_compute_stream_dependency(self):
         """Intermediate packed offload waits do not synchronize the CPU."""
-        runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=True))
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=True))
         offload_event = object()
         compute_stream = object()
         runtime._packed_offload_events = {3: offload_event}
@@ -668,7 +720,7 @@ class TestTorchSwapOptimizer(unittest.TestCase):
 
     def test_end_packed_step_cpu_synchronizes_only_tail_event(self):
         """One tail event drains all work serialized on the packed copy stream."""
-        runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=True))
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=True))
         earlier_event = object()
         tail_event = object()
         runtime._packed_ready_events = {0: earlier_event}
@@ -688,8 +740,8 @@ class TestTorchSwapOptimizer(unittest.TestCase):
             {"params": params[:2], "lr": 0.01},
             {"params": params[2:], "lr": 0.02},
         ])
-        runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=False, min_numel=1024))
-        adapter = TorchAdamBaseAdapter(optimizer, runtime.config, runtime)
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=False, min_numel=1024))
+        adapter = OptimizerSwapAdapter(optimizer, runtime.config, runtime)
         for param in params:
             param.grad = torch.ones_like(param)
 
@@ -702,11 +754,11 @@ class TestTorchSwapOptimizer(unittest.TestCase):
         """Swappable lazy moments avoid zero-initializing every device tensor."""
         param = torch.nn.Parameter(torch.ones(8))
         optimizer = torch.optim.Adam([param], lr=0.01)
-        runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=False, min_numel=1))
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=False, min_numel=1))
         runtime.is_swappable_tensor = mock.Mock(return_value=True)
         runtime.make_zero_cpu_tensor_like = mock.Mock(return_value=torch.zeros_like(param, device="cpu"))
         runtime.release_device_storage = mock.Mock()
-        adapter = TorchAdamBaseAdapter(optimizer, runtime.config, runtime)
+        adapter = OptimizerSwapAdapter(optimizer, runtime.config, runtime)
         param.grad = torch.ones_like(param)
 
         with mock.patch.object(torch, "zeros_like", wraps=torch.zeros_like) as zeros_like:
@@ -722,7 +774,7 @@ class TestTorchSwapOptimizer(unittest.TestCase):
 
     def test_packed_runtime_restores_cpu_slots_and_releases_two_staging_arenas(self):
         """Packed slot views roundtrip through two raw staging storages."""
-        runtime = TorchSwapRuntime(_DummyConfig())
+        runtime = PipelineSwapRuntime(_DummyConfig())
         runtime._packed_enabled = True
         runtime._get_copy_stream = lambda: None
         runtime.current_stream = lambda: None
@@ -801,10 +853,10 @@ class TestTorchSwapOptimizer(unittest.TestCase):
             _materialize_adam_state(optimizer, param)
         params[0].grad = torch.ones_like(params[0])
 
-        runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=True, min_numel=1))
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=True, min_numel=1))
         runtime.is_swappable_tensor = mock.Mock(return_value=True)
         runtime.prepare_packed_host = mock.Mock()
-        adapter = TorchAdamBaseAdapter(optimizer, runtime.config, runtime)
+        adapter = OptimizerSwapAdapter(optimizer, runtime.config, runtime)
 
         units = adapter.prepare_step()["units"]
 
@@ -821,11 +873,11 @@ class TestTorchSwapOptimizer(unittest.TestCase):
         slot = SwapSlot(name="exp_avg", tensor=device_tensor, swappable=True, state="device")
         unit = UpdateUnit(0, object(), object(), [slot])
 
-        self.assertIs(TorchAdamBaseAdapter._slot_tensor(unit, "exp_avg", state_tensor), device_tensor)
+        self.assertIs(OptimizerSwapAdapter._slot_tensor(unit, "exp_avg", state_tensor), device_tensor)
 
         slot.state = "host"
-        self.assertIs(TorchAdamBaseAdapter._slot_tensor(unit, "exp_avg", state_tensor), state_tensor)
-        self.assertIs(TorchAdamBaseAdapter._slot_tensor(unit, "exp_avg_sq", state_tensor), state_tensor)
+        self.assertIs(OptimizerSwapAdapter._slot_tensor(unit, "exp_avg", state_tensor), state_tensor)
+        self.assertIs(OptimizerSwapAdapter._slot_tensor(unit, "exp_avg_sq", state_tensor), state_tensor)
 
     def test_torch_step_batch_reads_active_slots_without_rebinding_optimizer_state(self):
         """Torch functional Adam receives staging views while public state keeps CPU mirrors."""
@@ -844,8 +896,8 @@ class TestTorchSwapOptimizer(unittest.TestCase):
             SwapSlot(name="exp_avg_sq", tensor=active_exp_avg_sq, swappable=True, state="device"),
         ]
         unit = UpdateUnit(0, param, torch.ones_like(param), slots)
-        runtime = TorchSwapRuntime(SwapOptimizerConfig(packed_swap=True, min_numel=1))
-        adapter = TorchAdamBaseAdapter(optimizer, runtime.config, runtime)
+        runtime = PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=True, min_numel=1))
+        adapter = OptimizerSwapAdapter(optimizer, runtime.config, runtime)
 
         with mock.patch.object(torch.optim._functional, "adam") as functional_adam:
             adapter.step_batch([unit], {})
@@ -961,7 +1013,7 @@ class TestTorchSwapOptimizer(unittest.TestCase):
             param_groups=[{"params": [param]}],
             state={param: {}},
         )
-        adapter = object.__new__(TorchAdamBaseAdapter)
+        adapter = object.__new__(OptimizerSwapAdapter)
         adapter.optimizer = optimizer
         adapter.runtime = runtime
         adapter.config = SimpleNamespace(min_numel=1, state_keys=None)
@@ -972,7 +1024,7 @@ class TestTorchSwapOptimizer(unittest.TestCase):
             zeros_like=mock.Mock(return_value=logical_state),
         )
 
-        with mock.patch.object(torch_swap_adapters, "torch", fake_torch):
+        with mock.patch.object(swap_optimizer_base, "torch", fake_torch):
             adapter.load_swappable_state(
                 {"param_groups": [{"params": [0]}]},
                 {0: {"exp_avg": torch.arange(4, dtype=torch.float32)}},
