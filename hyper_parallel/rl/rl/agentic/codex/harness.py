@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Codex 0.152.1 process harness and Hyper-RL AgentProgram implementation."""
+"""Codex 0.152.1 process harness and hyperparallel-RL AgentProgram implementation."""
 
 from __future__ import annotations
 
@@ -129,7 +129,7 @@ def _http_json(
 
 
 class CodexRuntime:
-    """Own one node-level gateway while Hyper-RL continues to own vLLM."""
+    """Own one node-level gateway while hyperparallel-RL continues to own vLLM."""
 
     def __init__(self, engine: Any, config: Mapping[str, Any]) -> None:
         """Bind the runtime to the existing shared rollout engine."""
@@ -331,7 +331,7 @@ class CodexAgentProgram:
             'web_search = "disabled"',
             "",
             "[model_providers.hyper_rl]",
-            'name = "Hyper-RL local policy"',
+            'name = "hyperparallel-RL local policy"',
             f"base_url = {_toml_string(self.gateway_url)}",
             'env_key = "OPENAI_API_KEY"',
             'wire_api = "responses"',

@@ -45,7 +45,7 @@ class ParsedAction:
 
 
 class InteractionProtocol(Protocol):
-    """Translate between model-specific syntax and Hyper-RL interaction data.
+    """Translate between model-specific syntax and hyperparallel-RL interaction data.
 
     Implement this protocol to support another interaction convention without
     changing AgentRunner, AgentSession, ToolEnvironment, or the trainer.

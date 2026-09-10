@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """CPU unit tests for trainable and frozen Actor roles."""
-# Hyper-RL CPU tests intentionally exercise the verified Torch runtime.
+# hyperparallel-RL CPU tests intentionally exercise the verified Torch runtime.
 # pylint: disable=forbidden-backend-import,missing-public-docstring
 
 import torch

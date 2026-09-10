@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Build token-exact Hyper-RL trajectories from DeepSeek Harness model calls."""
+"""Build token-exact hyperparallel-RL trajectories from DeepSeek Harness model calls."""
 
 from __future__ import annotations
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Shared, side-effect-free configuration for the Hyper-RL CPU UT suite."""
+"""Shared, side-effect-free configuration for the hyperparallel-RL CPU UT suite."""
 
 import os
 from pathlib import Path

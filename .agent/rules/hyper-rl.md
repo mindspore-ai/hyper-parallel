@@ -1,6 +1,6 @@
 ---
 name: hyper-rl
-description: Entry rule for Hyper-RL-owned work.
+description: Entry rule for hyperparallel-RL-owned work.
 paths:
   - hyper_parallel/rl/**
   - docs/rl-*.md
@@ -8,7 +8,7 @@ paths:
   - .agent/rules/rl/module-map.md
 ---
 
-# Hyper-RL
+# hyperparallel-RL
 
 Run RL commands from the repository root; `hyper_parallel/rl/` is a source root imported as `rl.*`. Open [`rl/module-map.md`](rl/module-map.md) only to locate ownership, and load navigation or product docs only when the change affects them.
 

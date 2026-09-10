@@ -1,9 +1,10 @@
-# Hyper-RL Module Map
+# hyperparallel-RL Module Map
 
 Use this stable index to locate subsystem ownership. Paths are relative to `hyper_parallel/rl/`; interface and runtime semantics live in the linked product docs.
 
 | Area | Code | Detail |
 | --- | --- | --- |
+| User entry | — | [中文 README](../../../hyper_parallel/rl/README.md) · [English README](../../../hyper_parallel/rl/README.en.md) |
 | Design | — | [Design goals and principles](../../../hyper_parallel/rl/docs/design.md) |
 | Delivery plan | — | [Milestones and acceptance](../../../hyper_parallel/rl/docs/TODO.md) |
 | Config | `rl/config.py` | [Architecture](../../../hyper_parallel/rl/docs/architecture.md) |

@@ -27,7 +27,7 @@ vendors/
 venv/
 .ipynb_checkpoints/
 
-# Hyper-RL local-only development context and run artifacts
+# hyperparallel-RL local-only development context and run artifacts
 .rollout-results/
 hyper_parallel/rl/AGENTS.md
 hyper_parallel/rl/local_docs/
@@ -37,6 +37,7 @@ hyper_parallel/rl/local_docs/
 *.dat
 *.svg
 !hyper_parallel/rl/docs/assets/hyper-rl-architecture.svg
+!hyper_parallel/rl/docs/assets/hyper-rl-logo.svg
 *.perf
 *.info
 *.ckpt

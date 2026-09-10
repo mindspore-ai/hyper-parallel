@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU unit tests for Hyper-RL advantage estimators and rule rewards."""
-# Hyper-RL CPU tests intentionally exercise the verified Torch runtime.
+"""CPU unit tests for hyperparallel-RL advantage estimators and rule rewards."""
+# hyperparallel-RL CPU tests intentionally exercise the verified Torch runtime.
 # pylint: disable=forbidden-backend-import
 
 import math
