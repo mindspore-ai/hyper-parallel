@@ -104,6 +104,13 @@ template-less vision leaves also need explicit `plan_overrides` parameter specs
 to satisfy FSDP owner coverage. Generated data and logs are stored under
 `output/training_demo`.
 
+A full-scale variant is provided as `train_kimi_vlm_full_1sn.yaml`: the full
+61-layer × 384-expert text tower with the complete vision tower, on one 16-node
+super-node (128 devices). At that size `enable_offload` is required, the
+sequence length is capped at 2048, and the vision-tower leaf specs in
+`plan_overrides` are mandatory (glob keys cannot replace them — see the note in
+the YAML).
+
 ## Full pretrained model
 
 Both full-model launchers load all 48 layers and the complete Hugging Face
