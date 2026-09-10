@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import Any, Literal
 
-from hyper_parallel.platform import get_platform
+import torch.distributed as dist
 
 RankCondition = bool | Callable[[], bool]
 DatasetLogLevel = Literal["debug", "info", "warn"]
@@ -31,12 +31,11 @@ _DATASET_LOG_FORMAT = (
     "[rank:%(rank_id)d] \t> %(message)s"
 )
 _DATASET_DATE_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
-platform = get_platform()
 
 
 def _get_rank() -> int:
     try:
-        rank = int(platform.get_rank())
+        rank = int(dist.get_rank())
     except (RuntimeError, ValueError):
         rank = 0
     return rank

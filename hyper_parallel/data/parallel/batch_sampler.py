@@ -22,14 +22,14 @@ import random
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, Literal, Union, cast
 
-from hyper_parallel.platform import get_platform
+import torch
+
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 
 IndexMapping = Union[Mapping[int, int], Sequence[int]]
 SamplerType = Literal["single", "cyclic"]
 
 logger = get_dataset_logger(__name__)
-platform = get_platform()
 
 
 def _validate_positive_integer(value: int, name: str) -> None:
@@ -274,7 +274,7 @@ def _resolve_index_mapping(
     mapping_source = data_rearrange_map if data_rearrange_map is not None else index_mapping
     if isinstance(mapping_source, (str, os.PathLike)):
         mapping_path = os.fspath(mapping_source)
-        loaded_mapping = platform.load_checkpoint(mapping_path, ckpt_format="torch")
+        loaded_mapping = torch.load(f=mapping_path)
         resolved_mapping = cast(IndexMapping, loaded_mapping)
         return resolved_mapping
     return mapping_source

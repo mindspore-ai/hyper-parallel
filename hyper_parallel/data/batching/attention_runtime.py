@@ -20,10 +20,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import Any
 
-from hyper_parallel.platform import get_platform
-
-
-platform = get_platform()
+import torch
 
 
 def build_dense_attention_masks(
@@ -55,7 +52,7 @@ def build_dense_attention_masks(
 
     # Attention mask (lower triangular).
     att_mask_batch = micro_batch_size if reset_attention_mask else 1
-    attention_mask = platform.ones((att_mask_batch, seq_length, seq_length), dtype=bool, device=device).tril()
+    attention_mask = torch.ones((att_mask_batch, seq_length, seq_length), dtype=torch.bool, device=device).tril()
     attention_mask = attention_mask.view(att_mask_batch, 1, seq_length, seq_length)
 
     if reset_attention_mask:
@@ -67,7 +64,7 @@ def build_dense_attention_masks(
 
     swa_mask = None
     if sliding_window is not None:
-        positions = platform.arange(seq_length, dtype=platform.tensor_dtype.int64, device=device)
+        positions = torch.arange(seq_length, dtype=torch.int64, device=device)
         query_positions = positions.unsqueeze(1)
         key_positions = positions.unsqueeze(0)
         token_distance = query_positions - key_positions

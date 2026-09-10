@@ -17,9 +17,8 @@
 from collections.abc import Mapping
 from typing import Any
 
-from hyper_parallel.platform import get_platform
+import torch
 
-platform = get_platform()
 
 _MODEL_INPUT_FIELDS = {
     "input_ids",
@@ -120,7 +119,7 @@ class VLMGetBatch:
         normalized_batch = self.processor.normalize_source_batch(source_batch)
         device_batch = {
             field: value.to(self.device, non_blocking=True)
-            if platform.is_tensor(value) else value
+            if torch.is_tensor(value) else value
             for field, value in normalized_batch.items()
         }
         return self.processor.prepare_batch(device_batch)

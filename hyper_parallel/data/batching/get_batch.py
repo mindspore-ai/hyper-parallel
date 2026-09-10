@@ -19,7 +19,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from hyper_parallel.platform import get_platform
+import torch
+
 from hyper_parallel.data.batching.attention_runtime import (
     AttentionRuntimeAdapter,
     build_dense_attention_masks,
@@ -36,7 +37,6 @@ from hyper_parallel.data.parallel import (
     create_dataloader_parallel_context,
 )
 
-platform = get_platform()
 logger = get_dataset_logger(__name__)
 
 class ParallelBatch:
@@ -239,8 +239,8 @@ class ParallelBatch:
 
         # This produces the same values as building global [B, S] positions
         # and then taking the CP slice, without allocating the global tensor.
-        position_ids = platform.arange(
-            cp_seq_start, cp_seq_end, dtype=platform.tensor_dtype.int64, device=input_ids.device
+        position_ids = torch.arange(
+            cp_seq_start, cp_seq_end, dtype=torch.int64, device=input_ids.device
         )
         local_position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
@@ -267,7 +267,7 @@ class ParallelBatch:
 
     def _build_loss_mask(self, parallel_batch: Mapping[str, Any]) -> Any:
         """Build the local loss mask from labels and input IDs."""
-        loss_mask = (parallel_batch["labels"] >= 0).to(dtype=platform.tensor_dtype.int64)
+        loss_mask = (parallel_batch["labels"] >= 0).to(dtype=torch.int64)
 
         if self.eod_mask_loss:
             eod_token_id = getattr(self.tokenizer, "eod", None)
