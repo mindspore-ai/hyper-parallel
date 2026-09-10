@@ -1765,18 +1765,6 @@ class MindSporePlatform(Platform):
         )
 
     @staticmethod
-    def get_optim_state_dict(model, optimizer, *, options=None):
-        raise NotImplementedError(
-            "optimizer state_dict adapter is currently supported only on Torch backend"
-        )
-
-    @staticmethod
-    def set_optim_state_dict(model, optimizer, optim_state_dict, *, options=None):
-        raise NotImplementedError(
-            "optimizer state_dict adapter is currently supported only on Torch backend"
-        )
-
-    @staticmethod
     def save_checkpoint(cell: Union[Cell, dict], file_path: str, ckpt_format: str = "safetensors") -> None:
         if isinstance(cell, dict):
             save_dict = {}
