@@ -21,13 +21,16 @@ import json
 import os
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.indexed.indexed_data_config import GPTDatasetConfig
 from hyper_parallel.data.indexed.indexed_helpers import build_blending_indices
+
+if TYPE_CHECKING:
+    from hyper_parallel.distributed_data.schema import SampleMetadata
 
 logger = get_dataset_logger(__name__)
 
@@ -53,6 +56,9 @@ class BlendedDataset:
         self.weights = _normalize_weights(weights)
         self.size = size
         self.config = config
+        self.requires_distributed_packing = all(
+            bool(getattr(dataset, "requires_distributed_packing", False)) for dataset in self.datasets
+        )
         self.unique_identifiers = OrderedDict()
         self.unique_identifiers["class"] = type(self).__name__
         self.unique_identifiers["datasets"] = self._collect_dataset_identifiers()
@@ -83,6 +89,22 @@ class BlendedDataset:
         sample_id = int(self.dataset_sample_index[index])
         sample = {"dataset_id": dataset_id, **self.datasets[dataset_id][sample_id]}
         return sample
+
+    def get_sample_metadata(self, index: int) -> SampleMetadata:
+        """Return metadata for the source selected by one blend index.
+
+        Args:
+            index: Index in the weighted blended source schedule.
+
+        Returns:
+            Metadata aligned with the payload at the same blended index.
+        """
+        if not self.requires_distributed_packing:
+            raise ValueError("BlendedDataset metadata is available only for distributed-packing sources")
+        dataset_id = int(self.dataset_index[index])
+        sample_id = int(self.dataset_sample_index[index])
+        metadata = self.datasets[dataset_id].get_sample_metadata(sample_id)
+        return metadata
 
     def _build_indices(self) -> tuple[np.ndarray, np.ndarray]:
         """Load or build the top-level blend index cache."""
@@ -130,6 +152,10 @@ class BlendedDataset:
         requested_counts = np.bincount(dataset_index, minlength=len(self.datasets))
         for dataset_id, requested_count in enumerate(requested_counts):
             dataset_size = len(self.datasets[dataset_id])
+            if self.requires_distributed_packing and dataset_size > 0:
+                source_positions = dataset_index == dataset_id
+                sample_index[source_positions] %= dataset_size
+                continue
             if requested_count > dataset_size:
                 raise ValueError(
                     f"Dataset {dataset_id} has only {dataset_size} samples, "
