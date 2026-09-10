@@ -1038,6 +1038,36 @@ class Platform:
         )
 
     @staticmethod
+    def get_optim_state_dict(model, optimizer, *, options=None):
+        """Get the optimizer state dictionary.
+
+        Args:
+            model: The model whose parameters are optimized.
+            optimizer: The optimizer instance.
+            options: Optional configuration for state dict extraction.
+
+        Returns:
+            dict: The optimizer state dictionary with FQN-based keys.
+        """
+        raise NotImplementedError(
+            "Platform subclasses must implement get_optim_state_dict"
+        )
+
+    @staticmethod
+    def set_optim_state_dict(model, optimizer, optim_state_dict, *, options=None):
+        """Set the optimizer state dictionary.
+
+        Args:
+            model: The model whose parameters are optimized.
+            optimizer: The optimizer instance.
+            optim_state_dict: The optimizer state dict to load.
+            options: Optional configuration for state dict loading.
+        """
+        raise NotImplementedError(
+            "Platform subclasses must implement set_optim_state_dict"
+        )
+
+    @staticmethod
     def save_checkpoint(cell, file_path: str, ckpt_format: str = "safetensors") -> None:
         """Save a cell/module checkpoint to file.
 

@@ -64,6 +64,9 @@ __all__ = [
     "load_checkpoint",
     # Resharding
     "ReshardHandler",
+    # Optimizer state dict
+    "get_optim_state_dict",
+    "set_optim_state_dict",
 ]
 
 # Main API
@@ -133,3 +136,9 @@ from hyper_parallel.core.distributed_checkpoint.saver import save_checkpoint
 
 # Resharding utilities
 from hyper_parallel.core.distributed_checkpoint.reshard import ReshardHandler
+
+# Optimizer state dict
+from hyper_parallel.core.distributed_checkpoint.state_dict import (
+    get_optim_state_dict,
+    set_optim_state_dict,
+)

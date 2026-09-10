@@ -1080,6 +1080,22 @@ class TorchPlatform(Platform):
         return _set_model_state_dict(model, model_state_dict, options=options)
 
     @staticmethod
+    def get_optim_state_dict(model, optimizer, *, options=None):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (
+            get_optim_state_dict as _get_optim_state_dict,
+        )
+        return _get_optim_state_dict(model, optimizer, options=options)
+
+    @staticmethod
+    def set_optim_state_dict(model, optimizer, optim_state_dict, *, options=None):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (
+            set_optim_state_dict as _set_optim_state_dict,
+        )
+        _set_optim_state_dict(model, optimizer, optim_state_dict, options=options)
+
+    @staticmethod
     def save_checkpoint(cell: Module, file_path: str, ckpt_format: str = "safetensors") -> None:
         if ckpt_format == "safetensors":
             save_file(tensors=cell, filename=file_path)
