@@ -21,6 +21,7 @@
 | [Optimizer](./guide/optimizer.md) | AdamW、Muon、ChainedOptimizer、学习率调度器 |
 | [DCP 分布式检查点](./guide/distributed_checkpoint.md) | 检查点保存/加载、异步 staging、离线转换 |
 | [自动并行](./guide/auto_parallel.md) | SAPP-ND、SAPP-PPB |
+| [MegaKernel 多核并行 Profiling](./guide/mega_kernel_profiling.md) | 内部阶段采集、Chrome Trace 导出与离线融合 |
 | [LlamaFactory + HyperParallel SFT 训练](./guide/llama_factory_hyperparallel_sft_guide.md) | 基于 LlamaFactory 和 HyperParallel 的 SFT 配置、启动、精度与性能验证 |
 
 ## API 参考

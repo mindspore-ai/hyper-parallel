@@ -22,11 +22,11 @@ from hyper_parallel.core.multicore.modules.mega_moe.spec import (
     _resolve_receive_capacity,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
-    _EVENT_COUNTER_BYTES,
     _WORKSPACE_ALIGNMENT,
     MegaMoeWorkspace,
     _spec_workspace_bytes,
 )
+from hyper_parallel.core.multicore.profiling import EVENT_COUNTER_BYTES
 
 
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
@@ -54,7 +54,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             (expected_capacity + routed_slots)
             * specification["hidden_size"]
             * element_size
-            + 2 * _EVENT_COUNTER_BYTES
+            + 2 * EVENT_COUNTER_BYTES
             + 4 * (_WORKSPACE_ALIGNMENT - 1)
         )
 

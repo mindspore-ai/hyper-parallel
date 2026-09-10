@@ -58,6 +58,7 @@ def _load_native() -> None:
             "Check the Python/Torch/torch_npu/CANN version combination and rebuild the Torch adapter."
         ) from error
 
+
 # ---------------------------------------------------------------------------
 # Python wrappers — thin pass-through to the registered C++ ops
 # ---------------------------------------------------------------------------
@@ -86,8 +87,11 @@ def mega_moe(
     down_proj_tiling: torch.Tensor,
     runtime_config: torch.Tensor,
     all_event_counters: torch.Tensor,
-    rank_id: int, ep: int, expert_num: int,
-    hidden_size: int, seq_size: int,
+    rank_id: int,
+    ep: int,
+    expert_num: int,
+    hidden_size: int,
+    seq_size: int,
 ) -> None:
     """
     MoE-FFN forward operator.
@@ -120,15 +124,34 @@ def mega_moe(
     """
     _load_native()
     torch.ops.hyper_parallel.mega_moe(
-        dispatch_target, dispatch_target_off,
-        dispatch_src, dispatch_src_off, dispatch_size,
-        up_proj_weight, up_proj_glist,
-        up_proj_y, swiglu_out,
-        down_proj_weight, down_proj_glist, down_proj_y,
-        combine_target, combine_target_off, combine_src_off, combine_size,
-        gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
-        runtime_config, all_event_counters,
-        rank_id, ep, expert_num, hidden_size, seq_size,
+        dispatch_target,
+        dispatch_target_off,
+        dispatch_src,
+        dispatch_src_off,
+        dispatch_size,
+        up_proj_weight,
+        up_proj_glist,
+        up_proj_y,
+        swiglu_out,
+        down_proj_weight,
+        down_proj_glist,
+        down_proj_y,
+        combine_target,
+        combine_target_off,
+        combine_src_off,
+        combine_size,
+        gmm_workspace,
+        up_proj_tiling,
+        swiglu_tiling,
+        down_proj_tiling,
+        runtime_config,
+        all_event_counters,
+        all_event_counters,
+        rank_id,
+        ep,
+        expert_num,
+        hidden_size,
+        seq_size,
     )
 
 
@@ -162,8 +185,11 @@ def mega_moe_grad(
     swiglu_grad_workspace: torch.Tensor,
     runtime_config: torch.Tensor,
     all_event_counters: torch.Tensor,
-    rank_id: int, ep: int, expert_num: int,
-    hidden_size: int, seq_size: int,
+    rank_id: int,
+    ep: int,
+    expert_num: int,
+    hidden_size: int,
+    seq_size: int,
 ) -> None:
     """
     MoE-FFN backward operator.
@@ -217,14 +243,262 @@ def mega_moe_grad(
     """
     _load_native()
     torch.ops.hyper_parallel.mega_moe_grad(
-        dispatch_target, dispatch_target_off,
-        dy, dispatch_src_off, dispatch_size,
-        hidden, hidden_dw,
-        w2, act_grad_y, gate, grad_gate, w1, gate_dx, grad_x,
-        combine_target_off, combine_src_off, combine_size,
-        permute_out, gate_dw, group_list,
-        act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
-        swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
-        runtime_config, all_event_counters,
-        rank_id, ep, expert_num, hidden_size, seq_size,
+        dispatch_target,
+        dispatch_target_off,
+        dy,
+        dispatch_src_off,
+        dispatch_size,
+        hidden,
+        hidden_dw,
+        w2,
+        act_grad_y,
+        gate,
+        grad_gate,
+        w1,
+        gate_dx,
+        grad_x,
+        combine_target_off,
+        combine_src_off,
+        combine_size,
+        permute_out,
+        gate_dw,
+        group_list,
+        act_grad_tiling,
+        gate_grad_tiling,
+        w1_grad_tiling,
+        w2_grad_tiling,
+        swiglu_grad_tiling,
+        gmm_workspace,
+        swiglu_grad_workspace,
+        runtime_config,
+        all_event_counters,
+        all_event_counters,
+        rank_id,
+        ep,
+        expert_num,
+        hidden_size,
+        seq_size,
+    )
+
+
+def _mega_moe_with_profile_buffer(
+    dispatch_target: torch.Tensor,
+    dispatch_target_off: torch.Tensor,
+    dispatch_src: torch.Tensor,
+    dispatch_src_off: torch.Tensor,
+    dispatch_size: torch.Tensor,
+    up_proj_weight: torch.Tensor,
+    up_proj_glist: torch.Tensor,
+    up_proj_y: torch.Tensor,
+    swiglu_out: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    down_proj_glist: torch.Tensor,
+    down_proj_y: torch.Tensor,
+    combine_target: torch.Tensor,
+    combine_target_off: torch.Tensor,
+    combine_src_off: torch.Tensor,
+    combine_size: torch.Tensor,
+    gmm_workspace: torch.Tensor,
+    up_proj_tiling: torch.Tensor,
+    swiglu_tiling: torch.Tensor,
+    down_proj_tiling: torch.Tensor,
+    runtime_config: torch.Tensor,
+    all_event_counters: torch.Tensor,
+    profile_buffer: torch.Tensor,
+    rank_id: int,
+    ep: int,
+    expert_num: int,
+    hidden_size: int,
+    seq_size: int,
+) -> None:
+    """
+    Launch the internal forward ABI with a profiler-owned ordinary NPU buffer.
+
+    Writes in-place to: dispatch_target, up_proj_y, swiglu_out, down_proj_y,
+                        combine_target.
+    All output tensors must be pre-allocated with correct shapes.
+
+    Parameters
+    ----------
+    dispatch_target, dispatch_target_off, dispatch_src, dispatch_src_off,
+    dispatch_size :
+        AllToAll dispatch buffers — dispatch_target written in-place.
+    up_proj_weight, up_proj_glist :
+        Expert weight and cumulative group sizes for GMM1 (up-projection).
+    up_proj_y, swiglu_out :
+        GMM1 output and SwiGLU output — written in-place.
+    down_proj_weight, down_proj_glist, down_proj_y :
+        Expert weight, cumulative group sizes, and output for GMM2 (down-projection).
+    combine_target, combine_target_off, combine_src_off, combine_size :
+        AllToAll combine buffers — combine_target written in-place.
+    gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling :
+        Pre-computed tiling tensors (from gen_runtime_data.py).
+    runtime_config :
+        Per-rank runtime config tensor (from gen_runtime_data.py).
+    all_event_counters :
+        Event synchronization counter tensor.
+    profile_buffer :
+        Ordinary NPU memory receiving per-worker cycle records.
+    rank_id, ep, expert_num, hidden_size, seq_size :
+        Topology / shape attributes.
+    """
+    _load_native()
+    torch.ops.hyper_parallel.mega_moe(
+        dispatch_target,
+        dispatch_target_off,
+        dispatch_src,
+        dispatch_src_off,
+        dispatch_size,
+        up_proj_weight,
+        up_proj_glist,
+        up_proj_y,
+        swiglu_out,
+        down_proj_weight,
+        down_proj_glist,
+        down_proj_y,
+        combine_target,
+        combine_target_off,
+        combine_src_off,
+        combine_size,
+        gmm_workspace,
+        up_proj_tiling,
+        swiglu_tiling,
+        down_proj_tiling,
+        runtime_config,
+        all_event_counters,
+        profile_buffer,
+        rank_id,
+        ep,
+        expert_num,
+        hidden_size,
+        seq_size,
+    )
+
+
+def _mega_moe_grad_with_profile_buffer(
+    dispatch_target: torch.Tensor,
+    dispatch_target_off: torch.Tensor,
+    dy: torch.Tensor,
+    dispatch_src_off: torch.Tensor,
+    dispatch_size: torch.Tensor,
+    hidden: torch.Tensor,
+    hidden_dw: torch.Tensor,
+    w2: torch.Tensor,
+    act_grad_y: torch.Tensor,
+    gate: torch.Tensor,
+    grad_gate: torch.Tensor,
+    w1: torch.Tensor,
+    gate_dx: torch.Tensor,
+    grad_x: torch.Tensor,
+    combine_target_off: torch.Tensor,
+    combine_src_off: torch.Tensor,
+    combine_size: torch.Tensor,
+    permute_out: torch.Tensor,
+    gate_dw: torch.Tensor,
+    group_list: torch.Tensor,
+    act_grad_tiling: torch.Tensor,
+    gate_grad_tiling: torch.Tensor,
+    w1_grad_tiling: torch.Tensor,
+    w2_grad_tiling: torch.Tensor,
+    swiglu_grad_tiling: torch.Tensor,
+    gmm_workspace: torch.Tensor,
+    swiglu_grad_workspace: torch.Tensor,
+    runtime_config: torch.Tensor,
+    all_event_counters: torch.Tensor,
+    profile_buffer: torch.Tensor,
+    rank_id: int,
+    ep: int,
+    expert_num: int,
+    hidden_size: int,
+    seq_size: int,
+) -> None:
+    """
+    Launch the internal backward ABI with a profiler-owned ordinary NPU buffer.
+
+    Writes in-place to: dispatch_target, hidden_dw, act_grad_y, grad_gate,
+                        gate_dx, grad_x, permute_out, gate_dw.
+    All output tensors must be pre-allocated with correct shapes.
+
+    Parameters
+    ----------
+    dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size :
+        AllToAll dispatch buffers — dispatch_target written in-place with
+        the dispatched gradient.  dy is the source gradient tensor.
+    hidden :
+        SwiGLU output saved from the forward pass (used by W2-grad, GMM4).
+    hidden_dw :
+        W2 weight gradient — written in-place.
+    w2 :
+        W2 weight (= down_proj_weight from forward).
+    act_grad_y :
+        Activation gradient output from GMM1 bwd (target @ W2.T) — written in-place.
+    gate :
+        up_proj_y saved from the forward pass (SwiGLU input).
+    grad_gate :
+        SwiGLU gradient output — written in-place.
+    w1 :
+        W1 weight (= up_proj_weight from forward).
+    gate_dx :
+        GMM2 bwd output (grad_gate @ W1.T), before AllToAll combine — written in-place.
+    grad_x :
+        AllToAll combine output (final activation gradient) — written in-place.
+    combine_target_off, combine_src_off, combine_size :
+        AllToAll combine buffer descriptors.
+    permute_out :
+        In-place intermediate buffer for W1-grad (GMM4).
+    gate_dw :
+        W1 weight gradient — written in-place.
+    group_list :
+        Cumulative expert token counts ([E] int64).
+    act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
+    swiglu_grad_tiling :
+        Pre-computed tiling tensors (from gen_runtime_data.py bwd).
+    gmm_workspace, swiglu_grad_workspace :
+        Workspace tensors.
+    runtime_config :
+        Per-rank runtime config tensor (from gen_runtime_data.py bwd).
+    all_event_counters :
+        Event synchronization counter tensor.
+    profile_buffer :
+        Ordinary NPU memory receiving per-worker cycle records.
+    rank_id, ep, expert_num, hidden_size, seq_size :
+        Topology / shape attributes.
+    """
+    _load_native()
+    torch.ops.hyper_parallel.mega_moe_grad(
+        dispatch_target,
+        dispatch_target_off,
+        dy,
+        dispatch_src_off,
+        dispatch_size,
+        hidden,
+        hidden_dw,
+        w2,
+        act_grad_y,
+        gate,
+        grad_gate,
+        w1,
+        gate_dx,
+        grad_x,
+        combine_target_off,
+        combine_src_off,
+        combine_size,
+        permute_out,
+        gate_dw,
+        group_list,
+        act_grad_tiling,
+        gate_grad_tiling,
+        w1_grad_tiling,
+        w2_grad_tiling,
+        swiglu_grad_tiling,
+        gmm_workspace,
+        swiglu_grad_workspace,
+        runtime_config,
+        all_event_counters,
+        profile_buffer,
+        rank_id,
+        ep,
+        expert_num,
+        hidden_size,
+        seq_size,
     )

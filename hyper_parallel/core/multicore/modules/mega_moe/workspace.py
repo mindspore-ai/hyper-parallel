@@ -24,12 +24,13 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.core.multicore.profiling import EVENT_COUNTER_BYTES
+
 from .spec import MegaMoeSpec, _resolve_receive_capacity
 
 
 _GMM_WORKSPACE_BYTES = 32 * 1024 * 1024
 _SWIGLU_GRAD_WORKSPACE_BYTES = 16 * 1024 * 1024
-_EVENT_COUNTER_BYTES = 4096
 _WORKSPACE_ALIGNMENT = 512
 _HEAP_GRANULARITY_BYTES = 64 * 1024 * 1024
 
@@ -48,10 +49,8 @@ def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -
         routed_slots,
         specification["ep_size"],
     )
-    tensor_bytes = (
-        (capacity + routed_slots) * specification["hidden_size"] * element_size
-    )
-    return tensor_bytes + 2 * _EVENT_COUNTER_BYTES + 4 * (_WORKSPACE_ALIGNMENT - 1)
+    tensor_bytes = (capacity + routed_slots) * specification["hidden_size"] * element_size
+    return tensor_bytes + 2 * EVENT_COUNTER_BYTES + 4 * (_WORKSPACE_ALIGNMENT - 1)
 
 
 def configure_symmetric_heap(
@@ -72,8 +71,7 @@ def configure_symmetric_heap(
         RuntimeError: If an explicit heap is smaller than the required workspace.
     """
     required_bytes = sum(
-        _spec_workspace_bytes(specification, tensor.element_size())
-        for specification in active_specifications
+        _spec_workspace_bytes(specification, tensor.element_size()) for specification in active_specifications
     )
     required_bytes = _round_up(required_bytes, _HEAP_GRANULARITY_BYTES)
     configured = os.getenv("SYMMETRIC_MEMORY_HEAP_SIZE")
@@ -84,13 +82,10 @@ def configure_symmetric_heap(
         configured_bytes = int(configured)
     except ValueError as error:
         raise ValueError(
-            "SYMMETRIC_MEMORY_HEAP_SIZE must be a positive integer number of bytes, "
-            f"got {configured!r}."
+            "SYMMETRIC_MEMORY_HEAP_SIZE must be a positive integer number of bytes, " f"got {configured!r}."
         ) from error
     if configured_bytes <= 0:
-        raise ValueError(
-            f"SYMMETRIC_MEMORY_HEAP_SIZE must be positive, got {configured_bytes}."
-        )
+        raise ValueError(f"SYMMETRIC_MEMORY_HEAP_SIZE must be positive, got {configured_bytes}.")
     if configured_bytes < required_bytes:
         raise RuntimeError(
             "SYMMETRIC_MEMORY_HEAP_SIZE is too small for active MegaMoe resources: "
@@ -137,9 +132,7 @@ class MegaMoeWorkspace:
                 and self.expert_capacity == requested_capacity
             )
             if not compatible:
-                raise ValueError(
-                    "MegaMoe workspace cannot change device, dtype, routed shape, or capacity."
-                )
+                raise ValueError("MegaMoe workspace cannot change device, dtype, routed shape, or capacity.")
             return
 
         self.dtype = dtype
@@ -158,12 +151,12 @@ class MegaMoeWorkspace:
                 _WORKSPACE_ALIGNMENT,
             )
             self.forward_event_counters = self.symmetric_memory.aligned_empty(
-                (_EVENT_COUNTER_BYTES,),
+                (EVENT_COUNTER_BYTES,),
                 torch.uint8,
                 _WORKSPACE_ALIGNMENT,
             )
             self.backward_event_counters = self.symmetric_memory.aligned_empty(
-                (_EVENT_COUNTER_BYTES,),
+                (EVENT_COUNTER_BYTES,),
                 torch.uint8,
                 _WORKSPACE_ALIGNMENT,
             )
@@ -187,9 +180,7 @@ class MegaMoeWorkspace:
         """Claim the serial workspace and order it after the previous stream."""
         with self.lock:
             if self.in_use:
-                raise RuntimeError(
-                    "MegaMoe execution resources do not support concurrent calls."
-                )
+                raise RuntimeError("MegaMoe execution resources do not support concurrent calls.")
             if self.used:
                 torch.npu.current_stream().wait_event(self.completion_event)
             self.in_use = True
@@ -198,9 +189,7 @@ class MegaMoeWorkspace:
         """Record completion ordering and release the serial workspace lease."""
         with self.lock:
             if not self.in_use:
-                raise RuntimeError(
-                    "MegaMoe workspace was released without an active lease."
-                )
+                raise RuntimeError("MegaMoe workspace was released without an active lease.")
             self.completion_event.record(torch.npu.current_stream())
             self.in_use = False
             self.used = True
@@ -234,9 +223,7 @@ class MegaMoeWorkspace:
         """Synchronize, release all buffers, and reset the workspace."""
         with self.lock:
             if self.in_use:
-                raise RuntimeError(
-                    "cannot close MegaMoe workspace during an active call."
-                )
+                raise RuntimeError("cannot close MegaMoe workspace during an active call.")
             if self.expert_buffer is None and self.gmm_workspace is None:
                 return
         torch.npu.synchronize(self.device)

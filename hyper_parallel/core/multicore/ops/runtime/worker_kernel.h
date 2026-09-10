@@ -16,6 +16,7 @@
  *   - static constexpr uint32_t TILING_IDX  — index into input_list for tiling params
  *   - static constexpr uint32_t EVENT_IDX   — index into input_list for all_event_counters
  *   - void ExecuteComputeKernel(TaskDesc)    — op-specific task dispatch switch
+ *   - static constexpr uint32_t PROFILE_IDX — index into input_list for the ordinary profile buffer
  *
  * Compute kernels (ExecuteMatmul, ExecuteShmemPutMem, etc.) are NOT part of this class;
  * they belong in each op's worker_kernel.cpp.
@@ -26,6 +27,7 @@
 
 #include "kernel_operator.h"
 #include "runtime_config.hpp"
+#include "cycle_trace_recorder.h"
 
 using namespace AscendC;  // NOLINT(build/namespaces)
 
@@ -33,6 +35,10 @@ template <typename Derived>
 class KernelWorkerBase {
  public:
   __aicore__ inline KernelWorkerBase() {}
+
+  static constexpr uint32_t PROFILE_DESC_WAIT_DEPENDENCY = 0x10000;
+  static constexpr uint32_t PROFILE_DESC_TRIGGER_EVENT = 0x10007;
+  static constexpr uint32_t PROFILE_DESC_TASK_TYPE_BASE = 0x20000;
 
   __aicore__ inline void Init(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr, GM_ADDR *input_list) {
     this->worker_id_ = worker_id;
@@ -63,6 +69,16 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void Process() {
+    bool profile_enabled = isCycleProfileEnabled(this->runtimeConfigPtr);
+    if (profile_enabled) {
+      ProcessProfiled();
+      return;
+    }
+    ProcessFast();
+  }
+
+ protected:
+  __aicore__ inline void ProcessFast() {
 #ifdef __DAV_C220_CUBE__
     uint32_t block_idx = this->worker_id_;
     do {
@@ -70,7 +86,7 @@ class KernelWorkerBase {
         return;
       }
       TaskId task_index = GetTaskIndex(block_idx);
-      ExecuteTask(task_index);
+      ExecuteTaskFast(task_index);
       block_idx = block_idx + this->core_num;
     } while (1);
 #else
@@ -83,14 +99,45 @@ class KernelWorkerBase {
         return;
       }
       TaskId task_index = GetTaskIndex(block_idx);
-      ExecuteTask(task_index);
+      ExecuteTaskFast(task_index);
       uint32_t half_num = this->vector_num / 2;
       block_idx = block_idx + half_num;
     } while (1);
 #endif
   }
 
- protected:
+  __aicore__ inline void ProcessProfiled() {
+    CycleTraceRecorder cycle_trace_recorder;
+    cycle_trace_recorder.Init(this->worker_id_, this->input_list[Derived::PROFILE_IDX],
+                              getAicProfileRecordCapacity(this->runtimeConfigPtr),
+                              getAivProfileRecordCapacity(this->runtimeConfigPtr));
+#ifdef __DAV_C220_CUBE__
+    uint32_t block_idx = this->worker_id_;
+    do {
+      if (block_idx >= this->cube_task_num) {
+        return;
+      }
+      TaskId task_index = GetTaskIndex(block_idx);
+      ExecuteTaskProfiled(task_index, cycle_trace_recorder);
+      block_idx = block_idx + this->core_num;
+    } while (1);
+#else
+    if (this->worker_id_ % 2 == 0) {
+      return;
+    }
+    uint32_t block_idx = this->worker_id_ / 2;
+    do {
+      if (block_idx >= this->vector_task_num) {
+        return;
+      }
+      TaskId task_index = GetTaskIndex(block_idx);
+      ExecuteTaskProfiled(task_index, cycle_trace_recorder);
+      uint32_t half_num = this->vector_num / 2;
+      block_idx = block_idx + half_num;
+    } while (1);
+#endif
+  }
+
   __aicore__ inline TaskId GetTaskIndex(uint32_t task_id) {
 #ifdef __DAV_C220_CUBE__
     return cube_task_indexs.GetValue(task_id);
@@ -126,7 +173,7 @@ class KernelWorkerBase {
 #endif
   }
 
-  __aicore__ inline void ExecuteTask(TaskId task_id) {
+  __aicore__ inline void ExecuteTaskFast(TaskId task_id) {
     TaskDesc task_desc;
     getTaskDesc(this->runtimeConfigPtr, &(task_desc), task_id);
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
@@ -135,6 +182,35 @@ class KernelWorkerBase {
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
     if (task_desc.task_type != TASK_SHMEM_PUT_MEM_SIGNAL) {
       TriggerEvent(task_desc.trigger_event);
+    }
+  }
+
+  __aicore__ inline void ExecuteTaskProfiled(TaskId task_id, CycleTraceRecorder &cycle_trace_recorder) {
+    TaskDesc task_desc;
+    getTaskDesc(this->runtimeConfigPtr, &(task_desc), task_id);
+    uint32_t owner_id = getTaskProfileOwnerId(this->runtimeConfigPtr, task_id);
+    if (task_desc.dependent_event != EVENT_INVALID_ID) {
+      uint64_t wait_start_cycle = cycle_trace_recorder.Now();
+      WaitForDependency(task_desc.dependent_event);
+      uint64_t wait_end_cycle = cycle_trace_recorder.Now();
+      cycle_trace_recorder.Record(Derived::PROFILE_DESC_WAIT_DEPENDENCY, task_id, task_desc.task_index, owner_id,
+                                  wait_start_cycle, wait_end_cycle);
+    }
+    uint32_t profile_desc_id = getTaskProfileDescId(this->runtimeConfigPtr, task_id);
+    if (profile_desc_id == PROFILE_DESC_INVALID_ID) {
+      profile_desc_id = PROFILE_DESC_TASK_TYPE_BASE + static_cast<uint32_t>(task_desc.task_type);
+    }
+    uint64_t compute_start_cycle = cycle_trace_recorder.Now();
+    static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
+    uint64_t compute_end_cycle = cycle_trace_recorder.Now();
+    cycle_trace_recorder.Record(profile_desc_id, task_id, task_desc.task_index, owner_id, compute_start_cycle,
+                                compute_end_cycle);
+    if (task_desc.task_type != TASK_SHMEM_PUT_MEM_SIGNAL) {
+      uint64_t trigger_start_cycle = cycle_trace_recorder.Now();
+      TriggerEvent(task_desc.trigger_event);
+      uint64_t trigger_end_cycle = cycle_trace_recorder.Now();
+      cycle_trace_recorder.Record(Derived::PROFILE_DESC_TRIGGER_EVENT, task_id, task_desc.task_index, owner_id,
+                                  trigger_start_cycle, trigger_end_cycle);
     }
   }
 

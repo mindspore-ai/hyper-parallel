@@ -22,6 +22,7 @@ Combines:
 import ctypes
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Any
 
 
 # ── Constants (match runtime_head.hpp exactly) ────────────────────────────────
@@ -37,6 +38,9 @@ QUEUE_CAPACITY       = 100
 TASK_TYPE_INDEX_NUM  = 256 * 100
 MAX_GROUP_LIST       = 512
 ATOMIC_ADD_VALUE_LEN = 8
+INVALID_PROFILE_DESC_ID  = 0xFFFFFFFF
+INVALID_PROFILE_OWNER_ID = 0xFFFFFFFF
+EVENT_INVALID_ID         = 0xFFFFFFFF
 
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
@@ -108,9 +112,19 @@ class TaskDescC(ctypes.Structure):
         ("extra_value_0",        ctypes.c_uint32),
         ("extra_value_1",        ctypes.c_uint32),
         ("extra_value_2",        ctypes.c_uint32),
-        ("extra_value_3",        ctypes.c_uint32),
-        ("extra_value_4",        ctypes.c_uint32),
+        ("profile_desc_id",      ctypes.c_uint32),
+        ("profile_owner_id",     ctypes.c_uint32),
     ]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize optional profiling metadata to explicit invalid sentinels."""
+        has_profile_desc = len(args) >= len(self._fields_) - 1 or "profile_desc_id" in kwargs
+        has_profile_owner = len(args) >= len(self._fields_) or "profile_owner_id" in kwargs
+        super().__init__(*args, **kwargs)
+        if not has_profile_desc:
+            self.profile_desc_id = INVALID_PROFILE_DESC_ID
+        if not has_profile_owner:
+            self.profile_owner_id = INVALID_PROFILE_OWNER_ID
 
 
 class EventDescC(ctypes.Structure):
@@ -147,6 +161,9 @@ class RuntimeConfigC(ctypes.Structure):
         ("dynamic_data",              DynamicDataC),
         ("grouped_matmul_group_list", ctypes.c_int64   * MAX_GROUP_LIST),
         ("atomic_add_values",         ctypes.c_int32   * ATOMIC_ADD_VALUE_LEN),
+        ("cycle_profiling_enabled",   ctypes.c_uint32),
+        ("aic_profile_record_capacity", ctypes.c_uint32),
+        ("aiv_profile_record_capacity", ctypes.c_uint32),
     ]
 
 
