@@ -19,7 +19,7 @@ Users provide model code and parallel configuration.
 Framework automatically handles all parallel logic.
 """
 
-from typing import Any, Callable, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -331,15 +331,64 @@ class GraphTrainer:
             label_batch,
         )
 
-    def _accumulate_grads(self, grads):
-        """Accumulate gradients"""
-        params = [p for p in self.model.parameters() if p.requires_grad]
+    def _accumulate_grads(self, grads: List[torch.Tensor]) -> None:
+        """Accumulate graph-computed gradients into the live model's parameters.
 
-        for param, grad in zip(params, grads):
+        The graph emits gradients in ``state_fqns`` order (trainable
+        parameters only, shared parameters included once per FQN), which
+        diverges from ``model.parameters()`` (deduplicated) when the model
+        ties weights. Mapping by FQN keeps every gradient on the right
+        parameter; the count check refuses to assign on mismatch instead of
+        letting ``zip`` silently truncate.
+
+        Accumulation (not overwrite) keeps ``train_step`` composable: several
+        micro-batch steps may run before ``optimizer_step`` (which ends with
+        ``zero_grad``), so per-step grads must sum into ``param.grad``.
+        """
+        # ``state_is_param`` is attached to the traced GraphModule by
+        # ``trace_model_graph``, not to the JointGraph dataclass itself.
+        state_is_param = getattr(self._joint_graph.graph_module, "state_is_param", None)
+        fqn_to_param = dict(self.model.named_parameters(remove_duplicate=False))
+        trainable = self._trainable_params_in_state_order(
+            self._joint_graph.state_fqns, state_is_param, fqn_to_param
+        )
+        if len(trainable) != len(grads):
+            raise ValueError(
+                f"Gradient count ({len(grads)}) does not match trainable "
+                f"parameter count ({len(trainable)}). The traced graph and "
+                f"the live model disagree on which parameters are trainable; "
+                f"refusing to assign gradients to avoid silent misalignment."
+            )
+
+        for param, grad in zip(trainable, grads):
             if param.grad is None:
                 param.grad = grad
             else:
                 param.grad += grad
+
+    @staticmethod
+    def _trainable_params_in_state_order(
+        state_fqns: List[str],
+        state_is_param: Optional[List[bool]],
+        fqn_to_param: Dict[str, torch.nn.Parameter],
+    ) -> List[torch.nn.Parameter]:
+        """Return the live trainable parameters in the graph's state order.
+
+        Mirrors the tracer's gradient emission order (``state_fqns`` order,
+        parameters only, trainable only, shared parameters kept per FQN), so
+        gradient ``i`` belongs to the returned parameter ``i``. Buffers share
+        ``state_fqns`` but are absent from the parameter lookup; they are
+        skipped explicitly so a missing ``state_is_param`` flag (old traces)
+        degrades to parameter-only instead of raising KeyError.
+        """
+        trainable: List[torch.nn.Parameter] = []
+        for idx, fqn in enumerate(state_fqns):
+            if state_is_param is not None and not state_is_param[idx]:
+                continue
+            param = fqn_to_param.get(fqn)
+            if param is not None and param.requires_grad:
+                trainable.append(param)
+        return trainable
 
 
 __all__ = ["GraphTrainer"]

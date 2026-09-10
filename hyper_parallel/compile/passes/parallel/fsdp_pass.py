@@ -169,9 +169,7 @@ class FSDPPass(GraphPass):
         )
 
         if not param_nodes:
-            _LOG.warning(
-                "No FSDP parameters found, check PassPlan or model structure"
-            )
+            _LOG.warning("No FSDP parameters found, check PassPlan or model structure")
             return graph_module
 
         graph_module = self._insert_all_gather_for_params(graph_module, param_nodes)
@@ -222,11 +220,12 @@ class FSDPPass(GraphPass):
         treated as a parameter (previous behaviour).
 
         The dim-0 divisibility gate mirrors ``_shard_live_model_params``: a
-        parameter whose leading dim is not divisible by ``fsdp_degree`` stays
-        replicated on both sides. Skipping it here would make the graph expect
-        a sharded input (AllGather reshapes ``[N/world, ...] -> [N, ...]``)
-        while the live model still holds the full ``[N, ...]`` tensor, causing
-        a shape mismatch at ``run_traced_graph`` time.
+        parameter that is 0-dim (scalar) or whose leading dim is not divisible
+        by ``fsdp_degree`` stays replicated on both sides. Skipping it here
+        would make the graph expect a sharded input (AllGather reshapes
+        ``[N/world, ...] -> [N, ...]``) while the live model still holds the
+        full ``[N, ...]`` tensor, causing a shape mismatch at
+        ``run_traced_graph`` time.
         """
         param_nodes: List[fx.Node] = []
 
@@ -252,24 +251,23 @@ class FSDPPass(GraphPass):
 
             fqn = state_fqns[idx]
 
-            if (
-                self._pass_plan is not None
-                and not self._param_belongs_to_fsdp_module(fqn)
+            if self._pass_plan is not None and not self._param_belongs_to_fsdp_module(
+                fqn
             ):
                 continue
 
-            # Divisibility gate: must match ``_shard_live_model_params`` so the
-            # graph and the live model agree on which parameters are sharded.
+            # Same gate as ``_shard_live_model_params``: scalar params
+            # (empty shape) and non-divisible dim-0 params stay replicated,
+            # so the graph and the live model agree on which parameters are
+            # sharded.
             param = param_lookup.get(fqn)
-            if (
-                param is not None
-                and param.shape
-                and param.shape[0] % self._fsdp_degree != 0
+            if param is not None and (
+                not param.shape or param.shape[0] % self._fsdp_degree != 0
             ):
                 _LOG.info(
                     "Skip %s: dim 0 (%s) not divisible by fsdp_degree (%s)",
                     fqn,
-                    param.shape[0],
+                    param.shape[0] if param.shape else "scalar",
                     self._fsdp_degree,
                 )
                 continue
@@ -306,9 +304,8 @@ class FSDPPass(GraphPass):
             # gate here would shard params the graph still expects full-rank
             # (no AllGather inserted), causing a shape mismatch at
             # ``run_traced_graph`` time on any non-``*`` plan.
-            if (
-                self._pass_plan is not None
-                and not self._param_belongs_to_fsdp_module(name)
+            if self._pass_plan is not None and not self._param_belongs_to_fsdp_module(
+                name
             ):
                 _LOG.info(
                     "Skip %s: not in an FSDP-wrapped module",
