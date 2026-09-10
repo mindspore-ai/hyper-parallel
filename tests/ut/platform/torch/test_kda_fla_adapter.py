@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from hyper_parallel.platform.torch.custom_ops.kda import fla_adapter
+from hyper_parallel.components.functional import kimi_delta_attention_fla_adapter as fla_adapter
 
 
 @pytest.fixture(autouse=True)

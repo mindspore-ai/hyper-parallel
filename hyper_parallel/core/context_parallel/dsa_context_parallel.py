@@ -40,10 +40,9 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.context_parallel import utils
+from hyper_parallel.core.context_parallel.utils import Module
 
-platform = get_platform()
-Module = platform.Module
 
 
 _SUPPORTED_LAYOUTS = ("BSND", "TND")
@@ -60,7 +59,7 @@ def _move_dim_to_front(value: Any, dim: int) -> tuple[Any, list[int]]:
     return value.permute(order).contiguous(), inverse
 
 
-class _DSASequenceReplicateGradientBridge(platform.Function):
+class _DSASequenceReplicateGradientBridge(utils.Function):
     """Reuse one gathered forward value while preserving per-consumer backward."""
 
     @staticmethod
@@ -94,7 +93,7 @@ class _DSASequenceReplicateGradientBridge(platform.Function):
                 f"got {output_shape[0]} and CP size {ctx.world_size}."
             )
         output_shape[0] //= ctx.world_size
-        local_grad, work = platform.reduce_scatter_single(
+        local_grad, work = utils.reduce_scatter_single(
             grad_front, output_shape, ctx.group, async_op=False
         )
         if work is not None:
@@ -181,7 +180,7 @@ class DSASequenceReplicateCache:
 
 def _is_tensor_or_dtensor(value: Any) -> bool:
     """Return True for framework tensors and HyperParallel DTensors."""
-    return isinstance(value, DTensor) or platform.is_tensor(value)
+    return isinstance(value, DTensor) or utils.is_tensor(value)
 
 
 def _to_sequence_shard(value: Any, device_mesh: DeviceMesh, seq_dim: int) -> Any:
@@ -305,7 +304,7 @@ def _dtensor_to_local_reducing_partial(value: Any) -> Any:
 
 def _register_boundary_hooks(module: Module, pre_hook, use_local_output: bool, seq_dim: int) -> None:
     """Register a DSA boundary pre-hook and its public output conversion hook."""
-    platform.register_forward_pre_hook(module, pre_hook, with_kwargs=True)
+    utils.register_forward_pre_hook(module, pre_hook, with_kwargs=True)
     def _finalize_output_hook(hook_module, hook_args, outputs):
         del hook_args
         return _finalize_output(
@@ -690,7 +689,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
     def _local_shape(value: Any) -> Optional[tuple]:
         if isinstance(value, DTensor):
             return value.local_shape
-        if platform.is_tensor(value):
+        if utils.is_tensor(value):
             return value.shape
         return None
 
@@ -704,7 +703,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
 
         if isinstance(value, DTensor):
             value = _dtensor_to_local_reducing_partial(value)
-        if not platform.is_tensor(value):
+        if not utils.is_tensor(value):
             return value
 
         target_len = target_shape[self.seq_dim]
@@ -769,7 +768,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
     def _get_local_idx(cp_mesh: DeviceMesh) -> int:
         """Return current rank's index in the CP mesh rank list."""
         rank_list = list(cp_mesh.rank_list)
-        rank = platform.get_rank()
+        rank = utils.get_rank()
         return rank_list.index(rank) if rank in rank_list else 0
 
     def _apply_with_loss_specs(
@@ -800,7 +799,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
                     completion_fn()
             return tuple(new_args), new_kwargs
 
-        platform.register_forward_pre_hook(module, _pre_hook, with_kwargs=True)
+        utils.register_forward_pre_hook(module, _pre_hook, with_kwargs=True)
         module.register_forward_hook(lambda _module, _args, outputs: self._process_outputs(_module, outputs))
         return module
 

@@ -219,7 +219,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         work = object()
 
         with patch.object(
-                async_cp_module.platform,
+                async_cp_module.utils,
                 "all_to_all_single",
                 return_value=(out_perm, work),
                 create=True,
@@ -265,7 +265,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         out_perm = torch.empty(6, 2, 4)
         work = object()
         with patch.object(
-                async_cp_module.platform,
+                async_cp_module.utils,
                 "all_gather_single",
                 return_value=(out_perm, work),
                 create=True,
@@ -298,11 +298,11 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
             v_proj = nn.Identity()
 
             with patch.object(
-                    async_cp_module.platform,
+                    async_cp_module.utils,
                     "register_forward_pre_hook",
                     create=True,
             ) as mock_pre, patch.object(
-                    async_cp_module.platform,
+                    async_cp_module.utils,
                     "register_full_backward_pre_hook",
                     create=True,
             ) as mock_bwd:
@@ -330,8 +330,8 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         k_proj = nn.Identity()
         v_proj = nn.Identity()
 
-        with patch.object(async_cp_module.platform, "register_forward_pre_hook", create=True) as mock_pre, \
-                patch.object(async_cp_module.platform, "register_full_backward_pre_hook", create=True) as mock_bwd:
+        with patch.object(async_cp_module.utils, "register_forward_pre_hook", create=True) as mock_pre, \
+                patch.object(async_cp_module.utils, "register_full_backward_pre_hook", create=True) as mock_bwd:
             result = style.apply(
                 module,
                 _FakeTwoDMesh(),
@@ -545,7 +545,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         bwd_slot = []
 
         with patch.object(
-                async_cp_module.platform,
+                async_cp_module.utils,
                 "differentiable_async_a2a_wait",
                 return_value="waited",
                 create=True,
@@ -564,7 +564,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         mock_wait.assert_called_once_with(tensor, "work", "out", "group", 2, 1, 2, bwd_slot)
 
         with patch.object(
-                async_cp_module.platform,
+                async_cp_module.utils,
                 "differentiable_async_allgather_wait",
                 return_value="gathered",
                 create=True,

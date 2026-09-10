@@ -141,7 +141,7 @@ def _launch_kda_state_gradient_summary(
     block_size: int = 64,
 ) -> torch.Tensor:
     """Launch the reverse-wavefront Triton-Ascend summary kernel."""
-    from .triton.state_summary import (  # pylint: disable=import-outside-toplevel
+    from ._kda_triton.state_summary import (  # pylint: disable=import-outside-toplevel
         kda_state_grad_ext_kernel,
     )
 
@@ -202,7 +202,7 @@ def _launch_kda_mixed_state_summary(
     chunk_size: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build ``S_ext`` and ``M`` in compile-time-separated BV=128 modes."""
-    from .triton.state_summary import (  # pylint: disable=import-outside-toplevel
+    from ._kda_triton.state_summary import (  # pylint: disable=import-outside-toplevel
         kda_split_state_summary_kernel,
     )
 

@@ -19,7 +19,7 @@ from typing import Optional
 import torch
 import triton
 
-from .triton.state_summary import (
+from ._gdn_triton.state_summary import (
     gdn_packed_state_summary_kernel,
     gdn_state_grad_ext_kernel,
 )

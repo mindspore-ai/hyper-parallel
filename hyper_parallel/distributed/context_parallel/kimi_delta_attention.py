@@ -748,7 +748,7 @@ class KimiDeltaAttentionP2PCP(nn.Module):
                 cp_size=self.cp_size,
             )
 
-        from hyper_parallel.platform.torch.custom_ops.kda.chunk_kda import (  # pylint: disable=import-outside-toplevel
+        from hyper_parallel.components.functional.kimi_delta_attention import (  # pylint: disable=import-outside-toplevel
             fused_chunk_kda_p2p,
         )
         return fused_chunk_kda_p2p(

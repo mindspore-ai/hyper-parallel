@@ -34,10 +34,9 @@ from hyper_parallel.core.context_parallel.dsa_context_parallel import (
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.context_parallel import utils
+from hyper_parallel.core.context_parallel.utils import Module
 
-platform = get_platform()
-Module = platform.Module
 
 
 class _AsyncSequenceReplicateSlot:
@@ -103,7 +102,7 @@ class _AsyncSequenceReplicateSlot:
             return self._producer_bwd_pre_hook(grad_output, bwd_slot)
 
         module.register_forward_hook(_post_hook)
-        platform.register_full_backward_pre_hook(module, _backward_pre_hook)
+        utils.register_full_backward_pre_hook(module, _backward_pre_hook)
 
     def _producer_bwd_pre_hook(self, grad_output: Any, bwd_slot: list) -> Any:
         """Wait deferred reduce-scatter before gradients cross the producer boundary."""
@@ -121,7 +120,7 @@ class _AsyncSequenceReplicateSlot:
         if not _is_tensor_or_dtensor(value):
             return
         local = self._local_tensor(value)
-        if not platform.is_tensor(local):
+        if not utils.is_tensor(local):
             return
         if self.world_size <= 1:
             self._slots.setdefault(slot_name, []).append(self._make_slot(value, local, None, None))
@@ -144,9 +143,9 @@ class _AsyncSequenceReplicateSlot:
             if work is None:
                 return self._wrap_gathered(local, item)
             graph_local = self._local_tensor(value)
-            if not platform.is_tensor(graph_local):
+            if not utils.is_tensor(graph_local):
                 graph_local = local
-            gathered = platform.differentiable_async_allgather_wait(
+            gathered = utils.differentiable_async_allgather_wait(
                 graph_local,
                 work,
                 out_perm,

@@ -4,7 +4,8 @@ include README.en.md
 include LICENSE
 include build.sh
 include hyper_parallel/data/indexed/csrc/Makefile
-include hyper_parallel/platform/torch/custom_ops/kda/README.md
+include hyper_parallel/components/functional/GDN_LICENSE
+include hyper_parallel/components/functional/KDA_README.md
 recursive-include scripts *.py *.sh *.json
 recursive-include hyper_parallel *.sh *.bash *.cpp *.cc *.h *.hpp *.cmake CMakeLists.txt *.patch *.json *.yaml *.ini *.md *.txt
 prune build
