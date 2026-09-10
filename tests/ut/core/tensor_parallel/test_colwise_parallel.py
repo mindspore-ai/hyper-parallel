@@ -146,18 +146,13 @@ class TestColwiseParallelApply(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_linear_calls_distribute_module(self, mock_style_platform, mock_mesh_platform):
+    def test_apply_linear_calls_distribute_module(self, mock_mesh_platform):
         """
         Feature: ColwiseParallel.apply on Linear module
         Description: apply ColwiseParallel to nn.Linear with mocked distribute_module
         Expectation: distribute_module is called with correct partition_fn, input_fn, output_fn
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.is_linear_module.return_value = True
-        mock_style_platform.is_embedding_module.return_value = False
-        mock_style_platform.Module = nn.Module
-
         style = ColwiseParallel()
         module = nn.Linear(8, 8)
 
@@ -171,20 +166,13 @@ class TestColwiseParallelApply(unittest.TestCase):
             self.assertIs(result, module)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_linear_invokes_distribute_module_callbacks(
-        self, mock_style_platform, mock_mesh_platform
-    ):
+    def test_apply_linear_invokes_distribute_module_callbacks(self, mock_mesh_platform):
         """
         Feature: ColwiseParallel.apply registers callable hooks on distribute_module
         Description: capture partition_fn, input_fn, output_fn and invoke them for Linear
         Expectation: partition_fn runs _partition_linear_fn; I/O fns return without error
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.is_linear_module.return_value = True
-        mock_style_platform.is_embedding_module.return_value = False
-        mock_style_platform.Module = nn.Module
-
         style = ColwiseParallel()
         module = nn.Linear(4, 4)
 
@@ -205,18 +193,13 @@ class TestColwiseParallelApply(unittest.TestCase):
             self.assertEqual(out, "out")
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_embedding_calls_distribute_module(self, mock_style_platform, mock_mesh_platform):
+    def test_apply_embedding_calls_distribute_module(self, mock_mesh_platform):
         """
         Feature: ColwiseParallel.apply on Embedding module
         Description: apply ColwiseParallel to nn.Embedding with mocked distribute_module
         Expectation: distribute_module is called once
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.is_linear_module.return_value = False
-        mock_style_platform.is_embedding_module.return_value = True
-        mock_style_platform.Module = nn.Module
-
         style = ColwiseParallel()
         module = nn.Embedding(100, 64)
 
@@ -227,20 +210,13 @@ class TestColwiseParallelApply(unittest.TestCase):
             self.assertIs(result, module)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_embedding_invokes_partition_fn(
-        self, mock_style_platform, mock_mesh_platform
-    ):
+    def test_apply_embedding_invokes_partition_fn(self, mock_mesh_platform):
         """
         Feature: ColwiseParallel.apply partition_fn for Embedding
         Description: invoke captured partition_fn after apply on Embedding module
         Expectation: _partition_embedding_fn is called once
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.is_linear_module.return_value = False
-        mock_style_platform.is_embedding_module.return_value = True
-        mock_style_platform.Module = nn.Module
-
         style = ColwiseParallel()
         module = nn.Embedding(8, 4)
 
@@ -253,18 +229,13 @@ class TestColwiseParallelApply(unittest.TestCase):
             mock_partition.assert_called_once_with(module, mesh)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_unsupported_module_raises(self, mock_style_platform, mock_mesh_platform):
+    def test_apply_unsupported_module_raises(self, mock_mesh_platform):
         """
         Feature: ColwiseParallel.apply rejects unsupported module types
         Description: apply ColwiseParallel to nn.LayerNorm
         Expectation: raises NotImplementedError mentioning supported types
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.is_linear_module.return_value = False
-        mock_style_platform.is_embedding_module.return_value = False
-        mock_style_platform.Module = nn.Module
-
         style = ColwiseParallel()
         module = nn.LayerNorm(8)
 

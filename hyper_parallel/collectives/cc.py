@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Distributed process group API"""
+"""PyTorch distributed process group API."""
 from datetime import timedelta
-from typing import Optional, Any, Union
+from typing import Any, Optional, Union
 
-from hyper_parallel import get_platform
+import torch.distributed as dist
+from torch.distributed import ProcessGroup
 
-platform = get_platform()
+
+_EXISTING_COMM_GROUPS: dict[str, ProcessGroup] = {}
+
+
+def _group_key(ranks: list[int]) -> str:
+    """Build a stable cache key from process-group ranks."""
+    return str(tuple(sorted(ranks)))
 
 
 def init_process_group(
@@ -45,24 +52,36 @@ def init_process_group(
         pg_options: Process group options for backend-specific configurations
         device_id: Specific device this process will work on
     """
-    platform.init_process_group(backend=backend, init_method=init_method, timeout=timeout, world_size=world_size,
-                                rank=rank, store=store, pg_options=pg_options, device_id=device_id)
+    dist.init_process_group(
+        backend=backend,
+        init_method=init_method,
+        timeout=timeout,
+        world_size=world_size,
+        rank=rank,
+        store=store,
+        pg_options=pg_options,
+        device_id=device_id,
+    )
 
 
-def destroy_process_group(group=None) -> None:
+def destroy_process_group(group: Optional[ProcessGroup] = None) -> None:
     """
     Destroy a given process group.
 
     Args:
         group: The process group to be destroyed. If None, destroys the default group.
 
-    Raises:
-        NotImplementedError: This method must be implemented by subclasses
     """
-    platform.destroy_process_group(group=group)
+    if group is None:
+        _EXISTING_COMM_GROUPS.clear()
+    else:
+        keys_to_destroy = [key for key, cached_group in _EXISTING_COMM_GROUPS.items() if cached_group == group]
+        for key in keys_to_destroy:
+            del _EXISTING_COMM_GROUPS[key]
+    dist.destroy_process_group(group)
 
 
-def get_process_group_ranks(group=None) -> list[int]:
+def get_process_group_ranks(group: Optional[ProcessGroup] = None) -> list[int]:
     """
     Get rank list of the given process group.
 
@@ -72,13 +91,12 @@ def get_process_group_ranks(group=None) -> list[int]:
     Returns:
         List of ranks in the specified process group.
 
-    Raises:
-        NotImplementedError: This method must be implemented by subclasses
     """
-    return platform.get_process_group_ranks(group=group)
+    resolved_group = group if group is not None else dist.group.WORLD
+    return dist.get_process_group_ranks(resolved_group)
 
 
-def get_backend(group=None):
+def get_backend(group: Optional[ProcessGroup] = None) -> str:
     """
     Get the backend of the given process group.
     Args:
@@ -87,38 +105,50 @@ def get_backend(group=None):
     Returns:
         The backend name of the specified process group.
 
-    Raises:
-        NotImplementedError: This method must be implemented by subclasses
     """
-    return platform.get_backend(group=group)
+    return dist.get_backend(group)
 
 
-def split_group(parent_pg: Any = None,
+def split_group(parent_pg: Optional[ProcessGroup] = None,
                 split_ranks: Optional[list] = None,
                 timeout: Optional[timedelta] = None,
                 pg_options: Optional[Any] = None,
                 group_desc: Optional[str] = None,
-                ) -> Any:
+                ) -> Optional[ProcessGroup]:
     """
     Create split group relative to the parent process group.
     """
-    return platform.split_group(parent_pg=parent_pg, split_ranks=split_ranks, timeout=timeout, pg_options=pg_options,
-                                group_desc=group_desc)
+    del parent_pg, timeout, pg_options, group_desc
+    if not split_ranks:
+        raise ValueError("split_ranks cannot be None or empty")
+
+    current_rank = dist.get_rank()
+    current_group = None
+    for ranks in split_ranks:
+        key = _group_key(ranks)
+        group = _EXISTING_COMM_GROUPS.get(key)
+        if group is None:
+            group = dist.new_group(ranks=ranks)
+            _EXISTING_COMM_GROUPS[key] = group
+        if current_rank in ranks:
+            current_group = group
+    return current_group
 
 
-def get_group_local_rank(group=None) -> int:
+def get_group_local_rank(group: Optional[ProcessGroup] = None) -> int:
     """get group local rank id"""
-    return platform.get_group_local_rank(group=group)
+    return dist.get_rank(group)
 
 
-def mark_created_groups(process_group: Union[Any, list[Any]]):
+def mark_created_groups(process_group: Union[ProcessGroup, list[ProcessGroup]]) -> None:
     """
     mark created groups
 
     Args:
         process_group (Union[Any, list[Any]]): A process group or a list of process groups.
 
-    Returns:
-        group corresponding to rank list if it exists, else None
     """
-    return platform.mark_created_groups(process_group=process_group)
+    groups = process_group if isinstance(process_group, list) else [process_group]
+    for group in groups:
+        ranks = dist.get_process_group_ranks(group)
+        _EXISTING_COMM_GROUPS[_group_key(ranks)] = group

@@ -118,18 +118,13 @@ class TestSequenceParallelApply(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_layernorm_calls_distribute_module(
-        self, mock_style_platform, mock_mesh_platform
-    ):
+    def test_apply_layernorm_calls_distribute_module(self, mock_mesh_platform):
         """
         Feature: SequenceParallel.apply on LayerNorm
         Description: mock distribute_module
         Expectation: distribute_module called once; returns module from mock
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.Module = nn.Module
-
         style = SequenceParallel()
         module = nn.LayerNorm(8)
 
@@ -140,18 +135,13 @@ class TestSequenceParallelApply(unittest.TestCase):
             self.assertIs(result, module)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_invokes_distribute_module_callbacks(
-        self, mock_style_platform, mock_mesh_platform
-    ):
+    def test_apply_invokes_distribute_module_callbacks(self, mock_mesh_platform):
         """
         Feature: SequenceParallel.apply registers partition/input/output callbacks
         Description: invoke callbacks captured from mocked distribute_module
         Expectation: partition_fn is no-op; input_fn/output_fn delegate to static helpers
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.Module = nn.Module
-
         style = SequenceParallel(sequence_dim=1)
         module = nn.LayerNorm(8)
 

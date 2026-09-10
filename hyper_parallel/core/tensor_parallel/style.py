@@ -22,6 +22,9 @@ Provides :class:`ParallelStyle` (ABC) and concrete implementations
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Tuple, Union
 
+import torch
+from torch import nn
+
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
     DTensor,
@@ -33,10 +36,13 @@ from hyper_parallel.core.dtensor.dtensor import (
     _distribute_module_set_param,
 )
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Replicate, Shard
-from hyper_parallel.platform import get_platform
 
-platform = get_platform()
-Module = platform.Module
+
+def _cast_fp_tensor(dtype: torch.dtype, tensor: torch.Tensor) -> torch.Tensor:
+    """Cast a floating-point tensor to ``dtype`` while preserving other tensors."""
+    if not torch.is_floating_point(tensor) or tensor.dtype == dtype:
+        return tensor
+    return tensor.to(dtype)
 
 
 def _src_data_rank_for_tensor(tensor: Any, src_data_rank: Optional[int]) -> Optional[int]:
@@ -72,7 +78,7 @@ class ParallelStyle(ABC):
     src_data_rank: Optional[int] = 0
 
     @abstractmethod
-    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+    def apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         """Apply this parallel style to *module* in-place and return it.
 
         Args:
@@ -87,8 +93,7 @@ class ParallelStyle(ABC):
 class ColwiseParallel(ParallelStyle):
     """Partition a compatible module in a column-wise fashion.
 
-    Currently supports Linear and Embedding modules (framework-agnostic via
-    ``platform.is_linear_module`` / ``platform.is_embedding_module``).
+    Currently supports PyTorch ``Linear`` and ``Embedding`` modules.
     Compose with :class:`RowwiseParallel` to shard MLP or Attention blocks.
 
     Keyword Args:
@@ -205,7 +210,7 @@ class ColwiseParallel(ParallelStyle):
             return outputs.to_local()
         return outputs
 
-    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+    def apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         """Apply column-wise parallelism to *module*.
 
         Args:
@@ -218,12 +223,12 @@ class ColwiseParallel(ParallelStyle):
         Raises:
             NotImplementedError: If *module* is not a supported type.
         """
-        if platform.is_linear_module(module):
+        if isinstance(module, nn.Linear):
 
             def partition_fn(submodule_path, submodule, device_mesh):
                 self._partition_linear_fn(submodule, device_mesh)
 
-        elif platform.is_embedding_module(module):
+        elif isinstance(module, nn.Embedding):
 
             def partition_fn(submodule_path, submodule, device_mesh):
                 self._partition_embedding_fn(submodule, device_mesh)
@@ -261,8 +266,7 @@ class ColwiseParallel(ParallelStyle):
 class RowwiseParallel(ParallelStyle):
     """Partition a compatible module in a row-wise fashion.
 
-    Currently supports Linear and Embedding modules (framework-agnostic via
-    ``platform.is_linear_module`` / ``platform.is_embedding_module``).
+    Currently supports PyTorch ``Linear`` and ``Embedding`` modules.
     Compose with :class:`ColwiseParallel` to shard MLP or Attention blocks.
 
     Keyword Args:
@@ -374,14 +378,14 @@ class RowwiseParallel(ParallelStyle):
         use_local_output: bool,
         outputs: Any,
         device_mesh: DeviceMesh,
-        module: Optional[Module] = None,
+        module: Optional[nn.Module] = None,
         reduce_dtype: Optional[Any] = None,
     ) -> Any:
         """Redistribute partial output and optionally convert to local."""
         if not isinstance(outputs, DTensor):
             # ``nn.Embedding.forward`` returns a plain tensor even when weight is sharded;
             # treat the local values as partial along the TP mesh (sum) before redistributing.
-            if module is not None and platform.is_embedding_module(module):
+            if module is not None and isinstance(module, nn.Embedding):
                 outputs = DTensor.from_local(outputs, device_mesh, [Partial("sum")])
             else:
                 raise TypeError(
@@ -389,7 +393,7 @@ class RowwiseParallel(ParallelStyle):
                     f"got {type(outputs)}. If this is an unsupported module, extend I/O hooks."
                 )
         if reduce_dtype is not None and tuple(outputs.placements) != tuple(output_layouts):
-            local_output = platform.cast_fp_tensor(reduce_dtype, outputs.to_local())
+            local_output = _cast_fp_tensor(reduce_dtype, outputs.to_local())
             outputs = DTensor.from_local(local_output, outputs.device_mesh, outputs.placements)
         if tuple(outputs.placements) != tuple(output_layouts):
             outputs = outputs.redistribute(device_mesh, output_layouts)
@@ -397,7 +401,7 @@ class RowwiseParallel(ParallelStyle):
             return outputs.to_local()
         return outputs
 
-    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+    def apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         """Apply row-wise parallelism to *module*.
 
         Args:
@@ -410,13 +414,13 @@ class RowwiseParallel(ParallelStyle):
         Raises:
             NotImplementedError: If *module* is not a supported type.
         """
-        if platform.is_linear_module(module):
+        if isinstance(module, nn.Linear):
 
             def partition_fn(submodule_path, submodule, device_mesh):
                 self._partition_linear_fn(submodule, device_mesh)
 
             self.desired_input_layouts = (Shard(-1),)
-        elif platform.is_embedding_module(module):
+        elif isinstance(module, nn.Embedding):
 
             def partition_fn(submodule_path, submodule, device_mesh):
                 self._partition_embedding_fn(submodule, device_mesh)
@@ -504,7 +508,7 @@ class SequenceParallel(ParallelStyle):
     @staticmethod
     def _prepare_input_fn(
         sequence_sharding: Tuple[Placement, ...],
-        mod: Module,
+        mod: nn.Module,
         inputs: Any,
         device_mesh: DeviceMesh,
     ) -> Any:
@@ -513,7 +517,7 @@ class SequenceParallel(ParallelStyle):
         if isinstance(input_tensor, DTensor):
             if tuple(input_tensor.placements) != tuple(sequence_sharding):
                 input_tensor = input_tensor.redistribute(device_mesh, sequence_sharding)
-        elif platform.is_tensor(input_tensor):
+        elif torch.is_tensor(input_tensor):
             input_tensor = DTensor.from_local(input_tensor, device_mesh, sequence_sharding)
         else:
             raise ValueError(
@@ -527,7 +531,7 @@ class SequenceParallel(ParallelStyle):
             return outputs.to_local()
         return outputs
 
-    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+    def apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         """Apply sequence-parallel hooks and replicate parameters via ``distribute_module``.
 
         Args:
@@ -633,7 +637,7 @@ class PrepareModuleInput(ParallelStyle):
             if isinstance(input_obj, DTensor):
                 dt_inp = input_obj
             else:
-                if not platform.is_tensor(input_obj):
+                if not torch.is_tensor(input_obj):
                     raise AssertionError("expecting input to be a framework tensor!")
                 dt_inp = DTensor.from_local(input_obj, mesh, (input_layout,))
 
@@ -677,21 +681,19 @@ class PrepareModuleInput(ParallelStyle):
             )
         return (prepared_arg_inputs, prepared_kwarg_inputs)
 
-    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+    def apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         if self.with_kwargs:
 
             def _pre_hook(_mod, inputs, kwargs):
                 return self._prepare_input_kwarg_fn(inputs, kwargs, device_mesh)
 
-            platform.register_forward_pre_hook(
-                module, _pre_hook, prepend=False, with_kwargs=True,
-            )
+            module.register_forward_pre_hook(_pre_hook, prepend=False, with_kwargs=True)
         else:
 
             def _pre_hook(_mod, inputs):
                 return self._prepare_input_fn(inputs, device_mesh)
 
-            platform.register_forward_pre_hook(module, _pre_hook, prepend=False)
+            module.register_forward_pre_hook(_pre_hook, prepend=False)
         return module
 
     def __repr__(self) -> str:
@@ -767,7 +769,7 @@ class PrepareModuleOutput(ParallelStyle):
                     and has_partial_output
                     and out_layout != desired_out_layout
                 ):
-                    local_out = platform.cast_fp_tensor(self.reduce_dtype, dt_out.to_local())
+                    local_out = _cast_fp_tensor(self.reduce_dtype, dt_out.to_local())
                     dt_out = DTensor.from_local(local_out, dt_out.device_mesh, dt_out.placements)
                 if out_layout != desired_out_layout:
                     dt_out = dt_out.redistribute(device_mesh, (desired_out_layout,))
@@ -780,7 +782,7 @@ class PrepareModuleOutput(ParallelStyle):
             return prepared_outputs[0]
         return tuple(prepared_outputs)
 
-    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+    def apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
 
         def _hook(_mod, _inputs, outputs):
             return self._prepare_out_fn(outputs, device_mesh)
@@ -835,7 +837,7 @@ class PrepareModuleInputOutput(ParallelStyle):
             use_local_output=use_local_output,
         )
 
-    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+    def apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         self.prepare_module_input.apply(module, device_mesh)
         self.prepare_module_output.apply(module, device_mesh)
         return module
@@ -984,11 +986,11 @@ class NoParallel(ParallelStyle):
             return outputs.to_local()
         return outputs
 
-    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+    def apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         """Apply no-parallel style: replicate params/buffers and attach I/O hooks.
 
         Args:
-            module: Any ``nn.Module`` or MindSpore ``Cell`` to wrap.
+            module: PyTorch ``nn.Module`` to wrap.
             device_mesh: 1-D device mesh for tensor parallelism.
 
         Returns:

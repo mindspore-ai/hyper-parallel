@@ -34,8 +34,6 @@ def _replace_with_mc2_linear(
     sequence_dim: int,
 ) -> MC2Linear:
     """Replace ``nn.Linear`` with configured ``MC2Linear`` in place."""
-    # Torch-only check: get_platform() is a process singleton and mixed UT may
-    # already have cached MindSpore, whose is_linear_module rejects nn.Linear.
     if not isinstance(module, nn.Linear):
         raise NotImplementedError(
             f"MC2 parallel style only supports Linear modules, but got {type(module).__name__}."

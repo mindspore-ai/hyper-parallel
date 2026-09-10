@@ -22,7 +22,6 @@ from torch import nn
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-import hyper_parallel.platform.platform as plat_mod
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.tensor_parallel.mc2 import (
     AllGatherMatmulFunction,
@@ -207,26 +206,12 @@ class TestMC2StyleApply(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             style.apply(nn.Embedding(10, 4), _FakeMesh())
 
-    def test_mc2_apply_works_when_platform_cache_is_mindspore(self):
-        """
-        Feature: MC2 apply does not depend on get_platform() singleton
-        Description: cache a MindSpore-like platform that rejects torch.nn.Linear
-        Expectation: MC2ColwiseParallel.apply still replaces nn.Linear
-        """
-        class _MindSporeLikePlatform:
-            @staticmethod
-            def is_linear_module(module):
-                return type(module).__name__ == "Dense"
-
+    def test_mc2_apply_uses_pytorch_linear_type(self):
+        """MC2 conversion recognizes ``torch.nn.Linear`` directly."""
         style = MC2ColwiseParallel(input_layouts=Shard(0), use_local_output=False)
         linear = nn.Linear(4, 8, bias=False)
-        previous = plat_mod.platform
-        plat_mod.platform = _MindSporeLikePlatform()
-        try:
-            with patch.object(ColwiseParallel, "apply", lambda self, module, device_mesh: module):
-                result = style.apply(linear, _FakeMesh())
-        finally:
-            plat_mod.platform = previous
+        with patch.object(ColwiseParallel, "apply", lambda self, module, device_mesh: module):
+            result = style.apply(linear, _FakeMesh())
 
         self.assertIsInstance(result, MC2Linear)
         self.assertEqual(result.mc2_mode, "all_gather")

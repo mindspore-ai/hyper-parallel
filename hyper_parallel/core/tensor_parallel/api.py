@@ -20,21 +20,17 @@ from contextlib import contextmanager
 from fnmatch import fnmatch
 from typing import Iterator, Optional, Union
 
+from torch import nn
+
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _mesh_resources
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
-from hyper_parallel.platform import get_platform
-
-platform = get_platform()
-Module = platform.Module
 
 __all__ = ["parallelize_module"]
 
 
-def _named_children(module: Module):
-    """Immediate child modules: PyTorch ``nn.Module.named_children`` or MindSpore ``Cell.name_cells``."""
-    if hasattr(module, "named_children"):
-        return module.named_children()
-    return module.name_cells().items()
+def _named_children(module: nn.Module):
+    """Return the immediate named children of a PyTorch module."""
+    return module.named_children()
 
 
 @contextmanager
@@ -58,12 +54,12 @@ def _validate_tp_mesh_dim(device_mesh: DeviceMesh) -> None:
 
 
 def parallelize_module(  # type: ignore[return]
-    module: Module,
+    module: nn.Module,
     device_mesh: Optional[DeviceMesh] = None,
     parallelize_plan: Optional[Union[ParallelStyle, dict[str, ParallelStyle]]] = None,
     *,
     src_data_rank: Optional[int] = 0,
-) -> Module:
+) -> nn.Module:
     """Apply parallel styles to *module* or submodules (PyTorch-compatible interface).
 
     Behaviour follows ``torch.distributed.tensor.parallel.parallelize_module``:
@@ -113,7 +109,7 @@ def parallelize_module(  # type: ignore[return]
     if isinstance(parallelize_plan, dict):
 
         def _apply_path(
-            current_module: Module,
+            current_module: nn.Module,
             atoms: list[str],
             style: ParallelStyle,
             src_rank: Optional[int],

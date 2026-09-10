@@ -45,9 +45,6 @@ from torch import nn
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard
-from hyper_parallel.platform import get_platform
-
-platform = get_platform()
 
 __all__ = [
     "get_hcomm_info",
@@ -117,7 +114,7 @@ def _move_front_to_dim(tensor: torch.Tensor, dim: int) -> torch.Tensor:
     return tensor.permute(*order).contiguous()
 
 
-class AllGatherMatmulFunction(platform.Function):
+class AllGatherMatmulFunction(torch.autograd.Function):
     """Column-parallel fused all-gather + matmul with custom backward.
 
     Forward (local view): ``out = AllGather_m(x) @ w^T``.
@@ -171,7 +168,7 @@ class AllGatherMatmulFunction(platform.Function):
         return grad_x, grad_w, None, None, grad_bias
 
 
-class MatmulReduceScatterFunction(platform.Function):
+class MatmulReduceScatterFunction(torch.autograd.Function):
     """Row-parallel fused matmul + reduce-scatter with custom backward.
 
     Forward (local view): ``out = ReduceScatter_m(x @ w^T)``.
