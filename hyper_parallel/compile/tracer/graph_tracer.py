@@ -150,6 +150,10 @@ class JointGraph:
     """
 
     graph_module: torch.fx.GraphModule
+    # Storage-free descriptors of the tracing-time user inputs (shape/dtype
+    # for tensors) via ``_input_meta``. Real sample tensors are deliberately
+    # not kept: they would pin their storage for the whole training run. The
+    # FakeTensor counterparts live in ``example_inputs``.
     inputs: List[Any]
     outputs: List[Any]
     param_names: List[str]
@@ -244,6 +248,25 @@ def _fakeify_input(fake_mode: FakeTensorMode, x: Any) -> Any:
     if not isinstance(x, torch.Tensor):
         return x
     return fake_mode.from_tensor(x, static_shapes=False)
+
+
+def _input_meta(x: Any) -> Any:
+    """Return a storage-free descriptor of a traced user input.
+
+    Tensors become shape/dtype metadata; primitives pass through; pytree
+    containers (list/tuple/dict) are converted recursively. Used for
+    ``JointGraph.inputs`` so the joint graph never pins the real sample
+    tensors' storage for the lifetime of training.
+    """
+    if isinstance(x, torch.Tensor):
+        return {"shape": tuple(x.shape), "dtype": str(x.dtype)}
+    if isinstance(x, tuple):
+        return tuple(_input_meta(v) for v in x)
+    if isinstance(x, list):
+        return [_input_meta(v) for v in x]
+    if isinstance(x, dict):
+        return {k: _input_meta(v) for k, v in x.items()}
+    return x
 
 
 def trace_model_graph(
@@ -379,7 +402,7 @@ def trace_model_graph(
 
     return JointGraph(
         graph_module=traced_graph,
-        inputs=[sample_input, sample_label],
+        inputs=[_input_meta(sample_input), _input_meta(sample_label)],
         outputs=[],
         param_names=param_names,
         param_shapes=param_shapes,
