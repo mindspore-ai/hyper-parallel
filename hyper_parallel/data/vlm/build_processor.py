@@ -19,21 +19,26 @@ from typing import Any
 from transformers import AutoProcessor
 
 
-def build_processor(pretrained_model_name_or_path: str, **kwargs: Any) -> Any:
-    """Build the Qwen3-VL processor and surface the tokenizer chat template.
+def build_processor(pretrained_model_name_or_path: str, *, trust_remote_code: bool = True, **kwargs: Any) -> Any:
+    """Build the VLM processor and surface the tokenizer chat template.
 
     Base checkpoints (e.g. Qwen3.5-0.8B-Base) carry the chat template on the
     tokenizer but not on the processor; fall back when the processor lacks one.
 
     Args:
         pretrained_model_name_or_path: Model identifier or local processor path.
+        trust_remote_code: Whether to load the repo's remote-code processor
+            (default True for backward compatibility). Models natively
+            registered in transformers (e.g. ``kimi_k25``) must pass False so
+            the native processor/``image_grid_thw`` protocol is used instead of
+            the remote-code ``grid_thws`` protocol.
         **kwargs: Options forwarded to ``AutoProcessor.from_pretrained``.
 
     Returns:
         The constructed processor.
     """
     processor = AutoProcessor.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=True, **kwargs
+        pretrained_model_name_or_path, trust_remote_code=trust_remote_code, **kwargs
     )
     if getattr(processor, "chat_template", None) is None:
         tokenizer_chat_template = getattr(

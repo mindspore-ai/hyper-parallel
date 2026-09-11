@@ -227,17 +227,17 @@ class FSDP2Manager:
         """Find transformer blocks under HF gradient-checkpointing containers."""
         wrap_modules = []
         wrapped_module_ids = set()
+        module_id_to_fqn = {id(module): fqn for fqn, module in model.named_modules()}
         for container_fqn, container in model.named_modules():
             if id(container) in wrapped_module_ids:
                 continue
             if not hasattr(container, "gradient_checkpointing"):
                 continue
-            for child_name, child in container.named_children():
+            for _, child in container.named_children():
                 blocks = list(child.children())
                 if not blocks:
                     continue
-                child_fqn = f"{container_fqn}.{child_name}" if container_fqn else child_name
-                for block_index, block in enumerate(blocks):
+                for block in blocks:
                     if id(block) in wrapped_module_ids:
                         continue
                     wrapped_module_ids.add(id(block))
@@ -246,9 +246,14 @@ class FSDP2Manager:
                         # The wrapper and its direct child represent one logical
                         # transformer block during module-tree traversal.
                         wrapped_module_ids.add(id(wrapped_module))
-                    wrap_modules.append(
-                        _WrapModuleInfo(f"{child_fqn}.{block_index}", block)
-                    )
+                    # Use the block's real module FQN (children may be named
+                    # attributes such as "q_proj" rather than ModuleList
+                    # indices; an index-composed FQN breaks owner resolution
+                    # and the FSDP source-shard-info validation under TP).
+                    real_fqn = module_id_to_fqn.get(id(block))
+                    if real_fqn is None:
+                        continue
+                    wrap_modules.append(_WrapModuleInfo(real_fqn, block))
         return wrap_modules, wrapped_module_ids
 
     def _find_expert_wrap_modules(

@@ -76,7 +76,12 @@ class VLMTrainer:
         if processor_path is None:
             self.base.processor = None
         else:
-            self.base.processor = build_processor(processor_path)
+            self.base.processor = build_processor(
+                processor_path,
+                trust_remote_code=bool(
+                    getattr(config.model, "trust_remote_code", True)
+                ),
+            )
         self.base.tokenizer = getattr(self.base.processor, "tokenizer", None)
         self.base.chat_template = None
 

@@ -399,6 +399,45 @@ def _get_total_norm(
     return total_p ** (1.0 / norm_type)
 
 
+def _accelerator_device() -> torch.device:
+    """Return the local accelerator device, preferring NPU over CUDA.
+
+    Under FSDP CPU offload the per-rank gradients (and hence norm scalars)
+    live on the CPU while their reduction groups use the accelerator
+    backend (hccl/nccl); the scalars are temporarily moved to this device
+    for the collectives.
+    """
+    for device_type in ("npu", "cuda"):
+        handle = getattr(torch, device_type, None)
+        if handle is not None and handle.is_available():
+            try:
+                return torch.device(device_type, handle.current_device())
+            except (RuntimeError, AssertionError):
+                return torch.device(device_type)
+    return torch.device("cpu")
+
+
+def _reduce_scalar_norm(
+    tensor: torch.Tensor,
+    reduce_op: "dist.ReduceOp",
+    group: "dist.ProcessGroup",
+) -> torch.Tensor:
+    """All-reduce a per-rank norm scalar over *group*.
+
+    Accelerator process groups (hccl/nccl) cannot reduce CPU tensors, so
+    when *tensor* is on the CPU (FSDP CPU offload) only the scalar is moved
+    to the local accelerator for the collective and the result is copied
+    back, keeping the caller's device semantics unchanged.
+    """
+    if tensor.is_cpu:
+        comm_tensor = tensor.to(device=_accelerator_device())
+        dist.all_reduce(comm_tensor, op=reduce_op, group=group)
+        tensor.copy_(comm_tensor)
+    else:
+        dist.all_reduce(tensor, op=reduce_op, group=group)
+    return tensor
+
+
 def _total_norm_inf(  # pylint: disable=R0913,R0917
     grad_groups, norm_type, mesh_cache, device, reduce_op,
 ):
@@ -409,10 +448,7 @@ def _total_norm_inf(  # pylint: disable=R0913,R0917
         if mesh_id is not None:
             mesh = mesh_cache[mesh_id]
             for dim in shard_dims:
-                dist.all_reduce(
-                    local_norm, op=reduce_op,
-                    group=mesh.get_group(dim),
-                )
+                _reduce_scalar_norm(local_norm, reduce_op, mesh.get_group(dim))
         group_norms.append(local_norm)
     if not group_norms:
         if norm_type == -math.inf:
@@ -430,10 +466,7 @@ def _total_norm_sum(grad_groups, norm_type, mesh_cache, device):
         if mesh_id is not None:
             mesh = mesh_cache[mesh_id]
             for dim in shard_dims:
-                dist.all_reduce(
-                    local_val, op=dist.ReduceOp.SUM,
-                    group=mesh.get_group(dim),
-                )
+                _reduce_scalar_norm(local_val, dist.ReduceOp.SUM, mesh.get_group(dim))
         total.add_(local_val)
     return total
 
@@ -533,7 +566,7 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
             local_p = torch.tensor(0.0, device=device, dtype=torch.float32)
 
         for group in sig_groups[sig]:
-            dist.all_reduce(local_p, op=dist.ReduceOp.SUM, group=group)
+            _reduce_scalar_norm(local_p, dist.ReduceOp.SUM, group)
 
         total_p = total_p + local_p
 

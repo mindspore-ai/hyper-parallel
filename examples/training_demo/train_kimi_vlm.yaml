@@ -1,0 +1,133 @@
+# Kimi-K2.5/K2.6 VLM demo: cropped text tower + full vision tower, FSDP-8.
+#
+# Data: the deterministic content-list dataset written by
+#   python -m examples.training_demo.prepare_kimi_vlm_data --output-dir ./output/training_demo/kimi_vlm_data
+# Run:  torchrun --standalone --nproc_per_node=8 scripts/train_vl.py \
+#         examples/training_demo/train_kimi_vlm.yaml \
+#         --model.config_path=/path/to/Kimi-K2.6 \
+#         --model.pretrained_model_name_or_path=/path/to/Kimi-K2.6
+#
+# The batch is replicated across TP ranks, so tp_size>1 is supported for the
+# text tower; CP/PP remain unsupported by the temporary VLM batch path.
+
+model:
+  _target_: examples.training_demo.cropped_kimi_vlm.build_cropped_kimi_vlm
+  pretrained_model_name_or_path: /path/to/Kimi-K2.6
+  config_path: /path/to/Kimi-K2.6
+  num_hidden_layers: 2
+  n_routed_experts: 8
+  trust_remote_code: false          # processor 走 native（image_grid_thw 协议）
+  local_files_only: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  validate_placement: false
+
+training:
+  train_iters: 10
+  train_samples: null
+  eval_iters: 0
+
+  global_batch_size: 8
+  micro_batch_size: 1
+
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: false
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides: []
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: off
+
+activation_swap: none
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+dataset:
+  _target_: hyper_parallel.data.vlm.build_vlm_dataset
+  data_config:
+    source_type: online
+  data_path: ./output/training_demo/kimi_vlm_data/data.json
+  data_transform:
+    _target_: hyper_parallel.data.vlm.kimi_transform.build_kimi_vlm_data_transform
+    max_seq_len: 1024
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.vlm.collator.build_vlm_collator
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ""
+  restore_from: null
+
+debug:
+  check_nan_inf: true
+  check_dataset: null
+
+profiling:
+  enabled: false
+  start_step: 3
+  end_step: 5
+  trace_dir: ./outputs/profiling
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_modules: false
+  rank: 0
