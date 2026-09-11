@@ -24,6 +24,8 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.core.multicore import shmem
+
 from .spec import MegaMoeSpec, _resolve_receive_capacity
 
 
@@ -76,24 +78,24 @@ def configure_symmetric_heap(
         for specification in active_specifications
     )
     required_bytes = _round_up(required_bytes, _HEAP_GRANULARITY_BYTES)
-    configured = os.getenv("SYMMETRIC_MEMORY_HEAP_SIZE")
+    configured = os.getenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE")
     if configured is None:
-        os.environ["SYMMETRIC_MEMORY_HEAP_SIZE"] = str(required_bytes)
+        os.environ["HYPER_PARALLEL_SHMEM_HEAP_SIZE"] = str(required_bytes)
         return required_bytes
     try:
         configured_bytes = int(configured)
     except ValueError as error:
         raise ValueError(
-            "SYMMETRIC_MEMORY_HEAP_SIZE must be a positive integer number of bytes, "
+            "HYPER_PARALLEL_SHMEM_HEAP_SIZE must be a positive integer number of bytes, "
             f"got {configured!r}."
         ) from error
     if configured_bytes <= 0:
         raise ValueError(
-            f"SYMMETRIC_MEMORY_HEAP_SIZE must be positive, got {configured_bytes}."
+            f"HYPER_PARALLEL_SHMEM_HEAP_SIZE must be positive, got {configured_bytes}."
         )
     if configured_bytes < required_bytes:
         raise RuntimeError(
-            "SYMMETRIC_MEMORY_HEAP_SIZE is too small for active MegaMoe resources: "
+            "HYPER_PARALLEL_SHMEM_HEAP_SIZE is too small for active MegaMoe resources: "
             f"configured {configured_bytes} bytes, requires at least {required_bytes} bytes."
         )
     return configured_bytes
@@ -103,7 +105,6 @@ def configure_symmetric_heap(
 class MegaMoeWorkspace:
     """Buffers owned by one standalone or explicitly shared resource group."""
 
-    symmetric_memory: Any
     shared: bool
     dtype: Any | None = None
     device: Any | None = None
@@ -147,25 +148,25 @@ class MegaMoeWorkspace:
         self.expert_capacity = requested_capacity
         self.routed_slots = spec.routed_slots
         try:
-            self.expert_buffer = self.symmetric_memory.aligned_empty(
+            self.expert_buffer = shmem.empty(
                 (requested_capacity, spec.hidden_size),
-                dtype,
-                _WORKSPACE_ALIGNMENT,
+                dtype=dtype,
+                alignment=_WORKSPACE_ALIGNMENT,
             )
-            self.routed_buffer = self.symmetric_memory.aligned_empty(
+            self.routed_buffer = shmem.empty(
                 (spec.routed_slots, spec.hidden_size),
-                dtype,
-                _WORKSPACE_ALIGNMENT,
+                dtype=dtype,
+                alignment=_WORKSPACE_ALIGNMENT,
             )
-            self.forward_event_counters = self.symmetric_memory.aligned_empty(
+            self.forward_event_counters = shmem.empty(
                 (_EVENT_COUNTER_BYTES,),
-                torch.uint8,
-                _WORKSPACE_ALIGNMENT,
+                dtype=torch.uint8,
+                alignment=_WORKSPACE_ALIGNMENT,
             )
-            self.backward_event_counters = self.symmetric_memory.aligned_empty(
+            self.backward_event_counters = shmem.empty(
                 (_EVENT_COUNTER_BYTES,),
-                torch.uint8,
-                _WORKSPACE_ALIGNMENT,
+                dtype=torch.uint8,
+                alignment=_WORKSPACE_ALIGNMENT,
             )
             self.gmm_workspace = torch.empty(
                 (_GMM_WORKSPACE_BYTES,),
@@ -216,7 +217,7 @@ class MegaMoeWorkspace:
             tensor = getattr(self, field_name)
             if tensor is None:
                 continue
-            self.symmetric_memory.free(tensor)
+            shmem.free(tensor)
             setattr(self, field_name, None)
         self.expert_capacity = 0
         self.routed_slots = 0
@@ -240,9 +241,11 @@ class MegaMoeWorkspace:
             if self.expert_buffer is None and self.gmm_workspace is None:
                 return
         torch.npu.synchronize(self.device)
-        self.symmetric_memory.barrier()
+        # Workspace teardown requires each collective barrier to complete before
+        # the following free or local Tensor release.
+        shmem.barrier()
         self._free_symmetric_tensors()
-        self.symmetric_memory.barrier()
+        shmem.barrier()
         self._free_local_tensors()
         self.dtype = None
         self.device = None

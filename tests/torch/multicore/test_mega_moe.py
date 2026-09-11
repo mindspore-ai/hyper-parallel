@@ -50,9 +50,9 @@ def _prepare_torch_multicore_test_environment() -> None:
 def _run_precision_worker(monkeypatch) -> None:
     """Run the two-rank precision worker with an isolated SHMEM endpoint."""
     _prepare_torch_multicore_test_environment()
-    monkeypatch.setenv("SYMMETRIC_MEMORY_HEAP_SIZE", str(64 * 1024 * 1024))
+    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", str(64 * 1024 * 1024))
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
-    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     with without_inherited_rank_environment():
         parallel_run(
             [
@@ -80,14 +80,14 @@ def test_mega_moe_level0_precision(monkeypatch) -> None:
 def _run_performance_worker(monkeypatch, result_dir: Path) -> dict:
     """Run common/MegaMoe A/B in one four-rank process group."""
     result_path = result_dir / "routed_expert_ab.json"
-    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PERFORMANCE_WORLD_SIZE))
     monkeypatch.setenv("HP_MEGA_MOE_PERF_WARMUP", "3")
     monkeypatch.setenv("HP_MEGA_MOE_PERF_MEASURED", "5")
     monkeypatch.setenv("HP_MEGA_MOE_MAX_PERF_RATIO", "1.10")
     monkeypatch.setenv("HP_MEGA_MOE_PERF_RESULT", str(result_path))
     monkeypatch.setenv("HCCL_NPU_SOCKET_PORT_RANGE", "62000-62063")
-    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     with without_inherited_rank_environment():
         parallel_run(
             [
@@ -156,11 +156,11 @@ def _run_acceptance_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case
     worker = "_test_mega_moe_resources.py" if cards == 2 else "_test_mega_moe_defaults.py"
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(cards))
     monkeypatch.setenv("HP_MEGA_MOE_LEVEL1_RESULT", str(result_path))
-    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     if cards == 2:
-        monkeypatch.setenv("SYMMETRIC_MEMORY_HEAP_SIZE", str(64 * 1024 * 1024))
+        monkeypatch.setenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", str(64 * 1024 * 1024))
     else:
-        monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+        monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
     with without_inherited_rank_environment():
         parallel_run(
             [TorchCase(str(Path(__file__).with_name(worker)), case, num_proc=cards)],
@@ -180,10 +180,15 @@ def _run_acceptance_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case
 def test_mega_moe_shared_resources(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Feature: Shared execution resources and private SHMEM ownership.
 
-    Description: Compare real serial stacks and alternate streams across repeated steps.
-    Expectation: Outputs, gradients and updates match, memory stabilizes and the last owner finalizes.
+    Description: Compare real serial stacks and alternate streams, then mix private/managed close orders.
+    Expectation: Outputs, gradients and updates match while memory remains stable.
     """
-    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_shared_resource_acceptance", 2)
+    _run_acceptance_worker(
+        monkeypatch,
+        tmp_path,
+        "test_mega_moe_shared_resource_acceptance",
+        2,
+    )
 
 
 @arg_mark(

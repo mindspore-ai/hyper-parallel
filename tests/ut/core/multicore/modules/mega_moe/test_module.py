@@ -231,6 +231,108 @@ class TestMegaMoeExperts(unittest.TestCase):
         layers[-1].close()
         resources.close.assert_called_once_with()
 
+    def test_execution_resource_pairs_shmem_acquire_and_release(self) -> None:
+        """Pair one SHMEM reference with one execution-resource lifetime."""
+        root_group = object()
+        bound_spec = SimpleNamespace(ep_group=root_group)
+        workspace = Mock()
+
+        with (
+            patch.object(
+                mega_moe_module,
+                "bind_mega_moe_spec",
+                return_value=bound_spec,
+            ),
+            patch.object(mega_moe_module, "configure_symmetric_heap"),
+            patch.object(mega_moe_module.shmem, "acquire") as mock_acquire,
+            patch.object(mega_moe_module.shmem, "release") as mock_release,
+            patch.object(mega_moe_module, "build_mega_moe_plan", return_value=object()),
+            patch.object(mega_moe_module, "MegaMoeWorkspace", return_value=workspace),
+        ):
+            resources = mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
+                {},
+                SimpleNamespace(device="npu:0"),
+                shared=False,
+                active_specifications=(),
+            )
+            mock_acquire.assert_called_once_with(root_group)
+            mock_release.assert_not_called()
+            resources.close()
+            resources.close()
+
+        workspace.close.assert_called_once_with()
+        mock_release.assert_called_once_with()
+
+    def test_execution_resource_construction_failure_releases_shmem(self) -> None:
+        """Release the acquired SHMEM reference when resource construction fails."""
+        root_group = object()
+        bound_spec = SimpleNamespace(ep_group=root_group)
+
+        with (
+            patch.object(
+                mega_moe_module,
+                "bind_mega_moe_spec",
+                return_value=bound_spec,
+            ),
+            patch.object(mega_moe_module, "configure_symmetric_heap"),
+            patch.object(mega_moe_module.shmem, "acquire") as mock_acquire,
+            patch.object(mega_moe_module.shmem, "release") as mock_release,
+            patch.object(
+                mega_moe_module,
+                "build_mega_moe_plan",
+                side_effect=RuntimeError("plan failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "plan failed"),
+        ):
+            mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
+                {},
+                SimpleNamespace(device="npu:0"),
+                shared=False,
+                active_specifications=(),
+            )
+
+        mock_acquire.assert_called_once_with(root_group)
+        mock_release.assert_called_once_with()
+
+    def test_workspace_close_failure_keeps_shmem_user(self) -> None:
+        """Do not leave SHMEM when a workspace cannot release its resources."""
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(  # pylint: disable=protected-access
+            mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
+        )
+        resources.workspace = Mock()
+        resources.workspace.close.side_effect = RuntimeError("workspace busy")
+        resources._closed = False  # pylint: disable=protected-access
+
+        with (
+            patch.object(mega_moe_module.shmem, "release") as mock_release,
+            self.assertRaisesRegex(RuntimeError, "workspace busy"),
+        ):
+            resources.close()
+
+        mock_release.assert_not_called()
+        self.assertFalse(resources._closed)  # pylint: disable=protected-access
+
+    def test_shmem_release_failure_keeps_execution_resource_open(self) -> None:
+        """Keep the resource open when its SHMEM reference cannot be released."""
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(  # pylint: disable=protected-access
+            mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
+        )
+        resources.workspace = Mock()
+        resources._closed = False  # pylint: disable=protected-access
+
+        with (
+            patch.object(
+                mega_moe_module.shmem,
+                "release",
+                side_effect=RuntimeError("release failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "release failed"),
+        ):
+            resources.close()
+
+        resources.workspace.close.assert_called_once_with()
+        self.assertFalse(resources._closed)  # pylint: disable=protected-access
+
 
 if __name__ == "__main__":
     unittest.main()

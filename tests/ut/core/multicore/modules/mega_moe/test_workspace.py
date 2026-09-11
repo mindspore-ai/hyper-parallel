@@ -78,8 +78,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
 
     def test_reuse_waits_with_event_without_host_synchronize(self) -> None:
         """Order serial reuse across streams without blocking the CPU."""
-        symmetric_memory = Mock()
-        workspace = MegaMoeWorkspace(symmetric_memory=symmetric_memory, shared=True)
+        workspace = MegaMoeWorkspace(shared=True)
         completion_event = Mock()
         current_stream = Mock()
         workspace.completion_event = completion_event

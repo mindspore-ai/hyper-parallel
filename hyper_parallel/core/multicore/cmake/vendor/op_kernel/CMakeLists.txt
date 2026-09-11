@@ -29,6 +29,7 @@ npu_op_kernel_library(ascendc_kernels
 npu_op_kernel_options(ascendc_kernels ALL OPTIONS
     -I${HP_SHMEM_SDK_ROOT}/include
     -I${HP_SHMEM_SDK_ROOT}/src/device
+    -I${HP_MULTICORE_SOURCE_ROOT}/shmem
     -Wno-macro-redefined
     -Wno-ignored-attributes
 )

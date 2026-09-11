@@ -74,7 +74,7 @@ def _run_router_layer(layer: torch.nn.Module, shape: baseline.MoeShape) -> list[
 def _validate_pair(shape: baseline.MoeShape, factor: float | None, scope: str) -> None:
     """Compare real output, every gradient and one update at the measured shape."""
     start_shmem_lifetime()
-    os.environ.pop("SYMMETRIC_MEMORY_HEAP_SIZE", None)
+    os.environ.pop("HYPER_PARALLEL_SHMEM_HEAP_SIZE", None)
     mega, common = baseline.new_layers(shape, expert_capacity_factor=factor)
     try:
         if scope == "router_experts":
@@ -94,7 +94,7 @@ def _validate_pair(shape: baseline.MoeShape, factor: float | None, scope: str) -
 
 def _measurement_layer(shape: baseline.MoeShape, backend: str, factor: float | None) -> torch.nn.Module:
     """Retain only one parameter-aligned backend while measuring memory."""
-    os.environ.pop("SYMMETRIC_MEMORY_HEAP_SIZE", None)
+    os.environ.pop("HYPER_PARALLEL_SHMEM_HEAP_SIZE", None)
     if backend == "common":
         return baseline.new_common_moe(shape)
     start_shmem_lifetime()

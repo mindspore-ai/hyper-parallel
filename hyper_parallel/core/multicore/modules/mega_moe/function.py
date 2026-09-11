@@ -20,6 +20,7 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .plan import MegaMoePlan
@@ -168,7 +169,8 @@ class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
                 routed_tokens,
                 dispatch,
             )
-            workspace.symmetric_memory.barrier()
+            # Enqueue only: mega_moe is launched immediately afterward on the same Stream.
+            shmem.barrier(blocking=False)
             multicore_ops.mega_moe(
                 dispatch,
                 metadata.dispatch_target_off * spec.hidden_size,
@@ -274,7 +276,8 @@ class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
                 weight1,
                 weight2,
             )
-            workspace.symmetric_memory.barrier()
+            # Enqueue only: mega_moe_grad is launched immediately afterward on the same Stream.
+            shmem.barrier(blocking=False)
             multicore_ops.mega_moe_grad(
                 dispatch,
                 dispatch_target_off * spec.hidden_size,
