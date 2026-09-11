@@ -259,6 +259,12 @@ class MindSporeHSDPParamV2(HSDPParamV2):
     MindSpore HSDP parameter.
     """
 
+    #: Whether ``_grad`` is a communication base this object allocated, and may
+    #: therefore reclaim in :meth:`reduce_scatter_output`. ``False`` while it is a
+    #: view of the caller's gradient, which the even dim-0 path uses on purpose to
+    #: avoid materialising a copy.
+    _grad_owns_storage = False
+
     def __init__(
         self,
         param: Parameter,
@@ -414,8 +420,12 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         """Return cached reduce-scatter output after waiting asynchronous work."""
         if self.reduce_scatter_comm_ctx.reduce_scatter_handle is not None:
             self.reduce_scatter_comm_ctx.reduce_scatter_handle.wait()
-            self._grad.untyped_storage().resize_(0)
+            # Only reclaim a communication base this object allocated; the even
+            # dim-0 path aliases the caller's gradient and must be left alone.
+            if self._grad_owns_storage:
+                self._grad.untyped_storage().resize_(0)
             self._grad = None
+            self._grad_owns_storage = False
             self.reduce_scatter_comm_ctx.reduce_scatter_handle = None
         return self.reduce_scatter_comm_ctx.reduce_scatter_output
 
@@ -423,6 +433,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         """Clear the cached reduce-scatter output."""
         self.reduce_scatter_comm_ctx.reduce_scatter_output = None
         self._grad = None
+        self._grad_owns_storage = False
 
     def all_reduce_output(self) -> Optional[ms.Tensor]:
         """Return cached all-reduce output after waiting asynchronous work."""
@@ -1104,19 +1115,32 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             grad = self.unsharded_accumulated_grad_data
         else:
             grad = self.unsharded_grad_data
-        self._grad = grad.to(self.reduce_comm_dtype(grad))
+        # Track whether the communication base is storage this object allocated.
+        # ``Tensor.to`` only allocates when the dtype actually changes and ``view``
+        # never does, so an even dim-0 gradient reduced in its own dtype leaves
+        # ``_grad`` aliasing the caller's gradient. That aliasing is deliberate --
+        # it keeps this path from materialising a copy -- but it means
+        # ``reduce_scatter_output`` must not reclaim the storage afterwards.
+        # Ownership is derived from the code path rather than by comparing storage
+        # pointers: observing ``untyped_storage()`` perturbs the very aliasing it
+        # would be reporting on.
+        comm_dtype = self.reduce_comm_dtype(grad)
+        self._grad_owns_storage = comm_dtype is not None and grad.dtype != comm_dtype
+        self._grad = grad.to(comm_dtype)
         shard_dim = self.hsdp_placement.dim
         if self.shard_world_size <= 1:
             self._grad = self._grad.view(-1)
         elif shard_dim != 0:
             grad_chunks = self._grad.chunk(self.shard_world_size, dim=shard_dim)
             self._grad = ms.mint.cat(grad_chunks, dim=0).view(-1)
+            self._grad_owns_storage = True
         else:
             if self._grad.shape[0] % self.shard_world_size != 0:
                 self._grad = _pack_dim0_reduce_scatter_input(
                     self._grad,
                     self.shard_world_size,
                 )
+                self._grad_owns_storage = True
             self._grad = self._grad.view(-1)
 
         apply_gradient_scaling_factor(self._grad, self.gradient_scaling_factor)

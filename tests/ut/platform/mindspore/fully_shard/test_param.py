@@ -963,6 +963,79 @@ class TestCommunicationContexts(MindSporeFullyShardUnitTest):
             np.array([1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 6.0, 0.0], dtype=np.float32),
         )
 
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.apply_gradient_scaling_factor")
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.reduce_scatter_tensor")
+    def test_reduce_scatter_output_keeps_aliased_gradient_storage(
+        self,
+        mock_reduce_scatter,
+        mock_apply_scaling,
+    ):
+        """
+        Feature: Per-parameter reduce-scatter buffer ownership.
+        Description: The even dim-0 path deliberately reuses the caller's gradient
+                     storage as the communication base. Complete the collective and
+                     let the cached output be reclaimed.
+        Expectation: The caller's gradient survives -- fully_shard only reclaims a
+                     communication base it allocated itself.
+        """
+        source_grad = ms.Tensor([1.0, 2.0, 3.0, 4.0])
+        hsdp_param = _bare_param()
+        hsdp_param._unsharded_param = SimpleNamespace(grad=source_grad)
+        hsdp_param._to_local_unsharded_grad = MagicMock(side_effect=lambda grad: grad)
+        hsdp_param.shard_world_size = 2
+        hsdp_param.hsdp_placement = Shard(0)
+        hsdp_param.padded_sharded_param_size = (2,)
+        hsdp_param.mesh_info = object.__new__(FSDPMeshInfo)
+        hsdp_param.mesh_info.shard_process_group = "fsdp"
+        hsdp_param.gradient_scaling_factor = None
+        mock_reduce_scatter.return_value = MagicMock()
+
+        hsdp_param.reduce_scatter_grad(reduce_op="sum")
+        self.assertFalse(hsdp_param._grad_owns_storage)
+
+        hsdp_param.reduce_scatter_output()
+
+        self.assertEqual(source_grad.untyped_storage().size(), 4 * 4)
+        np.testing.assert_allclose(
+            source_grad.asnumpy(), np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        )
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.apply_gradient_scaling_factor")
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.reduce_scatter_tensor")
+    def test_reduce_scatter_output_releases_packed_communication_base(
+        self,
+        mock_reduce_scatter,
+        mock_apply_scaling,
+    ):
+        """
+        Feature: Per-parameter reduce-scatter buffer ownership.
+        Description: An uneven dim-0 gradient is packed into a freshly allocated
+                     communication base, which fully_shard owns.
+        Expectation: That base is reclaimed, while the caller's gradient is intact.
+        """
+        source_grad = ms.Tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+        hsdp_param = _bare_param()
+        hsdp_param._unsharded_param = SimpleNamespace(grad=source_grad)
+        hsdp_param._to_local_unsharded_grad = MagicMock(side_effect=lambda grad: grad)
+        hsdp_param.is_sharded = True
+        hsdp_param.shard_world_size = 2
+        hsdp_param.hsdp_placement = Shard(0, uneven_shard=True)
+        hsdp_param._orig_size = (5,)
+        hsdp_param.padded_sharded_param_size = (3,)
+        hsdp_param.mesh_info = object.__new__(FSDPMeshInfo)
+        hsdp_param.mesh_info.shard_process_group = "fsdp"
+        hsdp_param.gradient_scaling_factor = None
+        mock_reduce_scatter.return_value = MagicMock()
+
+        hsdp_param.reduce_scatter_grad(reduce_op="sum")
+        self.assertTrue(hsdp_param._grad_owns_storage)
+
+        comm_base = hsdp_param._grad
+        hsdp_param.reduce_scatter_output()
+
+        self.assertEqual(comm_base.untyped_storage().size(), 0)
+        self.assertEqual(source_grad.untyped_storage().size(), 5 * 4)
+
     @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.all_reduce")
     def test_all_reduce_consumes_rs_output_and_uses_replicate_group(self, mock_all_reduce):
         """
