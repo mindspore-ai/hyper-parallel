@@ -1,4 +1,4 @@
-# hyperparallel-RL Module Map
+# HyperParallel-RL Module Map
 
 Use this stable index to locate subsystem ownership. Paths are relative to `hyper_parallel/rl/`; interface and runtime semantics live in the linked product docs.
 

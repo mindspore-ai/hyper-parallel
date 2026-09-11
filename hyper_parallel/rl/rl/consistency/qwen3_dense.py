@@ -204,7 +204,7 @@ def configure_consistency_profile(config: dict[str, Any]) -> str:
     """Atomically derive Trainer and rollout settings owned by consistency mode.
 
     Args:
-        config: Mutable, fully merged hyperparallel-RL configuration.
+        config: Mutable, fully merged HyperParallel-RL configuration.
 
     Returns:
         The internal recipe identity or ``off``.

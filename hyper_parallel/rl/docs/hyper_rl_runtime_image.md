@@ -1,4 +1,4 @@
-# hyperparallel-RL 运行镜像
+# HyperParallel-RL 运行镜像
 
 ## 镜像信息
 
@@ -82,7 +82,7 @@ PY
 - 与镜像版本匹配的 HyperParallel 仓库；
 - 模型和数据路径位于宿主机，并由 launcher 只读挂载。
 
-具体运行命令见 [hyperparallel-RL README](../README.md)。
+具体运行命令见 [HyperParallel-RL README](../README.md)。
 
 ## 从源码构建
 

@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Framework-neutral utilities shared by hyperparallel-RL runtime layers."""
+"""Framework-neutral utilities shared by HyperParallel-RL runtime layers."""

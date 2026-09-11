@@ -1,6 +1,6 @@
-# hyperparallel-RL 架构
+# HyperParallel-RL 架构
 
-hyperparallel-RL 当前运行时的核心是一个同步训练状态机：每一步只消费一个已发布策略生成的数据，并且只有完成训练、权重传输、worker 校验和 cache reset 后，下一策略版本才对 rollout 可见。
+HyperParallel-RL 当前运行时的核心是一个同步训练状态机：每一步只消费一个已发布策略生成的数据，并且只有完成训练、权重传输、worker 校验和 cache reset 后，下一策略版本才对 rollout 可见。
 
 可以用三个句子概括当前架构：
 
@@ -14,7 +14,7 @@ hyperparallel-RL 当前运行时的核心是一个同步训练状态机：每一
 
 ## 系统视图
 
-![hyperparallel-RL 架构：极简易用、易于扩展与昇腾亲和的组件和数据流](assets/hyper-rl-architecture.svg)
+![HyperParallel-RL 架构：极简易用、易于扩展与昇腾亲和的组件和数据流](assets/hyper-rl-architecture.svg)
 
 设计目标与取舍见[设计原则](design.md)。图中的统一入口和编排器连接以下三条主线：
 

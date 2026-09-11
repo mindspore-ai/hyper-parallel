@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU acceptance test for one complete successful hyperparallel-RL configuration."""
+"""CPU acceptance test for one complete successful HyperParallel-RL configuration."""
 # Test fixtures inspect stable runtime config attributes and local registry state.
 # pylint: disable=missing-public-docstring,protected-access
 

@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="192" height="128" viewBox="0 0 192 128" role="img" aria-labelledby="title desc">
-  <title id="title">hyperparallel-RL</title>
+  <title id="title">HyperParallel-RL</title>
   <desc id="desc">A calligraphic red H with gently tapered strokes, extending into a blue-gradient R and a sweeping L flourish.</desc>
   <defs>
     <linearGradient id="huawei-red" x1="64" y1="28" x2="64" y2="102" gradientUnits="userSpaceOnUse">

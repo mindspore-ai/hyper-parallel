@@ -1,4 +1,4 @@
-# hyperparallel-RL UT 方案与验收结果
+# HyperParallel-RL UT 方案与验收结果
 
 > 测试目录：`hyper_parallel/rl/rl_tests/ut`
 >
