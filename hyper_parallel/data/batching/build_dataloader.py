@@ -26,6 +26,7 @@ import torch
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 
@@ -513,6 +514,7 @@ class DynamicBatchDataLoader:
             dp_world_size: int | None = None,
             save_by_idx: bool | None = None,
             max_seq_len: int | None,
+            pad_to_token_budget: bool = False,
             min_buffered_samples: int = 200,
             drop_last: bool = True,
             use_background_prefetcher: bool = False,
@@ -541,6 +543,8 @@ class DynamicBatchDataLoader:
         self.batch_collate_fn = collate_fn
         self.dp_world_size = resolved_dp_world_size
         token_budget = batch_size * max_seq_len
+        # self.token_budget = token_budget
+        # self.pad_to_token_budget = pad_to_token_budget
         self.batcher = TextTokenBatcher(
             token_budget=token_budget,
             min_buffered_samples=min_buffered_samples,
@@ -582,6 +586,38 @@ class DynamicBatchDataLoader:
         )
         self.resume_pending = False
 
+    # def _pad_batch_to_token_budget(
+    #         self,
+    #         batch: Mapping[str, Any],
+    # ) -> Mapping[str, Any]:
+    #     """Pad one online packed batch to a graph-stable fixed token budget."""
+    #     if not self.pad_to_token_budget:
+    #         return batch
+
+    #     input_ids = batch.get("input_ids")
+    #     labels = batch.get("labels")
+    #     cu_seq_lens = batch.get("cu_seq_lens")
+    #     if input_ids is None or labels is None or cu_seq_lens is None:
+    #         return batch
+
+    #     current_seq_len = int(input_ids.shape[-1])
+    #     if current_seq_len >= self.token_budget:
+    #         return batch
+
+    #     pad_len = self.token_budget - current_seq_len
+    #     padded_batch = dict(batch)
+    #     padded_batch["input_ids"] = torch.cat(
+    #         (input_ids, input_ids.new_zeros((input_ids.shape[0], pad_len))),
+    #         dim=-1,
+    #     )
+    #     padded_batch["labels"] = torch.cat(
+    #         (labels, labels.new_full((labels.shape[0], pad_len), IGNORE_INDEX)),
+    #         dim=-1,
+    #     )
+    #     padded_end = cu_seq_lens[-1:] + pad_len
+    #     padded_batch["cu_seq_lens"] = torch.cat((cu_seq_lens, padded_end))
+    #     return padded_batch
+
     def __iter__(self) -> Iterator[Mapping[str, Any]]:
         """Start source iteration while retaining restored buffer state."""
         if not self.resume_pending:
@@ -604,6 +640,7 @@ class DynamicBatchDataLoader:
         while self.batcher.is_ready_for_micro_batch():
             model_samples = self.batcher.get_micro_batch()
             batch = self.batch_collate_fn(model_samples)
+            # batch = self._pad_batch_to_token_budget(self.batch_collate_fn(model_samples))
             yield batch
 
         # Keep filling the token buffer from the source iterator.
@@ -614,12 +651,14 @@ class DynamicBatchDataLoader:
             while self.batcher.is_ready_for_micro_batch():
                 model_samples = self.batcher.get_micro_batch()
                 batch = self.batch_collate_fn(model_samples)
+                # batch = self._pad_batch_to_token_budget(self.batch_collate_fn(model_samples))
                 yield batch
 
         # Preserve every pulled sample by draining below-threshold tail batches.
         while not self.batcher.empty():
             model_samples = self.batcher.get_micro_batch()
             batch = self.batch_collate_fn(model_samples)
+            # batch = self._pad_batch_to_token_budget(self.batch_collate_fn(model_samples))
             yield batch
 
     def state_dict(self) -> dict[str, Any]:

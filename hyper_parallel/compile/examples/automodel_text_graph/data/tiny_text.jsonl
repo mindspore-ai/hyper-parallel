@@ -1,0 +1,4 @@
+{"text": "GraphTrainer reuses the TextTrainer dataset pipeline through train_lm.py."}
+{"text": "This local corpus keeps the graph-mode smoke test deterministic and fast."}
+{"text": "AutoModel still owns model preparation while GraphTextTrainer replaces execution."}
+{"text": "A tiny plaintext dataset is enough to validate the unified YAML entry path."}

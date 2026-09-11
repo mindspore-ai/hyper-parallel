@@ -21,12 +21,13 @@ from typing import Any
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.text.build_data_transform import PlaintextTransform
-from hyper_parallel.data.indexed.indexed_dataset import (
-    build_indexed_dataset as _build_indexed_dataset,
-)
-from hyper_parallel.data.text.online.online_dataset import (
-    build_online_dataset as _build_online_dataset,
-)
+### WHHDEBUG
+# from hyper_parallel.data.indexed.indexed_dataset import (
+#     build_indexed_dataset as _build_indexed_dataset,
+# )
+# from hyper_parallel.data.text.online.online_dataset import (
+#     build_online_dataset as _build_online_dataset,
+# )
 from hyper_parallel.data.text.online.online_utils import ONLINE_PLAINTEXT_TEXT_KEYS_KEY
 from hyper_parallel.data.text.transform_dataset import apply_llm_data_transform
 from hyper_parallel.data.parallel import (
@@ -110,6 +111,10 @@ def build_online_text_dataset(
     if dataloader_context is None:
         dataloader_context = _build_dataloader_context(mesh_context, dataset_config)
 
+    from hyper_parallel.data.text.online.online_dataset import (  # pylint: disable=C0415
+        build_online_dataset as _build_online_dataset,
+    )
+
     online_dataset = _build_online_dataset(
         data_path=data_path,
         data_config=dataset_config,
@@ -164,6 +169,10 @@ def build_indexed_text_dataset(
 
     if dataloader_context is None:
         dataloader_context = _build_dataloader_context(mesh_context, dataset_config)
+
+    from hyper_parallel.data.indexed.indexed_dataset import (  # pylint: disable=C0415
+        build_indexed_dataset as _build_indexed_dataset,
+    )
 
     indexed_datasets = _build_indexed_dataset(
         data_path=data_path,

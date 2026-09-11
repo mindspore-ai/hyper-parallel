@@ -25,6 +25,7 @@ from hyper_parallel.models.build_options import CompileConfig, FSDP2Config
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 
 from hyper_parallel.trainer.config.data import DataLoaderConfig, DatasetConfig
+from hyper_parallel.trainer.config.graph import GraphConfig
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,
@@ -74,6 +75,7 @@ class TrainerConfig:
     dataset: Optional[DatasetConfig] = None
     dataloader: Optional[DataLoaderConfig] = None
     packed_sequence: Optional[Any] = None
+    graph: GraphConfig = field(default_factory=GraphConfig)
 
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)

@@ -12,23 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Language-model training entry point for the AutoModel workflow."""
+"""Graph-mode trainer selection options."""
 
-from hyper_parallel.compile import GraphTrainer
-from hyper_parallel.trainer.config.manager import parse_training_args
-from hyper_parallel.trainer.config import TrainerConfig
-from hyper_parallel.trainer.text_trainer import TextTrainer
+from dataclasses import dataclass
 
 
-def main() -> None:
-    """Resolve configured components and execute language-model training."""
-    config: TrainerConfig = parse_training_args()
-    if config.graph.enabled:
-        trainer = GraphTrainer.from_text_config(config)
-    else:
-        trainer = TextTrainer(config)
-    trainer.train()
+@dataclass
+class GraphConfig:
+    """Toggle graph-mode trainer selection from the standard YAML entry."""
 
+    enabled: bool = False
 
-if __name__ == "__main__":
-    main()

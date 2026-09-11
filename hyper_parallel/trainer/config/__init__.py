@@ -31,6 +31,7 @@ from hyper_parallel.trainer.config.data import (
     DatasetConfig,
     ModelAssetsConfig,
 )
+from hyper_parallel.trainer.config.graph import GraphConfig
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,
@@ -61,6 +62,7 @@ __all__ = [
     "DatasetConfig",
     "DebugConfig",
     "FSDP2Config",
+    "GraphConfig",
     "MixedPrecisionConfig",
     "OptimizerConfig",
     "ProfilingConfig",

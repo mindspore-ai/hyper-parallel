@@ -23,6 +23,24 @@ from hyper_parallel.trainer.config import Target, TrainerConfig
 from .parallel_config import PassConfig
 
 
+# def _wrap_dataloader_for_graph_mode(dataloader_config: Any) -> Any:
+#     """Enable graph-stable padding for dynamic online text batches."""
+#     if dataloader_config is None:
+#         return None
+
+#     target = getattr(dataloader_config, "target", None)
+#     if target is None:
+#         return dataloader_config
+
+#     if getattr(target, "_target_path", None) != "hyper_parallel.data.batching.DynamicBatchDataLoader":
+#         return dataloader_config
+
+#     return replace(
+#         dataloader_config,
+#         target=target.replace(pad_to_token_budget=True),
+#     )
+
+
 def clone_config_for_graph_mode(config: TrainerConfig) -> TrainerConfig:
     """Clone a TrainerConfig and disable eager per-layer compile.
 
@@ -34,6 +52,7 @@ def clone_config_for_graph_mode(config: TrainerConfig) -> TrainerConfig:
     return replace(
         config,
         model=wrap_model_target_for_graph_mode(config.model),
+        # dataloader=_wrap_dataloader_for_graph_mode(config.dataloader),
         compile=CompileConfig(enabled=False),
     )
 

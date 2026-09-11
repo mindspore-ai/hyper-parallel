@@ -1,0 +1,76 @@
+# Graph smoke YAML:
+# - minimal graph-mode online text example
+# - toy tokenizer + tiny local jsonl dataset
+# - single-card, 2-step quick sanity run
+
+model:
+  _target_: hyper_parallel.compile.examples.automodel_text_graph.recipe_support.build_tiny_automodel
+
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  adamw_config:
+    lr: 1.0e-4
+    adamw_weight_decay: 0.0
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 1.0e-4
+    lr_warmup_steps: 0
+
+training:
+  train_iters: 2
+  global_batch_size: 1
+  micro_batch_size: 1
+  logging_steps: 1
+  seed: 42
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 1
+
+graph:
+  enabled: true
+
+dataset:
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
+  data_path: /home/whh/graphtrainer/hyper_parallel/compile/examples/automodel_text_graph/data/tiny_text.jsonl
+  model_assets:
+    tokenizer:
+      _target_: hyper_parallel.compile.examples.automodel_text_graph.recipe_support.build_toy_tokenizer
+      pretrained_model_name_or_path: toy-online-tokenizer
+  data_transform:
+    _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 16
+  data_config:
+    dataset_type: mapping
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: true
+
+dataloader:
+  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
+  min_buffered_samples: 1
+  drop_last: false
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.ParallelBatch
+    source_type: online
+    attention_mode: dense
+
+checkpoint:
+  save_ckpt: false

@@ -99,6 +99,9 @@ compile:
   options: {}
   dynamo_cache_size_limit: 256
 
+graph:
+  enabled: false
+
 dataset:
   model_assets:
     chat_template: null

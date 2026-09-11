@@ -1,0 +1,90 @@
+# Graph standard-regression YAML:
+# - Qwen3-0.6B structure + online text dataset
+# - TP2 + FSDP2 four-card setup
+# - used to verify the standard scripts/train_lm.py graph entry
+
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /home/whh/used/hyper_dev/.assets/models/Qwen3-0.6B
+  ignore_mismatched_sizes: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  force_hf: true
+
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  adamw_config:
+    lr: 1.0e-4
+    adamw_weight_decay: 0.0
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 1.0e-4
+    lr_warmup_steps: 0
+
+training:
+  train_iters: 10
+  global_batch_size: 4
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  logging_steps: 1
+  seed: 42
+  enable_full_determinism: false
+
+accelerator:
+  tp_size: 2
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 2
+
+graph:
+  enabled: true
+
+dataset:
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
+  data_path: null
+  model_assets:
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /home/whh/used/hyper_dev/.assets/models/Qwen3-0.6B
+      use_fast: true
+      trust_remote_code: true
+  data_transform:
+    _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 128
+  data_config:
+    dataset_type: mapping
+    hf_dataset_name: Salesforce/wikitext
+    hf_config_name: wikitext-2-raw-v1
+    cache_dir: /home/whh/used/hyper_dev/.assets/datasets
+    labels_are_shifted: false
+    create_attention_mask_in_dataloader: true
+    create_ltor_fields_in_dataloader: false
+
+dataloader:
+  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
+  min_buffered_samples: 8
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.ParallelBatch
+    source_type: online
+    attention_mode: dense
+
+checkpoint:
+  save_ckpt: false

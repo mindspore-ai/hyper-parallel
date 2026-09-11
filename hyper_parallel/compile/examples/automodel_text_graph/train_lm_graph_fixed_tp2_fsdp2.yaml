@@ -1,0 +1,61 @@
+# Graph fixed-shape regression YAML:
+# - tiny automodel + fixed dummy dataset
+# - TP2 + FSDP2 four-card setup
+# - stable 10-step regression config for graph pipeline validation
+
+model:
+  _target_: hyper_parallel.compile.examples.automodel_text_graph.recipe_support.build_tiny_automodel
+
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  adamw_config:
+    lr: 1.0e-4
+    adamw_weight_decay: 0.0
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 1.0e-4
+    lr_warmup_steps: 0
+
+training:
+  train_iters: 10
+  global_batch_size: 4
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  logging_steps: 1
+  seed: 42
+
+accelerator:
+  tp_size: 2
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 2
+
+graph:
+  enabled: true
+
+dataset:
+  _target_: hyper_parallel.compile.examples.automodel_text_graph.recipe_support.build_fixed_dummy_dataset
+  size: 40
+  seq_len: 16
+  vocab_size: 128
+
+dataloader:
+  _target_: hyper_parallel.compile.examples.automodel_text_graph.recipe_support.build_rebuildable_dataloader
+  drop_last: false
+  use_background_prefetcher: false
+  collate_fn:
+    _target_: hyper_parallel.compile.examples.automodel_text_graph.recipe_support.build_simple_collate_fn
+  get_batch:
+    _target_: hyper_parallel.compile.examples.automodel_text_graph.recipe_support.build_simple_get_batch
+
+checkpoint:
+  save_ckpt: false
