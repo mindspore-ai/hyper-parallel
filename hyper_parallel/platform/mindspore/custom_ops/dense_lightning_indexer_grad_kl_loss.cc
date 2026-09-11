@@ -47,8 +47,10 @@ std::vector<ms::Tensor> npu_dense_lightning_indexer_grad_kl_loss(
 
   auto query_rope = query_rope_opt.value_or(ms::Tensor());
   auto key_rope = key_rope_opt.value_or(ms::Tensor());
-  auto actual_seq_qlen = std::make_pair(actual_seq_qlen_opt, true);
-  auto actual_seq_klen = std::make_pair(actual_seq_klen_opt, true);
+  auto actual_seq_qlen =
+    std::make_pair(actual_seq_qlen_opt.value_or(std::vector<int64_t>({})), true);
+  auto actual_seq_klen =
+    std::make_pair(actual_seq_klen_opt.value_or(std::vector<int64_t>({})), true);
   std::string layout = layout_opt.value_or("BSND");
   constexpr int64_t default_max = 9223372036854775807;
   int64_t sparse_mode = sparse_mode_opt.value_or(3);

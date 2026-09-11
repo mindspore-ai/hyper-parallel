@@ -48,8 +48,10 @@ std::vector<ms::Tensor> npu_dense_lightning_indexer_softmax_lse(
   int64_t pre_tokens_val = pre_tokens.value_or(9223372036854775807LL);
   int64_t next_tokens_val = next_tokens.value_or(9223372036854775807LL);
 
-  auto actual_seq_qlen_pair = std::make_pair(actual_seq_qlen, true);
-  auto actual_seq_klen_pair = std::make_pair(actual_seq_klen, true);
+  auto actual_seq_qlen_pair =
+    std::make_pair(actual_seq_qlen.value_or(std::vector<int64_t>({})), true);
+  auto actual_seq_klen_pair =
+    std::make_pair(actual_seq_klen.value_or(std::vector<int64_t>({})), true);
 
   auto [out0, out1] = GenResultTensors(query_index, key_index, layout_str);
 
