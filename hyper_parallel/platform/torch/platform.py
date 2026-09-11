@@ -1859,7 +1859,7 @@ class TorchPlatform(Platform):
         error_if_nonfinite=False, foreach=None,
     ):
         # pylint: disable=C0415
-        from hyper_parallel.platform.torch.clip_grad import (
+        from hyper_parallel.core.utils.clip_grad import (
             clip_grad_norm_ as _clip_grad_norm,
         )
         return _clip_grad_norm(
