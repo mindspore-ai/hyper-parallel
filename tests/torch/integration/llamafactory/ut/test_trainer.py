@@ -286,19 +286,8 @@ def test_export_to_hf_format_uses_hf_default_shard_size(monkeypatch, tmp_path):
             captured["tokenizer_dir"] = save_dir
             captured["tokenizer_max_shard_size"] = max_shard_size
 
-    class _FakePlatform:
-        @staticmethod
-        def get_rank():
-            return 0
-
-        @staticmethod
-        def get_world_size():
-            return 1
-
-    def _fake_get_platform():
-        return _FakePlatform()
-
-    monkeypatch.setattr(lf_utils, "get_platform", _fake_get_platform)
+    monkeypatch.setattr(lf_utils.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(lf_utils.dist, "get_world_size", lambda: 1)
 
     def _fake_get_model_state_dict(model, options=None):
         del model, options
@@ -371,7 +360,7 @@ def test_hp_args_fsdp_size_rejects_non_int():
 
 
 def _patch_mesh_environment(monkeypatch, world_size):
-    """Install fake init_device_mesh + get_platform that records call args."""
+    """Install fake mesh initialization and distributed world size."""
     calls = {}
 
     def fake_init(device_type, shape, mesh_dim_names=None):
@@ -380,13 +369,8 @@ def _patch_mesh_environment(monkeypatch, world_size):
         calls["mesh_dim_names"] = mesh_dim_names
         return f"mesh<{shape}, {mesh_dim_names}>"
 
-    class FakePlatform:
-        @staticmethod
-        def get_world_size():
-            return world_size
-
     monkeypatch.setattr(lf_utils, "init_device_mesh", fake_init)
-    monkeypatch.setattr(lf_utils, "get_platform", FakePlatform)
+    monkeypatch.setattr(lf_utils.dist, "get_world_size", lambda: world_size)
     return calls
 
 

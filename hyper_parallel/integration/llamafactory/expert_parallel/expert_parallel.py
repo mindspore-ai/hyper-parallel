@@ -19,6 +19,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import torch.distributed as dist
 # LlamaFactory is a PyTorch-only integration boundary.
 # pylint: disable-next=forbidden-backend-import
 from torch import nn
@@ -38,8 +39,6 @@ from hyper_parallel.integration.llamafactory.utils import (
     _resolve_shard_size,
     get_parameters_from_modules,
 )
-from hyper_parallel.platform import get_platform
-
 logger = logging.getLogger(__name__)
 
 
@@ -54,7 +53,7 @@ class _ExpertParallelContext:
 
 def _build_ep_mesh(hp_args: HyperParallelArguments) -> tuple[DeviceMesh, int, int]:
     """Build the EP x expert-FSDP mesh from validated arguments."""
-    edp_size = get_platform().get_world_size() // hp_args.ep_size
+    edp_size = dist.get_world_size() // hp_args.ep_size
     efsdp_size = hp_args.efsdp_size
     if efsdp_size is None:
         efsdp_size = edp_size

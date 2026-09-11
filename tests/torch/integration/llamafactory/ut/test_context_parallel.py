@@ -137,8 +137,12 @@ def test_cp_rank_and_dp_rank_follow_cp_dp_mesh_layout(monkeypatch):
     """
     hp_args = types.SimpleNamespace(cp_size=2)
     monkeypatch.setattr(
-        "hyper_parallel.integration.llamafactory.context_parallel.inputs.get_platform",
-        lambda: types.SimpleNamespace(get_rank=lambda: 5, get_world_size=lambda: 8),
+        "hyper_parallel.integration.llamafactory.context_parallel.inputs.dist.get_rank",
+        lambda: 5,
+    )
+    monkeypatch.setattr(
+        "hyper_parallel.integration.llamafactory.context_parallel.inputs.dist.get_world_size",
+        lambda: 8,
     )
 
     assert _get_cp_dp_ranks(hp_args) == (1, 2)
@@ -355,8 +359,8 @@ def test_cp_mesh_construction_with_cp_disabled(monkeypatch):
         _fake_init_device_mesh,
     )
     monkeypatch.setattr(
-        "hyper_parallel.integration.llamafactory.utils.get_platform",
-        lambda: types.SimpleNamespace(get_world_size=lambda: 8),
+        "hyper_parallel.integration.llamafactory.utils.dist.get_world_size",
+        lambda: 8,
     )
 
     accelerator = types.SimpleNamespace(torch_device_mesh=None, parallelism_config=None)
@@ -385,8 +389,8 @@ def test_cp_mesh_construction_with_cp_enabled(monkeypatch):
         _fake_init_device_mesh,
     )
     monkeypatch.setattr(
-        "hyper_parallel.integration.llamafactory.utils.get_platform",
-        lambda: types.SimpleNamespace(get_world_size=lambda: 8),
+        "hyper_parallel.integration.llamafactory.utils.dist.get_world_size",
+        lambda: 8,
     )
 
     accelerator = types.SimpleNamespace(torch_device_mesh=None, parallelism_config=None)
@@ -415,8 +419,8 @@ def test_cp_mesh_construction_reuses_cached_mesh(monkeypatch):
         _fake_init_device_mesh,
     )
     monkeypatch.setattr(
-        "hyper_parallel.integration.llamafactory.utils.get_platform",
-        lambda: types.SimpleNamespace(get_world_size=lambda: 8),
+        "hyper_parallel.integration.llamafactory.utils.dist.get_world_size",
+        lambda: 8,
     )
 
     accelerator = types.SimpleNamespace(torch_device_mesh=None, parallelism_config=None)
@@ -487,8 +491,12 @@ def test_get_cp_group_ranks_matches_dp_column(monkeypatch):
     Expectation: The computed CP group ranks match the current dp_rank column.
     """
     monkeypatch.setattr(
-        "hyper_parallel.integration.llamafactory.context_parallel.inputs.get_platform",
-        lambda: types.SimpleNamespace(get_rank=lambda: 3, get_world_size=lambda: 8),
+        "hyper_parallel.integration.llamafactory.context_parallel.inputs.dist.get_rank",
+        lambda: 3,
+    )
+    monkeypatch.setattr(
+        "hyper_parallel.integration.llamafactory.context_parallel.inputs.dist.get_world_size",
+        lambda: 8,
     )
 
     ranks = get_cp_group_ranks(types.SimpleNamespace(cp_size=2))
