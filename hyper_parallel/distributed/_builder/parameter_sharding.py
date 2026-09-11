@@ -29,7 +29,9 @@ import torch
 from torch import nn
 
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.distributed.recipe_spec import (
+    EP,
     PlacementMismatchError,
     resolve_placements,
 )
@@ -201,7 +203,7 @@ def _stack_moe_experts(module: nn.Module, ep_stack: Dict[str, List[str]]) -> Non
 # ────────────────────────────────────────────────────────────────────────────
 
 def _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh):
-    """Resolve dense TP and routed-expert source meshes for one sharding plan."""
+    """Resolve dense TP and virtual-EP source meshes for one sharding plan."""
     # Lazy import: applier imports parameter_sharding (_resolve_module) at
     # module level — importing applier here at module level would cycle.
     from hyper_parallel.distributed._builder.applier import (  # pylint: disable=C0415
@@ -226,10 +228,10 @@ def _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh):
     else:
         expert_mesh = None
     if ep_size > 0 and expert_mesh is None:
-        raise ValueError("Routed expert plan requires MeshContext.fsdp_moe_mesh")
+        raise ValueError("Virtual-EP plan requires MeshContext.fsdp_moe_mesh")
     if expert_mesh is not None:
         logger.info(
-            "expert mesh: using %s for parameter sharding, explicit compute injection, "
+            "virtual-EP mesh: using %s for parameter sharding, explicit compute injection, "
             "and FSDP source metadata",
             dict(zip(tuple(expert_mesh.mesh_dim_names), tuple(expert_mesh.mesh_shape))),
         )
@@ -249,7 +251,7 @@ def _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh):
 
 
 def _shard_planned_parameters(models, plan, mesh, expert_mesh, validate_mode):
-    """Shard dense and expert parameters, then update local attention metadata."""
+    """Shard dense and virtual-EP parameters, then update local metadata."""
     for model in models:
         for module_fqn, spec in plan.modules.items():
             module = _resolve_module(model, module_fqn)
@@ -263,12 +265,12 @@ def _shard_planned_parameters(models, plan, mesh, expert_mesh, validate_mode):
                 expert_params = {
                     name: placement
                     for name, placement in spec.params.items()
-                    if name.startswith("experts.")
+                    if isinstance((placement or {}).get(EP), Shard)
                 }
                 dense_params = {
                     name: placement
                     for name, placement in spec.params.items()
-                    if not name.startswith("experts.")
+                    if not isinstance((placement or {}).get(EP), Shard)
                 }
                 _shard_module_params(
                     module,

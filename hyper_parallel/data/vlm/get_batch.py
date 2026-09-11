@@ -19,6 +19,8 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.data.batching.attention_runtime import AttentionRuntimeAdapter
+
 
 _MODEL_INPUT_FIELDS = {
     "input_ids",
@@ -28,6 +30,7 @@ _MODEL_INPUT_FIELDS = {
     "text_position_ids",
     "router_attention_mask",
     "mm_token_type_ids",
+    "token_types",
     "pixel_values",
     "pixel_values_videos",
     "input_features",
@@ -39,6 +42,12 @@ _MODEL_INPUT_FIELDS = {
     "audio_mask",
     "image_grid_hw",
     "image_grid_thw",
+    "image_patch_offsets",
+    "image_vit_grid_hw",
+    "image_llm_grid_hw",
+    "image_batch_indices",
+    "image_token_starts",
+    "packed_seq_params",
     "video_grid_thw",
     "video_timestamp",
 }
@@ -71,13 +80,31 @@ class VLMBatchProcessor:
 class VLMGetBatch:
     """Prepare VLM batches for the temporary TP=CP=PP=1 training path."""
 
-    def __init__(self, *, mesh_context: Any, device: Any, pp_shared_data: bool = False) -> None:
+    def __init__(
+            self,
+            *,
+            mesh_context: Any,
+            device: Any,
+            pp_shared_data: bool = False,
+            attention_mode: str = "dense",
+            attention_runtime_adapter: AttentionRuntimeAdapter | None = None,
+            cp_algorithm: str = "ulysses",
+            causal: bool = True,
+            sliding_window: int | None = None,
+    ) -> None:
         """Validate the temporary VLM parallel boundary and store the device.
 
         Args:
             mesh_context: Trainer mesh exposing TP, CP, and PP sizes.
             device: Destination model device.
             pp_shared_data: Whether pipeline stages share the source batch.
+            attention_mode: ``dense`` preserves the source mask; ``compressed``
+                converts right-padding into compact sequence boundaries.
+            attention_runtime_adapter: Model-owned adapter used for compressed
+                attention metadata.
+            cp_algorithm: Context-parallel algorithm passed to the adapter.
+            causal: Whether the model uses causal attention.
+            sliding_window: Optional local-attention window passed to the adapter.
 
         Raises:
             NotImplementedError: If model parallelism or pipeline batch sharing is enabled.
@@ -95,8 +122,17 @@ class VLMGetBatch:
             )
         if pp_shared_data:
             raise NotImplementedError("The temporary VLM batch path does not support pp_shared_data")
+        if attention_mode not in {"dense", "compressed"}:
+            raise ValueError(f"unsupported VLM attention_mode: {attention_mode!r}")
+        if attention_mode == "compressed" and attention_runtime_adapter is None:
+            raise ValueError("compressed VLM attention requires attention_runtime_adapter")
         self.device = device
         self.processor = VLMBatchProcessor()
+        self.attention_mode = attention_mode
+        self.attention_runtime_adapter = attention_runtime_adapter
+        self.cp_algorithm = cp_algorithm
+        self.causal = causal
+        self.sliding_window = sliding_window
 
     def __call__(
             self,
@@ -122,7 +158,48 @@ class VLMGetBatch:
             if torch.is_tensor(value) else value
             for field, value in normalized_batch.items()
         }
+        if self.attention_mode == "compressed":
+            device_batch["packed_seq_params"] = self._build_packed_seq_params(device_batch)
+            device_batch.pop("attention_mask", None)
         return self.processor.prepare_batch(device_batch)
+
+    def _build_packed_seq_params(self, batch: Mapping[str, Any]) -> object:
+        """Convert right-padding into compact causal-attention boundaries."""
+        input_ids = batch["input_ids"]
+        attention_mask = batch.get("attention_mask")
+        if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+            raise ValueError("compressed VLM attention requires input_ids with shape [batch, sequence]")
+        if not isinstance(attention_mask, torch.Tensor) or attention_mask.shape != input_ids.shape:
+            raise ValueError("compressed VLM attention requires attention_mask with input_ids shape")
+
+        batch_size, sequence_length = input_ids.shape
+        boundaries = [0]
+        for batch_index, row in enumerate(attention_mask.tolist()):
+            valid_length = sum(bool(value) for value in row)
+            expected = [True] * valid_length + [False] * (sequence_length - valid_length)
+            if [bool(value) for value in row] != expected:
+                raise ValueError(
+                    "compressed VLM attention supports only right-padded attention_mask rows; "
+                    f"sample {batch_index} is not right-padded"
+                )
+            sample_start = batch_index * sequence_length
+            if valid_length:
+                boundaries.append(sample_start + valid_length)
+            if valid_length < sequence_length:
+                boundaries.append(sample_start + sequence_length)
+        if len(boundaries) < 2 or boundaries[-1] != batch_size * sequence_length:
+            raise ValueError("compressed VLM attention failed to cover the physical token batch")
+
+        cu_seq_lens = torch.tensor(boundaries, dtype=torch.int64, device=input_ids.device)
+        return self.attention_runtime_adapter.build_packed_seq_params(
+            cu_seq_lens=cu_seq_lens,
+            local_input_shape=input_ids.shape,
+            cp_rank=0,
+            cp_size=1,
+            cp_algorithm=self.cp_algorithm,
+            causal=self.causal,
+            sliding_window=self.sliding_window,
+        )
 
 
 def build_vlm_get_batch(
@@ -130,6 +207,11 @@ def build_vlm_get_batch(
         mesh_context: Any,
         device: Any,
         pp_shared_data: bool = False,
+        attention_mode: str = "dense",
+        attention_runtime_adapter: AttentionRuntimeAdapter | None = None,
+        cp_algorithm: str = "ulysses",
+        causal: bool = True,
+        sliding_window: int | None = None,
 ) -> VLMGetBatch:
     """Build the temporary self-contained VLM batch adapter.
 
@@ -137,11 +219,25 @@ def build_vlm_get_batch(
         mesh_context: Trainer mesh used to validate VLM parallel sizes.
         device: Destination model device.
         pp_shared_data: Reserved pipeline batch-sharing option.
+        attention_mode: Dense or compact compressed-attention input format.
+        attention_runtime_adapter: Optional model-owned compact metadata adapter.
+        cp_algorithm: Context-parallel algorithm selected by the model recipe.
+        causal: Whether compact attention is causal.
+        sliding_window: Optional compact sliding window.
 
     Returns:
         Callable VLM batch adapter.
     """
-    return VLMGetBatch(mesh_context=mesh_context, device=device, pp_shared_data=pp_shared_data)
+    return VLMGetBatch(
+        mesh_context=mesh_context,
+        device=device,
+        pp_shared_data=pp_shared_data,
+        attention_mode=attention_mode,
+        attention_runtime_adapter=attention_runtime_adapter,
+        cp_algorithm=cp_algorithm,
+        causal=causal,
+        sliding_window=sliding_window,
+    )
 
 
 __all__ = ["VLMBatchProcessor", "VLMGetBatch", "build_vlm_get_batch"]

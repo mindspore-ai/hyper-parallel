@@ -1,0 +1,63 @@
+schema_version: 1
+status: functional_smoke_pass
+baseline_commit: 8f933e7c2578934306bfba0e5a1d6672d505c3ae
+model:
+  path: /home/ma-user/work/y00512198/DeepSeek-V4.1-Flash
+  config_sha256: 8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879
+  transformers_version: 5.13.0
+  initialization: random
+  crop:
+    decoder_layers: 4
+    vision_layers: 1
+    routed_experts: 16
+data:
+  mode: online
+  sequence_length: 4096
+  train_records: 512
+  validation_records: 128
+  train_jsonl: output/training_demo/deepseek_v41/mm_data/deepseek_v41_messages/train.jsonl
+  train_sha256: 4728da3cc64ce744b6921f368cd306d87703482dd8620471e455f536bbc85a0f
+parallelism:
+  world_size: 16
+  tp: 1
+  cp: 1
+  ep: 16
+  pp: 1
+  dense_fsdp: 16
+  expert_data_shard: 1
+fsdp:
+  child_units: 12
+  adapter_units:
+    - model.vision.blocks.0
+    - model.aligner
+    - model.layers.1.engram
+    - model.layers.1.engram.wkv
+  execution_order:
+    - model.vision.blocks.0
+    - model.aligner
+    - model.layers.0
+    - model.layers.0.mlp.experts
+    - model.layers.1
+    - model.layers.1.engram
+    - model.layers.1.engram.wkv
+    - model.layers.1.mlp.experts
+    - model.layers.2
+    - model.layers.2.mlp.experts
+    - model.layers.3
+    - model.layers.3.mlp.experts
+validation:
+  unit_tests_passed: 36
+  distributed_smoke: passed
+  success_marker: output/training_demo/deepseek_v41/vlm_tp1_ep16.success
+  log: output/training_demo/deepseek_v41/run_vlm_tp1_ep16.log
+  max_allocated_gib: 41.5858
+  max_reserved_gib: 56.041
+  step_time_seconds: 13.933
+  foundation_loss: 11.6094
+  grad_norm: "inf"
+precision_acceptance: false
+limitations:
+  - Random initialization and Online data are functional validation only.
+  - Full pretrained 32-layer vision checkpoint has not been validated.
+  - Multimodal TP2, CP, and PP batch paths are not implemented.
+  - Multi-step communication overlap profiling has not been collected.

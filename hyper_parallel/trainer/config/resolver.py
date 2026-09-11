@@ -190,6 +190,11 @@ def _coerce_literal(value: object, choices: tuple, *, path: str) -> object:
 def coerce_value(value: object, annotation: object, *, path: str) -> object:
     """Validate and normalize one target argument or typed CLI override."""
 
+    # A nested target is a deferred instance of the annotated runtime type.
+    # Its constructor arguments are validated when its own node is resolved;
+    # the parent Target materializes it immediately before invocation.
+    if isinstance(value, Target):
+        return value
     if annotation in (Any, object):
         return value
     if isinstance(annotation, dataclasses.InitVar):
@@ -302,6 +307,28 @@ def _target_hints(target: object, *, path: str) -> dict[str, object]:
         raise _fail(path, f"could not resolve target type annotations: {exc}") from exc
 
 
+def _resolve_nested_target_nodes(value: object, *, path: str) -> object:
+    """Resolve reserved ``_target_`` nodes inside a target argument tree."""
+    if isinstance(value, Mapping):
+        if "_target_" in value:
+            return _resolve_target(value, path=path)
+        return {
+            key: _resolve_nested_target_nodes(item, path=f"{path}.{key}")
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _resolve_nested_target_nodes(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _resolve_nested_target_nodes(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        )
+    return value
+
+
 def _normalize_target_args(
     raw_args: Mapping[str, object],
     signature: inspect.Signature,
@@ -318,6 +345,7 @@ def _normalize_target_args(
     normalized = {}
     for name, value in raw_args.items():
         parameter = signature.parameters.get(name)
+        value = _resolve_nested_target_nodes(value, path=f"{path}.{name}")
         if parameter is None:
             normalized[name] = value
             continue
@@ -493,6 +521,8 @@ def resolve_component(node: object, *, expected_type: object, path: str) -> obje
         return _resolve_dataloader_config(node, path=path)
     if expected_type is OptimizerConfig:
         return _resolve_optimizer_config(node, path=path)
+    if isinstance(node, Mapping) and "_target_" in node:
+        return _resolve_target(node, path=path)
     if isinstance(expected_type, type) and dataclasses.is_dataclass(expected_type):
         return _resolve_dataclass(node, expected_type, path=path)
     return coerce_value(node, expected_type, path=path)

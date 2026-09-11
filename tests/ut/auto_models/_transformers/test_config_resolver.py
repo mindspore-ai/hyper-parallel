@@ -12,17 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Config-resolver characterization: the empty ``MODEL_ARCH_MAPPING`` HF fallback.
+"""Config-resolver characterization: custom models and the HF fallback.
 
 Renamed from ``test_registry.py`` in S5f (05 stage-5 item 4): the former
 ``_transformers/registry.py`` facade was split into
 ``_transformers/config_resolver.py`` (HF config helpers, tested here) and
-``models/registry.py`` (family registry, M1). With an empty mapping every
-architecture resolves to None, so ``get_is_hf_model`` always selects the
-HF native implementation; a broken lazy entry also falls back to HF
+``models/registry.py`` (family registry, M1). An unknown architecture resolves
+to None, so ``get_is_hf_model`` selects the HF native implementation; a broken lazy entry also falls back to HF
 instead of raising. No Hub/network access is needed: ``MODEL_ARCH_MAPPING``
-entries are injected locally and ``AutoConfig.from_pretrained`` is never
-called.
+entries are registered or injected locally and ``AutoConfig.from_pretrained``
+is never called.
 """
 # pylint: disable=wrong-import-position
 
@@ -30,6 +29,7 @@ import os
 import unittest
 from collections import OrderedDict
 from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
@@ -39,18 +39,24 @@ from tests.common.mark_utils import arg_mark
 
 
 class TestEmptyMappingFallback(unittest.TestCase):
-    """HF fallback semantics of the (currently empty) arch registry."""
+    """Custom-architecture resolution and HF fallback semantics."""
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_mapping_is_empty_ordered_dict(self):
-        """Current master ships no custom architectures.
-
-        The registry is filled lazily by ``models/registry.py``; update this
-        snapshot in the same commit that registers the first model.
-        """
+    def test_deepseek_v41_registers_lazily(self):
+        """Family discovery registers the V4.1 custom architecture."""
         self.assertIsInstance(registry.MODEL_ARCH_MAPPING, OrderedDict)
-        self.assertEqual(len(registry.MODEL_ARCH_MAPPING), 0)
+        spec = registry.get_model_adapter("deepseek_v41")
+        self.assertIsNotNone(spec)
+        self.assertEqual(
+            registry.MODEL_ARCH_MAPPING["DeepseekV41ForCausalLM"],
+            (
+                "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
+                "DeepseekV41CroppedForCausalLM",
+            ),
+        )
+        model_cls = registry._resolve_custom_model_cls("DeepseekV41ForCausalLM")
+        self.assertEqual(model_cls.__name__, "DeepseekV41CroppedForCausalLM")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -62,7 +68,7 @@ class TestEmptyMappingFallback(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_get_is_hf_model(self):
-        """Every config shape selects HF native while the mapping is empty."""
+        """Unknown and missing architectures select the HF implementation."""
         config = SimpleNamespace(architectures=["Qwen3MoeForCausalLM"])
         self.assertTrue(config_resolver.get_is_hf_model(config))
         self.assertTrue(config_resolver.get_is_hf_model(SimpleNamespace(architectures=[])))
@@ -70,6 +76,28 @@ class TestEmptyMappingFallback(unittest.TestCase):
         self.assertTrue(config_resolver.get_is_hf_model(SimpleNamespace()))
         # force_hf short-circuits regardless of architectures
         self.assertTrue(config_resolver.get_is_hf_model(config, force_hf=True))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_custom_model_resolution_triggers_family_discovery(self):
+        """AutoModel path selection should not require registry preheating."""
+        config = SimpleNamespace(
+            model_type="lazy_family",
+            architectures=["LazyFamilyForCausalLM"],
+        )
+        with (
+                patch.object(config_resolver, "get_model_adapter") as discover,
+                patch.object(
+                    config_resolver,
+                    "_resolve_custom_model_cls",
+                    return_value=dict,
+                ) as resolve,
+        ):
+            is_hf_model = config_resolver.get_is_hf_model(config)
+
+        self.assertFalse(is_hf_model)
+        discover.assert_called_once_with("lazy_family")
+        resolve.assert_called_once_with("LazyFamilyForCausalLM")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

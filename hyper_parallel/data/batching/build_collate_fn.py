@@ -19,6 +19,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from math import lcm
 from typing import Any
 
 import torch
@@ -67,6 +68,7 @@ class TextPackingCollator(DataCollator):
     """
 
     sequence_parallel_size: int = 1
+    sample_alignment: int = 1
 
     def __call__(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
         """Pack samples into one ``[1, packed_length]`` forward-backward batch.
@@ -83,22 +85,39 @@ class TextPackingCollator(DataCollator):
         if not model_samples:
             raise ValueError("model_samples must contain at least one Online sample")
 
-        packed_batch = {}
-        for field in ("input_ids", "labels"):
-            values = [model_sample[field] for model_sample in model_samples]
-            packed_batch[field] = torch.cat(values, dim=-1).unsqueeze(0)
+        if self.sample_alignment <= 0:
+            raise ValueError("sample_alignment must be positive")
+        aligned_lengths = []
+        values_by_field = {"input_ids": [], "labels": []}
+        for model_sample in model_samples:
+            sample_length = int(model_sample["input_ids"].shape[-1])
+            sample_pad = (-sample_length) % self.sample_alignment
+            aligned_lengths.append(sample_length + sample_pad)
+            values_by_field["input_ids"].append(model_sample["input_ids"])
+            values_by_field["labels"].append(model_sample["labels"])
+            if sample_pad:
+                values_by_field["input_ids"].append(
+                    model_sample["input_ids"].new_zeros(sample_pad)
+                )
+                values_by_field["labels"].append(
+                    model_sample["labels"].new_full((sample_pad,), IGNORE_INDEX)
+                )
+
+        packed_batch = {
+            field: torch.cat(values, dim=-1).unsqueeze(0)
+            for field, values in values_by_field.items()
+        }
 
         packed_seq_len = packed_batch["input_ids"].shape[-1]
-        pad_len = (-packed_seq_len) % self.sequence_parallel_size
+        physical_alignment = lcm(self.sequence_parallel_size, self.sample_alignment)
+        pad_len = (-packed_seq_len) % physical_alignment
         if pad_len:
             input_padding = packed_batch["input_ids"].new_zeros((1, pad_len))
             label_padding = packed_batch["labels"].new_full((1, pad_len), IGNORE_INDEX)
             packed_batch["input_ids"] = torch.cat((packed_batch["input_ids"], input_padding), dim=-1)
             packed_batch["labels"] = torch.cat((packed_batch["labels"], label_padding), dim=-1)
 
-        seq_lens = model_samples[0]["input_ids"].new_tensor(
-            [model_sample["input_ids"].shape[-1] for model_sample in model_samples]
-        )
+        seq_lens = model_samples[0]["input_ids"].new_tensor(aligned_lengths)
         zero = seq_lens.new_zeros(1)
         seq_ends = seq_lens.cumsum(dim=0)
         if pad_len:
@@ -142,7 +161,10 @@ def build_indexed_collate_fn() -> Callable[[list[Any]], Any]:
     return collate_fn
 
 
-def build_online_text_collate_fn(mesh_context: Any | None = None) -> DataCollator:
+def build_online_text_collate_fn(
+        mesh_context: Any | None = None,
+        sample_alignment: int = 1,
+) -> DataCollator:
     """Build Online text collation shared by fixed N and dynamic K batching.
 
     Packing concatenates ``input_ids`` and ``labels`` and emits ``cu_seq_lens``.
@@ -154,12 +176,18 @@ def build_online_text_collate_fn(mesh_context: Any | None = None) -> DataCollato
 
     Args:
         mesh_context: Runtime TP/CP topology injected by the Trainer.
+        sample_alignment: Pad every packed sample to this token multiple.
+            Compressed-attention adapters use their largest grouping ratio so
+            one group never mixes tokens from adjacent samples.
 
     Returns:
         A collator producing one forward-backward batch.
     """
     sequence_parallel_size = _get_sequence_parallel_size(mesh_context)
-    packing_collator = TextPackingCollator(sequence_parallel_size=sequence_parallel_size)
+    packing_collator = TextPackingCollator(
+        sequence_parallel_size=sequence_parallel_size,
+        sample_alignment=sample_alignment,
+    )
     collate_fn = MainCollator(packing_collator=packing_collator)
 
     return collate_fn
