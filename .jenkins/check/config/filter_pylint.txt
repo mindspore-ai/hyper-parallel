@@ -157,3 +157,7 @@
 #     public API and no get_platform() equivalent (mindspore has no FX-tracing
 #     surface); moving the package under platform/torch/ is tracked separately.
 "hyper-parallel/hyper_parallel/compile/"                                   "forbidden-backend-import"
+
+# 20. Graph-mode example scripts — runnable from a repo checkout without pip
+#     install, so they prepend the repo root to sys.path (documented pattern).
+"hyper-parallel/hyper_parallel/compile/examples/"                          "sys-path-mutation"

@@ -30,11 +30,18 @@ Covers the rules the dataclass asserts and that have regressed before:
 import unittest
 
 from hyper_parallel.compile.parallel_config import PassConfig
+from tests.common.mark_utils import arg_mark
 
 
 class TestPassConfigDefaults(unittest.TestCase):
     """Defaults reflect graph-mode's FSDP-focused intent."""
 
+    @arg_mark(
+        plat_marks=["cpu_linux"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="unessential",
+    )
     def test_defaults(self):
         """Test default config: FSDP on, overlap on, degrees unresolved."""
         cfg = PassConfig()
@@ -56,7 +63,30 @@ class TestPassConfigDefaults(unittest.TestCase):
         self.assertEqual(
             cfg.tp_size, 1, (f"tp_size default should be 1, got {cfg.tp_size}")
         )
+        # PP defaults: off by default (opt-in), degrees unresolved, safe
+        # microbatch of 1.
+        self.assertFalse(
+            cfg.pp_enabled,
+            (f"pp_enabled default should be False (opt-in), got {cfg.pp_enabled}"),
+        )
+        self.assertIsNone(
+            cfg.pp_degree,
+            (
+                f"pp_degree default should be None (resolve at runtime), got {cfg.pp_degree}"
+            ),
+        )
+        self.assertEqual(
+            cfg.pp_microbatch_size,
+            1,
+            (f"pp_microbatch_size default should be 1, got {cfg.pp_microbatch_size}"),
+        )
 
+    @arg_mark(
+        plat_marks=["cpu_linux"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="unessential",
+    )
     def test_explicit_construction(self):
         """Test explicit construction forwards every kwarg."""
         cfg = PassConfig(
@@ -64,16 +94,28 @@ class TestPassConfigDefaults(unittest.TestCase):
             fsdp_enabled=False,
             fsdp_degree=8,
             tp_size=2,
+            pp_enabled=True,
+            pp_degree=4,
+            pp_microbatch_size=2,
         )
         self.assertFalse(cfg.enable_overlap)
         self.assertFalse(cfg.fsdp_enabled)
         self.assertEqual(cfg.fsdp_degree, 8)
         self.assertEqual(cfg.tp_size, 2)
+        self.assertTrue(cfg.pp_enabled)
+        self.assertEqual(cfg.pp_degree, 4)
+        self.assertEqual(cfg.pp_microbatch_size, 2)
 
 
 class TestPassConfigValidation(unittest.TestCase):
     """``__post_init__`` catches misconfigurations early."""
 
+    @arg_mark(
+        plat_marks=["cpu_linux"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="unessential",
+    )
     def test_rejects_non_positive_tp_size(self):
         """Test ``tp_size < 1`` raises ValueError at construction."""
         for bad in (0, -1, -4):
@@ -88,6 +130,12 @@ class TestPassConfigValidation(unittest.TestCase):
                 ),
             )
 
+    @arg_mark(
+        plat_marks=["cpu_linux"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="unessential",
+    )
     def test_rejects_non_positive_fsdp_degree(self):
         """Test explicit ``fsdp_degree < 1`` raises ValueError."""
         for bad in (0, -1, -8):
@@ -102,11 +150,23 @@ class TestPassConfigValidation(unittest.TestCase):
                 ),
             )
 
+    @arg_mark(
+        plat_marks=["cpu_linux"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="unessential",
+    )
     def test_fsdp_degree_none_allowed(self):
         """Test ``fsdp_degree=None`` is the documented auto-resolve sentinel."""
         cfg = PassConfig(fsdp_degree=None)
         self.assertIsNone(cfg.fsdp_degree)
 
+    @arg_mark(
+        plat_marks=["cpu_linux"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="unessential",
+    )
     def test_validate_after_mutation(self):
         """Test ``validate()`` re-runs checks after a caller mutates a field.
 
@@ -135,10 +195,15 @@ class TestPassConfigTorchFree(unittest.TestCase):
     plain config field.
     """
 
+    @arg_mark(
+        plat_marks=["cpu_linux"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="unessential",
+    )
     def test_module_does_not_import_torch_at_top(self):
         """Test no top-level torch import in ``parallel_config`` module."""
         import hyper_parallel.compile.parallel_config as mod
-        import sys
 
         # torch / torch.distributed must not be a side-effect of importing
         # the config module. (It may be imported by *something else* in the

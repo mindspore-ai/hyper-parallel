@@ -21,7 +21,15 @@ Execution Order:
 1. Basic optimization: DeadCodeElimination, CanonicalizeGraph
 2. Execution layer:
    - FSDPPass (FSDP)
-3. Communication-compute overlap: AutoOverlapPass
+   - PpPass (pipeline-parallel stage split) — runs AFTER FSDPPass: the FSDP
+     collectives are value-level FX nodes that follow the data flow, so the
+     stage slices inherit this stage's all_gather/reduce_scatter untouched
+     while foreign stages' collectives are simply never copied. Splitting
+     first would hand FSDPPass two subgraphs and a loss-less output list,
+     breaking its grad-index contract.
+3. Communication-compute overlap: AutoOverlapPass (a no-op under PP — the
+   stage stub carries no wait_tensor nodes; the GPipe schedule overlaps
+   comm/compute at the Python level)
 
 The backend compilation slot (InductorPass) is intentionally not wired yet;
 add it here when an inductor backend integration lands.
@@ -33,6 +41,7 @@ from ..parallel_config import PassConfig
 from .base import GraphPass
 from .overlap.schedule import AutoOverlapPass
 from .parallel.fsdp_pass import FSDPPass
+from .parallel.pp_pass import PpPass
 
 if TYPE_CHECKING:
     from torch import fx
@@ -70,6 +79,8 @@ class PassPipeline:
         # 2. Execution layer: Parallel dimension partitioning
         if getattr(self.config, "fsdp_enabled", False):
             self.passes.append(FSDPPass(pass_plan=self.pass_plan))
+        if getattr(self.config, "pp_enabled", False):
+            self.passes.append(PpPass(pass_plan=self.pass_plan))
 
         # 3. Communication-compute overlap optimization
         if getattr(self.config, "enable_overlap", False):
