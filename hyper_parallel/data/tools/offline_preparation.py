@@ -43,7 +43,7 @@ except ImportError:
     NLTK_AVAILABLE = False
 
 # Store generated samples in the indexed ``.bin/.idx`` format.
-from hyper_parallel.data.indexed import io as indexed_dataset
+from hyper_parallel.data.tools import io as indexed_dataset
 
 
 class CustomLanguageVars(PunktLanguageVars):
