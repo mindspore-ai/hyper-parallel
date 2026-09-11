@@ -56,6 +56,7 @@
 /tests/ut/platform/mindspore/ @yangzhenzhang
 /tests/ut/platform/mindspore/fully_shard/ @DavidFFFan
 /tests/ut/core/context_parallel/ @yangzhenzhang
+/tests/ut/compile/ @kisnwang @zhenyu10
 
 /tests/torch/ @yangzhenzhang
 /tests/torch/activation_checkpoint/ @DavidFFFan
