@@ -14,10 +14,8 @@
 # ============================================================================
 """indexed: indexed (.idx/.bin) dataset implementation and C++ helpers.
 
-Moved from ``components/datasets/llm/indexed_*`` and
-``components/datasets/tools/indexed_dataset.py`` (now ``io.py``) in stage 6
-(05 §11.4/§11.6). Submodules are imported by full path; this package keeps
-no flat re-exports.
+Submodules are imported by full path; this package keeps no flat re-exports.
+Offline indexed I/O tools live in ``hyper_parallel.data.tools.io``.
 """
 
 from pathlib import Path
