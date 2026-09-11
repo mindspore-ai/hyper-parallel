@@ -235,10 +235,10 @@ custom_shard(...)
 
 ### `DFunction`
 
-自定义分布式 autograd 函数基类。
+Torch 自定义分布式 autograd 函数基类。
 
 ```python
-class DFunction(platform.Function):
+class DFunction(torch.autograd.Function):
     _op_name: str = None
 
     @staticmethod

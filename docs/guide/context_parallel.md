@@ -115,7 +115,7 @@ AsyncContextParallel(seq_dim=1, head_dim=2, ulysses_degree=None).apply(
 
 ## DSA CP
 
-DSA 这里指 DeepSeek Sparse Attention。DSA CP 不是通用 attention 的替代实现，而是给 DSA 相关算子边界准备 DTensor placement，使 `lightning_indexer`、`npu_sparse_flash_attention` 和 indexer-loss 自定义算子能够按 CP layout 分发。
+DSA 这里指 DeepSeek Sparse Attention。DSA CP 不是通用 attention 的替代实现，而是给 DSA 的 indexer、sparse attention 和 indexer-loss 模块边界准备 DTensor placement。边界实现负责消费转换后的 DTensor 或 local tensor 输入。
 
 DSA CP 当前只支持 `mode="colossal"`，`mode="ulysses"` 会直接报错。支持的输入布局为：
 

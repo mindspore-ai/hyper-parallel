@@ -867,26 +867,6 @@ class MindSporePlatform(Platform):
     dtype = ms.Type
     Function = _Function
 
-    _custom_ops_cls = None
-
-    @property
-    def custom_ops(self):
-        """Return the MindSpore platform custom ops instance.
-
-        .. warning::
-            This is an experimental API that subject to change or deletion.
-
-        Returns:
-            MindSporeCustomOps: Custom ops class that delegates to DFunction
-            implementations wrapping Ascend NPU custom C++ kernels.
-        """
-        if self._custom_ops_cls is None:
-            from hyper_parallel.platform.mindspore.custom_ops.custom_ops import (  # pylint: disable=import-outside-toplevel
-                MindSporeCustomOps,
-            )
-            self._custom_ops_cls = MindSporeCustomOps
-        return self._custom_ops_cls
-
     @staticmethod
     def get_swap_optimizer():
         """Return the MindSpore optimizer-state swap wrapper class."""
@@ -2039,13 +2019,13 @@ class MindSporePlatform(Platform):
         return checkpoint_exclude_wrapper(module, save_output=save_output)
 
     @staticmethod
-    def swap_wrapper(module, policy_fn=None, group_swap=False):
+    def swap_wrapper(module, policy_fn=None, group_swap=False):  # pylint: disable=arguments-differ
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import swap_wrapper
         return swap_wrapper(module, policy_fn=policy_fn, group_swap=group_swap)
 
     @staticmethod
-    def swap_tensor_wrapper(target, tag=None, group_swap=False):
+    def swap_tensor_wrapper(target, tag=None, group_swap=False):  # pylint: disable=arguments-differ
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import swap_tensor_wrapper
         return swap_tensor_wrapper(target, tag=tag, group_swap=group_swap)
@@ -2061,7 +2041,8 @@ class MindSporePlatform(Platform):
         return null_context_fn
 
     @staticmethod
-    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False):
+    def create_selective_checkpoint_contexts(  # pylint: disable=arguments-differ
+            policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False):
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.activation_checkpoint.sac import create_selective_checkpoint_contexts
         return create_selective_checkpoint_contexts(policy_fn_or_list,
@@ -2075,7 +2056,7 @@ class MindSporePlatform(Platform):
         ignore_sac_ops(ignore_ops)
 
     @staticmethod
-    def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
+    def async_save_on_cpu(policy_fn=None, group_swap: bool = False):  # pylint: disable=arguments-differ
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import AsyncSaveOnCpu
         return AsyncSaveOnCpu(policy_fn=policy_fn, group_swap=group_swap)

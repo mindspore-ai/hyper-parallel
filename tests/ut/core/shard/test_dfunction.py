@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for ``hyper_parallel.core.shard.dfunction``.
-
-All tests run on CPU without any distributed setup.  The torch platform is
-selected so that ``platform.Function = torch.autograd.Function``.
-"""
+"""Unit tests for the Torch-only distributed autograd ``DFunction``."""
+# pylint: disable=wrong-import-position
 import os
 import unittest
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
@@ -36,12 +34,14 @@ class _AddFunc(DFunction):
     """Element-wise add: output = x + y."""
 
     @staticmethod
-    def forward(ctx, x, y):  # pylint: disable=W0221
+    def forward(ctx: Any, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0221
+        """Add two tensors and save them for backward."""
         ctx.save_for_backward(x, y)
         return x + y
 
     @staticmethod
-    def backward(ctx, grad):  # pylint: disable=W0221
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:  # pylint: disable=W0221
+        """Return the incoming gradient for both inputs."""
         x, y = ctx.saved_tensors
         return torch.ones_like(x) * grad, torch.ones_like(y) * grad
 
@@ -50,13 +50,15 @@ class _ScaleFunc(DFunction):
     """Scale: output = x * scale (scale is a non-tensor positional arg)."""
 
     @staticmethod
-    def forward(ctx, x, scale):  # pylint: disable=W0221
+    def forward(ctx: Any, x: torch.Tensor, scale: float) -> torch.Tensor:  # pylint: disable=W0221
+        """Scale a tensor and save the scale for backward."""
         ctx.save_for_backward(x)
         ctx.scale = scale
         return x * scale
 
     @staticmethod
-    def backward(ctx, grad):  # pylint: disable=W0221
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, None]:  # pylint: disable=W0221
+        """Scale the incoming gradient and omit the scalar gradient."""
         # None for the non-tensor scale argument
         return grad * ctx.scale, None
 
@@ -65,12 +67,14 @@ class _MultiOutputFunc(DFunction):
     """Returns two outputs for testing tuple backward."""
 
     @staticmethod
-    def forward(ctx, x):  # pylint: disable=W0221
+    def forward(ctx: Any, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:  # pylint: disable=W0221
+        """Return two scaled views of the input."""
         ctx.save_for_backward(x)
         return x * 2, x * 3
 
     @staticmethod
-    def backward(ctx, grad_a, grad_b):  # pylint: disable=W0221
+    def backward(ctx: Any, grad_a: torch.Tensor, grad_b: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0221
+        """Combine gradients from both outputs."""
         return grad_a * 2 + grad_b * 3
 
 
@@ -78,11 +82,13 @@ class _NoOpNameFunc(DFunction):
     """DFunction subclass with no _op_name — for error-case testing."""
 
     @staticmethod
-    def forward(ctx, x):  # pylint: disable=W0221
+    def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0221
+        """Return the input unchanged."""
         return x
 
     @staticmethod
-    def backward(ctx, grad):  # pylint: disable=W0221
+    def backward(ctx: Any, grad: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0221
+        """Return the incoming gradient unchanged."""
         return grad
 
 
@@ -171,9 +177,9 @@ class TestDFunctionBasics(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestDFunctionBaseClass(unittest.TestCase):
-    """Verify the platform base class and class structure."""
+    """Verify the Torch base class and class structure."""
 
-    def test_platform_base_is_torch_function(self):
+    def test_base_is_torch_function(self):
         """DFunction inherits from torch.autograd.Function."""
         assert issubclass(DFunction, torch.autograd.Function), (
             f"DFunction should subclass torch.autograd.Function, "
@@ -204,7 +210,7 @@ class TestLocalCallable(unittest.TestCase):
     """Tests for _LocalCallable naming and caching behaviour."""
 
     def test_local_callable_name_attributes(self):
-        """_LocalCallable exposes both __name__ and .name for platform dispatchers."""
+        """_LocalCallable exposes __name__ for Torch operation-name resolution."""
         def _identity_fn(*a):
             return a
         fn = _identity_fn
@@ -212,8 +218,8 @@ class TestLocalCallable(unittest.TestCase):
         assert lc.__name__ == "TestOp", (
             f"__name__ mismatch: expected 'TestOp', got {lc.__name__}"
         )
-        assert lc.name == "TestOp", (
-            f".name mismatch: expected 'TestOp', got {lc.name}"
+        assert not hasattr(lc, "name"), (
+            f"Torch-only callable should not expose the MindSpore name attribute, got {vars(lc)}"
         )
 
     def test_local_callable_invocation(self):
@@ -245,25 +251,33 @@ class TestLocalCallable(unittest.TestCase):
         """Each DFunction subclass has its own independent _local_callable."""
 
         class _FuncA(DFunction):
+            """Test-only DFunction using operation name OpA."""
+
             _op_name = "OpA"
 
             @staticmethod
-            def forward(ctx, x):  # pylint: disable=W0221
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0221
+                """Return the input unchanged."""
                 return x
 
             @staticmethod
-            def backward(ctx, grad):  # pylint: disable=W0221
+            def backward(ctx: Any, grad: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0221
+                """Return the incoming gradient unchanged."""
                 return grad
 
         class _FuncB(DFunction):
+            """Test-only DFunction using operation name OpB."""
+
             _op_name = "OpB"
 
             @staticmethod
-            def forward(ctx, x):  # pylint: disable=W0221
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0221
+                """Double the input tensor."""
                 return x * 2
 
             @staticmethod
-            def backward(ctx, grad):  # pylint: disable=W0221
+            def backward(ctx: Any, grad: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0221
+                """Double the incoming gradient."""
                 return grad * 2
 
         lc_a = _FuncA._get_local_callable()

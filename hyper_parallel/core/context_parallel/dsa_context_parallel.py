@@ -14,11 +14,9 @@
 # ============================================================================
 """Context parallel style for DeepSeek Sparse Attention (DSA).
 
-These PyNative module-level styles are companions to the DSA distributed
-operators.  The distributed operators define the per-op layout rules for
-``lightning_indexer``, ``npu_sparse_flash_attention`` and indexer-loss custom
-ops; these styles prepare module inputs so those rules can be selected by the
-DTensor dispatcher.
+These PyNative module-level styles prepare DTensor placements at DSA indexer,
+sparse-attention, and indexer-loss module boundaries. Boundary implementations
+are responsible for consuming the resulting DTensor or local-tensor inputs.
 
 The first implementation intentionally supports only Colossal-style CP:
 query-side tensors are sharded on sequence, while key-side tensors are gathered

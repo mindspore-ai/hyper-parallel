@@ -135,10 +135,7 @@
 # 15. Expert Parallel tests — torch and torch_npu imports are conditionally used in distributed tests
 "hyper-parallel/tests/torch/expert_parallel/"                           "unused-import"
 
-# 16. Code static analysis fixes - custom_ops
-"hyper-parallel/hyper_parallel/platform/mindspore/custom_ops/"          "arguments-differ"
-
-# 17. LlamaFactory Context Parallel — Qwen3VL-MoE CP attention keeps the native
+# 16. LlamaFactory Context Parallel — Qwen3VL-MoE CP attention keeps the native
 #     forward signature for drop-in class patching; some native-only arguments are
 #     intentionally unused because CP applies RoPE after sequence/head exchange.
 "hyper-parallel/hyper_parallel/integration/llamafactory/context_parallel/models/qwen3_vl/qwen3vl_forward.py" "unused-argument"

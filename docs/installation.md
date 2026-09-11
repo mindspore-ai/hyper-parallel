@@ -31,7 +31,6 @@ zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释�
 | 参数 | 默认值 | 可选值 | 说明 |
 |------|--------|--------|------|
 | `--multicore` | `on` | `on`、`off` | 编译 Torch Multicore 及其私有 SHMEM。 |
-| `--custom-ops` | `on` | `on`、`off` | 编译 MindSpore custom ops。 |
 | `--soc-list` | `ascend910b,ascend910_93` | SoC 列表 | 选择 Multicore kernel 目标。 |
 | `--strict` | `off` | `on`、`off` | 所选 optional 组件失败时是否终止。 |
 | `--jobs` | `nproc` | 正整数 | 设置 native 编译并行度。 |
@@ -39,7 +38,7 @@ zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释�
 
 ```bash
 ./build.sh --help
-./build.sh --multicore on --custom-ops on --soc-list ascend910b,ascend910_93
+./build.sh --multicore on --soc-list ascend910b,ascend910_93
 ./build.sh --strict on --jobs 24
 # 安装本次命令打印的精确 wheel 路径
 pip install /absolute/path/to/the-built-wheel.whl

@@ -19,14 +19,15 @@ import glob
 import importlib
 import logging
 import os
-import sys
 import warnings
 from contextvars import ContextVar
+from functools import lru_cache
 from itertools import chain
 from typing import Any, Dict, FrozenSet, List, Optional
 
 import yaml
 
+from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import RaggedShardInfo
@@ -43,6 +44,10 @@ platform = get_platform()
 Tensor = platform.Tensor
 
 logger = logging.getLogger(__name__)
+
+_DISTRIBUTED_OPS_PACKAGE = "hyper_parallel.core.shard.ops"
+_DISTRIBUTED_OPS_DIR = os.path.realpath(os.path.join(os.path.dirname(__file__), "ops"))
+_DISTRIBUTED_OPS_YAML_DIR = os.path.join(_DISTRIBUTED_OPS_DIR, "yaml")
 
 
 def _apply_shard_offset_to_rng_args(args, offset_incr):
@@ -271,13 +276,7 @@ class OpDispatcher:
     })
 
     def __init__(self):
-        self._env_yaml_dir: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_YAML_DIR")
-        self._env_python_path: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_PYTHON_PATH")
-        # The following attributes are initialized in _setup_yaml_dir()
-        self.work_dir = ""  # Initialized in _setup_yaml_dir()
-        self.yaml_dir = ""  # Initialized in _setup_yaml_dir()
-
-        self._setup_paths_from_env()
+        self.yaml_dir = _DISTRIBUTED_OPS_YAML_DIR
 
         self.layout_infer_ops = self.safe_load_yaml_from_dir()
         # frozenset for O(1) membership (checked on every dispatch's bypass test).
@@ -319,88 +318,58 @@ class OpDispatcher:
 
         self._register_distributed_ops()
 
-    def _setup_paths_from_env(self):
-        """
-        Setup YAML directory and Python path from environment variables.
-
-        This method initializes the YAML directory and extends sys.path based on
-        environment variables HYPER_PARALLEL_OPS_YAML_DIR and HYPER_PARALLEL_OPS_PYTHON_PATH.
-        """
-        self._setup_yaml_dir(self._env_yaml_dir)
-        self._extend_sys_path(self._env_python_path)
-
-    def _setup_yaml_dir(self, env_yaml_dir: Optional[str]):
-        """
-        Feature: Configure yaml_dir/work_dir for OpDispatcher
-        Description: Resolve the YAML directory used to load distributed op definitions.
-                     If env_yaml_dir is an absolute path, use it directly; otherwise treat it
-                     as a path relative to the project work_dir. If env_yaml_dir is not set,
-                     fall back to the default 'shard/ops/yaml' under work_dir.
-        Expectation: self.yaml_dir and self.work_dir are set to valid values used later by
-                     safe_load_yaml_from_dir(); no functional behavior is changed.
-        """
-        if env_yaml_dir:
-            if os.path.isabs(env_yaml_dir):
-                self.yaml_dir = env_yaml_dir
-                self.work_dir = ""
-            else:
-                self.work_dir = os.path.normpath(
-                    os.path.join(os.path.dirname(os.path.realpath(__file__)), "../")
-                )
-                self.yaml_dir = env_yaml_dir
-        else:
-            self.yaml_dir = "shard/ops/yaml"
-            self.work_dir = os.path.normpath(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), "../")
-            )
-
-    @staticmethod
-    def _extend_sys_path(env_python_path: Optional[str]):
-        if not env_python_path:
-            return
-        python_paths = env_python_path.split(":")
-        for path in python_paths:
-            if path and os.path.isdir(path) and path not in sys.path:
-                sys.path.append(path)
-
     def _register_distributed_ops(self):
         for op_name, config in self.layout_infer_ops.items():
             self._register_single_distributed_op(op_name, config)
 
-    def _register_single_distributed_op(self, op_name: str, config: dict):
-        """
-        Feature: Register a single distributed op implementation
-        Description: Import the distributed op class specified by config and instantiate it
-                     with op_name to trigger registration in the distributed op registry.
-                     Prefer 'distributed_op_module' when provided; otherwise import from
-                     built-in module prefix 'hyper_parallel.core.shard.ops.' plus
-                     'distributed_op_file'. If import fails and an external python path is
-                     provided via env, fall back to importing 'distributed_op_file' directly.
-        Expectation: The distributed op class is imported and instantiated successfully,
-                     or the original import error is raised; no functional behavior is changed.
-        """
-        class_name = config["distributed_op_class"]
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _resolve_distributed_op_module(module_file: str) -> str:
+        """Resolve a distributed-op module after validating its package source.
 
+        Args:
+            module_file: Simple module name declared by a package-owned YAML file.
+
+        Returns:
+            Fully qualified module name within the built-in distributed-op package.
+
+        Raises:
+            ValueError: If module_file is not a simple Python identifier.
+            ImportError: If the module cannot be resolved from the trusted ops directory.
+        """
+        if not isinstance(module_file, str) or not module_file.isidentifier():
+            raise ValueError(f"Invalid distributed op module name: {module_file!r}")
+
+        module_name = f"{_DISTRIBUTED_OPS_PACKAGE}.{module_file}"
+        spec = importlib.util.find_spec(module_name)
+        if spec is None or spec.origin is None:
+            raise ImportError(f"Distributed op module cannot be resolved: {module_name}")
+
+        module_origin = os.path.realpath(spec.origin)
+        try:
+            common_path = os.path.commonpath((_DISTRIBUTED_OPS_DIR, module_origin))
+        except ValueError as exc:
+            raise ImportError(f"Distributed op module has an untrusted source: {module_name}") from exc
+        if common_path != _DISTRIBUTED_OPS_DIR:
+            raise ImportError(f"Distributed op module has an untrusted source: {module_name}")
+        return module_name
+
+    def _register_single_distributed_op(self, op_name: str, config: dict):
+        """Import and register a package-owned distributed operator implementation."""
         if "distributed_op_module" in config:
-            module_name = config["distributed_op_module"]
-            module = importlib.import_module(module_name)
-            op_class = getattr(module, class_name)
-            _ = op_class(op_name)
-            return
+            raise ValueError("distributed_op_module is not supported; use distributed_op_file")
+
+        class_name = config["distributed_op_class"]
+        if not isinstance(class_name, str) or not class_name.isidentifier():
+            raise ValueError(f"Invalid distributed op class name: {class_name!r}")
 
         module_file = config["distributed_op_file"]
-        try:
-            module_name = "hyper_parallel.core.shard.ops." + module_file
-            module = importlib.import_module(module_name)
-            op_class = getattr(module, class_name)
-            _ = op_class(op_name)
-        except (ModuleNotFoundError, ImportError):
-            if self._env_python_path:
-                module = importlib.import_module(module_file)
-                op_class = getattr(module, class_name)
-                _ = op_class(op_name)
-            else:
-                raise
+        module_name = self._resolve_distributed_op_module(module_file)
+        module = importlib.import_module(module_name)
+        op_class = getattr(module, class_name)
+        if not isinstance(op_class, type) or not issubclass(op_class, DistributedOp):
+            raise TypeError(f"Distributed op class must inherit DistributedOp: {class_name}")
+        _ = op_class(op_name)
 
     @staticmethod
     def _merge_default(config: dict):
@@ -429,7 +398,7 @@ class OpDispatcher:
             dict: Merged dictionary of all operator configurations loaded from YAML files.
         """
         yaml_dict = {}
-        yaml_path = os.path.join(self.work_dir, self.yaml_dir) if self.work_dir else self.yaml_dir
+        yaml_path = self.yaml_dir
         if not os.path.isdir(yaml_path):
             raise ValueError(f"Invalid yaml directory path: {yaml_path}")
 

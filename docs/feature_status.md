@@ -29,7 +29,7 @@
 - [x] 分布式算子支持列表
 - [x] 自定义分布式算子注册（YAML registry + Python impl）
 - [x] Custom Shard
-- [x] DFunction 自定义分布式 autograd 函数
+- [x] DFunction Torch 自定义分布式 autograd 函数
 - [x] Loss Parallel（TP 训练损失并行）
 
 #### TP Styles

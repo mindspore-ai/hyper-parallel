@@ -17,7 +17,7 @@ pip install "${wheel_path}"
 ```
 
 如明确只需要不含 optional native 组件的 core-only wheel，可使用
-`./build.sh --multicore off --custom-ops off`。indexed Dataset helper 是基础组件，没有独立关闭开关。
+`./build.sh --multicore off`。indexed Dataset helper 是基础组件，没有独立关闭开关。
 
 ### Q: 导入时报错 `GLIBC_2.xx not found`
 
@@ -31,23 +31,6 @@ pip install "${wheel_path}"
 
 **解决**：记录完整符号名和实际加载的 `.so` 路径，确认 wheel 的 Python/架构标签、框架与 CANN
 配套关系，以及框架需求的 CXX11 ABI 一致。
-
-### Q: MindSpore custom_ops 编译失败
-
-**原因**：CANN 环境未正确激活、MindSpore 版本 < 2.10，或当前 MindSpore 不提供 `CustomOpBuilder`。
-
-**解决**：
-
-```bash
-# 设置 CANN 路径
-source /usr/local/Ascend/cann/set_env.sh
-
-# 确认 MindSpore 版本
-python -c "import mindspore; print(mindspore.__version__)"
-
-# 仅重新构建 custom ops payload；该组件入口失败会直接退出，不生成 wheel
-bash hyper_parallel/platform/mindspore/custom_ops/build.sh
-```
 
 ### Q: PyTorch 扩展构建失败
 
