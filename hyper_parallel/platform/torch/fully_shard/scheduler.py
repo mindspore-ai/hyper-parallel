@@ -118,6 +118,9 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         flat_outputs, _ = tree_flatten(outputs)
         for output in flat_outputs:
             if isinstance(output, torch.Tensor) and output.requires_grad:
+                hook_output = output
+                if isinstance(output, DTensor) and getattr(output, "_is_fake_wrapper", False):
+                    hook_output = output.to_local()
                 handle_ref = [None]
                 # pylint: disable=C0103, W0102
 
@@ -128,7 +131,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
                         handle.remove()
                     return self._backward_pre_hook(grad)
                 # pylint: enable=C0103, W0102
-                handle = output.register_hook(wrapper_for_backward_pre_hook)
+                handle = hook_output.register_hook(wrapper_for_backward_pre_hook)
                 handle_ref[0] = handle
         return outputs
 

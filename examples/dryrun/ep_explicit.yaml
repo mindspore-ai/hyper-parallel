@@ -1,0 +1,152 @@
+# Four-rank EP training configuration with optional dry-run metadata.
+# By default this enters the regular TextTrainer path. Set dry_run.enabled=true
+# only when running FakeTensor memory simulation.
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: files/micro-batches/ep_explicit_model
+  torch_dtype: float32
+  attn_implementation: sdpa
+  force_hf: true
+
+training:
+  train_iters: 2
+  global_batch_size: 16
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: rank_average
+  max_grad_norm: 1.0
+  seed: 1234
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 4
+  pp_size: 1
+
+fsdp_config:
+  dp_shard_size: 1
+  edp_shard_size: 1
+  reshard_after_forward: false
+  # NPU _chunk_cat currently rejects mixed internal formats for EP gradients.
+  comm_fusion: false
+
+plan_overrides:
+  - match: "*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
+  - match: model.layers.0.mlp.shared_expert_gate
+    when: ep
+    params: &shared_expert_gate_params
+      weight: {ep: replicate}
+  - match: model.layers.1.mlp.shared_expert_gate
+    when: ep
+    params: *shared_expert_gate_params
+  - match: model.layers.2.mlp.shared_expert_gate
+    when: ep
+    params: *shared_expert_gate_params
+  - match: model.layers.3.mlp.shared_expert_gate
+    when: ep
+    params: *shared_expert_gate_params
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  adamw_config:
+    adamw_lr: 1.0e-4
+    adamw_weight_decay: 0.0
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+dataset:
+  _target_: tests.fixtures.data.datasets.DummyDataset
+  model_assets: {chat_template: null, tokenizer: null}
+  num_samples: 32
+  seq_len: 2048
+  vocab_size: 512
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.ParallelBatch
+    source_type: online
+    attention_mode: dense
+  batch_size: 1
+  drop_last: true
+  use_background_prefetcher: false
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config: {lr_warmup_steps: 0, min_lr: 0.0}
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./outputs/dryrun/ep_explicit/checkpoints
+dry_run:
+  enabled: true
+  output_dir: ./outputs/dryrun/ep_explicit/dryrun
+  value_dependencies:
+    rules:
+      # Per-layer loads are normalized from the real NPU profile. Each row is
+      # one EP source rank and sums to S * top_k = 4096 routed tokens.
+      - match: "model.layers.0.mlp"
+        handler: moe_routing
+        path: explicit
+        inputs:
+          source_expert_loads:
+            - [1472, 64, 64, 384, 256, 960, 864, 32]
+            - [1472, 64, 64, 384, 256, 960, 864, 32]
+            - [1472, 64, 64, 384, 256, 960, 864, 32]
+            - [1472, 64, 64, 384, 256, 960, 864, 32]
+      - match: "model.layers.1.mlp"
+        handler: moe_routing
+        path: explicit
+        inputs:
+          source_expert_loads:
+            - [1408, 448, 256, 0, 64, 0, 1792, 128]
+            - [1408, 448, 256, 0, 64, 0, 1792, 128]
+            - [1408, 448, 256, 0, 64, 0, 1792, 128]
+            - [1408, 448, 256, 0, 64, 0, 1792, 128]
+      - match: "model.layers.2.mlp"
+        handler: moe_routing
+        path: explicit
+        inputs:
+          source_expert_loads:
+            - [2048, 0, 0, 0, 0, 0, 2048, 0]
+            - [2048, 0, 0, 0, 0, 0, 2048, 0]
+            - [2048, 0, 0, 0, 0, 0, 2048, 0]
+            - [2048, 0, 0, 0, 0, 0, 2048, 0]
+      - match: "model.layers.3.mlp"
+        handler: moe_routing
+        path: explicit
+        inputs:
+          source_expert_loads:
+            - [1984, 0, 0, 0, 64, 0, 2048, 0]
+            - [1984, 0, 0, 0, 64, 0, 2048, 0]
+            - [1984, 0, 0, 0, 64, 0, 2048, 0]
+            - [1984, 0, 0, 0, 64, 0, 2048, 0]
+      # Qwen3.5 asks whether the dense attention mask is all ones. FakeTensor
+      # cannot materialize that scalar; dense batches use the true branch.
+      - match: model
+        handler: operator_debug
+        path: dense_mask
+        inputs:
+          mocks:
+            - source:
+                file: transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py
+                function: Qwen3_5MoeTextModel._update_linear_attn_mask
+                line: 1334
+              op: aten._local_scalar_dense.default
+              occurrence: 0
+              return: {scalar: true}
+profiling:
+  enabled: true
+  start_step: 1
+  end_step: 2
+  trace_dir: ./outputs/dryrun/ep_explicit/profile
+  record_shapes: true
+  profile_memory: true
+  with_stack: false
+  with_modules: true
+  rank: 0

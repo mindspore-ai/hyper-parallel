@@ -13,6 +13,9 @@ clone:
   dist_op_name: _torch_clone_dist_op
   distributed_op_class: ElementWiseWithPartialDistributedOp
 
+detach:
+  dist_op_name: _torch_detach_dist_op
+
 __invert__:
   dist_op_name: _torch___invert___dist_op
 
@@ -33,6 +36,18 @@ float:
 
 rsqrt:
   dist_op_name: _torch_rsqrt_dist_op
+
+sqrt:
+  dist_op_name: _torch_sqrt_dist_op
+
+lerp_:
+  dist_op_name: _torch_lerp_inplace_dist_op
+
+addcmul_:
+  dist_op_name: _torch_addcmul_inplace_dist_op
+
+addcdiv_:
+  dist_op_name: _torch_addcdiv_inplace_dist_op
 
 sigmoid:
   dist_op_name: _torch_sigmoid_dist_op

@@ -12,22 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Run text training from a resolved Trainer YAML configuration."""
+"""Run one configurable HyperModels LLM Dry-run step."""
 
 from hyper_parallel.trainer.config import TrainerConfig
 from hyper_parallel.trainer.config.manager import parse_training_args
 from hyper_parallel.trainer.dry_run import HyperModelsDryRunRunner
-from hyper_parallel.trainer.text_trainer import TextTrainer
 
 
 def main() -> None:
-    """Build Trainer components and execute the configured training loop."""
+    """Resolve YAML, execute the fake step, and write the rank-local CSV."""
     config: TrainerConfig = parse_training_args()
-    if config.dry_run is not None and config.dry_run.enabled:
-        HyperModelsDryRunRunner(config).run()
-        return
-    trainer = TextTrainer(config)
-    trainer.train()
+    HyperModelsDryRunRunner(config).run()
 
 
 if __name__ == "__main__":

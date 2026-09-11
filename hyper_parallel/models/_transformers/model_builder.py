@@ -23,7 +23,9 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 """
 
 import logging
-from typing import Any, Dict, Literal, Optional, Union
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Dict, Iterator, Literal, Optional, Union
 
 import torch
 from torch import nn
@@ -62,6 +64,32 @@ from hyper_parallel.models.registry import _resolve_custom_model_cls
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
 
 logger = logging.getLogger(__name__)
+
+
+_DEFER_MODEL_MATERIALIZATION: ContextVar[bool] = ContextVar(
+    "defer_model_materialization",
+    default=False,
+)
+
+
+@contextmanager
+def model_build_context() -> Iterator[None]:
+    """Build a fully parallelized meta model without materializing weights.
+
+    The context is intended for shape-only consumers such as Dry-run. Normal
+    callers keep the atomic materialize/load-or-initialize behavior without
+    adding control arguments to the public AutoModel methods.
+    """
+    token = _DEFER_MODEL_MATERIALIZATION.set(True)
+    try:
+        yield
+    finally:
+        _DEFER_MODEL_MATERIALIZATION.reset(token)
+
+
+def is_model_materialization_deferred() -> bool:
+    """Return whether the current model build must stop before materialization."""
+    return _DEFER_MODEL_MATERIALIZATION.get()
 
 
 def instantiate_infrastructure(
@@ -384,6 +412,8 @@ def _materialize_and_load_model(
     weights_mapping: Any,
 ) -> nn.Module:
     """Materialize model storage and load or initialize meta-device weights."""
+    if is_model_materialization_deferred():
+        return model
     model = _move_model_to_device(model, is_meta_device, device)
     if not is_meta_device:
         return model

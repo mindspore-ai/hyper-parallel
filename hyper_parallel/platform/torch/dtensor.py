@@ -21,6 +21,25 @@ from torch import Tensor
 class DTensorBase(Tensor):
     """torch dtensor base"""
 
+    @staticmethod
+    def _has_function_level_dispatch(func: Any) -> bool:
+        """Return whether a FakeTensor wrapper call has a Python-level rule."""
+        # pylint: disable=C0415
+        from torch._ops import OpOverload, OpOverloadPacket
+        from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
+        from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
+        from hyper_parallel.core.tensor_parallel._ce_op_registry import is_loss_parallel_op
+
+        if isinstance(func, (OpOverload, OpOverloadPacket)):
+            return False
+        op_name = getattr(func, "__name__", "")
+        return (
+            op_name in _OP_DISPATCHER.layout_infer_ops
+            or get_distributed_op(op_name) is not None
+            or op_name in _OP_DISPATCHER._random_ops  # pylint: disable=W0212
+            or is_loss_parallel_op(op_name)
+        )
+
     def __new__(cls, local_tensor, device_mesh=None, placements=None, layout=None, shape=None):
         """
         Create a new DTensorBase instance.
@@ -35,6 +54,19 @@ class DTensorBase(Tensor):
         """
         if isinstance(local_tensor, DTensorBase):
             # Copy from existing DTensorBase — use alias_placements to preserve multi-axis ordering
+            if getattr(local_tensor, "_is_fake_wrapper", False):
+                copy_placements = (
+                    local_tensor.layout.alias_placements
+                    if local_tensor.layout
+                    else local_tensor.placements
+                )
+                return cls(
+                    local_tensor._local_tensor,
+                    local_tensor.device_mesh,
+                    copy_placements,
+                    local_tensor.layout,
+                    shape=getattr(local_tensor, "_global_shape", None),
+                )
             t = Tensor._make_subclass(cls, local_tensor._local_tensor, local_tensor._local_tensor.requires_grad)
             copy_placements = local_tensor.layout.alias_placements if local_tensor.layout else local_tensor.placements
             t.__init_data__(
@@ -50,8 +82,24 @@ class DTensorBase(Tensor):
         if placements is None:
             raise ValueError("placements is None, must provide placements")
 
-        # Create Tensor subclass instance, sharing local_tensor's underlying storage
-        t = Tensor._make_subclass(cls, local_tensor, local_tensor.requires_grad)
+        # FakeTensor is itself a Python Tensor subclass, so it must be wrapped.
+        # pylint: disable=C0415
+        from torch._subclasses.fake_tensor import FakeTensor
+        if isinstance(local_tensor, FakeTensor):
+            t = Tensor._make_wrapper_subclass(
+                cls,
+                local_tensor.size(),
+                strides=local_tensor.stride(),
+                storage_offset=local_tensor.storage_offset(),
+                dtype=local_tensor.dtype,
+                layout=local_tensor.layout,
+                device=torch.device("meta"),
+                requires_grad=local_tensor.requires_grad,
+            )
+            t._is_fake_wrapper = True
+        else:
+            # Create Tensor subclass instance, sharing local_tensor's underlying storage.
+            t = Tensor._make_subclass(cls, local_tensor, local_tensor.requires_grad)
         t.__init_data__(local_tensor, device_mesh, placements, layout, shape)
         return t
 
@@ -81,9 +129,48 @@ class DTensorBase(Tensor):
         """
         kwargs = kwargs or {}
         # pylint: disable=C0415
+        from torch.utils._pytree import tree_flatten
+        flat_args, _ = tree_flatten((args, kwargs))
+        has_fake_wrapper = any(
+            isinstance(arg, DTensorBase)
+            and getattr(arg, "_is_fake_wrapper", False)
+            for arg in flat_args
+        )
+        if has_fake_wrapper and not cls._has_function_level_dispatch(func):
+            return super().__torch_function__(func, types, args, kwargs)
         from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
         out = _OP_DISPATCHER.dispatch(func, args, kwargs)
         return out
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        """Dispatch FakeTensor-wrapper DTensors through layout rules."""
+        # pylint: disable=C0415
+        from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
+        return _OP_DISPATCHER.dispatch(func, args, kwargs or {})
+
+    def __tensor_flatten__(self):
+        """Expose local storage to FakeTensor and MemTracker machinery."""
+        context = (
+            self._device_mesh,
+            self._alias_placements(),
+            self._layout,
+            getattr(self, "_global_shape", None),
+        )
+        return ["_local_tensor"], context
+
+    @classmethod
+    def __tensor_unflatten__(cls, inner_tensors, context, outer_size, outer_stride):
+        """Rebuild a wrapper DTensor from its flattened local tensor."""
+        del outer_size, outer_stride
+        device_mesh, placements, layout, shape = context
+        return cls(
+            inner_tensors["_local_tensor"],
+            device_mesh=device_mesh,
+            placements=placements,
+            layout=layout,
+            shape=shape,
+        )
 
     @property
     def grad(self) -> Optional[Tensor]:
@@ -93,6 +180,15 @@ class DTensorBase(Tensor):
         Returns:
             Optional[Tensor]: The gradient tensor, or None if no gradient is set.
         """
+        if getattr(self, "_is_fake_wrapper", False):
+            outer_grad = Tensor.grad.__get__(self, type(self))  # pylint: disable=C2801
+            if outer_grad is not None:
+                return outer_grad
+            pending_grad = getattr(self, "_fake_pending_grad", None)
+            if pending_grad is not None:
+                return pending_grad
+        if not self._local_tensor.is_leaf and not self._local_tensor.retains_grad:
+            return None
         return self._local_tensor.grad
 
     @grad.setter
@@ -103,6 +199,22 @@ class DTensorBase(Tensor):
         Args:
             value (Optional[Tensor]): The gradient tensor to set, or None to clear.
         """
+        if getattr(self, "_is_fake_wrapper", False):
+            local_grad = value.to_local() if isinstance(value, DTensorBase) else value
+            outer_grad = value
+            if value is not None and not isinstance(value, DTensorBase):
+                outer_grad = self.__class__(
+                    value,
+                    device_mesh=self._device_mesh,
+                    placements=self._alias_placements(),
+                    layout=self._layout,
+                    shape=getattr(self, "_global_shape", None),
+                )
+            Tensor.grad.__set__(self, outer_grad)  # pylint: disable=C2801
+            self._local_tensor.grad = local_grad
+            if value is None:
+                self._fake_pending_grad = None
+            return
         self._local_tensor.grad = value
 
     @property
@@ -244,22 +356,24 @@ class DTensorBase(Tensor):
     @property
     # pylint: disable=C2801
     def data(self):
-        """
-        Directory get Tensor.data relative storage.
-        After DTensor object created, there are two reference on underlying storage. (.data and ._local_tensor)
-        If not using DisableTorchFunctionSubclass, Tensor.__get__ will goto '__torch_function__',
-        and finally return '._local_tensor' storage.
-        """
-        with getattr(torch, "_C").DisableTorchFunctionSubclass():
-            # Directory get Tensor.data relative storage.
-            # If not using DisableTorchFunctionSubclass, Tensor.__get__ will goto __torch_funtin
-            return Tensor.data.__get__(self, type(self))
+        """Return the underlying Tensor's data view, bypassing DTensor wrappers."""
+        if getattr(self, "_is_fake_wrapper", False):
+            return self._local_tensor.data
+        return Tensor.data.__get__(self, type(self))
 
     @data.setter
     # pylint: disable=C2801
-    def data(self, value):
+    def data(self, value: Tensor) -> None:
         """Set the underlying tensor data, extracting the local shard if a DTensor is given."""
         local_value = value.to_local() if isinstance(value, DTensorBase) else value
+        if getattr(self, "_is_fake_wrapper", False):
+            if self.dtype != local_value.dtype:
+                raise ValueError(
+                    "Fake-wrapper DTensor data replacement must preserve dtype, "
+                    f"got {local_value.dtype} for {self.dtype}"
+                )
+            self._local_tensor = local_value
+            return
         # Tensor.data.__set__ on a Tensor subclass otherwise enters __torch_function__
         # and only rebinds _local_tensor through DTensor dispatch.
         with getattr(torch, "_C").DisableTorchFunctionSubclass():
@@ -370,6 +484,14 @@ class DTensorBase(Tensor):
             DTensorBase: A new DTensor with the converted local tensor.
         """
         new_local = self._local_tensor.to(*args, **kwargs)
+        if getattr(self, "_is_fake_wrapper", False):
+            return self.__class__(
+                new_local,
+                device_mesh=self._device_mesh,
+                placements=self._alias_placements(),
+                layout=self._layout,
+                shape=getattr(self, "_global_shape", None),
+            )
         new_dt = Tensor._make_subclass(type(self), new_local, new_local.requires_grad)
         new_dt.__init_data__(
             new_local,

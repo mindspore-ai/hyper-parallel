@@ -262,6 +262,14 @@ def _resolve_dataclass(node: object, config_type: type, *, path: str) -> object:
     config_fields = {field.name: field for field in fields(config_type)}
     unknown = sorted(set(node) - set(config_fields))
     if unknown:
+        legacy_dry_run_fields = {"attention", "moe", "tp_cross_entropy"}
+        legacy = sorted(set(unknown) & legacy_dry_run_fields)
+        if config_type.__name__ == "DryRunConfig" and legacy:
+            raise _fail(
+                path,
+                f"legacy value-dependency fields {legacy} are not supported; "
+                "use dry_run.value_dependencies.rules",
+            )
         raise _fail(path, f"unknown configuration fields: {unknown}")
 
     missing = [
