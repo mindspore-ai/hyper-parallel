@@ -16,85 +16,78 @@
 
 import unittest
 from contextlib import contextmanager
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
+import torch
+
+from hyper_parallel.core.dtensor import init_weights as init_weights_module
+
+_INIT_ON_DEVICE_TARGET = "hyper_parallel.core.dtensor.init_weights._init_on_device"
+
+
+@contextmanager
+def _fake_init_on_device(device, include_buffers=False):
+    """Stand-in for the Torch ``init_on_device`` context manager."""
+    del device, include_buffers
+    yield
 
 
 class TestInitEmptyWeights(unittest.TestCase):
     """Tests for InitEmptyWeights."""
-    @patch("hyper_parallel.core.dtensor.init_weights.platform")
-    def test_default_include_buffers_false(self, mock_platform):
+
+    @patch(_INIT_ON_DEVICE_TARGET, MagicMock(side_effect=_fake_init_on_device))
+    def test_default_include_buffers_false(self):
         """Test default include buffers false."""
-        mock_meta_device = MagicMock(name="meta_device")
-        mock_platform.meta_device = mock_meta_device
-
-        @contextmanager
-        def fake_init_on_device(device, include_buffers=False):
-            """Fake init on device."""
-            yield
-
-        mock_platform.init_on_device = MagicMock(side_effect=fake_init_on_device)
-
         from hyper_parallel.core.dtensor.init_weights import init_empty_weights
+
         with init_empty_weights():
             pass
 
-        mock_platform.init_on_device.assert_called_once_with(mock_meta_device, include_buffers=False)
+        init_weights_module._init_on_device.assert_called_once_with(  # pylint: disable=protected-access
+            torch.device("meta"), include_buffers=False
+        )
 
-    @patch("hyper_parallel.core.dtensor.init_weights.platform")
-    def test_include_buffers_true(self, mock_platform):
+    @patch(_INIT_ON_DEVICE_TARGET, MagicMock(side_effect=_fake_init_on_device))
+    def test_include_buffers_true(self):
         """Test include buffers true."""
-        mock_meta_device = MagicMock(name="meta_device")
-        mock_platform.meta_device = mock_meta_device
-
-        @contextmanager
-        def fake_init_on_device(device, include_buffers=False):
-            """Fake init on device."""
-            yield
-
-        mock_platform.init_on_device = MagicMock(side_effect=fake_init_on_device)
-
         from hyper_parallel.core.dtensor.init_weights import init_empty_weights
+
         with init_empty_weights(include_buffers=True):
             pass
 
-        mock_platform.init_on_device.assert_called_once_with(mock_meta_device, include_buffers=True)
+        init_weights_module._init_on_device.assert_called_once_with(  # pylint: disable=protected-access
+            torch.device("meta"), include_buffers=True
+        )
 
 
 class TestInitOnDevice(unittest.TestCase):
     """Tests for InitOnDevice."""
-    @patch("hyper_parallel.core.dtensor.init_weights.platform")
-    def test_default(self, mock_platform):
+
+    @patch(_INIT_ON_DEVICE_TARGET, MagicMock(side_effect=_fake_init_on_device))
+    def test_default(self):
         """Test default."""
-        @contextmanager
-        def fake_init_on_device(device, include_buffers=False):
-            """Fake init on device."""
-            yield
-
-        mock_platform.init_on_device = MagicMock(side_effect=fake_init_on_device)
-
         from hyper_parallel.core.dtensor.init_weights import init_on_device
+
         my_device = "npu:0"
         with init_on_device(my_device):
             pass
 
-        mock_platform.init_on_device.assert_called_once_with(my_device, include_buffers=False)
+        init_weights_module._init_on_device.assert_called_once_with(  # pylint: disable=protected-access
+            my_device, include_buffers=False
+        )
 
-    @patch("hyper_parallel.core.dtensor.init_weights.platform")
-    def test_include_buffers_true(self, mock_platform):
+    @patch(_INIT_ON_DEVICE_TARGET, MagicMock(side_effect=_fake_init_on_device))
+    def test_include_buffers_true(self):
         """Test include buffers true."""
-        @contextmanager
-        def fake_init_on_device(device, include_buffers=False):
-            """Fake init on device."""
-            yield
-
-        mock_platform.init_on_device = MagicMock(side_effect=fake_init_on_device)
-
         from hyper_parallel.core.dtensor.init_weights import init_on_device
+
         my_device = "cpu"
         with init_on_device(my_device, include_buffers=True):
             pass
 
-        mock_platform.init_on_device.assert_called_once_with(my_device, include_buffers=True)
+        init_weights_module._init_on_device.assert_called_once_with(  # pylint: disable=protected-access
+            my_device, include_buffers=True
+        )
 
 
 if __name__ == "__main__":

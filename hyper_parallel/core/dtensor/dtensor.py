@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """dtensor"""
+# pylint: disable=C9006,C9007
 import copy as cp
 import inspect
 import logging
@@ -20,7 +21,10 @@ import warnings
 from typing import Any, Callable, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
+import torch
+from torch import Tensor
 
+from hyper_parallel.core.dtensor import _utils
 from hyper_parallel.core.dtensor._collective_utils import mesh_broadcast, mesh_scatter
 from hyper_parallel.core.dtensor._ragged_utils import (
     _compute_ragged_slice,
@@ -36,13 +40,8 @@ from hyper_parallel.core.dtensor.layout import (
     _get_slice_tensor_by_layout,
 )
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Replicate, StridedShard
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel.core.utils import compute_local_shape_and_global_offset
-
-platform = get_platform()
-DTensorBase = platform.DTensorBase
-Tensor = platform.Tensor
+from hyper_parallel.platform.torch.dtensor import DTensorBase
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +79,7 @@ class SkipDTensorDispatch():
                 if isinstance(op, str):
                     names.add(op)
                 else:
-                    names.add(platform.get_op_name(op))
+                    names.add(_utils.get_op_name(op))
             self._no_skip_names = frozenset(names)
         self._dispatch_token = None
         self._ops_token = None
@@ -432,7 +431,7 @@ class DTensor(DTensorBase):
 
     def _from_converted_local(self, local_tensor: Tensor) -> 'DTensor':
         """Rebuild converted DTensor data without preserving Parameter identity."""
-        cls = DTensor if isinstance(self, platform.Parameter) else self.__class__
+        cls = DTensor if isinstance(self, torch.nn.Parameter) else self.__class__
         if not isinstance(self._layout, Layout):
             constructor_kwargs = {
                 "device_mesh": self._device_mesh,
@@ -594,49 +593,38 @@ class DTensor(DTensorBase):
             dtype:
                 Desired dtype.  Defaults to ``self.dtype`` on Torch.
             device:
-                Must match ``self``'s device (Torch only).
+                Must match ``self``'s device.
             requires_grad:
-                Forwarded on Torch; rejected on MindSpore.
+                If true, the new tensor requires gradient.
             layout:
-                Forwarded on Torch; rejected on MindSpore.
+                Desired layout of the new tensor.
             pin_memory:
-                Forwarded on Torch; rejected on MindSpore.
+                If true, the new tensor is allocated in pinned memory.
 
         Returns:
             DTensor: A new DTensor with all-``Replicate`` placements on
             ``self``'s ``DeviceMesh``.
 
         Raises:
-            ValueError: If a Torch-only kwarg is used on MindSpore, or
-                ``device`` does not match the DTensor's device.
+            ValueError: If ``device`` does not match the DTensor's device.
         """
         if isinstance(size, int):
             size = (size,)
 
-        if platform.platform_type == PlatformType.MINDSPORE:
-            if device is not None or layout is not None or requires_grad or pin_memory:
-                raise ValueError(
-                    f"DTensor.{method_name} only supports size and dtype "
-                    "on MindSpore."
-                )
-            local_kwargs = {}
-            if dtype is not None:
-                local_kwargs["dtype"] = dtype
-        else:
-            local_kwargs = {}
-            if dtype is not None:
-                local_kwargs["dtype"] = dtype
-            if device is not None:
-                self._validate_factory_device(device)
-                # An unindexed device such as "cuda" resolves to the framework's
-                # current device, which may differ from this DTensor's local device.
-                local_kwargs["device"] = self._local_tensor.device
-            if requires_grad:
-                local_kwargs["requires_grad"] = True
-            if layout is not None:
-                local_kwargs["layout"] = layout
-            if pin_memory:
-                local_kwargs["pin_memory"] = True
+        local_kwargs = {}
+        if dtype is not None:
+            local_kwargs["dtype"] = dtype
+        if device is not None:
+            self._validate_factory_device(device)
+            # An unindexed device such as "cuda" resolves to the framework's
+            # current device, which may differ from this DTensor's local device.
+            local_kwargs["device"] = self._local_tensor.device
+        if requires_grad:
+            local_kwargs["requires_grad"] = True
+        if layout is not None:
+            local_kwargs["layout"] = layout
+        if pin_memory:
+            local_kwargs["pin_memory"] = True
 
         factory = getattr(self._local_tensor, method_name)
         local_result = factory(size, **local_kwargs)
@@ -665,16 +653,15 @@ class DTensor(DTensorBase):
             size:
                 Output shape — an int or a sequence of ints.
             dtype:
-                Desired dtype.  Defaults to ``self.dtype`` (Torch).
-                Not forwarded to MindSpore unless explicitly set.
+                Desired dtype.  Defaults to ``self.dtype``.
             device:
-                Must match ``self``'s device.  Not supported on MindSpore.
+                Must match ``self``'s device.
             requires_grad:
-                Forwarded on Torch; rejected on MindSpore.
+                If true, the new tensor requires gradient.
             layout:
-                Forwarded on Torch; rejected on MindSpore.
+                Desired layout of the new tensor.
             pin_memory:
-                Forwarded on Torch; rejected on MindSpore.
+                If true, the new tensor is allocated in pinned memory.
 
         Returns:
             DTensor: A new all-Replicate DTensor filled with zeros.
@@ -707,16 +694,15 @@ class DTensor(DTensorBase):
             size:
                 Output shape — an int or a sequence of ints.
             dtype:
-                Desired dtype.  Defaults to ``self.dtype`` (Torch).
-                Not forwarded to MindSpore unless explicitly set.
+                Desired dtype.  Defaults to ``self.dtype``.
             device:
-                Must match ``self``'s device.  Not supported on MindSpore.
+                Must match ``self``'s device.
             requires_grad:
-                Forwarded on Torch; rejected on MindSpore.
+                If true, the new tensor requires gradient.
             layout:
-                Forwarded on Torch; rejected on MindSpore.
+                Desired layout of the new tensor.
             pin_memory:
-                Forwarded on Torch; rejected on MindSpore.
+                If true, the new tensor is allocated in pinned memory.
 
         Returns:
             DTensor: A new all-Replicate DTensor filled with ones.
@@ -1015,7 +1001,7 @@ def _distribute_tensor_with_communication(
             chunks = tuple(local.chunk(num_chunks, dim=shard_dim))
             if not chunks:
                 raise ValueError(f"cannot shard dim {shard_dim} into {num_chunks} chunks")
-            output = platform.empty_like(chunks[0])
+            output = torch.empty_like(chunks[0])
             local = mesh_scatter(output, chunks, device_mesh, mesh_dim, group_src=src_data_rank)
         elif placement.is_replicate() or placement.is_partial():
             local = mesh_broadcast(local, device_mesh, mesh_dim, group_src=src_data_rank)
@@ -1088,21 +1074,18 @@ def distribute_tensor(
 
 
 def _distribute_module_param_source(param: Any) -> Tensor:
-    """Tensor data used as the global tensor for :func:`distribute_tensor` (PyTorch uses ``param.data``)."""
-    if hasattr(param, "data"):
-        return param.data
-    return platform.get_param_local_data(param)
+    """Tensor data used as the global tensor for :func:`distribute_tensor`."""
+    return param.data
 
 
 def _distribute_module_new_parameter(key: str, dtensor: DTensor, requires_grad: bool) -> Any:
-    """Build a framework :class:`Parameter` holding *dtensor* (Torch vs MindSpore kwargs differ)."""
-    if platform.platform_type == PlatformType.MINDSPORE:
-        return platform.Parameter(dtensor, name=key, requires_grad=requires_grad)
-    return platform.Parameter(dtensor, requires_grad=requires_grad)
+    """Build a :class:`torch.nn.Parameter` holding *dtensor*."""
+    del key
+    return torch.nn.Parameter(dtensor, requires_grad=requires_grad)
 
 
 def _distribute_module_set_param(module: Any, key: str, new_param: Any) -> None:
-    """Register or assign a parameter on *module* (``nn.Module`` or MindSpore ``Cell``)."""
+    """Register or assign a parameter on *module* (``nn.Module``-like)."""
     if hasattr(module, "register_parameter"):
         module.register_parameter(key, new_param)
         return
@@ -1331,7 +1314,7 @@ def _dtensor_init_helper(
     )
 
     # initialize the local tensor
-    if init_op is platform.full:
+    if init_op is torch.full:
         fill_value = kwargs.pop("fill_value", 0)
         local_tensor = init_op(local_shape, fill_value, **kwargs)
     elif rng_tracked:
@@ -1382,7 +1365,7 @@ def ones(
     Returns:
         A :class:`DTensor` object on each rank
     """
-    ones_ = platform.ones
+    ones_ = torch.ones
     return _dtensor_init_helper(
         ones_,
         size,
@@ -1411,7 +1394,7 @@ def empty(
     Returns:
         A :class:`DTensor` object on each rank
     """
-    empty_ = platform.empty
+    empty_ = torch.empty
     return _dtensor_init_helper(
         empty_,
         size,
@@ -1443,7 +1426,7 @@ def full(
     Returns:
         A :class:`DTensor` object on each rank
     """
-    full_ = platform.full
+    full_ = torch.full
     return _dtensor_init_helper(
         full_,
         size,
@@ -1472,7 +1455,7 @@ def zeros(
     Returns:
         A :class:`DTensor` object on each rank
     """
-    zeros_ = platform.zeros
+    zeros_ = torch.zeros
     return _dtensor_init_helper(
         zeros_,
         size,
@@ -1495,13 +1478,13 @@ def rand(
         size: Global output shape.
         device_mesh: :class:`DeviceMesh` for the distributed layout.
         placements: Per-mesh-dimension :class:`Placement` values.
-        **kwargs: Forwarded to the platform ``rand`` call (for example ``dtype``).
+        **kwargs: Forwarded to :func:`torch.rand` (for example ``dtype``).
 
     Returns:
         A :class:`DTensor` object on each rank.
     """
     return _dtensor_init_helper(
-        platform.rand,
+        torch.rand,
         size,
         device_mesh=device_mesh,
         placements=placements,
@@ -1524,13 +1507,13 @@ def randn(
         size: Global output shape.
         device_mesh: :class:`DeviceMesh` for the distributed layout.
         placements: Per-mesh-dimension :class:`Placement` values.
-        **kwargs: Forwarded to the platform ``randn`` call (for example ``dtype``).
+        **kwargs: Forwarded to :func:`torch.randn` (for example ``dtype``).
 
     Returns:
         A :class:`DTensor` object on each rank.
     """
     return _dtensor_init_helper(
-        platform.randn,
+        torch.randn,
         size,
         device_mesh=device_mesh,
         placements=placements,

@@ -218,7 +218,7 @@ class TestUtil(unittest.TestCase):
 
     def test_create_chunk_list_for_empty_uneven_shard(self):
         """DCP geometry should retain the logical offset of an empty trailing shard."""
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=3):
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=3):
             mesh = DeviceMesh(
                 "cpu",
                 [0, 1, 2, 3],
@@ -404,8 +404,7 @@ class TestBroadcastShard(unittest.TestCase):
         """Build a rank-zero sharded DTensor without initializing a backend."""
         _DEVICE_MESH_MAP.clear()
         EXISTING_COMM_GROUPS.clear()
-        with patch(
-                "hyper_parallel.core.dtensor.device_mesh.platform.get_rank",
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank",
                 return_value=0,
         ):
             mesh = Layout((2,), ("dp",), init_backend=False).mesh

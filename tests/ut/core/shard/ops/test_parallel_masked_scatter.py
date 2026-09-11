@@ -14,7 +14,7 @@
 # ============================================================================
 """parallel_masked_scatter test"""
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
@@ -40,6 +40,12 @@ class TestParallelMaskedScatter(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -59,9 +65,6 @@ class TestParallelMaskedScatter(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -84,7 +87,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         output_layouts, _ = op.infer_layout(cache_values)
         return output_layouts[0]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_success(self, mock_platform):
         """
         Feature: MaskedScatter with fully replicated inputs
@@ -117,7 +120,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
             f"got {op.get_expand_impl(None, ((output_layout,), None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_fail_sharded_input(self, mock_platform):
         """
         Feature: MaskedScatter with sharded input
@@ -136,7 +139,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_fail_sharded_mask(self, mock_platform):
         """
         Feature: MaskedScatter with sharded mask
@@ -156,7 +159,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"input 1 is sharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_fail_sharded_source(self, mock_platform):
         """
         Feature: MaskedScatter with sharded source
@@ -175,7 +178,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"input 2 is sharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_success_scalar(self, mock_platform):
         """
         Feature: MaskedScatter with scalar inputs
@@ -193,7 +196,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         )
         # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_success_high_dim2(self, mock_platform):
         """
         Feature: MaskedScatter with high-dimensional tensors
@@ -215,7 +218,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         )
         # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_success_mixed_ranks(self, mock_platform):
         """
         Feature: MaskedScatter with mixed rank inputs
@@ -235,7 +238,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         )
         # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_fail_shard_last_dim(self, mock_platform):
         """
         Feature: MaskedScatter fail on last dim sharding
@@ -254,7 +257,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_success_1d_mesh(self, mock_platform):
         """
         Feature: MaskedScatter on 1D Mesh
@@ -272,7 +275,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         )
         # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_success_3d_mesh(self, mock_platform):
         """
         Feature: MaskedScatter on 3D Mesh
@@ -290,7 +293,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         )
         # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_fail_multiple_sharded(self, mock_platform):
         """
         Feature: MaskedScatter with multiple sharded inputs
@@ -307,7 +310,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_success_scalar_inputs(self, mock_platform):
         """
         Feature: MaskedScatter with scalar inputs
@@ -325,7 +328,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         )
         # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_success_1d_tensors(self, mock_platform):
         """
         Feature: MaskedScatter with 1D tensors
@@ -343,7 +346,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         )
         # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_success_source_broadcast(self, mock_platform):
         """
         Feature: MaskedScatter with source broadcast
@@ -362,7 +365,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         )
         # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_success_high_dim(self, mock_platform):
         """
         Feature: MaskedScatter with high-dimensional tensors
@@ -381,7 +384,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         )
         # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_fail_1d_mesh_sharded(self, mock_platform):
         """
         Feature: MaskedScatter failure on 1D Mesh
@@ -397,7 +400,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_fail_3d_mesh_sharded_inner(self, mock_platform):
         """
         Feature: MaskedScatter failure on 3D Mesh inner dimension
@@ -413,7 +416,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_fail_last_dim_sharding(self, mock_platform):
         """
         Feature: MaskedScatter failure on last dimension sharding
@@ -431,7 +434,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_fail_sharded_mask_only(self, mock_platform):
         """
         Feature: MaskedScatter failure when only Mask is sharded
@@ -448,7 +451,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"input 1 is sharded"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_masked_scatter_fail_multiple_bad_inputs(self, mock_platform):
         """
         Feature: MaskedScatter failure order

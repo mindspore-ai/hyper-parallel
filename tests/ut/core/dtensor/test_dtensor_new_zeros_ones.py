@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for DTensor.new_zeros() and DTensor.new_ones() — platform-agnostic."""
+"""Unit tests for DTensor.new_zeros() and DTensor.new_ones()."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -21,7 +21,6 @@ import torch
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from hyper_parallel.platform.platform import PlatformType
 
 # Bypass C extension by pulling the Python function from DTensor.__dict__.
 _new_zeros_fn = DTensor.__dict__["new_zeros"]
@@ -231,91 +230,6 @@ def test_new_zeros_requires_grad_forwarded(mock_from_local):
     mock_local.new_zeros.assert_called_once_with(
         (3, 4), requires_grad=True,
     )
-
-
-# =========================================================================
-# MindSpore  tests
-# =========================================================================
-
-@patch.object(DTensor, "from_local")
-@patch("hyper_parallel.core.dtensor.dtensor.platform")
-def test_new_zeros_mindspore_only_dtype(mock_platform, mock_from_local):
-    """MindSpore: only dtype is forwarded."""
-    mock_platform.platform_type = PlatformType.MINDSPORE
-    mesh = Mock(name="device_mesh")
-    mesh.ndim = 2
-    fake, mock_local = _make_mock_dtensor(mesh=mesh)
-    _new_zeros_fn(fake, (3, 4), dtype=torch.float16)
-    mock_local.new_zeros.assert_called_once_with((3, 4), dtype=torch.float16)
-    mock_from_local.assert_called_once()
-
-
-@patch("hyper_parallel.core.dtensor.dtensor.platform")
-def test_new_zeros_mindspore_no_dtype(mock_platform):
-    """MindSpore: no kwargs at all when no params set."""
-    mock_platform.platform_type = PlatformType.MINDSPORE
-    mesh = Mock(name="device_mesh")
-    mesh.ndim = 2
-    fake, mock_local = _make_mock_dtensor(mesh=mesh)
-    with patch.object(DTensor, "from_local"):
-        _new_zeros_fn(fake, (3, 4))
-    mock_local.new_zeros.assert_called_once_with((3, 4))
-
-
-@patch("hyper_parallel.core.dtensor.dtensor.platform")
-def test_new_zeros_mindspore_rejects_device(mock_platform):
-    """MindSpore: device=... → ValueError."""
-    mock_platform.platform_type = PlatformType.MINDSPORE
-    mesh = Mock(name="device_mesh")
-    mesh.ndim = 2
-    fake, _ = _make_mock_dtensor(mesh=mesh)
-    try:
-        _new_zeros_fn(fake, (3, 4), device=torch.device("cpu"))
-        assert False, "Expected ValueError"
-    except ValueError as e:
-        assert "only supports size and dtype" in str(e)
-
-
-@patch("hyper_parallel.core.dtensor.dtensor.platform")
-def test_new_zeros_mindspore_rejects_requires_grad(mock_platform):
-    """MindSpore: requires_grad=True → ValueError."""
-    mock_platform.platform_type = PlatformType.MINDSPORE
-    mesh = Mock(name="device_mesh")
-    mesh.ndim = 2
-    fake, _ = _make_mock_dtensor(mesh=mesh)
-    try:
-        _new_zeros_fn(fake, (3, 4), requires_grad=True)
-        assert False, "Expected ValueError"
-    except ValueError as e:
-        assert "only supports size and dtype" in str(e)
-
-
-@patch("hyper_parallel.core.dtensor.dtensor.platform")
-def test_new_zeros_mindspore_rejects_layout(mock_platform):
-    """MindSpore: layout=... → ValueError."""
-    mock_platform.platform_type = PlatformType.MINDSPORE
-    mesh = Mock(name="device_mesh")
-    mesh.ndim = 2
-    fake, _ = _make_mock_dtensor(mesh=mesh)
-    try:
-        _new_zeros_fn(fake, (3, 4), layout=torch.strided)
-        assert False, "Expected ValueError"
-    except ValueError as e:
-        assert "only supports size and dtype" in str(e)
-
-
-@patch("hyper_parallel.core.dtensor.dtensor.platform")
-def test_new_zeros_mindspore_rejects_pin_memory(mock_platform):
-    """MindSpore: pin_memory=True → ValueError."""
-    mock_platform.platform_type = PlatformType.MINDSPORE
-    mesh = Mock(name="device_mesh")
-    mesh.ndim = 2
-    fake, _ = _make_mock_dtensor(mesh=mesh)
-    try:
-        _new_zeros_fn(fake, (3, 4), pin_memory=True)
-        assert False, "Expected ValueError"
-    except ValueError as e:
-        assert "only supports size and dtype" in str(e)
 
 
 # =========================================================================

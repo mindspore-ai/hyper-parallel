@@ -42,6 +42,12 @@ class TestParallelScatter(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -61,9 +67,6 @@ class TestParallelScatter(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _create_mesh(self, mock_platform, shape=(2, 4), alias=("dp", "mp")):
         """Helper to create mesh and suppress pylint false positives."""
@@ -75,7 +78,7 @@ class TestParallelScatter(unittest.TestCase):
             init_backend=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_infer_layout_success(self, mock_platform):
         """
         Feature: Scatter on valid dimension
@@ -110,7 +113,7 @@ class TestParallelScatter(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_fail_sharded_dim(self, mock_platform):
         """
         Feature: Scatter on sharded dimension restriction
@@ -126,7 +129,7 @@ class TestParallelScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "scatter dim should be replicated"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_fail_index_mismatch(self, mock_platform):
         """
         Feature: Index layout validation
@@ -145,7 +148,7 @@ class TestParallelScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "index layout should match input layout"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_fail_src_mismatch(self, mock_platform):
         """
         Feature: Source layout validation
@@ -164,7 +167,7 @@ class TestParallelScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "src layout should match input layout"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_negative_dim_normalization(self, mock_platform):
         """
         Feature: Dimension normalization
@@ -184,7 +187,7 @@ class TestParallelScatter(unittest.TestCase):
             f"expected={input_layout.tensor_map}, got={output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_fail_negative_dim_sharded(self, mock_platform):
         """
         Feature: Dimension normalization with sharded check
@@ -203,7 +206,7 @@ class TestParallelScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "scatter dim should be replicated"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_scalar_src(self, mock_platform):
         """
         Feature: Scalar source support
@@ -223,7 +226,7 @@ class TestParallelScatter(unittest.TestCase):
             f"expected={input_layout.tensor_map}, got={output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_fail_partial_input(self, mock_platform):
         """
         Feature: Partial input validation
@@ -239,7 +242,7 @@ class TestParallelScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_3d_complex_sharding(self, mock_platform):
         """
         Feature: 3D Tensor Scatter
@@ -265,7 +268,7 @@ class TestParallelScatter(unittest.TestCase):
             f"expected={input_layout.tensor_map}, got={output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_all_replicated(self, mock_platform):
         """
         Feature: Fully replicated input
@@ -285,7 +288,7 @@ class TestParallelScatter(unittest.TestCase):
             f"expected={input_layout.tensor_map}, got={output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_fail_invalid_dim_type(self, mock_platform):
         """
         Feature: Dim type validation
@@ -301,7 +304,7 @@ class TestParallelScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dim should be an integer"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_fail_dim_out_of_bounds_high(self, mock_platform):
         """
         Feature: Dim bounds check (Upper)
@@ -317,7 +320,7 @@ class TestParallelScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "should be in range"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_fail_dim_out_of_bounds_low(self, mock_platform):
         """
         Feature: Dim bounds check (Lower)
@@ -333,7 +336,7 @@ class TestParallelScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "should be in range"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_fail_none_input_layout(self, mock_platform):
         """
         Feature: None input layout validation
@@ -345,7 +348,7 @@ class TestParallelScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "should be a DTensor with a valid layout"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_null_index_layout(self, mock_platform):
         """
         Feature: Null index layout tolerance
@@ -365,7 +368,7 @@ class TestParallelScatter(unittest.TestCase):
             f"expected={input_layout.tensor_map}, got={output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_fail_sharded_src_mismatch_complex(self, mock_platform):
         """
         Feature: Src layout mismatch with replication
@@ -384,7 +387,7 @@ class TestParallelScatter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "src layout should match input layout"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_preprocess(self, mock_platform):
         """
         Feature: Preprocess for Scatter operator
@@ -430,7 +433,7 @@ class TestParallelScatter(unittest.TestCase):
             f"cache_values[3] should be src_layout, got {cache_values[3]}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_preprocess_scalar_src(self, mock_platform):
         """
         Feature: Preprocess with scalar src

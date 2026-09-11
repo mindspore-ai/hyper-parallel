@@ -44,6 +44,12 @@ class TestParallelCat(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         self.platform = get_platform()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -63,9 +69,6 @@ class TestParallelCat(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -87,7 +90,7 @@ class TestParallelCat(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=world_size)
         return init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("dp",))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_mismatch(self, mock_platform):
         """
         Feature: Cat layout inference with mismatched input layouts
@@ -101,7 +104,7 @@ class TestParallelCat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "All input tensors must have the same layout"):
             op.infer_layout([x_layout, y_layout, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_get_expand_impl_unsharded_dim(self, mock_platform):
         """
         Feature: Get execution implementation for unsharded dimension
@@ -119,7 +122,7 @@ class TestParallelCat(unittest.TestCase):
             "Concatenating on an unsharded dimension should return None to use the fallback PyTorch cat."
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_multiple_inputs(self, mock_platform):
         """
         Feature: Cat layout inference with more than 2 inputs
@@ -137,7 +140,7 @@ class TestParallelCat(unittest.TestCase):
         assert output_layout == x_layout, "Output layout should be identical to the input layout."
         assert cache_values[-1] == 1, "Dimension should remain 1."
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_negative_dim_3d(self, mock_platform):
         """
         Feature: Negative dimension normalization for 3D tensors
@@ -152,7 +155,7 @@ class TestParallelCat(unittest.TestCase):
 
         assert output_layouts[0] == x_layout, "Negative dimension -2 should be accepted as dim 1."
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_dim_minus_ndim(self, mock_platform):
         """
         Feature: Negative dimension normalization boundary case (dim = -ndim)
@@ -166,7 +169,7 @@ class TestParallelCat(unittest.TestCase):
 
         assert output_layouts[0] == x_layout, "Dimension -2 on a 2D tensor should be accepted as dim 0."
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_get_expand_impl_unsharded_dim_3d(self, mock_platform):
         """
         Feature: Execution implementation for unsharded dimension in 3D
@@ -183,7 +186,7 @@ class TestParallelCat(unittest.TestCase):
             "Concatenating on an unsharded dimension should return None."
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_mismatch_multiple(self, mock_platform):
         """
         Feature: Mismatched layouts across multiple inputs
@@ -197,7 +200,7 @@ class TestParallelCat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "All input tensors must have the same layout"):
             op.infer_layout([layout_1, layout_1, layout_2, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_get_expand_impl_all_replicated(self, mock_platform):
         """
         Feature: Execution implementation when fully replicated
@@ -219,7 +222,7 @@ class TestParallelCat(unittest.TestCase):
             "Fully replicated tensor should return None for dim=1."
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_sharded_dim_raises(self, mock_platform):
         """
         Feature: Cat layout inference on a sharded dimension
@@ -232,7 +235,7 @@ class TestParallelCat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Concatenation along a sharded dimension"):
             op.infer_layout([layout, layout, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_negative_sharded_dim_raises(self, mock_platform):
         """
         Feature: Cat layout inference on a negative sharded dimension
@@ -245,7 +248,7 @@ class TestParallelCat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"normalized_dim=1\) is not supported"):
             op.infer_layout([layout, layout, -1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_empty_inputs(self, mock_platform):
         """
         Feature: Cat layout inference with empty inputs
@@ -255,7 +258,7 @@ class TestParallelCat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cat requires at least one input DTensor"):
             op.infer_layout([0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_scalar_args_ignored(self, mock_platform):
         """
         Feature: Cat layout inference with scalar inputs mixed in
@@ -269,7 +272,7 @@ class TestParallelCat(unittest.TestCase):
         output_layout = output_layouts[0]
         assert output_layout == layout, "Output layout should match the valid base layout."
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_default_dim(self, mock_platform):
         """
         Feature: Cat layout inference with default dimension
@@ -298,7 +301,7 @@ class TestParallelCat(unittest.TestCase):
 
         assert output_layout == layout
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_default_dim_sharded(self, mock_platform):
         """
         Feature: Cat layout inference with default dimension (sharded)
@@ -311,7 +314,7 @@ class TestParallelCat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Concatenation along a sharded dimension"):
             op.infer_layout([layout, layout, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_single_input(self, mock_platform):
         """
         Feature: Cat layout inference with a single input tensor
@@ -325,7 +328,7 @@ class TestParallelCat(unittest.TestCase):
         output_layout = output_layouts[0]
         assert output_layout == layout
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_sharded_dim_multiple_inputs(self, mock_platform):
         """
         Feature: Cat layout inference on a sharded dim with >2 inputs
@@ -338,7 +341,7 @@ class TestParallelCat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Concatenation along a sharded dimension"):
             op.infer_layout([layout, layout, layout, 1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_all_none_layouts(self, mock_platform):
         """
         Feature: Cat layout inference when all layouts are None
@@ -348,7 +351,7 @@ class TestParallelCat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cat requires at least one input DTensor"):
             op.infer_layout([None, None, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_1d_mesh(self, mock_platform):
         """
         Feature: Cat layout inference on 1D DeviceMesh
@@ -363,7 +366,7 @@ class TestParallelCat(unittest.TestCase):
 
         assert output_layout == layout, "1D mesh concatenation on Replicate dim should succeed."
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_4d_tensor_dim2(self, mock_platform):
         """
         Feature: Cat layout inference on 4D tensors
@@ -378,7 +381,7 @@ class TestParallelCat(unittest.TestCase):
 
         assert output_layout == layout, "Concatenating 4D tensor on unsharded dim 2 should succeed."
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_last_dim(self, mock_platform):
         """
         Feature: Cat layout inference on the last dimension
@@ -393,7 +396,7 @@ class TestParallelCat(unittest.TestCase):
 
         assert output_layout == layout
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_get_expand_impl_cache_values(self, mock_platform):
         """
         Feature: get_expand_impl with cache values
@@ -410,7 +413,7 @@ class TestParallelCat(unittest.TestCase):
             "Cache values should be safely handled by get_expand_impl."
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_interleaved_parallel(self, mock_platform):
         """
         Feature: Cat layout inference with interleaved parallel (virtual sharding)
@@ -425,7 +428,7 @@ class TestParallelCat(unittest.TestCase):
 
         assert output_layout == layout
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_negative_dim_replicate(self, mock_platform):
         """
         Feature: Negative dimension normalization on a replicated dimension
@@ -440,7 +443,7 @@ class TestParallelCat(unittest.TestCase):
 
         assert output_layout == layout
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_interspersed_nones(self, mock_platform):
         """
         Feature: Cat layout inference with interspersed None layouts
@@ -455,7 +458,7 @@ class TestParallelCat(unittest.TestCase):
 
         assert output_layout == layout, "Should correctly ignore all None layouts and return the valid base layout."
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_multi_axis_sharded_dim_raises(self, mock_platform):
         """
         Feature: Cat layout inference on a multi-axis mesh
@@ -468,7 +471,7 @@ class TestParallelCat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Concatenation along a sharded dimension"):
             op.infer_layout([layout, layout, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_out_of_bounds_dim_positive(self, mock_platform):
         """
         Feature: Cat layout inference with out-of-bounds dimension
@@ -481,7 +484,7 @@ class TestParallelCat(unittest.TestCase):
         with self.assertRaises(ValueError):
             op.infer_layout([layout, layout, 5])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_get_expand_impl_multi_layout_tuple(self, mock_platform):
         """
         Feature: get_expand_impl with multiple inputs
@@ -498,7 +501,7 @@ class TestParallelCat(unittest.TestCase):
             "Should return None to use native cat implementation."
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_mismatch_shard_vs_replicate(self, mock_platform):
         """
         Feature: Layout mismatch detection (Shard vs Replicate)
@@ -512,7 +515,7 @@ class TestParallelCat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "All input tensors must have the same layout"):
             op.infer_layout([layout1, layout2, 1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_mismatch_shard0_vs_shard1(self, mock_platform):
         """
         Feature: Layout mismatch detection (Different Shard Mesh Dimensions)
@@ -526,7 +529,7 @@ class TestParallelCat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "All input tensors must have the same layout"):
             op.infer_layout([layout1, layout2, 1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cat_layout_inference_negative_dim_normalization_3d(self, mock_platform):
         """
         Feature: Negative dimension normalization for 3D tensors (dim=-1)

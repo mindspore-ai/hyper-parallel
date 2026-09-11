@@ -13,10 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """parallel_scaled_dot_product_attention unit test"""
-import os
+# pylint: disable=C9006,C9007,C0415,W0613,W0404,W0621
 import unittest
-from unittest.mock import patch
-import numpy as np
+from unittest.mock import MagicMock, patch
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE, Layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -39,6 +38,12 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -52,9 +57,6 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, sp, mp) mesh via init_device_mesh."""
@@ -81,7 +83,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
             f"Expected {expected_out_map}, got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_no_parallel_1(self, mock_platform):
         """
         Feature: Layout inference with no parallelism.
@@ -95,7 +97,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (-1, -1, -1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_data_parallel_2(self, mock_platform):
         """
         Feature: Layout inference with data parallelism.
@@ -110,7 +112,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (2, -1, -1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_head_parallel_3(self, mock_platform):
         """
         Feature: Layout inference with head parallelism.
@@ -125,7 +127,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (-1, 0, -1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_sequence_parallel_4(self, mock_platform):
         """
         Feature: Layout inference with sequence parallelism.
@@ -139,7 +141,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (-1, -1, 1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_hybrid_dp_mp_5(self, mock_platform):
         """
         Feature: Layout inference with hybrid DP + MP.
@@ -154,7 +156,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (2, 0, -1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_hybrid_dp_sp_mp_6(self, mock_platform):
         """
         Feature: Layout inference with full hybrid DP + SP + MP.
@@ -168,7 +170,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (2, 0, 1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_kv_different_layout_raises_7(self, mock_platform):
         """
         Feature: Layout inference rejects different KV sharding.
@@ -183,7 +185,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Key and Value must have identical"):
             op.infer_layout([q_layout, k_layout, v_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_dp_mp_2d_mesh_8(self, mock_platform):
         """
         Feature: Layout inference with DP + MP on a 2D mesh.
@@ -198,7 +200,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (1, 0, -1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_dp_sp_2d_mesh_9(self, mock_platform):
         """
         Feature: Layout inference with DP + SP on a 2D mesh.
@@ -212,7 +214,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (1, -1, 0, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_single_device_10(self, mock_platform):
         """
         Feature: Layout inference with single device mesh.
@@ -227,7 +229,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (-1, -1, -1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_large_world_size_11(self, mock_platform):
         """
         Feature: Layout inference with large world size.
@@ -241,7 +243,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (3, 1, 2, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_single_output_layout_12(self, mock_platform):
         """
         Feature: Layout inference returns a single output layout.
@@ -260,7 +262,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         assert isinstance(output_layout, Layout), "Should return a single Layout"
         assert output_layout.tensor_map == (1, 0, -1, -1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_head_dim_always_replicated_13(self, mock_platform):
         """
         Feature: Layout inference never shards head_dim.
@@ -278,7 +280,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         tensor_map = output_layout.tensor_map
         assert tensor_map[3] == -1, "Head dim (dim 3) should not be sharded"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_3d_input_head_parallel_14(self, mock_platform):
         """
         Feature: Layout inference for 3D input [N, S, D].
@@ -293,7 +295,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (0, -1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_3d_input_sp_mp_15(self, mock_platform):
         """
         Feature: Layout inference for 3D input with SP + MP.
@@ -308,7 +310,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (0, 1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_output_matches_query_layout_16(self, mock_platform):
         """
         Feature: Output layout always matches query layout.
@@ -327,7 +329,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
             "Output tensor_map should match query tensor_map"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_sp_only_on_query_17(self, mock_platform):
         """
         Feature: Layout inference with SP only applied to query.
@@ -342,7 +344,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (-1, -1, 0, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_sp_mp_2d_mesh_18(self, mock_platform):
         """
         Feature: Layout inference with SP + MP on a 2D mesh.
@@ -357,7 +359,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         self._run_scenario(q_layout, k_layout, v_layout, (-1, 0, 1, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_error_query_layout_none_19(self, mock_platform):
         """
         Feature: Error handling when query layout is None.
@@ -372,7 +374,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "query layout should not be None"):
             op.infer_layout([None, k_layout, v_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_kv_seq_sharding_not_supported_20(self, mock_platform):
         """
         Feature: Error handling when KV sequence is sharded alongside query sequence.
@@ -388,7 +390,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "KV sequence sharding"):
             op.infer_layout([q_layout, k_layout, v_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_kv_seq_sharding_query_replicated_21(self, mock_platform):
         """
         Feature: Error handling when KV seq is sharded while query seq is replicated.
@@ -403,7 +405,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "KV sequence sharding"):
             op.infer_layout([q_layout, k_layout, v_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_partial_key_raises_22(self, mock_platform):
         """
         Feature: Error handling when Key has Partial status.
@@ -419,7 +421,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             op.infer_layout([q_layout, k_layout, v_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_mesh_mismatch_raises_23(self, mock_platform):
         """
         Feature: Error handling when K/V mesh differs from Query mesh.
@@ -439,7 +441,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mesh must match"):
             op.infer_layout([q_layout, k_layout, v_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_batch_sharded_q_plain_kv_raises_24(self, mock_platform):
         """
         Feature: Mixed DTensor/plain Tensor validation.
@@ -451,7 +453,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "batch and head dimensions must not be sharded"):
             op.infer_layout([q_layout, None, None])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_head_sharded_q_plain_kv_raises_25(self, mock_platform):
         """
         Feature: Mixed DTensor/plain Tensor validation.
@@ -463,7 +465,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "batch and head dimensions must not be sharded"):
             op.infer_layout([q_layout, None, None])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_seq_sharded_q_plain_kv_success_26(self, mock_platform):
         """
         Feature: Mixed DTensor/plain Tensor validation.
@@ -479,7 +481,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
             f"Expected (-1, -1, 1, -1), got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_replicated_q_plain_kv_success_27(self, mock_platform):
         """
         Feature: Mixed DTensor/plain Tensor validation.
@@ -495,7 +497,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
             f"Expected (-1, -1, -1, -1), got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_asymmetric_kv_raises_28(self, mock_platform):
         """
         Feature: Mixed DTensor/plain Tensor validation.
@@ -508,7 +510,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Key and Value must both be DTensors"):
             op.infer_layout([q_layout, k_layout, None])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_asymmetric_kv_reverse_raises_29(self, mock_platform):
         """
         Feature: Mixed DTensor/plain Tensor validation.
@@ -521,7 +523,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Key and Value must both be DTensors"):
             op.infer_layout([q_layout, None, v_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_ndim_mismatch_raises_30(self, mock_platform):
         """
         Feature: ndim validation.
@@ -535,7 +537,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must have the same rank"):
             op.infer_layout([q_layout, k_layout, v_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_ndim_invalid_raises_31(self, mock_platform):
         """
         Feature: ndim validation.
@@ -548,7 +550,7 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only 3D or 4D inputs are supported"):
             op.infer_layout([q_layout, q_layout, q_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sdpa_dim_sharding_not_supported_32(self, mock_platform):
         """
         Feature: D-dimension sharding prohibition.
@@ -575,6 +577,12 @@ class TestSdpaHelperMethods(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -584,9 +592,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
     def _setup_mock_platform(self, mock_platform, world_size=8):
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         self._setup_mock_platform(mock_platform, world_size=8)
@@ -608,7 +613,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
             ScaledDotProductAttentionDistributedOp._normalize_dim_map(0), 0
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_dims_3d_tensor(self, mock_platform):
         """_get_dims returns {head:0, seq:1, dim:2} for a 3D layout."""
         self._setup_mock_platform(mock_platform, world_size=8)
@@ -622,7 +627,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         self.assertEqual(dims["dim"], 2)
         self.assertNotIn("batch", dims)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_dims_4d_tensor(self, mock_platform):
         """_get_dims returns {batch:0, head:1, seq:2, dim:3} for a 4D layout."""
         self._setup_mock_platform(mock_platform, world_size=8)
@@ -647,7 +652,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         dims = op._get_dims(mock_layout)
         self.assertEqual(dims, {"batch": 0, "head": 1, "seq": 2, "dim": 3})
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_dim_split_num_no_alias_tensor_map(self, mock_platform):
         """_get_dim_split_num returns 1 when layout has no alias_tensor_map."""
         from unittest.mock import MagicMock
@@ -656,7 +661,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         result = op._get_dim_split_num(mock_layout, 0)
         self.assertEqual(result, 1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_dim_split_num_dim_out_of_range_returns_one(self, mock_platform):
         """_get_dim_split_num returns 1 when dim_idx >= len(alias_tensor_map)."""
         from unittest.mock import MagicMock
@@ -665,7 +670,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         result = op._get_dim_split_num(mock_layout, 5)
         self.assertEqual(result, 1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_dim_split_num_none_mapping_returns_one(self, mock_platform):
         """_get_dim_split_num returns 1 for a 'None' mapped dimension."""
         from unittest.mock import MagicMock
@@ -674,7 +679,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         result = op._get_dim_split_num(mock_layout, 0)
         self.assertEqual(result, 1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_dim_split_num_string_mapping_returns_device_count(self, mock_platform):
         """_get_dim_split_num returns device count for a string-mapped dimension."""
         self._setup_mock_platform(mock_platform, world_size=8)
@@ -685,7 +690,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         result = op._get_dim_split_num(layout, 0)
         self.assertEqual(result, 2)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_split_info_all_replicated(self, mock_platform):
         """_get_split_info returns 1 for all dims when layout is fully replicated."""
         self._setup_mock_platform(mock_platform, world_size=8)
@@ -699,7 +704,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         self.assertEqual(split_info["head"], 1)
         self.assertEqual(split_info["seq"], 1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_validate_sharding_consistency_none_key_returns(self, mock_platform):
         """_validate_sharding_consistency does nothing when key_layout is None."""
         self._setup_mock_platform(mock_platform, world_size=8)
@@ -709,7 +714,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         q_layout = _build_layout(mesh, (Shard(0), Replicate()), 4)
         op._validate_sharding_consistency(q_layout, None, {"batch": 0, "head": 1, "dim": 3})
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_validate_sharding_consistency_mismatch_raises(self, mock_platform):
         """_validate_sharding_consistency raises ValueError for batch mismatch."""
         self._setup_mock_platform(mock_platform, world_size=8)
@@ -722,13 +727,13 @@ class TestSdpaHelperMethods(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "identical batch sharding"):
             op._validate_sharding_consistency(q_layout, k_layout, dims)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_expand_impl_none_query_returns_none(self, mock_platform):
         """get_expand_impl with None query layout returns None."""
         result = op.get_expand_impl(None, None, [None])
         self.assertIsNone(result)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_key_value_mismatch_raises(self, mock_platform):
         """infer_layout raises ValueError when Key and Value have different tensor_maps."""
         self._setup_mock_platform(mock_platform, world_size=8)
@@ -741,7 +746,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Key and Value must have identical"):
             op.infer_layout([q_layout, k_layout, v_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_expand_impl_returns_callable(self, mock_platform):
         """get_expand_impl with valid layouts returns a callable expanded_impl."""
         self._setup_mock_platform(mock_platform, world_size=8)
@@ -754,7 +759,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         impl = op.get_expand_impl(lambda *a, **k: "result", None, [q_layout, k_layout, v_layout])
         self.assertTrue(callable(impl))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_expand_impl_callable_no_sp_calls_func(self, mock_platform):
         """expanded_impl with no sequence parallelism calls func directly."""
         from unittest.mock import MagicMock
@@ -780,7 +785,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         self.assertEqual(result, "attention_output")
         self.assertEqual(len(func_calls), 1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_q_k_sharding_mismatch_raises(self, mock_platform):
         """infer_layout raises ValueError when Q/K sharding mismatch on non-seq dims."""
         self._setup_mock_platform(mock_platform, world_size=8)
@@ -862,7 +867,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         )
         self.assertEqual(adj_mask.shape[2], local_q_len)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.ops.parallel_scaled_dot_product_attention.platform")
     def test_expanded_impl_with_sequence_parallelism(self, mock_sdpa_platform, mock_mesh_platform):
         """expanded_impl with SP active calls _adjust_attn_mask_for_sp and then func."""

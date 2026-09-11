@@ -36,6 +36,12 @@ class TestParallelPad(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -49,9 +55,6 @@ class TestParallelPad(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -63,7 +66,7 @@ class TestParallelPad(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "tp", "mp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_pad_infer_layout_success_unsharded(self, mock_platform):
         """
         Feature: Pad unsharded dimension
@@ -89,7 +92,7 @@ class TestParallelPad(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_pad_infer_layout_fail_sharded(self, mock_platform):
         """
         Feature: Pad sharded dimension
@@ -105,7 +108,7 @@ class TestParallelPad(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not support padding on a sharded dimension"):
             op.infer_layout([x_layout, pad])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_pad_infer_layout_mixed_dims(self, mock_platform):
         """
         Feature: Pad specific dimension in multi-dim tensor
@@ -126,7 +129,7 @@ class TestParallelPad(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not support padding on a sharded dimension"):
             op.infer_layout([x_layout, pad_fail])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_pad_infer_layout_zero_padding_on_sharded(self, mock_platform):
         """
         Feature: Zero padding on sharded dimension
@@ -144,7 +147,7 @@ class TestParallelPad(unittest.TestCase):
         assert extra_info is None, f"Pad extra_info should be None, got {extra_info}"
         assert output_layout.to_dict()["tensor_map"] == x_layout.to_dict()["tensor_map"]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_pad_infer_layout_invalid_args(self, mock_platform):
         """
         Feature: Validate arguments
@@ -161,7 +164,7 @@ class TestParallelPad(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "but tensor only has"):
             op.infer_layout([x_layout, (1, 1, 1, 1)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_pad_partial_input_raises_error(self, mock_platform):
         """
         Feature: Partial input validation
@@ -175,7 +178,7 @@ class TestParallelPad(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             op.infer_layout([x_layout, (1, 1)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_pad_preprocess_positional_args(self, mock_platform):
         """
         Feature: Pad preprocess

@@ -84,7 +84,7 @@ def test_distribute_shard_then_replicate():
 
     with patch("hyper_parallel.core.dtensor.dtensor.mesh_scatter", return_value=scattered) as mock_scatter, \
          patch("hyper_parallel.core.dtensor.dtensor.mesh_broadcast", return_value=broadcasted) as mock_broadcast, \
-         patch("hyper_parallel.core.dtensor.dtensor.platform.empty_like", return_value=MagicMock()):
+         patch("hyper_parallel.core.dtensor.dtensor.torch.empty_like", return_value=MagicMock()):
         out = _distribute_tensor_with_communication(
             tensor, mesh, [Shard(0), Replicate()], src_data_rank=0
         )

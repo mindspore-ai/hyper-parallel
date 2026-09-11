@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Platform monkey-patch tracer for collective communication operations."""
+"""Tracer for the collective communication operations of core.dtensor."""
 import threading
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict
 
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.dtensor import _utils
 
-# Collective methods to intercept on the platform class.
+# Collective functions in hyper_parallel.core.dtensor._utils to intercept.
 _COLLECTIVE_METHODS = (
     "differentiable_all_gather_concat",
     "differentiable_all_to_all",
@@ -30,7 +30,7 @@ _COLLECTIVE_METHODS = (
 
 
 class CollectiveTracer:
-    """Intercepts platform collective operations via monkey-patching.
+    """Intercepts core.dtensor collective operations via monkey-patching.
 
     Args:
         on_collective_call: Callback invoked after each collective with
@@ -42,27 +42,16 @@ class CollectiveTracer:
     def __init__(self, on_collective_call: Callable):
         self._callback = on_collective_call
         self._originals: Dict[str, object] = {}
-        self._platform_cls: Optional[type] = None
 
     def install(self):
-        """Replace platform collective methods with tracing wrappers."""
+        """Replace the ``_utils`` collective functions with tracing wrappers."""
         with self._patch_lock:
-            platform = get_platform()
-            self._platform_cls = type(platform)
-            cls = self._platform_cls
-
             for name in _COLLECTIVE_METHODS:
-                if name not in cls.__dict__:
+                if not hasattr(_utils, name):
                     continue
-                # Save the raw descriptor (staticmethod wrapper) for exact restoration.
-                original_descriptor = cls.__dict__[name]
-                self._originals[name] = original_descriptor
-
-                # Unwrap staticmethod to get the underlying function.
-                if isinstance(original_descriptor, staticmethod):
-                    original_func = original_descriptor.__func__
-                else:
-                    original_func = original_descriptor
+                # Save the raw function for exact restoration.
+                original_func = getattr(_utils, name)
+                self._originals[name] = original_func
 
                 callback = self._callback
                 method_name = name
@@ -78,16 +67,11 @@ class CollectiveTracer:
                     return wrapper
 
                 wrapper = _make_wrapper(original_func, callback, method_name)
-                setattr(cls, name, staticmethod(wrapper))
+                setattr(_utils, name, wrapper)
 
     def uninstall(self):
-        """Restore original platform collective methods."""
+        """Restore the original ``_utils`` collective functions."""
         with self._patch_lock:
-            if self._platform_cls is None:
-                return
-            cls = self._platform_cls
-            for name, original_descriptor in self._originals.items():
-                # Use type.__setattr__ to precisely restore the original descriptor.
-                type.__setattr__(cls, name, original_descriptor)
+            for name, original_func in self._originals.items():
+                setattr(_utils, name, original_func)
             self._originals.clear()
-            self._platform_cls = None

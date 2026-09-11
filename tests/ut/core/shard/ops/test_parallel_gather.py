@@ -15,7 +15,7 @@
 """parallel_gather test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
@@ -72,6 +72,12 @@ class TestParallelGatherD(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         self.op = GatherDDistributedOp("GatherD")
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -91,9 +97,6 @@ class TestParallelGatherD(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -115,7 +118,7 @@ class TestParallelGatherD(unittest.TestCase):
             init_backend=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gatherd_preprocess(self, mock_platform):
         """Verify GatherD preprocess builds positional local args and cache_values."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -130,7 +133,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert not local_kwargs
         assert cache_values == [input_layout, index_layout, 0]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gatherd_data_parallel_dim0(self, mock_platform):
         """
         Feature: Data Parallel for GatherD
@@ -156,7 +159,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert impl is not None, "Data parallel dim0 should have expand implementation"
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gatherd_data_parallel_dim1(self, mock_platform):
         """
         Feature: GatherD dim-axis sharding inference
@@ -182,7 +185,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert impl is not None, "Data parallel dim1 should have expand implementation"
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gatherd_input_both_shard_replicate_index(self, mock_platform):
         """
         Feature: GatherD multi-dim sharding validation
@@ -198,7 +201,7 @@ class TestParallelGatherD(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same sharding on non-dim axis 1"):
             _infer_one(self.op, [input_layout, index_layout, dim])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gatherd_column_parallel(self, mock_platform):
         """
         Feature: GatherD cross-axis sharding validation
@@ -214,7 +217,7 @@ class TestParallelGatherD(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same sharding on non-dim axis 1"):
             _infer_one(self.op, [input_layout, index_layout, dim])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gatherd_row_parallel(self, mock_platform):
         """
         Feature: Enhanced Model Parallel for GatherD
@@ -240,7 +243,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert impl is not None, "Row parallel should have expand implementation"
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gatherd_input_shard_dp_index_both_shard_conflict(self, mock_platform):
         """
         Feature: GatherD conflicting shard and partial inference
@@ -257,7 +260,7 @@ class TestParallelGatherD(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial dim must be replicate."):
             _infer_one(self.op, [input_layout, index_layout, dim])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gatherd_input_multi_shard_with_matched_index_non_dim_shard(self, mock_platform):
         """
         Feature: GatherD multi-shard inference with matched non-dim axis
@@ -284,7 +287,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert impl is not None, "Matched non-dim shard case should have expand implementation"
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gatherd_3d_mesh_input_multi_shard(self, mock_platform):
         """
         Feature: GatherD 3D mesh sharding inference
@@ -312,7 +315,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert impl is not None, "3D mesh with sharded index should have expand implementation"
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gatherd_3d_mesh_matched_non_dim_shard(self, mock_platform):
         """
         Feature: GatherD 3D mesh sharding inference
@@ -340,7 +343,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert impl is not None, "3D mesh matched non-dim shard case should have expand implementation"
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gatherd_rank_mismatch_error(self, mock_platform):
         """
         Feature: GatherD layout inference error handling
@@ -356,7 +359,7 @@ class TestParallelGatherD(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same number of dimensions"):
             _infer_one(self.op, [input_layout, index_layout, dim])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gatherd_invalid_dim_error(self, mock_platform):
         """
         Feature: GatherD layout inference error handling
@@ -384,6 +387,12 @@ class TestParallelGatherNd(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         self.op = GatherNdDistributedOp("GatherNd")
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -403,9 +412,6 @@ class TestParallelGatherNd(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_1d_mesh(self, mock_platform, world_size=8):
         """Set up mock and return a standard 1D mesh via init_device_mesh."""
@@ -422,7 +428,7 @@ class TestParallelGatherNd(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=mesh_dim_names)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gathernd_preprocess_with_shape(self, mock_platform):
         """Verify GatherNd preprocess caches layouts and shapes."""
         mesh = self._make_1d_mesh(mock_platform, world_size=8)
@@ -437,7 +443,7 @@ class TestParallelGatherNd(unittest.TestCase):
         assert not local_kwargs
         assert cache_values == [input_layout, indices_layout, (16, 64), (16, 2)]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gathernd_preprocess_packed_call(self, mock_platform):
         """Verify GatherNd preprocess receives clean unpacked args.
 
@@ -461,7 +467,7 @@ class TestParallelGatherNd(unittest.TestCase):
         assert not local_kwargs
         assert cache_values == [input_layout, indices_layout, (16, 64), (16, 2)]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gathernd_data_parallel(self, mock_platform):
         """
         Feature: GatherNd layout inference.
@@ -486,7 +492,7 @@ class TestParallelGatherNd(unittest.TestCase):
             f"got {_expand_impl(self.op, None, out_layout, [p_layout, i_layout, [16, 64], [16, 2]])}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gathernd_model_parallel(self, mock_platform):
         """
         Feature: GatherNd layout inference.
@@ -504,7 +510,7 @@ class TestParallelGatherNd(unittest.TestCase):
             f"GatherNd model parallel failed. Expected {expected_map}, got {out_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gathernd_replicated(self, mock_platform):
         """
         Feature: GatherNd layout inference.
@@ -522,7 +528,7 @@ class TestParallelGatherNd(unittest.TestCase):
             f"GatherNd replicated failed. Expected {expected_map}, got {out_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gathernd_indices_last_dim_sharded_error(self, mock_platform):
         """
         Feature: GatherNd layout inference.
@@ -537,7 +543,7 @@ class TestParallelGatherNd(unittest.TestCase):
         with self.assertRaises(ValueError):
             _infer_one(self.op, [p_layout, i_layout, [16, 64], [16, 2]])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gathernd_params_sharded_error(self, mock_platform):
         """
         Feature: GatherNd layout inference.
@@ -552,7 +558,7 @@ class TestParallelGatherNd(unittest.TestCase):
         with self.assertRaises(ValueError):
             _infer_one(self.op, [p_layout, i_layout, [16, 64], [16, 2]])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gathernd_3d_indices_no_extra_args(self, mock_platform):
         """
         Feature: GatherNd layout inference.
@@ -570,7 +576,7 @@ class TestParallelGatherNd(unittest.TestCase):
             f"GatherNd 3D indices failed. Expected {expected_map}, got {out_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_gathernd_params_is_none_layout(self, mock_platform):
         """
         Feature: GatherNd layout inference.
@@ -600,6 +606,12 @@ class TestParallelIndexSelect(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -619,9 +631,6 @@ class TestParallelIndexSelect(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform, mesh_dim_names=("dp", "tp")):
         """Set up mock and return a standard 2x4 mesh via init_device_mesh."""
@@ -638,7 +647,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=world_size)
         return init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("dp",))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_preprocess(self, mock_platform):
         """Verify IndexSelect preprocess builds positional local args and cache_values."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -653,7 +662,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         assert not local_kwargs
         assert cache_values == [p_layout, i_layout, 0]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_valid_axis_0(self, mock_platform):
         """
         Feature: Valid index_select on axis 0
@@ -682,7 +691,7 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"got {_expand_impl(op, None, output_layout, _index_select_cache(layouts, extra_args))}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_valid_axis_1(self, mock_platform):
         """
         Feature: Valid index_select on axis 1
@@ -711,7 +720,7 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"got {_expand_impl(op, None, output_layout, _index_select_cache(layouts, extra_args))}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_valid_negative_axis(self, mock_platform):
         """
         Feature: Valid index_select with negative axis
@@ -740,7 +749,7 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"got {_expand_impl(op, None, output_layout, _index_select_cache(layouts, extra_args))}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_invalid_index_ndim(self, mock_platform):
         """
         Feature: Invalid multi-dimensional index tensor
@@ -757,7 +766,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "index is not a one-dimensional Tensor"):
             _infer_one(op, _index_select_cache(layouts, extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_invalid_axis_positive(self, mock_platform):
         """
         Feature: Invalid positive axis
@@ -774,7 +783,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "is out of valid range"):
             _infer_one(op, _index_select_cache(layouts, extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_invalid_axis_negative(self, mock_platform):
         """
         Feature: Invalid negative axis
@@ -791,7 +800,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "is out of valid range"):
             _infer_one(op, _index_select_cache(layouts, extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_unsharded_axis_unsharded_index(self, mock_platform):
         """
         Feature: Index select layout inference
@@ -818,7 +827,7 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"got {_expand_impl(op, None, output_layout, [p_layout, i_layout, 1])}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_sharded_axis_unsharded_index(self, mock_platform):
         """
         Feature: Index select layout inference
@@ -845,7 +854,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_negative_axis(self, mock_platform):
         """
         Feature: Index select layout inference
@@ -871,7 +880,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_axis_out_of_bounds_positive(self, mock_platform):
         """
         Feature: Index select layout inference
@@ -887,7 +896,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dim value 2 is out of valid range"):
             _infer_one(op, [p_layout, i_layout, 2])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_axis_out_of_bounds_negative(self, mock_platform):
         """
         Feature: Index select layout inference
@@ -903,7 +912,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dim value -3 is out of valid range"):
             _infer_one(op, [p_layout, i_layout, -3])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_invalid_index_ndim_2(self, mock_platform):
         """
         Feature: Index select layout inference
@@ -920,7 +929,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "index is not a one-dimensional Tensor"):
             _infer_one(op, [p_layout, i_layout, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_invalid_partial_input(self, mock_platform):
         """
         Feature: Index select layout inference
@@ -937,7 +946,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status which is not allowed"):
             _infer_one(op, [p_layout, i_layout, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_3d_input_axis_0(self, mock_platform):
         """
         Feature: Index select layout inference
@@ -964,7 +973,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_1d_input_axis_0(self, mock_platform):
         """
         Feature: Index select layout inference
@@ -992,7 +1001,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_scalar_index_invalid(self, mock_platform):
         """
         Feature: Index select layout inference
@@ -1010,7 +1019,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "index is not a one-dimensional Tensor"):
             _infer_one(op, [p_layout, i_layout, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_get_expand_impl_unsharded(self, mock_platform):
         """
         Feature: Index select expand implementation
@@ -1029,7 +1038,7 @@ class TestParallelIndexSelect(unittest.TestCase):
 
         assert impl is None, "Should return None when axis is unsharded"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_get_expand_impl_sharded(self, mock_platform):
         """
         Feature: Index select expand implementation
@@ -1049,7 +1058,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         assert impl is not dummy_func, "Should return custom wrapper when axis is sharded"
         assert impl.__name__ == "expand_impl", "Wrapper function should be named 'expand_impl'"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_negative_axis_on_3d_tensor(self, mock_platform):
         """
         Feature: Index select layout inference
@@ -1077,7 +1086,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_4d_param_axis_2(self, mock_platform):
         """
         Feature: Index select on 4D tensor
@@ -1104,7 +1113,7 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"got {_expand_impl(op, None, output_layout, [p_layout, i_layout, 2])}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_3d_mesh_fully_sharded_axis_1(self, mock_platform):
         """
         Feature: Index select with a 3D DeviceMesh
@@ -1132,7 +1141,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_1d_mesh_param_sharded(self, mock_platform):
         """
         Feature: Index select with 1D DeviceMesh
@@ -1160,7 +1169,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_1d_mesh_index_sharded(self, mock_platform):
         """
         Feature: Index select with 1D DeviceMesh and sharded index
@@ -1187,7 +1196,7 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"got {_expand_impl(op, None, output_layout, [p_layout, i_layout, 1])}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_1d_param_negative_axis(self, mock_platform):
         """
         Feature: Index select on 1D tensor with negative axis
@@ -1215,7 +1224,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_5d_param_last_axis(self, mock_platform):
         """
         Feature: Index select on 5D tensor
@@ -1243,7 +1252,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_output_mesh_shape_preservation(self, mock_platform):
         """
         Feature: Output layout properties
@@ -1266,7 +1275,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_output_alias_name_preservation(self, mock_platform):
         """
         Feature: Output layout properties
@@ -1289,7 +1298,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_output_rank_list_preservation(self, mock_platform):
         """
         Feature: Output layout properties
@@ -1312,7 +1321,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_expand_impl_negative_sharded_axis(self, mock_platform):
         """
         Feature: get_expand_impl with negative axis
@@ -1330,7 +1339,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         assert impl is not dummy_func, "Should return custom wrapper for negative sharded axis."
         assert impl.__name__ == "expand_impl", "Wrapper function should be named 'expand_impl'."
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_expand_impl_other_dims_sharded_only(self, mock_platform):
         """
         Feature: get_expand_impl with unsharded axis but other sharded dims
@@ -1348,7 +1357,7 @@ class TestParallelIndexSelect(unittest.TestCase):
 
         assert impl is None, "Should return None when target axis is unsharded, regardless of other dims."
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_partial_index_layout_invalid(self, mock_platform):
         """
         Feature: Partial layout rejection
@@ -1364,7 +1373,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status which is not allowed"):
             _infer_one(op, [p_layout, i_layout, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_index_select_0d_param_invalid(self, mock_platform):
         """
         Feature: 0D scalar parameter layout

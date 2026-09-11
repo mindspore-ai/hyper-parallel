@@ -225,7 +225,7 @@ class TestContextParallel(unittest.TestCase):
             "keep",
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_wrap_cp_output_dtensor_redistributes_existing_cp_output(self, mock_mesh_platform):
         """CP output wrapping should redistribute existing DTensor placements when needed."""
         mesh = self._make_mesh(mock_mesh_platform)
@@ -242,7 +242,7 @@ class TestContextParallel(unittest.TestCase):
         self.assertEqual(result.device_mesh.to_hash(), mesh.to_hash())
         self.assertEqual(result.placements, (Shard(1),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_pre_hook_colossal_rewrites_positional_and_keyword_qkv(self, mock_mesh_platform):
         """Colossal pre-hook should shard Q and gather K/V for args and kwargs."""
         mesh = self._make_mesh(mock_mesh_platform)
@@ -275,7 +275,7 @@ class TestContextParallel(unittest.TestCase):
         self.assertEqual(kwargs["value"].placements, (Replicate(),))
         self.assertEqual(kwargs["mask"], "keep")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_pre_hook_ulysses_rewrites_positional_qkv(self, mock_mesh_platform):
         """Ulysses pre-hook should apply ATA to positional Q/K/V inputs."""
         mesh = self._make_mesh(mock_mesh_platform)
@@ -337,7 +337,7 @@ class TestContextParallel(unittest.TestCase):
                 submesh_size=2,
             )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scatter_and_gather_sequence_helpers_return_dtensor(self, mock_mesh_platform):
         """CP scatter/gather helpers should return DTensors with requested placements."""
         mesh = self._make_mesh(mock_mesh_platform)
@@ -361,7 +361,7 @@ class TestContextParallel(unittest.TestCase):
         self.assertEqual(scattered.placements, (Shard(2),))
         self.assertEqual(gathered.placements, (Shard(1),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_pre_hook_hybrid_rewrites_2d_placements(self, mock_mesh_platform):
         """Hybrid pre-hook should use 2-D placements for Q and gathered K/V."""
         mesh = self._make_mesh(mock_mesh_platform, mesh_shape=(1, 1), mesh_dim_names=("co", "ds"))
@@ -395,7 +395,7 @@ class TestContextParallel(unittest.TestCase):
         self.assertEqual(kwargs["key"].placements, (Replicate(), Shard(2)))
         self.assertEqual(kwargs["value"].placements, (Replicate(), Shard(2)))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_hybrid_layout_preserves_non_cp_dtensor_and_rejects_bad_heads(self, mock_mesh_platform):
         """Hybrid CP layout helpers should preserve TP layout and validate head divisibility."""
         self._setup_mock_platform(mock_mesh_platform, world_size=8)
@@ -431,7 +431,7 @@ class TestContextParallel(unittest.TestCase):
                 ds_size=2,
             )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_post_hook_colossal_returns_local_outputs(self, mock_mesh_platform):
         """Colossal post-hook should convert direct DTensor outputs to locals."""
         mesh = self._make_mesh(mock_mesh_platform)
@@ -449,7 +449,7 @@ class TestContextParallel(unittest.TestCase):
         self.assertTrue(torch.equal(outputs[0], local))
         self.assertEqual(outputs[1], "keep")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_post_hook_colossal_preserves_non_cp_dtensor_output_layout(self, mock_mesh_platform):
         """Colossal post-hook should drop CP and restore the incoming non-CP layout."""
         self._setup_mock_platform(mock_mesh_platform, world_size=4)
@@ -492,7 +492,7 @@ class TestContextParallel(unittest.TestCase):
         self.assertTrue(torch.equal(output.to_local(), local_out))
         self.assertFalse(hasattr(module, cp_module._OUTPUT_LAYOUT_STACK_ATTR))  # pylint: disable=protected-access
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_post_hook_ata_reconstructs_each_tensor_output(self, mock_mesh_platform):
         """ATA post-hook should reverse head sharding and keep non-tensor outputs."""
         mesh = self._make_mesh(mock_mesh_platform)
@@ -512,7 +512,7 @@ class TestContextParallel(unittest.TestCase):
         self.assertEqual(outputs[1], "keep")
         mock_gather.assert_called_once()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_post_hook_hybrid_output_policies(self, mock_mesh_platform):
         """Hybrid post-hook should support local, CP-DTensor, and non-CP output policies."""
         self._setup_mock_platform(mock_mesh_platform, world_size=8)

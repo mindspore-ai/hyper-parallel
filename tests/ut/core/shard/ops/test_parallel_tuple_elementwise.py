@@ -62,20 +62,26 @@ class TestTupleElementWiseDistributedOpInferLayout(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_empty_layouts_returns_none(self, mock_platform):
         """Empty input layouts returns None."""
         op = TupleElementWiseDistributedOp("tuple_elementwise_empty")
         result = op.infer_layout([])
         self.assertIsNone(result)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_single_layout_returned_as_tuple(self, mock_platform):
         """Single input layout is returned unchanged as the layouts object."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -85,7 +91,7 @@ class TestTupleElementWiseDistributedOpInferLayout(unittest.TestCase):
         self.assertEqual(result, (layout,))
         self.assertIsNot(result[0], layout)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_multiple_layouts_returned_as_is(self, mock_platform):
         """Multiple input layouts are returned as-is (the full tuple)."""
         mesh = _make_mesh(mock_platform, (2, 2), ("dp", "mp"))
@@ -95,7 +101,7 @@ class TestTupleElementWiseDistributedOpInferLayout(unittest.TestCase):
         result = _infer_layout(op, [layout1, layout2])
         self.assertEqual(result, (layout1, layout2))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sharded_layout_returned(self, mock_platform):
         """Sharded input layouts are returned correctly."""
         mesh = _make_mesh(mock_platform, (4,), ("dp",))
@@ -104,7 +110,7 @@ class TestTupleElementWiseDistributedOpInferLayout(unittest.TestCase):
         result = _infer_layout(op, [layout])
         self.assertEqual(result, (layout,))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_none_layout_in_inputs(self, mock_platform):
         """None layout in inputs is returned as part of the result."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -113,7 +119,7 @@ class TestTupleElementWiseDistributedOpInferLayout(unittest.TestCase):
         result = _infer_layout(op, [layout, None])
         self.assertEqual(result, (layout, None))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_three_layouts_returned(self, mock_platform):
         """Three input layouts are returned as-is."""
         mesh = _make_mesh(mock_platform, (2, 2, 2), ("dp", "cp", "mp"))
@@ -124,7 +130,7 @@ class TestTupleElementWiseDistributedOpInferLayout(unittest.TestCase):
         result = _infer_layout(op, [layout1, layout2, layout3])
         self.assertEqual(result, (layout1, layout2, layout3))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partial_input_raises_error(self, mock_platform):
         """Partial input layout is rejected."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))

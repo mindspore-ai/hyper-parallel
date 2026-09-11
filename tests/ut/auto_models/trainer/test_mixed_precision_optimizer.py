@@ -217,7 +217,7 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertIs(model.fp32.main_param, model.fp32)
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
     def test_main_param_preserves_dtensor_layout_and_optimizer_metadata(
             self,
             mock_get_rank,

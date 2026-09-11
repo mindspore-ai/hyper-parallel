@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,6 +41,12 @@ class TestParallelSlice(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -60,9 +66,6 @@ class TestParallelSlice(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -74,7 +77,7 @@ class TestParallelSlice(unittest.TestCase):
             init_backend=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_slice_layout_1(self, mock_platform):
         """
         Feature: MatMul data parallel
@@ -101,7 +104,7 @@ class TestParallelSlice(unittest.TestCase):
         assert impl("local_x", (0, 0), (8, 4)) == "sliced"
         assert calls == [("local_x", (0, 0), (4, 4))]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_slice_layout_2(self, mock_platform):
         """
         Feature: MatMul data parallel
@@ -114,7 +117,7 @@ class TestParallelSlice(unittest.TestCase):
         with self.assertRaises(ValueError):
             _ = op.infer_layout([x_layout, (0, 0), (4, 4), (8, 8)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_slice_preprocess(self, mock_platform):
         """
         Feature: Slice preprocess

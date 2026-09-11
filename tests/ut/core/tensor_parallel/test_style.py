@@ -119,6 +119,12 @@ class TestParallelStyle(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -141,7 +147,7 @@ class TestParallelStyle(unittest.TestCase):
             init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cannot_instantiate_abstract_class(self, mock_platform):
         """
         Feature: ParallelStyle abstract base class instantiation
@@ -153,7 +159,7 @@ class TestParallelStyle(unittest.TestCase):
             ParallelStyle()
         self.assertIn("abstract", str(ctx.exception).lower())
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_concrete_subclass_can_be_instantiated(self, mock_platform):
         """
         Feature: concrete ParallelStyle subclass instantiation
@@ -165,7 +171,7 @@ class TestParallelStyle(unittest.TestCase):
         self.assertIsNotNone(style)
         self.assertFalse(style.apply_called)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_src_data_rank_default_value(self, mock_platform):
         """
         Feature: ParallelStyle src_data_rank default value
@@ -176,7 +182,7 @@ class TestParallelStyle(unittest.TestCase):
         style = ConcreteParallelStyle()
         self.assertEqual(style.src_data_rank, 0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_src_data_rank_can_be_set(self, mock_platform):
         """
         Feature: ParallelStyle src_data_rank modification
@@ -188,7 +194,7 @@ class TestParallelStyle(unittest.TestCase):
         style.src_data_rank = 2
         self.assertEqual(style.src_data_rank, 2)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_src_data_rank_can_be_none(self, mock_platform):
         """
         Feature: ParallelStyle src_data_rank may be None
@@ -200,7 +206,7 @@ class TestParallelStyle(unittest.TestCase):
         style.src_data_rank = None
         self.assertIsNone(style.src_data_rank)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_apply_receives_correct_arguments(self, mock_platform):
         """
         Feature: ParallelStyle.apply receives module and mesh
@@ -218,7 +224,7 @@ class TestParallelStyle(unittest.TestCase):
         self.assertIs(style.last_device_mesh, mesh)
         self.assertIs(result, module)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_apply_can_return_wrapped_module(self, mock_platform):
         """
         Feature: ParallelStyle.apply may return wrapped module
@@ -235,7 +241,7 @@ class TestParallelStyle(unittest.TestCase):
         self.assertIsInstance(result, nn.Module)
         self.assertIs(result.wrapped, module)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_apply_called_multiple_times(self, mock_platform):
         """
         Feature: ParallelStyle.apply may run multiple times
@@ -254,7 +260,7 @@ class TestParallelStyle(unittest.TestCase):
         self.assertIs(style.last_module, module2)
         self.assertTrue(style.apply_called)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_different_styles_have_independent_src_data_rank(self, mock_platform):
         """
         Feature: independent src_data_rank per ParallelStyle instance
@@ -278,6 +284,12 @@ class TestParallelStyleWithMockMesh(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -291,7 +303,7 @@ class TestParallelStyleWithMockMesh(unittest.TestCase):
             lambda t: t.numpy() if hasattr(t, "numpy") else __import__("numpy").array(t)
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_apply_with_different_mesh_dimensions(self, mock_platform):
         """
         Feature: ParallelStyle.apply with varying 1-D mesh world sizes
@@ -337,6 +349,12 @@ class TestPrepareModuleInput(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -394,7 +412,7 @@ class TestPrepareModuleInput(unittest.TestCase):
                 desired_input_kwarg_layouts={},
             )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_forward_matches_pytorch_prepare_module_input_case(self, mock_platform):
         """Same layout contract as PyTorch ``test_prepare_module_input`` (rank-agnostic check)."""
         mesh = self._make_1d_mesh(mock_platform, size=1)
@@ -411,7 +429,7 @@ class TestPrepareModuleInput(unittest.TestCase):
             restored = output.redistribute(mesh, [Shard(0)]).to_local()
         self.assertTrue(torch.allclose(inp, restored))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_parallelize_module_single_style_like_pytorch(self, mock_platform):
         """``parallelize_module(m, mesh, PrepareModuleInput(...))`` applies hooks on root."""
         mesh = self._make_1d_mesh(mock_platform, size=1)
@@ -431,7 +449,7 @@ class TestPrepareModuleInput(unittest.TestCase):
             restored = out.redistribute(mesh, [Shard(0)]).to_local()
         self.assertTrue(torch.allclose(inp, restored))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_use_local_output_true_passes_local_tensor_to_forward(self, mock_platform):
         """With ``use_local_output=True``, forward receives plain tensors, not DTensor."""
         mesh = self._make_1d_mesh(mock_platform, size=1)
@@ -446,7 +464,7 @@ class TestPrepareModuleInput(unittest.TestCase):
         self.assertIsInstance(out, torch.Tensor)
         self.assertTrue(torch.allclose(inp, out))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_value_error_when_forward_arity_mismatches_input_layouts(self, mock_platform):
         """Raise ``ValueError`` when the number of forward args does not match ``input_layouts``."""
         mesh = self._make_1d_mesh(mock_platform, size=1)
@@ -463,7 +481,7 @@ class TestPrepareModuleInput(unittest.TestCase):
         with self.assertRaises(ValueError):
             module(torch.randn(2, 2), torch.randn(2, 2))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_none_placeholder_leaves_input_unchanged(self, mock_platform):
         """A ``None`` slot in layout tuples skips preparing that positional argument."""
         mesh = self._make_1d_mesh(mock_platform, size=1)
@@ -483,7 +501,7 @@ class TestPrepareModuleInput(unittest.TestCase):
         out = module(x, y)
         self.assertTrue(torch.all(torch.eq(out, y)))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_with_kwargs_prepares_kwarg_tensor(self, mock_platform):
         """``input_kwarg_layouts`` prepares keyword tensor arguments like positional ones."""
         mesh = self._make_1d_mesh(mock_platform, size=1)
@@ -600,6 +618,12 @@ class TestPrepareModuleOutput(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -655,7 +679,7 @@ class TestPrepareModuleOutput(unittest.TestCase):
             style._prepare_out_fn((torch.randn(1), torch.randn(1)), mesh)
         self.assertIn("same length", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_forward_matches_pytorch_prepare_module_output_case(self, mock_platform):
         """Same as PyTorch ``test_prepare_module_output`` (Replicate -> Shard(0) on hook)."""
         mesh = self._make_1d_mesh(mock_platform, size=1)
@@ -673,7 +697,7 @@ class TestPrepareModuleOutput(unittest.TestCase):
             expected = dtensor.redistribute(mesh, [Shard(0)]).to_local()
         self.assertTrue(torch.allclose(expected, output))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_none_placeholder_skips_second_output(self, mock_platform):
         """``None`` in ``output_layouts`` leaves the matching return value untouched."""
         mesh = self._make_1d_mesh(mock_platform, size=1)
@@ -689,7 +713,7 @@ class TestPrepareModuleOutput(unittest.TestCase):
         self.assertIsInstance(b, torch.Tensor)
         self.assertEqual(b.item(), 1.0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_use_local_output_false_returns_dtensor(self, mock_platform):
         """With ``use_local_output=False``, the hook leaves outputs as :class:`DTensor`."""
         mesh = self._make_1d_mesh(mock_platform, size=1)
@@ -710,6 +734,12 @@ class TestPrepareModuleInputOutput(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -732,7 +762,7 @@ class TestPrepareModuleInputOutput(unittest.TestCase):
             init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_forward_matches_pytorch_prepare_module_input_output_case(self, mock_platform):
         """Same end-to-end tensor equality as PyTorch ``test_prepare_module_input_output``."""
         mesh = self._make_1d_mesh(mock_platform, size=1)

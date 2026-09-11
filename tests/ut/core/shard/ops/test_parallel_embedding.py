@@ -42,6 +42,12 @@ class TestParallelEmbedding(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -53,9 +59,6 @@ class TestParallelEmbedding(unittest.TestCase):
         """Configure common mock-platform attributes."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh."""
@@ -67,7 +70,7 @@ class TestParallelEmbedding(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=mesh_dim_names)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_embedding_data_parallel(self, mock_platform):
         """
         Feature: Data Parallel for Embedding
@@ -91,7 +94,7 @@ class TestParallelEmbedding(unittest.TestCase):
             # Implementation should be native (None) for DP
             self.assertIsNone(op.get_expand_impl(None, (output_layouts, None), cache_values))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_embedding_column_parallel(self, mock_platform):
         """
         Feature: Column Parallel (Model Parallel) for Embedding
@@ -118,7 +121,7 @@ class TestParallelEmbedding(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Column-Parallel.*does not support `max_norm`"):
                 impl(MagicMock(), MagicMock(), max_norm=1.0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_embedding_row_parallel(self, mock_platform):
         """
         Feature: Row Parallel for Embedding (Vocab Sharding)
@@ -141,7 +144,7 @@ class TestParallelEmbedding(unittest.TestCase):
             mp_idx = mesh.axis_index("mp")
             self.assertEqual(output_layout.partial[mp_idx], "sum")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_embedding_row_and_column_parallel_3d(self, mock_platform):
         """
         Feature: Row and Column Parallel on 3D Mesh
@@ -164,7 +167,7 @@ class TestParallelEmbedding(unittest.TestCase):
             vp_idx = mesh.axis_index("vp")
             self.assertEqual(output_layout.partial[vp_idx], "sum")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_embedding_seq_dimension_sharding(self, mock_platform):
         """
         Feature: Sequence dimension sharding
@@ -181,7 +184,7 @@ class TestParallelEmbedding(unittest.TestCase):
             output_layout = output_layouts[0]
             self.assertEqual(output_layout.tensor_map, (-1, 0, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_embedding_invalid_missing_weight_layout(self, mock_platform):
         """
         Feature: Input validation
@@ -195,7 +198,7 @@ class TestParallelEmbedding(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cache_values length should be 2"):
                 op.infer_layout([input_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_embedding_partial_conflict_error(self, mock_platform):
         """
         Feature: Sharding/Partial conflict detection
@@ -211,7 +214,7 @@ class TestParallelEmbedding(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Partial dim must be replicate"):
                 op.infer_layout([input_layout, weight_layout])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_embedding_row_parallel_params_validation(self, mock_platform):
         """
         Feature: Row Parallel runtime parameter validation
@@ -230,7 +233,7 @@ class TestParallelEmbedding(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Row-Parallel.*does not support `scale_grad_by_freq=True`"):
                 impl(MagicMock(), MagicMock(), scale_grad_by_freq=True)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_embedding_fully_sharded_weights(self, mock_platform):
         """
         Feature: Fully sharded weights (Vocab and Embed dimensions).
@@ -252,7 +255,7 @@ class TestParallelEmbedding(unittest.TestCase):
             # Partial should be on dp axis (index 0) due to vocab sharding
             self.assertEqual(output_layout.partial[0], "sum")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_embedding_3d_input_sharding(self, mock_platform):
         """
         Feature: 3D input tensor sharding.
@@ -271,7 +274,7 @@ class TestParallelEmbedding(unittest.TestCase):
             # Expected map: (1, -1, -1, 0)
             self.assertEqual(output_layout.tensor_map, (1, -1, -1, 0))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_embedding_input_multi_dim_sharding(self, mock_platform):
         """
         Feature: Multi-sharded input.
@@ -320,7 +323,7 @@ class TestParallelEmbedding(unittest.TestCase):
 
 
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_embedding_column_parallel_scale_grad_freq(self, mock_platform):
         """
         Feature: CP Parameter validation.
@@ -354,20 +357,23 @@ class TestEmbeddingRowParallelImpl(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_row_parallel_max_norm_raises(self, mock_platform):
         """RP impl with max_norm raises ValueError."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         mesh = init_device_mesh(
             device_type="npu", mesh_shape=(4,), mesh_dim_names=("mp",), init_backend=False
         )

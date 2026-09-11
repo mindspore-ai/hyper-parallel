@@ -37,8 +37,8 @@ import torch.distributed as dist
 from torch import nn
 
 from hyper_parallel import ColwiseParallel, RowwiseParallel, init_device_mesh, parallelize_module
+from hyper_parallel.core.dtensor import _utils
 from hyper_parallel.core.dtensor.debug import CommDebugMode
-from hyper_parallel.platform import get_platform as _get_platform
 from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
 
@@ -290,49 +290,50 @@ def test_comm_debug_mode_with_module_tracker():
 
 
 # ---------------------------------------------------------------------------
-# Test 5: platform methods restored after exit
+# Test 5: collective functions restored after exit
 # ---------------------------------------------------------------------------
 def test_comm_debug_mode_restores_platform():
     """
-    Feature: Platform method restoration
+    Feature: Collective function restoration
     Description: After CommDebugMode exits, collective methods are exactly restored.
-    Expectation: cls.__dict__ entries match originals after context exit.
+    Expectation: ``_utils`` module entries match originals after context exit.
 
     Example output (2 ranks, gloo):
-        Platform methods correctly restored: ['differentiable_all_reduce',
+        Collective methods correctly restored: ['differentiable_all_reduce',
             'differentiable_all_gather_concat', 'differentiable_reduce_scatter']
 
-    Verifies the monkey-patch lifecycle: inside CommDebugMode the platform's
-    staticmethod descriptors are replaced with tracing wrappers; on exit,
-    ``type.__setattr__`` restores the original descriptors exactly (identity
-    check via ``is``), so no tracing overhead leaks into subsequent code.
+    Verifies the monkey-patch lifecycle: inside CommDebugMode the collective
+    functions in ``hyper_parallel.core.dtensor._utils`` are replaced with
+    tracing wrappers; on exit the original function objects are restored
+    exactly (identity check via ``is``), so no tracing overhead leaks into
+    subsequent code.
     """
     init_backend(_DEVICE_TYPE)
 
-    cls = type(_get_platform())
+    module = _utils
 
     originals = {}
     for name in ("differentiable_all_reduce", "differentiable_all_gather_concat",
                  "differentiable_reduce_scatter"):
-        if name in cls.__dict__:
-            originals[name] = cls.__dict__[name]
+        if hasattr(module, name):
+            originals[name] = getattr(module, name)
 
     with CommDebugMode():
-        # Inside: methods should be patched (different from originals)
+        # Inside: functions should be patched (different from originals)
         for name, orig_method in originals.items():
-            assert cls.__dict__[name] is not orig_method, (
+            assert getattr(module, name) is not orig_method, (
                 f"{name} should be patched inside CommDebugMode"
             )
 
-    # Outside: methods should be restored
+    # Outside: functions should be restored
     for name, orig in originals.items():
-        assert cls.__dict__[name] is orig, (
+        assert getattr(module, name) is orig, (
             f"{name} not restored after CommDebugMode exit"
         )
 
     rank = dist.get_rank()
     if rank == 0:
-        print(f"\n[Test 5] Platform methods correctly restored: {list(originals.keys())}")
+        print(f"\n[Test 5] Collective methods correctly restored: {list(originals.keys())}")
 
 
 # ---------------------------------------------------------------------------

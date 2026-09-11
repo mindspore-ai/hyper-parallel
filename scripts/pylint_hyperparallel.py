@@ -31,6 +31,7 @@ APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
 BACKEND_IMPORTS = {"torch", "mindspore"}
 PLATFORM_ALLOWED_PARTS = ("hyper_parallel/platform/", "tests/", "scripts/", ".agent/")
 TORCH_ONLY_CORE_PARTS = (
+    "hyper_parallel/core/dtensor/",
     "hyper_parallel/core/multicore/",
     "hyper_parallel/core/shard/dfunction.py",
 )

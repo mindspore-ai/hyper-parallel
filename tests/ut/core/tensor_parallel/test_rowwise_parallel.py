@@ -132,6 +132,12 @@ class TestRowwiseParallelApply(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -155,7 +161,7 @@ class TestRowwiseParallelApply(unittest.TestCase):
             init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_apply_linear_calls_distribute_module(self, mock_mesh_platform):
         """
         Feature: RowwiseParallel.apply on Linear module
@@ -173,7 +179,7 @@ class TestRowwiseParallelApply(unittest.TestCase):
             self.assertIs(result, module)
             self.assertEqual(style.desired_input_layouts, (Shard(-1),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_apply_linear_invokes_distribute_module_callbacks(self, mock_mesh_platform):
         """
         Feature: RowwiseParallel.apply registers callable hooks on distribute_module
@@ -200,7 +206,7 @@ class TestRowwiseParallelApply(unittest.TestCase):
             self.assertEqual(inp, "inp")
             self.assertEqual(out, "out")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_apply_embedding_calls_distribute_module(self, mock_mesh_platform):
         """
         Feature: RowwiseParallel.apply on Embedding module
@@ -218,7 +224,7 @@ class TestRowwiseParallelApply(unittest.TestCase):
             self.assertIs(result, module)
             self.assertEqual(style.desired_input_layouts, (Replicate(),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_apply_embedding_invokes_partition_fn(self, mock_mesh_platform):
         """
         Feature: RowwiseParallel.apply partition_fn for Embedding
@@ -237,7 +243,7 @@ class TestRowwiseParallelApply(unittest.TestCase):
             partition_fn("emb", module, mesh)
             mock_partition.assert_called_once_with(module, mesh)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_apply_unsupported_module_raises(self, mock_mesh_platform):
         """
         Feature: RowwiseParallel.apply rejects unsupported module types
@@ -260,6 +266,12 @@ class TestRowwiseParallelPartition(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -283,7 +295,7 @@ class TestRowwiseParallelPartition(unittest.TestCase):
             init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partition_linear_fn_weight_shard1_bias_replicate(self, mock_platform):
         """
         Feature: RowwiseParallel._partition_linear_fn sharding strategy
@@ -309,7 +321,7 @@ class TestRowwiseParallelPartition(unittest.TestCase):
             self.assertEqual(placements_used[0], [Shard(1)])
             self.assertEqual(placements_used[1], [Replicate()])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partition_linear_fn_no_bias(self, mock_platform):
         """
         Feature: RowwiseParallel._partition_linear_fn with no bias
@@ -333,7 +345,7 @@ class TestRowwiseParallelPartition(unittest.TestCase):
             self.assertEqual(mock_dt.call_count, 1)
             self.assertEqual(mock_dt.call_args[0][2], [Shard(1)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partition_embedding_fn_uses_shard0(self, mock_platform):
         """
         Feature: RowwiseParallel._partition_embedding_fn sharding strategy
@@ -357,7 +369,7 @@ class TestRowwiseParallelPartition(unittest.TestCase):
             for call in mock_dt.call_args_list:
                 self.assertEqual(call[0][2], [Shard(0)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partition_embedding_fn_skips_none_param(self, mock_platform):
         """
         Feature: RowwiseParallel._partition_embedding_fn skips None parameters
@@ -391,6 +403,12 @@ class TestRowwiseParallelIO(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -451,7 +469,7 @@ class TestRowwiseParallelIO(unittest.TestCase):
             )
             mock_dtensor.redistribute.assert_called_once_with(mesh, desired_layouts)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_prepare_output_fn_to_local(self, mock_platform):
         """
         Feature: _prepare_output_fn converts to local tensor
@@ -468,7 +486,7 @@ class TestRowwiseParallelIO(unittest.TestCase):
         self.assertIsInstance(result, torch.Tensor)
         self.assertTrue(torch.allclose(result, local))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_prepare_output_fn_keeps_dtensor(self, mock_platform):
         """
         Feature: _prepare_output_fn keeps DTensor when use_local_output=False
@@ -482,7 +500,7 @@ class TestRowwiseParallelIO(unittest.TestCase):
         )
         self.assertIs(result, dt_out)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_prepare_output_fn_redistributes_if_needed(self, mock_platform):
         """
         Feature: _prepare_output_fn redistributes when placements differ
@@ -554,6 +572,12 @@ class TestColRowComposition(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -577,7 +601,7 @@ class TestColRowComposition(unittest.TestCase):
             init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_mlp_colwise_rowwise_composition(self, mock_mesh_platform):
         """
         Feature: ColwiseParallel + RowwiseParallel composition on MLP

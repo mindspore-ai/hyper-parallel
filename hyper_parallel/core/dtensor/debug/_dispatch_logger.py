@@ -13,13 +13,14 @@
 # limitations under the License.
 # ============================================================================
 """Debug logging helpers for OpDispatcher dispatch enter/exit tracing."""
+# pylint: disable=R0401
 import logging
 from typing import Any
 
-from hyper_parallel.platform import get_platform
+import torch
 
 logger = logging.getLogger(__name__)
-_Tensor = get_platform().Tensor
+_Tensor = torch.Tensor
 
 
 def log_dispatch_enter(op_name: str, args: tuple, kwargs: dict) -> None:

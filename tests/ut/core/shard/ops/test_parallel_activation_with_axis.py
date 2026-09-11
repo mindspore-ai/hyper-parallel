@@ -39,6 +39,12 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -63,9 +69,6 @@ class TestParallelActivationWithAxis(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -87,7 +90,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
             init_backend=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_data_parallel_success(self, mock_platform):
         """
         Feature: ActivationWithAxis data parallel
@@ -115,7 +118,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
             f"got {op.get_expand_impl(None, ((output_layout,), None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_model_parallel_success(self, mock_platform):
         """
         Feature: ActivationWithAxis model parallel
@@ -136,7 +139,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_all_replicated(self, mock_platform):
         """
         Feature: ActivationWithAxis all replicated
@@ -157,7 +160,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_negative_dim(self, mock_platform):
         """
         Feature: ActivationWithAxis negative dimension index
@@ -178,7 +181,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_sharded_dim_failure(self, mock_platform):
         """
         Feature: ActivationWithAxis sharded dimension check
@@ -193,7 +196,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires the reduction axis to be un-sharded"):
             op.infer_layout([x_layout, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_model_parallel_on_mp_axis_failure(self, mock_platform):
         """
         Feature: ActivationWithAxis model parallel check
@@ -208,7 +211,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires the reduction axis to be un-sharded"):
             op.infer_layout([x_layout, -1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_multi_axis_tuple(self, mock_platform):
         """
         Feature: ActivationWithAxis with multiple axes
@@ -229,7 +232,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_multi_axis_sharded_failure(self, mock_platform):
         """
         Feature: ActivationWithAxis with multiple axes, one sharded
@@ -244,7 +247,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires the reduction axis to be un-sharded"):
             op.infer_layout([x_layout, (0, 2)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_input_consistency_failure(self, mock_platform):
         """
         Feature: ActivationWithAxis layout consistency check
@@ -259,7 +262,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires all tensor inputs to have the same layout"):
             op.infer_layout([layout1, layout2, 1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_multi_input_same_layout(self, mock_platform):
         """
         Feature: ActivationWithAxis with multiple inputs (same layout)
@@ -280,7 +283,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_3d_tensor(self, mock_platform):
         """
         Feature: ActivationWithAxis on 3D tensor
@@ -301,7 +304,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_invalid_extra_args_type(self, mock_platform):
         """
         Feature: ActivationWithAxis invalid extra args type
@@ -316,7 +319,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "should be int or tuple"):
             op.infer_layout([x_layout, "invalid"])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_partial_input(self, mock_platform):
         """
         Feature: ActivationWithAxis with partial input
@@ -332,7 +335,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
             op.infer_layout([x_layout, 1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_activation_with_axis_preprocess(self, mock_platform):
         """
         Feature: ActivationWithAxis preprocess
@@ -366,6 +369,12 @@ class TestParallelSoftmax(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -384,9 +393,6 @@ class TestParallelSoftmax(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_1d_mesh(self, mock_platform, world_size=8, mesh_name="dp"):
         """Set up mock and return a standard 1D mesh via init_device_mesh."""
@@ -403,7 +409,7 @@ class TestParallelSoftmax(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=4)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=mesh_dim_names)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_softmax_layout_data_parallel(self, mock_platform):
         """
         Feature: Softmax data parallel
@@ -430,7 +436,7 @@ class TestParallelSoftmax(unittest.TestCase):
             f"got {softmax_ms_op.get_expand_impl(None, ((output_layout,), None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_softmax_layout_data_parallel_value_failed(self, mock_platform):
         """
         Feature: Softmax data parallel value failed
@@ -445,7 +451,7 @@ class TestParallelSoftmax(unittest.TestCase):
         with self.assertRaises(ValueError):
             _ = softmax_ms_op.infer_layout([x_layout, 0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_data_parallel_success(self, mock_platform):
         """
         Feature: Softmax compatible with PyTorch (dim arg)
@@ -465,7 +471,7 @@ class TestParallelSoftmax(unittest.TestCase):
             f"DP test failed. Expected {expected_map}, got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_negative_dim_success(self, mock_platform):
         """
         Feature: Softmax compatible with PyTorch
@@ -483,7 +489,7 @@ class TestParallelSoftmax(unittest.TestCase):
         expected_map = x_layout.tensor_map
         assert output_layout.tensor_map == expected_map
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_sharded_dim_failure(self, mock_platform):
         """
         Feature: Softmax distributed check
@@ -501,7 +507,7 @@ class TestParallelSoftmax(unittest.TestCase):
         self.assertIn("is sharded", str(context.exception))
         self.assertIn("requires the reduction axis to be un-sharded", str(context.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_model_parallel_failure(self, mock_platform):
         """
         Feature: Softmax distributed check
@@ -518,7 +524,7 @@ class TestParallelSoftmax(unittest.TestCase):
 
         self.assertIn("is sharded", str(context.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_model_parallel_success_on_other_axis(self, mock_platform):
         """
         Feature: Softmax distributed check
@@ -536,7 +542,7 @@ class TestParallelSoftmax(unittest.TestCase):
         expected_map = x_layout.tensor_map
         assert output_layout.tensor_map == expected_map
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_input_consistency_failure(self, mock_platform):
         """
         Feature: Layout consistency check
@@ -553,7 +559,7 @@ class TestParallelSoftmax(unittest.TestCase):
 
         self.assertIn("requires all tensor inputs to have the same layout", str(context.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_multi_axis_mesh_success(self, mock_platform):
         """
         Feature: Softmax with multi-axis device mesh
@@ -573,7 +579,7 @@ class TestParallelSoftmax(unittest.TestCase):
             f"Multi-axis mesh test failed. Expected {expected_map}, got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_interleaved_parallel_success(self, mock_platform):
         """
         Feature: Softmax with interleaved parallel
@@ -591,7 +597,7 @@ class TestParallelSoftmax(unittest.TestCase):
         assert output_layout.tensor_map == x_layout.tensor_map
         assert output_layout.to_dict()["interleaved_parallel"] is True
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_non_contiguous_rank_list(self, mock_platform):
         """
         Feature: Softmax with non-contiguous rank list
@@ -615,7 +621,7 @@ class TestParallelSoftmax(unittest.TestCase):
         assert output_layout.rank_list == (3, 1, 0, 2)
         assert output_layout.tensor_map == x_layout.tensor_map
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_multi_input_same_layout_success(self, mock_platform):
         """
         Feature: Softmax with multiple inputs (same layout)

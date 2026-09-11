@@ -47,7 +47,7 @@ class TestRandFactory(unittest.TestCase):
              patch.object(dtensor_mod, "_build_layout", return_value=layout), \
              patch("hyper_parallel.core.dtensor.random.is_rng_supported_mesh", return_value=True), \
              patch("hyper_parallel.core.shard._op_dispatch._OP_DISPATCHER", dispatcher), \
-             patch.object(dtensor_mod.platform, "rand", return_value=torch.randn(2, 4)) as mock_rand, \
+             patch.object(dtensor_mod.torch, "rand", return_value=torch.randn(2, 4)) as mock_rand, \
              patch.object(dtensor_mod, "DTensor") as mock_dtensor:
             rand((4, 4), mesh, placements, dtype=torch.float32)
         mock_rand.assert_called_once_with((2, 4), dtype=torch.float32)
@@ -61,7 +61,7 @@ class TestRandFactory(unittest.TestCase):
 
         with patch.object(dtensor_mod, "compute_local_shape_and_global_offset", return_value=(2, 4)), \
              patch("hyper_parallel.core.dtensor.random.is_rng_supported_mesh", return_value=False), \
-             patch.object(dtensor_mod.platform, "randn", return_value=torch.randn(2, 4)) as mock_randn, \
+             patch.object(dtensor_mod.torch, "randn", return_value=torch.randn(2, 4)) as mock_randn, \
              patch.object(dtensor_mod, "DTensor") as mock_dtensor:
             randn((4, 4), mesh, placements)
         mock_randn.assert_called_once_with((2, 4))

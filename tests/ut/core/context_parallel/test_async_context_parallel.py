@@ -396,7 +396,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         self.assertEqual(fwd_slots["k"]["out_perm"], "ag_out")
         self.assertEqual(fwd_slots["k"]["layout"], ("cp_mesh", (Replicate(),)))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_ulysses_slot_restores_cp_tp_composed_head_layout(self, mock_mesh_platform):
         """Async Ulysses wait should restore CP+TP layout instead of CP-only layout."""
         _setup_mock_mesh_platform(mock_mesh_platform, world_size=4)
@@ -430,7 +430,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         self.assertEqual(result.placements, (StridedShard(2, 2), Shard(2)))
         self.assertTrue(torch.equal(result.to_local(), local_after_a2a))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_colossal_slot_restores_tp_layout_after_async_allgather(self, mock_mesh_platform):
         """Async Colossal K/V all-gather should keep TP layout metadata."""
         _setup_mock_mesh_platform(mock_mesh_platform, world_size=4)
@@ -464,7 +464,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         self.assertEqual(result.placements, (Replicate(), Shard(2)))
         self.assertTrue(torch.equal(result.to_local(), gathered))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_hybrid_slot_restores_co_ds_tp_composed_layout(self, mock_mesh_platform):
         """Async Hybrid A2A should restore the full CO+DS+TP execution layout."""
         _setup_mock_mesh_platform(mock_mesh_platform, world_size=8)
@@ -497,7 +497,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         self.assertEqual(result.device_mesh.mesh_dim_names, ("co", "ds", "tp"))
         self.assertEqual(result.placements, (Shard(1), StridedShard(2, 2), Shard(2)))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_wait_a2a_dtensor_wraps_wait_result_with_recorded_layout(self, mock_mesh_platform):
         """_wait_a2a_dtensor should use the slot layout captured before communication."""
         _setup_mock_mesh_platform(mock_mesh_platform, world_size=4)
@@ -642,7 +642,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         self.assertEqual(kwargs, {})
         mock_wait.assert_called_once()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_ulysses_layout_from_non_cp_dtensor_input(self, mock_mesh_platform):
         """Pure Ulysses layout helper should preserve incoming non-CP DTensor layout."""
         _setup_mock_mesh_platform(mock_mesh_platform, world_size=4)
@@ -664,7 +664,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         self.assertEqual(mesh.mesh_dim_names, ("cp", "tp"))
         self.assertEqual(placements, (StridedShard(2, 2), Shard(2)))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_attn_post_hook_ata_reconstructs_outputs(self, mock_mesh_platform):
         """Async attention post-hook should reverse ATA for tuple and scalar outputs."""
         _setup_mock_mesh_platform(mock_mesh_platform, world_size=1)
@@ -689,7 +689,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         self.assertEqual(outputs[1], "keep")
         mock_gather.assert_called_once()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_wrap_async_cp_result_supports_legacy_slot_tuple(self, mock_mesh_platform):
         """Legacy ``(work, out_perm)`` slots should fall back to the provided CP layout."""
         _setup_mock_mesh_platform(mock_mesh_platform, world_size=2)

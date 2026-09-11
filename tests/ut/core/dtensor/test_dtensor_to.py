@@ -227,7 +227,7 @@ def _make_parameter_dtensor(monkeypatch, mesh="fake_mesh", placements=None):
             raise AssertionError("ParameterDTensor constructor should not be used")
 
     calls = []
-    monkeypatch.setattr(dtensor_mod.platform, "Parameter", _FakeParameter)
+    monkeypatch.setattr(dtensor_mod.torch.nn, "Parameter", _FakeParameter)
     monkeypatch.setattr(dtensor_mod, "DTensor", _BaseDTensor)
 
     mock_local = Mock(name="local_tensor")

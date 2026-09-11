@@ -66,6 +66,12 @@ class TestParallelElementwiseOps(unittest.TestCase):
         _LAYOUT_CACHE.clear()
         self.op = ElementWiseDistributedOp("element_wise")
         self.op_with_partial = AddDistributedOp("element_wise_with_partial")
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -85,9 +91,6 @@ class TestParallelElementwiseOps(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, sp, mp) mesh via init_device_mesh."""
@@ -191,7 +194,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         assert cache_values[1] is y_layout
         assert cache_values[2] == [(4, 8), (4, 8)]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_single_input_partial_0(self, mock_platform):
         """
         Feature: Element-wise operator with single input
@@ -205,7 +208,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
             self.op.infer_layout(_make_cache_values((x_layout,), {"input_shapes": [(4, 8, 16)]}))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_single_input_replicate_1(self, mock_platform):
         """
         Feature: Element-wise operator with single input
@@ -223,7 +226,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             flag=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_single_input_sharded_2(self, mock_platform):
         """
         Feature: Element-wise operator with single input
@@ -240,7 +243,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             flag=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_single_input_partial_3(self, mock_platform):
         """
         Feature: Element-wise operator with single input
@@ -257,7 +260,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
 
         assert output_layout.partial[mesh.axis_index("dp")] == "sum"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_both_replicate_4(self, mock_platform):
         """
         Feature: Element-wise operator with two inputs
@@ -275,7 +278,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             flag=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_both_sharded_same_5(self, mock_platform):
         """
         Feature: Element-wise operator with two inputs
@@ -293,7 +296,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             flag=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_one_sharded_one_replicate_6(self, mock_platform):
         """
         Feature: Element-wise operator with two inputs
@@ -311,7 +314,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             flag=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_different_sharding_conflict_7(self, mock_platform):
         """
         Feature: Element-wise operator with two inputs
@@ -327,7 +330,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "should have same sharding pattern"):
             self.op.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sharded_broadcasts_to_replicated_8(self, mock_platform):
         """
         Feature: Element-wise operator with broadcasting
@@ -343,7 +346,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Broadcasting dimension cannot be sharded"):
             self.op.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_replicated_broadcasts_to_sharded_9(self, mock_platform):
         """
         Feature: Element-wise operator with broadcasting
@@ -362,7 +365,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             flag=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_both_need_broadcast_10(self, mock_platform):
         """
         Feature: Element-wise operator with broadcasting
@@ -380,7 +383,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             flag=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_complex_broadcast_11(self, mock_platform):
         """
         Feature: Element-wise operator with broadcasting
@@ -398,7 +401,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             flag=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_scalar_broadcast_12(self, mock_platform):
         """
         Feature: Element-wise operator with broadcasting
@@ -416,7 +419,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             flag=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partial_with_replicate_13(self, mock_platform):
         """
         Feature: Element-wise operator with Partial
@@ -440,7 +443,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         )
         assert callable(impl), "Returned impl should be a callable function"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partial_with_partial_same_14(self, mock_platform):
         """
         Feature: Element-wise operator with Partial
@@ -463,7 +466,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             f"get_expand_impl test failed. Expected None, got {impl}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partial_with_partial_different_15(self, mock_platform):
         """
         Feature: Element-wise operator with Partial
@@ -481,7 +484,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "partial operations should be same"):
             self.op_with_partial.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_shard_with_partial_conflict_16(self, mock_platform):
         """
         Feature: Element-wise operator with Shard and Partial
@@ -498,7 +501,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Shard and Partial should not coexist on same device axis"):
             self.op_with_partial.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partial_broadcasts_to_sharded_17(self, mock_platform):
         """
         Feature: Element-wise operator with Partial broadcasting
@@ -515,7 +518,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Shard and Partial should not coexist on same device axis"):
             self.op_with_partial.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_multiple_inputs_18(self, mock_platform):
         """
         Feature: Element-wise operator
@@ -541,7 +544,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
                                     (x_layout, y_layout, z_layout), extra_args)}"""
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_output_shard_partial_conflict_19(self, mock_platform):
         """
         Feature: Element-wise operator
@@ -558,7 +561,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Shard and Partial should not coexist on same device axis"):
             self.op_with_partial.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_incompatible_broadcast_shapes_20(self, mock_platform):
         """
         Feature: Element-wise operator with broadcasting
@@ -574,7 +577,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot be broadcast"):
             self.op_with_partial.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_1d_to_3d_broadcast_21(self, mock_platform):
         """
         Feature: Element-wise operator with different dimension counts
@@ -596,7 +599,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         )[0][0]
         assert output_layout.placements == [Shard(0), Shard(1), Shard(2)]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_no_input_shapes_provided_22(self, mock_platform):
         """
         Feature: Element-wise operator
@@ -619,6 +622,12 @@ class TestParallelArithmetic(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -632,9 +641,6 @@ class TestParallelArithmetic(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -646,7 +652,7 @@ class TestParallelArithmetic(unittest.TestCase):
             init_backend=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_add_layout_hybrid_parallel(self, mock_platform):
         """
         Feature: add hybrid parallel
@@ -677,7 +683,7 @@ class TestParallelArithmetic(unittest.TestCase):
             f"got {impl}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_add_layout_broadcast(self, mock_platform):
         """
         Feature: add hybrid parallel
@@ -699,7 +705,7 @@ class TestParallelArithmetic(unittest.TestCase):
             f"got {output_layout.alias_tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_mul_layout_broadcast(self, mock_platform):
         """
         Feature: mul hybrid parallel
@@ -721,7 +727,7 @@ class TestParallelArithmetic(unittest.TestCase):
             f"got {output_layout.alias_tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sub_layout_broadcast(self, mock_platform):
         """
         Feature: sub hybrid parallel
@@ -743,7 +749,7 @@ class TestParallelArithmetic(unittest.TestCase):
             f"got {output_layout.alias_tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_div_layout_broadcast(self, mock_platform):
         """
         Feature: div hybrid parallel
@@ -775,6 +781,12 @@ class TestParallelZerosLike(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         self.op = ElementWiseDistributedOp("zeros_like")
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Restore global state after each test."""
@@ -786,9 +798,6 @@ class TestParallelZerosLike(unittest.TestCase):
         """Configure minimal mock-platform attributes needed by init_device_mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Return a 2x4 (dp, mp) mesh with mocked backend."""
@@ -800,7 +809,7 @@ class TestParallelZerosLike(unittest.TestCase):
             init_backend=False,
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_zeros_like_data_parallel(self, mock_platform):
         """
         Feature: zeros_like data parallel
@@ -827,7 +836,7 @@ class TestParallelZerosLike(unittest.TestCase):
             "get_expand_impl should return None"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_zeros_like_all_replicated(self, mock_platform):
         """
         Feature: zeros_like all replicated
@@ -848,7 +857,7 @@ class TestParallelZerosLike(unittest.TestCase):
             f"expected={expected_map}, got={output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_zeros_like_partial_input_raises(self, mock_platform):
         """
         Feature: zeros_like partial input error
@@ -872,6 +881,12 @@ class TestParallelSoftplusExt(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         self.op = ElementWiseDistributedOp("SoftplusExt")
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Restore global state after each test."""
@@ -883,9 +898,6 @@ class TestParallelSoftplusExt(unittest.TestCase):
         """Configure minimal mock-platform attributes needed by init_device_mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Return a 2x4 (dp, mp) mesh with mocked backend."""
@@ -917,7 +929,7 @@ class TestParallelSoftplusExt(unittest.TestCase):
         assert local_kwargs == {}
         assert cache_values[0] is x_layout
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_softplus_ext_data_parallel(self, mock_platform):
         """
         Feature: SoftplusExt data parallel
@@ -938,7 +950,7 @@ class TestParallelSoftplusExt(unittest.TestCase):
             f"expected={expected_map}, got={output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_softplus_ext_all_replicated(self, mock_platform):
         """
         Feature: SoftplusExt all replicated
@@ -959,7 +971,7 @@ class TestParallelSoftplusExt(unittest.TestCase):
             f"expected={expected_map}, got={output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_softplus_ext_partial_input_raises(self, mock_platform):
         """
         Feature: SoftplusExt partial input error
@@ -983,6 +995,12 @@ class TestParallelSqrt(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         self.op = ElementWiseDistributedOp("Sqrt")
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Restore global state after each test."""
@@ -994,9 +1012,6 @@ class TestParallelSqrt(unittest.TestCase):
         """Configure minimal mock-platform attributes needed by init_device_mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Return a 2x4 (dp, mp) mesh with mocked backend."""
@@ -1028,7 +1043,7 @@ class TestParallelSqrt(unittest.TestCase):
         assert local_kwargs == {}
         assert cache_values[0] is x_layout
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sqrt_data_parallel(self, mock_platform):
         """
         Feature: Sqrt data parallel
@@ -1049,7 +1064,7 @@ class TestParallelSqrt(unittest.TestCase):
             f"expected={expected_map}, got={output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sqrt_all_replicated(self, mock_platform):
         """
         Feature: Sqrt all replicated
@@ -1070,7 +1085,7 @@ class TestParallelSqrt(unittest.TestCase):
             f"expected={expected_map}, got={output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sqrt_model_parallel(self, mock_platform):
         """
         Feature: Sqrt model parallel
@@ -1091,7 +1106,7 @@ class TestParallelSqrt(unittest.TestCase):
             f"expected={expected_map}, got={output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sqrt_partial_input_raises(self, mock_platform):
         """
         Feature: Sqrt partial input error

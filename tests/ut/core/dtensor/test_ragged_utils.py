@@ -63,8 +63,7 @@ class TestRaggedDTensor(unittest.TestCase):
         """Use mesh rank zero and isolate global mesh caches."""
         _DEVICE_MESH_MAP.clear()
         EXISTING_COMM_GROUPS.clear()
-        self.rank_patcher = patch(
-            "hyper_parallel.core.dtensor.device_mesh.platform.get_rank",
+        self.rank_patcher = patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank",
             return_value=0,
         )
         self.rank_patcher.start()
@@ -207,7 +206,7 @@ class TestRaggedDTensor(unittest.TestCase):
 
         with patch.object(source.layout.mesh, "get_group", return_value="ragged_group"), patch(
             "hyper_parallel.core.dtensor.tensor_redistribution."
-            "platform.differentiable_variable_all_gather",
+            "_utils.differentiable_variable_all_gather",
             return_value=gathered,
         ) as mock_all_gather:
             result = source.redistribute(mesh, (Replicate(),))
@@ -232,7 +231,7 @@ class TestRaggedDTensor(unittest.TestCase):
 
         with patch.object(source.layout.mesh, "get_group", return_value="ragged_group"), patch(
             "hyper_parallel.core.dtensor.tensor_redistribution."
-            "platform.differentiable_variable_all_gather",
+            "_utils.differentiable_variable_all_gather",
             return_value=gathered,
         ), patch(
             "hyper_parallel.core.dtensor.tensor_redistribution."
@@ -439,7 +438,7 @@ class TestRaggedDTensor(unittest.TestCase):
 
         with patch.object(source.layout.mesh, "get_group", return_value="ragged_group"), patch(
             "hyper_parallel.core.dtensor.tensor_redistribution."
-            "platform.differentiable_variable_all_gather",
+            "_utils.differentiable_variable_all_gather",
             return_value=torch.arange(6 * 4 * 8),
         ), patch(
             "hyper_parallel.core.dtensor.tensor_redistribution."
@@ -552,7 +551,7 @@ class TestRaggedDTensor(unittest.TestCase):
 
         with patch.object(source.layout.mesh, "get_group", return_value="ragged_group"), patch(
             "hyper_parallel.core.dtensor.tensor_redistribution."
-            "platform.differentiable_all_to_all_single",
+            "_utils.differentiable_all_to_all_single",
             return_value=expected,
         ) as mock_all_to_all:
             result = source.redistribute(mesh, (target_placement,))
@@ -579,11 +578,11 @@ class TestRaggedDTensor(unittest.TestCase):
 
         with patch.object(source.layout.mesh, "get_group", return_value="ragged_group"), patch(
             "hyper_parallel.core.dtensor.tensor_redistribution."
-            "platform.differentiable_variable_all_gather",
+            "_utils.differentiable_variable_all_gather",
             return_value=gathered,
         ) as mock_all_gather, patch(
             "hyper_parallel.core.dtensor.tensor_redistribution."
-            "platform.differentiable_all_to_all_single",
+            "_utils.differentiable_all_to_all_single",
         ) as mock_all_to_all:
             result = source.redistribute(
                 mesh,
