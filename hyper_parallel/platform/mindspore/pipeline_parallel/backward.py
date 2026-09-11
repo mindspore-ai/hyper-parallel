@@ -15,6 +15,7 @@
 """parallel grad helper (dx/dw split)"""
 from __future__ import absolute_import
 from collections import deque, defaultdict
+from typing import Any
 import warnings
 import logging
 from mindspore.utils._pytree import tree_flatten, tree_leaves, tree_unflatten
@@ -22,6 +23,8 @@ from mindspore.common.api import _pynative_executor, _GradientEdge
 from mindspore._c_expression import run_backward
 from mindspore.common.tensor import Tensor
 from mindspore import ops
+
+from hyper_parallel.core.backward_target import split_backward_targets
 
 
 def _fill_grads(output_tensor):
@@ -246,7 +249,17 @@ class GradFunction:
         ``Ascend`` ``GPU`` ``CPU``
     """
 
-    def __init__(self, output, inputs, kwargs, weights, has_aux, grad_position):
+    def __init__(
+            self,
+            output: Any,
+            inputs: Any,
+            kwargs: dict,
+            weights: Any,
+            has_aux: bool,
+            grad_position: Any,
+            default_sens: Any = None,
+    ) -> None:
+        """Capture a forward graph and its requested gradient inputs."""
         self.output = output
         self.inputs = inputs
         self.flatten_input_size = 0
@@ -254,6 +267,7 @@ class GradFunction:
         self.weights = weights
         self.has_aux = has_aux
         self.grad_position = grad_position
+        self.default_sens = default_sens
         # Storage for intermediate gradients captured during dx computation
         self._saved_intermediates = []
         self.aux_inputs_data = None
@@ -264,6 +278,19 @@ class GradFunction:
         self.inputs = None
         self.weights = None
         self._saved_intermediates = []
+        self.default_sens = None
+
+    @property
+    def has_explicit_backward_targets(self) -> bool:
+        """Whether forward declared stage-local autograd roots."""
+        return self.default_sens is not None
+
+    @property
+    def has_input_targets(self) -> bool:
+        """Whether a positional input was selected for gradient computation."""
+        if isinstance(self.grad_position, int):
+            return self.grad_position == -1 or self.grad_position >= 0
+        return bool(self.grad_position)
 
     def _collect_weight_tensors(self):
         """Collect weight tensors into a list."""
@@ -384,6 +411,8 @@ class GradFunction:
             Tuple of (output_tensor, processed_sens)
         """
         output_tensor = self.output
+        if sens is None and self.default_sens is not None:
+            sens = self.default_sens
         if self.has_aux:
             if not isinstance(self.output, (tuple, list)):
                 raise TypeError(
@@ -707,5 +736,22 @@ def forward_and_gradfn(fn, *inputs, weights=None, has_aux=False, grad_position=-
         raise e
     finally:
         _pynative_executor.set_grad_flag(prev_grad_flag)
-    grad_fn = GradFunction(res, inputs, kwargs, weights, has_aux, grad_position)
+    _, backward_targets = split_backward_targets(res)
+    grad_output = res
+    default_sens = None
+    if backward_targets:
+        grad_output = tuple(target.tensor for target in backward_targets)
+        default_sens = tuple(
+            ops.ones_like(target.tensor) if target.gradient is None else target.gradient
+            for target in backward_targets
+        )
+    grad_fn = GradFunction(
+        grad_output,
+        inputs,
+        kwargs,
+        weights,
+        has_aux,
+        grad_position,
+        default_sens=default_sens,
+    )
     return res, grad_fn

@@ -1239,6 +1239,25 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement no_grad")
 
     @staticmethod
+    def backward(
+            tensors: Any,
+            gradients: Any = None,
+            retain_graph: bool = False,
+            create_graph: bool = False,
+            inputs: Any = None,
+    ) -> Any:
+        """Run a multi-root backward pass.
+
+        Args:
+            tensors: Tensor or sequence of tensors that act as autograd roots.
+            gradients: Optional matching sensitivity tensor or sequence.
+            retain_graph (bool): Whether to retain the autograd graph.
+            create_graph (bool): Whether to create a differentiable backward graph.
+            inputs: Optional tensor or sequence restricting gradient accumulation.
+        """
+        raise NotImplementedError("Platform subclasses must implement backward")
+
+    @staticmethod
     def preserve_version_counter(tensor):
         """Get a context manager that preserves version for an internal tensor update."""
         raise NotImplementedError("Platform subclasses must implement preserve_version_counter")

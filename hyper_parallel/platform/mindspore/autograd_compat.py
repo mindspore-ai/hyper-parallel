@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import warnings
+from typing import Any, Optional
 
 from mindspore import ops
 from mindspore._c_expression import TensorPy, pyboost_detach, run_backward
@@ -181,9 +182,15 @@ def _make_grads(outputs, grads):
     return tuple(new_grads)
 
 
-def backward(self, gradient=None, retain_graph=None, create_graph=False, inputs=None):
-    """Run torch-style backward on a MindSpore tensor."""
-    outputs = (self,)
+def backward_tensors(
+        outputs: Any,
+        gradients: Any = None,
+        retain_graph: Optional[bool] = None,
+        create_graph: bool = False,
+        inputs: Any = None,
+) -> Any:
+    """Run a multi-root backward pass on MindSpore tensors."""
+    outputs = _tensor_or_tensors_to_tuple(outputs, 1)
     has_explicit_inputs = inputs is not None
     if isinstance(inputs, list):
         inputs = tuple(inputs)
@@ -196,7 +203,7 @@ def backward(self, gradient=None, retain_graph=None, create_graph=False, inputs=
     if has_explicit_inputs and len(inputs) == 0:
         raise RuntimeError("'inputs' argument to backward() cannot be empty.")
 
-    grad_tensors = _tensor_or_tensors_to_tuple(gradient, len(outputs))
+    grad_tensors = _tensor_or_tensors_to_tuple(gradients, len(outputs))
     grad_tensors = _make_grads(outputs, grad_tensors)
     if retain_graph is None:
         retain_graph = create_graph
@@ -210,6 +217,17 @@ def backward(self, gradient=None, retain_graph=None, create_graph=False, inputs=
         allow_unreachable=True,
         accumulate_grad=True,
     )
+
+
+def backward(
+        self: TensorPy,
+        gradient: Any = None,
+        retain_graph: Optional[bool] = None,
+        create_graph: bool = False,
+        inputs: Any = None,
+) -> Any:
+    """Run torch-style backward on a MindSpore tensor."""
+    return backward_tensors(self, gradient, retain_graph, create_graph, inputs)
 
 
 def enable_mindspore_backward_compat() -> None:

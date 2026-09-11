@@ -1414,6 +1414,23 @@ class TorchPlatform(Platform):
         return torch.no_grad()
 
     @staticmethod
+    def backward(
+            tensors: Any,
+            gradients: Any = None,
+            retain_graph: bool = False,
+            create_graph: bool = False,
+            inputs: Any = None,
+    ) -> Any:
+        """Run PyTorch backward for one or more explicit roots."""
+        return torch.autograd.backward(
+            tensors,
+            grad_tensors=gradients,
+            retain_graph=retain_graph,
+            create_graph=create_graph,
+            inputs=inputs,
+        )
+
+    @staticmethod
     def preserve_version_counter(tensor):
         return torch.autograd._unsafe_preserve_version_counter(tensor)  # pylint: disable=W0212
 

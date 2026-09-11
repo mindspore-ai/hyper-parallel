@@ -16,6 +16,7 @@
 import contextlib
 
 from hyper_parallel.platform import get_platform
+from hyper_parallel.core.backward_target import split_backward_targets
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 from hyper_parallel.platform.mindspore.pipeline_parallel.backward import forward_and_gradfn
 
@@ -23,6 +24,14 @@ from hyper_parallel.platform.mindspore.pipeline_parallel.backward import forward
 # ``platform/mindspore/platform.py`` imports ``PipelineStageBase`` from this
 # module during its own initialization, so a module-scope call here would
 # re-enter that partial import and raise ImportError.
+
+
+def _disable_backward_on_value(value):
+    """Mark Tensor leaves as forward-only values at a pipeline boundary."""
+    platform = get_platform()
+    if platform.is_tensor(value):
+        return value.detach()
+    return value
 
 
 class PipelineStageBase:
@@ -145,6 +154,9 @@ class PipelineStageBase:
             self.recompute_handles[micro_index] = handles
         else:
             out = self.submodule(*composite_args, **composite_kwargs)
+        out, backward_targets = split_backward_targets(out)
+        if backward_targets:
+            out = get_platform().tree_map(_disable_backward_on_value, out)
         out_tuple = out if isinstance(out, tuple) else (out,)
         self.fwd_outputs_cache[micro_index] = out_tuple
         if self.is_last_stage:
@@ -203,7 +215,9 @@ class PipelineStageBase:
             if handles else contextlib.nullcontext()
         )
         with session_ctx:
-            if self.is_first_stage:
+            if grad_fn.has_explicit_backward_targets:
+                grad_fn.accumulate_grad()
+            elif self.is_first_stage:
                 sens = self._build_padded_sens(micro_index)
                 grad_fn.accumulate_grad(sens=sens)
             else:
@@ -244,7 +258,9 @@ class PipelineStageBase:
             # Index, NOT pop: backward_weight_one_chunk performs the terminal pop.
             grad_fn = self.fwd_grad_fn_cache[micro_index]
             handles = self.recompute_handles.get(micro_index)
-            if self.is_last_stage:
+            if grad_fn.has_explicit_backward_targets:
+                sens = None
+            elif self.is_last_stage:
                 sens = self.get_last_stage_sens(self.last_stage_outputs)
             else:
                 sens = self._build_padded_sens(micro_index)
@@ -286,7 +302,9 @@ class PipelineStageBase:
                 if handles else contextlib.nullcontext()
             )
             with session_ctx:
-                if self.is_first_stage:
+                if grad_fn.has_explicit_backward_targets and not grad_fn.has_input_targets:
+                    grad_fn.accumulate_grad()
+                elif self.is_first_stage:
                     sens = self._build_padded_sens(micro_index)
                     grad_fn.accumulate_grad(sens=sens)
                 else:

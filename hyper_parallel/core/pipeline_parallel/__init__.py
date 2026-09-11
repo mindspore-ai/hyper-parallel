@@ -23,3 +23,10 @@ from hyper_parallel.core.pipeline_parallel.mpipe import ScheduleMPipeTranspose
 from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
 from hyper_parallel.core.pipeline_parallel.hook_coordinator import HookCoordinator, HookRole
 from hyper_parallel.core.pipeline_parallel.comm_compute_overlap import CommComputeOverlap
+from hyper_parallel.core.backward_target import (
+    AuxiliaryOutput,
+    BackwardTarget,
+    attach_backward_targets,
+    backward_targets,
+    split_backward_targets,
+)
