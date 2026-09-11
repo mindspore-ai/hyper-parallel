@@ -20,19 +20,23 @@ operators.  The distributed operators define the per-op layout rules for
 ops; these styles prepare module inputs so those rules can be selected by the
 DTensor dispatcher.
 
-The first implementation intentionally supports only Colossal-style CP:
-query-side tensors are sharded on sequence, while key-side tensors are gathered
-to CP-replicated layouts.  Ulysses/head sharding is rejected because the current
-DSA kernels require attention head, index head, head dim and sparse top-k dims to
-stay replicated.
+Indexer, sparse-attention, and indexer-loss styles intentionally retain their
+Colossal-style CP path: query-side tensors are sequence-sharded and key-side
+tensors are gathered to CP-replicated layouts.  The dense teacher-attention
+boundary additionally supports Ulysses and Hybrid CP because its expanded Q/K/V
+heads can be sharded.  Its attention output and LSE statistics use different
+axis orders, so their reverse all-to-all layouts are handled independently.
 """
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from hyper_parallel.core.context_parallel.context_parallel import (
+    ContextParallel,
     _OUTPUT_NON_CP,
     _drop_cp_from_output,
     _ensure_1d,
+    _gather_head_to_seq,
+    _is_cp_composed_dtensor,
     _non_cp_dtensor_layout,
     _pop_output_layout,
     _push_output_layout,
@@ -428,6 +432,137 @@ def _apply_sparse_attention_boundary(
 
     _register_boundary_hooks(module, _pre_hook, style.use_local_output, style.seq_dim)
     return module
+
+
+class DSADenseAttentionContextParallel(ContextParallel):
+    """Ulysses/Hybrid CP for the DSA dense teacher-attention boundary.
+
+    ``DSADenseFlashAttention`` returns three tensors whose public layouts are
+    not uniform in BSND mode:
+
+    - attention output: ``[B, S, N, D]``;
+    - softmax max/sum: ``[B, N, S, 1]``.
+
+    The base :class:`ContextParallel` post-hook applies one sequence/head axis
+    pair to every tuple item, which is correct for ordinary attention modules
+    that return only the attention output, but would reverse the two softmax
+    statistics on the wrong axes. This DSA-specific style reuses all base
+    pre-hooks and overrides only the Ulysses/Hybrid reverse all-to-all.
+
+    The style deliberately returns local tensors. The surrounding DSA module
+    consumes the LSE statistics in its local indexer-loss boundary, while TP
+    metadata is already represented by the local head shard.
+
+    Args:
+        layout: Dense FlashAttention input layout, ``"BSND"`` or ``"TND"``.
+        ulysses_degree: Ulysses sub-mesh size. It has the same meaning as in
+            :class:`ContextParallel`: CP size for pure Ulysses, one for pure
+            Colossal, and a proper divisor of CP size for Hybrid CP.
+        tnd_lse_canonical: Set only when the wrapped caller has already
+            converted packed FlashAttention TND statistics to ``[N, T, 1]``.
+            Ulysses/Hybrid TND requires this contract and fails during
+            :meth:`apply` otherwise.
+    """
+
+    _OUTPUT_COUNT = 3
+
+    def __init__(
+            self,
+            *,
+            layout: str = "BSND",
+            ulysses_degree: Optional[int] = None,
+            tnd_lse_canonical: bool = False,
+    ) -> None:
+        """Initialize the dense teacher boundary for the requested tensor layout."""
+        layout = layout.upper()
+        if layout not in _SUPPORTED_LAYOUTS:
+            raise ValueError(f"layout must be one of {_SUPPORTED_LAYOUTS}, but got {layout!r}.")
+        self.layout = layout
+        self.tnd_lse_canonical = bool(tnd_lse_canonical)
+        if layout == "BSND":
+            self.output_dims = ((1, 2), (2, 1), (2, 1))
+        elif self.tnd_lse_canonical:
+            # FlashAttention emits packed TND LSE as [T, N, 8]. The caller
+            # canonicalizes it to [N, T, 1] before this post-hook. Reverse it
+            # along (sequence=1, head=0), independently of the attention
+            # output's (sequence=0, head=1) axes.
+            self.output_dims = ((0, 1), (1, 0), (1, 0))
+        else:
+            self.output_dims = ((0, 1), (0, 1), (0, 1))
+        seq_dim, head_dim = self.output_dims[0]
+        super().__init__(
+            seq_dim=seq_dim,
+            head_dim=head_dim,
+            ulysses_degree=ulysses_degree,
+            qkv_indices=(0, 1, 2),
+            qkv_kwarg_names=("query", "key", "value"),
+            use_local_output=True,
+        )
+
+    def __repr__(self) -> str:
+        """Return the user-visible dense teacher CP configuration."""
+        return (
+            f"{self.__class__.__name__}(layout={self.layout!r}, "
+            f"ulysses_degree={self.ulysses_degree!r}, "
+            f"tnd_lse_canonical={self.tnd_lse_canonical!r})"
+        )
+
+    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+        """Validate the packed-TND contract before installing CP hooks."""
+        cp_size = device_mesh.mesh.numel()
+        ulysses_degree = self.ulysses_degree if self.ulysses_degree is not None else cp_size
+        if self.layout == "TND" and ulysses_degree > 1 and not self.tnd_lse_canonical:
+            raise ValueError(
+                "TND dense-teacher Ulysses/Hybrid requires packed LSE to be "
+                "canonicalized to [N, T, 1] before the reverse CP hook; set "
+                "tnd_lse_canonical=True only on an outer boundary that provides it."
+            )
+        return super().apply(module, device_mesh)
+
+    def _validate_outputs(self, outputs):
+        """Require the stable ``(attention_out, softmax_max, softmax_sum)`` contract."""
+        if not isinstance(outputs, (tuple, list)) or len(outputs) != self._OUTPUT_COUNT:
+            raise ValueError(
+                "DSA dense teacher attention must return "
+                "(attention_out, softmax_max, softmax_sum)."
+            )
+
+    @staticmethod
+    def _reverse_ulysses_item(value, ds_submesh, seq_dim: int, head_dim: int):
+        """Reverse one pure-Ulysses output while preserving composed CP+TP input."""
+        if not _is_tensor_or_dtensor(value):
+            return value
+        if isinstance(value, DTensor) and not _is_cp_composed_dtensor(value, ds_submesh):
+            value = value.to_local()
+        return _gather_head_to_seq(value, ds_submesh, seq_dim, head_dim).to_local()
+
+    @staticmethod
+    def _reverse_hybrid_item(value, ds_submesh, seq_dim: int, head_dim: int):
+        """Reverse one Hybrid output on its Ulysses sub-mesh."""
+        if not _is_tensor_or_dtensor(value):
+            return value
+        value = value.to_local() if isinstance(value, DTensor) else value
+        return _gather_head_to_seq(value, ds_submesh, seq_dim, head_dim).to_local()
+
+    def _reverse_outputs(self, outputs, ds_submesh, reverse_fn):
+        """Reverse all dense-teacher outputs with their individual axis pairs."""
+        self._validate_outputs(outputs)
+        return type(outputs)(
+            reverse_fn(value, ds_submesh, seq_dim, head_dim)
+            for value, (seq_dim, head_dim) in zip(outputs, self.output_dims)
+        )
+
+    def _post_hook_ata(self, module, inputs, outputs, ds_submesh):  # pylint: disable=unused-argument
+        """Reverse pure Ulysses with separate attention-output and LSE axes."""
+        _pop_output_layout(module)
+        return self._reverse_outputs(outputs, ds_submesh, self._reverse_ulysses_item)
+
+    def _post_hook_hybrid(  # pylint: disable=unused-argument
+            self, module, inputs, outputs, hybrid_cp_mesh, ds_submesh
+    ):
+        """Reverse Hybrid Ulysses with separate attention-output and LSE axes."""
+        _pop_output_layout(module)
+        return self._reverse_outputs(outputs, ds_submesh, self._reverse_hybrid_item)
 
 
 class DSAIndexerContextParallel(ParallelStyle):

@@ -15,6 +15,7 @@
 """Unit tests for DSA context-parallel boundary hook styles."""
 import os
 import unittest
+from functools import partial
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -26,6 +27,7 @@ from hyper_parallel.core.context_parallel import (
     AsyncDSAIndexerContextParallel,
     AsyncDSAIndexerLossContextParallel,
     AsyncDSASparseAttentionContextParallel,
+    DSADenseAttentionContextParallel,
     DSAIndexerContextParallel,
     DSAIndexerLossContextParallel,
     DSASparseAttentionContextParallel,
@@ -71,6 +73,49 @@ class _SingleIdentityModule(nn.Module):
 
     def forward(self, value):
         return value
+
+
+class _GatheredResult:
+    """Minimal reverse-ATA result exposing the DTensor local API."""
+
+    def __init__(self, value: object) -> None:
+        """Store the local result returned by the patched gather."""
+        self.value = value
+
+    def to_local(self) -> object:
+        """Return the local tensor."""
+        return self.value
+
+
+class _MeshShape:
+    """Minimal mesh-shape facade consumed by ContextParallel.apply."""
+
+    @staticmethod
+    def numel() -> int:
+        """Return the synthetic CP world size."""
+        return 4
+
+
+class _RouteMesh:
+    """Minimal four-rank CP mesh facade."""
+
+    mesh = _MeshShape()
+
+
+class _HybridMesh:
+    """Minimal two-dimensional Hybrid CP mesh facade."""
+
+    mesh_dim_names = ("co", "ds")
+
+    def __init__(self, ds_submesh: object) -> None:
+        """Store the Ulysses sub-mesh returned by name lookup."""
+        self.ds_submesh = ds_submesh
+
+    def __getitem__(self, name: str) -> object:
+        """Return the synthetic Ulysses dimension."""
+        if name != "ds":
+            raise KeyError(name)
+        return self.ds_submesh
 
 
 class TestDsaContextParallel(unittest.TestCase):
@@ -282,6 +327,138 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertIsInstance(AsyncDSAIndexerContextParallel(), DSAIndexerContextParallel)
         self.assertIsInstance(AsyncDSAIndexerLossContextParallel(), DSAIndexerLossContextParallel)
         self.assertIsInstance(AsyncDSASparseAttentionContextParallel(), DSASparseAttentionContextParallel)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_dense_teacher_ulysses_post_hook_uses_per_output_dims(self, mock_mesh_platform):
+        """Dense teacher reverses BSND LSE on N/S axes and clears its layout stack."""
+        mesh = self._make_cp_mesh(mock_mesh_platform)
+        module = _SingleIdentityModule()
+        outputs = (
+            torch.randn(2, 4, 8, 16),
+            torch.randn(2, 8, 4, 1),
+            torch.randn(2, 8, 4, 1),
+        )
+
+        for layout, canonical, expected_dims in (
+                ("BSND", False, [(1, 2), (2, 1), (2, 1)]),
+                ("TND", True, [(0, 1), (1, 0), (1, 0)]),
+        ):
+            fake_gather = MagicMock(side_effect=lambda value, *_: _GatheredResult(value))
+
+            style = DSADenseAttentionContextParallel(
+                layout=layout,
+                ulysses_degree=4,
+                tnd_lse_canonical=canonical,
+            )
+            style._record_q_output_tp_layout(module, [outputs[0]], {}, mesh)
+            with patch(
+                    "hyper_parallel.core.context_parallel.dsa_context_parallel._gather_head_to_seq",
+                    fake_gather,
+            ):
+                actual = style._post_hook_ata(module, (), outputs, mesh)
+
+            self.assertTrue(all(call.args[1] is mesh for call in fake_gather.call_args_list))
+            self.assertEqual(
+                [(call.args[2], call.args[3]) for call in fake_gather.call_args_list],
+                expected_dims,
+            )
+            self.assertTrue(all(actual_item is expected_item
+                                for actual_item, expected_item in zip(actual, outputs)))
+            self.assertFalse(hasattr(module, _OUTPUT_LAYOUT_STACK_ATTR))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_dense_teacher_hybrid_post_hook_uses_per_output_dims(self, mock_mesh_platform):
+        """Hybrid dense teacher uses the same per-output reverse-ATA contract."""
+        mesh = self._make_cp_mesh(mock_mesh_platform)
+        module = _SingleIdentityModule()
+        outputs = (
+            torch.randn(2, 4, 8, 16),
+            torch.randn(2, 8, 4, 1),
+            torch.randn(2, 8, 4, 1),
+        )
+        fake_gather = MagicMock(side_effect=lambda value, *_: _GatheredResult(value))
+
+        style = DSADenseAttentionContextParallel(layout="BSND", ulysses_degree=2)
+        style._record_q_output_tp_layout(module, [outputs[0]], {}, mesh)
+        with patch(
+                "hyper_parallel.core.context_parallel.dsa_context_parallel._gather_head_to_seq",
+                fake_gather,
+        ):
+            actual = style._post_hook_hybrid(module, (), outputs, object(), mesh)
+
+        self.assertTrue(all(call.args[1] is mesh for call in fake_gather.call_args_list))
+        self.assertEqual(
+            [(call.args[2], call.args[3]) for call in fake_gather.call_args_list],
+            [(1, 2), (2, 1), (2, 1)],
+        )
+        self.assertTrue(all(actual_item is expected_item
+                            for actual_item, expected_item in zip(actual, outputs)))
+        self.assertFalse(hasattr(module, _OUTPUT_LAYOUT_STACK_ATTR))
+
+    def test_dense_teacher_validates_layout_and_output_contract(self):
+        """Dense teacher fails early for unsupported layouts or boundary outputs."""
+        self.assertIs(
+            DSADenseAttentionContextParallel._post_hook_colossal,
+            ContextParallel._post_hook_colossal,
+        )
+        with self.assertRaisesRegex(ValueError, "layout must be one of"):
+            DSADenseAttentionContextParallel(layout="BNSD")
+        style = DSADenseAttentionContextParallel(layout="BSND")
+        with self.assertRaisesRegex(ValueError, "must return"):
+            style._validate_outputs((torch.ones(1), torch.ones(1)))
+
+    def test_tnd_dense_teacher_rejects_raw_lse_for_ulysses(self):
+        """Public TND Ulysses style must not silently reverse packed raw LSE."""
+        style = DSADenseAttentionContextParallel(layout="TND", ulysses_degree=4)
+        with self.assertRaisesRegex(ValueError, "canonicalized to \\[N, T, 1\\]"):
+            style.apply(MagicMock(), _RouteMesh())
+
+    @staticmethod
+    def _registered_hook(call):
+        """Return the bound method stored in a direct or partial hook."""
+        hook = call.args[0]
+        return hook.func if isinstance(hook, partial) else hook
+
+    def test_dense_teacher_degree_selects_matching_post_hook(self):
+        """Colossal, Ulysses and Hybrid install the matching reverse boundary."""
+        route_mesh = _RouteMesh()
+
+        module = MagicMock()
+        colossal = DSADenseAttentionContextParallel(layout="BSND", ulysses_degree=1)
+        with patch(
+                "hyper_parallel.core.context_parallel.context_parallel._ensure_1d",
+                return_value=object(),
+        ):
+            colossal.apply(module, route_mesh)
+        hook = self._registered_hook(module.register_forward_hook.call_args)
+        self.assertEqual(hook.__name__, "_post_hook_colossal")
+        self.assertIs(hook.__self__, colossal)
+
+        module = MagicMock()
+        ulysses = DSADenseAttentionContextParallel(layout="BSND", ulysses_degree=4)
+        with patch(
+                "hyper_parallel.core.context_parallel.context_parallel._ensure_1d",
+                return_value=object(),
+        ):
+            ulysses.apply(module, route_mesh)
+        hook = self._registered_hook(module.register_forward_hook.call_args)
+        self.assertEqual(hook.__name__, "_post_hook_ata")
+        self.assertIs(hook.__self__, ulysses)
+
+        module = MagicMock()
+        ds_submesh = object()
+        hybrid_mesh = _HybridMesh(ds_submesh)
+        hybrid = DSADenseAttentionContextParallel(layout="BSND", ulysses_degree=2)
+        with patch(
+                "hyper_parallel.core.context_parallel.context_parallel._build_hybrid_cp_mesh",
+                return_value=hybrid_mesh,
+        ):
+            hybrid.apply(module, route_mesh)
+        registered = module.register_forward_hook.call_args.args[0]
+        self.assertIsInstance(registered, partial)
+        self.assertEqual(registered.func.__name__, "_post_hook_hybrid")
+        self.assertIs(registered.func.__self__, hybrid)
+        self.assertIs(registered.keywords["ds_submesh"], ds_submesh)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_indexer_boundary_inputs_are_rewritten(self, mock_mesh_platform):
