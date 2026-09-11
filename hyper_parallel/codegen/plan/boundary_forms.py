@@ -136,9 +136,10 @@ def classify_boundary_form(
 
     axes = tuple(mesh_dim_names or ())
     if not axes:
-        # No active sharding axes: the runtime routes ep-keyed entries to the
-        # expert mesh (a runtime object — not statically decidable) and treats
-        # everything else as an exact no-op passthrough.
+        # No active sharding axes: the runtime routes entries whose ``ep``
+        # placement actually changes to the expert mesh (a runtime object —
+        # not statically decidable) and treats everything else as an exact
+        # no-op passthrough.
         if inner_wrap or _entry_has_ep_placement(entry):
             return BoundaryForm(form=FORM_GENERIC)
         return BoundaryForm(form=FORM_IDENTITY)
@@ -286,13 +287,32 @@ def _op_text(result: dict) -> str:
 
 
 def _entry_has_ep_placement(entry: dict[str, Any]) -> bool:
-    """Whether the entry carries any ``ep`` placement key on any side."""
+    """Whether any declared name's ``ep`` placement actually changes.
+
+    Every frozen entry declares full per-axis dicts, so an identity ``ep`` key
+    (``R -> R``) is the plan's way of saying "not EP-dependent" — not a
+    dependency on the runtime expert mesh.  Under a degenerate topology
+    (``tp=cp=ep=1``) the plan carries no active axes and every ``ep`` key is
+    ``R -> R``; reading key *existence* as EP dependence would force the
+    generic form on boundaries whose semantics are an exact no-op, while the
+    install path is skipped entirely for such meshes — the rewritten
+    forward's ``_hyper_boundary`` reference would never be bound.
+    """
     for src_field, dst_field in _SIDE_FIELDS:
-        for named in (entry.get(src_field) or {}, entry.get(dst_field) or {}):
-            for placement in named.values():
-                if isinstance(placement, dict) and "ep" in placement:
-                    return True
+        src_named = entry.get(src_field) or {}
+        dst_named = entry.get(dst_field) or {}
+        for name in sorted(set(src_named) | set(dst_named)):
+            if _ep_axis(src_named.get(name)) != _ep_axis(dst_named.get(name)):
+                return True
     return False
+
+
+def _ep_axis(placement: Any) -> str:
+    """One named placement's canonical ``ep`` value (absent / non-dict = ``R``)."""
+    if not isinstance(placement, dict):
+        return "R"
+    value = placement.get("ep")
+    return value if isinstance(value, str) and value else "R"
 
 
 def _declared_out_names(entry: dict[str, Any]) -> tuple[str, ...]:

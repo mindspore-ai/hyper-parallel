@@ -20,7 +20,7 @@ module instance; the generated forwards call
 ``self._hyper_boundary.redistribute_inputs/outputs`` with no per-call
 re-resolution.  These tests lock the binding behavior and — critically — the
 install-time mesh routing: it must match ``hyper_redistribute``'s per-call
-routing (empty-active-axes no-op, ep-entry expert-mesh compile, dense-mesh
+routing (empty-active-axes no-op, changing-ep expert-mesh compile, dense-mesh
 compile with ep keys dropped), because that routing is runtime-conditional
 and must never be baked into generated source text.
 """
@@ -397,16 +397,22 @@ def test_install_routing_matches_hyper_redistribute(monkeypatch):
     Runtime-conditional mesh routing must stay in ``hyper_install_boundaries``
     (never baked into source text): with active axes everything compiles on
     the dense mesh (ep keys are dropped later by ``resolve_placements``);
-    without active axes an ep-keyed entry compiles on the expert mesh while
-    everything else is an exact no-op passthrough.
+    without active axes an entry whose ``ep`` placement actually *changes*
+    compiles on the expert mesh while everything else — including entries
+    carrying only identity ``R -> R`` ep keys — is an exact no-op passthrough
+    (the shared ``boundary_forms`` criterion; identity keys are the frozen
+    plan's "not EP-dependent" marker, so a degenerate tp=cp=ep=1 topology
+    prunes such boundaries to identity form while install is skipped).
 
     Feature: boundary-install
-    Description: Three routing branches are exercised: (1) active axes
-        present → dense-mesh compile even for ep-keyed entries; (2) no active
-        axes and no expert mesh → exact no-op passthrough; (3) no active axes
-        but expert mesh with ep keys → expert-mesh compile.
+    Description: Four routing branches are exercised: (1) active axes
+        present → dense-mesh compile even for an ep-changing entry; (2) no
+        active axes and no expert mesh → exact no-op passthrough; (3) no
+        active axes but expert mesh with a changing ep placement →
+        expert-mesh compile; (4) expert mesh with only identity ep keys →
+        no-op passthrough.
     Expectation: Compiled-boundary mesh/dims match hyper_redistribute's routing
-        in all three branches; no-op passthrough returns payloads unchanged.
+        in all four branches; no-op passthrough returns payloads unchanged.
     """
     from hyper_parallel.distributed._builder import tp_collective_lowering
 
@@ -432,13 +438,20 @@ def test_install_routing_matches_hyper_redistribute(monkeypatch):
 
     ep_entry = {
         "is_boundary": True,
-        "in_src": {"input": {"cp": "S(1)", "ep": "S(0)", "tp": "S(1)"}},
+        "in_src": {"input": {"cp": "S(1)", "ep": "R", "tp": "S(1)"}},
         "in_dst": {"input": {"cp": "S(1)", "ep": "S(0)", "tp": "S(1)"}},
-        "out_src": {"output": {"cp": "S(1)", "ep": "S(0)", "tp": "S(1)"}},
+        "out_src": {"output": {"cp": "S(1)", "ep": "R", "tp": "S(1)"}},
         "out_dst": {"output": {"cp": "S(1)", "ep": "S(0)", "tp": "S(1)"}},
     }
+    identity_ep_entry = {
+        "is_boundary": True,
+        "in_src": {"input": {"cp": "R", "ep": "R", "tp": "R"}},
+        "in_dst": {"input": {"cp": "R", "ep": "R", "tp": "R"}},
+        "out_src": {"output": {"cp": "R", "ep": "R", "tp": "R"}},
+        "out_dst": {"output": {"cp": "R", "ep": "R", "tp": "R"}},
+    }
 
-    # Active axes present: dense compile, even for an ep-keyed entry.
+    # Active axes present: dense compile, even for an ep-changing entry.
     model = Root()
     runtime.hyper_install_boundaries(
         model, {"embed_tokens": ep_entry}, "mesh", ("cp", "tp")
@@ -460,7 +473,8 @@ def test_install_routing_matches_hyper_redistribute(monkeypatch):
     assert installed.redistribute_inputs(payload) == payload
     assert installed.redistribute_outputs("out") == "out"
 
-    # No active axes but an expert mesh and ep keys: expert-mesh compile.
+    # No active axes but an expert mesh and a changing ep placement:
+    # expert-mesh compile.
     compiled.clear()
     state = {"active": (), "expert": expert}
     model = Root()
@@ -468,6 +482,20 @@ def test_install_routing_matches_hyper_redistribute(monkeypatch):
         model, {"embed_tokens": ep_entry}, "mesh", ()
     )
     assert compiled == [(expert, None)]
+
+    # Expert mesh but only identity ep keys (R -> R): not EP-dependent, so
+    # the boundary is an exact no-op passthrough even though ep > 1.
+    compiled.clear()
+    model = Root()
+    runtime.hyper_install_boundaries(
+        model, {"embed_tokens": identity_ep_entry}, "mesh", ()
+    )
+    assert compiled == []
+    installed = model.embed_tokens._hyper_boundary
+    assert installed.noop is True
+    payload = ((torch.tensor(1),), {})
+    assert installed.redistribute_inputs(payload) == payload
+    assert installed.redistribute_outputs("out") == "out"
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",

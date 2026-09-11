@@ -58,11 +58,16 @@ class Alpha(nn.Module):
 
 
 def _boundary(fqn: str, class_name: str) -> tuple[str, dict]:
-    """A minimal but real-shaped frozen boundary entry for one class."""
+    """A minimal but real-shaped frozen boundary entry for one class.
+
+    The input side carries a cp transition (``S(1) -> R``) that is not
+    TP-lowerable, so with the plan's active axes (``("cp", "tp")``) the
+    entry classifies as the generic redistribute form.
+    """
     entry = {
         "is_boundary": True,
         "in_src": {"x": {"tp": "S(1)", "ep": "R", "cp": "S(1)"}},
-        "in_dst": {"x": {"tp": "R", "ep": "R", "cp": "S(1)"}},
+        "in_dst": {"x": {"tp": "R", "ep": "R", "cp": "R"}},
         "out_src": {"output": {"tp": "S(-1)", "ep": "R", "cp": "S(1)"}},
         "out_dst": {"output": {"tp": "R", "ep": "R", "cp": "S(1)"}},
         "params": {"weight": {"tp": "S(0)", "ep": "R", "cp": "R"}},
@@ -80,7 +85,10 @@ def _plan(*, alpha_first: bool) -> dict:
     else:
         plan = {**beta_entry, **alpha_entry}
         boundary_classes = {**beta_map, **alpha_map}
-    return {"param_plan": plan, "injections": []}, boundary_classes
+    return (
+        {"param_plan": plan, "injections": [], "mesh_dim_names": ("cp", "tp")},
+        boundary_classes,
+    )
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
@@ -240,6 +248,77 @@ def test_identity_boundary_forward_is_pruned():
     text = lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
 
     assert text == SOURCE_TEXT
+
+
+def _degenerate_entry() -> dict:
+    """A degenerate-topology boundary: full per-axis dicts, every axis identity.
+
+    This is the frozen shape a tp=cp=ep=1 regeneration produces: the freeze
+    declares every axis (``cp``/``ep``/``tp``) with canonical strings, so an
+    identity ``ep: R -> R`` key is present even though the entry is not
+    EP-dependent.
+    """
+    return {
+        "is_boundary": True,
+        "in_src": {"x": {"cp": "R", "ep": "R", "tp": "R"}},
+        "in_dst": {"x": {"cp": "R", "ep": "R", "tp": "R"}},
+        "out_src": {"output": {"cp": "R", "ep": "R", "tp": "R"}},
+        "out_dst": {"output": {"cp": "R", "ep": "R", "tp": "R"}},
+    }
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_degenerate_topology_identity_ep_keys_are_pruned():
+    """Empty active axes + identity ``ep`` keys prune the rewrite entirely.
+
+    Regression lock for the tp=cp=ep=1 failure: reading ``ep`` key
+    *existence* as EP dependence forced the generic form on boundaries whose
+    semantics are an exact no-op, while the install path is skipped entirely
+    for such meshes — the rewritten forward's ``_hyper_boundary`` reference
+    was never bound and training crashed with ``AttributeError``.  Only an
+    ``ep`` placement that actually *changes* is an expert-mesh dependency.
+
+    Feature: codegen-lowering
+    Description: A plan with no active axes (``mesh_dim_names`` empty/None)
+        and a boundary declaring full per-axis dicts with identity ``ep``
+        keys is lowered through ``lower_forward_boundaries``.
+    Expectation: The emitted text equals the source text — no
+        ``_forward_impl``, no marker, no ``_hyper_boundary`` reference.
+    """
+    plan, classes = _single_plan(_degenerate_entry())
+
+    text = lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
+
+    assert text == SOURCE_TEXT
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_degenerate_topology_changing_ep_renders_generic():
+    """Empty active axes + a changing ``ep`` placement keep the generic rewrite.
+
+    The mirror of the pruning test: an entry whose ``ep`` placement actually
+    changes (``R -> S(0)``) is genuinely expert-mesh dependent — not
+    statically decidable — so it must keep the rewritten redistribute forward
+    that ``hyper_install_boundaries`` binds.
+
+    Feature: codegen-lowering
+    Description: A plan with no active axes and a boundary whose ``ep``
+        placement changes is lowered through ``lower_forward_boundaries``.
+    Expectation: The forward is rewritten to the generic form:
+        ``_forward_impl`` extraction and ``self._hyper_boundary`` calls.
+    """
+    entry = _degenerate_entry()
+    entry["in_dst"]["x"]["ep"] = "S(0)"
+    entry["out_dst"]["output"]["ep"] = "S(0)"
+    plan, classes = _single_plan(entry)
+
+    text = lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
+
+    assert "_forward_impl" in text
+    assert "self._hyper_boundary.redistribute_inputs" in text
+    assert "self._hyper_boundary.redistribute_outputs" in text
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",

@@ -47,6 +47,14 @@ from hyper_parallel.codegen.meta import (
     meta_to_dict,
     validate_meta_schema,
 )
+# Shared boundary-form classifier (module-level imports are stdlib-only, so
+# this stays importable without torch).  The EP-dependence criterion must be
+# the same one generation used to pick the boundary's forward form: an entry
+# whose ``ep`` placement actually *changes* routes to the expert mesh; an
+# identity ``R -> R`` key (the frozen plan's "not EP-dependent" marker) is not
+# a dependency, so a degenerate topology (tp=cp=ep=1) prunes such boundaries
+# to the identity form while the install path is skipped entirely.
+from hyper_parallel.codegen.plan.boundary_forms import _entry_has_ep_placement
 
 # ``sharding/apply`` imports torch at module level, so it is deliberately not
 # imported here: runtime.py must stay importable without torch (generation-time
@@ -660,21 +668,6 @@ def _boundary_for_entry(entry: dict[str, Any], mesh: Any, mesh_dim_names=None):
     return boundary
 
 
-def _entry_has_ep_placement(entry: dict[str, Any]) -> bool:
-    """Return whether the frozen boundary entry carries any ``ep`` placement.
-
-    EP-boundary entries (e.g. ``*.mlp`` with ``when: ep``) have ``ep`` keys
-    in their ``in_src``/``out_src``/etc. placement dicts.  Non-EP entries
-    (attention, norm) only have ``tp``/``cp`` keys.
-    """
-    for field in ("in_src", "in_dst", "out_src", "out_dst"):
-        placements = entry.get(field) or {}
-        for named in placements.values():
-            if isinstance(named, dict) and "ep" in named:
-                return True
-    return False
-
-
 def hyper_redistribute(
     tensor,
     plan_entry: dict[str, Any],
@@ -715,10 +708,12 @@ def hyper_redistribute(
     # (mesh_dim_names is empty — tp=1/cp=1), boundary placements on
     # tp/cp are identity. Two sub-cases:
     #   - No expert mesh (ep=1): all placements are identity → no-op.
-    #   - Expert mesh exists (ep>1): EP-boundary entries (carrying ``ep``
-    #     placements) must still redistribute on the expert mesh (which
-    #     has no FSDP axes, avoiding the uneven-shard NotImplementedError).
-    #     Non-EP entries are still identity → no-op.
+    #   - Expert mesh exists (ep>1): EP-boundary entries (whose ``ep``
+    #     placement actually *changes* — the shared ``boundary_forms``
+    #     criterion; an identity ``R -> R`` key is not EP dependence) must
+    #     still redistribute on the expert mesh (which has no FSDP axes,
+    #     avoiding the uneven-shard NotImplementedError).  Non-EP entries
+    #     are still identity → no-op.
     if not active_dim_names:
         if expert_mesh is not None and _entry_has_ep_placement(plan_entry):
             boundary = _boundary_for_entry(plan_entry, expert_mesh, None)
