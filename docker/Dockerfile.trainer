@@ -1,0 +1,219 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# =============================================================================
+# HyperParallel Trainer 镜像 (aarch64 / Ascend 910B, 离线 CANN 构建)
+# Base OS : openEuler 24.03 LTS-SP2
+# Python  : 3.11
+# CANN    : 9.1.0 主包 + 910b-ops 算子包 (离线 .run, 需放在仓库根目录)
+# 框架    : PyTorch 2.9.1 + torch-npu 2.9.1 (默认 torch 后端)
+# 模型层  : transformers 5.16.1 (AutoModels 直接复用 HF 模型实现)
+#
+# 与 Dockerfile.hyper-parallel-npu 的差异:
+#   1. 不依赖 Quay CANN 基础镜像, 用离线 .run 包在 openEuler 上自装 CANN,
+#      适配内网/离线环境;
+#   2. 不走 `pip install -e .`, 而是执行 build.sh 最小构建
+#      (--multicore off --shmem off --custom-ops off) 产出并安装含
+#      Indexed Dataset C++ helper 的 wheel, 源码树保留在 /opt/hyper-parallel
+#      供 torchrun --module examples.training_demo.train_text 等入口使用;
+#   3. 额外固化 trainer 运行依赖 (transformers/torchdata/einops/psutil 等),
+#      镜像可直接跑 AutoModels TextTrainer 训练。
+#
+# 构建 (仓库根目录执行, 需先放置两个 CANN 离线包):
+#   Ascend-cann_9.1.0_linux-aarch64.run
+#   Ascend-cann-910b-ops_9.1.0_linux-aarch64.run
+#
+#   docker build -f docker/Dockerfile.trainer \
+#       -t hyperparallel-trainer:torch2.9.1-cann9.1.0 .
+#
+# 运行: NPU 驱动不在镜像内, 需从宿主机挂载 /usr/local/Ascend/driver 并透传
+# /dev/davinci* 等设备 (完整示例见 docker/README.md)。
+# =============================================================================
+
+# 指定平台, 避免在多架构主机上拉错
+FROM --platform=linux/arm64 openeuler/openeuler:24.03-lts-sp2
+
+# -----------------------------------------------------------------------------
+# 1. 系统依赖 (openEuler 源, 构建时联网)
+# -----------------------------------------------------------------------------
+RUN yum install -y \
+        python3.11 \
+        python3-devel \
+        python3-pip \
+        gcc \
+        gcc-c++ \
+        make \
+        cmake \
+        ninja-build \
+        git \
+        wget \
+        curl \
+        tar \
+        unzip \
+        bzip2 \
+        xz \
+        zlib-devel \
+        bzip2-devel \
+        openssl-devel \
+        ncurses-devel \
+        sqlite-devel \
+        readline-devel \
+        tk-devel \
+        gdbm-devel \
+        libffi-devel \
+        xz-devel \
+        pciutils \
+        numactl \
+        vim \
+        less \
+        iproute \
+        procps-ng \
+        which \
+        file \
+        && yum clean all \
+        && rm -rf /var/cache/yum
+
+# 让 python3.11 成为默认 python / pip
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && ln -sf /usr/bin/pip3.11  /usr/bin/pip3  \
+    && ln -sf /usr/bin/pip3.11  /usr/bin/pip
+
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# 升级 pip / setuptools / wheel
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# -----------------------------------------------------------------------------
+# 2. 安装 CANN toolkit (离线 .run 包, 放在仓库根目录)
+#    主包 Ascend-cann_9.1.0 (combo run 包) + 910b-ops 算子包 (910B 专用)
+# -----------------------------------------------------------------------------
+COPY Ascend-cann_9.1.0_linux-aarch64.run           /tmp/cann/
+COPY Ascend-cann-910b-ops_9.1.0_linux-aarch64.run  /tmp/cann/
+
+RUN chmod +x /tmp/cann/*.run \
+    && /tmp/cann/Ascend-cann_9.1.0_linux-aarch64.run \
+           --install --install-for-all --quiet \
+    && /tmp/cann/Ascend-cann-910b-ops_9.1.0_linux-aarch64.run \
+           --install --install-for-all --quiet \
+    && rm -rf /tmp/cann
+
+# -----------------------------------------------------------------------------
+# 3. 安装 PyTorch 2.9.1 + torch-npu 2.9.1 (默认 torch 后端)
+#    aarch64 wheel 走 PyPI 镜像, 无需 pytorch 官方源
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+        torch==2.9.1 \
+        torch-npu==2.9.1
+
+# transformers (AutoModels 复用 HF 模型实现) + 基础依赖 + 构建依赖
+RUN pip install --no-cache-dir \
+        transformers==5.16.1 \
+        pyyaml \
+        safetensors \
+        tqdm \
+        pybind11
+
+# trainer 数据/运行时依赖 (build_dataloader 的 StatefulDataLoader、
+# trainer/runtime 的 psutil; einops 为 components 可选路径依赖, 一并装入)
+RUN pip install --no-cache-dir \
+        torchdata \
+        einops \
+        psutil
+
+# -----------------------------------------------------------------------------
+# 4. 安装 hyper-parallel (当前源码, 镜像内置, 不依赖运行时挂载)
+#    build.sh 最小构建: 关闭 multicore/shmem/custom-ops, 必编 Indexed Dataset
+#    C++ helper, 产出完整 wheel 后安装; 源码树保留在 /opt/hyper-parallel
+# -----------------------------------------------------------------------------
+COPY . /opt/hyper-parallel
+
+RUN cd /opt/hyper-parallel \
+    && bash build.sh --multicore off --shmem off --custom-ops off \
+    && pip install --no-cache-dir dist/hyper_parallel-*.whl
+
+# omni_training_custom_ops 占位包 (仅 DeepSeek DSA 算子路径需要真包, 来自
+# veomni 项目, 无公开 wheel; components/modules 的顶层 import 链会在 import
+# 期强依赖该包, 而常规 LLM 训练路径 (如 qwen3_moe) 实际不调用任何 DSA 算子,
+# 仓库内也无属性访问. 此占位包让 import 通过, 若未来代码真正调用 DSA 算子
+# 会在此处显式报错)
+RUN mkdir -p /opt/omni-stub/omni_training_custom_ops \
+    && printf '%s\n' \
+        '"""Placeholder: real pkg ships DeepSeek-DSA CANN ops (veomni project)."""' \
+        '' \
+        '' \
+        'def __getattr__(name):' \
+        '    raise NotImplementedError(' \
+        '        f"omni_training_custom_ops.{name} is a placeholder in this image; "' \
+        '        "install the real veomni custom-ops package to use DeepSeek DSA ops"' \
+        '    )' \
+        > /opt/omni-stub/omni_training_custom_ops/__init__.py
+
+# -----------------------------------------------------------------------------
+# 5. 环境变量 (CANN / torch-npu 运行所需)
+#    完整复刻 CANN set_env.sh 的变量; HYPER_PARALLEL_PLATFORM=torch
+# -----------------------------------------------------------------------------
+ENV ASCEND_HOME=/usr/local/Ascend
+ENV ASCEND_TOOLKIT_HOME=${ASCEND_HOME}/ascend-toolkit/latest
+ENV ASCEND_HOME_PATH=${ASCEND_TOOLKIT_HOME}
+ENV LD_LIBRARY_PATH=${ASCEND_TOOLKIT_HOME}/lib64:${ASCEND_TOOLKIT_HOME}/lib64/plugin/opskernel:${ASCEND_TOOLKIT_HOME}/lib64/plugin/nnengine:${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:${ASCEND_HOME}/driver/lib64:${ASCEND_HOME}/driver/lib64/common:${ASCEND_HOME}/driver/lib64/driver:${LD_LIBRARY_PATH}
+ENV PYTHONPATH=/opt/omni-stub:${ASCEND_TOOLKIT_HOME}/python/site-packages:${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe:${ASCEND_TOOLKIT_HOME}/latest/pyACL/python/site-packages/acl
+ENV PATH=${ASCEND_TOOLKIT_HOME}/bin:${ASCEND_TOOLKIT_HOME}/compiler/ccec_compiler/bin:${PATH}
+ENV ASCEND_AICPU_PATH=${ASCEND_TOOLKIT_HOME}
+ENV ASCEND_OPP_PATH=${ASCEND_TOOLKIT_HOME}/opp
+ENV TOOLCHAIN_HOME=${ASCEND_TOOLKIT_HOME}/toolkit
+ENV TF_PLUGIN_PATH=${ASCEND_TOOLKIT_HOME}/tfplugin/latest
+# hyper_parallel 平台后端: torch (TextTrainer 为 torch 实现)
+ENV HYPER_PARALLEL_PLATFORM=torch
+
+# 让普通用户也能找到 CANN + driver 动态库 (driver lib64 在运行时由 -v 挂载进来)
+RUN echo "${ASCEND_TOOLKIT_HOME}/lib64" > /etc/ld.so.conf.d/ascend.conf \
+    && echo "${ASCEND_TOOLKIT_HOME}/lib64/plugin/opskernel" >> /etc/ld.so.conf.d/ascend.conf \
+    && echo "${ASCEND_TOOLKIT_HOME}/lib64/plugin/nnengine" >> /etc/ld.so.conf.d/ascend.conf \
+    && echo "${ASCEND_HOME}/driver/lib64" >> /etc/ld.so.conf.d/ascend.conf \
+    && echo "${ASCEND_HOME}/driver/lib64/common" >> /etc/ld.so.conf.d/ascend.conf \
+    && echo "${ASCEND_HOME}/driver/lib64/driver" >> /etc/ld.so.conf.d/ascend.conf \
+    && ldconfig
+
+# -----------------------------------------------------------------------------
+# 6. 工作目录与镜像内组件验证 (无 NPU 驱动环境下的静态验证)
+#    注: torch_npu / TextTrainer / HyperAutoModel 的 import 需要 NPU 驱动
+#    (libascend_hal.so, 运行时由 -v 从宿主机挂载 /usr/local/Ascend/driver),
+#    构建期无驱动故只做驱动无关校验; 设备侧验证示例见 docker/README.md
+# -----------------------------------------------------------------------------
+WORKDIR /opt/hyper-parallel
+
+RUN echo "========== Image versions ==========" \
+    && cat /etc/os-release | head -n 2 \
+    && echo "---- python ----" && python --version \
+    && echo "---- torch / torch_npu ----" \
+    && TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+       python -c "import torch; print('torch', torch.__version__)" \
+    && TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+       python -c "from importlib.metadata import version; print('torch_npu', version('torch_npu'))" \
+    && echo "---- transformers ----" \
+    && TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+       python -c "import transformers; print('transformers', transformers.__version__)" \
+    && TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+       python -c "import os, transformers; p = os.path.join(os.path.dirname(transformers.__file__), 'models', 'qwen3_moe', 'modeling_qwen3_moe.py'); assert os.path.isfile(p), p; print('qwen3_moe modeling module present')" \
+    && echo "---- hyper_parallel ----" \
+    && TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+       python -c "import hyper_parallel as hp; print('hyper_parallel platform:', type(hp.get_platform()).__name__)" \
+    && TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+       python -c "from hyper_parallel.data.indexed.indexed_helpers import build_sample_index; print('indexed C++ helper OK')" \
+    && TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+       python -c "import omni_training_custom_ops; print('omni_training_custom_ops placeholder OK')" \
+    && pip show hyper_parallel | head -n 4 \
+    && echo "========== Verify done =========="
+
+CMD ["/bin/bash"]
