@@ -329,6 +329,89 @@ class TestCoreApiHelpersTorch(unittest.TestCase):
         hsdp_sync_stream()
         mock_platform.wait_grad_handle.assert_called_once_with()
 
+
+class TestHSDPModuleReduceCommInterval(unittest.TestCase):
+    """Unit tests for the Torch-only reduce communication interval API."""
+
+    @staticmethod
+    def _module(comm_fusion: bool = False) -> HSDPModule:
+        """Create an initialized HSDPModule stub with a per-parameter context."""
+        module = HSDPModule()
+        module.hsdp_scheduler = SimpleNamespace(
+            comm_fusion_policy=SimpleNamespace(enable_comm_fusion=comm_fusion),
+            scheduler_ctx=SimpleNamespace(
+                lazy_init_done=False,
+                per_param_comm_ctx=SimpleNamespace(reduce_interval=1),
+            ),
+        )
+        return module
+
+    @patch("hyper_parallel.core.fully_shard.api.platform.platform_type", PlatformType.PYTORCH)
+    def test_default_and_explicit_intervals_update_shared_context(self):
+        """Default and explicit positive intervals should update the scheduler context."""
+        module = self._module()
+
+        module.set_reduce_comm_interval()
+        self.assertEqual(module.hsdp_scheduler.scheduler_ctx.per_param_comm_ctx.reduce_interval, 1)
+
+        module.set_reduce_comm_interval(4)
+        self.assertEqual(module.hsdp_scheduler.scheduler_ctx.per_param_comm_ctx.reduce_interval, 4)
+
+    @patch("hyper_parallel.core.fully_shard.api.warnings.warn")
+    @patch("hyper_parallel.core.fully_shard.api.platform.platform_type", PlatformType.PYTORCH)
+    def test_supported_configurations_do_not_warn(self, mock_warn):
+        """Non-fused intervals and the fused default should not emit a warning."""
+        module = self._module(comm_fusion=False)
+        module.set_reduce_comm_interval(3)
+
+        fused_module = self._module(comm_fusion=True)
+        fused_module.set_reduce_comm_interval(1)
+
+        mock_warn.assert_not_called()
+        self.assertEqual(module.hsdp_scheduler.scheduler_ctx.per_param_comm_ctx.reduce_interval, 3)
+        self.assertEqual(fused_module.hsdp_scheduler.scheduler_ctx.per_param_comm_ctx.reduce_interval, 1)
+
+    @patch("hyper_parallel.core.fully_shard.api.platform.platform_type", PlatformType.PYTORCH)
+    def test_comm_fusion_warns_and_forces_interval_one(self):
+        """Comm fusion should warn and retain its single-work communication lifecycle."""
+        module = self._module(comm_fusion=True)
+        module.hsdp_scheduler.scheduler_ctx.per_param_comm_ctx.reduce_interval = 5
+
+        with self.assertWarnsRegex(UserWarning, "comm_fusion=True"):
+            module.set_reduce_comm_interval(2)
+
+        self.assertEqual(module.hsdp_scheduler.scheduler_ctx.per_param_comm_ctx.reduce_interval, 1)
+
+    @patch("hyper_parallel.core.fully_shard.api.platform.platform_type", PlatformType.PYTORCH)
+    def test_invalid_intervals_do_not_change_configuration(self):
+        """Boolean, non-integer, and non-positive intervals should be rejected."""
+        module = self._module()
+        invalid_intervals = (True, False, 0, -1, 1.0, "2", None)
+
+        for interval in invalid_intervals:
+            with self.subTest(interval=interval), self.assertRaisesRegex(ValueError, "positive int"):
+                module.set_reduce_comm_interval(interval)
+
+        self.assertEqual(module.hsdp_scheduler.scheduler_ctx.per_param_comm_ctx.reduce_interval, 1)
+
+    @patch("hyper_parallel.core.fully_shard.api.platform.platform_type", PlatformType.PYTORCH)
+    def test_uninitialized_module_is_rejected(self):
+        """The interval API should require initialization through fully_shard."""
+        module = HSDPModule()
+
+        with self.assertRaisesRegex(ValueError, "fully_shard"):
+            module.set_reduce_comm_interval(2)
+
+    @patch("hyper_parallel.core.fully_shard.api.platform.platform_type", PlatformType.PYTORCH)
+    def test_configuration_after_first_forward_is_rejected(self):
+        """The interval must be configured before the shared tree is initialized."""
+        module = self._module()
+        module.hsdp_scheduler.scheduler_ctx.lazy_init_done = True
+
+        with self.assertRaisesRegex(ValueError, "before the root module's first forward"):
+            module.set_reduce_comm_interval(2)
+
+
 class TestFullyShardListAPI(unittest.TestCase):
     """Unit tests for fully_shard list support (mocked to avoid NPU/dist)."""
 
@@ -354,7 +437,10 @@ class TestFullyShardListAPI(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cover every parameter"):
             _validate_managed_params_source_shard_infos(managed, {first: metadata})
         with self.assertRaisesRegex(ValueError, "not managed"):
-            _validate_managed_params_source_shard_infos(managed, {first: metadata, second: metadata, external: metadata})
+            _validate_managed_params_source_shard_infos(
+                managed,
+                {first: metadata, second: metadata, external: metadata},
+            )
         with self.assertRaisesRegex(ValueError, "SourceShardMetaInfo"):
             _validate_managed_params_source_shard_infos(managed, {first: metadata, second: object()})
         origin_metadata = SourceShardMetaInfo(self._create_mock_mesh(), (Replicate(),), origin_is_dtensor=True)

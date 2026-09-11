@@ -261,13 +261,22 @@ class MindSporeHSDPStateV2(HSDPState):
             self.post_backward_for_comm_fusion()
             return
 
-        previous_groups = self._wait_prev_reduce_scatter()
-        self._wait_prev_reduce_scatter_without_all_reduce()
+        expired_reduce_scatter_params = []
+        expired_all_reduce_groups = []
+        if self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params:
+            expired_reduce_scatter_params = (
+                self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params.popleft()
+            )
+            expired_all_reduce_groups = (
+                self.scheduler_ctx.per_param_comm_ctx.pre_all_reduce_groups.popleft()
+            )
+            self._wait_prev_reduce_scatter(expired_all_reduce_groups)
+            self._wait_prev_reduce_scatter_without_all_reduce(expired_reduce_scatter_params)
         self._issue_reduce_scatter_for_current_module()
-        self._issue_prev_fused_all_reduce(previous_groups)
+        self._issue_prev_fused_all_reduce(expired_all_reduce_groups)
 
     def _issue_reduce_scatter_for_current_module(self) -> None:
-        """Issue per-parameter reduce-scatter and fuse compatible HSDP all-reduces."""
+        """Issue this unit's reduce-scatter and append one queue slot."""
         params_to_reduce = []
         for hsdp_param in self.hsdp_params:
             skip_param = (
@@ -280,8 +289,6 @@ class MindSporeHSDPStateV2(HSDPState):
             )
             if not skip_param:
                 params_to_reduce.append(hsdp_param)
-        if not params_to_reduce:
-            return
 
         groups_by_comm = defaultdict(list)
         for hsdp_param in params_to_reduce:
@@ -292,6 +299,7 @@ class MindSporeHSDPStateV2(HSDPState):
             else:
                 groups_by_comm[None].append(hsdp_param)
 
+        direct_reduce_scatter_params = []
         for hsdp_param in groups_by_comm.get(None, ()):
             logger.debug(
                 "post_backward module=%s launch=reduce_scatter param=%s all_reduce=False",
@@ -299,8 +307,9 @@ class MindSporeHSDPStateV2(HSDPState):
                 hsdp_param,
             )
             hsdp_param.reduce_scatter_grad(reduce_op=self.reduce_op_type)
-            self.scheduler_ctx.pre_reduce_scatter_params.append(hsdp_param)
+            direct_reduce_scatter_params.append(hsdp_param)
 
+        all_reduce_groups = []
         for group_key, hsdp_params in groups_by_comm.items():
             if group_key is None:
                 continue
@@ -320,45 +329,56 @@ class MindSporeHSDPStateV2(HSDPState):
                     reduce_op=self.reduce_op_type,
                     output_buffer=group.get_param_buffer_view(index),
                 )
-            self.scheduler_ctx.pre_all_reduce_groups.append(group)
+            all_reduce_groups.append(group)
 
-    def _wait_prev_reduce_scatter(self) -> List[AllReduceParamGroup]:
-        """Wait previous fused reduce-scatter groups before all-reduce."""
-        if not self.scheduler_ctx.pre_all_reduce_groups:
-            return []
-        previous_groups = list(self.scheduler_ctx.pre_all_reduce_groups)
-        self.scheduler_ctx.pre_all_reduce_groups.clear()
-        for previous_group in previous_groups:
+        self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params.append(
+            direct_reduce_scatter_params
+        )
+        self.scheduler_ctx.per_param_comm_ctx.pre_all_reduce_groups.append(all_reduce_groups)
+
+    def _wait_prev_reduce_scatter(self, all_reduce_groups: List[AllReduceParamGroup]) -> None:
+        """Wait a previous unit's reduce-scatter groups before all-reduce."""
+        for all_reduce_group in all_reduce_groups:
             logger.debug(
                 "post_backward module=%s wait=fused_reduce_scatter group_params=%s",
                 self,
-                previous_group.hsdp_params,
+                all_reduce_group.hsdp_params,
             )
-            for hsdp_param in previous_group.hsdp_params:
+            for hsdp_param in all_reduce_group.hsdp_params:
                 hsdp_param.reduce_scatter_output()
                 hsdp_param.clear_reduce_scatter_output()
                 if hsdp_param.unsharded_accumulated_grad_data is not None:
                     hsdp_param.unsharded_accumulated_grad = None
                 elif hsdp_param.unsharded_param.grad is not None:
                     hsdp_param.unsharded_param.grad = None
-        return previous_groups
 
-    def _issue_prev_fused_all_reduce(self, previous_groups: List[AllReduceParamGroup]) -> None:
-        """Launch the previous module's fused all-reduce asynchronously."""
-        for previous_group in previous_groups:
-            previous_group.accumulate_reduce_partial_outputs()
+    def _issue_prev_fused_all_reduce(
+        self,
+        all_reduce_groups: List[AllReduceParamGroup],
+    ) -> None:
+        """Launch a previous unit's fused all-reduce after its RS wait."""
+        for all_reduce_group in all_reduce_groups:
+            all_reduce_group.accumulate_reduce_partial_outputs()
             logger.debug(
                 "post_backward module=%s launch=fused_all_reduce group_params=%s",
                 self,
-                previous_group.hsdp_params,
+                all_reduce_group.hsdp_params,
             )
-            previous_group.issue_async_allreduce()
-            self.scheduler_ctx.pending_all_reduce_groups.append(previous_group)
+            all_reduce_group.issue_async_allreduce()
+            self.scheduler_ctx.per_param_comm_ctx.all_reduce_work_groups.append(all_reduce_group)
 
-    def _wait_prev_reduce_scatter_without_all_reduce(self) -> None:
-        """Wait reduce-scatter outputs that do not enter a DP all-reduce."""
-        while self.scheduler_ctx.pre_reduce_scatter_params:
-            hsdp_param = self.scheduler_ctx.pre_reduce_scatter_params.pop(0)
+    def _wait_prev_reduce_scatter_without_all_reduce(
+        self,
+        hsdp_params: List[MindSporeHSDPParamV2],
+    ) -> None:
+        """Wait a previous unit's RS outputs that skip DP all-reduce.
+
+        The public gradient-accumulation API configures
+        ``requires_all_reduce`` recursively for the whole module tree. The root
+        hook relies on that invariant when it drains child slots through the
+        root state.
+        """
+        for hsdp_param in hsdp_params:
             logger.debug(
                 "post_backward module=%s wait=reduce_scatter param=%s",
                 self,
@@ -382,21 +402,20 @@ class MindSporeHSDPStateV2(HSDPState):
 
     def wait_and_split_all_reduce_work_groups(self) -> None:
         """Wait fused all-reduce work and expose each parameter result."""
-        for group in self.scheduler_ctx.pending_all_reduce_groups:
+        for group in self.scheduler_ctx.per_param_comm_ctx.all_reduce_work_groups:
             logger.debug(
                 "post_backward module=%s wait=fused_all_reduce group_params=%s",
                 self,
                 group.hsdp_params,
             )
             group.wait_and_split_grads()
-        self.scheduler_ctx.pending_all_reduce_groups.clear()
+        self.scheduler_ctx.per_param_comm_ctx.all_reduce_work_groups.clear()
 
     def reset_iter_state(self) -> None:
         """Clear communication bookkeeping without clearing optimizer gradients."""
-        self.scheduler_ctx.pre_reduce_scatter_params.clear()
-        self.scheduler_ctx.pre_all_reduce_params.clear()
-        self.scheduler_ctx.pre_all_reduce_groups.clear()
-        self.scheduler_ctx.pending_all_reduce_groups.clear()
+        self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params.clear()
+        self.scheduler_ctx.per_param_comm_ctx.pre_all_reduce_groups.clear()
+        self.scheduler_ctx.per_param_comm_ctx.all_reduce_work_groups.clear()
         if self.param_group is not None:
             self.param_group.reset_iter_state()
         for hsdp_param in self.hsdp_params:
