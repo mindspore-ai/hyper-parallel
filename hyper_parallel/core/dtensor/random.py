@@ -539,16 +539,13 @@ def fork_rng(
     to the state that it was previously in.
 
     Args:
-        devices (iterable of Device IDs): devices for which to fork
-            the RNG. CPU RNG state is always forked. By default, :meth:`fork_rng` operates
-            on all devices, but will emit a warning if your machine has a lot
-            of devices, since this function will run very slowly in that case.
-            If you explicitly specify devices, this warning will be suppressed
-        enabled (bool): if ``False``, the RNG is not forked.  This is a convenience
-            argument for easily disabling the context manager without having
-            to delete it and unindent your Python code under it.
-        device_type (str): device type str, default is `npu`. As for supported device,
-            see details in :ref:`accelerator<accelerators>`
+        devices (iterable of Device IDs): accelerator devices whose RNG states
+            are preserved. The host RNG state is preserved unconditionally. If
+            omitted, every visible device is included.
+        enabled (bool): whether state preservation is active. When disabled,
+            the context manager yields without changing any RNG state.
+        device_type (str): accelerator type associated with the requested
+            devices. Defaults to ``"npu"``.
     """
 
     device_mod = platform.get_device_handle()
@@ -568,8 +565,7 @@ def fork_rng(
             _fork_rng_warned_already = True
         devices = list(range(num_devices))
     else:
-        # Protect against user passing us a generator; we need to traverse this
-        # multiple times but a generator will be exhausted upon first traversal
+        # Materialize the device selection once for both state capture and restore.
         devices = list(devices)
 
     cpu_rng_state = platform.get_rng_state()
