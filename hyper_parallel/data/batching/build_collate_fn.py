@@ -21,13 +21,10 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 from torch.utils.data import default_collate
 
-from hyper_parallel.platform import get_platform
 from hyper_parallel.data.constants import IGNORE_INDEX
-
-
-platform = get_platform()
 
 
 def _get_sequence_parallel_size(mesh_context: Any | None) -> int:
@@ -89,15 +86,15 @@ class TextPackingCollator(DataCollator):
         packed_batch = {}
         for field in ("input_ids", "labels"):
             values = [model_sample[field] for model_sample in model_samples]
-            packed_batch[field] = platform.cat(values, dim=-1).unsqueeze(0)
+            packed_batch[field] = torch.cat(values, dim=-1).unsqueeze(0)
 
         packed_seq_len = packed_batch["input_ids"].shape[-1]
         pad_len = (-packed_seq_len) % self.sequence_parallel_size
         if pad_len:
             input_padding = packed_batch["input_ids"].new_zeros((1, pad_len))
             label_padding = packed_batch["labels"].new_full((1, pad_len), IGNORE_INDEX)
-            packed_batch["input_ids"] = platform.cat((packed_batch["input_ids"], input_padding), dim=-1)
-            packed_batch["labels"] = platform.cat((packed_batch["labels"], label_padding), dim=-1)
+            packed_batch["input_ids"] = torch.cat((packed_batch["input_ids"], input_padding), dim=-1)
+            packed_batch["labels"] = torch.cat((packed_batch["labels"], label_padding), dim=-1)
 
         seq_lens = model_samples[0]["input_ids"].new_tensor(
             [model_sample["input_ids"].shape[-1] for model_sample in model_samples]
@@ -109,9 +106,9 @@ class TextPackingCollator(DataCollator):
             # attention metadata covers every physical Q/KV token. Its labels
             # remain IGNORE_INDEX and therefore do not contribute to the loss.
             padded_end = seq_ends[-1:] + pad_len
-            seq_ends = platform.cat((seq_ends, padded_end))
-        cu_seq_lens = platform.cat((zero, seq_ends))
-        cu_seq_lens = platform.tensor_type_cast(cu_seq_lens, "int32")
+            seq_ends = torch.cat((seq_ends, padded_end))
+        cu_seq_lens = torch.cat((zero, seq_ends))
+        cu_seq_lens = cu_seq_lens.to(torch.int32)
         packed_batch["cu_seq_lens"] = cu_seq_lens
 
         return packed_batch

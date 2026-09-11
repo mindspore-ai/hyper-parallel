@@ -14,7 +14,8 @@
 # ============================================================================
 
 PYTHON ?= python3
-CXXFLAGS += -O3 -Wall -Wextra -shared -std=c++11 -fPIC -fdiagnostics-color
+CXXFLAGS += -O3 -Wall -Wextra -shared -std=c++11 -fPIC -fdiagnostics-color -fstack-protector-strong
+LDFLAGS += -Wl,-z,relro,-z,now -s
 CPPFLAGS += $(shell $(PYTHON) -m pybind11 --includes)
 LIBRARY_NAME = _indexed_helpers_cpp
 LIBRARY_EXTENSION = $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
@@ -25,7 +26,7 @@ OUTPUT = ../$(LIBRARY_NAME)$(LIBRARY_EXTENSION)
 all: $(OUTPUT)
 
 $(OUTPUT): indexed_helpers.cpp
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $< -o $@
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $< -o $@ $(LDFLAGS)
 
 clean:
 	$(RM) ../$(LIBRARY_NAME)*.so

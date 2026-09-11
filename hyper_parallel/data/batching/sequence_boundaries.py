@@ -19,10 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from hyper_parallel.platform import get_platform
-
-
-platform = get_platform()
+import torch
 
 
 class OnlineBoundaryResolver:
@@ -38,7 +35,7 @@ class OnlineBoundaryResolver:
             Global int32 cumulative sequence boundaries.
         """
         raw_cu_seq_lens = canonical_batch["cu_seq_lens"]
-        cu_seq_lens = platform.tensor_type_cast(raw_cu_seq_lens, "int32")
+        cu_seq_lens = raw_cu_seq_lens.to(torch.int32)
 
         return cu_seq_lens
 
@@ -65,7 +62,7 @@ class IndexedBoundaryResolver:
         """
         input_ids = canonical_batch["input_ids"]
         batch_size, seq_len = input_ids.shape
-        token_indices = platform.arange(seq_len, dtype=input_ids.dtype, device=input_ids.device)
+        token_indices = torch.arange(seq_len, dtype=input_ids.dtype, device=input_ids.device)
 
         # Collect flattened, nonzero cumulative sequence ends. A leading zero
         # is prepended below to form ``cu_seq_lens``.
@@ -93,6 +90,6 @@ class IndexedBoundaryResolver:
                 seq_ends.append(row_end)
 
         # Packed attention uses the standard leading-zero cumulative form.
-        cu_seq_lens = platform.tensor([0, *seq_ends], dtype=platform.tensor_dtype.int32)
+        cu_seq_lens = torch.tensor([0, *seq_ends], dtype=torch.int32)
 
         return cu_seq_lens

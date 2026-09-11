@@ -21,10 +21,10 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
-from hyper_parallel.platform import get_platform
+import torch.distributed as dist
+
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 
-platform = get_platform()
 logger = get_dataset_logger(__name__)
 
 
@@ -74,7 +74,7 @@ def _is_global_cache_builder_rank(shared_storage: bool) -> bool:
         return True
 
     try:
-        global_rank = int(platform.get_rank())
+        global_rank = int(dist.get_rank())
     except (RuntimeError, ValueError):
         global_rank = 0
     builds_shared_cache = global_rank == 0
@@ -101,7 +101,7 @@ def create_dataloader_parallel_context(
     """
     device_mesh = getattr(mesh_context, "device_mesh", None)
     try:
-        world_size = int(platform.get_world_size())
+        world_size = int(dist.get_world_size())
     except (RuntimeError, ValueError):
         world_size = 1
     distributed_enabled = device_mesh is not None and world_size > 1
@@ -118,7 +118,7 @@ def create_dataloader_parallel_context(
     dataloader_context = DataLoaderParallelContext(
         build_on_rank=build_on_rank,
         build_cache_on_rank=build_cache_on_rank,
-        barrier=barrier or platform.barrier,
+        barrier=barrier or dist.barrier,
         distributed_enabled=True,
         data_index_cache=data_index_cache,
         dp_rank=int(getattr(mesh_context, "dp_rank", 0)),

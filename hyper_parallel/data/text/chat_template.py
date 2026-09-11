@@ -217,7 +217,7 @@ class ChatTemplate(ABC):
         self.tokenizer.chat_template = self.get_jinja_template()
         try:
             self.tokenizer.save_pretrained(output_dir)
-        except Exception:
+        except OSError:
             logger.warning("Failed to save tokenizer.")
 
     @abstractmethod

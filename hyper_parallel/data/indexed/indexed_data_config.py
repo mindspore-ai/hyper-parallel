@@ -24,11 +24,11 @@ from typing import Any
 
 import numpy as np
 
-from hyper_parallel.platform import get_platform
+import torch.distributed as dist
+
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 
 logger = get_dataset_logger(__name__)
-platform = get_platform()
 
 
 @dataclass
@@ -145,14 +145,14 @@ def _discover_indexed_paths(
         root_layout = (subdirectories, top_files)
 
     gathered_layouts: list[tuple[list[str], list[str]] | None] = [None] * world_size
-    platform.all_gather_object(gathered_layouts, root_layout)
+    dist.all_gather_object(gathered_layouts, root_layout)
     rank_zero_layout = gathered_layouts[0]
     if rank_zero_layout is None:
         raise ValueError("Rank 0 did not provide the indexed directory layout")
     subdirectories, file_paths = rank_zero_layout
     local_files = _walk_bin_directories(subdirectories[rank::world_size])
     gathered_files: list[list[str] | None] = [None] * world_size
-    platform.all_gather_object(gathered_files, local_files)
+    dist.all_gather_object(gathered_files, local_files)
     for rank_files in gathered_files:
         if rank_files:
             file_paths.extend(rank_files)
@@ -180,8 +180,8 @@ def resolve_data_paths(
     # 2. Use distributed walking only after the process group is available.
     # Before initialization, one process walks all configured directories.
     try:
-        rank = int(platform.get_rank())
-        world_size = int(platform.get_world_size())
+        rank = int(dist.get_rank())
+        world_size = int(dist.get_world_size())
     except (RuntimeError, ValueError):
         rank, world_size = 0, 1
     use_distributed_walk = distributed_walk and world_size > 1

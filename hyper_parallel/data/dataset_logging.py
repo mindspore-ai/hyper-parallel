@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import Any, Literal
 
-from hyper_parallel.platform import get_platform
+import torch.distributed as dist
 
 RankCondition = bool | Callable[[], bool]
 DatasetLogLevel = Literal["debug", "info", "warn"]
@@ -31,12 +31,11 @@ _DATASET_LOG_FORMAT = (
     "[rank:%(rank_id)d] \t> %(message)s"
 )
 _DATASET_DATE_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
-platform = get_platform()
 
 
 def _get_rank() -> int:
     try:
-        rank = int(platform.get_rank())
+        rank = int(dist.get_rank())
     except (RuntimeError, ValueError):
         rank = 0
     return rank
@@ -77,19 +76,18 @@ _DEBUG_RANK_FILTER = _DatasetDebugRankFilter()
 class DatasetLogger(logging.LoggerAdapter):
     """Add an optional rank condition to Dataset DEBUG records."""
 
-    def debug(
-            self, message: object, *args: object, enabled: RankCondition | None = None, **kwargs: Any,
-    ) -> None:
+    def debug(self, msg: object, *args: object, **kwargs: Any) -> None:
         """Log on default ranks, or on ranks selected by ``enabled`` when provided."""
         if not self.isEnabledFor(logging.DEBUG):
             return
+        enabled: RankCondition | None = kwargs.pop("enabled", None)
         if enabled is not None:
             rank_enabled = enabled() if callable(enabled) else enabled
             extra = dict(kwargs.get("extra", {}))
             extra["dataset_rank_enabled"] = rank_enabled
             kwargs["extra"] = extra
         kwargs.setdefault("stacklevel", 2)
-        self.logger.debug(message, *args, **kwargs)
+        self.logger.debug(msg, *args, **kwargs)
 
 
 def get_dataset_logger(name: str) -> DatasetLogger:

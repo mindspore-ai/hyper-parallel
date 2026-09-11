@@ -29,14 +29,12 @@ components/datasets/parallel/batch_parallel.py in stage 6 (05 §11.2).
 """
 
 from collections.abc import Mapping
-from typing import Any, Callable, Optional
+from typing import Any
 import torch
+import torch.distributed as dist
+
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.platform import get_platform
 from hyper_parallel.data.parallel.dataloader_parallel import DataLoaderParallelContext
-
-
-platform = get_platform()
 
 
 def shard_batch_for_cp(batch: dict[str, Any], cp_mesh: DeviceMesh) -> dict[str, Any]:
@@ -219,7 +217,7 @@ class CPBatchSharder:
 
         cp_rank = self.parallel_context.cp_rank
         for field, value in cp_batch.items():
-            local_value = platform.chunk(value, split_dim=1, split_size=cp_size, index=cp_rank)
+            local_value = torch.chunk(value, cp_size, dim=1)[cp_rank]
             cp_batch[field] = local_value.contiguous()
 
         return cp_batch
@@ -261,12 +259,12 @@ class TPBatchBroadcaster:
         # the target device before communication.
         if tp_rank == 0:
             parallel_batch = {
-                field: value.to(self.device, dtype=platform.tensor_dtype.int64, non_blocking=True)
+                field: value.to(self.device, dtype=torch.int64, non_blocking=True)
                 for field, value in cp_local_batch.items()
             }
             local_cu_seq_lens = None
             if cu_seq_lens is not None:
-                local_cu_seq_lens = cu_seq_lens.to(self.device, dtype=platform.tensor_dtype.int32, non_blocking=True)
+                local_cu_seq_lens = cu_seq_lens.to(self.device, dtype=torch.int32, non_blocking=True)
         else:
             parallel_batch = None
             local_cu_seq_lens = None
@@ -281,37 +279,35 @@ class TPBatchBroadcaster:
         if tp_rank == 0:
             batch_size, seq_len = parallel_batch["input_ids"].shape
             num_boundaries = 0 if local_cu_seq_lens is None else local_cu_seq_lens.numel()
-            batch_meta = platform.tensor(
+            batch_meta = torch.tensor(
                 [batch_size, seq_len, num_boundaries],
-                dtype=platform.tensor_dtype.int64,
+                dtype=torch.int64,
                 device=self.device,
             )
         else:
-            batch_meta = platform.empty((3,), dtype=platform.tensor_dtype.int64, device=self.device)
+            batch_meta = torch.empty((3,), dtype=torch.int64, device=self.device)
 
         tp_group = self.parallel_context.tp_group
-        platform.broadcast(batch_meta, group=tp_group, group_src=0)
+        dist.broadcast(batch_meta, group=tp_group, group_src=0)
 
         # Non-source TP ranks allocate the same device shapes and dtypes.
         if tp_rank != 0:
             batch_size, seq_len, num_boundaries = [int(value) for value in batch_meta.tolist()]
             shape = (batch_size, seq_len)
             parallel_batch = {
-                "input_ids": platform.empty(shape, dtype=platform.tensor_dtype.int64, device=self.device),
-                "labels": platform.empty(shape, dtype=platform.tensor_dtype.int64, device=self.device),
+                "input_ids": torch.empty(shape, dtype=torch.int64, device=self.device),
+                "labels": torch.empty(shape, dtype=torch.int64, device=self.device),
             }
             if num_boundaries > 0:
-                local_cu_seq_lens = platform.empty(
-                    (num_boundaries,), dtype=platform.tensor_dtype.int32, device=self.device
-                )
+                local_cu_seq_lens = torch.empty((num_boundaries,), dtype=torch.int32, device=self.device)
 
         # Broadcast only model fields that cannot be regenerated locally.
         for field in ("input_ids", "labels"):
-            platform.broadcast(parallel_batch[field], group=tp_group, group_src=0)
+            dist.broadcast(parallel_batch[field], group=tp_group, group_src=0)
 
         # Packed boundaries remain global across CP ranks and variable in size.
         if local_cu_seq_lens is not None:
-            platform.broadcast(local_cu_seq_lens, group=tp_group, group_src=0)
+            dist.broadcast(local_cu_seq_lens, group=tp_group, group_src=0)
 
         parallel_batch["cu_seq_lens"] = local_cu_seq_lens
 
