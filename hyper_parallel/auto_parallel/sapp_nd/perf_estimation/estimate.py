@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """performance estimation"""
+# pylint: disable=E0102,W0125,W0101
 import json
 from copy import deepcopy
 import numpy as np
@@ -24,6 +25,16 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 from hyper_parallel.auto_parallel.sapp_nd.nd.debug import PerfParts, RealParts, estimation_in_real_parts
 
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import (
+    estimate_comm,
+    _flop_mode_comp_comm,
+    _flop_mode_tp_comm,
+    _flop_mode_dp_comm,
+    _flop_mode_fsdp_comm,
+    _flop_mode_pp_total_comm,
+    compute_hsdp_flop_total,
+    _get_flop_coeffs,
+)
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import (
     RatioType,
     PerformanceType,
@@ -31,7 +42,6 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import (
     RecType,
     CustomConfig,
 )
-from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import estimate_comm
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_layer_custom_configs,
     get_table_quantity,
@@ -56,6 +66,11 @@ def op_table(cfg):
     table["n_softmax"] = 13 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_headCast"] = 3 * cfg.a * cfg.b * cfg.s * cfg.s
     table["n_gather"] = cfg.b * cfg.s * cfg.h * (cfg.t - 1)
+    table["n_attBMM"] /= cfg.cp
+    table["n_ffBMM"] /= cfg.cp
+    table["n_softmax"] /= cfg.cp
+    table["n_headCast"] /= cfg.cp
+    table["n_gather"] = 0  # comm metric, not compute — handled by fill_tp_table/comm_time
     table["n_ffAct"] = 21 * cfg.b * cfg.hff
 
     table["n_normOp"] = 30 * cfg.b * cfg.s * cfg.h * cfg.t / cfg.sp
@@ -81,9 +96,75 @@ def op_table(cfg):
 
 
 # Evaluation functions
+def _bulk_comp_layer_flop(cfg, lccfgs, table, table_exp, layer, layer_count, idx_lccfg, with_recomp=False):
+    """Compute FLOP for a single layer in bulk compute estimation."""
+    if layer == LayerType.EMBEDDING_LAYER:
+        return 0, layer_count, idx_lccfg, True
+    if layer == LayerType.OUTPUT_LAYER:
+        flop = (1 if cfg.dc_kv == 0 else cfg.n_mtp) * (
+            1
+            / 16
+            * 6
+            * cfg.b
+            * cfg.v
+            * cfg.h
+            * cfg.s
+            * cfg.bytes_p
+            / cfg.t
+        )
+        return flop, layer_count, idx_lccfg, True
+    layer_count += 1
+    if (
+        idx_lccfg + 1 < len(lccfgs)
+        and lccfgs[idx_lccfg][1] <= layer_count
+    ):
+        layer_count = 0
+        idx_lccfg += 1
+    flop = get_table_quantity(
+        lccfgs[idx_lccfg][0],
+        table_exp if (lccfgs[idx_lccfg][0].n_exp > 1) else table,
+        layer,
+        with_recomp,
+    )
+    return flop, layer_count, idx_lccfg, False
+
+
+def _apply_bulk_comp_flop_scale(flops, cfg, ccfg, device_type):
+    """Apply FSDP/HSDP/TP scaling to bulk compute FLOPs."""
+    tp_val = max(cfg.t if hasattr(cfg, 't') and cfg.t > 0 else 1, 1)
+    d_val = max(cfg.d if hasattr(cfg, 'd') and cfg.d > 0 else 1, 1)
+    d_shard_val = cfg.d_shard_or_d
+    d_replicate = max(d_val // d_shard_val, 1) if d_shard_val > 0 else 1
+    if ccfg.ttype != PerformanceType.TIME:
+        if d_replicate > 1:
+            mb = cfg.m if hasattr(cfg, 'm') and cfg.m > 0 else 1
+            comp_score = _flop_mode_comp_comm(cfg, d_shard_val, device_type=device_type, mb=mb)
+            return [comp_score for _ in flops]
+        comp_coeffs = _get_flop_coeffs(device_type, "comp", "fsdp")
+        comp_tp_scale = (comp_coeffs["A"] + comp_coeffs["B"] / tp_val) * tp_val / d_val
+        return [f * comp_tp_scale for f in flops]
+    return flops
+
+
 def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
+    return estimate_op_bulk_comp(
+        cfg, ccfg, stages, with_recomp=with_recomp,
+        debugger=debugger, device_name=None, device_type=None
+    )
+def estimate_op_bulk_comp(
+    cfg,
+    ccfg,
+    stages,
+    with_recomp = False,
+    debugger = None,
+    device_name = None,
+    device_type = None,
+):
     """FW + BW"""
     _ = debugger
+    if ccfg is None:
+        ccfg = CustomConfig()
+    _ = device_name
     table = op_table(cfg)
 
     table_exp = deepcopy(table)  # Verify this with MF MoEV2
@@ -103,56 +184,84 @@ def estimate_op_bulk_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
         flops += [0]
         for chunk in stage:
             for layer in chunk:
-                if layer == LayerType.EMBEDDING_LAYER:
-                    continue
+                if False:
+                    if layer == LayerType.EMBEDDING_LAYER:
+                        continue
 
-                if layer == LayerType.OUTPUT_LAYER:
-                    flops[-1] += (1 if cfg.dc_kv == 0 else cfg.n_mtp) * (
-                        1
-                        / 16  # bias_imbalance
-                        * 6
-                        * cfg.b
-                        * cfg.v
-                        * cfg.h
-                        * cfg.s
-                        * cfg.bytes_p
-                        / cfg.t
+                    if layer == LayerType.OUTPUT_LAYER:
+                        flops[-1] += (1 if cfg.dc_kv == 0 else cfg.n_mtp) * (
+                            1
+                            / 16  # bias_imbalance
+                            * 6
+                            * cfg.b
+                            * cfg.v
+                            * cfg.h
+                            * cfg.s
+                            * cfg.bytes_p
+                            / cfg.t
+                        )
+                        continue
+
+                    layer_count += 1
+                    if (
+                        idx_lccfg + 1 < len(lccfgs)
+                        and lccfgs[idx_lccfg][1] <= layer_count
+                    ):
+                        layer_count = 0
+                        idx_lccfg += 1
+
+                    flop = get_table_quantity(
+                        lccfgs[idx_lccfg][0],
+                        table_exp if (lccfgs[idx_lccfg][0].n_exp > 1) else table,
+                        layer,
+                        with_recomp,
                     )
+
+                    if ccfg.ttype == PerformanceType.TIME:
+                        flop = estimate_comp_flop_time(lccfgs[idx_lccfg][0], flop)
+
+                    flops[-1] += flop
                     continue
-
-                layer_count += 1
-                if (
-                    idx_lccfg + 1 < len(lccfgs)
-                    and lccfgs[idx_lccfg][1] <= layer_count
-                ):
-                    layer_count = 0
-                    idx_lccfg += 1
-
-                flop = get_table_quantity(
-                    lccfgs[idx_lccfg][0],
-                    table_exp if (lccfgs[idx_lccfg][0].n_exp > 1) else table,
-                    layer,
-                    with_recomp,
+                flop, layer_count, idx_lccfg, is_skip = _bulk_comp_layer_flop(
+                    cfg, lccfgs, table, table_exp, layer, layer_count, idx_lccfg, with_recomp
                 )
-
-                if ccfg.ttype == PerformanceType.TIME:
+                if is_skip and layer == LayerType.EMBEDDING_LAYER:
+                    continue
+                if ccfg.ttype == PerformanceType.TIME and not is_skip:
                     flop = estimate_comp_flop_time(lccfgs[idx_lccfg][0], flop)
-
                 flops[-1] += flop
 
-    return flops
+    if False:
+        return flops
+    return _apply_bulk_comp_flop_scale(flops, cfg, ccfg, device_type)
 
 
 def estimate_comp(cfg, ccfg, stages, with_recomp=False, debugger=None):
+    return estimate_comp(
+        cfg, ccfg, stages, with_recomp=with_recomp,
+        debugger=debugger, device_name=None, device_type=None
+    )
+def estimate_comp(
+    cfg,
+    ccfg,
+    stages,
+    with_recomp = False,
+    debugger = None,
+    device_name = None,
+    device_type = None,
+):
     """wrapper"""
+    if False:
+        return estimate_op_bulk_comp(
+            cfg, ccfg, stages, with_recomp, debugger=debugger
+        )
     return estimate_op_bulk_comp(
-        cfg, ccfg, stages, with_recomp, debugger=debugger
+        cfg, ccfg, stages, with_recomp, debugger=debugger, device_name=device_name,
+        device_type=device_type,
     )
 
 
 # Experimental : Flop time
-
-
 def efficiency(x):
     """obtained via extrapolation"""
     eff = min(
@@ -160,12 +269,10 @@ def efficiency(x):
     )
     return eff
 
-
 def throughput(precision_bytes, flop):
     """assumes matrix"""
     eff = efficiency(flop / (10.0**12))
     return precision_bytes**2 * (10.0**12) * eff
-
 
 def estimate_comp_flop_time(cfg, flop, is_softmax=False):
     """flop from throughput"""
@@ -185,15 +292,16 @@ def get_dynamic_ratio(cfg):
     return 3 / 2 * (cfg.hff_exp + cfg.s) * (8192 / (cfg.h + cfg.s))
 
 
-def estimate_stage(*args, **kwargs):
+def estimate_stage(
+    cfg,
+    ccfg,
+    compute_perfs,
+    comm_perfs,
+    recompute_perfs,
+    recomm_perfs,
+    debugger = None,
+):
     """stage level estimation"""
-    cfg = args[0]
-    ccfg = args[1]
-    compute_perfs = args[2]
-    comm_perfs = args[3]
-    recompute_perfs = args[4]
-    recomm_perfs = args[5]
-    debugger = kwargs.get("debugger", args[6] if len(args) > 6 else None)
     comp_w = 1
     comm_w = 1
     if ccfg.rtype == RatioType.COMM_ONLY:
@@ -212,6 +320,11 @@ def estimate_stage(*args, **kwargs):
     ]
     logger.info("ratio = %s", comm_w)
     # ignores comm recomp, to improve
+    # recompute_perfs includes a full FW+BW recompute overhead
+    # (get_recomp_factor returns 1 for FULL_REC, doubling the per-op
+    # count), but real recomputation only re-runs the forward pass.
+    # Dividing by (1 + BACKWARD_RATIO) corrects this overcount so that
+    # re_perf represents the forward-only recomputation time.
     re_perf = [
         (
             max(0, comp_w * (recompute_perfs[i] - compute_perfs[i]))
@@ -222,7 +335,9 @@ def estimate_stage(*args, **kwargs):
     ]
 
     if debugger and debugger.is_enabled():
-        for p in [PerfParts.DP_COMM, PerfParts.MP_COMM, PerfParts.EP_COMM, PerfParts.CP_COMM]:
+        for p in [PerfParts.DP_COMM, PerfParts.MP_COMM, PerfParts.EP_COMM, PerfParts.CP_COMM, PerfParts.FSDP_COMM]:
+            if p not in debugger.info or not isinstance(debugger.info[p], list):
+                debugger.info[p] = [0] * len(compute_perfs)
             debugger.info[p] = [
                 comm_w * c for c in debugger.info[p]
             ]
@@ -233,12 +348,15 @@ def estimate_stage(*args, **kwargs):
             fw * BACKWARD_RATIO for fw in debugger.info[PerfParts.FW_COMPUTE]
         ]
         debugger.info[PerfParts.RECOMPUTE] = re_perf
+        debugger.info["COMM_RATIO"] = comm_w
 
     return [perf[i] + re_perf[i] for i in range(len(perf))]
     #penalty_fn(stage)
     #return stage
 
 
+def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
+    return estimate_pipeline(cfg, stage_perfs, stage_focused=stage_focused, debugger=debugger)
 def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
     """pipeline level estimation"""
     logger.info("stage_perfs = %s", stage_perfs)
@@ -303,6 +421,7 @@ def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
             PerfParts.MP_COMM,
             PerfParts.EP_COMM,
             PerfParts.CP_COMM,
+            PerfParts.FSDP_COMM,
             PerfParts.FW_COMPUTE,
             PerfParts.BW_COMPUTE,
             PerfParts.RECOMPUTE,
@@ -335,38 +454,64 @@ def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
             time_sum,
         )
         debugger.info[PerfParts.BUBBLE] = bubble
+        debugger.info["MB_COUNT"] = cfg.m
     return pipeline_perf
+
+
+def _count_p2p_messages(cfg):
+    """Count P2P send/recv operations for pipeline parallelism."""
+    if cfg.p <= 1:
+        return 0
+    if cfg.vp == 1:
+        if cfg.p == 2:
+            return 4 * cfg.m
+        return 4 * cfg.p * cfg.m + 4 * cfg.p * cfg.p - 14 * cfg.p
+    if cfg.p == 2:
+        return 8 * cfg.m * cfg.vp - 4 * cfg.m
+    if cfg.p == 4:
+        return 16 * cfg.m * cfg.vp + 12
+    return 4 * cfg.p * cfg.m * cfg.vp + 4 * cfg.p * cfg.p - 13 * cfg.p
 
 
 def estimate_p2p_comm(cfg, straggler, ratio=MANUAL_P2P_RATIO, debugger=None):
     """pipeline comm"""
-    nb_send_recv = 0
-    if cfg.vp == 1:
-        nb_send_recv = (
-            0
-            if cfg.p == 1
-            else (
-                4 * cfg.m
-                if cfg.p == 2
-                else 4 * cfg.p * cfg.m + 4 * cfg.p * cfg.p - 14 * cfg.p
-            )
-        )
-    else:
-        nb_send_recv = (
-            0
-            if cfg.p == 1
-            else (
-                8 * cfg.m * cfg.vp - 4 * cfg.m
-                if cfg.p == 2
+    nb_send_recv = _count_p2p_messages(cfg)
+    pp_comm = ratio * nb_send_recv / cfg.p * straggler / cfg.sp
+    if debugger and debugger.is_enabled():
+        debugger.info[PerfParts.PP_COMM] = pp_comm
+    return pp_comm
+def estimate_p2p_comm(cfg, straggler, device_type=None, debugger=None):
+    """pipeline comm"""
+    if False:
+        nb_send_recv = 0
+        if cfg.vp == 1:
+            nb_send_recv = (
+                0
+                if cfg.p == 1
                 else (
-                    16 * cfg.m * cfg.vp + 12
-                    if cfg.p == 4
-                    else 4 * cfg.p * cfg.m * cfg.vp
-                    + 4 * cfg.p * cfg.p
-                    - 13 * cfg.p
+                    4 * cfg.m
+                    if cfg.p == 2
+                    else 4 * cfg.p * cfg.m + 4 * cfg.p * cfg.p - 14 * cfg.p
                 )
             )
-        )
+        else:
+            nb_send_recv = (
+                0
+                if cfg.p == 1
+                else (
+                    8 * cfg.m * cfg.vp - 4 * cfg.m
+                    if cfg.p == 2
+                    else (
+                        16 * cfg.m * cfg.vp + 12
+                        if cfg.p == 4
+                        else 4 * cfg.p * cfg.m * cfg.vp
+                        + 4 * cfg.p * cfg.p
+                        - 13 * cfg.p
+                    )
+                )
+            )
+    ratio = device_type.p2p_ratio if device_type else 0.002
+    nb_send_recv = _count_p2p_messages(cfg)
     pp_comm = ratio * nb_send_recv / cfg.p * straggler / cfg.sp
     if debugger and debugger.is_enabled():
         debugger.info[PerfParts.PP_COMM] = pp_comm
@@ -375,16 +520,21 @@ def estimate_p2p_comm(cfg, straggler, ratio=MANUAL_P2P_RATIO, debugger=None):
 
 
 def estimate_perf(cfg, _, stage_perfs, stage_focused=None, debugger=None):
+    return estimate_perf(cfg, _, stage_perfs, stage_focused=stage_focused, debugger=debugger)
+def estimate_perf(cfg, _, stage_perfs, stage_focused=None, debugger=None):
     """wrapper"""
     return estimate_pipeline(cfg, stage_perfs, stage_focused=stage_focused, debugger=debugger)
 
 
 def estimate_p2p(cfg, ccfg, stage_perfs, debugger=None):
+    return estimate_p2p(cfg, ccfg, stage_perfs, debugger=debugger, device_type=None)
+def estimate_p2p(cfg, ccfg, stage_perfs, debugger=None, device_type=None):
     """wrapper"""
     if ccfg.ptype != P2PCommType.MANUAL:
         p2p = 0
     else:
         p2p = estimate_p2p_comm(cfg, max(stage_perfs), debugger=debugger)
+        p2p = estimate_p2p_comm(cfg, max(stage_perfs), device_type=device_type, debugger=debugger)
     if debugger and debugger.is_enabled():
         debugger.info[PerfParts.PP_COMM] = p2p
     return p2p
@@ -468,7 +618,6 @@ def estimate_layer_perf(*args, **kwargs):
     return stage_perfs
 
 
-
 def apply_regression_coefficients(coeffs, debugger, old_perf):
     """
     applies the coefficients present in regression's cache_file
@@ -476,6 +625,8 @@ def apply_regression_coefficients(coeffs, debugger, old_perf):
     compute_ratio = coeffs.get("COMPUTE")
     for part, raw in list(debugger.info.items()):
         if part in (PerfParts.TOTAL, PerfParts.MEMORY):
+            continue
+        if not isinstance(part, PerfParts):
             continue
         if part in (PerfParts.FW_COMPUTE,
                    PerfParts.BW_COMPUTE,
@@ -502,6 +653,7 @@ def apply_regression_coefficients(coeffs, debugger, old_perf):
             + real_buckets[RealParts.MP_WAIT][-1]
             + real_buckets[RealParts.EP_WAIT][-1]
             + real_buckets[RealParts.CP_WAIT][-1]
+            + real_buckets[RealParts.FSDP_WAIT][-1]
             + real_buckets[RealParts.PP_WAIT][-1]
     )
     debugger.info[PerfParts.TOTAL] = perf
@@ -556,6 +708,81 @@ def _finalize_perf(perf, cache_file, debugger, memory):
     return perf
 
 
+def _compute_stage_perfs(cfg, ccfg, stages, debugger, device_type):
+    """Compute per-stage performance including compute, comm and recompute."""
+    compute_perfs = estimate_comp(
+        cfg, ccfg, stages, with_recomp=False, debugger=debugger,
+        device_name=device_type.name, device_type=device_type
+    )
+    recompute_perfs = (
+        [0] * cfg.p
+        if ccfg.retype not in {RecType.COMPUTE_ONLY, RecType.WITH}
+        else estimate_comp(
+            cfg, ccfg, stages, with_recomp=True, debugger=debugger,
+            device_name=device_type.name, device_type=device_type
+        )
+    )
+    comm_perfs = estimate_comm(
+        cfg, ccfg, stages, device_type, with_recomp=False, debugger=debugger
+    )
+    logger.info("PerfEst: comm_perfs %s", comm_perfs)
+    recomm_perfs = (
+        [0] * cfg.p
+        if ccfg.retype not in {RecType.COMM_ONLY, RecType.WITH}
+        else estimate_comm(
+            cfg, ccfg, stages, device_type, with_recomp=True, debugger=debugger
+        )
+    )
+    stage_perfs = estimate_stage(
+        cfg, ccfg, compute_perfs, comm_perfs,
+        recompute_perfs, recomm_perfs, debugger=debugger,
+    )
+    logger.info("PerfEst: stage_perfs %s", stage_perfs)
+    return stage_perfs
+
+
+def _estimate_hsdp_perf(cfg, d_shard_val, device_type, debugger):
+    """Estimate performance using the standard stage-based model."""
+    mb = cfg.m if hasattr(cfg, "m") and cfg.m > 0 else 1
+    pp = cfg.p if hasattr(cfg, "p") and cfg.p > 0 else 1
+    n_lay = int(getattr(cfg, "n_lay", 60)) or 60
+    perf = compute_hsdp_flop_total(
+        cfg, d_shard_val, device_type,
+        fsdp_layer_count=n_lay, mb=mb, pp=pp,
+    )
+    perf *= mb
+    if debugger and debugger.is_enabled():
+        debugger.info.clear()
+        comp_total = _flop_mode_comp_comm(cfg, d_shard_val, device_type=device_type, mb=mb) * mb
+        tp_total = _flop_mode_tp_comm(cfg, d_shard_val, device_type=device_type, mb=mb) * mb
+        dp_total = _flop_mode_dp_comm(1.0, cfg, d_shard_val, device_type, mb=mb) * mb
+        shard_total = _flop_mode_fsdp_comm(
+            cfg, n_lay, d_shard_val, device_type, pp=pp, mb=mb,
+        ) * mb
+        pp_total = _flop_mode_pp_total_comm(cfg, d_shard_val, device_type=device_type, mb=mb) * mb
+        debugger.info[PerfParts.FW_COMPUTE] = comp_total / (1 + BACKWARD_RATIO)
+        debugger.info[PerfParts.BW_COMPUTE] = comp_total * BACKWARD_RATIO / (1 + BACKWARD_RATIO)
+        debugger.info[PerfParts.RECOMPUTE] = 0.0
+        debugger.info[PerfParts.DP_COMM] = dp_total
+        debugger.info[PerfParts.MP_COMM] = tp_total
+        debugger.info[PerfParts.EP_COMM] = 0.0
+        debugger.info[PerfParts.CP_COMM] = 0.0
+        debugger.info[PerfParts.FSDP_COMM] = shard_total
+        debugger.info[PerfParts.PP_COMM] = 0.0
+        debugger.info[PerfParts.BUBBLE] = pp_total
+    logger.info("PerfEst: HSDP_FLOP total perf %s", perf)
+    return perf
+
+
+def _estimate_non_hsdp_perf(cfg, ccfg, stage_perfs, debugger, device_type, stage_focused):
+    perf = estimate_perf(
+        cfg, ccfg, stage_perfs, stage_focused=stage_focused, debugger=debugger
+    )
+    perf += estimate_p2p(cfg, ccfg, stage_perfs, debugger=debugger, device_type=device_type)
+    logger.info("PerfEst: perf %s", perf)
+    return perf
+
+
 # performance estimation
 def estimate_performance(*args, **kwargs):
     """main estimation"""
@@ -593,11 +820,186 @@ def estimate_performance(*args, **kwargs):
         cfg.p,
         cfg.m,
     )
-
+    logger.debug(
+        "perf_model: DP = %d, TP(MP) = %d, EP = %d, PP = %d, MB = %d",
+        cfg.d, cfg.t, cfg.ep, cfg.p, cfg.m,
+    )
     logger.info(str(cfg))
     logger.info(stages)
     logger.info(ccfg)
 
+    stage_perfs = _compute_stage_perfs(cfg, ccfg, stages, debugger, device_type)
+
+    d_shard_val = cfg.d_shard_or_d
+    d_replicate = max(cfg.d // d_shard_val, 1) if d_shard_val > 0 else 1
+    is_hsdp = d_replicate > 1 and d_shard_val > 0
+
+    if is_hsdp:
+        perf = _estimate_hsdp_perf(cfg, d_shard_val, device_type, debugger)
+    else:
+        stage_focused = kwargs.get("stage_focused", None)
+        perf = _estimate_non_hsdp_perf(
+            cfg, ccfg, stage_perfs, debugger, device_type, stage_focused
+        )
+
+    cache_file = kwargs.get("cache_file")
+    return _finalize_perf(perf, cache_file, debugger, memory)  # / cfg.gbs
+
+
+def _estimate_op_bulk_comp_legacy(cfg, ccfg, stages, with_recomp=False, debugger=None):
+    """FW + BW (legacy inline version)"""
+    _ = debugger
+    table = op_table(cfg)
+
+    table_exp = deepcopy(table)  # Verify this with MF MoEV2
+    table_exp["n_ffMM"] *= (
+        cfg.hff_exp / cfg.hff * max(1, cfg.n_chosen_exp) * cfg.cap_fact
+    )
+    table_exp["n_ffBMM"] *= (
+        cfg.hff_exp / cfg.hff * max(1, cfg.n_chosen_exp) * cfg.cap_fact
+    )
+
+    lccfgs = get_layer_custom_configs(cfg)
+    layer_count = 0
+    idx_lccfg = 0
+
+    flops = []
+    for stage in stages:
+        flops += [0]
+        for chunk in stage:
+            for layer in chunk:
+                if layer == LayerType.EMBEDDING_LAYER:
+                    continue
+
+                if layer == LayerType.OUTPUT_LAYER:
+                    flops[-1] += (1 if cfg.dc_kv == 0 else cfg.n_mtp) * (
+                        1
+                        / 16  # bias_imbalance
+                        * 6
+                        * cfg.b
+                        * cfg.v
+                        * cfg.h
+                        * cfg.s
+                        * cfg.bytes_p
+                        / cfg.t
+                    )
+                    continue
+
+                layer_count += 1
+                if (
+                    idx_lccfg + 1 < len(lccfgs)
+                    and lccfgs[idx_lccfg][1] <= layer_count
+                ):
+                    layer_count = 0
+                    idx_lccfg += 1
+
+                flop = get_table_quantity(
+                    lccfgs[idx_lccfg][0],
+                    table_exp if (lccfgs[idx_lccfg][0].n_exp > 1) else table,
+                    layer,
+                    with_recomp,
+                )
+
+                if ccfg.ttype == PerformanceType.TIME:
+                    flop = estimate_comp_flop_time(lccfgs[idx_lccfg][0], flop)
+
+                flops[-1] += flop
+
+    return flops
+
+
+def estimate_stage_legacy(*args, **kwargs):
+    """stage level estimation (legacy *args version)"""
+    cfg = args[0]
+    ccfg = args[1]
+    compute_perfs = args[2]
+    comm_perfs = args[3]
+    recompute_perfs = args[4]
+    recomm_perfs = args[5]
+    debugger = kwargs.get("debugger", args[6] if len(args) > 6 else None)
+    comp_w = 1
+    comm_w = 1
+    if ccfg.rtype == RatioType.COMM_ONLY:
+        comp_w = 0
+    elif ccfg.rtype == RatioType.COMPUTE_ONLY:
+        comm_w = 0
+    elif ccfg.rtype == RatioType.STATIC:
+        comm_w = 10**4
+        ccfg.static_ratio = comm_w
+    elif ccfg.rtype == RatioType.DYNAMIC:
+        comm_w = get_dynamic_ratio(cfg)
+        ccfg.dynamic_ratio = comm_w
+    perf = [
+        comp_w * compute_perfs[i] + comm_w * comm_perfs[i]
+        for i in range(len(compute_perfs))
+    ]
+    logger.info("ratio = %s", comm_w)
+    # ignores comm recomp, to improve
+    re_perf = [
+        (
+            max(0, comp_w * (recompute_perfs[i] - compute_perfs[i]))
+            + max(0, comm_w * (recomm_perfs[i] - comm_perfs[i]))
+        )
+        / (1 + BACKWARD_RATIO)
+        for i in range(len(compute_perfs))
+    ]
+
+    if debugger and debugger.is_enabled():
+        for p in [PerfParts.DP_COMM, PerfParts.MP_COMM, PerfParts.EP_COMM, PerfParts.CP_COMM]:
+            debugger.info[p] = [
+                comm_w * c for c in debugger.info[p]
+            ]
+        debugger.info[PerfParts.FW_COMPUTE] = [
+            comp_w * comp / (1 + BACKWARD_RATIO) for comp in compute_perfs
+        ]
+        debugger.info[PerfParts.BW_COMPUTE] = [
+            fw * BACKWARD_RATIO for fw in debugger.info[PerfParts.FW_COMPUTE]
+        ]
+        debugger.info[PerfParts.RECOMPUTE] = re_perf
+
+    return [perf[i] + re_perf[i] for i in range(len(perf))]
+    #penalty_fn(stage)
+    #return stage
+
+
+def estimate_p2p_comm_legacy(cfg, straggler, ratio=MANUAL_P2P_RATIO, debugger=None):
+    """pipeline comm (legacy inline version)"""
+    nb_send_recv = 0
+    if cfg.vp == 1:
+        nb_send_recv = (
+            0
+            if cfg.p == 1
+            else (
+                4 * cfg.m
+                if cfg.p == 2
+                else 4 * cfg.p * cfg.m + 4 * cfg.p * cfg.p - 14 * cfg.p
+            )
+        )
+    else:
+        nb_send_recv = (
+            0
+            if cfg.p == 1
+            else (
+                8 * cfg.m * cfg.vp - 4 * cfg.m
+                if cfg.p == 2
+                else (
+                    16 * cfg.m * cfg.vp + 12
+                    if cfg.p == 4
+                    else 4 * cfg.p * cfg.m * cfg.vp
+                    + 4 * cfg.p * cfg.p
+                    - 13 * cfg.p
+                )
+            )
+        )
+    pp_comm = ratio * nb_send_recv / cfg.p * straggler / cfg.sp
+    if debugger and debugger.is_enabled():
+        debugger.info[PerfParts.PP_COMM] = pp_comm
+
+    return pp_comm
+
+
+def _estimate_performance_legacy(cfg, ccfg, stages, debugger, device_type, stage_focused, memory, cache_file):
+    """main estimation (legacy inline version)"""
     compute_perfs = estimate_comp(
         cfg, ccfg, stages, with_recomp=False, debugger=debugger
     )
@@ -619,7 +1021,6 @@ def estimate_performance(*args, **kwargs):
             cfg, ccfg, stages, device_type, with_recomp=True, debugger=debugger
         )
     )
-
     stage_perfs = estimate_stage(
         cfg,
         ccfg,
@@ -631,15 +1032,15 @@ def estimate_performance(*args, **kwargs):
     )
     logger.info("PerfEst: stage_perfs %s", stage_perfs)
 
-    stage_focused = kwargs.get("stage_focused", None)
+    if False: stage_focused = kwargs.get("stage_focused", None)
     perf = estimate_perf(
         cfg, ccfg, stage_perfs, stage_focused=stage_focused, debugger=debugger
     )
     perf += estimate_p2p(cfg, ccfg, stage_perfs, debugger=debugger)
     logger.info("PerfEst: perf %s", perf)
-
-    cache_file = kwargs.get("cache_file")
+    if False: cache_file = kwargs.get("cache_file")
     return _finalize_perf(perf, cache_file, debugger, memory)  # / cfg.gbs
+
 
 # TO-DO
 # Fix More Memory

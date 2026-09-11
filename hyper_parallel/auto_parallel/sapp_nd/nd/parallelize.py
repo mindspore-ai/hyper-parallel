@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """find parallelization"""
+# pylint: disable=W0125
 
 from contextlib import nullcontext
 import time
@@ -25,6 +26,7 @@ from typing import Any, Optional, Tuple
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_performance
+from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import CustomConfig
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.global_config import GlobalConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
@@ -139,6 +141,10 @@ class ParallelizeLayer:
             Dim.TP.set_bound(kv_heads)
             logger.warning(
                 "Because of n_kv_heads, MP will be limited to %s",
+                str(kv_heads),
+            )
+            logger.warning(
+                "Because of n_kv_heads, TP(MP) will be limited to %s",
                 str(kv_heads),
             )
         else:
@@ -312,6 +318,50 @@ class ParallelizeLayer:
         #     space = self.parallel_loops(space, pool, (dtpc_p, (mbs, 1)))
         return space
 
+    def _parallel_loops_fsdop(self, space, pool, dtpc_p, mbsn, ep, vpp, dp, tp):
+        """Iterate over FSDP/OP/d_shard/SP sub-space for one (ep, vpp)."""
+        for fsdp in self.config.bool_space(Dim.FSDP):
+            if fsdp and dp < 2:
+                continue
+            if fsdp and ep > 1:
+                continue
+            if fsdp:
+                op_space = [1]
+                d_shard_space = self.config.hsdp_space(dp)
+            else:
+                op_space = self.config.space(
+                    Dim.OP, self.config.max_op(dp, tp, ep)
+                )
+                d_shard_space = [1]
+            for op in op_space:
+                for d_shard in d_shard_space:
+                    for sp in self.config.bool_space(Dim.SP):
+                        space = self.inside_loop_nest(
+                            space,
+                            pool,
+                            (
+                                dtpc_p,
+                                mbsn,
+                                (ep, vpp, op, sp, fsdp, d_shard),
+                            ),
+                        )
+        return space
+
+    def _parallel_loops_legacy(self, space, pool, dtpc_p, mbsn, ep, vpp, dp, tp):
+        """Legacy parallel loops without FSDP/d_shard (preserved for reference)."""
+        for _ in [None]:
+            for _ in [None]:
+                for _ in [None]:
+                    for op in self.config.space(
+                        Dim.OP, self.config.max_op(dp, tp, ep)
+                    ):
+                        for sp in self.config.bool_space(Dim.SP):
+                            space = self.inside_loop_nest(
+                                space,
+                                pool,
+                                (dtpc_p, mbsn, (ep, vpp, op, sp)),
+                            )
+
     def parallel_loops(self, space: Any, pool: Any, dims: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 2: dimensions dependent on others"""
         dtpc_p, mbsn = dims
@@ -320,15 +370,9 @@ class ParallelizeLayer:
             for vpp in self.config.range_space(
                 Dim.VPP, min(4, pp, self.config.total_layer_num() // pp)
             ):
-                for op in self.config.space(
-                    Dim.OP, self.config.max_op(dp, tp, ep)
-                ):
-                    for sp in self.config.bool_space(Dim.SP):
-                        space = self.inside_loop_nest(
-                            space,
-                            pool,
-                            (dtpc_p, mbsn, (ep, vpp, op, sp)),
-                        )
+                space = self._parallel_loops_fsdop(
+                    space, pool, dtpc_p, mbsn, ep, vpp, dp, tp
+                )
         return space
 
     def inside_loop_nest(self, space: Any, pool: Any, dims: Any) -> Tuple[dict, int]:
@@ -417,10 +461,13 @@ class ParallelizeLayer:
                             cache_file=cache_file,
                         )
                         debugger.write()
+                        debugger.info.pop(Debug.PerfParts.TOTAL, None)
+                        debugger.info.pop(Debug.PerfParts.MEMORY, None)
                         debug_parts = list(debugger.info.keys())
                         values = list(debugger.info.values())
-                        del values[-2:]
-                        del debug_parts[-2:]
+                        if False:
+                            del values[-2:]
+                            del debug_parts[-2:]
                     else:
                         score = estimate_performance(
                             self.config.ccfg,
@@ -446,7 +493,42 @@ class ParallelizeLayer:
                 new_scored_space = scored_space
         return (sorted(new_scored_space, key=lambda x: x[2]), debug_parts)
 
-    def order_space_test_comm_classified(self, space: Any, order_by: Any = 2) -> Any:
+    def _score_single_config(self, config, ccfg, stage_focused=None):
+        """Score a single parallel config: estimate memory and performance."""
+        debugger = Debug.Debug(
+            config, info_type=Debug.PerfParts, enable=self.enable_debug
+        )
+        # If MB (microbatch number) is not in the config dimensions,
+        # inject it so set_strategy can compute m from gbs/d/b.
+        injected_mbn = False
+        if Dim.MBN not in config.dims_val and Dim.MBS in config.dims_val and Dim.DP in config.dims_val:
+            dp_val = config.dims_val[Dim.DP]
+            mbs_val = config.dims_val[Dim.MBS]
+            if isinstance(dp_val, int) and isinstance(mbs_val, int) and dp_val > 0 and mbs_val > 0:
+                mbn = self.global_batch_size // dp_val // mbs_val
+                if mbn > 0:
+                    config.dims_val[Dim.MBN] = mbn
+                    injected_mbn = True
+        self.config.set_parallel_config(config)
+        if injected_mbn:
+            del config.dims_val[Dim.MBN]
+        peak_mem = self.memory_estim()
+        est_kwargs = {
+            "debugger": debugger,
+            "device_type": self.machine.device,
+            "ccfg": ccfg,
+        }
+        if stage_focused is not None:
+            est_kwargs["stage_focused"] = stage_focused
+        score = estimate_performance(self.config.ccfg, **est_kwargs)
+        debugger.write()
+        debugger.info.pop(Debug.PerfParts.TOTAL, None)
+        debugger.info.pop(Debug.PerfParts.MEMORY, None)
+        debug_parts = list(debugger.info.keys())
+        values = list(debugger.info.values())
+        return peak_mem, score, debug_parts, values
+
+    def order_space_test_comm_classified_legacy(self, space, order_by=2):
         """Order the given space with performance estimation"""
         scored_space = []
         debug_parts = []
@@ -474,7 +556,7 @@ class ParallelizeLayer:
         del debug_parts[-2:]
         return (sorted(scored_space, key=lambda x: x[order_by]), debug_parts)
 
-    def order_space_test(self, space: Any, order_by: Any = 2) -> Any:
+    def order_space_test_legacy(self, space, order_by=2):
         """Order the given space with performance estimation"""
         scored_space = []
         debug_parts = []
@@ -499,6 +581,39 @@ class ParallelizeLayer:
 
             logger.info("config %s has score %f", str(config), score)
         del debug_parts[-2:]
+        return (sorted(scored_space, key=lambda x: x[order_by]), debug_parts)
+
+    def order_space_test_comm_classified(self, space, order_by=2, ccfg=None):
+        """Order the given space with performance estimation"""
+        if ccfg is None:
+            ccfg = CustomConfig()
+        scored_space = []
+        debug_parts = []
+        for config, real_time, real_comm_wait in space:
+            peak_mem, score, debug_parts, values = self._score_single_config(
+                config, ccfg, stage_focused=0,
+            )
+            scored_space.append(
+                (config, peak_mem, real_time, score, values, real_comm_wait)
+            )
+
+            logger.info("config %s has score %f", str(config), score)
+        return (sorted(scored_space, key=lambda x: x[order_by]), debug_parts)
+
+    def order_space_test(self, space, order_by=2, ccfg=None):
+        """Order the given space with performance estimation"""
+        if ccfg is None:
+            ccfg = CustomConfig()
+        scored_space = []
+        debug_parts = []
+        for config, real_time in space:
+            logger.info("Test config %s", str(config))
+            peak_mem, score, debug_parts, values = self._score_single_config(
+                config, ccfg,
+            )
+            scored_space.append((config, peak_mem, real_time, score, values))
+
+            logger.info("config %s has score %f", str(config), score)
         return (sorted(scored_space, key=lambda x: x[order_by]), debug_parts)
 
     def plot_title(self) -> str:

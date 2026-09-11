@@ -13,11 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """parser child class"""
+# pylint: disable=W0125
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
-
 
 class CostModelParserMindformers(_CostModelParser):
     """parser class for MindFormers format"""
@@ -29,6 +29,10 @@ class CostModelParserMindformers(_CostModelParser):
         """MindFormer format for strategy"""
         self.ccfg.has_op = self.config.parallel.enable_parallel_optimizer
         op_cfg = self.config.parallel.parallel_optimizer_config
+        # When op_cfg is None/falsy, has_grad_shard keeps its default
+        # (False).  This is intentional: without an explicit
+        # gradient_accumulation_shard config, grad sharding (and thus
+        # FSDP/ZeRO-2+) should not be assumed.
         if op_cfg:
             self.ccfg.has_grad_shard = op_cfg.gradient_accumulation_shard
         self.ccfg.vocab_emb_dp = self.config.parallel_config.vocab_emb_dp
@@ -53,8 +57,13 @@ class CostModelParserMindformers(_CostModelParser):
         self.ccfg.ep = max(
             1, self.config.parallel_config.expert_parallel
         )  # Expert parallel
+        self.ccfg.use_seq_parallel = self.config.parallel_config.use_seq_parallel
+        if False:
+            self.ccfg.sp = (
+                self.ccfg.t if self.config.parallel_config.use_seq_parallel else 1
+            )
         self.ccfg.sp = (
-            self.ccfg.t if self.config.parallel_config.use_seq_parallel else 1
+            self.ccfg.t if self.ccfg.use_seq_parallel else 1
         )  # Sequence parallel factor
         if self.ccfg.cp > 1 and self.ccfg.sp > 1:
             logger.warning(
@@ -161,6 +170,60 @@ class CostModelParserMindformers(_CostModelParser):
             self.ccfg.k_1st_dense = max(self.ccfg.k_1st_dense, cfg.first_k_dense_replace)
             self.config_dp_tp_exp(self.ccfg)
             self.ccfg.gmm = cfg.moe_grouped_gemm
+
+    def __config_parse_yaml_fp_bytes(self):
+        """Parse MindFormer format for FP byte storages and framework overhead."""
+        self.ccfg.bytes_p = self.ccfg.fp_bytes(
+            self.config.model.model_config.param_init_type,
+        )  # parameters
+        if not self.ccfg.bytes_p:
+            self.ccfg.bytes_p = self.ccfg.fp_bytes(
+                self.config.model.model_config.params_dtype
+            )
+        self.ccfg.bytes_compute = self.ccfg.fp_bytes(
+            self.config.model.model_config.compute_dtype
+        )  # activations
+        self.ccfg.bytes_softmax = self.ccfg.fp_bytes(
+            self.config.model.model_config.softmax_compute_type
+        )  # softmax output
+        if not self.ccfg.bytes_softmax:
+            self.ccfg.bytes_softmax = self.ccfg.fp_bytes(
+                self.config.model.model_config.softmax_compute_dtype
+            )
+        if not self.ccfg.bytes_p:
+            raise AttributeError("bytes_p not positive")
+        if not self.ccfg.bytes_compute:
+            raise AttributeError("bytes_compute not positive")
+        self.ccfg.bytes_grad = 4
+        self.ccfg.bytes_os = 4
+        self.ccfg.bytes_norm = 4
+
+        if not getattr(self.ccfg, "framework_overhead", 0):
+            cap_gb = self.ccfg.device_capacity.to_gb().size
+            self.ccfg.framework_overhead = int(
+                10.5 * 1024 ** 3 * (cap_gb / 32.0) ** 1.74
+            )
+        else:
+            self.ccfg.framework_overhead = getattr(
+                self.ccfg, "framework_overhead", 0
+            )
+
+    def __config_parse_yaml_optimizer_shard(self):
+        """Parse MindFormer format for optimizer parallel and FSDP shard factors."""
+        # Optimizer parallel factors
+        if self.ccfg.op_weight_shard:
+            self.ccfg.os_max_shard = self.ccfg.op_weight_shard
+        elif self.ccfg.has_op:
+            self.ccfg.os_max_shard = self.ccfg.d * self.ccfg.t
+        else:
+            self.ccfg.os_max_shard = 1
+        self.ccfg.fsdp = self.is_fsdp(self.ccfg)
+        if self.ccfg.fsdp:
+            self.ccfg.d_shard = self.ccfg.d
+            self.config_fsdp_shard(self.ccfg)
+        else:
+            self.ccfg.d_shard = 1
+            self.config_optimizer_shard(self.ccfg)
 
     def __config_parse_yaml_op_recompute(self):
         """MindFormer format for select recompute"""
@@ -274,14 +337,26 @@ class CostModelParserMindformers(_CostModelParser):
             self.ccfg.os_max_shard = 1
         self.config_optimizer_shard(self.ccfg)
 
+        self.__config_parse_yaml_fp_bytes()
+        self.__config_parse_yaml_optimizer_shard()
+
         # Other factors
         self.config_shard_emb()
         self.ccfg.shard_output_activ = 1
+        self.ccfg.recompute_slice_activation = (
+            self.config.recompute_config.recompute_slice_activation
+        )
         self.ccfg.shard_recompute_input = (
             self.ccfg.t
-            if self.config.recompute_config.recompute_slice_activation
+            if self.ccfg.recompute_slice_activation
             else 1
         )
+        if False:
+            self.ccfg.shard_recompute_input = (
+                self.ccfg.t
+                if self.config.recompute_config.recompute_slice_activation
+                else 1
+            )
         self.ccfg.s_fa = (
             self.ccfg.s
             if not self.config.model.model_config.use_flash_attention

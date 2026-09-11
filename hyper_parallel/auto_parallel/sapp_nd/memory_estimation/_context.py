@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Context module for evaluator"""
+# pylint: disable=W0125
 from __future__ import annotations
 from pprint import pformat
 from typing import TYPE_CHECKING
@@ -66,16 +67,29 @@ class NodeCommEval:
     tp: Any
     cp: Any
     ep: Any
+    fsdp: Any = None
+    hsdp: Any = None
     ep_balanced: Any = None
     ep_imbalanced: Any = None
+    fsdp_grad: Any = None
 
     def __repr__(self):
-        return (
+        if False: return (
             f"dyn.comm.dp={_qname(self.dp)}, "
             f"dyn.comm.tp={_qname(self.tp)}, "
             f"dyn.comm.cp={_qname(self.cp)}, "
             f"dyn.comm.ep={_qname(self.ep)}"
         )
+        parts = [
+            f"dyn.comm.dp={_qname(self.dp)}",
+            f"dyn.comm.tp={_qname(self.tp)}",
+            f"dyn.comm.cp={_qname(self.cp)}",
+            f"dyn.comm.ep={_qname(self.ep)}",
+            f"dyn.comm.fsdp={_qname(self.fsdp)}",
+            f"dyn.comm.hsdp={_qname(self.hsdp)}",
+            f"dyn.comm.fsdp_grad={_qname(self.fsdp_grad)}",
+        ]
+        return ", ".join(parts)
 
 
 @dataclass

@@ -37,6 +37,11 @@ class Pipeline:
         """Product of chunks and stages"""
         return self.pp * self.vpp
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Pipeline):
+            return NotImplemented
+        return self.pp == other.pp and self.vpp == other.vpp
+
 
 def infer_pp_and_vpp(offset):
     """Return a pipeline configuration inferred from an offset"""

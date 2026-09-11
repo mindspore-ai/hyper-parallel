@@ -13,11 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """parser child class"""
+# pylint: disable=W0125
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
-
 
 class CostModelParserMindspeed(_CostModelParser):
     """parser class for MindSpeed format"""
@@ -152,7 +152,10 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.cp = self.config.tmp.cp
         cc.d = self.config.tmp.dp
         cc.ep = max(cc.expert_model_parallel_size, self.config.tmp.ep)
-        cc.sp = cc.t if mod.sequence_parallel else 1
+        cc.use_seq_parallel = bool(mod.sequence_parallel)
+        if False:
+            cc.sp = cc.t if mod.sequence_parallel else 1
+        cc.sp = cc.t if cc.use_seq_parallel else 1
         if cc.cp > 1 and cc.sp > 1:
             logger.warning(
                 "sequence parallelism and context parallelism are both enabled"
@@ -223,6 +226,8 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.has_fa = True
         cc.has_op = True  # mod.use_distributed_optimizer
         cc.has_grad_shard = True
+        cc.has_op = bool(getattr(mod, "use_distributed_optimizer", False))
+        cc.has_grad_shard = cc.has_op
         # cc.vp_less_mem = False
         cc.has_clip = False
         cc.cp_algo = "colossalai_cp"
@@ -263,10 +268,18 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.bytes_grad = 4
         cc.bytes_os = 4
         cc.bytes_norm = 4
+        cc.framework_overhead = getattr(cc, "framework_overhead", 0)
 
         # Optimizer parallel factors
         cc.os_max_shard = cc.d * cc.t
-        self.config_optimizer_shard(cc)
+        cc.op_weight_shard = cc.os_max_shard if cc.has_op else 0
+        cc.fsdp = self.is_fsdp(cc)
+        if cc.fsdp:
+            cc.d_shard = cc.d
+            self.config_fsdp_shard(cc)
+        else:
+            cc.d_shard = 1
+            self.config_optimizer_shard(cc)
 
         # Other factors
         cc.shard_embed = cc.t * cc.d
@@ -292,6 +305,7 @@ class CostModelParserMindspeed(_CostModelParser):
         cc.comm_cp = float(cc.cp > 1)  # context parallel comm factor
         cc.comm_dp_overlap = 0.9  # transitional overlap, see _cost_model_variables.py
         cc.comm_tp_overlap = 0.5  # transitional overlap, see _cost_model_variables.py
+        self.config_comm_flag(cc)
         cc.gbs = cc.b * cc.d * cc.m
         cc.n_mtp = mod.mtp_num_layers
         # Recomputation

@@ -12,6 +12,9 @@ nodes_mem_comp :
       comm :
         dp: dp_comm_embed
         tp: tp_comm_embed
+        fsdp: fsdp_comm_embed
+        hsdp: hsdp_comm_embed
+        fsdp_grad: fsdp_grad_comm_embed
 
   # EvalTail
   tail :
@@ -25,6 +28,9 @@ nodes_mem_comp :
       activation : activ_output
       comm:
         dp: comm_output
+        fsdp: fsdp_comm_output
+        hsdp: hsdp_comm_output
+        fsdp_grad: fsdp_grad_comm_output
 
   # EvalBody
   body :
@@ -40,10 +46,16 @@ nodes_mem_comp :
         comm:
             dp : dp_comm_layer
             tp : tp_comm_layer
+            dp : dp_buffer_comm
+            tp : tp_buffer_comm
             ep : ep_comm_layer
             ep_balanced : ep_comm_layer_balanced
             ep_imbalanced : ep_comm_layer_imbalanced
             cp : cp_comm_layer
+            cp : cp_comm_buffer
+            fsdp : fsdp_buffer_comm
+            hsdp : hsdp_inter_buffer_comm
+            fsdp_grad : fsdp_grad_buffer_comm
         compute : &compute_lay
           router : router_compute_cost
           expert_balanced : expert_compute_cost_balanced
@@ -62,6 +74,13 @@ nodes_mem_comp :
         activation : fullrec_layer_activ
         comm:
             dp: dp_comm_layer
+            dp: dp_buffer_comm
+            tp: tp_buffer_comm
+            ep: ep_comm_layer
+            cp: cp_comm_buffer
+            fsdp: fsdp_buffer_comm
+            hsdp: hsdp_inter_buffer_comm
+            fsdp_grad: fsdp_grad_buffer_comm
 
 passes :
   vpp_less_memory : False
@@ -102,6 +121,7 @@ pp_sched :
       fun : pp_gpipe_micro_factor
       
 comm_expr : max(dp, tp, cp) + ep
+comm_expr : max(fsdp + hsdp, fsdp_grad) + max(dp, tp, cp) + ep
 
 # trace_fun: num_params_attn
 default_pp_sched : *def_sched

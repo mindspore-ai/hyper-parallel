@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=missing-class-docstring,missing-function-docstring
 """Unit tests for body.py: MoE/dense layer param splitting and memory estimation.
 
 Test IDs:
@@ -32,6 +33,8 @@ import os
 import unittest
 from unittest.mock import MagicMock, PropertyMock
 
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._backbone import _Backbone
+
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
@@ -46,6 +49,8 @@ def _make_ccfg(
     hff_exp=14336,
     ep=1,
     etp=1,
+    t=1,
+    cp=1,
     bytes_p=2,
     bytes_os=12,
     bytes_grad=2,
@@ -55,6 +60,8 @@ def _make_ccfg(
     shard_grad_non_exp=1.0,
     shard_grad_exp=1.0,
     shard_grad_exp_partial=1.0,
+    comm_fsdp=0,
+    fsdp_all_gather_buffer=0,
 ):
     """Create a mock CostModelConfig for body tests."""
     ccfg = MagicMock()
@@ -65,6 +72,8 @@ def _make_ccfg(
     ccfg.hff_exp = hff_exp
     ccfg.ep = ep
     ccfg.etp = etp
+    ccfg.t = t
+    ccfg.cp = cp
     ccfg.n_ffMM = 1
     ccfg.n_ffBMM = 0
     ccfg.bytes_p = bytes_p
@@ -76,6 +85,10 @@ def _make_ccfg(
     ccfg.shard_grad_non_exp = shard_grad_non_exp
     ccfg.shard_grad_exp = shard_grad_exp
     ccfg.shard_grad_exp_partial = shard_grad_exp_partial
+    ccfg.fsdp = False
+    ccfg.bytes_compute = bytes_p
+    ccfg.comm_fsdp = comm_fsdp
+    ccfg.fsdp_all_gather_buffer = fsdp_all_gather_buffer
     return ccfg
 
 
@@ -611,6 +624,20 @@ class TestActCpLayer(unittest.TestCase):
         result = EvalBody.act_cp_layer(ccfg, ctx)
         # kv_dim = 8 * 128 / 1 = 1024
         self.assertGreater(result.kv_cache_memory, 0)
+
+
+class TestBackboneAdjustFrameworkOverhead(unittest.TestCase):
+
+    def test_hsdp_adjustment(self):
+        method = _Backbone._Backbone__adjust_framework_overhead
+        result = method(1000, 4, 2, 2)
+        self.assertIsInstance(result, int)
+        self.assertGreater(result, 0)
+
+    def test_no_shard_no_adjustment(self):
+        method = _Backbone._Backbone__adjust_framework_overhead
+        result = method(1000, 1, 1, 2)
+        self.assertEqual(result, 1000)
 
 
 class TestConfigOptimizerShard(unittest.TestCase):

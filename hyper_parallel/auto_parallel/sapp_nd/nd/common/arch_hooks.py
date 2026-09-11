@@ -13,7 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Custom variables per model (expert knowledge)"""
+# pylint: disable=W0613,E0102
 import math
+
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
@@ -266,6 +268,8 @@ def custom_cm(ccfg):
     for idx, f in enumerate(ccfg.layer_custom_config):
 
         def wrap_hook(e, f=f):
+            pass
+        def wrap_hook(e, f = f):
             if isinstance(e, CostModelConfig):
                 e = CWrap(e)
             f[1](e)

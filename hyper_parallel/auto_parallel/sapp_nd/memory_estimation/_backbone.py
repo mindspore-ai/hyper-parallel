@@ -16,6 +16,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 import os
+import sys as _sys
 import ast
 import math
 import logging
@@ -191,6 +192,9 @@ class _Backbone:
                 "tp": MemType.AG_COMM,
                 "cp": MemType.AG_COMM,
                 "ep": MemType.A2A_COMM,
+                "fsdp": MemType.AG_COMM,
+                "hsdp": MemType.AG_COMM,
+                "fsdp_grad": MemType.AG_COMM,
             }
             comm_mem = {}
             for k, fun in vars(comm_eval_field).items():
@@ -233,7 +237,10 @@ class _Backbone:
                 name = f"Lay_{real_id}_{lay_type.name[0]}"
                 idx = chunk_id * len(dyn_mem_i) + lay_id
                 stat = self.mb(stat_mem_i[chunk_id][lay_id])
-                dyn = self.mb(dyn_mem_i[chunk_id][lay_id])
+                if isinstance(dyn_mem_i[chunk_id][lay_id], (list, tuple)):
+                    dyn = self.mb(sum(dyn_mem_i[chunk_id][lay_id]))
+                else:
+                    dyn = self.mb(dyn_mem_i[chunk_id][lay_id])
                 ax.bar(
                     0.1,
                     [dyn],
@@ -359,7 +366,12 @@ class _Backbone:
             }
         for mem_type in list(MemType):
             val = self._ctx.accu_mem_type[mem_type]
-            stage_logs[stage_id].accu_mem_type[mem_type] += val
+            if mem_type in (MemType.AG_COMM, MemType.A2A_COMM):
+                stage_logs[stage_id].accu_mem_type[mem_type] = max(
+                    stage_logs[stage_id].accu_mem_type[mem_type], val
+                )
+            else:
+                stage_logs[stage_id].accu_mem_type[mem_type] += val
 
     def __preprocess_layer_custom_config_list(self, stages: list) -> list:
         """flatten layer_custom_config for backbone estimation"""
@@ -489,7 +501,11 @@ class _Backbone:
 
         stage_misc = {
             "stat": [[[0 for _ in c] for c in s] for s in stages],
-            "dyn": [[[0 for _ in c] for c in s] for s in stages],
+            "dyn": (
+                [[[(0, 0) for _ in c] for c in s] for s in stages]
+                if os.environ.get("_SAPP_LEGACY_DYN") != "1"
+                else [[[0 for _ in c] for c in s] for s in stages]
+            ),
             "logs": [Config({}) for _ in range(self._ccfg.p)],
         }
         # tmp_ppb_lay_desc = []  # PPB purpose
@@ -612,9 +628,21 @@ class _Backbone:
                     self._ctx.current_node = node
                     static_mem = self._inner_static_mem()
                     sm["stat"][stage_id][chunk_id][lay_id] = static_mem
-                    sm["dyn"][stage_id][chunk_id][lay_id] = sum(
-                        self._inner_dynamic_mem()
-                    )
+                    dyn_val = self._inner_dynamic_mem()
+                    if isinstance(dyn_val, tuple):
+                        sm["dyn"][stage_id][chunk_id][lay_id] = dyn_val
+                    else:
+                        sm["dyn"][stage_id][chunk_id][lay_id] = sum(
+                            self._inner_dynamic_mem()
+                        )
+                    if os.environ.get("_SAPP_DEBUG_DYN") == "1":
+                        _sys.stderr.write(
+                            f"DEBUG_DYN stage={stage_id} chunk={chunk_id} lay={lay_id} "
+                            f"node={node} active={dyn_val[0] if isinstance(dyn_val, tuple) else dyn_val} "
+                            f"comm={dyn_val[1] if isinstance(dyn_val, tuple) else 0} "
+                            f"mf={self._ctx.micro_factor} h={self._ccfg.h} "
+                            f"hff={self._ccfg.hff} t={self._ccfg.t}\n"
+                        )
                     if verbose:
                         logger.info("pp micro factor for dynamic: %s",self._ctx.micro_factor)
                     # PPB Purpose
@@ -634,7 +662,99 @@ class _Backbone:
                         self._ppb_obj.add_to_ppb_list(ppb_lay_desc, desc)
                 self.__update_stage_logs(sm["logs"], stage_id)
 
-    def __postprocess_stages(self, *args):
+    def __compute_raw_dynamic(self, num_stages, stages, record_lay_types, sm, safety_buffer):
+        """Compute raw dynamic memory per stage."""
+        raw_dyn = []
+        for stage_id in range(num_stages):
+            act_sum = sum(
+                sum(aval for aval, _ in cell) for cell in sm["dyn"][stage_id]
+            )
+            comm_peak = max(
+                max(comm for _, comm in cell) for cell in sm["dyn"][stage_id]
+            )
+            dyn = act_sum + comm_peak
+            self._ctx.init_tmp_buff()
+            if not self._ccfg.freeze:
+                dyn += self._overhead_obj.estimate(
+                    stages, stage_id, record_lay_types
+                )
+                self.__update_stage_logs(sm["logs"], stage_id)
+            if dyn > 0:
+                dyn += safety_buffer
+            raw_dyn.append(dyn)
+        return raw_dyn
+
+    @staticmethod
+    def __adjust_framework_overhead(fw_oh: int, d_shard: int, d_replicate: int, tp: int,
+                                     ccfg=None) -> int:
+        """Adjust framework overhead based on FSDP/HSDP/TP configuration."""
+        hsdp_coeff = getattr(ccfg, 'fw_oh_hsdp_shard_coeff', 0.03) if ccfg else 0.03
+        fsdp_coeff = getattr(ccfg, 'fw_oh_fsdp_shard_coeff', 0.01) if ccfg else 0.01
+        rep_discount = getattr(ccfg, 'fw_oh_replicate_discount', 0.025) if ccfg else 0.025
+        shard_rep_interact = getattr(ccfg, 'fw_oh_shard_replicate_interact', 0.03) if ccfg else 0.03
+        tp_threshold = getattr(ccfg, 'fw_oh_tp_hsdp_threshold', 8) if ccfg else 8
+        tp_extra_ratio = getattr(ccfg, 'fw_oh_tp_hsdp_extra_ratio', 0.28) if ccfg else 0.28
+
+        if fw_oh > 0 and d_shard > 1:
+            if d_replicate > 1:
+                fw_oh = int(fw_oh * (1.0 + hsdp_coeff * (d_shard - 1)))
+            else:
+                fw_oh = int(fw_oh * (1.0 + fsdp_coeff * (d_shard - 1)))
+        if fw_oh > 0 and d_replicate > 1:
+            fw_oh = int(fw_oh / (1.0 + rep_discount * (d_replicate - 1)))
+        if fw_oh > 0 and d_shard > 1 and d_replicate > 1:
+            fw_oh = int(fw_oh / (1.0 + shard_rep_interact * (d_shard - 1) * (d_replicate - 1) / d_shard))
+        if fw_oh > 0 and d_replicate > 1 and tp >= tp_threshold:
+            tp_hsdp_extra = int(fw_oh * tp_extra_ratio)
+            fw_oh += tp_hsdp_extra
+        return fw_oh
+
+    def __build_stage_insight(
+        self, stage_id, raw_dyn, total_raw, total_fw_oh,
+        num_stages, sm, verbose, spec_stage_id, insights,
+    ):
+        """Build memory insight dict for a single stage."""
+        ins = {}  # Mem Insights purpose
+        ins["Static"] = sum(
+            sum(mem for mem in c) for c in sm["stat"][stage_id]
+        )
+        ins["Dynamic"] = raw_dyn[stage_id]
+        if total_raw > 0 and ins["Dynamic"] > 0:
+            fw_oh_share = total_fw_oh * (
+                0.5 / num_stages + 0.5 * raw_dyn[stage_id] / total_raw
+            )
+            ins["Dynamic"] += int(fw_oh_share)
+        elif ins["Dynamic"] > 0:
+            ins["Dynamic"] += total_fw_oh // num_stages
+        stage_accu = sm["logs"][stage_id].accu_mem_type
+        ins["ModelParameters"] = self.mb(stage_accu[MemType.MODEL_PARAM])
+        ins["OptimizerStates"] = self.mb(stage_accu[MemType.OPTIM_STATE])
+        ins["AccumulGradients"] = self.mb(stage_accu[MemType.ACCU_GRAD])
+        ins["Attn"] = self.mb(stage_accu[MemType.ATTN_ACTIV])
+        ins["FFn"] = self.mb(stage_accu[MemType.FFN_ACTIV])
+        ins["Norm"] = self.mb(stage_accu[MemType.NORM_ACTIV])
+        ins["AllGather Comm"] = self.mb(stage_accu[MemType.AG_COMM])
+        ins["All2All Comm"] = self.mb(stage_accu[MemType.A2A_COMM])
+
+        if self._ccfg.cp > 1:
+            cp_memory = EvalBody.act_cp_layer(self._ccfg, self._ctx)
+            cp_comm_buffer = EvalLayerComm.cp_comm_buffer(self._ccfg, self._ctx)
+
+            ins["CP KV Cache"] = self.mb(cp_memory.kv_cache_memory)
+            ins["CP Attn Scores"] = self.mb(cp_memory.attention_scores_memory)
+            ins["CP Softmax"] = self.mb(cp_memory.softmax_outputs_memory)
+            ins["CP Comm Buffer"] = self.mb(cp_comm_buffer)
+            ins["CP Reduction"] = self.mb(cp_memory.total_reduction)
+
+        ins["Node Log"] = sm["logs"][stage_id].node_compute_log
+        # VERBOSE
+        if verbose and spec_stage_id in (-1, stage_id):
+            self.__verbose_insights(sm, stage_id, ins)
+        ins["Static"] = self.mb(ins["Static"])
+        ins["Dynamic"] = self.mb(ins["Dynamic"])
+        insights.append(ins)
+
+    def __postprocess_stages_legacy(self, *args):  # pylint: disable=W0238
         """Build memory insights from raw stage evaluation buffers."""
         stages, record_lay_types = args[0], args[1]
         sm = args[2]
@@ -684,6 +804,41 @@ class _Backbone:
             ins["Static"] = self.mb(ins["Static"])
             ins["Dynamic"] = self.mb(ins["Dynamic"])
             insights += [ins]
+
+    def __postprocess_stages(self, *args):
+        """Build memory insights from raw stage evaluation buffers."""
+        stages, record_lay_types = args[0], args[1]
+        sm = args[2]
+        verbose, spec_stage_id = args[3], args[4]
+        insights = args[5]
+        num_stages = self._ccfg.p
+        safety_buffer = int(getattr(self._ccfg, 'safety_buffer_gb', 1)) * 1024 * 1024 * 1024
+        raw_dyn = self.__compute_raw_dynamic(num_stages, stages, record_lay_types, sm, safety_buffer)
+        if os.environ.get("_SAPP_DEBUG_DYN") == "1":
+            for sid in range(num_stages):
+                act_s = sum(
+                    sum(aval for aval, _ in cell) for cell in sm["dyn"][sid]
+                )
+                comm_p = max(
+                    max(comm for _, comm in cell) for cell in sm["dyn"][sid]
+                )
+                _sys.stderr.write(
+                    f"DEBUG_POST stage={sid} act_sum={act_s/(1024**2):.1f}MB "
+                    f"comm_peak={comm_p/(1024**2):.1f}MB "
+                    f"raw_dyn={raw_dyn[sid]/(1024**2):.1f}MB\n"
+                )
+        total_raw = sum(raw_dyn)
+        fw_oh = self._ccfg.framework_overhead
+        d_shard = self._ccfg.d_shard_or_d
+        d_replicate = self._ccfg.d // d_shard if d_shard > 0 else 1
+        tp = self._ccfg.t
+        fw_oh = self.__adjust_framework_overhead(fw_oh, d_shard, d_replicate, tp, ccfg=self._ccfg)
+        total_fw_oh = fw_oh * num_stages
+        for stage_id in range(num_stages):
+            self.__build_stage_insight(
+                stage_id, raw_dyn, total_raw, total_fw_oh, num_stages,
+                sm, verbose, spec_stage_id, insights,
+            )
 
     def __verbose_insights(self, *args):
         """logging purpose"""

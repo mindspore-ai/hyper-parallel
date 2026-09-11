@@ -42,6 +42,7 @@ class EvaluatorV2(_Utils, _HookManager):
         self.ppb = None
         super().__init__(*args, **kwargs)
         self._child_cls = self
+        self.ppb = None
 
     def reset_config(self) -> None:
         """reset current config"""
@@ -96,6 +97,8 @@ class EvaluatorV2(_Utils, _HookManager):
         self, stages: list = None, ppb_format=1, device_type=Hard.Device_A2
     ) -> Dict:
         """PPB's input"""
+        # pylint: disable=W0105
+        """Estimate per-layer memory footprint."""
         logger.info(device_type)
         if self.ppb:
             return self.ppb

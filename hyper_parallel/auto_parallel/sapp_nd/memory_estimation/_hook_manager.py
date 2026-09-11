@@ -157,6 +157,9 @@ class _HookManager(_Backbone):
         dyn_ep_comm = kwargs.get("dyn_ep_comm", c_comm)
         dyn_ep_comm_balanced = kwargs.get("dyn_ep_comm_balanced", None)
         dyn_ep_comm_imbalanced = kwargs.get("dyn_ep_comm_imbalanced", None)
+        dyn_fsdp_comm = kwargs.get("dyn_fsdp_comm", c_comm)
+        dyn_hsdp_comm = kwargs.get("dyn_hsdp_comm", c_comm)
+        dyn_fsdp_grad_comm = kwargs.get("dyn_fsdp_grad_comm", c_comm)
         if not self.__is_valid_eval_func(dyn_dp_comm):
             dyn_dp_comm = self._ctx.node_eval[target_node].dyn.comm.dp
         if not self.__is_valid_eval_func(dyn_tp_comm):
@@ -165,6 +168,21 @@ class _HookManager(_Backbone):
             dyn_cp_comm = self._ctx.node_eval[target_node].dyn.comm.cp
         if not self.__is_valid_eval_func(dyn_ep_comm):
             dyn_ep_comm = self._ctx.node_eval[target_node].dyn.comm.ep
+        if not self.__is_valid_eval_func(dyn_fsdp_comm):
+            if target_node in self._ctx.node_eval:
+                dyn_fsdp_comm = self._ctx.node_eval[target_node].dyn.comm.fsdp
+            else:
+                dyn_fsdp_comm = 0
+        if not self.__is_valid_eval_func(dyn_hsdp_comm):
+            if target_node in self._ctx.node_eval:
+                dyn_hsdp_comm = self._ctx.node_eval[target_node].dyn.comm.hsdp
+            else:
+                dyn_hsdp_comm = 0
+        if not self.__is_valid_eval_func(dyn_fsdp_grad_comm):
+            if target_node in self._ctx.node_eval:
+                dyn_fsdp_grad_comm = self._ctx.node_eval[target_node].dyn.comm.fsdp_grad
+            if not self.__is_valid_eval_func(dyn_fsdp_grad_comm):
+                dyn_fsdp_grad_comm = 0
         comm_cls_obj = cls_obj
         if self.is_regular_layer(target_node):
             comm_cls_obj = EvalLayerComm
@@ -183,8 +201,11 @@ class _HookManager(_Backbone):
             self.__custom_getattr(comm_cls_obj, dyn_tp_comm),
             self.__custom_getattr(comm_cls_obj, dyn_cp_comm),
             self.__custom_getattr(comm_cls_obj, dyn_ep_comm),
+            self.__custom_getattr(comm_cls_obj, dyn_fsdp_comm),
+            self.__custom_getattr(comm_cls_obj, dyn_hsdp_comm),
             ep_balanced=ep_balanced,
             ep_imbalanced=ep_imbalanced,
+            fsdp_grad=self.__custom_getattr(comm_cls_obj, dyn_fsdp_grad_comm),
         )
 
     def __resolve_compute_fun(self, name):
@@ -434,6 +455,11 @@ class _HookManager(_Backbone):
             dyn_tp_comm=self.eval_cfg.nodes_mem_comp.head.dyn_fun.comm.tp,
             dyn_cp_comm=self.eval_cfg.nodes_mem_comp.head.dyn_fun.comm.cp,
             dyn_ep_comm=self.eval_cfg.nodes_mem_comp.head.dyn_fun.comm.ep,
+            dyn_fsdp_comm=self.eval_cfg.nodes_mem_comp.head.dyn_fun.comm.fsdp,
+            dyn_hsdp_comm=self.eval_cfg.nodes_mem_comp.head.dyn_fun.comm.hsdp,
+            dyn_fsdp_grad_comm=getattr(
+                self.eval_cfg.nodes_mem_comp.head.dyn_fun.comm, "fsdp_grad", 0
+            ),
         )
 
         # tail
@@ -449,6 +475,11 @@ class _HookManager(_Backbone):
             dyn_tp_comm=self.eval_cfg.nodes_mem_comp.tail.dyn_fun.comm.tp,
             dyn_cp_comm=self.eval_cfg.nodes_mem_comp.tail.dyn_fun.comm.cp,
             dyn_ep_comm=self.eval_cfg.nodes_mem_comp.tail.dyn_fun.comm.ep,
+            dyn_fsdp_comm=self.eval_cfg.nodes_mem_comp.tail.dyn_fun.comm.fsdp,
+            dyn_hsdp_comm=self.eval_cfg.nodes_mem_comp.tail.dyn_fun.comm.hsdp,
+            dyn_fsdp_grad_comm=getattr(
+                self.eval_cfg.nodes_mem_comp.tail.dyn_fun.comm, "fsdp_grad", 0
+            ),
         )
 
         # body
@@ -460,7 +491,11 @@ class _HookManager(_Backbone):
                 "dyn_tp_comm": comm_cfg.tp,
                 "dyn_cp_comm": comm_cfg.cp,
                 "dyn_ep_comm": comm_cfg.ep,
+                "dyn_fsdp_comm": comm_cfg.fsdp,
+                "dyn_hsdp_comm": comm_cfg.hsdp,
             }
+            if hasattr(comm_cfg, "fsdp_grad"):
+                comm_kwargs["dyn_fsdp_grad_comm"] = comm_cfg.fsdp_grad
             if hasattr(comm_cfg, "ep_balanced"):
                 comm_kwargs["dyn_ep_comm_balanced"] = comm_cfg.ep_balanced
             if hasattr(comm_cfg, "ep_imbalanced"):

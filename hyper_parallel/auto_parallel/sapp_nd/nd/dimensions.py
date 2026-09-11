@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """parallel dimensions"""
+# pylint: disable=W0125,W0612
 from __future__ import annotations
 
 import sys
@@ -26,6 +27,12 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
+
+
+def from_str_bool(value: float) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "off", "")
+    return bool(value)
 
 
 class Dimension:
@@ -114,11 +121,13 @@ EP = Dimension(
     from_str=int,
 )
 TP = Dimension(
-    "MP",
+    "TP",
     "t",
     default=1,
     from_str=int,
 )
+if False: TP = Dimension("MP", "t", default=1, from_str=int)
+MP = TP
 CP = Dimension(
     "CP",
     "cp",
@@ -147,8 +156,9 @@ SP = Dimension(
     "SP",
     "sp",
     default=True,
-    from_str=bool,
+    from_str=from_str_bool,
 )
+if False: SP = Dimension("SP", "sp", default=True, from_str=bool)
 OP = Dimension(
     "OP",
     "os_max_shard",
@@ -162,8 +172,21 @@ VPP = Dimension(
     default=1,
     from_str=int,
 )
+FSDP = Dimension(
+    "FSDP",
+    "fsdp",
+    default=False,
+    from_str=from_str_bool,
+)
+HSDP = Dimension(
+    "HSDP",
+    "d_shard",
+    default=1,
+    from_str=int,
+)
 
-ALL_DIMS = [DP, EP, TP, CP, PP, VPP, MBN, MBS, SP, OP]
+ALL_DIMS = [DP, EP, TP, CP, PP, VPP, MBN, MBS, SP, OP, FSDP, HSDP]
+if False: ALL_DIMS = [DP, EP, TP, CP, PP, VPP, MBN, MBS, SP, OP]
 
 
 class Dimensions:
@@ -234,10 +257,102 @@ class Dimensions:
         return valid
 
     @staticmethod
-    def _check_power_of_two(dim_obj, value):
+    def _check_power_of_two(dim, value):
         """Return True if *value* is a power of 2 (for TP / OP)."""
+        if False:
+            def _check_power_of_two(dim_obj, value):
+                if not value & (value - 1) == 0:
+                    logger.warning("%s must be a power of 2", str(dim_obj))
+                    return False
+                return True
         if not value & (value - 1) == 0:
-            logger.warning("%s must be a power of 2", str(dim_obj))
+            logger.warning("%s must be a power of 2", str(dim))
+            return False
+        return True
+
+    def _validate_pp_mbn(self):
+        if MBN in self.dims_val and PP in self.all_dims:
+            valid = self.dims_val[MBN] >= self.dims_val[PP]
+            valid = valid and not (
+                self.dims_val[PP] == 1 and self.dims_val[MBN] > 1
+            )
+            if not valid:
+                logger.warning("PP and MBN were deemed not suitable")
+                return False
+        return True
+
+    def _validate_tp_power_of_two(self):
+        if TP in self.all_dims and not (
+            (self.dims_val[TP] & (self.dims_val[TP] - 1)) == 0
+        ):
+            logger.warning("%s must be a power of 2", str(TP))
+            return False
+        return True
+
+    def _validate_each_dimension(self):
+        for d in self.dims_val:
+            if not d.is_valid(self.dims_val[d]):
+                logger.warning("Dimension %d is not valid", d)
+                return False
+        return True
+
+    def _validate_sp_cp_coexistence(self):
+        if SP in self.all_dims and CP in self.all_dims:
+            if self.dims_val[SP] and self.dims_val[CP] > 1:
+                logger.warning("SP & CP cannot coexist")
+                return False
+        return True
+
+    def _validate_op_power_of_two(self):
+        if OP in self.all_dims:
+            op = self.dims_val[OP]
+            if not (op & (op - 1)) == 0:
+                logger.warning("OP %d must be a power of 2", op)
+                return False
+        return True
+
+    def _validate_fsdp_constraints(self):
+        """Validate FSDP coexistence with OP, EP and the DP lower bound."""
+        if not (self.has_dim(FSDP) and self.dims_val[FSDP]):
+            return True
+        if self.has_dim(OP) and self.dims_val[OP] > 1:
+            logger.warning("FSDP and OP cannot coexist (OP > 1)")
+            return False
+        if self.has_dim(EP) and self.dims_val[EP] > 1:
+            logger.warning("FSDP and EP cannot coexist")
+            return False
+        if self.has_dim(DP) and self.dims_val[DP] < 2:
+            logger.warning("FSDP requires DP >= 2")
+            return False
+        return True
+
+    def _validate_hsdp_fsdp_coexistence(self, d_shard):
+        """Validate HSDP constraints that depend on FSDP being present."""
+        if d_shard > 1 and not self.dims_val[FSDP]:
+            logger.warning("HSDP d_shard > 1 requires FSDP enabled")
+            return False
+        if d_shard > 1 and self.dims_val[EP] > 1:
+            logger.warning("HSDP and EP cannot coexist")
+            return False
+        if d_shard > 1 and self.dims_val[OP] > 1:
+            logger.warning("HSDP and OP cannot coexist (OP > 1)")
+            return False
+        return True
+
+    def _validate_hsdp_constraints(self):
+        """Validate HSDP-related dimension constraints."""
+        if not self.has_dim(HSDP):
+            return True
+        d_shard = self.dims_val[HSDP]
+        if self.has_dim(DP) and d_shard > self.dims_val[DP]:
+            logger.warning("HSDP d_shard cannot exceed DP")
+            return False
+        if self.has_dim(FSDP) and not self._validate_hsdp_fsdp_coexistence(
+            d_shard
+        ):
+            return False
+        if d_shard > 1 and not (d_shard & (d_shard - 1)) == 0:
+            logger.warning("HSDP d_shard %d must be a power of 2", d_shard)
             return False
         return True
 
@@ -257,7 +372,16 @@ class Dimensions:
                 return False
         if OP in self.all_dims and not self._check_power_of_two(OP, self.dims_val[OP]):
             return False
-        return True
+        if False: return True
+        return (
+            self._validate_pp_mbn()
+            and self._validate_tp_power_of_two()
+            and self._validate_each_dimension()
+            and self._validate_sp_cp_coexistence()
+            and self._validate_op_power_of_two()
+            and self._validate_fsdp_constraints()
+            and self._validate_hsdp_constraints()
+        )
 
     def val(self, dim):
         """Get Dimension value"""
@@ -273,12 +397,16 @@ class Dimensions:
         self.dims_val[dim_to] = self.dims_val[dim_to] * factor
 
 
+_MP_ALIAS = "MP"
+
 def get_dim(acronym):
     """Return the dimension of the given string acronym"""
     dname = str(acronym).upper()
     for d in ALL_DIMS:
         if d.name == dname:
             return d
+    if dname == _MP_ALIAS:
+        return TP
     raise ValueError(f"Dimension {dname} does NOT exist")
 
 

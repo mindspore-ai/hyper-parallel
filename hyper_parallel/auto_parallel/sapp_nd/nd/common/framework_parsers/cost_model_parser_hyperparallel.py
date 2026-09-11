@@ -19,11 +19,11 @@ import importlib.util
 import time
 import sys
 import os
+
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
-
 
 class CostModelParserHyperparallel(_CostModelParser):
     """parser class for HyperParallel format"""
@@ -144,6 +144,13 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.__parse_strat()
         self.__parse_moe()
         self.config_optimizer_shard(self.ccfg)  # need to adapt FSDP
+        self.ccfg.fsdp = self.is_fsdp(self.ccfg)
+        d_shard = max(1, self.config.parallelism.data_parallel_shard_degree)
+        self.ccfg.d_shard = d_shard if self.ccfg.fsdp else 1
+        if self.ccfg.fsdp:
+            self.config_fsdp_shard(self.ccfg)
+        else:
+            self.config_optimizer_shard(self.ccfg)  # need to adapt FSDP
         self.config_comm_flag(self.ccfg)
         self.__parse_batch()
         self.__init_shard()
@@ -163,11 +170,14 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.p = max(1, self.config.parallelism.pipeline_parallel_degree)
         self.ccfg.cp = max(1, self.config.parallelism.context_parallel_degree)
         self.ccfg.ep = max(1, self.config.parallelism.expert_parallel_degree)
+        self.ccfg.use_seq_parallel = True
         self.ccfg.sp = self.ccfg.t
         self.ccfg.vp = 1
         self.ccfg.op_weight_shard = (
             self.config.parallelism.data_parallel_shard_degree * self.ccfg.t
         )
+        self.ccfg.has_op = self.ccfg.op_weight_shard > self.ccfg.t  # Assuming
+        self.ccfg.has_grad_shard = self.ccfg.has_op  # Assuming FSDP grad shard
         self.ccfg.os_max_shard = (
             self.ccfg.op_weight_shard if self.ccfg.op_weight_shard >= 1
             else self.ccfg.d * self.ccfg.t
@@ -292,7 +302,10 @@ class CostModelParserHyperparallel(_CostModelParser):
         """sharding vars"""
         self.ccfg.shard_embed = self.ccfg.t
         self.ccfg.shard_output_activ = True
+        self.ccfg.shard_output_activ = self.ccfg.t
+        self.ccfg.recompute_slice_activation = True
         self.ccfg.shard_recompute_input = True
+        self.ccfg.shard_recompute_input = self.ccfg.t
         self.ccfg.is_shard_mtp_param = True
 
     def __init_bytes(self):
@@ -303,3 +316,6 @@ class CostModelParserHyperparallel(_CostModelParser):
         self.ccfg.bytes_grad = 4
         self.ccfg.bytes_os = 4
         self.ccfg.bytes_norm = 4
+        self.ccfg.framework_overhead = getattr(
+            self.ccfg, "framework_overhead", 0
+        )

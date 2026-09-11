@@ -13,10 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """One configuration interface for parallelization"""
+# pylint: disable=W0101,W0125,W0612
 
 import copy
 from math import gcd
 
+from typing import Any, List
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
@@ -109,16 +111,20 @@ class GlobalConfig:
         if expert_num > 1:
             ep = self.dim_val(Dim.EP, parallel_config)
             dp = self.dim_val(Dim.DP, parallel_config)
+            tp = self.dim_val(Dim.TP, parallel_config)
             mp = self.dim_val(Dim.TP, parallel_config)
             logger.debug(
                 "moe valid ? EP %d <= E %d & EP %d <= DP %d * MP %d",
+                "moe valid ? EP %d <= E %d & EP %d <= DP %d * TP(MP) %d",
                 ep,
                 expert_num,
                 ep,
                 dp,
                 mp,
+                tp,
             )
             return ep <= min(expert_num, dp * mp)
+            return ep <= min(expert_num, dp * tp)
         return True
 
     def ep_constraints_valid(self, parallel_config):
@@ -164,6 +170,8 @@ class GlobalConfig:
         """Create a parallel config from parallel values"""
         logger.debug("dimensions considered: %s", str(self.dimensions))
 
+        if kwargs.get("tp") is None and kwargs.get("mp") is not None:
+            kwargs["tp"] = kwargs.pop("mp")
         dims = []
         # dims.append((Dim.DP, dp))
         for dim in self.dimensions:
@@ -180,12 +188,14 @@ class GlobalConfig:
     def make_parallel_config(self, dtpc_p, mbsn, evos_p):
         """Create a parallel config from parallel values"""
         logger.debug("dimensions considered: %s", str(self.dimensions))
-        (dp, mp, pp, cp) = dtpc_p
+        if False: (dp, mp, pp, cp) = dtpc_p
+        (dp, tp, pp, cp) = dtpc_p
         (mbs, mbn) = mbsn
-        (ep, vpp, op, sp) = evos_p
+        if False: (ep, vpp, op, sp) = evos_p
+        (ep, vpp, op, sp, fsdp, d_shard) = evos_p
         return self.make_parallel_config_args(
             dp=dp,
-            mp=mp,
+            tp=tp,
             pp=pp,
             cp=cp,
             mbs=mbs,
@@ -194,6 +204,8 @@ class GlobalConfig:
             vpp=vpp,
             op=op,
             sp=sp,
+            fsdp=fsdp,
+            hsdp=d_shard,
         )
 
     def set_parallel_config(self, parallel_config):
@@ -264,6 +276,15 @@ class GlobalConfig:
         if dim in self.dimensions:
             return [False, True]
         return [dim.from_config(self.ccfg)]
+
+    def hsdp_space(self, dp: int) -> List[Any]:
+        if Dim.HSDP not in self.dimensions:
+            return [dp]
+        power_of_2_divisors = Hard.all_divisors(dp)
+        valid = [s for s in power_of_2_divisors if 2 <= s < dp]
+        if not valid:
+            return [dp]
+        return [dp] + valid
 
     def max_op(self, dp, tp, ep):
         """Compute bound for dimension OP"""

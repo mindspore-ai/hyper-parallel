@@ -13,7 +13,10 @@
 # limitations under the License.
 # ============================================================================
 """Experimental : Comm time"""
+# pylint: disable=E0102,W0125,C0103,W0612,W0613,R1702
 from copy import deepcopy
+from math import log10, log2
+
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
@@ -45,8 +48,111 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import
     compute_kv_dim,
     CostModelConfig,
 )
-
 COUNT_OPTIMIZER = False
+
+_LOG10_MB_FLOOR = -3.0
+_LOG10_MB_RANGE = 5.0
+
+
+def _get_flop_coeffs(device_type, dimension, sub_key):
+    """Get FLOP-mode regression coefficients from device_type."""
+    if device_type is not None and hasattr(device_type, 'flop_coeffs'):
+        dim_coeffs = device_type.flop_coeffs.get(dimension, {})
+        if dim_coeffs:
+            result = dim_coeffs.get(sub_key, {})
+            if result:
+                return result
+    fallback = Hard.device_map.get("V4")
+    if fallback and fallback.flop_coeffs:
+        dim_coeffs = fallback.flop_coeffs.get(dimension, {})
+        result = dim_coeffs.get(sub_key, {})
+        if result:
+            return result
+    return {}
+
+
+def _compute_hsdp_features(cfg, d_shard_val, device_type, mb=1):
+    """Compute shared derived features for HSDP/FSDP FLOP-mode models."""
+    d_val = cfg.d if getattr(cfg, "d", 1) > 0 else 1
+    tp_val = max(cfg.t if getattr(cfg, "t", 1) > 0 else 1, 1)
+    cp_val = max(cfg.cp if getattr(cfg, "cp", 1) > 0 else 1, 1)
+    d_replicate = max(d_val // d_shard_val, 1) if d_shard_val > 0 else 1
+
+    sg = d_shard_val * cp_val * tp_val
+    default_dev = Hard.device_map.get("V4", Hard.Device_A2)
+    dev_per_node = device_type.intra_node_num() if device_type else default_dev.intra_node_num()
+    cross = 1.0 if sg * d_replicate > dev_per_node else 0.0
+    inv_sg = 1.0 / sg if sg > 0 else 0.0
+    inv_tp = 1.0 / tp_val if tp_val > 0 else 0.0
+    ag_vol = 1.0 - 1.0 / d_shard_val if d_shard_val > 0 else 0.0
+    mb_val = max(mb, 1)
+
+    return {
+        "tp": tp_val, "cp": cp_val, "d": d_val,
+        "d_shard": d_shard_val, "d_replicate": d_replicate,
+        "sg": sg, "inv_sg": inv_sg, "inv_tp": inv_tp,
+        "ag_vol": ag_vol, "cross": cross,
+        "cross_inv_tp": cross / tp_val if tp_val > 0 else 0.0,
+        "cross_ag_vol": cross * ag_vol,
+        "cross_d_rep": cross * d_replicate,
+        "cross_sg": cross * sg,
+        "inv_sg_d_rep": inv_sg * d_replicate,
+        "ag_vol_d_rep": ag_vol * d_replicate,
+        "log2_d_rep": log2(d_replicate) if d_replicate > 0 else 0.0,
+        "log2_m": log2(mb_val) if mb_val > 0 else 0.0,
+        "m": mb_val, "pp": 1, "dev_per_node": dev_per_node,
+    }
+
+
+def _flop_mode_comp_comm(cfg, d_shard_val, device_type=None, mb=1):
+    """Estimate COMP cost for FLOP mode when d_replicate > 1 (HSDP)."""
+    f = _compute_hsdp_features(cfg, d_shard_val, device_type, mb=mb)
+    if f["d_replicate"] <= 1:
+        return 0.0
+    c = _get_flop_coeffs(device_type, "comp", "hsdp")
+    if not c:
+        return 0.0
+    total = (
+        c.get("INTERCEPT", 0)
+        + c.get("TP", 0) * f["tp"]
+        + c.get("INV_TP", 0) * f["inv_tp"]
+        + c.get("DP", 0) * f["d"]
+        + c.get("AG_VOL", 0) * f["ag_vol"]
+        + c.get("CROSS_INV_TP", 0) * f["cross_inv_tp"]
+        + c.get("LOG2_M", 0) * f["log2_m"]
+    )
+    score = total / f["m"]
+    logger.info(
+        "FLOP_COMP_HSDP: d=%d tp=%d d_shard=%d d_rep=%d m=%d score=%.2f",
+        f["d"], f["tp"], f["d_shard"], f["d_replicate"], f["m"], score,
+    )
+    return score
+
+
+def _msg_size_efficient_bw(msg_bytes: float, peak_bw_gbps: float,
+                            small_eff: float = 0.5,
+                            large_eff: float = 0.7) -> float:
+    """Compute message-size-dependent effective bandwidth in bytes/s.
+
+    Small messages suffer from protocol overhead (low efficiency);
+    large messages approach peak bandwidth.  Uses a smooth transition
+    based on log10(msg_size_in_MB).
+
+    Args:
+        msg_bytes: Per-rank message size in bytes.
+        peak_bw_gbps: Peak link bandwidth in GB/s.
+        small_eff: Efficiency for small messages (< 1 MB).
+        large_eff: Efficiency for large messages (> 100 MB).
+
+    Returns:
+        Effective bandwidth in bytes/s.
+    """
+    msg_mb = msg_bytes / 1e6
+    if msg_mb <= 0:
+        return peak_bw_gbps * 1e9 * small_eff
+    t = max(0.0, min(1.0, (log10(max(msg_mb, 1e-6)) - _LOG10_MB_FLOOR) / _LOG10_MB_RANGE))
+    eff = small_eff + (large_eff - small_eff) * t
+    return peak_bw_gbps * 1e9 * eff
 
 
 def _cp_resolve_topology(cp, device_per_node, bw_intra, bw_inter):
@@ -67,12 +173,26 @@ def _cp_resolve_topology(cp, device_per_node, bw_intra, bw_inter):
 
 
 def _cp_comm_zero(ccfg):
+    return _cp_comm_zero(ccfg, device_type=None)
+def _cp_comm_zero(ccfg, device_type=None):
     """Return a zero CPCommunicationCost for cp <= 1."""
+    overlap_ratio = device_type.cp_overlap_ratio if device_type else 0.5
+    if False:
+        return CPCommunicationCost(
+            kv_volume_per_step=0.0, total_kv_volume=0.0, comm_volume=0.0,
+            ring_steps=0, ring_directions=0,
+            total_comm_time=0.0, exposed_comm_time=0.0,
+            overlap_ratio=0.5, effective_bandwidth=0.0,
+            topology="none", cp_degree=int(ccfg.cp),
+            seq_len=int(ccfg.s), batch_size=int(ccfg.b),
+            attention_type=AttentionType.MHA, kv_dim=0,
+            cp_algo=CPAlgo.COLOSSALAI_CP,
+        )
     return CPCommunicationCost(
         kv_volume_per_step=0.0, total_kv_volume=0.0, comm_volume=0.0,
         ring_steps=0, ring_directions=0,
         total_comm_time=0.0, exposed_comm_time=0.0,
-        overlap_ratio=0.5, effective_bandwidth=0.0,
+        overlap_ratio=overlap_ratio, effective_bandwidth=0.0,
         topology="none", cp_degree=int(ccfg.cp),
         seq_len=int(ccfg.s), batch_size=int(ccfg.b),
         attention_type=AttentionType.MHA, kv_dim=0,
@@ -84,8 +204,17 @@ def _cp_comm_cost_common(volume_per_step, total_kv_volume, comm_volume,
                           ring_steps, ring_directions, cp, s, b,
                           attention_type, kv_dim, cp_algo, topology,
                           effective_bandwidth):
+    return _cp_comm_cost_common(volume_per_step, total_kv_volume, comm_volume,
+                                ring_steps, ring_directions, cp, s, b,
+                                attention_type, kv_dim, cp_algo, topology,
+                                effective_bandwidth, device_type=None)
+def _cp_comm_cost_common(volume_per_step, total_kv_volume, comm_volume,
+                          ring_steps, ring_directions, cp, s, b,
+                          attention_type, kv_dim, cp_algo, topology,
+                          effective_bandwidth, device_type=None):
     """Build CPCommunicationCost with standard time calculation."""
     overlap_ratio = 0.5
+    overlap_ratio = device_type.cp_overlap_ratio if device_type else 0.5
     total_comm_time = (total_kv_volume / (effective_bandwidth * 1e9)) * 1e3
     exposed_comm_time = total_comm_time * (1 - overlap_ratio)
     return CPCommunicationCost(
@@ -105,6 +234,8 @@ def _cp_comm_cost_common(volume_per_step, total_kv_volume, comm_volume,
 
 
 def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPCommunicationCost:
+    return cp_comm_layer_detailed(ccfg, ctx, device_type=None)
+def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None, device_type=None) -> CPCommunicationCost:
     """Estimate CP communication cost with detailed breakdown.
 
     Ring CP (colossalai_cp / hybrid_cp):
@@ -120,7 +251,9 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
         Total volume = 2 * per-All2All volume.
     """
     if ccfg.cp <= 1:
-        return _cp_comm_zero(ccfg)
+        if False:
+            return _cp_comm_zero(ccfg)
+        return _cp_comm_zero(ccfg, device_type=device_type)
 
     s, b = ccfg.s, ccfg.b
     cp = ccfg.cp
@@ -152,9 +285,14 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
                + ccfg.n_ffMM * ccfg.hff)
             / t
         )
+        if False:
+            return _cp_comm_cost_common(
+                a2a_vol, a2a_vol * 2, comm_vol, 0, 2, cp, s, b,
+                attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
         return _cp_comm_cost_common(
             a2a_vol, a2a_vol * 2, comm_vol, 0, 2, cp, s, b,
-            attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
+            attention_type, kv_dim, cp_algo, topology, effective_bandwidth,
+            device_type=device_type)
 
     kv_bytes = 4
     kv_vol_step = (s / cp) * b * kv_dim * kv_bytes
@@ -168,9 +306,14 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
            + ccfg.n_ffMM * ccfg.hff)
         / t
     )
+    if False:
+        return _cp_comm_cost_common(
+            kv_vol_step, total_kv, comm_vol, int(cp - 1), 2, cp, s, b,
+            attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
     return _cp_comm_cost_common(
         kv_vol_step, total_kv, comm_vol, int(cp - 1), 2, cp, s, b,
-        attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
+        attention_type, kv_dim, cp_algo, topology, effective_bandwidth,
+        device_type=device_type)
 
 
 def fill_dp_table(cfg, tables):
@@ -250,6 +393,328 @@ def fill_ep_table(cfg, tables, device_type):
     tables[Dim.EP] = table_ep
 
 
+def comm_embed_ouput(cfg):
+    """ "formula"""
+    comm_embed = cfg.bytes_compute * cfg.h * cfg.v / cfg.shard_embed
+    comm_output = cfg.h * cfg.v / cfg.t
+    return comm_embed, comm_output
+
+
+def prepare_context():
+    """context object"""
+    ctx = Context()
+    ctx.attn_num_p = EvalAttn.num_params_attn
+    ctx.ffn_num_p = EvalFFn.num_params_ffn
+    ctx.norm_num_p = EvalNorm.num_params_norm
+
+    ctx.node_eval[LayerType.EMBEDDING_LAYER] = NodeEval(
+        EvalHead.num_params_embed, None, None
+    )
+    ctx.node_eval[LayerType.OUTPUT_LAYER] = NodeEval(
+        EvalTail.num_params_output, None, None
+    )
+    ctx.node_eval[LayerType.NOT_REC_LAYER] = NodeEval(
+        EvalBody.num_params_layer, None, None
+    )
+    ctx.enable_accu_log = False
+    return ctx
+
+
+def _accumulate_layer_comm(comm, param):
+    """Accumulate per-layer communication volumes for DP, FSDP, TP, EP, CP."""
+    cfg = param["cfg"]
+    ctx = param["ctx"]
+    layer = ctx.current_node
+
+    fsdp_intra_vol = 0.0
+    hsdp_inter_vol = 0.0
+    tp_layer_count = 0
+    fsdp_layer_count = 0
+
+    is_fsdp_layer = (
+        layer not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
+    )
+    if is_fsdp_layer and param["flatten"]:
+        custom_fun = param["flatten"].pop(0)
+        if custom_fun:
+            custom_fun(cfg)
+        logger.info("is layer moe ? %s", cfg.n_exp > 1)
+        ctx.current_node = LayerType.NOT_REC_LAYER
+        logger.info("param ctx %s", ctx)
+        comm[Dim.DP] += EvalLayerComm.dp_comm_layer(cfg, ctx)
+        comm[Dim.FSDP] += EvalLayerComm.fsdp_comm_layer(cfg, ctx)
+        non_exp, routed, shared = ctx.eval.num_p(cfg, ctx)
+        exp = routed + shared
+        bc = cfg.bytes_compute
+        fsdp_intra_vol += non_exp * bc * 2
+        if cfg.n_exp > 1:
+            fsdp_intra_vol += exp * bc * 2
+        d_shard_local = cfg.d_shard_or_d
+        if getattr(cfg, "comm_hsdp", 0) > 0 and d_shard_local < cfg.d:
+            sharded_non_exp = non_exp / (d_shard_local * cfg.cp * cfg.t)
+            sharded_exp = exp / (d_shard_local * cfg.cp * cfg.t_exp) if cfg.n_exp > 1 else 0
+            hsdp_inter_vol += (sharded_non_exp + sharded_exp) * bc
+    fsdp_layer_count = 1 if is_fsdp_layer else 0
+
+    comm[Dim.TP] += EvalLayerComm.tp_comm_layer(cfg, ctx, 1)
+    tp_layer_count += 1
+    comm[Dim.EP] += EvalLayerComm.ep_comm_layer(cfg, ctx, 1)
+    comm[Dim.CP] += cp_comm_layer_detailed(cfg, ctx, device_type=param.get("device_type")).comm_volume
+
+    return fsdp_intra_vol, hsdp_inter_vol, tp_layer_count, fsdp_layer_count
+
+
+def _accumulate_layer_comm_inline_legacy(comm, param):
+    """Legacy inline layer comm accumulation (preserved for reference)."""
+    for _stage in [None]:
+        for _chunk in [None]:
+            for layer in [None]:
+                if (
+                    layer
+                    not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
+                    and param["flatten"]
+                ):
+                    custom_fun = param["flatten"].pop(0)
+                    if custom_fun:
+                        custom_fun(param["cfg"])
+                    logger.info("is layer moe ? %s", param["cfg"].n_exp > 1)
+                    param["ctx"].current_node = LayerType.NOT_REC_LAYER
+                    logger.info("param ctx %s", param["ctx"])
+                    comm[Dim.DP] += EvalLayerComm.dp_comm_layer(param["cfg"], param["ctx"])
+
+                comm[Dim.TP] += EvalLayerComm.tp_comm_layer(
+                    param["cfg"], param["ctx"], 1
+                )  # / 4 #* (param["cfg"].t - 1)
+                comm[Dim.EP] += EvalLayerComm.ep_comm_layer(
+                    param["cfg"], param["ctx"], 1
+                )  # * param["cfg"].ep
+                comm[Dim.CP] += cp_comm_layer_detailed(
+                    param["cfg"], param["ctx"]
+                ).comm_volume
+                # min(device_type.level_bound_number[0], param["cfg"].ep)
+                # comm_cp += EvalLayerComm.cp_comm_layer
+                # (param["cfg"], param["ctx"])
+
+
+def _flop_mode_fsdp_comm(cfg, fsdp_layer_count, d_shard_val, device_type, pp=1, mb=1):
+    """Estimate FSDP/HSDP communication cost for FLOP mode."""
+    if fsdp_layer_count <= 0 or d_shard_val <= 0:
+        return 0.0
+
+    f = _compute_hsdp_features(cfg, d_shard_val, device_type, mb=mb)
+    f["pp"] = max(pp, 1)
+    is_hsdp = f["d_replicate"] > 1
+
+    sub_key = "hsdp" if is_hsdp else "fsdp"
+    c = _get_flop_coeffs(device_type, "shard", sub_key)
+    if not c:
+        return 0.0
+
+    if is_hsdp:
+        total = (
+            c.get("INTERCEPT", 0)
+            + c.get("TP", 0) * f["tp"]
+            + c.get("SG", 0) * f["sg"]
+            + c.get("CROSS_AG_VOL", 0) * f["cross_ag_vol"]
+            + c.get("CROSS_INV_TP", 0) * f["cross_inv_tp"]
+            + c.get("INV_SG_D_REP", 0) * f["inv_sg_d_rep"]
+            + c.get("AG_VOL_D_REP", 0) * f["ag_vol_d_rep"]
+        )
+        return total / f["pp"] / f["m"]
+    per_layer = (
+        c.get("INTERCEPT", 0)
+        + c.get("INV_SG", 0) * f["inv_sg"]
+        + c.get("CROSS_INV_TP", 0) * f["cross_inv_tp"]
+        + c.get("D_SHARD", 0) * f["d_shard"]
+        + c.get("TP", 0) * f["tp"]
+    )
+    return per_layer * 2 * fsdp_layer_count / f["pp"] / f["m"]
+
+
+def _flop_mode_dp_comm(comm_dp_raw, cfg, d_shard_val, device_type, mb=1):
+    """Estimate DP communication cost for FLOP mode."""
+    if comm_dp_raw <= 0:
+        return 0.0
+
+    f = _compute_hsdp_features(cfg, d_shard_val, device_type, mb=mb)
+
+    if (cfg.fsdp or d_shard_val > 1) and d_shard_val > 0:
+        if f["sg"] <= 1:
+            return 0.0
+
+        if f["d_replicate"] > 1:
+            c = _get_flop_coeffs(device_type, "dp", "hsdp")
+            if not c:
+                return 0.0
+            dp_val = f["d_replicate"] * f["d_shard"]
+            total = (
+                c.get("INTERCEPT", 0)
+                + c.get("TP", 0) * f["tp"]
+                + c.get("DP", 0) * dp_val
+                + c.get("SG", 0) * f["sg"]
+                + c.get("AG_VOL", 0) * f["ag_vol"]
+                + c.get("D_REP", 0) * f["d_replicate"]
+                + c.get("CROSS_AG_VOL", 0) * f["cross_ag_vol"]
+            )
+            score = total / f["m"]
+            logger.info(
+                "FLOP_DP_HSDP: d=%d tp=%d d_shard=%d sg=%d d_rep=%d "
+                "cross=%.1f score=%.2f mb=%d raw=%.4f",
+                f["d"], f["tp"], f["d_shard"], f["sg"], f["d_replicate"],
+                f["cross"], score, f["m"], comm_dp_raw,
+            )
+            return score
+
+        return 0.0
+
+    logger.info(
+        "FLOP_DP_FALLBACK: d=%d tp=%d fsdp=%s d_shard=%d raw=%.4f result=0.0",
+        f["d"], f["tp"], cfg.fsdp, f["d_shard"],
+        comm_dp_raw,
+    )
+    return 0.0
+
+
+def _flop_mode_tp_comm(cfg, d_shard_val, device_type, mb=1):
+    """Estimate TP communication cost for FLOP mode when d_replicate > 1."""
+    f = _compute_hsdp_features(cfg, d_shard_val, device_type, mb=mb)
+    if f["d_replicate"] <= 1:
+        return 0.0
+    c = _get_flop_coeffs(device_type, "tp", "hsdp")
+    if not c:
+        return 0.0
+    total = (
+        c.get("INTERCEPT", 0)
+        + c.get("INV_TP", 0) * f["inv_tp"]
+        + c.get("INV_SG", 0) * f["inv_sg"]
+        + c.get("LOG2_D_REP", 0) * f["log2_d_rep"]
+        + c.get("CROSS_D_REP", 0) * f["cross_d_rep"]
+        + c.get("CROSS_SG", 0) * f["cross_sg"]
+        + c.get("M", 0) * f["m"]
+    )
+    score = total / f["m"]
+    logger.info(
+        "FLOP_TP_HSDP: d=%d tp=%d d_shard=%d sg=%d d_rep=%d "
+        "cross=%.1f m=%d score=%.2f",
+        f["d"], f["tp"], f["d_shard"], f["sg"], f["d_replicate"],
+        f["cross"], f["m"], score,
+    )
+    return score
+
+
+def _flop_mode_pp_total_comm(cfg, d_shard_val, device_type, mb=1):
+    """Estimate PP_TOTAL cost for FLOP mode when d_replicate > 1 (HSDP)."""
+    f = _compute_hsdp_features(cfg, d_shard_val, device_type, mb=mb)
+    if f["d_replicate"] <= 1:
+        return 0.0
+    c = _get_flop_coeffs(device_type, "pp", "hsdp")
+    if not c:
+        return 0.0
+    total = (
+        c.get("INTERCEPT", 0)
+        + c.get("AG_VOL_D_REP", 0) * f["ag_vol_d_rep"]
+        + c.get("CROSS_SG", 0) * f["cross_sg"]
+        + c.get("M", 0) * f["m"]
+    )
+    score = total / f["m"]
+    logger.info(
+        "FLOP_PP_TOTAL_HSDP: d=%d tp=%d d_shard=%d sg=%d d_rep=%d "
+        "cross=%.1f m=%d score=%.2f",
+        f["d"], f["tp"], f["d_shard"], f["sg"], f["d_replicate"],
+        f["cross"], f["m"], score,
+    )
+    return score
+
+
+def compute_hsdp_flop_total(cfg, d_shard_val, device_type, fsdp_layer_count, mb=1, pp=1):
+    """Estimate performance using HSDP FLOP model."""
+    comp_score = _flop_mode_comp_comm(cfg, d_shard_val, device_type=device_type, mb=mb)
+    tp_score = _flop_mode_tp_comm(cfg, d_shard_val, device_type=device_type, mb=mb)
+    dp_score = _flop_mode_dp_comm(1.0, cfg, d_shard_val, device_type, mb=mb)
+    shard_score = _flop_mode_fsdp_comm(
+        cfg, fsdp_layer_count, d_shard_val, device_type, pp=pp, mb=mb,
+    )
+    pp_score = _flop_mode_pp_total_comm(cfg, d_shard_val, device_type, mb=mb)
+    total_score = comp_score + tp_score + shard_score + dp_score + pp_score
+    logger.info(
+        "HSDP_FLOP_TOTAL: comp=%.2f tp=%.2f shard=%.2f dp=%.2f pp=%.2f total=%.2f",
+        comp_score, tp_score, shard_score, dp_score, pp_score, total_score,
+    )
+    return total_score
+
+
+def _apply_flop_mode(comm, param, fsdp_layer_count):
+    """Apply FLOP-mode estimation to comm_time calculation."""
+    cfg = param["cfg"]
+    d_shard_val = cfg.d_shard_or_d
+    mb = cfg.m if hasattr(cfg, "m") and cfg.m > 0 else 1
+    pp = cfg.p if hasattr(cfg, "p") and cfg.p > 0 else 1
+
+    f = _compute_hsdp_features(cfg, d_shard_val, param["device_type"], mb=mb)
+    dev_per_node = f["dev_per_node"]
+
+    if f["d_replicate"] > 1:
+        comm[Dim.TP] = _flop_mode_tp_comm(
+            cfg, d_shard_val, param["device_type"], mb=mb,
+        )
+    else:
+        c = _get_flop_coeffs(param["device_type"], "tp", "fsdp")
+        if c:
+            tp_scaling = (c.get("A", 0) + c.get("B", 0) * f["tp"] + c.get("C", 0) / f["tp"]) / max(f["d"], 1)
+            comm[Dim.TP] *= max(1, f["tp"] // dev_per_node) * tp_scaling
+
+    comm[Dim.EP] *= max(1, param["cfg"].ep // dev_per_node)
+    comm[Dim.CP] *= max(1, param["cfg"].cp // dev_per_node)
+
+    dp_result = _flop_mode_dp_comm(comm[Dim.DP], cfg, d_shard_val, param["device_type"], mb=mb)
+    if dp_result > 0:
+        comm[Dim.DP] = dp_result
+
+    if (cfg.fsdp or d_shard_val > 1) and fsdp_layer_count > 0:
+        comm[Dim.FSDP] = _flop_mode_fsdp_comm(
+            cfg, fsdp_layer_count, d_shard_val, param["device_type"],
+            pp=pp, mb=mb,
+        )
+
+
+def _apply_dev_per_node_scaling_legacy(comm, param):
+    """Legacy dev_per_node scaling (preserved for reference)."""
+    for _ in [None]:
+        dev_per_node = param["device_type"].level_bound_number[0]
+        comm[Dim.TP] *= max(1, param["cfg"].t // dev_per_node)
+        comm[Dim.EP] *= max(1, param["cfg"].ep // dev_per_node)
+        comm[Dim.CP] *= max(1, param["cfg"].cp // dev_per_node)
+
+
+def _apply_overlap_correction_legacy(comm, param):
+    """Legacy overlap correction (preserved for reference)."""
+    for _ in [None]:
+        # Transitional overlap correction.
+        # The search runs the FLOP path, which has no other overlap
+        # modeling; these factors are the only overlap correction on that
+        # path.  The TIME path's estimate_comm_score(overlap=...) call
+        # above is zeroed, so this is the single source of overlap for
+        # both paths.
+        # Defaults (dp=0.9, tp=0.5) are MindFormers-validated overlap, not
+        # test hacks: they made the model match real MindFormers step times.
+        # Re-validating for the hyper-parallel target is a follow-up.
+        # Follow-up: source from hardware, fix estimate_comm_score's dim
+        # list and add latency, then fold this into estimate_comm_score.
+        comm[Dim.DP] *= (1 - param["cfg"].comm_dp_overlap)
+        comm[Dim.TP] *= (1 - param["cfg"].comm_tp_overlap)
+
+
+def _apply_a3_ratio_legacy(comm, param):
+    """Legacy A3 ratio correction (preserved for reference)."""
+    for _ in [None]:
+        if param["device_type"].name == "A3":
+            logger.info("A3 ratio")
+            comm[Dim.DP] /= 2
+            comm[Dim.TP] /= 2
+            comm[Dim.EP] /= 2
+            comm[Dim.CP] /= 2
+
+
 def dp_ratio(cfg, device_type):
     """formula"""
     return (
@@ -312,6 +777,7 @@ def estimate_op_bulk_comm(*args, **kwargs):
     param["idx_lccfg"] = 0
     comms = {Dim.DP: [], Dim.TP: [], Dim.EP: []}
     # ignores comm recomp, to improve
+    comms = {Dim.DP: [], Dim.TP: [], Dim.EP: []}
     for stage in param["stages"]:
         comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0}
         for chunk in stage:
@@ -338,6 +804,20 @@ def estimate_op_bulk_comm(*args, **kwargs):
         comm[Dim.DP] *= param["dp_ratio"]
         comm[Dim.TP] *= param["cfg"].comm_t
         comm[Dim.EP] *= param["cfg"].comm_ep
+        # Transitional overlap correction.
+        # The search runs the FLOP path, which has no other overlap
+        # modeling; these factors are the only overlap correction on that
+        # path.  The TIME path's estimate_comm_score(overlap=...) call
+        # above is zeroed, so this is the single source of overlap for
+        # both paths.
+        # Defaults (dp=0.9, tp=0.5) are MindFormers-validated overlap, not
+        # test hacks: they made the model match real MindFormers step times.
+        # Re-validating for the hyper-parallel target is a follow-up.
+        # Follow-up: source from hardware, fix estimate_comm_score's dim
+        # list and add latency, then fold this into estimate_comm_score.
+        if False:
+            comm[Dim.DP] *= (1 - param["cfg"].comm_dp_overlap)
+            comm[Dim.TP] *= (1 - param["cfg"].comm_tp_overlap)
 
         if param["device_type"].name == "A3":
             logger.info("A3 ratio")
@@ -357,6 +837,8 @@ def estimate_op_bulk_comm(*args, **kwargs):
 
     res = []
     for i, c in enumerate(comms[Dim.TP]):
+        if False:
+            res += [c + comms[Dim.DP][i] + comms[Dim.EP][i] + comms[Dim.CP][i]]
         res.append(comms[Dim.DP][i] + c + comms[Dim.EP][i])
 
     return res
@@ -465,39 +947,17 @@ def estimate_from_mem_comm(*args, **kwargs):
     param["flatten"] = sum(
         [[f[1]] * f[0] for f in param["cfg"].layer_custom_config], []
     )
-    comms = {Dim.DP: [], Dim.TP: [], Dim.EP: [], Dim.CP: []}
+    comms = {Dim.DP: [], Dim.TP: [], Dim.EP: [], Dim.CP: [], Dim.FSDP: []}
     for stage in param["stages"]:
-        comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0}
+        comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0, Dim.FSDP: 0.0}
+        stage_fsdp_count = 0
         for chunk in stage:
             for layer in chunk:
                 param["ctx"].current_node = layer
-                if (
-                    layer
-                    not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
-                    and param["flatten"]
-                ):
-                    custom_fun = param["flatten"].pop(0)
-                    if custom_fun:
-                        custom_fun(param["cfg"])
-                    logger.info("is layer moe ? %s", param["cfg"].n_exp > 1)
-                    param["ctx"].current_node = LayerType.NOT_REC_LAYER
-                    logger.info("param ctx %s", param["ctx"])
-                    comm[Dim.DP] += EvalLayerComm.dp_comm_layer(param["cfg"], param["ctx"])
+                _, _, _, fc = _accumulate_layer_comm(comm, param)
+                stage_fsdp_count += fc
 
-                comm[Dim.TP] += EvalLayerComm.tp_comm_layer(
-                    param["cfg"], param["ctx"], 1
-                )  # / 4 #* (param["cfg"].t - 1)
-                comm[Dim.EP] += EvalLayerComm.ep_comm_layer(
-                    param["cfg"], param["ctx"], 1
-                )  # * param["cfg"].ep
-                comm[Dim.CP] += cp_comm_layer_detailed(
-                    param["cfg"], param["ctx"]
-                ).comm_volume
-                # min(device_type.level_bound_number[0], param["cfg"].ep)
-                # comm_cp += EvalLayerComm.cp_comm_layer
-                # (param["cfg"], param["ctx"])
-
-
+        _apply_flop_mode(comm, param, stage_fsdp_count)
 
         if param["ccfg"].ttype == PerformanceType.TIME:
             for dim, ov in zip([Dim.DP, Dim.TP, Dim.CP], [0.0, 0.0, 0.0]):
@@ -509,48 +969,40 @@ def estimate_from_mem_comm(*args, **kwargs):
                     device=param["device_type"],
                 )
 
-        dev_per_node = param["device_type"].level_bound_number[0]
-        comm[Dim.TP] *= max(1, param["cfg"].t // dev_per_node)
-        comm[Dim.EP] *= max(1, param["cfg"].ep // dev_per_node)
-        comm[Dim.CP] *= max(1, param["cfg"].cp // dev_per_node)
+        comm[Dim.TP] *= param["cfg"].comm_t
+        comm[Dim.EP] *= param["cfg"].comm_ep
 
-        # Transitional overlap correction.
-        # The search runs the FLOP path, which has no other overlap
-        # modeling; these factors are the only overlap correction on that
-        # path.  The TIME path's estimate_comm_score(overlap=...) call
-        # above is zeroed, so this is the single source of overlap for
-        # both paths.
-        # Defaults (dp=0.9, tp=0.5) are MindFormers-validated overlap, not
-        # test hacks: they made the model match real MindFormers step times.
-        # Re-validating for the hyper-parallel target is a follow-up.
-        # Follow-up: source from hardware, fix estimate_comm_score's dim
-        # list and add latency, then fold this into estimate_comm_score.
-        comm[Dim.DP] *= (1 - param["cfg"].comm_dp_overlap)
-        comm[Dim.TP] *= (1 - param["cfg"].comm_tp_overlap)
+        d_shard_val = param["cfg"].d_shard_or_d
+        if not (param["cfg"].fsdp or d_shard_val > 1):
+            comm[Dim.DP] *= (1 - param["cfg"].comm_dp_overlap)
+            comm[Dim.TP] *= (1 - param["cfg"].comm_tp_overlap)
 
-        if param["device_type"].name == "A3":
-            logger.info("A3 ratio")
-            comm[Dim.DP] /= 2
-            comm[Dim.TP] /= 2
-            comm[Dim.EP] /= 2
-            comm[Dim.CP] /= 2
+        scale = param["device_type"].comm_scale_factor
+        if scale != 1.0:
+            logger.info("comm scale factor: %.2f", scale)
+            for dim in (Dim.DP, Dim.TP, Dim.EP, Dim.CP, Dim.FSDP):
+                comm[dim] *= scale
 
         comms[Dim.DP].append(comm[Dim.DP])
         comms[Dim.TP].append(comm[Dim.TP])
         comms[Dim.EP].append(comm[Dim.EP])
         comms[Dim.CP].append(comm[Dim.CP])
+        comms[Dim.FSDP].append(comm[Dim.FSDP])
 
     if param["debugger"] and param["debugger"].is_enabled():
         logger.info("DP_COMM = %s", comms[Dim.DP])
-        logger.info("MP_COMM = %s", comms[Dim.TP])
+        logger.info("TP(MP)_COMM = %s", comms[Dim.TP])
         logger.info("EP_COMM = %s", comms[Dim.EP])
         logger.info("CP_COMM = %s", comms[Dim.CP])
+        logger.info("FSDP_COMM = %s", comms[Dim.FSDP])
         param["debugger"].info[PerfParts.DP_COMM] = comms[Dim.DP]
         param["debugger"].info[PerfParts.MP_COMM] = comms[Dim.TP]
         param["debugger"].info[PerfParts.EP_COMM] = comms[Dim.EP]
         param["debugger"].info[PerfParts.CP_COMM] = comms[Dim.CP]
+        param["debugger"].info[PerfParts.FSDP_COMM] = comms[Dim.FSDP]
         if param["cfg"].cp > 1:
-            cp_comm_details = cp_comm_layer_detailed(param["cfg"], param["ctx"])
+            cp_comm_details = cp_comm_layer_detailed(param["cfg"], param["ctx"],
+                                                      device_type=param.get("device_type"))
             param["debugger"].info["CP_KV_VOLUME"] = cp_comm_details.total_kv_volume
             param["debugger"].info["CP_EXPOSED_TIME"] = cp_comm_details.exposed_comm_time
             param["debugger"].info["CP_TOPOLOGY"] = cp_comm_details.topology
@@ -558,7 +1010,7 @@ def estimate_from_mem_comm(*args, **kwargs):
 
     res = []
     for i, c in enumerate(comms[Dim.TP]):
-        res += [c + comms[Dim.DP][i] + comms[Dim.EP][i] + comms[Dim.CP][i]]
+        res += [c + comms[Dim.DP][i] + comms[Dim.EP][i] + comms[Dim.CP][i] + comms[Dim.FSDP][i]]
 
     return res
 
@@ -590,6 +1042,23 @@ def level_efficiency(level):
     if level == NetworkLevel.CLUSTER:
         return 0.9
     raise ValueError
+def level_efficiency(level, device=None):
+    """to improve for Ascend A2"""
+    if device is None:
+        if level == NetworkLevel.NODE:
+            return 0.7
+        if level == NetworkLevel.CLUSTER:
+            return 0.9
+        raise ValueError
+    idx = level.value - 1 if isinstance(level, NetworkLevel) else level - 1
+    p2p_eff = getattr(device, 'p2p_efficiency', None)
+    if p2p_eff is not None and 0 <= idx < len(p2p_eff):
+        return p2p_eff[idx]
+    if 0 <= idx < len(device.level_efficiency):
+        return device.level_efficiency[idx]
+    raise ValueError(
+        f"No efficiency for level {level}; device required"
+    )
 
 
 def level_bandwidth(level):
@@ -599,6 +1068,23 @@ def level_bandwidth(level):
     if level == NetworkLevel.CLUSTER:
         return 25
     raise ValueError
+def level_bandwidth(level, device=None):
+    """to improve for Ascend A2"""
+    if device is None:
+        if level == NetworkLevel.NODE:
+            return 300
+        if level == NetworkLevel.CLUSTER:
+            return 25
+        raise ValueError
+    idx = level.value - 1 if isinstance(level, NetworkLevel) else level - 1
+    p2p = getattr(device, 'p2p_bandwidth', None)
+    if p2p is not None and idx < len(p2p):
+        return p2p[idx]
+    if 0 <= idx < len(device.level_bandwidth):
+        return device.level_bandwidth[idx]
+    raise ValueError(
+        f"No P2P bandwidth for level {level}; device required"
+    )
 
 
 def level_latency(level):
@@ -608,12 +1094,34 @@ def level_latency(level):
     if level == NetworkLevel.CLUSTER:
         return 0.00002
     raise ValueError
+def level_latency(level, device=None):
+    """to improve for Ascend A2"""
+    if device is None:
+        if level == NetworkLevel.NODE:
+            return 0.00001
+        if level == NetworkLevel.CLUSTER:
+            return 0.00002
+        raise ValueError
+    idx = level.value - 1 if isinstance(level, NetworkLevel) else level - 1
+    if 0 <= idx < len(device.level_latency):
+        return device.level_latency[idx]
+    raise ValueError(
+        f"No latency for level {level}; device required"
+    )
 
 
 def comm_throughput(level):
     """formula"""
     eff = level_efficiency(level)
     bw = level_bandwidth(level)
+def comm_throughput(level, device=None):
+    """formula"""
+    if device is None:
+        eff = level_efficiency(level)
+        bw = level_bandwidth(level)
+    else:
+        eff = level_efficiency(level, device=device)
+        bw = level_bandwidth(level, device=device)
     return bw * eff
 
 
@@ -621,10 +1129,123 @@ def estimate_comm_size_time(_, comm_size, level):
     """formula"""
     th = comm_throughput(level)
     lat = level_latency(level)
+def estimate_comm_size_time(_, comm_size, level, device=None):
+    """formula"""
+    if device is None:
+        th = comm_throughput(level)
+        lat = level_latency(level)
+    else:
+        th = comm_throughput(level, device=device)
+        lat = level_latency(level, device=device)
     return lat + comm_size / th
 
 
+def _shard_group_levels(device, shard_size):
+    """Compute message-size-dependent effective bandwidth."""
+    remaining = shard_size
+    levels = []
+    for level in range(device.levels):
+        bound = device.level_bound_number[level]
+        if bound:
+            n = min(remaining, bound)
+            remaining = remaining // n if n > 0 else remaining
+        else:
+            n = remaining
+        levels.append(n)
+    return levels
+
+
 def estimate_comm_score(
+    cfg,
+    comm_volume,
+    dim,
+    overlap = 0.0,
+    device = Hard.device_map['A2'],
+    a2a_efficiency = None,
+    shard_group_size = 0,
+    per_rank_msg = False,
+):
+    """Estimate communication time in seconds from byte volume.
+
+    Uses a standard collective-communication model:
+      time = (1 - overlap) * sum over levels [
+          2 * (n_level - 1) / n_level * msg_per_level / bw_level
+          + latency_level * 2 * (n_level - 1)
+      ]
+    where n_level is the number of ranks at that level participating
+    in the collective, and msg_per_level is the per-rank message size.
+
+    level_bandwidth is stored in GB/s; converted to B/s here.
+
+    a2a_efficiency: if set, overrides level_efficiency for all-to-all
+    operations.  Can be:
+      - float: applied to all levels
+      - dict mapping level index (0-based) to float: per-level override
+    FSDP needs different efficiencies for intra-node (level 0) vs
+    inter-node (level 1) due to kernel launch overhead and protocol
+    differences.
+
+    shard_group_size: if > 0, use this instead of level_assign for
+    hierarchy decomposition.  Needed for FSDP where the all-gather
+    group is d_shard*cp*t ranks, which may not align with any single
+    dimension in level_assign (e.g., DP=1,TP=8,FSDP=True).
+
+    per_rank_msg: if True, comm_volume is already the per-rank message
+    size (not total).  Skip the /n_level division.  Use for FSDP/HSDP
+    where the volume is pre-computed as a per-rank shard.
+    """
+    if comm_volume <= 0:
+        return 0
+
+    d_shard = cfg.d_shard_or_d
+
+    if shard_group_size > 0:
+        n_levels = _shard_group_levels(device, shard_group_size)
+    else:
+        assignment = device.level_assign(
+            dp=cfg.d, tp=cfg.t, cp=cfg.cp, pp=cfg.p, d_shard=d_shard
+        )
+        lookup_dim = dim if dim in assignment else Dim.DP
+        n_levels = assignment[lookup_dim]
+
+    time_s = 0
+    for level in range(device.levels):
+        n_level = n_levels[level]
+        if n_level <= 1:
+            continue
+        if per_rank_msg:
+            msg_per_rank = comm_volume
+        elif shard_group_size > 0:
+            prod_from_l = 1
+            for k in range(level, len(n_levels)):
+                prod_from_l *= n_levels[k]
+            msg_per_rank = comm_volume / prod_from_l
+        else:
+            msg_per_rank = comm_volume / n_level
+        if isinstance(a2a_efficiency, dict):
+            eff = a2a_efficiency.get(level, level_efficiency(NetworkLevel(level + 1), device=device))
+        elif a2a_efficiency is not None:
+            eff = a2a_efficiency
+        else:
+            eff = level_efficiency(NetworkLevel(level + 1), device=device)
+        bw_bps = device.level_bandwidth[level] * 1e9 * eff
+        lat = level_latency(NetworkLevel(level + 1), device=device)
+        if per_rank_msg:
+            collective_time = (
+                (n_level - 1) * msg_per_rank / bw_bps
+                + lat * 2 * (n_level - 1)
+            )
+        else:
+            collective_time = (
+                2 * (n_level - 1) / n_level * msg_per_rank / bw_bps
+                + lat * 2 * (n_level - 1)
+            )
+        time_s += collective_time
+
+    return time_s * (1 - overlap)
+
+
+def estimate_comm_score_legacy(
     cfg, comm_volume, dim, overlap=0.0, device=Hard.device_map["A2"]
 ):
     """score assignment"""

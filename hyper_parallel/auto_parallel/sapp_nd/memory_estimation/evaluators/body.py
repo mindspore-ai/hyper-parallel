@@ -64,12 +64,26 @@ class EvalBody:
     def stat_p_layer(ccfg: CostModelConfig, ctx: Context) -> float:
         """model param"""
         non_exp_p, routed_p, shared_p = ctx.eval.num_p(ccfg, ctx)
+        # FSDP stores sharded parameters in compute dtype (e.g. bf16=2 bytes),
+        # not param_init_type (fp32=4 bytes).  Without this, param memory is
+        # overcounted by bytes_p/bytes_compute (typically 2x).
+        bytes_param = ccfg.bytes_compute if getattr(ccfg, "fsdp", False) else ccfg.bytes_p
         # Routed experts: EP sharding
         routed_mem = routed_p / ccfg.ep * ccfg.bytes_p / ccfg.shard_p_os_exp
+        routed_mem = routed_p / ccfg.ep * bytes_param / ccfg.shard_p_os_exp
         # Shared experts: partial DP sharding
         shared_mem = shared_p * ccfg.bytes_p / ccfg.shard_p_os_exp_partial
+        shared_mem = shared_p * bytes_param / ccfg.shard_p_os_exp_partial
         # Non expert
         non_exp_mem = non_exp_p * ccfg.bytes_p / ccfg.shard_p_os_non_exp_partial
+        non_exp_mem = non_exp_p * bytes_param / ccfg.shard_p_os_non_exp_partial
+        # NOTE: FSDP all-gather buffer was previously included here but is a
+        # dynamic (temporary) buffer, not static param memory.  It is already
+        # accounted for in the dynamic comm path via ``fsdp_buffer_comm`` in
+        # the YAML config (``comm_expr: max(fsdp + hsdp, fsdp_grad)
+        # + max(dp, tp, cp) + ep``).  Adding it here caused double-counting
+        # (static MODEL_PARAM + dynamic AG_COMM).  The static side has been
+        # removed to fix this.
         return non_exp_mem + routed_mem + shared_mem
 
     @staticmethod
@@ -90,12 +104,18 @@ class EvalBody:
     def stat_grad_layer(ccfg: CostModelConfig, ctx: Context) -> float:
         """gradients"""
         non_exp_p, routed_p, shared_p = ctx.eval.num_p(ccfg, ctx)
+        # FSDP stores sharded gradients in compute dtype (e.g. bf16=2 bytes),
+        # not fp32 (4 bytes).  Without this, gradient memory is overcounted.
+        bytes_g = ccfg.bytes_compute if getattr(ccfg, "fsdp", False) else ccfg.bytes_grad
         # Routed experts
         routed_mem = routed_p / ccfg.ep * ccfg.bytes_grad / ccfg.shard_grad_exp
+        routed_mem = routed_p / ccfg.ep * bytes_g / ccfg.shard_grad_exp
         # Shared experts: use shard_grad_exp_partial (independent of os sharding)
         shared_mem = shared_p * ccfg.bytes_grad / ccfg.shard_grad_exp_partial
+        shared_mem = shared_p * bytes_g / ccfg.shard_grad_exp_partial
         # Non expert
         non_exp_mem = non_exp_p * ccfg.bytes_grad / ccfg.shard_grad_non_exp
+        non_exp_mem = non_exp_p * bytes_g / ccfg.shard_grad_non_exp
         return non_exp_mem + routed_mem + shared_mem
 
     # No recompute and select recompute
