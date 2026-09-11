@@ -48,10 +48,84 @@ class _DSATensorContext:
     key: Tensor
     q_pe: Tensor
     k_pe: Tensor
+    actual_q_len: Any
+    actual_kv_len: Any
 
 
 _dsa_tensor_context = contextvars.ContextVar(
     "hyper_dsa_tensor_context", default=None)
+
+
+def _dsa_gather_causal_kv(tensor, actual_seq_len, context):
+    """Gather and compact the causal KV context for this rank's queries."""
+    gathered = _gather_sequence(tensor, context)
+    batch_size, global_length = gathered.shape[:2]
+    local_length = tensor.size(1)
+    expected_global_length = local_length * context.size
+    if global_length != expected_global_length:
+        raise RuntimeError(
+            f"gathered DSA sequence length {global_length} does not match "
+            f"local length {local_length} * CP size {context.size}")
+
+    if actual_seq_len is None:
+        boundaries = [
+            (batch_index + 1) * global_length
+            for batch_index in range(batch_size)
+        ]
+    elif isinstance(actual_seq_len, Tensor):
+        boundaries = [int(value) for value in actual_seq_len.tolist()]
+    else:
+        boundaries = [int(value) for value in actual_seq_len]
+    total_length = batch_size * global_length
+    if not boundaries or boundaries[-1] != total_length:
+        raise ValueError(
+            "DSA CP requires global cumulative sequence lengths ending at "
+            f"{total_length}, got {boundaries}")
+    if any(right <= left for left, right in zip([0] + boundaries, boundaries)):
+        raise ValueError(
+            "DSA cumulative sequence lengths must be increasing, got "
+            f"{boundaries}")
+
+    sequences = []
+    sequence_start = 0
+    for sequence_end in boundaries:
+        sequences.append((sequence_start, sequence_end))
+        sequence_start = sequence_end
+
+    query_lengths = []
+    key_lengths = []
+    key_ranges = []
+    query_total = 0
+    key_total = 0
+    for batch_index in range(batch_size):
+        query_start = batch_index * global_length + context.rank * local_length
+        query_end = query_start + local_length
+        for sequence_start, sequence_end in sequences:
+            local_start = max(sequence_start, query_start)
+            local_end = min(sequence_end, query_end)
+            if local_start >= local_end:
+                continue
+            query_total += local_end - local_start
+            key_total += local_end - sequence_start
+            query_lengths.append(query_total)
+            key_lengths.append(key_total)
+            key_ranges.append((sequence_start, local_end))
+
+    expected_query_total = batch_size * local_length
+    if query_total != expected_query_total:
+        raise ValueError(
+            "global cumulative sequence lengths do not cover this CP rank's "
+            f"{expected_query_total} local query tokens")
+    flat_gathered = gathered.flatten(0, 1)
+    compact = torch.cat(
+        [flat_gathered[start:end] for start, end in key_ranges], dim=0)
+    compact = compact.unsqueeze(0).contiguous()
+    if isinstance(actual_seq_len, Tensor):
+        query_lengths = torch.tensor(
+            query_lengths, dtype=torch.int32, device=tensor.device)
+        key_lengths = torch.tensor(
+            key_lengths, dtype=torch.int32, device=tensor.device)
+    return compact, query_lengths, key_lengths
 
 
 def _mome_cp_halo_exchange(attention_module, context):
@@ -144,72 +218,117 @@ def _mla_cp_alltoall(attention_functions, context):
     attention_functions["npu_fa_rescale"] = mla_with_sequence_head_exchange
 
 
-def _dsa_cp_alltoall(attention_module, attention_functions, context):
-    """Configure CP all-to-all for the DSA indexer, attention, and KL loss."""
+def _mla_cp_allgather(attention_functions, context):
+    """Configure local-query KV AllGather around the MLA backend."""
+    original = attention_functions["npu_fa_rescale"]
+    if getattr(original, _ULYSSES_WRAPPED_FLAG, False):
+        return
+
+    @functools.wraps(original)
+    def mla_with_gathered_kv(
+            module: Any, query: Tensor, key: Tensor, value: Tensor,
+            attention_mask: Any, **kwargs: Any) -> Tensor:
+        """Run MLA with local full-head queries and compact causal K/V."""
+        if module.attention_type != "mla":
+            return original(
+                module, query, key, value, attention_mask, **kwargs)
+        if not module.apply_FA_rescale or module.use_fused_sink_fa:
+            raise ValueError(
+                "MLA KV AllGather CP supports only non-fused npu_fa_rescale")
+        local_shape = tuple(query.shape)
+        sequence_lengths = (
+            kwargs.get("actual_q_len")
+            if kwargs.get("actual_q_len") is not None
+            else kwargs.get("actual_kv_len"))
+        key, local_q_len, local_kv_len = _dsa_gather_causal_kv(
+            key, sequence_lengths, context)
+        value, _, _ = _dsa_gather_causal_kv(
+            value, sequence_lengths, context)
+        call_kwargs = kwargs.copy()
+        call_kwargs.update(
+            seq_length=query.size(1),
+            n_head=query.size(2),
+            actual_q_len=local_q_len,
+            actual_kv_len=local_kv_len,
+        )
+        output = original(
+            module, query, key, value, attention_mask, **call_kwargs)
+        if output.shape[:3] != torch.Size(local_shape[:3]):
+            raise RuntimeError(
+                f"MLA KV AllGather CP output {tuple(output.shape)} does not "
+                f"preserve {local_shape}")
+        return output
+
+    setattr(mla_with_gathered_kv, _ULYSSES_WRAPPED_FLAG, True)
+    attention_functions["npu_fa_rescale"] = mla_with_gathered_kv
+
+
+def _dsa_cp_allgather(attention_module, attention_functions, context):
+    """Configure local-query CP for the DSA indexer, attention, and KL loss."""
     original_indexer = attention_module.dsa_lightning_indexer_forward
     original_sparse = attention_functions["dsa_sparse_attention"]
     original_kl = attention_module.SparseLightningIndexerKLLossTrainFunction
 
     if not getattr(original_indexer, _ULYSSES_WRAPPED_FLAG, False):
         @functools.wraps(original_indexer)
-        def index_with_gathered_sequence(
+        def index_with_local_query(
                 module: Any, index_query: Tensor, index_key: Tensor,
                 merge_weight: Tensor,
                 actual_q_len: Any, actual_kv_len: Any) -> Any:
-            """Run the DSA indexer on the CP-exchanged sequence layout."""
-            index_query = _sequence_to_head(index_query, context)
-            merge_weight = _sequence_to_head(
-                merge_weight.unsqueeze(-1), context).squeeze(-1)
-            index_key = _gather_sequence(index_key, context)
-            length = index_query.size(1)
+            """Select TopK for local full-head queries and causal global keys."""
+            sequence_lengths = (
+                actual_q_len if actual_q_len is not None else actual_kv_len)
+            index_key, local_q_len, local_kv_len = _dsa_gather_causal_kv(
+                index_key, sequence_lengths, context)
             return original_indexer(
                 module, index_query, index_key, merge_weight,
-                _global_seq_len(
-                    actual_q_len, length, index_query.device),
-                _global_seq_len(
-                    actual_kv_len, length, index_query.device))
+                local_q_len, local_kv_len)
 
-        setattr(index_with_gathered_sequence, _ULYSSES_WRAPPED_FLAG, True)
+        setattr(index_with_local_query, _ULYSSES_WRAPPED_FLAG, True)
         attention_module.dsa_lightning_indexer_forward = (
-            index_with_gathered_sequence)
+            index_with_local_query)
 
     if not getattr(original_sparse, _ULYSSES_WRAPPED_FLAG, False):
         @functools.wraps(original_sparse)
         def sparse_attention_with_gathered_kv(
                 module: Any, query: Tensor, key: Tensor, value: Tensor,
                 attention_mask: Any, **kwargs: Any) -> tuple[Tensor, Any, Any]:
-            """Run DSA sparse attention with head-sharded Q and gathered K/V."""
+            """Run DSA sparse attention with local queries and causal global K/V."""
             del attention_mask
             local_shape = tuple(query.shape)
-            query = _sequence_to_head(query, context)
-            q_pe = _sequence_to_head(kwargs["q_pe"], context)
-            key = _gather_sequence(key, context)
-            value = _gather_sequence(value, context)
-            k_pe = _gather_sequence(kwargs["k_pe"], context)
-            length = query.size(1)
+            try:
+                q_pe = kwargs["q_pe"]
+                k_pe = kwargs["k_pe"]
+            except KeyError as exc:
+                raise ValueError(
+                    "DSA CP requires q_pe and k_pe keyword arguments") from exc
+            sequence_lengths = (
+                kwargs.get("actual_q_len")
+                if kwargs.get("actual_q_len") is not None
+                else kwargs.get("actual_kv_len"))
+            key, local_q_len, local_kv_len = _dsa_gather_causal_kv(
+                key, sequence_lengths, context)
+            value, _, _ = _dsa_gather_causal_kv(
+                value, sequence_lengths, context)
+            k_pe, _, _ = _dsa_gather_causal_kv(
+                k_pe, sequence_lengths, context)
             call_kwargs = kwargs.copy()
             call_kwargs.update(
-                q_pe=q_pe, k_pe=k_pe, seq_length=length,
+                q_pe=q_pe, k_pe=k_pe, seq_length=query.size(1),
                 n_head=query.size(2),
-                actual_q_len=_global_seq_len(
-                    kwargs.get("actual_q_len"), length, query.device),
-                actual_kv_len=_global_seq_len(
-                    kwargs.get("actual_kv_len"), length, query.device),
+                actual_q_len=local_q_len,
+                actual_kv_len=local_kv_len,
             )
-            old_heads = module.num_heads
-            module.num_heads = query.size(2)
-            try:
-                output, softmax_max, softmax_sum = original_sparse(
-                    module, query, key, value, None, **call_kwargs)
-            finally:
-                module.num_heads = old_heads
+            output, softmax_max, softmax_sum = original_sparse(
+                module, query, key, value, None, **call_kwargs)
             if module.training and not module.freeze_dsa:
                 _dsa_tensor_context.set(_DSATensorContext(
-                    query=query, key=key, q_pe=q_pe, k_pe=k_pe))
-            output = _head_to_sequence(output, context)
+                    query=query, key=key, q_pe=q_pe, k_pe=k_pe,
+                    actual_q_len=local_q_len,
+                    actual_kv_len=local_kv_len))
             if output.shape[:3] != torch.Size(local_shape[:3]):
                 raise RuntimeError(
-                    f"DSA CP output {tuple(output.shape)} does not restore "
+                    f"DSA CP output {tuple(output.shape)} does not preserve "
                     f"{local_shape}")
             return output, softmax_max, softmax_sum
 
@@ -241,20 +360,19 @@ def _dsa_cp_alltoall(attention_module, attention_functions, context):
                 query_tnd, key_tnd, q_pe_tnd, k_pe_tnd = [
                     tensor.flatten(0, 1) for tensor in
                     (saved.query, saved.key, saved.q_pe, saved.k_pe)]
-                length = saved.query.size(1)
                 return original_kl.apply(
                     index_query, index_key, merge_weight, query_tnd, key_tnd,
                     topk_indices, softmax_max, softmax_sum, q_pe_tnd,
                     k_pe_tnd,
-                    _global_seq_len(
-                        actual_seq_qlen, length, saved.query.device),
-                    _global_seq_len(
-                        actual_seq_klen, length, saved.query.device),
+                    saved.actual_q_len, saved.actual_kv_len,
                     scale, loss_coeff)
 
         setattr(CPDSAKLLoss, _ULYSSES_WRAPPED_FLAG, True)
         attention_module.SparseLightningIndexerKLLossTrainFunction = (
             CPDSAKLLoss)
+
+
+_dsa_cp_alltoall = _dsa_cp_allgather
 
 
 def head_tail_load_balance_attention(
