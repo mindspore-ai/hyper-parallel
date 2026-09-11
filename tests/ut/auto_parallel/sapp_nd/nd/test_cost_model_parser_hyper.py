@@ -551,6 +551,27 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.bytes_os, 4)
         self.assertEqual(ccfg.bytes_norm, 4)
 
+    def test_top_level_model_init_dtype_sizes_the_parameters(self):
+        """
+        Feature: _init_bytes.
+        Description: model_init_dtype is a top-level AutoModels key applied
+            after the weights are loaded. Ignoring it leaves the parameters
+            sized as float32 and doubles the parameter memory term.
+        Expectation: A low-precision model_init_dtype halves bytes_p, and an
+            explicit FSDP param_dtype still outranks it.
+        """
+        cfg = _dense_overrides(model={"param_init_type": "float32"})
+        self.assertEqual(_make_ccfg(cfg).bytes_p, 4)
+
+        cfg_init = _dense_overrides(model={"param_init_type": "float32"})
+        cfg_init["model_init_dtype"] = "bfloat16"
+        self.assertEqual(_make_ccfg(cfg_init).bytes_p, 2)
+
+        cfg_both = _dense_overrides(model={"param_init_type": "float32"})
+        cfg_both["model_init_dtype"] = "bfloat16"
+        cfg_both["fsdp_config"] = {"mix_precision": {"param_dtype": "float32"}}
+        self.assertEqual(_make_ccfg(cfg_both).bytes_p, 4)
+
     # ---- L0: Shard -------------------------------------------------------
 
     def test_init_shard_values(self):
@@ -990,6 +1011,32 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         per_stage = vision.n_lay // vision.p // vision.vp
         self.assertEqual(vision.offset[0], vision.n_lay - per_stage)
         self.assertEqual(vision.offset[1:], [-per_stage] * (vision.p - 1))
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_vl_submodules_own_their_eval_overrides(self, mock_hf):
+        """
+        Feature: multimodal submodule isolation.
+        Description: Each submodule runs its own arch hook, and hooks such as
+            custom_cm register formulas by mutating overwrite_eval_functions.
+            A shared table would let one submodule's formulas silently apply
+            to the other and to the parent.
+        Expectation: The three tables are distinct objects, and a write
+            through one submodule reaches neither the sibling nor the parent.
+        """
+        mock_hf.return_value = self._vl_config()
+        ccfg = _make_ccfg(_auto_models_config())
+        vision, text = ccfg.mm_ccfgs["vision"], ccfg.mm_ccfgs["text"]
+
+        self.assertIsNot(text.overwrite_eval_functions,
+                         ccfg.overwrite_eval_functions)
+        self.assertIsNot(vision.overwrite_eval_functions,
+                         ccfg.overwrite_eval_functions)
+        self.assertIsNot(text.overwrite_eval_functions,
+                         vision.overwrite_eval_functions)
+
+        text.overwrite_eval_functions["num_params_norm"] = lambda *_: 0.0
+        self.assertNotIn("num_params_norm", vision.overwrite_eval_functions)
+        self.assertNotIn("num_params_norm", ccfg.overwrite_eval_functions)
 
     def test_vision_hook_wraps_a_bare_config(self):
         """

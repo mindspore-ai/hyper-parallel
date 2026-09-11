@@ -282,7 +282,12 @@ class CostModelParserHyperV2(_CostModelParser):
         )
 
     def _clone_submodule(self, name: str) -> Any:
-        """Return a submodule cost config seeded from the parsed parent."""
+        """Return a submodule cost config seeded from the parsed parent.
+
+        The loop below copies references, so every mutable container the
+        arch hooks write to has to be rebuilt: each submodule runs its own
+        hook and must not see the others' overrides.
+        """
         cc = type(self.ccfg)({})
         for key, value in self.ccfg.__dict__.items():
             if key in ("mm_ccfgs", "mm_order", "mm_main", "hooks_dict"):
@@ -294,6 +299,7 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.parser = self
         cc.model_name = name
         cc.rec_op = Config(dict(self.ccfg.rec_op.__dict__))
+        cc.overwrite_eval_functions = dict(self.ccfg.overwrite_eval_functions)
         cc.layer_custom_config = [(cc.n_lay + cc.n_mtp, None)]
         cc.offset = self._even_offset()
         return cc
@@ -633,13 +639,20 @@ class CostModelParserHyperV2(_CostModelParser):
         })
 
     def _init_bytes(self):
-        """Set FP byte sizes from AutoModels or legacy dtype fields."""
+        """Set FP byte sizes from AutoModels or legacy dtype fields.
+
+        ``model_init_dtype`` is a top-level AutoModels key applied after the
+        weights are loaded, so it outranks ``model.torch_dtype`` for the
+        stored parameters but not an explicit FSDP ``param_dtype``.
+        """
         model_raw = self._get_cfg_attr(self.config, "model", Config({}))
         fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
         mix_precision = self._get_cfg_attr(fsdp, "mix_precision", Config({}))
         model_dtype = self._get_cfg_attr(model_raw, "torch_dtype", None)
+        init_dtype = self._get_cfg_attr(self.config, "model_init_dtype", None)
         self.ccfg.bytes_p = self._bytes_from_dtype(
             self._get_cfg_attr(mix_precision, "param_dtype", None)
+            or init_dtype
             or model_dtype
             or self._get_cfg_attr(model_raw, "param_init_type", "float32")
         )

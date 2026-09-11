@@ -24,6 +24,9 @@ Test IDs:
   HM-C05: __set_node_eval_compute_fun returns None when all names None
   HM-C06: __set_node_eval_compute_fun preserves existing compute when no override
   HM-Y01: import_eval_yaml loads compute config from YAML body node
+  HM-O01: __custom_getattr prefers an overwrite_eval_functions entry
+  HM-O02: __custom_getattr falls back to the yaml name without an entry
+  HM-O03: __custom_getattr leaves an inline callable field untouched
 """
 import os
 import unittest
@@ -32,6 +35,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.compute import EvalExpertCompute
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalNorm
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import (
     NodeComputeEval,
     NodeDynEval,
@@ -208,6 +212,67 @@ class TestSetNodeEvalComputeFun(unittest.TestCase):
         )
         result = hm._HookManager__set_node_eval_compute_fun(node)
         self.assertIsNone(result)
+
+
+class TestCustomGetattrOverride(unittest.TestCase):
+    """HM-O: overwrite_eval_functions must win over the config_eval yaml name.
+
+    The priority order documented on __custom_getattr puts the override
+    (2) above the yaml formula name (3). An arch hook such as custom_cm
+    registers its own num_params_norm, and the estimator has to use it.
+    """
+
+    @staticmethod
+    def _make_hm(overrides=None):
+        """Return a minimal _HookManager carrying the given override table."""
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._hook_manager import _HookManager
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context
+        hm = object.__new__(_HookManager)
+        hm._ctx = Context()
+        hm.toggle_func_trace = False
+        hm._ccfg = MagicMock()
+        hm._ccfg.overwrite_eval_functions = overrides if overrides is not None else {}
+        return hm
+
+    def test_override_wins_over_yaml_name(self):
+        """
+        Feature: TestCustomGetattrOverride.
+        Description: An override registered for a formula name must be
+            returned instead of the evaluator class attribute of that name.
+        Expectation: The registered function is returned, not EvalNorm's.
+        """
+        def _custom_norm(_ccfg, _ctx):
+            return 42.0
+
+        hm = self._make_hm({"num_params_norm": _custom_norm})
+        res = hm._HookManager__custom_getattr(EvalNorm, "num_params_norm")
+        self.assertIs(res, _custom_norm)
+        self.assertIsNot(res, EvalNorm.num_params_norm)
+
+    def test_yaml_name_used_without_override(self):
+        """
+        Feature: TestCustomGetattrOverride.
+        Description: With an empty override table the yaml formula name must
+            still resolve against the evaluator class.
+        Expectation: EvalNorm.num_params_norm is returned.
+        """
+        hm = self._make_hm()
+        res = hm._HookManager__custom_getattr(EvalNorm, "num_params_norm")
+        self.assertIs(res, EvalNorm.num_params_norm)
+
+    def test_inline_callable_is_not_overridden(self):
+        """
+        Feature: TestCustomGetattrOverride.
+        Description: A callable passed inline is priority 1 and must outrank
+            the override table even when a same-named entry exists.
+        Expectation: The inline callable is returned unchanged.
+        """
+        def _inline(_ccfg, _ctx):
+            return 1.0
+
+        hm = self._make_hm({"num_params_norm": lambda *_: 42.0})
+        res = hm._HookManager__custom_getattr(EvalNorm, _inline)
+        self.assertIs(res, _inline)
 
 
 if __name__ == "__main__":
