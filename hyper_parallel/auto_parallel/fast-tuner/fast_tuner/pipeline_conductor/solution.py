@@ -15,7 +15,7 @@
 '''
 This Module consists a couple of utility functions
 for solution. Including parser, peak memory calculation
-and validity check
+and validity check.
 '''
 
 import itertools
