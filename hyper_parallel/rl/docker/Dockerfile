@@ -39,8 +39,8 @@ assert actual == expected, f'dependency version mismatch: expected={expected}, a
 RUN npm install --global "@openai/codex@${CODEX_CLI_VERSION}" \
     && codex --version | grep -Eq "(^|[[:space:]])${CODEX_CLI_VERSION}($|[[:space:]])"
 
-LABEL org.opencontainers.image.title="Hyper-RL Qwen3 runtime" \
-      org.opencontainers.image.description="Pinned Ascend dependencies for Hyper-RL Qwen3 TP consistency" \
+LABEL org.opencontainers.image.title="hyperparallel-RL Qwen3 runtime" \
+      org.opencontainers.image.description="Pinned Ascend dependencies for hyperparallel-RL Qwen3 TP consistency" \
       org.opencontainers.image.base.name="hyper-parallel/unified-e2-dev:v0.22.1rc1" \
       hyper-rl.flash-attn-npu.version="0.2.0b1" \
       hyper-rl.batch-invariant-ops.version="1.0.0" \

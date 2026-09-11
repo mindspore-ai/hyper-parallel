@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DeepSeek Harness SDK process boundary and Hyper-RL AgentProgram."""
+"""DeepSeek Harness SDK process boundary and hyperparallel-RL AgentProgram."""
 
 from __future__ import annotations
 
@@ -118,7 +118,7 @@ def _json_value(value: Any) -> Any:
 
 
 class DeepSeekRuntime:
-    """Own one DeepSeek-only gateway while Hyper-RL continues to own vLLM."""
+    """Own one DeepSeek-only gateway while hyperparallel-RL continues to own vLLM."""
 
     def __init__(self, engine: Any, config: Mapping[str, Any]) -> None:
         """Bind the independent runtime to the existing shared rollout engine."""

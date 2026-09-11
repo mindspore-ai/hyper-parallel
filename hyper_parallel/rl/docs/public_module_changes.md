@@ -146,7 +146,7 @@ public_signature_changes=none
 | AdamW device | 参数已位于当前 accelerator 的路径 |
 | Clip-grad layout | 普通无 `_sharding_spec` Parameter |
 
-最新 master 同步后，完整 Hyper-RL suite 与公共 tied、DCP、optimizer、clip-grad、parallel-dims 和 upstream
+最新 master 同步后，完整 hyperparallel-RL suite 与公共 tied、DCP、optimizer、clip-grad、parallel-dims 和 upstream
 swap-optimizer 回归在同一 pytest 进程中为 `466 passed`。公共修改没有引入兼容 alias、运行时版本分支或 RL 专用配置。
 
 ## CODEOWNER 审查建议

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""User-owned agent control flow with the canonical Hyper-RL trajectory output."""
+"""User-owned agent control flow with the canonical hyperparallel-RL trajectory output."""
 
 import asyncio
 import time
@@ -41,7 +41,7 @@ class ProgramAgentRunner:
 
     The factory receives ``(prompt, policy_version, sample_index)``.  User code
     owns the semantic loop and may call an external inference service, tools,
-    or a sandbox.  Hyper-RL owns validation, batching, and downstream learning.
+    or a sandbox.  hyperparallel-RL owns validation, batching, and downstream learning.
     """
 
     def __init__(

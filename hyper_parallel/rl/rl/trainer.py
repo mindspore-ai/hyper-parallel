@@ -304,7 +304,7 @@ class SyncTrainer:
     """Synchronous RL orchestrator composed from HyperAutoModel role runtimes.
 
     Args:
-        resolved_config: Fully merged Hyper-RL YAML configuration.
+        resolved_config: Fully merged hyperparallel-RL YAML configuration.
     """
 
     def __init__(self, resolved_config: Mapping[str, Any]) -> None:

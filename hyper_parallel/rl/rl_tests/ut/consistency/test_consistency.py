@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU unit tests for the Hyper-RL numerical consistency contract."""
+"""CPU unit tests for the hyperparallel-RL numerical consistency contract."""
 # Local test doubles are not public APIs; the suite intentionally uses Torch CPU tensors.
 # pylint: disable=forbidden-backend-import,missing-public-docstring
 

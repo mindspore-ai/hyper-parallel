@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Expose an existing Hyper-RL ToolRegistry through MCP stdio without tool rewrites."""
+"""Expose an existing hyperparallel-RL ToolRegistry through MCP stdio without tool rewrites."""
 
 from __future__ import annotations
 

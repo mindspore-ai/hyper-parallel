@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Lightweight vLLM plugin for Hyper-RL model registration."""
+"""Lightweight vLLM plugin for hyperparallel-RL model registration."""
 import logging
 import os
 from importlib.metadata import PackageNotFoundError

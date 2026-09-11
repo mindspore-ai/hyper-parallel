@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="128" viewBox="0 0 192 128" role="img" aria-labelledby="title desc">
+  <title id="title">hyperparallel-RL</title>
+  <desc id="desc">A calligraphic red H with gently tapered strokes, extending into a blue-gradient R and a sweeping L flourish.</desc>
+  <defs>
+    <linearGradient id="huawei-red" x1="64" y1="28" x2="64" y2="102" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E60012"/>
+      <stop offset="0.65" stop-color="#D3000D"/>
+      <stop offset="1" stop-color="#A00000"/>
+    </linearGradient>
+    <linearGradient id="mindspore-blue" x1="92" y1="54" x2="160" y2="74" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8FF4FF"/>
+      <stop offset="0.517598932" stop-color="#73B3FF"/>
+      <stop offset="1" stop-color="#5F81FF"/>
+    </linearGradient>
+  </defs>
+  <path d="M43 30C46 28 50 28 54 29L44 99C40 102 35 102 32 100Z" fill="url(#huawei-red)"/>
+  <path d="M84 28C88 26 93 26 97 28L88 94C87 99 84 102 79 102H73Z" fill="url(#huawei-red)"/>
+  <path d="M41 64C57 67 75 60 89 54L87 64C72 70 56 73 40 70Z" fill="url(#huawei-red)"/>
+  <path d="M95 28C118 23 137 31 135 48C134 61 119 69 103 68C115 77 118 90 133 94C148 99 164 96 175 88C172 101 151 109 132 104C112 100 110 80 92 68L93 61C111 64 125 57 126 47C128 35 112 31 95 35Z" fill="url(#mindspore-blue)"/>
+  <path d="M148 62L141 84C138 94 144 98 155 96C162 95 169 92 175 88C171 100 157 105 146 103C135 102 130 96 134 84L140 64Z" fill="url(#mindspore-blue)"/>
+</svg>

@@ -69,7 +69,7 @@ if actual != expected:
 for module in ("batch_invariant_ops", "flash_attn_npu"):
     if find_spec(module) is None:
         raise RuntimeError(f"Image dependency module is unavailable: {module}")
-print(f"Hyper-RL image dependencies verified: {actual}")
+print(f"hyperparallel-RL image dependencies verified: {actual}")
 PY
 '
 

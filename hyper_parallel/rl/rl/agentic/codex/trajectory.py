@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Build a strict token-exact Hyper-RL trajectory from captured Codex turns."""
+"""Build a strict token-exact hyperparallel-RL trajectory from captured Codex turns."""
 
 from __future__ import annotations
 

@@ -266,7 +266,7 @@ def main() -> int:
             f"only_on_disk={sorted(disk_agents - listed_agents)}"
         )
 
-    # Hyper-RL has one path-scoped entry rule.
+    # hyperparallel-RL has one path-scoped entry rule.
     if "hyper-rl" not in disk_rules:
         errors.append("rules: 'hyper-rl' is missing under .agent/rules/")
 

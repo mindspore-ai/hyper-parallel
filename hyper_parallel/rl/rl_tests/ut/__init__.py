@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Independent CPU unit tests for Hyper-RL."""
+"""Independent CPU unit tests for hyperparallel-RL."""

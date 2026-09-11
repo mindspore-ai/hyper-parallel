@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""``torchrun`` entry point for the minimal Hyper-RL GRPO demo."""
+"""``torchrun`` entry point for the minimal hyperparallel-RL GRPO demo."""
 
 import argparse
 import logging
@@ -77,11 +77,11 @@ def load_config(config_path: str, overrides: list[str]) -> dict[str, Any]:
 
 
 def main() -> None:
-    """Parse configuration and execute the Hyper-RL trainer."""
+    """Parse configuration and execute the hyperparallel-RL trainer."""
     parser = argparse.ArgumentParser(description="Hyper-Parallel minimal GRPO trainer")
     parser.add_argument(
         "config",
-        help="Path to Hyper-RL YAML configuration",
+        help="Path to hyperparallel-RL YAML configuration",
     )
     args, overrides = parser.parse_known_args()
     logging.basicConfig(

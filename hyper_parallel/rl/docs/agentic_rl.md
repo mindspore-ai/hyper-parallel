@@ -1,13 +1,13 @@
-# Agentic RL：Agentic 模块如何接入 Hyper-RL
+# Agentic RL：Agentic 模块如何接入 hyperparallel-RL
 
 Agentic 模块负责让模型在一个 episode 内反复执行“生成动作—调用工具—接收观察—继续生成”，并把完整过程收敛为
-Hyper-RL 认识的 `Trajectory`。Hyper-RL 仍然负责数据加载、批处理、优势估计、Actor 更新、权重发布和检查点。
+hyperparallel-RL 认识的 `Trajectory`。hyperparallel-RL 仍然负责数据加载、批处理、优势估计、Actor 更新、权重发布和检查点。
 
-换句话说，Agentic 决定模型如何与任务环境交互；Hyper-RL 决定这些交互数据如何用于强化学习。
+换句话说，Agentic 决定模型如何与任务环境交互；hyperparallel-RL 决定这些交互数据如何用于强化学习。
 
 ## 整体关系
 
-![Agentic RL 与 Hyper-RL 的交互架构](images/agentic_rl_architecture.svg)
+![Agentic RL 与 hyperparallel-RL 的交互架构](images/agentic_rl_architecture.svg)
 
 图中实线表示一次训练 step 内的数据或调用方向，虚线表示 Actor 更新后向共享 vLLM 发布下一版本策略。三种 runner
 共享同一套 `PromptRecord → Trajectory → ExperienceBatch` 训练契约，不会形成第二条独立训练链路。
@@ -18,7 +18,7 @@ Hyper-RL 认识的 `Trajectory`。Hyper-RL 仍然负责数据加载、批处理�
 | --- | --- | --- |
 | Agentic | episode 生命周期、多轮动作与观察、工具执行、终止判断、任务奖励、轨迹构造 | 优势估计、梯度更新、权重发布 |
 | Rollout | 提供共享 vLLM 推理端点，返回 token ID、raw logprob 和策略身份 | 任务语义和奖励规则 |
-| Hyper-RL Trainer | 构建 prompt、选择 runner、准备训练 batch、更新 Actor、发布策略并记录指标 | 具体工具如何实现 |
+| hyperparallel-RL Trainer | 构建 prompt、选择 runner、准备训练 batch、更新 Actor、发布策略并记录指标 | 具体工具如何实现 |
 
 `SyncTrainer` 是唯一的顶层编排者。它在 `rl/trainer.py` 中创建 rollout engine，再根据 `agentic.runner` 选择对应的
 rollout manager。Agentic 不绕过 Trainer，也不直接更新模型参数。
@@ -27,7 +27,7 @@ rollout manager。Agentic 不绕过 Trainer，也不直接更新模型参数。
 
 | `agentic.runner` | 实际入口 | episode 控制者 | 适用方式 |
 | --- | --- | --- | --- |
-| `internal`（默认） | `RolloutManager` → `AgentRunner` | Hyper-RL 内部循环 | 自定义环境、协议和 Python 工具 |
+| `internal`（默认） | `RolloutManager` → `AgentRunner` | hyperparallel-RL 内部循环 | 自定义环境、协议和 Python 工具 |
 | `codex` | `CodexRolloutManager` → `ProgramAgentRunner` | Codex CLI program | Codex Responses 协议、shell 或 MCP 工具 |
 | `deepseek` | `DeepSeekRolloutManager` → `ProgramAgentRunner` | DeepSeek Harness program | DeepSeek Chat 协议和 Harness 工具 |
 
@@ -64,7 +64,7 @@ dummy 输出会被丢弃，不进入训练。
 Codex 可按配置启动 MCP stdio server。`rl/agentic/mcp_server.py` 只是把现有 `ToolRegistry` 暴露为 MCP
 `tools/list` 和 `tools/call`，不会复制或改写工具实现。
 
-## Hyper-RL 如何消费 Agentic 结果
+## hyperparallel-RL 如何消费 Agentic 结果
 
 一次训练 step 的真实顺序位于 `SyncTrainer._train_step()`：
 

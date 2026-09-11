@@ -29,7 +29,7 @@ expected = {'deepseek-harness-sdk': '${DEEPSEEK_HARNESS_VERSION}', \
 assert actual == expected, f'dependency version mismatch: expected={expected}, actual={actual}'; \
 import deepseek_harness; print(actual)"
 
-LABEL org.opencontainers.image.title="Hyper-RL DeepSeek Harness runtime" \
-      org.opencontainers.image.description="DeepSeek Harness runtime for Hyper-RL on Ascend" \
+LABEL org.opencontainers.image.title="hyperparallel-RL DeepSeek Harness runtime" \
+      org.opencontainers.image.description="DeepSeek Harness runtime for hyperparallel-RL on Ascend" \
       org.opencontainers.image.base.name="${BASE_IMAGE}" \
       hyper-rl.deepseek-harness-sdk.version="0.1.1rc1"
