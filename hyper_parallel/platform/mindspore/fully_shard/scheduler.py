@@ -130,7 +130,16 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
     # pylint: disable=W0212
     def _backward_pre_hook(self, grad):
         """Execute backward pre hook."""
-        _pynative_executor.queue_backward_final_callback(self._root_backward_hook)
+        ctx = self.scheduler_ctx
+        ctx.post_backward_schedulers[self] = None
+        # The first entry owns finalization in the enclosing backward task. A reentrant
+        # checkpoint's inner FSDP units may register callbacks on a nested task; those
+        # callbacks must still finish local gradients without draining the outer queue.
+        callback = self._backward_hook
+        if not ctx.post_backward_final_callback_queued:
+            ctx.post_backward_final_callback_queued = True
+            callback = self._root_backward_hook
+        _pynative_executor.queue_backward_final_callback(callback)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return grad
         HSDPSchedulerV2.root_bp_state = True
@@ -139,32 +148,29 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
 
     # pylint: disable=W0613
     def _root_backward_hook(self, force_reduce=False):
-        """Finalize the outermost backward: drain pending reductions and apply grads.
+        """Finalize participating units, then drain once in their enclosing backward.
 
-        The drain is unconditional. Every step below is self-limiting -- the fused
-        groups are ``None``-guarded and ``reduce_params`` is an empty-queue no-op
-        when there is no pending work -- so running them on every invocation never
-        double-applies and preserves the invariant that a parameter's ``.grad`` is
-        either ``None`` or a fully reduced value. This mirrors torch FSDP2, whose
-        wait in ``_root_post_backward_final_callback`` is likewise not gated on the
-        per-group post-backward training state.
+        Reentrant inner-task callbacks only call ``_backward_hook``. Non-reentrant
+        recomputation can instead defer a unit's local final callback until after this
+        one. Finish every participating unit first, including units whose inputs did
+        not require gradients and therefore have no ``PostBackwardFunction``.
 
-        Gating the drain on ``scheduler_state != BACKWARD`` is unsafe for any unit
-        that acts as a root while being fed a differentiable activation: its input's
-        ``PostBackwardFunction`` drives ``scheduler_state == BACKWARD``, so the gate
-        would skip the drain and leak the last module's reduce-scatter into the next
-        optimizer step. Pipeline accumulation keeps the queues empty here, launches
-        reduction after each stage's final backward, and drains the final tail through
-        :meth:`wait_for_pending_reductions`.
-
-        ``root_bp_state`` (top-level root backward in flight; gates forward prefetch during
-        activation recompute) is independent of the drain and is cleared only by the root
-        module's own hook, keyed on ``_is_root``.
+        Callback ownership is independent of ``_is_root`` and ``scheduler_state``:
+        an unwrapped model may expose several FSDP roots with differentiable inputs.
+        Such roots still need their terminal reduction even after local post-backward.
+        Pipeline callers retain the explicit ``wait_for_pending_reductions`` entry.
         """
-        self._backward_hook()
-        if self._is_root:
-            HSDPSchedulerV2.root_bp_state = False
-        self.wait_for_pending_reductions()
+        ctx = self.scheduler_ctx
+        schedulers = tuple(ctx.post_backward_schedulers) or (self,)
+        try:
+            for scheduler in schedulers:
+                scheduler._backward_hook()
+            if any(scheduler._is_root for scheduler in schedulers):
+                HSDPSchedulerV2.root_bp_state = False
+            self.wait_for_pending_reductions()
+        finally:
+            ctx.post_backward_schedulers.clear()
+            ctx.post_backward_final_callback_queued = False
 
     def wait_for_pending_reductions(self) -> None:
         """Drain every asynchronous gradient reduction queued by this backend."""
