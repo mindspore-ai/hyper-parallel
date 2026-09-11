@@ -32,6 +32,7 @@ from hyper_parallel.auto_models.components.distributed.cp_wrappers import (
     is_hf_style_attention,
     is_sdpa_attention,
     mla_dsa_ulysses_cp_wrapper,
+    npu_gqa_ulysses_cp_wrapper,
     sdpa_qkv_cp_wrapper,
 )
 from hyper_parallel.auto_models.components.distributed.sharding_applier import (
@@ -1110,6 +1111,65 @@ class _FakeCPMesh:
 class _FakeCPContext:
     size = 2
     rank = 1
+
+
+def test_npu_gqa_ulysses_wraps_attention_interface(monkeypatch):
+    """NPU GQA Ulysses exchanges QKV and restores the BSND output."""
+    calls = []
+
+    def fake_seq_to_head(tensor, seq_dim, head_dim, cp_mesh):
+        calls.append(("seq_to_head", seq_dim, head_dim, cp_mesh))
+        return tensor
+
+    def fake_head_to_seq(tensor, seq_dim, head_dim, cp_mesh):
+        calls.append(("head_to_seq", seq_dim, head_dim, cp_mesh))
+        return tensor
+
+    monkeypatch.setattr(
+        "hyper_parallel.auto_models.components.distributed.cp_wrappers.ulysses_seq_to_head",
+        fake_seq_to_head,
+    )
+    monkeypatch.setattr(
+        "hyper_parallel.auto_models.components.distributed.cp_wrappers.ulysses_head_to_seq",
+        fake_head_to_seq,
+    )
+
+    class _NpuGqa(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention_interface = self._attention
+
+        @staticmethod
+        def _attention(module, query, key, value, attention_mask, **kwargs):
+            del module, key, value, attention_mask, kwargs
+            return query.transpose(1, 2), None
+
+    module = _NpuGqa()
+    cp_mesh = _FakeCPMesh()
+    npu_gqa_ulysses_cp_wrapper(module, None, None, cp_mesh, None)
+    query = torch.randn(1, 4, 8, 16)
+    output, attention_weights = module.attention_interface(
+        module, query, query, query, None
+    )
+
+    expected = query.transpose(1, 2)
+    torch.testing.assert_close(
+        output,
+        expected,
+        msg=f"NPU GQA Ulysses output mismatch: expected={expected.shape}, got={output.shape}",
+    )
+    assert attention_weights is None, (
+        f"NPU GQA Ulysses should preserve attention weights: got={attention_weights}"
+    )
+    assert [call[0] for call in calls] == [
+        "seq_to_head",
+        "seq_to_head",
+        "seq_to_head",
+        "head_to_seq",
+    ], f"NPU GQA Ulysses communication order mismatch: calls={calls}"
+    assert calls[-1][1:3] == (1, 2), (
+        f"NPU GQA output must use BSND dimensions: got={calls[-1][1:3]}"
+    )
 
 
 def _text_forward(self, inputs_embeds=None, **kwargs):

@@ -53,7 +53,7 @@ model, source_shard_info = apply_sharding_plan(model, plan, mesh)   # production
 | `region_dispatch` | `bool`（注入时必填） | **区域计算的 validate 执行模式**：`False`=不可 dispatch（自身 forward 含数据依赖逻辑，或注入物含通信/自定义 kernel）→ 骨架/适配器黑盒；`True`=注入物纯标准算子可 dispatch → validate 穿透 + out_src 真校验 | 自研 EP-aware MoE 传 `False`；融合算子注入传 `True` | 解析链环 2 / 适配器分支 |
 | `local_compute_fn` | `@local_compute` 工厂 `fn(mesh, tp_mesh, cp_mesh, ep_mesh, [module], <配置键...>) -> compute_fn`（compute_fn 为 `fn(module, *args, **kw) -> Tensor`） | 替换骨架内的计算函数（骨架的边界缝合/双模式不变）；**唯一形态 = 区域计算工厂**，apply 期 build 一次，mesh 家族必选声明、框架填充、用不用随你 | 自研 MoE 注入自定义 dispatch（自定义 router/expert 布局/DeepEP） | 解析链环 1，**不改写任何字段** |
 | `inner_target` | `str`（属性名/`"self"`） | **纯位置**：指定被包装目标（`"self"`=边界模块自身/子模块属性名，拼错 fail-fast）；**与 `inner_wrapper` 成对必填**（自动定位启发式已删除） | 用 `inner_wrapper` 时必填——包装自身写 `"self"`，包装子模块写属性名 | target 链环 1，不改写任何字段 |
-| `inner_wrapper` | `str`（注册表名）或 callable/Target | **纯行为**：str 显式固定仓内 CP 参考 wrapper（`"sdpa_qkv"/"sdpa_hf"/"flex_qkv"/"flex_hf"`，注册表 `INNER_WRAPPER_REGISTRY` 开放注册）；callable/Target 自定义（原地替换 target.forward，织入/拦截姿态） | 仓内四路满足时 str 固定；覆盖不到（如内部直调 flash_attn_varlen）时 callable | wrapper 链环 1-2，不改写任何字段 |
+| `inner_wrapper` | `str`（注册表名）或 callable/Target | **纯行为**：str 显式固定仓内 CP 参考 wrapper（如 `"sdpa_hf_ulysses"` / `"npu_gqa_ulysses"`，注册表 `INNER_WRAPPER_REGISTRY` 开放注册）；callable/Target 自定义（原地替换 target.forward，织入/拦截姿态） | 仓内 wrapper 满足时使用注册名；覆盖不到（如内部直调 flash_attn_varlen）时 callable | wrapper 链环 1-2，不改写任何字段 |
 
 > **仓内参考实现说明**：EP 侧仓内参考 `_hf_native_ep_compute`（planner 识别 HF 原生
 > MoE 且 ep_size>1 时经 `_ep_size>0` 意图自动注入，local 链环 2）；CP 侧仓内

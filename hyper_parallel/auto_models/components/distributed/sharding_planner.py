@@ -150,7 +150,7 @@ _SPECIAL_HANDLER_PATTERNS: Dict[str, str] = {
 # without an owner.
 _LEAF_SEGMENT_GUARD = frozenset({
     "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
-    "qkv_proj", "fused_qkv", "gate_up_proj", "query_key_value",
+    "qkv_proj", "fused_qkv", "linear_qkv", "gate_up_proj", "query_key_value",
     "experts", "gate", "linear", "proj",
     "fc1", "fc2", "w1", "w2", "w3", "w13", "dense", "dense_h_to_4h", "dense_4h_to_h",
 })

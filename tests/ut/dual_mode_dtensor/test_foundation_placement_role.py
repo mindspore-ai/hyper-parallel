@@ -193,6 +193,8 @@ def test_param_role_and_classifier():
     # ---- case: shared_experts_not_moe_expert ----
     # shared_experts must hit SHARED_EXPERT before experts.
     assert role("m.mlp.shared_experts.w1") == ParamRole.SHARED_EXPERT, "case: shared_experts_not_moe_expert"
+
+
     assert role("m.mlp.experts.w1") == ParamRole.MOE_EXPERT, "case: shared_experts_not_moe_expert"
 
     # ---- case: gate_proj_not_moe_gate ----
@@ -231,6 +233,19 @@ def test_param_role_and_classifier():
     # ---- case: segment_substring_within_one_segment ----
     # F1 segment substring: the fragment matches within a single segment (no cross-segment).
     assert role("m.mlp.experts.gate_up_proj.weight") == ParamRole.MOE_EXPERT, "case: segment_substring_within_one_segment"
+
+
+def test_optimized_gqa_parameters_form_attention_boundary():
+    """A fused linear-QKV replacement remains a planner attention boundary."""
+    model = _NamedModel([
+        "model.layers.0.self_attn.linear_qkv.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+    ])
+    roles = ParameterClassifier().classify(model)
+
+    assert roles["model.layers.0.self_attn.linear_qkv.weight"] == ParamRole.FUSED_QKV
+    groups = ShardingPlanner()._group_by_boundary(roles)  # pylint: disable=protected-access
+    assert "model.layers.0.self_attn" in groups
 
 
 # ==========================================================================

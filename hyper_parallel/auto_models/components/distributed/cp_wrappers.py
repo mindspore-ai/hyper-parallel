@@ -934,6 +934,48 @@ def sdpa_qkv_ulysses_cp_wrapper(
 
 
 @inner_wrapper
+def npu_gqa_ulysses_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> None:
+    """Apply Pure Ulysses to a GQA module using an NPU attention interface.
+
+    The owning GQA module keeps projection, RoPE, gating, and output projection
+    logic in its regular ``forward``. This wrapper only adapts the QKV tensors
+    around its ``attention_interface`` from sequence shards to head shards and
+    restores the NPU operator's BSND output to the local sequence layout.
+    """
+    del mesh, tp_mesh, ep_mesh
+    _require_ulysses_cp_mesh(cp_mesh, "npu_gqa_ulysses")
+    original_attention = getattr(target_module, "attention_interface", None)
+    if not callable(original_attention):
+        raise TypeError(
+            "NPU GQA Ulysses requires a callable attention_interface"
+        )
+
+    @functools.wraps(original_attention)
+    def ulysses_attention(
+            module: Module, query: torch.Tensor, key: torch.Tensor,
+            value: torch.Tensor, attention_mask: Any, **kwargs: Any) -> Any:
+        """Run the NPU attention interface in the Ulysses head layout."""
+        query, key, value = (
+            ulysses_seq_to_head(tensor, 2, 1, cp_mesh)
+            for tensor in (query, key, value)
+        )
+        output, attention_weights = original_attention(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            **kwargs,
+        )
+        output = ulysses_head_to_seq(output, 1, 2, cp_mesh)
+        return output, attention_weights
+
+    target_module.attention_interface = ulysses_attention
+
+
+@inner_wrapper
 def flex_qkv_ulysses_cp_wrapper(
         target_module: Module, mesh: Any, tp_mesh: Any,
         cp_mesh: Any, ep_mesh: Any) -> None:
@@ -1965,6 +2007,7 @@ INNER_WRAPPER_REGISTRY = {
     "flex_qkv": flex_qkv_cp_wrapper,
     "flex_hf": flex_hf_cp_wrapper,
     "sdpa_qkv_ulysses": sdpa_qkv_ulysses_cp_wrapper,
+    "npu_gqa_ulysses": npu_gqa_ulysses_cp_wrapper,
     "flex_qkv_ulysses": flex_qkv_ulysses_cp_wrapper,
     "sdpa_hf_ulysses": sdpa_hf_ulysses_cp_wrapper,
     "flex_hf_ulysses": flex_hf_ulysses_cp_wrapper,

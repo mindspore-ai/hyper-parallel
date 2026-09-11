@@ -1,0 +1,154 @@
+# Eight-rank Qwen3.8-27B Trainer configuration with high-performance modules.
+
+model:
+  _target_: hyper_parallel.auto_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.8-27B
+  ignore_mismatched_sizes: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  force_hf: true
+
+training:
+  train_iters: 3
+  train_samples: null
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 2
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  - match: "*.self_attn"
+    module_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5Attention
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.auto_models.modules.GatedGQAAttention
+  - match: "*.self_attn"
+    when: cp
+    inner_target: self
+    inner_wrapper: npu_gqa_ulysses
+    region_dispatch: false
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+
+activation_swap: none
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: Qwen/Qwen3.8-27B
+      tokenizer_type: pretokenized
+      vocab_size: 248320
+      eod_token_id: 248044
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_indexed_text_dataset
+  data_path: ./outputs/qwen3_8/data/parallel_offline_text_document
+  data_config:
+    seq_length: 4096
+    split: "1, 0, 0"
+    mock_data: false
+    distributed_walk: true
+    is_dataset_from_mr: false
+    simple_blend: "no"
+    data_lazy_load: true
+    skip_data_check: true
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+    create_ltor_fields_in_dataloader: false
+
+dataloader:
+  _target_: hyper_parallel.auto_models.components.datasets.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.auto_models.components.datasets.build_indexed_collate_fn
+  get_batch:
+    _target_: hyper_parallel.auto_models.components.datasets.ParallelBatch
+    source_type: indexed
+    attention_mode: dense
+    cp_algorithm: ulysses
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.auto_models.components.optim.optimizer.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.95]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.auto_models.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 0
+    min_lr: 1.0e-6
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./outputs/qwen3_8/checkpoints
+  save_steps: 10
+  save_epochs: 1
+  is_async: false
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: false
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
+
+profiling:
+  enabled: false
+  start_step: 3
+  end_step: 4
+  trace_dir: ./outputs/qwen3_8/profiling
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_modules: false
+  rank: 0

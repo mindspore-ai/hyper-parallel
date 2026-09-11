@@ -75,7 +75,7 @@ _FORBIDDEN_USER_ATTRS = frozenset({
 # (q_b_proj covers the MLA up-projection, D-14).
 _QKV_WEIGHT_SUFFIXES = (
     "q_proj.weight", "q_b_proj.weight", "k_proj.weight", "v_proj.weight",
-    "qkv_proj.weight", "qkv.weight",
+    "qkv_proj.weight", "linear_qkv.weight", "qkv.weight",
 )
 
 
