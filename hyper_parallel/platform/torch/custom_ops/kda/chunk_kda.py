@@ -442,6 +442,9 @@ class _KDAStateP2PFunction(torch.autograd.Function):
             scale=ctx.scale,
             chunk_size=ctx.chunk_size,
         )
+        # These recomputed tensors have no consumers after dhu. Dropping
+        # local references lets the allocator reuse their storage on this stream.
+        del query_gated, key_gated, w, u, grad_value_local, _
         (
             grad_query,
             grad_key,
@@ -464,6 +467,8 @@ class _KDAStateP2PFunction(torch.autograd.Function):
             scale=ctx.scale,
             chunk_size=ctx.chunk_size,
         )
+        # Release recomputed states before intra backward allocates its outputs.
+        del states, grad_states, value_new
         grad_query, grad_key, grad_beta, grad_gate = ops.chunk_kda_bwd_intra(
             q=query,
             k=key,
