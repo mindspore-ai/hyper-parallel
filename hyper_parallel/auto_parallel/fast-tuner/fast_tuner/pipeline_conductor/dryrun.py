@@ -25,6 +25,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from multiprocessing import Pool
 
 from fast_tuner.utils.logger import logger
@@ -93,6 +94,9 @@ class DryRun:
         """
         with open(env_config_json, 'r', encoding='utf-8') as f:
             env_vars = json.load(f)
+        blocked = {'PYTHONPATH', 'LD_LIBRARY_PATH'} & env_vars.keys()
+        if blocked:
+            raise ValueError(f'Environment configuration contains blocked variables: {sorted(blocked)}')
         env_vars['RANK_SIZE'] = str(rank_size)
         os.environ.update(env_vars)
 
@@ -122,9 +126,12 @@ class DryRun:
         log_file = os.path.join(cwd, self.log_file_name, f'rank_{rank_id}.log')
         logger.info(f"start training for rank_{rank_id}, device_{device_id}, waiting a moment...")
         if self.config_file_type == 0:
+            script_path = os.path.abspath(self.ms_adapter_file)
+            if not os.path.isfile(script_path):
+                raise ValueError(f'MindSpore adapter script does not exist: {script_path}')
             os.environ['ASCEND_RT_VISIBLE_DEVICES'] = str(device_id)
             os.environ['RANK_ID'] = str(rank_id)
-            command = ['python', self.ms_adapter_file, '--register_path',
+            command = [sys.executable, script_path, '--register_path',
                        self.register_path, '--config', self.config_file]
             with open(log_file, 'w', encoding='utf-8') as log:
                 subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=False)

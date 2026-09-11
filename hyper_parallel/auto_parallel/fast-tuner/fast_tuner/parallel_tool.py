@@ -104,6 +104,8 @@ def main():
                         help='Path to the TOML file')
     parser.add_argument(f"--{InputParam.PARAM_MAPPING['MINDFORMERS_DIR']}",
                         default='', help='Directory of mindformers')
+    parser.add_argument(f"--{InputParam.PARAM_MAPPING['REGISTER_PATH']}",
+                        default='research/jiutian', help='MindFormers registration path')
     parser.add_argument(f"--{InputParam.PARAM_MAPPING['MINDSPEED_PATH']}", default='',
                         help='Path to the MindSpeed file')
     parser.add_argument(f"--{InputParam.PARAM_MAPPING['TORCHTITAN_PATH']}", default='',
