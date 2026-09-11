@@ -48,6 +48,10 @@ def _build_dataloader_context(
     dataloader_context = create_dataloader_parallel_context(
         mesh_context,
         data_index_cache=bool(data_config.get("data_index_cache", False)),
+        collective_source=(
+            data_config.get("packing_stage") == "distributed_dataloader"
+            or data_config.get("load_balance") == "native_batch_sampler"
+        ),
         shared_storage=not bool(data_config.get("no_shared_storage", False)),
     )
     return dataloader_context

@@ -17,9 +17,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
+
+if TYPE_CHECKING:
+    from hyper_parallel.distributed_data.schema import SampleMetadata
 
 logger = get_dataset_logger(__name__)
 
@@ -54,6 +57,26 @@ class LazyDatasetProxy:
         dataset = self._get_dataset()
         sample = dataset[index]
         return sample
+
+    @property
+    def requires_distributed_packing(self) -> bool:
+        """Return whether the deferred Dataset exposes unpacked source samples."""
+        if isinstance(self._unique_identifiers, Mapping):
+            return self._unique_identifiers.get("class") == "IndexedSourceDataset"
+        return False
+
+    def get_sample_metadata(self, index: int) -> SampleMetadata:
+        """Construct the Dataset if necessary and read metadata.
+
+        Args:
+            index: Source index in the deferred Dataset.
+
+        Returns:
+            Planning metadata without reading the source payload.
+        """
+        if not self.requires_distributed_packing:
+            raise ValueError("Lazy Dataset metadata is available only for distributed-packing sources")
+        return self._get_dataset().get_sample_metadata(index)
 
     @property
     def unique_identifiers(self) -> Any:

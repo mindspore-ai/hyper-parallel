@@ -34,6 +34,7 @@ import json
 import logging
 from abc import ABC
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -100,6 +101,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hyper_parallel.data.text.chat_template import ChatTemplate
+    from hyper_parallel.distributed_data.schema import SampleMetadata
 
 
 class BaseTrainer(Stateful, ABC):
@@ -145,8 +147,10 @@ class BaseTrainer(Stateful, ABC):
 
     # Data
     train_dataset: Dataset
+    data_transform: Any
     collate_fn: Any
     train_dataloader: Any
+    num_micro_batches: int
 
     # Model
     model: PreTrainedModel = None
@@ -356,7 +360,7 @@ class BaseTrainer(Stateful, ABC):
         """Require a concrete Trainer to build its micro-batch collator."""
         raise NotImplementedError("Concrete Trainer must implement _build_collate_fn")
 
-    def _build_dataloader(self) -> None:
+    def _build_dataloader(self, *, metadata_fn: Callable[[Any], SampleMetadata] | None = None) -> None:
         """Build and assign train, validation, and test dataloaders."""
         split_names = ("train", "valid", "test")
         datasets = tuple(getattr(self, f"{split_name}_dataset", None) for split_name in split_names)
@@ -366,8 +370,10 @@ class BaseTrainer(Stateful, ABC):
             collate_fn=self.collate_fn,
             mesh_context=self.mesh,
             training_config=self.config.training,
+            data_config=getattr(self.config.dataset, "data_config", {}),
             max_seq_len=getattr(self.data_transform, "max_seq_len", None),
             default_seed=self.default_seed,
+            metadata_fn=metadata_fn,
         )
         for split_name, dataloader, batch_sampler in zip(split_names, dataloaders, batch_samplers):
             setattr(self, f"{split_name}_dataloader", dataloader)
