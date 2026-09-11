@@ -13,10 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Context-parallel input helpers for the LlamaFactory integration."""
+
 import torch
 import torch.distributed as dist
-
-from hyper_parallel.platform import get_platform
 
 _CP_GROUP_CACHE: dict[tuple[int, ...], dist.ProcessGroup] = {}
 _CP_VISION_INPUT_KEYS = {
@@ -31,11 +30,11 @@ _CP_VISION_INPUT_KEYS = {
 def _get_cp_dp_ranks(hp_args) -> tuple[int, int]:
     """Map global rank to logical ``(cp_rank, dp_rank)`` for a ``(dp, cp)`` mesh."""
     cp_size = getattr(hp_args, "cp_size", 1)
-    rank = get_platform().get_rank()
+    rank = dist.get_rank()
     if cp_size <= 1:
         return 0, rank
 
-    world_size = get_platform().get_world_size()
+    world_size = dist.get_world_size()
     if world_size % cp_size != 0:
         raise ValueError(f"world_size ({world_size}) must be divisible by cp_size ({cp_size}).")
 
@@ -61,7 +60,7 @@ def get_cp_group(hp_args):
         return None
 
     _, dp_rank = _get_cp_dp_ranks(hp_args)
-    world_size = get_platform().get_world_size()
+    world_size = dist.get_world_size()
     target_ranks = tuple(dp_rank * cp_size + cp_idx for cp_idx in range(cp_size))
     cached_group = _CP_GROUP_CACHE.get(target_ranks)
     if cached_group is not None:

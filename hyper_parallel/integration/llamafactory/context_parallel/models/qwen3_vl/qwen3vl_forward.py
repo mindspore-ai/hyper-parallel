@@ -647,7 +647,7 @@ class Qwen3VLMoeTextAttentionForCP:
 
 
 def _get_qwen3vl_moe_text_attention_cp_class(base_cls: type) -> type:
-    """Return a CP subclass for the model-native Qwen3VL-MoE TextAttention cell."""
+    """Return a CP subclass for the model-native Qwen3VL-MoE TextAttention module."""
     cached_cls = _QWEN3VL_MOE_TEXT_ATTENTION_CP_CLASSES.get(base_cls)
     if cached_cls is not None:
         return cached_cls

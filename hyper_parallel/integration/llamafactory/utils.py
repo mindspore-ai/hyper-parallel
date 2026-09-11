@@ -51,8 +51,6 @@ from hyper_parallel.integration.llamafactory.context_parallel.inputs import (
     get_dp_rank,
     shard_inputs_for_cp,
 )
-from hyper_parallel.platform import get_platform
-
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -197,7 +195,7 @@ class HyperParallelArguments:
         """Validate that parallel dimensions divide the runtime world size."""
         if self.cp_size == 1 and self.ep_size == 1 and self.efsdp_size is None:
             return
-        world_size = get_platform().get_world_size()
+        world_size = dist.get_world_size()
         if self.cp_size > 1 and world_size % self.cp_size != 0:
             raise ValueError(f"world_size ({world_size}) must be divisible by cp_size ({self.cp_size}).")
         if self.ep_size == 1 and self.efsdp_size is None:
@@ -306,7 +304,7 @@ def _build_device_mesh(accelerator, hp_args):
     """
     if hp_args.fsdp_size is not None:
         device_type = _resolve_device_type(hp_args)
-        world_size = get_platform().get_world_size()
+        world_size = dist.get_world_size()
         fsdp_size = hp_args.fsdp_size
         if fsdp_size >= world_size:
             return init_device_mesh(device_type, (world_size,), mesh_dim_names=("dp",))
@@ -339,7 +337,7 @@ def _build_device_mesh(accelerator, hp_args):
         return cached_mesh
 
     device_type = _resolve_device_type(hp_args)
-    world_size = get_platform().get_world_size()
+    world_size = dist.get_world_size()
     cp_size = getattr(hp_args, "cp_size", 1)
     if cp_size > 1:
         if world_size % cp_size != 0:
@@ -855,11 +853,11 @@ def _resolve_shard_size(mesh) -> int:
     per-param shard count regardless of HSDP layout.
     """
     if mesh is None:
-        return get_platform().get_world_size()
+        return dist.get_world_size()
     shape = getattr(mesh, "mesh_shape", None)
     if shape:
         return int(shape[-1])
-    return mesh.size() if hasattr(mesh, "size") else get_platform().get_world_size()
+    return mesh.size() if hasattr(mesh, "size") else dist.get_world_size()
 
 
 def _collect_replicate_params(model: nn.Module, shard_size: int) -> set:
@@ -1064,7 +1062,7 @@ def export_to_hf_format(model: nn.Module, tokenizer, save_dir: str) -> None:
     options = StateDictOptions(full_state_dict=True, cpu_offload=True)
     state_dict = hp_get_model_state_dict(model, options=options)
 
-    if get_platform().get_rank() == 0:
+    if dist.get_rank() == 0:
         export_dir.mkdir(parents=True, exist_ok=True)
 
         if hasattr(model, "save_pretrained"):
@@ -1075,8 +1073,8 @@ def export_to_hf_format(model: nn.Module, tokenizer, save_dir: str) -> None:
         if tokenizer is not None:
             tokenizer.save_pretrained(str(export_dir))
 
-    if get_platform().get_world_size() > 1:
-        torch.distributed.barrier()
+    if dist.get_world_size() > 1:
+        dist.barrier()
 
 
 def save_hsdp_checkpoint(
@@ -1090,7 +1088,7 @@ def save_hsdp_checkpoint(
     from hyper_parallel.core.distributed_checkpoint.api import save as hp_save  # pylint: disable=C0415
 
     os.makedirs(output_dir, exist_ok=True)
-    rank = get_platform().get_rank()
+    rank = dist.get_rank()
 
     model_dir = os.path.join(output_dir, f"{HSDP_MODEL_NAME}_0")
     os.makedirs(model_dir, exist_ok=True)
@@ -1133,7 +1131,7 @@ def load_hsdp_optimizer_and_scheduler(
     if checkpoint_dir is None:
         return
 
-    rank = get_platform().get_rank()
+    rank = dist.get_rank()
     optim_file = os.path.join(checkpoint_dir, f"{HSDP_OPTIMIZER_NAME}_rank{rank}.pt")
 
     if os.path.isfile(optim_file) and optimizer is not None:
