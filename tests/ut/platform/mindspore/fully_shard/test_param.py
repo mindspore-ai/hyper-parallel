@@ -19,7 +19,7 @@ import os
 import unittest
 from types import SimpleNamespace
 from typing import Optional, Sequence, Tuple
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import numpy as np
 import pytest
@@ -661,6 +661,27 @@ class TestParameterHelpers(MindSporeFullyShardUnitTest):
 
         self.assertIs(hsdp_param._unsharded_param, stable_param)
         stable_buffer.narrow.assert_not_called()
+
+    def test_no_comm_async_unshard_defers_reset(self):
+        """A local-only prefetch should defer parameter reset until synchronous unshard."""
+        hsdp_param = _bare_param()
+        hsdp_param.is_sharded = False
+        hsdp_param.mesh_info = None
+        hsdp_param.reset_sharded_param = MagicMock()
+        all_gather_input = MagicMock()
+
+        with patch.object(
+            MindSporeHSDPParamV2,
+            "all_gather_inputs",
+            new_callable=PropertyMock,
+            return_value=[all_gather_input],
+        ):
+            hsdp_param.unshard(async_op=True)
+            hsdp_param.reset_sharded_param.assert_not_called()
+
+            hsdp_param.unshard(async_op=False)
+
+        hsdp_param.reset_sharded_param.assert_called_once_with()
 
     def test_init_unsharded_param_restores_non_dim_zero_layout(self):
         """Per-parameter all-gather should inline chunk-cat reconstruction for dimension one."""
