@@ -26,13 +26,13 @@ from typing import Optional
 
 import torch
 
-from .triton.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
-from .triton.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
-from .triton.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from .triton.cumsum import chunk_local_cumsum
-from .triton.solve_tril import solve_tril
-from .triton.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
-from .triton.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
+from ._gdn_triton.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
+from ._gdn_triton.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
+from ._gdn_triton.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from ._gdn_triton.cumsum import chunk_local_cumsum
+from ._gdn_triton.solve_tril import solve_tril
+from ._gdn_triton.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from ._gdn_triton.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor]:

@@ -560,7 +560,7 @@ class TestDsaContextParallel(unittest.TestCase):
         slot._slots.setdefault("key", []).append(slot._make_slot(producer_local, producer_local, work, out_perm))
 
         with patch(
-                "hyper_parallel.core.context_parallel.async_dsa_context_parallel.platform"
+                "hyper_parallel.core.context_parallel.async_dsa_context_parallel.utils"
                 ".differentiable_async_allgather_wait",
                 return_value=gathered,
         ) as mock_wait:

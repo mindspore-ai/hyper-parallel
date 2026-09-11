@@ -591,12 +591,12 @@ class _GDNStateP2PTritonFunction(torch.autograd.Function):
         next_rank: int,
     ) -> torch.Tensor:
         """Run fused local GDN and forward its affine state across CP ranks."""
-        from hyper_parallel.platform.torch.custom_ops.gdn.chunk_gated_delta_rule import (  # pylint: disable=import-outside-toplevel
+        from hyper_parallel.components.functional.gated_delta_net import (  # pylint: disable=import-outside-toplevel
             chunk_gated_delta_rule_fwd_apply_state_saved,
             chunk_gated_delta_rule_fwd_output_saved,
             chunk_gated_delta_rule_fwd_prepare_saved,
         )
-        from hyper_parallel.platform.torch.custom_ops.gdn.state_summary import (  # pylint: disable=import-outside-toplevel
+        from hyper_parallel.components.functional.gated_delta_net_state_summary import (  # pylint: disable=import-outside-toplevel
             apply_gdn_state_summary,
             chunk_gated_delta_rule_state_summary_fwd,
         )
@@ -697,12 +697,12 @@ class _GDNStateP2PTritonFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):  # pylint: disable=too-many-locals
         """Backpropagate local GDN tensors and the state gradient wavefront."""
-        from hyper_parallel.platform.torch.custom_ops.gdn.chunk_gated_delta_rule import (  # pylint: disable=import-outside-toplevel
+        from hyper_parallel.components.functional.gated_delta_net import (  # pylint: disable=import-outside-toplevel
             chunk_gated_delta_rule_bwd_finish_saved,
             chunk_gated_delta_rule_bwd_prepare_saved,
             chunk_gated_delta_rule_bwd_state_saved,
         )
-        from hyper_parallel.platform.torch.custom_ops.gdn.state_summary import (  # pylint: disable=import-outside-toplevel
+        from hyper_parallel.components.functional.gated_delta_net_state_summary import (  # pylint: disable=import-outside-toplevel
             apply_gdn_state_gradient_summary,
             chunk_gated_delta_rule_state_gradient_summary_bwd,
         )

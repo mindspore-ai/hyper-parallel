@@ -20,11 +20,9 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, StridedShard
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.context_parallel import utils
+from hyper_parallel.core.context_parallel.utils import Module, Tensor
 
-platform = get_platform()
-Module = platform.Module
-Tensor = platform.Tensor
 
 _OUTPUT_LAYOUT_STACK_ATTR = "_context_parallel_output_layout_stack"
 _OUTPUT_LOCAL = "local"
@@ -824,7 +822,7 @@ class ContextParallel(ParallelStyle):
         """Replace ``module.forward`` with the load-balanced two-sub-FA wrapper."""
         ws = co_submesh.mesh.numel()
         rank_list = list(co_submesh.rank_list)
-        local_idx = rank_list.index(platform.get_rank())
+        local_idx = rank_list.index(utils.get_rank())
         target_idx = ws - 1 - local_idx
         module.forward = partial(
             self._lb_colossal_forward,
@@ -875,7 +873,7 @@ class ContextParallel(ParallelStyle):
         q_keep = q.narrow(seq_dim, 0, half)
         q_mine = q.narrow(seq_dim, half, half)
 
-        q_peer = platform.p2p_exchange(q_mine, peer_rank)
+        q_peer = utils.p2p_exchange(q_mine, peer_rank)
         k_full = _gather_seq(new_args[k_idx], co_submesh, seq_dim).to_local()
         v_full = _gather_seq(new_args[v_idx], co_submesh, seq_dim).to_local()
 
@@ -894,6 +892,6 @@ class ContextParallel(ParallelStyle):
 
         fa1_out = _fa(q_keep, split_id=2 * local_idx)
         fa2_out = _fa(q_peer, split_id=2 * target_idx + 1)
-        fa2_our = platform.p2p_exchange(fa2_out, peer_rank)
-        out = platform.cat([fa1_out, fa2_our], dim=seq_dim)
+        fa2_our = utils.p2p_exchange(fa2_out, peer_rank)
+        out = utils.cat([fa1_out, fa2_our], dim=seq_dim)
         return _finalize_colossal_output(out, output_layout, co_submesh, seq_dim, self.use_local_output)

@@ -18,19 +18,15 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import torch
+import torch.distributed as dist
 
-from hyper_parallel.platform import get_platform
-
-from .fla_adapter import get_fla_kda_staged_ops, run_fla_chunk_kda
-from .state_summary import (
+from .kimi_delta_attention_fla_adapter import get_fla_kda_staged_ops, run_fla_chunk_kda
+from .kimi_delta_attention_state_summary import (
     apply_kda_state_gradient_summary,
     apply_kda_state_summary,
     kda_state_gradient_summary_from_prepared,
     kda_state_summary_forward_from_prepared,
 )
-
-
-platform = get_platform()
 
 
 def _validate_local_inputs(
@@ -224,7 +220,7 @@ class _KDAStateP2PFunction(torch.autograd.Function):
                 device=query.device,
                 dtype=torch.float32,
             )
-            recv_work = platform.irecv(
+            recv_work = dist.irecv(
                 initial_state,
                 src=prev_rank,
                 group=cp_group,
@@ -263,7 +259,7 @@ class _KDAStateP2PFunction(torch.autograd.Function):
                 initial_state,
             )
             send_state = final_state.contiguous()
-            send_work = platform.isend(
+            send_work = dist.isend(
                 send_state,
                 dst=next_rank,
                 group=cp_group,
@@ -360,7 +356,7 @@ class _KDAStateP2PFunction(torch.autograd.Function):
                 device=query.device,
                 dtype=torch.float32,
             )
-            recv_work = platform.irecv(
+            recv_work = dist.irecv(
                 grad_final_state,
                 src=ctx.next_rank,
                 group=ctx.cp_group,
@@ -424,7 +420,7 @@ class _KDAStateP2PFunction(torch.autograd.Function):
                 grad_final_state,
             )
             send_state_gradient = grad_initial_state.contiguous()
-            send_work = platform.isend(
+            send_work = dist.isend(
                 send_state_gradient,
                 dst=ctx.prev_rank,
                 group=ctx.cp_group,

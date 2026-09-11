@@ -244,7 +244,7 @@ def chunk_gated_delta_rule(
             "chunk_size=64, and sequence length divisible by 64."
         )
 
-    from hyper_parallel.platform.torch.custom_ops.gdn.chunk_gated_delta_rule import (  # pylint: disable=import-outside-toplevel
+    from hyper_parallel.components.functional.gated_delta_net import (  # pylint: disable=import-outside-toplevel
         chunk_gated_delta_rule as triton_chunk_gated_delta_rule,
     )
 

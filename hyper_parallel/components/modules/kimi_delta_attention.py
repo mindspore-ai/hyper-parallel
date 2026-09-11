@@ -111,7 +111,7 @@ def is_triton_kda_available(
         lower_bound=lower_bound,
     ):
         return False
-    from hyper_parallel.platform.torch.custom_ops.kda.fla_adapter import (  # pylint: disable=import-outside-toplevel
+    from hyper_parallel.components.functional.kimi_delta_attention_fla_adapter import (  # pylint: disable=import-outside-toplevel
         is_fla_triton_kda_available,
     )
     return is_fla_triton_kda_available()
@@ -556,7 +556,7 @@ def chunk_kda(
             "head_k_dim=head_v_dim=128, chunk_size=64, and a supported safe gate."
         )
 
-    from hyper_parallel.platform.torch.custom_ops.kda.chunk_kda import (  # pylint: disable=import-outside-toplevel
+    from hyper_parallel.components.functional.kimi_delta_attention import (  # pylint: disable=import-outside-toplevel
         fused_chunk_kda,
     )
 

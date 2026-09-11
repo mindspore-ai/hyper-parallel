@@ -41,11 +41,9 @@ from hyper_parallel.core.context_parallel.context_parallel import (
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.context_parallel import utils
+from hyper_parallel.core.context_parallel.utils import Module, Tensor
 
-platform = get_platform()
-Module = platform.Module
-Tensor = platform.Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +74,9 @@ def _launch_async_a2a_seq_to_head(
     ).permute(
         [head_dim] + list(range(head_dim)) + list(range(head_dim + 1, ndim))
     ).contiguous()
-    out_perm, work = platform.all_to_all_single(_detach_if_available(x_perm), list(x_perm.shape), group, async_op=True)
+    out_perm, work = utils.all_to_all_single(
+        _detach_if_available(x_perm), list(x_perm.shape), group, async_op=True
+    )
     return work, out_perm
 
 
@@ -127,7 +127,9 @@ def _launch_async_allgather_seq(
     x_perm = _move_dim_to_front(tensor.contiguous(), gather_dim)
     output_shape = list(x_perm.shape)
     output_shape[0] *= world_size
-    out_perm, work = platform.all_gather_single(_detach_if_available(x_perm), output_shape, group, async_op=True)
+    out_perm, work = utils.all_gather_single(
+        _detach_if_available(x_perm), output_shape, group, async_op=True
+    )
     return work, out_perm
 
 
@@ -321,7 +323,7 @@ class AsyncContextParallel(ContextParallel):
             fwd_slots=fwd_ag_slots,
             bwd_slots=bwd_ag_slots,
         )
-        platform.register_forward_pre_hook(
+        utils.register_forward_pre_hook(
             module,
             partial(
                 self._attn_pre_hook_colossal,
@@ -402,7 +404,7 @@ class AsyncContextParallel(ContextParallel):
             layout_mesh=a2a_layout_mesh,
             layout_placements=a2a_layout_placements,
         )
-        platform.register_forward_pre_hook(
+        utils.register_forward_pre_hook(
             module,
             pre_hook,
             with_kwargs=True,
@@ -433,7 +435,7 @@ class AsyncContextParallel(ContextParallel):
                 partial(self._proj_post_hook, key=key, submesh=submesh, group=group, world_size=world_size,
                         fwd_slots=fwd_slots, layout_mesh=layout_mesh, layout_placements=layout_placements)
             )
-            platform.register_full_backward_pre_hook(
+            utils.register_full_backward_pre_hook(
                 proj,
                 partial(self._proj_bwd_pre_hook, bwd_slot=bwd_slots[key])
             )
@@ -463,7 +465,7 @@ class AsyncContextParallel(ContextParallel):
                 partial(self._proj_ag_post_hook, key=key, submesh=submesh, group=group, world_size=world_size,
                         fwd_slots=fwd_slots)
             )
-            platform.register_full_backward_pre_hook(
+            utils.register_full_backward_pre_hook(
                 proj,
                 partial(self._proj_ag_bwd_pre_hook, bwd_slot=bwd_slots[key])
             )
@@ -517,7 +519,7 @@ class AsyncContextParallel(ContextParallel):
         slot = fwd_slots[key]
         work, out_perm = _slot_comm(slot)
         fwd_slots[key] = None
-        return platform.differentiable_async_a2a_wait(
+        return utils.differentiable_async_a2a_wait(
             tensor, work, out_perm, group, world_size,
             self.seq_dim, self.head_dim,  # concat_dim=seq_dim, split_dim=head_dim
             bwd_slot,
@@ -548,7 +550,7 @@ class AsyncContextParallel(ContextParallel):
 
     def _wait_allgather(self, tensor, group, world_size, work, out_perm, bwd_slot=None):
         """Wait for pre-launched AllGather and return gathered tensor."""
-        return platform.differentiable_async_allgather_wait(
+        return utils.differentiable_async_allgather_wait(
             tensor,
             work,
             out_perm,

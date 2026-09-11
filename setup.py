@@ -222,7 +222,7 @@ if __name__ == '__main__':
         scripts=['hyper_parallel/core/multicore/scripts/hyper_parallel_multicore_set_env.bash'],
         package_data={
             'hyper_parallel.core.shard.ops': ['yaml/*.yaml'],
-            'hyper_parallel.platform.torch.custom_ops.gdn': ['LICENSE'],
+            'hyper_parallel.components.functional': ['GDN_LICENSE', 'KDA_README.md'],
             'hyper_parallel.core.multicore': ['README.md', 'docs/**/*', 'examples/**/*', 'set_env.bash'],
             'hyper_parallel.models.qwen3_moe': ['recipes/*.yaml'],
             'hyper_parallel.auto_parallel.sapp_nd.memory_estimation': [
