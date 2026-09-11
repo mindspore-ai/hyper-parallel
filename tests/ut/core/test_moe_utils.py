@@ -24,7 +24,8 @@ Test IDs:
 """
 import os
 import unittest
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
@@ -58,31 +59,39 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
         dp_group = GroupInfo("dp_group", MagicMock(), 2)
 
-        with patch("hyper_parallel.core.moe_utils.platform") as mock_platform:
-            mock_all_reduce = MagicMock()
-            mock_platform.all_reduce = mock_all_reduce
+        with patch("hyper_parallel.core.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(moe, lr=1e-3, dp_group=dp_group)
 
-            mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, dp_group)
+            mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, group=dp_group.group)
             moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
 
     def test_dp_group_sync_with_process_group(self):
-        """DP group provided as ProcessGroup: should wrap then sync."""
+        """DP group provided as ProcessGroup: should sync with the raw group."""
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
-        mock_pg = MagicMock()
-        mock_pg.group = None
+        mock_pg = MagicMock(spec=torch.distributed.ProcessGroup)
 
-        with patch("hyper_parallel.core.moe_utils.platform") as mock_platform:
-            mock_all_reduce = MagicMock()
-            mock_platform.all_reduce = mock_all_reduce
+        with patch("hyper_parallel.core.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(moe, lr=1e-3, dp_group=mock_pg)
 
-            args, _ = mock_all_reduce.call_args
-            self.assertIs(args[0], moe.tokens_per_expert)
-            self.assertTrue(hasattr(args[1], "group"))
+            mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, group=mock_pg)
             moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
+
+    def test_group_wrapper_sync_updates_counts_before_bias(self):
+        """A duck-typed group wrapper passes its raw group and updates stats in place."""
+        moe = self._make_moe_mock([1.0, 2.0, 3.0, 4.0])
+        group = SimpleNamespace(group=object())
+        moe.update_expert_bias.side_effect = lambda **_kwargs: torch.testing.assert_close(
+            moe.tokens_per_expert, torch.tensor([2.0, 4.0, 6.0, 8.0]),
+        )
+
+        with patch("hyper_parallel.core.moe_utils.dist.all_reduce") as mock_all_reduce:
+            mock_all_reduce.side_effect = lambda tensor, **_kwargs: tensor.mul_(2)
+            sync_and_update_expert_bias(moe, dp_group=group)
+
+        mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, group=group.group)
+        moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
 
     def test_tp_cp_dp_sync_all_groups(self):
         """All three groups provided: should sync in order TP, CP, DP."""
@@ -91,19 +100,18 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
         cp_group = GroupInfo("cp_group", MagicMock(), 2)
         dp_group = GroupInfo("dp_group", MagicMock(), 2)
 
-        with patch("hyper_parallel.core.moe_utils.platform") as mock_platform:
-            mock_all_reduce = MagicMock()
-            mock_platform.all_reduce = mock_all_reduce
+        with patch("hyper_parallel.core.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(
                 moe, lr=1e-3, tp_group=tp_group, cp_group=cp_group, dp_group=dp_group,
             )
 
             self.assertEqual(mock_all_reduce.call_count, 3)
-            call_args_list = [call[0] for call in mock_all_reduce.call_args_list]
-            self.assertEqual(call_args_list[0][1], tp_group)
-            self.assertEqual(call_args_list[1][1], cp_group)
-            self.assertEqual(call_args_list[2][1], dp_group)
+            self.assertEqual(mock_all_reduce.call_args_list, [
+                call(moe.tokens_per_expert, group=tp_group.group),
+                call(moe.tokens_per_expert, group=cp_group.group),
+                call(moe.tokens_per_expert, group=dp_group.group),
+            ])
             moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
 
     def test_num_recomputations_passed(self):
@@ -119,13 +127,11 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
         tp_group = GroupInfo("tp_group", MagicMock(), 2)
 
-        with patch("hyper_parallel.core.moe_utils.platform") as mock_platform:
-            mock_all_reduce = MagicMock()
-            mock_platform.all_reduce = mock_all_reduce
+        with patch("hyper_parallel.core.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(moe, lr=1e-3, tp_group=tp_group)
 
-            mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, tp_group)
+            mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, group=tp_group.group)
             moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
 
     def test_cp_only_sync(self):
@@ -133,13 +139,11 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
         moe = self._make_moe_mock([10.0, 20.0, 30.0, 40.0])
         cp_group = GroupInfo("cp_group", MagicMock(), 2)
 
-        with patch("hyper_parallel.core.moe_utils.platform") as mock_platform:
-            mock_all_reduce = MagicMock()
-            mock_platform.all_reduce = mock_all_reduce
+        with patch("hyper_parallel.core.moe_utils.dist.all_reduce") as mock_all_reduce:
 
             sync_and_update_expert_bias(moe, lr=1e-3, cp_group=cp_group)
 
-            mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, cp_group)
+            mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, group=cp_group.group)
             moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
 
     def test_integration_with_real_moe(self):
