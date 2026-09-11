@@ -23,7 +23,10 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 """
 
 import logging
-from typing import Any, Dict, Literal, Optional, Union
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterator, Literal, Optional, Union
 
 import torch
 from torch import nn
@@ -62,6 +65,68 @@ from hyper_parallel.models.registry import _resolve_custom_model_cls
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
 
 logger = logging.getLogger(__name__)
+
+
+_DEFER_MODEL_MATERIALIZATION: ContextVar[bool] = ContextVar(
+    "defer_model_materialization",
+    default=False,
+)
+
+
+@dataclass(frozen=True)
+class DeferredModelBuildRequest:
+    """Normal builder state exposed to one scoped deferred-model adapter.
+
+    The request intentionally carries only Trainer-independent construction
+    infrastructure.  It lets Dry-run replace the whole-model sharding stage
+    with stage-local pipeline assembly without adding options to public model
+    factory methods.
+    """
+
+    distributed_setup: Optional[DistributedSetup]
+    mesh: Optional[MeshContext]
+    sharding_planner: Optional[ShardingPlanner]
+    fsdp2_manager: Optional[FSDP2Manager]
+    validate_placement: bool
+    model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]]
+
+
+DeferredModelBuildAdapter = Callable[[nn.Module, DeferredModelBuildRequest], nn.Module]
+
+
+_DEFERRED_MODEL_BUILD_ADAPTER: ContextVar[Optional[DeferredModelBuildAdapter]] = ContextVar(
+    "deferred_model_build_adapter",
+    default=None,
+)
+
+
+@contextmanager
+def model_build_context(
+        adapter: Optional[DeferredModelBuildAdapter] = None,
+) -> Iterator[None]:
+    """Build a fully parallelized meta model without materializing weights.
+
+    The context is intended for shape-only consumers such as Dry-run. Normal
+    callers keep the atomic materialize/load-or-initialize behavior without
+    adding control arguments to the public AutoModel methods.
+    """
+    token = _DEFER_MODEL_MATERIALIZATION.set(True)
+    adapter_token = _DEFERRED_MODEL_BUILD_ADAPTER.set(adapter)
+    try:
+        yield
+    finally:
+        _DEFERRED_MODEL_BUILD_ADAPTER.reset(adapter_token)
+        _DEFER_MODEL_MATERIALIZATION.reset(token)
+
+
+def is_model_materialization_deferred() -> bool:
+    """Return whether the current model build must stop before materialization."""
+    return _DEFER_MODEL_MATERIALIZATION.get()
+
+
+def get_deferred_model_build_adapter() -> Optional[DeferredModelBuildAdapter]:
+    """Return the adapter attached to the current deferred build scope."""
+    return _DEFERRED_MODEL_BUILD_ADAPTER.get()
 
 
 def instantiate_infrastructure(
@@ -144,17 +209,32 @@ def _init_model(
     architectures = getattr(hf_config, "architectures", []) or []
     arch_name = architectures[0] if architectures else ""
 
+    def build_hf_from_config() -> PreTrainedModel:
+        """Construct config-only state for ``from_config`` and deferred loads."""
+        config_kwargs = dict(kwargs)
+        # ``from_pretrained`` accepts loader-only options that the concrete
+        # model constructor behind AutoModel.from_config does not recognize.
+        for name in (
+                "local_files_only",
+                "revision",
+                "cache_dir",
+                "force_download",
+                "proxies",
+                "token",
+                "use_safetensors",
+        ):
+            config_kwargs.pop(name, None)
+        if torch_dtype != "auto":
+            config_kwargs["dtype"] = torch_dtype
+        config_kwargs["attn_implementation"] = attn_implementation
+        return getattr(cls, "_from_config_parent_class")(hf_config, **config_kwargs)
+
+    deferred = is_model_materialization_deferred()
+
     # ── Path A: HF native ──
     if is_hf_model:
-        if pretrained_model_name_or_path is None:
-            config_kwargs = dict(kwargs)
-            if torch_dtype != "auto":
-                config_kwargs["dtype"] = torch_dtype
-            config_kwargs["attn_implementation"] = attn_implementation
-            model = getattr(cls, "_from_config_parent_class")(
-                hf_config,
-                **config_kwargs,
-            )
+        if pretrained_model_name_or_path is None or deferred:
+            model = build_hf_from_config()
         else:
             model = getattr(cls, "_from_pretrained_parent_class")(
                 pretrained_model_name_or_path,
@@ -174,14 +254,8 @@ def _init_model(
             "Custom model class for %s not found; falling back to HF native.",
             arch_name,
         )
-        if pretrained_model_name_or_path is None:
-            config_kwargs = dict(kwargs)
-            if torch_dtype != "auto":
-                config_kwargs["dtype"] = torch_dtype
-            config_kwargs["attn_implementation"] = attn_implementation
-            model = getattr(cls, "_from_config_parent_class")(
-                hf_config, **config_kwargs
-            )
+        if pretrained_model_name_or_path is None or deferred:
+            model = build_hf_from_config()
         else:
             model = getattr(cls, "_from_pretrained_parent_class")(
                 pretrained_model_name_or_path,
@@ -194,7 +268,7 @@ def _init_model(
         return False, model
 
     # Instantiate custom model
-    if pretrained_model_name_or_path is not None:
+    if pretrained_model_name_or_path is not None and not deferred:
         model = custom_model_cls.from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
@@ -335,7 +409,6 @@ def _build_replacement_context(
 
 
 def _apply_pre_sharding_features(
-    model: nn.Module,
     peft_config: Optional[Any],
     qat_config: Optional[Any],
     fp8_config: Optional[Any],
@@ -384,6 +457,8 @@ def _materialize_and_load_model(
     weights_mapping: Any,
 ) -> nn.Module:
     """Materialize model storage and load or initialize meta-device weights."""
+    if is_model_materialization_deferred():
+        return model
     model = _move_model_to_device(model, is_meta_device, device)
     if not is_meta_device:
         return model
@@ -434,7 +509,7 @@ def apply_model_infrastructure(
         compile_config, validate_placement, fsdp2_manager
     )
     _apply_pre_sharding_features(
-        model, peft_config, qat_config, fp8_config
+        peft_config, qat_config, fp8_config
     )
 
     # Step 5.5: structure-preserving replacement before plan derivation.

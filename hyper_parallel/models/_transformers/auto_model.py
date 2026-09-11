@@ -31,9 +31,12 @@ from transformers import (
 )
 
 from hyper_parallel.models._transformers.model_builder import (
+    DeferredModelBuildRequest,
     _init_model,
     apply_model_infrastructure,
+    get_deferred_model_build_adapter,
     instantiate_infrastructure,
+    is_model_materialization_deferred,
 )
 from hyper_parallel.models._transformers.config_resolver import get_hf_config, get_is_hf_model
 from hyper_parallel.distributed.mesh import DistributedSetup
@@ -49,6 +52,37 @@ def _current_device() -> torch.device:
     if device_type == "cpu":
         return torch.device("cpu")
     return torch.device(device_type, get_device_id())
+
+
+def _model_init_context(is_hf_model: bool, quantization_config: Optional[Any]) -> tuple[bool, Any]:
+    """Resolve whether model construction uses meta storage and its contexts."""
+    # Lazy imports keep compatibility with transformers versions that moved
+    # ``no_init_weights`` between modules.
+    # pylint: disable=import-outside-toplevel
+    from contextlib import nullcontext
+    from torch._subclasses.fake_tensor import unset_fake_temporarily
+    from transformers.modeling_utils import ContextManagers
+    try:
+        from transformers.modeling_utils import no_init_weights
+    except ImportError:
+        from transformers.initialization import no_init_weights
+    from hyper_parallel import init_empty_weights
+    # pylint: enable=import-outside-toplevel
+
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    deferred = is_model_materialization_deferred()
+    is_meta_device = (
+        world_size > 1 or not is_hf_model or deferred
+    ) and quantization_config is None
+    if not is_meta_device:
+        return False, nullcontext()
+
+    init_contexts = [no_init_weights(), init_empty_weights()]
+    if deferred:
+        # init_empty_weights replaces registered Parameters itself; let it
+        # create ordinary meta tensors before FakeTensor handles sharding.
+        init_contexts.insert(0, unset_fake_temporarily())
+    return True, ContextManagers(init_contexts)
 
 
 class _BaseHyperAutoModelClass:
@@ -247,29 +281,10 @@ class _BaseHyperAutoModelClass:
         Step 3-12: apply_model_infrastructure (PEFT, QAT, ShardingPlan,
         activation checkpoint, FSDP2, load, layer compile)
         """
-        # Lazy imports: no_init_weights moved between transformers submodules
-        # across versions (hence the ImportError fallback).
-        # pylint: disable=import-outside-toplevel
-        from contextlib import nullcontext
-        from transformers.modeling_utils import ContextManagers
-        try:
-            from transformers.modeling_utils import no_init_weights
-        except ImportError:
-            from transformers.initialization import no_init_weights
-        from hyper_parallel import init_empty_weights
-        # pylint: enable=import-outside-toplevel
-
-        # Step 1: Determine meta device (inline world-size probe: auto_models
-        # must not import the trainer runtime).
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        is_meta_device = (
-            world_size > 1 or not is_hf_model
-        ) and kwargs.get("quantization_config") is None
-
-        init_ctx = (
-            ContextManagers([no_init_weights(), init_empty_weights()])
-            if is_meta_device
-            else nullcontext()
+        # The inline world-size probe avoids importing trainer runtime here.
+        is_meta_device, init_ctx = _model_init_context(
+            is_hf_model,
+            kwargs.get("quantization_config"),
         )
 
         # Step 2: Build model
@@ -286,29 +301,44 @@ class _BaseHyperAutoModelClass:
                 **kwargs,
             )
 
-        # Step 3-12: Apply infrastructure
-        model = apply_model_infrastructure(
-            model,
-            mesh=mesh,
-            sharding_planner=sharding_planner,
-            fsdp2_manager=fsdp2_manager,
-            peft_config=peft_config,
-            qat_config=qat_config,
-            fp8_config=fp8_config,
-            freeze_config=freeze_config,
-            compile_config=compile_config,
-            is_meta_device=is_meta_device,
-            is_hf_model=is_hf_model,
-            device=_current_device(),
-            load_base_model=load_base_model,
-            pretrained_path=pretrained_model_name_or_path,
-            validate_placement=validate_placement,
-            distributed_setup=distributed_setup,
-            activation_checkpoint=activation_checkpoint,
-            swap_inputs=swap_inputs,
-            activation_swap=activation_swap,
-            model_init_dtype=model_init_dtype,
-        )
+        # Step 3-12: Apply infrastructure, or let a scoped Dry-run adapter
+        # replace whole-model assembly with stage-local pipeline assembly.
+        adapter = get_deferred_model_build_adapter()
+        if adapter is not None:
+            model = adapter(
+                model,
+                DeferredModelBuildRequest(
+                    distributed_setup=distributed_setup,
+                    mesh=mesh,
+                    sharding_planner=sharding_planner,
+                    fsdp2_manager=fsdp2_manager,
+                    validate_placement=validate_placement,
+                    model_init_dtype=model_init_dtype,
+                ),
+            )
+        else:
+            model = apply_model_infrastructure(
+                model,
+                mesh=mesh,
+                sharding_planner=sharding_planner,
+                fsdp2_manager=fsdp2_manager,
+                peft_config=peft_config,
+                qat_config=qat_config,
+                fp8_config=fp8_config,
+                freeze_config=freeze_config,
+                compile_config=compile_config,
+                is_meta_device=is_meta_device,
+                is_hf_model=is_hf_model,
+                device=_current_device(),
+                load_base_model=load_base_model,
+                pretrained_path=pretrained_model_name_or_path,
+                validate_placement=validate_placement,
+                distributed_setup=distributed_setup,
+                activation_checkpoint=activation_checkpoint,
+                swap_inputs=swap_inputs,
+                activation_swap=activation_swap,
+                model_init_dtype=model_init_dtype,
+            )
 
         model.train()
         return model

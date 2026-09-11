@@ -29,11 +29,6 @@ from typing import Any, List, Literal, Optional, Union
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.models.build_options import (
-    CompileConfig,
-    FSDP2Config,
-    FSDP2MixedPrecisionConfig,
-)
 from hyper_parallel.models.replacement import (
     ModuleReplacementFactory,
     ModuleReplacementSpec,
@@ -53,6 +48,10 @@ class AcceleratorConfig:
     cp_size: int = 1
     ep_size: int = 1
     pp_size: int = 1
+    pp_micro_batch_num: int = 1
+    pp_schedule: Optional[Literal["gpipe", "1f1b"]] = None
+    pp_vpp: int = 1
+    pp_layer_split: Optional[List[int]] = None
     sequence_parallel: bool = False
     loss_parallel: bool = False
 
