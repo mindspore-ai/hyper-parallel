@@ -292,9 +292,12 @@ class BaseTrainer(Stateful, ABC):
             swap_inputs=getattr(self.config.activation_checkpoint, "swap_inputs", False),
             activation_swap=self.config.activation_swap,
             compile_config=self.config.compile,
+            codegen=self.config.codegen,
+            modeling_backend=self.config.modeling_backend,
             # The final dtype is applied inside the atomic build (05 stage-5
             # item 5); the Trainer no longer patches it afterwards.
             model_init_dtype=self.config.model_init_dtype,
+            codegen_config=self.config,
         )
         self.model_config = self.model.config
         if self.global_rank == 0:

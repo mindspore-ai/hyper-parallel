@@ -20,8 +20,17 @@ loads and validates that dependency normally.
 """
 
 import importlib
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from hyper_parallel.components.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
+    from hyper_parallel.components.modules.gqa_attention import GatedGQAAttention, GQAAttention
+    from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+    from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
+    from hyper_parallel.components.modules.mla_attention import MLAAttention
+    from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
+    from hyper_parallel.components.modules.shared_expert import SharedExpert
+    from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
 
 _EXPORT_TO_MODULE = {
     "DeepseekV32DSAAttention": "dsa_attention",
@@ -38,6 +47,8 @@ _EXPORT_TO_MODULE = {
     "SwiGLUMLP": "swiglu_mlp",
 }
 
+__all__ = list(_EXPORT_TO_MODULE)
+
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     """Resolve a public class by importing only its owning submodule."""
@@ -49,4 +60,7 @@ def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     globals()[name] = value
     return value
 
-__all__ = list(_EXPORT_TO_MODULE)
+
+def __dir__() -> list[str]:
+    """Include lazy public exports in ``dir()``."""
+    return sorted(set(globals()) | set(__all__))
