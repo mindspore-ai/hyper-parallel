@@ -54,6 +54,37 @@ def _current_device() -> torch.device:
     return torch.device(device_type, get_device_id())
 
 
+def _model_init_context(is_hf_model: bool, quantization_config: Optional[Any]) -> tuple[bool, Any]:
+    """Resolve whether model construction uses meta storage and its contexts."""
+    # Lazy imports keep compatibility with transformers versions that moved
+    # ``no_init_weights`` between modules.
+    # pylint: disable=import-outside-toplevel
+    from contextlib import nullcontext
+    from torch._subclasses.fake_tensor import unset_fake_temporarily
+    from transformers.modeling_utils import ContextManagers
+    try:
+        from transformers.modeling_utils import no_init_weights
+    except ImportError:
+        from transformers.initialization import no_init_weights
+    from hyper_parallel import init_empty_weights
+    # pylint: enable=import-outside-toplevel
+
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    deferred = is_model_materialization_deferred()
+    is_meta_device = (
+        world_size > 1 or not is_hf_model or deferred
+    ) and quantization_config is None
+    if not is_meta_device:
+        return False, nullcontext()
+
+    init_contexts = [no_init_weights(), init_empty_weights()]
+    if deferred:
+        # init_empty_weights replaces registered Parameters itself; let it
+        # create ordinary meta tensors before FakeTensor handles sharding.
+        init_contexts.insert(0, unset_fake_temporarily())
+    return True, ContextManagers(init_contexts)
+
+
 class _BaseHyperAutoModelClass:
     """Shared from_pretrained / from_config logic.
 
@@ -250,34 +281,11 @@ class _BaseHyperAutoModelClass:
         Step 3-12: apply_model_infrastructure (PEFT, QAT, ShardingPlan,
         activation checkpoint, FSDP2, load, layer compile)
         """
-        # Lazy imports: no_init_weights moved between transformers submodules
-        # across versions (hence the ImportError fallback).
-        # pylint: disable=import-outside-toplevel
-        from contextlib import nullcontext
-        from torch._subclasses.fake_tensor import unset_fake_temporarily
-        from transformers.modeling_utils import ContextManagers
-        try:
-            from transformers.modeling_utils import no_init_weights
-        except ImportError:
-            from transformers.initialization import no_init_weights
-        from hyper_parallel import init_empty_weights
-        # pylint: enable=import-outside-toplevel
-
-        # Step 1: Determine meta device (inline world-size probe: auto_models
-        # must not import the trainer runtime).
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        is_meta_device = (
-            world_size > 1
-            or not is_hf_model
-            or is_model_materialization_deferred()
-        ) and kwargs.get("quantization_config") is None
-
-        init_contexts = [no_init_weights(), init_empty_weights()]
-        if is_model_materialization_deferred():
-            # init_empty_weights replaces registered Parameters itself; let it
-            # create ordinary meta tensors before FakeTensor handles sharding.
-            init_contexts.insert(0, unset_fake_temporarily())
-        init_ctx = ContextManagers(init_contexts) if is_meta_device else nullcontext()
+        # The inline world-size probe avoids importing trainer runtime here.
+        is_meta_device, init_ctx = _model_init_context(
+            is_hf_model,
+            kwargs.get("quantization_config"),
+        )
 
         # Step 2: Build model
         with init_ctx:

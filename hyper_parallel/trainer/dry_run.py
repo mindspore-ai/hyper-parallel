@@ -100,6 +100,22 @@ class _DryRunPipelineModel(nn.Module):
         self.config = chunks[0].module.config
 
 
+class _DryRunBaseTrainer(BaseTrainer):
+    """Expose the minimal BaseTrainer initialization used by Dry-run."""
+
+    def initialize_dry_run_components(self, loss_fn: Optional[nn.Module]) -> None:
+        """Build the loss, optimizer, and execution contexts for one fake step.
+
+        Args:
+            loss_fn: Optional pipeline-owned loss module.
+        """
+        if loss_fn is None:
+            self._build_loss()
+        else:
+            self.loss_fn = loss_fn
+        self._build_optimizer()
+        self._build_training_context()
+
 
 class HyperModelsDryRunRunner:
     """Execute one shape-accurate fake LLM training step and report memory."""
@@ -481,7 +497,8 @@ class HyperModelsDryRunRunner:
         original_concatenate = DeviceMesh.concatenate
         simulation_device = self._simulation_torch_device()
 
-        def _resolve_device(_mesh: Any) -> torch.device:
+        def _resolve_device(mesh: Any) -> torch.device:
+            del mesh
             return simulation_device
 
         def _concatenate_meshes(meshes: Any) -> DeviceMesh:
@@ -536,10 +553,10 @@ class HyperModelsDryRunRunner:
             setup: DistributedSetup,
             model: nn.Module,
             loss_fn: Optional[nn.Module] = None,
-    ) -> BaseTrainer:
+    ) -> _DryRunBaseTrainer:
         """Create only the BaseTrainer state needed by one fake training step."""
         runtime = self._get_runtime()
-        base = BaseTrainer.__new__(BaseTrainer)
+        base = _DryRunBaseTrainer.__new__(_DryRunBaseTrainer)
         base.config = self.config
         base.local_rank = runtime.local_rank
         base.global_rank = runtime.rank
@@ -556,12 +573,7 @@ class HyperModelsDryRunRunner:
             module for module in model.modules()
             if hasattr(module, "hsdp_scheduler")
         ]
-        if loss_fn is None:
-            BaseTrainer._build_loss(base)
-        else:
-            base.loss_fn = loss_fn
-        BaseTrainer._build_optimizer(base)
-        BaseTrainer._build_training_context(base)
+        base.initialize_dry_run_components(loss_fn)
         return base
 
     def _build_loss(self) -> nn.Module:
@@ -656,6 +668,26 @@ class HyperModelsDryRunRunner:
         gradient_tensors = tracker.refresh_parameter_gradients(base.model)
         operator_trace.refresh_tensor_roles(gradient_tensors)
 
+    def _apply_optimizer_step(
+            self,
+            base: BaseTrainer,
+            tracker: Any,
+            operator_trace: Any,
+            value_dependencies: Any,
+    ) -> None:
+        """Finalize gradients and apply one optimizer update."""
+        hsdp_sync_stream()
+        gradient_tensors = tracker.refresh_parameter_gradients(base.model)
+        operator_trace.refresh_tensor_roles(gradient_tensors)
+        del gradient_tensors
+        clip_grad_norm_(base.model, self.config.training.max_grad_norm)
+        optimizers = base.optimizer if isinstance(base.optimizer, list) else [base.optimizer]
+        with value_dependencies.logical_scope("optimizer"):
+            for optimizer in optimizers:
+                with SkipDTensorDispatch():
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
     def _execute_step(
             self,
             base: BaseTrainer,
@@ -692,7 +724,7 @@ class HyperModelsDryRunRunner:
                 value_dependencies.fake_step_context(base),
                 self._loss_context(base),
         ):
-            for _micro_index in range(num_micro_batches):
+            for _ in range(num_micro_batches):
                 self._execute_micro_step(
                     base,
                     batch,
@@ -700,17 +732,7 @@ class HyperModelsDryRunRunner:
                     tracker,
                     operator_trace,
                 )
-            hsdp_sync_stream()
-            gradient_tensors = tracker.refresh_parameter_gradients(base.model)
-            operator_trace.refresh_tensor_roles(gradient_tensors)
-            del gradient_tensors
-            clip_grad_norm_(base.model, self.config.training.max_grad_norm)
-            optimizers = base.optimizer if isinstance(base.optimizer, list) else [base.optimizer]
-            with value_dependencies.logical_scope("optimizer"):
-                for optimizer in optimizers:
-                    with SkipDTensorDispatch():
-                        optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
+            self._apply_optimizer_step(base, tracker, operator_trace, value_dependencies)
             tracker.clear_fake_dtensor_grad_bridges()
         operator_trace.finalize()
         return torch_dry_run.build_memory_report(
@@ -869,16 +891,14 @@ class HyperModelsDryRunRunner:
 
         return build_pipeline_model
 
-    def _execute_pipeline_step(
+    def _build_pipeline_execution(
             self,
             base: BaseTrainer,
             batch: _DryRunTrainingBatch,
-            profile: Any,
-            value_dependencies: Any,
             chunks: tuple[_PreparedPipelineChunk, ...],
             pp_mesh: DeviceMesh,
-    ) -> dict[str, Any]:
-        """Execute the pipeline schedule with logical, value-free P2P transport."""
+    ) -> tuple[list[DryRunPipelineStage], Any, tuple[int, ...], int]:
+        """Build local pipeline stages and their logical schedule."""
         num_micro_batches = self.config.accelerator.pp_micro_batch_num
         stage_num = self.config.accelerator.pp_size * self.config.accelerator.pp_vpp
         stage_indices = tuple(prepared.chunk.stage_index for prepared in chunks)
@@ -906,6 +926,56 @@ class HyperModelsDryRunRunner:
             if labels is None:
                 raise ValueError("Pipeline Dry-run requires loss_inputs.labels")
             stages[-1].set_micro_labels(list(labels.chunk(num_micro_batches, dim=0)))
+        return stages, schedule, stage_indices, stage_num
+
+    def _pipeline_metadata(
+            self,
+            chunks: tuple[_PreparedPipelineChunk, ...],
+            stage_indices: tuple[int, ...],
+            stage_num: int,
+    ) -> dict[str, Any]:
+        """Describe the mocked pipeline topology and transport semantics."""
+        return {
+            "pipeline_schedule": normalize_pipeline_schedule(
+                self.config.accelerator.pp_schedule,
+                self.config.accelerator.pp_vpp,
+            ),
+            "pp_vpp": self.config.accelerator.pp_vpp,
+            "global_stage_count": stage_num,
+            "local_stage_indices": list(stage_indices),
+            "pipeline_chunks": [
+                {
+                    "stage_index": stage_index,
+                    "layer_start": prepared.chunk.layer_start,
+                    "layer_end": prepared.chunk.layer_end,
+                }
+                for prepared, stage_index in zip(chunks, stage_indices)
+            ],
+            "pipeline_mock": {
+                "transport": "mocked",
+                "payload_transfer": False,
+                "timing_model": False,
+                "supported_capabilities": ["schedule_order", "logical_memory_lifecycle"],
+            },
+        }
+
+    def _execute_pipeline_step(
+            self,
+            base: BaseTrainer,
+            batch: _DryRunTrainingBatch,
+            profile: Any,
+            value_dependencies: Any,
+            chunks: tuple[_PreparedPipelineChunk, ...],
+            pp_mesh: DeviceMesh,
+    ) -> dict[str, Any]:
+        """Execute the pipeline schedule with logical, value-free P2P transport."""
+        num_micro_batches = self.config.accelerator.pp_micro_batch_num
+        stages, schedule, stage_indices, stage_num = self._build_pipeline_execution(
+            base,
+            batch,
+            chunks,
+            pp_mesh,
+        )
 
         self._initialize_flat_buffers(base.model)
         self._configure_gradient_sync(base)
@@ -931,46 +1001,14 @@ class HyperModelsDryRunRunner:
                     base.model_bwd_context,
             ):
                 losses = schedule.run(*schedule_args, **schedule_kwargs)
-                hsdp_sync_stream()
-                gradient_tensors = tracker.refresh_parameter_gradients(base.model)
-                operator_trace.refresh_tensor_roles(gradient_tensors)
-                del gradient_tensors
-                clip_grad_norm_(base.model, self.config.training.max_grad_norm)
-                optimizers = base.optimizer if isinstance(base.optimizer, list) else [base.optimizer]
-                with value_dependencies.logical_scope("optimizer"):
-                    for optimizer in optimizers:
-                        with SkipDTensorDispatch():
-                            optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
+                self._apply_optimizer_step(base, tracker, operator_trace, value_dependencies)
         finally:
             losses.clear()
             tracker.clear_fake_dtensor_grad_bridges()
             for stage in stages:
                 stage.clear_all_states()
         operator_trace.finalize()
-        pipeline_metadata = {
-            "pipeline_schedule": normalize_pipeline_schedule(
-                self.config.accelerator.pp_schedule,
-                self.config.accelerator.pp_vpp,
-            ),
-            "pp_vpp": self.config.accelerator.pp_vpp,
-            "global_stage_count": stage_num,
-            "local_stage_indices": list(stage_indices),
-            "pipeline_chunks": [
-                {
-                    "stage_index": stage_index,
-                    "layer_start": prepared.chunk.layer_start,
-                    "layer_end": prepared.chunk.layer_end,
-                }
-                for prepared, stage_index in zip(chunks, stage_indices)
-            ],
-            "pipeline_mock": {
-                "transport": "mocked",
-                "payload_transfer": False,
-                "timing_model": False,
-                "supported_capabilities": ["schedule_order", "logical_memory_lifecycle"],
-            },
-        }
+        pipeline_metadata = self._pipeline_metadata(chunks, stage_indices, stage_num)
         return torch_dry_run.build_memory_report(
             tracker,
             self._metadata(base, batch, profile, pipeline_metadata, num_micro_batches),
@@ -1017,20 +1055,12 @@ class HyperModelsDryRunRunner:
             target_tokens_per_rank=batch.target_tokens_per_rank,
         )
 
-    def run(self) -> dict[str, Any]:
-        """Execute one fake step, write the rank-local CSV, and return its report."""
-        runtime = self._get_runtime()
-        dry_run = self._validate_config()
-        csv_path = os.path.join(
-            dry_run.output_dir,
-            f"rank_{runtime.rank}",
-            f"rank_{runtime.rank}_memory.csv",
-        )
-        json_path = os.path.splitext(csv_path)[0] + ".json"
-        target_device = self._resolve_target_device()
-        self._simulation_device = self._select_simulation_device(target_device)
-        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
-
+    def _probe_training_batch(
+            self,
+            runtime: torch_dry_run.DryRunRuntime,
+            fake_mode: FakeTensorMode,
+    ) -> _DryRunTrainingBatch:
+        """Read one CPU batch and erase its tensor values for simulation."""
         self._stage = "data_probe"
         data_group_initialized = False
         cpu_setup = None
@@ -1051,11 +1081,22 @@ class HyperModelsDryRunRunner:
             )
             del cpu_batch
             del probe_model
+            return batch
         finally:
             cpu_setup = None
             if data_group_initialized:
                 destroy_distributed_runtime()
 
+    def _run_simulation(
+            self,
+            runtime: torch_dry_run.DryRunRuntime,
+            dry_run: DryRunConfig,
+            batch: _DryRunTrainingBatch,
+            fake_mode: FakeTensorMode,
+            json_path: str,
+            csv_path: str,
+    ) -> dict[str, Any]:
+        """Execute one fake distributed step and persist its memory report."""
         initialized_here = False
         try:
             self._stage = "distributed_setup"
@@ -1144,6 +1185,22 @@ class HyperModelsDryRunRunner:
         finally:
             if initialized_here:
                 destroy_distributed_runtime()
+
+    def run(self) -> dict[str, Any]:
+        """Execute one fake step, write the rank-local CSV, and return its report."""
+        runtime = self._get_runtime()
+        dry_run = self._validate_config()
+        csv_path = os.path.join(
+            dry_run.output_dir,
+            f"rank_{runtime.rank}",
+            f"rank_{runtime.rank}_memory.csv",
+        )
+        json_path = os.path.splitext(csv_path)[0] + ".json"
+        target_device = self._resolve_target_device()
+        self._simulation_device = self._select_simulation_device(target_device)
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+        batch = self._probe_training_batch(runtime, fake_mode)
+        return self._run_simulation(runtime, dry_run, batch, fake_mode, json_path, csv_path)
 
 
 __all__ = ["HyperModelsDryRunRunner"]

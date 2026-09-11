@@ -29,11 +29,6 @@ from typing import Any, List, Literal, Optional, Union
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.models.build_options import (
-    CompileConfig,
-    FSDP2Config,
-    FSDP2MixedPrecisionConfig,
-)
 from hyper_parallel.models.replacement import (
     ModuleReplacementFactory,
     ModuleReplacementSpec,

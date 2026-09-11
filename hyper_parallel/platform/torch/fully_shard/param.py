@@ -1037,20 +1037,21 @@ class TorchHSDPParamV2(HSDPParamV2):
         self._setattr_on_modules(self.sharded_param)
 
     def _update_shardedparam_storage_forcely(self,):
-        sharded_param_data = self.sharded_param.data
+        # ``DTensor.data`` dispatches to the local tensor. Disable subclass
+        # dispatch to inspect the outer DTensor TensorImpl instead.
+        with torch._C.DisableTorchFunctionSubclass():  # pylint: disable=not-context-manager
+            sharded_param_storage = self.sharded_param.untyped_storage()
         local_tensor_data = self.sharded_param._local_tensor.data
+        local_tensor_storage = local_tensor_data.untyped_storage()
         from torch._subclasses.fake_tensor import FakeTensor  # pylint: disable=C0415
-        if isinstance(sharded_param_data, FakeTensor) and isinstance(local_tensor_data, FakeTensor):
-            storage_changed = (
-                sharded_param_data.untyped_storage()
-                is not local_tensor_data.untyped_storage()
-            )
+        if isinstance(local_tensor_data, FakeTensor):
+            storage_changed = sharded_param_storage is not local_tensor_storage
         else:
-            storage_changed = sharded_param_data.data_ptr() != local_tensor_data.data_ptr()
-        if (
-            sharded_param_data.device != local_tensor_data.device
-            or storage_changed
-        ):
+            storage_changed = (
+                sharded_param_storage.device != local_tensor_storage.device
+                or sharded_param_storage.data_ptr() != local_tensor_storage.data_ptr()
+            )
+        if storage_changed:
             local_tensor_data.requires_grad_(self.sharded_param.requires_grad)
             # TensorImpl keeps storage_ptr, storage_offset, sizes, strides, dtype and metadatas
             # so swap TensorImpl can make self.sharded_param ref the self.sharded_param._local_tensor's TensorImpl

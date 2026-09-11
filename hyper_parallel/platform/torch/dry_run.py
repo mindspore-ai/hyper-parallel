@@ -118,50 +118,62 @@ class DryRunBatchMocker:
                     memory_format=torch.preserve_format,
                 )
         if isinstance(value, Mapping):
-            mocked_items = [(key, self.mock(item)) for key, item in value.items()]
-            if type(value) is dict:  # pylint: disable=unidiomatic-typecheck
-                return dict(mocked_items)
-            try:
-                mocked_mapping = copy.copy(value)
-                mocked_mapping.clear()
-                mocked_mapping.update(mocked_items)
-                return mocked_mapping
-            except (AttributeError, TypeError):
-                try:
-                    return type(value)(mocked_items)
-                except TypeError as exc:
-                    raise ValueError(
-                        "Dry-run cannot preserve batch mapping carrier "
-                        f"{type(value).__module__}.{type(value).__qualname__}"
-                    ) from exc
-        if isinstance(value, list):
-            return [self.mock(item) for item in value]
-        if isinstance(value, tuple):
-            mocked = tuple(self.mock(item) for item in value)
-            if hasattr(value, "_fields"):
-                return type(value)(*mocked)
-            return mocked
+            return self._mock_mapping(value)
+        if isinstance(value, (list, tuple)):
+            return self._mock_sequence(value)
         if is_dataclass(value) and not isinstance(value, type):
-            updates = {
-                field.name: self.mock(getattr(value, field.name))
-                for field in fields(value)
-                if field.init
-            }
-            mocked_dataclass = replace(value, **updates)
-            for field in fields(value):
-                if not field.init:
-                    object.__setattr__(
-                        mocked_dataclass,
-                        field.name,
-                        self.mock(getattr(value, field.name)),
-                    )
-            return mocked_dataclass
+            return self._mock_dataclass(value)
         if hasattr(value, "__dict__") and self._contains_tensor(vars(value)):
             raise ValueError(
                 "Dry-run cannot mock tensor-bearing batch carrier "
                 f"{type(value).__module__}.{type(value).__qualname__}"
             )
         return value
+
+    def _mock_mapping(self, value: Mapping[Any, Any]) -> Mapping[Any, Any]:
+        """Mock mapping values while preserving the mapping carrier type."""
+        mocked_items = [(key, self.mock(item)) for key, item in value.items()]
+        if type(value) is dict:  # pylint: disable=unidiomatic-typecheck
+            return dict(mocked_items)
+        try:
+            mocked_mapping = copy.copy(value)
+            mocked_mapping.clear()
+            mocked_mapping.update(mocked_items)
+            return mocked_mapping
+        except (AttributeError, TypeError):
+            try:
+                return type(value)(mocked_items)
+            except TypeError as exc:
+                raise ValueError(
+                    "Dry-run cannot preserve batch mapping carrier "
+                    f"{type(value).__module__}.{type(value).__qualname__}"
+                ) from exc
+
+    def _mock_sequence(self, value: Any) -> Any:
+        """Mock list and tuple values while preserving named tuples."""
+        mocked = tuple(self.mock(item) for item in value)
+        if isinstance(value, list):
+            return list(mocked)
+        if hasattr(value, "_fields"):
+            return type(value)(*mocked)
+        return mocked
+
+    def _mock_dataclass(self, value: Any) -> Any:
+        """Mock initialized and deferred dataclass fields."""
+        updates = {
+            field.name: self.mock(getattr(value, field.name))
+            for field in fields(value)
+            if field.init
+        }
+        mocked_dataclass = replace(value, **updates)
+        for field in fields(value):
+            if not field.init:
+                object.__setattr__(
+                    mocked_dataclass,
+                    field.name,
+                    self.mock(getattr(value, field.name)),
+                )
+        return mocked_dataclass
 
     def _contains_tensor(self, value: Any) -> bool:
         """Return whether an unsupported object recursively owns a tensor."""
@@ -433,31 +445,34 @@ class OperatorDebugValueDependencyHandler(ValueDependencyHandler):
         selectors = set()
         for index, mock in enumerate(mocks):
             location = f"operator_debug mock {index} for {target!r}"
-            if not isinstance(mock, dict) or set(mock) != {"source", "op", "occurrence", "return"}:
-                raise ValueError(
-                    f"{location} must contain source, op, occurrence, and return"
-                )
-            source = mock["source"]
-            if not isinstance(source, dict) or set(source) != {"file", "function", "line"}:
-                raise ValueError(f"{location}.source must contain file, function, and line")
-            if (
-                    not isinstance(source["file"], str)
-                    or not isinstance(source["function"], str)
-                    or not isinstance(source["line"], int)
-                    or isinstance(source["line"], bool)
-                    or source["line"] < 1
-            ):
-                raise ValueError(f"{location} has an invalid source anchor")
-            if not isinstance(mock["op"], str) or not mock["op"].startswith("aten."):
-                raise ValueError(f"{location}.op must be an ATen overload name")
-            occurrence = mock["occurrence"]
-            if not isinstance(occurrence, int) or isinstance(occurrence, bool) or occurrence < 0:
-                raise ValueError(f"{location}.occurrence must be a non-negative integer")
-            selector = (source["file"], source["function"], source["line"], mock["op"], occurrence)
+            selector = _operator_debug_selector(mock, location)
             if selector in selectors:
                 raise ValueError(f"{location} duplicates an earlier selector")
             selectors.add(selector)
             _validate_operator_return(mock["return"], location)
+
+
+def _operator_debug_selector(mock: Any, location: str) -> tuple[Any, ...]:
+    """Validate and return the stable selector for one operator mock."""
+    if not isinstance(mock, dict) or set(mock) != {"source", "op", "occurrence", "return"}:
+        raise ValueError(f"{location} must contain source, op, occurrence, and return")
+    source = mock["source"]
+    if not isinstance(source, dict) or set(source) != {"file", "function", "line"}:
+        raise ValueError(f"{location}.source must contain file, function, and line")
+    if (
+            not isinstance(source["file"], str)
+            or not isinstance(source["function"], str)
+            or not isinstance(source["line"], int)
+            or isinstance(source["line"], bool)
+            or source["line"] < 1
+    ):
+        raise ValueError(f"{location} has an invalid source anchor")
+    if not isinstance(mock["op"], str) or not mock["op"].startswith("aten."):
+        raise ValueError(f"{location}.op must be an ATen overload name")
+    occurrence = mock["occurrence"]
+    if not isinstance(occurrence, int) or isinstance(occurrence, bool) or occurrence < 0:
+        raise ValueError(f"{location}.occurrence must be a non-negative integer")
+    return source["file"], source["function"], source["line"], mock["op"], occurrence
 
 
 def _validate_operator_return(spec: Any, location: str) -> None:
@@ -470,31 +485,46 @@ def _validate_operator_return(spec: Any, location: str) -> None:
             raise ValueError(f"{location}.return.scalar must be bool, int, or float")
         return
     if kind == "tensor":
-        if not isinstance(value, dict) or set(value) != {"shape", "dtype"}:
-            raise ValueError(f"{location}.return.tensor must contain shape and dtype")
-        shape = value["shape"]
-        if not isinstance(shape, list) or any(
-                not isinstance(size, int) or isinstance(size, bool) or size < 0 for size in shape
-        ):
-            raise ValueError(f"{location}.return.tensor.shape must contain non-negative integers")
-        if not isinstance(value["dtype"], str) or not value["dtype"]:
-            raise ValueError(f"{location}.return.tensor.dtype must be a non-empty string")
+        _validate_operator_tensor_return(value, location)
         return
     if kind in ("tuple", "list"):
-        if not isinstance(value, list):
-            raise ValueError(f"{location}.return.{kind} must be a list")
-        for index, item in enumerate(value):
-            _validate_operator_return(item, f"{location}.return.{kind}[{index}]")
+        _validate_operator_sequence_return(value, kind, location)
         return
     if kind == "by_global_rank":
-        if not isinstance(value, dict) or not value:
-            raise ValueError(f"{location}.return.by_global_rank must be a non-empty mapping")
-        for rank, item in value.items():
-            if not isinstance(rank, (int, str)) or not str(rank).isdigit():
-                raise ValueError(f"{location}.return.by_global_rank keys must be non-negative ranks")
-            _validate_operator_return(item, f"{location}.return.by_global_rank[{rank}]")
+        _validate_operator_rank_return(value, location)
         return
     raise ValueError(f"{location}.return uses unsupported kind {kind!r}")
+
+
+def _validate_operator_tensor_return(value: Any, location: str) -> None:
+    """Validate a tensor-shaped operator-debug return."""
+    if not isinstance(value, dict) or set(value) != {"shape", "dtype"}:
+        raise ValueError(f"{location}.return.tensor must contain shape and dtype")
+    shape = value["shape"]
+    if not isinstance(shape, list) or any(
+            not isinstance(size, int) or isinstance(size, bool) or size < 0 for size in shape
+    ):
+        raise ValueError(f"{location}.return.tensor.shape must contain non-negative integers")
+    if not isinstance(value["dtype"], str) or not value["dtype"]:
+        raise ValueError(f"{location}.return.tensor.dtype must be a non-empty string")
+
+
+def _validate_operator_sequence_return(value: Any, kind: str, location: str) -> None:
+    """Validate a tuple- or list-shaped operator-debug return."""
+    if not isinstance(value, list):
+        raise ValueError(f"{location}.return.{kind} must be a list")
+    for index, item in enumerate(value):
+        _validate_operator_return(item, f"{location}.return.{kind}[{index}]")
+
+
+def _validate_operator_rank_return(value: Any, location: str) -> None:
+    """Validate a rank-indexed operator-debug return."""
+    if not isinstance(value, dict) or not value:
+        raise ValueError(f"{location}.return.by_global_rank must be a non-empty mapping")
+    for rank, item in value.items():
+        if not isinstance(rank, (int, str)) or not str(rank).isdigit():
+            raise ValueError(f"{location}.return.by_global_rank keys must be non-negative ranks")
+        _validate_operator_return(item, f"{location}.return.by_global_rank[{rank}]")
 
 
 for _builtin_handler in (
@@ -668,6 +698,66 @@ class _DryRunValueProfile:
         """Store JSON-safe runtime consumption details for the final report."""
         self._runtime_metadata = metadata
 
+    def _moe_routing_matrix(
+            self,
+            layer: Dict[str, Any],
+            ep_size: int,
+            num_experts: int,
+            expected: int,
+            module_name: str,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Build the configured or synthetic source-to-expert load matrix."""
+        policy = layer["routing_policy"]
+        if policy == "explicit":
+            return self._explicit_moe_matrix(
+                layer.get("source_expert_loads"),
+                ep_size,
+                num_experts,
+                expected,
+                module_name,
+            )
+
+        hotspot = int(layer.get("hotspot_expert", 0))
+        if policy == "hotspot" and not 0 <= hotspot < num_experts:
+            raise ValueError(f"MoE hotspot_expert for {module_name!r} must be in [0, {num_experts})")
+        if policy == "hotspot":
+            row = tuple(expected if index == hotspot else 0 for index in range(num_experts))
+        else:
+            base, remainder = divmod(expected, num_experts)
+            row = tuple(base + int(index < remainder) for index in range(num_experts))
+        return tuple(row for _ in range(ep_size))
+
+    @staticmethod
+    def _local_expert_start(
+            module_name: str,
+            ep_size: int,
+            ep_rank: int,
+            num_experts: int,
+            local_expert_count: int,
+    ) -> int:
+        """Validate the expert layout and return this rank's first expert."""
+        if local_expert_count < 1:
+            raise ValueError(f"MoE {module_name!r} has no local experts")
+        if local_expert_count == num_experts:
+            return 0
+        if num_experts % ep_size or local_expert_count != num_experts // ep_size:
+            raise ValueError(f"MoE {module_name!r} local expert layout is incompatible with EP={ep_size}")
+        return ep_rank * local_expert_count
+
+    @staticmethod
+    def _expert_ranges(
+            ep_size: int,
+            num_experts: int,
+            local_expert_count: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return the global expert range owned by each destination rank."""
+        if local_expert_count == num_experts:
+            return ((0, num_experts),)
+        return tuple(
+            (rank * local_expert_count, (rank + 1) * local_expert_count)
+            for rank in range(ep_size)
+        )
+
     def moe_routing_plan(
             self, module_name: str, module: Any, ep_size: int, ep_rank: int,
             local_tokens: int, local_expert_count: int,
@@ -678,36 +768,14 @@ class _DryRunValueProfile:
         layer = self.moe_layers.get(module_name)
         if layer is None:
             raise ValueError(f"MoE module {module_name!r} has no value-dependency rule")
-        policy = layer["routing_policy"]
-        hotspot = int(layer.get("hotspot_expert", 0))
-        if policy == "explicit":
-            matrix = self._explicit_moe_matrix(
-                layer.get(
-                    "source_expert_loads",
-                    None,
-                ),
-                ep_size,
-                num_experts,
-                expected,
-                module_name,
-            )
-        else:
-            if policy == "hotspot" and not 0 <= hotspot < num_experts:
-                raise ValueError(f"MoE hotspot_expert for {module_name!r} must be in [0, {num_experts})")
-            if policy == "hotspot":
-                row = tuple(expected if index == hotspot else 0 for index in range(num_experts))
-            else:
-                base, remainder = divmod(expected, num_experts)
-                row = tuple(base + int(index < remainder) for index in range(num_experts))
-            matrix = tuple(row for _ in range(ep_size))
-        if local_expert_count < 1:
-            raise ValueError(f"MoE {module_name!r} has no local experts")
-        if local_expert_count == num_experts:
-            start = 0
-        else:
-            if num_experts % ep_size or local_expert_count != num_experts // ep_size:
-                raise ValueError(f"MoE {module_name!r} local expert layout is incompatible with EP={ep_size}")
-            start = ep_rank * local_expert_count
+        matrix = self._moe_routing_matrix(layer, ep_size, num_experts, expected, module_name)
+        start = self._local_expert_start(
+            module_name,
+            ep_size,
+            ep_rank,
+            num_experts,
+            local_expert_count,
+        )
         local_loads = tuple(
             sum(row[index] for row in matrix)
             for index in range(start, start + local_expert_count)
@@ -717,13 +785,7 @@ class _DryRunValueProfile:
             for source_rank in range(ep_size)
             for expert_index in range(start, start + local_expert_count)
         )
-        if local_expert_count == num_experts:
-            expert_ranges = ((0, num_experts),)
-        else:
-            expert_ranges = tuple(
-                (rank * local_expert_count, (rank + 1) * local_expert_count)
-                for rank in range(ep_size)
-            )
+        expert_ranges = self._expert_ranges(ep_size, num_experts, local_expert_count)
         input_splits = tuple(
             sum(matrix[ep_rank][start_index:end_index])
             for start_index, end_index in expert_ranges
@@ -1499,8 +1561,19 @@ class _MoERoutingValueDependencyRuntime(_MoERoutingValueDependencyRuntimeBase):
         def grouped_forward(
                 current_experts: Any,
                 dispatched: Any,
-                _local_indices: Any,
+                local_indices: Any,
         ) -> Any:
+            """Execute grouped experts with the simulated token distribution.
+
+            Args:
+                current_experts: Local expert module collection.
+                dispatched: Tokens received by the local experts.
+                local_indices: Runtime expert indices, unused by the simulation.
+
+            Returns:
+                The grouped expert outputs.
+            """
+            del local_indices
             layout, weights = self._expert_weight_layout(
                 SimpleNamespace(experts=current_experts)
             )
@@ -2070,7 +2143,8 @@ def _create_indexed_mem_tracker(mem_tracker_type: Any) -> Any:
 
             seen = set()
             if getattr(parameter, "_is_fake_wrapper", False):
-                gradient = torch.Tensor.grad.__get__(parameter, type(parameter))
+                # Bypass the DTensor grad override and inspect wrapper storage.
+                gradient = torch.Tensor.grad.__get__(parameter, type(parameter))  # pylint: disable=C2801
             else:
                 gradient = getattr(parameter, "grad", None)
             if gradient is not None:
@@ -2739,6 +2813,35 @@ def _create_operator_trace_mode(tracker: Any, device_type: str) -> Any:
     return _OperatorTraceMode()
 
 
+def _report_device_name(device: str, device_type: str, report_device_type: Optional[str]) -> str:
+    """Replace a simulation-device prefix with its logical report prefix."""
+    if report_device_type is None:
+        return device
+    prefix, separator, suffix = device.partition(":")
+    if prefix != device_type:
+        return device
+    return report_device_type + (separator + suffix if separator else "")
+
+
+def _rewrite_module_snapshot_devices(
+        modules: list[Dict[str, Any]],
+        device_type: str,
+        report_device_type: Optional[str],
+) -> None:
+    """Rewrite device keys in every serialized module snapshot in place."""
+    if report_device_type is None or report_device_type == device_type:
+        return
+    for module in modules:
+        for snapshots in module["snapshots"].values():
+            for snapshot in snapshots:
+                renamed = {
+                    _report_device_name(device, device_type, report_device_type): values
+                    for device, values in snapshot.items()
+                }
+                snapshot.clear()
+                snapshot.update(renamed)
+
+
 def build_memory_report(
         tracker: Any,
         metadata: Dict[str, Any],
@@ -2780,25 +2883,12 @@ def build_memory_report(
 
     devices = {}
     for device in sorted(set(peak) | set(current)):
-        report_device = device
-        if report_device_type is not None:
-            prefix, separator, suffix = device.partition(":")
-            if prefix == device_type:
-                report_device = report_device_type + (separator + suffix if separator else "")
+        report_device = _report_device_name(device, device_type, report_device_type)
         devices[report_device] = {
             "peak": peak.get(device, {}),
             "current": current.get(device, {}),
         }
-    if report_device_type is not None and report_device_type != device_type:
-        for module in modules:
-            for snapshots in module["snapshots"].values():
-                for snapshot in snapshots:
-                    for device in list(snapshot):
-                        prefix, separator, suffix = device.partition(":")
-                        if prefix == device_type:
-                            snapshot[
-                                report_device_type + (separator + suffix if separator else "")
-                            ] = snapshot.pop(device)
+    _rewrite_module_snapshot_devices(modules, device_type, report_device_type)
     return {
         "schema_version": _SCHEMA_VERSION,
         "status": "ok",

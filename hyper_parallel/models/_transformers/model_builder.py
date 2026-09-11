@@ -409,7 +409,6 @@ def _build_replacement_context(
 
 
 def _apply_pre_sharding_features(
-    model: nn.Module,
     peft_config: Optional[Any],
     qat_config: Optional[Any],
     fp8_config: Optional[Any],
@@ -510,7 +509,7 @@ def apply_model_infrastructure(
         compile_config, validate_placement, fsdp2_manager
     )
     _apply_pre_sharding_features(
-        model, peft_config, qat_config, fp8_config
+        peft_config, qat_config, fp8_config
     )
 
     # Step 5.5: structure-preserving replacement before plan derivation.

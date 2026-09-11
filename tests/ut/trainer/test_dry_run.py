@@ -15,6 +15,9 @@
 """Unit tests for the primary LLM dry-run workflow."""
 # pylint: disable=protected-access
 
+import subprocess
+import sys
+import tempfile
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -25,7 +28,6 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed._tools.mem_tracker import MemTracker
 
-from examples.training_demo import train_text
 from hyper_parallel.models._transformers import model_builder
 from hyper_parallel.platform.torch.dry_run import (
     DryRunBatchMocker,
@@ -133,26 +135,41 @@ class TestDryRunConfiguration(unittest.TestCase):
                 DryRunRuntime(rank=0, world_size=2, local_rank=0),
             )._validate_config()
 
-    def test_training_entrypoint_selects_dry_run_or_regular_trainer(self):
-        """Route enabled dry-run configurations away from normal training."""
-        for enabled in (True, False):
-            with self.subTest(enabled=enabled):
-                config = _config(DryRunConfig(enabled=enabled))
-                with (
-                    patch.object(train_text, "parse_training_args", return_value=config),
-                    patch.object(train_text, "HyperModelsDryRunRunner") as dry_runner_type,
-                    patch.object(train_text, "TextTrainer") as trainer_type,
-                ):
-                    train_text.main()
+    def test_dry_run_import_defers_optional_torchdata_requirement(self):
+        """Import Dry-run without torchdata and fail only when building a loader."""
+        script = """
+import builtins
 
-                if enabled:
-                    dry_runner_type.assert_called_once_with(config)
-                    dry_runner_type.return_value.run.assert_called_once_with()
-                    trainer_type.assert_not_called()
-                else:
-                    trainer_type.assert_called_once_with(config)
-                    trainer_type.return_value.train.assert_called_once_with()
-                    dry_runner_type.assert_not_called()
+original_import = builtins.__import__
+
+
+def import_without_torchdata(name, global_vars=None, local_vars=None, fromlist=(), level=0):
+    if name == "torchdata" or name.startswith("torchdata."):
+        error = ModuleNotFoundError("No module named 'torchdata'")
+        error.name = "torchdata"
+        raise error
+    return original_import(name, global_vars, local_vars, fromlist, level)
+
+
+builtins.__import__ = import_without_torchdata
+from hyper_parallel.trainer import config
+from hyper_parallel.trainer import dry_run
+from hyper_parallel.data.batching import FixedBatchDataLoader
+
+assert config is not None
+assert dry_run is not None
+try:
+    FixedBatchDataLoader(dataset=[])
+except ModuleNotFoundError as error:
+    assert "pip install 'hyper_parallel[torch]'" in str(error)
+else:
+    raise AssertionError("FixedBatchDataLoader must require torchdata")
+"""
+        subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            cwd=tempfile.gettempdir(),
+        )
 
 
 class TestDryRunModelAndData(unittest.TestCase):
@@ -198,10 +215,10 @@ class TestDryRunModelAndData(unittest.TestCase):
         probe = DryRunDataProbe(base)
 
         with (
-            patch.object(type(probe._trainer), "_build_model_assets") as build_assets,
-            patch.object(type(probe._trainer), "_build_data_transform") as build_transform,
-            patch.object(type(probe._trainer), "_build_collate_fn") as build_collate,
-            patch.object(type(probe._trainer), "_build_get_batch") as build_get_batch,
+            patch.object(type(probe._trainer), "_build_model_assets"),
+            patch.object(type(probe._trainer), "_build_data_transform"),
+            patch.object(type(probe._trainer), "_build_collate_fn"),
+            patch.object(type(probe._trainer), "_build_get_batch"),
         ):
             probe.build()
             prepared = probe.read_first_batch()

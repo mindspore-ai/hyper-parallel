@@ -144,10 +144,26 @@ class DTensorBase(Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        """Dispatch FakeTensor-wrapper DTensors through layout rules."""
+        """Dispatch FakeTensor-wrapper DTensors through layout rules only."""
+        kwargs = kwargs or {}
         # pylint: disable=C0415
+        from torch.utils._pytree import tree_flatten
+        flat_args, _ = tree_flatten((args, kwargs))
+        has_fake_wrapper = any(
+            isinstance(arg, DTensorBase)
+            and getattr(arg, "_is_fake_wrapper", False)
+            for arg in flat_args
+        )
+        if not has_fake_wrapper:
+            # Normal DTensors share the local tensor's storage. Let native
+            # operators such as c10d.send_/recv_ use that storage directly,
+            # as they did before FakeTensor wrapper dispatch was introduced.
+            torch_c = getattr(torch, "_C")
+            with torch_c.DisableTorchFunctionSubclass():  # pylint: disable=not-context-manager
+                with torch_c._DisableTorchDispatch():  # pylint: disable=protected-access,not-context-manager
+                    return func(*args, **kwargs)
         from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
-        return _OP_DISPATCHER.dispatch(func, args, kwargs or {})
+        return _OP_DISPATCHER.dispatch(func, args, kwargs)
 
     def __tensor_flatten__(self):
         """Expose local storage to FakeTensor and MemTracker machinery."""
