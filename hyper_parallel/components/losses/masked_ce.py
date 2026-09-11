@@ -60,7 +60,7 @@ class MaskedCrossEntropy:
             with torch.no_grad():
                 if mask.device != labels.device:
                     mask = mask.to(labels.device)
-                labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
+                labels = labels.masked_fill(mask.view(-1) == 0, self.ignore_index)
 
         if self.fp32_upcast:
             logits = logits.float()

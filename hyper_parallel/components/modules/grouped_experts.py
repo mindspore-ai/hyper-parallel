@@ -387,7 +387,7 @@ class GroupedExperts(nn.Module):
                 permuted, gate_up_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
             )
             if self.add_bias:
-                b1 = self.bias1.view(self.num_local_experts, 1, -1)
+                b1 = self.bias1.view(self.num_local_experts, -1)
                 fc1_output = fc1_output + torch.repeat_interleave(b1, self._tokens_per_expert_gmm, dim=0)
         else:
             gate_up_proj_2d = gate_up_proj.view(self.hidden_size, -1)
@@ -410,7 +410,7 @@ class GroupedExperts(nn.Module):
                 fc1_output, down_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
             )
             if self.add_bias:
-                b2 = self.bias2.view(self.num_local_experts, 1, -1)
+                b2 = self.bias2.view(self.num_local_experts, -1)
                 fc2_output = fc2_output + torch.repeat_interleave(
                     b2, self._tokens_per_expert_gmm, dim=0,
                 )

@@ -252,6 +252,7 @@ def _prepare_hybrid_sdpa_kwargs(
 
 def _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kwargs):
     """CP-aware SDPA: K/V all-gather + D-04 offset-aware causal mask."""
+    q, k, v, kwargs = _normalize_hf_sdpa_gqa(q, k, v, kwargs)
     cp_dim = 2  # sequence dim of the [B, N, S, H] layout
     global_k, global_v = flex_cp_allgather(
         k.contiguous(), v.contiguous(), cp_dim, cp_mesh)
