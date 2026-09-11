@@ -23,6 +23,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import torch
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -467,13 +468,13 @@ class TestUnwrapArgsAndKwargs(unittest.TestCase):
         assert isinstance(original["x"], MagicMock), \
             "Original dict should not be mutated"
 
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
+    @patch("hyper_parallel.core.shard._op_dispatch.get_op_name")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_dispatch_bypass_unwraps_kwargs(self, mock_device_platform, mock_dispatch_platform):
+    def test_dispatch_bypass_unwraps_kwargs(self, mock_device_platform, mock_get_op_name):
         """Test dispatch bypass path unwraps kwargs containing DTensors."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
 
-        mock_dispatch_platform.get_op_name.return_value = "fake_op"
+        mock_get_op_name.return_value = "fake_op"
 
         local = np.array([1.0, 2.0])
         dt = MagicMock(spec=DTensor)
@@ -488,7 +489,6 @@ class TestUnwrapArgsAndKwargs(unittest.TestCase):
         dispatcher = OpDispatcher.__new__(OpDispatcher)
         dispatcher.whitelist = ["fake_op"]
         dispatcher._random_ops = set()
-        dispatcher._random_ms_ops = set()
         dispatcher.layout_infer_ops = {}
 
         result = dispatcher.dispatch(fake_op, (dt,), {"bias": dt, "alpha": 0.5})
@@ -681,12 +681,9 @@ class TestLookupOrInferLayout(unittest.TestCase):
     """
 
     @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_lookup_cache_miss_path(self, mock_platform, mock_cache_cls):
+    def test_lookup_cache_miss_path(self, mock_cache_cls):
         """Cache miss: infer_layout and get_expand_impl called; wrap_output called via dispatch."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_platform.get_op_name.return_value = "TestOp"
 
         mock_output_layouts = (MagicMock(),)
         mock_dist_op = MagicMock()
@@ -710,16 +707,13 @@ class TestLookupOrInferLayout(unittest.TestCase):
         mock_dist_op.wrap_output.assert_called_once()
 
     @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_lookup_cache_hit_path(self, mock_platform, mock_cache_cls):
+    def test_lookup_cache_hit_path(self, mock_cache_cls):
         """Cache hit: infer_layout NOT called; cached op_impl and infer_result used."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
         # LayoutCacheKey is re-imported here because _reload_op_dispatch_with_env_str may have
         # reloaded the module, making the module-level LayoutCacheKey a stale class definition
         # that no longer matches what OpDispatcher uses internally.
         from hyper_parallel.core.shard._op_dispatch import LayoutCacheKey  # pylint: disable=W0404,W0621
-
-        mock_platform.get_op_name.return_value = "CachedOp"
 
         mock_output_layouts = (MagicMock(),)
         mock_dist_op = MagicMock()
@@ -754,17 +748,16 @@ class TestDispatchRandomPath(unittest.TestCase):
     Expectation: Correct routing for each case.
     """
 
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_dispatch_random_op_path(self, mock_platform):
+    @patch("hyper_parallel.core.shard._op_dispatch.get_op_name")
+    def test_dispatch_random_op_path(self, mock_get_op_name):
         """dispatch routes random ops to _dispatch_random_op."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
 
-        mock_platform.get_op_name.return_value = "random_test_op_coverage"
+        mock_get_op_name.return_value = "random_test_op_coverage"
 
         d = object.__new__(OpDispatcher)
         d.whitelist = []
         d._random_ops = {"random_test_op_coverage"}
-        d._random_ms_ops = set()
         d.layout_infer_ops = {}
         d._dispatch_random_op = MagicMock(return_value="random_result")
 
@@ -774,18 +767,17 @@ class TestDispatchRandomPath(unittest.TestCase):
         d._dispatch_random_op.assert_called_once()
 
     @patch("hyper_parallel.core.shard._op_dispatch.get_distributed_op")
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_dispatch_auto_register_path(self, mock_platform, mock_get_dist_op):
+    @patch("hyper_parallel.core.shard._op_dispatch.get_op_name")
+    def test_dispatch_auto_register_path(self, mock_get_op_name, mock_get_dist_op):
         """dispatch auto-registers programmatically registered ops."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
 
-        mock_platform.get_op_name.return_value = "auto_reg_op"
+        mock_get_op_name.return_value = "auto_reg_op"
         mock_get_dist_op.return_value = MagicMock()
 
         d = object.__new__(OpDispatcher)
         d.whitelist = []
         d._random_ops = set()
-        d._random_ms_ops = set()
         d.layout_infer_ops = {}
         d._dispatch_layout_infer = MagicMock(return_value="layout_result")
 
@@ -794,81 +786,14 @@ class TestDispatchRandomPath(unittest.TestCase):
         self.assertIn("auto_reg_op", d.layout_infer_ops)
         d._dispatch_layout_infer.assert_called_once()
 
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_dispatch_ms_random_op_path(self, mock_platform):
-        """dispatch routes MindSpore random ops to _dispatch_random_op."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_platform.get_op_name.return_value = "BernoulliExt"
-
-        d = object.__new__(OpDispatcher)
-        d.whitelist = []
-        d._random_ops = set()
-        d._random_ms_ops = {"BernoulliExt"}
-        d.layout_infer_ops = {}
-        d._dispatch_random_op = MagicMock(return_value="ms_random_result")
-
-        fake_op = MagicMock()
-        result = d.dispatch(fake_op, (), {})
-        self.assertEqual(result, "ms_random_result")
-
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_dispatch_new_ms_random_ops_path(self, mock_platform):
-        """Newly whitelisted MindSpore random kernels route to _dispatch_random_op."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        for op_name in ("NormalTensorTensor", "UniformExt", "RandExt"):
-            with self.subTest(op_name=op_name):
-                mock_platform.get_op_name.return_value = op_name
-                d = object.__new__(OpDispatcher)
-                d.whitelist = []
-                d._random_ops = set()
-                d._random_ms_ops = {op_name}
-                d.layout_infer_ops = {}
-                d._dispatch_random_op = MagicMock(return_value=f"{op_name}_result")
-                result = d.dispatch(MagicMock(), (), {})
-                self.assertEqual(result, f"{op_name}_result")
-                d._dispatch_random_op.assert_called_once()
-
 
 class TestRandomOpReturnsSelf(unittest.TestCase):
     """
     Feature: OpDispatcher._random_op_returns_self.
-    Description: Explicit MindSpore inplace set, FuncDropoutExt special case,
-                 and Torch '_' suffix drive inplace return semantics.
+    Description: FuncDropoutExt special case and Torch '_' suffix drive inplace
+                 return semantics.
     Expectation: Correct True/False for representative op names and arguments.
     """
-
-    def test_random_inplace_ms_ops_return_true(self):
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        for op_name in OpDispatcher._RANDOM_INPLACE_MS_OPS:
-            with self.subTest(op_name=op_name):
-                self.assertTrue(OpDispatcher._random_op_returns_self(op_name, (), {}))
-
-    def test_random_inplace_ms_ops_subset_of_random_ms_ops(self):
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        d = OpDispatcher()
-        self.assertTrue(
-            OpDispatcher._RANDOM_INPLACE_MS_OPS.issubset(d._random_ms_ops),
-            "Every MindSpore inplace random kernel must also be in _random_ms_ops.",
-        )
-
-    def test_ms_out_of_place_random_ops_return_false(self):
-        """MindSpore out-of-place random kernels must not return self."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        for op_name in (
-            "BernoulliExt",
-            "MultinomialExt",
-            "NormalTensorTensor",
-            "UniformExt",
-            "RandExt",
-            "FuncDropoutExt",
-        ):
-            with self.subTest(op_name=op_name):
-                self.assertFalse(OpDispatcher._random_op_returns_self(op_name, (MagicMock(),), {}))
 
     def test_torch_inplace_suffix_returns_true(self):
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
@@ -918,11 +843,10 @@ class TestDispatchRandomInplaceReturnsSelf(unittest.TestCase):
     """
     Feature: OpDispatcher._dispatch_random_op return value for in-place random ops.
     Description: In-place random ops must return the input DTensor itself, not a new
-                 wrapper. Torch in-place names end with '_' (e.g. normal_);
-                 MindSpore in-place random kernels are listed in
-                 ``OpDispatcher._RANDOM_INPLACE_MS_OPS``. ``FuncDropoutExt`` uses
-                 its ``inplace`` argument instead. Non-in-place random ops (e.g.
-                 Randn) return a freshly wrapped DTensor.
+                 wrapper. Torch in-place names end with '_' (e.g. normal_).
+                 ``FuncDropoutExt`` uses its ``inplace`` argument instead.
+                 Non-in-place random ops (e.g. randn) return a freshly wrapped
+                 DTensor.
     Expectation: _dispatch_random_op returns self for in-place names and a new wrapper
                  for non-in-place names.
     """
@@ -947,29 +871,23 @@ class TestDispatchRandomInplaceReturnsSelf(unittest.TestCase):
         return result, first_arg
 
     def test_inplace_ops_return_self(self):
-        """Torch '_' suffix and _RANDOM_INPLACE_MS_OPS kernels return self."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        for op_name in ("normal_", *OpDispatcher._RANDOM_INPLACE_MS_OPS):
+        """Torch '_' suffix kernels return self."""
+        for op_name in ("normal_", "bernoulli_"):
             with self.subTest(op_name=op_name):
                 result, first_arg = self._dispatch(op_name, MagicMock(return_value=MagicMock()))
                 self.assertIs(result, first_arg)
 
     def test_non_inplace_op_returns_new_wrapper(self):
         """Out-of-place random ops wrap the result in a new DTensor."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher, Tensor
-
         out_of_place_ops = (
-            "Randn",
-            "BernoulliExt",
-            "UniformExt",
-            "NormalTensorTensor",
-            "RandExt",
+            "randn",
+            "rand",
+            "bernoulli",
+            "native_dropout",
         )
         for op_name in out_of_place_ops:
             with self.subTest(op_name=op_name):
-                self.assertNotIn(op_name, OpDispatcher._RANDOM_INPLACE_MS_OPS)
-                op_call = MagicMock(return_value=MagicMock(spec=Tensor))
+                op_call = MagicMock(return_value=torch.tensor([1.0]))
                 with patch.object(DTensor, "from_local", return_value="new_wrapper"):
                     result, first_arg = self._dispatch(op_name, op_call)
                 self.assertIsNot(result, first_arg)
@@ -1002,10 +920,8 @@ class TestDispatchRandomInplaceReturnsSelf(unittest.TestCase):
 
     def test_func_dropout_ext_out_of_place_wraps(self):
         """FuncDropoutExt(inplace=False) wraps the local result in a new DTensor."""
-        from hyper_parallel.core.shard._op_dispatch import Tensor
-
         first_arg = MagicMock(spec=DTensor)
-        op_call = MagicMock(return_value=MagicMock(spec=Tensor))
+        op_call = MagicMock(return_value=torch.tensor([1.0]))
         with patch.object(DTensor, "from_local", return_value="new_wrapper"):
             result, returned_first_arg = self._dispatch(
                 "FuncDropoutExt",

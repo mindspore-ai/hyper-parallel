@@ -25,61 +25,22 @@ from contextvars import ContextVar
 from itertools import chain
 from typing import Any, Dict, FrozenSet, List, Optional
 
+import torch
 import yaml
 
+from hyper_parallel.core.shard.utils import distributed_cross_entropy_from_op_call, get_op_name
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import RaggedShardInfo
 from hyper_parallel.core.dtensor.random import OffsetBasedRNGTracker, is_rng_supported_mesh
 from hyper_parallel.core.dtensor.debug._dispatch_logger import log_dispatch_enter, log_dispatch_exit
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.platform import PlatformType
 
 from hyper_parallel.core.tensor_parallel._ce_op_registry import is_loss_parallel_op, is_decomposed_ce_op
 from hyper_parallel.core.tensor_parallel.loss_parallel import is_loss_parallel_active
 from hyper_parallel.core.tensor_parallel.loss_parallel_ops_common import _is_shard_on_last_dim
 
-platform = get_platform()
-Tensor = platform.Tensor
-
 logger = logging.getLogger(__name__)
 
-
-def _apply_shard_offset_to_rng_args(args, offset_incr):
-    """Apply per-shard offset increment to seed/offset tensors in MindSpore random op args.
-
-    MindSpore random ops (e.g. ``randn_like_``) receive ``(seed, offset)`` as
-    explicit int64 scalar tensors from ``default_generator._step()`` in the
-    Python wrapper *before* the C++ dispatch triggers ``__fallback__``.  By the
-    time ``_dispatch_random_op`` is called, the kernel will use whatever
-    ``(seed, offset)`` values are in the args—it does **not** read the
-    generator again. This function finds the offset tensor and adds the
-    per-rank offset increment so each shard gets a unique random stream.
-
-    The (seed, offset) pair is identified as the last two consecutive int64
-    0-dim tensors in *args* (scanning from the end to skip trailing dtype /
-    device arguments).
-
-    Args:
-        args: The list of local args for the random op.
-        offset_incr (int): Per-shard offset increment.
-
-    Returns:
-        list: Modified args with the offset tensor adjusted.
-    """
-    int64_dtype = platform.tensor_dtype.int64
-    last_int64_idx = -1
-    for i in range(len(args) - 1, -1, -1):
-        arg = args[i]
-        if isinstance(arg, Tensor) and arg.dtype == int64_dtype and arg.ndim == 0:
-            if last_int64_idx == i + 1:
-                offset_idx = i + 1
-                new_args = list(args)
-                new_offset = int(new_args[offset_idx].item()) + offset_incr
-                new_args[offset_idx] = platform.tensor([new_offset], dtype=int64_dtype).reshape(())
-                return new_args
-            last_int64_idx = i
-    return args
 
 _dtensor_dispatch_disabled: ContextVar[bool] = ContextVar('_dtensor_dispatch_disabled', default=False)
 _no_skip_ops: ContextVar[FrozenSet[str]] = ContextVar('_no_skip_ops', default=frozenset())
@@ -98,15 +59,6 @@ _RAGGED_ELEMENTWISE_OPS = {
     "mul": "binary", "mul_": "binary", "pow": "binary",
     "sub": "binary", "__rsub__": "binary", "__rpow__": "binary",
     "true_divide": "binary",
-    # MindSpore public APIs dispatch with primitive names. Aliased APIs share
-    # one name, e.g. abs/absolute -> Abs and neg/negative -> Neg.
-    "Abs": "unary", "Clone": "unary", "Cos": "unary", "Exp": "unary",
-    "GeLU": "unary", "GeluExt": "unary", "IsInf": "unary", "IsNan": "unary",
-    "Log": "unary", "Neg": "unary", "ReLU": "unary", "Rsqrt": "unary",
-    "Sigmoid": "unary", "SiLU": "unary", "Sin": "unary", "Sqrt": "unary",
-    "Square": "unary",
-    "Add": "binary", "AddExt": "binary", "Div": "binary", "Mul": "binary",
-    "Pow": "binary", "RealDiv": "binary", "Sub": "binary", "SubExt": "binary",
 }
 
 _RAGGED_INPLACE_ELEMENTWISE_OPS = frozenset({
@@ -260,16 +212,6 @@ class OpDispatcher:
     _INPLACE_BYPASS_OPS = frozenset(
         {"InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv"})
 
-    # MindSpore random kernels that always mutate an existing tensor in place.
-    # Out-of-place random kernels belong in _random_ms_ops only, not here.
-    _RANDOM_INPLACE_MS_OPS = frozenset({
-        "InplaceBernoulliScalar",
-        "InplaceBernoulliTensor",
-        "InplaceNormal",
-        "InplaceRandom",
-        "InplaceUniform",
-    })
-
     def __init__(self):
         self._env_yaml_dir: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_YAML_DIR")
         self._env_python_path: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_PYTHON_PATH")
@@ -290,25 +232,11 @@ class OpDispatcher:
                                     "_has_compatible_shallow_copy_type", "is_floating_point", "is_contiguous",
                                     "get_device"})
 
-        # Ops requiring args unpacking for layout inference (packed as prim, name, real_args).
-        # frozenset so the aclop-normalization gate in _dispatch_layout_infer is O(1).
-        self.unpack_ops = frozenset({"ScatterUpdate", "Mod", "GatherNd", "StopGradient"})
-
         self._random_ops = {
             "normal_", "uniform_", "bernoulli", "bernoulli_",
             "native_dropout", "rand", "rand_like", "randn",
             "randn_like", "randint_like", "kaiming_uniform_",
             "multinomial",
-        }
-        # Only mint random op support
-        # MindSpore use the actual kernel name.
-        self._random_ms_ops = {
-            "BernoulliExt", "MultinomialExt",
-            "InplaceBernoulliScalar", "InplaceBernoulliTensor",
-            "InplaceNormal", "InplaceRandom", "InplaceUniform",
-            "NormalFloatFloat", "NormalFloatTensor", "NormalTensorFloat", "NormalTensorTensor",
-            "RandpermExt", "Randn", "RandLikeExt", "RandnLike", "RandInt", "RandIntLike", "RandExt",
-            "FuncDropoutExt", "UniformExt",
         }
         self._rng_tracker: Optional[OffsetBasedRNGTracker] = None
         # Op names proven to be loss/CE-irrelevant (both is_loss_parallel_op and
@@ -475,17 +403,6 @@ class OpDispatcher:
                 global_shape=first_arg.shape,
                 generator=maybe_user_generator,
             ):
-                # MindSpore random ops (e.g. mint.randn_like) extract (seed, offset)
-                # from default_generator._step() in the Python wrapper *before* the
-                # C++ dispatch triggers __fallback__. The callback reuses these
-                # pre-fetched tensor args, so set_rng_state inside _distribute_region
-                # has no effect on the kernel. Fix: apply the per-shard offset
-                # increment directly to the offset tensor in the args.
-                if platform.platform_type == PlatformType.MINDSPORE:
-                    offset_incr = self._rng_tracker.compute_offset_incr(
-                        first_arg.device_mesh, first_arg.placements, first_arg.shape,
-                    )
-                    local_args = _apply_shard_offset_to_rng_args(local_args, offset_incr)
                 local_results = op_call(*local_args, **local_kwargs)
         else:
             if maybe_user_generator is not None:
@@ -505,8 +422,6 @@ class OpDispatcher:
     @staticmethod
     def _random_op_returns_self(op_name: str, args, kwargs) -> bool:
         """Return True when a random op mutates an existing DTensor in place."""
-        if op_name in OpDispatcher._RANDOM_INPLACE_MS_OPS:
-            return True
         if op_name == "FuncDropoutExt":
             return OpDispatcher._func_dropout_ext_inplace(args, kwargs)
         # Torch random inplace ops follow the ATen '_' suffix convention.
@@ -517,9 +432,8 @@ class OpDispatcher:
         """Wrap a random op's local result(s) back into DTensor(s).
 
         In-place ops return the input DTensor itself. Torch random inplace ops use
-        the ATen '_' suffix; MindSpore inplace random kernels are listed in
-        ``_RANDOM_INPLACE_MS_OPS``. ``FuncDropoutExt`` is handled separately
-        because the same kernel serves both modes via its ``inplace`` argument.
+        the ATen '_' suffix. ``FuncDropoutExt`` is handled separately because the
+        same kernel serves both modes via its ``inplace`` argument.
         """
         if OpDispatcher._random_op_returns_self(op_name, args, kwargs):
             return first_arg
@@ -528,10 +442,10 @@ class OpDispatcher:
         # Some ops return tuple/list, e.g. native_dropout returns (output, mask).
         if isinstance(local_results, (tuple, list)):
             return tuple(
-                DTensor.from_local(r, mesh, placements) if isinstance(r, Tensor) else r
+                DTensor.from_local(r, mesh, placements) if isinstance(r, torch.Tensor) else r
                 for r in local_results
             )
-        if isinstance(local_results, Tensor):
+        if isinstance(local_results, torch.Tensor):
             return DTensor.from_local(local_results, mesh, placements)
         # Fallback: return as-is for non-Tensor results (currently unreachable with existing _random_ops).
         return local_results
@@ -620,7 +534,7 @@ class OpDispatcher:
         local_args = tuple(self._unwrap_args(args))
         local_kwargs = self._unwrap_kwargs(kwargs)
         py_output = op_call(*local_args, **local_kwargs)
-        op_name = platform.get_op_name(op_call)
+        op_name = get_op_name(op_call)
         if op_name in _RAGGED_INPLACE_ELEMENTWISE_OPS:
             if not args or not isinstance(args[0], DTensor):
                 raise ValueError(
@@ -678,7 +592,7 @@ class OpDispatcher:
         """Return True if the op should bypass DTensor dispatch and run locally.
 
         Args:
-            op_name: Canonical operator name from platform.get_op_name().
+            op_name: Canonical operator name from get_op_name().
 
         Returns:
             True when the op is whitelisted or DTensor dispatch is globally disabled.
@@ -724,7 +638,7 @@ class OpDispatcher:
         """Check if should dispatch through loss_parallel path.
 
         Args:
-            op_name: Canonical operator name from platform.get_op_name().
+            op_name: Canonical operator name from get_op_name().
 
         Returns:
             True when in loss_parallel context and op is a CE entry point.
@@ -781,14 +695,6 @@ class OpDispatcher:
         Returns:
             Result of the distributed cross_entropy computation.
         """
-        if platform.platform_type == PlatformType.PYTORCH:
-            # pylint: disable=C0415
-            from hyper_parallel.platform.torch.loss_parallel_ops import distributed_cross_entropy_from_op_call
-        elif platform.platform_type == PlatformType.MINDSPORE:
-            # pylint: disable=C0415
-            from hyper_parallel.platform.mindspore.loss_parallel_ops import distributed_cross_entropy_from_op_call
-        else:
-            raise RuntimeError(f"Unsupported platform for loss_parallel: {platform.platform_type}")
         return distributed_cross_entropy_from_op_call(op_call, args, kwargs)
 
     def _check_ce_op_without_loss_parallel_context(self, op_name: str, args: tuple):
@@ -819,67 +725,6 @@ class OpDispatcher:
                 f"If you intentionally want to gather all shards to compute cross_entropy "
                 f"(not recommended for large vocabulary), use logits.full_tensor() explicitly."
             )
-
-    @staticmethod
-    def _normalize_aclop_args(op_name: str, unpack_ops: list, args: tuple) -> tuple:
-        """
-        Normalize aclop-packed arguments for MindSpore backend operators.
-
-        NOTE: This handles MindSpore aclop operators whose kernel signature packs
-        arguments as ``(prim, op_name_str, (real_arg0, real_arg1, ...))``. The
-        ``prim`` and ``op_name_str`` are preserved as ``packed_call`` for the
-        final kernel invocation, while the real tensor arguments are extracted
-        for layout inference and preprocessing.
-
-        **aclop is planned for deprecation.** Once aclop is fully removed, this
-        normalization and the associated ``unpack_ops`` list can be deleted.
-
-        Args:
-            op_name (str): Canonical operator name.
-            unpack_ops (list): List of op names that may use aclop packed format.
-            args (tuple): Raw positional arguments from the op call.
-
-        Returns:
-            tuple: ``(packed_call, normalized_args)``
-                - **packed_call**: ``(prim, op_name_str)`` tuple for kernel
-                  invocation, or ``None`` if no unpacking was performed.
-                - **normalized_args**: The real tensor arguments (unpacked if
-                  the packed format was detected, otherwise the original args).
-        """
-        if OpDispatcher._is_aclop_packed(op_name, unpack_ops, args):
-            return (args[0], args[1]), tuple(args[2])
-        return None, args
-
-    @staticmethod
-    def _is_aclop_packed(op_name: str, unpack_ops: list, args: tuple) -> bool:
-        """Check if arguments use aclop packed format."""
-        return (
-            op_name in unpack_ops
-            and len(args) == 3
-            and isinstance(args[1], str)
-            and isinstance(args[2], (tuple, list))
-        )
-
-    @staticmethod
-    def _call_op_impl(op_impl: callable, packed_call, args, kwargs: dict):
-        """Invoke *op_impl* with optional aclop packed-call wrapping.
-
-        When *packed_call* is not ``None`` the MindSpore aclop kernel expects
-        ``(prim, op_name, (arg0, arg1, ...))``.  Otherwise *args* are spread
-        as positional arguments in the usual way.
-
-        Args:
-            op_impl: The op implementation callable.
-            packed_call: ``(prim, op_name)`` tuple or ``None``.
-            args: Local tensor arguments (list or tuple).
-            kwargs: Keyword arguments dict.
-
-        Returns:
-            Result of the *op_impl* invocation.
-        """
-        if packed_call is not None:
-            return op_impl(packed_call[0], packed_call[1], tuple(args), **kwargs)
-        return op_impl(*args, **kwargs)
 
     def _handle_unregistered_op(
         self, op_name: str, op_call: callable, args: tuple, kwargs: dict
@@ -924,7 +769,7 @@ class OpDispatcher:
             if op_name == "cross_entropy" and len(gathered_args) >= 2:
                 logits = gathered_args[0]
                 targets = gathered_args[1]
-                if isinstance(logits, Tensor) and isinstance(targets, Tensor):
+                if isinstance(logits, torch.Tensor) and isinstance(targets, torch.Tensor):
                     if logits.ndim > 2 and targets.ndim > 1 and targets.ndim == logits.ndim - 1:
                         vocab_size = logits.shape[-1]
                         gathered_args[0] = logits.reshape(-1, vocab_size)
@@ -956,15 +801,6 @@ class OpDispatcher:
         cache_manager = LayoutCacheManager.get_instance()
         distribute_op = cache_manager.distributed_op(op_name)
 
-        # Normalize aclop-packed args before any per-op processing. Only the handful
-        # of (deprecation-bound) unpack_ops ever use the packed format, so gate the
-        # whole normalization behind an O(1) membership test instead of paying two
-        # function frames (_normalize_aclop_args + _is_aclop_packed) on every op.
-        if op_name in getattr(self, 'unpack_ops', ()):
-            packed_call, args = self._normalize_aclop_args(op_name, self.unpack_ops, args)
-        else:
-            packed_call = None
-
         result = distribute_op.preprocess(args, kwargs)
         if result is None:
             raise RuntimeError(
@@ -979,7 +815,7 @@ class OpDispatcher:
         )
 
         op_impl = op_call if op_impl is None else op_impl
-        py_output = OpDispatcher._call_op_impl(op_impl, packed_call, local_args, local_kwargs)
+        py_output = op_impl(*local_args, **local_kwargs)
         output = distribute_op.wrap_output(py_output, infer_result[0])
         return OpDispatcher._restore_inplace_dtensor_result(op_name, args, output)
 
@@ -1019,7 +855,7 @@ class OpDispatcher:
         Returns:
             Result of the dispatched op call.
         """
-        op_name = platform.get_op_name(op_call)
+        op_name = get_op_name(op_call)
         if logger.isEnabledFor(logging.DEBUG):
             log_dispatch_enter(op_name, args, kwargs)
 
@@ -1046,7 +882,7 @@ class OpDispatcher:
                     result = args[0]
                 return result
 
-            if op_name in self._random_ops or op_name in self._random_ms_ops:
+            if op_name in self._random_ops:
                 result = self._dispatch_random_op(op_name, op_call, args, kwargs)
                 return result
 

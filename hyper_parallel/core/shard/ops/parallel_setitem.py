@@ -21,9 +21,10 @@ BASIC (int/slice/None/Ellipsis), ADVANCED (list/LongTensor), BOOL_MASK (not supp
 """
 from typing import Any, Tuple
 
+import torch
+
 from hyper_parallel.core.dtensor.dtensor import DTensor, _build_layout
 from hyper_parallel.core.dtensor.placement_types import Replicate
-from hyper_parallel.platform import get_platform
 from .parallel_getitem import (
     _BASIC,
     _BOOL_MASK,
@@ -34,9 +35,6 @@ from .parallel_getitem import (
     GetItemDistributedOp,
 )
 from .parallel_ops import DistributedOp
-
-platform = get_platform()
-Tensor = platform.Tensor
 
 
 def _normalize___setitem___args(self_t, key, value):
@@ -343,7 +341,7 @@ class SetItemDistributedOp(DistributedOp):
                 return local_value, None  # 0-D DTensor treated as scalar
             return local_value, ("dtensor", value.layout, value_shape)
 
-        if isinstance(value, Tensor):
+        if isinstance(value, torch.Tensor):
             value_desc = ("plain_tensor", tuple(value.shape))
             if value.ndim > 0 and kind != _BOOL_MASK:
                 _validate_value_broadcast(op_name, tuple(value.shape), lhs_shape)

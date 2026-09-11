@@ -20,11 +20,7 @@ from copy import deepcopy
 from typing import Sequence, Union, Tuple, List
 
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
-
-platform = get_platform()
-Tensor = platform.Tensor
 
 
 StrOrTuple = Union[str, Tuple["StrOrTuple", ...], List["StrOrTuple"]]

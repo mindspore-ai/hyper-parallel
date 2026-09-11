@@ -823,8 +823,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
     # ===== preprocess tests =====
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.shard.ops.parallel_getitem.platform")
-    def test_preprocess_basic(self, mock_op_platform, mock_dt_platform):
+    def test_preprocess_basic(self, mock_dt_platform):
         """
         Feature: preprocess for basic indexing.
         Description: Verify preprocess normalizes args and builds cache_values.
@@ -832,9 +831,6 @@ class TestGetItemDistributedOp(unittest.TestCase):
         """
         mesh = self._make_2x2_mesh(mock_dt_platform)
         self_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-
-        mock_bool = MagicMock()
-        mock_op_platform.bool = mock_bool
 
         mock_tensor = self._make_mock_dtensor(self_layout, "local_tensor_data")
         local_args, local_kwargs, cache_values = getitem_op.preprocess(

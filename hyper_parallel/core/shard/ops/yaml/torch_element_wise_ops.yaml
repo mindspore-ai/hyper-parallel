@@ -1,0 +1,5 @@
+
+dropout:
+  dist_op_name: _torch_dropout_dist_op
+  distributed_op_class: ElementWiseDistributedOp
+  distributed_op_file: parallel_elementwise

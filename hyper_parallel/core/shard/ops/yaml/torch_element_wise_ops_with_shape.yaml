@@ -1,0 +1,22 @@
+__default__:
+  distributed_op_class: ElementWiseDistributedOp
+  distributed_op_file: parallel_elementwise
+
+ne:
+  dist_op_name: _torch_ne_dist_op
+
+remainder:
+  dist_op_name: _torch_remainder_dist_op
+
+mul_:
+  dist_op_name: _torch_mul__dist_op
+  distributed_op_class: ElementWiseWithPartialDistributedOp
+
+div_:
+  dist_op_name: _torch_div__dist_op
+
+isnan:
+  dist_op_name: _torch_isnan_dist_op
+
+isinf:
+  dist_op_name: _torch_isinf_dist_op
