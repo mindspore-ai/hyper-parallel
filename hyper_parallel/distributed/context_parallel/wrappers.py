@@ -250,8 +250,10 @@ def _prepare_hybrid_sdpa_kwargs(
     )
 
 
-def _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kwargs):
+def _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kwargs, *, normalize_gqa=False):
     """CP-aware SDPA: K/V all-gather + D-04 offset-aware causal mask."""
+    if normalize_gqa:
+        q, k, v, kwargs = _normalize_hf_sdpa_gqa(q, k, v, kwargs)
     cp_dim = 2  # sequence dim of the [B, N, S, H] layout
     global_k, global_v = flex_cp_allgather(
         k.contiguous(), v.contiguous(), cp_dim, cp_mesh)
@@ -535,7 +537,9 @@ def sdpa_hf_cp_wrapper(
         def cp_aware_sdpa(q: Any, k: Any, v: Any, **kw: Any) -> Any:
             """CP-aware SDPA replacement: all-gather K/V plus the D-04 mask."""
             fired["hit"] = True
-            return _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kw)
+            return _cp_sdpa_call(
+                orig_sdpa, cp_mesh, q, k, v, kw, normalize_gqa=True
+            )
 
         F.scaled_dot_product_attention = cp_aware_sdpa
         try:

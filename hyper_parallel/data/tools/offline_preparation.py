@@ -307,30 +307,32 @@ class Partition:
         pack_to_seq_len = getattr(self.args, "pack_to_seq_len", None)
         chunk_size = pack_to_seq_len + 1 if pack_to_seq_len is not None else None
         token_buffers = {key: [] for key in keys}
-        with open(input_file_name, "r", encoding="utf-8") as fin:
-            encoded_docs = pool.imap(encoder.encode, fin, 32)
-            for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
-                if self.args.find_optimal_num_workers and i > self.args.max_documents:
-                    break
-                total_bytes_processed += bytes_processed
-                for key in keys:
-                    if chunk_size is None:
-                        builders[key].add_document(doc[key], sentence_lens[key])
-                        continue
-                    token_buffers[key].extend(doc[key])
-                    complete_length = len(token_buffers[key]) // chunk_size * chunk_size
-                    for offset in range(0, complete_length, chunk_size):
-                        chunk = token_buffers[key][offset : offset + chunk_size]
-                        builders[key].add_document(chunk, [chunk_size])
-                    del token_buffers[key][:complete_length]
-                self.print_processing_stats(i, proc_start, total_bytes_processed)
+        try:
+            with open(input_file_name, "r", encoding="utf-8") as fin:
+                encoded_docs = pool.imap(encoder.encode, fin, 32)
+                for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
+                    if self.args.find_optimal_num_workers and i > self.args.max_documents:
+                        break
+                    total_bytes_processed += bytes_processed
+                    for key in keys:
+                        if chunk_size is None:
+                            builders[key].add_document(doc[key], sentence_lens[key])
+                            continue
+                        token_buffers[key].extend(doc[key])
+                        complete_length = len(token_buffers[key]) // chunk_size * chunk_size
+                        for offset in range(0, complete_length, chunk_size):
+                            chunk = token_buffers[key][offset : offset + chunk_size]
+                            builders[key].add_document(chunk, [chunk_size])
+                        del token_buffers[key][:complete_length]
+                    self.print_processing_stats(i, proc_start, total_bytes_processed)
 
-        keys = self.args.json_keys
-        for key in keys:
-            builders[key].finalize(output_idx_files[key])
-
-        pool.close()
-        pool.join()
+            for key in keys:
+                builders[key].finalize(output_idx_files[key])
+        finally:
+            for builder in builders.values():
+                builder.data_file.close()
+            pool.close()
+            pool.join()
 
         return self.performance
 

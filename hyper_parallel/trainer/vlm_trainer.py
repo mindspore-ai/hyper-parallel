@@ -188,7 +188,8 @@ class VLMTrainer:
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
-        for micro_step, (model_inputs, loss_inputs) in enumerate(training_batches):
+        for micro_step, batch in enumerate(training_batches):
+            model_inputs, loss_inputs = batch
             self.base.model_reshard(micro_step, num_micro_steps)
             self.base.configure_fsdp_gradient_sync(
                 micro_step,
@@ -200,6 +201,10 @@ class VLMTrainer:
                 for name, token_count in self.base.current_token_counts.items()
             }
             loss, loss_dict = self.base.forward_backward_step(model_inputs)
+
+            # Release each device batch as soon as its backward pass completes;
+            # prefetching all micro-batches must not pin them until step end.
+            training_batches[micro_step] = None
 
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():

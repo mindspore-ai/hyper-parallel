@@ -69,11 +69,14 @@ class ProfilerWithMem:
     # delegate ctx-manager behaviour
     def __enter__(self) -> Any:
         """Enter the wrapped profiler's context manager."""
-        return self._p.__enter__()
+        self.start()
+        return self
 
     def __exit__(self, *a: Any) -> Any:
         """Exit the wrapped profiler's context manager."""
-        return self._p.__exit__(*a)
+        del a
+        self.stop()
+        return False
 
     def start(self) -> Any:
         """Start profiling and begin recording the allocator history."""
@@ -83,9 +86,10 @@ class ProfilerWithMem:
 
     def stop(self) -> Any:
         """Stop profiling and stop recording the allocator history."""
-        out = self._p.stop()
-        get_torch_device().memory._record_memory_history(enabled=None)  # step recording memory snapshot
-        return out
+        try:
+            return self._p.stop()
+        finally:
+            get_torch_device().memory._record_memory_history(enabled=None)
 
     def step(self, *a: Any, **kw: Any) -> Any:
         """Advance the wrapped profiler by one step."""

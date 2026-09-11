@@ -203,7 +203,19 @@ def build_dataset_for_dataloader(
         local_dataset = dataset_factory()
 
     if barrier_needed:
-        dataloader_context.barrier()
+        try:
+            dataloader_context.barrier()
+        finally:
+            # Dataset-specific barriers may own a temporary auxiliary group.
+            # Close it after all ranks have crossed the barrier so repeated
+            # dataset builds do not retain process groups and file handles.
+            barrier = dataloader_context.barrier
+            barrier_owner = getattr(barrier, "__self__", None)
+            if barrier_owner is None and hasattr(barrier, "close"):
+                barrier_owner = barrier
+            close = getattr(barrier_owner, "close", None)
+            if close is not None:
+                close()
 
     if not builds_cache_first and owns_dataset:
         local_dataset = dataset_factory()
