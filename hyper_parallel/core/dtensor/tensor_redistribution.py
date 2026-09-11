@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,8 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """tensor_redistribution"""
+# pylint: disable=C9006,C9007
 import logging
 
+import torch.distributed as dist
+
+from hyper_parallel.core.dtensor import _utils
 from hyper_parallel.core.dtensor._ragged_utils import (
     _compute_ragged_all_to_all_splits,
     _compute_ragged_slice,
@@ -23,8 +27,6 @@ from hyper_parallel.core.dtensor._ragged_utils import (
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout, RaggedShardInfo
 from hyper_parallel.core.dtensor.redistribute_infer import RedistributionOperatorInfer
-from hyper_parallel.platform import get_platform
-platform = get_platform()
 
 logger = logging.getLogger(__name__)
 
@@ -70,21 +72,21 @@ class TensorRedistribution:
         """args: (*rank_list, concat_dim)"""
         rank_list = args[0:-1]
         concat_dim = args[-1]
-        group = platform.create_group(rank_list)
+        group = _utils.create_group(rank_list)
         concat_size = len(rank_list)
         logger.debug(
             "differentiable_all_gather_concat: input_shape=%s, concat_dim=%d, "
             "concat_size=%d, rank_list=%s",
             tuple(x.shape), concat_dim, concat_size, rank_list,
         )
-        return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
+        return _utils.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
 
 
     @staticmethod
     def _construct_strided_slice(x, *args):
         """args: (begin, end, strides)"""
         dims = len(args) // 3
-        return platform.construct_strided_slice(x, args[0: dims], args[dims: 2 * dims], args[2 * dims:])
+        return _utils.construct_strided_slice(x, args[0: dims], args[dims: 2 * dims], args[2 * dims:])
 
     @staticmethod
     def _construct_all_concat_new(x, *args):
@@ -92,13 +94,13 @@ class TensorRedistribution:
         rank_list = args[2]
         concat_dim = args[0]
         concat_size = args[1]
-        group = platform.create_group(rank_list)
+        group = _utils.create_group(rank_list)
         logger.debug(
             "differentiable_all_gather_concat: input_shape=%s, concat_dim=%d, "
             "concat_size=%d, rank_list=%s",
             tuple(x.shape), concat_dim, concat_size, rank_list,
         )
-        return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
+        return _utils.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
 
     def _construct_all_split(self, x, *args):
         """args: (split_dim, split_size, group)"""
@@ -106,13 +108,13 @@ class TensorRedistribution:
         split_dim = args[0]
         split_size = args[1]
         idx = rank_list.index(self.rank_id)
-        return platform.chunk(x, split_dim, split_size, idx)
+        return _utils.chunk(x, split_dim, split_size, idx)
 
     @staticmethod
     def _construct_all_to_all(x, *args):
         """args: (split_dim, concat_dim, permute_size, group)"""
         split_dim, concat_dim, split_count, rank_list = args
-        group = platform.create_group(rank_list)
+        group = _utils.create_group(rank_list)
         logger.debug(
             "differentiable_all_to_all: input_shape=%s, split_dim=%d, "
             "concat_dim=%d, split_count=%d, rank_list=%s",
@@ -153,7 +155,7 @@ class TensorRedistribution:
             reshape_shape = tuple(reshape_shape)
             x_reshaped = x_reshaped.reshape(reshape_shape)
         x_reshaped = x_reshaped.contiguous()
-        output_tensor = platform.differentiable_all_to_all(
+        output_tensor = _utils.differentiable_all_to_all(
             input_data=x_reshaped,
             output_shape=reshape_shape,
             group=group
@@ -295,7 +297,7 @@ class TensorRedistribution:
         from_layout = input_x.layout
         x = input_x
         if not self.is_init:
-            self.rank_id = platform.get_rank()
+            self.rank_id = dist.get_rank()
             self.is_init = True
         key = from_layout.compact_str + to_layout.compact_str + str(self.rank_id)
         if key in self._transform_cache:
@@ -340,7 +342,7 @@ class TensorRedistribution:
             gathered = local_tensor
         else:
             group = from_layout.mesh.get_group(info.mesh_dim)
-            gathered = platform.differentiable_variable_all_gather(
+            gathered = _utils.differentiable_variable_all_gather(
                 local_tensor,
                 output_splits,
                 group,
@@ -413,7 +415,7 @@ class TensorRedistribution:
             flat_output = flat_input
         else:
             group = from_layout.mesh.get_group(source_info.mesh_dim)
-            flat_output = platform.differentiable_all_to_all_single(
+            flat_output = _utils.differentiable_all_to_all_single(
                 flat_input,
                 input_splits,
                 output_splits,
@@ -435,7 +437,7 @@ class TensorRedistribution:
         from_layout_tuple, to_layout_tuple = \
             _construct_layout_tuple_for_transform_operator_list(from_layout, to_layout, from_full_shape)
         self._transform_cache[key] = \
-            platform.get_tensor_transform().transform_tensor_sharding(from_layout_tuple, to_layout_tuple,
+            _utils.get_tensor_transform().transform_tensor_sharding(from_layout_tuple, to_layout_tuple,
                                                                       rank_list, False, self.rank_id)
         return self._transform_cache[key]
 
@@ -452,14 +454,14 @@ class TensorRedistribution:
             x = x.unsqueeze(0)
         if op == 'avg':
             dev_num = layout.mesh_shape[layout.alias_name.index(dev_dim)]
-            x = platform.differentiable_all_reduce(x, 'sum', group)
+            x = _utils.differentiable_all_reduce(x, 'sum', group)
             x = x / dev_num
         elif op == 'all':
-            x_int32 = platform.tensor_type_cast(x.bool(), 'int32')  # True→1, False→0
-            x = platform.differentiable_all_reduce(x_int32, 'all', group)
+            x_int32 = _utils.tensor_type_cast(x.bool(), 'int32')  # True→1, False→0
+            x = _utils.differentiable_all_reduce(x_int32, 'all', group)
             x = x.bool()
         else:
-            x = platform.differentiable_all_reduce(x, op, group)
+            x = _utils.differentiable_all_reduce(x, op, group)
         if zero_dim:
             x = x.squeeze(0)
         return x
@@ -474,7 +476,7 @@ class TensorRedistribution:
             tuple(x.shape), axis, op, dev_dim, dev_num,
         )
         group = layout.get_comm_group_by_axis(dev_dim)
-        output_tensor = platform.differentiable_reduce_scatter(x, dev_num, axis, op, group)
+        output_tensor = _utils.differentiable_reduce_scatter(x, dev_num, axis, op, group)
         return output_tensor
 
     def reduce_partial(self, input_x, to_layout):

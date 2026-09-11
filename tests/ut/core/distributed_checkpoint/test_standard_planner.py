@@ -69,8 +69,7 @@ class TestStandardPlanner(unittest.TestCase):
         """Build a rank-zero RaggedShard DTensor without initializing a backend."""
         _DEVICE_MESH_MAP.clear()
         EXISTING_COMM_GROUPS.clear()
-        with patch(
-                "hyper_parallel.core.dtensor.device_mesh.platform.get_rank",
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank",
                 return_value=0,
         ):
             mesh = Layout((2,), ("ragged",), init_backend=False).mesh

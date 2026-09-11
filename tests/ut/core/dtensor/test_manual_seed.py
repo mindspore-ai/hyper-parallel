@@ -38,13 +38,13 @@ class TestIsRngSupportedMesh(unittest.TestCase):
             self.assertFalse(is_rng_supported_mesh(mesh))
         self.assertTrue(any("cpu" in str(w.message).lower() for w in rec))
 
-    @patch("hyper_parallel.core.dtensor.random.platform.get_device_handle")
+    @patch("hyper_parallel.core.dtensor.random._utils.get_device_handle")
     def test_returns_true_when_handle_has_set_rng_state(self, mock_get_handle):
-        """When the platform device handle exposes ``set_rng_state``, RNG is supported."""
+        """When the device handle exposes ``set_rng_state``, RNG is supported."""
         mock_get_handle.return_value = MagicMock(spec=["set_rng_state"])
         self.assertTrue(is_rng_supported_mesh(None))
 
-    @patch("hyper_parallel.core.dtensor.random.platform.get_device_handle")
+    @patch("hyper_parallel.core.dtensor.random._utils.get_device_handle")
     def test_returns_false_without_set_rng_state(self, mock_get_handle):
         """Missing ``set_rng_state`` on the handle yields ``False`` for a non-CPU mesh."""
 
@@ -66,10 +66,10 @@ class TestManualSeed(unittest.TestCase):
         _OP_DISPATCHER._rng_tracker = None
 
     def test_no_op_on_cpu_mesh_does_not_touch_dispatcher_seed(self):
-        """Unsupported mesh: early return; no ``platform.manual_seed``."""
+        """Unsupported mesh: early return; no ``torch.manual_seed``."""
         mesh = MagicMock()
         mesh.device_type = "cpu"
-        with patch("hyper_parallel.core.dtensor.random.platform.manual_seed") as mock_ms:
+        with patch("hyper_parallel.core.dtensor.random._utils.manual_seed") as mock_ms:
             manual_seed(42, mesh)
         mock_ms.assert_not_called()
 
@@ -87,26 +87,26 @@ class TestManualSeed(unittest.TestCase):
         mock_tracker_cls.assert_called_once_with(run_state_sync=False)
 
     @patch("hyper_parallel.core.dtensor.random.OffsetBasedRNGTracker")
-    @patch("hyper_parallel.core.dtensor.random.platform.manual_seed")
+    @patch("hyper_parallel.core.dtensor.random.torch.manual_seed")
     @patch("hyper_parallel.core.dtensor.random.is_rng_supported_mesh", return_value=True)
     def test_calls_platform_manual_seed_with_seed(
-        self, mock_is_rng, mock_platform_manual_seed, mock_tracker_cls
+        self, mock_is_rng, mock_torch_manual_seed, mock_tracker_cls
     ):
-        """Happy path: install tracker once, then ``platform.manual_seed(seed)``."""
+        """Happy path: install tracker once, then ``torch.manual_seed(seed)``."""
         del mock_is_rng
         mock_tracker_cls.return_value = MagicMock()
         mesh = MagicMock()
         mesh.device_type = "npu"
         mesh.get_coordinate.return_value = (0,)
         manual_seed(99_001, mesh)
-        mock_platform_manual_seed.assert_called_once_with(99_001)
+        mock_torch_manual_seed.assert_called_once_with(99_001)
         self.assertIs(_OP_DISPATCHER._rng_tracker, mock_tracker_cls.return_value)
 
     @patch("hyper_parallel.core.dtensor.random.OffsetBasedRNGTracker")
-    @patch("hyper_parallel.core.dtensor.random.platform.manual_seed")
+    @patch("hyper_parallel.core.dtensor.random.torch.manual_seed")
     @patch("hyper_parallel.core.dtensor.random.is_rng_supported_mesh", return_value=True)
     def test_tracker_constructed_only_once_across_two_calls(
-        self, mock_is_rng, mock_platform_manual_seed, mock_tracker_cls
+        self, mock_is_rng, mock_torch_manual_seed, mock_tracker_cls
     ):
         """Second ``manual_seed`` reuses existing ``_rng_tracker`` (no second construction)."""
         del mock_is_rng
@@ -117,7 +117,7 @@ class TestManualSeed(unittest.TestCase):
         manual_seed(1, mesh)
         manual_seed(2, mesh)
         self.assertEqual(mock_tracker_cls.call_count, 1)
-        self.assertEqual(mock_platform_manual_seed.call_count, 2)
+        self.assertEqual(mock_torch_manual_seed.call_count, 2)
 
 
 if __name__ == "__main__":

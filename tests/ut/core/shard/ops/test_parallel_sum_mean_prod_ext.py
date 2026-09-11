@@ -36,6 +36,12 @@ class TestParallelSumMeanProdExt(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Restore global cache state after each test."""
@@ -55,9 +61,6 @@ class TestParallelSumMeanProdExt(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2×2×2 (dp, cp, mp) mesh via init_device_mesh."""
@@ -83,7 +86,7 @@ class TestParallelSumMeanProdExt(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sum_ext_data_parallel_1(self, mock_platform):
         """
         Feature: Data parallel.
@@ -97,7 +100,7 @@ class TestParallelSumMeanProdExt(unittest.TestCase):
         self._run_scenario("SumExt", expected_map=(-1, -1), cache_values=cache_values)
         self._run_scenario("MeanExt", expected_map=(-1, -1), cache_values=cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sum_ext_model_parallel_2(self, mock_platform):
         """
         Feature: Model parallel.
@@ -111,7 +114,7 @@ class TestParallelSumMeanProdExt(unittest.TestCase):
         self._run_scenario("SumExt", expected_map=(-1, -1, -1), cache_values=cache_values)
         self._run_scenario("MeanExt", expected_map=(-1, -1, -1), cache_values=cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sum_ext_hybrid_parallel_3(self, mock_platform):
         """
         Feature: Hybrid parallel.
@@ -125,7 +128,7 @@ class TestParallelSumMeanProdExt(unittest.TestCase):
         self._run_scenario("SumExt", expected_map=(2, 0), cache_values=cache_values)
         self._run_scenario("MeanExt", expected_map=(2, 0), cache_values=cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sum_ext_reduce_multiple_dims_4(self, mock_platform):
         """
         Feature: Reduce over multiple dims.
@@ -139,7 +142,7 @@ class TestParallelSumMeanProdExt(unittest.TestCase):
         self._run_scenario("SumExt", expected_map=(-1, 1, -1), cache_values=cache_values)
         self._run_scenario("MeanExt", expected_map=(-1, 1, -1), cache_values=cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sum_ext_reduce_all_dims_5(self, mock_platform):
         """
         Feature: Reduce over all dims.

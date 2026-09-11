@@ -183,7 +183,7 @@ def test_ep_meta_initialization_preserves_dtensor_and_hsdp_state(monkeypatch):
     """EP meta initialization should release storage without losing distributed ownership."""
     # A topology-only CPU mesh makes DTensor metadata testable without launching workers.
     monkeypatch.setattr(
-        "hyper_parallel.core.dtensor.device_mesh.platform.get_rank", lambda: 0
+        "hyper_parallel.core.dtensor.device_mesh.dist.get_rank", lambda: 0
     )
     expert_mesh = DeviceMesh(
         "cpu",

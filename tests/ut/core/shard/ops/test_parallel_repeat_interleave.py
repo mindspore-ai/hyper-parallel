@@ -41,6 +41,12 @@ class TestParallelRepeatInterleave(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -54,16 +60,13 @@ class TestParallelRepeatInterleave(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, tp) mesh via init_device_mesh."""
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_layout_data_parallel(self, mock_platform):
         """
         Feature: RepeatInterleave data parallel
@@ -91,7 +94,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
             f"got {op.get_expand_impl(None, result, cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_layout_tensor_parallel(self, mock_platform):
         """
         Feature: RepeatInterleave tensor parallel
@@ -111,7 +114,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_with_tensor_layout_data_parallel(self, mock_platform):
         """
         Feature: RepeatInterleave data parallel
@@ -131,7 +134,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_with_tensor_layout_tensor_parallel(self, mock_platform):
         """
         Feature: RepeatInterleave tensor parallel
@@ -151,7 +154,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_dim_none_layout_data_parallel(self, mock_platform):
         """
         Feature: RepeatInterleave data parallel
@@ -170,7 +173,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_dim_none_layout_tensor_parallel(self, mock_platform):
         """
         Feature: RepeatInterleave tensor parallel
@@ -189,7 +192,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_layout_hybrid_parallel(self, mock_platform):
         """
         Feature: RepeatInterleave hybrid parallel
@@ -208,7 +211,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_layout_all_replicated(self, mock_platform):
         """
         Feature: RepeatInterleave all replicated
@@ -228,7 +231,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_layout_negative_dim(self, mock_platform):
         """
         Feature: RepeatInterleave negative dim
@@ -248,7 +251,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
             f"got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_partial_input_error(self, mock_platform):
         """
         Feature: RepeatInterleave partial input validation
@@ -262,7 +265,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "status which is not allowed"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_strided_shard_repeat_dim_error(self, mock_platform):
         """
         Feature: RepeatInterleave StridedShard repeat dim validation
@@ -276,7 +279,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "repeat dimension should be replicated"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_layout_sharded_dim_error(self, mock_platform):
         """
         Feature: RepeatInterleave on sharded dimension
@@ -291,7 +294,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "repeat dimension should be replicated"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_repeat_interleave_layout_error_dim_out_of_range(self, mock_platform):
         """
         Feature: Test indicating a invalid dim
@@ -336,7 +339,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
             f"Normalize kwargs mismatch: expected {{'output_size': 10}}, got {kwargs}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_with_int_repeats(self, mock_platform):
         """
         Feature: Preprocess with int repeats
@@ -367,7 +370,7 @@ class TestParallelRepeatInterleave(unittest.TestCase):
         )
         assert cache_values[1] == 1, f"cache_values[1] should be 1, got {cache_values[1]}"
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_dim_none(self, mock_platform):
         """
         Feature: Preprocess with dim=None

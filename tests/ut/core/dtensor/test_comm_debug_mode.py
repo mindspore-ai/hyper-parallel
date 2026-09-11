@@ -96,7 +96,7 @@ class TestCallRecords(unittest.TestCase):
 # 2. CollectiveTracer tests
 # ---------------------------------------------------------------------------
 class TestCollectiveTracer(unittest.TestCase):
-    """Tests for platform monkey-patch collective tracing."""
+    """Tests for collective tracing on the ``core.dtensor._utils`` helpers."""
 
     def test_install_and_uninstall_restores_original(self):
         """
@@ -104,18 +104,16 @@ class TestCollectiveTracer(unittest.TestCase):
         Description: After uninstall(), platform methods are exactly restored.
         Expectation: Function identity matches the original before patching.
         """
-        from hyper_parallel.platform import get_platform
-        platform = get_platform()
-        cls = type(platform)
+        from hyper_parallel.core.dtensor import _utils
 
-        # Save originals (raw descriptors from cls.__dict__).
+        # Save originals (raw module attributes).
         originals = {}
         for name in ("differentiable_all_reduce", "differentiable_all_gather_concat"):
-            if name in cls.__dict__:
-                originals[name] = cls.__dict__[name]
+            if hasattr(_utils, name):
+                originals[name] = getattr(_utils, name)
 
         if not originals:
-            self.skipTest("No patchable methods on current platform")
+            self.skipTest("No patchable collective helpers on _utils")
 
         callback = Mock()
         tracer = CollectiveTracer(callback)
@@ -123,13 +121,13 @@ class TestCollectiveTracer(unittest.TestCase):
 
         # Verify methods are now different.
         for name, orig_val in originals.items():
-            self.assertIsNot(cls.__dict__[name], orig_val)
+            self.assertIsNot(getattr(_utils, name), orig_val)
 
         tracer.uninstall()
 
         # Verify exact restoration.
         for name, orig in originals.items():
-            self.assertIs(cls.__dict__[name], orig)
+            self.assertIs(getattr(_utils, name), orig)
 
     def test_callback_is_invoked(self):
         """
@@ -137,11 +135,9 @@ class TestCollectiveTracer(unittest.TestCase):
         Description: The callback fires when a patched method is called.
         Expectation: Callback receives (method_name, args, kwargs, result).
         """
-        from hyper_parallel.platform import get_platform
-        platform = get_platform()
-        cls = type(platform)
+        from hyper_parallel.core.dtensor import _utils
 
-        if "differentiable_all_reduce" not in cls.__dict__:
+        if not hasattr(_utils, "differentiable_all_reduce"):
             self.skipTest("differentiable_all_reduce not available")
 
         callback = Mock()
@@ -155,7 +151,7 @@ class TestCollectiveTracer(unittest.TestCase):
             mock_data = torch.randn(4)
             mock_group = Mock()
             try:
-                platform.differentiable_all_reduce(mock_data, "sum", mock_group)
+                _utils.differentiable_all_reduce(mock_data, "sum", mock_group)
             except Exception:  # pylint: disable=W0703
                 pass  # Original may fail without real distributed setup
         finally:
@@ -167,10 +163,9 @@ class TestCollectiveTracer(unittest.TestCase):
         Description: A failing callback does not affect the original function.
         Expectation: The patched method still returns the original result.
         """
-        from hyper_parallel.platform import get_platform
-        cls = type(get_platform())
+        from hyper_parallel.core.dtensor import _utils
 
-        if "differentiable_all_reduce" not in cls.__dict__:
+        if not hasattr(_utils, "differentiable_all_reduce"):
             self.skipTest("differentiable_all_reduce not available")
 
         def bad_callback(*args):
@@ -228,20 +223,19 @@ class TestCommDebugModeContextManager(unittest.TestCase):
         Description: After CommDebugMode exits, all platform methods are restored.
         Expectation: cls.__dict__ entries match originals.
         """
-        from hyper_parallel.platform import get_platform
-        cls = type(get_platform())
+        from hyper_parallel.core.dtensor import _utils
 
         originals = {}
         for name in ("differentiable_all_reduce", "differentiable_reduce_scatter"):
-            if name in cls.__dict__:
-                originals[name] = cls.__dict__[name]
+            if hasattr(_utils, name):
+                originals[name] = getattr(_utils, name)
 
         mode = CommDebugMode()
         with mode:
             pass
 
         for name, orig in originals.items():
-            self.assertIs(cls.__dict__[name], orig,
+            self.assertIs(getattr(_utils, name), orig,
                           f"{name} not restored after __exit__")
 
     def test_empty_tracing_table(self):

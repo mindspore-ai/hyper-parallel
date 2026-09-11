@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,33 +13,31 @@
 # limitations under the License.
 # ============================================================================
 """device mesh"""
+# pylint: disable=C9006,C9007
 
 import copy
 import threading
 from types import TracebackType
 from typing import Any, List, Literal, Optional, Sequence, Type, Union
 import numpy as np
+import torch
+import torch.distributed as dist
 
+from hyper_parallel.core.dtensor import _utils
 from hyper_parallel.core.dtensor._mesh_layout import IntTuple, _MeshLayout, _contiguous_strides, _is_int
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, Platform, PlatformType
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
-platform = get_platform()
-Tensor = platform.Tensor
+Tensor = torch.Tensor
 
 
 def _host_tensor_from_numpy(np_array: np.ndarray):
     """Build a host-resident int tensor from a NumPy array for rank/mesh bookkeeping.
 
-    A real platform's ``from_numpy`` keeps the tensor off the meta device, so it stays
-    ``asnumpy``-able even when a DeviceMesh is built under ``ms.DeviceCtx("meta")``
-    (``fully_shard`` with ``mesh=None``). Unit tests run with a mocked ``platform``
-    (no real ``from_numpy``, and never under a meta context), so fall back to the plain
-    ``Tensor`` constructor there.
+    ``torch.from_numpy`` keeps the tensor off the meta device, so it stays
+    materialized even when a DeviceMesh is built while ``fully_shard`` runs with
+    ``mesh=None``.
     """
-    if isinstance(platform, Platform):
-        return platform.from_numpy(np_array)
-    return Tensor(np_array).int()
+    return torch.from_numpy(np_array)
 
 
 class _MeshEnv(threading.local):
@@ -59,7 +57,6 @@ class _MeshEnv(threading.local):
 _mesh_resources = _MeshEnv()
 
 BackendConfig = Optional[str]
-_CP_MESH_DIM_NAMES = {"cp", "co", "ds"}
 
 
 def _get_sub_rank_list(mesh_shape, mesh_dim_names, rank_list, sub_mesh_dim_names, current_rank):
@@ -107,16 +104,6 @@ def _normalize_backend_value(value: Any) -> BackendConfig:
     return None
 
 
-def _get_cp_pg_options(mesh_dim_names: Optional[tuple[str, ...]], dim: int) -> Optional[dict[str, Any]]:
-    if (
-            platform.platform_type == PlatformType.MINDSPORE
-            and mesh_dim_names
-            and mesh_dim_names[dim] in _CP_MESH_DIM_NAMES
-    ):
-        return {"hccl_config": {"hccl_op_expansion_mode": "AIV"}}
-    return None
-
-
 def _normalize_backend_override(
         backend_override: dict[Union[int, str], Any],
         ndim: int,
@@ -158,12 +145,8 @@ class DeviceMesh:
     Topological abstraction describing cluster devices.
 
     Args:
-        device_type (str): Device type. Valid values depend on the active platform:
-
-            - **PyTorch** (same as ``torch.distributed.device_mesh.DeviceMesh``):
-              ``"cpu"``, ``"cuda"``, ``"npu"``.
-            - **MindSpore** (mapped to the corresponding communication backend):
-              ``"cpu"`` → mccl, ``"gpu"`` → nccl, ``"npu"`` → hccl.
+        device_type (str): Device type. Valid values are ``"cpu"``, ``"cuda"``
+            and ``"npu"`` (same as ``torch.distributed.device_mesh.DeviceMesh``).
         mesh (Union[Tensor, list, tuple, np.ndarray, None]): A multi-dimensional array, list, or integer
             tensor describing the device layout. The IDs in the mesh are global IDs of the
             default process group, representing the multi-dimensional networking structure
@@ -189,10 +172,7 @@ class DeviceMesh:
     mesh: Union[Tensor, list, tuple, np.ndarray]
     mesh_dim_names: Union[tuple[str, ...], list[str], None]
 
-    _VALID_DEVICE_TYPES = {
-        PlatformType.PYTORCH: {"cpu", "cuda", "npu"},
-        PlatformType.MINDSPORE: {"cpu", "gpu", "npu"},
-    }
+    _VALID_DEVICE_TYPES = {"cpu", "cuda", "npu"}
 
     def __init__(self,
                  device_type: Literal["cpu", "cuda", "gpu", "npu"],
@@ -208,10 +188,10 @@ class DeviceMesh:
         self.device_type = device_type
 
         if _init_backend:
-            platform.init_process_group()
+            _utils.init_process_group()
 
         self._layout, self._rank_map = self._resolve_layout_and_rank_map(mesh, _layout, _rank_map)
-        self._rank = platform.get_rank()
+        self._rank = dist.get_rank() if dist.is_initialized() else 0
         self._root_mesh = _root_mesh
         self._refresh_mesh_view()
         self._set_mesh_dim_names(mesh_dim_names)
@@ -220,12 +200,11 @@ class DeviceMesh:
 
     @classmethod
     def _validate_device_type(cls, device_type: str) -> None:
-        """Validate that the requested device type is supported on the active platform."""
-        valid_device_types = cls._VALID_DEVICE_TYPES.get(platform.platform_type)
-        if valid_device_types is not None and device_type not in valid_device_types:
+        """Validate that the requested device type is supported on the torch backend."""
+        if device_type not in cls._VALID_DEVICE_TYPES:
             raise ValueError(
-                f"Invalid device_type '{device_type}' for {platform.platform_type.name} platform. "
-                f"Valid device types are: {sorted(valid_device_types)}"
+                f"Invalid device_type '{device_type}'. "
+                f"Valid device types are: {sorted(cls._VALID_DEVICE_TYPES)}"
             )
 
     @classmethod
@@ -240,7 +219,7 @@ class DeviceMesh:
             raise TypeError("Cannot provide both explicit mesh and private _layout/_rank_map arguments.")
 
         if mesh is None and (layout is None or rank_map is None):
-            world_size = platform.get_world_size()
+            world_size = dist.get_world_size()
             mesh = list(range(world_size))
 
         if mesh is not None:
@@ -260,11 +239,11 @@ class DeviceMesh:
         """Materialize the visible mesh tensor and the derived shape/rank metadata."""
         # Compute everything in numpy first so the intermediate ops don't need
         # a real device. Otherwise the call would fail (or SIGSEGV on Ascend)
-        # when DeviceMesh is constructed inside a ``ms.DeviceCtx("meta")``
+        # when DeviceMesh is constructed while a meta device context is active.
         # block — e.g., from ``DeviceMesh.concatenate`` invoked under
         # ``fully_shard``, which forces fresh ``Tensor()`` constructions onto
         # the meta device and any subsequent op (asnumpy, nonzero, …) crashes.
-        rank_map_np = platform.tensor_to_numpy(self._rank_map).reshape(-1)
+        rank_map_np = self._rank_map.cpu().numpy().reshape(-1)
         full_mesh_np = self._layout.remap_to_numpy(rank_map_np)
         if full_mesh_np.shape[0] == 1:
             per_rank_mesh_np = full_mesh_np[0]
@@ -337,7 +316,7 @@ class DeviceMesh:
 
     @staticmethod
     def _build_rank_map_from_mesh(mesh: Tensor) -> Tensor:
-        return _host_tensor_from_numpy(platform.tensor_to_numpy(mesh).reshape(-1).astype(np.int32))
+        return _host_tensor_from_numpy(mesh.cpu().numpy().reshape(-1).astype(np.int32))
 
     @staticmethod
     def _convert_rank_map_to_tensor(rank_map: Tensor) -> Tensor:
@@ -349,8 +328,8 @@ class DeviceMesh:
         if isinstance(rank_map, Tensor):
             # Reuse the existing tensor as-is so we preserve its real device.
             # Going through ``Tensor(np_array)`` would re-create on whatever
-            # device context is active (e.g. ``ms.DeviceCtx("meta")`` while
-            # ``DeviceMesh.concatenate`` runs under ``fully_shard``), which then
+            # device context is active (e.g. while ``DeviceMesh.concatenate``
+            # runs under ``fully_shard``), which then
             # breaks the immediate ``asnumpy()`` in ``_refresh_mesh_view``.
             # All in-tree callers that pass a Tensor pass an existing
             # ``DeviceMesh._rank_map`` — already a flat int32 tensor, so no
@@ -366,7 +345,7 @@ class DeviceMesh:
             return full_mesh[0]
 
         if current_rank is None:
-            current_rank = platform.get_rank()
+            current_rank = dist.get_rank()
 
         rank_coords = (full_mesh == current_rank).nonzero()
         if rank_coords.shape[0] > 0:
@@ -380,7 +359,7 @@ class DeviceMesh:
         """Compute the current rank coordinates inside this mesh view."""
         # Use the cached numpy view rather than ``self.mesh`` so this works
         # even when the mesh tensor lives on the meta device (DeviceMesh
-        # constructed under ``ms.DeviceCtx("meta")`` via ``fully_shard``).
+        # constructed under a meta device context via ``fully_shard``).
         per_rank_mesh_np = getattr(self, "_per_rank_mesh_np", None)
         if per_rank_mesh_np is not None:
             rank_coords = np.argwhere(per_rank_mesh_np == self._rank)
@@ -436,9 +415,9 @@ class DeviceMesh:
 
     @staticmethod
     def _convert_mesh_to_tensor(mesh: Union[Tensor, list, tuple, np.ndarray]) -> Tensor:
-        """Convert a public mesh input into an int32 platform tensor."""
+        """Convert a public mesh input into an int32 torch tensor."""
         if isinstance(mesh, Tensor):
-            mesh = platform.tensor_to_numpy(mesh)
+            mesh = mesh.cpu().numpy()
         elif isinstance(mesh, (list, tuple)):
             mesh = np.array(mesh)
         elif not isinstance(mesh, np.ndarray):
@@ -461,10 +440,10 @@ class DeviceMesh:
             split_rank = _get_sub_rank_list(mesh_shape, mesh_dim_names, rank_list, dim_name, rank)
             sorted_rank = tuple(sorted(split_rank))
             split_ranks.add(sorted_rank)
-            if rank == platform.get_rank():
+            if rank == dist.get_rank():
                 group_key = str(sorted_rank)
         split_ranks = sorted([list(item) for item in split_ranks])
-        platform.split_group(split_ranks=split_ranks)
+        _utils.split_group(split_ranks=split_ranks)
         return group_key
 
     @staticmethod
@@ -473,8 +452,8 @@ class DeviceMesh:
             rank_map: Tensor,
     ) -> tuple[list[list[int]], Optional[str]]:
         """Build rank lists and the local cache key for one logical mesh axis."""
-        pg_ranks_by_dim = sub_layout.remap_to_numpy(platform.tensor_to_numpy(rank_map))
-        current_rank = platform.get_rank()
+        pg_ranks_by_dim = sub_layout.remap_to_numpy(rank_map.cpu().numpy())
+        current_rank = dist.get_rank()
         split_ranks = []
         split_ranks_set = set()
         group_key = None
@@ -521,7 +500,7 @@ class DeviceMesh:
             if _should_defer_group_init(sub_layout, backend_override[dim]):
                 dim_group_names.append(None)
                 continue
-            group = platform.split_group(split_ranks=split_ranks, pg_options=_get_cp_pg_options(mesh_dim_names, dim))
+            group = _utils.split_group(split_ranks=split_ranks)
             DeviceMesh._cache_group_if_needed(group_key, group)
             dim_group_names.append(group_key)
         return dim_group_names
@@ -773,9 +752,9 @@ class DeviceMesh:
                    ) -> 'DeviceMesh':
         """Build a DeviceMesh from an existing process group or a list of groups."""
         if not isinstance(group, list):
-            group_ranks = platform.get_process_group_ranks(group)
+            group_ranks = dist.get_process_group_ranks(group)
             group_key = str(tuple(sorted(group_ranks)))
-            if not platform.get_created_group(group_ranks):
+            if not _utils.get_created_group(group_ranks):
                 EXISTING_COMM_GROUPS[group_key] = group
             tensor_type_mesh_invalid = isinstance(mesh, Tensor) and mesh.tolist() != group_ranks
             not_tensor_type_mesh_invalid = mesh is not None and not isinstance(mesh, Tensor) and mesh != group_ranks
@@ -798,9 +777,9 @@ class DeviceMesh:
         device_mesh = DeviceMesh(device_type, mesh, mesh_dim_names=mesh_dim_names, _init_backend=False)
         device_mesh._dim_group_names = []  # pylint: disable=W0212
         for dim_group in groups:
-            group_ranks = platform.get_process_group_ranks(dim_group)
+            group_ranks = dist.get_process_group_ranks(dim_group)
             group_key = str(tuple(sorted(group_ranks)))
-            if not platform.get_created_group(group_ranks):
+            if not _utils.get_created_group(group_ranks):
                 EXISTING_COMM_GROUPS[group_key] = dim_group
             device_mesh._dim_group_names.append(group_key)  # pylint: disable=W0212
         return device_mesh
@@ -1333,10 +1312,7 @@ class DeviceMesh:
             return group_key
 
         split_ranks, group_key = DeviceMesh._build_dim_split_ranks(self._layout[mesh_dim], self._rank_map)
-        group = platform.split_group(
-            split_ranks=split_ranks,
-            pg_options=_get_cp_pg_options(self.mesh_dim_names, mesh_dim),
-        )
+        group = _utils.split_group(split_ranks=split_ranks)
         DeviceMesh._cache_group_if_needed(group_key, group)
         self._dim_group_names[mesh_dim] = group_key
         return group_key
@@ -1501,9 +1477,9 @@ def init_device_mesh(
             )
     else:
         if init_backend:
-            platform.init_process_group()
+            _utils.init_process_group()
         try:
-            current_rank = platform.get_rank()
+            current_rank = dist.get_rank()
         except Exception as exc:
             raise RuntimeError(
                 "init_device_mesh: failed to get current rank for automatic rank_list generation. "

@@ -15,7 +15,7 @@
 """parallel_norm test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
@@ -42,6 +42,12 @@ class TestRmsNorm(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -61,9 +67,6 @@ class TestRmsNorm(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -80,7 +83,7 @@ class TestRmsNorm(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=(mesh_dim_name,))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_rmsnorm_data_parallel_success(self, mock_platform):
         """
         Feature: RmsNorm data parallel
@@ -111,7 +114,7 @@ class TestRmsNorm(unittest.TestCase):
             f"got {rmsnorm_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_rmsnorm_model_parallel_success(self, mock_platform):
         """
         Feature: RmsNorm model parallel
@@ -135,7 +138,7 @@ class TestRmsNorm(unittest.TestCase):
             f"got {out_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_rmsnorm_hybrid_parallel_success(self, mock_platform):
         """
         Feature: RmsNorm hybrid parallel
@@ -158,7 +161,7 @@ class TestRmsNorm(unittest.TestCase):
             f"got {out_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_rmsnorm_all_replicated(self, mock_platform):
         """
         Feature: RmsNorm all replicated
@@ -182,7 +185,7 @@ class TestRmsNorm(unittest.TestCase):
             f"got {out_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_rmsnorm_3d_tensor(self, mock_platform):
         """
         Feature: RmsNorm 3D tensor
@@ -205,7 +208,7 @@ class TestRmsNorm(unittest.TestCase):
             f"got {out_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_rmsnorm_sharded_dim_failure(self, mock_platform):
         """
         Feature: RmsNorm sharded dimension error
@@ -223,7 +226,7 @@ class TestRmsNorm(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "splitting after begin_norm_axis"):
             rmsnorm_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_rmsnorm_sharding_mismatch_failure(self, mock_platform):
         """
         Feature: RmsNorm sharding mismatch error
@@ -242,7 +245,7 @@ class TestRmsNorm(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "should equal"):
             rmsnorm_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_rmsnorm_insufficient_cache_values_failure(self, mock_platform):
         """
         Feature: RmsNorm insufficient cache values error
@@ -258,7 +261,7 @@ class TestRmsNorm(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cache_values size .* is less than 2"):
             rmsnorm_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_rmsnorm_mismatched_mesh_shape_failure(self, mock_platform):
         """
         Feature: RmsNorm mismatched mesh shape error
@@ -278,7 +281,7 @@ class TestRmsNorm(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must have same mesh_shape"):
             rmsnorm_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_rmsnorm_partial_input_failure(self, mock_platform):
         """
         Feature: RmsNorm partial input error
@@ -309,6 +312,12 @@ class TestLayerNorm(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -328,9 +337,6 @@ class TestLayerNorm(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -342,7 +348,7 @@ class TestLayerNorm(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "mp", "tp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_layernorm_data_parallel_success(self, mock_platform):
         """
         Feature: LayerNorm data parallel
@@ -370,7 +376,7 @@ class TestLayerNorm(unittest.TestCase):
             f"got {layernorm_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_layernorm_model_parallel_success(self, mock_platform):
         """
         Feature: LayerNorm model parallel
@@ -391,7 +397,7 @@ class TestLayerNorm(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_layernorm_hybrid_parallel_success(self, mock_platform):
         """
         Feature: LayerNorm hybrid parallel
@@ -412,7 +418,7 @@ class TestLayerNorm(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_layernorm_all_replicated(self, mock_platform):
         """
         Feature: LayerNorm all replicated
@@ -433,7 +439,7 @@ class TestLayerNorm(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_layernorm_3d_tensor(self, mock_platform):
         """
         Feature: LayerNorm 3D tensor
@@ -454,7 +460,7 @@ class TestLayerNorm(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_layernorm_sharded_dim_failure(self, mock_platform):
         """
         Feature: LayerNorm sharded dimension error
@@ -470,7 +476,7 @@ class TestLayerNorm(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Cannot perform sharding on normalized dimension"):
             layernorm_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_layernorm_normalized_shape_too_large_failure(self, mock_platform):
         """
         Feature: LayerNorm normalized_shape too large error
@@ -486,7 +492,7 @@ class TestLayerNorm(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "larger than input ndim"):
             layernorm_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_layernorm_none_input_failure(self, mock_platform):
         """
         Feature: LayerNorm None input error
@@ -498,7 +504,7 @@ class TestLayerNorm(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires a valid input tensor layout"):
             layernorm_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_layernorm_invalid_normalized_shape_type_failure(self, mock_platform):
         """
         Feature: LayerNorm invalid normalized_shape type error
@@ -514,7 +520,7 @@ class TestLayerNorm(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "normalized_shape must be int, list, or tuple"):
             layernorm_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_layernorm_partial_input_failure(self, mock_platform):
         """
         Feature: LayerNorm partial input error

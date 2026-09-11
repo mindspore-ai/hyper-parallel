@@ -46,6 +46,12 @@ class TestGetItemDistributedOp(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -59,9 +65,6 @@ class TestGetItemDistributedOp(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2 (dp, mp) mesh."""
@@ -152,7 +155,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
 
     # ===== Positive cases: infer_layout (plan §3.5 order) =====
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_basic_int_index_replicated(self, mock_platform):
         """
         Feature: Basic int index on fully replicated tensor.
@@ -170,7 +173,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         out_layout = result[0][0]
         self.assertEqual(out_layout.alias_tensor_map, ("None",))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_basic_slice_replicated(self, mock_platform):
         """
         Feature: Basic slice on fully replicated tensor.
@@ -188,7 +191,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         out_layout = result[0][0]
         self.assertEqual(out_layout.alias_tensor_map, ("None", "None"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_basic_ellipsis(self, mock_platform):
         """
         Feature: Ellipsis on replicated tensor.
@@ -206,7 +209,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         out_layout = result[0][0]
         self.assertEqual(out_layout.alias_tensor_map, ("None", "None"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_basic_newaxis_front(self, mock_platform):
         """
         Feature: Newaxis at front on replicated tensor.
@@ -224,7 +227,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         out_layout = result[0][0]
         self.assertEqual(out_layout.alias_tensor_map, ("None", "None", "None"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_basic_newaxis_middle(self, mock_platform):
         """
         Feature: Newaxis in middle on replicated tensor.
@@ -242,7 +245,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         out_layout = result[0][0]
         self.assertEqual(out_layout.alias_tensor_map, ("None", "None", "None"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_basic_mixed(self, mock_platform):
         """
         Feature: Mixed basic indexing with int, full slice, Ellipsis, and newaxis.
@@ -261,7 +264,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         # int(0) removes dim0, ::1 keeps dim1, Ellipsis fills dim2, None adds dim
         self.assertEqual(out_layout.alias_tensor_map, ("None", "None", "None"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_basic_tuple_form(self, mock_platform):
         """
         Feature: Tuple of ints indexing produces scalar output.
@@ -280,7 +283,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         # Both dims removed by int indices → 0-d scalar
         self.assertEqual(out_layout.alias_tensor_map, ())
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_basic_empty_tuple(self, mock_platform):
         """
         Feature: Empty tuple indexing returns unchanged tensor.
@@ -298,7 +301,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         out_layout = result[0][0]
         self.assertEqual(out_layout.alias_tensor_map, self_layout.alias_tensor_map)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_basic_shard_keep_dim0(self, mock_platform):
         """
         Feature: Shard dim0 kept when indexing dim1 only.
@@ -316,7 +319,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         out_layout = result[0][0]
         self.assertEqual(out_layout.alias_tensor_map, ("dp", "None"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_basic_shard_keep_dim1(self, mock_platform):
         """
         Feature: Shard dim1 kept when indexing dim0 only.
@@ -334,7 +337,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         out_layout = result[0][0]
         self.assertEqual(out_layout.alias_tensor_map, ("None", "dp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_advanced_single_list_replicated(self, mock_platform):
         """
         Feature: Advanced indexing with single list on replicated tensor.
@@ -353,7 +356,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         # Advanced index on dim0: broadcast dim (replicated) + dim1 kept (replicated)
         self.assertEqual(out_layout.alias_tensor_map, ("None", "None"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_advanced_keep_shard_outside(self, mock_platform):
         """
         Feature: Advanced indexing keeps shard on non-indexed dims.
@@ -372,7 +375,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         # Advanced index on dim0 → broadcast dim (replicated) + dim1 (kept shard)
         self.assertEqual(out_layout.alias_tensor_map, ("None", "dp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_advanced_paired_indices_replicated(self, mock_platform):
         """
         Feature: Paired advanced indices on replicated tensor.
@@ -391,7 +394,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         # Both dims replaced by broadcast shape (2,) → 1 dim replicated
         self.assertEqual(out_layout.alias_tensor_map, ("None",))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_advanced_multi_d_index(self, mock_platform):
         """
         Feature: Multi-dimensional LongTensor advanced index on replicated tensor.
@@ -411,7 +414,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         # Index shape (2,2) replaces dim0 → 2 broadcast dims + dim1 kept → 3 dims
         self.assertEqual(out_layout.alias_tensor_map, ("None", "None", "None"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_advanced_consecutive_with_basic(self, mock_platform):
         """
         Feature: Consecutive advanced indices mixed with basic slice on 3D tensor.
@@ -430,7 +433,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         # dim0 kept (slice), dim1-2 replaced by broadcast (2,) → 2 dims
         self.assertEqual(out_layout.alias_tensor_map, ("None", "None"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_advanced_split_with_basic(self, mock_platform):
         """
         Feature: Non-consecutive advanced indices mixed with basic slice on 3D tensor.
@@ -449,7 +452,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         # Non-consecutive → broadcast (2,) at front + dim1 kept → 2 dims
         self.assertEqual(out_layout.alias_tensor_map, ("None", "None"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_zero_size_slice(self, mock_platform):
         """
         Feature: Zero-size slice on replicated tensor.
@@ -468,7 +471,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         # Non-full slice but dim0 is replicate (valid), dim1 kept
         self.assertEqual(out_layout.alias_tensor_map, ("None", "None"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_zero_d_long_tensor_index(self, mock_platform):
         """
         Feature: 0-D LongTensor index treated as int on replicated tensor.
@@ -490,7 +493,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
 
     # ===== Error cases: infer_layout (plan §3.5 order) =====
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_int_on_sharded_dim(self, mock_platform):
         """
         Feature: Integer index on Shard(0) produces an owner-only RaggedShard.
@@ -516,7 +519,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         self.assertEqual(local_index, 2)
         self.assertEqual(output_global_shape, (10,))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_negative_int_on_sharded_dim(self, mock_platform):
         """Normalize a negative global index before owner and local-index inference."""
         mesh = self._make_1d_mesh(mock_platform)
@@ -533,7 +536,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
             (RaggedShard(dims=(0,), local_units=(0, 1)),),
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sharded_int_rejects_multidimensional_mesh(self, mock_platform):
         """Reject owner-only RaggedShard indexing when the input mesh is not one-dimensional."""
         mesh = self._make_2x2_mesh(mock_platform)
@@ -543,7 +546,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-replicate dim 0"):
             getitem_op.infer_layout([self_layout, key_desc, (8, 10), kind])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sharded_int_rejects_non_divisible_dim0(self, mock_platform):
         """Reject owner inference that does not match the current uniform Shard slicing contract."""
         mesh = self._make_1d_mesh(mock_platform)
@@ -553,7 +556,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-replicate dim 0"):
             getitem_op.infer_layout([self_layout, key_desc, (7, 10), kind])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sharded_int_rejects_scalar_output(self, mock_platform):
         """Reject one-dimensional input indexing until owner-only scalar placement is defined."""
         mesh = self._make_1d_mesh(mock_platform)
@@ -563,7 +566,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-replicate dim 0"):
             getitem_op.infer_layout([self_layout, key_desc, (8,), kind])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sharded_int_owner_view_mutates_parent(self, mock_platform):
         """Wrap the owner row as RaggedShard and preserve storage aliasing through zero_."""
         mesh = self._make_1d_mesh(mock_platform)
@@ -583,7 +586,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         self.assertEqual(tuple(result.local_shape), (4,))
         self.assertTrue(torch.equal(local_parent[2], torch.zeros(4, dtype=local_parent.dtype)))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sharded_int_non_owner_returns_empty_view(self, mock_platform):
         """Return a valid zero-unit RaggedShard view without changing the non-owner parent."""
         mesh = self._make_1d_mesh(mock_platform)
@@ -604,7 +607,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
         self.assertEqual(tuple(result.local_shape), (0,))
         self.assertTrue(torch.equal(local_parent, expected_parent))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sharded_int_rejects_non_contiguous_local_tensor(self, mock_platform):
         """Reject local storage that cannot preserve aliasing through a flat view."""
         mesh = self._make_1d_mesh(mock_platform)
@@ -619,7 +622,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires a contiguous local tensor"):
                 impl(local_parent, 6)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partial_slice_on_sharded_dim(self, mock_platform):
         """
         Feature: Error when non-full slice on sharded dimension.
@@ -637,7 +640,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
             getitem_op.infer_layout(cache_values)
         self.assertIn("non-replicate dim 0", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_advanced_on_sharded_dim(self, mock_platform):
         """
         Feature: Error when advanced index on sharded dimension.
@@ -655,7 +658,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
             getitem_op.infer_layout(cache_values)
         self.assertIn("non-replicate dim 0", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_advanced_index_tensor_sharded(self, mock_platform):
         """
         Feature: Error when advanced index tensor is sharded.
@@ -674,7 +677,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
             getitem_op.infer_layout(cache_values)
         self.assertIn("index tensor must be replicated", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.ops.parallel_getitem._is_bool_tensor", return_value=True)
     def test_bool_mask_1d(self, mock_is_bool, mock_platform):
         """
@@ -696,7 +699,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
             getitem_op.infer_layout(cache_values)
         self.assertIn("boolean-mask", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.ops.parallel_getitem._is_bool_tensor", return_value=True)
     def test_bool_mask_full(self, mock_is_bool, mock_platform):
         """
@@ -718,7 +721,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
             getitem_op.infer_layout(cache_values)
         self.assertIn("boolean-mask", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_slice_step_2(self, mock_platform):
         """
         Feature: Error when slice step is not 1 or None.
@@ -736,7 +739,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
             getitem_op.infer_layout(cache_values)
         self.assertIn("slice step", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_negative_step(self, mock_platform):
         """
         Feature: Error when slice step is negative.
@@ -754,7 +757,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
             getitem_op.infer_layout(cache_values)
         self.assertIn("slice step", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_int_out_of_range(self, mock_platform):
         """
         Feature: Error when int index is out of range.
@@ -782,7 +785,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
             _key_cache_descriptor(object())
         self.assertIn("unsupported index type", str(ctx.exception))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partial_input(self, mock_platform):
         """
         Feature: Error when input has Partial status.
@@ -802,7 +805,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
 
     # ===== get_expand_impl =====
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_expand_impl_returns_none(self, mock_platform):
         """
         Feature: get_expand_impl returns None.
@@ -822,7 +825,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
 
     # ===== preprocess tests =====
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     @patch("hyper_parallel.core.shard.ops.parallel_getitem.platform")
     def test_preprocess_basic(self, mock_op_platform, mock_dt_platform):
         """

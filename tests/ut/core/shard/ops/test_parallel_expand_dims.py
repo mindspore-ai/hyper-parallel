@@ -40,6 +40,12 @@ class TestParallelExpandDims(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         self.op = ExpandDimsDistributedOp("ExpandDims")
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -59,9 +65,6 @@ class TestParallelExpandDims(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform, mesh_dim_names=("dp", "cp", "mp")):
         """Set up mock and return a standard 2x2x2 mesh via init_device_mesh."""
@@ -83,7 +86,7 @@ class TestParallelExpandDims(unittest.TestCase):
             f"got {self.op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_data_parallel_1(self, mock_platform):
         """
         Feature: Data parallel.
@@ -96,7 +99,7 @@ class TestParallelExpandDims(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(-1, 2, -1, -1), extra_args=[0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_model_parallel_2(self, mock_platform):
         """
         Feature: Model parallel.
@@ -109,7 +112,7 @@ class TestParallelExpandDims(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(-1, -1, -1, 0), extra_args=[2])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_hybrid_parallel_3(self, mock_platform):
         """
         Feature: Hybrid parallel.
@@ -122,7 +125,7 @@ class TestParallelExpandDims(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, -1, 1, 0), extra_args=[1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_insert_at_end_4(self, mock_platform):
         """
         Feature: Insert at end.
@@ -135,7 +138,7 @@ class TestParallelExpandDims(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 1, 0, -1), extra_args=[-1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_negative_axis_5(self, mock_platform):
         """
         Feature: Negative axis indexing.
@@ -148,7 +151,7 @@ class TestParallelExpandDims(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 1, -1, 0), extra_args=[-2])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_all_replicated_6(self, mock_platform):
         """
         Feature: All replicated.
@@ -161,7 +164,7 @@ class TestParallelExpandDims(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(-1, -1, -1, -1), extra_args=[1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_2d_tensor_7(self, mock_platform):
         """
         Feature: 2D tensor.
@@ -174,7 +177,7 @@ class TestParallelExpandDims(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, -1, 1), extra_args=[1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_scalar_to_1d_8(self, mock_platform):
         """
         Feature: Expand scalar.
@@ -187,7 +190,7 @@ class TestParallelExpandDims(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(-1,), extra_args=[0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_extreme_negative_axis_9(self, mock_platform):
         """
         Feature: Extreme negative axis.
@@ -200,7 +203,7 @@ class TestParallelExpandDims(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(-1, 2, 1, 0), extra_args=[-4])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_invalid_axis_10(self, mock_platform):
         """
         Feature: Invalid axis.
@@ -214,7 +217,7 @@ class TestParallelExpandDims(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "out of range for input rank"):
             self.op.infer_layout([x_layout, 5])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_partial_input_raises_error(self, mock_platform):
         """Verify ExpandDims rejects inputs with Partial status."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -224,7 +227,7 @@ class TestParallelExpandDims(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             self.op.infer_layout([x_layout, 1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_preprocess(self, mock_platform):
         """Verify preprocess converts DTensor input to local args and cache values."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -251,6 +254,12 @@ class TestParallelExpandDimsView(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         self.op = ExpandDimsDistributedOp("ExpandDimsView")
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -264,9 +273,6 @@ class TestParallelExpandDimsView(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform, mesh_dim_names=("dp", "cp", "mp")):
         """Set up mock and return a standard 2x2x2 mesh via init_device_mesh."""
@@ -288,7 +294,7 @@ class TestParallelExpandDimsView(unittest.TestCase):
             f"got {self.op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_view_data_parallel_1(self, mock_platform):
         """
         Feature: Data parallel.
@@ -301,7 +307,7 @@ class TestParallelExpandDimsView(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(-1, 2, -1, -1), extra_args=[0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_view_model_parallel_2(self, mock_platform):
         """
         Feature: Model parallel.
@@ -314,7 +320,7 @@ class TestParallelExpandDimsView(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(-1, -1, -1, 0), extra_args=[2])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_view_hybrid_parallel_3(self, mock_platform):
         """
         Feature: Hybrid parallel.
@@ -327,7 +333,7 @@ class TestParallelExpandDimsView(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, -1, 1, 0), extra_args=[1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_view_insert_at_end_4(self, mock_platform):
         """
         Feature: Insert at end.
@@ -340,7 +346,7 @@ class TestParallelExpandDimsView(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 1, 0, -1), extra_args=[-1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_view_negative_axis_5(self, mock_platform):
         """
         Feature: Negative axis indexing.
@@ -353,7 +359,7 @@ class TestParallelExpandDimsView(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 1, -1, 0), extra_args=[-2])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_view_all_replicated_6(self, mock_platform):
         """
         Feature: All replicated.
@@ -366,7 +372,7 @@ class TestParallelExpandDimsView(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(-1, -1, -1, -1), extra_args=[1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_view_2d_tensor_7(self, mock_platform):
         """
         Feature: 2D tensor.
@@ -379,7 +385,7 @@ class TestParallelExpandDimsView(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, -1, 1), extra_args=[1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_view_scalar_to_1d_8(self, mock_platform):
         """
         Feature: Expand scalar.
@@ -392,7 +398,7 @@ class TestParallelExpandDimsView(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(-1,), extra_args=[0])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_view_extreme_negative_axis_9(self, mock_platform):
         """
         Feature: Extreme negative axis.
@@ -405,7 +411,7 @@ class TestParallelExpandDimsView(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(-1, 2, 1, 0), extra_args=[-4])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_view_invalid_axis_10(self, mock_platform):
         """
         Feature: Invalid axis.
@@ -419,7 +425,7 @@ class TestParallelExpandDimsView(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "out of range for input rank"):
             self.op.infer_layout([x_layout, 5])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_partial_input_raises_error(self, mock_platform):
         """Verify ExpandDims rejects inputs with Partial status."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -429,7 +435,7 @@ class TestParallelExpandDimsView(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             self.op.infer_layout([x_layout, 1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expanddims_preprocess(self, mock_platform):
         """Verify preprocess converts DTensor input to local args and cache values."""
         mesh = self._make_2x2x2_mesh(mock_platform)

@@ -14,7 +14,7 @@
 # ============================================================================
 """parallel_expand test"""
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
@@ -41,6 +41,12 @@ class TestParallelExpand(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -60,9 +66,6 @@ class TestParallelExpand(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -79,7 +82,7 @@ class TestParallelExpand(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=4)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=mesh_dim_names)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_layout_inference(self, mock_platform):
         """
         Feature: Expand unsharded singleton dimension
@@ -106,7 +109,7 @@ class TestParallelExpand(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_same_size_preserve_sharding(self, mock_platform):
         """
         Feature: Expand with explicit same-size dimensions preserves sharding.
@@ -127,7 +130,7 @@ class TestParallelExpand(unittest.TestCase):
             f"got {output_layout.alias_tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_layout_inference_3d(self, mock_platform):
         """
         Feature: Expand with -1 preservation
@@ -148,7 +151,7 @@ class TestParallelExpand(unittest.TestCase):
             f"got {output_layout.alias_tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_layout_prepend_new_dimensions(self, mock_platform):
         """
         Feature: Expand prepending multiple new dimensions
@@ -169,7 +172,7 @@ class TestParallelExpand(unittest.TestCase):
             f"got {output_layout.alias_tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_layout_scalar_expansion(self, mock_platform):
         """
         Feature: Expand scalar tensor
@@ -189,7 +192,7 @@ class TestParallelExpand(unittest.TestCase):
             f"Scalar expansion failed. Expected {expected_map}, got {output_layout.alias_tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_layout_invalid_expand_sharded_dim(self, mock_platform):
         """
         Feature: Expand sharded dimension
@@ -204,7 +207,7 @@ class TestParallelExpand(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot expand dimension 0"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_layout_invalid_minus_one_for_new_dim(self, mock_platform):
         """
         Feature: Expand with -1 for new dimension
@@ -219,7 +222,7 @@ class TestParallelExpand(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot use -1 for new dimension at position 0"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_layout_invalid_dimension_reduction(self, mock_platform):
         """
         Feature: Expand reducing dimensions
@@ -234,7 +237,7 @@ class TestParallelExpand(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot reduce dimensions with expand"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_as_layout_basic_expansion(self, mock_platform):
         """
         Feature: Basic expand_as with unsharded singleton dimension
@@ -261,7 +264,7 @@ class TestParallelExpand(unittest.TestCase):
             f"got {op2.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_as_layout_3d_preservation(self, mock_platform):
         """
         Feature: 3D expand_as with middle dimension expansion
@@ -282,7 +285,7 @@ class TestParallelExpand(unittest.TestCase):
             f"got {output_layout.alias_tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_as_layout_prepend_dimensions(self, mock_platform):
         """
         Feature: Expand_as with prepended dimensions (rank promotion)
@@ -303,7 +306,7 @@ class TestParallelExpand(unittest.TestCase):
             f"got {output_layout.alias_tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_as_layout_scalar_expansion(self, mock_platform):
         """
         Feature: Scalar tensor expand_as
@@ -323,7 +326,7 @@ class TestParallelExpand(unittest.TestCase):
             f"Scalar expand_as failed. Expected {expected_map}, got {output_layout.alias_tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_as_layout_invalid_sharded_singleton(self, mock_platform):
         """
         Feature: Expand_as on sharded singleton dimension
@@ -338,7 +341,7 @@ class TestParallelExpand(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot expand sharded dimension 1"):
             op2.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_as_layout_invalid_non_singleton_mismatch(self, mock_platform):
         """
         Feature: Non-singleton dimension size mismatch
@@ -353,7 +356,7 @@ class TestParallelExpand(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot expand dimension 1 from size 3 to 5"):
             op2.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_as_layout_invalid_rank_reduction(self, mock_platform):
         """
         Feature: Target rank smaller than input rank
@@ -368,7 +371,7 @@ class TestParallelExpand(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target shape.*cannot be smaller than input shape"):
             op2.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_expand_as_layout_right_aligned_broadcast(self, mock_platform):
         """
         Feature: Right-aligned dimension matching (PyTorch broadcast semantics)

@@ -77,6 +77,12 @@ class TestYamlRegistration(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -107,6 +113,12 @@ class TestInferLayoutPositive(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -133,7 +145,7 @@ class TestInferLayoutPositive(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=shape[0] * shape[1])
         return init_device_mesh(device_type="npu", mesh_shape=shape, mesh_dim_names=names)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_all_replicated_4d_5(self, mock_platform):
         """
         Feature: infer_layout with all inputs replicated (4-D).
@@ -160,7 +172,7 @@ class TestInferLayoutPositive(unittest.TestCase):
             f"got {op.get_expand_impl(None, (out,), [x, cos, sin])}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dp_b_cos_replicated_6(self, mock_platform):
         """
         Feature: infer_layout BNSD B-dim DP, cos/sin broadcast (11SD shape).
@@ -180,7 +192,7 @@ class TestInferLayoutPositive(unittest.TestCase):
             msg=f"DP-B output should be (0,-1,-1,-1), got {out.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tp_n_cos_broadcast_7(self, mock_platform):
         """
         Feature: infer_layout BNSD N-dim TP, cos/sin in 11SD shape (N=1 broadcast).
@@ -200,7 +212,7 @@ class TestInferLayoutPositive(unittest.TestCase):
             msg=f"TP-N output should be (-1,0,-1,-1), got {out.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cp_s_cos_same_shard_8(self, mock_platform):
         """
         Feature: infer_layout BNSD S-dim CP, cos/sin sharded same as x.
@@ -220,7 +232,7 @@ class TestInferLayoutPositive(unittest.TestCase):
             msg=f"CP-S output should be (-1,-1,0,-1), got {out.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cp_s_cos_replicated_9(self, mock_platform):
         """
         Feature: infer_layout BNSD S-dim CP, cos/sin Replicate (S=1 broadcast case).
@@ -240,8 +252,8 @@ class TestInferLayoutPositive(unittest.TestCase):
             msg=f"CP-S with cos Replicate should be (-1,-1,0,-1), got {out.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dp_tp_2d_mesh_10(self, mock_mesh_plat, mock_layout_plat):
         """
         Feature: infer_layout BNSD with DP+TP on 2-D mesh.
@@ -267,8 +279,8 @@ class TestInferLayoutPositive(unittest.TestCase):
             msg=f"DP+TP output should be (1,0,-1,-1), got {out.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dp_cp_2d_mesh_11(self, mock_mesh_plat, mock_layout_plat):
         """
         Feature: infer_layout BNSD with DP+CP on 2-D mesh.
@@ -292,8 +304,8 @@ class TestInferLayoutPositive(unittest.TestCase):
             msg=f"DP+CP output should be (1,-1,0,-1), got {out.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.layout.dist")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tp_cp_2d_mesh_12(self, mock_mesh_plat, mock_layout_plat):
         """
         Feature: infer_layout BNSD with TP+CP on 2-D mesh.
@@ -317,7 +329,7 @@ class TestInferLayoutPositive(unittest.TestCase):
             msg=f"TP+CP output should be (-1,1,0,-1), got {out.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_all_replicated_3d_tnd_13(self, mock_platform):
         """
         Feature: infer_layout 3-D TND all replicated.
@@ -338,7 +350,7 @@ class TestInferLayoutPositive(unittest.TestCase):
             msg=f"TND all-replicated output should be (-1,-1,-1), got {out.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tnd_dp_t_14(self, mock_platform):
         """
         Feature: infer_layout 3-D TND with T-dim DP.
@@ -358,7 +370,7 @@ class TestInferLayoutPositive(unittest.TestCase):
             msg=f"TND T-dim DP output should be (0,-1,-1), got {out.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_output_is_independent_deepcopy_15(self, mock_platform):
         """
         Feature: infer_layout output is an independent deep copy of x_layout.
@@ -386,6 +398,12 @@ class TestInferLayoutNegative(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -569,6 +587,12 @@ class TestPreprocessRouting(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -599,7 +623,7 @@ class TestPreprocessRouting(unittest.TestCase):
         dt.to_local.return_value = "local"
         return dt
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_primitive_mode_in_local_args(self, mock_platform):
         """
         Feature: Primitive preprocess puts mode in local_args, local_kwargs empty.
@@ -624,7 +648,7 @@ class TestPreprocessRouting(unittest.TestCase):
         self.assertEqual(len(cv), 3,
                          msg=f"cache_values should have 3 entries, got {len(cv)}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_pytorch_rotary_mode_in_local_kwargs(self, mock_platform):
         """
         Feature: PyTorch preprocess puts rotary_mode in local_kwargs.
@@ -655,7 +679,7 @@ class TestPreprocessRouting(unittest.TestCase):
         self.assertEqual(len(cv), 3,
                          msg=f"cache_values should have 3 entries, got {len(cv)}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_preprocess_pytorch_no_rotary_mode_empty_kwargs(self, mock_platform):
         """
         Feature: PyTorch preprocess with no rotary_mode → empty local_kwargs.
@@ -688,6 +712,12 @@ class TestNpuRotaryMulYamlRegistration(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()

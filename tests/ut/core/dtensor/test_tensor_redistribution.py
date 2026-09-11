@@ -61,9 +61,9 @@ class _MockedTestCase(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        self.patcher_dm = patch("hyper_parallel.core.dtensor.device_mesh.platform")
+        self.patcher_dm = patch("hyper_parallel.core.dtensor.device_mesh.dist", MagicMock())
         self.patcher_dm_tensor = patch("hyper_parallel.core.dtensor.device_mesh.Tensor", torch.Tensor)
-        self.patcher_tr = patch("hyper_parallel.core.dtensor.tensor_redistribution.platform")
+        self.patcher_tr = patch("hyper_parallel.core.dtensor.tensor_redistribution._utils")
 
         self.mock_dm_platform = self.patcher_dm.start()
         self.patcher_dm_tensor.start()

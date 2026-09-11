@@ -17,7 +17,7 @@ Unit tests for InplaceScatterValueDistributedOp.
 """
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
@@ -40,6 +40,12 @@ class TestInplaceScatterValue(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -53,9 +59,6 @@ class TestInplaceScatterValue(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh."""
@@ -77,7 +80,7 @@ class TestInplaceScatterValue(unittest.TestCase):
             init_backend=False
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_inplace_scatter_value_data_parallel_success(self, mock_platform):
         """Test with data parallel sharding - scatter on unsharded dimension."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -101,7 +104,7 @@ class TestInplaceScatterValue(unittest.TestCase):
             f"Output layout should not be partial, got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_inplace_scatter_value_model_parallel_success(self, mock_platform):
         """Test with model parallel sharding - scatter on unsharded dimension."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -125,7 +128,7 @@ class TestInplaceScatterValue(unittest.TestCase):
             f"Output layout should not be partial, got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_inplace_scatter_value_hybrid_parallel_success(self, mock_platform):
         """Test with hybrid parallel sharding."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -149,7 +152,7 @@ class TestInplaceScatterValue(unittest.TestCase):
             f"Output layout should not be partial, got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_inplace_scatter_value_all_replicated(self, mock_platform):
         """Test with all replicated layout."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -173,7 +176,7 @@ class TestInplaceScatterValue(unittest.TestCase):
             f"Output layout should not be partial, got {output_layout.partial}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_inplace_scatter_value_negative_dim(self, mock_platform):
         """Test with negative dimension index."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -204,7 +207,7 @@ class TestInplaceScatterValue(unittest.TestCase):
             "get_expand_impl should return None",
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_inplace_scatter_value_sharded_dim_failure(self, mock_platform):
         """Test error when scattering on sharded dimension."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -220,7 +223,7 @@ class TestInplaceScatterValue(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "scatter along sharded dimension"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_inplace_scatter_value_invalid_index_layout_failure(self, mock_platform):
         """Test error when index layout has different sharding on non-dim axes."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -236,7 +239,7 @@ class TestInplaceScatterValue(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "input and index must use the same sharding"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_inplace_scatter_value_invalid_dim_failure(self, mock_platform):
         """Test error with out-of-bounds dimension index."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -252,7 +255,7 @@ class TestInplaceScatterValue(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dim .* is out of bounds"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_inplace_scatter_value_invalid_dim_type_failure(self, mock_platform):
         """Test error when dim is not an integer."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -268,7 +271,7 @@ class TestInplaceScatterValue(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dim should be an integer"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_inplace_scatter_value_none_input_layout_failure(self, mock_platform):
         """Test error when input layout is None."""
         cache_values = [None, None, 0]
@@ -276,7 +279,7 @@ class TestInplaceScatterValue(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "input layout should not be None"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_inplace_scatter_value_none_index_layout_failure(self, mock_platform):
         """Test error when index layout is None."""
         mesh = self._make_2x4_mesh(mock_platform)

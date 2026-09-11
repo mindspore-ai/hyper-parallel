@@ -121,7 +121,7 @@ class TestDsaContextParallel(unittest.TestCase):
         )
         return root["cp"], root["tp"]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_non_cp_dtensor_enters_cp_on_composed_mesh_and_drops_cp_on_exit(self, mock_mesh_platform):
         """TP DTensor inputs should run inside CP+TP and leave CP with TP preserved."""
         cp_mesh, tp_mesh = self._make_cp_tp_meshes(mock_mesh_platform)
@@ -148,7 +148,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(output.device_mesh.mesh_dim_names, ("tp",))
         self.assertEqual(output.placements, (Shard(2),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_cp_head_shard_uses_strided_shard_when_tp_already_shards_head(self, mock_mesh_platform):
         """CP Shard(seq)->Shard(head) should preserve right-to-left head split order with TP."""
         self._setup_mock_platform(mock_mesh_platform, world_size=2)
@@ -184,7 +184,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(output.device_mesh.mesh_dim_names, ("tp",))
         self.assertEqual(output.placements, (Shard(2),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_context_parallel_output_policy_follows_q_input_boundary(self, mock_mesh_platform):
         """With DTensor output enabled, CP mirrors local/CP/TP input boundaries."""
         cp_mesh, tp_mesh = self._make_cp_tp_meshes(mock_mesh_platform)
@@ -216,7 +216,7 @@ class TestDsaContextParallel(unittest.TestCase):
             self.assertEqual(tp_output.device_mesh.mesh_dim_names, ("tp",))
             self.assertEqual(tp_output.placements, (Shard(2),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_output_layout_record_uses_stack_for_reentrant_forward(self, mock_mesh_platform):
         """Nested CP forwards should pop the most recent Q layout first."""
         cp_mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -237,7 +237,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertNotIsInstance(outer_output, DTensor)
         self.assertFalse(hasattr(module, _OUTPUT_LAYOUT_STACK_ATTR))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_composed_mesh_follows_root_order_when_cp_is_after_tp(self, mock_mesh_platform):
         """TP+CP composition should preserve placements when root order is TP,CP."""
         cp_mesh, tp_mesh = self._make_tp_cp_meshes(mock_mesh_platform)
@@ -283,7 +283,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertIsInstance(AsyncDSAIndexerLossContextParallel(), DSAIndexerLossContextParallel)
         self.assertIsInstance(AsyncDSASparseAttentionContextParallel(), DSASparseAttentionContextParallel)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_indexer_boundary_inputs_are_rewritten(self, mock_mesh_platform):
         """Indexer boundary should receive q/w sharded and k replicated."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -304,7 +304,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out[1].placements, (Replicate(),))
         self.assertEqual(out[2].placements, (Shard(1),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_indexer_boundary_kwargs_are_rewritten(self, mock_mesh_platform):
         """Indexer boundary should also rewrite configured keyword arguments."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -333,7 +333,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out_kwargs["weights"].placements, (Shard(1),))
         self.assertEqual(out_kwargs["keep"], "unchanged")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sparse_attention_boundary_inputs_are_rewritten(self, mock_mesh_platform):
         """Sparse FA boundary should receive q/topk shard and k/v replicate."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -357,7 +357,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out[4].placements, (Shard(1),))
         self.assertEqual(out[5].placements, (Replicate(),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sparse_attention_and_loss_reuse_main_kv_gathers(self, mock_mesh_platform):
         """Sparse DSA should share only gradient-safe global K/V activations."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -413,7 +413,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertNotEqual(loss_out[3].to_local().data_ptr(), attention_out[1].to_local().data_ptr())
         self.assertEqual(mock_replicate.call_count, 3)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_shared_main_kv_preserves_parent_gradient(self, mock_mesh_platform):
         """Aliased K/V gather should preserve the gradient of their common latent."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -439,7 +439,7 @@ class TestDsaContextParallel(unittest.TestCase):
 
         self.assertTrue(torch.equal(latent.grad, torch.full_like(latent, 2.0)))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sparse_attention_boundary_kwargs_are_rewritten(self, mock_mesh_platform):
         """Sparse FA boundary should also rewrite configured keyword arguments."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -486,7 +486,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out_kwargs["query_rope"].placements, (Shard(1),))
         self.assertEqual(out_kwargs["key_rope"].placements, (Replicate(),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_async_sparse_attention_boundary_inputs_are_rewritten(self, mock_mesh_platform):
         """Async sparse FA boundary preserves the same public DSA CP placements."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -510,7 +510,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out[4].placements, (Shard(1),))
         self.assertEqual(out[5].placements, (Replicate(),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_async_indexer_waits_prelaunched_key_handoff(self, mock_mesh_platform):
         """Async indexer CP should consume producer-launched key-side tensor."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -530,7 +530,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out[1].placements, (Replicate(),))
         self.assertTrue(torch.equal(out[1].to_local(), producer_key))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_async_dsa_handoff_preserves_non_cp_tp_layout(self, mock_mesh_platform):
         """Prelaunched DSA sequence-replicate handoff should restore CP+TP layout."""
         cp_mesh, tp_mesh = self._make_cp_tp_meshes(mock_mesh_platform)
@@ -547,7 +547,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out.placements, (Replicate(), Shard(2)))
         self.assertTrue(torch.equal(out.to_local(), producer_key.to_local()))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_async_slot_wait_uses_consumer_value_as_backward_anchor(self, mock_mesh_platform):
         """Async DSA wait should attach autograd to the hook-wrapped consumer value."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -570,7 +570,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertIs(mock_wait.call_args.args[0], consumer_value)
         self.assertIsNot(mock_wait.call_args.args[0], producer_local)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_async_sparse_attention_waits_prelaunched_handoffs(self, mock_mesh_platform):
         """Async sparse FA CP should wait producer hooks for key/value/key_rope."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -603,7 +603,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertTrue(torch.equal(out[2].to_local(), value))
         self.assertTrue(torch.equal(out[5].to_local(), key_rope))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_async_slot_waits_backward_handle_at_producer_boundary(self, mock_mesh_platform):
         """Async DSA should defer all-gather backward wait to the producer boundary."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -618,7 +618,7 @@ class TestDsaContextParallel(unittest.TestCase):
         work.wait.assert_called_once()
         self.assertTrue(torch.equal(result[0], expected_grad))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_async_indexer_loss_waits_prelaunched_handoffs(self, mock_mesh_platform):
         """Async indexer-loss CP should wait key/key-index/key-rope producer hooks."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -660,7 +660,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out[7].placements, (Shard(2),))
         self.assertTrue(torch.equal(out[9].to_local(), key_rope))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_indexer_loss_boundary_inputs_are_rewritten(self, mock_mesh_platform):
         """Indexer-loss boundary should shard query-side tensors and replicate key-side tensors."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -695,7 +695,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out[8].placements, (Shard(1),))
         self.assertEqual(out[9].placements, (Replicate(),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dense_indexer_loss_boundary_inputs_are_rewritten(self, mock_mesh_platform):
         """Dense indexer-loss should shard query-side softmax stats without treating them as topk."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -738,7 +738,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out[10].placements, (Shard(1),))
         self.assertEqual(out[11].placements, (Replicate(),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tnd_indexer_loss_stats_use_query_stats_sequence_dim(self, mock_mesh_platform):
         """TND indexer-loss stats should shard on their T dimension."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -768,7 +768,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out[7].placements, (Shard(1),))
         self.assertEqual(out[8].placements, (Shard(0),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_indexer_loss_stats_preserve_existing_tp_layout(self, mock_mesh_platform):
         """Query-side softmax stats should enter CP on composed CP+TP mesh."""
         cp_mesh, tp_mesh = self._make_cp_tp_meshes(mock_mesh_platform)
@@ -797,7 +797,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out[7].device_mesh.mesh_dim_names, ("cp", "tp"))
         self.assertEqual(out[7].placements, (Shard(2), Shard(1)))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_indexer_loss_boundary_kwargs_are_rewritten(self, mock_mesh_platform):
         """Indexer-loss boundary should also rewrite configured keyword arguments."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
@@ -864,7 +864,7 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out_kwargs["query_rope"].placements, (Shard(1),))
         self.assertEqual(out_kwargs["key_rope"].placements, (Replicate(),))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_public_output_hook_returns_local_tensor(self, mock_mesh_platform):
         """Public output should default to local tensor conversion."""
         mesh = self._make_cp_mesh(mock_mesh_platform)

@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,13 +13,14 @@
 # limitations under the License.
 # ============================================================================
 """layout"""
+# pylint: disable=C9006,C9007,C9008
 
 import copy
 import functools
 from typing import Any, NamedTuple, Optional, Sequence
 
 import numpy as np
-
+import torch.distributed as dist
 
 from hyper_parallel.core.dtensor.placement_types import (
     Partial,
@@ -30,9 +31,6 @@ from hyper_parallel.core.dtensor.placement_types import (
     StridedShard,
 )
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _create_device_mesh
-from hyper_parallel.platform import get_platform
-
-platform = get_platform()
 
 
 class RaggedShardInfo(NamedTuple):
@@ -842,7 +840,7 @@ class Layout:
         dim_entry = alias_tm[tensor_dim]
         if dim_entry == 'None':
             return 0
-        rank = platform.get_rank()
+        rank = dist.get_rank()
         if isinstance(dim_entry, tuple):
             non_none = [ax for ax in dim_entry if ax != 'None']
             if not non_none:

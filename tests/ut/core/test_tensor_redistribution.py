@@ -156,7 +156,7 @@ class TestTensorRedistributionConstructOps(unittest.TestCase):
         # Assert
         self.assertTrue(result)
 
-    @patch('hyper_parallel.core.dtensor.tensor_redistribution.platform')
+    @patch('hyper_parallel.core.dtensor.tensor_redistribution._utils')
     def test_construct_all_to_all_raises_when_dim_not_evenly_divisible(
         self, mock_platform
     ):
@@ -174,7 +174,7 @@ class TestTensorRedistributionConstructOps(unittest.TestCase):
 
     def test_infer_ops_list_decomposes_strided_shard_concat(self):
         """StridedShard -> Replicate should decompose into standard concat groups."""
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
             cases = [
                 (
                     (2, 2),
@@ -220,7 +220,7 @@ class TestTensorRedistributionConstructOps(unittest.TestCase):
 
     def test_infer_ops_list_keeps_plain_tuple_concat_combined(self):
         """Plain same-dim Shard -> Replicate should keep the original combined concat."""
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
             src_layout = Layout((2, 2), ("dp", "tp"), init_backend=False)
             src_layout.set_placements([Shard(0), Shard(0)])
             src_layout.placement_to_tensor_map(dim=2)
@@ -248,7 +248,7 @@ class TestTensorRedistributionAllReduce(unittest.TestCase):
         self.redistribution = TensorRedistribution()
         self.device = torch.device("cpu")
 
-    @patch('hyper_parallel.core.dtensor.tensor_redistribution.platform')
+    @patch('hyper_parallel.core.dtensor.tensor_redistribution._utils')
     def test_allreduce_along_dev_dim_sum_op(self, mock_platform):
         """Test _allreduce_along_dev_dim with sum op calls differentiable_all_reduce."""
         # Arrange
@@ -270,7 +270,7 @@ class TestTensorRedistributionAllReduce(unittest.TestCase):
         )
         self.assertTrue(torch.equal(result, x))
 
-    @patch('hyper_parallel.core.dtensor.tensor_redistribution.platform')
+    @patch('hyper_parallel.core.dtensor.tensor_redistribution._utils')
     def test_allreduce_along_dev_dim_avg_op_divides_by_dev_num(self, mock_platform):
         """Test _allreduce_along_dev_dim with avg op divides result by dev_num."""
         # Arrange
@@ -294,7 +294,7 @@ class TestTensorRedistributionAllReduce(unittest.TestCase):
         expected = torch.tensor([2.0, 4.0, 6.0], device=self.device)
         self.assertTrue(torch.allclose(result, expected))
 
-    @patch('hyper_parallel.core.dtensor.tensor_redistribution.platform')
+    @patch('hyper_parallel.core.dtensor.tensor_redistribution._utils')
     def test_allreduce_along_dev_dim_zero_dim_tensor(self, mock_platform):
         """Test _allreduce_along_dev_dim handles 0-dim tensor correctly."""
         # Arrange
@@ -316,7 +316,7 @@ class TestTensorRedistributionAllReduce(unittest.TestCase):
         self.assertEqual(result.dim(), 0)
         self.assertAlmostEqual(result.item(), 6.0)
 
-    @patch('hyper_parallel.core.dtensor.tensor_redistribution.platform')
+    @patch('hyper_parallel.core.dtensor.tensor_redistribution._utils')
     def test_allreduce_along_dev_dim_all_op_casts_to_bool(self, mock_platform):
         """Test _allreduce_along_dev_dim with all op casts to int32, reduces, then back to bool."""
         # Arrange
@@ -360,7 +360,7 @@ class TestTensorRedistributionReduceScatter(unittest.TestCase):
         self.redistribution = TensorRedistribution()
         self.device = torch.device("cpu")
 
-    @patch('hyper_parallel.core.dtensor.tensor_redistribution.platform')
+    @patch('hyper_parallel.core.dtensor.tensor_redistribution._utils')
     def test_reduce_scatter_along_dev_dim_calls_differentiable_reduce_scatter(
         self, mock_platform
     ):

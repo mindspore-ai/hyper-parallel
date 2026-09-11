@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -39,6 +39,12 @@ class TestParallelSqueeze(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         self.op = SqueezeDistributedOp("Squeeze")
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -58,9 +64,6 @@ class TestParallelSqueeze(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, cp, mp) mesh via init_device_mesh."""
@@ -113,7 +116,7 @@ class TestParallelSqueeze(unittest.TestCase):
         assert not local_kwargs
         assert cache_values == [x_layout, 1, (8, 1, 4)]
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_data_parallel_1(self, mock_platform):
         """
         Feature: Data parallel.
@@ -126,7 +129,7 @@ class TestParallelSqueeze(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, -1), axis=1, input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_model_parallel_2(self, mock_platform):
         """
         Feature: Model parallel.
@@ -139,7 +142,7 @@ class TestParallelSqueeze(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(-1, 0), axis=0, input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_hybrid_parallel_3(self, mock_platform):
         """
         Feature: Hybrid parallel.
@@ -152,7 +155,7 @@ class TestParallelSqueeze(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 1, 0), axis=1, input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_remove_at_end_4(self, mock_platform):
         """
         Feature: Remove singleton at end.
@@ -165,7 +168,7 @@ class TestParallelSqueeze(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 1, 0), axis=-1, input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_negative_axis_5(self, mock_platform):
         """
         Feature: Negative axis indexing.
@@ -178,7 +181,7 @@ class TestParallelSqueeze(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 0), axis=-2, input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_all_singletons_6(self, mock_platform):
         """
         Feature: Remove all singleton dimensions.
@@ -191,7 +194,7 @@ class TestParallelSqueeze(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 1, 0), axis=None, input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_multiple_axes_7(self, mock_platform):
         """
         Feature: Remove multiple singleton dimensions.
@@ -204,7 +207,7 @@ class TestParallelSqueeze(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 1, 0), axis=[0, 2, 4], input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_no_singletons_8(self, mock_platform):
         """
         Feature: No singleton dimensions to remove.
@@ -218,7 +221,7 @@ class TestParallelSqueeze(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._run_scenario(x_layout, expected_map=(), axis=1, input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_scalar_9(self, mock_platform):
         """
         Feature: Squeeze scalar.
@@ -231,7 +234,7 @@ class TestParallelSqueeze(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(), axis=None, input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_invalid_axis_10(self, mock_platform):
         """
         Feature: Invalid axis.
@@ -245,7 +248,7 @@ class TestParallelSqueeze(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._run_scenario(x_layout, expected_map=(), axis=5, input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_negative_axes_list_11(self, mock_platform):
         """
         Feature: Multiple negative axes.
@@ -258,7 +261,7 @@ class TestParallelSqueeze(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 1, 0), axis=[-6, -4, -2], input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_mixed_axes_12(self, mock_platform):
         """
         Feature: Mixed positive and negative axes.
@@ -271,7 +274,7 @@ class TestParallelSqueeze(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 1, 0), axis=[0, -4, 4], input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_partial_axes_13(self, mock_platform):
         """
         Feature: Partial axes removal.
@@ -284,7 +287,7 @@ class TestParallelSqueeze(unittest.TestCase):
 
         self._run_scenario(x_layout, expected_map=(2, 1, 0, -1), axis=[0, 2, 4], input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_shape_not_one_14(self, mock_platform):
         """
         Feature: Try to squeeze dimension with shape not equal to 1.
@@ -298,7 +301,7 @@ class TestParallelSqueeze(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._run_scenario(x_layout, expected_map=(), axis=0, input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_distributed_dimension_15(self, mock_platform):
         """
         Feature: Try to squeeze distributed dimension.
@@ -312,7 +315,7 @@ class TestParallelSqueeze(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._run_scenario(x_layout, expected_map=(), axis=1, input_shape=input_shape)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_no_input_shapes_16(self, mock_platform):
         """
         Feature: No input_shapes provided.
@@ -334,7 +337,7 @@ class TestParallelSqueeze(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.op.infer_layout([x_layout, None, 1])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_squeeze_scalar_with_axis_17(self, mock_platform):
         """
         Feature: Try to specify axis for scalar.

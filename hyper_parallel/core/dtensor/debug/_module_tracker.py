@@ -15,10 +15,7 @@
 """nn.Module forward/backward hook tracker for CommDebugMode."""
 from typing import Callable, List
 
-from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.dtensor import _distribute_module_named_modules
-
-platform = get_platform()
 
 
 class ModuleTracker:

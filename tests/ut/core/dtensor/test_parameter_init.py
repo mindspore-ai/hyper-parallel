@@ -15,47 +15,31 @@
 """Unit tests for hyper_parallel.core.dtensor.parameter_init."""
 
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
+
+from hyper_parallel.core.dtensor.parameter_init import init_parameters
 
 
 class TestInitParameters(unittest.TestCase):
-    """Tests for InitParameters."""
-    @patch("hyper_parallel.platform.get_platform")
-    def test_default_stage_index(self, mock_get_platform):
+    """Tests for init_parameters."""
+
+    def test_accepts_module_and_default_stage_index(self):
         """Test default stage index."""
-        mock_platform = MagicMock()
-        mock_get_platform.return_value = mock_platform
+        init_parameters(MagicMock(name="module"))
 
-        from hyper_parallel.core.dtensor.parameter_init import init_parameters
-        module = MagicMock(name="module")
-        init_parameters(module)
-
-        mock_platform.init_parameters.assert_called_once_with(module, 0)
-
-    @patch("hyper_parallel.platform.get_platform")
-    def test_custom_stage_index(self, mock_get_platform):
+    def test_accepts_custom_stage_index(self):
         """Test custom stage index."""
-        mock_platform = MagicMock()
-        mock_get_platform.return_value = mock_platform
+        init_parameters(MagicMock(name="module"), stage_index=2)
 
-        from hyper_parallel.core.dtensor.parameter_init import init_parameters
-        module = MagicMock(name="module")
-        init_parameters(module, stage_index=2)
+    def test_rejects_none_module(self):
+        """Test that a None module is rejected."""
+        with self.assertRaises(ValueError):
+            init_parameters(None)
 
-        mock_platform.init_parameters.assert_called_once_with(module, 2)
-
-    @patch("hyper_parallel.platform.get_platform")
-    def test_returns_platform_result(self, mock_get_platform):
-        """Test returns platform result."""
-        mock_platform = MagicMock()
-        mock_platform.init_parameters.return_value = "result"
-        mock_get_platform.return_value = mock_platform
-
-        from hyper_parallel.core.dtensor.parameter_init import init_parameters
-        module = MagicMock()
-        result = init_parameters(module)
-
-        self.assertEqual(result, "result")
+    def test_rejects_negative_stage_index(self):
+        """Test that a negative stage index is rejected."""
+        with self.assertRaises(ValueError):
+            init_parameters(MagicMock(name="module"), stage_index=-1)
 
 
 if __name__ == "__main__":

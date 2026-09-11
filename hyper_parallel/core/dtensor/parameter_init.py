@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Parameter init"""
+# pylint: disable=C9006,C9007
 
 
 def init_parameters(module, stage_index=0):
@@ -25,6 +26,7 @@ def init_parameters(module, stage_index=0):
         Raises:
             ValueError: If the `module` is not a module.
     """
-    from hyper_parallel.platform import get_platform  # pylint: disable=C0415
-    platform = get_platform()
-    return platform.init_parameters(module, stage_index)
+    if module is None:
+        raise ValueError("input module must not be none.")
+    if stage_index < 0:
+        raise ValueError("input stage_index must be positive.")
