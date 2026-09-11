@@ -66,7 +66,6 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 from torch import fx, nn
 
-from tests.common.mark_utils import arg_mark  # pylint: disable=C0413
 
 from hyper_parallel.compile.parallel_config import PassConfig  # pylint: disable=C0413
 from hyper_parallel.compile.passes.parallel.pp_pass import (  # pylint: disable=C0413
@@ -288,12 +287,6 @@ def _run_pp(gm, model, rank, cfg=None, plan=None):
 class TestPpPassRunGuards(unittest.TestCase):
     """``PpPass.run`` early-returns / raises on bad preconditions."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_run_skips_when_dist_not_initialized(self):
         """Test the pass early-returns when ``dist`` is not initialized."""
         cfg = PassConfig(fsdp_enabled=False, pp_enabled=True, pp_degree=2)
@@ -308,12 +301,6 @@ class TestPpPassRunGuards(unittest.TestCase):
             "skipped run must not slice state_fqns",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_run_skips_when_world_size_one(self):
         """Test the pass early-returns when ``world_size == 1``."""
         cfg = PassConfig(fsdp_enabled=False, pp_enabled=True, pp_degree=2)
@@ -322,12 +309,6 @@ class TestPpPassRunGuards(unittest.TestCase):
             result = PpPass().run(gm, cfg, model=MiniLLM())
         self.assertIs(result, gm, "single-card run should return the same graph")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_run_raises_when_model_kwarg_missing(self):
         """Test the pass raises when the live ``model=`` kwarg is omitted."""
         cfg = PassConfig(fsdp_enabled=False, pp_enabled=True, pp_degree=2)
@@ -337,12 +318,6 @@ class TestPpPassRunGuards(unittest.TestCase):
                 PpPass().run(gm, cfg)
         self.assertIn("model", str(ctx.exception))
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_run_rejects_fsdp_hybrid_without_mesh(self):
         """Test PP+FSDP without a mesh is rejected (1-D fallback can't host PP)."""
         cfg = PassConfig(fsdp_enabled=True, pp_enabled=True, pp_degree=2)
@@ -352,12 +327,6 @@ class TestPpPassRunGuards(unittest.TestCase):
                 PpPass().run(gm, cfg, model=MiniLLM())
         self.assertIn("mesh", str(ctx.exception))
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_run_rejects_partial_pp_degree(self):
         """Test 1 < pp_degree < world_size is rejected (no silent DP replication).
 
@@ -371,12 +340,6 @@ class TestPpPassRunGuards(unittest.TestCase):
                 PpPass().run(gm, cfg, model=MiniLLM())
         self.assertIn("pure-PP", str(ctx.exception))
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_run_skips_when_pp_degree_one(self):
         """Test ``pp_degree=1`` explicitly disables the pass."""
         cfg = PassConfig(fsdp_enabled=False, pp_enabled=True, pp_degree=1)
@@ -396,12 +359,6 @@ class TestPpPassStage0(unittest.TestCase):
         self.model = MiniLLM()
         _run_pp(self.gm, self.model, rank=0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_state_sliced_to_stage0(self):
         """Test ``state_fqns`` is updated IN PLACE to stage 0's params."""
         self.assertEqual(
@@ -411,12 +368,6 @@ class TestPpPassStage0(unittest.TestCase):
         )
         self.assertEqual(self.gm.num_state_inputs, 4)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_foreign_submodules_pruned(self):
         """Test lin1/head are pruned from the live model, stage modules kept."""
         self.assertIsNone(self.model.lin1, "foreign stage-1 module must be pruned")
@@ -424,12 +375,6 @@ class TestPpPassStage0(unittest.TestCase):
         self.assertIsNotNone(self.model.embed, "stage-0 module must survive")
         self.assertIsNotNone(self.model.lin0, "stage-0 module must survive")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_schedule_stub_installed(self):
         """Test the stub graph dispatches via a call_module node."""
         sched = self.gm.pp_schedule
@@ -445,12 +390,6 @@ class TestPpPassStage0(unittest.TestCase):
         )
         self.assertEqual(module_calls[0].target, "pp_schedule")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_fwd_subgraph_ends_at_boundary(self):
         """Test the fwd subgraph computes stage-0 modules and emits h1 first."""
         fwd_g = self.gm.pp_schedule.fwd_gm.graph
@@ -467,12 +406,6 @@ class TestPpPassStage0(unittest.TestCase):
         placeholder_names = [n.name for n in fwd_g.nodes if n.op == "placeholder"]
         self.assertNotIn("lin1_weight", placeholder_names)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_bwd_subgraph_outputs_only_stage_grads(self):
         """Test bwd outputs are exactly stage 0's 4 param grads (no trailing)."""
         bwd_g = self.gm.pp_schedule.bwd_gm.graph
@@ -493,12 +426,6 @@ class TestPpPassStage1(unittest.TestCase):
         self.model = MiniLLM()
         _run_pp(self.gm, self.model, rank=1)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_state_sliced_to_stage1(self):
         """Test ``state_fqns`` is updated IN PLACE to stage 1's params."""
         self.assertEqual(
@@ -507,12 +434,6 @@ class TestPpPassStage1(unittest.TestCase):
             f"stage 1 owns lin1+head state, got {self.gm.state_fqns}",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_foreign_submodules_pruned(self):
         """Test embed/lin0 are pruned, stage-1 modules kept."""
         self.assertIsNone(self.model.embed)
@@ -520,12 +441,6 @@ class TestPpPassStage1(unittest.TestCase):
         self.assertIsNotNone(self.model.lin1)
         self.assertIsNotNone(self.model.head)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_fwd_takes_act_in_placeholder(self):
         """Test the fwd subgraph receives the boundary activation."""
         sched = self.gm.pp_schedule
@@ -545,12 +460,6 @@ class TestPpPassStage1(unittest.TestCase):
             "first fwd output on the last stage must be the loss",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_bwd_emits_trailing_boundary_grad(self):
         """Test bwd outputs carry the boundary gradient for stage 0."""
         sched = self.gm.pp_schedule
@@ -570,12 +479,6 @@ class TestPpPassStage1(unittest.TestCase):
 class TestPpPassErrors(unittest.TestCase):
     """Boundary and plan validation errors."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_multiple_crossing_tensors_supported(self):
         """Test extra crossing values ship as additional boundary outputs."""
         gm = _mini_llm_joint_graph(extra_cross=True)
@@ -592,12 +495,6 @@ class TestPpPassErrors(unittest.TestCase):
             "crosses so it is deduplicated out of saved",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_manual_plan_wrong_stage_count_rejected(self):
         """Test a plan declaring fewer stages than pp_degree fails."""
         plan = PassPlan()
@@ -607,12 +504,6 @@ class TestPpPassErrors(unittest.TestCase):
             _run_pp(gm, MiniLLM(), rank=0, plan=plan)
         self.assertIn("pp_degree", str(ctx.exception))
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_skip_stage_dataflow_rejected(self):
         """Test a value crossing 2+ cuts fails with an actionable error.
 
@@ -638,12 +529,6 @@ class TestPpPassErrors(unittest.TestCase):
 class TestPruneLiveModel(unittest.TestCase):
     """``_prune_live_model`` handles container elements with descendant cuts."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_descendant_cut_recurses_into_container_element(self):
         """Test a cut inside a container element recurses (key-preserving).
 
@@ -690,23 +575,11 @@ class TestPruneLiveModel(unittest.TestCase):
 class TestAutoStageSplit(unittest.TestCase):
     """Default even-by-layers split."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_even_fallback_split_without_container(self):
         """Test top-level children split evenly without a ModuleList."""
         stages = _auto_stage_split(MiniLLM(), 2)
         self.assertEqual(stages, [["embed", "lin0"], ["lin1", "head"]])
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_container_split_with_input_output_weighting(self):
         """Test layers are evenly distributed; head/tail modules attached."""
         stages = _auto_stage_split(ContainerModel(num_layers=5), 2)
@@ -718,12 +591,6 @@ class TestAutoStageSplit(unittest.TestCase):
             ],
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_too_few_children_rejected(self):
         """Test more stages than children is an error without a container."""
 
@@ -739,12 +606,6 @@ class TestAutoStageSplit(unittest.TestCase):
         with self.assertRaises(ValueError):
             _auto_stage_split(TwoModule(), 4)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_single_stage_rejected(self):
         """Test ``pp_degree < 2`` cannot produce a split."""
         with self.assertRaises(ValueError):
@@ -754,12 +615,6 @@ class TestAutoStageSplit(unittest.TestCase):
 class TestPassPlanPpStage(unittest.TestCase):
     """``PassPlan.pp_stage`` builder validation."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_wildcard_rejected(self):
         """Test stage cuts must be exact FQNs (no wildcards)."""
         plan = PassPlan()
@@ -767,36 +622,18 @@ class TestPassPlanPpStage(unittest.TestCase):
             plan.pp_stage(0, ["layers.*"])
         self.assertIn("wildcard", str(ctx.exception))
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_negative_stage_rejected(self):
         """Test a negative stage index is rejected."""
         plan = PassPlan()
         with self.assertRaises(ValueError):
             plan.pp_stage(-1, ["embed"])
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_manual_plan_resolves(self):
         """Test a complete manual plan passes plan resolution."""
         pas = PpPass(pass_plan=_manual_plan())
         stages = pas._resolve_stage_plan(MiniLLM(), 2)  # pylint: disable=protected-access
         self.assertEqual(stages, [["embed", "lin0"], ["lin1", "head"]])
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_unknown_module_rejected(self):
         """Test stage FQNs must exist in the model."""
         plan = PassPlan()
@@ -807,12 +644,6 @@ class TestPassPlanPpStage(unittest.TestCase):
             pas._resolve_stage_plan(MiniLLM(), 2)  # pylint: disable=protected-access
         self.assertIn("nope", str(ctx.exception))
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_partial_plan_warns_on_unassigned_modules(self):
         """Test modules no stage declares are named in a warning."""
         plan = PassPlan()
@@ -825,12 +656,6 @@ class TestPassPlanPpStage(unittest.TestCase):
             pas._resolve_stage_plan(MiniLLM(), 2)  # pylint: disable=protected-access
         self.assertIn("head", "".join(logs.output))
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_container_ancestors_do_not_warn(self):
         """Test ancestor containers of declared elements warn nothing."""
         plan = PassPlan()
@@ -849,12 +674,6 @@ class TestPassPlanPpStage(unittest.TestCase):
 class TestPropagateAnchorStages(unittest.TestCase):
     """Backward arg stage propagation reaches its fixpoint in one pass."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_transitive_chain_pulled_in_one_reverse_pass(self):
         """Test a downstream-anchored bwd chain pulls its args transitively.
 
@@ -998,12 +817,6 @@ class TestScheduleGradEquivalence(unittest.TestCase):
 
         return _LM().to(torch.float64)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_pp_grads_match_full_batch_mean(self):
         """Test 2-stage PP grads match the reference full-batch grads."""
         plan = PassPlan()
@@ -1072,12 +885,6 @@ class TestScheduleGradEquivalence(unittest.TestCase):
 class TestYamlPpSection(unittest.TestCase):
     """YAML ``pp:`` section parsing."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_yaml_stages_parsed(self):
         """Test the mapping and list YAML shapes both parse."""
         import tempfile  # pylint: disable=C0415
@@ -1136,12 +943,6 @@ class TestScheduleGPipe(unittest.TestCase):
         )
         return sched
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_middle_stage_grads_averaged_and_p2p_issued(self):
         """Test microbatch loop: recv -> fwd -> send, grads mean over mb."""
         state = [torch.zeros(4, 4)]
@@ -1177,12 +978,6 @@ class TestScheduleGPipe(unittest.TestCase):
         # receives: act_in (fwd) + grad_in (bwd), once per microbatch each
         self.assertEqual(mock_dist.irecv.call_count, 4)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_scalar_boundary_values_packed_as_int64(self):
         """Test sym_size-style scalars ship as 0-d int64 and arrive as ints."""
         state = [torch.zeros(4, 4)]
@@ -1231,12 +1026,6 @@ class TestScheduleGPipe(unittest.TestCase):
         self.assertTrue(torch.is_tensor(loss))
         self.assertEqual(len(grads), 1)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_batch_not_divisible_rejected(self):
         """Test an indivisible batch size fails loudly."""
         sched = self._make_sched(

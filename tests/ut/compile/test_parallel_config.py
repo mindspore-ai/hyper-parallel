@@ -30,18 +30,11 @@ Covers the rules the dataclass asserts and that have regressed before:
 import unittest
 
 from hyper_parallel.compile.parallel_config import PassConfig
-from tests.common.mark_utils import arg_mark
 
 
 class TestPassConfigDefaults(unittest.TestCase):
     """Defaults reflect graph-mode's FSDP-focused intent."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_defaults(self):
         """Test default config: FSDP on, overlap on, degrees unresolved."""
         cfg = PassConfig()
@@ -81,12 +74,6 @@ class TestPassConfigDefaults(unittest.TestCase):
             (f"pp_microbatch_size default should be 1, got {cfg.pp_microbatch_size}"),
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_explicit_construction(self):
         """Test explicit construction forwards every kwarg."""
         cfg = PassConfig(
@@ -110,12 +97,6 @@ class TestPassConfigDefaults(unittest.TestCase):
 class TestPassConfigValidation(unittest.TestCase):
     """``__post_init__`` catches misconfigurations early."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_rejects_non_positive_tp_size(self):
         """Test ``tp_size < 1`` raises ValueError at construction."""
         for bad in (0, -1, -4):
@@ -130,12 +111,6 @@ class TestPassConfigValidation(unittest.TestCase):
                 ),
             )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_rejects_non_positive_fsdp_degree(self):
         """Test explicit ``fsdp_degree < 1`` raises ValueError."""
         for bad in (0, -1, -8):
@@ -150,23 +125,11 @@ class TestPassConfigValidation(unittest.TestCase):
                 ),
             )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_fsdp_degree_none_allowed(self):
         """Test ``fsdp_degree=None`` is the documented auto-resolve sentinel."""
         cfg = PassConfig(fsdp_degree=None)
         self.assertIsNone(cfg.fsdp_degree)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_validate_after_mutation(self):
         """Test ``validate()`` re-runs checks after a caller mutates a field.
 
@@ -195,12 +158,6 @@ class TestPassConfigTorchFree(unittest.TestCase):
     plain config field.
     """
 
-    @arg_mark(
-        plat_marks=["cpu_linux"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_module_does_not_import_torch_at_top(self):
         """Test no top-level torch import in ``parallel_config`` module."""
         import hyper_parallel.compile.parallel_config as mod
