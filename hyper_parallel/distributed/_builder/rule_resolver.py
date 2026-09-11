@@ -265,7 +265,8 @@ def _merge_into(derived: ModuleShardingSpec,
     for attr in _CONTRACT_FIELDS:
         _merge_contract_field(derived, user_spec, attr)
     for attr in ("local_compute_fn", "inner_target", "inner_wrapper",
-                 "inner_out_src", "region_dispatch", "tp_divide_attrs"):
+                 "inner_out_src", "region_dispatch", "tp_divide_attrs",
+                 "_head_count_owner"):
         value = getattr(user_spec, attr)
         if value is not None:
             setattr(derived, attr, value)

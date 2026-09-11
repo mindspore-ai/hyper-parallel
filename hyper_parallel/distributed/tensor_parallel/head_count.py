@@ -65,7 +65,7 @@ class TpLocalAttrPlan:
 #   never sharded) and num_key_value_groups (a ratio -- TP-invariant).
 Q_HEAD_ATTRS = (
     "num_heads", "num_attention_heads", "n_heads", "num_attn_heads",
-    "n_head", "heads", "num_head",
+    "n_head", "heads", "num_head", "num_index_heads",
 )
 KV_HEAD_ATTRS = ("num_key_value_heads", "num_kv_heads", "kv_heads")
 

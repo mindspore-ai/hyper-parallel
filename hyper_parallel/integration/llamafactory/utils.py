@@ -995,6 +995,34 @@ def _restore_non_persistent_buffers(
         model.tie_weights()
 
 
+def _is_hsdp_param_sharded(hsdp_param) -> bool:
+    """Return the HSDP parameter state across legacy and V2 APIs."""
+    legacy_state = getattr(hsdp_param, "is_sharded", None)
+    if legacy_state is not None:
+        return bool(legacy_state)
+
+    from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState  # pylint: disable=C0415
+
+    if not hasattr(hsdp_param, "sharded_state"):
+        raise AttributeError(
+            f"{type(hsdp_param).__name__} exposes neither is_sharded nor sharded_state."
+        )
+    return hsdp_param.sharded_state is ShardedState.SHARDED
+
+
+def _refresh_hsdp_mixed_precision_dtypes(state) -> None:
+    """Refresh mixed-precision metadata across HSDP API versions."""
+    state_init = getattr(state, "_init_mp_dtypes", None)
+    if state_init is not None:
+        state_init()
+        return
+
+    param_group = getattr(state, "param_group", None)
+    group_init = getattr(param_group, "_init_mp_dtypes", None)
+    if group_init is not None:
+        group_init()
+
+
 def _maybe_upcast_trainable_params(accelerator, model: nn.Module) -> None:
     """Upcast model parameters to fp32 when mixed precision requires Accelerate-compatible behavior.
 
@@ -1015,8 +1043,9 @@ def _maybe_upcast_trainable_params(accelerator, model: nn.Module) -> None:
         if isinstance(module, HSDPModule):
             state = module.hsdp_scheduler.hsdp_state  # pylint: disable=protected-access
             for hsdp_param in state.hsdp_params:
-                hsdp_param.reset_sharded_param()
-            state._init_mp_dtypes()  # pylint: disable=protected-access
+                if _is_hsdp_param_sharded(hsdp_param):
+                    hsdp_param.reset_sharded_param()
+            _refresh_hsdp_mixed_precision_dtypes(state)
 
     if accelerator.is_main_process:
         warnings.warn(

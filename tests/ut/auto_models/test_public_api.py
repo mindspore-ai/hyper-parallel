@@ -83,6 +83,7 @@ class TestShardingConfigContracts(unittest.TestCase):
                 ("_needs_cp_attn", "False"),
                 ("_resolved_inner_wrapper", "None"),
                 ("_resolved_inner_target", "None"),
+                ("_head_count_owner", "None"),
                 ("_ep_stack", "<factory> {}"),
                 ("_ep_size", "0"),
             ],

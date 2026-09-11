@@ -80,6 +80,22 @@ from hyper_parallel.distributed._builder.special_handlers import (
     _SPECIAL_HANDLER_PATTERNS,
     _collect_special_handlers,
 )
+from hyper_parallel.distributed._builder.dsa_template import (
+    build_dsa_specs,
+    matches_dsa_template,
+)
+from hyper_parallel.distributed._builder.mhc_template import (
+    build_mhc_specs,
+    matches_mhc_template,
+)
+from hyper_parallel.distributed._builder.mtp_template import (
+    build_mtp_specs,
+    matches_mtp_template,
+)
+from hyper_parallel.distributed._builder.shared_expert_template import (
+    build_shared_expert_specs,
+    matches_shared_expert_template,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +104,17 @@ logger = logging.getLogger(__name__)
 # ``models/<family>/adapter/registration.py`` (DeepSeek MLA, Qwen2-MoE
 # shared_expert_gate), discovered through ``models/registry.py``. The
 # planner core stays family-agnostic (05 §15.9 step 1).
+
+# Specialized structural templates (Phase 1-4): DSA/MHC/MTP boundaries that
+# do not fit the standard attention/mlp/norm role patterns.  Each provider is
+# matched from module capabilities (not config.architectures/model_type) and
+# emits fully self-declared specs.
+_STRUCTURAL_TEMPLATE_PROVIDERS = (
+    ("dsa", matches_dsa_template, build_dsa_specs),
+    ("mhc", matches_mhc_template, build_mhc_specs),
+    ("mtp", matches_mtp_template, build_mtp_specs),
+    ("shared_expert", matches_shared_expert_template, build_shared_expert_specs),
+)
 
 
 # Leaf-segment guard for projection/container segment names: these segment
@@ -235,6 +262,39 @@ class ShardingPlanner:
                 )
             plan.modules[boundary_fqn] = spec
 
+        # Specialized structural templates (Phase 1-4): DSA/MHC/MTP boundaries
+        # that do not fit the standard attention/mlp/norm role patterns use the
+        # same provider pipeline, but are matched from module capabilities
+        # instead of config.architectures/model_type.
+        self._derive_structural_template_specs(plan, model)
+
+    @staticmethod
+    def _derive_structural_template_specs(
+        plan: ShardingPlan, model: Any,
+    ) -> None:
+        """Derive specialized templates selected from the model structure.
+
+        The generic structural templates cover standard attention/mlp/norm/
+        embed/lm_head boundaries; the DSA/MHC/MTP builders cover model-specific
+        leaves (head-sharded index/query projections, MHC pre-modules, sink
+        parameters, MTP projections).  The builders emit fully self-declared
+        specs, so they are assigned directly into the plan — exactly like the
+        generic templates' output — and need no override-style merge/insert
+        matching (that machinery now serves only user plan_overrides in Phase
+        4.5).
+        """
+        for name, matcher, builder in _STRUCTURAL_TEMPLATE_PROVIDERS:
+            if not matcher(model):
+                continue
+            specs = builder(model)
+            logger.debug(
+                "Matched structural sharding template %s (%d specs)",
+                name,
+                len(specs),
+            )
+            for fqn, spec in specs.items():
+                plan.modules[fqn] = spec
+
     def _finalize_boundary_specs(
         self,
         plan: ShardingPlan,
@@ -362,7 +422,7 @@ class ShardingPlanner:
         # Phase 4.5: unified override pass — merge mode (unset fields inherit
         # the derived spec) / insert mode (fully self-declared only) / glob.
         self._finalize_boundary_specs(
-            plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names
+            plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names,
         )
 
         # D-14 invariants (05 §13.2/§13.3): full self-declaration + param
@@ -920,7 +980,6 @@ class ShardingPlanner:
             spec, expert_params, stacks, batched, boundary_fqn, template
         )
         self._set_extended_ep_contract(spec, ep_extend)
-
 
     @staticmethod
     def _finalize_fused_expert_tp_guard(plan: ShardingPlan, *, tp_size: int) -> None:
