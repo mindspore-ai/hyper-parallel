@@ -19,9 +19,12 @@ from __future__ import annotations
 import copy
 import pickle
 from collections.abc import Iterator, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from threading import Thread
 from typing import Any, Literal
+
+import torch
 
 from hyper_parallel.distributed_data.data_constructor import PackingDataConstructor
 from hyper_parallel.distributed_data.batch_sampler import BatchSamplerReader
@@ -73,6 +76,9 @@ class _ReaderSnapshot:
     metadata: tuple[BufferedSampleMetadata, ...]
     error: str | None = None
     batch_position: int | None = None
+    # External-step readers provide the legacy producer's already selected
+    # local pack boundaries.  Stream readers leave this empty.
+    reference_bins: tuple[tuple[BufferedSampleMetadata, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,6 +92,7 @@ class _PlanControl:
 class _PrefetchResult:
     delivery: ConstructedBatch | None = None
     error: BaseException | None = None
+    completed: bool = False
 
 
 def _validate_loader_components(
@@ -150,9 +157,6 @@ class DistributedDataLoader(Iterator[Any]):
     after the current batch has been delivered to the trainer.
     """
 
-    VERSION = 5
-    collective_source = True
-
     def __init__(
             self,
             *,
@@ -173,10 +177,11 @@ class DistributedDataLoader(Iterator[Any]):
             double_buffer: bool,
             config_fingerprint: str,
             batch_sampler_mode: bool = False,
+            external_step_mode: bool = False,
             initial_epoch: int = 0,
     ) -> None:
         """Store the fully validated runtime components."""
-        if not batch_sampler_mode and step_sample_selector is None:
+        if not batch_sampler_mode and not external_step_mode and step_sample_selector is None:
             raise ValueError("Stream-based loading requires a StepSampleSelector.")
         _validate_loader_components(
             topology=topology,
@@ -205,6 +210,7 @@ class DistributedDataLoader(Iterator[Any]):
         self._double_buffer = double_buffer
         self._config_fingerprint = config_fingerprint
         self._batch_sampler_mode = batch_sampler_mode
+        self._external_step_mode = external_step_mode
         self._epoch = initial_epoch
         self._step = 0
         self._stopped = False
@@ -214,6 +220,7 @@ class DistributedDataLoader(Iterator[Any]):
         self._pending_plan: DistributedPackingPlan | None = None
         self._prefetch_thread: Thread | None = None
         self._prefetch_result: _PrefetchResult | None = None
+        self._prefetch_stream: Any = None
 
     def __iter__(self) -> "DistributedDataLoader":
         """Return this stateful distributed iterator."""
@@ -221,7 +228,10 @@ class DistributedDataLoader(Iterator[Any]):
 
     def __next__(self) -> Any:
         """Collectively construct and return the next rank-local batch."""
-        received = self._take_prefetched() if self._double_buffer else self._collect_next_delivery()
+        if self._double_buffer:
+            received = self._finish_prefetched_delivery(self._take_prefetched())
+        else:
+            received = self._collect_next_delivery()
         data = self._consume_delivery(received)
         if self._double_buffer:
             self._start_prefetch()
@@ -247,6 +257,39 @@ class DistributedDataLoader(Iterator[Any]):
                 constructor_delivery = self._constructor_envelope(error=iterator_state_error)
             else:
                 constructor_delivery = self._produce_on_data_plane()
+        received = self._model_transport.broadcast(constructor_delivery)
+        if was_stopped and not received.stopped:
+            raise ValueError("Distributed DataLoader stopped state differs across model-parallel peers.")
+        return received
+
+    def _collect_next_data_plane_delivery(self) -> ConstructedBatch | None:
+        """Prepare a batch without entering model-group collectives."""
+        constructor_delivery = None
+        if self._data_plane.is_member:
+            iterator_state_error = self._data_plane.synchronize_iterator_state(
+                epoch=self._epoch,
+                step=self._step,
+                stopped=self._stopped,
+                model_group_error=None,
+            )
+            if iterator_state_error is not None:
+                constructor_delivery = self._constructor_envelope(error=iterator_state_error)
+            else:
+                constructor_delivery = self._produce_on_data_plane()
+        return constructor_delivery
+
+    def _finish_prefetched_delivery(self, constructor_delivery: ConstructedBatch | None) -> ConstructedBatch:
+        """Perform model-group synchronization and broadcast on the caller thread."""
+        was_stopped = self._stopped
+        model_group_error = self._model_transport.synchronize_iterator_state(
+            epoch=self._epoch,
+            step=self._step,
+            stopped=self._stopped,
+        )
+        if self._data_plane.is_member:
+            model_group_error = self._data_plane.synchronize_error(model_group_error)
+        if model_group_error is not None:
+            constructor_delivery = self._constructor_envelope(error=model_group_error)
         received = self._model_transport.broadcast(constructor_delivery)
         if was_stopped and not received.stopped:
             raise ValueError("Distributed DataLoader stopped state differs across model-parallel peers.")
@@ -298,11 +341,41 @@ class DistributedDataLoader(Iterator[Any]):
     def _run_prefetch(self) -> None:
         """Produce one result without allowing exceptions to strand the consumer."""
         try:
-            self._prefetch_result = _PrefetchResult(delivery=self._collect_next_delivery())
+            # Accelerator device context is thread-local on CUDA/NPU.  A
+            # background prefetch thread otherwise falls back to device 0,
+            # which makes HCCL/NCCL communicator creation see duplicate
+            # physical devices across ranks.
+            self._bind_prefetch_device()
+            with self._prefetch_stream_context():
+                self._prefetch_result = _PrefetchResult(
+                    delivery=self._collect_next_data_plane_delivery(),
+                    completed=True,
+                )
         except BaseException as exc:  # The foreground re-raises failures at the next iterator boundary.
             self._prefetch_result = _PrefetchResult(error=exc)
 
-    def _take_prefetched(self) -> ConstructedBatch:
+    def _bind_prefetch_device(self) -> None:
+        """Bind the rank-local accelerator for collectives in the prefetch thread."""
+        device = getattr(self._data_plane, "communication_device", None)
+        if device is None:
+            return
+        device_module = getattr(torch, device.type, None)
+        if device_module is not None and hasattr(device_module, "set_device"):
+            device_module.set_device(device)
+
+    def _prefetch_stream_context(self) -> Any:
+        """Keep payload HCCL dependencies off the model's caller stream."""
+        device = getattr(self._data_plane, "communication_device", None)
+        if device is None or device.type != "npu":
+            return nullcontext()
+        device_module = getattr(torch, device.type)
+        if self._prefetch_stream is None:
+            self._prefetch_stream = device_module.Stream(device=device)
+        # H2D, collective, wait and D2H must share this stream; isolating only
+        # the collective omits the send buffer's producer dependency.
+        return device_module.stream(self._prefetch_stream)
+
+    def _take_prefetched(self) -> ConstructedBatch | None:
         """Wait for and return the current background result."""
         if self._prefetch_thread is None:
             self._start_prefetch()
@@ -317,8 +390,8 @@ class DistributedDataLoader(Iterator[Any]):
             raise ValueError("Double buffering completed without a prefetch result.")
         if result.error is not None:
             raise result.error
-        if result.delivery is None:
-            raise ValueError("Double buffering completed without a constructed batch delivery.")
+        if not result.completed:
+            raise ValueError("Double buffering completed without a finished prefetch result.")
         return result.delivery
 
     @property
@@ -352,7 +425,6 @@ class DistributedDataLoader(Iterator[Any]):
         if self._pending_local_keys:
             raise ValueError("Cannot checkpoint while a distributed batch is in flight.")
         state = {
-            "version": self.VERSION,
             "topology_fingerprint": self._topology.fingerprint,
             "config_fingerprint": self._config_fingerprint,
             "global_rank": self._topology.global_rank,
@@ -406,7 +478,6 @@ class DistributedDataLoader(Iterator[Any]):
 
     def _validate_checkpoint_identity(self, state: Mapping[str, Any]) -> None:
         expected = {
-            "version": self.VERSION,
             "topology_fingerprint": self._topology.fingerprint,
             "config_fingerprint": self._config_fingerprint,
             "global_rank": self._topology.global_rank,
@@ -545,7 +616,6 @@ class DistributedDataLoader(Iterator[Any]):
         if shared_error is not None:
             self._pending_local_keys.clear()
             return self._constructor_envelope(error=shared_error)
-
         return self._construct_received_payloads(plan, received_payloads)
 
     def _produce_metadata_batch(self, plan: DistributedPackingPlan) -> ConstructedBatch | None:
@@ -624,6 +694,7 @@ class DistributedDataLoader(Iterator[Any]):
                 exhausted=True,
                 can_read_more=False,
                 metadata=(),
+                reference_bins=(),
             )
         planning_reader = self._planning_reader()
         if planning_reader is None:
@@ -635,6 +706,7 @@ class DistributedDataLoader(Iterator[Any]):
                 exhausted=False,
                 can_read_more=False,
                 metadata=(),
+                reference_bins=(),
                 error=f"Dataset Reader rank {self._topology.global_rank} did not provide its reader.",
             )
 
@@ -670,7 +742,8 @@ class DistributedDataLoader(Iterator[Any]):
             ),
             metadata=planning_reader.metadata(),
             error=error,
-            batch_position=planning_reader.batch_position if isinstance(planning_reader, BatchSamplerReader) else None,
+            batch_position=getattr(planning_reader, "batch_position", None),
+            reference_bins=tuple(getattr(planning_reader, "reference_bins", ())),
         )
 
     def _build_plan_control(self, snapshots: tuple[Any, ...]) -> _PlanControl:
@@ -733,6 +806,8 @@ class DistributedDataLoader(Iterator[Any]):
         try:
             if self._batch_sampler_mode:
                 selection = self._select_native_batch(reader_snapshots)
+            elif self._external_step_mode:
+                selection = self._select_external_step(reader_snapshots)
             else:
                 selection = self._step_sample_selector.select(
                     candidates,
@@ -752,6 +827,58 @@ class DistributedDataLoader(Iterator[Any]):
             error=(
                 f"Dataset Reader buffers reached max_buffered_samples={self._max_buffered_samples} before "
                 f"Step Sample Selection could form {self._planner.distributed_bin_count} complete packing bins."
+            ),
+        )
+
+    def _select_external_step(self, snapshots: list[_ReaderSnapshot]) -> StepSampleSelection | None:
+        """Freeze the exact sample set emitted by an external legacy producer.
+
+        Each Dataset Reader has already run its local VeOmni selector for the
+        current step.  We preserve that union and let the HP planner only
+        change target-rank placement.  The reference bins are used solely to
+        validate that every local producer emitted the expected number of
+        packs; the planner is still free to repack the frozen samples.
+        """
+        reader_snapshots = [snapshot for snapshot in snapshots if snapshot.is_reader]
+        if not reader_snapshots:
+            return None
+        positions = {snapshot.batch_position for snapshot in reader_snapshots}
+        if len(positions) != 1 or self._step not in positions:
+            raise ValueError("External-step readers have inconsistent producer step cursors.")
+        if all(snapshot.exhausted for snapshot in reader_snapshots):
+            return None
+        if any(snapshot.exhausted for snapshot in reader_snapshots):
+            raise ValueError("External-step readers exhausted at different forward/backward steps.")
+        expected_bins = self._planner.distributed_bin_count
+        reference_bins = tuple(
+            packing_bin
+            for snapshot in sorted(reader_snapshots, key=lambda item: item.rank)
+            for packing_bin in snapshot.reference_bins
+        )
+        if len(reference_bins) != expected_bins:
+            raise ValueError(
+                f"External-step producers emitted {len(reference_bins)} local packs, "
+                f"expected {expected_bins}."
+            )
+        samples = tuple(
+            item
+            for snapshot in sorted(reader_snapshots, key=lambda item: item.rank)
+            for item in snapshot.metadata
+        )
+        if not samples:
+            raise ValueError("External-step producers emitted no samples for an active step.")
+        # Reader-local streams have different sample counts, so their source
+        # ordinals are not contiguous globally.  Renumber only the frozen
+        # selection; SampleKey remains the routing identity.
+        external_samples = tuple(
+            BufferedSampleMetadata(item.key, item.metadata, position)
+            for position, item in enumerate(samples)
+        )
+        return StepSampleSelection(
+            samples=external_samples,
+            reference_bins=tuple(
+                tuple(item.key for item in packing_bin)
+                for packing_bin in reference_bins
             ),
         )
 

@@ -540,6 +540,13 @@ class DatasetReader:
             "next_ordinal": self._next_ordinal,
             "exhausted": self._exhausted,
             "error": self._error,
+            # Preserve stateful interleave/filter cursors for online iterable
+            # sources. Worker-local state is avoided by the training adapter.
+            "dataset_state": (
+                self._dataset.state_dict()
+                if callable(getattr(self._dataset, "state_dict", None))
+                else None
+            ),
             # Correctness-first checkpointing retains transformed read-ahead
             # payloads. A compact index-replay format can be layered on later.
             "buffer": self._buffer,
@@ -567,6 +574,9 @@ class DatasetReader:
         self._exhausted = exhausted
         self._error = error
         self._buffer = buffer
+        dataset_state = state.get("dataset_state")
+        if dataset_state is not None and callable(getattr(self._dataset, "load_state_dict", None)):
+            self._dataset.load_state_dict(dataset_state)
         self._iterator = None
 
     def _checkpoint_identity(self) -> dict[str, Any]:

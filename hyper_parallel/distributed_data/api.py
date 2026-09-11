@@ -417,6 +417,7 @@ class _BuildState:
     reader_size: int | None = None
     direct_dataset_size: int | None = None
     local_error: str | None = None
+    external_step_mode: bool = False
 
     @property
     def is_reader(self) -> bool:
@@ -547,7 +548,30 @@ def _configure_local_data_sources(
         metadata: Sequence[SampleMetadata] | None,
         config: DistributedDatasetConfig,
         loader_options: dict[str, Any],
+        external_step_reader: Any | None = None,
 ) -> None:
+    if external_step_reader is not None:
+        if state.metadata_mode:
+            raise ValueError("external_step_reader requires online metadata_fn mode.")
+        if not state.is_reader:
+            raise ValueError("external_step_reader may only be provided on Dataset Reader ranks.")
+        required_methods = (
+            "fill",
+            "metadata",
+            "selected_payloads",
+            "commit",
+            "state_dict",
+            "load_state_dict",
+            "set_epoch",
+        )
+        missing = [name for name in required_methods if not callable(getattr(external_step_reader, name, None))]
+        if not hasattr(external_step_reader, "reference_bins"):
+            missing.append("reference_bins")
+        if missing:
+            raise ValueError(f"external_step_reader is missing methods: {missing}")
+        state.dataset_reader = external_step_reader
+        state.external_step_mode = True
+        return
     if state.is_reader:
         reader_idx = state.dataset_reader_ranks.index(state.topology.global_rank)
         if state.metadata_mode:
@@ -625,6 +649,7 @@ def _populate_build_state(
         collate_fn: Callable[[Sequence[Any]], Any] | None,
         communication_device: Any,
         batch_sampler: Any = None,
+        external_step_reader: Any | None = None,
 ) -> None:
     if not isinstance(config, DistributedDatasetConfig):
         raise ValueError(f"config must be DistributedDatasetConfig, but got {type(config)}.")
@@ -653,7 +678,10 @@ def _populate_build_state(
     state.dataset_reader_ranks, state.planner_rank = _resolve_service_ranks(state.topology, config)
     batch_sampler_fingerprint = None
     if batch_sampler is None:
-        _configure_local_data_sources(state, dataset, metadata_fn, metadata, config, loader_options)
+        _configure_local_data_sources(
+            state, dataset, metadata_fn, metadata, config, loader_options,
+            external_step_reader=external_step_reader,
+        )
     else:
         batch_sampler_fingerprint = _configure_batch_sampler_sources(
             state, dataset, metadata_fn, metadata, config, batch_sampler, loader_options,
@@ -694,7 +722,7 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
     is_direct_reader = state.metadata_mode and state.topology is not None and (
         state.is_reader if dataset_already_sharded else state.topology.is_constructor
     )
-    synchronize_build_preflight(
+    state.external_step_mode = synchronize_build_preflight(
         build_fingerprint=build_fingerprint,
         is_reader=state.is_reader,
         reader_size=state.reader_size,
@@ -703,10 +731,20 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
         metadata_mode=state.metadata_mode,
         dataset_already_sharded=dataset_already_sharded,
         local_error=state.local_error,
+        external_step_mode=state.external_step_mode,
     )
+    # Consumer-only ranks have no reader object, but must share selection mode
+    # and checkpoint identity with the ranks that produce their model batch.
+    if state.external_step_mode and state.config_fingerprint is not None:
+        state.config_fingerprint += ":external_step"
 
 
-def _require_build_state(state: _BuildState, *, batch_sampler_mode: bool) -> None:
+def _require_build_state(
+        state: _BuildState,
+        *,
+        batch_sampler_mode: bool,
+        external_step_mode: bool,
+) -> None:
     required_components = (
         state.topology,
         state.dataset_reader_ranks,
@@ -715,7 +753,7 @@ def _require_build_state(state: _BuildState, *, batch_sampler_mode: bool) -> Non
         state.constructor,
         state.config_fingerprint,
     )
-    if not batch_sampler_mode:
+    if not batch_sampler_mode and not external_step_mode:
         required_components += (state.step_sample_selector,)
     if any(component is None for component in required_components):
         raise ValueError("Distributed DataLoader build preflight completed without validated components.")
@@ -733,6 +771,7 @@ def build_distributed_dataloader(
         collate_fn: Callable[[Sequence[Any]], Any] | None = None,
         communication_device: Any = None,
         batch_sampler: Any = None,
+        external_step_reader: Any | None = None,
 ) -> DistributedDataLoader:
     """Build a sample-balanced distributed DataLoader from a raw Dataset.
 
@@ -785,6 +824,12 @@ def build_distributed_dataloader(
             be omitted. Metadata entries must describe these Dataset indices,
             not underlying document indices. Checkpoint through this loader,
             not through the sampler's speculative prefetch cursor.
+        external_step_reader: Optional rank-local external producer. It must
+            expose ``fill``, ``metadata``, ``reference_bins``,
+            ``selected_payloads``, ``commit``, and checkpoint/epoch methods.
+            One call to ``fill`` supplies exactly one already-selected local
+            VeOmni step. HP preserves that step's union and only rebalances
+            its target ranks.
 
     Returns:
         Stateful collective iterator yielding constructed local batches.
@@ -807,6 +852,7 @@ def build_distributed_dataloader(
         collate_fn=collate_fn,
         communication_device=communication_device,
         batch_sampler=batch_sampler,
+        external_step_reader=external_step_reader,
     )
 
 
@@ -822,6 +868,7 @@ def _build_distributed_dataloader_impl(
         collate_fn: Callable[[Sequence[Any]], Any] | None,
         communication_device: Any,
         batch_sampler: Any = None,
+        external_step_reader: Any | None = None,
 ) -> DistributedDataLoader:
     state = _BuildState(metadata_mode=metadata_fn is None)
     try:
@@ -837,12 +884,17 @@ def _build_distributed_dataloader_impl(
             collate_fn,
             communication_device,
             batch_sampler,
+            external_step_reader,
         )
     except Exception as exc:  # Every WORLD rank must fail before subgroup creation.
         state.local_error = f"{type(exc).__name__}: {exc}"
 
     _synchronize_build_state(state, config)
-    _require_build_state(state, batch_sampler_mode=batch_sampler is not None)
+    _require_build_state(
+        state,
+        batch_sampler_mode=batch_sampler is not None,
+        external_step_mode=state.external_step_mode,
+    )
     metadata_payload_exchange = state.metadata_mode and config.dataset_already_sharded
     groups = create_data_groups(
         state.topology,
@@ -856,6 +908,7 @@ def _build_distributed_dataloader_impl(
 
     return DistributedDataLoader(
         batch_sampler_mode=batch_sampler is not None,
+        external_step_mode=state.external_step_mode,
         initial_epoch=0 if batch_sampler is None else batch_sampler.epoch,
         topology=state.topology,
         dataset_reader_ranks=state.dataset_reader_ranks,

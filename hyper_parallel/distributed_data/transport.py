@@ -64,7 +64,8 @@ def synchronize_build_preflight(
         metadata_mode: bool,
         dataset_already_sharded: bool,
         local_error: str | None,
-) -> None:
+        external_step_mode: bool = False,
+) -> bool:
     """Validate rank-local build inputs on WORLD before creating subgroups.
 
     Args:
@@ -79,6 +80,10 @@ def synchronize_build_preflight(
         dataset_already_sharded: Whether each Dataset Reader owns an independent
             local sample and metadata stream.
         local_error: Formatted local validation error, if any.
+        external_step_mode: Whether this rank owns an external step reader.
+
+    Returns:
+        Whether all Dataset Readers use external step selection.
 
     Raises:
         ValueError: If any rank failed validation, build inputs differ, or
@@ -97,11 +102,12 @@ def synchronize_build_preflight(
         metadata_mode,
         dataset_already_sharded,
         local_error,
+        external_step_mode,
     )
     if not distributed:
         if local_error is not None:
             raise ValueError(f"Distributed DataLoader build preflight failed on rank {rank}: {local_error}")
-        return
+        return external_step_mode
 
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, status)
@@ -122,12 +128,16 @@ def synchronize_build_preflight(
         metadata_mode=metadata_mode,
         dataset_already_sharded=dataset_already_sharded,
     )
+    reader_modes = {item[9] for item in normalized if item[2]}
+    if len(reader_modes) > 1:
+        raise ValueError("Distributed DataLoader external step mode differs across Dataset Readers.")
+    return True in reader_modes
 
 
 def _normalize_build_statuses(gathered: Sequence[Any]) -> tuple[tuple[Any, ...], ...]:
     normalized = []
     for expected_rank, item in enumerate(gathered):
-        if not isinstance(item, tuple) or len(item) != 9 or item[0] != expected_rank:
+        if not isinstance(item, tuple) or len(item) != 10 or item[0] != expected_rank:
             raise ValueError("Distributed DataLoader build preflight received an invalid WORLD status.")
         normalized.append(item)
     return tuple(normalized)
@@ -572,6 +582,11 @@ class DataPlaneTransport:
     def ranks(self) -> tuple[int, ...]:
         """Return data-plane ranks in collective order."""
         return self._ranks
+
+    @property
+    def communication_device(self) -> torch.device | None:
+        """Return the rank-local accelerator used by payload collectives."""
+        return self._communication_device
 
     def all_gather_object(self, value: Any) -> tuple[Any, ...]:
         """Gather small control objects on every data-plane rank.
