@@ -16,8 +16,9 @@
 
 import time
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Optional, Union
 
+from hyper_parallel.models.flops import batch_seq_len, resolve_flops_per_token
 from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
 from hyper_parallel.trainer.runtime.distributed import all_reduce
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -48,6 +49,35 @@ class EnvironMeterCallback(Callback):
         self._consumed_samples = 0
         self.trainer.step_train_metrics = {}
         self.trainer.step_env_metrics = {}
+        # TFLOPS/MFU inputs: FLOPs per token are derived from the model and
+        # its config geometry (``hyper_parallel.models.flops``) — a model's
+        # own ``hp_flops_per_token`` wins when present — using the sequence
+        # length observed from the first training batch. Resolution is lazy
+        # so callback-vs-model init order does not matter.
+        self._flops_per_token: Optional[float] = None  # resolved lazily
+        self._seq_len: Optional[int] = None  # captured from the first batch
+        self._peak_tflops = trainer.config.training.peak_tflops
+
+    def _resolve_flops_per_token(self) -> Optional[float]:
+        """Resolve FLOPs/token lazily from the model and its config geometry."""
+        if self._flops_per_token is not None:
+            return self._flops_per_token
+        value = resolve_flops_per_token(
+            getattr(self.trainer, "model", None),
+            model_config=getattr(self.trainer, "model_config", None),
+            seq_len=self._resolve_seq_len(),
+        )
+        if value:
+            self._flops_per_token = value
+        return self._flops_per_token
+
+    def _resolve_seq_len(self) -> Optional[int]:
+        """Return the observed batch sequence length or a config fallback."""
+        if self._seq_len is not None:
+            return self._seq_len
+        model_config = getattr(self.trainer, "model_config", None)
+        max_positions = getattr(model_config, "max_position_embeddings", None)
+        return int(max_positions) if max_positions else None
 
     @staticmethod
     def _scalar(value: Any, name: str) -> float:
@@ -72,7 +102,7 @@ class EnvironMeterCallback(Callback):
             raise ValueError(f"Metric {name!r} must be scalar, but got {value!r}") from exc
 
     @staticmethod
-    def _tensor_numel(value: Any) -> int | None:
+    def _tensor_numel(value: Any) -> Optional[int]:
         """Return ``value.numel()`` when it exposes a tensor-like interface."""
         numel = getattr(value, "numel", None)
         if not callable(numel):
@@ -115,7 +145,7 @@ class EnvironMeterCallback(Callback):
         return int(shape[0])
 
     @staticmethod
-    def _batch_mapping(value: Any) -> Mapping[str, Any] | None:
+    def _batch_mapping(value: Any) -> Optional[Mapping[str, Any]]:
         """Return metric inputs for a mapping or prepared runtime batch."""
         if isinstance(value, Mapping):
             return value
@@ -149,7 +179,7 @@ class EnvironMeterCallback(Callback):
             return None
         return dp_cp_mesh.get_group()
 
-    def _reduce(self, value: float | int, op: str) -> float:
+    def _reduce(self, value: Union[float, int], op: str) -> float:
         """Reduce one scalar metric, with a single-process no-op fallback."""
         if get_world_size_safe() <= 1:
             return float(value)
@@ -223,12 +253,20 @@ class EnvironMeterCallback(Callback):
     def on_step_begin(
         self,
         state: TrainerState,
-        micro_batches: list[dict[str, Any]] | None = None,
+        micro_batches: Optional[list[dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> None:
-        """Start timing and count local input tokens and samples."""
+        """Start timing and count local input tokens and samples.
+
+        Args:
+            state: Current trainer state (unused; step comes from counters).
+            micro_batches: Micro-batches of the step, used for token,
+                sample and sequence-length accounting.
+        """
         del state, kwargs
         batches = self._micro_batches(micro_batches)
+        if self._seq_len is None:
+            self._seq_len = batch_seq_len(batches)
         self._local_step_tokens = sum(self._batch_tokens(batch) for batch in batches)
         self._local_step_samples = sum(self._batch_samples(batch) for batch in batches)
         self._step_start_time = time.perf_counter()
@@ -237,11 +275,18 @@ class EnvironMeterCallback(Callback):
         self,
         state: TrainerState,
         loss: float,
-        loss_dict: dict[str, float] | None,
+        loss_dict: Optional[dict[str, float]],
         grad_norm: float,
         **kwargs: Any,
     ) -> None:
-        """Reduce and publish metrics for one completed optimizer step."""
+        """Reduce and publish metrics for one completed optimizer step.
+
+        Args:
+            state: Current trainer state (step counters live on counters).
+            loss: Reduced total loss for the step.
+            loss_dict: Per-component loss values for the step.
+            grad_norm: Global gradient norm for the step.
+        """
         del state, kwargs
         step_time = max(time.perf_counter() - self._step_start_time, 0.0)
         global_step_time = self._reduce(step_time, op="max")
@@ -270,5 +315,15 @@ class EnvironMeterCallback(Callback):
             "data/consumed_samples": float(self._consumed_samples),
             **self._memory_metrics(),
         }
+        if self._resolve_flops_per_token():
+            # Observed TFLOPS = tokens/sec x flops/token / 1e12 (6N convention;
+            # activation-checkpoint recompute is not useful FLOPs).
+            env_metrics["performance/tflops"] = (
+                tokens_per_second * self._flops_per_token / 1e12
+            )
+            if self._peak_tflops:
+                env_metrics["performance/mfu"] = env_metrics["performance/tflops"] / (
+                    self._peak_tflops * max(get_world_size_safe(), 1)
+                )
         self.trainer.step_train_metrics = train_metrics
         self.trainer.step_env_metrics = env_metrics
