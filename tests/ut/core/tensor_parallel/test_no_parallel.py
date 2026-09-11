@@ -157,18 +157,13 @@ class TestNoParallelApply(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_linear_calls_distribute_module(
-        self, mock_style_platform, mock_mesh_platform
-    ):
+    def test_apply_linear_calls_distribute_module(self, mock_mesh_platform):
         """
         Feature: NoParallel.apply on Linear module
         Description: mock distribute_module
         Expectation: distribute_module called with partition_fn=None; returns module from mock
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.Module = nn.Module
-
         style = NoParallel()
         module = nn.Linear(8, 16)
 
@@ -182,18 +177,13 @@ class TestNoParallelApply(unittest.TestCase):
             self.assertIs(result, module)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_invokes_distribute_module_callbacks(
-        self, mock_style_platform, mock_mesh_platform
-    ):
+    def test_apply_invokes_distribute_module_callbacks(self, mock_mesh_platform):
         """
         Feature: NoParallel.apply registers input/output callbacks
         Description: invoke callbacks captured from mocked distribute_module
         Expectation: partition_fn is None; input_fn/output_fn delegate to static helpers
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.Module = nn.Module
-
         style = NoParallel()
         module = nn.Linear(8, 16)
 
@@ -214,18 +204,13 @@ class TestNoParallelApply(unittest.TestCase):
             self.assertEqual(out, "out")
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_layernorm_calls_distribute_module(
-        self, mock_style_platform, mock_mesh_platform
-    ):
+    def test_apply_layernorm_calls_distribute_module(self, mock_mesh_platform):
         """
         Feature: NoParallel.apply on LayerNorm module
         Description: mock distribute_module
         Expectation: distribute_module called once; returns module from mock
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.Module = nn.Module
-
         style = NoParallel()
         module = nn.LayerNorm(8)
 
@@ -406,18 +391,13 @@ class TestNoParallelIntegration(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_parallelize_module_dict_plan_with_no_parallel(
-        self, mock_style_platform, mock_mesh_platform
-    ):
+    def test_parallelize_module_dict_plan_with_no_parallel(self, mock_mesh_platform):
         """
         Feature: parallelize_module with dict plan containing NoParallel
         Description: apply NoParallel via parallelize_module dict
         Expectation: distribute_module called on target module
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.Module = nn.Module
-
         class SimpleModel(nn.Module):
             def __init__(self):
                 super().__init__()

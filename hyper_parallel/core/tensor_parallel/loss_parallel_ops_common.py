@@ -14,8 +14,7 @@
 # ============================================================================
 """Common utilities for loss_parallel operations.
 
-This module contains platform-agnostic helper functions and validation logic
-shared between PyTorch and MindSpore implementations.
+This module contains PyTorch helper functions and validation logic.
 """
 
 from __future__ import annotations

@@ -156,18 +156,13 @@ class TestRowwiseParallelApply(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_linear_calls_distribute_module(self, mock_style_platform, mock_mesh_platform):
+    def test_apply_linear_calls_distribute_module(self, mock_mesh_platform):
         """
         Feature: RowwiseParallel.apply on Linear module
         Description: apply RowwiseParallel to nn.Linear with mocked distribute_module
         Expectation: distribute_module is called; desired_input_layouts is (Shard(-1),)
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.is_linear_module.return_value = True
-        mock_style_platform.is_embedding_module.return_value = False
-        mock_style_platform.Module = nn.Module
-
         style = RowwiseParallel()
         module = nn.Linear(8, 8)
 
@@ -179,20 +174,13 @@ class TestRowwiseParallelApply(unittest.TestCase):
             self.assertEqual(style.desired_input_layouts, (Shard(-1),))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_linear_invokes_distribute_module_callbacks(
-        self, mock_style_platform, mock_mesh_platform
-    ):
+    def test_apply_linear_invokes_distribute_module_callbacks(self, mock_mesh_platform):
         """
         Feature: RowwiseParallel.apply registers callable hooks on distribute_module
         Description: capture and invoke partition_fn, input_fn, output_fn for Linear
         Expectation: partition_fn calls _partition_linear_fn; I/O hooks delegate to static helpers
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.is_linear_module.return_value = True
-        mock_style_platform.is_embedding_module.return_value = False
-        mock_style_platform.Module = nn.Module
-
         style = RowwiseParallel()
         module = nn.Linear(4, 4)
 
@@ -213,18 +201,13 @@ class TestRowwiseParallelApply(unittest.TestCase):
             self.assertEqual(out, "out")
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_embedding_calls_distribute_module(self, mock_style_platform, mock_mesh_platform):
+    def test_apply_embedding_calls_distribute_module(self, mock_mesh_platform):
         """
         Feature: RowwiseParallel.apply on Embedding module
         Description: apply RowwiseParallel to nn.Embedding with mocked distribute_module
         Expectation: distribute_module is called; desired_input_layouts is (Replicate(),)
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.is_linear_module.return_value = False
-        mock_style_platform.is_embedding_module.return_value = True
-        mock_style_platform.Module = nn.Module
-
         style = RowwiseParallel()
         module = nn.Embedding(100, 64)
 
@@ -236,20 +219,13 @@ class TestRowwiseParallelApply(unittest.TestCase):
             self.assertEqual(style.desired_input_layouts, (Replicate(),))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_embedding_invokes_partition_fn(
-        self, mock_style_platform, mock_mesh_platform
-    ):
+    def test_apply_embedding_invokes_partition_fn(self, mock_mesh_platform):
         """
         Feature: RowwiseParallel.apply partition_fn for Embedding
         Description: invoke captured partition_fn after apply on Embedding module
         Expectation: _partition_embedding_fn is called once
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.is_linear_module.return_value = False
-        mock_style_platform.is_embedding_module.return_value = True
-        mock_style_platform.Module = nn.Module
-
         style = RowwiseParallel()
         module = nn.Embedding(8, 4)
 
@@ -262,18 +238,13 @@ class TestRowwiseParallelApply(unittest.TestCase):
             mock_partition.assert_called_once_with(module, mesh)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_apply_unsupported_module_raises(self, mock_style_platform, mock_mesh_platform):
+    def test_apply_unsupported_module_raises(self, mock_mesh_platform):
         """
         Feature: RowwiseParallel.apply rejects unsupported module types
         Description: apply RowwiseParallel to nn.LayerNorm
         Expectation: raises NotImplementedError mentioning supported types
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.is_linear_module.return_value = False
-        mock_style_platform.is_embedding_module.return_value = False
-        mock_style_platform.Module = nn.Module
-
         style = RowwiseParallel()
         module = nn.LayerNorm(8)
 
@@ -529,14 +500,12 @@ class TestRowwiseParallelIO(unittest.TestCase):
         self.assertIsInstance(result, torch.Tensor)
         self.assertTrue(torch.allclose(result, expected))
 
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_prepare_output_fn_embedding_wraps_partial(self, mock_platform):
+    def test_prepare_output_fn_embedding_wraps_partial(self):
         """
         Feature: RowwiseParallel._prepare_output_fn Embedding partial path
         Description: plain tensor output from Embedding with embedding module passed in
         Expectation: DTensor.from_local is called with Partial(sum) before redistribute
         """
-        mock_platform.is_embedding_module.return_value = True
         mesh = MagicMock()
         module = nn.Embedding(10, 4)
         local_out = torch.randn(2, 4)
@@ -562,14 +531,12 @@ class TestRowwiseParallelIO(unittest.TestCase):
             mock_dt.redistribute.assert_called_once_with(mesh, (Replicate(),))
             self.assertIs(result, local_out)
 
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_prepare_output_fn_non_embedding_plain_tensor_raises(self, mock_platform):
+    def test_prepare_output_fn_non_embedding_plain_tensor_raises(self):
         """
         Feature: RowwiseParallel._prepare_output_fn rejects plain tensors for Linear
         Description: non-DTensor output without an Embedding module
         Expectation: TypeError mentioning DTensor / unsupported module
         """
-        mock_platform.is_embedding_module.return_value = False
         with self.assertRaises(TypeError) as ctx:
             RowwiseParallel._prepare_output_fn(
                 (Replicate(),),
@@ -611,18 +578,13 @@ class TestColRowComposition(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_mlp_colwise_rowwise_composition(self, mock_style_platform, mock_mesh_platform):
+    def test_mlp_colwise_rowwise_composition(self, mock_mesh_platform):
         """
         Feature: ColwiseParallel + RowwiseParallel composition on MLP
         Description: parallelize_module with linear1=ColwiseParallel, linear2=RowwiseParallel
         Expectation: distribute_module called twice (once per submodule)
         """
         mesh = self._make_1d_mesh(mock_mesh_platform)
-        mock_style_platform.is_linear_module.return_value = True
-        mock_style_platform.is_embedding_module.return_value = False
-        mock_style_platform.Module = nn.Module
-
         class MLP(nn.Module):
             def __init__(self):
                 super().__init__()

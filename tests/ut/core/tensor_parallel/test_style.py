@@ -39,12 +39,29 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.tensor_parallel.api import parallelize_module
 from hyper_parallel.core.tensor_parallel.style import (
+    _cast_fp_tensor,
     ParallelStyle,
     PrepareModuleInput,
     PrepareModuleInputOutput,
     PrepareModuleOutput,
 )
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
+
+
+class TestTorchTensorHelpers(unittest.TestCase):
+    """Tests for direct PyTorch tensor helpers used by parallel styles."""
+
+    def test_cast_fp_tensor_casts_floating_tensor(self):
+        """A floating tensor is converted to the requested reduction dtype."""
+        tensor = torch.ones(2, dtype=torch.float16)
+        result = _cast_fp_tensor(torch.float32, tensor)
+        self.assertEqual(result.dtype, torch.float32)
+
+    def test_cast_fp_tensor_preserves_integer_tensor(self):
+        """Integer tensors are not converted by the floating-point helper."""
+        tensor = torch.ones(2, dtype=torch.int64)
+        result = _cast_fp_tensor(torch.float32, tensor)
+        self.assertIs(result, tensor)
 
 
 def _patch_platform_rank_for_dtensor_redistribute(world_size: int = 1):
@@ -563,14 +580,12 @@ class TestPrepareModuleInput(unittest.TestCase):
         mock_dt.redistribute.assert_called_once_with(mesh, (Shard(0),))
         self.assertTrue(torch.allclose(result, local))
 
-    @patch("hyper_parallel.core.tensor_parallel.style.platform")
-    def test_prepare_input_arg_raises_for_non_tensor(self, mock_platform):
+    def test_prepare_input_arg_raises_for_non_tensor(self):
         """
         Feature: PrepareModuleInput._prepare_input_arg type validation
         Description: non-tensor, non-DTensor positional value with a layout set
         Expectation: AssertionError
         """
-        mock_platform.is_tensor.return_value = False
         style = PrepareModuleInput(
             input_layouts=Replicate(),
             desired_input_layouts=Replicate(),

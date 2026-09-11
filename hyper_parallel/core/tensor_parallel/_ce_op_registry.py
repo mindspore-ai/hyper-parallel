@@ -14,7 +14,7 @@
 # ============================================================================
 """CE operator name registry.
 
-Set of operator names on the CE decomposition path; elements are platform.get_op_name results.
+Set of canonical PyTorch operator names on the CE decomposition path.
 Allows extension via register_loss_parallel_op_names (for test injection).
 """
 
@@ -87,7 +87,7 @@ def register_loss_parallel_op_names(*names: str) -> None:
     """Extend CE operator name set (for test injection).
 
     Args:
-        *names: Operator names to register (platform.get_op_name results).
+        *names: Canonical PyTorch operator names to register.
     """
     _EXTENDED_CE_OP_NAMES.update(names)
 
@@ -105,7 +105,7 @@ def is_loss_parallel_op(op_name: str) -> bool:
     """Check if operator is a CE entry point (e.g., cross_entropy).
 
     Args:
-        op_name: Operator name (platform.get_op_name result).
+        op_name: Canonical PyTorch operator name.
 
     Returns:
         bool: Whether operator is a CE entry point.
@@ -117,7 +117,7 @@ def is_decomposed_ce_op(op_name: str) -> bool:
     """Check if operator is a decomposed CE op (e.g., log_softmax, nll_loss).
 
     Args:
-        op_name: Operator name (platform.get_op_name result).
+        op_name: Canonical PyTorch operator name.
 
     Returns:
         bool: Whether operator is a decomposed CE op.
