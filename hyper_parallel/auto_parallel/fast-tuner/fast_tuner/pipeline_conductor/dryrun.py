@@ -1,4 +1,4 @@
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2024-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import subprocess
 from multiprocessing import Pool
 
 from fast_tuner.utils.logger import logger
+from fast_tuner.pipeline_conductor import pp_util
 from fast_tuner.pipeline_conductor.pp_util import (
     pipeline_output_file,
     str2bool,
@@ -35,8 +36,7 @@ from fast_tuner.pipeline_conductor.pp_util import (
     str2list
 )
 
-DRYRUN_CONFIG_ERROR = ('The config_file location and ms_adapter_file location '
-                       'are essential, please config!')
+DRYRUN_CONFIG_ERROR = 'A shell config and adapter script are required.'
 
 
 class DryRun:
@@ -47,18 +47,17 @@ class DryRun:
     stages to collect memory usage statistics and validate pipeline configurations.
     """
     env_config_json = ''
-    register_path = 'research/jiutian'
     dryrun_lim = 16
     config_file_type = 0
     is_write_to_file = True
 
-    def __init__(self, config_file_path, ms_adapter_file_path, output_name):
+    def __init__(self, config_file_path, adapter_file_path, output_name):
         """
         Initialize DryRun instance.
         
         """
         self.config_file = config_file_path
-        self.ms_adapter_file = ms_adapter_file_path
+        self.adapter_file = adapter_file_path
         self.rank_gap = None
         pp_output_file = os.path.join(os.getcwd(), pipeline_output_file)
         if not os.path.exists(pp_output_file):
@@ -101,10 +100,8 @@ class DryRun:
         """
         Start dry-run with specified configuration parameters.
         """
-        if self.config_file_type == 0:
-            name = pp_util.bulid_yaml(self.config_file, recompute_config, offset,
-                                      num_layers, num_vpp, num_stage, dense_layers, micro)
-        elif self.config_file_type == 1:
+        del recompute_config
+        if self.config_file_type == 1:
             name = pp_util.bulid_shell(self.config_file, offset, num_layers,
                                        num_vpp, num_stage, dense_layers, micro)
         else:
@@ -116,27 +113,19 @@ class DryRun:
         """
         Execute dry-run for a specific rank/stage.
         """
+        if self.config_file_type != 1:
+            raise TypeError(DRYRUN_CONFIG_ERROR)
         device_id = stage
         rank_id = stage * self.rank_gap
         cwd = os.getcwd()
         log_file = os.path.join(cwd, self.log_file_name, f'rank_{rank_id}.log')
         logger.info(f"start training for rank_{rank_id}, device_{device_id}, waiting a moment...")
-        if self.config_file_type == 0:
-            os.environ['ASCEND_RT_VISIBLE_DEVICES'] = str(device_id)
-            os.environ['RANK_ID'] = str(rank_id)
-            command = ['python', self.ms_adapter_file, '--register_path',
-                       self.register_path, '--config', self.config_file]
-            with open(log_file, 'w', encoding='utf-8') as log:
-                subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=False)
-        elif self.config_file_type == 1:
-            env = os.environ.copy()
-            env['RANK_ID'] = str(rank_id)
-            command = ['bash', self.config_file, str(device_id),
-                       self.ms_adapter_file, log_file]
-            subprocess.run(command, env=env, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, check=False)
-        else:
-            raise TypeError(DRYRUN_CONFIG_ERROR)
+        env = os.environ.copy()
+        env['RANK_ID'] = str(rank_id)
+        command = ['bash', self.config_file, str(device_id),
+                   self.adapter_file, log_file]
+        subprocess.run(command, env=env, stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE, check=False)
 
     def extract_memory_info(self, num_stage):
         """
@@ -164,28 +153,27 @@ class DryRun:
         return peak_mem
 
 
-def one_rank_dryrun(stage, yaml_file, mindformer_file, output_file_name):
+def one_rank_dryrun(stage, config_file_path, adapter_file_path, output_file_name):
     """
     Execute dry-run for a single rank/stage.
     """
-    dry_run = DryRun(yaml_file, mindformer_file, output_file_name)
-    rank_size, pipeline_stage = pp_util.get_ranks_stages(yaml_file)
+    if DryRun.config_file_type != 1:
+        raise TypeError(DRYRUN_CONFIG_ERROR)
+    dry_run = DryRun(config_file_path, adapter_file_path, output_file_name)
+    rank_size, pipeline_stage = pp_util.get_shell_ranks_stages(config_file_path)
     dry_run.rank_gap = rank_size // pipeline_stage
     dry_run.set_env(rank_size, dry_run.env_config_json)
     dry_run.run_rank(stage)
 
 
-def all_rank_dryrun(config_file_path, ms_adapter_file_path, output_file_name):
+def all_rank_dryrun(config_file_path, adapter_file_path, output_file_name):
     """
     Execute dry-run for all ranks/stages.
     """
-    dry_run = DryRun(config_file_path, ms_adapter_file_path, output_file_name)
-    if DryRun.config_file_type == 0:
-        rank_size, pipeline_stage = pp_util.get_ranks_stages(config_file_path)
-    elif DryRun.config_file_type == 1:
-        rank_size, pipeline_stage = pp_util.get_shell_ranks_stages(config_file_path)
-    else:
+    if DryRun.config_file_type != 1:
         raise TypeError(DRYRUN_CONFIG_ERROR)
+    dry_run = DryRun(config_file_path, adapter_file_path, output_file_name)
+    rank_size, pipeline_stage = pp_util.get_shell_ranks_stages(config_file_path)
     dry_run.dryrun(pipeline_stage, rank_size)
     print(dry_run.extract_memory_info(pipeline_stage))
     print(dry_run.extract_memory_info_act(pipeline_stage))
@@ -193,18 +181,14 @@ def all_rank_dryrun(config_file_path, ms_adapter_file_path, output_file_name):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        prog='Yaml config dryrun',
-        description='Write config to the yaml file, and dryrun it',
+        prog='Shell config dryrun',
+        description='Write config to the shell file, and dryrun it',
         epilog=''
     )
-    parser.add_argument('--yaml', '-y', type=str, default=None,
-                        help="Path of training config (.yaml)")
     parser.add_argument('--shell', '-sh', type=str, default=None,
                         help="Path of training config (.sh)")
-    parser.add_argument('--mindformers', '-mf', type=str, default=None,
-                        help="Absolute path of run_mindformers (.py)")
-    parser.add_argument('--mindspeed', '-mp', type=str, default=None,
-                        help="Absolute path of posttrain_gpt (.py)")
+    parser.add_argument('--adapter', '-a', '-mp', type=str, default=None,
+                        help="Absolute path of the adapter script")
     parser.add_argument('--output_file', '-f', type=str, default='dryrun_output',
                         help="The location to place the output files")
     parser.add_argument('--offset', '-o', type=str2list,
@@ -220,26 +204,19 @@ if __name__ == "__main__":
     parser.add_argument('--env_config_json', '-e', type=str, required=True,
                         default='./config/boss_env_config.json',
                         help="Path of environment config (.json)")
-    parser.add_argument('--register_path', '-rp', type=str, default='research/jiutian',
-                        help="Path of register")
     parser.add_argument('--dryrun_lim', '-dl', type=str2int, default=16,
                         help="The number of dryrun at once")
     args = parser.parse_args()
 
-    if args.yaml and args.mindformers:
-        config_file = args.yaml
-        ms_adapter_file = args.mindformers
-        DryRun.config_file_type = 0
-    elif args.shell and args.mindspeed:
+    if args.shell and args.adapter:
         config_file = args.shell
-        ms_adapter_file = args.mindspeed
+        adapter_file = args.adapter
         DryRun.config_file_type = 1
     else:
         raise TypeError(DRYRUN_CONFIG_ERROR)
 
     output_file = args.output_file
     DryRun.env_config_json = args.env_config_json
-    DryRun.register_path = args.register_path
     DryRun.dryrun_lim = args.dryrun_lim
     if args.recompute_layers and args.is_recompute is None:
         args.is_recompute = True
@@ -247,12 +224,10 @@ if __name__ == "__main__":
         args.is_select_recompute = True
 
     if args.offset is None and args.is_select_recompute is None and args.is_recompute is None:
-        logger.info('Use old yaml config to dryrun')
-    elif DryRun.config_file_type == 0:
-        config_file = pp_util.build_new_config_yaml(args)
+        logger.info('Use existing shell config to dryrun')
     elif DryRun.config_file_type == 1:
         config_file = pp_util.build_new_config_shell(args)
     else:
         raise TypeError(DRYRUN_CONFIG_ERROR)
 
-    all_rank_dryrun(config_file, ms_adapter_file, output_file)
+    all_rank_dryrun(config_file, adapter_file, output_file)

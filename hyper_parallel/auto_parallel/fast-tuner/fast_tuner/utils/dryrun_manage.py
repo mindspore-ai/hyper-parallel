@@ -42,10 +42,8 @@ def create_target_dir(file, target_directory):
 def execute_command(para, config_file_path, target_dir, rank_id, tp):
     '''execute dryrun command'''
     if para.YAML_PATH:
-        command = ['python', os.path.join(para.MINDFORMERS_DIR, 'run_mindformer.py'), '--config', config_file_path,
-               '--register_path', para.REGISTER_PATH]
-    else:
-        command = ['bash', config_file_path]
+        raise ValueError('YAML dryrun execution is not supported.')
+    command = ['bash', config_file_path]
     try:
         # build log file path
         os.environ['RANK_ID'] = str(rank_id)
