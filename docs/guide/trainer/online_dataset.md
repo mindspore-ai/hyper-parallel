@@ -191,9 +191,23 @@ data_transform:
 
 `text_keys` 可以是一个字段名，也可以是候选字段列表。配置列表时，框架使用记录中第一个存在的字段。
 
+Instruction / Alpaca 等由 `instruction`、`input`、`output` 字段构成的数据，可以配置 `text_template`，在
+tokenize 前把这些字段渲染成一段纯文本：
+
+```yaml
+data_transform:
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+  data_type: plaintext
+  text_template: "Instruction: {instruction}\nInput: {input}\nOutput: {output}"
+  max_seq_len: 2048
+```
+
+`text_template` 使用 Python 格式字符串，`{字段名}` 会从原始记录中取值；字段缺失或模板非法时会在构建时报错。
+未配置 `text_template` 时，plaintext 直接读取 `text_keys` 指定的字段。
+
 Plaintext transform 按以下步骤处理数据：
 
-1. 从 `text_keys` 指定的字段读取文本。
+1. 从 `text_keys` 指定的字段读取文本，或使用 `text_template` 渲染记录。
 2. 使用 tokenizer 的 `encode(..., add_special_tokens=False)` 生成 token ID。
 3. 如果 tokenizer 定义了 `eos_token_id`，在文本末尾追加 EOS。
 4. 生成 `input_ids`，并复制 `input_ids` 作为 `labels`。
@@ -220,6 +234,22 @@ data_transform:
 
 Conversation transform 从 `text_keys` 指定的字段读取消息列表，将其交给 chat template 编码，并把结果转换为
 模型字段。Conversation 数据必须同时配置 tokenizer 和 chat template。
+
+ShareGPT 等使用 `conversations: [{from, value}]` 结构的数据，可以通过 `role_key` 和 `content_key` 映射到
+chat template 所需的 `role` / `content`：
+
+```yaml
+data_transform:
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+  data_type: conversation
+  text_keys: conversations
+  role_key: from
+  content_key: value
+  max_seq_len: 2048
+```
+
+转换时会统一常见角色名：`human` → `user`、`gpt` / `assistant` / `bot` / `model` → `assistant`，`system`
+保持不变；`role_map` 可以追加自定义别名。
 
 Online Dataset 会跳过 causal shift 后没有任何可训练 label 的无效样本。当前每条源记录仍必须产生一个最终可训练
 样本，不支持将一条 conversation 稳定展开为多个样本。
@@ -430,6 +460,17 @@ Dataset 使用的 `data_index_cache` 语义，避免把 indexed Dataset 的索�
 | `shuffle` | iterable | `true` | 是否启用流式 buffer shuffle |
 | `shuffle_buffer_size` | iterable | `10000` | Shuffle buffer 大小，必须大于零 |
 | `split_by_data_parallel` | iterable | `true` | 是否按 DP rank 在数据源侧分片 |
+
+`data_transform` 的转换参数如下：
+
+| 参数 | 适用类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `data_type` | 全部 | 无 | `plaintext` 或 `conversation` |
+| `text_keys` | plaintext / conversation | `text` / `conversation` | 源文本或消息字段（或候选字段列表） |
+| `text_template` | plaintext | `null` | Instruction / Alpaca 等字段渲染模板 |
+| `role_key` | conversation | `role` | ShareGPT 等源数据的角色字段名 |
+| `content_key` | conversation | `content` | ShareGPT 等源数据的内容字段名 |
+| `role_map` | conversation | `null` | 追加的自定义角色别名映射 |
 
 Iterable shuffle 的 seed 由 `training.seed` 注入 Online Dataset；不要在 `data_config` 中单独配置 seed。
 
