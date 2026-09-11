@@ -38,9 +38,6 @@ class KernelWorkerBase {
     this->worker_id_ = worker_id;
     this->runtimeConfigPtr = runtimeConfigPtr;
 
-    this->tpipe_.InitBuffer(tBuf, DISPATCH_TOKEN_UB_SIZE);
-    tpipe_.Destroy();
-
     all_event_counters.SetGlobalBuffer((__gm__ int32_t *)(input_list[Derived::EVENT_IDX]), MAX_EVENT_NUM);
 
     all_event_num_triggers.SetGlobalBuffer((__gm__ int32_t *)(this->runtimeConfigPtr + getAllEventNumTriggersOffset()),
@@ -100,30 +97,36 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void AtomicAddForAllEventCounters(uint32_t event_index) {
+    TPipe eventPipe;
 #ifdef __DAV_C220_CUBE__
-    this->localSet = tBuf.GetWithOffset<int32_t>(EXP_TOKEN_COUNT_FLAG_CNT, 0);
+    TBuf<AscendC::TPosition::A1> eventBuffer;
+#else
+    TBuf<AscendC::TPosition::VECOUT> eventBuffer;
+#endif
+    eventPipe.InitBuffer(eventBuffer, DISPATCH_TOKEN_UB_SIZE);
+    LocalTensor<int32_t> localSet = eventBuffer.GetWithOffset<int32_t>(EXP_TOKEN_COUNT_FLAG_CNT, 0);
+#ifdef __DAV_C220_CUBE__
     SyncFunc<AscendC::HardEvent::S_MTE2>();
-    DataCopy(this->localSet, this->atomic_add_values, EXP_TOKEN_COUNT_FLAG_CNT);
+    DataCopy(localSet, this->atomic_add_values, EXP_TOKEN_COUNT_FLAG_CNT);
     SyncFunc<AscendC::HardEvent::MTE2_S>();
     AscendC::SetAtomicAdd<int32_t>();
     SyncFunc<AscendC::HardEvent::S_MTE2>();
-    DataCopy(this->all_event_counters[event_index], this->localSet, EXP_TOKEN_COUNT_FLAG_CNT);
+    DataCopy(this->all_event_counters[event_index], localSet, EXP_TOKEN_COUNT_FLAG_CNT);
     SyncFunc<AscendC::HardEvent::MTE2_S>();
     AscendC::SetAtomicNone();
-    tBuf.FreeTensor(this->localSet);
 #else
-    this->localSet = tBuf.GetWithOffset<int32_t>(EXP_TOKEN_COUNT_FLAG_CNT, 0);
-    this->localSet.SetValue(0, 1);
+    localSet.SetValue(0, 1);
     for (int32_t i = 1; i < EXP_TOKEN_COUNT_FLAG_CNT; ++i) {
-      this->localSet.SetValue(i, 0);
+      localSet.SetValue(i, 0);
     }
     AscendC::SetAtomicAdd<int32_t>();
     SyncFunc<AscendC::HardEvent::S_MTE3>();
-    DataCopy(this->all_event_counters[event_index], this->localSet, EXP_TOKEN_COUNT_FLAG_CNT);
+    DataCopy(this->all_event_counters[event_index], localSet, EXP_TOKEN_COUNT_FLAG_CNT);
     SyncFunc<AscendC::HardEvent::MTE3_S>();
     AscendC::SetAtomicNone();
-    tBuf.FreeTensor(this->localSet);
 #endif
+    eventBuffer.FreeTensor(localSet);
+    eventPipe.Destroy();
   }
 
   __aicore__ inline void ExecuteTask(TaskId task_id) {
@@ -192,14 +195,6 @@ class KernelWorkerBase {
   uint32_t task_num = 0;
   int32_t vector_task_num = 0;
   int32_t cube_task_num = 0;
-
-  TPipe tpipe_;
-#ifdef __DAV_C220_CUBE__
-  TBuf<AscendC::TPosition::A1> tBuf;
-#else
-  TBuf<AscendC::TPosition::VECOUT> tBuf;
-#endif
-  LocalTensor<int32_t> localSet;
 
   GlobalTensor<int32_t> all_event_counters;
   GlobalTensor<int32_t> all_event_num_triggers;

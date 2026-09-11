@@ -22,7 +22,11 @@ constexpr uint32_t NUM_WORKERS_CUBE = 24;
 constexpr uint32_t QUEUE_CAPACITY = 100;
 constexpr uint32_t TASK_TYPE_INDEX_NUM = 256 * 100;
 constexpr uint32_t MAX_GROUP_LIST = 512;
+constexpr uint32_t MAX_EXPERT_NUM_PER_RANK = 16;
 constexpr uint32_t ATOMIC_ADD_VALUE_LEN = 8;
+
+static_assert(NUM_WORKERS_CUBE * MAX_EXPERT_NUM_PER_RANK <= MAX_GROUP_LIST,
+              "Grouped-list scratch slots exceed the runtime-config buffer.");
 
 constexpr uint32_t UB_32B_ALIGN = 32;
 constexpr uint32_t EXP_TOKEN_COUNT_FLAG_CNT = UB_32B_ALIGN / sizeof(int32_t);  // 8
@@ -275,8 +279,8 @@ __aicore__ inline void getDynamicData(__gm__ uint8_t *tiling, DynamicData *tilin
 
 __aicore__ inline uint32_t getGroupedMatmulGroupListOffset() { return getDynamicDataOffset() + 4 * UINT32_T_SIZE; }
 
-__aicore__ inline uint32_t getGroupedMatmulGroupListOffsetById(__gm__ uint8_t *tiling, uint32_t block_idx) {
-  return getGroupedMatmulGroupListOffset() + 8 * INT64_T_SIZE * block_idx;
+__aicore__ inline uint32_t getGroupedMatmulGroupListOffsetById(uint32_t worker_id) {
+  return getGroupedMatmulGroupListOffset() + MAX_EXPERT_NUM_PER_RANK * INT64_T_SIZE * worker_id;
 }
 
 __aicore__ inline uint32_t getAtomicAddValuesOffset() {

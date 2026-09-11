@@ -59,10 +59,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   __aicore__ inline void ExecuteMatmul(const TaskDesc &task_desc) {}
 
   __aicore__ inline void cacheWriteThrough(__gm__ uint8_t *sourceAddr, int64_t length) {
+    if (length <= 0) {
+      return;
+    }
     __gm__ uint8_t *start =
       (__gm__ uint8_t *)((int64_t)sourceAddr / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE);
-    __gm__ uint8_t *end =
-      (__gm__ uint8_t *)(((int64_t)sourceAddr + length) / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE);
+    __gm__ uint8_t *end = (__gm__ uint8_t *)(((int64_t)sourceAddr + length - 1) / AscendC::CACHE_LINE_SIZE *
+                                             AscendC::CACHE_LINE_SIZE);
     AscendC::GlobalTensor<uint8_t> global;
     global.SetGlobalBuffer(start);
     for (uint32_t i = 0; i <= end - start; i += AscendC::CACHE_LINE_SIZE) {
@@ -154,8 +157,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         int64_t expert_num_single_rank = expert_num / ep;
         grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
 
-        GM_ADDR grouped_list_real = this->runtimeConfigPtr + getGroupedMatmulGroupListOffsetById(
-                                                               this->runtimeConfigPtr, AscendC::GetBlockIdx() * 2);
+        GM_ADDR grouped_list_real =
+          this->runtimeConfigPtr + getGroupedMatmulGroupListOffsetById(AscendC::GetBlockIdx());
         GlobalTensor<int64_t> grouped_list_tensor_real;
         grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
         uint32_t data_index = task_desc.task_index / this->core_num;
@@ -177,7 +180,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
             grouped_list_tensor_real.SetValue(i, 0);
           }
         }
-        cacheWriteThrough(grouped_list_real, expert_num_single_rank);
+        cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
 
         GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
         __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);

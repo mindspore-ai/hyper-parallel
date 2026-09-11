@@ -36,8 +36,9 @@ import numpy as np
 
 from hyper_parallel.core.multicore.scheduler.config import (
     RuntimeConfigC, QUEUE_CAPACITY,
-    TaskSplitValue, init_task_split_value,
+    TaskSplitValue, init_task_split_value, validate_runtime_config,
 )
+from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 from hyper_parallel.core.multicore.scheduler.scheduler import revise_task_queue
 from hyper_parallel.core.multicore.tasks.utils import add_terminate, add_dynamic_data
 from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import (
@@ -48,7 +49,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for forward data generation."""
     p = argparse.ArgumentParser()
     p.add_argument('--tp',                type=int, default=4)
@@ -69,7 +70,7 @@ def parse_args():
     return p.parse_args()
 
 
-def build_config_for_rank(graph, tsv: TaskSplitValue, rank_id: int,
+def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
                           num_cube_cores: int = 24) -> RuntimeConfigC:
     """Build RuntimeConfig for a single rank."""
     cfg = RuntimeConfigC()
@@ -95,6 +96,7 @@ def build_config_for_rank(graph, tsv: TaskSplitValue, rank_id: int,
 
     cfg.task_num = task_num_all
     cfg.atomic_add_values[0] = 1
+    validate_runtime_config(cfg, tsv, num_cube_cores)
     return cfg
 
 
@@ -106,7 +108,7 @@ def write_bin(path: str, data: bytes) -> None:
     print(f"  wrote {len(data):>10,} bytes → {path}")
 
 
-def main():
+def main() -> None:
     """Entry point for forward pass runtime data generation."""
     args = parse_args()
     out  = args.output_dir
