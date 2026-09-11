@@ -22,6 +22,57 @@ from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
 
 
+# NOTE: These helpers intentionally mirror parallel_elementwise.py while the
+# Partial contribution policy is still evolving. Keep both copies aligned
+# until they are migrated together after the shared interface is finalized.
+def _partial_signature(layout, mesh_ndim: int) -> tuple:
+    """Return one Partial entry per output mesh dimension."""
+    if layout is None:
+        return (None,) * mesh_ndim
+    partial = tuple(layout.partial)
+    if len(partial) != mesh_ndim:
+        raise ValueError(
+            f"Input and output mesh dimensions must match, but got "
+            f"input={len(partial)} and output={mesh_ndim}."
+        )
+    return partial
+
+
+def _contributes_to_partial_output(input_layout, output_layout) -> bool:
+    """Return whether this rank contributes an input to a Partial output.
+
+    An input that is not Partial on one of the output's Partial axes is
+    replicated along that axis. Only coordinate zero may contribute that
+    replicated value, otherwise the eventual reduction would count it once
+    per rank on the added axis.
+    """
+    output_partial = tuple(output_layout.partial)
+    input_partial = _partial_signature(input_layout, len(output_partial))
+    for mesh_dim, output_partial_type in enumerate(output_partial):
+        if (
+            output_partial_type is not None
+            and input_partial[mesh_dim] is None
+            and output_layout.mesh.get_local_rank(mesh_dim) != 0
+        ):
+            return False
+    return True
+
+
+def _zero_contribution(value):
+    """Create a strict zero while retaining a floating tensor's grad edge."""
+    is_complex = getattr(value, "is_complex", None)
+    if callable(is_complex) and is_complex():
+        return value * 0
+    if hasattr(value, "clamp"):
+        # ``value * 0`` turns +/-Inf into NaN. Clamp first so the forward value
+        # is finite, then multiply by zero to make the derivative zero even at
+        # the clamp boundary.
+        return value.clamp(0, 0) * 0
+    if isinstance(value, (bool, int, float, complex)):
+        return type(value)(0)
+    return value * 0
+
+
 def _propagate_partial_from_inputs(out_layout, x_layout, w_layout):
     """
     Propagate Partial status from input layouts to the output layout for matmul-like operations.
@@ -658,13 +709,11 @@ class LinearDistributedOp(DistributedOp):
 
     def get_expand_impl(self, func: Callable, infer_result: tuple,
                         cache_values: list) -> Optional[Callable]:
-        """
-        Return a custom expand implementation when bias scaling is needed.
+        """Return a rank-local implementation when bias contribution gating is needed.
 
-        When the contracting dimension is sharded each rank computes a partial sum
-        (x_shard @ w_shard.T + bias).  After AllReduce the bias would accumulate
-        scaling_factor times.  The returned closure pre-divides bias by scaling_factor
-        to keep the result numerically correct.
+        When the output is Partial(sum), a replicated bias may only be added by
+        coordinate zero on each newly partial mesh axis. Otherwise the eventual
+        reduction would count the bias once per rank on that axis.
 
         Args:
             func: Original operator callable.
@@ -672,36 +721,35 @@ class LinearDistributedOp(DistributedOp):
             cache_values (list): [x_layout, w_layout, bias_layout].
 
         Returns:
-            callable | None: expand_impl closure when scaling is required, else None.
+            callable | None: Contribution-aware closure when gating is required, else None.
         """
-        x_layout = cache_values[0]
         bias_layout = cache_values[2]
-        x_map = x_layout.alias_tensor_map
-        x_contract_dim = len(x_map) - 1
-
-        # Guard: scaling only needed when contract dim is sharded AND bias is present
-        if x_map[x_contract_dim] == "None" or not bias_layout:
+        if not bias_layout:
             return None
 
         output_layout = infer_result[0][0]
-        scaling_factor = 1
-        if isinstance(x_map[x_contract_dim], tuple):
-            for axis in x_map[x_contract_dim]:
-                scaling_factor *= output_layout.mesh.get_device_num_along_axis(axis)
-        else:
-            scaling_factor *= output_layout.mesh.get_device_num_along_axis(x_map[x_contract_dim])
+        output_partial = tuple(output_layout.partial)
+        bias_partial = _partial_signature(bias_layout, len(output_partial))
+        needs_gating = any(
+            output_partial_type == "sum" and bias_partial[mesh_dim] is None
+            for mesh_dim, output_partial_type in enumerate(output_partial)
+        )
+        if not needs_gating:
+            return None
+        bias_contributes = _contributes_to_partial_output(bias_layout, output_layout)
 
         def expand_impl(x: object, w: object, bias: object) -> object:
-            """Pre-scale bias to counteract the AllReduce accumulation over shards.
+            """Add bias only on ranks that contribute to the Partial output.
 
             Args:
                 x (object): Local input activation tensor.
                 w (object): Local weight tensor.
-                bias (object): Local bias tensor to be pre-scaled.
+                bias (object): Local bias tensor.
 
             Returns:
-                object: Result of the linear operation with pre-scaled bias.
+                object: Result of the linear operation with contribution-aware bias.
             """
-            return func(x, w, bias / scaling_factor)
+            local_bias = bias if bias_contributes else _zero_contribution(bias)
+            return func(x, w, local_bias)
 
         return expand_impl

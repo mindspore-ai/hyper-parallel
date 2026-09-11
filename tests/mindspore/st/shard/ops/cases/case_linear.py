@@ -56,7 +56,6 @@ register(OpShardCase(
     mesh_dim_names=("dp", "tp"),
     ))
 
-
 register(OpShardCase(
     name="linear_ops_dp_with_bias",
     fn=_linear_with_bias,
@@ -84,6 +83,22 @@ register(OpShardCase(
         (Shard(0), Replicate()),       # x: batch on dp
         (Replicate(), Shard(0)),       # w: out_features on tp
         (Replicate(), Shard(0)),       # b: out_features on tp
+    ],
+    compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
+    tags=("npu_level0",),
+    mesh_shape=(2, 2),
+    mesh_dim_names=("dp", "tp"),
+    ))
+
+
+register(OpShardCase(
+    name="linear_ops_tp_row_with_bias",
+    fn=_linear_with_bias,
+    inputs=[_X_SPEC, _W_SPEC, _B_SPEC],
+    placements=[
+        (Shard(0), Shard(1)),          # x: batch on dp, in_features on tp
+        (Replicate(), Shard(1)),       # w: in_features on tp
+        (Replicate(), Replicate()),    # b: one contribution per tp group
     ],
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     tags=("npu_level0",),

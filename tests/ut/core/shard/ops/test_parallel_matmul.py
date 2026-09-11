@@ -583,9 +583,9 @@ class TestParallelLinear(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_linear_get_expand_impl_with_bias_and_sharded_contract_dim(self, mock_platform):
         """
-        Feature: LinearDistributedOp get_expand_impl returns callable when bias scaling is needed.
+        Feature: LinearDistributedOp gates replicated bias for a Partial output.
         Description: Contract dim is sharded and a replicated bias DTensor is provided.
-        Expectation: get_expand_impl returns a callable that pre-scales bias by the shard factor.
+        Expectation: The contribution rank passes the complete bias to the local linear call.
         """
         mesh = self._make_2x4_mesh(mock_platform)
         x_layout = _build_layout(mesh, (Shard(0), Shard(1)), 2)
@@ -593,11 +593,38 @@ class TestParallelLinear(unittest.TestCase):
         bias_layout = _build_layout(mesh, (Replicate(), Replicate()), 1)
         cache_values = [x_layout, w_layout, bias_layout]
         output_layouts, _ = linear_op.infer_layout(cache_values)
-        impl = linear_op.get_expand_impl(None, (output_layouts, None), cache_values)
+        func = MagicMock(side_effect=lambda x, w, bias: bias)
+        impl = linear_op.get_expand_impl(func, (output_layouts, None), cache_values)
         assert callable(impl), (
             f"get_expand_impl should return callable when contract dim is sharded "
             f"and bias is present, got {type(impl)}"
         )
+        bias = np.array([1.0, 2.0], dtype=np.float32)
+        result = impl(object(), object(), bias)
+        np.testing.assert_array_equal(result, bias)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_linear_get_expand_impl_zeros_bias_on_non_contributing_rank(self, mock_platform):
+        """
+        Feature: LinearDistributedOp suppresses repeated bias contributions.
+        Description: Contract dim is sharded and the current rank is nonzero on that mesh axis.
+        Expectation: The local linear call receives a zero bias instead of a scaled bias.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Shard(0), Shard(1)), 2)
+        w_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
+        bias_layout = _build_layout(mesh, (Replicate(), Replicate()), 1)
+        cache_values = [x_layout, w_layout, bias_layout]
+        output_layouts, _ = linear_op.infer_layout(cache_values)
+        self.assertEqual(output_layouts[0].partial, [None, "sum"])
+        func = MagicMock(side_effect=lambda x, w, bias: bias)
+
+        with patch.object(output_layouts[0].mesh, "get_local_rank", return_value=1):
+            impl = linear_op.get_expand_impl(func, (output_layouts, None), cache_values)
+
+        bias = np.array([1.0, 2.0], dtype=np.float32)
+        result = impl(object(), object(), bias)
+        np.testing.assert_array_equal(result, np.zeros_like(bias))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_linear_partial_input_propagated(self, mock_platform):

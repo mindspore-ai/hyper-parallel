@@ -20,7 +20,11 @@ import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from hyper_parallel.core.shard.ops.parallel_elementwise import ElementWiseDistributedOp, AddDistributedOp
+from hyper_parallel.core.shard.ops.parallel_elementwise import (
+    AddDistributedOp,
+    ElementWiseDistributedOp,
+    SubDistributedOp,
+)
 from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP
@@ -439,6 +443,95 @@ class TestParallelElementwiseOps(unittest.TestCase):
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
         assert callable(impl), "Returned impl should be a callable function"
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_add_partial_with_replicate_gates_repeated_value(self, mock_platform):
+        """
+        Feature: Add Partial(sum) contribution gating.
+        Description: Add a Partial input and a replicated input on the same mesh axis.
+        Expectation: Coordinate zero adds the replicated value; other coordinates add zero.
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        replicated_layout = copy.deepcopy(
+            _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 1)
+        )
+        partial_layout = copy.deepcopy(replicated_layout)
+        partial_layout.set_partial_by_dev_axis("dp", "sum")
+        output_layout = _infer_output_layout(
+            self.op_with_partial,
+            (partial_layout, replicated_layout),
+            {"input_shapes": [(2,), (2,)]},
+        )
+        func = MagicMock(side_effect=lambda x, y: x + y)
+        partial_value = np.array([1.0, 2.0], dtype=np.float32)
+        replicated_value = np.array([3.0, 4.0], dtype=np.float32)
+
+        rank_zero_impl = _get_expand_impl(
+            self.op_with_partial,
+            func,
+            output_layout,
+            (partial_layout, replicated_layout),
+            {"input_shapes": [(2,), (2,)]},
+        )
+        np.testing.assert_array_equal(
+            rank_zero_impl(partial_value, replicated_value),
+            partial_value + replicated_value,
+        )
+
+        with patch.object(output_layout.mesh, "get_local_rank", return_value=1):
+            nonzero_rank_impl = _get_expand_impl(
+                self.op_with_partial,
+                func,
+                output_layout,
+                (partial_layout, replicated_layout),
+                {"input_shapes": [(2,), (2,)]},
+            )
+        np.testing.assert_array_equal(nonzero_rank_impl(partial_value, replicated_value), partial_value)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sub_replicate_minus_partial_preserves_sign(self, mock_platform):
+        """
+        Feature: Sub Partial(sum) contribution gating.
+        Description: Subtract a Partial input from a replicated input.
+        Expectation: Nonzero coordinates compute zero minus their Partial contribution.
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        replicated_layout = copy.deepcopy(
+            _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 1)
+        )
+        partial_layout = copy.deepcopy(replicated_layout)
+        partial_layout.set_partial_by_dev_axis("dp", "sum")
+        op = SubDistributedOp("Sub")
+        output_layout = _infer_output_layout(
+            op,
+            (replicated_layout, partial_layout),
+            {"input_shapes": [(2,), (2,)]},
+        )
+        func = MagicMock(side_effect=lambda x, y: x - y)
+        replicated_value = np.array([3.0, 4.0], dtype=np.float32)
+        partial_value = np.array([1.0, 2.0], dtype=np.float32)
+
+        rank_zero_impl = _get_expand_impl(
+            op,
+            func,
+            output_layout,
+            (replicated_layout, partial_layout),
+            {"input_shapes": [(2,), (2,)]},
+        )
+        np.testing.assert_array_equal(
+            rank_zero_impl(replicated_value, partial_value),
+            replicated_value - partial_value,
+        )
+
+        with patch.object(output_layout.mesh, "get_local_rank", return_value=1):
+            nonzero_rank_impl = _get_expand_impl(
+                op,
+                func,
+                output_layout,
+                (replicated_layout, partial_layout),
+                {"input_shapes": [(2,), (2,)]},
+            )
+        np.testing.assert_array_equal(nonzero_rank_impl(replicated_value, partial_value), -partial_value)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_partial_with_partial_same_14(self, mock_platform):
