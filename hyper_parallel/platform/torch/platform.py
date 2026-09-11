@@ -562,6 +562,17 @@ class TorchPlatform(Platform):
 
     _custom_ops_cls = None
 
+    @staticmethod
+    def register_optimizer_tensor_type(tensor_type) -> None:
+        """Register a tensor subclass for PyTorch optimizer and foreach selection."""
+        from torch.optim.optimizer import _foreach_supported_types as optimizer_tensor_types
+        from torch.utils._foreach_utils import _foreach_supported_types as foreach_tensor_types
+
+        if tensor_type not in optimizer_tensor_types:
+            optimizer_tensor_types.append(tensor_type)
+        if tensor_type not in foreach_tensor_types:
+            foreach_tensor_types.append(tensor_type)
+
     @property
     def custom_ops(self):
         """Return the Torch platform custom ops instance.
