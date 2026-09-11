@@ -38,7 +38,12 @@ class VLMDataset(Dataset):
         """Load records from the JSON file and resolve media paths."""
         del dataset_options
         with open(data_path, "r", encoding="utf-8") as handle:
-            self.records = json.load(handle)
+            if data_path.endswith(".jsonl"):
+                self.records = [json.loads(line) for line in handle if line.strip()]
+            else:
+                self.records = json.load(handle)
+        if not isinstance(self.records, list) or not all(isinstance(record, dict) for record in self.records):
+            raise ValueError("VLM data must be a JSON list or JSONL stream of object records")
         root = os.path.dirname(os.path.abspath(data_path))
         for record in self.records:
             self._resolve_record_paths(record, root)
@@ -58,6 +63,11 @@ class VLMDataset(Dataset):
                 for key in ("url", "image", "video"):
                     if key in item and isinstance(item[key], str):
                         item[key] = self._resolve(root, item[key])
+                image_url = item.get("image_url")
+                if isinstance(image_url, str):
+                    item["image_url"] = self._resolve(root, image_url)
+                elif isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+                    image_url["url"] = self._resolve(root, image_url["url"])
 
     @staticmethod
     def _resolve(root: str, path: str) -> str:
@@ -83,10 +93,19 @@ class _TransformDataset(Dataset):
     without silently replacing or duplicating records.
     """
 
-    def __init__(self, source: Dataset, transform: Optional[SampleTransform]) -> None:
+    def __init__(
+            self,
+            source: Dataset,
+            transform: Optional[SampleTransform],
+            *,
+            validate_trainable: bool = True,
+    ) -> None:
         """Build the index of trainable samples from the source dataset."""
         self.source = source
         self.transform = transform
+        if not validate_trainable:
+            self.indices = list(range(len(source)))
+            return
         self.indices = []
         for index, record in enumerate(source):
             sample = transform(record) if transform is not None else record
@@ -120,6 +139,7 @@ def build_vlm_dataset(
         tokenizer: Any = None,
         mesh_context: Any = None,
         training_config: Any = None,
+        validate_trainable: bool = True,
         **dataset_options: Any,
 ) -> Any:
     """Build a transform-wrapped VLM dataset from an online source.
@@ -131,6 +151,9 @@ def build_vlm_dataset(
         tokenizer: Tokenizer (accepted for the shared Trainer contract).
         mesh_context: Mesh context (accepted for the shared Trainer contract).
         training_config: Training plan (accepted for the shared Trainer contract).
+        validate_trainable: Whether to eagerly drop records without labels.
+            Set false for validated fixed-length V4.1 SFT data to avoid image
+            preprocessing every record before the first training batch.
         **dataset_options: Reserved source-specific options.
 
     Returns:
@@ -144,7 +167,7 @@ def build_vlm_dataset(
         raise ValueError(f"Unsupported VLM source type: {data_config.get('source_type')!r}")
     if data_path is None:
         raise ValueError("online VLM dataset requires data_path")
-    return _TransformDataset(VLMDataset(data_path), transform)
+    return _TransformDataset(VLMDataset(data_path), transform, validate_trainable=validate_trainable)
 
 
 __all__ = ["VLMDataset", "build_vlm_dataset"]

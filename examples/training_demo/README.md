@@ -1,4 +1,4 @@
-# Cropped Qwen3-MoE training demos
+# Cropped Hugging Face training demos
 
 These examples build a layer-cropped Qwen3-30B-A3B model with
 `HyperAutoModelForCausalLM.from_config`. They read the complete Hugging Face
@@ -103,3 +103,84 @@ model/tokenizer loading into `local_files_only` mode. The Offline launcher also
 validates both Indexed Dataset files. Missing local assets therefore fail
 explicitly rather than triggering a network download. Additional typed Trainer
 overrides may be appended to either command.
+
+## DeepSeek-V4.1 Engram and shared compressed attention
+
+`train_deepseek_v41_online.yaml` is a four-layer, randomly initialized
+DeepSeek-V4.1 text crop. Four layers are the minimum that execute all requested
+paths: layer 1 owns Engram, layer 2 publishes compressed KV and Lightning
+Indexer selections plus compact hierarchical candidate blocks, and layer 3
+performs a fresh Reindex over that candidate pool. The crop also enables the
+PanGu-style selected-TopK Indexer KL training path. Vision, DSpark, the second
+Engram layer, later compressed-attention source groups, PP-stage shadow
+indexers, runtime KV-cache decode, and FP4 QAT remain outside this validation
+crop. Raw KV, shared compressed KV, and compressed index K use PanGu-style
+asynchronous KV-all-gather CP.
+
+The Engram table is scaled consistently instead of truncating a checkpoint
+table. `prepare_deepseek_v41_assets.py` changes every active hash bucket to a
+different prime near 4096, then recomputes offsets and the embedding row count.
+For the active layer-1 table this changes 384,006,168 rows to 100,776 rows while
+retaining 3 n-gram orders, 8 hash heads, and a 256-wide embedding. The tokenizer
+normalization and hash multipliers remain the V4.1 values.
+
+Online packing emits compact sample boundaries instead of a dense `[S,S]`
+attention mask. Each packed sample is aligned to the encoder compression ratio,
+so neither CSA2 compressor groups nor Engram n-grams cross sample boundaries.
+
+Prepare the shell using
+[`current_hf_model_environment.md`](../../docs/guide/trainer/current_hf_model_environment.md),
+then run TP1 first. A successful TP1 run creates a marker required by TP2:
+
+```bash
+bash examples/training_demo/run_deepseek_v41_online.sh \
+    /path/to/DeepSeek-V4.1-Flash tp1
+
+bash examples/training_demo/run_deepseek_v41_online.sh \
+    /path/to/DeepSeek-V4.1-Flash tp2
+
+bash examples/training_demo/run_deepseek_v41_online.sh \
+    /path/to/DeepSeek-V4.1-Flash cp2
+```
+
+All modes use 16 processes, Online tokenization, a 4096-token sequence, EP=16,
+and the mandatory FP32-main-parameter policy. TP1 uses FSDP=16; TP2 uses
+FSDP=8 and enables sequence parallel so Engram's replicated fusion projections
+operate on disjoint token slices, matching PanGu's `SequenceParallelLinear`
+contract. CP2 keeps TP=1 and uses asynchronous Colossal/KV-all-gather CP; it
+does not use Ulysses sequence-to-head exchange. The launcher reads only local
+config/tokenizer files and creates the scaled Engram metadata plus deterministic
+Online JSONL under `output/training_demo/deepseek_v41`.
+
+The algorithm comparison, TP/CP/EP placement rationale, parameter inventory,
+and validation results are recorded in
+[`deepseek_v41_mhc_engram_migration_report.md`](../../docs/guide/trainer/deepseek_v41_mhc_engram_migration_report.md).
+The DSA module and CP design, including why the legacy MLA/DSA Ulysses wrapper
+does not fit CSA2, are documented in
+[`deepseek_v41_dsa_cp_adapter_analysis.md`](../../docs/guide/trainer/deepseek_v41_dsa_cp_adapter_analysis.md).
+
+## DeepSeek-V4.1 native multimodal Online smoke
+
+The multimodal recipe adds the native V4.1 ViT, 3x3 aligner, image-boundary
+embeddings, image-aware MoE routing, and OpenAI-messages image data transform.
+It uses one vision block and 16 routed experts for the validation crop while
+retaining the released model dimensions. The model adapter declares per-vision
+block, aligner, and mixed-mesh Engram FSDP units plus the actual forward order;
+the generic FSDP manager contains no DeepSeek-specific branches.
+
+Prepare the environment and the local image JSONL, then run:
+
+```bash
+bash examples/training_demo/run_deepseek_v41_vlm_online.sh \
+    /path/to/DeepSeek-V4.1-Flash \
+    /path/to/train.jsonl
+```
+
+The default data path is
+`output/training_demo/deepseek_v41/mm_data/deepseek_v41_messages/train.jsonl`.
+The launcher removes a stale success marker before starting and recreates it
+only after all 16 ranks complete. FSDP design, parameter ownership, validation
+evidence, and remaining full-model work are recorded in
+[`deepseek_v41_multimodal_fsdp_report.md`](../../docs/guide/trainer/deepseek_v41_multimodal_fsdp_report.md).
+The 16-card, 4K, 100-step Online result and reproducible loss curve are in
+[`deepseek_v41_flash_hyperparallel_100step_report.md`](../../docs/guide/trainer/deepseek_v41_flash_hyperparallel_100step_report.md).

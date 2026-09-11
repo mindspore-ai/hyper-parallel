@@ -1,0 +1,258 @@
+# Four-layer DeepSeek-V4.1 validation crop: Online 4K and EP16.
+# The launcher selects TP1/FSDP16 or TP2/FSDP8 with sequence parallel.
+
+model:
+  _target_: examples.training_demo.cropped_deepseek_v41.build_cropped_deepseek_v41
+  config_path: /path/to/DeepSeek-V4.1-Flash
+  engram_assets_path: ./output/training_demo/deepseek_v41/engram_validation.json
+  num_hidden_layers: 4
+  # Exercise the released decoder's post-training Full -> Reindex hierarchy
+  # on crop layers 2 -> 3. The crop keeps a larger-than-TopK candidate pool.
+  exercise_post_training_indexer: true
+  # Validation-only value: the V4.1 report does not publish the production
+  # coefficient. This activates PanGu-style sparse-stage Indexer KL training.
+  indexer_loss_coeff: 0.001
+  torch_dtype: bfloat16
+  validate_placement: false
+
+model_init_dtype: float32
+
+training:
+  train_iters: 1
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 16
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 16
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 16
+  edp_shard_size: 1
+  replicate_params: []
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: false
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  - match:
+      - "model.layers.0.attn_hc"
+      - "model.layers.0.ffn_hc"
+      - "model.layers.1.attn_hc"
+      - "model.layers.1.ffn_hc"
+      - "model.layers.2.attn_hc"
+      - "model.layers.2.ffn_hc"
+      - "model.layers.3.attn_hc"
+      - "model.layers.3.ffn_hc"
+    module_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4HyperConnection
+    replace_module:
+      _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+  - match: "model.layers.1.engram"
+    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41EngramPlaceholder
+    replace_module:
+      _target_: hyper_parallel.components.modules.engram.EngramModule
+  - match:
+      - "model.layers.0.self_attn"
+      - "model.layers.1.self_attn"
+      - "model.layers.2.self_attn"
+      - "model.layers.3.self_attn"
+    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41AttentionPlaceholder
+    replace_module:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.replacements.replace_deepseek_v41_shared_attention
+  - match: "*.self_attn"
+    # num_heads is auto-derived from q_b_proj sharding; the KV-group ratio is
+    # TP-invariant. Only V4.1's grouped output-projection count is custom.
+    tp_divide_attrs: [num_groups]
+  - match: "*.self_attn"
+    # PanGu-style explicit parallel region: Indexer Q/merge heads are TP
+    # column-sharded and all-reduce scores before Top-K; CP keeps local Q and
+    # asynchronously gathers raw KV, compressed KV, and index K. The module
+    # owns the communication launch/wait points.
+    region_dispatch: false
+    inner_target: self
+    inner_wrapper:
+      _target_: >-
+        hyper_parallel.models.deepseek_v41.adapter.context_parallel.deepseek_v41_shared_attention_parallel_wrapper
+  # mHC is full-hidden pointwise compute. Like PanGu SequenceParallelLinear,
+  # its small coefficient parameters stay replicated across TP; CP only owns
+  # the local token slice and FSDP owns parameter sharding on the DP×CP domain.
+  - match: "model.layers.0.attn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.0.ffn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.1.attn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.1.ffn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.1.engram"
+    params:
+      q_weight: {tp: replicate}
+      k_weight: {tp: replicate}
+      # The flat table is the only Engram state row-sharded across the virtual
+      # EP domain. Lookup values/gradients travel through sparse all-to-all.
+      embed.weight: {ep: "shard(0)"}
+      wkv.weight: {tp: replicate}
+  - match: "model.layers.1.engram"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.expert_parallel.deepseek_v41_engram_compute_fn
+  - match: "model.layers.2.attn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.2.ffn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.3.attn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.3.ffn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.expert_parallel.deepseek_v41_ep_compute_fn
+      use_grouped_gemm: false
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: "off"
+
+activation_swap: none
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /path/to/DeepSeek-V4.1-Flash
+      local_files_only: true
+      use_fast: true
+      trust_remote_code: false
+  data_transform:
+    _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 4096
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
+  data_path: ./output/training_demo/deepseek_v41/online_4k.jsonl
+  data_config:
+    dataset_type: mapping
+    hf_dataset_name: null
+    # Emit compact sample boundaries through the V4.1 runtime adapter. A dense
+    # [S,S] mask would be infeasible at the report's 64K/1M training lengths.
+    create_attention_mask_in_dataloader: true
+    labels_are_shifted: true
+
+dataloader:
+  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
+  min_buffered_samples: 16
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+    # Encoder CSA2 uses ratio=2. Per-sample alignment prevents one compressed
+    # group from mixing the tail of one packed sample with the next sample.
+    sample_alignment: 2
+  get_batch:
+    _target_: hyper_parallel.data.batching.ParallelBatch
+    source_type: online
+    attention_mode: compressed
+    cp_algorithm: colossal
+    # Nested targets let the model adapter supply its compact CSA2 metadata
+    # contract while the framework continues to own the generic batch flow.
+    attention_runtime_adapter:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.packed_sequence.DeepseekV41AttentionRuntimeAdapter
+  dataloader_type: cyclic
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  fp32_main_params: true
+  no_decay_params: [bias, norm, ln_]
+  muon_config:
+    muon_lr: 3.0e-5
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 3.0e-5
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./output/training_demo/deepseek_v41/checkpoints
+  restore_from: null
+
+debug:
+  check_nan_inf: false
+  check_dataset: null

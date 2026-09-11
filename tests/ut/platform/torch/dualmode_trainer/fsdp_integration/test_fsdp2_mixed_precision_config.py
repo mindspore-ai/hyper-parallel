@@ -17,7 +17,8 @@
 
 import os
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
@@ -29,6 +30,27 @@ from hyper_parallel.models.build_options import (
 )
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from tests.common.mark_utils import arg_mark
+
+
+class _AdapterDeclaredFSDPModel(torch.nn.Module):
+    """Minimal model that declares two non-decoder FSDP execution units."""
+
+    gradient_checkpointing = False
+
+    def __init__(self) -> None:
+        """Create visual modules outside the HF decoder discovery convention."""
+        super().__init__()
+        self.config = SimpleNamespace(
+            model_type="adapter_declared_fsdp_test",
+            architectures=[],
+        )
+        self.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+        self.vision = torch.nn.Sequential(
+            torch.nn.Linear(2, 2),
+            torch.nn.ReLU(),
+            torch.nn.Linear(2, 2),
+        )
+        self.aligner = torch.nn.Linear(2, 2)
 
 
 class TestFSDP2MixedPrecisionConfig(unittest.TestCase):
@@ -97,6 +119,74 @@ class TestFSDP2MixedPrecisionConfig(unittest.TestCase):
         self.assertTrue(configured)
         hsdp_module.set_reduce_op_type.assert_called_once_with("sum", recurse=False)
         hsdp_module.set_gradient_scaling_factor.assert_called_once_with(1.0 / 8.0)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_model_declares_non_decoder_fsdp_units(self):
+        """Discover adapter-declared units alongside ordinary FSDP units.
+
+        Feature: extensible FSDP child-unit discovery.
+        Description: A custom model declares vision modules not represented by
+            HF's gradient-checkpointing decoder container.
+        Expectation: The FSDP manager preserves their full model-qualified
+            module paths as independently unsharded forward units.
+        """
+        manager = FSDP2Manager(FSDP2Config(), MagicMock())
+        adapter_spec = SimpleNamespace(
+            fsdp_wrap_modules=lambda model: ("vision.0", "aligner"),
+            fsdp_excluded_subtrees=lambda model: ("vision",),
+            fsdp_execution_order=lambda model, module_fqns: (
+                "vision.0",
+                "aligner",
+                "layers.0",
+            ),
+        )
+        model = _AdapterDeclaredFSDPModel()
+        with patch(
+            "hyper_parallel.distributed._builder.fsdp_adapter.get_model_adapter",
+            return_value=adapter_spec,
+        ):
+            wrap_modules = manager._find_wrap_modules(  # pylint: disable=protected-access
+                model,
+            )
+            ordered_wrap_modules = manager._order_wrap_modules(  # pylint: disable=protected-access
+                model,
+                wrap_modules,
+            )
+
+        self.assertEqual(
+            [wrap_module.fqn for wrap_module in wrap_modules],
+            ["layers.0", "vision.0", "aligner"],
+        )
+        self.assertEqual(
+            [wrap_module.fqn for wrap_module in ordered_wrap_modules],
+            ["vision.0", "aligner", "layers.0"],
+        )
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_model_accepts_nested_declared_fsdp_units(self):
+        """Accept adapter declarations with intentional nested ownership.
+
+        Feature: extensible FSDP child-unit validation.
+        Description: A model adapter declares a parent on one FSDP mesh and a
+            large descendant that will use another mesh.
+        Expectation: Both units are retained so the deepest unit can be
+            wrapped first and excluded from its parent's managed parameters.
+        """
+        model = _AdapterDeclaredFSDPModel()
+        adapter_spec = SimpleNamespace(
+            fsdp_wrap_modules=lambda model: ("vision", "vision.0"),
+        )
+        with patch(
+            "hyper_parallel.distributed._builder.fsdp_adapter.get_model_adapter",
+            return_value=adapter_spec,
+        ):
+            wrap_modules = FSDP2Manager._find_adapter_declared_wrap_modules(  # pylint: disable=protected-access
+                model,
+            )
+        self.assertEqual(
+            [wrap_module.fqn for wrap_module in wrap_modules],
+            ["vision", "vision.0"],
+        )
 
 
 if __name__ == "__main__":

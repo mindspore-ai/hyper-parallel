@@ -190,14 +190,14 @@ def _validate_ep_compute_injections(plan, model):
                         "module's actual submodule names).\n"
                     )
             raise ValueError(
-                f"ep_size={spec._ep_size} is active (expert parameters "  # pylint: disable=protected-access
-                f"will be sharded as {{EP: Shard(0)}}), but boundary "
+                f"ep_size={spec._ep_size} is active (parameters explicitly "  # pylint: disable=protected-access
+                f"declared with EP sharding use the virtual-EP source mesh), but boundary "
                 f"{fqn!r} has no local-region compute source — nothing "
-                "executes the expert compute and all-to-all, and the "
+                "executes the corresponding local compute and all-to-all, and the "
                 "framework no longer injects any implementation "
                 "automatically. Choose one of:\n"
                 f"{suggestion}"
-                "  ① Pick a built-in archetype factory per the model's "
+                "  ① Routed MoE: pick a built-in archetype factory per the model's "
                 "behavior (full semantics: router / shared expert / gate / "
                 "merge all implemented cohesively; see the recipes.py "
                 "module docstring for the available archetypes and the "
@@ -211,11 +211,11 @@ def _validate_ep_compute_injections(plan, model):
                 "           _target_: hyper_parallel.distributed.expert_parallel."
                 "recipes.qwen2moe_ep_compute_fn   # pick per the "
                 "archetype table\n"
-                "  ② Atypical MoE → write your own factory following "
-                "examples/distributed/ep_factories.py (use require_attrs "
-                "for the same build-time interface validation)\n"
-                "  ③ In-house EP-aware MoE (all-to-all already inside "
-                "forward) → declare region_dispatch: false")
+                "  ② Model-specific MoE or another EP-sharded module (for "
+                "example a sparse table): provide a local_compute_fn from "
+                "models/<family>/adapter and validate its interface at build time\n"
+                "  ③ A module whose forward already owns all-to-all: declare "
+                "region_dispatch: false")
 
 
 def _preflight_compute_injection(plan, mesh, model=None):

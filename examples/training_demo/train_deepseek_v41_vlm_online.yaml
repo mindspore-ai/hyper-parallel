@@ -1,0 +1,259 @@
+# Four-layer DeepSeek-V4.1 native-VLM validation crop.
+# This smoke uses one vision block (rather than the released 32) while retaining
+# every released hidden, attention, patch, aligner, vocabulary, and expert size.
+
+model:
+  _target_: examples.training_demo.cropped_deepseek_v41.build_cropped_deepseek_v41
+  config_path: /path/to/DeepSeek-V4.1-Flash
+  engram_assets_path: ./output/training_demo/deepseek_v41/engram_validation.json
+  num_hidden_layers: 4
+  vision_num_hidden_layers: 1
+  # EP16 smoke: one routed expert per rank, while preserving the released
+  # top-k (6), routing, dispatch, and optimizer-sharding paths.
+  num_routed_experts: 16
+  exercise_post_training_indexer: true
+  indexer_loss_coeff: 0.001
+  torch_dtype: bfloat16
+  validate_placement: false
+
+model_init_dtype: float32
+
+training:
+  train_iters: 1
+  train_samples: null
+  eval_iters: 0
+  # EP16 forms a 16-rank data-parallel domain.  Keep one 4k multimodal
+  # sample per rank while making one optimizer step globally well-defined.
+  global_batch_size: 16
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 16
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 16
+  edp_shard_size: 1
+  replicate_params: []
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: false
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  - match:
+      - "model.layers.0.attn_hc"
+      - "model.layers.0.ffn_hc"
+      - "model.layers.1.attn_hc"
+      - "model.layers.1.ffn_hc"
+      - "model.layers.2.attn_hc"
+      - "model.layers.2.ffn_hc"
+      - "model.layers.3.attn_hc"
+      - "model.layers.3.ffn_hc"
+    module_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4HyperConnection
+    replace_module:
+      _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+  - match: "model.layers.1.engram"
+    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41EngramPlaceholder
+    replace_module:
+      _target_: hyper_parallel.components.modules.engram.EngramModule
+  - match:
+      - "model.layers.0.self_attn"
+      - "model.layers.1.self_attn"
+      - "model.layers.2.self_attn"
+      - "model.layers.3.self_attn"
+    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41AttentionPlaceholder
+    replace_module:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.replacements.replace_deepseek_v41_shared_attention
+  - match: "*.self_attn"
+    tp_divide_attrs: [num_groups]
+  - match: "*.self_attn"
+    region_dispatch: false
+    inner_target: self
+    inner_wrapper:
+      _target_: >-
+        hyper_parallel.models.deepseek_v41.adapter.context_parallel.deepseek_v41_shared_attention_parallel_wrapper
+  # V4.1 image boundary embeddings are model-owned scalars. They stay
+  # replicated over TP (TP1 in this smoke) and are covered by FSDP16.
+  - match: "model"
+    params:
+      image_start: {tp: replicate}
+      image_end: {tp: replicate}
+      image_newline: {tp: replicate}
+  # mHC coefficients are pointwise full-hidden parameters. They remain
+  # replicated over TP while FSDP shards their optimizer state.
+  - match: "model.layers.0.attn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.0.ffn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.1.attn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.1.ffn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.1.engram"
+    params:
+      q_weight: {tp: replicate}
+      k_weight: {tp: replicate}
+      embed.weight: {ep: "shard(0)"}
+      wkv.weight: {tp: replicate}
+  - match: "model.layers.1.engram"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.expert_parallel.deepseek_v41_engram_compute_fn
+  - match: "model.layers.2.attn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.2.ffn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.3.attn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.3.ffn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  # The native vision crop is TP1 in this recipe. Declare its custom linear
+  # weights explicitly so FSDP owns them, and keep them out of decoder-MoE EP.
+  - match: "model.vision.patch_embed.proj"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.vision.blocks.0.attn.wqkv"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.vision.blocks.0.attn.wo"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.layers.*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.expert_parallel.deepseek_v41_ep_compute_fn
+      use_grouped_gemm: false
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: "off"
+
+activation_swap: none
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer: null
+  data_transform:
+    _target_: hyper_parallel.data.vlm.deepseek_v41.build_deepseek_v41_vlm_data_transform
+    config_path: /path/to/DeepSeek-V4.1-Flash
+    max_seq_len: 4096
+    # Keep the released preprocessing semantics while bounding this cropped
+    # validation model to at most 128 post-aligner image tokens per image.
+    max_image_tokens: 128
+  _target_: hyper_parallel.data.vlm.dataset.build_vlm_dataset
+  data_path: ./output/training_demo/deepseek_v41/mm_data/deepseek_v41_messages/train.jsonl
+  data_config:
+    source_type: online
+  validate_trainable: false
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.vlm.collator.build_vlm_collator
+  get_batch:
+    _target_: hyper_parallel.data.vlm.get_batch.build_vlm_get_batch
+    attention_mode: compressed
+    cp_algorithm: colossal
+    attention_runtime_adapter:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.packed_sequence.DeepseekV41AttentionRuntimeAdapter
+  dataloader_type: cyclic
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  fp32_main_params: true
+  no_decay_params: [bias, norm, ln_]
+  muon_config:
+    muon_lr: 3.0e-5
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 3.0e-5
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./output/training_demo/deepseek_v41/vlm_checkpoints
+  restore_from: null
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
