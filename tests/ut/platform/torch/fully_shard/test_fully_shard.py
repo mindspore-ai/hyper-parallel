@@ -576,8 +576,11 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         self.assertIs(param_v2._spmd_mesh, unified_mesh)
         self.assertEqual(placements, (Replicate(), Shard(1)))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
-    def test_storage_source_layout_filters_native_dtensor_fsdp_axes(self, mock_get_rank):
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.is_initialized", return_value=True)
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
+    def test_storage_source_layout_filters_native_dtensor_fsdp_axes(  # pylint: disable=unused-argument
+        self, mock_get_rank, mock_is_initialized
+    ):
         """Storage composition should exclude FSDP-owned axes without mutating compute metadata."""
         # World layout (dp, cp, tp) with rank 0 at coordinate (0, 0, 0). The
         # FSDP domain flattens and renames (dp, cp), so only rank topology —
@@ -798,7 +801,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
                 device=torch.device("cpu"),
             )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
     def test_device_mesh_concatenate_concatenates_explicit_dp_and_tp_meshes(self, mock_get_rank):
         """Verify concatenate rebuilds the original root mesh from DP and TP sub-meshes."""
         root_mesh = DeviceMesh(
@@ -985,7 +988,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         _GROUP_INFO_CACHE.clear()
         EXISTING_COMM_GROUPS.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
     def test_get_rank_list_for_axes_honors_explicit_rank(self, mock_get_rank):
         """Verify get_rank_list_for_axes uses the provided rank instead of mesh.rank."""
         mesh = DeviceMesh(
@@ -1000,7 +1003,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         self.assertEqual(rank_list, [1, 3])
 
     @patch("hyper_parallel.platform.torch.fully_shard.state.TorchHSDPParamV2")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
     def test_state_builds_param_metadata_per_parameter(self, mock_get_rank, mock_hsdp_param_cls):
         """Verify managed parameters receive parameter-specific DP and source-layout metadata."""
         mesh = DeviceMesh(
@@ -1068,7 +1071,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         self.assertTrue(passed_source_shard_infos[1].origin_is_dtensor)
 
     @patch("hyper_parallel.platform.torch.fully_shard.state.TorchHSDPParamV2")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
     def test_state_passes_source_shard_info_to_each_parameter(self, mock_get_rank, mock_hsdp_param_cls):
         """The state should pass parameter-identity metadata into each Torch wrapper."""
         mesh = DeviceMesh(
@@ -1312,7 +1315,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "replicate_weight"):
             TorchHSDPStateV2._validate_cpu_offload_params(state)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
     def test_device_mesh_concatenate_rejects_mismatched_root_meshes(self, mock_get_rank):
         """Verify concatenate rejects meshes coming from different root rank sets."""
         dp_mesh = DeviceMesh(
@@ -1335,7 +1338,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "share the same root mesh"):
             DeviceMesh.concatenate([dp_mesh, tp_mesh])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
     def test_device_mesh_concatenate_rejects_root_mesh_without_dp_prefix_order(self, mock_get_rank):
         """Verify concatenate rejects sub-meshes that violate the root mesh dimension order."""
         root_mesh = DeviceMesh(
@@ -1350,7 +1353,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "follow the root mesh order"):
             DeviceMesh.concatenate([dp_mesh, tp_mesh])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
     def test_layout_deepcopy_preserves_submesh_root_for_concatenate(self, mock_get_rank):
         """Verify deepcopy keeps sub-mesh root references usable by concatenate."""
         root_mesh = DeviceMesh(

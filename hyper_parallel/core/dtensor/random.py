@@ -17,6 +17,7 @@
 Provides utilities for tracking and synchronizing random number generator states
 across multiple devices in distributed training scenarios.
 """
+# pylint: disable=C9006,C9007,W0603
 
 __all__ = [
     "is_rng_supported_mesh",
@@ -32,13 +33,14 @@ from typing import Optional
 import functools
 import operator
 
+import torch
+import torch.distributed as dist
+
+from hyper_parallel.core.dtensor import _utils
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.platform import get_platform
 
-platform = get_platform()
-DTensorBase = platform.DTensorBase
-Tensor = platform.tensor
+Tensor = torch.tensor
 
 logger = getLogger(__name__)
 
@@ -52,8 +54,8 @@ def is_rng_supported_mesh(device_mesh: Optional[DeviceMesh] = None) -> bool:
 
     Args:
         device_mesh: Optional :class:`DeviceMesh` to check (same semantics as PyTorch
-            ``torch.distributed.tensor``). If omitted, checks the active platform device
-            handle only.
+            ``torch.distributed.tensor``). If omitted, only the active device handle
+            is checked.
 
     Returns:
         bool: ``True`` if the device mesh supports DTensor random operations,
@@ -65,7 +67,7 @@ def is_rng_supported_mesh(device_mesh: Optional[DeviceMesh] = None) -> bool:
             stacklevel=2,
         )
         return False
-    device_handle = platform.get_device_handle()
+    device_handle = _utils.get_device_handle()
     if device_handle and hasattr(device_handle, "set_rng_state"):
         return True
     if device_mesh is not None:
@@ -95,26 +97,26 @@ class _PhiloxState:
     @property
     def offset(self) -> int:
         """Return the offset value (last 8 bytes) of the Philox RNG state."""
-        return int(self._state[8:].view(dtype=platform.tensor_dtype.int64).item())
+        return int(self._state[8:].view(dtype=torch.int64).item())
 
     @offset.setter
     def offset(self, offset: int) -> None:
         """Set the offset value of the Philox RNG state."""
-        offset_tensor = Tensor([offset], dtype=platform.tensor_dtype.uint64).view(
-            platform.tensor_dtype.uint8
+        offset_tensor = Tensor([offset], dtype=torch.uint64).view(
+            torch.uint8
         ) # device?
         self._state[8:] = offset_tensor
 
     @property
     def seed(self) -> int:
         """Return the seed value (first 8 bytes) of the Philox RNG state."""
-        return int(self._state[:8].view(dtype=platform.tensor_dtype.uint64).item())
+        return int(self._state[:8].view(dtype=torch.uint64).item())
 
     @seed.setter
     def seed(self, seed: int) -> None:
         """Set the seed value of the Philox RNG state."""
-        seed_tensor = Tensor([seed], dtype=platform.tensor_dtype.uint64).view(
-            platform.tensor_dtype.uint8
+        seed_tensor = Tensor([seed], dtype=torch.uint64).view(
+            torch.uint8
         )# device
         self._state[:8] = seed_tensor
 
@@ -132,7 +134,7 @@ class _RNGStateTracker:
 
     def __init__(self, device):
         self._device = device
-        self._device_handle = platform.get_device_handle()
+        self._device_handle = _utils.get_device_handle()
         if not self._device_handle:
             raise RuntimeError(
                 f"{self.__class__.__name__} instantiation requires the presence of "
@@ -173,7 +175,7 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
         rng_state = self._get_device_state()
         if run_state_sync:
             # synchronize RNG state using rank 0's current one
-            platform.broadcast(rng_state, 0)
+            dist.broadcast(rng_state, 0)
             my_rng_state = self._get_device_state()
             if not all(my_rng_state == rng_state):
                 logger.warning(
@@ -187,8 +189,8 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
             self._set_device_state(rng_state)
 
     def _manual_seed(self, parallel_seed: int) -> None:
-        """Set default RNG seed (``platform.manual_seed``); same idea as PyTorch DTensor."""
-        platform.manual_seed(parallel_seed)
+        """Set the default RNG seed (``torch.manual_seed``), as in PyTorch DTensor."""
+        torch.manual_seed(parallel_seed)
 
     def _get_device_state(self):
         rng_state = self._device_handle.get_rng_state().to(self._device)
@@ -218,7 +220,7 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
             old_offset = state.offset
             self._set_pre_op_offset(state, device_mesh, placements, global_shape)
             with fork_rng(
-                devices=[self._device], device_type=platform.device_type()
+                devices=[self._device], device_type=_utils.device_type()
             ):
                 self._device_handle.set_rng_state(state.state)
                 try:
@@ -438,11 +440,11 @@ def _calc_shard_linear_idx(shard_coord: list[int], shard_size: list[int]) -> int
 
 
 def _resolve_device():
-    device_handle = platform.get_device_handle()
-    device_idx = platform.get_rank() % platform.device_count(device_handle)
+    device_handle = _utils.get_device_handle()
+    device_idx = dist.get_rank() % _utils.device_count(device_handle)
 
     def get_device(device_idx):
-        return platform.device(device_idx)
+        return _utils.device(device_idx)
 
     return get_device(device_idx)
 
@@ -487,7 +489,7 @@ def manual_seed(seed: int, device_mesh: DeviceMesh) -> None:
             "the behavior of DTensor random ops is undefined."
         )
 
-    platform.manual_seed(seed)
+    torch.manual_seed(seed)
 
 
 def local_shard_size_and_offset(
@@ -551,10 +553,10 @@ def fork_rng(
             see details in :ref:`accelerator<accelerators>`
     """
 
-    device_mod = platform.get_device_handle()
+    device_mod = _utils.get_device_handle()
     if device_mod is None:
         raise RuntimeError(
-            f"{platform} has no module of `{device_type}`, you should register "
+            f"torch has no module of `{device_type}`, you should register it first."
         )
     global _fork_rng_warned_already
 
@@ -563,7 +565,7 @@ def fork_rng(
         return
 
     if devices is None:
-        num_devices = platform.device_count(device_mod)
+        num_devices = _utils.device_count(device_mod)
         if num_devices > 1 and not _fork_rng_warned_already:
             _fork_rng_warned_already = True
         devices = list(range(num_devices))
@@ -572,12 +574,12 @@ def fork_rng(
         # multiple times but a generator will be exhausted upon first traversal
         devices = list(devices)
 
-    cpu_rng_state = platform.get_rng_state()
-    device_rng_states = [platform.get_rng_state(device, device_mod) for device in devices]
+    cpu_rng_state = _utils.get_rng_state()
+    device_rng_states = [_utils.get_rng_state(device, device_mod) for device in devices]
 
     try:
         yield
     finally:
-        platform.set_rng_state(cpu_rng_state)
+        _utils.set_rng_state(cpu_rng_state)
         for device, device_rng_state in zip(devices, device_rng_states):
-            platform.set_rng_state(device_rng_state, device, device_mod)
+            _utils.set_rng_state(device_rng_state, device, device_mod)

@@ -40,6 +40,12 @@ class TestParallelTopK(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Restore global cache state after each test."""
@@ -59,9 +65,6 @@ class TestParallelTopK(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -84,7 +87,7 @@ class TestParallelTopK(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=4)
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_topk_layout_data_parallel(self, mock_platform):
         """
         Feature: TopK data parallel
@@ -114,7 +117,7 @@ class TestParallelTopK(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_topk_layout_tensor_parallel(self, mock_platform):
         """
         Feature: TopK tensor parallel
@@ -134,7 +137,7 @@ class TestParallelTopK(unittest.TestCase):
             f"got values={values_layout.tensor_map}, indices={indices_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_topk_layout_tensor_and_data_parallel(self, mock_platform):
         """
         Feature: TopK hybrid parallel
@@ -154,7 +157,7 @@ class TestParallelTopK(unittest.TestCase):
             f"got values={values_layout.tensor_map}, indices={indices_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_topk_partial_input_raises_error(self, mock_platform):
         """
         Feature: TopKDistributedOp rejects inputs with Partial status.
@@ -168,7 +171,7 @@ class TestParallelTopK(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             torch_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_topk_layout_data_parallel(self, mock_platform):
         """
         Feature: TopK data parallel (torch path)
@@ -188,7 +191,7 @@ class TestParallelTopK(unittest.TestCase):
             f"got values={values_layout.tensor_map}, indices={indices_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_topk_layout_tensor_parallel(self, mock_platform):
         """
         Feature: TopK tensor parallel (torch path)
@@ -208,7 +211,7 @@ class TestParallelTopK(unittest.TestCase):
             f"got values={values_layout.tensor_map}, indices={indices_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_topk_layout_mixed_parallel_invalid(self, mock_platform):
         """
         Feature: Test topk on a sharded dimension
@@ -222,7 +225,7 @@ class TestParallelTopK(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sharded dimension"):
             torch_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_topk_layout_error_dim_out_of_range(self, mock_platform):
         """
         Feature: Test indicating a invalid dim
@@ -236,7 +239,7 @@ class TestParallelTopK(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dimension out of range"):
             torch_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_topk_preprocess_torch(self, mock_platform):
         """
         Feature: TopKDistributedOp preprocess for PyTorch path.
@@ -267,7 +270,7 @@ class TestParallelTopK(unittest.TestCase):
             f"dim default should be -1, got {local_args[2]}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_topk_preprocess_mindspore(self, mock_platform):
         """
         Feature: TopKDistributedOp preprocess for MindSpore Primitive path.
@@ -299,7 +302,7 @@ class TestParallelTopK(unittest.TestCase):
         )
 
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_topk_multiaxis_tuple_sharded_dim_error(self, mock_platform):
         """
         Feature: TopKDistributedOp rejects StridedShard multi-axis mapping on topk dim.

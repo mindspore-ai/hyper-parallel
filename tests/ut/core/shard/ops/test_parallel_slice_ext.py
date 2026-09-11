@@ -15,7 +15,7 @@
 """parallel_slice_ext test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
@@ -38,6 +38,12 @@ class TestParallelSliceExt(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Restore global cache state after each test."""
@@ -51,9 +57,6 @@ class TestParallelSliceExt(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, mp, cp) mesh via init_device_mesh."""
@@ -65,7 +68,7 @@ class TestParallelSliceExt(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=4)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_normal(self, mock_platform):
         """
         Feature: SliceExt operator layout inference under normal conditions.
@@ -95,7 +98,7 @@ class TestParallelSliceExt(unittest.TestCase):
             f"got {slice_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_sharded_axis_error(self, mock_platform):
         """
         Feature: SliceExt operator layout inference with sharded axis.
@@ -111,7 +114,7 @@ class TestParallelSliceExt(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sharded axis"):
             slice_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_negative_dim(self, mock_platform):
         """
         Feature: SliceExt operator handles negative dimension index.
@@ -139,7 +142,7 @@ class TestParallelSliceExt(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sharded axis"):
             slice_op.infer_layout(cache_values_invalid)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_all_replicate(self, mock_platform):
         """
         Feature: SliceExt operator layout inference with all Replicate placements.
@@ -160,7 +163,7 @@ class TestParallelSliceExt(unittest.TestCase):
             f"expected {input_layout.tensor_map}, got {output_layout.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_partial_input_error(self, mock_platform):
         """
         Feature: SliceExt operator rejects Partial status inputs.
@@ -175,7 +178,7 @@ class TestParallelSliceExt(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             slice_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_invalid_axis_type(self, mock_platform):
         """
         Feature: SliceExt operator validates axis is int.
@@ -189,7 +192,7 @@ class TestParallelSliceExt(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "axis should be int"):
             slice_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_infer_layout_axis_out_of_range(self, mock_platform):
         """
         Feature: SliceExt operator validates axis is in range.

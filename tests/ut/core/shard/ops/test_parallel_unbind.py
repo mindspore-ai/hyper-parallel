@@ -40,6 +40,12 @@ class TestParallelUnbind(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -59,9 +65,6 @@ class TestParallelUnbind(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -73,7 +76,7 @@ class TestParallelUnbind(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=mesh_dim_names)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_layout_inference_dim0(self, mock_platform):
         """
         Feature: Unbind on unsharded dimension 0
@@ -108,7 +111,7 @@ class TestParallelUnbind(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_layout_inference_dim1(self, mock_platform):
         """
         Feature: Unbind on unsharded dimension 1
@@ -133,7 +136,7 @@ class TestParallelUnbind(unittest.TestCase):
                 f"Unbind dim1 failed. Expected {expected_map}, got {layout.to_dict()['tensor_map']}"
             )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_layout_inference_negative_dim(self, mock_platform):
         """
         Feature: Unbind with negative dimension
@@ -158,7 +161,7 @@ class TestParallelUnbind(unittest.TestCase):
                 f"Unbind negative dim failed. Expected {expected_map}, got {layout.to_dict()['tensor_map']}"
             )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_layout_sharded_dim_error(self, mock_platform):
         """
         Feature: Unbind sharded dimension error
@@ -174,7 +177,7 @@ class TestParallelUnbind(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unbinding a sharded dimension is not supported"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_layout_dim_out_of_range(self, mock_platform):
         """
         Feature: Unbind dimension out of range
@@ -190,7 +193,7 @@ class TestParallelUnbind(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dimension out of range"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_preprocess(self, mock_platform):
         """
         Feature: Unbind preprocess
@@ -229,7 +232,7 @@ class TestParallelUnbind(unittest.TestCase):
             f"Expected dim=0 in cache_values[2], got {cache_values[2]}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_preprocess_default_dim(self, mock_platform):
         """
         Feature: Unbind preprocess with default dim

@@ -64,7 +64,7 @@ class TestFromLocalRunCheck(unittest.TestCase):
             del obj
             out_list[:] = gathered
 
-        with patch("hyper_parallel.core.dtensor._from_local_utils.platform.all_gather_object", side_effect=fake_all_gather):
+        with patch("hyper_parallel.core.dtensor._from_local_utils.dist.all_gather_object", side_effect=fake_all_gather):
             with self.assertRaises(ValueError):
                 _from_local_utils.check_tensor_meta(
                     local,

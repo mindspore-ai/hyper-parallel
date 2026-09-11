@@ -38,6 +38,12 @@ class TestParallelStack(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         EXISTING_COMM_GROUPS.clear()
@@ -48,9 +54,6 @@ class TestParallelStack(unittest.TestCase):
         """Mock a 2x4 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         mock_platform.platform_type = MagicMock()
         return init_device_mesh(
             device_type="cpu",
@@ -60,7 +63,7 @@ class TestParallelStack(unittest.TestCase):
         )
 
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_layout_inference_dim_0(self, mock_platform):
         """Test Stack layout inference inserting a new dimension at dim 0."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -91,7 +94,7 @@ class TestParallelStack(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_layout_inference_dim_last(self, mock_platform):
         """Test Stack layout inference inserting a new dimension at the end."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -110,7 +113,7 @@ class TestParallelStack(unittest.TestCase):
         self.assertEqual(out_layout.tensor_map, expected_map,
                          f"Expected {expected_map}, got {out_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_layout_inference_all_replicate(self, mock_platform):
         """Test Stack layout inference with fully replicated inputs."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -128,7 +131,7 @@ class TestParallelStack(unittest.TestCase):
         self.assertEqual(out_layout.tensor_map, expected_map)
 
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_preprocess_single_tensor(self, mock_platform):
         """Test Stack preprocess handles a single input tensor correctly."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -149,7 +152,7 @@ class TestParallelStack(unittest.TestCase):
         self.assertEqual(cache_values[0], x_layout)
         self.assertEqual(cache_values[1], 0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_layout_inference_1d_tensor(self, mock_platform):
         """Test Stack layout inference when stacking 1D tensors into a 2D tensor."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -172,7 +175,7 @@ class TestParallelStack(unittest.TestCase):
         self.assertEqual(out_layout.tensor_map, expected_map)
         self.assertIsNone(extra_info)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_layout_inference_0d_tensor(self, mock_platform):
         """Test Stack layout inference when stacking 0D tensors (scalars) into a 1D tensor."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -196,14 +199,11 @@ class TestParallelStack(unittest.TestCase):
         """Mock a 2x2x2 device mesh for complex tests."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
         mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 2, 2),
                                 mesh_dim_names=("dp", "tp", "mp"), init_backend=False)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_layout_inference_complex_mesh(self, mock_platform):
         """Test Stack layout inference on a 3D mesh with mixed sharding."""
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -226,7 +226,7 @@ class TestParallelStack(unittest.TestCase):
         expected_map = (2, -1, 0)
         self.assertEqual(out_layout.tensor_map, expected_map)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_layout_inference_negative_dim_last(self, mock_platform):
         """Test Stack layout inference using dim=-1 (stacking at the end)."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -246,7 +246,7 @@ class TestParallelStack(unittest.TestCase):
                          f"Expected {expected_map}, got {out_layout.tensor_map}")
         self.assertIsNone(extra_info)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_layout_inference_negative_dim_first(self, mock_platform):
         """Test Stack layout inference using dim=-3 for a 2D tensor (stacking at the beginning)."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -265,7 +265,7 @@ class TestParallelStack(unittest.TestCase):
         self.assertEqual(out_layout.tensor_map, expected_map,
                          f"Expected {expected_map}, got {out_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_preprocess_multiple_tensors(self, mock_platform):
         """Test Stack preprocess properly extracts locals from multiple tensors."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -292,7 +292,7 @@ class TestParallelStack(unittest.TestCase):
         self.assertEqual(cache_values[1], x_layout)
         self.assertEqual(cache_values[2], 1)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_layout_inference_mismatched_layouts(self, mock_platform):
         """Test Stack layout inference raises ValueError for mismatched input layouts."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -305,7 +305,7 @@ class TestParallelStack(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "all input tensors must have the same layout"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_layout_inference_empty_inputs(self, mock_platform):
         """Test Stack layout inference raises ValueError when no layouts are provided."""
         # Only dimension is passed in cache_values, mimicking an empty tensor list
@@ -314,7 +314,7 @@ class TestParallelStack(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "stack requires at least one input tensor"):
             op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_layout_inference_dim_out_of_bounds(self, mock_platform):
         """Test Stack layout inference raises ValueError when dimension is out of valid bounds."""
         mesh = self._make_2x4_mesh(mock_platform)
@@ -330,7 +330,7 @@ class TestParallelStack(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dimension out of range"):
             op.infer_layout(cache_values_neg)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_partial_input_raises_error(self, mock_platform):
         """
         Feature: StackDistributedOp rejects inputs with Partial status.
@@ -352,6 +352,12 @@ class TestParallelStackExt(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clean up after each test method."""
@@ -365,9 +371,6 @@ class TestParallelStackExt(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, cp, mp) mesh via init_device_mesh."""
@@ -394,7 +397,7 @@ class TestParallelStackExt(unittest.TestCase):
             f"StackExt failed. Expected {expected_map}, got {got_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_ext_dispatch_and_layout(self, mock_platform):
         """
         Feature: StackExt distributed op dispatch and layout inference
@@ -419,7 +422,7 @@ class TestParallelStackExt(unittest.TestCase):
             f"got {stack_ext_op.get_expand_impl(None, infer_result, cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_ext_layout_cache(self, mock_platform):
         """
         Feature: StackExt layout inference stability (cache-like behavior)
@@ -437,7 +440,7 @@ class TestParallelStackExt(unittest.TestCase):
 
         assert out1[0].tensor_map == out2[0].tensor_map
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_ext_axis0_same_layout_1(self, mock_platform):
         """
         Feature: StackExt output layout inference with inserted dimension
@@ -451,7 +454,7 @@ class TestParallelStackExt(unittest.TestCase):
 
         self._run_scenario(layouts=[x1, x2], axis=0, expected_map=(-1, 2, 1, 0))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_ext_axis1_same_layout_2(self, mock_platform):
         """
         Feature: StackExt output layout inference with inserted dimension
@@ -465,7 +468,7 @@ class TestParallelStackExt(unittest.TestCase):
 
         self._run_scenario(layouts=[x1, x2], axis=1, expected_map=(2, -1, 1, 0))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_ext_axis_minus1_3(self, mock_platform):
         """
         Feature: StackExt output layout inference with inserted dimension
@@ -479,7 +482,7 @@ class TestParallelStackExt(unittest.TestCase):
 
         self._run_scenario(layouts=[x1, x2], axis=-1, expected_map=(2, 1, 0, -1))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_ext_with_none_layout_4(self, mock_platform):
         """
         Feature: StackExt layout inference with optional None-layout inputs
@@ -494,7 +497,7 @@ class TestParallelStackExt(unittest.TestCase):
 
         self._run_scenario(layouts=[x1, x2], axis=0, expected_map=(-1, 2, 1, 0))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_ext_mismatch_tensor_map_should_raise_5(self, mock_platform):
         """
         Feature: StackExt input layout validation
@@ -509,7 +512,7 @@ class TestParallelStackExt(unittest.TestCase):
         with self.assertRaises(ValueError):
             _ = self._infer_layout(stack_ext_op, [x1, x2], axis=0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_ext_mismatch_mesh_shape_should_raise_6(self, mock_platform):
         """
         Feature: StackExt input layout validation
@@ -526,7 +529,7 @@ class TestParallelStackExt(unittest.TestCase):
         with self.assertRaises(ValueError):
             _ = self._infer_layout(stack_ext_op, [x1, x2], axis=0)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_stack_ext_axis_out_of_range_should_raise_7(self, mock_platform):
         """
         Feature: StackExt axis range validation

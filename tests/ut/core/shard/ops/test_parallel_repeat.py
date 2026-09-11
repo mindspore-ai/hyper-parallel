@@ -41,6 +41,12 @@ class TestParallelRepeat(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -60,9 +66,6 @@ class TestParallelRepeat(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.tensor_to_numpy.side_effect = (
-            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
-        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
@@ -91,7 +94,7 @@ class TestParallelRepeat(unittest.TestCase):
         assert extra_info is None, f"Repeat extra_info should be None, got {extra_info}"
         return output_layouts[0], output_layouts, cache_values
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_inference(self, mock_platform):
         """
         Feature: Repeat unsharded dimension
@@ -116,7 +119,7 @@ class TestParallelRepeat(unittest.TestCase):
             f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_inference_3d(self, mock_platform):
         """
         Feature: Repeat with preservation (repeat=1)
@@ -134,7 +137,7 @@ class TestParallelRepeat(unittest.TestCase):
             f"Preserve with repeat=1 failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_prepend_new_dimensions(self, mock_platform):
         """
         Feature: Repeat prepending multiple new dimensions
@@ -152,7 +155,7 @@ class TestParallelRepeat(unittest.TestCase):
             f"Prepend multiple new dimensions failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_scalar_expansion(self, mock_platform):
         """
         Feature: Repeat scalar tensor
@@ -170,7 +173,7 @@ class TestParallelRepeat(unittest.TestCase):
             f"Scalar repeat failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_invalid_repeat_sharded_dim(self, mock_platform):
         """
         Feature: Repeat sharded dimension
@@ -184,7 +187,7 @@ class TestParallelRepeat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Cannot repeat dimension 0 which is sharded"):
             op.infer_layout([x_layout, (5, 1)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_packed_tuple_args(self, mock_platform):
         """
         Feature: Repeat with tuple args
@@ -202,7 +205,7 @@ class TestParallelRepeat(unittest.TestCase):
             f"Packed tuple repeat failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_all_ones(self, mock_platform):
         """
         Feature: Repeat with all ones (shape-preserving)
@@ -220,7 +223,7 @@ class TestParallelRepeat(unittest.TestCase):
             f"All ones repeat failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_zero_repeat(self, mock_platform):
         """
         Feature: Repeat with 0 (creating a zero-size tensor)
@@ -238,7 +241,7 @@ class TestParallelRepeat(unittest.TestCase):
             f"Zero repeat failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_invalid_zero_repeat_sharded(self, mock_platform):
         """
         Feature: Repeat sharded dimension with 0
@@ -252,7 +255,7 @@ class TestParallelRepeat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Cannot repeat dimension 0 which is sharded"):
             op.infer_layout([x_layout, (0, 1)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_1d_to_4d_prepend(self, mock_platform):
         """
         Feature: Prepend multiple dimensions to 1D tensor
@@ -270,7 +273,7 @@ class TestParallelRepeat(unittest.TestCase):
             f"1D to 4D prepend failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_fully_replicated(self, mock_platform):
         """
         Feature: Repeat fully replicated tensor
@@ -288,7 +291,7 @@ class TestParallelRepeat(unittest.TestCase):
             f"Fully replicated repeat failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_missing_layout(self, mock_platform):
         """
         Feature: Validate empty layouts
@@ -301,7 +304,7 @@ class TestParallelRepeat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires a valid input tensor layout"):
             op.infer_layout([])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_missing_extra_args(self, mock_platform):
         """
         Feature: Validate empty repeat sizes
@@ -315,7 +318,7 @@ class TestParallelRepeat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires repeat sizes in cache_values"):
             op.infer_layout([x_layout, tuple()])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_list_packed_args(self, mock_platform):
         """
         Feature: Robust parsing of cache_values as list
@@ -333,7 +336,7 @@ class TestParallelRepeat(unittest.TestCase):
             f"List packed args failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_float_args_cast(self, mock_platform):
         """
         Feature: Convert float arguments to integer
@@ -351,7 +354,7 @@ class TestParallelRepeat(unittest.TestCase):
             f"Float args cast failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_complex_3d_mesh(self, mock_platform):
         """
         Feature: Repeat over 3D DeviceMesh
@@ -369,7 +372,7 @@ class TestParallelRepeat(unittest.TestCase):
             f"Complex 3D mesh repeat failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_layout_partial_input_raises_error(self, mock_platform):
         """
         Feature: Validate Partial input
@@ -383,7 +386,7 @@ class TestParallelRepeat(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             op.infer_layout([x_layout, (1, 1)])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_repeat_preprocess(self, mock_platform):
         """
         Feature: RepeatDistributedOp preprocess.

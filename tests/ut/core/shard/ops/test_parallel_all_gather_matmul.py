@@ -37,6 +37,12 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clear global state after each test."""
@@ -161,7 +167,7 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
     # cache_values format: [x1_layout, x2_layout, trans_x2, gather_output]
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_agm_replicated_3(self, mock_platform):
         """
         Feature: infer_layout all replicated.
@@ -182,7 +188,7 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
         self.assertEqual(gather_layout.tensor_map, (-1, -1),
                          msg=f"Replicated gather_out: expected (-1,-1), got {gather_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_agm_input_shard0_x2_replicate_4(self, mock_platform):
         """
         Feature: infer_layout x1 Shard(0) on tp, x2 Replicate.
@@ -203,7 +209,7 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
         self.assertEqual(gather_layout.tensor_map, (-1, -1),
                          msg=f"Expected (-1,-1), got {gather_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_agm_input_shard0_x2_shard1_5(self, mock_platform):
         """
         Feature: infer_layout x1 Shard(0) on tp, x2 Shard(1) on n.
@@ -224,7 +230,7 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
         self.assertEqual(gather_layout.tensor_map, (-1, -1),
                          msg=f"Expected (-1,-1), got {gather_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_agm_trans_x2_false_n_sharded_6(self, mock_platform):
         """
         Feature: infer_layout trans_x2=False, x2 Shard(1).
@@ -242,7 +248,7 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
         self.assertEqual(out_layout.tensor_map, (-1, 0),
                          msg=f"trans_x2=False n sharded: expected (-1, 0), got {out_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_agm_trans_x2_true_n_sharded_7(self, mock_platform):
         """
         Feature: infer_layout trans_x2=True, x2 Shard(0) on n.
@@ -262,7 +268,7 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
         self.assertEqual(out_layout.tensor_map, (-1, 0),
                          msg=f"trans_x2=True n sharded: expected (-1, 0), got {out_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_agm_gather_output_false_8(self, mock_platform):
         """
         Feature: infer_layout gather_output=False.
@@ -283,7 +289,7 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
             msg=f"gather_output=False: expected (-1,), got {gather_layout.tensor_map}",
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_agm_2d_mesh_dp_tp_9(self, mock_platform):
         """
         Feature: infer_layout 2D (dp=2, tp=4) mesh.
@@ -305,7 +311,7 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
         self.assertEqual(gather_layout.tensor_map, (-1, -1),
                          msg=f"2D mesh gather_out: expected (-1,-1), got {gather_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_output_independent_copies_10(self, mock_platform):
         """
         Feature: infer_layout returns independent deep copies for output and gather_out.
@@ -329,7 +335,7 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
     # infer_layout — error cases
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partial_input_raises_11(self, mock_platform):
         """
         Feature: infer_layout rejects Partial inputs.
@@ -345,7 +351,7 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             op.infer_layout([x1_layout, x2_layout, False, True])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_agm_k_sharded_output_partial_12(self, mock_platform):
         """
         Feature: infer_layout k-dim sharded on both x1 and x2 — output is Partial.
@@ -371,7 +377,7 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
         self.assertEqual(gather_layout.tensor_map, (-1, 0),
                          msg=f"k sharded: expected gather_out tensor_map (-1,0), got {gather_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_agm_k_mismatch_raises_13(self, mock_platform):
         """
         Feature: infer_layout rejects mismatched k-dim placements between x1 and x2.
@@ -386,7 +392,7 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "k-dim.*placement.*must match"):
             op.infer_layout([x1_layout, x2_layout, False, True])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_input_m_multi_mesh_raises_14(self, mock_platform):
         """
         Feature: infer_layout rejects x1 m-dim jointly sharded across multiple mesh dims.

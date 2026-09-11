@@ -67,11 +67,11 @@ def _setup_mock_platform(platform_mock):
 
 
 class _MockedDeviceMeshTestCase(unittest.TestCase):
-    """Base class that patches the device_mesh platform."""
+    """Base class that patches the device_mesh distributed backend."""
 
     def setUp(self):
         """Set up test fixtures."""
-        patcher_dm = patch("hyper_parallel.core.dtensor.device_mesh.platform")
+        patcher_dm = patch("hyper_parallel.core.dtensor.device_mesh.dist", MagicMock())
         patcher_tensor = patch("hyper_parallel.core.dtensor.device_mesh.Tensor", torch.Tensor)
         self.mock_platform = patcher_dm.start()
         patcher_tensor.start()

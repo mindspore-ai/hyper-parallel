@@ -163,49 +163,49 @@ class TestCalcShardInfo(unittest.TestCase):
 
 class TestForkRng(unittest.TestCase):
     """Tests for ForkRng."""
-    @patch("hyper_parallel.core.dtensor.random.platform")
-    def test_enabled_false(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.random._utils")
+    def test_enabled_false(self, mock_utils):
         """Test enabled false."""
-        mock_platform.get_device_handle.return_value = MagicMock()
+        mock_utils.get_device_handle.return_value = MagicMock()
         with fork_rng(enabled=False):
             pass
         # Should not save/restore states
-        mock_platform.get_rng_state.assert_not_called()
+        mock_utils.get_rng_state.assert_not_called()
 
-    @patch("hyper_parallel.core.dtensor.random.platform")
-    def test_device_handle_none_raises(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.random._utils")
+    def test_device_handle_none_raises(self, mock_utils):
         """Test device handle none raises."""
-        mock_platform.get_device_handle.return_value = None
+        mock_utils.get_device_handle.return_value = None
         with self.assertRaises(RuntimeError):
             with fork_rng():
                 pass
 
-    @patch("hyper_parallel.core.dtensor.random.platform")
-    def test_specified_devices(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.random._utils")
+    def test_specified_devices(self, mock_utils):
         """Test specified devices."""
         mock_handle = MagicMock()
-        mock_platform.get_device_handle.return_value = mock_handle
-        mock_platform.get_rng_state.return_value = MagicMock()
+        mock_utils.get_device_handle.return_value = mock_handle
+        mock_utils.get_rng_state.return_value = MagicMock()
 
         with fork_rng(devices=[0, 1]):
             pass
 
         # Should save CPU state + 2 device states
-        self.assertEqual(mock_platform.get_rng_state.call_count, 3)  # 1 cpu + 2 devices
-        self.assertEqual(mock_platform.set_rng_state.call_count, 3)  # restore all
+        self.assertEqual(mock_utils.get_rng_state.call_count, 3)  # 1 cpu + 2 devices
+        self.assertEqual(mock_utils.set_rng_state.call_count, 3)  # restore all
 
-    @patch("hyper_parallel.core.dtensor.random.platform")
-    def test_devices_none_auto(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.random._utils")
+    def test_devices_none_auto(self, mock_utils):
         """Test devices none auto."""
         mock_handle = MagicMock()
-        mock_platform.get_device_handle.return_value = mock_handle
-        mock_platform.device_count.return_value = 2
-        mock_platform.get_rng_state.return_value = MagicMock()
+        mock_utils.get_device_handle.return_value = mock_handle
+        mock_utils.device_count.return_value = 2
+        mock_utils.get_rng_state.return_value = MagicMock()
 
         with fork_rng(devices=None):
             pass
 
-        mock_platform.device_count.assert_called_once_with(mock_handle)
+        mock_utils.device_count.assert_called_once_with(mock_handle)
 
 
 # ===========================================================================
@@ -214,18 +214,19 @@ class TestForkRng(unittest.TestCase):
 
 class TestResolveDevice(unittest.TestCase):
     """Tests for ResolveDevice."""
-    @patch("hyper_parallel.core.dtensor.random.platform")
-    def test_basic(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.random.dist")
+    @patch("hyper_parallel.core.dtensor.random._utils")
+    def test_basic(self, mock_utils, mock_dist):
         """Test basic."""
         mock_handle = MagicMock()
-        mock_platform.get_device_handle.return_value = mock_handle
-        mock_platform.get_rank.return_value = 3
-        mock_platform.device_count.return_value = 2
-        mock_platform.device.return_value = "device_1"
+        mock_utils.get_device_handle.return_value = mock_handle
+        mock_dist.get_rank.return_value = 3
+        mock_utils.device_count.return_value = 2
+        mock_utils.device.return_value = "device_1"
 
         result = _resolve_device()
         # rank 3 % 2 = 1
-        mock_platform.device.assert_called_once_with(1)
+        mock_utils.device.assert_called_once_with(1)
         self.assertEqual(result, "device_1")
 
 
@@ -235,36 +236,36 @@ class TestResolveDevice(unittest.TestCase):
 
 class TestIsRngSupportedMesh(unittest.TestCase):
     """Tests for IsRngSupportedMesh."""
-    @patch("hyper_parallel.core.dtensor.random.platform")
-    def test_cpu_mesh_returns_false(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.random._utils")
+    def test_cpu_mesh_returns_false(self, mock_utils):
         """Test cpu mesh returns false."""
         mock_mesh = MagicMock()
         mock_mesh.device_type = "cpu"
         result = is_rng_supported_mesh(mock_mesh)
         self.assertFalse(result)
 
-    @patch("hyper_parallel.core.dtensor.random.platform")
-    def test_device_handle_with_set_rng_state(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.random._utils")
+    def test_device_handle_with_set_rng_state(self, mock_utils):
         """Test device handle with set rng state."""
         mock_handle = MagicMock()
         mock_handle.set_rng_state = MagicMock()
-        mock_platform.get_device_handle.return_value = mock_handle
+        mock_utils.get_device_handle.return_value = mock_handle
         result = is_rng_supported_mesh()
         self.assertTrue(result)
 
-    @patch("hyper_parallel.core.dtensor.random.platform")
-    def test_no_device_handle_with_mesh(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.random._utils")
+    def test_no_device_handle_with_mesh(self, mock_utils):
         """Test no device handle with mesh."""
-        mock_platform.get_device_handle.return_value = None
+        mock_utils.get_device_handle.return_value = None
         mock_mesh = MagicMock()
         mock_mesh.device_type = "npu"
         result = is_rng_supported_mesh(mock_mesh)
         self.assertFalse(result)
 
-    @patch("hyper_parallel.core.dtensor.random.platform")
-    def test_no_device_handle_no_mesh(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.random._utils")
+    def test_no_device_handle_no_mesh(self, mock_utils):
         """Test no device handle no mesh."""
-        mock_platform.get_device_handle.return_value = None
+        mock_utils.get_device_handle.return_value = None
         result = is_rng_supported_mesh()
         self.assertFalse(result)
 
@@ -275,8 +276,8 @@ class TestIsRngSupportedMesh(unittest.TestCase):
 
 class TestSetPostOpOffset(unittest.TestCase):
     """Tests for SetPostOpOffset."""
-    @patch("hyper_parallel.core.dtensor.random.platform")
-    def test_numel_alignment(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.random._utils")
+    def test_numel_alignment(self, mock_utils):
         """Test numel alignment."""
         # Test _set_post_op_offset logic directly without instantiating OffsetBasedRNGTracker
         # The logic: numel = prod(global_shape), numel = (numel + 3) // 4 * 4, offset = old_offset + numel
@@ -296,8 +297,8 @@ class TestSetPostOpOffset(unittest.TestCase):
 
 class TestComputeOffsetIncr(unittest.TestCase):
     """Tests for ComputeOffsetIncr."""
-    @patch("hyper_parallel.core.dtensor.random.platform")
-    def test_basic_computation(self, mock_platform):
+    @patch("hyper_parallel.core.dtensor.random._utils")
+    def test_basic_computation(self, mock_utils):
         """Test basic computation."""
         # Test the formula: (shard_linear_idx * local_size + 3) // 4 * 4
         # For 1D shard with coord=1, size=2: linear_idx=1

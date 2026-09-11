@@ -100,12 +100,18 @@ class TestCustomShardInPlacementsValidation(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_in_placements_length_mismatch_raises(self, mock_platform):
         """in_placements length != args count raises ValueError."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -121,7 +127,7 @@ class TestCustomShardInPlacementsValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             wrapped(dt, dt)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dtensor_input_without_in_placements_raises(self, mock_platform):
         """DTensor input when in_placements is None raises RuntimeError."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -137,7 +143,7 @@ class TestCustomShardInPlacementsValidation(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             wrapped(dt)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_dtensor_at_none_placement_position_raises(self, mock_platform):
         """DTensor input at position where in_placements[i] is None raises TypeError."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -153,7 +159,7 @@ class TestCustomShardInPlacementsValidation(unittest.TestCase):
         with self.assertRaises(TypeError):
             wrapped(dt)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_non_dtensor_with_placement_raises(self, mock_platform):
         """Non-DTensor input at a position that expects Placement raises TypeError."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -178,12 +184,18 @@ class TestCustomShardOutputValidation(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_output_count_mismatch_raises(self, mock_platform):
         """Output count != out_placements count raises ValueError."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -200,7 +212,7 @@ class TestCustomShardOutputValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             wrapped(dt)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tensor_output_with_none_placement_raises(self, mock_platform):
         """Tensor output with None out_placements raises TypeError."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -219,7 +231,7 @@ class TestCustomShardOutputValidation(unittest.TestCase):
             with self.assertRaises(TypeError):
                 wrapped(dt)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_non_tensor_output_with_placement_raises(self, mock_platform):
         """Non-tensor output (e.g., int) with non-None placement raises TypeError."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -246,12 +258,18 @@ class TestCustomShardRedistributeInputs(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_no_redistribute_when_flag_false(self, mock_platform):
         """redistribute_inputs=False skips redistribution."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
@@ -291,12 +309,18 @@ class TestCustomShardTupleOutput(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_tuple_output_multiple_dtensors(self, mock_mesh_platform):
         """Tuple of two Tensor outputs yields two DTensors."""
         mesh = _make_mesh(mock_mesh_platform, (1,), ("dp",))
@@ -318,7 +342,7 @@ class TestCustomShardTupleOutput(unittest.TestCase):
                 self.assertIsInstance(result, tuple)
                 self.assertEqual(len(result), 2)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_single_tensor_output_returns_dtensor(self, mock_mesh_platform):
         """Single Tensor output with out_placements wraps in DTensor."""
         mesh = _make_mesh(mock_mesh_platform, (1,), ("dp",))
@@ -338,7 +362,7 @@ class TestCustomShardTupleOutput(unittest.TestCase):
                 result = wrapped(dt)
                 self.assertIsNotNone(result)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_non_tensor_output_with_none_placement_passes_through(self, mock_platform):
         """Non-tensor output with None out_placement passes through unchanged."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))

@@ -125,8 +125,7 @@ class TestAsyncStaging(unittest.TestCase):
         """Ragged DTensor staging keeps the explicit logical global shape."""
         _DEVICE_MESH_MAP.clear()
         EXISTING_COMM_GROUPS.clear()
-        with patch(
-                "hyper_parallel.core.dtensor.device_mesh.platform.get_rank",
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank",
                 return_value=0,
         ):
             mesh = Layout((2,), ("ragged",), init_backend=False).mesh

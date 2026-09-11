@@ -17,11 +17,12 @@ from __future__ import annotations
 
 from typing import Optional, Sequence
 
-from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.platform import get_platform
+import torch
+import torch.distributed as dist
 
-platform = get_platform()
-Tensor = platform.Tensor
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+
+Tensor = torch.Tensor
 
 
 def _ensure_mesh_process_groups(mesh: DeviceMesh) -> None:
@@ -50,10 +51,11 @@ def mesh_scatter(
         chunk.contiguous() if hasattr(chunk, "is_contiguous") and not chunk.is_contiguous() else chunk
         for chunk in scatter_list
     ]
-    if platform.get_group_rank(group) == group_src:
-        platform.scatter(output, list(contiguous_list), group=group, group_src=group_src)
+    src = dist.get_global_rank(group, group_src)
+    if dist.get_group_rank(group, dist.get_rank()) == group_src:
+        dist.scatter(output, list(contiguous_list), src=src, group=group)
     else:
-        platform.scatter(output, None, group=group, group_src=group_src)
+        dist.scatter(output, None, src=src, group=group)
     return output
 
 
@@ -89,8 +91,8 @@ def mesh_scatter_ragged(
             f"group_src must be in [0, {group_size}), but got {group_src}"
         )
 
-    group_rank = platform.get_group_rank(group)
-    source_global_rank = platform.get_global_rank(group, group_src)
+    group_rank = dist.get_group_rank(group, dist.get_rank())
+    source_global_rank = dist.get_global_rank(group, group_src)
     if group_rank == group_src:
         if scatter_list is None or len(scatter_list) != group_size:
             raise ValueError(
@@ -102,11 +104,11 @@ def mesh_scatter_ragged(
         for destination_group_rank, chunk in enumerate(scatter_list):
             if destination_group_rank == group_src:
                 continue
-            destination_global_rank = platform.get_global_rank(
+            destination_global_rank = dist.get_global_rank(
                 group, destination_group_rank
             )
             works.append(
-                platform.isend(
+                dist.isend(
                     chunk.contiguous(),
                     dst=destination_global_rank,
                     group=group,
@@ -116,7 +118,7 @@ def mesh_scatter_ragged(
             work.wait()
         return output
 
-    work = platform.irecv(
+    work = dist.irecv(
         output,
         src=source_global_rank,
         group=group,
@@ -137,5 +139,5 @@ def mesh_broadcast(
     group = mesh.get_group(mesh_dim)
     if hasattr(tensor, "is_contiguous") and not tensor.is_contiguous():
         tensor = tensor.contiguous()
-    platform.broadcast(tensor, group=group, group_src=group_src)
+    dist.broadcast(tensor, src=dist.get_global_rank(group, group_src), group=group)
     return tensor

@@ -46,7 +46,7 @@ class TestHSDPParamCoreHelpers(unittest.TestCase):
 
     def _make_mesh(self, mesh, mesh_dim_names):
         """Create a DeviceMesh with mocked rank helpers so UT does not need dist init."""
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform") as mock_platform:
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist", MagicMock()) as mock_platform:
             mock_platform.get_rank.return_value = 0
             mock_platform.get_world_size.return_value = int(torch.tensor(mesh).numel())
             mock_platform.tensor_to_numpy.side_effect = (

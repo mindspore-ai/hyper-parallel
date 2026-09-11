@@ -37,6 +37,12 @@ class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
+        self._utils_patcher = patch(
+            "hyper_parallel.core.dtensor.device_mesh._utils"
+        )
+        self._mock_utils = self._utils_patcher.start()
+        self._mock_utils.get_created_group.return_value = MagicMock()
+        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self) -> None:
         """Clear global state after each test."""
@@ -114,7 +120,7 @@ class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
     # cache_values format: [x1_layout, x2_layout, trans_x2]
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_mrs_basic_tp_3(self, mock_platform):
         """
         Feature: infer_layout basic TP case.
@@ -135,7 +141,7 @@ class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
         self.assertEqual(out_layout.tensor_map, (0, -1),
                          msg=f"Basic TP: expected (0, -1), got {out_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_mrs_trans_x2_true_4(self, mock_platform):
         """
         Feature: infer_layout trans_x2=True.
@@ -156,7 +162,7 @@ class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
         self.assertEqual(out_layout.tensor_map, (0, -1),
                          msg=f"trans_x2=True: expected (0, -1), got {out_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_mrs_dp_tp_mesh_5(self, mock_platform):
         """
         Feature: infer_layout 2D (dp=2, tp=4) mesh, x1 m sharded by dp, k sharded by tp.
@@ -181,7 +187,7 @@ class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
         self.assertEqual(out_layout.tensor_map, ((1, 0), -1),
                          msg=f"DP+TP mesh: expected ((1, 0), -1), got {out_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_mrs_x2_n_sharded_6(self, mock_platform):
         """
         Feature: infer_layout x2 n-dim sharded.
@@ -203,7 +209,7 @@ class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
         self.assertEqual(out_layout.tensor_map, (0, 1),
                          msg=f"x2 n sharded: expected (0, 1), got {out_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_mrs_x2_n_replicate_7(self, mock_platform):
         """
         Feature: infer_layout x2 n-dim Replicate.
@@ -221,7 +227,7 @@ class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
         self.assertEqual(out_layout.tensor_map, (0, -1),
                          msg=f"n Replicate: expected (0, -1), got {out_layout.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_output_independent_copy_8(self, mock_platform):
         """
         Feature: infer_layout returns an independent deep copy of output layout.
@@ -244,7 +250,7 @@ class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
     # infer_layout — error cases
     # ------------------------------------------------------------------
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partial_input_raises_9(self, mock_platform):
         """
         Feature: infer_layout rejects Partial inputs.
@@ -260,7 +266,7 @@ class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partial status"):
             op.infer_layout([x1_layout, x2_layout, False])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_k_replicate_raises_10(self, mock_platform):
         """
         Feature: infer_layout rejects x1 k-dim (dim 1) Replicate.
@@ -275,7 +281,7 @@ class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "x1 k-dim.*must be Shard"):
             op.infer_layout([x1_layout, x2_layout, False])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_k_mismatch_raises_11(self, mock_platform):
         """
         Feature: infer_layout rejects x2 k-dim layout mismatch with x1 k-dim.

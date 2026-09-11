@@ -107,7 +107,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         module.weight = torch.nn.Parameter(torch.arange(15, dtype=torch.float32).view(5, 3))
         module_info = ParamModuleInfo(module, "weight", [], [])
         mesh_info = object.__new__(FSDPMeshInfo)
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
             mesh_info.mesh = DeviceMesh(
                 "cpu",
                 [1, 0],
@@ -160,7 +160,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         module.weight = torch.nn.Parameter(torch.empty(4, device="meta"))
         module_info = ParamModuleInfo(module, "weight", [], [])
         mesh_info = object.__new__(FSDPMeshInfo)
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
             mesh_info.mesh = DeviceMesh(
                 "cpu",
                 [0, 1],
@@ -214,7 +214,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         module.weight = torch.nn.Parameter(torch.arange(6, dtype=torch.float32).view(2, 3))
         module_info = ParamModuleInfo(module, "weight", [], [])
         mesh_info = object.__new__(FSDPMeshInfo)
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
             mesh_info.mesh = DeviceMesh(
                 "cpu",
                 [1, 2, 3, 0],
@@ -251,7 +251,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         module.weight = torch.nn.Parameter(torch.arange(15, dtype=torch.float32).view(5, 3))
         module_info = ParamModuleInfo(module, "weight", [], [])
         mesh_info = object.__new__(HSDPMeshInfo)
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
             mesh_info.mesh = DeviceMesh(
                 "cpu",
                 [[1, 0], [3, 2]],
@@ -286,7 +286,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         module = torch.nn.Module()
         module.weight = torch.nn.Parameter(torch.arange(15, dtype=torch.float32).view(5, 3))
         module_info = ParamModuleInfo(module, "weight", [], [])
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
             root_mesh = DeviceMesh(
                 "cpu",
                 [[0, 1], [2, 3]],
@@ -304,7 +304,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         mesh_info.shard_process_group = None
         source_shard_info = SourceShardMetaInfo(tp_mesh, (Shard(0),), origin_is_dtensor=False)
 
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
             hsdp_param = TorchHSDPParamV2(
                 module.weight,
                 module_info,
@@ -593,10 +593,12 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         )
 
     @patch("hyper_parallel.platform.torch.fully_shard.param.dist.all_reduce")
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
-    def test_all_reduce_source_replicate_grad_excludes_native_fsdp_axes(
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.is_initialized", return_value=True)
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
+    def test_all_reduce_source_replicate_grad_excludes_native_fsdp_axes(  # pylint: disable=unused-argument
         self,
         mock_get_rank,
+        mock_is_initialized,
         mock_all_reduce,
     ):
         """Native DTensor DP/CP axes already reduced by FSDP must not be reduced twice."""

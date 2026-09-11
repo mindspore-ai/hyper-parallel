@@ -13,11 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """Empty / on-device weight initialization utilities."""
+# pylint: disable=C9006,C9007
 
 from contextlib import contextmanager
-from hyper_parallel.platform import get_platform
 
-platform = get_platform()
+import torch
+
+from hyper_parallel.core.dtensor._utils import init_on_device as _init_on_device
 
 
 @contextmanager
@@ -44,7 +46,7 @@ def init_empty_weights(include_buffers=False):
         A model initialised under this context has **no weights**.  You cannot
         call ``model.to(some_device)`` directly; load a checkpoint first.
     """
-    with platform.init_on_device(platform.meta_device, include_buffers=include_buffers):
+    with _init_on_device(torch.device("meta"), include_buffers=include_buffers):
         yield
 
 
@@ -65,5 +67,5 @@ def init_on_device(device, include_buffers=False):
         with init_on_device(torch.device("npu")):
             model = MyModel()  # parameters live on Ascend
     """
-    with platform.init_on_device(device, include_buffers=include_buffers):
+    with _init_on_device(device, include_buffers=include_buffers):
         yield
