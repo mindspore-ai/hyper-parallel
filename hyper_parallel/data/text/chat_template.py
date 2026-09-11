@@ -23,7 +23,6 @@ Canonical merge (05 §11.3) of the former
 
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, MutableMapping, Optional, Sequence, Type, Union
-import torch
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -504,7 +503,7 @@ class JanusTemplate(ChatTemplate):
             and images_emb_mask.
 
         Raises:
-            ValueError: If a message role is not one of system, user, or assistant.
+            ValueError: If a message role or image placeholder count is invalid.
         """
         input_ids, attention_mask, labels = [], [], []
         images_seq_mask, images_emb_mask = [], []
@@ -520,13 +519,12 @@ class JanusTemplate(ChatTemplate):
             input_ids += content_ids
             attention_mask += [1] * len(content_ids)
             image_token_id = self.tokenizer.vocab.get("<image_placeholder>")
-            content_ids_tensor = torch.tensor(content_ids)
-            images_seq_mask += (content_ids_tensor == image_token_id).tolist()
-            image_token_id = self.tokenizer.vocab.get("<image_placeholder>")
-            num_image_tokens = torch.sum(content_ids_tensor == image_token_id).item()
-            n_image = num_image_tokens // 576
-            if n_image > 0:
-                images_emb_mask.append([True] * num_image_tokens)
+            content_image_mask = [token == image_token_id for token in content_ids]
+            images_seq_mask += content_image_mask
+            num_image_tokens = sum(content_image_mask)
+            if num_image_tokens % 576:
+                raise ValueError("Each Janus image must have 576 placeholder tokens")
+            images_emb_mask.extend([[True] * 576 for _ in range(num_image_tokens // 576)])
 
             labels += _janus_labels(content_ids, image_token_id, message["loss_mask"], task_type)
 

@@ -20,7 +20,7 @@ import weakref
 
 import numpy
 
-from hyper_parallel.data.indexed.io import (
+from hyper_parallel.data.tools.io import (
     IndexedDataset,
     _FileBinReader,
     _IndexReader,
