@@ -38,6 +38,7 @@ from hyper_parallel.distributed._builder.source_shard import (
 )
 from hyper_parallel.distributed.tensor_parallel.head_count import (
     maybe_update_head_counts,
+    update_module_head_counts,
 )
 
 logger = logging.getLogger(__name__)
@@ -290,13 +291,27 @@ def _shard_planned_parameters(models, plan, mesh, expert_mesh, validate_mode):
                     plan.mesh_dim_names,
                 )
             if not validate_mode:
-                maybe_update_head_counts(
-                    module,
-                    spec,
-                    module_fqn,
-                    mesh,
-                    plan.mesh_dim_names,
-                )
+                head_count_owner = getattr(spec, "_head_count_owner", None)
+                if head_count_owner is not None:
+                    # Some architectures keep cached head counts on a parent
+                    # attention module while the projection that proves the
+                    # heads are TP-sharded is a nested leaf boundary.  The DSA
+                    # template records that parent explicitly; update it after
+                    # sharding the tagged leaf.  update_module_head_counts is
+                    # idempotent, so a shared/canonical owner remains safe if
+                    # a manually assembled plan tags it more than once.
+                    owner_module = _resolve_module(model, head_count_owner)
+                    tp_size = mesh["tp"].size() if "tp" in plan.mesh_dim_names else 1
+                    update_module_head_counts(
+                        owner_module, tp_size, head_count_owner)
+                else:
+                    maybe_update_head_counts(
+                        module,
+                        spec,
+                        module_fqn,
+                        mesh,
+                        plan.mesh_dim_names,
+                    )
 
 
 def _build_runtime_source_shard_info(
