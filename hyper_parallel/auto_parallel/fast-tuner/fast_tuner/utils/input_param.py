@@ -25,6 +25,7 @@ class InputParam:
         "SHELL_PATH" : "shell_path",
         "TOML_PATH" : "toml_path",
         "MINDFORMERS_DIR" : "mindformers_dir",
+        "REGISTER_PATH": "register_path",
         "MINDSPEED_PATH" : "mindspeed_path",
         "TORCHTITAN_PATH": "torchtitan_path",
         "DRYRUN_DATA_DIR" : "dryrun_data_dir",

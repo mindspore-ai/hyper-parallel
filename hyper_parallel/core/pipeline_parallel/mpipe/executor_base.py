@@ -113,7 +113,19 @@ class MPipeTransposeExecutorBase(ABC):
         """Receive a tensor's ``(shape, dtype)`` from ``src`` (exchanged every step)."""
         meta: list = [None, None]
         platform.recv_object_list(meta, src, self._mpipe_group)
-        return meta[0], meta[1]
+        shape, dtype = meta
+        if not isinstance(shape, (tuple, list)) or not shape or len(shape) > 8:
+            raise ValueError(f'Invalid tensor metadata shape from rank {src}: {shape!r}')
+        if any(not isinstance(dim, int) or dim < 0 for dim in shape):
+            raise ValueError(f'Invalid tensor metadata dimensions from rank {src}: {shape!r}')
+        numel = 1
+        for dim in shape:
+            numel *= dim
+            if numel > 2**31 - 1:
+                raise ValueError(f'Tensor metadata exceeds the supported size from rank {src}: {shape!r}')
+        if dtype is None:
+            raise ValueError(f'Missing tensor metadata dtype from rank {src}')
+        return tuple(shape), dtype
 
     def _output_arity(self):
         """Number of output tensors to communicate (cached after first use)."""

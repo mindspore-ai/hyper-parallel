@@ -15,6 +15,7 @@
 """dryrun operation"""
 import os
 import subprocess
+import sys
 import re
 import json
 from multiprocessing import Pool
@@ -42,8 +43,13 @@ def create_target_dir(file, target_directory):
 def execute_command(para, config_file_path, target_dir, rank_id, tp):
     '''execute dryrun command'''
     if para.YAML_PATH:
-        command = ['python', os.path.join(para.MINDFORMERS_DIR, 'run_mindformer.py'), '--config', config_file_path,
-               '--register_path', para.REGISTER_PATH]
+        if not para.MINDFORMERS_DIR:
+            raise ValueError('mindformers_dir must be set explicitly for a YAML dryrun.')
+        script_path = os.path.abspath(os.path.join(para.MINDFORMERS_DIR, 'run_mindformer.py'))
+        if not os.path.isfile(script_path):
+            raise ValueError(f'MindFormers entry script does not exist: {script_path}')
+        command = [sys.executable, script_path, '--config', config_file_path,
+                   '--register_path', para.REGISTER_PATH]
     else:
         command = ['bash', config_file_path]
     try:
