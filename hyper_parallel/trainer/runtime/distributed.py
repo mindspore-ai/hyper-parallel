@@ -246,8 +246,12 @@ def destroy_process_group() -> None:
         from hyper_parallel.core.dtensor.tensor_redistribution import _tensor_redistribution  # pylint: disable=C0415
         from hyper_parallel.core.fully_shard.hsdp_param import _GROUP_INFO_CACHE  # pylint: disable=C0415
         from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS  # pylint: disable=C0415
+        from hyper_parallel.platform.torch.platform import (  # pylint: disable=C0415
+            _P2P_MULTI_STREAM_GROUPS,
+        )
 
         EXISTING_COMM_GROUPS.clear()
+        _P2P_MULTI_STREAM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
         _GROUP_INFO_CACHE.clear()

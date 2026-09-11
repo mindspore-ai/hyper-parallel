@@ -379,7 +379,13 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
         ignore_mask = target_flat != ignore_index
 
         if weight is not None:
-            sample_weights = weight[target_flat]
+            # Ignore positions may contain -100, which is not a valid class
+            # index. Use a harmless index there; their gradients are masked
+            # below and therefore do not contribute to the result.
+            safe_target = torch.where(
+                ignore_mask, target_flat, torch.zeros_like(target_flat)
+            )
+            sample_weights = weight[safe_target]
         else:
             sample_weights = None
 
@@ -394,13 +400,11 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
 
         if reduction == "none":
             grad_scale_expanded = grad_scale.unsqueeze(-1)
-            if sample_weights is not None:
-                grad_scale_expanded = grad_scale_expanded * sample_weights.unsqueeze(-1)
-            grad_input = softmax_local * grad_scale_expanded
         else:
-            if sample_weights is not None:
-                grad_scale = grad_scale * sample_weights.unsqueeze(-1)
-            grad_input = softmax_local * grad_scale.unsqueeze(-1)
+            grad_scale_expanded = grad_scale.reshape(1, 1)
+        if sample_weights is not None:
+            grad_scale_expanded = grad_scale_expanded * sample_weights.unsqueeze(-1)
+        grad_input = softmax_local * grad_scale_expanded
 
         local_targets = torch.where(in_vocab_mask, target_flat - vocab_start, torch.zeros_like(target_flat))
 
@@ -408,12 +412,13 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
             row_indices = torch.arange(batch_size, device=target.device, dtype=torch.long)
 
             if reduction == "none":
+                grad_values = -grad_scale
                 if sample_weights is not None:
-                    grad_values = -grad_scale * sample_weights
-                else:
-                    grad_values = -grad_scale
+                    grad_values = grad_values * sample_weights
             else:
                 grad_values = -grad_scale.expand_as(target_flat)
+                if sample_weights is not None:
+                    grad_values = grad_values * sample_weights
 
             grad_input = grad_input.contiguous()
             grad_input[row_indices[in_vocab_mask], local_targets[in_vocab_mask]] += grad_values[in_vocab_mask]
