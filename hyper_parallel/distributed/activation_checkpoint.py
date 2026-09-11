@@ -15,6 +15,7 @@
 """Activation checkpointing helpers for distributed model components."""
 
 import logging
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -26,7 +27,10 @@ from hyper_parallel.core.activation_checkpoint.activation_checkpoint import (
     CheckpointPolicy,
     checkpoint_wrapper,
 )
-from hyper_parallel.core.activation_checkpoint.swap import SwapManager
+from hyper_parallel.core.activation_checkpoint.swap import (
+    SwapManager,
+    _teardown_wired_swap_layers,
+)
 from hyper_parallel.platform import get_platform
 
 logger = logging.getLogger(__name__)
@@ -521,9 +525,26 @@ def _register_forward_prefetch_layers(containers: list[_LayerContainerInfo]) -> 
             for relative_path, wrapper in _find_checkpoint_wrappers(current_block).items():
                 wrapper_chains.setdefault(relative_path, []).append(wrapper)
 
+        wired_modules: list[nn.Module] = []
         for wrappers in wrapper_chains.values():
             for current_wrapper, next_wrapper in zip(wrappers, wrappers[1:]):
                 swap_manager.set_forward_prefetch_layer(current_wrapper, next_wrapper)
+                wired_modules.extend((current_wrapper, next_wrapper))
+        wired_modules = list(dict.fromkeys(wired_modules))  # dedupe, keep order
+
+        # swap layers registered above live in the process-wide SwapManager
+        # singleton and are never torn down otherwise, so a long-lived process
+        # that rebuilds or discards models leaks SwapGroup entries and hook
+        # handles.  Tear them down when the container is collected.  The
+        # container must not be a finalizer argument (that would keep it alive);
+        # only the wired child modules are captured, and the callback receives
+        # them directly because the container is unreachable at that point.
+        if wired_modules:
+            weakref.finalize(
+                container_info.container,
+                _teardown_wired_swap_layers,
+                wired_modules,
+            )
 
 
 def _wrap_first_existing_attr(

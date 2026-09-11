@@ -22,7 +22,7 @@ import warnings
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Dict, Iterator, List, Optional, Set
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform import get_platform
@@ -921,6 +921,37 @@ class SwapManager:
             removed_count += 1
         return removed_count
 
+    def unregister_forward_prefetch_layer(self, module: Any) -> int:
+        """Tear down prefetch wiring registered on ``module`` and its group.
+
+        Removes the four forward/backward swap hooks installed on ``module``
+        by :meth:`set_forward_prefetch_layer` and drops its swap group from the
+        process-wide singleton.  Mirrors the reverse of :meth:`set_forward_prefetch_layer`
+        so models destroyed in a long-lived process do not leave stale ``SwapGroup``
+        entries or hook handles behind (see the swap-inputs path in
+        ``distributed/activation_checkpoint.py``, which installs these hooks but
+        previously had no teardown).
+
+        Args:
+            module: A layer that participated in a prefetch chain.
+
+        Returns:
+            Number of removed hook handles.
+        """
+        removed_count = self.unregister_forward_prefetch_hooks(module)
+        group_name = getattr(module, "_swap_group_name", None)
+        if group_name is not None:
+            self.abort_group(group_name)
+            delattr(module, "_swap_group_name")
+            if hasattr(module, "_swap_group_order"):
+                delattr(module, "_swap_group_order")
+        # Also drop the swap state so a module re-registered through
+        # set_forward_prefetch_layer does not inherit a stale "pre_backward"
+        # flag that would short-circuit the new forward pre-hook.
+        if hasattr(module, "_swap_state"):
+            delattr(module, "_swap_state")
+        return removed_count
+
     def set_forward_prefetch_layer(self, first_layer, second_layer):
         """
         Configure prefetching and offloading order between two consecutive layers.
@@ -1093,3 +1124,25 @@ class SwapManager:
         if self._copy_stream is None:
             self._copy_stream = platform.new_stream()
         return self._copy_stream
+
+
+def _teardown_wired_swap_layers(wired_modules: Iterable[Any]) -> None:
+    """Release swap groups and prefetch hooks for an iterable of wired layers.
+
+    Teardown for layers already registered through
+    :meth:`SwapManager.set_forward_prefetch_layer` (the swap-inputs paths in
+    ``distributed/activation_checkpoint.py`` and ``distributed/attention_swap.py``).
+    Those paths register the modules in the process-wide singleton and install
+    hook handles, but never otherwise tear them down, so a long-lived process
+    that rebuilds or discards models leaks ``SwapGroup`` entries and hook
+    handles.  This is called from each path's life-cycle finalizer with the wired
+    modules held directly, because the model container is unreachable at that
+    point and its module tree can no longer be traversed.  Idempotent: a module
+    with no ``_swap_group_name`` (already released) is a no-op.
+
+    Args:
+        wired_modules: Layers that participated in a swap prefetch chain.
+    """
+    manager = SwapManager()
+    for module in wired_modules:
+        manager.unregister_forward_prefetch_layer(module)

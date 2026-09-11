@@ -303,7 +303,9 @@ class TestPipelineSwapRuntime(unittest.TestCase):
             ("wait", copy_event, compute_stream),
             ("release", slot),
         ])
-        self.assertIs(slot.event, copy_event)
+        # The waited event is cleared so the slot does not carry a stale event
+        # that a later drain or re-enqueue would re-wait.
+        self.assertIsNone(slot.event)
 
     def test_synchronize_cpu_mirrors_waits_before_checkpoint_read(self):
         """Checkpoint host reads wait after stream-ordered D2H and release."""
@@ -405,6 +407,54 @@ class TestPipelineSwapRuntime(unittest.TestCase):
             "offload:moment2",
             "wait_offload:moment2",
         ])
+
+    def test_exception_in_step_batch_drains_pending_transfers(self):
+        """A mid-pipeline exception settles h2d slots and leaves terminals alone."""
+        runtime = _DummySwapRuntime()
+        cpu_mirror = object()
+        slots = [
+            SwapSlot(name="moment0", tensor=object(), cpu_tensor=cpu_mirror, storage_nbytes=16, state="host"),
+            SwapSlot(name="moment1", tensor=object(), cpu_tensor=cpu_mirror, storage_nbytes=16, state="host"),
+            SwapSlot(name="moment2", tensor=object(), cpu_tensor=cpu_mirror, storage_nbytes=16, state="host"),
+        ]
+        units = [
+            UpdateUnit(adapter_index=index, param=object(), grad=object(), slots=[slot])
+            for index, slot in enumerate(slots)
+        ]
+
+        def _failing_step(batch, ctx):
+            raise RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            runtime.run_pipeline([[unit] for unit in units], object(), _failing_step)
+
+        # The first update raised. Batch0 was prefetched+waited (device, terminal),
+        # batch1 was prefetched (h2d, not yet waited) and settles to device, batch2
+        # never left host.
+        self.assertEqual(slots[0].state, "device")
+        self.assertEqual(slots[1].state, "device")
+        self.assertEqual(slots[2].state, "host")
+        self.assertIsNone(slots[1].event)
+
+    def test_drain_pending_transfers_is_noop_when_no_intermediate_states(self):
+        """Terminal-only slots are left untouched and no stream work is recorded."""
+        runtime = _DummySwapRuntime()
+        wait_calls = []
+        runtime.wait_event = mock.Mock(side_effect=lambda event, stream: wait_calls.append(event))
+        slots = [
+            SwapSlot(name="moment0", tensor=object(), state="device"),
+            SwapSlot(name="moment1", tensor=object(), cpu_tensor=object(), state="host"),
+        ]
+        units = [
+            UpdateUnit(adapter_index=index, param=object(), grad=object(), slots=[slot])
+            for index, slot in enumerate(slots)
+        ]
+
+        runtime._drain_pending_transfers([[unit] for unit in units])
+
+        self.assertEqual(slots[0].state, "device")
+        self.assertEqual(slots[1].state, "host")
+        self.assertEqual(wait_calls, [])
 
     def test_packed_pipeline_overlaps_copy_chain_with_other_arena_update(self):
         """D2H batch i and H2D batch i+2 share a chain while the other arena updates."""
