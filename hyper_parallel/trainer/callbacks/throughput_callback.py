@@ -79,8 +79,14 @@ class ThroughputMFUCallback(Callback):
         """
         super().__init__(trainer)
         training_cfg = trainer.config.training
-        self._log_steps = log_steps or training_cfg.logging_steps
-        self._peak_tflops = peak_tflops or training_cfg.peak_tflops
+        # Explicit 0 is meaningful (log_steps<=0 disables emission), so only
+        # fall back to the config default when the argument is truly unset.
+        self._log_steps = (
+            log_steps if log_steps is not None else training_cfg.logging_steps
+        )
+        self._peak_tflops = (
+            peak_tflops if peak_tflops is not None else training_cfg.peak_tflops
+        )
         self._global_batch_size = int(getattr(training_cfg, "global_batch_size", 1) or 1)
         self._flops_per_token: Optional[float] = None  # resolved lazily
         self._seq_len: Optional[int] = None  # captured from the first batch
