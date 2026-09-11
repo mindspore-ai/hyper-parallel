@@ -71,3 +71,9 @@ class OnlineDatasetBarrier:
             timeout=self.timeout,
             wait_all_ranks=True,
         )
+
+    def close(self) -> None:
+        """Release the auxiliary process group after a dataset build."""
+        if self._gloo_group is not None and dist.is_initialized():
+            dist.destroy_process_group(self._gloo_group)
+        self._gloo_group = None
