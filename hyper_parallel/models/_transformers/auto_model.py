@@ -31,8 +31,10 @@ from transformers import (
 )
 
 from hyper_parallel.models._transformers.model_builder import (
+    DeferredModelBuildRequest,
     _init_model,
     apply_model_infrastructure,
+    get_deferred_model_build_adapter,
     instantiate_infrastructure,
     is_model_materialization_deferred,
 )
@@ -291,29 +293,44 @@ class _BaseHyperAutoModelClass:
                 **kwargs,
             )
 
-        # Step 3-12: Apply infrastructure
-        model = apply_model_infrastructure(
-            model,
-            mesh=mesh,
-            sharding_planner=sharding_planner,
-            fsdp2_manager=fsdp2_manager,
-            peft_config=peft_config,
-            qat_config=qat_config,
-            fp8_config=fp8_config,
-            freeze_config=freeze_config,
-            compile_config=compile_config,
-            is_meta_device=is_meta_device,
-            is_hf_model=is_hf_model,
-            device=_current_device(),
-            load_base_model=load_base_model,
-            pretrained_path=pretrained_model_name_or_path,
-            validate_placement=validate_placement,
-            distributed_setup=distributed_setup,
-            activation_checkpoint=activation_checkpoint,
-            swap_inputs=swap_inputs,
-            activation_swap=activation_swap,
-            model_init_dtype=model_init_dtype,
-        )
+        # Step 3-12: Apply infrastructure, or let a scoped Dry-run adapter
+        # replace whole-model assembly with stage-local pipeline assembly.
+        adapter = get_deferred_model_build_adapter()
+        if adapter is not None:
+            model = adapter(
+                model,
+                DeferredModelBuildRequest(
+                    distributed_setup=distributed_setup,
+                    mesh=mesh,
+                    sharding_planner=sharding_planner,
+                    fsdp2_manager=fsdp2_manager,
+                    validate_placement=validate_placement,
+                    model_init_dtype=model_init_dtype,
+                ),
+            )
+        else:
+            model = apply_model_infrastructure(
+                model,
+                mesh=mesh,
+                sharding_planner=sharding_planner,
+                fsdp2_manager=fsdp2_manager,
+                peft_config=peft_config,
+                qat_config=qat_config,
+                fp8_config=fp8_config,
+                freeze_config=freeze_config,
+                compile_config=compile_config,
+                is_meta_device=is_meta_device,
+                is_hf_model=is_hf_model,
+                device=_current_device(),
+                load_base_model=load_base_model,
+                pretrained_path=pretrained_model_name_or_path,
+                validate_placement=validate_placement,
+                distributed_setup=distributed_setup,
+                activation_checkpoint=activation_checkpoint,
+                swap_inputs=swap_inputs,
+                activation_swap=activation_swap,
+                model_init_dtype=model_init_dtype,
+            )
 
         model.train()
         return model

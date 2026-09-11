@@ -4,8 +4,24 @@ Dry-run 从本地 Hugging Face `config.json` 构建 meta 模型，不读取模�
 并使用 FakeTensor 执行一次完整的 forward、loss、backward 和 optimizer step。
 每个 rank 会输出 JSON 摘要和内存生命周期 CSV。
 
-基础实现支持 TP、CP、EP、FSDP/HSDP 及其合法组合。当前不支持 PP；当
-`accelerator.pp_size > 1` 时会明确报错，PP adapter 相关实现保留在后续堆叠提交中。
+基础实现支持 TP、CP、EP、FSDP/HSDP 及其合法组合。PP adapter 支持 PP 与
+TP、CP、FSDP/HSDP 的组合，并通过 `dry_run.pipeline_stage_builder` 在正常
+`config.model.build(...)` 构造链路中切分 stage；它不读取权重或建立真实 P2P 传输。
+
+## PP adapter 示例
+
+先生成本地仅含配置的模型目录，再以 PP2 × FSDP2 启动：
+
+```bash
+python -m examples.dryrun.prepare_model --output-dir outputs/dryrun/models
+torchrun --standalone --nproc_per_node=4 \
+  --module examples.training_demo.train_text examples/dryrun/pp_fsdp.yaml
+```
+
+PP adapter 模拟 scheduler 顺序、stage-local 参数/激活/梯度生命周期与 Tensor/DTensor
+boundary；它不传输 payload、不估算通信时间。当前不支持 EP、sequence parallel、loss
+parallel、activation swap 或 tied embeddings。正式 Trainer PP 装配完成后，应以该 adapter
+作为需要审查和替换的范围。
 
 ## EP explicit 示例
 

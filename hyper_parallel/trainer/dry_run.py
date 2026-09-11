@@ -22,7 +22,7 @@ import re
 from copy import copy
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any, Iterator, Optional
 
 import torch
@@ -33,8 +33,11 @@ from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.distributed._tools.mem_tracker import MemTracker
 
 from hyper_parallel.models._transformers.model_builder import (
+    DeferredModelBuildRequest,
+    apply_model_init_dtype,
     model_build_context,
 )
+from hyper_parallel.components.losses.model_output import ModelOutputLoss
 from hyper_parallel.data.batching.build_dataloader import calculate_num_micro_batches
 from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.models.build_options import get_device_type
@@ -45,6 +48,18 @@ from hyper_parallel.trainer.config import (
     normalize_distributed_setup_overrides,
 )
 from hyper_parallel.trainer.dry_run_data import DryRunDataProbe, PreparedDryRunBatch
+from hyper_parallel.trainer.dry_run_pipeline import (
+    DryRunPipelineStage,
+    build_pipeline_schedule,
+    normalize_pipeline_schedule,
+)
+from hyper_parallel.trainer.dry_run_pipeline_assembly import (
+    _DryRunParallelContext,
+    _PreparedPipelineChunk,
+    build_distributed_setup as build_pipeline_distributed_setup,
+    build_pipeline_chunks,
+    prepare_pipeline_chunks,
+)
 from hyper_parallel.trainer.runtime.distributed import destroy_process_group as destroy_distributed_runtime
 from hyper_parallel.trainer.runtime.random import set_seed
 from hyper_parallel import SkipDTensorDispatch, hsdp_sync_stream
@@ -66,6 +81,23 @@ class _DryRunTrainingBatch:
     token_counts: dict[str, int]
     valid_token_count: int
     target_tokens_per_rank: tuple[int, ...]
+
+
+@dataclass
+class _DryRunPipelineBuildState:
+    """Keep adapter-produced chunks beside the normal builder return value."""
+
+    chunks: Optional[tuple[_PreparedPipelineChunk, ...]] = None
+
+
+class _DryRunPipelineModel(nn.Module):
+    """Own all rank-local pipeline chunks for optimizer and memory tracking."""
+
+    def __init__(self, chunks: tuple[_PreparedPipelineChunk, ...]) -> None:
+        """Register chunks and expose their shared model configuration."""
+        super().__init__()
+        self.chunks = nn.ModuleList(chunk.module for chunk in chunks)
+        self.config = chunks[0].module.config
 
 
 
@@ -130,13 +162,57 @@ class HyperModelsDryRunRunner:
         if self.config.compile.enabled:
             raise NotImplementedError("LLM Dry-run does not support torch.compile")
         torch_dry_run._DryRunValueProfile(dry_run)  # pylint: disable=protected-access
-        if self.config.accelerator.pp_size > 1:
-            raise NotImplementedError(
-                "Pipeline parallel dry-run is not supported by the base implementation; "
-                "use the PP adapter implementation until Trainer PP integration is available"
-            )
         self._validate_topology()
+        self._validate_pipeline_config(dry_run)
         return dry_run
+
+    def _validate_pipeline_config(self, dry_run: DryRunConfig) -> None:
+        """Validate supported PP adapter combinations and batch topology."""
+        accelerator = self.config.accelerator
+        if accelerator.pp_size == 1:
+            return
+        if dry_run.pipeline_stage_builder is None:
+            raise ValueError("dry_run.pipeline_stage_builder must be configured when pp_size > 1")
+        unsupported_sizes = {
+            "ep_size": accelerator.ep_size,
+            "edp_shard_size": self.config.fsdp_config.edp_shard_size,
+        }
+        enabled_unsupported = {name: size for name, size in unsupported_sizes.items() if size != 1}
+        if enabled_unsupported:
+            raise NotImplementedError(
+                "Pipeline Dry-run supports TP, CP, FSDP, and HSDP only; got "
+                f"{enabled_unsupported}"
+            )
+        if accelerator.sequence_parallel or accelerator.loss_parallel:
+            raise NotImplementedError(
+                "Pipeline Dry-run does not support sequence_parallel or loss_parallel"
+            )
+        if self.config.activation_swap != "none":
+            raise NotImplementedError("Pipeline Dry-run does not support activation swap")
+        micro_batch_num = accelerator.pp_micro_batch_num
+        if not isinstance(micro_batch_num, int) or isinstance(micro_batch_num, bool) or micro_batch_num < 1:
+            raise ValueError("accelerator.pp_micro_batch_num must be a positive integer")
+        runtime = self._get_runtime()
+        dp_size = runtime.world_size // (accelerator.pp_size * accelerator.tp_size * accelerator.cp_size)
+        if self.config.training.global_batch_size % dp_size:
+            raise ValueError(
+                "training.global_batch_size must be divisible by the PP-local DP size, "
+                f"got {self.config.training.global_batch_size} and {dp_size}"
+            )
+        local_batch_size = self.config.training.global_batch_size // dp_size
+        if local_batch_size % micro_batch_num:
+            raise ValueError(
+                "DP-local batch size must be divisible by accelerator.pp_micro_batch_num, "
+                f"got {local_batch_size} and {micro_batch_num}"
+            )
+        normalize_pipeline_schedule(accelerator.pp_schedule, accelerator.pp_vpp)
+        if accelerator.pp_layer_split is not None:
+            stage_num = accelerator.pp_size * accelerator.pp_vpp
+            if len(accelerator.pp_layer_split) != stage_num:
+                raise ValueError(
+                    f"accelerator.pp_layer_split must contain {stage_num} entries, "
+                    f"got {len(accelerator.pp_layer_split)}"
+                )
 
     def _validate_topology(self) -> None:
         """Validate the configured topology against the launcher world size."""
@@ -146,6 +222,7 @@ class HyperModelsDryRunRunner:
             "tp_size": accelerator.tp_size,
             "cp_size": accelerator.cp_size,
             "ep_size": accelerator.ep_size,
+            "pp_size": accelerator.pp_size,
             "dp_shard_size": self.config.fsdp_config.dp_shard_size,
             "edp_shard_size": self.config.fsdp_config.edp_shard_size,
         }
@@ -159,10 +236,10 @@ class HyperModelsDryRunRunner:
                 "Dry-run parallel sizes must be positive integers, got "
                 f"{invalid_sizes}"
             )
-        non_dp_size = accelerator.tp_size * accelerator.cp_size
+        non_dp_size = accelerator.tp_size * accelerator.cp_size * accelerator.pp_size
         if runtime.world_size % non_dp_size:
             raise ValueError(
-                f"WORLD_SIZE {runtime.world_size} is not divisible by TP*CP "
+                f"WORLD_SIZE {runtime.world_size} is not divisible by TP*CP*PP "
                 f"size {non_dp_size}"
             )
         dp_size = runtime.world_size // non_dp_size
@@ -429,9 +506,13 @@ class HyperModelsDryRunRunner:
             self._get_runtime().local_rank,
         )
 
-    def _build_target_model(self, setup: DistributedSetup) -> nn.Module:
+    def _build_target_model(
+            self,
+            setup: DistributedSetup,
+            adapter: Optional[Any] = None,
+    ) -> nn.Module:
         """Build the configured model through the normal deferred Target path."""
-        with model_build_context():
+        with model_build_context(adapter=adapter):
             model = self.config.model.build(
                 distributed_setup=setup,
                 peft_config=self.config.peft,
@@ -454,6 +535,7 @@ class HyperModelsDryRunRunner:
             self,
             setup: DistributedSetup,
             model: nn.Module,
+            loss_fn: Optional[nn.Module] = None,
     ) -> BaseTrainer:
         """Create only the BaseTrainer state needed by one fake training step."""
         runtime = self._get_runtime()
@@ -474,14 +556,42 @@ class HyperModelsDryRunRunner:
             module for module in model.modules()
             if hasattr(module, "hsdp_scheduler")
         ]
-        BaseTrainer._build_loss(base)
+        if loss_fn is None:
+            BaseTrainer._build_loss(base)
+        else:
+            base.loss_fn = loss_fn
         BaseTrainer._build_optimizer(base)
         BaseTrainer._build_training_context(base)
         return base
 
+    def _build_loss(self) -> nn.Module:
+        """Build the loss before it is bound into a pipeline stage adapter."""
+        loss_fn = self.config.loss_fn.build() if self.config.loss_fn is not None else ModelOutputLoss()
+        if not isinstance(loss_fn, nn.Module):
+            raise ValueError("config.loss_fn must build a torch.nn.Module")
+        return loss_fn
+
     def _materialize_fake_model(self, model: nn.Module) -> nn.Module:
         """Materialize meta state as FakeTensors without assigning values."""
-        model.to_empty(device=self._simulation_torch_device())
+        fake_parameter = next((
+            parameter
+            for parameter in model.parameters()
+            if hasattr(parameter, "fake_mode")
+        ), None)
+        if fake_parameter is None:
+            # FSDP may move every stage parameter into its internal state, so
+            # the plain pipeline root no longer exposes a parameter from which
+            # to recover the active FakeTensor converter.
+            model.to_empty(device=self._simulation_torch_device())
+            return model
+        converter = fake_parameter.fake_mode.fake_tensor_converter.meta_converter
+        tensor_memo = converter.tensor_memo
+        tensor_memo.clear()
+        converter.tensor_memo = {}
+        try:
+            model.to_empty(device=self._simulation_torch_device())
+        finally:
+            converter.tensor_memo = tensor_memo
         return model
 
     @staticmethod
@@ -616,6 +726,7 @@ class HyperModelsDryRunRunner:
             base: BaseTrainer,
             batch: _DryRunTrainingBatch,
             profile: Any,
+            pipeline: Optional[dict[str, Any]] = None,
             num_micro_batches: Optional[int] = None,
     ) -> dict[str, Any]:
         """Build reproducibility metadata for the memory report."""
@@ -651,6 +762,8 @@ class HyperModelsDryRunRunner:
         }
         if num_micro_batches is not None:
             metadata["num_micro_batches"] = num_micro_batches
+        if pipeline is not None:
+            metadata.update(pipeline)
         return metadata
 
     @classmethod
@@ -710,6 +823,200 @@ class HyperModelsDryRunRunner:
             }
         return value
 
+    def _build_pipeline_adapter(
+            self,
+            parallel_context: _DryRunParallelContext,
+            batch: _DryRunTrainingBatch,
+            profile: Any,
+            loss_fn: nn.Module,
+            build_state: _DryRunPipelineBuildState,
+    ) -> Any:
+        """Create the scoped normal-builder adapter used by pipeline Dry-run."""
+        num_micro_batches = self.config.accelerator.pp_micro_batch_num
+
+        def build_pipeline_model(
+                model: nn.Module,
+                request: DeferredModelBuildRequest,
+        ) -> nn.Module:
+            """Split one raw meta model and apply stage-local infrastructure."""
+            if request.distributed_setup is not parallel_context.setup:
+                raise RuntimeError("Pipeline Dry-run adapter received an unexpected DistributedSetup")
+            if request.sharding_planner is None:
+                raise RuntimeError("Pipeline Dry-run requires a normal sharding planner")
+            self._record_model_dtype(model)
+            chunks = build_pipeline_chunks(
+                self.config,
+                model,
+                loss_fn,
+                num_micro_batches,
+                parallel_context,
+                self._resolved_dtype,
+                tuple(int(size) for size in batch.model_inputs["input_ids"].shape),
+            )
+            chunks = prepare_pipeline_chunks(
+                chunks,
+                parallel_context.setup,
+                request.sharding_planner,
+                request.fsdp2_manager,
+                request.validate_placement,
+                self._dry_run_fsdp_device,
+            )
+            pipeline_model = _DryRunPipelineModel(chunks)
+            apply_model_init_dtype(pipeline_model, request.model_init_dtype)
+            profile.project_model(pipeline_model)
+            build_state.chunks = chunks
+            return pipeline_model
+
+        return build_pipeline_model
+
+    def _execute_pipeline_step(
+            self,
+            base: BaseTrainer,
+            batch: _DryRunTrainingBatch,
+            profile: Any,
+            value_dependencies: Any,
+            chunks: tuple[_PreparedPipelineChunk, ...],
+            pp_mesh: DeviceMesh,
+    ) -> dict[str, Any]:
+        """Execute the pipeline schedule with logical, value-free P2P transport."""
+        num_micro_batches = self.config.accelerator.pp_micro_batch_num
+        stage_num = self.config.accelerator.pp_size * self.config.accelerator.pp_vpp
+        stage_indices = tuple(prepared.chunk.stage_index for prepared in chunks)
+        stages = [
+            DryRunPipelineStage(
+                prepared.module,
+                stage_index=stage_index,
+                stage_num=stage_num,
+                device=base.device,
+                input_metadata=prepared.input_metadata,
+                output_metadata=prepared.output_metadata,
+                mesh=pp_mesh,
+            )
+            for prepared, stage_index in zip(chunks, stage_indices)
+        ]
+        schedule = build_pipeline_schedule(
+            stages,
+            num_micro_batches,
+            schedule_name=self.config.accelerator.pp_schedule,
+            pp_vpp=self.config.accelerator.pp_vpp,
+            **({"p2p_transport": "plain"} if self.config.accelerator.pp_vpp > 1 else {}),
+        )
+        if stages[-1].is_last_stage:
+            labels = batch.loss_inputs.get("labels")
+            if labels is None:
+                raise ValueError("Pipeline Dry-run requires loss_inputs.labels")
+            stages[-1].set_micro_labels(list(labels.chunk(num_micro_batches, dim=0)))
+
+        self._initialize_flat_buffers(base.model)
+        self._configure_gradient_sync(base)
+        tracker = torch_dry_run._create_indexed_mem_tracker(MemTracker)  # pylint: disable=protected-access
+        tracked_optimizers = getattr(base.optimizer, "chained_optimizers", [base.optimizer])
+        tracker.track_external(base.model, *tracked_optimizers, *self._training_batch_tensors(batch))
+        operator_trace = torch_dry_run._create_operator_trace_mode(  # pylint: disable=protected-access
+            tracker, self._simulation_device
+        )
+        schedule_args = (batch.model_inputs["input_ids"],) if stages[0].is_first_stage else ()
+        schedule_kwargs = {
+            name: value
+            for name, value in batch.model_inputs.items()
+            if name != "input_ids" and value is not None
+        }
+        losses = []
+        try:
+            with (
+                    tracker,
+                    operator_trace,
+                    value_dependencies.fake_step_context(base),
+                    base.model_fwd_context,
+                    base.model_bwd_context,
+            ):
+                losses = schedule.run(*schedule_args, **schedule_kwargs)
+                hsdp_sync_stream()
+                gradient_tensors = tracker.refresh_parameter_gradients(base.model)
+                operator_trace.refresh_tensor_roles(gradient_tensors)
+                del gradient_tensors
+                clip_grad_norm_(base.model, self.config.training.max_grad_norm)
+                optimizers = base.optimizer if isinstance(base.optimizer, list) else [base.optimizer]
+                with value_dependencies.logical_scope("optimizer"):
+                    for optimizer in optimizers:
+                        with SkipDTensorDispatch():
+                            optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+        finally:
+            losses.clear()
+            tracker.clear_fake_dtensor_grad_bridges()
+            for stage in stages:
+                stage.clear_all_states()
+        operator_trace.finalize()
+        pipeline_metadata = {
+            "pipeline_schedule": normalize_pipeline_schedule(
+                self.config.accelerator.pp_schedule,
+                self.config.accelerator.pp_vpp,
+            ),
+            "pp_vpp": self.config.accelerator.pp_vpp,
+            "global_stage_count": stage_num,
+            "local_stage_indices": list(stage_indices),
+            "pipeline_chunks": [
+                {
+                    "stage_index": stage_index,
+                    "layer_start": prepared.chunk.layer_start,
+                    "layer_end": prepared.chunk.layer_end,
+                }
+                for prepared, stage_index in zip(chunks, stage_indices)
+            ],
+            "pipeline_mock": {
+                "transport": "mocked",
+                "payload_transfer": False,
+                "timing_model": False,
+                "supported_capabilities": ["schedule_order", "logical_memory_lifecycle"],
+            },
+        }
+        return torch_dry_run.build_memory_report(
+            tracker,
+            self._metadata(base, batch, profile, pipeline_metadata, num_micro_batches),
+            self._simulation_device,
+            operator_trace.memory_blocks,
+            report_device_type=self._target_device,
+        )
+
+    @staticmethod
+    def _repeat_pipeline_batch(
+            batch: _DryRunTrainingBatch,
+            num_micro_batches: int,
+    ) -> _DryRunTrainingBatch:
+        """Repeat one normal micro-batch into the configured pipeline batch."""
+        micro_batch_size = int(batch.model_inputs["input_ids"].shape[0])
+
+        def repeat(value: Any) -> Any:
+            """Repeat tensor leaves carrying the leading batch dimension."""
+            if isinstance(value, torch.Tensor) and value.ndim and value.shape[0] == micro_batch_size:
+                return torch.cat([value] * num_micro_batches, dim=0)
+            if isinstance(value, Mapping):
+                return {name: repeat(item) for name, item in value.items()}
+            if isinstance(value, list):
+                return [repeat(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(repeat(item) for item in value)
+            if is_dataclass(value) and not isinstance(value, type):
+                repeated = replace(value, **{
+                    field.name: repeat(getattr(value, field.name))
+                    for field in fields(value)
+                    if field.init
+                })
+                for field in fields(value):
+                    if not field.init:
+                        object.__setattr__(repeated, field.name, repeat(getattr(value, field.name)))
+                return repeated
+            return value
+
+        return _DryRunTrainingBatch(
+            model_inputs=repeat(batch.model_inputs),
+            loss_inputs=repeat(batch.loss_inputs),
+            token_counts={name: count * num_micro_batches for name, count in batch.token_counts.items()},
+            valid_token_count=batch.valid_token_count,
+            target_tokens_per_rank=batch.target_tokens_per_rank,
+        )
+
     def run(self) -> dict[str, Any]:
         """Execute one fake step, write the rank-local CSV, and return its report."""
         runtime = self._get_runtime()
@@ -754,9 +1061,15 @@ class HyperModelsDryRunRunner:
             self._stage = "distributed_setup"
             self._init_fake_process_group(runtime)
             initialized_here = True
-            setup = self._build_distributed_setup(
-                runtime,
-                self._simulation_device,
+            parallel_context = (
+                build_pipeline_distributed_setup(self.config, runtime, self._simulation_device)
+                if self.config.accelerator.pp_size > 1
+                else None
+            )
+            setup = (
+                parallel_context.setup
+                if parallel_context is not None
+                else self._build_distributed_setup(runtime, self._simulation_device)
             )
             normalize_distributed_setup_overrides(setup, self.config)
 
@@ -764,21 +1077,58 @@ class HyperModelsDryRunRunner:
             profile = torch_dry_run._DryRunValueProfile(dry_run)  # pylint: disable=protected-access
             with fake_mode:
                 with self._dry_run_fsdp_device():
-                    model = self._build_target_model(setup)
+                    if parallel_context is None:
+                        model = self._build_target_model(setup)
+                        pipeline_state = None
+                        loss_fn = None
+                    else:
+                        loss_fn = self._build_loss()
+                        pipeline_state = _DryRunPipelineBuildState()
+                        model = self._build_target_model(
+                            setup,
+                            self._build_pipeline_adapter(
+                                parallel_context,
+                                batch,
+                                profile,
+                                loss_fn,
+                                pipeline_state,
+                            ),
+                        )
                 self._record_model_dtype(model)
-                profile.bind_model(model)
+                if pipeline_state is None:
+                    profile.bind_model(model)
                 value_dependencies = torch_dry_run.ValueDependencyManager(
                     profile, model, runtime,
                 )
                 self._stage = "materialize"
                 model = self._materialize_fake_model(model)
-                base = self._prepare_base(setup, model)
                 profile.configure_tp_cross_entropy_counts(
                     batch.valid_token_count,
                     batch.target_tokens_per_rank,
                 )
-                self._stage = "fake_step"
-                report = self._execute_step(base, batch, profile, value_dependencies)
+                if pipeline_state is None:
+                    base = self._prepare_base(setup, model)
+                    self._stage = "fake_step"
+                    report = self._execute_step(base, batch, profile, value_dependencies)
+                else:
+                    if pipeline_state.chunks is None or parallel_context is None or loss_fn is None:
+                        raise RuntimeError("Pipeline Dry-run adapter did not produce local pipeline chunks")
+                    if parallel_context.pp_mesh is None:
+                        raise RuntimeError("Pipeline Dry-run requires a PP mesh")
+                    base = self._prepare_base(setup, model, loss_fn)
+                    pipeline_batch = self._repeat_pipeline_batch(
+                        batch,
+                        self.config.accelerator.pp_micro_batch_num,
+                    )
+                    self._stage = "pipeline_fake_step"
+                    report = self._execute_pipeline_step(
+                        base,
+                        pipeline_batch,
+                        profile,
+                        value_dependencies,
+                        pipeline_state.chunks,
+                        parallel_context.pp_mesh,
+                    )
 
             self._stage = "report_generation"
             torch_dry_run.write_memory_report(report, json_path)

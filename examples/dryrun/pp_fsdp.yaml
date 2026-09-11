@@ -1,0 +1,43 @@
+# Four-rank PP2 x FSDP2 FakeTensor dry-run.
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: outputs/dryrun/models/parallel_validation_llama
+  local_files_only: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+training: {train_iters: 2, global_batch_size: 4, micro_batch_size: 1, backend: hccl, init_device: meta, max_grad_norm: 1.0, seed: 1234}
+accelerator: {tp_size: 1, cp_size: 1, ep_size: 1, pp_size: 2, pp_micro_batch_num: 2, pp_schedule: 1f1b, pp_vpp: 1}
+fsdp_config:
+  dp_shard_size: 2
+  edp_shard_size: 1
+  reshard_after_forward: true
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  adamw_config: {adamw_lr: 1.0e-4, adamw_weight_decay: 0.01, adamw_betas: [0.9, 0.999], adamw_eps: 1.0e-8}
+dataset: {_target_: tests.fixtures.data.datasets.DummyDataset, model_assets: {chat_template: null, tokenizer: null}, num_samples: 16, seq_len: 512, vocab_size: 32768}
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn: {_target_: hyper_parallel.data.batching.build_online_text_collate_fn}
+  get_batch: {_target_: hyper_parallel.data.batching.ParallelBatch, source_type: online, attention_mode: dense, cp_algorithm: ulysses}
+  batch_size: 1
+  drop_last: true
+  use_background_prefetcher: false
+checkpoint: {save_ckpt: false, checkpoint_dir: ./outputs/dryrun/pp_fsdp/checkpoints}
+dry_run:
+  target_device: npu
+  sequence_length: 32
+  output_dir: ./outputs/dryrun/pp_fsdp
+  pipeline_stage_builder: {_target_: examples.dryrun.pipeline.build_hf_llama_dry_run_stage}
+  value_dependencies:
+    rules:
+      - {match: "*.self_attn", handler: attention, path: causal}
+profiling:
+  enabled: true
+  start_step: 1
+  end_step: 2
+  trace_dir: ./outputs/profile/pp_fsdp
+  record_shapes: true
+  profile_memory: true
+  with_stack: true
+  with_modules: true
+  rank: 0

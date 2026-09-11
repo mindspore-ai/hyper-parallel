@@ -58,6 +58,26 @@ def prepare_tiny_configs(output_dir: Path) -> None:
     ).save_pretrained(moe_dir)
 
 
+def prepare_pp_config(output_dir: Path) -> None:
+    """Write the config-only Llama model used by the PP adapter example.
+
+    Args:
+        output_dir: Parent directory for local model configurations.
+    """
+    model_dir = output_dir / "pp_llama"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    LlamaConfig(
+        vocab_size=32768,
+        hidden_size=2304,
+        intermediate_size=6144,
+        num_hidden_layers=4,
+        num_attention_heads=18,
+        num_key_value_heads=6,
+        max_position_embeddings=8192,
+        tie_word_embeddings=False,
+    ).save_pretrained(model_dir)
+
+
 def prepare_8b_configs(output_dir: Path) -> None:
     """Write dense and MoE models with roughly eight billion parameters.
 
@@ -213,6 +233,7 @@ def main() -> None:
     args = parser.parse_args()
     output_dir = args.output_dir.resolve()
     prepare_tiny_configs(output_dir)
+    prepare_pp_config(output_dir)
     prepare_8b_configs(output_dir)
     prepare_legacy_validation_configs(output_dir)
     prepare_micro_batch_validation_configs(output_dir)

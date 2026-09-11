@@ -17,6 +17,9 @@
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
+from hyper_parallel.trainer.config.target import Target
+
+
 @dataclass
 class DryRunConfig:
     """Shape and value-profile configuration for logical LLM memory analysis."""
@@ -27,3 +30,4 @@ class DryRunConfig:
     output_dir: str = "outputs/dry_run"
     device_memory_gib: Optional[float] = None
     value_dependencies: dict[str, Any] = field(default_factory=lambda: {"rules": []})
+    pipeline_stage_builder: Optional[Target[Any]] = None

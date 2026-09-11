@@ -598,6 +598,27 @@ class _DryRunValueProfile:
             resolved.setdefault(handler_name, {})[target] = rule
         self._resolved = resolved
 
+    def project_model(self, model: Any, context: Any = None) -> None:
+        """Keep validated value-dependency rules owned by one pipeline stage.
+
+        ``bind_model`` must run on the complete model before this projection.
+        Rules are intentionally not glob-expanded again: a valid global target
+        may be owned by a different pipeline rank.
+        """
+        self._target_modules = dict(model.named_modules())
+        projected = {}
+        for handler_name, targets in self._resolved.items():
+            handler = self._handlers[handler_name]
+            supported_targets = set(handler.discover(model, context))
+            local_targets = {}
+            for target, rule in targets.items():
+                for local_target in supported_targets:
+                    if local_target == target or local_target.endswith(f".{target}"):
+                        local_targets[local_target] = rule
+            if local_targets:
+                projected[handler_name] = local_targets
+        self._resolved = projected
+
     def resolved_rules(self, handler: str) -> Dict[str, _ValueDependencyRule]:
         """Return expanded rules for one handler."""
         return dict(self._resolved.get(handler, {}))

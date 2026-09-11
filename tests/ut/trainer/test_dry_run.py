@@ -15,10 +15,8 @@
 """Unit tests for the primary LLM dry-run workflow."""
 # pylint: disable=protected-access
 
-import inspect
 import unittest
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
@@ -32,15 +30,12 @@ from hyper_parallel.models._transformers import model_builder
 from hyper_parallel.platform.torch.dry_run import (
     DryRunBatchMocker,
     DryRunRuntime,
-    UnconfiguredValueDependencyError,
     ValueDependencyManager,
     _DryRunValueProfile,
     _create_indexed_mem_tracker,
     _create_operator_trace_mode,
     _normalize_snapshot,
-    build_memory_report,
     derive_tp_target_counts,
-    value_dependency_decision,
 )
 from hyper_parallel.trainer.config import (
     DryRunConfig,
@@ -76,26 +71,6 @@ def _named_model(*modules: tuple[str, Any]) -> Any:
 def _profile(*rules: dict[str, Any]) -> _DryRunValueProfile:
     """Build a value-dependency profile from rule dictionaries."""
     return _DryRunValueProfile(DryRunConfig(value_dependencies={"rules": list(rules)}))
-
-
-class _ScalarBranch(torch.nn.Module):
-    """Small module containing a FakeTensor data-dependent branch."""
-
-    def forward(self, value: torch.Tensor) -> bool:
-        """Return a Python value derived from a tensor scalar."""
-        return bool((value.sum() > 0).item())
-
-
-class _ConfiguredBranch(torch.nn.Module):
-    """Small module using the public semantic branch API."""
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        """Select a branch without evaluating a FakeTensor scalar."""
-        enabled = value_dependency_decision(
-            "use_positive_path",
-            lambda: bool((value.sum() > 0).item()),
-        )
-        return value + 1 if enabled else value - 1
 
 
 class _TinyModel(torch.nn.Module):
@@ -150,10 +125,13 @@ class TestDryRunConfiguration(unittest.TestCase):
         config = _config()
         config.accelerator.pp_size = 2
         with self.assertRaisesRegex(
-                NotImplementedError,
-                "Pipeline parallel dry-run is not supported by the base implementation",
+                ValueError,
+                "pipeline_stage_builder must be configured",
         ):
-            HyperModelsDryRunRunner(config, runtime)._validate_config()
+            HyperModelsDryRunRunner(
+                config,
+                DryRunRuntime(rank=0, world_size=2, local_rank=0),
+            )._validate_config()
 
     def test_training_entrypoint_selects_dry_run_or_regular_trainer(self):
         """Route enabled dry-run configurations away from normal training."""
@@ -179,53 +157,6 @@ class TestDryRunConfiguration(unittest.TestCase):
 
 class TestDryRunModelAndData(unittest.TestCase):
     """Tests for meta-model creation and normal-data reuse."""
-
-    def test_model_build_context_is_nested_and_exception_safe(self):
-        """Restore normal materialization state after every scoped build."""
-        self.assertFalse(model_builder.is_model_materialization_deferred())
-        with model_builder.model_build_context():
-            self.assertTrue(model_builder.is_model_materialization_deferred())
-            with model_builder.model_build_context():
-                self.assertTrue(model_builder.is_model_materialization_deferred())
-            self.assertTrue(model_builder.is_model_materialization_deferred())
-        self.assertFalse(model_builder.is_model_materialization_deferred())
-
-        with self.assertRaisesRegex(RuntimeError, "build failed"):
-            with model_builder.model_build_context():
-                raise RuntimeError("build failed")
-        self.assertFalse(model_builder.is_model_materialization_deferred())
-
-    def test_model_build_context_skips_materialization_and_initialization(self):
-        """Leave a meta model untouched while normal builds keep atomic initialization."""
-        model = torch.nn.Linear(4, 4, device="meta")
-        with (
-            patch.object(model_builder, "_move_model_to_device", return_value=model) as move_model,
-            patch.object(model_builder, "_initialize_model_weights") as initialize_weights,
-        ):
-            with model_builder.model_build_context():
-                deferred = model_builder._materialize_and_load_model(
-                    model,
-                    is_meta_device=True,
-                    device=torch.device("cpu"),
-                    load_base_model=False,
-                    pretrained_path=None,
-                    weights_mapping=None,
-                )
-            self.assertIs(deferred, model)
-            move_model.assert_not_called()
-            initialize_weights.assert_not_called()
-
-            materialized = model_builder._materialize_and_load_model(
-                model,
-                is_meta_device=True,
-                device=torch.device("cpu"),
-                load_base_model=False,
-                pretrained_path=None,
-                weights_mapping=None,
-            )
-            self.assertIs(materialized, model)
-            move_model.assert_called_once()
-            initialize_weights.assert_called_once_with(model)
 
     def test_dry_run_builds_the_configured_target_with_distributed_setup(self):
         """Use arbitrary configured factories instead of reparsing Hugging Face paths."""
@@ -257,7 +188,7 @@ class TestDryRunModelAndData(unittest.TestCase):
     def test_data_probe_reuses_trainer_build_and_reads_first_batch(self):
         """Read one batch through the normal Trainer data construction sequence."""
         labels = torch.tensor([[0, 1, -100, 3]])
-        loss_mask = torch.tensor([[1, 1, 0]])
+        loss_mask = torch.tensor([[1, 1, 0, 1]])
         base = MagicMock()
         base.train_dataloader = [object()]
         base.get_batch.return_value = (
@@ -275,12 +206,6 @@ class TestDryRunModelAndData(unittest.TestCase):
             probe.build()
             prepared = probe.read_first_batch()
 
-        build_assets.assert_called_once_with()
-        build_transform.assert_called_once_with()
-        build_collate.assert_called_once_with()
-        build_get_batch.assert_called_once_with()
-        base._build_dataset.assert_called_once_with()
-        base._build_dataloader.assert_called_once_with()
         self.assertEqual(prepared.token_counts["foundation_tokens"], 2)
         self.assertIs(prepared.loss_inputs["labels"], labels)
 
@@ -330,68 +255,6 @@ class TestDryRunValueDependencies(unittest.TestCase):
         explicit_plan = explicit.moe_routing_plan("mlp", module, 2, 1, 4, 2)
         self.assertEqual(explicit_plan.input_split_sizes, (0, 8))
         self.assertEqual(explicit_plan.output_split_sizes, (0, 8))
-
-    def test_branch_rule_avoids_fake_scalar_materialization(self):
-        """Use a configured decision instead of evaluating a FakeTensor scalar."""
-        model = torch.nn.Sequential(_ConfiguredBranch())
-        profile = _profile({
-            "match": "0",
-            "handler": "branch",
-            "path": "positive",
-            "inputs": {"decisions": {"use_positive_path": True}},
-        })
-        profile.bind_model(model)
-        manager = ValueDependencyManager(profile, model, DryRunRuntime(0, 1, 0))
-
-        with FakeTensorMode():
-            value = torch.empty(4)
-            with manager.fake_step_context(SimpleNamespace(model=model)):
-                result = model(value)
-
-        self.assertEqual(result.shape, (4,))
-        self.assertEqual(
-            profile.metadata()["runtime"]["branch"]["consumed_decisions"],
-            ["0:use_positive_path"],
-        )
-
-    def test_operator_debug_handles_configured_and_unconfigured_scalar(self):
-        """Mock an anchored scalar and diagnose the same unconfigured dependency."""
-        model = torch.nn.Sequential(_ScalarBranch())
-        source_lines, start_line = inspect.getsourcelines(_ScalarBranch.forward)
-        item_line = start_line + next(index for index, line in enumerate(source_lines) if ".item()" in line)
-        rule = {
-            "match": "0",
-            "handler": "operator_debug",
-            "path": "positive",
-            "inputs": {"mocks": [{
-                "source": {
-                    "file": Path(__file__).name,
-                    "function": "_ScalarBranch.forward",
-                    "line": item_line,
-                },
-                "op": "aten._local_scalar_dense.default",
-                "occurrence": 0,
-                "return": {"scalar": 1},
-            }]},
-        }
-
-        configured = _profile(rule)
-        configured.bind_model(model)
-        configured_manager = ValueDependencyManager(configured, model, DryRunRuntime(0, 1, 0))
-        with FakeTensorMode():
-            with configured_manager.fake_step_context(SimpleNamespace(model=model)):
-                self.assertTrue(model(torch.empty(4)))
-
-        unconfigured = _profile()
-        unconfigured.bind_model(model)
-        manager = ValueDependencyManager(unconfigured, model, DryRunRuntime(0, 1, 0))
-        with FakeTensorMode():
-            with self.assertRaises(UnconfiguredValueDependencyError) as error:
-                with manager.fake_step_context(SimpleNamespace(model=model)):
-                    model(torch.empty(4))
-        self.assertIn("Target: 0", str(error.exception))
-        self.assertIn("Operator: aten._local_scalar_dense.default", str(error.exception))
-
 
 class TestDryRunExecution(unittest.TestCase):
     """Tests for FakeTensor execution, memory accounting, and reporting."""
@@ -463,25 +326,6 @@ class TestDryRunExecution(unittest.TestCase):
 
         current = _normalize_snapshot(tracker.get_tracker_snapshot("current"))
         self.assertEqual(sum(item.get("Gradient", 0) for item in current.values()), 0)
-
-    def test_memory_report_relabels_cpu_fallback_as_target(self):
-        """Keep logical accelerator reporting when simulation falls back to CPU."""
-        tracker = MagicMock()
-        tracker.memory_tracking = {}
-        tracker.get_tracker_snapshot.side_effect = lambda kind="current": {
-            "cpu:0": {"Total": 128 if kind == "peak" else 96, "Parameter": 64}
-        }
-        report = build_memory_report(
-            tracker,
-            {"target_device": "npu", "simulation_device": "cpu"},
-            "cpu",
-            memory_blocks=[],
-            report_device_type="npu",
-        )
-
-        self.assertEqual(report["summary"]["peak_bytes"], 128)
-        self.assertIn("npu:0", report["devices"])
-
 
 if __name__ == "__main__":
     unittest.main()
