@@ -282,6 +282,24 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement get_tensor_storage_size")
 
     @staticmethod
+    def copy_each(dests: list, srcs: list) -> None:
+        """Copy each source into the destination beside it, pairwise.
+
+        A framework that can do the whole set in one go should override this: starting a
+        copy costs far more than a small one moves, so a caller with many small pairs is
+        paying per pair rather than for its data.
+
+        Args:
+            dests (list): Tensors to copy into, one per source.
+            srcs (list): Tensors to copy from, matching ``dests`` in length and shape.
+        """
+        for dest, src in zip(dests, srcs):
+            if hasattr(dest, "copy_"):
+                dest.copy_(src)
+            else:
+                dest[...] = src
+
+    @staticmethod
     def differentiable_all_reduce(data, op, group):
         """Perform differentiable all-reduce operation.
 
@@ -542,6 +560,26 @@ class Platform:
     def broadcast(data, src=None, group=None, async_op=False, group_src=None):
         """Broadcast tensor from source rank to all ranks in group."""
         raise NotImplementedError("Platform subclasses must implement broadcast")
+
+    @staticmethod
+    def broadcast_async(data: Any, src: Optional[int] = None, group: Any = None,
+                        group_src: Optional[int] = None) -> Any:
+        """Start a broadcast and hand back its work handle without waiting on it.
+
+        Unlike :meth:`broadcast`, which waits even when asked for an async op, this leaves
+        the waiting to the caller, so several broadcasts can be in flight at once.
+
+        Args:
+            data: The tensor to broadcast, written in place on the receiving ranks.
+            src (int, optional): Global rank the data comes from. Defaults to None.
+            group: The process group for communication. Defaults to None.
+            group_src (int, optional): Source given as a rank within the group instead of a
+                global one. Defaults to None.
+
+        Returns:
+            A work handle to wait on, or None if the backend completed the call inline.
+        """
+        raise NotImplementedError("Platform subclasses must implement broadcast_async")
 
     @staticmethod
     def scatter(output, scatter_list, src=None, group=None, async_op=False, group_src=None):
@@ -1839,6 +1877,18 @@ class Platform:
         raise NotImplementedError(
             "Platform subclasses must implement clip_grad_norm_"
         )
+
+    @staticmethod
+    def get_world_group() -> Any:
+        """The group holding every rank, which the job runs on.
+
+        It exists from initialization onwards and outlives anything that borrows it, so a
+        caller that reuses it here must not destroy it the way it would one of its own.
+
+        Returns:
+            The process group of every rank.
+        """
+        raise NotImplementedError("Platform subclasses must implement get_world_group")
 
     @staticmethod
     def get_created_group(rank_list: Union[list[int], tuple[int]]):

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """UT for :mod:`hyper_parallel.core.distributed_checkpoint.planner`."""
+import pickle
 import unittest
 
 from hyper_parallel.core.distributed_checkpoint.metadata import (
@@ -127,5 +128,91 @@ class TestPlanner(unittest.TestCase):
         self.assertEqual(read_item.type, LoadItemType.TENSOR)
 
 
+class TestLoadPlanIdentity(unittest.TestCase):
+    """Tests for the stripped plan that travels through the all-gather."""
+
+    @staticmethod
+    def _plan():
+        """A load plan with one tensor item and one byte-io item."""
+        return LoadPlan(items=[
+            ReadItem(
+                type=LoadItemType.TENSOR,
+                dest_index=MetadataIndex(fqn="w", offset=(4, 0), index=1),
+                dest_offsets=(0, 2),
+                storage_index=MetadataIndex(fqn="w", offset=(0, 0), index=3),
+                storage_offsets=(4, 2),
+                lengths=(2, 4),
+            ),
+            ReadItem(
+                type=LoadItemType.BYTE_IO,
+                dest_index=MetadataIndex(fqn="opt"),
+                dest_offsets=(0,),
+                storage_index=MetadataIndex(fqn="opt"),
+                storage_offsets=(0,),
+                lengths=(0,),
+            ),
+        ])
+
+    def test_identity_keeps_what_recognizes_a_read_and_drops_the_rest(self):
+        """
+        Feature: LoadPlan.identity.
+        Description: Strip a plan holding a tensor item and a byte-io item.
+        Expectation: Type, destination and lengths survive untouched, so the global plan can
+            still tell which shard a read lands in and how much of it it moves, while the
+            checkpoint location is elided.
+        """
+        original = self._plan()
+
+        stripped = original.identity()
+
+        for before, after in zip(original.items, stripped.items):
+            self.assertEqual(after.type, before.type)
+            self.assertEqual(after.dest_index, before.dest_index)
+            self.assertEqual(after.lengths, before.lengths)
+            self.assertEqual(after.storage_offsets, ())
+            self.assertNotEqual(after.storage_index, before.storage_index)
+
+    def test_identity_leaves_the_original_plan_alone(self):
+        """
+        Feature: LoadPlan.identity.
+        Description: Strip a plan and then look at the plan it was taken from.
+        Expectation: Unchanged. The rank that sends the stripped copy goes on to execute the
+            original, which still has to say where in the checkpoint to read from.
+        """
+        original = self._plan()
+
+        original.identity()
+
+        self.assertEqual(original.items[0].storage_offsets, (4, 2))
+        self.assertEqual(original.items[0].storage_index, MetadataIndex(fqn="w", offset=(0, 0), index=3))
+
+    def test_identity_is_smaller_on_the_wire(self):
+        """
+        Feature: LoadPlan.identity.
+        Description: Pickle a plan of a hundred tensor items both ways, the way the
+            all-gather does.
+        Expectation: The stripped plan is markedly smaller. Every rank sends its plan to
+            every other one, so this is the cost that grows with the world size.
+        """
+        items = [
+            ReadItem(
+                type=LoadItemType.TENSOR,
+                dest_index=MetadataIndex(fqn=f"layers.{index}.weight", offset=(index, 0), index=0),
+                dest_offsets=(0, 0),
+                storage_index=MetadataIndex(fqn=f"layers.{index}.weight", offset=(0, 0), index=index),
+                storage_offsets=(index, 0),
+                lengths=(2, 4),
+            )
+            for index in range(100)
+        ]
+        plan = LoadPlan(items=items)
+
+        full = len(pickle.dumps(plan))
+        stripped = len(pickle.dumps(plan.identity()))
+
+        self.assertLess(stripped, full * 0.75)
+
+
 if __name__ == "__main__":
+
     unittest.main()

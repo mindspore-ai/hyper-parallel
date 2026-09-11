@@ -20,6 +20,7 @@ import pickle
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 import torch
@@ -47,6 +48,7 @@ from hyper_parallel.core.distributed_checkpoint.metadata import (
     MetadataIndex,
 )
 from hyper_parallel.core.distributed_checkpoint.planner import (
+    BroadcastSource,
     SavePlan,
     WriteItem,
     WriteItemType,
@@ -57,6 +59,30 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import RaggedShard
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+
+
+class _FakeBatcher:
+    """Stands in for the batcher, noting the shards handed to it instead of sending any."""
+
+    def __init__(self, events: list = None) -> None:
+        """Note shards into ``events`` when given one, and count them either way."""
+        self.events = events
+        self.sent = 0
+        self.batched = 0
+
+    def add(self, in_flight: Any, state_dict: dict, item: Any) -> None:
+        """Take one shard, as the real batcher does, without reaching a backend."""
+        self.sent += 1
+        if self.events is not None:
+            self.events.append(f"send {item.dest_index.fqn}")
+
+    def flush(self, in_flight: Any) -> None:
+        """Send whatever is waiting, which for a stand-in is nothing."""
+
+
+def _pairs(reader: Any, reqs: list, storage_data: dict, keys: Any = None) -> list:
+    """What a read hands back, without a checkpoint file behind it: an item, and nothing read."""
+    return [(req, None) for req in reqs]
 
 
 class TestFilesystemStorage(unittest.TestCase):
@@ -255,7 +281,7 @@ class TestFilesystemStorage(unittest.TestCase):
         Description: Load plan with ReadItems referencing the same safetensors file.
         Expectation: Items are grouped under one absolute file path key.
         """
-        from hyper_parallel.core.distributed_checkpoint.planner import LoadItemType, LoadPlan, ReadItem
+        from hyper_parallel.core.distributed_checkpoint.planner import LoadItemType, ReadItem
 
         storage_index = MetadataIndex(fqn="w", offset=(0, 0), index=0)
         storage_info = StorageInfo(relative_path="_rank0_.safetensors", offset=0, length=-1)
@@ -271,10 +297,202 @@ class TestFilesystemStorage(unittest.TestCase):
             storage_offsets=(0, 0),
             lengths=(2, 2),
         )
-        grouped = reader._group_items_by_file(LoadPlan(items=[read_item]))
+        grouped = reader._group_items_by_file([read_item])
         self.assertEqual(len(grouped), 1)
         self.assertEqual(len(next(iter(grouped.values()))), 1)
 
 
+    @staticmethod
+    def _pipeline_reader(tmpdir, shards, files=1):
+        """
+        A reader over a checkpoint, with a plan holding the given shards.
+
+        Args:
+            tmpdir (str): Directory the checkpoint files are made in.
+            shards (list): ``(fqn, source)`` per shard, source None when this rank alone
+                wants it.
+            files (int): Over how many files the shards are spread, one to a shard and round
+                again. More than one is what the dedup leaves behind for the entries a load
+                does not broadcast: the rank that wrote one is whichever was carrying the
+                least at the time, so they sit wherever that put them.
+
+        Returns:
+            tuple: The reader and the load plan to hand it.
+        """
+        from hyper_parallel.core.distributed_checkpoint.planner import (
+            LoadItemType, LoadPlan, ReadItem,
+        )
+
+        storage_data, items = {}, []
+        for index, (fqn, source) in enumerate(shards):
+            relative = f"_rank{index % files}_.safetensors"
+            Path(tmpdir, relative).touch()
+            metadata_index = MetadataIndex(fqn=fqn, offset=(index,), index=index)
+            storage_data[metadata_index] = StorageInfo(relative_path=relative, offset=0, length=-1)
+            items.append(ReadItem(
+                type=LoadItemType.TENSOR,
+                dest_index=metadata_index,
+                dest_offsets=(0,),
+                storage_index=metadata_index,
+                storage_offsets=(0,),
+                lengths=(2,),
+                source=source,
+            ))
+        reader = FileSystemReader(tmpdir)
+        reader.storage_data = storage_data
+        return reader, LoadPlan(items=items)
+
+    def test_execute_read_sends_each_shard_as_soon_as_it_is_in_place(self):
+        """
+        Feature: FileSystemReader.execute_read pipelining.
+        Description: Two shards this rank reads on behalf of its group, one it receives from
+            elsewhere, and one nobody else wants. What is put in place, and what is sent, are
+            recorded as they happen.
+        Expectation: Every shared shard is sent right after it lands and before the next one
+            does, and the shard nobody shares comes last. That interleaving is what leaves a
+            send in flight while the shard after it is being read; putting everything in
+            place first would keep the group waiting through all of it, and taking the
+            private shard early would delay every send behind it.
+        """
+        mine = BroadcastSource(group_ranks=(0, 1), src_rank=0)
+        theirs = BroadcastSource(group_ranks=(0, 1), src_rank=1)
+        events = []
+
+        def record_apply(fetched: list, planner: Any) -> None:
+            """Note which shards were put in place instead of copying anything."""
+            events.extend(f"apply {req.dest_index.fqn}" for req, payload in fetched)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reader, plan = self._pipeline_reader(
+                tmpdir, [("alone", None), ("a", mine), ("b", theirs), ("c", mine)]
+            )
+            files = fs_mod._OpenFiles(8, lambda path: path, lambda _reader: None)
+            with patch.object(fs_mod, "_open_checkpoint_files", lambda: files), \
+                    patch.object(fs_mod, "_fetch_tensor_file", _pairs), \
+                    patch.object(fs_mod, "_apply_fetched", record_apply), \
+                    patch.object(fs_mod, "BroadcastBatcher",
+                                 lambda *_args: _FakeBatcher(events)), \
+                    patch.object(fs_mod, "wait_broadcasts", lambda _in_flight: None):
+                reader.execute_read(plan, Mock(), {(0, 1): "pre_built"})
+
+        self.assertEqual(
+            events, ["apply a", "send a", "send b", "apply c", "send c", "apply alone"]
+        )
+
+    def test_the_shards_nobody_shares_are_read_a_file_at_a_time(self):
+        """
+        Feature: execute_read gathering the shards of one file into a single read.
+        Description: Thirty-six shards nobody else wants, spread over twelve files and
+            landing in the plan a file apart, with the handle cache cut to one file so that
+            nothing is held from one shard to the next.
+        Expectation: Twelve reads and twelve opens, each read carrying the three shards of
+            one file. Nothing waits on these shards, so nothing holds them to the order the
+            ranks agreed on and they are gathered by file instead, which leaves the read
+            independent of how much the cache happens to be holding. It is the pickled
+            entries this matters to most: a load never broadcasts one, so every rank reads
+            every entry it wants, out of whatever file the dedup put it in, and nothing
+            holds a bytes file open between reads - eighty entries over three files cost
+            eighty opens where three would do.
+        """
+        opened, reads = [], []
+
+        def open_one(path: str) -> Any:
+            """Stand in for opening a file, and count the opening."""
+            opened.append(path)
+            return path
+
+        def record_read(reader: Any, reqs: list, storage_data: dict) -> list:
+            """Note which shards one read asked its file for."""
+            reads.append([req.dest_index.fqn for req in reqs])
+            return _pairs(reader, reqs, storage_data)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reader, plan = self._pipeline_reader(
+                tmpdir, [(f"w{shard:02d}", None) for shard in range(36)], files=12)
+            held = fs_mod._OpenFiles(1, open_one, lambda _reader: None)
+            with patch.object(fs_mod, "_open_checkpoint_files", lambda: held), \
+                    patch.object(fs_mod, "_fetch_tensor_file", record_read), \
+                    patch.object(fs_mod, "_apply_fetched", lambda *_args: None), \
+                    patch.object(fs_mod, "wait_broadcasts", lambda _in_flight: None):
+                reader.execute_read(plan, Mock(), None)
+
+        self.assertEqual([len(read) for read in reads], [3] * 12,
+                         "a file was asked for its shards one at a time")
+        self.assertEqual(len(opened), 12, "a file was opened again for a later shard of it")
+        self.assertEqual(sorted(fqn for read in reads for fqn in read),
+                         sorted(f"w{shard:02d}" for shard in range(36)),
+                         "gathering by file left a shard unread")
+
+    def test_a_read_of_a_file_that_is_not_there_says_which_one(self):
+        """
+        Feature: FileSystemReader.execute_read on a checkpoint file that is missing.
+        Description: A plan naming a file the checkpoint directory does not hold, which is
+            what a checkpoint half copied or half written leaves behind.
+        Expectation: FileNotFoundError naming the file. Nothing looks for the file before
+            opening it: safetensors raises that itself, and so does the builtin open behind
+            a bytes file, so a check ahead of them said no more than they do and said it
+            with a stat per file - a round trip of its own on shared storage.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reader, plan = self._pipeline_reader(tmpdir, [("gone", None)])
+            Path(tmpdir, "_rank0_.safetensors").unlink()
+            with patch.object(fs_mod, "BroadcastBatcher", lambda *_args: _FakeBatcher()), \
+                    patch.object(fs_mod, "wait_broadcasts", lambda _in_flight: None):
+                with self.assertRaises(FileNotFoundError) as caught:
+                    reader.execute_read(plan, Mock(), None)
+
+        self.assertIn("_rank0_.safetensors", str(caught.exception))
+
+    def test_a_read_that_fails_fails_the_load(self):
+        """
+        Feature: FileSystemReader.execute_read read failures.
+        Description: A read that raises, as an unreadable checkpoint file would.
+        Expectation: The load raises it rather than carrying on. Reads are pulled one shard
+            at a time as the copies ask for them, so a failure has to come out of the pull
+            that asked for it; one swallowed there would leave the load putting shards in
+            place that were never read.
+        """
+        mine = BroadcastSource(group_ranks=(0, 1), src_rank=0)
+
+        def fail(reader: Any, reqs: list, storage_data: dict, keys: Any = None) -> list:
+            """A read that goes wrong, as an unreadable checkpoint file would."""
+            raise RuntimeError("checkpoint file is not readable")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reader, plan = self._pipeline_reader(tmpdir, [(name, mine) for name in "ab"])
+            files = fs_mod._OpenFiles(8, lambda path: path, lambda _reader: None)
+            with patch.object(fs_mod, "_open_checkpoint_files", lambda: files), \
+                    patch.object(fs_mod, "_fetch_tensor_file", fail), \
+                    patch.object(fs_mod, "BroadcastBatcher", lambda *_args: _FakeBatcher()), \
+                    patch.object(fs_mod, "wait_broadcasts", lambda _in_flight: None):
+                with self.assertRaises(RuntimeError):
+                    reader.execute_read(plan, Mock(), {(0, 1): "pre_built"})
+
+    def test_execute_read_keeps_a_checkpoint_file_open_across_shards(self):
+        """
+        Feature: FileSystemReader.execute_read file handling.
+        Description: Three shards of one checkpoint file, read one at a time by the pipeline.
+        Expectation: The file is opened once. Going through the shards in the order every
+            rank agrees on returns to the same file over and over, and opening one costs far
+            more than the slice read it wraps, so reopening per shard would pay that over
+            and over for nothing.
+        """
+        mine = BroadcastSource(group_ranks=(0, 1), src_rank=0)
+        opened = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reader, plan = self._pipeline_reader(tmpdir, [(name, mine) for name in ("a", "b", "c")])
+            files = fs_mod._OpenFiles(8, lambda path: opened.append(path) or path, lambda _reader: None)
+            with patch.object(fs_mod, "_open_checkpoint_files", lambda: files), \
+                    patch.object(fs_mod, "_fetch_tensor_file", _pairs), \
+                    patch.object(fs_mod, "_apply_fetched", lambda *_args: None), \
+                    patch.object(fs_mod, "BroadcastBatcher", lambda *_args: _FakeBatcher()), \
+                    patch.object(fs_mod, "wait_broadcasts", lambda _in_flight: None):
+                reader.execute_read(plan, Mock(), {(0, 1): "pre_built"})
+
+        self.assertEqual(len(opened), 1)
+
+
 if __name__ == "__main__":
+
     unittest.main()

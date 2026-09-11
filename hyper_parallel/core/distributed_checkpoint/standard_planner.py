@@ -16,7 +16,9 @@
 """Standard planner implementations for checkpoint save and load."""
 
 from dataclasses import dataclass
+from collections import defaultdict
 import dataclasses
+import math
 from itertools import compress
 import pickle
 from typing import Any, Optional, Union
@@ -25,9 +27,9 @@ from hyper_parallel.core.distributed_checkpoint.metadata import (
     CHUNK_INFO,
     Metadata,
     MetadataIndex,
+    dtype_element_size,
     ChunkStorageMetadata,
     ChunkInfo,
-    BroadcastInfo,
     TensorStorageMetadata,
     TensorProperties,
     BytesStorageMetadata
@@ -40,7 +42,8 @@ from hyper_parallel.core.distributed_checkpoint.planner import (
     WriteItem,
     WriteItemType,
     ReadItem,
-    LoadItemType
+    LoadItemType,
+    BroadcastSource,
 )
 from hyper_parallel.core.distributed_checkpoint.reshard import infer_intersection
 from hyper_parallel.core.distributed_checkpoint.ragged_utils import (
@@ -52,16 +55,41 @@ from hyper_parallel.core.distributed_checkpoint.util import (
     chunk_to_area,
     create_chunk_list_for_tensor,
     plan_ownership_masks,
-    infer_same_shard_ranks_for_dtensor,
     flatten_state_dict,
     set_element,
     dcp_timer_decorator,
-    BROADCAST_INFO,
+    logger,
     platform,
     Tensor,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout, infer_slice_area_by_layout
+
+
+def _own_plan_index(all_plans: Union[list[SavePlan], list[LoadPlan]], rank: int) -> int:
+    """
+    Locate this rank's plan in the gathered list.
+
+    Both gather paths return one entry per rank in rank order; without collectives the
+    "gather" is just this rank's own plan in a one element list.
+
+    Args:
+        all_plans (Union[list[SavePlan], list[LoadPlan]]): Local plans from all ranks.
+        rank (int): Rank looking for its own plan.
+
+    Returns:
+        int: Index of this rank's plan.
+
+    Raises:
+        ValueError: If the gathered list holds no plan for this rank.
+    """
+    own_index = rank if len(all_plans) > 1 else 0
+    if not 0 <= own_index < len(all_plans):
+        raise ValueError(
+            f"Rank {rank} has no plan of its own among the {len(all_plans)} gathered "
+            "plans; the gathered list must hold one plan per rank, in rank order."
+        )
+    return own_index
 
 
 @dataclass(frozen=True)
@@ -267,7 +295,7 @@ class StandardSavePlanner(SavePlanner):
         Raises:
             ValueError: If an item has an unsupported type.
         """
-        own_index = self._own_plan_index(all_plans)
+        own_index = _own_plan_index(all_plans, self.rank)
 
         # Redundant items are skipped through a per-plan mask rather than by materialising
         # deduplicated plans: the loop below walks plan.items anyway.
@@ -321,30 +349,6 @@ class StandardSavePlanner(SavePlanner):
                 merged_mapping.update(p.planner_data)
             metadata.planner_data = merged_mapping
         return dataclasses.replace(all_plans[own_index], items=own_items), metadata
-
-    def _own_plan_index(self, all_plans: list[SavePlan]) -> int:
-        """
-        Locate this rank's plan in the gathered list.
-
-        Both gather paths return one entry per rank in rank order; without collectives the
-        "gather" is just this rank's own plan in a one element list.
-
-        Args:
-            all_plans (list[SavePlan]): Local plans from all ranks.
-
-        Returns:
-            int: Index of this rank's plan.
-
-        Raises:
-            ValueError: If the gathered list holds no plan for this rank.
-        """
-        own_index = self.rank if len(all_plans) > 1 else 0
-        if not 0 <= own_index < len(all_plans):
-            raise ValueError(
-                f"Rank {self.rank} has no plan of its own among the {len(all_plans)} gathered "
-                "plans; the gathered list must hold one plan per rank, in rank order."
-            )
-        return own_index
 
     @staticmethod
     def _global_chunks_for(fqn: str, properties: TensorProperties, size: tuple, fqn_info: dict) -> list:
@@ -438,6 +442,7 @@ def create_read_items_for_chunk_list(
     fqn: str,
     checkpoint_md: TensorStorageMetadata,
     local_chunks: list[ChunkStorageMetadata],
+    broadcastable: bool = True,
 ) -> list[ReadItem]:
     """
     Create ReadItems by matching local chunks (what this rank needs) with
@@ -449,6 +454,8 @@ def create_read_items_for_chunk_list(
         fqn (str): Fully qualified name of the tensor.
         checkpoint_md (TensorStorageMetadata): Tensor storage metadata from checkpoint.
         local_chunks (list[ChunkStorageMetadata]): List of local chunks needed by this rank.
+        broadcastable (bool): Whether a collective could write into where these reads land.
+            Default True; see :attr:`ReadItem.broadcastable`.
 
     Returns:
         list[ReadItem]: List of ReadItems for loading the required data.
@@ -478,9 +485,42 @@ def create_read_items_for_chunk_list(
                     storage_index=MetadataIndex(fqn=fqn, offset=storage_chunk.offsets, index=storage_idx),
                     storage_offsets=storage_offsets,
                     lengths=lengths,
+                    broadcastable=broadcastable,
                 )
             )
     return read_items
+
+
+def _is_on_host(obj: Any) -> bool:
+    """
+    Whether a state dict entry's local buffer sits in host memory rather than on the device.
+
+    An entry that stayed on the host is read by every rank that wants it rather than read
+    once and sent, because sending it is not worth what it costs and often is not possible
+    at all. What stays on the host is little and few: an optimizer keeps its step counter
+    there while the moments beside it follow the parameter onto the device, one fp32 scalar
+    per parameter tensor, so a model of nine thousand of them leaves 36 KiB a rank -- read
+    out of a file that is already open, beside the other shards of that file. The broadcast
+    that would replace it costs a collective and two passes through a staging buffer, and
+    on the host network of a large job that collective is a tree over TCP whose latency
+    alone outweighs the read.
+
+    And a load that broadcasts at all does so through groups raised on the accelerator
+    library, which holds no backend for host memory and refuses a tensor kept there.
+
+    What a broadcast carries is the local buffer, the same one :func:`_shard_buffer` hands
+    the collective, so a DTensor is asked about its shard rather than about the whole tensor
+    it is part of. An entry that does not say where it lives is taken to be where the rest
+    of the load is.
+
+    Args:
+        obj (Any): State dict entry.
+
+    Returns:
+        bool: True only when the entry says it is in host memory.
+    """
+    local = obj.to_local() if isinstance(obj, DTensor) else obj
+    return getattr(getattr(local, "device", None), "type", None) == "cpu"
 
 
 class StandardLoadPlanner(LoadPlanner):
@@ -490,16 +530,13 @@ class StandardLoadPlanner(LoadPlanner):
     Iterate state_dict and creates load plans via chunk list for resharding support.
     """
 
-    def __init__(self, allow_partial_load: bool = False, broadcast_from_minimum_rank: bool = False):
+    def __init__(self, allow_partial_load: bool = False, broadcast_replicated_tensors: bool = False):
         """
         Args:
             allow_partial_load (bool): If True, allow loading when checkpoint has fewer keys than state_dict.
                 Default False.
-            broadcast_from_minimum_rank (bool): If True, only the lowest rank holding a
-                shard reads it and the rest receive it by broadcast. Off by default to
-                match :func:`load` and :class:`FileSystemReader`: enabling it on the
-                planner alone makes every other rank skip its read while no broadcast
-                ever runs, leaving those ranks with unloaded tensors.
+            broadcast_replicated_tensors (bool): If True, a tensor that several ranks load
+                identically is read by one of them and sent to the rest. Off by default;
                 ``configure_planner`` overrides this from :func:`load`.
         """
         self.state_dict: Optional[dict[str, Any]] = None
@@ -507,7 +544,7 @@ class StandardLoadPlanner(LoadPlanner):
         self.is_coordinator: bool = False
         self.rank: int = 0
         self.allow_partial_load = allow_partial_load
-        self.broadcast_from_minimum_rank: bool = broadcast_from_minimum_rank
+        self.broadcast_replicated_tensors: bool = broadcast_replicated_tensors
         self.flatten_state_dict: bool = True
 
     def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs) -> None:
@@ -523,55 +560,14 @@ class StandardLoadPlanner(LoadPlanner):
         self.metadata = metadata
         self.is_coordinator = kwargs.get("is_coordinator", False)
         self.rank = kwargs.get("rank", 0)
-        self.broadcast_from_minimum_rank = kwargs.get("broadcast_from_minimum_rank", self.broadcast_from_minimum_rank)
+        self.broadcast_replicated_tensors = kwargs.get(
+            "broadcast_replicated_tensors", self.broadcast_replicated_tensors
+        )
         self.flatten_state_dict = kwargs.get("flatten_state_dict", True)
         self.original_state_dict = state_dict
         if self.flatten_state_dict:
             state_dict, self.name_mapping = flatten_state_dict(state_dict)
         self.state_dict = state_dict
-
-    def should_load_shard(self, tensor):
-        """
-        Check whether the current rank has to read ``tensor`` from the storage.
-
-        When several ranks hold the same shard, only the minimum rank of the group reads it and
-        the group is recorded on the tensor as ``BROADCAST_INFO``, so that the remaining ranks
-        get their copy through :func:`broadcast_loaded_tensors` instead of the storage.
-
-        Recording the group is a side effect, so call this only for entries the load plan does
-        read: an entry marked here and then skipped is broadcast from a source rank that never
-        loaded it, which overwrites the value every other rank of the group already holds.
-
-        Args:
-            tensor (Any): State dict entry, a DTensor or a tensor carrying ``CHUNK_INFO``.
-
-        Returns:
-            bool: True if this rank reads the shard, False if it receives it by broadcast.
-
-        Raises:
-            ValueError: If the chunk info has an unexpected type, or if the shard group is
-                empty, or if the current rank is not a member of the shard group.
-        """
-        if isinstance(tensor, DTensor):
-            group_ranks = infer_same_shard_ranks_for_dtensor(tensor)
-        elif hasattr(tensor, CHUNK_INFO):
-            if not isinstance(getattr(tensor, CHUNK_INFO), ChunkInfo):
-                raise ValueError(f"The chunk info attached to tensor must be of type {ChunkInfo}")
-            group_ranks = getattr(tensor, CHUNK_INFO).replica_rank_list
-            if group_ranks is None:
-                return True
-        else:
-            return True
-
-        if not group_ranks:
-            raise ValueError("The tensor must be distributed on at least one rank.")
-        if self.rank not in group_ranks:
-            raise ValueError(f"Current rank {self.rank} is not in the same shard group {group_ranks}.")
-
-        load_rank = min(group_ranks)
-        if len(group_ranks) > 1:
-            setattr(tensor, BROADCAST_INFO, BroadcastInfo(group_ranks, load_rank))
-        return self.rank == load_rank
 
     def _rank_owns_dtensor_shard(self, obj: Any) -> bool:
         """
@@ -598,6 +594,7 @@ class StandardLoadPlanner(LoadPlanner):
             return True
         return self.rank in rank_list
 
+    @dcp_timer_decorator
     def build_local_plan(self) -> LoadPlan:
         """
         Build local load plan.
@@ -629,11 +626,11 @@ class StandardLoadPlanner(LoadPlanner):
                     )
                 if not self._rank_owns_dtensor_shard(obj):
                     continue
-                if self.broadcast_from_minimum_rank and not self.should_load_shard(obj):
-                    continue
                 # Both DTensor and platform.Tensor: create local chunks and read items
                 local_chunks = create_chunk_list_for_tensor(obj)
-                requests += create_read_items_for_chunk_list(fqn, md, local_chunks)
+                requests += create_read_items_for_chunk_list(
+                    fqn, md, local_chunks, broadcastable=not _is_on_host(obj),
+                )
             else:
                 requests.append(
                     ReadItem(
@@ -647,29 +644,99 @@ class StandardLoadPlanner(LoadPlanner):
                 )
         return LoadPlan(items=requests)
 
+    @dcp_timer_decorator
     def build_global_plan(self, all_plans: list[LoadPlan]) -> LoadPlan:
         """
-        Build this rank's final load plan from all local plans.
+        Decide, across all ranks, who reads which shard and who is sent it instead.
 
-        Reads need no cross-rank coordination, so this rank's own plan is returned untouched. A
-        more sophisticated implementation would use the other ranks' plans to coordinate here.
+        A shard held by several ranks needs only one of them to reach storage. This finds
+        those groups in the gathered plans, picks the reader of each, and marks the items of
+        this rank's plan with that decision. Shards are handed out one at a time and are not
+        tied to one another: the two shards of a tensor go to two groups and two broadcasts,
+        even when the same ranks hold both. Nothing is dropped from the plan either, since a
+        rank that receives a shard still has to take part in the broadcast carrying it.
+
+        Every rank runs this over the same gathered plans and reads only its own shards, so
+        only this rank's plan is built. The assignment is a pure function of the gathered
+        plans, so the ranks of a group name the same reader without one more round of
+        communication.
 
         Args:
-            all_plans (list[LoadPlan]): Local plans from all ranks, indexed by rank.
+            all_plans (list[LoadPlan]): Local plan of every rank, indexed by global rank.
 
         Returns:
-            LoadPlan: This rank's load plan.
-
-        Raises:
-            ValueError: If the gathered list holds no plan for this rank.
+            LoadPlan: This rank's plan, with the items of its replicated shards marked.
         """
-        own_index = self.rank if len(all_plans) > 1 else 0
-        if not 0 <= own_index < len(all_plans):
-            raise ValueError(
-                f"Rank {self.rank} has no plan of its own among the {len(all_plans)} gathered "
-                "plans; the gathered list must hold one plan per rank, in rank order."
-            )
-        return all_plans[own_index]
+        own_plan = all_plans[_own_plan_index(all_plans, self.rank)]
+
+        # A world of one has no one to broadcast with.
+        if not self.broadcast_replicated_tensors or len(all_plans) < 2:
+            return own_plan
+
+        # Which ranks hold each shard, and how many elements reading it moves. dest_index
+        # names the shard -- which local chunk of which tensor -- and ranks naming the same
+        # one hold the same buffer, since a chunk and the checkpoint layout together settle
+        # what has to be read for it. BYTE_IO items are left out: each rank rebuilds its
+        # own pickled object, not storage a collective could write into.
+        #
+        # A shard some rank reported as not worth sending is left out for much the same
+        # reason: what sits in host memory is little enough that reading it costs less than
+        # moving it, and the group a broadcast would go through may hold no backend for it
+        # anyway. One rank saying so is enough, and every rank reads the same report out of
+        # the gather, so they all drop the same shards and go on naming the same readers
+        # for the rest.
+        replicas: dict[MetadataIndex, set[int]] = defaultdict(set)
+        group_elements: dict[MetadataIndex, int] = defaultdict(int)
+        unsendable: set[MetadataIndex] = set()
+        for rank, plan in enumerate(all_plans):
+            for item in plan.items:
+                if item.type is LoadItemType.TENSOR:
+                    replicas[item.dest_index].add(rank)
+                    group_elements[item.dest_index] += math.prod(item.lengths)
+                    if not item.broadcastable:
+                        unsendable.add(item.dest_index)
+
+        item_size = {
+            fqn: dtype_element_size(getattr(getattr(md, "properties", None), "dtype", None))
+            for fqn, md in self.metadata.state_dict_metadata.items()
+        }
+        # Every member of a group counted its own read into group_elements, and they all read
+        # the same, so dividing by the group size gives back what the one reader will move.
+        shards = [
+            (item_size[index.fqn] * group_elements[index] // len(ranks), index, tuple(sorted(ranks)))
+            for index, ranks in replicas.items() if len(ranks) > 1 and index not in unsendable
+        ]
+        if not shards:
+            return own_plan
+
+        # Heaviest shard first, each to the rank of its group that has been given the fewest
+        # bytes so far: the costly reads are placed while the ranks are still even, and the
+        # small ones fill the gaps afterwards. Shards are weighed rather than counted so
+        # that one rank does not end up with all the large ones. Equal ones keep the order
+        # replicas was filled in, which follows the gathered plans and so is the same on
+        # every rank -- keep it that way, since ranks that disagreed here would name
+        # different readers and hang on one another broadcasts.
+        shards.sort(key=lambda shard: -shard[0])
+        load_bytes = [0] * len(all_plans)
+        sources: dict[MetadataIndex, BroadcastSource] = {}
+        for nbytes, index, group_ranks in shards:
+            src_rank = min(group_ranks, key=lambda rank: (load_bytes[rank], rank))
+            load_bytes[src_rank] += nbytes
+            sources[index] = BroadcastSource(group_ranks=group_ranks, src_rank=src_rank)
+
+        logger.info(
+            "[rank=%d] >>> %d replicated shards: busiest rank reads %d of %d bytes",
+            self.rank, len(shards), max(load_bytes), sum(load_bytes),
+        )
+
+        # Mark this rank's items whether it reads or receives: the item is what tells a rank
+        # which side of the broadcast it is on. A shard is held by one group, so an item
+        # naming it is enough -- which rank the plan belongs to does not come into it.
+        return dataclasses.replace(own_plan, items=[
+            dataclasses.replace(item, source=sources[item.dest_index])
+            if item.dest_index in sources else item
+            for item in own_plan.items
+        ])
 
     def finalize_plan(self, plan: LoadPlan) -> LoadPlan:
         """

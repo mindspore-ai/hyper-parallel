@@ -1,5 +1,6 @@
 """safe_open-based tensor load behavior for DCP torch reader"""
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from tests.torch.utils import init_dist
@@ -53,6 +54,9 @@ class _FakeSliceFile:
     def keys(self):
         return ["layer.weight"]
 
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
     def get_slice(self, key):
         self.slice_calls.append(key)
         return _FakeTensor(self.shape)
@@ -62,25 +66,32 @@ class _FakeSliceFile:
         return _FakeTensor(self.shape)
 
 
-class _SafeOpenContext:
-    def __init__(self, tensor_file):
-        self.tensor_file = tensor_file
-
-    def __enter__(self):
-        return self.tensor_file
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-
 def _runtime_imports():
+    """Import the reader internals under test, and wrap them the way execute_read calls them.
+
+    The imports sit inside the function because every case calls this only after
+    ``init_dist()``, so the DCP modules are first imported with the platform already up.
+    The wrapper saves each case from repeating how a read of one file is put together.
+    """
     # pylint: disable=import-outside-toplevel
-    from hyper_parallel.core.distributed_checkpoint.filesystem_storage import _load_tensor_file
+    from hyper_parallel.core.distributed_checkpoint.filesystem_storage import (
+        _apply_fetched,
+        _fetch_tensor_file,
+        _open_checkpoint_files,
+    )
     from hyper_parallel.core.distributed_checkpoint.metadata import MetadataIndex
     from hyper_parallel.core.distributed_checkpoint.planner import LoadItemType, ReadItem
     from hyper_parallel.core.distributed_checkpoint.storage import StorageInfo
 
-    return _load_tensor_file, MetadataIndex, LoadItemType, ReadItem, StorageInfo
+    def load_tensor_file(path: str, reqs: list, planner: Any, storage_data: dict) -> None:
+        """Both halves of a read of one file, as execute_read puts them together."""
+        open_files = _open_checkpoint_files()
+        try:
+            _apply_fetched(_fetch_tensor_file(open_files.reader(path), reqs, storage_data), planner)
+        finally:
+            open_files.close()
+
+    return load_tensor_file, MetadataIndex, LoadItemType, ReadItem, StorageInfo
 
 
 def _build_read_item(metadata_index_cls, load_item_type_cls, read_item_cls, storage_offsets=(), lengths=()):
@@ -127,7 +138,7 @@ def test_dcp_safe_open_lazy_tensor_lookup():
 
     with patch(
         "hyper_parallel.core.distributed_checkpoint.filesystem_storage.safe_open",
-        side_effect=lambda *args, **kwargs: _SafeOpenContext(tensor_file),
+        side_effect=lambda *args, **kwargs: tensor_file,
     ), patch(
         "hyper_parallel.platform.torch.platform.TorchPlatform.load_checkpoint",
         side_effect=AssertionError("safe_open path should not call load_checkpoint"),
@@ -161,7 +172,7 @@ def test_dcp_safe_open_slice_lookup():
 
     with patch(
         "hyper_parallel.core.distributed_checkpoint.filesystem_storage.safe_open",
-        side_effect=lambda *args, **kwargs: _SafeOpenContext(tensor_file),
+        side_effect=lambda *args, **kwargs: tensor_file,
     ), patch(
         "hyper_parallel.platform.torch.platform.TorchPlatform.load_checkpoint",
         side_effect=AssertionError("safe_open path should not call load_checkpoint"),

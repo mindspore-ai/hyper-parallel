@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test DCP load with broadcast_from_minimum_rank"""
+"""test DCP load with broadcast_replicated_tensors"""
 
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
@@ -25,11 +25,11 @@ def test_dcp_broadcast_load_on_demand_groups():
     """
     Feature: parallel run case in distributed_checkpoint
     Description:
-        1.test_dcp_load_broadcast_from_minimum_rank
+        1.test_dcp_load_broadcast_replicated_tensors
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(DCP_BROADCAST_LOAD, "test_dcp_load_broadcast_from_minimum_rank", num_proc=4),
+        TorchCase(DCP_BROADCAST_LOAD, "test_dcp_load_broadcast_replicated_tensors", num_proc=4),
     ])
 
 
@@ -64,13 +64,13 @@ def test_dcp_broadcast_load_gloo():
     """
     Feature: parallel run case in distributed_checkpoint
     Description:
-        1.test_dcp_load_broadcast_from_minimum_rank
+        1.test_dcp_load_broadcast_replicated_tensors
         2.test_dcp_load_broadcast_with_prebuilt_groups
         3.test_dcp_load_broadcast_plain_tensor_with_chunk_info
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(DCP_BROADCAST_LOAD, "test_dcp_load_broadcast_from_minimum_rank", num_proc=4),
+        TorchCase(DCP_BROADCAST_LOAD, "test_dcp_load_broadcast_replicated_tensors", num_proc=4),
         TorchCase(DCP_BROADCAST_LOAD, "test_dcp_load_broadcast_with_prebuilt_groups", num_proc=4),
     ])
     parallel_run([

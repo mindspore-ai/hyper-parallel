@@ -65,6 +65,18 @@ class TestApi(unittest.TestCase):
         self.assertIn("checkpoint_id", str(ctx.exception))
         mock_barrier.assert_not_called()
 
+    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_rank", return_value=0)
+    def test_load_requires_checkpoint_id_or_reader(self, mock_rank):
+        """
+        Feature: load input validation.
+        Description: Call load without checkpoint_id or storage_reader.
+        Expectation: ValueError is raised, before anything that needs a live process group.
+        """
+        with self.assertRaises(ValueError) as ctx:
+            load({"w": torch.zeros(1)}, no_dist=True)
+        self.assertIn("checkpoint_id", str(ctx.exception))
+        mock_rank.assert_not_called()
+
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size", return_value=1)
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_rank", return_value=0)
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")

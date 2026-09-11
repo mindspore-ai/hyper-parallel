@@ -70,3 +70,28 @@ def test_dcp_resharding_api_group3():
     parallel_run([
         TorchCase(DCP_RESHARDING_API, "test_dcp_safe_open_with_fully_shard_tp_dp_resharding_load", 12258, 4),
     ])
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_dcp_resharding_api_group4():
+    """
+    Feature: parallel run case for checkpoint DCP resharding with the replicated-shard broadcast on.
+    Description:
+        1.test_dcp_safe_open_resharding_load_with_broadcast
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(DCP_RESHARDING_API, "test_dcp_safe_open_resharding_load_with_broadcast", 12261, 4),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_dcp_resharding_api_group4_gloo():
+    """
+    Feature: parallel run case for checkpoint DCP resharding with the replicated-shard broadcast on.
+    Description:
+        1.test_dcp_safe_open_resharding_load_with_broadcast
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(DCP_RESHARDING_API, "test_dcp_safe_open_resharding_load_with_broadcast", num_proc=4),
+    ])

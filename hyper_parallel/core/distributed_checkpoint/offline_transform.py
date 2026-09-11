@@ -430,9 +430,11 @@ def dcp_to_full_state_dict(src_dir: str | os.PathLike[str]) -> dict[str, Any]:
 
     local_plan = planner.build_local_plan()
     local_data = storage_reader.optimize_local_plan(local_plan)
-    all_data = [local_data]
 
-    central_plan = planner.build_global_plan(all_data)
+    # build_global_plan decides across ranks who reads which shard, so it takes every rank's
+    # plan and hands back the one belonging to the rank running it. This reads a checkpoint
+    # on its own, so the only plan among them is its own.
+    central_plan = planner.build_global_plan([local_data])
     central_plan = storage_reader.optimize_global_plan(central_plan)
 
     final_local_plan = planner.finalize_plan(central_plan)

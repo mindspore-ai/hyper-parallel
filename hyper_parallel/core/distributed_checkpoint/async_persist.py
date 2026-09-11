@@ -631,6 +631,26 @@ def assemble_file_path(checkpoint_id: str, file_type: FileType, file_id: int) ->
     return f"{checkpoint_id}/{file_type.name}_{file_id}.pkl"
 
 
+def _safe_remove_file(file_path: str) -> None:
+    """
+    Delete a file that has been read, without letting the delete fail the load.
+
+    What it held has already been read, so a file that will not go is a leftover worth a
+    warning rather than a reason to fail a save that has its data. One attempt is enough:
+    what refuses here - a read-only mount, a directory this rank may not write in - does
+    not clear by asking again.
+
+    Args:
+        file_path (str): File to delete.
+    """
+    try:
+        os.remove(file_path)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(
+            "Could not remove the STORAGE_DATA file %s, because the error: %s", file_path, e
+        )
+
+
 def load_file(checkpoint_id: str, file_type: FileType, file_id: int):
     """
     Reads files from the storage.
@@ -653,12 +673,15 @@ def load_file(checkpoint_id: str, file_type: FileType, file_id: int):
                 return None
             f.seek(0)
             result = pickle.load(f)
-        if file_type == FileType.STORAGE_DATA:
-            os.remove(file_path)
-        return result
     except FileNotFoundError:
+        # The rank that owns this file has not written it yet; the caller comes back round.
         return None
 
+    # Delete only the STORAGE_DATA file. Do not delete the LOCAL_PALN file,
+    # as it is generated only during the initial save.
+    if file_type == FileType.STORAGE_DATA:
+        _safe_remove_file(file_path)
+    return result
 
 
 @dcp_timer_decorator
