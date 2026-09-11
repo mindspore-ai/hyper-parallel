@@ -1,4 +1,4 @@
-﻿# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -121,15 +121,16 @@ def preflight_integrity_check(
     """Validate the existing bundle before training starts; fail fast on drift.
 
     Composes the check-layer per-zone verifiers: signature, output hashes,
-    importability, meta schema, and a warning for skipped overrides.  The
-    frozen ``param_plan`` is verified for internal consistency (an empty plan
-    fails — generation always freezes a derived plan); full model-side
-    coverage against the live parameter tree runs later in
-    :func:`init_generated_model`, where a model handle exists.
+    importability, meta schema, boundary-form structure, and a warning for
+    skipped overrides.  The frozen ``param_plan`` is verified for internal
+    consistency (an empty plan fails — generation always freezes a derived
+    plan); full model-side coverage against the live parameter tree runs
+    later in :func:`init_generated_model`, where a model handle exists.
     """
     if not getattr(config, "codegen", False):
         return
     from hyper_parallel.codegen.check.preflight import (
+        verify_boundary_forms,
         verify_generated_import,
         verify_meta_required_fields,
         verify_output_hashes,
@@ -151,6 +152,7 @@ def preflight_integrity_check(
     verify_signature(meta, signature)
     verify_output_hashes(meta, layout)
     verify_generated_import(layout)
+    verify_boundary_forms(meta, layout)
     verify_param_plan(meta, model=None)
     warn_skipped_overrides(meta)
 

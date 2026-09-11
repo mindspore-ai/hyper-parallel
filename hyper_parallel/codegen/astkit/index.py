@@ -24,7 +24,8 @@ Nothing here imports torch or the training stack.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+import textwrap
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -48,6 +49,12 @@ class FunctionInfo:
     #: ``arg_name`` by ``sharding_applier._bind_input_indices``).  ``self`` is
     #: excluded; ``*args`` / ``**kwargs`` are not part of the positional list.
     param_names: list[str]
+    #: Keyword-only parameter names (``def f(self, x, *, y=1)`` -> ``["y"]``).
+    kwonly_names: list[str] = field(default_factory=list)
+    #: Whether the signature carries ``*args`` / ``**kwargs``.  A statically
+    #: rewritten forward must forward every argument it received, so variable
+    #: parameter lists disqualify the static form.
+    has_var_params: bool = False
 
 
 @dataclass
@@ -192,10 +199,14 @@ def _build_function_info(node: ast.AST, text: str, offset_for) -> FunctionInfo:
     # are part of a positional call; ``*args`` / ``**kwargs`` are not.
     params = getattr(node, "args", None)
     positional: list[str] = []
+    kwonly: list[str] = []
+    has_var_params = False
     if params is not None:
         for arg in params.posonlyargs + params.args:
             if arg.arg != "self":
                 positional.append(arg.arg)
+        kwonly = [arg.arg for arg in params.kwonlyargs]
+        has_var_params = params.vararg is not None or params.kwarg is not None
 
     body = node.body
     body_start: Optional[int] = None
@@ -234,7 +245,60 @@ def _build_function_info(node: ast.AST, text: str, offset_for) -> FunctionInfo:
         body_end=body_end,
         def_offset=def_offset,
         param_names=positional,
+        kwonly_names=kwonly,
+        has_var_params=has_var_params,
     )
+
+
+def returns_single_value(source_text: str, func: FunctionInfo) -> bool:
+    """Whether every ``return`` in the function returns a bare single value.
+
+    ``return`` / ``return x`` / ``return f(x)`` are single; ``return a, b`` /
+    ``return (a, b)`` / ``return [a, b]`` / ``return *a,`` are not.  The
+    compiled boundary plan indexes into a returned sequence by
+    ``arg_index``, so a static single-tensor operator call can only replace
+    the output redistribution when the return is a single value.
+
+    The function's ``def`` span (decorators skipped) is re-parsed on its own;
+    a parse failure fails closed (``False``) — the caller demotes the static
+    form rather than guessing.  The span starts at the ``def`` line's first
+    byte, which for a class method carries the method indent; ``dedent``
+    strips that common prefix so the isolated def parses as a top-level
+    statement (an indented first line would raise ``IndentationError`` and
+    fail every method closed).
+    """
+    if func.body_start is None or func.body_end is None:
+        return False
+    def_line_start = _def_keyword_offset(source_text, func)
+    span = textwrap.dedent(source_text[def_line_start:func.body_end])
+    try:
+        tree = ast.parse(span)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Return):
+            value = node.value
+            if value is None:
+                continue
+            if isinstance(value, (ast.Tuple, ast.List, ast.Starred)):
+                return False
+    return True
+
+
+def _def_keyword_offset(source_text: str, func: FunctionInfo) -> int:
+    """Byte offset of the ``def`` keyword line, skipping decorator lines.
+
+    ``func.def_offset`` anchors the FIRST line of the method (a decorator when
+    one is present); the span fed to ``ast.parse`` must start at the ``def``
+    keyword itself.  Shared logic with ``_build_forward_impl_edit`` in
+    emit/parallel (kept local — three lines, not worth a cross-module helper).
+    """
+    def_line_start = func.def_offset
+    for line in source_text[def_line_start:func.body_start].splitlines(keepends=True):
+        if line.lstrip().startswith("def "):
+            break
+        def_line_start += len(line)
+    return def_line_start
 
 
 def _line_offsets(lines: list[str]) -> list[int]:

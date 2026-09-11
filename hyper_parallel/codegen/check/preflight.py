@@ -1,4 +1,4 @@
-﻿# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -140,6 +140,99 @@ def warn_skipped_overrides(meta: Any) -> None:
     logger.warning("\n".join(lines))
 
 
+def verify_boundary_forms(meta: Any, layout: Any) -> None:
+    """Fail fast when persisted forward forms disagree with the frozen plan.
+
+    Re-derives every boundary class's emitted form from the persisted meta —
+    through ``iter_emitted_forms``, the emitter's own decision path — and
+    checks the generated source carries exactly that structure:
+
+    - ``identity``: the original forward is untouched (no extracted
+      ``_forward_impl``, no form marker);
+    - ``tp_collective``: the class carries the ``tp_collective`` marker and
+      the extracted ``_forward_impl``, and the rewritten forward references
+      only the static template's own attributes (``self._hyper_tp`` /
+      ``self._forward_impl``);
+    - ``generic`` / ``region``: the extracted ``_forward_impl`` without the
+      marker (the compiled-plan / local-compute engines own the forward).
+
+    A drift means the modeling file was edited after generation (or the
+    emitter and this check disagree); the install-time validation would
+    silently fall back, masking a broken artifact, so fail fast instead.
+    """
+    import re
+
+    from hyper_parallel.codegen.astkit.index import build_source_index
+    from hyper_parallel.codegen.emit.parallel import (
+        TP_FORM_ATTRIBUTE,
+        TP_FORM_MARKER,
+        iter_emitted_forms,
+    )
+    from hyper_parallel.codegen.plan.boundary_forms import (
+        FORM_IDENTITY,
+        FORM_TP_COLLECTIVE,
+    )
+
+    with open(layout.modeling_path, "r", encoding="utf-8") as handle:
+        source_text = handle.read()
+    index = build_source_index(source_text)
+    boundary_classes = getattr(meta, "boundary_classes", None) or {}
+    source = getattr(meta, "source", None)
+    module_name = (
+        source.get("module_name")
+        if isinstance(source, dict)
+        else getattr(source, "module_name", "")
+    )
+
+    for class_name, _form, emitted, func, _injection in iter_emitted_forms(
+        source_text,
+        meta,
+        boundary_classes=boundary_classes,
+        module_name=module_name,
+    ):
+        info = index.find_class(class_name)
+        has_impl = info is not None and "_forward_impl" in info.methods
+        class_body = source_text[info.class_offset:info.end_offset] if info else ""
+        has_marker = f'{TP_FORM_ATTRIBUTE} = "{TP_FORM_MARKER}"' in class_body
+        if emitted == FORM_IDENTITY:
+            if has_impl or has_marker:
+                raise RuntimeError(
+                    f"codegen preflight: class {class_name} was pruned as "
+                    f"identity but the source carries a rewritten forward "
+                    f"(marker={has_marker}, _forward_impl={has_impl}); "
+                    "regenerate the artifact"
+                )
+            continue
+        if not has_impl:
+            raise RuntimeError(
+                f"codegen preflight: class {class_name} should carry an "
+                f"extracted _forward_impl for form {emitted!r} but does not; "
+                "regenerate the artifact"
+            )
+        if emitted == FORM_TP_COLLECTIVE:
+            if not has_marker:
+                raise RuntimeError(
+                    f"codegen preflight: class {class_name} should carry the "
+                    f"{TP_FORM_MARKER} marker but does not; regenerate the "
+                    "artifact"
+                )
+            body = source_text[func.body_start:func.body_end]
+            stray = re.search(r"self\._hyper_(?!tp\b)", body)
+            if stray is not None:
+                raise RuntimeError(
+                    f"codegen preflight: static tp_collective forward on "
+                    f"class {class_name} references {stray.group(0)}* "
+                    "attributes outside the static template; regenerate the "
+                    "artifact"
+                )
+        elif has_marker:
+            raise RuntimeError(
+                f"codegen preflight: class {class_name} carries the "
+                f"{TP_FORM_MARKER} marker but its emitted form is "
+                f"{emitted!r}; regenerate the artifact"
+            )
+
+
 def verify_param_plan(meta: Any, model: Any) -> None:
     """Verify the frozen param plan covers the model's trainable parameters.
 
@@ -266,6 +359,7 @@ def _sha256(path: str) -> str:
 
 
 __all__ = [
+    "verify_boundary_forms",
     "verify_generated_import",
     "verify_meta_required_fields",
     "verify_output_hashes",

@@ -44,6 +44,18 @@ class Beta(nn.Module):
         return x + 1
 '''
 
+VARIADIC_SOURCE_TEXT = '''\
+import torch
+from torch import nn
+
+
+class Alpha(nn.Module):
+    """A boundary class whose forward takes variadic arguments."""
+
+    def forward(self, x, *args, **kwargs):
+        return x * 2
+'''
+
 
 def _boundary(fqn: str, class_name: str) -> tuple[str, dict]:
     """A minimal but real-shaped frozen boundary entry for one class."""
@@ -153,3 +165,105 @@ def test_generated_parallelize_installs_boundaries_without_globals():
     assert body.index("hyper_install_boundaries") < body.index("hyper_bind_compute")
     assert "globals()" not in body
     assert "hyper_wrap_module_boundaries" not in body
+
+
+def _tp_collective_entry() -> dict:
+    """A TP-lowerable boundary: in S(1)->R, out P(sum)->S(1) on the tp axis."""
+    return {
+        "is_boundary": True,
+        "in_src": {"x": {"tp": "S(1)"}},
+        "in_dst": {"x": {"tp": "R"}},
+        "out_src": {"output": {"tp": "P(sum)"}},
+        "out_dst": {"output": {"tp": "S(1)"}},
+    }
+
+
+def _identity_entry() -> dict:
+    """An all-identity boundary: no transition on any axis, nothing to lower."""
+    return {
+        "is_boundary": True,
+        "in_src": {"x": {"tp": "R"}},
+        "in_dst": {"x": {"tp": "R"}},
+        "out_src": {"output": {"tp": "R"}},
+        "out_dst": {"output": {"tp": "R"}},
+    }
+
+
+def _single_plan(entry: dict) -> tuple[dict, dict]:
+    """A frozen plan whose only boundary is ``blocks.alpha`` (class Alpha)."""
+    plan = {"param_plan": {"blocks.alpha": entry}, "injections": []}
+    return plan, {"blocks.alpha": "Alpha"}
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_tp_collective_boundary_renders_static_operators():
+    """A TP-lowerable boundary with a static signature renders bare operators.
+
+    Feature: codegen-lowering
+    Description: A boundary whose declared transitions are all TP-lowerable
+        and whose forward passes the structural gates is rewritten to the
+        static template: the class marker, ``_forward_impl`` extraction, and
+        ``self._hyper_tp`` operator calls instead of the generic redistribute.
+    Expectation: The emitted text carries the ``tp_collective`` marker, the
+        input all_gather call, the extracted impl call, and the output
+        reduce_scatter call; no ``self._hyper_boundary`` reference remains.
+    """
+    plan, classes = _single_plan(_tp_collective_entry())
+    plan["mesh_dim_names"] = ("tp",)
+
+    text = lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
+
+    assert '_hyper_boundary_form = "tp_collective"' in text
+    assert "x = self._hyper_tp.all_gather(x, dim=1)" in text
+    assert "outputs = self._forward_impl(x)" in text
+    assert "outputs = self._hyper_tp.reduce_scatter(outputs, dim=1)" in text
+    assert "self._hyper_boundary" not in text
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_identity_boundary_forward_is_pruned():
+    """An all-identity boundary keeps its original forward untouched.
+
+    Feature: codegen-lowering
+    Description: A boundary whose declared transitions are all identity is
+        pruned: the runtime install path covers the exact no-op / to-local
+        semantics with its generic wrapper, so rewriting the forward would
+        add indirection without changing behavior.
+    Expectation: The emitted text equals the source text (no
+        ``_forward_impl``, no marker, no redistribute calls).
+    """
+    plan, classes = _single_plan(_identity_entry())
+    plan["mesh_dim_names"] = ("tp",)
+
+    text = lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
+
+    assert text == SOURCE_TEXT
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_tp_collective_falls_back_to_generic_on_variadic_signature():
+    """A ``*args``/``**kwargs`` forward cannot carry the static template.
+
+    Feature: codegen-lowering
+    Description: The static template re-passes every declared parameter by
+        name, so a variadic signature fails the structural gates and the
+        boundary renders as the generic redistribute form instead — even
+        though the plan's transitions classify as tp_collective.
+    Expectation: No marker and no ``_hyper_tp`` calls; the forward goes
+        through ``self._hyper_boundary.redistribute_inputs/outputs``.
+    """
+    plan, classes = _single_plan(_tp_collective_entry())
+    plan["mesh_dim_names"] = ("tp",)
+
+    text = lower_forward_boundaries(
+        VARIADIC_SOURCE_TEXT, plan, boundary_classes=classes
+    )
+
+    assert "_hyper_boundary_form" not in text
+    assert "_hyper_tp" not in text
+    assert "_forward_impl" in text
+    assert "self._hyper_boundary.redistribute_inputs" in text
+    assert "self._hyper_boundary.redistribute_outputs" in text

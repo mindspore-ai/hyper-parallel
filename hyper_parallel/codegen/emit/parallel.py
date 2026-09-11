@@ -3,14 +3,12 @@
 # ============================================================================
 """Lower the frozen parallel plan into explicit forward code.
 
-The lowerer sinks forward wrappers into the source: each boundary class's
-``forward`` is rewritten to redistribute through the instance-bound compiled
-plan (``self._hyper_boundary``, bound once by ``hyper_install_boundaries``)
-and run the region's compute (inner CP wrapper / EP local compute) explicitly.
-
-The lowerer is a pure function over the source text + the frozen plan.  It
-returns the patched text.  Structural work (finding a class / its forward /
-the import block) is delegated to :mod:`astkit`.
+The lowerer sinks forward wrappers into the source.  Which form a boundary
+class's ``forward`` takes is decided by
+:func:`hyper_parallel.codegen.plan.boundary_forms.classify_boundary_form` —
+the same pure classifier the runtime re-runs at install time and preflight
+re-runs at train time, so the three stages can never disagree about a
+boundary's form.
 
 Class vs FQN: the frozen plan is keyed by boundary FQN
 (``model.layers.0.self_attn``), but a ``class.forward`` is shared by many
@@ -22,17 +20,36 @@ The original ``forward`` is kept
 verbatim as the class-private ``_forward_impl`` (extracted by a zero-width
 insert before the ``def forward`` — a fresh-source operation, so the offsets
 stay valid when combined with the body replacement), and the public
-``forward`` is rewritten in one of two forms:
+``forward`` is rewritten in one of the classified forms:
 
-- shape 1 — plain redistribute: redistribute in, ``_forward_impl``, out;
-- shape 2 — local region: redistribute in, ``__hyper_compute__`` (bound by
-  ``hyper_parallelize``), re-wrap locals per ``out_src``, redistribute
-  out.
+- ``identity`` (pruned): every declared transition is identity on the plan's
+  active axes — the class forward is NOT rewritten at all.  The runtime's
+  install path covers the exact no-op / to-local semantics with its generic
+  wrapper, so pruning is byte-for-byte equivalent to the previous rewrite.
+- ``tp_collective`` (static bare operators): every declared transition is
+  identity or TP-lowerable, and the source-side structural gates pass
+  (single-value return, no ``*args``/``**kwargs``, declared inputs bind to
+  forward parameters).  The forward names its form with the class attribute
+  ``_hyper_boundary_form = "tp_collective"`` and calls bare operators on
+  ``self._hyper_tp`` (bound at install time after the runtime re-validates
+  the compiled plan against the live mesh; on mismatch the runtime replaces
+  the forward with the generic engine — the baked calls never run unvalidated).
+- ``generic``: redistribute in, ``_forward_impl``, redistribute out, through
+  the instance-bound compiled plan (``self._hyper_boundary``, bound once by
+  ``hyper_install_boundaries``), with a declarative comment block annotating
+  what each side's transitions lower to.
+- ``region`` (EP MoE local region): redistribute in,
+  ``__hyper_compute__`` (bound by ``hyper_parallelize``), re-wrap locals per
+  ``out_src``, redistribute out.
 
-A CP inner-wrapper boundary (shape 3) is *also* shape 1 in the generated
-code: the wrapper is installed at runtime by ``hyper_apply_inner_wrapper``
-(it mutates ``target.forward`` in place — not a bindable callable), and runs
-inside the ``_forward_impl`` call.
+A CP inner-wrapper boundary is ``generic`` in the generated code: the wrapper
+is installed at runtime by ``hyper_apply_inner_wrapper`` (it mutates
+``target.forward`` in place — not a bindable callable), and runs inside the
+``_forward_impl`` call.
+
+The lowerer is a pure function over the source text + the frozen plan.  It
+returns the patched text.  Structural work (finding a class / its forward /
+the import block) is delegated to :mod:`astkit`.
 """
 from __future__ import annotations
 
@@ -48,6 +65,16 @@ from hyper_parallel.codegen.astkit.index import (
     FunctionInfo,
     SourceIndex,
     build_source_index,
+    returns_single_value,
+)
+from hyper_parallel.codegen.plan.boundary_forms import (
+    FORM_GENERIC,
+    FORM_IDENTITY,
+    FORM_REGION,
+    FORM_TP_COLLECTIVE,
+    BoundaryForm,
+    TransitionOp,
+    classify_boundary_form,
 )
 
 #: Meta / entry field names the lowerer reads off a frozen entry.
@@ -71,47 +98,39 @@ def lower_forward_boundaries(
     is the FQN -> class name map (``meta.boundary_classes``); when omitted it
     degrades to the class name looked up from the source index itself, which is
     only correct if every boundary FQN's leaf class name equals the key's tail —
-    ``_class_for_fqn``.
+    ``_class_for_fqn``.  The plan's active axes (``mesh_dim_names``) drive
+    :func:`classify_boundary_form`; the classified form plus the source-side
+    structural gates decide which template each class gets (see the module
+    docstring).
 
     Returns the patched source text.  This function only rewrites the
     ``forward`` bodies; the rewritten bodies reference the ``_hyper_boundary``
-    / ``_hyper_rewrap`` instance attributes that ``hyper_install_boundaries``
-    binds at runtime — no per-boundary global constant is emitted.
+    / ``_hyper_rewrap`` / ``_hyper_tp`` instance attributes that
+    ``hyper_install_boundaries`` binds at runtime — no per-boundary global
+    constant is emitted.
     """
-    index = build_source_index(source_text)
-    param_plan = _plan_field(frozen_plan, "param_plan") or {}
-    injections = _plan_field(frozen_plan, "injections") or []
-    injection_by_class = _index_injections_by_class(injections, boundary_classes, index)
-
-    groups = _group_boundaries_by_class(
-        param_plan, boundary_classes, index, module_name=module_name
-    )
-
     edits: list[TextEdit] = []
-    # Iterate boundary classes in sorted ``class_name`` order.  ``groups`` is
-    # built by walking ``param_plan``, whose insertion order is NOT stable
-    # across the write/reload cycle: ``meta.param_plan`` is persisted with
-    # ``json.dump(..., sort_keys=True)``, which reorders the keys
-    # alphabetically, so reload-ing the meta yields a different class order
-    # than the in-memory freeze did.  An order that depends on ``param_plan``'s
-    # provenance would make the emitted modeling file differ between "generate
-    # once" and "re-emit from reloaded meta" — breaking artifact drift checks
-    # (which re-emit the bundle from the on-disk meta and compare bytes).
-    # Sorting here makes the byte stream a pure function of which classes are
-    # boundaries, independent of how ``param_plan`` reached us.
-    for class_name in sorted(groups):
-        group = groups[class_name]
-        # Fail fast when one class's FQNs disagree on the contract: one shared
-        # ``forward`` cannot carry two boundary plans.
-        _verify_class_contract(group, class_name)
-        func = _require_forward(index, class_name)
-        body = _build_forward_body(injection_by_class.get(class_name), func)
+    for class_name, form, emitted, func, injection in iter_emitted_forms(
+        source_text,
+        frozen_plan,
+        boundary_classes=boundary_classes,
+        module_name=module_name,
+    ):
+        del class_name
+        if emitted == FORM_IDENTITY:
+            # Pruned: the runtime's install path covers the exact no-op /
+            # to-local semantics with its generic wrapper, so leaving the
+            # original forward untouched is behavior-preserving.
+            continue
+        body = _build_forward_body(injection, func, form, emitted)
         # Keep the original forward as ``_forward_impl``. The
         # extracted method is inserted BEFORE the ``def forward`` (zero-width
         # edit at ``def_offset``), and the rewritten body replaces the original
         # body at ``body_start`` — the two spans never overlap, so the
-        # incremental-shift validation in ``_apply_edits`` passes.
-        impl = _build_forward_impl_edit(source_text, func)
+        # incremental-shift validation in ``_apply_edits`` passes.  The static
+        # form additionally prefixes the class marker naming the form.
+        marker = _TP_FORM_MARKER_LINE if emitted == FORM_TP_COLLECTIVE else None
+        impl = _build_forward_impl_edit(source_text, func, prefix=marker)
         if impl is not None:
             edits.append(impl)
         edits.extend(replace_function_body(source_text, func, body, indent=""))
@@ -125,6 +144,127 @@ def lower_forward_boundaries(
             "cannot safely rewrite: " + ", ".join(nested)
         )
     return apply_edits(source_text, edits)
+
+
+#: Class attribute a ``tp_collective`` forward carries, naming its form so the
+#: runtime install path and preflight can recognize the static template.
+TP_FORM_ATTRIBUTE = "_hyper_boundary_form"
+#: The marker value naming the statically lowered TP-collective form.
+TP_FORM_MARKER = "tp_collective"
+#: The emitted marker statement (method indent, followed by a blank line).
+_TP_FORM_MARKER_LINE = f'    {TP_FORM_ATTRIBUTE} = "{TP_FORM_MARKER}"\n\n'
+
+
+def iter_emitted_forms(
+    source_text: str,
+    frozen_plan: Any,
+    *,
+    boundary_classes: Optional[dict[str, str]] = None,
+    module_name: str = "",
+):
+    """Yield every boundary class's emit decision over ``source_text``.
+
+    Single decision path shared by the emitter
+    (:func:`lower_forward_boundaries`) and the train-time preflight
+    (``check/preflight.verify_boundary_forms``): classification
+    (:func:`classify_boundary_form`) plus the structural gates
+    (:func:`resolve_emitted_form`), per boundary class.  Yields
+    ``(class_name, form, emitted, func, injection)`` — ``form`` the
+    classifier's verdict, ``emitted`` the form actually rendered after the
+    gates, ``func`` the class's ``forward`` :class:`FunctionInfo`, and
+    ``injection`` the class's frozen injection rule (``None`` when absent).
+
+    Boundary classes are iterated in sorted ``class_name`` order.  The
+    grouping walks ``param_plan``, whose insertion order is NOT stable
+    across the write/reload cycle: ``meta.param_plan`` is persisted with
+    ``json.dump(..., sort_keys=True)``, which reorders the keys
+    alphabetically, so reload-ing the meta yields a different class order
+    than the in-memory freeze did.  Sorting here makes the emitted byte
+    stream a pure function of which classes are boundaries, independent of
+    how ``param_plan`` reached us.
+    """
+    index = build_source_index(source_text)
+    param_plan = _plan_field(frozen_plan, "param_plan") or {}
+    injections = _plan_field(frozen_plan, "injections") or []
+    injection_by_class = _index_injections_by_class(injections, boundary_classes, index)
+    mesh_dim_names = tuple(_plan_field(frozen_plan, "mesh_dim_names") or ())
+
+    groups = _group_boundaries_by_class(
+        param_plan, boundary_classes, index, module_name=module_name
+    )
+    for class_name in sorted(groups):
+        group = groups[class_name]
+        # Fail fast when one class's FQNs disagree on the contract: one shared
+        # ``forward`` cannot carry two boundary plans.  The canonical entry is
+        # the per-class contract every FQN agreed on.
+        canonical_entry = _verify_class_contract(group, class_name)
+        func = _require_forward(index, class_name)
+        injection = injection_by_class.get(class_name)
+        form = classify_boundary_form(canonical_entry, mesh_dim_names, injection)
+        emitted = resolve_emitted_form(source_text, func, form)
+        yield class_name, form, emitted, func, injection
+
+
+def resolve_emitted_form(
+    source_text: str,
+    func: FunctionInfo,
+    form: BoundaryForm,
+) -> str:
+    """The form the emitter actually renders for one classified boundary.
+
+    The classifier's ``tp_collective`` is an *optimistic* verdict: the static
+    template additionally requires the source-side structural gates (no
+    ``*args``/``**kwargs``, single-value returns, declared inputs binding to
+    forward parameters, output ops targeting the first output).  A boundary
+    that fails a gate renders as ``generic`` instead.  This resolver is the
+    single decision shared by the emitter and preflight, so the emitted file
+    and the train-time check can never disagree about which template a class
+    got.
+    """
+    if form.form in (FORM_IDENTITY, FORM_REGION, FORM_GENERIC):
+        return form.form
+    if _static_gates_pass(source_text, func, form):
+        return FORM_TP_COLLECTIVE
+    return FORM_GENERIC
+
+
+def _static_gates_pass(source_text: str, func: FunctionInfo, form: BoundaryForm) -> bool:
+    """Whether the static bare-operator template is admissible for ``func``.
+
+    Gates (each mirrors a concrete way the generic engine is more general
+    than a static rewrite):
+
+    1. No ``*args`` / ``**kwargs`` — the static forward must re-pass every
+       argument it received by name; a variable parameter list cannot be
+       enumerated statically.
+    2. Every ``return`` is a single value — the compiled output plan indexes
+       into a returned sequence by ``arg_index``; the static template applies
+       ops to the one ``outputs`` variable, which is only equivalent when the
+       forward never returns a tuple/list.
+    3. Every declared input name binds to a forward parameter — the generic
+       engine skips an ``in_src`` name the caller never passed (``_get_arg``
+       default ``None``); the static template would reference an unbound
+       variable instead, so a declared name outside the signature disqualifies
+       the static form.
+    4. Every non-identity output op targets the first declared output — with a
+       single-value return the compiled plan applies index-0 ops only; an op
+       mapped to a later output position cannot be expressed statically.
+    """
+    if func.has_var_params:
+        return False
+    if not returns_single_value(source_text, func):
+        return False
+    signature_names = set(func.param_names) | set(func.kwonly_names)
+    if not set(form.in_declared) <= signature_names:
+        return False
+    out_names = form.out_names
+    for name in form.out_ops:
+        # An op name missing from the declared order compiles to index 0
+        # (``_compile_output_plan``'s ``name_to_idx.get(name, 0)``), which the
+        # single-value template covers; a later position does not.
+        if name in out_names and out_names.index(name) != 0:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +475,9 @@ def _require_forward(index: SourceIndex, class_name: str) -> FunctionInfo:
 
 
 def _build_forward_impl_edit(
-    source_text: str, func: FunctionInfo
+    source_text: str,
+    func: FunctionInfo,
+    prefix: Optional[str] = None,
 ) -> Optional[TextEdit]:
     """Build an edit that extracts ``forward`` as ``_forward_impl``.
 
@@ -343,7 +485,9 @@ def _build_forward_impl_edit(
     inserted as the private ``_forward_impl`` right before the rewritten
     ``def forward``.  The copy keeps the original signature and body byte-for-
     byte, re-indented to the method's own indent, with the ``def forward``
-    renamed to ``def _forward_impl``.
+    renamed to ``def _forward_impl``.  ``prefix`` (the static form's class
+    marker) is prepended to the same insertion — one zero-width edit at
+    ``def_offset``, so the edit set never carries two edits at one offset.
 
     Returns ``None`` when the forward has no replaceable body (single-line/
     pass) — there is nothing meaningful to extract, and ``forward`` itself was
@@ -387,39 +531,42 @@ def _build_forward_impl_edit(
     # A method must be separated from the next one by a newline, so pad.
     if not impl.endswith("\n"):
         impl += "\n"
+    if prefix:
+        impl = prefix + impl
     return TextEdit(func.def_offset, func.def_offset, impl)
 
 
 def _build_forward_body(
     injection: Optional[dict[str, Any]],
     func: FunctionInfo,
+    form: BoundaryForm,
+    emitted: str,
 ) -> str:
     """Render the rewritten forward body for one boundary class.
 
-    Supports three boundary forms: a
-    plain redistribute boundary, a local-region boundary (``local_compute_fn``),
-    and an inner-wrapper boundary (''CP'' attention).  The redistribute calls
-    go through the instance-bound compiled plan (``self._hyper_boundary`` /
-    ``self._hyper_rewrap``, installed by ``hyper_install_boundaries``);
-    ``__hyper_compute__`` is bound by ``hyper_bind_compute`` for the
-    local-region shape; an inner-wrapper boundary is emitted as
-    plain-redistribute (shape 1) and its CP wrapper is installed at runtime by
-    ``hyper_apply_inner_wrapper``.  Either way the class stays
-    runtime-importable without a mesh.
+    ``emitted`` is :func:`resolve_emitted_form`'s verdict (the classifier's
+    form after the static gates).  The redistribute calls go through the
+    instance-bound compiled plan (``self._hyper_boundary`` /
+    ``self._hyper_rewrap``, installed by ``hyper_install_boundaries``); the
+    static ``tp_collective`` form calls bare operators on ``self._hyper_tp``
+    instead; ``__hyper_compute__`` is bound by ``hyper_bind_compute`` for the
+    local-region shape.  Either way the class stays runtime-importable without
+    a mesh.
     """
+    if emitted == FORM_TP_COLLECTIVE:
+        return _render_tp_collective_forward(func, form)
+
     input_redist = _render_input_redistribute(func)
     out_redist = _render_output_redistribute()
 
     local = injection.get("local_compute_fn") if injection else None
-    inner = injection.get("inner_wrapper") if injection else None
-
     if local is not None:
         return _render_local_compute(local, input_redist, out_redist)
-    # The inner CP wrapper is installed at runtime by
-    # ``hyper_apply_inner_wrapper`` (it mutates ``target.forward`` in place,
-    # not a bindable callable), so the generated forward is SHAPE-1: plain
-    # redistribute.  The wrapper runs inside the ``_forward_impl`` call.
-    return _render_plain_redistribute(input_redist, out_redist)
+    # A generic boundary (including an inner-wrapper one — the CP wrapper is
+    # installed at runtime by ``hyper_apply_inner_wrapper`` and weaves into
+    # this forward) redistributes through the compiled plan, annotated with
+    # what each side's transitions lower to.
+    return _render_plain_redistribute(input_redist, out_redist, form)
 
 
 def _render_input_redistribute(func: FunctionInfo) -> str:
@@ -450,20 +597,117 @@ def _render_rewrap_outputs() -> str:
     return "        outputs = self._hyper_rewrap(outputs)"
 
 
-def _render_plain_redistribute(input_redist: str, out_redist: str) -> str:
-    """Plain boundary (shape 1): redistribute in, run the original forward, redistribute out."""
+def _ordered_notes(notes: dict[str, str]) -> list[str]:
+    """Declarative annotation lines for one side, in deterministic name order."""
+    return [f"        # {notes[name]}" for name in sorted(notes)]
+
+
+def _render_plain_redistribute(
+    input_redist: str, out_redist: str, form: BoundaryForm
+) -> str:
+    """Generic boundary: annotated redistribute around the original forward.
+
+    The comment blocks are the plan's own declaration: one line per
+    non-identity transition (``name: axis S(1) -> R ==> all_gather(dim=1)`` or
+    ``==> dtensor redistribute`` for transitions the compiled plan's DTensor
+    fallback owns), so a reader sees what the boundary communicates without
+    re-deriving the plan.
+    """
     return "\n".join([
         "        # [HYPER BOUNDARY] input redistribution",
+        *_ordered_notes(form.in_notes),
         input_redist,
         "",
         "        # [HYPER BOUNDARY] original forward body (now ``_forward_impl``)",
         "        outputs = self._forward_impl(*args, **kwargs)",
         "",
         "        # [HYPER BOUNDARY] output redistribution",
+        *_ordered_notes(form.out_notes),
         out_redist,
         "",
         "        return outputs",
     ])
+
+
+# ---------------------------------------------------------------------------
+# static tp_collective template
+# ---------------------------------------------------------------------------
+
+def _render_tp_collective_forward(func: FunctionInfo, form: BoundaryForm) -> str:
+    """Static boundary: bare TP operators, semantics of ``RedistOp.execute``.
+
+    The rendered body is instruction-equivalent to the generic engine with the
+    TP lowerer attached:
+
+    - identity inputs — ``self._hyper_tp.to_local(name)`` (a DTensor unwraps to
+      its local shard, anything else passes through);
+    - TP-lowerable inputs/outputs — ``self._hyper_tp.<kind>(...)`` (the bound
+      operator unwraps a DTensor input and runs the collective on the tp
+      group; ``None`` passes through, like the compiled plan's ``None`` skip);
+    - ``_forward_impl`` is called with every declared parameter in signature
+      order (the static forward re-binds names, so no ``*args`` re-pass).
+
+    ``self._hyper_tp`` is bound by ``hyper_install_boundaries`` only after the
+    runtime re-validates the emitted form against the live mesh; on mismatch
+    the runtime replaces this forward with the generic engine, so the baked
+    calls never run unvalidated.
+    """
+    lines = [
+        "        # [HYPER TP-COLLECTIVE] statically lowered boundary — the runtime",
+        "        # re-validates this form at install time and replaces the forward",
+        "        # with the generic engine on any mismatch.",
+    ]
+    for name in form.in_declared:
+        op = form.in_ops.get(name)
+        if op is None:
+            note = form.in_notes.get(name) or f"{name}: identity ==> to_local"
+            lines.append(f"        # {note}")
+            lines.append(f"        {name} = self._hyper_tp.to_local({name})")
+        else:
+            lines.append(f"        # {form.in_notes[name]}")
+            lines.append(_render_tp_call(name, op))
+    lines.append("")
+    lines.append(
+        "        # [HYPER TP-COLLECTIVE] original forward body (now ``_forward_impl``)"
+    )
+    lines.append(_render_forward_call(func))
+    for name, op in form.out_ops.items():
+        lines.append(f"        # {form.out_notes[name]}")
+        lines.append(f"        outputs = {_render_tp_call_expr('outputs', op)}")
+    lines.append("")
+    lines.append("        return outputs")
+    return "\n".join(lines)
+
+
+def _render_tp_call_expr(target: str, op: TransitionOp) -> str:
+    """One bare-operator call expression (``self._hyper_tp.<kind>(...)``)."""
+    if op.kind == "all_reduce":
+        return f"self._hyper_tp.all_reduce({target})"
+    return f"self._hyper_tp.{op.kind}({target}, dim={op.tensor_dim})"
+
+
+def _render_tp_call(name: str, op: TransitionOp) -> str:
+    """One input-side bare-operator statement (rebinding the named input)."""
+    return f"        {name} = {_render_tp_call_expr(name, op)}"
+
+
+def _render_forward_call(func: FunctionInfo) -> str:
+    """The ``self._forward_impl(...)`` call, every parameter re-passed by name.
+
+    Positional parameters go positionally, keyword-only ones by keyword — the
+    call is a pure re-pass of the static forward's own signature, so defaults
+    and call-site keyword usage both survive the rewrite.
+    """
+    args = list(func.param_names) + [f"{name}={name}" for name in func.kwonly_names]
+    if not args:
+        return "        outputs = self._forward_impl()"
+    single = f"        outputs = self._forward_impl({', '.join(args)})"
+    if len(single) <= 100:
+        return single
+    lines = ["        outputs = self._forward_impl("]
+    lines.extend(f"            {arg}," for arg in args)
+    lines.append("        )")
+    return "\n".join(lines)
 
 
 def _render_local_compute(
@@ -540,5 +784,9 @@ def _validate_no_circular(edits: list[TextEdit]) -> list[str]:
 
 
 __all__ = [
+    "TP_FORM_ATTRIBUTE",
+    "TP_FORM_MARKER",
+    "iter_emitted_forms",
     "lower_forward_boundaries",
+    "resolve_emitted_form",
 ]

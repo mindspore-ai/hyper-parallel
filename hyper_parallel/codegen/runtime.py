@@ -35,6 +35,7 @@ from __future__ import annotations
 import functools
 import inspect
 import json
+import logging
 import os
 import sys
 from typing import Any, Optional
@@ -51,6 +52,9 @@ from hyper_parallel.codegen.meta import (
 # imported here: runtime.py must stay importable without torch (generation-time
 # hosts and the local smoke tests import this module for its pure helpers).  The
 # apply helpers are imported lazily inside the one function that needs each.
+
+logger = logging.getLogger(__name__)
+
 
 def load_codegen_meta(artifact_dir: str) -> Optional[CodegenMeta]:
     """Read ``codegen_meta.json`` from an artifact directory.
@@ -945,6 +949,11 @@ class InstalledBoundary:
                 "hyper_install_boundaries requires a DeviceMesh / MeshContext "
                 "to compile boundaries against"
             )
+        # Routing facts the tp_collective re-validation reads: the dense mesh
+        # and the active axis names this boundary actually compiled against
+        # (empty = the no-op / expert-mesh branches below).
+        self.dense_mesh = dense_mesh
+        self.active_dim_names = tuple(active_dim_names or ())
         self.noop = False
         self._boundary = None
         if not active_dim_names:
@@ -998,6 +1007,56 @@ class InstalledBoundary:
         return _rewrap_execute(output, self._rewrap_plan, self._rewrap_mesh)
 
 
+class TPOperators:
+    """Bare-operator runtime bound to a statically lowered boundary forward.
+
+    A ``tp_collective`` template calls ``self._hyper_tp.<kind>(...)`` directly
+    (``emit/parallel``'s static form); ``hyper_install_boundaries`` binds this
+    object only after re-validating that form against the live mesh, so the
+    baked calls never run unvalidated.  Each method is instruction-equivalent
+    to the compiled engine running the same transition (``RedistOp.execute``
+    with the TP lowerer attached): a DTensor input unwraps to its local shard
+    first, ``None`` passes through untouched (the compiled plan's skip), and
+    the collective dispatches through ``TPCollectiveLowerer.execution_op`` —
+    so a gloo ``reduce_scatter`` remaps to all_reduce + local chunk exactly
+    as the placement-driven path does.
+    """
+
+    def __init__(self, lowerer: Any) -> None:
+        """Capture the install-time TP lowerer every operator dispatches through."""
+        self._lowerer = lowerer
+
+    def to_local(self, tensor: Any) -> Any:
+        """Identity-transition semantics: a DTensor unwraps to its local shard."""
+        from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0415
+
+        if isinstance(tensor, DTensor):
+            return tensor.to_local()
+        return tensor
+
+    def all_gather(self, tensor: Any, dim: Optional[int] = None) -> Any:
+        """Shard -> Replicate on the tp axis: concat-gather along ``dim``."""
+        return self._execute("all_gather", tensor, dim)
+
+    def all_reduce(self, tensor: Any) -> Any:
+        """Partial -> Replicate on the tp axis: sum-reduce over the tp group."""
+        return self._execute("all_reduce", tensor)
+
+    def reduce_scatter(self, tensor: Any, dim: Optional[int] = None) -> Any:
+        """Partial -> Shard on the tp axis: sum-reduce, then shard along ``dim``."""
+        return self._execute("reduce_scatter", tensor, dim)
+
+    def _execute(self, kind: str, tensor: Any, dim: Optional[int] = None) -> Any:
+        """Unwrap, skip ``None``, and run one lowered collective op."""
+        from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0415
+
+        if tensor is None:
+            return None
+        if isinstance(tensor, DTensor):
+            tensor = tensor.to_local()
+        return self._lowerer.execution_op(kind, tensor_dim=dim).execute(tensor)
+
+
 def _wrap_installed_boundary_forward(module: Any, installed: InstalledBoundary) -> None:
     """Install native-style boundary entry/exit redistribution on one module.
 
@@ -1017,6 +1076,81 @@ def _wrap_installed_boundary_forward(module: Any, installed: InstalledBoundary) 
     module.forward = codegen_boundary_forward
     module._codegen_boundary_wrapped = True
     module._codegen_original_forward = original_forward
+
+
+def _wrap_static_fallback_forward(module: Any, installed: InstalledBoundary) -> None:
+    """Replace a rejected static ``tp_collective`` forward with the generic engine.
+
+    The static template's body references ``self._hyper_tp``, which this
+    install path refused to bind; replacing ``module.forward`` wholesale
+    keeps the class runnable — the compiled plan carries the same
+    transitions through the generic redistribute engine.
+    """
+    impl = module._forward_impl
+
+    def generic_boundary_forward(*args: Any, **kwargs: Any) -> Any:
+        redist_args, redist_kwargs = installed.redistribute_inputs((args, kwargs))
+        outputs = impl(*redist_args, **redist_kwargs)
+        return installed.redistribute_outputs(outputs)
+
+    module.forward = generic_boundary_forward
+
+
+def _install_static_tp_operators(
+    module: Any,
+    entry: dict[str, Any],
+    installed: InstalledBoundary,
+    mesh_dim_names: Optional[tuple[str, ...]],
+    injection: Optional[dict[str, Any]],
+) -> None:
+    """Validate a statically lowered ``tp_collective`` forward against the live mesh.
+
+    The emitter baked bare-operator calls under an optimistic verdict — the
+    frozen entry classified as ``tp_collective`` under the plan's own axes
+    and the source passed the structural gates (the class marker records
+    that).  The live mesh may disagree: active axes the plan did not freeze,
+    a tp rank order the lowerer rejects, a backend without the needed
+    collective.  Re-derive the form from the install-time routing facts
+    (``installed.active_dim_names``, the live mesh's mesh-major order) and
+    bind ``module._hyper_tp`` only when the live verdict reproduces the
+    emitted ops; on any mismatch replace the forward with the generic
+    engine, so the baked calls never run unvalidated.
+    """
+    from hyper_parallel.codegen.emit.parallel import (  # pylint: disable=C0415
+        TP_FORM_ATTRIBUTE,
+        TP_FORM_MARKER,
+    )
+    from hyper_parallel.codegen.plan.boundary_forms import (  # pylint: disable=C0415
+        FORM_TP_COLLECTIVE,
+        classify_boundary_form,
+    )
+    from hyper_parallel.distributed._builder.tp_collective_lowering import (  # pylint: disable=C0415
+        create_tp_collective_lowerer,
+    )
+
+    if getattr(module, TP_FORM_ATTRIBUTE, None) != TP_FORM_MARKER:
+        return
+    lowerer = create_tp_collective_lowerer(
+        installed.dense_mesh, installed.active_dim_names
+    )
+    emitted = classify_boundary_form(entry, mesh_dim_names, injection)
+    live = classify_boundary_form(entry, installed.active_dim_names, injection)
+    if (
+        lowerer is not None
+        and emitted.form == FORM_TP_COLLECTIVE
+        and live.form == FORM_TP_COLLECTIVE
+        and live.in_ops == emitted.in_ops
+        and live.out_ops == emitted.out_ops
+    ):
+        module._hyper_tp = TPOperators(lowerer)
+        return
+    logger.warning(
+        "hyper_install_boundaries: static tp_collective forward on %s does not "
+        "match the live mesh (emitted=%s live=%s lowerer=%s); falling back to "
+        "the generic redistribute engine",
+        type(module).__name__, emitted.form, live.form, lowerer is not None,
+    )
+    _wrap_static_fallback_forward(module, installed)
 
 
 def hyper_install_boundaries(
@@ -1042,6 +1176,10 @@ def hyper_install_boundaries(
     after the vocab-parallel-embedding wrap, mirroring the previous runtime
     behavior.  Region boundaries (``local_compute_fn`` in ``injections``)
     also receive ``module._hyper_rewrap`` for the generated rewrap call.
+    A statically lowered ``tp_collective`` forward additionally gets its
+    bare operators bound (``module._hyper_tp``) only after the live-mesh
+    re-validation in :func:`_install_static_tp_operators`; a mismatch
+    replaces the forward with the generic engine.
     """
     if not param_plan:
         return
@@ -1080,6 +1218,13 @@ def hyper_install_boundaries(
                 # as a plain function call, so bind the bound method (not the
                 # InstalledBoundary object — that is not callable).
                 module._hyper_rewrap = installed.rewrap_outputs
+            _install_static_tp_operators(
+                module,
+                entry,
+                installed,
+                mesh_dim_names,
+                _injection_spec(injections or [], param_plan, fqn),
+            )
             continue
         spec = _FrozenBoundarySpec(entry)
         if spec.params:

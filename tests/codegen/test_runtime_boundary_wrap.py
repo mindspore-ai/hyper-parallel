@@ -588,3 +588,281 @@ def test_legacy_wrap_alias_still_covers_unlowered_boundaries(monkeypatch):
 
     assert getattr(model.embed_tokens, "_codegen_boundary_wrapped") is True
     assert model.embed_tokens("original") == ("output-redist", ("compute", "input-redist"))
+
+
+# ---------------------------------------------------------------------------
+# static tp_collective validation / fallback
+# ---------------------------------------------------------------------------
+
+
+class StaticLeaf(nn.Module):
+    """Class-shaped ``tp_collective`` boundary: marker + static template body.
+
+    The body mirrors what ``emit/parallel`` renders for an entry whose input
+    side is identity (R -> R, rendered ``to_local``) and whose output side is
+    a Partial -> Shard transition (rendered ``reduce_scatter``).
+    """
+
+    _hyper_boundary_form = "tp_collective"
+
+    def _forward_impl(self, x):
+        return ("impl", x)
+
+    def forward(self, x):
+        x = self._hyper_tp.to_local(x)
+        outputs = self._forward_impl(x)
+        outputs = self._hyper_tp.reduce_scatter(outputs, dim=1)
+        return outputs
+
+
+class StaticInstalledBoundary:
+    """InstalledBoundary double exposing the routing facts the validator reads."""
+
+    def __init__(self, entry, mesh_context, mesh_dim_names=None, *, module=None):
+        self.entry = entry
+        self.module = module
+        self.dense_mesh = mesh_context
+        self.active_dim_names = tuple(mesh_dim_names or ())
+        self.sides = []
+
+    def redistribute_inputs(self, payload):
+        self.sides.append("in")
+        return (("input-redist",), {})
+
+    def redistribute_outputs(self, outputs):
+        self.sides.append("out")
+        return ("output-redist", outputs)
+
+    def rewrap_outputs(self, output):
+        return output
+
+
+class RecordingLowerer:
+    """Lowerer double recording bare-operator dispatch without a process group."""
+
+    def __init__(self):
+        self.calls = []
+
+    def execution_op(self, kind, tensor_dim=None, reduce_op="sum"):
+        self.calls.append((kind, tensor_dim))
+        return self
+
+    def execute(self, tensor):
+        return ("executed", tensor)
+
+
+def _static_entry():
+    """A tp_collective entry: identity input, Partial -> Shard output."""
+    return {
+        "is_boundary": True,
+        "in_src": {"x": {"tp": "R"}},
+        "in_dst": {"x": {"tp": "R"}},
+        "out_src": {"output": {"tp": "P(sum)"}},
+        "out_dst": {"output": {"tp": "S(1)"}},
+    }
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_tp_operators_dispatch_and_passthrough():
+    """Bare operators dispatch through the lowerer; ``None`` passes through.
+
+    Feature: boundary-install
+    Description: ``TPOperators`` mirrors the compiled engine's execution per
+        transition — identity inputs unwrap/pass through, ``None`` skips (the
+        compiled plan's skip), and collectives dispatch through
+        ``TPCollectiveLowerer.execution_op`` with the emitted kind and dim.
+    Expectation: Every call records ``(kind, tensor_dim)`` on the lowerer and
+        returns its executed result; ``None`` never reaches the lowerer.
+    """
+    lowerer = RecordingLowerer()
+    ops = runtime.TPOperators(lowerer)
+
+    assert ops.to_local(None) is None
+    plain = object()
+    assert ops.to_local(plain) is plain
+    assert ops.all_gather(None, dim=1) is None
+    assert ops.all_reduce("t") == ("executed", "t")
+    assert ops.all_gather("t", dim=1) == ("executed", "t")
+    assert ops.reduce_scatter("t", dim=-1) == ("executed", "t")
+    assert lowerer.calls == [
+        ("all_reduce", None),
+        ("all_gather", 1),
+        ("reduce_scatter", -1),
+    ]
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_tp_operators_unwrap_dtensor_inputs(monkeypatch):
+    """DTensor inputs unwrap to the local shard before any operator runs.
+
+    Feature: boundary-install
+    Description: ``RedistOp.execute`` unwraps a DTensor to its local shard
+        before running the execution op; ``TPOperators`` must do the same for
+        both the identity ``to_local`` and the collective operators.
+    Expectation: ``to_local`` returns the shard, and a collective executes on
+        the shard (not on the DTensor wrapper).
+    """
+    from hyper_parallel.core.dtensor import dtensor as dtensor_module
+
+    class FakeDTensor:
+        """DTensor double: only ``to_local`` is exercised."""
+
+        def __init__(self, local):
+            self._local = local
+
+        def to_local(self):
+            return self._local
+
+    monkeypatch.setattr(dtensor_module, "DTensor", FakeDTensor)
+    ops = runtime.TPOperators(RecordingLowerer())
+    wrapped = FakeDTensor("local-shard")
+
+    assert ops.to_local(wrapped) == "local-shard"
+    assert ops.all_reduce(wrapped) == ("executed", "local-shard")
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_install_static_tp_collective_binds_operators_on_match(monkeypatch):
+    """A form match binds ``_hyper_tp`` and leaves the static forward in place.
+
+    Feature: boundary-install
+    Description: When the emitted marker, the live-mesh re-classification,
+        and the TP lowerer all agree, ``hyper_install_boundaries`` binds the
+        bare-operator runtime (``module._hyper_tp``) and does NOT touch the
+        generated static forward.
+    Expectation: ``_hyper_tp`` is a ``TPOperators`` carrying the lowerer; the
+        forward still resolves to the class's own method; calling it runs the
+        bare-operator pipeline.
+    """
+    from hyper_parallel.distributed._builder import tp_collective_lowering
+
+    lowerer = RecordingLowerer()
+    monkeypatch.setattr(
+        tp_collective_lowering,
+        "create_tp_collective_lowerer",
+        lambda mesh, dims: lowerer,
+    )
+    monkeypatch.setattr(runtime, "InstalledBoundary", StaticInstalledBoundary)
+
+    model = nn.Module()
+    model.self_attn = StaticLeaf()
+    runtime.hyper_install_boundaries(
+        model,
+        {"self_attn": _static_entry()},
+        mesh_context=FakeDenseMesh(),
+        mesh_dim_names=("tp",),
+    )
+
+    assert isinstance(model.self_attn._hyper_tp, runtime.TPOperators)
+    assert model.self_attn._hyper_tp._lowerer is lowerer
+    # The static forward was not replaced (no instance-level forward).
+    assert "forward" not in model.self_attn.__dict__
+    assert model.self_attn("x") == ("executed", ("impl", "x"))
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_install_static_tp_collective_falls_back_when_lowerer_unavailable(
+    monkeypatch,
+):
+    """No TP lowerer (rank order / backend) replaces the forward with generic.
+
+    Feature: boundary-install
+    Description: ``create_tp_collective_lowerer`` returns ``None`` when the tp
+        rank order differs from the group or the backend lacks a collective;
+        the baked ``self._hyper_tp`` calls would then crash, so the install
+        path must replace the forward with the generic redistribute engine.
+    Expectation: ``_hyper_tp`` is not bound; the instance carries a replaced
+        forward that dispatches input-redist -> ``_forward_impl`` ->
+        output-redist through the compiled plan.
+    """
+    from hyper_parallel.distributed._builder import tp_collective_lowering
+
+    monkeypatch.setattr(
+        tp_collective_lowering,
+        "create_tp_collective_lowerer",
+        lambda mesh, dims: None,
+    )
+    monkeypatch.setattr(runtime, "InstalledBoundary", StaticInstalledBoundary)
+
+    model = nn.Module()
+    model.self_attn = StaticLeaf()
+    runtime.hyper_install_boundaries(
+        model,
+        {"self_attn": _static_entry()},
+        mesh_context=FakeDenseMesh(),
+        mesh_dim_names=("tp",),
+    )
+
+    assert not hasattr(model.self_attn, "_hyper_tp")
+    assert "forward" in model.self_attn.__dict__
+    assert model.self_attn("x") == ("output-redist", ("impl", "input-redist"))
+    installed = model.self_attn._hyper_boundary
+    assert installed.sides == ["in", "out"]
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_install_static_tp_collective_falls_back_when_live_axes_disagree(
+    monkeypatch,
+):
+    """A live mesh without the plan's tp axis demotes the static form.
+
+    Feature: boundary-install
+    Description: The plan froze axes ``("tp",)`` (emitted verdict
+        tp_collective), but the live mesh routes with no active axes — the
+        live re-classification is identity, not tp_collective.  Even with a
+        usable lowerer the emitted ops no longer describe the boundary, so
+        the forward must fall back to the generic engine.
+    Expectation: ``_hyper_tp`` is not bound; the forward is replaced.
+    """
+    from hyper_parallel.distributed._builder import tp_collective_lowering
+
+    lowerer = RecordingLowerer()
+    monkeypatch.setattr(
+        tp_collective_lowering,
+        "create_tp_collective_lowerer",
+        lambda mesh, dims: lowerer,
+    )
+
+    module = StaticLeaf()
+    installed = StaticInstalledBoundary(_static_entry(), FakeDenseMesh(), ())
+    runtime._install_static_tp_operators(
+        module, _static_entry(), installed, ("tp",), None
+    )
+
+    assert not hasattr(module, "_hyper_tp")
+    assert "forward" in module.__dict__
+    assert module("x") == ("output-redist", ("impl", "input-redist"))
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_install_leaves_unmarked_lowered_boundary_alone(monkeypatch):
+    """A lowered boundary without the marker gets no tp operators, no rewrite.
+
+    Feature: boundary-install
+    Description: Generic / region lowered forwards (no
+        ``_hyper_boundary_form`` marker) never enter the static validation —
+        they already route through ``self._hyper_boundary``.
+    Expectation: No ``_hyper_tp`` binding and no instance-level forward.
+    """
+    from hyper_parallel.distributed._builder import tp_collective_lowering
+
+    monkeypatch.setattr(
+        tp_collective_lowering,
+        "create_tp_collective_lowerer",
+        lambda mesh, dims: RecordingLowerer(),
+    )
+
+    module = LoweredLeaf()
+    installed = StaticInstalledBoundary(_static_entry(), FakeDenseMesh(), ("tp",))
+    runtime._install_static_tp_operators(
+        module, _static_entry(), installed, ("tp",), None
+    )
+
+    assert not hasattr(module, "_hyper_tp")
+    assert "forward" not in module.__dict__
