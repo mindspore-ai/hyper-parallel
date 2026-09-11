@@ -981,13 +981,21 @@ class OpDispatcher:
         op_impl = op_call if op_impl is None else op_impl
         py_output = OpDispatcher._call_op_impl(op_impl, packed_call, local_args, local_kwargs)
         output = distribute_op.wrap_output(py_output, infer_result[0])
-        return OpDispatcher._restore_inplace_dtensor_result(op_name, args, output)
+        return OpDispatcher._restore_mutable_dtensor_result(op_name, args, kwargs, output)
 
     @staticmethod
-    def _restore_inplace_dtensor_result(op_name: str, args: tuple, output: Any) -> Any:
-        """Return the original DTensor wrapper after a local in-place operation."""
-        if op_name in {"add_", "sub_"} and args and isinstance(args[0], DTensor):
+    def _is_dtensor_wrapper(value: Any) -> bool:
+        """Return whether value is a DTensor wrapper or compatible mock."""
+        return isinstance(value, DTensor) or hasattr(value, "_layout")
+
+    @staticmethod
+    def _restore_mutable_dtensor_result(op_name: str, args: tuple, kwargs: dict, output: Any) -> Any:
+        """Return the original DTensor wrapper after local mutable-output operations."""
+        if op_name in {"add_", "sub_", "index_add_"} and args and OpDispatcher._is_dtensor_wrapper(args[0]):
             return args[0]
+        out = kwargs.get("out") if kwargs else None
+        if op_name in {"index_add"} and OpDispatcher._is_dtensor_wrapper(out):
+            return out
         return output
 
     @staticmethod
