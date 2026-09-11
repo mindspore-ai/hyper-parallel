@@ -35,9 +35,11 @@ from unittest.mock import MagicMock, patch
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import numpy as np  # pylint: disable=C0413
 import torch  # pylint: disable=C0413
+import torch.distributed as dist  # pylint: disable=C0413
 
 from hyper_parallel.core.dtensor.placement_types import Partial  # pylint: disable=C0413
 from hyper_parallel.platform.torch import clip_grad as clip_grad_mod  # pylint: disable=C0413
+from tests.common.mark_utils import arg_mark  # pylint: disable=C0413
 
 
 def _make_mesh(dim_to_group):
@@ -325,6 +327,153 @@ class TestClipGradPartialPath(unittest.TestCase):
             f"Partial norm must NOT equal the un-reduced local norm: "
             f"got={total_norm.item()}, raw_local={raw_local}",
         )
+
+
+class TestClipGradScalarReductionDevice(unittest.TestCase):
+    """Norm-scalar reductions pick their device from the group's backend.
+
+    A CPU scalar (FSDP CPU offload) may only be moved to an accelerator when
+    the reduction group itself cannot reduce CPU tensors: moving it for a
+    CPU-capable backend such as Gloo makes the collective fail with
+    ``No backend type associated with device type <accelerator>``.
+    """
+
+    def _reduce_scalar(self, backend):
+        """Reduce a scalar over a mocked group reporting *backend*.
+
+        Returns the tensor handed to ``all_reduce`` and the accelerator mock.
+        """
+        scalar = torch.tensor(3.0)
+        group = MagicMock(name="group")
+        accelerator = MagicMock(return_value=torch.device("cpu"))
+        with patch.object(clip_grad_mod.dist, "get_backend", return_value=backend), \
+             patch.object(clip_grad_mod, "_accelerator_device", accelerator), \
+             patch.object(clip_grad_mod.dist, "all_reduce") as all_reduce:
+            clip_grad_mod._reduce_scalar_norm(  # pylint: disable=W0212
+                scalar, clip_grad_mod.dist.ReduceOp.SUM, group,
+            )
+        return all_reduce.call_args[0][0], accelerator
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_cpu_capable_backend_keeps_scalar_on_cpu(self):
+        """Reduce a CPU scalar over a Gloo group.
+
+        Feature: backend-aware norm-scalar reduction for FSDP CPU offload.
+
+        Description: Gloo accepts CPU tensors, so the scalar of a CPU-resident
+        norm is reduced where it is.
+
+        Expectation: ``all_reduce`` receives the original CPU tensor and no
+        accelerator device is resolved.
+        """
+        reduced, accelerator = self._reduce_scalar("gloo")
+        self.assertTrue(reduced.is_cpu, "Gloo must reduce the CPU scalar on the CPU")
+        accelerator.assert_not_called()
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_composite_backend_with_cpu_sub_backend_keeps_scalar_on_cpu(self):
+        """Reduce a CPU scalar over a group exposing both Gloo and NCCL.
+
+        Feature: backend-aware norm-scalar reduction for FSDP CPU offload.
+
+        Description: A multi-backend group routes a CPU tensor through its CPU
+        sub-backend, so the accelerator sub-backend must not take over.
+
+        Expectation: the scalar stays on the CPU and no accelerator device is
+        resolved.
+        """
+        reduced, accelerator = self._reduce_scalar("cpu:gloo,cuda:nccl")
+        self.assertTrue(reduced.is_cpu, "a CPU-capable sub-backend wins over the accelerator one")
+        accelerator.assert_not_called()
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_nccl_backend_moves_scalar_to_cuda(self):
+        """Reduce a CPU scalar over an NCCL group.
+
+        Feature: backend-aware norm-scalar reduction for FSDP CPU offload.
+
+        Description: NCCL cannot reduce CPU tensors, so the scalar has to be
+        moved to the CUDA device of the local rank.
+
+        Expectation: the accelerator device is resolved for ``cuda``.
+        """
+        self._reduce_scalar("nccl")[1].assert_called_once_with("cuda")
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_hccl_backend_moves_scalar_to_npu(self):
+        """Reduce a CPU scalar over an HCCL group.
+
+        Feature: backend-aware norm-scalar reduction for FSDP CPU offload.
+
+        Description: HCCL cannot reduce CPU tensors, so the scalar has to be
+        moved to the NPU of the local rank.
+
+        Expectation: the accelerator device is resolved for ``npu``.
+        """
+        self._reduce_scalar("hccl")[1].assert_called_once_with("npu")
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_unknown_backend_keeps_scalar_on_cpu(self):
+        """Reduce a CPU scalar over a group whose backend is outside the map.
+
+        Feature: backend-aware norm-scalar reduction for FSDP CPU offload.
+
+        Description: An unmapped backend must not be assumed to be an
+        accelerator one.
+
+        Expectation: the scalar stays on the CPU and no accelerator device is
+        resolved.
+        """
+        reduced, accelerator = self._reduce_scalar("undefined")
+        self.assertTrue(reduced.is_cpu, "an unmapped backend must not move the scalar")
+        accelerator.assert_not_called()
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_unregistered_group_keeps_scalar_on_cpu(self):
+        """Reduce a CPU scalar over a group outside the distributed world.
+
+        Feature: backend-aware norm-scalar reduction for FSDP CPU offload.
+
+        Description: ``dist.get_backend`` rejects a group that was never
+        registered, and that rejection must not turn into a device move.
+
+        Expectation: the scalar stays on the CPU and no accelerator device is
+        resolved.
+        """
+        with patch.object(clip_grad_mod, "_accelerator_device") as accelerator, \
+             patch.object(clip_grad_mod.dist, "all_reduce") as all_reduce:
+            clip_grad_mod._reduce_scalar_norm(  # pylint: disable=W0212
+                torch.tensor(3.0), clip_grad_mod.dist.ReduceOp.SUM,
+                MagicMock(name="unregistered"),
+            )
+        self.assertTrue(all_reduce.call_args[0][0].is_cpu)
+        accelerator.assert_not_called()
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_real_gloo_group_reduces_cpu_scalar(self):
+        """Reduce a CPU scalar over a real single-rank Gloo group.
+
+        Feature: backend-aware norm-scalar reduction for FSDP CPU offload.
+
+        Description: Exercise the Gloo branch against a real process group
+        instead of a mocked backend string.
+
+        Expectation: the scalar is reduced in place and the result is the
+        single-rank value.
+        """
+        if dist.is_initialized():
+            self.skipTest("a process group is already initialized by another test")
+        dist.init_process_group(
+            backend="gloo", rank=0, world_size=1, store=dist.HashStore(),
+        )
+        try:
+            group = dist.new_group(backend="gloo")
+            reduced = clip_grad_mod._reduce_scalar_norm(  # pylint: disable=W0212
+                torch.tensor(3.0), dist.ReduceOp.SUM, group,
+            )
+        finally:
+            dist.destroy_process_group()
+        self.assertEqual(reduced.item(), 3.0)
 
 
 if __name__ == "__main__":

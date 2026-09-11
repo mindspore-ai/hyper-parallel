@@ -399,6 +399,79 @@ def _get_total_norm(
     return total_p ** (1.0 / norm_type)
 
 
+# Reduction backends mapped to the device type their collectives require; a
+# backend absent from this map reduces CPU tensors natively (gloo, mpi).
+_BACKEND_DEVICE_TYPES = {
+    "nccl": "cuda",
+    "hccl": "npu",
+}
+
+# A multi-backend group that registers one of these routes a CPU tensor
+# through that sub-backend instead of its accelerator one.
+_CPU_CAPABLE_BACKENDS = frozenset({"gloo", "mpi"})
+
+
+def _backend_device_type(group: "dist.ProcessGroup") -> Optional[str]:
+    """Return the device type *group* requires for its collective tensors.
+
+    ``dist.get_backend`` reports a composite backend for multi-backend groups
+    (e.g. ``cpu:gloo,cuda:nccl``); a group able to reduce CPU tensors itself
+    yields ``None``, as does a group outside the distributed world.
+
+    Args:
+        group: Process group the collective runs over.
+
+    Returns:
+        The accelerator device type (``npu``/``cuda``) to move a CPU scalar to,
+        or ``None`` when the scalar can be reduced where it is.
+    """
+    try:
+        backend = str(dist.get_backend(group)).lower()
+    except (RuntimeError, ValueError):
+        return None
+    names = [part.split(":")[-1].strip() for part in backend.split(",")]
+    if any(name in _CPU_CAPABLE_BACKENDS for name in names):
+        return None
+    for name in names:
+        device_type = _BACKEND_DEVICE_TYPES.get(name)
+        if device_type is not None:
+            return device_type
+    return None
+
+
+def _accelerator_device(device_type: str) -> torch.device:
+    """Return this rank's local accelerator device of *device_type*."""
+    handle = getattr(torch, device_type, None)
+    if handle is None or not handle.is_available():
+        return torch.device("cpu")
+    try:
+        return torch.device(device_type, handle.current_device())
+    except (RuntimeError, AssertionError):
+        return torch.device(device_type)
+
+
+def _reduce_scalar_norm(
+    tensor: torch.Tensor,
+    reduce_op: "dist.ReduceOp",
+    group: "dist.ProcessGroup",
+) -> torch.Tensor:
+    """All-reduce a per-rank norm scalar over *group*.
+
+    Accelerator process groups (hccl/nccl) cannot reduce CPU tensors, so under
+    FSDP CPU offload the scalar is temporarily moved to the local accelerator
+    of that group's backend and the result is copied back, keeping the caller's
+    device semantics unchanged. CPU-capable groups reduce the scalar in place.
+    """
+    device_type = _backend_device_type(group) if tensor.is_cpu else None
+    if device_type is None:
+        dist.all_reduce(tensor, op=reduce_op, group=group)
+        return tensor
+    comm_tensor = tensor.to(device=_accelerator_device(device_type))
+    dist.all_reduce(comm_tensor, op=reduce_op, group=group)
+    tensor.copy_(comm_tensor)
+    return tensor
+
+
 def _total_norm_inf(  # pylint: disable=R0913,R0917
     grad_groups, norm_type, mesh_cache, device, reduce_op,
 ):
@@ -409,10 +482,7 @@ def _total_norm_inf(  # pylint: disable=R0913,R0917
         if mesh_id is not None:
             mesh = mesh_cache[mesh_id]
             for dim in shard_dims:
-                dist.all_reduce(
-                    local_norm, op=reduce_op,
-                    group=mesh.get_group(dim),
-                )
+                _reduce_scalar_norm(local_norm, reduce_op, mesh.get_group(dim))
         group_norms.append(local_norm)
     if not group_norms:
         if norm_type == -math.inf:
@@ -430,10 +500,7 @@ def _total_norm_sum(grad_groups, norm_type, mesh_cache, device):
         if mesh_id is not None:
             mesh = mesh_cache[mesh_id]
             for dim in shard_dims:
-                dist.all_reduce(
-                    local_val, op=dist.ReduceOp.SUM,
-                    group=mesh.get_group(dim),
-                )
+                _reduce_scalar_norm(local_val, dist.ReduceOp.SUM, mesh.get_group(dim))
         total.add_(local_val)
     return total
 
@@ -533,7 +600,7 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
             local_p = torch.tensor(0.0, device=device, dtype=torch.float32)
 
         for group in sig_groups[sig]:
-            dist.all_reduce(local_p, op=dist.ReduceOp.SUM, group=group)
+            _reduce_scalar_norm(local_p, dist.ReduceOp.SUM, group)
 
         total_p = total_p + local_p
 
