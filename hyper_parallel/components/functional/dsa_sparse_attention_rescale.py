@@ -129,10 +129,11 @@ class _SparseAttentionRescale(torch.autograd.Function):
     def backward(
         ctx: Any,
         grad_rescaled_output: torch.Tensor,
-        _grad_softmax_max: torch.Tensor,
-        _grad_softmax_sum: torch.Tensor,
+        grad_softmax_max: torch.Tensor,
+        grad_softmax_sum: torch.Tensor,
     ) -> tuple:
         """Run the explicit sparse- and fusion-attention backward operators."""
+        del grad_softmax_max, grad_softmax_sum
         (
             query_nope,
             compressed_kv,
@@ -156,8 +157,9 @@ class _SparseAttentionRescale(torch.autograd.Function):
         ]
         grad_output = rearrange(output_scale * grad_rescaled_output, "b s n d -> (b s) n d")
         rescaled_output_tnd = rearrange(rescaled_output, "b s n d -> (b s) n d")
-        grad_output = grad_output[:, :, :-query_rope.size(-1)]
-        rescaled_output_tnd = rescaled_output_tnd[:, :, :-query_rope.size(-1)]
+        if query_rope.size(-1) > 0:
+            grad_output = grad_output[:, :, :-query_rope.size(-1)]
+            rescaled_output_tnd = rescaled_output_tnd[:, :, :-query_rope.size(-1)]
 
         grad_query_nope, grad_key, grad_value, grad_query_rope, grad_key_rope = (
             torch.ops.custom.npu_sparse_flash_attention_grad_enhance(
@@ -182,13 +184,10 @@ class _SparseAttentionRescale(torch.autograd.Function):
             )
         )
         sink_grad_output = rearrange(sink_scale * grad_rescaled_output, "b s n d -> s b (n d)")
-        query = torch.cat([query_nope, query_rope], dim=-1)
-        sink_query = rearrange(query, "b s n d -> s b (n d)")
-        sink_key_sbh = rearrange(sink_key, "b s n d -> s b (n d)")
         sink_value_sbh = rearrange(sink_value, "b s n d -> s b (n d)")
         sink_grad_query, sink_grad_key, sink_grad_value, *_ = torch_npu.npu_fusion_attention_grad(
-            sink_query,
-            sink_key_sbh,
+            rearrange(torch.cat([query_nope, query_rope], dim=-1), "b s n d -> s b (n d)"),
+            rearrange(sink_key, "b s n d -> s b (n d)"),
             sink_value_sbh,
             sink_grad_output.to(sink_key.dtype),
             num_heads,
