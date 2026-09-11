@@ -14,6 +14,8 @@
 # ============================================================================
 """Compact Online-packing metadata for DeepSeek-V4.1 CSA2."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from typing import Any
 

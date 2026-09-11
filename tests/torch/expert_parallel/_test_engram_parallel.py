@@ -15,6 +15,7 @@
 """Distributed CPU precision worker for Engram EP lookup and CP hashing."""
 
 from copy import deepcopy
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -27,6 +28,7 @@ class _EngramSource(nn.Module):
     """Small source-layout fixture accepted by the Engram replacement."""
 
     def __init__(self) -> None:
+        """Populate the fixture with a minimal Engram-compatible asset set."""
         super().__init__()
         assets = {
             "layer_ids": [1],
@@ -51,7 +53,12 @@ class _EngramSource(nn.Module):
         self.q_weight = nn.Parameter(torch.ones(2, 4))
         self.k_weight = nn.Parameter(torch.ones(2, 4))
 
-    def forward(self, hidden_states, input_ids, segment_starts=None):
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            input_ids: torch.Tensor,
+            segment_starts: Any = None,
+    ) -> None:
         """The source forward is unused by this worker."""
         del hidden_states, input_ids, segment_starts
         raise RuntimeError("fixture forward is intentionally unavailable")
