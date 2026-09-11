@@ -24,6 +24,7 @@ nn = pytest.importorskip("mindspore.nn")
 ms.set_context(mode=ms.PYNATIVE_MODE, device_target="CPU")
 
 from hyper_parallel.platform.mindspore.platform import (  # pylint: disable=wrong-import-position
+    AsyncCollectiveTensor,
     MindSporePlatform,
     _MSDifferentiableAllToAllSingle,
     _mindspore_variable_all_gather,
@@ -35,6 +36,17 @@ from hyper_parallel.platform.mindspore.platform import (  # pylint: disable=wron
 def _tensor(rows: int = 3, width: int = 4):
     """Create a deterministic two-dimensional MindSpore tensor."""
     return ms.Tensor(np.arange(rows * width, dtype=np.float32).reshape(rows, width))
+
+
+class _FakeWork:
+    """Record whether an async collective was waited."""
+
+    def __init__(self):
+        self.wait_calls = 0
+
+    def wait(self):
+        """Record one wait call."""
+        self.wait_calls += 1
 
 
 def test_prepare_batch_p2p_group_does_not_synchronize():
@@ -137,23 +149,6 @@ def test_variable_split_validation_uses_dim_zero_rows():
         _validate_variable_row_splits(_tensor(), [1, 1], [1, 1], "group")
 
 
-def test_differentiable_all_to_all_forwards_row_splits():
-    """The public API accepts N-D input and row-count splits."""
-    input_tensor = _tensor()
-    sentinel = object()
-    with mock.patch(
-        "hyper_parallel.platform.mindspore.platform.get_group_size", return_value=2
-    ), mock.patch.object(
-        _MSDifferentiableAllToAllSingle, "apply", return_value=sentinel
-    ) as mock_apply:
-        result = MindSporePlatform.differentiable_all_to_all_single(
-            input_tensor, [1, 2], [2, 1], "group"
-        )
-
-    assert result is sentinel
-    assert mock_apply.call_args.args == (input_tensor, [2, 1], [1, 2], "group")
-
-
 def test_variable_all_to_all_allocates_nd_output_from_row_splits():
     """The communication wrapper receives an N-D output shape and row splits."""
     input_tensor = _tensor()
@@ -215,3 +210,55 @@ def test_variable_all_to_all_backward_swaps_splits():
         [1, 2],
         "group",
     )
+
+
+def test_variable_all_to_all_single_swaps_splits_in_backward():
+    """The differentiable A2A saves metadata and reverses the split direction."""
+    calls = []
+
+    def fake_all_to_all_single(output, output_split_sizes, input_split_sizes, group, async_op, **kwargs):
+        calls.append((input_split_sizes, output_split_sizes, group, async_op))
+        output.copy_(kwargs["input"])
+        return None
+
+    value = ms.Tensor(np.arange(4, dtype=np.float32))
+
+    def loss_fn(input_tensor):
+        output = MindSporePlatform.differentiable_all_to_all_single(
+            input_tensor, [3, 1], [1, 3], "ep_group",
+        )
+        return output.sum()
+
+    with mock.patch(
+            "hyper_parallel.platform.mindspore.platform.dist.all_to_all_single",
+            side_effect=fake_all_to_all_single,
+    ):
+        grad = ms.grad(loss_fn)(value)
+
+    np.testing.assert_array_equal(grad.asnumpy(), np.ones((4,), dtype=np.float32))
+    assert calls == [
+        ([3, 1], [1, 3], "ep_group", False),
+        ([1, 3], [3, 1], "ep_group", False),
+    ]
+
+
+def test_async_variable_all_to_all_keeps_zero_output_lazy():
+    """A zero-length async output remains lazy and is not waited at launch."""
+    work = _FakeWork()
+
+    with mock.patch(
+            "hyper_parallel.platform.mindspore.platform.dist.all_to_all_single",
+            return_value=work,
+    ) as all_to_all:
+        output = MindSporePlatform.differentiable_all_to_all_single_async(
+            ms.Tensor(np.empty((0,), dtype=np.float32)),
+            [0, 0],
+            [0, 0],
+            "ep_group",
+        )
+
+    assert isinstance(output, AsyncCollectiveTensor)
+    assert output.shape == (0,)
+    assert work.wait_calls == 0
+    allocated_output = all_to_all.call_args.kwargs["output"]
+    assert allocated_output.shape == (0,)
