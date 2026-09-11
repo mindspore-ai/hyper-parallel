@@ -129,8 +129,8 @@ class _SparseAttentionRescale(torch.autograd.Function):
     def backward(
         ctx: Any,
         grad_rescaled_output: torch.Tensor,
-        _grad_softmax_max: torch.Tensor,
-        _grad_softmax_sum: torch.Tensor,
+        unused_grad_softmax_max: torch.Tensor,
+        unused_grad_softmax_sum: torch.Tensor,
     ) -> tuple:
         """Run the explicit sparse- and fusion-attention backward operators."""
         (
@@ -156,8 +156,9 @@ class _SparseAttentionRescale(torch.autograd.Function):
         ]
         grad_output = rearrange(output_scale * grad_rescaled_output, "b s n d -> (b s) n d")
         rescaled_output_tnd = rearrange(rescaled_output, "b s n d -> (b s) n d")
-        grad_output = grad_output[:, :, :-query_rope.size(-1)]
-        rescaled_output_tnd = rescaled_output_tnd[:, :, :-query_rope.size(-1)]
+        if query_rope.size(-1) > 0:
+            grad_output = grad_output[:, :, :-query_rope.size(-1)]
+            rescaled_output_tnd = rescaled_output_tnd[:, :, :-query_rope.size(-1)]
 
         grad_query_nope, grad_key, grad_value, grad_query_rope, grad_key_rope = (
             torch.ops.custom.npu_sparse_flash_attention_grad_enhance(
