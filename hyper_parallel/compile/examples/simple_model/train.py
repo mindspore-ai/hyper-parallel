@@ -22,6 +22,7 @@ Demonstrates how to use HyperParallel Graph Mode for training a simple model.
 import argparse
 import sys
 from pathlib import Path
+from typing import Iterator, Tuple
 
 import torch
 import torch.distributed as dist
@@ -37,7 +38,8 @@ from hyper_parallel.compile import (  # pylint: disable=C0413
 )
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """Parse example CLI arguments."""
     parser = argparse.ArgumentParser(
         description="Simple Model Training with HyperParallel Graph Mode"
     )
@@ -45,7 +47,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def setup_distributed():
+def setup_distributed() -> None:
     """Initialize distributed training"""
     if not dist.is_initialized():
         dist.init_process_group(backend="hccl")
@@ -53,18 +55,20 @@ def setup_distributed():
         torch.npu.set_device(dist.get_rank() % torch.npu.device_count())
 
 
-def cleanup_distributed():
+def cleanup_distributed() -> None:
     """Cleanup distributed training"""
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
 def load_config(config_path: str) -> dict:
+    """Load the example YAML config."""
     with open(config_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def build_pass_config(config: dict) -> PassConfig:
+    """Build the pass config from the YAML ``parallel`` section."""
     pass_config = config["parallel"]
     return PassConfig(
         enable_overlap=pass_config.get("enable_overlap", True),
@@ -98,7 +102,9 @@ def build_pass_plan(config: dict) -> PassPlan:
     return plan
 
 
-def train_fn(model, input_ids, labels):
+def train_fn(
+    model: torch.nn.Module, input_ids: torch.Tensor, labels: torch.Tensor
+) -> torch.Tensor:
     """Training function"""
     logits = model(input_ids)
     shift_logits = logits[..., :-1, :].contiguous()
@@ -111,7 +117,8 @@ def train_fn(model, input_ids, labels):
     return loss
 
 
-def main():
+def main() -> None:
+    """Run single/multi-card FSDP training on the dummy model."""
     args = parse_args()
     config = load_config(args.config)
 
@@ -130,12 +137,14 @@ def main():
 
     # Create dummy model (example)
     class DummyModel(torch.nn.Module):
-        def __init__(self, vocab_size, dim):
+        def __init__(self, vocab_size: int, dim: int) -> None:
+            """Initialize embedding + projection head."""
             super().__init__()
             self.embed = torch.nn.Embedding(vocab_size, dim)
             self.linear = torch.nn.Linear(dim, vocab_size)
 
-        def forward(self, x):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """Embed then project to vocab logits."""
             return self.linear(self.embed(x))
 
     # Materialize the model on a real device. GraphTrainer executes the
@@ -170,7 +179,8 @@ def main():
     g_input_ids = torch.randint(0, vocab_size, (1, max_seq_len))
     g_labels = torch.randint(0, vocab_size, (1, max_seq_len))
 
-    def data_iter():
+    def data_iter() -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        """Yield the same synthetic batch each step (demo workload)."""
         for _ in range(max_steps):
             input_ids = g_input_ids
             labels = g_labels

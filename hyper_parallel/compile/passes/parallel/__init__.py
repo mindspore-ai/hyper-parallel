@@ -17,5 +17,7 @@ Parallel Passes - Parallel Partitioning Passes
 """
 
 from .fsdp_pass import FSDPPass
+from .pp_pass import PpPass
+from .pp_schedule import ScheduleGPipe
 
-__all__ = ["FSDPPass"]
+__all__ = ["FSDPPass", "PpPass", "ScheduleGPipe"]

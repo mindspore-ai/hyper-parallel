@@ -1,0 +1,48 @@
+# Pipeline Parallel example configuration.
+#
+# NOTE: fsdp / pp are TOP-LEVEL keys here so the whole file can be fed
+# directly to create_sharding_plan_from_yaml(); model / train / logging keys
+# are ignored by the plan parser.
+
+model:
+  vocab_size: 512
+  dim: 64
+  num_layers: 4     # must be >= pp_degree for the even-by-layers split
+  seq_len: 32
+
+train:
+  max_steps: 20
+  batch_size: 8     # must be divisible by pp_microbatch_size
+  optimizer:
+    lr: 3.0e-4
+  grad_clip: 1.0
+
+logging:
+  log_interval: 5
+
+# ============================================================================
+# Stage split plan (parsed by create_sharding_plan_from_yaml)
+# ============================================================================
+# Pipeline-parallel (v1): pure PP — FSDP must stay disabled, and
+# world_size must equal pp_degree (one stage per rank).
+fsdp:
+  enabled: false
+
+pp:
+  # Omit "stages" entirely for the AUTOMATIC even-by-layers split:
+  #   stage 0 -> [tok_embeddings, layers.0, layers.1]
+  #   stage 1 -> [layers.2, layers.3, norm, lm_head]
+  #
+  # Or declare the cut manually (exact module FQNs, no wildcards):
+  # stages:
+  #   - [tok_embeddings, layers.0, layers.1]
+  #   - [layers.2, layers.3, norm, lm_head]
+
+# ============================================================================
+# Parallel Configuration (Core)
+# ============================================================================
+parallel:
+  enable_overlap: true
+  pp_enabled: true        # opt-in; PpPass slices the joint graph per stage
+  pp_degree: 2            # == world_size (one stage per rank, v1)
+  pp_microbatch_size: 2   # batch_size 8 -> 4 microbatches in flight
