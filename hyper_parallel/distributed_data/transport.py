@@ -446,70 +446,6 @@ def _decode_payload_segment(frame: bytes) -> tuple[tuple[SampleKey, Any], ...]:
     return items
 
 
-def _is_non_negative_integer(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
-
-
-def _validate_iterator_fields(
-        status: Any,
-        ranks: Sequence[int],
-        *,
-        expected_length: int,
-        scope: str,
-) -> tuple[Any, ...] | str:
-    if not isinstance(status, tuple) or len(status) != expected_length:
-        return f"{scope} contributed an invalid iterator-state status."
-    rank, rank_epoch, rank_step, rank_stopped = status[:4]
-    if not _is_non_negative_integer(rank) or rank not in ranks:
-        return f"{scope} contributed an invalid iterator-state rank."
-    if not _is_non_negative_integer(rank_epoch):
-        return f"{scope} {rank} contributed an invalid iterator epoch."
-    if not _is_non_negative_integer(rank_step):
-        return f"{scope} {rank} contributed an invalid iterator step."
-    if not isinstance(rank_stopped, bool):
-        return f"{scope} {rank} contributed an invalid stopped state."
-    return status
-
-
-def _normalize_iterator_statuses(
-        statuses: Sequence[Any],
-        ranks: Sequence[int],
-        *,
-        expected_length: int,
-        scope: str,
-) -> tuple[tuple[tuple[Any, ...], ...] | None, str | None]:
-    normalized = []
-    for status in statuses:
-        result = _validate_iterator_fields(status, ranks, expected_length=expected_length, scope=scope)
-        if isinstance(result, str):
-            return None, result
-        normalized.append(result)
-    return tuple(normalized), None
-
-
-def _iterator_coverage_error(
-        normalized: Sequence[tuple[Any, ...]],
-        ranks: Sequence[int],
-        *,
-        scope: str,
-) -> str | None:
-    contributed_ranks = [status[0] for status in normalized]
-    if len(contributed_ranks) != len(set(contributed_ranks)) or set(contributed_ranks) != set(ranks):
-        return f"{scope} iterator states have invalid rank coverage {contributed_ranks}."
-    return None
-
-
-def _iterator_state_error(normalized: Sequence[tuple[Any, ...]], *, scope: str) -> str | None:
-    states = {(status[1], status[2], status[3]) for status in normalized}
-    if len(states) == 1:
-        return None
-    details = ", ".join(
-        f"rank {status[0]}=(epoch={status[1]}, step={status[2]}, stopped={status[3]})"
-        for status in normalized
-    )
-    return f"{scope} ranks have inconsistent iterator state: {details}."
-
-
 def _exchange_payload_sizes(input_splits: Sequence[int], control_group: Any) -> list[int]:
     size_input = torch.tensor(tuple(input_splits), dtype=torch.int64)
     size_output = torch.empty_like(size_input)
@@ -644,37 +580,6 @@ class DataPlaneTransport:
         payload = [value if self._global_rank == self._planner_rank else None]
         dist.broadcast_object_list(payload, src=self._planner_rank, group=self._control_group)
         return payload[0]
-
-    def synchronize_iterator_state(
-            self,
-            *,
-            epoch: int,
-            step: int,
-            stopped: bool,
-    ) -> str | None:
-        """Validate iterator state across all data-plane ranks before reading.
-
-        Args:
-            epoch: Current epoch number.
-            step: Current iterator step.
-            stopped: Whether local iteration has stopped.
-
-        Returns:
-            A shared validation error, if any.
-        """
-        statuses = self.all_gather_object((self._global_rank, epoch, step, stopped))
-        normalized, validation_error = _normalize_iterator_statuses(
-            statuses,
-            self._ranks,
-            expected_length=4,
-            scope="Data-plane rank",
-        )
-        if validation_error is not None or normalized is None:
-            return validation_error
-        coverage_error = _iterator_coverage_error(normalized, self._ranks, scope="Data-plane")
-        if coverage_error is not None:
-            return coverage_error
-        return _iterator_state_error(normalized, scope="Data-plane")
 
     def prepare_exchange(
             self,

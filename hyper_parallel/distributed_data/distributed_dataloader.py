@@ -242,15 +242,7 @@ class DistributedDataLoader(Iterator[Any]):
         was_stopped = self._stopped
         constructor_delivery = None
         if self._data_plane.is_member:
-            iterator_state_error = self._data_plane.synchronize_iterator_state(
-                epoch=self._epoch,
-                step=self._step,
-                stopped=self._stopped,
-            )
-            if iterator_state_error is not None:
-                constructor_delivery = self._constructor_envelope(error=iterator_state_error)
-            else:
-                constructor_delivery = self._produce_on_data_plane()
+            constructor_delivery = self._produce_on_data_plane()
         received = self._model_transport.broadcast(constructor_delivery)
         if was_stopped and not received.stopped:
             raise ValueError("Distributed DataLoader stopped state differs across model-parallel peers.")
@@ -258,18 +250,9 @@ class DistributedDataLoader(Iterator[Any]):
 
     def _collect_next_data_plane_delivery(self) -> ConstructedBatch | None:
         """Prepare a batch without entering model-group collectives."""
-        constructor_delivery = None
         if self._data_plane.is_member:
-            iterator_state_error = self._data_plane.synchronize_iterator_state(
-                epoch=self._epoch,
-                step=self._step,
-                stopped=self._stopped,
-            )
-            if iterator_state_error is not None:
-                constructor_delivery = self._constructor_envelope(error=iterator_state_error)
-            else:
-                constructor_delivery = self._produce_on_data_plane()
-        return constructor_delivery
+            return self._produce_on_data_plane()
+        return None
 
     def _finish_prefetched_delivery(self, constructor_delivery: ConstructedBatch | None) -> ConstructedBatch:
         """Broadcast the prefetched batch on the caller thread."""
