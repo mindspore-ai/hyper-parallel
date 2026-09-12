@@ -1,0 +1,9 @@
+permute:
+  dist_op_name: _torch_permute_dist_op
+  distributed_op_class: TransposeDistributedOp
+  distributed_op_file: parallel_transpose
+
+transpose:
+  dist_op_name: _torch_transpose_dist_op
+  distributed_op_class: TransposeDistributedOp
+  distributed_op_file: parallel_transpose

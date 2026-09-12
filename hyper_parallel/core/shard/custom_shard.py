@@ -16,12 +16,12 @@
 
 import queue
 from typing import Callable, Tuple, Optional
+
+import torch
+
 from hyper_parallel.core.dtensor.layout import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Placement
-from hyper_parallel.platform import get_platform
-platform = get_platform()
-Tensor = platform.Tensor
 
 
 def _process_custom_shard_inputs(args, in_placements, redistribute_inputs, device_mesh):
@@ -106,7 +106,7 @@ def _wrap_custom_shard_outputs(out, out_placements, contain_distributed_arg, dev
 
     dist_output = []
     for item, out_placement in zip(out_tuple, out_placements):
-        if isinstance(item, Tensor):
+        if isinstance(item, torch.Tensor):
             if out_placement is None:
                 raise TypeError(
                     "Tensor output requires non-None out_placements!"

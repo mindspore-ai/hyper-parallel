@@ -13,9 +13,10 @@
 # limitations under the License.
 # ============================================================================
 """parallel_scaled_dot_product_attention unit test"""
-# pylint: disable=C9006,C9007,C0415,W0613,W0404,W0621
+import os
 import unittest
 from unittest.mock import MagicMock, patch
+import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE, Layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -57,6 +58,9 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, sp, mp) mesh via init_device_mesh."""
@@ -592,6 +596,9 @@ class TestSdpaHelperMethods(unittest.TestCase):
     def _setup_mock_platform(self, mock_platform, world_size=8):
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
 
     def _make_2x4_mesh(self, mock_platform):
         self._setup_mock_platform(mock_platform, world_size=8)
@@ -868,12 +875,10 @@ class TestSdpaHelperMethods(unittest.TestCase):
         self.assertEqual(adj_mask.shape[2], local_q_len)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.ops.parallel_scaled_dot_product_attention.platform")
-    def test_expanded_impl_with_sequence_parallelism(self, mock_sdpa_platform, mock_mesh_platform):
+    def test_expanded_impl_with_sequence_parallelism(self, mock_mesh_platform):
         """expanded_impl with SP active calls _adjust_attn_mask_for_sp and then func."""
         import torch
         self._setup_mock_platform(mock_mesh_platform, world_size=8)
-        mock_sdpa_platform.get_rank.return_value = 0
         mesh = init_device_mesh(
             device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("sp", "mp")
         )

@@ -1,9 +1,0 @@
-squeeze:
-  dist_op_name: _torch_squeeze_dist_op
-  distributed_op_class: SqueezeDistributedOp
-  distributed_op_file: parallel_squeeze
-
-Squeeze:
-  dist_op_name: _squeeze_dist_op
-  distributed_op_class: SqueezeDistributedOp
-  distributed_op_file: parallel_squeeze

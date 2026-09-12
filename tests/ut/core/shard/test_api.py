@@ -17,12 +17,13 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import numpy as np
+import torch
 
 import hyper_parallel
-from hyper_parallel import shard_module, parallelize_value_and_grad
+from hyper_parallel import shard_module
 from hyper_parallel.core.dtensor.dtensor import DTensor, _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
@@ -55,13 +56,11 @@ class TestPublicShardApi(unittest.TestCase):
     def test_public_shard_exports(self) -> None:
         """
         Feature: Public shard API compatibility.
-        Description: Import the legacy functions through the package root.
-        Expectation: Both exports retain their original implementations and appear in __all__.
+        Description: Import the shard helper through the package root.
+        Expectation: The export retains its original implementation and appears in __all__.
         """
         self.assertIs(shard_module, shard_api.shard_module)
-        self.assertIs(parallelize_value_and_grad, shard_api.parallelize_value_and_grad)
         self.assertIn("shard_module", hyper_parallel.__all__)
-        self.assertIn("parallelize_value_and_grad", hyper_parallel.__all__)
 
 
 class TestHasKwargs(unittest.TestCase):
@@ -132,12 +131,6 @@ class TestConvertShardingPlan(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
-        self._utils_patcher = patch(
-            "hyper_parallel.core.dtensor.device_mesh._utils"
-        )
-        self._mock_utils = self._utils_patcher.start()
-        self._mock_utils.get_created_group.return_value = MagicMock()
-        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -416,33 +409,23 @@ class TestShardModule(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
-        self._utils_patcher = patch(
-            "hyper_parallel.core.dtensor.device_mesh._utils"
-        )
-        self._mock_utils = self._utils_patcher.start()
-        self._mock_utils.get_created_group.return_value = MagicMock()
-        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_world_size_one_returns_none(self, mock_api_platform):
+    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=1)
+    def test_world_size_one_returns_none(self, mock_get_world_size):
         """When world_size==1, shard_module returns None immediately."""
-        mock_api_platform.get_world_size.return_value = 1
         model = MagicMock()
         mesh = MagicMock()
         plan = ShardingPlan()
         result = shard_api.shard_module(model, mesh, plan)
         self.assertIsNone(result)
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_invalid_sharding_plan_type_raises(self, mock_api_platform):
+    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    def test_invalid_sharding_plan_type_raises(self, mock_get_world_size):
         """Passing a dict instead of ShardingPlan raises TypeError."""
-        mock_api_platform.get_world_size.return_value = 2
-        mock_api_platform.Module = object
-
         model = MagicMock()
         mesh = MagicMock()
 
@@ -450,12 +433,9 @@ class TestShardModule(unittest.TestCase):
             shard_api.shard_module(model, mesh, {"w": (Shard(0),)})
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_callable_is_wrapped_when_not_module(self, mock_api_platform, mock_mesh_platform):
+    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    def test_callable_is_wrapped_when_not_module(self, mock_get_world_size, mock_mesh_platform):
         """When model is not a Module, _shard_callable wraps it."""
-        mock_api_platform.get_world_size.return_value = 2
-        mock_api_platform.Module = type(None)
-
         _make_mesh(mock_mesh_platform, (2,), ("dp",))
         mesh = list(_DEVICE_MESH_MAP.values())[0]
 
@@ -467,12 +447,9 @@ class TestShardModule(unittest.TestCase):
         self.assertIs(result, my_func)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_input_plan_must_be_dict(self, mock_api_platform, mock_mesh_platform):
+    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    def test_input_plan_must_be_dict(self, mock_get_world_size, mock_mesh_platform):
         """Non-dict input_plan raises TypeError."""
-        mock_api_platform.get_world_size.return_value = 2
-        mock_api_platform.Module = object
-
         _make_mesh(mock_mesh_platform, (2,), ("dp",))
         mesh = list(_DEVICE_MESH_MAP.values())[0]
 
@@ -483,12 +460,9 @@ class TestShardModule(unittest.TestCase):
             shard_api.shard_module(model, mesh, plan)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_output_plan_must_be_dict(self, mock_api_platform, mock_mesh_platform):
+    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    def test_output_plan_must_be_dict(self, mock_get_world_size, mock_mesh_platform):
         """Non-dict output_plan raises TypeError."""
-        mock_api_platform.get_world_size.return_value = 2
-        mock_api_platform.Module = object
-
         _make_mesh(mock_mesh_platform, (2,), ("dp",))
         mesh = list(_DEVICE_MESH_MAP.values())[0]
 
@@ -508,15 +482,12 @@ class TestRegisterHook(unittest.TestCase):
 
     def test_invalid_key_suffix_raises(self):
         """Keys not ending in 'input'/'output' raise ValueError."""
-        model = MagicMock()
-        model.named_modules = MagicMock(return_value=[("", model)])
+        model = torch.nn.Module()
 
-        with patch("hyper_parallel.core.shard.api.platform") as mock_platform:
-            mock_platform.get_cells_and_names.return_value = [("", model)]
-            mock_layout = MagicMock()
-            plan = {"bad_key": mock_layout}
-            with self.assertRaises(ValueError):
-                shard_api._register_hook(model, plan)
+        mock_layout = MagicMock()
+        plan = {"bad_key": mock_layout}
+        with self.assertRaises(ValueError):
+            shard_api._register_hook(model, plan)
 
 
 class TestConvertShardingPlanEdgePaths(unittest.TestCase):
@@ -530,12 +501,6 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
-        self._utils_patcher = patch(
-            "hyper_parallel.core.dtensor.device_mesh._utils"
-        )
-        self._mock_utils = self._utils_patcher.start()
-        self._mock_utils.get_created_group.return_value = MagicMock()
-        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -552,7 +517,7 @@ class TestConvertShardingPlanEdgePaths(unittest.TestCase):
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_nested_placement_tuple_is_not_placement(self, mock_platform):
-        """Tuple of placement tuples is NOT a placement spec — falls to _convert_value tuple branch."""
+        """Tuple of placement tuples is NOT a placement spec → falls to _convert_value tuple branch."""
         mesh = _make_mesh(mock_platform, (2,), ("dp",))
         plan = {"parameter": {"w": ((Shard(0),), (Shard(1),))}}
         result = shard_api._convert_sharding_plan(plan, mesh)
@@ -703,42 +668,28 @@ class TestHookFunctions(unittest.TestCase):
     Expectation: When cell.in_layout / out_layout is not None, redistribution occurs.
     """
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_forward_pre_hook_with_layout(self, mock_platform):
+    def test_forward_pre_hook_with_layout(self):
         """_forward_pre_hook processes args when cell.in_layout is set."""
-        cell = MagicMock()
+        cell = torch.nn.Identity()
         cell.in_layout = [None]
-
-        def construct_fn(x):
-            pass
-
-        mock_platform.get_cell_construct.return_value = construct_fn
         result = shard_api._forward_pre_hook(cell, (42,))
         self.assertEqual(result, (42,))
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_forward_pre_hook_no_layout_returns_args(self, mock_platform):
+    def test_forward_pre_hook_no_layout_returns_args(self):
         """_forward_pre_hook returns args unchanged when in_layout is None."""
         cell = MagicMock()
         cell.in_layout = None
         result = shard_api._forward_pre_hook(cell, (1, 2))
         self.assertEqual(result, (1, 2))
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_forward_pre_with_kwargs_hook_with_layout(self, mock_platform):
+    def test_forward_pre_with_kwargs_hook_with_layout(self):
         """_forward_pre_with_kwargs_hook processes args/kwargs when in_layout is set."""
-        cell = MagicMock()
+        cell = torch.nn.Identity()
         cell.in_layout = [None]
-
-        def construct_fn(x):
-            pass
-
-        mock_platform.get_cell_construct.return_value = construct_fn
         args_out, kwargs_out = shard_api._forward_pre_with_kwargs_hook(cell, (42,), {"k": 1})
         self.assertEqual(args_out, (42,))
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_forward_pre_with_kwargs_hook_no_layout(self, mock_platform):
+    def test_forward_pre_with_kwargs_hook_no_layout(self):
         """_forward_pre_with_kwargs_hook returns unchanged when in_layout is None."""
         cell = MagicMock()
         cell.in_layout = None
@@ -784,92 +735,64 @@ class TestRegisterHookValid(unittest.TestCase):
     Expectation: register_forward_pre_hook / register_forward_hook called correctly.
     """
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_register_input_hook_no_kwargs(self, mock_platform):
+    class _NoKwargsModule(torch.nn.Module):
+        """Module with a forward signature that has no default arguments."""
+
+        def forward(self, x):
+            """Return input unchanged."""
+            return x
+
+    class _WithKwargsModule(torch.nn.Module):
+        """Module with a forward signature that has default arguments."""
+
+        def forward(self, x, y=None):
+            """Return input unchanged."""
+            return x if y is None else x + y
+
+    def test_register_input_hook_no_kwargs(self):
         """Registers forward_pre_hook (no-kwargs variant) for input layout."""
-        mock_cell = MagicMock()
-
-        def construct_fn(x):
-            pass
-
-        mock_platform.get_cells_and_names.return_value = [("", mock_cell)]
-        mock_platform.get_cell_construct.return_value = construct_fn
-
+        cell = self._NoKwargsModule()
         mock_layout = MagicMock()
-        shard_api._register_hook(mock_cell, {"input": [mock_layout]})
+        shard_api._register_hook(cell, {"input": [mock_layout]})
 
-        mock_cell.register_forward_pre_hook.assert_called_once_with(
-            shard_api._forward_pre_hook, with_kwargs=False
-        )
-        self.assertEqual(mock_cell.in_layout, [mock_layout])
+        self.assertIn(shard_api._forward_pre_hook, cell._forward_pre_hooks.values())
+        self.assertEqual(cell.in_layout, [mock_layout])
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_register_output_hook_no_kwargs(self, mock_platform):
+    def test_register_output_hook_no_kwargs(self):
         """Registers forward_hook (no-kwargs variant) for output layout."""
-        mock_cell = MagicMock()
-
-        def construct_fn(x):
-            pass
-
-        mock_platform.get_cells_and_names.return_value = [("", mock_cell)]
-        mock_platform.get_cell_construct.return_value = construct_fn
-
+        cell = self._NoKwargsModule()
         mock_layout = MagicMock()
-        shard_api._register_hook(mock_cell, {"output": [mock_layout]})
+        shard_api._register_hook(cell, {"output": [mock_layout]})
 
-        mock_cell.register_forward_hook.assert_called_once_with(
-            shard_api._forward_hook, with_kwargs=False
-        )
-        self.assertEqual(mock_cell.out_layout, [mock_layout])
+        self.assertIn(shard_api._forward_hook, cell._forward_hooks.values())
+        self.assertEqual(cell.out_layout, [mock_layout])
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_register_hook_with_kwargs_construct(self, mock_platform):
+    def test_register_hook_with_kwargs_construct(self):
         """Registers kwargs-variant hooks when construct has default args."""
-        mock_cell = MagicMock()
-
-        def construct_fn(x, y=None):
-            pass
-
-        mock_platform.get_cells_and_names.return_value = [("", mock_cell)]
-        mock_platform.get_cell_construct.return_value = construct_fn
-
+        cell = self._WithKwargsModule()
         mock_layout = MagicMock()
-        shard_api._register_hook(mock_cell, {"input": [mock_layout]})
+        shard_api._register_hook(cell, {"input": [mock_layout]})
 
-        mock_cell.register_forward_pre_hook.assert_called_once_with(
-            shard_api._forward_pre_with_kwargs_hook, with_kwargs=True
-        )
+        self.assertIn(shard_api._forward_pre_with_kwargs_hook, cell._forward_pre_hooks.values())
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_register_hook_none_value_skipped(self, mock_platform):
+    def test_register_hook_none_value_skipped(self):
         """None value in plan is skipped without registering any hook."""
-        mock_cell = MagicMock()
-        mock_platform.get_cells_and_names.return_value = [("", mock_cell)]
+        cell = self._NoKwargsModule()
 
-        shard_api._register_hook(mock_cell, {"input": None})
+        shard_api._register_hook(cell, {"input": None})
 
-        mock_cell.register_forward_pre_hook.assert_not_called()
-        mock_cell.register_forward_hook.assert_not_called()
+        self.assertEqual(len(cell._forward_pre_hooks), 0)
+        self.assertEqual(len(cell._forward_hooks), 0)
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_register_hook_submodule_key(self, mock_platform):
+    def test_register_hook_submodule_key(self):
         """Plan key with dot prefix finds named sub-cell."""
-        root_cell = MagicMock()
-        sub_cell = MagicMock()
-
-        def construct_fn(x):
-            pass
-
-        mock_platform.get_cells_and_names.return_value = [
-            ("", root_cell), ("layer", sub_cell)
-        ]
-        mock_platform.get_cell_construct.return_value = construct_fn
-
+        root_cell = torch.nn.Module()
+        root_cell.layer = self._NoKwargsModule()
         mock_layout = MagicMock()
         shard_api._register_hook(root_cell, {"layer.input": [mock_layout]})
 
-        sub_cell.register_forward_pre_hook.assert_called_once()
-        self.assertEqual(sub_cell.in_layout, [mock_layout])
+        self.assertIn(shard_api._forward_pre_hook, root_cell.layer._forward_pre_hooks.values())
+        self.assertEqual(root_cell.layer.in_layout, [mock_layout])
 
 
 class TestRegisterLocalTensorHook(unittest.TestCase):
@@ -879,67 +802,49 @@ class TestRegisterLocalTensorHook(unittest.TestCase):
     Expectation: Hook is registered; DTensor outputs unwrapped, others passed through.
     """
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_hook_registered_on_named_cell(self, mock_platform):
+    def test_hook_registered_on_named_cell(self):
         """Hook is registered on the specified sub-cell."""
-        root = MagicMock()
-        sub = MagicMock()
-        mock_platform.get_cells_and_names.return_value = [("", root), ("sub", sub)]
+        root = torch.nn.Module()
+        root.sub = torch.nn.Module()
 
         shard_api._register_local_tensor_hook(root, ["sub"])
 
-        sub.register_forward_hook.assert_called_once()
+        self.assertEqual(len(root.sub._forward_hooks), 1)
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_hook_func_unwraps_dtensor(self, mock_platform):
+    def test_hook_func_unwraps_dtensor(self):
         """Registered hook converts DTensor output to local tensor."""
-        root = MagicMock()
-        sub = MagicMock()
-        captured_hook = []
-
-        def fake_register(hook_fn):
-            captured_hook.append(hook_fn)
-
-        sub.register_forward_hook = fake_register
-        mock_platform.get_cells_and_names.return_value = [("", root), ("sub", sub)]
+        root = torch.nn.Module()
+        root.sub = torch.nn.Module()
 
         shard_api._register_local_tensor_hook(root, ["sub"])
-        self.assertTrue(captured_hook)
+        hook = next(iter(root.sub._forward_hooks.values()))
 
         dt = MagicMock(spec=DTensor)
         dt.to_local.return_value = "local_tensor"
-        result = captured_hook[0](sub, (), dt)
+        result = hook(root.sub, (), dt)
         self.assertEqual(result, "local_tensor")
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_hook_func_passes_non_dtensor(self, mock_platform):
+    def test_hook_func_passes_non_dtensor(self):
         """Registered hook passes through non-DTensor scalar output."""
-        root = MagicMock()
-        sub = MagicMock()
-        captured_hook = []
-
-        sub.register_forward_hook = captured_hook.append
-        mock_platform.get_cells_and_names.return_value = [("", root), ("sub", sub)]
+        root = torch.nn.Module()
+        root.sub = torch.nn.Module()
 
         shard_api._register_local_tensor_hook(root, ["sub"])
-        result = captured_hook[0](sub, (), 42)
+        hook = next(iter(root.sub._forward_hooks.values()))
+        result = hook(root.sub, (), 42)
         self.assertEqual(result, 42)
 
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_hook_func_unwraps_tuple_output(self, mock_platform):
+    def test_hook_func_unwraps_tuple_output(self):
         """Registered hook recursively unwraps DTensor in tuple output."""
-        root = MagicMock()
-        sub = MagicMock()
-        captured_hook = []
-
-        sub.register_forward_hook = captured_hook.append
-        mock_platform.get_cells_and_names.return_value = [("", root), ("sub", sub)]
+        root = torch.nn.Module()
+        root.sub = torch.nn.Module()
 
         shard_api._register_local_tensor_hook(root, ["sub"])
+        hook = next(iter(root.sub._forward_hooks.values()))
 
         dt = MagicMock(spec=DTensor)
         dt.to_local.return_value = "local"
-        result = captured_hook[0](sub, (), (dt, 99))
+        result = hook(root.sub, (), (dt, 99))
         self.assertIsInstance(result, tuple)
         self.assertEqual(result[0], "local")
         self.assertEqual(result[1], 99)
@@ -1003,24 +908,15 @@ class TestShardModuleWithPlan(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
-        self._utils_patcher = patch(
-            "hyper_parallel.core.dtensor.device_mesh._utils"
-        )
-        self._mock_utils = self._utils_patcher.start()
-        self._mock_utils.get_created_group.return_value = MagicMock()
-        self.addCleanup(self._utils_patcher.stop)
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.platform")
-    def test_callable_with_full_plan(self, mock_api, mock_mesh):
+    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    def test_callable_with_full_plan(self, mock_get_world_size, mock_mesh):
         """shard_module with plan + input_plan + output_plan + return_local_tensor (callable)."""
-        mock_api.get_world_size.return_value = 2
-        mock_api.Module = type(None)
-
         _make_mesh(mock_mesh, (2,), ("dp",))
         mesh = list(_DEVICE_MESH_MAP.values())[0]
 
@@ -1037,58 +933,44 @@ class TestShardModuleWithPlan(unittest.TestCase):
         self.assertTrue(callable(result))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.platform")
-    @patch("hyper_parallel.core.shard.api.Module", object)
-    def test_param_not_found_raises_value_error(self, mock_api, mock_mesh):
+    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    def test_param_not_found_raises_value_error(self, mock_get_world_size, mock_mesh):
         """shard_module raises ValueError when param not found in model."""
-        mock_api.get_world_size.return_value = 2
-        mock_api.search_parameter_by_name.return_value = None
-
         _make_mesh(mock_mesh, (2,), ("dp",))
         mesh = list(_DEVICE_MESH_MAP.values())[0]
 
-        model = object()
+        model = torch.nn.Module()
         plan = ShardingPlan(plan={"missing.weight": (Shard(0),)})
         with self.assertRaises(ValueError):
             shard_api.shard_module(model, mesh, plan)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.platform")
-    @patch("hyper_parallel.core.shard.api.Module", object)
-    def test_param_layout_not_layout_raises_value_error(self, mock_api, mock_mesh):
+    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    def test_param_layout_not_layout_raises_value_error(self, mock_get_world_size, mock_mesh):
         """shard_module raises ValueError when layout is not a Layout instance."""
-        mock_api.get_world_size.return_value = 2
-
         _make_mesh(mock_mesh, (2,), ("dp",))
         mesh = list(_DEVICE_MESH_MAP.values())[0]
 
-        model = object()
+        model = torch.nn.Module()
         plan = ShardingPlan(plan={"w": 42})
         with self.assertRaises((ValueError, TypeError)):
             shard_api.shard_module(model, mesh, plan)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.platform")
-    @patch("hyper_parallel.core.shard.api.Module", object)
-    def test_param_found_and_applied(self, mock_api, mock_mesh):
+    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    def test_param_found_and_applied(self, mock_get_world_size, mock_mesh):
         """shard_module applies layout to found parameter and returns model."""
-        from hyper_parallel.core.dtensor.layout import Layout as _Layout
-
-        mock_api.get_world_size.return_value = 2
         _make_mesh(mock_mesh, (2,), ("dp",))
         mesh = list(_DEVICE_MESH_MAP.values())[0]
 
-        mock_param = MagicMock()
-        mock_param.dim.return_value = 1
-        mock_api.search_parameter_by_name.return_value = ("", "w", mock_param)
-        mock_api.set_layout_into_parameter.return_value = mock_param
-        mock_api.update_parameter_by_name.return_value = None
-
-        model = object()
-        plan = ShardingPlan(plan={"w": (Shard(0),)})
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+        original_weight = model[0].weight
+        plan = ShardingPlan(plan={"0.weight": (Shard(0),)})
         result = shard_api.shard_module(model, mesh, plan)
         self.assertIs(result, model)
-        mock_api.set_layout_into_parameter.assert_called_once()
+        self.assertIsNot(model[0].weight, original_weight)
+        self.assertIsInstance(model[0].weight, DTensor)
+        self.assertEqual(model[0].weight.to_local().shape, torch.Size([2, 4]))
 
 
 if __name__ == "__main__":

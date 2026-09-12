@@ -62,6 +62,9 @@ class TestSetItemDistributedOp(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
 
     def _make_2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2 (dp, mp) mesh."""
@@ -192,8 +195,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
     # ===== Error cases =====
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.ops.parallel_setitem.platform")
-    def test_setitem_bool_mask(self, mock_op_platform, mock_dt_platform):
+    def test_setitem_bool_mask(self, mock_dt_platform):
         """
         Feature: Error on BoolTensor mask LHS.
         Description: x[x > 5] = 0 should error.
@@ -201,9 +203,6 @@ class TestSetItemDistributedOp(unittest.TestCase):
         """
         mesh = self._make_2x2_mesh(mock_dt_platform)
         self_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-
-        mock_bool = MagicMock()
-        mock_op_platform.bool = mock_bool
 
         key_desc = (("bool_mask", (8, 10)),)
         cache_values = [self_layout, key_desc, (8, 10), _BOOL_MASK, None, None]
@@ -213,8 +212,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
         self.assertIn("boolean-mask", str(ctx.exception))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.ops.parallel_setitem.platform")
-    def test_setitem_shard_dim_write(self, mock_op_platform, mock_dt_platform):
+    def test_setitem_shard_dim_write(self, mock_dt_platform):
         """
         Feature: Error when writing to sharded dimension.
         Description: x[2] = 0 with shard on dim0.
@@ -222,9 +220,6 @@ class TestSetItemDistributedOp(unittest.TestCase):
         """
         mesh = self._make_2x2_mesh(mock_dt_platform)
         self_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
-
-        mock_bool = MagicMock()
-        mock_op_platform.bool = mock_bool
 
         key_desc, kind = _key_cache_descriptor(2)
         cache_values = [self_layout, key_desc, (8, 10), kind, None, (10,)]
@@ -234,8 +229,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
         self.assertIn("non-replicate dim 0", str(ctx.exception))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.ops.parallel_setitem.platform")
-    def test_setitem_value_layout_mismatch(self, mock_op_platform, mock_dt_platform):
+    def test_setitem_value_layout_mismatch(self, mock_dt_platform):
         """
         Feature: Error when DTensor value layout mismatches LHS expected layout.
         Description: x[:, 1:3] = v where v has different sharding.
@@ -244,9 +238,6 @@ class TestSetItemDistributedOp(unittest.TestCase):
         mesh = self._make_2x2_mesh(mock_dt_platform)
         self_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
         val_layout = _build_layout(mesh, (Shard(0), Shard(1)), 2)
-
-        mock_bool = MagicMock()
-        mock_op_platform.bool = mock_bool
 
         key_desc, kind = _key_cache_descriptor((slice(None), slice(1, 3)))
         value_desc = ("dtensor", val_layout, (8, 2))
@@ -257,8 +248,7 @@ class TestSetItemDistributedOp(unittest.TestCase):
         self.assertIn("value layout mismatch", str(ctx.exception))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.ops.parallel_setitem.platform")
-    def test_setitem_value_shape_mismatch(self, mock_op_platform, mock_dt_platform):
+    def test_setitem_value_shape_mismatch(self, mock_dt_platform):
         """
         Feature: Error when value shape cannot broadcast to LHS slice.
         Description: x[1:3] = zeros(3, 5) with LHS shape (2, 5).
@@ -266,9 +256,6 @@ class TestSetItemDistributedOp(unittest.TestCase):
         """
         mesh = self._make_2x2_mesh(mock_dt_platform)
         self_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-
-        mock_bool = MagicMock()
-        mock_op_platform.bool = mock_bool
 
         key_desc, kind = _key_cache_descriptor(slice(1, 3))
         value_desc = ("plain_tensor", (3, 5), "torch.float32")

@@ -1,4 +1,0 @@
-ArgSort:
-  dist_op_name: _argsort_dist_op
-  distributed_op_class: ArgsortDistributedOp
-  distributed_op_file: parallel_argsort

@@ -65,6 +65,9 @@ class TestGetItemDistributedOp(unittest.TestCase):
             mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
 
     def _make_2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2 (dp, mp) mesh."""
@@ -826,8 +829,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
     # ===== preprocess tests =====
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.ops.parallel_getitem.platform")
-    def test_preprocess_basic(self, mock_op_platform, mock_dt_platform):
+    def test_preprocess_basic(self, mock_dt_platform):
         """
         Feature: preprocess for basic indexing.
         Description: Verify preprocess normalizes args and builds cache_values.
@@ -835,9 +837,6 @@ class TestGetItemDistributedOp(unittest.TestCase):
         """
         mesh = self._make_2x2_mesh(mock_dt_platform)
         self_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-
-        mock_bool = MagicMock()
-        mock_op_platform.bool = mock_bool
 
         mock_tensor = self._make_mock_dtensor(self_layout, "local_tensor_data")
         local_args, local_kwargs, cache_values = getitem_op.preprocess(

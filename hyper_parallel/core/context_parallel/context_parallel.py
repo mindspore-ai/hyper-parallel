@@ -858,8 +858,9 @@ class ContextParallel(ParallelStyle):
 
         FA2's output is exchanged back; final output = ``cat([FA1, FA2_recv])``.
         """
-        from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import (  # pylint: disable=import-outside-toplevel
-            _set_lb_override, _clear_lb_override,
+        from hyper_parallel.core.shard.utils import (  # pylint: disable=import-outside-toplevel
+            _set_lb_override,
+            _clear_lb_override,
         )
 
         seq_dim = self.seq_dim

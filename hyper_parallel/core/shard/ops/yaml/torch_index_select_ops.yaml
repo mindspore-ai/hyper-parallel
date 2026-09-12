@@ -1,0 +1,4 @@
+index_select:
+  dist_op_name: _torch_index_select_dist_op
+  distributed_op_class: IndexSelectDistributedOp
+  distributed_op_file: parallel_gather
