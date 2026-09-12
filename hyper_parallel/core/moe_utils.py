@@ -14,16 +14,13 @@
 # ============================================================================
 """MoE utilities for distributed training."""
 
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional, Any
 
-from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
-from hyper_parallel.platform import get_platform
+import torch.distributed as dist
+from torch import nn
 
 if TYPE_CHECKING:
     from hyper_parallel.platform.torch.common.moe import MoE
-
-platform = get_platform()
 
 
 def sync_and_update_expert_bias(
@@ -81,38 +78,11 @@ def sync_and_update_expert_bias(
         Reference implementation: Megatron-LM megatron/core/transformer/moe/moe_utils.py
         uses TP×CP×DP group synchronization for global batch statistics.
     """
-    need_sync = tp_group is not None or cp_group is not None or dp_group is not None
-
-    if need_sync:
-        if tp_group is not None:
-            group_info = _ensure_group_info(tp_group)
-            platform.all_reduce(moe.tokens_per_expert, group_info)
-        if cp_group is not None:
-            group_info = _ensure_group_info(cp_group)
-            platform.all_reduce(moe.tokens_per_expert, group_info)
-        if dp_group is not None:
-            group_info = _ensure_group_info(dp_group)
-            platform.all_reduce(moe.tokens_per_expert, group_info)
+    for group in (tp_group, cp_group, dp_group):
+        if group is not None:
+            dist.all_reduce(moe.tokens_per_expert, group=getattr(group, "group", group))
 
     moe.update_expert_bias(lr=lr, num_recomputations=num_recomputations)
-
-
-def _ensure_group_info(group: Any) -> GroupInfo:
-    """Convert ProcessGroup to GroupInfo if needed.
-
-    Args:
-        group: Either a ProcessGroup or a GroupInfo object.
-
-    Returns:
-        GroupInfo object.
-    """
-    if isinstance(group, GroupInfo):
-        return group
-
-    if hasattr(group, "group"):
-        return group
-
-    return SimpleNamespace(group=group)
 
 
 def _get_moe_layers(model: "nn.Module") -> list:

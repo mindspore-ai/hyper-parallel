@@ -33,9 +33,14 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.expert_parallel.expert_parallel import (
     AllToAllTokenDispatcher,
+    AsyncHandle,
     DeredundencyDispatchContext,
     DeredundencyTokenDispatcher,
     DispatchContext,
+    _AsyncA2ALazyBwd,
+    differentiable_all_gather_concat,
+    differentiable_all_to_all_single,
+    differentiable_reduce_scatter,
     _generate_deredundency_dispatch_indices,
     _generate_permute_indices,
     _permute,
@@ -44,18 +49,29 @@ from hyper_parallel.core.expert_parallel.expert_parallel import (
     TensorParallel,
     ExpertTensorParallel,
 )
-from hyper_parallel.platform import AsyncHandle
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _configure_count_exchange(mock_dist, counts):
+    """Emulate Torch's output-buffer collective; publish counts only on wait."""
+    def _exchange(output, input_tensor, **_kwargs):
+        """Return pending work that fills the output on wait."""
+        del input_tensor
+        work = MagicMock()
+        work.wait.side_effect = lambda: output.copy_(counts)
+        return work
+
+    mock_dist.all_to_all_single.side_effect = _exchange
+
+
 def _make_mock_device_mesh(ep_size: int, local_rank: int = 0):
     """Return a minimal DeviceMesh mock for EP unit tests."""
     mesh = MagicMock()
     mesh.size.return_value = ep_size
-    mesh.get_group.return_value = None  # group not used when platform is mocked
+    mesh.get_group.return_value = None  # group not used when Torch is mocked
     mesh.get_local_rank.return_value = local_rank
     return mesh
 
@@ -78,6 +94,96 @@ def _make_mock_module(num_experts: int = 4, dim: int = 8, hidden_dim: int = 16):
 # ---------------------------------------------------------------------------
 # C1: _generate_permute_indices
 # ---------------------------------------------------------------------------
+
+class TestTorchCollectives(unittest.TestCase):
+    """Exercise the local collective helpers with real Torch autograd on CPU."""
+
+    @patch("torch.distributed.all_to_all_single")
+    def test_variable_all_to_all_backward_reverses_splits(self, mock_a2a):
+        """Uneven and empty token exchanges preserve gradients and inverse splits."""
+        mock_a2a.side_effect = lambda output, tensor, **_kwargs: output.copy_(tensor.flip(0))
+        group = object()
+        for input_splits, output_splits in (([1, 3], [3, 1]), ([0, 0], [0, 0])):
+            with self.subTest(input_splits=input_splits, output_splits=output_splits):
+                mock_a2a.reset_mock()
+                tokens = torch.randn(sum(input_splits), 2, dtype=torch.float64, requires_grad=True)
+                output = differentiable_all_to_all_single(tokens, input_splits, output_splits, group)
+                weights = torch.arange(output.numel(), dtype=output.dtype).view_as(output)
+                output.backward(weights)
+
+                torch.testing.assert_close(output, tokens.flip(0))
+                torch.testing.assert_close(tokens.grad, weights.flip(0))
+                self.assertEqual(mock_a2a.call_count, 2, f"Expected 2 calls, got {mock_a2a.call_count}")
+                forward_call, backward_call = mock_a2a.call_args_list
+                self.assertEqual(forward_call.kwargs, {
+                    "input_split_sizes": input_splits, "output_split_sizes": output_splits, "group": group,
+                })
+                self.assertEqual(backward_call.kwargs, {
+                    "input_split_sizes": output_splits, "output_split_sizes": input_splits, "group": group,
+                })
+
+    @patch("torch.distributed._functional_collectives.wait_tensor")
+    @patch("torch.distributed._functional_collectives.all_to_all_single")
+    def test_async_all_to_all_backward_preserves_lazy_wait(self, mock_async_a2a, mock_wait):
+        """Forward and backward exchange inverse splits without an eager wait."""
+        mock_async_a2a.side_effect = lambda tensor, *_args: tensor.flip(0)
+        group = object()
+        for input_splits, output_splits in (([1, 3], [3, 1]), ([0, 0], [0, 0])):
+            with self.subTest(input_splits=input_splits, output_splits=output_splits):
+                mock_async_a2a.reset_mock()
+                tokens = torch.randn(sum(input_splits), 2, requires_grad=True)
+                output = _AsyncA2ALazyBwd.apply(tokens, output_splits, input_splits, group)
+                weights = torch.arange(output.numel(), dtype=output.dtype).view_as(output)
+                output.backward(weights)
+
+                torch.testing.assert_close(output, tokens.flip(0))
+                torch.testing.assert_close(tokens.grad, weights.flip(0))
+                forward_call, backward_call = mock_async_a2a.call_args_list
+                self.assertEqual(forward_call.args[1:], (output_splits, input_splits, group))
+                self.assertEqual(backward_call.args[1:], (input_splits, output_splits, group))
+                mock_wait.assert_not_called()
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func.all_gather")
+    def test_all_gather_materialises_input_and_gradients(self, mock_gather):
+        """Concatenation sends contiguous gradients back to every gathered shard."""
+        tokens = torch.randn(2, 3).t()
+        shards = [torch.randn(3, 2, requires_grad=True) for _ in range(2)]
+        contiguous_grads = []
+        for shard in shards:
+            shard.register_hook(lambda grad: contiguous_grads.append(grad.is_contiguous()))
+        mock_gather.return_value = tuple(shards)
+        group = object()
+
+        output = differentiable_all_gather_concat(tokens, group, 2, 0)
+        output.sum().backward()
+
+        torch.testing.assert_close(output, torch.cat(shards))
+        self.assertTrue(mock_gather.call_args.args[0].is_contiguous())
+        self.assertIs(mock_gather.call_args.kwargs["group"], group)
+        self.assertEqual(contiguous_grads, [True, True])
+        for shard in shards:
+            torch.testing.assert_close(shard.grad, torch.ones_like(shard))
+
+    @patch("torch.distributed.get_world_size", return_value=2)
+    @patch("torch.distributed.all_gather")
+    @patch("torch.distributed.reduce_scatter")
+    def test_reduce_scatter_sum_backward(self, mock_scatter, mock_gather, mock_size):
+        """OEP sum/scatter propagates each output gradient to both input chunks."""
+        del mock_size
+        mock_scatter.side_effect = lambda output, chunks, **_kwargs: output.copy_(sum(chunks))
+        mock_gather.side_effect = lambda outputs, tensor, **_kwargs: [out.copy_(tensor) for out in outputs]
+        tokens = torch.randn(2, 4).t().requires_grad_()
+        group = object()
+
+        output = differentiable_reduce_scatter(tokens, 2, 0, "sum", group)
+        weights = torch.arange(4, dtype=output.dtype).view_as(output)
+        output.backward(weights)
+
+        torch.testing.assert_close(output, tokens[:2] + tokens[2:])
+        torch.testing.assert_close(tokens.grad, weights.repeat(2, 1))
+        self.assertIs(mock_scatter.call_args.kwargs["group"], group)
+        self.assertEqual(mock_scatter.call_args.kwargs["op"], torch.distributed.ReduceOp.SUM)
+
 
 class TestGeneratePermuteIndices(unittest.TestCase):
     """Unit tests for ``_generate_permute_indices``."""
@@ -373,7 +479,7 @@ class TestExpertParallelDispatcherSelection(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# C2: ExpertParallel._token_dispatch (mocked platform collectives)
+# C2: ExpertParallel._token_dispatch (mocked Torch collectives)
 # ---------------------------------------------------------------------------
 
 class TestExpertParallelDispatch(unittest.TestCase):
@@ -396,15 +502,14 @@ class TestExpertParallelDispatch(unittest.TestCase):
         self.mock_mesh = _make_mock_device_mesh(self.ep_size)
         self.module = _make_mock_module()
 
-    def _call_dispatch(self, mock_platform):
-        """Configure platform mock and call _token_dispatch."""
+    def _call_dispatch(self, mock_dist, mock_dist_func):
+        """Configure Torch mock and call _token_dispatch."""
         # all_to_all_single returns (counts_out, None)
-        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
+        _configure_count_exchange(mock_dist, self.counts_out)
         # differentiable_all_to_all_single returns input unchanged (identity)
-        mock_platform.differentiable_all_to_all_single.side_effect = (
-            lambda inp, *_args, **_kw: inp
+        mock_dist_func.all_to_all_single.side_effect = (
+            lambda _out, inp, *_args, **_kw: inp
         )
-        mock_platform.arange.side_effect = torch.arange
 
         return self.ep._token_dispatch(
             module=self.module,
@@ -412,14 +517,15 @@ class TestExpertParallelDispatch(unittest.TestCase):
             device_mesh=self.mock_mesh,
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_returns_permuted_and_counts(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatch_returns_permuted_and_counts(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_dispatch return values
         Description: dispatch returns (permuted_x, local_counts) with correct shapes.
         Expectation: permuted_x.shape = (10, dim), local_counts.shape = (2,)
         """
-        permuted_x, local_counts = self._call_dispatch(mock_platform)
+        permuted_x, local_counts = self._call_dispatch(mock_dist, mock_dist_func)
         self.assertEqual(
             permuted_x.shape, (self.total_tokens, self.dim),
             f"permuted_x.shape={permuted_x.shape}, expected ({self.total_tokens}, {self.dim})"
@@ -429,8 +535,9 @@ class TestExpertParallelDispatch(unittest.TestCase):
             f"local_counts.shape={local_counts.shape}, expected ({self.num_local_experts},)"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_computes_correct_splits(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatch_computes_correct_splits(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_dispatch split computation
         Description: input_splits and output_splits are derived from token counts.
@@ -438,7 +545,7 @@ class TestExpertParallelDispatch(unittest.TestCase):
             output_splits[r] = tokens this rank receives from rank r.
         Expectation: input_splits = [5, 5], output_splits = [5, 5]
         """
-        self._call_dispatch(mock_platform)
+        self._call_dispatch(mock_dist, mock_dist_func)
         # rank0 block: 3+2=5, rank1 block: 1+4=5
         ctx = self.module._ep_dispatch_ctx
         self.assertEqual(
@@ -450,8 +557,9 @@ class TestExpertParallelDispatch(unittest.TestCase):
             f"output_splits={ctx.output_splits}, expected [5, 5]"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_produces_expert_major_order(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatch_produces_expert_major_order(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_dispatch expert-major permutation
         Description: Dispatch permutes tokens into expert-major order so that
@@ -459,14 +567,15 @@ class TestExpertParallelDispatch(unittest.TestCase):
             for local expert 1.
         Expectation: local_counts = [4, 6] matching counts_out column sums
         """
-        _, local_counts = self._call_dispatch(mock_platform)
+        _, local_counts = self._call_dispatch(mock_dist, mock_dist_func)
         # expert 0: rank0->exp0(3) + rank1->exp0(1) = 4
         # expert 1: rank0->exp1(2) + rank1->exp1(4) = 6
         self.assertEqual(int(local_counts[0]), 4, f"local_counts[0]={local_counts[0]}, expected 4")
         self.assertEqual(int(local_counts[1]), 6, f"local_counts[1]={local_counts[1]}, expected 6")
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_saves_state_for_combine(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatch_saves_state_for_combine(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_dispatch state preservation
         Description: After dispatch, input_splits, output_splits, input_shape,
@@ -474,7 +583,7 @@ class TestExpertParallelDispatch(unittest.TestCase):
             for use by combine.
         Expectation: module has _ep_dispatch_ctx with four non-None components
         """
-        self._call_dispatch(mock_platform)
+        self._call_dispatch(mock_dist, mock_dist_func)
         self.assertTrue(hasattr(self.module, "_ep_dispatch_ctx"),
                        "module should have _ep_dispatch_ctx attribute")
         ctx = self.module._ep_dispatch_ctx
@@ -484,8 +593,9 @@ class TestExpertParallelDispatch(unittest.TestCase):
         self.assertIsNotNone(ctx.input_shape, f"input_shape should be set, got {ctx.input_shape}")
         self.assertIsNotNone(ctx.permuted_indices, f"permuted_indices should be set, got {ctx.permuted_indices}")
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_two_consecutive_forwards_isolate_state(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_two_consecutive_forwards_isolate_state(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel state isolation across forwards
         Description: Consecutive forward passes should have independent dispatch contexts.
@@ -494,11 +604,10 @@ class TestExpertParallelDispatch(unittest.TestCase):
         # Setup mocks
         counts_out = torch.tensor([3, 2, 1, 4])
         total_tokens = int(counts_out.sum())
-        mock_platform.all_to_all_single.return_value = (counts_out, None)
-        mock_platform.differentiable_all_to_all_single.side_effect = (
-            lambda inp, *_args, **_kw: inp
+        _configure_count_exchange(mock_dist, counts_out)
+        mock_dist_func.all_to_all_single.side_effect = (
+            lambda _out, inp, *_args, **_kw: inp
         )
-        mock_platform.arange.side_effect = torch.arange
 
         module = _make_mock_module()
         mock_mesh = _make_mock_device_mesh(self.ep_size)
@@ -506,38 +615,38 @@ class TestExpertParallelDispatch(unittest.TestCase):
         # First forward
         inputs1 = (torch.randn(total_tokens, self.dim), torch.tensor([3, 2, 1, 4]))
         self.ep._token_dispatch(module, inputs1, mock_mesh)
-        
+
         # Context should be set after dispatch
-        self.assertTrue(hasattr(module, "_ep_dispatch_ctx"), 
+        self.assertTrue(hasattr(module, "_ep_dispatch_ctx"),
                        "module should have _ep_dispatch_ctx after dispatch")
         ctx1 = module._ep_dispatch_ctx
         ctx1_id = id(ctx1)
-        
+
         # Combine should NOT clear the context (needed for backward pass in PyNative mode)
         output1 = torch.randn(total_tokens, self.dim)
         combined1 = self.ep._token_combine(module, output1, mock_mesh)
-        self.assertTrue(hasattr(module, "_ep_dispatch_ctx"), 
+        self.assertTrue(hasattr(module, "_ep_dispatch_ctx"),
                        "module._ep_dispatch_ctx should persist after combine for backward pass")
-        self.assertIs(module._ep_dispatch_ctx, ctx1, 
+        self.assertIs(module._ep_dispatch_ctx, ctx1,
                      "Context should remain the same object after combine")
 
         # Second forward with different data - context gets overwritten
         counts_out2 = torch.tensor([4, 2, 2, 4])
         total_tokens2 = int(counts_out2.sum())
-        mock_platform.all_to_all_single.return_value = (counts_out2, None)
-        
+        _configure_count_exchange(mock_dist, counts_out2)
+
         inputs2 = (torch.randn(total_tokens2, self.dim), torch.tensor([4, 2, 2, 4]))
         self.ep._token_dispatch(module, inputs2, mock_mesh)
-        
+
         # Context should be a new object (overwritten), not the same as first forward
         self.assertTrue(hasattr(module, "_ep_dispatch_ctx"))
         ctx2 = module._ep_dispatch_ctx
         ctx2_id = id(ctx2)
-        self.assertNotEqual(ctx1_id, ctx2_id, 
+        self.assertNotEqual(ctx1_id, ctx2_id,
                            "Each forward should create a new dispatch context")
         self.assertIsNot(ctx1, ctx2,
                         "Second forward should overwrite context with new object")
-        
+
         # Combine after second forward
         output2 = torch.randn(total_tokens2, self.dim)
         combined2 = self.ep._token_combine(module, output2, mock_mesh)
@@ -555,13 +664,13 @@ class TestExpertParallelDispatch(unittest.TestCase):
         """
         module = _make_mock_module()
         mock_mesh = _make_mock_device_mesh(self.ep_size)
-        
+
         with self.assertRaisesRegex(RuntimeError, "no dispatch context found"):
             self.ep._token_combine(module, torch.randn(10, self.dim), mock_mesh)
 
 
 # ---------------------------------------------------------------------------
-# C2: ExpertParallel._token_combine (mocked platform collectives)
+# C2: ExpertParallel._token_combine (mocked Torch collectives)
 # ---------------------------------------------------------------------------
 
 class TestExpertParallelCombine(unittest.TestCase):
@@ -580,19 +689,19 @@ class TestExpertParallelCombine(unittest.TestCase):
         self.mock_mesh = _make_mock_device_mesh(self.ep_size)
         self.module = _make_mock_module()
 
-    def _run_dispatch_and_combine(self, expert_output, mock_platform):
-        """Run dispatch then combine using the same platform mock."""
-        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
-        mock_platform.arange.side_effect = torch.arange
+    def _run_dispatch_and_combine(self, expert_output, mock_dist, mock_dist_func):
+        """Run dispatch then combine using the same Torch mock."""
+        _configure_count_exchange(mock_dist, self.counts_out)
 
         captured = {}
 
-        def identity_a2a(inp: object, *_args: object, **_kw: object) -> object:
+        def identity_a2a(output_tensor: object, inp: object, *_args: object, **_kw: object) -> object:
             """Pass-through all-to-all capture for testing."""
+            del output_tensor
             captured["input"] = inp
             return inp
 
-        mock_platform.differentiable_all_to_all_single.side_effect = identity_a2a
+        mock_dist_func.all_to_all_single.side_effect = identity_a2a
 
         self.ep._token_dispatch(
             module=self.module,
@@ -606,44 +715,46 @@ class TestExpertParallelCombine(unittest.TestCase):
         )
         return combined
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_combine_output_shape_matches_original(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_combine_output_shape_matches_original(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_combine output shape
         Description: combine restores tensor to the shape it had before dispatch.
         Expectation: combined.shape == (total_tokens, dim)
         """
         expert_output = torch.randn(self.total_tokens, self.dim)
-        combined = self._run_dispatch_and_combine(expert_output, mock_platform)
+        combined = self._run_dispatch_and_combine(expert_output, mock_dist, mock_dist_func)
         self.assertEqual(
             combined.shape, (self.total_tokens, self.dim),
             f"combined.shape={combined.shape}, expected ({self.total_tokens}, {self.dim})"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_combine_is_inverse_of_dispatch_permutation(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_combine_is_inverse_of_dispatch_permutation(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_combine round-trip
         Description: dispatch then combine with identity expert computation
             restores the original routed_input tensor.
         Expectation: combined is allclose to routed_input
         """
-        # Since platform a2a is identity, the token values don't change.
+        # Since Torch a2a is identity, the token values don't change.
         # After dispatch (permute) and combine (unpermute) with identity expert,
         # we should recover routed_input.
-        mock_platform.arange.side_effect = torch.arange
         _, permuted_x, perm_idx, _ = _permute(
             self.routed_input, self.counts_out, self.ep_size, self.num_local_experts
         )
-        combined = self._run_dispatch_and_combine(permuted_x, mock_platform)
+        combined = self._run_dispatch_and_combine(permuted_x, mock_dist, mock_dist_func)
         self.assertTrue(
             torch.allclose(combined, self.routed_input, atol=1e-6),
             (f"Round-trip failed: "
              f"max diff={(combined - self.routed_input).abs().max():.2e}")
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_combine_calls_differentiable_a2a(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_combine_calls_differentiable_a2a(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_combine uses differentiable all-to-all
         Description: _token_combine must call differentiable_all_to_all_single so
@@ -651,16 +762,17 @@ class TestExpertParallelCombine(unittest.TestCase):
         Expectation: differentiable_all_to_all_single called at least once during combine
         """
         expert_output = torch.randn(self.total_tokens, self.dim)
-        self._run_dispatch_and_combine(expert_output, mock_platform)
-        call_count = mock_platform.differentiable_all_to_all_single.call_count
+        self._run_dispatch_and_combine(expert_output, mock_dist, mock_dist_func)
+        call_count = mock_dist_func.all_to_all_single.call_count
         # dispatch calls it once, combine calls it once -> total >= 2
         self.assertGreaterEqual(
             call_count, 2,
             f"differentiable_all_to_all_single called {call_count} times, expected >= 2"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_combine_swaps_input_output_splits(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_combine_swaps_input_output_splits(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_combine swaps splits for reverse all-to-all
         Description: combine passes (output_splits, input_splits) to the all-to-all,
@@ -668,25 +780,26 @@ class TestExpertParallelCombine(unittest.TestCase):
         Expectation: the second a2a call's input_splits == dispatch output_splits
         """
         expert_output = torch.randn(self.total_tokens, self.dim)
-        self._run_dispatch_and_combine(expert_output, mock_platform)
+        self._run_dispatch_and_combine(expert_output, mock_dist, mock_dist_func)
         # Setup mocks and run dispatch
-        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
-        mock_platform.arange.side_effect = torch.arange
+        _configure_count_exchange(mock_dist, self.counts_out)
 
-        def identity_a2a(inp: object, *_args: object, **_kw: object) -> object:
+        def identity_a2a(output_tensor: object, inp: object, *_args: object, **_kw: object) -> object:
+            """Return the collective input unchanged."""
+            del output_tensor
             return inp
 
-        mock_platform.differentiable_all_to_all_single.side_effect = identity_a2a
+        mock_dist_func.all_to_all_single.side_effect = identity_a2a
 
         self.ep._token_dispatch(
             module=self.module,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
             device_mesh=self.mock_mesh,
         )
-        
+
         # Read dispatch context BEFORE combine clears it
         dispatch_output_splits = self.module._ep_dispatch_ctx.output_splits
-        
+
         # Now run combine
         self.ep._token_combine(
             module=self.module,
@@ -694,12 +807,12 @@ class TestExpertParallelCombine(unittest.TestCase):
             device_mesh=self.mock_mesh,
         )
 
-        call_args_list = mock_platform.differentiable_all_to_all_single.call_args_list
+        call_args_list = mock_dist_func.all_to_all_single.call_args_list
         # call_args_list[0] = dispatch call, call_args_list[1] = combine call
         self.assertGreaterEqual(len(call_args_list), 2)
         combine_call = call_args_list[1]
-        # positional args: (inp, input_splits, output_splits, group)
-        combine_input_splits = combine_call.args[1]
+        # Torch receives split sizes as keyword arguments.
+        combine_input_splits = combine_call.kwargs["input_split_sizes"]
         self.assertEqual(
             combine_input_splits, dispatch_output_splits,
             (f"combine input_splits={combine_input_splits} "
@@ -725,18 +838,18 @@ class TestAllToAllTokenDispatcher(unittest.TestCase):
         self.routed_input = torch.randn(self.total_tokens, self.dim)
         self.mock_mesh = _make_mock_device_mesh(self.ep_size)
 
-    def _configure_platform(self, mock_platform):
-        """Set up the platform mock for dispatch/combine."""
-        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
-        mock_platform.differentiable_all_to_all_single.side_effect = (
-            lambda inp, *_args, **_kw: inp
+    def _configure_collectives(self, mock_dist, mock_dist_func):
+        """Set up the Torch mock for dispatch/combine."""
+        _configure_count_exchange(mock_dist, self.counts_out)
+        mock_dist_func.all_to_all_single.side_effect = (
+            lambda _out, inp, *_args, **_kw: inp
         )
-        mock_platform.arange.side_effect = torch.arange
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_standalone(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatch_standalone(self, mock_dist, mock_dist_func):
         """dispatch can be called directly without an ExpertParallel instance."""
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         permuted, local_counts, ctx = AllToAllTokenDispatcher.dispatch(
             module=None,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
@@ -752,10 +865,11 @@ class TestAllToAllTokenDispatcher(unittest.TestCase):
             f"local_counts shape {local_counts.shape}, expected ({self.num_local_experts},)"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_context_fields(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatch_context_fields(self, mock_dist, mock_dist_func):
         """dispatch returns a DispatchContext with correct field values."""
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         _, _, ctx = AllToAllTokenDispatcher.dispatch(
             module=None,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
@@ -778,10 +892,11 @@ class TestAllToAllTokenDispatcher(unittest.TestCase):
             f"expected {self.total_tokens}"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_combine_with_manual_context(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_combine_with_manual_context(self, mock_dist, mock_dist_func):
         """combine can be called with a manually constructed DispatchContext."""
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         ctx = DispatchContext(
             input_splits=[5, 5],
             output_splits=[5, 5],
@@ -799,10 +914,11 @@ class TestAllToAllTokenDispatcher(unittest.TestCase):
             f"combined shape {combined.shape}, expected ({self.total_tokens}, {self.dim})"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_combine_round_trip(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatch_combine_round_trip(self, mock_dist, mock_dist_func):
         """dispatch then combine with identity expert restores original input."""
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         permuted, _, ctx = AllToAllTokenDispatcher.dispatch(
             module=None,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
@@ -835,18 +951,72 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         self.routed_input = torch.randn(self.total_tokens, self.dim)
         self.mock_mesh = _make_mock_device_mesh(self.ep_size)
 
-    def _configure_platform(self, mock_platform):
-        """Set up the platform mock for deredundency dispatch/combine."""
-        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
-        mock_platform.differentiable_all_to_all_single.side_effect = (
-            lambda inp, *_args, **_kw: inp
+    def _configure_collectives(self, mock_dist, mock_dist_func):
+        """Set up the Torch mock for deredundency dispatch/combine."""
+        _configure_count_exchange(mock_dist, self.counts_out)
+        mock_dist_func.all_to_all_single.side_effect = (
+            lambda _out, inp, *_args, **_kw: inp
         )
-        mock_platform.arange.side_effect = torch.arange
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_indices_keep_local_expert_blocks_contiguous(self, mock_platform):
+    @patch("torch.distributed._functional_collectives.wait_tensor")
+    @patch("torch.distributed._functional_collectives.all_to_all_single")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_2d_dispatch_and_sync_async_combine(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
+        """OEP gathers counts before tokens and both combine paths sum weighted outputs."""
+        counts = torch.tensor([1, 1])
+        tokens = torch.tensor([[2.0], [4.0]])
+        coeff = torch.tensor([0.5, 0.5])
+        oep_group, iep_group = object(), object()
+        mesh = MagicMock(ndim=2, mesh_dim_names=("oep", "iep"))
+        mesh.size.side_effect = lambda dim: (2, 1)[dim]
+        mesh.get_group.side_effect = lambda dim: (oep_group, iep_group)[dim]
+        mesh.get_local_rank.return_value = 0
+
+        def _gather_counts(output, input_tensor, **_kwargs):
+            del input_tensor
+            work = MagicMock()
+            work.wait.side_effect = lambda: output.copy_(counts.repeat(2))
+            return work
+
+        mock_dist.all_gather_into_tensor.side_effect = _gather_counts
+        _configure_count_exchange(mock_dist, torch.tensor([2]))
+        mock_dist_func.all_gather.side_effect = [
+            (tokens, torch.tensor([[6.0], [8.0]])),
+            (coeff, torch.tensor([0.25, 0.25])),
+        ]
+        mock_dist_func.all_to_all_single.side_effect = lambda _out, tensor, **_kwargs: tensor
+        mock_dist_func.reduce_scatter.side_effect = (
+            lambda _out, chunks, **_kwargs: chunks[0] + torch.tensor([[0.0], [2.0]])
+        )
+        mock_async_a2a.side_effect = lambda tensor, *_args: tensor
+
+        dispatched, local_counts, ctx = DeredundencyTokenDispatcher.dispatch(None, (tokens, counts, coeff), mesh)
+        torch.testing.assert_close(dispatched, torch.tensor([[2.0], [6.0]]))
+        torch.testing.assert_close(local_counts, torch.tensor([2]))
+        torch.testing.assert_close(ctx.router_coeff, torch.tensor([0.5, 0.25]))
+        self.assertIs(mock_dist.all_gather_into_tensor.call_args.kwargs["group"], oep_group)
+        self.assertTrue(mock_dist.all_gather_into_tensor.call_args.kwargs["async_op"])
+        self.assertIs(mock_dist.all_to_all_single.call_args.kwargs["group"], iep_group)
+
+        sync_output = DeredundencyTokenDispatcher.combine(None, dispatched, mesh, ctx)
+        torch.testing.assert_close(sync_output, torch.tensor([[1.0], [2.0]]))
+        chunks = mock_dist_func.reduce_scatter.call_args.args[1]
+        torch.testing.assert_close(torch.cat(chunks), torch.tensor([[1.0], [0.0], [1.5], [0.0]]))
+        self.assertIs(mock_dist_func.reduce_scatter.call_args.kwargs["group"], oep_group)
+
+        mock_dist_func.reduce_scatter.reset_mock()
+        handle = DeredundencyTokenDispatcher.combine_start(dispatched, mesh, ctx)
+        mock_dist_func.reduce_scatter.assert_not_called()
+        mock_wait.assert_not_called()
+        async_output = handle.wait()
+        torch.testing.assert_close(async_output, sync_output)
+        self.assertIs(handle.wait(), async_output)
+        mock_wait.assert_called_once()
+        mock_dist_func.reduce_scatter.assert_called_once()
+
+    def test_dispatch_indices_keep_local_expert_blocks_contiguous(self):
         """Deredundency dispatch groups OEP sources inside each local expert block."""
-        mock_platform.arange.side_effect = torch.arange
         gathered_counts = torch.tensor(
             [
                 [1, 2, 3, 4],
@@ -873,10 +1043,11 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         self.assertTrue(torch.equal(dispatch_indices, expected_indices))
         self.assertTrue(torch.equal(node_counts_per_expert, expected_counts))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_1d_degenerates_to_standard_contract(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatch_1d_degenerates_to_standard_contract(self, mock_dist, mock_dist_func):
         """A 1-D mesh preserves the standard dispatcher input/output contract."""
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         permuted, local_counts, ctx = DeredundencyTokenDispatcher.dispatch(
             module=None,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
@@ -888,10 +1059,11 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         self.assertEqual(ctx.oep_size, 1)
         self.assertTrue(torch.equal(ctx.dispatch_indices, torch.arange(self.total_tokens)))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_context_uses_inner_ep_splits(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatch_context_uses_inner_ep_splits(self, mock_dist, mock_dist_func):
         """Deredundency context stores IEP splits for the reverse combine path."""
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         _, _, ctx = DeredundencyTokenDispatcher.dispatch(
             module=None,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
@@ -901,10 +1073,11 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         self.assertEqual(ctx.output_splits, [5, 5])
         self.assertEqual(ctx.gathered_shape, (self.total_tokens, self.dim))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_saves_router_coeff_when_provided(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatch_saves_router_coeff_when_provided(self, mock_dist, mock_dist_func):
         """Deredundency dispatch saves router coefficients for combine weighting."""
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         router_coeff = torch.arange(self.total_tokens, dtype=torch.float32)
         _, _, ctx = DeredundencyTokenDispatcher.dispatch(
             module=None,
@@ -913,10 +1086,11 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         )
         self.assertTrue(torch.equal(ctx.router_coeff, router_coeff))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_combine_round_trip_1d(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatch_combine_round_trip_1d(self, mock_dist, mock_dist_func):
         """dispatch then combine with identity expert restores the routed input."""
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         permuted, _, ctx = DeredundencyTokenDispatcher.dispatch(
             module=None,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
@@ -930,11 +1104,14 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(combined, self.routed_input, atol=1e-6))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_combine_start_wait_round_trip_1d(self, mock_platform):
+    @patch("torch.distributed._functional_collectives.wait_tensor")
+    @patch("torch.distributed._functional_collectives.all_to_all_single")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_combine_start_wait_round_trip_1d(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
         """async combine path matches sync combine for the 1-D deredundency case."""
-        self._configure_platform(mock_platform)
-        mock_platform.differentiable_all_to_all_single_async.side_effect = (
+        self._configure_collectives(mock_dist, mock_dist_func)
+        mock_async_a2a.side_effect = (
             lambda inp, *_args, **_kw: inp
         )
         permuted, _, ctx = DeredundencyTokenDispatcher.dispatch(
@@ -948,18 +1125,19 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
             device_mesh=self.mock_mesh,
             ctx=ctx,
         )
-        with patch("hyper_parallel.platform.platform.get_platform") as mock_get_platform:
-            mock_get_platform.return_value.wait_async_tensor.side_effect = lambda tensor: tensor
-            combined = DeredundencyTokenDispatcher.combine_wait(handle)
+        mock_wait.side_effect = lambda tensor: tensor
+        combined = DeredundencyTokenDispatcher.combine_wait(handle)
 
         self.assertIsInstance(handle, AsyncHandle)
         self.assertTrue(torch.allclose(combined, self.routed_input, atol=1e-6))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_combine_start_uses_async_iep_all_to_all(self, mock_platform):
+    @patch("torch.distributed._functional_collectives.all_to_all_single")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_combine_start_uses_async_iep_all_to_all(self, mock_dist, mock_dist_func, mock_async_a2a):
         """combine_start launches the async IEP reverse all-to-all."""
-        self._configure_platform(mock_platform)
-        mock_platform.differentiable_all_to_all_single_async.side_effect = (
+        self._configure_collectives(mock_dist, mock_dist_func)
+        mock_async_a2a.side_effect = (
             lambda inp, *_args, **_kw: inp
         )
         permuted, _, ctx = DeredundencyTokenDispatcher.dispatch(
@@ -967,7 +1145,7 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
             device_mesh=self.mock_mesh,
         )
-        mock_platform.differentiable_all_to_all_single.reset_mock()
+        mock_dist_func.all_to_all_single.reset_mock()
 
         DeredundencyTokenDispatcher.combine_start(
             routed_output=permuted,
@@ -975,14 +1153,14 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
             ctx=ctx,
         )
 
-        mock_platform.differentiable_all_to_all_single.assert_not_called()
-        mock_platform.differentiable_all_to_all_single_async.assert_called_once()
+        mock_dist_func.all_to_all_single.assert_not_called()
+        mock_async_a2a.assert_called_once()
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_combine_weights_and_accumulates_duplicate_dispatch_indices(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    def test_combine_weights_and_accumulates_duplicate_dispatch_indices(self, mock_dist_func):
         """combine applies router_coeff and scatter-adds duplicate token positions."""
-        mock_platform.differentiable_all_to_all_single.side_effect = (
-            lambda inp, *_args, **_kw: inp
+        mock_dist_func.all_to_all_single.side_effect = (
+            lambda _out, inp, *_args, **_kw: inp
         )
         mesh = _make_mock_device_mesh(ep_size=1)
         routed_output = torch.tensor(
@@ -1007,10 +1185,11 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         expected = torch.tensor([[1.0, 1.0], [7.0, 7.0]])
         self.assertTrue(torch.allclose(combined, expected, atol=1e-6))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_combine_wait_runs_weight_and_scatter_postprocess(self, mock_platform):
+    @patch("torch.distributed._functional_collectives.wait_tensor")
+    @patch("torch.distributed._functional_collectives.all_to_all_single")
+    def test_combine_wait_runs_weight_and_scatter_postprocess(self, mock_async_a2a, mock_wait):
         """async combine wait applies router_coeff and scatter-add like sync combine."""
-        mock_platform.differentiable_all_to_all_single_async.side_effect = (
+        mock_async_a2a.side_effect = (
             lambda inp, *_args, **_kw: inp
         )
         mesh = _make_mock_device_mesh(ep_size=1)
@@ -1033,17 +1212,17 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
             device_mesh=mesh,
             ctx=ctx,
         )
-        with patch("hyper_parallel.platform.platform.get_platform") as mock_get_platform:
-            mock_get_platform.return_value.wait_async_tensor.side_effect = lambda tensor: tensor
-            combined = DeredundencyTokenDispatcher.combine_wait(handle)
+        mock_wait.side_effect = lambda tensor: tensor
+        combined = DeredundencyTokenDispatcher.combine_wait(handle)
 
         expected = torch.tensor([[1.0, 1.0], [7.0, 7.0]])
         self.assertTrue(torch.allclose(combined, expected, atol=1e-6))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatch_rejects_non_divisible_expert_count(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatch_rejects_non_divisible_expert_count(self, mock_dist, mock_dist_func):
         """Expert count must be divisible by the resolved full EP size."""
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         bad_counts = torch.tensor([1, 2, 3])
         with self.assertRaisesRegex(ValueError, "divisible by the full EP size"):
             DeredundencyTokenDispatcher.dispatch(
@@ -1052,8 +1231,9 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
                 device_mesh=self.mock_mesh,
             )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_expert_parallel_deredundency_round_trip_via_hooks(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_expert_parallel_deredundency_round_trip_via_hooks(self, mock_dist, mock_dist_func):
         """ExpertParallel+deredundency dispatch→combine runs end-to-end with a
         matching context (regression guard for the hardcoded-AllToAll bug).
 
@@ -1065,7 +1245,7 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         ``self._token_dispatcher``, the produced context is a
         ``DeredundencyDispatchContext`` and combine consumes it cleanly.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         ep = ExpertParallel(token_dispatcher="deredundency")
         module = _make_mock_module(num_experts=4, dim=self.dim)
 
@@ -1089,8 +1269,9 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         self.assertEqual(combined.shape, (self.total_tokens, self.dim))
         self.assertTrue(torch.allclose(combined, self.routed_input, atol=1e-6))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_deredundency_inputs2_is_router_coeff_not_permuted_probs(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_deredundency_inputs2_is_router_coeff_not_permuted_probs(self, mock_dist, mock_dist_func):
         """The third input is router_coeff (combine weighting), not permuted_probs.
 
         Unlike ``AllToAllTokenDispatcher.dispatch`` — which returns a 4-tuple
@@ -1100,7 +1281,7 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         handed back for in-expert weighting.  This pins the documented
         incompatibility with ``score_before_experts=False``.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         router_coeff = torch.arange(self.total_tokens, dtype=torch.float32)
         dispatch_out = DeredundencyTokenDispatcher.dispatch(
             module=None,
@@ -1282,8 +1463,9 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
             f"w3 should use [Shard(0), Shard(1)], got {shard_by_key.get('w3')}"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_etp_dispatch_delegates_to_ep_submesh(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_etp_dispatch_delegates_to_ep_submesh(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertTensorParallel._token_dispatch delegates to EP sub-mesh
         Description: _token_dispatch should use device_mesh["ep"] for all-to-all,
@@ -1304,11 +1486,10 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
         full_mesh = MagicMock()
         full_mesh.__getitem__ = MagicMock(return_value=ep_submesh)
 
-        mock_platform.all_to_all_single.return_value = (counts_out, None)
-        mock_platform.differentiable_all_to_all_single.side_effect = (
-            lambda inp, *_args, **_kw: inp
+        _configure_count_exchange(mock_dist, counts_out)
+        mock_dist_func.all_to_all_single.side_effect = (
+            lambda _out, inp, *_args, **_kw: inp
         )
-        mock_platform.arange.side_effect = torch.arange
 
         module = _make_mock_module()
         etp._token_dispatch(
@@ -1321,8 +1502,9 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
         # reads it once for the score guard and once for dispatch.
         full_mesh.__getitem__.assert_any_call("ep")
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_etp_combine_delegates_to_ep_submesh(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_etp_combine_delegates_to_ep_submesh(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertTensorParallel._token_combine delegates to EP sub-mesh
         Description: _token_combine should use device_mesh["ep"] for all-to-all.
@@ -1340,11 +1522,10 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
         full_mesh = MagicMock()
         full_mesh.__getitem__ = MagicMock(return_value=ep_submesh)
 
-        mock_platform.all_to_all_single.return_value = (counts_out, None)
-        mock_platform.differentiable_all_to_all_single.side_effect = (
-            lambda inp, *_args, **_kw: inp
+        _configure_count_exchange(mock_dist, counts_out)
+        mock_dist_func.all_to_all_single.side_effect = (
+            lambda _out, inp, *_args, **_kw: inp
         )
-        mock_platform.arange.side_effect = torch.arange
 
         # First dispatch to set state
         module = _make_mock_module()
@@ -1380,29 +1561,28 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# C5: AsyncHandle (from platform), combine_start/combine_wait, permuted_probs dispatch
+# C5: EP AsyncHandle, combine_start/combine_wait, permuted_probs dispatch
 # ---------------------------------------------------------------------------
 
 class TestAsyncHandle(unittest.TestCase):
     """Unit tests for :class:`AsyncHandle`."""
 
-    def test_wait_calls_platform_once(self):
+    def test_wait_calls_torch_once(self):
         """
         Feature: AsyncHandle.wait idempotency
-        Description: First wait calls platform.wait_async_tensor; second wait is a no-op.
-        Expectation: platform.wait_async_tensor called exactly once.
+        Description: First wait calls wait_async_tensor; second wait is a no-op.
+        Expectation: wait_async_tensor called exactly once.
         """
         mock_tensor = MagicMock()
         handle = AsyncHandle(mock_tensor)
 
-        with patch("hyper_parallel.platform.platform.get_platform") as mock_get_plat:
-            mock_plat = mock_get_plat.return_value
-            mock_plat.wait_async_tensor.return_value = mock_tensor
+        with patch("torch.distributed._functional_collectives.wait_tensor") as mock_wait:
+            mock_wait.return_value = mock_tensor
             result1 = handle.wait()
             result2 = handle.wait()
 
-        self.assertEqual(mock_plat.wait_async_tensor.call_count, 1,
-                         "wait_async_tensor should be called exactly once")
+        self.assertEqual(mock_wait.call_count, 1,
+                         "wait_tensor should be called exactly once")
         self.assertIs(result1, mock_tensor)
         self.assertIs(result2, mock_tensor)
 
@@ -1415,9 +1595,8 @@ class TestAsyncHandle(unittest.TestCase):
         real_tensor = torch.randn(4)
         handle = AsyncHandle(real_tensor)
 
-        with patch("hyper_parallel.platform.platform.get_platform") as mock_get_plat:
-            mock_plat = mock_get_plat.return_value
-            mock_plat.wait_async_tensor.side_effect = lambda t: t
+        with patch("torch.distributed._functional_collectives.wait_tensor") as mock_wait:
+            mock_wait.side_effect = lambda t: t
             result = handle.wait()
 
         self.assertIs(result, real_tensor)
@@ -1436,22 +1615,23 @@ class TestCombineStartWait(unittest.TestCase):
         self.mock_mesh = _make_mock_device_mesh(self.ep_size)
         self.module = _make_mock_module()
 
-    def _configure_platform(self, mock_platform):
-        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
-        mock_platform.differentiable_all_to_all_single.side_effect = (
-            lambda inp, *_args, **_kw: inp
+    def _configure_collectives(self, mock_dist, mock_dist_func):
+        _configure_count_exchange(mock_dist, self.counts_out)
+        mock_dist_func.all_to_all_single.side_effect = (
+            lambda _out, inp, *_args, **_kw: inp
         )
-        mock_platform.arange.side_effect = torch.arange
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_combine_start_returns_handle(self, mock_platform):
+    @patch("torch.distributed._functional_collectives.all_to_all_single")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_combine_start_returns_handle(self, mock_dist, mock_dist_func, mock_async_a2a):
         """
         Feature: combine_start return types
         Description: combine_start returns an AsyncHandle.
         Expectation: handle is AsyncHandle.
         """
-        self._configure_platform(mock_platform)
-        mock_platform.differentiable_all_to_all_single_async.side_effect = (
+        self._configure_collectives(mock_dist, mock_dist_func)
+        mock_async_a2a.side_effect = (
             lambda inp, *_args, **_kw: inp
         )
 
@@ -1467,15 +1647,18 @@ class TestCombineStartWait(unittest.TestCase):
 
         self.assertIsInstance(handle, AsyncHandle)
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_combine_start_wait_round_trip(self, mock_platform):
+    @patch("torch.distributed._functional_collectives.wait_tensor")
+    @patch("torch.distributed._functional_collectives.all_to_all_single")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_combine_start_wait_round_trip(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
         """
         Feature: combine_start + combine_wait round-trip (OV-01)
         Description: Output of combine_start→combine_wait matches synchronous combine().
         Expectation: numerical equality with sync combine output.
         """
-        self._configure_platform(mock_platform)
-        mock_platform.differentiable_all_to_all_single_async.side_effect = (
+        self._configure_collectives(mock_dist, mock_dist_func)
+        mock_async_a2a.side_effect = (
             lambda inp, *_args, **_kw: inp
         )
 
@@ -1498,9 +1681,8 @@ class TestCombineStartWait(unittest.TestCase):
         handle = AllToAllTokenDispatcher.combine_start(
             expert_output, self.mock_mesh, ctx
         )
-        with patch("hyper_parallel.platform.platform.get_platform") as mock_get_platform:
-            mock_get_platform.return_value.wait_async_tensor.side_effect = lambda t: t
-            combined_async = AllToAllTokenDispatcher.combine_wait(handle)
+        mock_wait.side_effect = lambda tensor: tensor
+        combined_async = AllToAllTokenDispatcher.combine_wait(handle)
 
         self.assertTrue(
             torch.allclose(combined_async, combined_sync, atol=1e-6),
@@ -1508,15 +1690,17 @@ class TestCombineStartWait(unittest.TestCase):
             f"{(combined_async - combined_sync).abs().max():.2e}"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_combine_start_calls_async_a2a(self, mock_platform):
+    @patch("torch.distributed._functional_collectives.all_to_all_single")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_combine_start_calls_async_a2a(self, mock_dist, mock_dist_func, mock_async_a2a):
         """
         Feature: combine_start uses differentiable_all_to_all_single_async
         Description: combine_start must call the async variant, not the sync one.
         Expectation: differentiable_all_to_all_single_async called once.
         """
-        self._configure_platform(mock_platform)
-        mock_platform.differentiable_all_to_all_single_async.side_effect = (
+        self._configure_collectives(mock_dist, mock_dist_func)
+        mock_async_a2a.side_effect = (
             lambda inp, *_args, **_kw: inp
         )
 
@@ -1528,7 +1712,7 @@ class TestCombineStartWait(unittest.TestCase):
         expert_output = torch.randn(self.total_tokens, self.dim)
         AllToAllTokenDispatcher.combine_start(expert_output, self.mock_mesh, ctx)
 
-        mock_platform.differentiable_all_to_all_single_async.assert_called_once()
+        mock_async_a2a.assert_called_once()
 
 
 class TestExpertParallelAsyncCombine(unittest.TestCase):
@@ -1545,30 +1729,33 @@ class TestExpertParallelAsyncCombine(unittest.TestCase):
         self.mock_mesh = _make_mock_device_mesh(self.ep_size)
         self.module = _make_mock_module()
 
-    def _configure_platform(self, mock_platform) -> None:
-        """Set up platform mocks for sync and async combine paths."""
-        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
-        mock_platform.differentiable_all_to_all_single.side_effect = (
+    def _configure_collectives(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait) -> None:
+        """Set up Torch mocks for sync and async combine paths."""
+        _configure_count_exchange(mock_dist, self.counts_out)
+        mock_dist_func.all_to_all_single.side_effect = (
+            lambda _out, inp, *_args, **_kw: inp
+        )
+        mock_async_a2a.side_effect = (
             lambda inp, *_args, **_kw: inp
         )
-        mock_platform.differentiable_all_to_all_single_async.side_effect = (
-            lambda inp, *_args, **_kw: inp
-        )
-        mock_platform.wait_async_tensor.side_effect = lambda t: t
-        mock_platform.arange.side_effect = torch.arange
+        mock_wait.side_effect = lambda t: t
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_async_combine_no_shared_expert_degradation(self, mock_platform):
+    @patch("torch.distributed._functional_collectives.wait_tensor")
+    @patch("torch.distributed._functional_collectives.all_to_all_single")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_async_combine_no_shared_expert_degradation(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
         """
         Feature: async_combine=True without shared_expert (OV-02)
         Description: When async_combine=True, output should match sync path numerically.
         Expectation: combined output is allclose to sync ExpertParallel output.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func, mock_async_a2a, mock_wait)
         ep_sync = ExpertParallel(async_combine=False)
         ep_async = ExpertParallel(async_combine=True)
 
-        with patch("hyper_parallel.platform.platform.get_platform", return_value=mock_platform):
+        with patch("torch.distributed._functional_collectives.wait_tensor",
+                   side_effect=lambda tensor: tensor):
             module_sync = _make_mock_module()
             ep_sync._token_dispatch(
                 module_sync,
@@ -1592,18 +1779,22 @@ class TestExpertParallelAsyncCombine(unittest.TestCase):
             f"{(combined_async - combined_sync).abs().max():.2e}"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_async_combine_stores_handle_on_module(self, mock_platform):
+    @patch("torch.distributed._functional_collectives.wait_tensor")
+    @patch("torch.distributed._functional_collectives.all_to_all_single")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_async_combine_stores_handle_on_module(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
         """
         Feature: async_combine=True stores handle on module
         Description: After _token_combine with async_combine, the module has
             _ep_combine_handle attribute.
         Expectation: attribute exists and has correct type.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func, mock_async_a2a, mock_wait)
         ep_async = ExpertParallel(async_combine=True)
 
-        with patch("hyper_parallel.platform.platform.get_platform", return_value=mock_platform):
+        with patch("torch.distributed._functional_collectives.wait_tensor",
+                   side_effect=lambda tensor: tensor):
             ep_async._token_dispatch(
                 self.module,
                 (self.routed_input, self.num_tokens_per_expert_in),
@@ -1615,14 +1806,17 @@ class TestExpertParallelAsyncCombine(unittest.TestCase):
         self.assertTrue(hasattr(self.module, "_ep_combine_handle"))
         self.assertIsInstance(self.module._ep_combine_handle, AsyncHandle)
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_sync_combine_does_not_store_handle(self, mock_platform):
+    @patch("torch.distributed._functional_collectives.wait_tensor")
+    @patch("torch.distributed._functional_collectives.all_to_all_single")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_sync_combine_does_not_store_handle(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
         """
         Feature: async_combine=False does not store handle
         Description: Sync path should not set _ep_combine_handle.
         Expectation: attribute is absent after sync combine.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func, mock_async_a2a, mock_wait)
         ep_sync = ExpertParallel(async_combine=False)
 
         ep_sync._token_dispatch(
@@ -1660,16 +1854,16 @@ class TestPermutedProbsDispatch(unittest.TestCase):
         self.mock_mesh = _make_mock_device_mesh(self.ep_size)
         self.module = _make_mock_module()
 
-    def _configure_platform(self, mock_platform):
-        """Set up the platform mock for dispatch with identity all-to-all."""
-        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
-        mock_platform.differentiable_all_to_all_single.side_effect = (
-            lambda inp, *_args, **_kw: inp
+    def _configure_collectives(self, mock_dist, mock_dist_func):
+        """Set up the Torch mock for dispatch with identity all-to-all."""
+        _configure_count_exchange(mock_dist, self.counts_out)
+        mock_dist_func.all_to_all_single.side_effect = (
+            lambda _out, inp, *_args, **_kw: inp
         )
-        mock_platform.arange.side_effect = torch.arange
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_ep_dispatch_returns_probs_when_provided(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_ep_dispatch_returns_probs_when_provided(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_dispatch returns permuted_probs
         Description: When a third input (permuted_probs) is provided, dispatch
@@ -1678,7 +1872,7 @@ class TestPermutedProbsDispatch(unittest.TestCase):
         Expectation: result is a 3-tuple whose last element is a 1-D tensor of
             length total_tokens.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         ep = ExpertParallel()
         result = ep._token_dispatch(
             self.module,
@@ -1707,15 +1901,16 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             f"expected {self.total_tokens}"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_ep_dispatch_omits_probs_when_absent(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_ep_dispatch_omits_probs_when_absent(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_dispatch without permuted_probs
         Description: When only (routed_input, num_tokens_per_expert) is given,
             dispatch returns the original 2-tuple (permuted_x, local_counts).
         Expectation: result is a 2-tuple.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         ep = ExpertParallel()
         result = ep._token_dispatch(
             self.module,
@@ -1735,8 +1930,9 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             f"expected ({self.num_local_experts},)"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_ep_dispatch_none_probs_falls_back_to_two_tuple(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_ep_dispatch_none_probs_falls_back_to_two_tuple(self, mock_dist, mock_dist_func):
         """
         Feature: None permuted_probs is treated as absent
         Description: Passing permuted_probs=None must behave like the 2-input
@@ -1744,7 +1940,7 @@ class TestPermutedProbsDispatch(unittest.TestCase):
         Expectation: dispatch returns a 2-tuple and does not call the second
             all-to-all for probs.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         ep = ExpertParallel()
         result = ep._token_dispatch(
             self.module,
@@ -1754,12 +1950,13 @@ class TestPermutedProbsDispatch(unittest.TestCase):
         self.assertEqual(len(result), 2, f"expected 2-tuple, got len={len(result)}")
         # Only the token-exchange a2a fires; the probs a2a must be skipped.
         self.assertEqual(
-            mock_platform.differentiable_all_to_all_single.call_count, 1,
+            mock_dist_func.all_to_all_single.call_count, 1,
             "probs all-to-all must not fire when permuted_probs is None"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_ep_probs_exchanged_via_second_differentiable_a2a(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_ep_probs_exchanged_via_second_differentiable_a2a(self, mock_dist, mock_dist_func):
         """
         Feature: permuted_probs uses a differentiable all-to-all
         Description: When permuted_probs is provided, the dispatch path issues a
@@ -1768,7 +1965,7 @@ class TestPermutedProbsDispatch(unittest.TestCase):
         Expectation: differentiable_all_to_all_single called exactly twice;
             the second call's input is the permuted_probs tensor.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         ep = ExpertParallel()
         ep._token_dispatch(
             self.module,
@@ -1776,27 +1973,28 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             self.mock_mesh,
         )
         self.assertEqual(
-            mock_platform.differentiable_all_to_all_single.call_count, 2,
+            mock_dist_func.all_to_all_single.call_count, 2,
             "expected token + probs all-to-all (2 calls)"
         )
-        # Second a2a call carries permuted_probs as its input (first positional arg).
-        probs_call = mock_platform.differentiable_all_to_all_single.call_args_list[1]
+        # Second a2a call carries permuted_probs as its input (second positional arg).
+        probs_call = mock_dist_func.all_to_all_single.call_args_list[1]
         self.assertIs(
-            probs_call.args[0], self.permuted_probs,
+            probs_call.args[1], self.permuted_probs,
             "second differentiable_all_to_all_single should exchange permuted_probs"
         )
         # Same splits as the token exchange: (input_splits, output_splits) = ([5,5],[5,5]).
         self.assertEqual(
-            probs_call.args[1], [5, 5],
-            f"probs input_splits={probs_call.args[1]}, expected [5, 5]"
+            probs_call.kwargs['input_split_sizes'], [5, 5],
+            f"probs input_splits={probs_call.kwargs['input_split_sizes']}, expected [5, 5]"
         )
         self.assertEqual(
-            probs_call.args[2], [5, 5],
-            f"probs output_splits={probs_call.args[2]}, expected [5, 5]"
+            probs_call.kwargs['output_split_sizes'], [5, 5],
+            f"probs output_splits={probs_call.kwargs['output_split_sizes']}, expected [5, 5]"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_ep_probs_reordered_to_expert_major(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_ep_probs_reordered_to_expert_major(self, mock_dist, mock_dist_func):
         """
         Feature: permuted_probs reordered rank-major → expert-major
         Description: With identity all-to-all, dispatched_probs == permuted_probs
@@ -1807,7 +2005,7 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             for every i, where token_perm_idx is the indices _permute produces
             for the tokens.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         ep = ExpertParallel()
         _, _, permuted_probs = ep._token_dispatch(
             self.module,
@@ -1824,8 +2022,9 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             "permuted_probs must track the same expert-major permutation as tokens"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_ep_ctx_stores_probs_input_shape_when_provided(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_ep_ctx_stores_probs_input_shape_when_provided(self, mock_dist, mock_dist_func):
         """
         Feature: DispatchContext.probs_input_shape set on the probs path
         Description: When permuted_probs is provided, the stored dispatch context
@@ -1834,7 +2033,7 @@ class TestPermutedProbsDispatch(unittest.TestCase):
         Expectation: ctx.probs_input_shape == (total_tokens,) with probs,
             None without.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         ep = ExpertParallel()
 
         # With probs -> probs_input_shape populated.
@@ -1862,8 +2061,9 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             "probs_input_shape should be None when permuted_probs is absent"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_etp_dispatch_returns_probs_via_ep_submesh(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_etp_dispatch_returns_probs_via_ep_submesh(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertTensorParallel._token_dispatch propagates permuted_probs
         Description: ETP delegates to AllToAllTokenDispatcher via the EP
@@ -1871,7 +2071,7 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             ExpertParallel (replaces the old score_after_dispatch rejection).
         Expectation: dispatch returns a 3-tuple; ["ep"] is used for the exchange.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
         etp = ExpertTensorParallel()
 
         ep_submesh = _make_mock_device_mesh(self.ep_size)
@@ -1903,8 +2103,9 @@ class TestPermutedProbsDispatch(unittest.TestCase):
         )
         full_mesh.__getitem__.assert_called_once_with("ep")
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
-    def test_dispatcher_standalone_returns_four_tuple_with_probs(self, mock_platform):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    def test_dispatcher_standalone_returns_four_tuple_with_probs(self, mock_dist, mock_dist_func):
         """
         Feature: AllToAllTokenDispatcher.dispatch direct return with probs
         Description: The static dispatcher returns a 4-tuple
@@ -1914,7 +2115,7 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             DispatchContext with probs_input_shape populated only on the
             probs path.
         """
-        self._configure_platform(mock_platform)
+        self._configure_collectives(mock_dist, mock_dist_func)
 
         # With probs -> 4-tuple.
         result = AllToAllTokenDispatcher.dispatch(
