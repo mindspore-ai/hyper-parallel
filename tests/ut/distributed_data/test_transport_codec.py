@@ -170,12 +170,9 @@ class TestDataPlaneTransport(unittest.TestCase):
             collective_groups.append(kwargs["group"])
             output.copy_(input_tensor)
 
-        with (
-                patch.object(transport, "synchronize_error", return_value=None),
-                patch(
-                    "hyper_parallel.distributed_data.transport.dist.all_to_all_single",
-                    side_effect=fake_all_to_all,
-                ),
+        with patch(
+                "hyper_parallel.distributed_data.transport.dist.all_to_all_single",
+                side_effect=fake_all_to_all,
         ):
             received = transport.exchange_prepared(prepared)
 

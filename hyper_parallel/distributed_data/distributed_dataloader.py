@@ -240,18 +240,12 @@ class DistributedDataLoader(Iterator[Any]):
     def _collect_next_delivery(self) -> ConstructedBatch:
         """Run one complete distributed data transaction."""
         was_stopped = self._stopped
-        model_group_error = self._model_transport.synchronize_iterator_state(
-            epoch=self._epoch,
-            step=self._step,
-            stopped=self._stopped,
-        )
         constructor_delivery = None
         if self._data_plane.is_member:
             iterator_state_error = self._data_plane.synchronize_iterator_state(
                 epoch=self._epoch,
                 step=self._step,
                 stopped=self._stopped,
-                model_group_error=model_group_error,
             )
             if iterator_state_error is not None:
                 constructor_delivery = self._constructor_envelope(error=iterator_state_error)
@@ -270,7 +264,6 @@ class DistributedDataLoader(Iterator[Any]):
                 epoch=self._epoch,
                 step=self._step,
                 stopped=self._stopped,
-                model_group_error=None,
             )
             if iterator_state_error is not None:
                 constructor_delivery = self._constructor_envelope(error=iterator_state_error)
@@ -279,17 +272,8 @@ class DistributedDataLoader(Iterator[Any]):
         return constructor_delivery
 
     def _finish_prefetched_delivery(self, constructor_delivery: ConstructedBatch | None) -> ConstructedBatch:
-        """Perform model-group synchronization and broadcast on the caller thread."""
+        """Broadcast the prefetched batch on the caller thread."""
         was_stopped = self._stopped
-        model_group_error = self._model_transport.synchronize_iterator_state(
-            epoch=self._epoch,
-            step=self._step,
-            stopped=self._stopped,
-        )
-        if self._data_plane.is_member:
-            model_group_error = self._data_plane.synchronize_error(model_group_error)
-        if model_group_error is not None:
-            constructor_delivery = self._constructor_envelope(error=model_group_error)
         received = self._model_transport.broadcast(constructor_delivery)
         if was_stopped and not received.stopped:
             raise ValueError("Distributed DataLoader stopped state differs across model-parallel peers.")
@@ -597,43 +581,18 @@ class DistributedDataLoader(Iterator[Any]):
         if self._metadata_mode and not self._metadata_payload_exchange:
             return self._produce_metadata_batch(plan)
 
-        outgoing, preparation_error = self._prepare_outgoing(plan, local_selected_keys)
-        shared_error = self._data_plane.synchronize_error(preparation_error)
-        if shared_error is not None:
-            self._pending_local_keys.clear()
-            return self._constructor_envelope(error=shared_error)
-        if outgoing is None:
-            self._pending_local_keys.clear()
-            return self._constructor_envelope(error="Payload preflight returned no prepared exchange.")
-
-        received_payloads: dict[SampleKey, Any] = {}
-        exchange_error = None
-        try:
-            received_payloads = self._data_plane.exchange_prepared(outgoing)
-        except Exception as exc:  # A2A has completed; synchronize decode/validation errors next.
-            exchange_error = self._format_error("sample payload exchange", exc)
-        shared_error = self._data_plane.synchronize_error(exchange_error)
-        if shared_error is not None:
-            self._pending_local_keys.clear()
-            return self._constructor_envelope(error=shared_error)
+        outgoing = self._prepare_outgoing(plan, local_selected_keys)
+        received_payloads = self._data_plane.exchange_prepared(outgoing)
         return self._construct_received_payloads(plan, received_payloads)
 
     def _produce_metadata_batch(self, plan: DistributedPackingPlan) -> ConstructedBatch | None:
         """Directly read constructor-assigned shared indices without payload A2A."""
         received_payloads: dict[SampleKey, Any] = {}
-        fetch_error = None
         if self._topology.is_constructor:
-            try:
-                if self._direct_sample_loader is None:
-                    raise ValueError("A metadata Data Constructor has no plan-aware sample loader.")
-                constructor_plan = plan.constructor_for(self._topology.data_rank)
-                received_payloads = self._direct_sample_loader.fetch(constructor_plan)
-            except Exception as exc:
-                fetch_error = self._format_error("metadata direct read", exc)
-        shared_error = self._data_plane.synchronize_error(fetch_error)
-        if shared_error is not None:
-            self._pending_local_keys.clear()
-            return self._constructor_envelope(error=shared_error)
+            if self._direct_sample_loader is None:
+                raise ValueError("A metadata Data Constructor has no plan-aware sample loader.")
+            constructor_plan = plan.constructor_for(self._topology.data_rank)
+            received_payloads = self._direct_sample_loader.fetch(constructor_plan)
         return self._construct_received_payloads(plan, received_payloads)
 
     def _construct_received_payloads(
@@ -641,26 +600,16 @@ class DistributedDataLoader(Iterator[Any]):
             plan: DistributedPackingPlan,
             received_payloads: dict[SampleKey, Any],
     ) -> ConstructedBatch | None:
-        """Construct one local batch and synchronize constructor failures."""
+        """Construct one local batch and return it on the Data Constructor rank."""
         local_batch = None
-        construction_error = None
         if self._topology.is_constructor:
-            try:
-                constructor_plan = plan.constructor_for(self._topology.data_rank)
-                local_batch = self._data_constructor.construct(constructor_plan, received_payloads)
-                # Object broadcast uses pickle; fail collectively before peers
-                # enter different model-group collectives.
-                pickle.dumps(local_batch, protocol=pickle.HIGHEST_PROTOCOL)
-            except Exception as exc:
-                construction_error = self._format_error("Data Constructor", exc)
+            constructor_plan = plan.constructor_for(self._topology.data_rank)
+            local_batch = self._data_constructor.construct(constructor_plan, received_payloads)
+            pickle.dumps(local_batch, protocol=pickle.HIGHEST_PROTOCOL)
         elif received_payloads:
-            construction_error = (
+            raise ValueError(
                 f"Non-constructor rank {self._topology.global_rank} received unexpected sample payloads."
             )
-        shared_error = self._data_plane.synchronize_error(construction_error)
-        if shared_error is not None:
-            self._pending_local_keys.clear()
-            return self._constructor_envelope(error=shared_error)
         if not self._topology.is_constructor:
             return None
         return ConstructedBatch(step=plan.step, plan_id=plan.plan_id, data=local_batch)
@@ -903,31 +852,27 @@ class DistributedDataLoader(Iterator[Any]):
             self,
             plan: DistributedPackingPlan,
             local_selected_keys: set[SampleKey],
-    ) -> tuple[PreparedPayloadExchange | None, str | None]:
+    ) -> PreparedPayloadExchange:
         outgoing: dict[int, list[tuple[SampleKey, Any]]] = {}
-        try:
-            if local_selected_keys:
-                if self._metadata_payload_exchange:
-                    if self._direct_sample_loader is None:
-                        raise ValueError("A pre-sharded metadata Reader has no plan-aware sample loader.")
-                    ordered_keys = tuple(key for key in plan.selected_keys if key in local_selected_keys)
-                    payloads = tuple(self._direct_sample_loader.fetch_keys(ordered_keys).items())
-                else:
-                    if self._dataset_reader is None:
-                        raise ValueError("A planned Dataset Reader rank has no Dataset Reader.")
-                    payloads = self._dataset_reader.selected_payloads(local_selected_keys)
-                target_by_key = {
-                    sample.key: self._topology.constructor_ranks[constructor.target_data_rank]
-                    for constructor in plan.constructors
-                    for packing_bin in constructor.bins
-                    for sample in packing_bin.samples
-                }
-                for key, payload in payloads:
-                    outgoing.setdefault(target_by_key[key], []).append((key, payload))
-            prepared = self._data_plane.prepare_exchange(outgoing)
-            return prepared, None
-        except Exception as exc:
-            return None, self._format_error("payload serialization/allocation", exc)
+        if local_selected_keys:
+            if self._metadata_payload_exchange:
+                if self._direct_sample_loader is None:
+                    raise ValueError("A pre-sharded metadata Reader has no plan-aware sample loader.")
+                ordered_keys = tuple(key for key in plan.selected_keys if key in local_selected_keys)
+                payloads = tuple(self._direct_sample_loader.fetch_keys(ordered_keys).items())
+            else:
+                if self._dataset_reader is None:
+                    raise ValueError("A planned Dataset Reader rank has no Dataset Reader.")
+                payloads = self._dataset_reader.selected_payloads(local_selected_keys)
+            target_by_key = {
+                sample.key: self._topology.constructor_ranks[constructor.target_data_rank]
+                for constructor in plan.constructors
+                for packing_bin in constructor.bins
+                for sample in packing_bin.samples
+            }
+            for key, payload in payloads:
+                outgoing.setdefault(target_by_key[key], []).append((key, payload))
+        return self._data_plane.prepare_exchange(outgoing)
 
     def _planning_reader(self) -> DatasetReader | MetadataReader | BatchSamplerReader | None:
         """Return this rank's online or metadata-only Dataset Reader."""

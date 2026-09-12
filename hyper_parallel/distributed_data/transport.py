@@ -645,69 +645,35 @@ class DataPlaneTransport:
         dist.broadcast_object_list(payload, src=self._planner_rank, group=self._control_group)
         return payload[0]
 
-    def synchronize_error(self, error: str | None) -> str | None:
-        """Return the first rank-ordered error observed by the data plane.
-
-        Args:
-            error: Rank-local formatted error, if any.
-
-        Returns:
-            The first shared error in rank order, if any.
-        """
-        statuses = self.all_gather_object((self._global_rank, error))
-        normalized = []
-        for status in statuses:
-            if not isinstance(status, tuple) or len(status) != 2:
-                return "Data-plane rank contributed an invalid error status."
-            rank, message = status
-            if not isinstance(rank, int) or isinstance(rank, bool) or rank not in self._ranks:
-                return "Data-plane rank contributed an invalid error-status rank."
-            if message is not None and not isinstance(message, str):
-                return f"Data-plane rank {rank} contributed a non-string error."
-            if message is not None:
-                normalized.append((rank, message))
-        return min(normalized)[1] if normalized else None
-
     def synchronize_iterator_state(
             self,
             *,
             epoch: int,
             step: int,
             stopped: bool,
-            model_group_error: str | None,
     ) -> str | None:
-        """Validate iterator state across all model groups before reading.
+        """Validate iterator state across all data-plane ranks before reading.
 
         Args:
             epoch: Current epoch number.
             step: Current iterator step.
             stopped: Whether local iteration has stopped.
-            model_group_error: Model-group synchronization error, if any.
 
         Returns:
             A shared validation error, if any.
         """
-        statuses = self.all_gather_object((self._global_rank, epoch, step, stopped, model_group_error))
+        statuses = self.all_gather_object((self._global_rank, epoch, step, stopped))
         normalized, validation_error = _normalize_iterator_statuses(
             statuses,
             self._ranks,
-            expected_length=5,
+            expected_length=4,
             scope="Data-plane rank",
         )
         if validation_error is not None or normalized is None:
             return validation_error
-        invalid_model_error = next(
-            (status for status in normalized if status[4] is not None and not isinstance(status[4], str)),
-            None,
-        )
-        if invalid_model_error is not None:
-            return f"Data-plane rank {invalid_model_error[0]} contributed a non-string model-group error."
         coverage_error = _iterator_coverage_error(normalized, self._ranks, scope="Data-plane")
         if coverage_error is not None:
             return coverage_error
-        errors = sorted((status[0], status[4]) for status in normalized if status[4] is not None)
-        if errors:
-            return errors[0][1]
         return _iterator_state_error(normalized, scope="Data-plane")
 
     def prepare_exchange(
@@ -771,9 +737,8 @@ class DataPlaneTransport:
             prepared.send_tensor,
             len(self._ranks),
         )
-        shared_error = self.synchronize_error(allocation_error)
-        if shared_error is not None:
-            raise ValueError(shared_error)
+        if allocation_error is not None:
+            raise ValueError(allocation_error)
         if received_tensor is None:
             raise ValueError("Payload receive allocation did not produce a tensor.")
         data_work = dist.all_to_all_single(
@@ -806,36 +771,6 @@ class ModelParallelTransport:
         self._constructor_rank = topology.constructor_rank
         self._global_rank = topology.global_rank
         self._distributed = groups.distributed
-
-    def synchronize_iterator_state(self, *, epoch: int, step: int, stopped: bool) -> str | None:
-        """Return a shared error when peers restored different iterator state.
-
-        Args:
-            epoch: Current epoch number.
-            step: Current iterator step.
-            stopped: Whether local iteration has stopped.
-
-        Returns:
-            A shared validation error, if any.
-        """
-        if len(self._ranks) == 1:
-            return None
-        if not self._distributed or self._group is None:
-            return "Multi-rank model delivery requires an initialized process group."
-        gathered = [None] * len(self._ranks)
-        dist.all_gather_object(gathered, (self._global_rank, epoch, step, stopped), group=self._group)
-        normalized, validation_error = _normalize_iterator_statuses(
-            gathered,
-            self._ranks,
-            expected_length=4,
-            scope="Model-parallel rank",
-        )
-        if validation_error is not None or normalized is None:
-            return validation_error
-        coverage_error = _iterator_coverage_error(normalized, self._ranks, scope="Model-parallel")
-        if coverage_error is not None:
-            return coverage_error
-        return _iterator_state_error(normalized, scope="Model-parallel")
 
     def broadcast(self, batch: ConstructedBatch | None) -> ConstructedBatch:
         """Return the constructor's batch envelope on every model-parallel peer.
