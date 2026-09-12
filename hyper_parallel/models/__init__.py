@@ -40,6 +40,11 @@ from hyper_parallel.models.build_options import (
     ModelBuildOptions,
     normalize_build_options,
 )
+from hyper_parallel.models.flops import (
+    batch_seq_len,
+    estimate_flops_per_token,
+    resolve_flops_per_token,
+)
 
 if TYPE_CHECKING:
     from hyper_parallel.models._transformers import (
@@ -64,9 +69,12 @@ __all__ = [
     "HyperAutoModelForSequenceClassification",
     "ModelAdapterSpec",
     "ModelBuildOptions",
+    "batch_seq_len",
+    "estimate_flops_per_token",
     "get_model_adapter",
     "normalize_build_options",
     "register_model_adapter",
+    "resolve_flops_per_token",
 ]
 
 
