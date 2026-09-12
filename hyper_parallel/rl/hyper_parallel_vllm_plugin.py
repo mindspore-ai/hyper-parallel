@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Forward the installed vLLM plugin entry point to the hyperparallel-RL runtime."""
+"""Forward the installed vLLM plugin entry point to the HyperParallel-RL runtime."""
 
 from rl.roles.rollout.vllm_plugin import (
     HYPER_DEEPSEEK_V3_ARCHITECTURE,

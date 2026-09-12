@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Public cross-module contracts for the hyperparallel-RL runtime."""
+"""Public cross-module contracts for the HyperParallel-RL runtime."""
 
 from importlib import import_module
 from typing import Any

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU unit test for distributed hyperparallel-RL evaluation aggregation."""
+"""CPU unit test for distributed HyperParallel-RL evaluation aggregation."""
 # Local test doubles are not public APIs; the suite intentionally uses Torch CPU tensors.
 # pylint: disable=forbidden-backend-import,missing-public-docstring
 

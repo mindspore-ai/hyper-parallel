@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Token-first dataset and training contracts for the hyperparallel-RL runtime."""
+"""Token-first dataset and training contracts for the HyperParallel-RL runtime."""
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 

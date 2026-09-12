@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Monitoring fan-out and built-in backends for hyperparallel-RL."""
+"""Monitoring fan-out and built-in backends for HyperParallel-RL."""
 from rl.utils.monitoring.config import sanitize_config
 from rl.utils.monitoring.metrics import (
     ActorMetricAccumulator,

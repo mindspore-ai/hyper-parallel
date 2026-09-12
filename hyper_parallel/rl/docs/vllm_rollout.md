@@ -2,7 +2,7 @@
 
 ## 适用范围
 
-本文定义 hyperparallel-RL 的 shared vLLM rollout 合同，覆盖 Qwen3 Hyper/Native TP1/TP2、colocated NPU IPC、disjoint HCCL、
+本文定义 HyperParallel-RL 的 shared vLLM rollout 合同，覆盖 Qwen3 Hyper/Native TP1/TP2、colocated NPU IPC、disjoint HCCL、
 在线权重发布和同步失败语义；[MoE 模型](moe_models.md) 复用这些合同，仅扩展静态专家归属及模型特有布局。
 
 ## Ownership
@@ -18,7 +18,7 @@ Trainer ranks
 - Trainer rank 0 启动、检查并关闭 server process group；其他 ranks 连接同一 endpoint。
 - Owner 启动前拒绝已占用端口，health 成功后再次确认 owned process 存活。
 - 所有 Trainer ranks 必须解析出相同 endpoint 和 physical worker mapping。
-- vLLM upstream 管理 DP routing 和 frontend 数量；hyperparallel-RL 不设置生产用固定 DP rank header。
+- vLLM upstream 管理 DP routing 和 frontend 数量；HyperParallel-RL 不设置生产用固定 DP rank header。
 - `rank_local`、per-rank server、per-replica port 和 `api_server_count` 已删除。
 
 Colocated 使用完整 Trainer 设备集，不接受 `visible_devices`。Disjoint 必须配置互不重复、与 Trainer 不重叠且数量等于

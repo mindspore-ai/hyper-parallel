@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Validate hyperparallel-RL configuration and adapt it to Hyper-Parallel."""
+"""Validate HyperParallel-RL configuration and adapt it to Hyper-Parallel."""
 
 import json
 import math
@@ -214,7 +214,7 @@ def _parallel_size(vllm: Mapping[str, Any], field: str) -> int:
 
 
 def _trainer_topology(accelerator: Mapping[str, Any]) -> dict[str, int]:
-    """Return the validated Trainer topology used by hyperparallel-RL orchestration."""
+    """Return the validated Trainer topology used by HyperParallel-RL orchestration."""
     topology = {
         "dp_replicate": int(accelerator.get("dp_replicate", 1)),
         "dp_shard": int(accelerator.get("dp_shard", 0)),
@@ -237,7 +237,7 @@ def _trainer_topology(accelerator: Mapping[str, Any]) -> dict[str, int]:
     }
     if unsupported:
         raise ValueError(
-            "hyperparallel-RL Trainer currently supports dp_replicate=1, TP1/TP2, "
+            "HyperParallel-RL Trainer currently supports dp_replicate=1, TP1/TP2, "
             f"and CP=PP=1; invalid topology={unsupported}"
         )
     return topology
@@ -790,7 +790,7 @@ def _validate_logging(config: Mapping[str, Any]) -> None:
 
 
 def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
-    """Validate hyperparallel-RL configuration before distributed startup."""
+    """Validate HyperParallel-RL configuration before distributed startup."""
     unknown = set(config) - _EXPECTED_TOP_LEVEL
     if unknown:
         raise ValueError(f"Unsupported top-level configuration keys: {sorted(unknown)}")
@@ -967,7 +967,7 @@ def resolve_vllm_automatic_limits(config: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve workload- and KV-bounded vLLM limits before validation.
 
     Args:
-        config: Fully merged hyperparallel-RL configuration.
+        config: Fully merged HyperParallel-RL configuration.
 
     Returns:
         A detached configuration with ``max_num_seqs`` resolved when it is null.
@@ -1210,7 +1210,7 @@ def _build_checkpoint_config(
 
 
 def build_runtime_config(config: Mapping[str, Any]) -> TrainerConfig:
-    """Translate hyperparallel-RL YAML into the HyperAutoModel runtime configuration."""
+    """Translate HyperParallel-RL YAML into the HyperAutoModel runtime configuration."""
     model_config = required_mapping(config, "model")
     train_config = required_mapping(config, "train")
     accelerator_config = required_mapping(train_config, "accelerator")

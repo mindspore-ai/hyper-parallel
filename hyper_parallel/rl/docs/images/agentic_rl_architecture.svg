@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img"
      aria-labelledby="title description">
-  <title id="title">Agentic RL interaction with hyperparallel-RL</title>
+  <title id="title">Agentic RL interaction with HyperParallel-RL</title>
   <desc id="description">
     Prompt records enter SyncTrainer, which selects an internal, Codex, or DeepSeek runner. All paths use one shared
-    vLLM policy and produce a canonical trajectory. hyperparallel-RL builds an experience batch, updates the actor, and
+    vLLM policy and produce a canonical trajectory. HyperParallel-RL builds an experience batch, updates the actor, and
     publishes the next policy snapshot back to vLLM.
   </desc>
   <defs>
@@ -28,7 +28,7 @@
   </defs>
 
   <rect class="canvas" width="1440" height="900"/>
-  <text class="title" x="720" y="48" text-anchor="middle">Agentic RL in hyperparallel-RL</text>
+  <text class="title" x="720" y="48" text-anchor="middle">Agentic RL in HyperParallel-RL</text>
   <text class="subtitle" x="720" y="76" text-anchor="middle">
     One rollout contract, three runner paths, one shared policy lifecycle
   </text>

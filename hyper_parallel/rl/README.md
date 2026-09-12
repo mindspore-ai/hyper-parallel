@@ -1,7 +1,7 @@
 <!-- markdownlint-disable MD033 -->
 <h1 align="center">
-  <img src="docs/assets/hyper-rl-logo.svg" width="120" height="80" alt="hyperparallel-RL logo"><br>
-  hyperparallel-RL · Experimental
+  <img src="docs/assets/hyper-rl-logo.svg" width="120" height="80" alt="HyperParallel-RL logo"><br>
+  HyperParallel-RL · Experimental
 </h1>
 
 <p align="center"><strong>A lightweight, extensible reinforcement learning framework.</strong></p>
@@ -12,15 +12,15 @@
 
 <p align="center"><strong>中文</strong> | <a href="README.en.md">English</a></p>
 
-<p align="center"><a href="#why-hyper-rl">Why hyperparallel-RL</a> · <a href="#架构">架构</a> · <a href="#安装与环境">安装</a> · <a href="#快速开始">快速开始</a> · <a href="#扩展与定制">扩展与定制</a> · <a href="#支持范围">支持范围</a> · <a href="#文档">文档</a> · <a href="#citation">Citation</a>
+<p align="center"><a href="#why-hyper-rl">Why HyperParallel-RL</a> · <a href="#架构">架构</a> · <a href="#安装与环境">安装</a> · <a href="#快速开始">快速开始</a> · <a href="#扩展与定制">扩展与定制</a> · <a href="#支持范围">支持范围</a> · <a href="#文档">文档</a> · <a href="#citation">Citation</a>
 </p>
 <!-- markdownlint-enable MD033 -->
 
 ---
 
-hyperparallel-RL 是面向 LLM、VLM、世界模型、具身智能和 Agentic AI 的强化学习框架，以**极简易用、易于扩展、昇腾亲和**为设计原则，以**规模化高效训练**为架构目标。
+HyperParallel-RL 是面向 LLM、VLM、世界模型、具身智能和 Agentic AI 的强化学习框架，以**极简易用、易于扩展、昇腾亲和**为设计原则，以**规模化高效训练**为架构目标。
 
-用户通过 Python 定义任务、交互、工具与奖励，基础策略优化与多轮 Agent 交互复用同一训练链路。HyperParallel 承载并行训练，vLLM 承载采样，hyperparallel-RL 通过显式编排、统一轨迹与策略发布连接两者。
+用户通过 Python 定义任务、交互、工具与奖励，基础策略优化与多轮 Agent 交互复用同一训练链路。HyperParallel 承载并行训练，vLLM 承载采样，HyperParallel-RL 通过显式编排、统一轨迹与策略发布连接两者。
 
 > **实验版本**：当前验证范围为单节点 Ascend NPU、同步 GRPO、Qwen3 dense 及部分 MoE 路径。异步、多模态、世界模型与具身智能的端到端训练尚未提供。具体能力与验证状态见[支持范围](#支持范围)。
 
@@ -31,7 +31,7 @@ hyperparallel-RL 是面向 LLM、VLM、世界模型、具身智能和 Agentic AI
 <!-- markdownlint-disable-next-line MD033 -->
 <a id="why-hyper-rl"></a>
 
-## 🌟 Why hyperparallel-RL
+## 🌟 Why HyperParallel-RL
 
 ### 🪶 极简易用
 
@@ -40,7 +40,7 @@ hyperparallel-RL 是面向 LLM、VLM、世界模型、具身智能和 Agentic AI
 - **精简技术栈**：HyperParallel 负责训练与并行，vLLM 负责采样；同步训练直接编排，无需 Ray。
 - **显式训练流程**：SyncTrainer 组织采样、学习、权重发布、评估与恢复，便于追踪执行和定位问题。
 - **明确的运行起点**：提供[固定运行镜像](docs/hyper_rl_runtime_image.md)、模型配置与启动脚本，通过 Qwen3-4B [单步检查](#快速开始)验证训练链路。
-- **人类可读，Agent 可追踪**：人类通过[功能导航](../../docs/rl-navigation.md)定位配置、实现与测试；开发 Agent 从 [AGENTS.md](../../AGENTS.md) 进入 [hyperparallel-RL 规则](../../.agent/rules/hyper-rl.md)，按任务读取同一套权威文档。
+- **人类可读，Agent 可追踪**：人类通过[功能导航](../../docs/rl-navigation.md)定位配置、实现与测试；开发 Agent 从 [AGENTS.md](../../AGENTS.md) 进入 [HyperParallel-RL 规则](../../.agent/rules/hyper-rl.md)，按任务读取同一套权威文档。
 
 ### 🧩 易于扩展
 
@@ -59,7 +59,7 @@ hyperparallel-RL 是面向 LLM、VLM、世界模型、具身智能和 Agentic AI
 - **共卡与分离部署**：Qwen3 dense 支持训推共卡或独立设备部署，分别通过 NPU IPC、HCCL 发布权重；共卡按阶段释放与恢复采样侧资源。MoE 当前限于共卡，见[支持范围](#支持范围)。
 - **流式权重同步**：分桶传输与确认后释放缓冲控制临时内存占用；显式 direct-reshard 按训推分片交集传输参数，同时保留 full-gather 路径。见 [vLLM Rollout](docs/vllm_rollout.md)。
 
-底层优化基础还包括 HyperParallel 的[单边通信与多核 MoE 通算重叠](../../docs/guide/multicore_moe.md)，其 hyperparallel-RL 接入与端到端收益待验证。
+底层优化基础还包括 HyperParallel 的[单边通信与多核 MoE 通算重叠](../../docs/guide/multicore_moe.md)，其 HyperParallel-RL 接入与端到端收益待验证。
 
 ### 🔗 训推一致性
 
@@ -78,9 +78,9 @@ Bit-Exact 默认关闭，已验证范围为单节点 Ascend、BF16/eager、Qwen3
 
 ## 🏗️ 架构
 
-![hyperparallel-RL 同步架构：任务扩展、vLLM 采样、统一轨迹、HyperParallel 训练与策略发布](docs/assets/hyper-rl-architecture.svg)
+![HyperParallel-RL 同步架构：任务扩展、vLLM 采样、统一轨迹、HyperParallel 训练与策略发布](docs/assets/hyper-rl-architecture.svg)
 
-用户扩展定义任务与学习目标，hyperparallel-RL 核心组织训练闭环，基础设施承载推理与并行训练。实线箭头表示采样到策略发布的循环，虚线表示扩展入口。
+用户扩展定义任务与学习目标，HyperParallel-RL 核心组织训练闭环，基础设施承载推理与并行训练。实线箭头表示采样到策略发布的循环，虚线表示扩展入口。
 
 组件与状态边界见[架构文档](docs/architecture.md)，配置、实现与测试入口见[功能导航](../../docs/rl-navigation.md)。
 
@@ -176,7 +176,7 @@ export HYPER_AGENTIC_TASK=search_r1
 
 ## 🧩 扩展与定制
 
-hyperparallel-RL 提供任务、数据与算法层的扩展入口。单轮任务与多轮 Agent 交互共用训练链路；涉及训练机制的定制，可基于 fork 修改相应模块。
+HyperParallel-RL 提供任务、数据与算法层的扩展入口。单轮任务与多轮 Agent 交互共用训练链路；涉及训练机制的定制，可基于 fork 修改相应模块。
 
 | 扩展范围 | 实现入口 |
 | --- | --- |
@@ -294,7 +294,7 @@ MoE 的具体配置与验收见[模型文档](docs/moe_models.md)；规划依赖
 | 文档 | 内容 |
 | --- | --- |
 | [设计目标与原则](docs/design.md) | 基础设施选型、模块边界与扩展取舍 |
-| [hyperparallel-RL 架构](docs/architecture.md) | 组件、数据合同、训练生命周期和边界 |
+| [HyperParallel-RL 架构](docs/architecture.md) | 组件、数据合同、训练生命周期和边界 |
 | [vLLM Rollout](docs/vllm_rollout.md) | 资源归属、采样准入、权重事务与失败语义 |
 | [交付计划](docs/TODO.md) | 阶段任务、依赖关系与验收标准 |
 
@@ -313,13 +313,13 @@ MoE 的具体配置与验收见[模型文档](docs/moe_models.md)；规划依赖
 
 ## 📝 Citation
 
-如使用 hyperparallel-RL，可引用以下软件条目，并在实验中注明所用 commit。
+如使用 HyperParallel-RL，可引用以下软件条目，并在实验中注明所用 commit。
 
 ```bibtex
 @software{hyper_rl_2026,
-  title = {hyperparallel-RL: A Lightweight, Extensible Reinforcement Learning Framework},
+  title = {HyperParallel-RL: A Lightweight, Extensible Reinforcement Learning Framework},
   year  = {2026},
   url   = {https://gitcode.com/mindspore/hyper-parallel},
-  note  = {hyperparallel-RL module in the HyperParallel repository}
+  note  = {HyperParallel-RL module in the HyperParallel repository}
 }
 ```

@@ -8,7 +8,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 
 ---
 
-## hyperparallel-RL Entry
+## HyperParallel-RL Entry
 
 - For RL-owned code, docs, or agent rules, start with `.agent/rules/hyper-rl.md`. It is the sole RL entry.
 - RL rules do not apply to other HyperParallel modules. Handle a required main-project change separately under that module's rules.

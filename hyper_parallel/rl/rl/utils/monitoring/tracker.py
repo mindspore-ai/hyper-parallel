@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Rank-zero fan-out across configured hyperparallel-RL monitoring backends."""
+"""Rank-zero fan-out across configured HyperParallel-RL monitoring backends."""
 
 from typing import Any, Mapping, Optional, Sequence
 

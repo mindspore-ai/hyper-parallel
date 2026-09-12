@@ -1,7 +1,7 @@
 <!-- markdownlint-disable MD033 -->
 <h1 align="center">
-  <img src="docs/assets/hyper-rl-logo.svg" width="120" height="80" alt="hyperparallel-RL logo"><br>
-  hyperparallel-RL · Experimental
+  <img src="docs/assets/hyper-rl-logo.svg" width="120" height="80" alt="HyperParallel-RL logo"><br>
+  HyperParallel-RL · Experimental
 </h1>
 
 <p align="center"><strong>A lightweight, extensible reinforcement learning framework.</strong></p>
@@ -12,15 +12,15 @@
 
 <p align="center"><a href="README.md">中文</a> | <strong>English</strong></p>
 
-<p align="center"><a href="#why-hyper-rl">Why hyperparallel-RL</a> · <a href="#architecture">Architecture</a> · <a href="#installation-and-environment">Installation</a> · <a href="#quick-start">Quick Start</a> · <a href="#extensions-and-customization">Customization</a> · <a href="#supported-capabilities">Capabilities</a> · <a href="#documentation">Documentation</a> · <a href="#citation">Citation</a>
+<p align="center"><a href="#why-hyper-rl">Why HyperParallel-RL</a> · <a href="#architecture">Architecture</a> · <a href="#installation-and-environment">Installation</a> · <a href="#quick-start">Quick Start</a> · <a href="#extensions-and-customization">Customization</a> · <a href="#supported-capabilities">Capabilities</a> · <a href="#documentation">Documentation</a> · <a href="#citation">Citation</a>
 </p>
 <!-- markdownlint-enable MD033 -->
 
 ---
 
-hyperparallel-RL is a reinforcement learning framework for LLMs, VLMs, world models, embodied intelligence, and agentic AI. Its design principles are **simple to use, easy to extend, and Ascend-friendly**, with **scalable, efficient training** as its architectural goal.
+HyperParallel-RL is a reinforcement learning framework for LLMs, VLMs, world models, embodied intelligence, and agentic AI. Its design principles are **simple to use, easy to extend, and Ascend-friendly**, with **scalable, efficient training** as its architectural goal.
 
-Users define tasks, interactions, tools, and rewards in Python. Basic policy optimization and multi-turn agent interactions share a training pipeline. HyperParallel handles parallel training, vLLM handles sampling, and hyperparallel-RL connects them through explicit orchestration, shared trajectories, and policy publication.
+Users define tasks, interactions, tools, and rewards in Python. Basic policy optimization and multi-turn agent interactions share a training pipeline. HyperParallel handles parallel training, vLLM handles sampling, and HyperParallel-RL connects them through explicit orchestration, shared trajectories, and policy publication.
 
 > **Experimental:** Current validation covers single-node Ascend NPUs, synchronous GRPO, Qwen3 dense, and selected MoE paths. End-to-end asynchronous, multimodal, world-model, and embodied-intelligence training is not yet available. See [supported capabilities](#supported-capabilities) for scope and validation status.
 
@@ -31,7 +31,7 @@ Users define tasks, interactions, tools, and rewards in Python. Basic policy opt
 <!-- markdownlint-disable-next-line MD033 -->
 <a id="why-hyper-rl"></a>
 
-## 🌟 Why hyperparallel-RL
+## 🌟 Why HyperParallel-RL
 
 ### 🪶 Simple to use
 
@@ -40,7 +40,7 @@ Fewer deployment dependencies and a training flow that is easy to follow and run
 - **A minimal stack:** HyperParallel handles training and parallelism; vLLM handles sampling. Synchronous training uses direct orchestration without Ray.
 - **An explicit training flow:** SyncTrainer organizes sampling, learning, weight publication, evaluation, and recovery, making execution easier to trace and debug.
 - **A clear starting point:** A [pinned runtime image](docs/hyper_rl_runtime_image.md), model configurations, and launch scripts support a Qwen3-4B [single-step check](#quick-start) of the training pipeline.
-- **Human-readable, agent-traceable:** Developers use the [feature navigation](../../docs/rl-navigation.md) to locate configurations, implementations, and tests. Coding agents enter through [AGENTS.md](../../AGENTS.md) and the [hyperparallel-RL rules](../../.agent/rules/hyper-rl.md), reading the same authoritative documentation as needed.
+- **Human-readable, agent-traceable:** Developers use the [feature navigation](../../docs/rl-navigation.md) to locate configurations, implementations, and tests. Coding agents enter through [AGENTS.md](../../AGENTS.md) and the [HyperParallel-RL rules](../../.agent/rules/hyper-rl.md), reading the same authoritative documentation as needed.
 
 ### 🧩 Easy to extend
 
@@ -59,7 +59,7 @@ Organize training and sampling around Ascend computation, memory, and communicat
 - **Colocated and disjoint deployment:** Qwen3 dense supports shared or separate training/inference devices, publishing weights through NPU IPC or HCCL respectively. Colocated deployment releases and restores inference resources by phase. MoE currently requires colocation; see [supported capabilities](#supported-capabilities).
 - **Streaming weight synchronization:** Bucketed transfer and buffer release after acknowledgment bound temporary memory use. Explicit direct-reshard transfers parameter intersections between training and inference shards; full-gather remains available. See [vLLM Rollout](docs/vllm_rollout.md).
 
-HyperParallel also provides [one-sided communication and multicore MoE communication–computation overlap](../../docs/guide/multicore_moe.md) as a foundation for further optimization. hyperparallel-RL integration and end-to-end benefits remain to be validated.
+HyperParallel also provides [one-sided communication and multicore MoE communication–computation overlap](../../docs/guide/multicore_moe.md) as a foundation for further optimization. HyperParallel-RL integration and end-to-end benefits remain to be validated.
 
 ### 🔗 Training–inference consistency
 
@@ -78,9 +78,9 @@ Bit-Exact is disabled by default and validated for single-node Ascend, BF16/eage
 
 ## 🏗️ Architecture
 
-![hyperparallel-RL synchronous architecture: task extensions, vLLM sampling, shared trajectories, HyperParallel training, and policy publication](docs/assets/hyper-rl-architecture.svg)
+![HyperParallel-RL synchronous architecture: task extensions, vLLM sampling, shared trajectories, HyperParallel training, and policy publication](docs/assets/hyper-rl-architecture.svg)
 
-User extensions define tasks and learning objectives; the hyperparallel-RL core organizes the training loop; infrastructure handles inference and parallel training. Solid arrows show the sampling-to-publication loop, and dashed lines mark extensions. Diagram labels are currently in Chinese.
+User extensions define tasks and learning objectives; the HyperParallel-RL core organizes the training loop; infrastructure handles inference and parallel training. Solid arrows show the sampling-to-publication loop, and dashed lines mark extensions. Diagram labels are currently in Chinese.
 
 See [Architecture](docs/architecture.md) for component and state boundaries, and [feature navigation](../../docs/rl-navigation.md) for configurations, implementations, and tests.
 
@@ -176,7 +176,7 @@ Other entry points: [Programmatic agents](docs/agentic_rl.md) · [Deployment and
 
 ## 🧩 Extensions and customization
 
-hyperparallel-RL exposes task, data, and algorithm extension points. Single-turn tasks and multi-turn agent interactions share the training pipeline. Training mechanisms can be customized by modifying the relevant modules in a fork.
+HyperParallel-RL exposes task, data, and algorithm extension points. Single-turn tasks and multi-turn agent interactions share the training pipeline. Training mechanisms can be customized by modifying the relevant modules in a fork.
 
 | Extension | Implementation entry point |
 | --- | --- |
@@ -296,7 +296,7 @@ Linked product documentation is currently primarily in Chinese. Both README edit
 | Document | Contents |
 | --- | --- |
 | [Design Goals and Principles](docs/design.md) | Infrastructure choices, module boundaries, and extension tradeoffs |
-| [hyperparallel-RL Architecture](docs/architecture.md) | Components, data contracts, training lifecycle, and boundaries |
+| [HyperParallel-RL Architecture](docs/architecture.md) | Components, data contracts, training lifecycle, and boundaries |
 | [vLLM Rollout](docs/vllm_rollout.md) | Resource ownership, sampling admission, weight transactions, and failure semantics |
 | [Delivery Plan](docs/TODO.md) | Milestones, dependencies, and acceptance criteria |
 
@@ -315,13 +315,13 @@ Linked product documentation is currently primarily in Chinese. Both README edit
 
 ## 📝 Citation
 
-If you use hyperparallel-RL, you can cite the software below and record the commit used in your experiments.
+If you use HyperParallel-RL, you can cite the software below and record the commit used in your experiments.
 
 ```bibtex
 @software{hyper_rl_2026,
-  title = {hyperparallel-RL: A Lightweight, Extensible Reinforcement Learning Framework},
+  title = {HyperParallel-RL: A Lightweight, Extensible Reinforcement Learning Framework},
   year  = {2026},
   url   = {https://gitcode.com/mindspore/hyper-parallel},
-  note  = {hyperparallel-RL module in the HyperParallel repository}
+  note  = {HyperParallel-RL module in the HyperParallel repository}
 }
 ```

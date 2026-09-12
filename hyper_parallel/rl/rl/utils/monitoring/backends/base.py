@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Stable interface implemented by hyperparallel-RL monitoring backends."""
+"""Stable interface implemented by HyperParallel-RL monitoring backends."""
 
 from typing import Any, Mapping, Protocol, Sequence
 

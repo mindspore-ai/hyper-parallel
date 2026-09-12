@@ -1,4 +1,4 @@
-# hyperparallel-RL PR1354 ST 设计与运行
+# HyperParallel-RL PR1354 ST 设计与运行
 
 ## 目标与边界
 

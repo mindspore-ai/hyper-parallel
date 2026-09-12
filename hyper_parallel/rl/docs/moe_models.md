@@ -1,6 +1,6 @@
 # MoE 模型
 
-hyperparallel-RL 支持 Qwen3-30B-A3B 和 DeepSeek-V3 family 的 Moonlight-16B-A3B-Instruct，使用固定运行镜像中的
+HyperParallel-RL 支持 Qwen3-30B-A3B 和 DeepSeek-V3 family 的 Moonlight-16B-A3B-Instruct，使用固定运行镜像中的
 Transformers 5.5.4、vLLM/vLLM-Ascend。模型识别来自 checkpoint 的 `config.json`，不依赖本地目录名称。
 环境准备和镜像挂载见 [README](../README.md)，共享运行时与事务合同见 [vLLM Rollout](vllm_rollout.md)。
 

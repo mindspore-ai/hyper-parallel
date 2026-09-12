@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="810" viewBox="0 0 1200 810" role="img" aria-labelledby="title desc">
-<title id="title">hyperparallel-RL：三层架构与同步训练闭环</title>
-<desc id="desc">用户通过 Python 扩展任务、交互、工具、奖励与算法。hyperparallel-RL 核心由 SyncTrainer 显式编排采样、统一轨迹、学习与策略发布。vLLM 承载推理采样，HyperParallel 承载模型训练与并行。原始 token 保真，更新前可选 Bit-Exact 校验，策略发布完成后恢复采样。</desc>
+<title id="title">HyperParallel-RL：三层架构与同步训练闭环</title>
+<desc id="desc">用户通过 Python 扩展任务、交互、工具、奖励与算法。HyperParallel-RL 核心由 SyncTrainer 显式编排采样、统一轨迹、学习与策略发布。vLLM 承载推理采样，HyperParallel 承载模型训练与并行。原始 token 保真，更新前可选 Bit-Exact 校验，策略发布完成后恢复采样。</desc>
 <defs>
 <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#536b89"/></marker>
 <marker id="blue" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#3577c5"/></marker>
@@ -13,7 +13,7 @@ text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Micr
 </style>
 </defs>
 <rect width="1200" height="810" rx="20" fill="#f8fafc"/>
-<text x="36" y="46" class="heading">hyperparallel-RL</text>
+<text x="36" y="46" class="heading">HyperParallel-RL</text>
 <text x="1164" y="43" text-anchor="end" class="body">当前同步架构</text>
 
 <rect x="32" y="72" width="1136" height="134" rx="16" fill="#f4f0f9" stroke="#e4daee"/>
@@ -30,7 +30,7 @@ text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Micr
 <path d="M275 206V240M659 206V240M984 206V240" class="extension"/>
 
 <rect x="32" y="240" width="1136" height="330" rx="16" fill="white" stroke="#cbd8e7"/>
-<text x="54" y="270" class="layer">hyperparallel-RL 核心</text>
+<text x="54" y="270" class="layer">HyperParallel-RL 核心</text>
 <rect x="54" y="285" width="1092" height="51" rx="10" fill="#20354e"/>
 <text x="76" y="317" class="title" style="fill:white">SyncTrainer · 显式编排</text>
 <text x="1124" y="316" text-anchor="end" class="body" style="fill:#d7e5f4">YAML / CLI 入口 · 评估与恢复 · 同步无需 Ray</text>

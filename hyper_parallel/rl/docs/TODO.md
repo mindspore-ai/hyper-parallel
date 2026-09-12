@@ -1,4 +1,4 @@
-# hyperparallel-RL 交付计划
+# HyperParallel-RL 交付计划
 
 **目标：以精简、可扩展的核心，支持从基础强化学习到多轮 Agent、多模态与大规模异步训练。**
 

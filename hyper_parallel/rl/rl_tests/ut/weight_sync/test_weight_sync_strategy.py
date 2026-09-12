@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU unit tests for hyperparallel-RL weight-sync strategy selection."""
+"""CPU unit tests for HyperParallel-RL weight-sync strategy selection."""
 
 import pytest
 
