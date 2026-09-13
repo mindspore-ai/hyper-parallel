@@ -1,0 +1,185 @@
+schema_version: 1
+integration:
+  model_id: deepseek-ai/DeepSeek-V4.1-Flash
+  task: causal_language_modeling
+  mode: cropped_from_config
+  hyper_parallel_commit: 08901cba5dbed4a849970c9ded8482cb974ab79a
+  source:
+    local_path: /home/ma-user/work/y00512198/DeepSeek-V4.1-Flash
+    revision: dba1be0a40aa45a94ad051997016db3960a90277
+    config_sha256: 8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879
+    tokenizer_sha256: c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b
+    download_status: source_and_lfs_pointers_only
+    checkpoint_weights_available: false
+  comparison_baseline:
+    model_id: DeepSeek-V4-Flash-0731
+    revision: 7872f01b1d1fe23eabc4c98b48bffcef5a386062
+    inference_source_sha256: c0c19e6c9fa439bac7fbb1c5bc1868232dfd5aa2f439a548d0e33dcc2a9edd3f
+  transformers:
+    version: 5.13.0
+    import_path: /home/ma-user/work/y00512198/hyper-parallel-nongit-20260910/outputs/pythonpath/transformers-5.13.0
+config_mutations:
+  num_hidden_layers: {source: 40, validation: 4}
+  retained_text_layers: [0, 1, 2, 3]
+  engram_layers: {source: [1, 14], validation: [1]}
+  engram_bucket_base: {source: 16000000, validation: 4096}
+  engram_num_embeddings:
+    source: [384006168, 384016682]
+    validation: [100776]
+    validation_padded_for_ep16: [100784]
+  engram_invariants:
+    max_ngram_size: 4
+    hash_heads: 8
+    head_dim: 256
+    normalized_vocabulary_size: 99092
+    synchronized_fields: [prime_moduli, bucket_offsets, num_embeddings]
+  compress_ratios: [0, 0, 2, 2]
+  kv_source_layers: [2]
+  index_source_layers: [2, 3]
+  candidate_source_layer: 2
+  candidate_topk_blocks: {source: 2048, validation: 128}
+  candidate_block_size: 8
+  candidate_positions: {source: 16384, validation: 1024}
+  index_topk: 512
+  indexer_loss_coeff: 0.001
+  indexer_loss_coeff_status: validation_only_not_published_by_v41
+  routing: learned_moe_on_every_retained_layer
+  parameter_initialization: random
+data:
+  mode: online
+  path: output/training_demo/deepseek_v41/online_4k.jsonl
+  sha256: 68bbf4588ad4a56b51a7e09a1c4998af7f0b54bd0ddb4ee937178957f779dd4b
+  tokenizer_path: /home/ma-user/work/y00512198/DeepSeek-V4.1-Flash
+  sequence_length: 4096
+  packing: online_best_fit_with_compact_sample_boundaries
+  sample_alignment: 2
+  create_attention_mask_in_dataloader: true
+  labels_are_shifted: true
+  offline_dataset_path: null
+engram_assets:
+  path: output/training_demo/deepseek_v41/engram_validation.json
+  sha256: 409ea31125e9690d0af1b6a91d0c32e1435023c7f71278807e2feff997aa2290
+capabilities:
+  registry: lazy_family_discovery_and_custom_causal_lm
+  replacements:
+    - all_retained_attention_modules
+    - all_retained_mhc_modules
+    - layer_1_engram_module
+  weight_transforms: none
+  tensor_parallel: [1, 2]
+  tensor_parallel_sequence_parallel:
+    tp1: false
+    tp2: true
+  context_parallel:
+    engram_component: implemented_and_distributed_tested
+    shared_compressed_attention: async_kv_all_gather_with_packed_boundaries_distributed_tested
+    algorithm: colossal
+    supported_degrees: [1, 2]
+  csa2_modes: [full, reindex, reuse]
+  hierarchical_candidate_indexer: implemented
+  indexer_training_loss: selected_topk_kl_pangu_style
+  packed_attention: compact_sample_boundaries_without_dense_s2_mask
+  expert_parallel: 16
+  fsdp:
+    tp1: 16
+    tp2: 8
+    cp2: 16
+  loss_parallel: false
+  runtime_kv_cache: inference_only_not_in_training_scope
+  fp4_kv_and_indexer_qat: unsupported
+  explicit_dense_attention_mask: rejected_use_compact_packed_metadata
+precision:
+  model_init_dtype: float32
+  fsdp_param_dtype: bfloat16
+  fsdp_reduce_dtype: float32
+  fsdp_output_dtype: bfloat16
+  cast_forward_inputs: false
+  fp32_main_params: true
+validation:
+  expected_order: [tp1_ep16_fsdp16, tp2_ep16_fsdp8, cp2_ep16_fsdp16]
+  sequence_length: 4096
+  train_iterations: 1
+  completed_tests:
+    - name: focused_cpu_engram_shared_attention
+      command: >-
+        PYTHONPATH=<transformers-5.13.0>:$PWD pytest -q
+        tests/ut/auto_models/models/deepseek_v41/test_deepseek_v41_crop.py
+      result: 18_passed
+    - name: engram_ep_cp_distributed
+      command: pytest -q tests/torch/expert_parallel/test_engram_parallel.py
+      result: 1_passed
+    - name: shared_compressed_dsa_cp_distributed
+      command: >-
+        PYTHONPATH=<transformers-5.13.0>:$PWD pytest -q
+        tests/torch/context_parallel/test_deepseek_v41_dsa_cp.py
+      result: 1_passed_2_process_gloo_packed_cp_and_tp_indexer_gradients
+    - name: planner_regression_selection
+      command: >-
+        pytest -q tests/ut/auto_models/test_public_api.py
+        tests/ut/dual_mode_dtensor/test_ep_moe_local_region.py
+        tests/ut/dual_mode_dtensor/test_foundation_placement_role.py
+        tests/ut/dual_mode_dtensor/test_plan_overrides.py
+        tests/ut/dual_mode_dtensor/test_planner_arch_flow.py
+        tests/ut/dual_mode_dtensor/test_planner_golden_plans.py
+        tests/ut/dual_mode_dtensor/test_precompiled_boundary.py
+      result: 72_passed
+    - name: generic_expert_parallel_unit
+      command: pytest -q tests/ut/core/expert_parallel/test_expert_parallel.py
+      result: 67_passed
+    - name: tp1_ep16_fsdp16_online_4k
+      command: bash examples/training_demo/run_deepseek_v41_online.sh <model_path> tp1
+      result: passed
+      log: output/training_demo/deepseek_v41/run_tp1.log
+      metrics:
+        foundation_loss: 12.8242
+        grad_norm: 67.3168
+        step_time_seconds: 19.8277
+        max_allocated_gb: 50.0054
+        max_reserved_gb: 60.0371
+    - name: tp2_ep16_fsdp8_online_4k
+      command: bash examples/training_demo/run_deepseek_v41_online.sh <model_path> tp2
+      result: passed
+      log: output/training_demo/deepseek_v41/run_tp2.log
+      sequence_parallel: true
+      metrics:
+        foundation_loss: 12.625
+        grad_norm: 67.3998
+        step_time_seconds: 15.9357
+        max_allocated_gb: 43.9169
+        max_reserved_gb: 58.9805
+    - name: cp2_ep16_fsdp16_online_4k
+      command: bash examples/training_demo/run_deepseek_v41_online.sh <model_path> cp2
+      result: passed
+      log: output/training_demo/deepseek_v41/run_cp2.log
+      sequence_parallel: false
+      metrics:
+        foundation_loss: 13
+        grad_norm: 67.8727
+        step_time_seconds: 14.8038
+        max_allocated_gb: 44.9848
+        max_reserved_gb: 58.9805
+  pending_tests: []
+  telemetry_notes:
+    - The environment callback reported zero Online token/sample counters in both successful runs.
+    - >-
+      Nonzero loss and gradients confirm that each optimizer step consumed a batch;
+      throughput is not acceptance evidence.
+    - >-
+      TP2 with sequence_parallel=false reached optimizer.step but exhausted device memory;
+      enabling the PanGu-aligned sequence-parallel path completed and reduced peak allocation.
+    - >-
+      One TP1 attempt completed backward but hit an HCCL EJ0003 port collision while lazily
+      creating the existing gradient-clip communicator; cleanup and an identical rerun passed.
+    - CP2 completed on 16 NPU devices; the one-step smoke did not collect a communication-overlap timeline.
+    - The remaining integer ArgSort AiCPU warning comes from the generic EP dispatcher, not the DSA indexer.
+  repository_check:
+    command: python3 .agent/skills/autogit/scripts/autogit.py check
+    result: blocked_before_checks
+    reason: npm failed to install markdownlint-cli2 because of SELF_SIGNED_CERT_IN_CHAIN
+limitations:
+  - Online data is functional smoke evidence, not formal precision acceptance.
+  - No checkpoint tensors were downloaded, converted, or loaded.
+  - Vision, DSpark, later source groups, PP-stage shadow indexers, and the second Engram layer are cropped out.
+  - V4.1 does not publish the production Indexer loss coefficient; the smoke value is validation-only.
+  - Runtime KV cache and SWA bounded replay are inference or rollout concerns, not this full-sequence training forward.
+  - Main-KV E2M1 and Indexer-QK MXFP4 QAT are required for formal post-training fidelity but are not implemented.

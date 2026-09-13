@@ -1083,7 +1083,7 @@ def test_router_and_expert_utils(tiny_hf_native_moe, tiny_hf_batched_moe):
             self.local_expert_count = 1
             self.gate_up_proj = nn.Parameter(torch.randn(1, 8, 4))
             self.down_proj = nn.Parameter(torch.randn(1, 4, 4))
-            self.ep_act_fn = torch.tanh
+            self._ep_act_fn = torch.tanh
 
     experts = Experts()
     hidden_states = torch.randn(3, 4)
