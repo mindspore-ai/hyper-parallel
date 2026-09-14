@@ -28,6 +28,7 @@ import logging
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING, Any
 
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
@@ -296,12 +297,31 @@ class FSDP2Manager:
                 wrapped_module_ids,
             )
         )
+        wrap_modules.extend(self._find_extra_wrap_modules(model, wrapped_module_ids))
         if not wrap_modules:
             raise ValueError(
                 "wrap_policy='transformer_block' did not find a non-empty "
                 "block container under an HF gradient_checkpointing module"
             )
         return wrap_modules
+
+    def _find_extra_wrap_modules(
+        self, model: ModuleClass, wrapped_module_ids: set[int],
+    ) -> list[_WrapModuleInfo]:
+        """Select shallowest matches per glob, without also wrapping their descendants."""
+        selected = []
+        modules = dict(model.named_modules())
+        for pattern in self.config.extra_wrap_modules:
+            matches = [(fqn, module) for fqn, module in modules.items() if fnmatchcase(fqn, pattern)]
+            if not matches or any(not fqn for fqn, _ in matches):
+                raise ValueError(f"extra_wrap_modules pattern must match non-root modules: {pattern!r}")
+            for fqn, module in matches:
+                if any(fqn.startswith(f"{parent_fqn}.") for parent_fqn, _ in matches):
+                    continue
+                if id(module) not in wrapped_module_ids:
+                    selected.append(_WrapModuleInfo(fqn, module))
+                    wrapped_module_ids.add(id(module))
+        return selected
 
     @staticmethod
     def _resolve_parameter_owners(

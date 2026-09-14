@@ -214,13 +214,16 @@ def _prepare_ep_dispatch(
     global_expert_count: int,
     ep_size: int,
     ep_group: Any,
+    preserve_router_dtype: bool = False,
 ):
     """Sort routed tokens and exchange per-rank dispatch counts."""
     flattened_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     token_count = flattened_states.shape[0]
     experts_per_token = topk_indices.shape[1]
     expert_indices = topk_indices.reshape(-1)
-    expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
+    expert_weights = topk_weights.reshape(-1)
+    if not preserve_router_dtype:
+        expert_weights = expert_weights.to(flattened_states.dtype)
     source_indices = torch.arange(token_count, device=flattened_states.device).repeat_interleave(experts_per_token)
     destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
     dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort()
@@ -283,6 +286,7 @@ def ep_routed_forward(
     *,
     router_fn: Callable,
     ep_group: Any,
+    preserve_router_dtype: bool = False,
 ) -> torch.Tensor:
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
@@ -341,6 +345,7 @@ def ep_routed_forward(
         global_expert_count=global_expert_count,
         ep_size=ep_size,
         ep_group=ep_group,
+        preserve_router_dtype=preserve_router_dtype,
     )
     (
         source_token_indices,

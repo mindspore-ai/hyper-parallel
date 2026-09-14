@@ -19,7 +19,7 @@ Stub — provides from_pretrained/from_config as entry points.
 """
 
 import logging
-from typing import Any, Literal, Optional, Union
+from typing import Any, Callable, Literal, Optional, Union
 
 import torch
 from transformers import (
@@ -169,11 +169,14 @@ class _BaseHyperAutoModelClass:
         swap_inputs: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        model_initializer: Optional[Callable[[torch.nn.Module], None]] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
         """Build model from PretrainedConfig (no weight loading).
 
-        Following design doc 01 §6.1.
+        Following design doc 01 §6.1. ``model_initializer`` optionally replaces
+        native initialization after meta materialization; it must initialize
+        the final sharded parameter layout without gathering the whole model.
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
@@ -200,6 +203,7 @@ class _BaseHyperAutoModelClass:
             attn_implementation=attn_implementation,
             validate_placement=validate_placement,
             load_base_model=False,
+            model_initializer=model_initializer,
             distributed_setup=distributed_setup,
             qat_config=qat_config,
             fp8_config=fp8_config,
@@ -237,6 +241,7 @@ class _BaseHyperAutoModelClass:
         swap_inputs: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        model_initializer: Optional[Callable[[torch.nn.Module], None]] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Core model building orchestration.
@@ -308,6 +313,7 @@ class _BaseHyperAutoModelClass:
             swap_inputs=swap_inputs,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
+            model_initializer=model_initializer,
         )
 
         model.train()

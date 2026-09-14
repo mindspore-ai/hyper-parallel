@@ -1,0 +1,96 @@
+# Full-width Kimi image/text smoke training; run through debug/kimi_k26_pretrain/run.sh.
+model:
+  _target_: hyper_parallel.models.kimi_k26.build.build_kimi_k26_for_pretraining
+  config_path: Kimi-K2.6
+  num_hidden_layers: 3
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  num_vision_layers: 2
+training:
+  logging_steps: 1
+  train_iters: 3
+  train_samples: null
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: false
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+fsdp_config:
+  dp_shard_size: 8
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 0
+  backward_prefetch_depth: 0
+  comm_fusion: false
+  extra_wrap_modules:
+  - language_model.model.layers.*.mlp.experts.*
+  edp_shard_size: 1
+plan_overrides:
+- match: '*.mlp'
+  when: ep
+  region_dispatch: false
+  local_compute_fn:
+    _target_: hyper_parallel.models.kimi_k26.expert_parallel.kimi_k26_moe_compute_fn
+    use_grouped_gemm: false
+mixed_precision:
+  enabled: false
+activation_checkpoint:
+  mode: 'off'
+activation_swap: none
+compile:
+  enabled: false
+dataset:
+  _target_: smoke_data.build_smoke_dataset
+  config_path: Kimi-K2.6
+  data_config:
+    seq_length: 4096
+    image_grid_height: 16
+    image_grid_width: 16
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.vlm.build_vlm_collator
+  get_batch:
+    _target_: hyper_parallel.data.vlm.build_vlm_get_batch
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  no_decay_params:
+  - bias
+  - norm
+  adamw_config:
+    adamw_lr: 1.0e-05
+    adamw_weight_decay: 0.01
+    adamw_betas:
+    - 0.9
+    - 0.95
+    adamw_eps: 1.0e-08
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-05
+    lr_warmup_steps: 1
+    min_lr: 0.0
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: debug/kimi_k26_pretrain/configs/vlm
