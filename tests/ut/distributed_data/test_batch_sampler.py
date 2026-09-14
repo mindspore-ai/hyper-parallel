@@ -202,7 +202,7 @@ class TestNativeBatchSampler(unittest.TestCase):
             )
 
     def test_metadata_reader_advances_only_on_complete_commit(self) -> None:
-        """Metadata-only reads retain the committed sampler cursor until delivery."""
+        """Metadata-only reads retain the committed sampler cursor until the batch is consumed."""
         sampler = _sampler()
         reader = BatchSamplerReader(
             sampler, reader_rank=0,

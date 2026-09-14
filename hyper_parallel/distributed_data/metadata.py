@@ -165,7 +165,7 @@ class MetadataReader:
         return tuple(self._buffer)
 
     def commit(self, selected_keys: set[SampleKey]) -> None:
-        """Remove selected metadata only after construction and delivery succeed.
+        """Remove selected metadata only after batch construction and broadcast succeed.
 
         Args:
             selected_keys: Keys of successfully consumed samples.

@@ -99,7 +99,7 @@ def _assert_loss_gradient_parity(
 
 
 def _run_epoch(prefix: str, mesh_context: object, double_buffer: bool) -> None:
-    """Check metadata-only Readers, direct Constructor reads, and TP delivery."""
+    """Check metadata-only Readers, direct Constructor reads, and TP batch broadcast."""
     rank = dist.get_rank()
     config = {
         "seq_length": 8, "split": "1, 0, 0", "mock_data": False,

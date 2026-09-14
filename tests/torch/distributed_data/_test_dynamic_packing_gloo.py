@@ -470,7 +470,7 @@ def _run_epoch(mesh: Any, dataset_reader_ranks: tuple[int, ...] | None) -> None:
         )
     for model_only_rank in set(range(_WORLD_SIZE)) - set(effective_readers):
         assert gathered_plans[model_only_rank] is None, (
-            f"A model-only rank must wait for MP delivery without joining planning: "
+            f"A model-only rank must wait for MP batch broadcast without joining planning: "
             f"rank={model_only_rank}, plan={gathered_plans[model_only_rank]!r}."
         )
     reference_plan = gathered_plans[effective_readers[0]]
@@ -724,7 +724,7 @@ def _assert_metadata_error_is_collective(mesh: Any) -> None:
 
 
 def test_dynamic_packing_dp2_mp2_gloo() -> None:
-    """Verify Dataset Reader, Planner, and Data Constructor delivery on DP=2/MP=2."""
+    """Verify sample reading, planning, construction, and MP batch broadcast on DP=2/MP=2."""
     dist.init_process_group(backend="gloo")
     try:
         world_size = dist.get_world_size()

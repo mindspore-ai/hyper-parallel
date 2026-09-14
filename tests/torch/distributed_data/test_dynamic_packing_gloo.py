@@ -29,7 +29,7 @@ _WORKER = str(Path(__file__).resolve().parent / "_test_dynamic_packing_gloo.py")
     essential_mark="essential",
 )
 def test_dynamic_packing_dp2_mp2_gloo() -> None:
-    """Run sample routing, MP delivery, exactly-once, and collective STOP coverage."""
+    """Run sample routing, MP batch broadcast, exactly-once, and collective STOP coverage."""
     torchrun_case(
         file_name=_WORKER,
         case_name="test_dynamic_packing_dp2_mp2_gloo",

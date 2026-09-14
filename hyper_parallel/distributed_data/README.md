@@ -115,8 +115,8 @@ each DP Constructor advances its native BatchSampler once
   -> balance only this frozen round (one complete Dataset output per bin)
   -> online: payload A2A / shared metadata: target reads, no payload A2A
   -> original collate_fn receives complete Dataset outputs
-  -> deliver the local batch to model-parallel peers
-  -> commit the native sampler cursor after delivery
+  -> broadcast the local batch to model-parallel peers
+  -> validate the batch, commit the native sampler cursor, and return the data
 ```
 
 For DP=2 and `local_batch_size=2`, if native samplers yield `[0, 1]` and
@@ -257,7 +257,7 @@ native HP BatchSampler selects each round's Dataset-index occurrences
   filtered/transformed Dataset index space, not the original JSON row numbers.
 - The HP VLM runtime currently requires **TP=CP=PP=1**; this integration keeps
   that boundary and supports DP. It does not add VLM packing, video/audio
-  adapters, or a new model-parallel batch-delivery implementation.
+  adapters, or a new model-parallel batch-broadcast implementation.
 - Omit `load_balance` to retain the native DataLoader. Enabled loaders own
   checkpoint cursors and epochs; VLMTrainer preserves a restored first-epoch
   cursor and waits for outstanding prefetch before distributed teardown.
@@ -367,7 +367,7 @@ HYPER_PARALLEL_PLATFORM=torch python -m pytest -q \
 ```
 
 The integration test creates real `.bin/.idx` files and verifies DP2/TP2
-delivery, index-only planning, no payload A2A, double buffering, and loss/gradient
+batch broadcast, index-only planning, no payload A2A, double buffering, and loss/gradient
 parity against independently evaluated documents with unequal valid-token
 counts. The unit tests cover weighted blending, persistent spawned workers,
 checkpoint replay, and the unchanged default GPT Dataset path.
@@ -382,11 +382,13 @@ stream across Dataset Readers. Iterable Datasets own their shuffle order, so
 use `shuffle=False` in this configuration.
 
 With `double_buffer=True`, the first iterator call constructs its batch before
-returning. After each successful delivery, a background thread prepares exactly
+returning. After each batch is returned, a background thread prepares exactly
 one subsequent distributed batch while the trainer consumes the current batch.
-The background path uses the dedicated data control, payload, and model-delivery
-process groups created by this package; it does not issue collectives on the
-trainer's process groups. The default is `False`.
+`_prepare_next_batch()` runs on that thread using the dedicated data control and
+payload process groups. `_broadcast_batch()` runs on the caller thread using the
+dedicated model-parallel batch group, then `_consume_batch()` validates the result,
+commits Reader progress, and returns the training data. These operations do not
+issue collectives on the trainer's process groups. The default is `False`.
 
 With this option enabled, `metadata_fn`, `pack_fn`, and `collate_fn` run on the
 prefetch thread and may overlap model execution. They must not mutate shared
@@ -431,7 +433,7 @@ used for a batch type without a compatible `to` method.
 
 Every rank must continue to call `next(loader)` in the same order because the
 distributed loader performs collective planning and model-parallel Host
-delivery. In that normal path, each rank moves its delivered local batch and a
+broadcast. In that normal path, each rank moves its received local batch and a
 separate CP rank-0 device broadcast is unnecessary. A legacy rank-0-only
 DataLoader may instead use `DeviceBatchPrefetcher` only on the source rank and
 call `wait()` before its existing device broadcast.

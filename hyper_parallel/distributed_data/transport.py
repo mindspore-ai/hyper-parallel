@@ -256,7 +256,7 @@ def create_data_groups(
         topology: Constructor and model-consumer topology.
         dataset_reader_ranks: Global ranks that materialize raw samples.
         planner_rank: Global rank that creates loading plans.
-        cpu_backend: Backend used for control and object delivery.
+        cpu_backend: Backend used for control and model-parallel batch broadcast.
         payload_backend: Optional backend for online payload A2A. When omitted
             with an accelerator communication device, the WORLD backend is used.
         communication_device: Optional rank-local device for payload tensors.
@@ -703,7 +703,7 @@ class ModelParallelTransport:
                 raise ValueError("A singleton model group requires a local ConstructedBatch.")
             return batch
         if not self._distributed or self._group is None:
-            raise ValueError("Multi-rank model delivery requires an initialized process group.")
+            raise ValueError("Multi-rank model broadcast requires an initialized process group.")
         if is_constructor and not isinstance(batch, ConstructedBatch):
             raise ValueError("The Data Constructor must provide a ConstructedBatch.")
         if not is_constructor and batch is not None:

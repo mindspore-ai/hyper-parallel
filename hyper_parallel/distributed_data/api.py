@@ -114,7 +114,7 @@ class DistributedDatasetConfig:
         double_buffer: Whether to prepare the next distributed local batch in
             a background thread while the trainer consumes the current batch.
         cpu_backend: torch.distributed backend for metadata/control and MP
-            object delivery.
+            batch broadcast.
         payload_backend: Optional payload A2A backend. With an
             accelerator communication device, the WORLD backend is used by default;
             otherwise this falls back to ``cpu_backend``.

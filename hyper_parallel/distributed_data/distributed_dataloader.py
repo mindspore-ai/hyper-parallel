@@ -89,7 +89,7 @@ class _PlanControl:
 
 @dataclass(frozen=True)
 class _PrefetchResult:
-    delivery: ConstructedBatch | None = None
+    batch: ConstructedBatch | None = None
     error: BaseException | None = None
     completed: bool = False
 
@@ -153,7 +153,7 @@ class DistributedDataLoader(Iterator[Any]):
     current Step Sample Selection, balances that exact set, moves payloads,
     constructs local batches, and broadcasts them to model-parallel peers.
     Optional double buffering runs the next transaction in a background thread
-    after the current batch has been delivered to the trainer.
+    after the current batch has been returned to the trainer.
     """
 
     def __init__(
@@ -228,41 +228,41 @@ class DistributedDataLoader(Iterator[Any]):
     def __next__(self) -> Any:
         """Collectively construct and return the next rank-local batch."""
         if self._double_buffer:
-            received = self._finish_prefetched_delivery(self._take_prefetched())
+            received = self._broadcast_batch(self._take_prefetched())
         else:
-            received = self._collect_next_delivery()
-        data = self._consume_delivery(received)
+            received = self._prepare_and_broadcast_batch()
+        data = self._consume_batch(received)
         if self._double_buffer:
             self._start_prefetch()
         return data
 
-    def _collect_next_delivery(self) -> ConstructedBatch:
-        """Run one complete distributed data transaction."""
+    def _prepare_and_broadcast_batch(self) -> ConstructedBatch:
+        """Prepare the next batch and broadcast it to model-parallel peers."""
         was_stopped = self._stopped
-        constructor_delivery = None
+        constructed_batch = None
         if self._data_plane.is_member:
-            constructor_delivery = self._produce_on_data_plane()
-        received = self._model_transport.broadcast(constructor_delivery)
+            constructed_batch = self._produce_on_data_plane()
+        received = self._model_transport.broadcast(constructed_batch)
         if was_stopped and not received.stopped:
             raise ValueError("Distributed DataLoader stopped state differs across model-parallel peers.")
         return received
 
-    def _collect_next_data_plane_delivery(self) -> ConstructedBatch | None:
-        """Prepare a batch without entering model-group collectives."""
+    def _prepare_next_batch(self) -> ConstructedBatch | None:
+        """Select, balance, route, and construct samples without model-group broadcast."""
         if self._data_plane.is_member:
             return self._produce_on_data_plane()
         return None
 
-    def _finish_prefetched_delivery(self, constructor_delivery: ConstructedBatch | None) -> ConstructedBatch:
-        """Broadcast the prefetched batch on the caller thread."""
+    def _broadcast_batch(self, constructed_batch: ConstructedBatch | None) -> ConstructedBatch:
+        """Broadcast the constructed batch to model-parallel peers on the caller thread."""
         was_stopped = self._stopped
-        received = self._model_transport.broadcast(constructor_delivery)
+        received = self._model_transport.broadcast(constructed_batch)
         if was_stopped and not received.stopped:
             raise ValueError("Distributed DataLoader stopped state differs across model-parallel peers.")
         return received
 
-    def _consume_delivery(self, received: ConstructedBatch) -> Any:
-        """Validate, commit, and expose a completed distributed transaction."""
+    def _consume_batch(self, received: ConstructedBatch) -> Any:
+        """Validate the batch, commit Reader progress, and return its training data."""
         if received.error is not None:
             raise RuntimeError(received.error)
         if received.step != self._step:
@@ -277,9 +277,9 @@ class DistributedDataLoader(Iterator[Any]):
             raise ValueError("An active constructed batch must include a plan_id.")
         if self._data_plane.is_member:
             if self._pending_plan is None or self._pending_plan.plan_id != received.plan_id:
-                raise ValueError("Delivered batch does not match the pending distributed packing plan.")
+                raise ValueError("Received batch does not match the pending distributed packing plan.")
 
-        # Dataset Reader buffers are committed only after construction and delivery
+        # Dataset Reader buffers are committed only after construction and broadcast
         # have both succeeded, leaving checkpoint boundaries unambiguous.
         planning_reader = self._planning_reader()
         if planning_reader is not None:
@@ -314,7 +314,7 @@ class DistributedDataLoader(Iterator[Any]):
             self._bind_prefetch_device()
             with self._prefetch_stream_context():
                 self._prefetch_result = _PrefetchResult(
-                    delivery=self._collect_next_data_plane_delivery(),
+                    batch=self._prepare_next_batch(),
                     completed=True,
                 )
         except BaseException as exc:  # The foreground re-raises failures at the next iterator boundary.
@@ -358,11 +358,11 @@ class DistributedDataLoader(Iterator[Any]):
             raise result.error
         if not result.completed:
             raise ValueError("Double buffering completed without a finished prefetch result.")
-        return result.delivery
+        return result.batch
 
     @property
     def last_plan_id(self) -> str | None:
-        """Return the most recently delivered deterministic plan identifier."""
+        """Return the deterministic plan identifier of the last returned batch."""
         return self._last_plan_id
 
     def wait_for_prefetch(self) -> None:

@@ -325,7 +325,7 @@ class DistributedPackingPlan:
 
 @dataclass(frozen=True)
 class ConstructedBatch:
-    """Internal delivery envelope broadcast from a Data Constructor to MP peers."""
+    """Constructor result containing batch data or stop/error status for MP broadcast."""
 
     step: int
     plan_id: str | None
