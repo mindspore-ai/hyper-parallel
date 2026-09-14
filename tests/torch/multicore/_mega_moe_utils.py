@@ -27,8 +27,8 @@ import torch.distributed as dist
 import torch_npu
 
 from hyper_parallel.core.multicore._loader import get_multicore_paths
-from hyper_parallel.core.multicore.shmem._bindings import _require_library
 from hyper_parallel.core.multicore.shmem import lifecycle
+from hyper_parallel.core.multicore.shmem._bindings import _require_library
 from tests.common.port_utils import allocate_port
 
 
@@ -86,10 +86,18 @@ def environment_identity() -> dict:
     native_files = [adapter, *vendor.rglob("*.so"), *vendor.rglob("*.o")]
     shmem_root = _require_library().parents[2]
     native_files.extend(shmem_root.rglob("*.so"))
+    source_sha, source_sha_error = None, None
+    try:
+        source_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.PIPE
+        ).strip()
+    except subprocess.CalledProcessError as error:
+        source_sha_error = f"git rev-parse HEAD exited with status {error.returncode}: {error.stderr.strip()}"
+    except OSError as error:
+        source_sha_error = f"git rev-parse HEAD could not run: {error}"
     return {
-        "source_sha": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=root, text=True
-        ).strip(),
+        "source_sha": source_sha,
+        "source_sha_error": source_sha_error,
         "worker_sha256": {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
             for path in Path(__file__).parent.glob("*mega_moe*.py")

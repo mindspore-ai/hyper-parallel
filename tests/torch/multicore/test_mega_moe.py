@@ -24,13 +24,13 @@ from pathlib import Path
 import pytest
 
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import TorchCase, parallel_run
+from tests.common.port_utils import allocate_port
 from tests.torch.multicore._test_env import (
     multicore_adapter_is_available,
     prepare_multicore_test_environment,
     without_inherited_rank_environment,
 )
-from tests.common.parallel_case import TorchCase, parallel_run
-from tests.common.port_utils import allocate_port
 
 _WORKER = str(Path(__file__).resolve().parent / "_test_mega_moe.py")
 _PRECISION_WORLD_SIZE = 2
@@ -153,7 +153,7 @@ def _run_acceptance_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case
     _prepare_torch_multicore_test_environment()
     result_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path)))
     result_path = result_dir / f"{case}.json"
-    worker = "_test_mega_moe_resources.py" if cards == 2 else "_test_mega_moe_defaults.py"
+    worker = "_test_mega_moe_resources.py" if cards == 2 else "_test_mega_moe_router_interface.py"
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(cards))
     monkeypatch.setenv("HP_MEGA_MOE_LEVEL1_RESULT", str(result_path))
     monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
@@ -192,10 +192,10 @@ def test_mega_moe_shared_resources(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     card_mark="allcards",
     essential_mark="unessential",
 )
-def test_mega_moe_default_interface(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Feature: Default and explicit capacity without Router-provided counts.
+def test_mega_moe_router_interface(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Feature: Router interface without caller-provided expert counts.
 
-    Description: Compare identical representative shapes in ABBA order, including Router timing.
-    Expectation: Outputs and gradients agree; stable latency, peak memory and software identity are recorded.
+    Description: Connect a trainable Router and run one common/MegaMoe step at the representative shape.
+    Expectation: Outputs, input/route/expert/Router gradients and one SGD update agree without supplied counts.
     """
-    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_default_capacity_acceptance", 4)
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_router_interface", 4)
