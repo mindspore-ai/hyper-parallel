@@ -17,6 +17,7 @@
 from typing import Optional
 
 import torch  # pylint: disable=forbidden-backend-import
+from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.quantization.functional.npu_mxfp8 import (
     mxfp8_grouped_matmul,
@@ -43,6 +44,17 @@ class _MXFP8GroupedLinearFunction(torch.autograd.Function):
         ``weight`` follows the standard expert-linear layout
         ``[experts, out_features, in_features]``. The NPU GMM receives its
         transposed ``[experts, in_features, out_features]`` representation.
+
+        Args:
+            ctx: Autograd context owning saved operands and group metadata.
+            inputs: High-precision expert-major input matrix.
+            weight: High-precision packed expert weights.
+            group_list: Token boundaries or counts, one per expert.
+            quantizer: MXFP8 quantizer shared by forward and backward.
+            group_list_type: Zero for cumulative boundaries, one for counts.
+
+        Returns:
+            Expert-major projection output with the input's logical dtype.
         """
 
         if inputs.ndim != 2:
@@ -81,18 +93,19 @@ class _MXFP8GroupedLinearFunction(torch.autograd.Function):
         ctx.weight_shape = weight.shape
         ctx.weight_dtype = weight.dtype
         ctx.weight_device = weight.device
-        ctx.group_list = group_list
         ctx.group_list_type = group_list_type
         ctx.quantizer = quantizer
         ctx.empty_input = inputs.shape[0] == 0
         if ctx.empty_input:
+            ctx.save_for_backward(group_list, None, None)
             return inputs.new_empty((0, weight.shape[-2]))
 
         needs_grad_input = inputs.requires_grad
         needs_grad_weight = weight.requires_grad
+        # Only column-wise quantization partitions blocks at expert boundaries.
         input_quant = quantizer.quantize(
             inputs,
-            group_list=group_list,
+            group_list=group_list if needs_grad_weight else None,
             group_list_type=group_list_type,
             rowwise=True,
             colwise=needs_grad_weight,
@@ -112,13 +125,17 @@ class _MXFP8GroupedLinearFunction(torch.autograd.Function):
             group_list_type=group_list_type,
             output_dtype=inputs.dtype,
         )
-        ctx.input_quant = input_quant if needs_grad_weight else None
-        ctx.weight_quant = weight_quant if needs_grad_input else None
         input_quant.update_usage(rowwise=False, colwise=needs_grad_weight)
         weight_quant.update_usage(rowwise=needs_grad_input, colwise=False)
+        ctx.save_for_backward(
+            group_list,
+            input_quant if needs_grad_weight else None,
+            weight_quant if needs_grad_input else None,
+        )
         return output
 
     @staticmethod
+    @once_differentiable
     def backward(
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
@@ -129,8 +146,17 @@ class _MXFP8GroupedLinearFunction(torch.autograd.Function):
         None,
         None,
     ]:
-        """Execute grouped dgrad and wgrad with shared output quantization."""
+        """Execute first-order grouped gradients; higher derivatives are unsupported.
 
+        Args:
+            ctx: Autograd context containing saved operands and group metadata.
+            grad_output: High-precision gradient of the grouped projection output.
+
+        Returns:
+            Input and weight gradients, followed by None for the remaining inputs.
+        """
+
+        group_list, input_quant, weight_quant = ctx.saved_tensors
         needs_grad_input = ctx.needs_input_grad[0]
         needs_grad_weight = ctx.needs_input_grad[1]
         if ctx.empty_input:
@@ -158,7 +184,7 @@ class _MXFP8GroupedLinearFunction(torch.autograd.Function):
         grad_weight = None
         grad_quant = ctx.quantizer.quantize(
             grad_output,
-            group_list=ctx.group_list,
+            group_list=group_list if needs_grad_weight else None,
             group_list_type=ctx.group_list_type,
             rowwise=needs_grad_input,
             colwise=needs_grad_weight,
@@ -166,27 +192,25 @@ class _MXFP8GroupedLinearFunction(torch.autograd.Function):
         if needs_grad_input:
             grad_input = mxfp8_grouped_matmul(
                 grad_quant,
-                ctx.weight_quant,
+                weight_quant,
                 layout="NT",
-                group_list=ctx.group_list,
+                group_list=group_list,
                 group_type=0,
                 group_list_type=ctx.group_list_type,
                 output_dtype=ctx.input_dtype,
             )
         if needs_grad_weight:
             grad_weight_for_gmm = mxfp8_grouped_matmul(
-                ctx.input_quant,
+                input_quant,
                 grad_quant,
                 layout="TN",
-                group_list=ctx.group_list,
+                group_list=group_list,
                 group_type=2,
                 group_list_type=ctx.group_list_type,
                 output_dtype=ctx.weight_dtype,
             )
             grad_weight = grad_weight_for_gmm.transpose(-2, -1).contiguous()
         grad_quant.update_usage(rowwise=False, colwise=False)
-        ctx.input_quant = None
-        ctx.weight_quant = None
         return grad_input, grad_weight, None, None, None
 
 

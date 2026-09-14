@@ -17,6 +17,7 @@
 from typing import Optional
 
 import torch  # pylint: disable=forbidden-backend-import
+from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.quantization.functional.npu_mxfp8 import (
     mxfp8_matmul,
@@ -44,7 +45,17 @@ class _MXFP8LinearFunction(torch.autograd.Function):
         weight: torch.Tensor,
         quantizer: MXFP8Quantizer,
     ) -> torch.Tensor:
-        """Execute the bias-free MXFP8 forward."""
+        """Execute the bias-free MXFP8 forward.
+
+        Args:
+            ctx: Autograd context owning the saved quantized operands.
+            inputs: High-precision input with the contracting dimension last.
+            weight: High-precision weight in [out_features, in_features] layout.
+            quantizer: MXFP8 quantizer shared by forward and backward.
+
+        Returns:
+            High-precision output preserving the input's leading dimensions.
+        """
 
         input_matrix = _as_matrix(inputs)
         needs_grad_input = inputs.requires_grad
@@ -68,8 +79,6 @@ class _MXFP8LinearFunction(torch.autograd.Function):
         ctx.input_shape = inputs.shape
         ctx.weight_dtype = weight.dtype
         ctx.quantizer = quantizer
-        ctx.input_quant = input_quant if needs_grad_weight else None
-        ctx.weight_quant = weight_quant if needs_grad_input else None
         input_quant.update_usage(
             rowwise=False,
             colwise=needs_grad_weight,
@@ -78,17 +87,31 @@ class _MXFP8LinearFunction(torch.autograd.Function):
             rowwise=False,
             colwise=needs_grad_input,
         )
+        ctx.save_for_backward(
+            input_quant if needs_grad_weight else None,
+            weight_quant if needs_grad_input else None,
+        )
         if inputs.ndim != 2:
             output = output.reshape(*inputs.shape[:-1], output.shape[-1])
         return output
 
     @staticmethod
+    @once_differentiable
     def backward(
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], None]:
-        """Execute dgrad and wgrad with one shared grad-output quantization."""
+        """Execute first-order dgrad and wgrad; higher derivatives are unsupported.
 
+        Args:
+            ctx: Autograd context containing saved operands and shape metadata.
+            grad_output: High-precision gradient of the projection output.
+
+        Returns:
+            Input and weight gradients, followed by None for the quantizer.
+        """
+
+        input_quant, weight_quant = ctx.saved_tensors
         grad_matrix = _as_matrix(grad_output)
         quantizer = ctx.quantizer
         grad_input = None
@@ -104,7 +127,7 @@ class _MXFP8LinearFunction(torch.autograd.Function):
         if needs_grad_input:
             grad_input = mxfp8_matmul(
                 grad_quant,
-                ctx.weight_quant,
+                weight_quant,
                 layout="NN",
                 output_dtype=grad_output.dtype,
             )
@@ -113,13 +136,11 @@ class _MXFP8LinearFunction(torch.autograd.Function):
         if needs_grad_weight:
             grad_weight = mxfp8_matmul(
                 grad_quant,
-                ctx.input_quant,
+                input_quant,
                 layout="TN",
                 output_dtype=ctx.weight_dtype,
             )
         grad_quant.update_usage(rowwise=False, colwise=False)
-        ctx.input_quant = None
-        ctx.weight_quant = None
         return grad_input, grad_weight, None
 
 
@@ -128,7 +149,16 @@ def mxfp8_linear(
     weight: torch.Tensor,
     quantizer: MXFP8Quantizer,
 ) -> torch.Tensor:
-    """Apply the bias-free Dense MXFP8 autograd function."""
+    """Apply the bias-free Dense MXFP8 autograd function.
+
+    Args:
+        inputs: High-precision input with the contracting dimension last.
+        weight: High-precision weight in [out_features, in_features] layout.
+        quantizer: MXFP8 quantizer shared by forward and backward.
+
+    Returns:
+        High-precision output preserving the input's leading dimensions.
+    """
 
     return _MXFP8LinearFunction.apply(
         inputs,
