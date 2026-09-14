@@ -30,6 +30,7 @@ _TEXT_FIELDS = {
     "text_position_ids",
     "router_attention_mask",
     "mm_token_type_ids",
+    "token_types",
 }
 
 
@@ -56,13 +57,46 @@ class VLMCollator:
         batch = default_collate(text_samples)
         if any(modal_samples):
             for field in {field for sample in modal_samples for field in sample}:
+                if field == "image_patch_offsets":
+                    batch[field] = self._merge_image_patch_offsets(modal_samples)
+                    continue
                 values = [sample[field] for sample in modal_samples if field in sample]
                 batch[field] = (
                     torch.cat(values, dim=0)
                     if isinstance(values[0], torch.Tensor)
                     else default_collate(values)
                 )
+            if "image_vit_grid_hw" in batch:
+                batch["image_batch_indices"] = self._build_image_batch_indices(modal_samples)
         return batch
+
+    @staticmethod
+    def _merge_image_patch_offsets(modal_samples: list[dict[str, Any]]) -> torch.Tensor:
+        """Concatenate per-sample image patch offsets into one global offset vector."""
+        merged_offsets = []
+        patch_total = 0
+        for sample in modal_samples:
+            offsets = sample.get("image_patch_offsets")
+            if not isinstance(offsets, torch.Tensor) or offsets.ndim != 1 or offsets.numel() == 0:
+                raise ValueError("VLM image_patch_offsets must be a non-empty one-dimensional tensor")
+            if int(offsets[0]) != 0 or torch.any(offsets[1:] < offsets[:-1]):
+                raise ValueError("VLM image_patch_offsets must start at zero and be non-decreasing")
+            if not merged_offsets:
+                merged_offsets.append(offsets.new_zeros(1))
+            merged_offsets.append(offsets[1:] + patch_total)
+            patch_total += int(offsets[-1])
+        return torch.cat(merged_offsets, dim=0)
+
+    @staticmethod
+    def _build_image_batch_indices(modal_samples: list[dict[str, Any]]) -> torch.Tensor:
+        """Record which text sample owns each concatenated image metadata row."""
+        image_batch_indices = []
+        for batch_index, sample in enumerate(modal_samples):
+            grids = sample.get("image_vit_grid_hw")
+            if not isinstance(grids, torch.Tensor) or grids.ndim != 2 or grids.shape[1] != 2:
+                raise ValueError("VLM image_vit_grid_hw must have shape [num_images, 2]")
+            image_batch_indices.append(torch.full((grids.shape[0],), batch_index, dtype=torch.long))
+        return torch.cat(image_batch_indices, dim=0)
 
 
 def build_vlm_collator(

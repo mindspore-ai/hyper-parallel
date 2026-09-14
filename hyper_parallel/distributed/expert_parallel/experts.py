@@ -123,10 +123,17 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
         expert_token_count = int(local_expert_counts[local_expert_index])
         expert_states = sorted_states[token_start:token_start + expert_token_count]
         if up_weight is None:
-            gate_states, up_states = F.linear(  # pylint: disable=not-callable
+            gate_up_states = F.linear(  # pylint: disable=not-callable
                 expert_states,
                 gate_weight[local_expert_index],
-            ).chunk(2, dim=-1)
+            )
+            apply_gate = getattr(experts, "_ep_apply_gate", None)
+            if apply_gate is None:
+                gate_states, up_states = gate_up_states.chunk(2, dim=-1)
+                activation = getattr(experts, "_ep_act_fn", F.silu)
+                activated_states = activation(gate_states) * up_states
+            else:
+                activated_states = apply_gate(gate_up_states)
         else:
             gate_states = F.linear(  # pylint: disable=not-callable
                 expert_states, gate_weight[local_expert_index]
@@ -134,10 +141,11 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
             up_states = F.linear(  # pylint: disable=not-callable
                 expert_states, up_weight[local_expert_index]
             )
-        activation = getattr(experts, "_ep_act_fn", F.silu)
+            activation = getattr(experts, "_ep_act_fn", F.silu)
+            activated_states = activation(gate_states) * up_states
         sorted_outputs.append(
             F.linear(  # pylint: disable=not-callable
-                activation(gate_states) * up_states,
+                activated_states,
                 down_weight[local_expert_index],
             )
         )
@@ -168,6 +176,7 @@ def bind_local_expert_forward(
     module: Any,
     ep_size: int,
     use_grouped_gemm: bool = False,
+    apply_gate: Optional[Callable] = None,
 ) -> None:
     """Install the local expert compute entry used by TP-extend-EP.
 
@@ -175,7 +184,8 @@ def bind_local_expert_forward(
     time: sets ``module.experts.local_expert_count`` and installs
     ``experts.forward`` (via the forward rewriter's bound-forward install
     point) so nested FSDP hooks unshard/reshard around the local SwiGLU
-    computation.
+    computation. ``apply_gate`` supplies model-specific fused gate/up
+    semantics when the default activation-times-up rule is insufficient.
     """
     global_expert_count = _get_global_expert_count(module)
     if global_expert_count % ep_size != 0:
@@ -197,7 +207,10 @@ def bind_local_expert_forward(
                 f"{type(module).__name__}: unsupported expert activation {hidden_act!r}; "
                 "provide experts.act_fn or extend the EP activation registry"
             )
+    if apply_gate is not None and use_grouped_gemm:
+        raise ValueError("custom expert gate activation is not supported by grouped GEMM")
     module.experts._ep_act_fn = activation
+    module.experts._ep_apply_gate = apply_gate
     module.experts._ep_use_grouped_gemm = use_grouped_gemm
     # The forward write itself lives in the forward rewriter (05 §15.2.3:
     # the single MethodType/assignment site); this binder only sets the

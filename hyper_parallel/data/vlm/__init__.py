@@ -26,6 +26,7 @@ from hyper_parallel.data.vlm.build_data_transform import build_vlm_data_transfor
 from hyper_parallel.data.vlm.build_processor import build_processor
 from hyper_parallel.data.vlm.collator import build_vlm_collator
 from hyper_parallel.data.vlm.dataset import build_vlm_dataset
+from hyper_parallel.data.vlm.deepseek_v41 import build_deepseek_v41_vlm_data_transform
 from hyper_parallel.data.vlm.get_batch import (
     VLMBatchProcessor,
     VLMGetBatch,
@@ -40,4 +41,5 @@ __all__ = [
     "build_vlm_data_transform",
     "build_vlm_dataset",
     "build_vlm_get_batch",
+    "build_deepseek_v41_vlm_data_transform",
 ]

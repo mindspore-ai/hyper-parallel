@@ -24,7 +24,10 @@ from typing import Any
 
 from transformers import AutoConfig, PretrainedConfig
 
-from hyper_parallel.models.registry import _resolve_custom_model_cls
+from hyper_parallel.models.registry import (
+    _resolve_custom_model_cls,
+    get_model_adapter,
+)
 
 __all__ = [
     "get_hf_config",
@@ -43,6 +46,13 @@ def get_is_hf_model(config: PretrainedConfig, force_hf: bool = False) -> bool:
         return True
     architectures = getattr(config, "architectures", []) or []
     arch_name = architectures[0] if architectures else ""
+    # Family registration is intentionally lazy. Model construction is the
+    # first operation that requires the concrete implementation, so discover
+    # the adapter here before consulting its custom-model registration.
+    identities = (getattr(config, "model_type", ""), arch_name)
+    for identity in identities:
+        if identity and get_model_adapter(identity) is not None:
+            break
     return _resolve_custom_model_cls(arch_name) is None
 
 

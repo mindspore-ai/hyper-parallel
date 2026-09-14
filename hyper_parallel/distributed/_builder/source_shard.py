@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=missing-apache-license-header
 """source_shard: build_source_shard_info (05 §6.7.1).
 
 source_shard_info is read from the ShardingPlan (rather than from DTensors — under
@@ -26,15 +27,18 @@ final sharded parameter carries the full distributed layout (FSDP dims +
 source dims) for downstream consumers such as distributed checkpointing.
 """
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple, TypeAlias
 
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
 from hyper_parallel import DeviceMesh, DTensor, Replicate
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Shard
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.fully_shard.hsdp_utils import get_managed_modules_parameters
 from hyper_parallel.distributed.plan import ShardingPlan
-from hyper_parallel.distributed.recipe_spec import resolve_placements
+from hyper_parallel.distributed.recipe_spec import EP, resolve_placements
+from hyper_parallel.platform import get_platform
 
 # Mesh dimensions whose sharding semantics belong to FSDP (or to other
 # parallelism concerns), never to the source layout recorded here:
@@ -128,10 +132,11 @@ def build_source_shard_info(
         for param_name, named_placement in spec.params.items():
             full_fqn = f"{fqn}.{param_name}"
             _check_fsdp_owned_axes(full_fqn, named_placement)
-            if spec._ep_size > 0 and param_name.startswith("experts."):  # pylint: disable=protected-access
+            if (spec._ep_size > 0  # pylint: disable=protected-access
+                    and isinstance((named_placement or {}).get(EP), Shard)):
                 if expert_source_mesh is None:
                     raise ValueError(
-                        "Routed expert metadata requires an expert EP source mesh"
+                        "Virtual-EP parameter metadata requires an EP source mesh"
                     )
                 placements = tuple(resolve_placements(named_placement, expert_source_dims))
                 info[full_fqn] = (placements, expert_mesh)
@@ -329,10 +334,16 @@ def _get_default_source_shard_info(manager) -> fully_shard_utils.SourceShardMeta
 def _build_managed_source_shard_info(
     manager,
     owner: ModuleClass,
-    owner_by_parameter: Mapping[ParameterClass, ModuleClass],
     metadata_by_parameter: SourceShardInfoByParam | None,
 ) -> SourceShardInfoByParam | None:
-    """Select and complete metadata for parameters managed by one wrap call."""
+    """Select and complete metadata for parameters managed by one wrap call.
+
+    Metadata must use the same parameter selection as ``fully_shard``. In
+    particular, nested FSDP units mark their parameters initialized before the
+    parent is wrapped, so ownership assigned from the pre-wrap module tree can
+    over-approximate the actual parameter set. Deriving this set through the
+    shared helper keeps source-layout metadata complete and exact.
+    """
     if metadata_by_parameter is None:
         return None
 
@@ -341,11 +352,9 @@ def _build_managed_source_shard_info(
         manager.mesh_context.fsdp_non_moe_mesh is not None
         or manager.mesh_context.device_mesh is not None
     ):
-        default_source_shard_info = _get_default_source_shard_info(manager, )
+        default_source_shard_info = _get_default_source_shard_info(manager)
     managed_source_shard_info = {}
-    for parameter, parameter_owner in owner_by_parameter.items():
-        if parameter_owner is not owner:
-            continue
+    for parameter in get_managed_modules_parameters((owner,)):
         source_shard_info = metadata_by_parameter.get(parameter)
         if source_shard_info is None:
             if default_source_shard_info is None:

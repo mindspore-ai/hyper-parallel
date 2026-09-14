@@ -511,8 +511,8 @@ def test_error_paths():
     with pytest.raises(ValueError, match="conflicts with FSDP ownership"):
         build_source_shard_info(plan, _FakeTpMesh())
 
-    # --- case: tp_extend_ep_requires_expert_source_mesh ---
-    # Routed-expert metadata requires the derived EP child mesh.
+    # --- case: virtual_ep_requires_source_mesh ---
+    # Any explicitly EP-sharded parameter requires the derived EP child mesh.
     plan = ShardingPlan(mesh_dim_names=("tp",))
     moe_spec = ModuleShardingSpec(
         params={"experts.gate_proj": {EP: Shard(0)}}
@@ -521,6 +521,6 @@ def test_error_paths():
     plan.modules["model.layers.0.mlp"] = moe_spec
     with pytest.raises(
         ValueError,
-        match="Routed expert metadata requires an expert EP source mesh",
+        match="Virtual-EP parameter metadata requires an EP source mesh",
     ):
         build_source_shard_info(plan, _FakeTpMesh())

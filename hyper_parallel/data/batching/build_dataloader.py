@@ -283,8 +283,11 @@ class FixedBatchDataLoader(StatefulDataLoader):
             seed: int = 1234,
             pin_memory: bool = False,
             prefetch_factor: int | None = None,
+            dp_world_size: int | None = None,
+            max_seq_len: int | None = None,
     ) -> None:
         """Initialize the stateful DataLoader."""
+        del dp_world_size, max_seq_len
         self.drop_last = drop_last
         self.use_background_prefetcher = use_background_prefetcher
         generator = torch.Generator().manual_seed(seed)

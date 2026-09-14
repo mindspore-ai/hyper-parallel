@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=missing-apache-license-header
 """adapter_spec: ModelAdapterSpec — the shared model-adapter data contract.
 
 One ``ModelAdapterSpec`` per model family declares the architecture
@@ -55,6 +56,18 @@ class ModelAdapterSpec:
             before the default naming rules in Phase 1 (e.g. DeepSeek MLA's
             replicated down-projections). Lives here so the generic planner
             never carries per-family knowledge.
+        fsdp_wrap_modules: provider accepting the built model and returning
+            exact module FQNs that form additional FSDP child units. Use this
+            for non-decoder execution branches such as a vision tower or
+            multimodal projector; the generic HF decoder discovery remains the
+            default when this provider is absent.
+        fsdp_excluded_subtrees: provider returning exact module FQNs whose
+            subtrees must not be interpreted as HF decoder containers. The
+            adapter may still declare nested FSDP units inside those branches.
+        fsdp_execution_order: provider accepting the built model and every
+            selected child-unit FQN, then returning their first-forward
+            execution order. This lets conditional multimodal models override
+            module-registration order for FSDP communication prefetching.
         loss: provider returning model-family output-loss adapters that must
             intercept the model before a full terminal output is materialized.
     """
@@ -67,4 +80,7 @@ class ModelAdapterSpec:
     context_parallel: Optional[Callable[..., Any]] = None
     expert_parallel: Optional[Callable[..., Any]] = None
     sharding_rules: Optional[Callable[..., Any]] = None
+    fsdp_wrap_modules: Optional[Callable[..., Any]] = None
+    fsdp_excluded_subtrees: Optional[Callable[..., Any]] = None
+    fsdp_execution_order: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
