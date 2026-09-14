@@ -17,6 +17,8 @@
 from collections import defaultdict
 from typing import Any, Dict
 
+import torch  # pylint: disable=forbidden-backend-import
+
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data.batching import calculate_num_micro_batches
@@ -216,7 +218,7 @@ class VLMTrainer:
             else [self.base.optimizer]
         )
         for optimizer in optimizers:
-            with SkipDTensorDispatch():
+            with SkipDTensorDispatch(no_skip={torch.zeros_like}):
                 optimizer.step()
             optimizer.zero_grad()
 

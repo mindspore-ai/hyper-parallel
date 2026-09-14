@@ -45,7 +45,6 @@ fsdp_config:
   mix_precision:
     param_dtype: bfloat16
     reduce_dtype: float32
-    output_dtype: bfloat16
     cast_forward_inputs: false
   reshard_after_forward: true
   reshard_after_backward: true
@@ -56,26 +55,16 @@ fsdp_config:
 
 plan_overrides:
   - match:
-      - "model.layers.0.attn_hc"
-      - "model.layers.0.ffn_hc"
-      - "model.layers.1.attn_hc"
-      - "model.layers.1.ffn_hc"
-      - "model.layers.2.attn_hc"
-      - "model.layers.2.ffn_hc"
-      - "model.layers.3.attn_hc"
-      - "model.layers.3.ffn_hc"
+      - "model.layers.*.attn_hc"
+      - "model.layers.*.ffn_hc"
     module_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4HyperConnection
     replace_module:
       _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
-  - match: "model.layers.1.engram"
+  - match: "model.layers.*.engram"
     module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41EngramPlaceholder
     replace_module:
       _target_: hyper_parallel.components.modules.engram.EngramModule
-  - match:
-      - "model.layers.0.self_attn"
-      - "model.layers.1.self_attn"
-      - "model.layers.2.self_attn"
-      - "model.layers.3.self_attn"
+  - match: "model.layers.*.self_attn"
     module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41AttentionPlaceholder
     replace_module:
       _target_: hyper_parallel.models.deepseek_v41.adapter.replacements.replace_deepseek_v41_shared_attention
@@ -93,62 +82,55 @@ plan_overrides:
     inner_wrapper:
       _target_: >-
         hyper_parallel.models.deepseek_v41.adapter.context_parallel.deepseek_v41_shared_attention_parallel_wrapper
-  # mHC is full-hidden pointwise compute. Like PanGu SequenceParallelLinear,
-  # its small coefficient parameters stay replicated across TP; CP only owns
-  # the local token slice and FSDP owns parameter sharding on the DP×CP domain.
-  - match: "model.layers.0.attn_hc"
+  # A fully declared glob expands against the final replaced model tree and
+  # creates one boundary for every mHC module, independent of model depth.
+  - match: "model.layers.*.*_hc"
+    region_dispatch: false
     params:
       fn: {tp: replicate}
       base: {tp: replicate}
       scale: {tp: replicate}
-  - match: "model.layers.0.ffn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "model.layers.1.attn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "model.layers.1.ffn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "model.layers.1.engram"
+    in_src:
+      hidden_streams: {tp: replicate, cp: "shard(1)", ep: replicate}
+    in_dst:
+      hidden_streams: {tp: replicate, cp: "shard(1)", ep: replicate}
+    out_src:
+      pre: {tp: replicate, cp: "shard(1)", ep: replicate}
+      post: {tp: replicate, cp: "shard(1)", ep: replicate}
+      residual: {tp: replicate, cp: "shard(1)", ep: replicate}
+    out_dst:
+      pre: {tp: replicate, cp: "shard(1)", ep: replicate}
+      post: {tp: replicate, cp: "shard(1)", ep: replicate}
+      residual: {tp: replicate, cp: "shard(1)", ep: replicate}
+  # When TP sequence parallel is active, the later entry replaces only the
+  # mHC activation contract; parameter and local-region declarations inherit.
+  - match: "model.layers.*.*_hc"
+    when: sequence_parallel
+    in_src:
+      hidden_streams: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+    in_dst:
+      hidden_streams: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+    out_src:
+      pre: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+      post: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+      residual: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+    out_dst:
+      pre: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+      post: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+      residual: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+  # Engram layers are discovered by the glob. The table layout creates the
+  # boundary; sparse all-to-all compute is added only for active virtual EP.
+  - match: "model.layers.*.engram"
     params:
       q_weight: {tp: replicate}
       k_weight: {tp: replicate}
-      # The flat table is the only Engram state row-sharded across the virtual
-      # EP domain. Lookup values/gradients travel through sparse all-to-all.
       embed.weight: {ep: "shard(0)"}
       wkv.weight: {tp: replicate}
-  - match: "model.layers.1.engram"
+  - match: "model.layers.*.engram"
     when: ep
     region_dispatch: false
     local_compute_fn:
       _target_: hyper_parallel.models.deepseek_v41.adapter.expert_parallel.deepseek_v41_engram_compute_fn
-  - match: "model.layers.2.attn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "model.layers.2.ffn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "model.layers.3.attn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "model.layers.3.ffn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
   - match: "*.mlp"
     when: ep
     region_dispatch: false
@@ -212,8 +194,8 @@ dataloader:
     cp_algorithm: colossal
     # Nested targets let the model adapter supply its compact CSA2 metadata
     # contract while the framework continues to own the generic batch flow.
-    attention_runtime_adapter:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.packed_sequence.DeepseekV41AttentionRuntimeAdapter
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.packed_sequence.DeepseekV41RuntimeInputAdapter
   dataloader_type: cyclic
   data_rearrange_map: null
   data_sharding: false

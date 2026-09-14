@@ -92,7 +92,8 @@ _debug_mode_observer: ContextVar = ContextVar('_debug_mode_observer', default=No
 
 _RAGGED_ELEMENTWISE_OPS = {
     # Torch public APIs dispatch with these lowercase names.
-    "abs": "unary", "absolute": "unary", "clone": "unary", "cos": "unary",
+    "abs": "unary", "absolute": "unary", "clamp": "unary",
+    "clamp_max": "unary", "clamp_min": "unary", "clone": "unary", "cos": "unary",
     "conj": "unary", "empty_like": "unary", "exp": "unary", "gelu": "unary",
     "isinf": "unary", "isnan": "unary",
     "log": "unary", "neg": "unary", "negative": "unary", "relu": "unary",

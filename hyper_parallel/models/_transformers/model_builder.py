@@ -553,11 +553,11 @@ def _refresh_hsdp_precision_state(model: nn.Module) -> None:
             hsdp_param.init_dtype_attrs(hsdp_state.mp_policy)
 
 
-def _validate_model_init_dtype(
+def _validate_model_state_dtype(
         model: nn.Module,
         target_dtype: torch.dtype,
 ) -> None:
-    """Validate floating model parameters and buffers after conversion."""
+    """Validate floating model parameters and buffers against a resolved dtype."""
     mismatched = [
         name
         for name, tensor in (
@@ -568,9 +568,30 @@ def _validate_model_init_dtype(
     ]
     if mismatched:
         raise RuntimeError(
-            "Model initialization dtype conversion failed for: "
+            "Model initialization dtype validation failed for: "
             f"{', '.join(sorted(mismatched))}"
         )
+
+
+def validate_model_init_dtype(
+        model: nn.Module,
+        model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]],
+) -> None:
+    """Validate model state without converting live parameters.
+
+    Use this after checkpoint restore, when FSDP and optimizer objects already
+    reference the model parameters. Dtype conversion belongs to the atomic model
+    build before those runtime relationships are established.
+
+    Args:
+        model: Model whose floating parameters and buffers are validated.
+        model_init_dtype: Required initialization dtype, or ``None`` to disable
+            validation.
+    """
+    target_dtype = _resolve_model_init_dtype(model_init_dtype)
+    if target_dtype is None:
+        return
+    _validate_model_state_dtype(model, target_dtype)
 
 
 def apply_model_init_dtype(
@@ -617,4 +638,4 @@ def apply_model_init_dtype(
             )
 
     _refresh_hsdp_precision_state(model)
-    _validate_model_init_dtype(model, target_dtype)
+    _validate_model_state_dtype(model, target_dtype)

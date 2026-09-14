@@ -5,6 +5,15 @@ __default__:
 relu:
   dist_op_name: _torch_relu_dist_op
 
+clamp:
+  dist_op_name: _torch_clamp_dist_op
+
+clamp_max:
+  dist_op_name: _torch_clamp_max_dist_op
+
+clamp_min:
+  dist_op_name: _torch_clamp_min_dist_op
+
 __rsub__:
   dist_op_name: _torch___sub___dist_op
   distributed_op_class: SubDistributedOp

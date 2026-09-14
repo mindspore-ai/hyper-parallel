@@ -16,31 +16,37 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping
 from typing import Any
 
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedPackedSequence,
 )
-from hyper_parallel.data.batching.attention_runtime import AttentionRuntimeAdapter
+from hyper_parallel.data.batching.runtime_input import (
+    RuntimeInputAdapter,
+    RuntimeInputContext,
+)
 
 
-class DeepseekV41AttentionRuntimeAdapter(AttentionRuntimeAdapter):
-    """Translate global sample boundaries into one contiguous CP shard."""
+class DeepseekV41RuntimeInputAdapter(RuntimeInputAdapter):
+    """Build V4.1 model inputs from generic batch and parallel metadata."""
 
-    def build_packed_seq_params(
+    def build_runtime_inputs(
             self,
             *,
-            cu_seq_lens: Any,
-            local_input_shape: Sequence[int],
-            cp_rank: int,
-            cp_size: int,
-            cp_algorithm: str,
-            causal: bool,
-            sliding_window: int | None,
-    ) -> SharedCompressedPackedSequence:
-        """Build compact boundaries without an O(sequence squared) mask."""
-        del sliding_window
+            batch: Mapping[str, Any],
+            context: RuntimeInputContext,
+    ) -> Mapping[str, Any]:
+        """Build compact CSA2 boundaries without an O(sequence squared) mask."""
+        options = context.options
+        attention_mode = options.get("attention_mode")
+        if attention_mode != "compressed":
+            raise ValueError(
+                "DeepSeek-V4.1 runtime inputs require compressed attention, "
+                f"got attention_mode={attention_mode!r}"
+            )
+        causal = bool(options.get("causal", True))
+        cp_algorithm = str(options.get("cp_algorithm", "ulysses"))
         if not causal:
             raise ValueError("DeepSeek-V4.1 CSA2 packed attention must be causal")
         if cp_algorithm != "colossal":
@@ -48,17 +54,32 @@ class DeepseekV41AttentionRuntimeAdapter(AttentionRuntimeAdapter):
                 "DeepSeek-V4.1 CSA2 requires contiguous Colossal CP shards, "
                 f"got cp_algorithm={cp_algorithm!r}"
             )
+        local_input_shape = context.local_input_shape
         if len(local_input_shape) != 2 or int(local_input_shape[0]) != 1:
             raise ValueError(
                 "DeepSeek-V4.1 compact packing requires local input shape [1, sequence], "
                 f"got {tuple(local_input_shape)}"
             )
         local_sequence_length = int(local_input_shape[1])
-        return SharedCompressedPackedSequence(
-            cu_seq_lens=cu_seq_lens,
-            local_query_start=cp_rank * local_sequence_length,
-            local_query_length=local_sequence_length,
-            global_sequence_length=cp_size * local_sequence_length,
-        )
+        cp_rank = context.parallel_ranks.get("cp", 0)
+        cp_size = context.parallel_sizes.get("cp", 1)
+        return {
+            "packed_seq_params": SharedCompressedPackedSequence(
+                cu_seq_lens=batch["cu_seq_lens"],
+                local_query_start=cp_rank * local_sequence_length,
+                local_query_length=local_sequence_length,
+                global_sequence_length=cp_size * local_sequence_length,
+            )
+        }
 
-__all__ = ["DeepseekV41AttentionRuntimeAdapter"]
+
+# Backward-compatible import name for downstream recipes. The object implements
+# the new generic RuntimeInputAdapter contract even when constructed via the old
+# class name.
+DeepseekV41AttentionRuntimeAdapter = DeepseekV41RuntimeInputAdapter
+
+
+__all__ = [
+    "DeepseekV41AttentionRuntimeAdapter",
+    "DeepseekV41RuntimeInputAdapter",
+]

@@ -37,6 +37,10 @@ from hyper_parallel.data.batching.build_dataloader import (
 from hyper_parallel.data.batching.data_collator import MakeMicroBatchCollator
 from hyper_parallel.data.batching.dataloader import DataLoader
 from hyper_parallel.data.batching.get_batch import ParallelBatch
+from hyper_parallel.data.batching.runtime_input import (
+    RuntimeInputAdapter,
+    RuntimeInputContext,
+)
 from hyper_parallel.data.batching.sequence_boundaries import (
     IndexedBoundaryResolver,
     OnlineBoundaryResolver,
@@ -53,6 +57,8 @@ __all__ = [
     "MakeMicroBatchCollator",
     "OnlineBoundaryResolver",
     "ParallelBatch",
+    "RuntimeInputAdapter",
+    "RuntimeInputContext",
     "TextPackingCollator",
     "TextTokenBatcher",
     "build_dataloader",

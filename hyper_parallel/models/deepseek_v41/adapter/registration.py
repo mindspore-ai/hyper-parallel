@@ -17,6 +17,9 @@
 from typing import Any
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.deepseek_v41.adapter.checkpoint import (
+    register_deepseek_v41_checkpoint_mapping,
+)
 from hyper_parallel.models.registry import (
     register_custom_model,
     register_model_adapter,
@@ -127,6 +130,7 @@ register_custom_model(
     "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
     "DeepseekV41CroppedForCausalLM",
 )
+register_deepseek_v41_checkpoint_mapping()
 
 DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV41ForCausalLM",

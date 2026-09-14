@@ -196,9 +196,12 @@ class DeepseekV41Compressor(nn.Module):
     def __init__(self, config: Any, compress_ratio: int) -> None:
         """Create the learned KV pooling projections."""
         super().__init__()
+        if compress_ratio < 1:
+            raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
         self.compress_ratio = compress_ratio
         self.wkv = nn.Linear(config.hidden_size, config.head_dim, bias=False)
-        self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False)
+        if compress_ratio > 1:
+            self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False)
         self.norm = DeepseekV4RMSNorm(config.head_dim, eps=config.rms_norm_eps)
 
     def forward(
@@ -208,6 +211,12 @@ class DeepseekV41Compressor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return unrotated and RoPE-rotated compressed KV tensors."""
         batch_size, sequence_length, _ = hidden_states.shape
+        if self.compress_ratio == 1:
+            latent = self.norm(self.wkv(hidden_states))
+            cos, sin = compress_position_embeddings
+            rotated = apply_rotary_pos_emb(latent.unsqueeze(1), cos, sin).squeeze(1)
+            return latent, rotated
+
         usable = sequence_length - sequence_length % self.compress_ratio
         key_value = self.wkv(hidden_states[:, :usable])
         gate = self.wgate(hidden_states[:, :usable])
@@ -266,9 +275,21 @@ class DeepseekV41AttentionPlaceholder(DeepseekV4Attention):
     def __init__(self, config: Any, layer_idx: int) -> None:
         """Create V4 parameters plus the source-only compressor and indexer."""
         super().__init__(config, layer_idx)
+        # DeepSeek-V4 applies this unweighted RMSNorm after q_b_proj. V4.1
+        # explicitly removes it: q_norm remains between wq_a and wq_b, while
+        # the projected query heads go directly into RoPE.
+        del self.q_b_norm
         self.compress_ratio = int(config.v41_compress_ratios[layer_idx])
         self.is_kv_source = layer_idx in config.v41_kv_source_layer_ids
         self.is_index_source = layer_idx in config.v41_index_source_layer_ids
+        kv_sources = [source for source in config.v41_kv_source_layer_ids if source <= layer_idx]
+        index_sources = [source for source in config.v41_index_source_layer_ids if source <= layer_idx]
+        self.kv_source_layer_idx = max(kv_sources, default=None)
+        self.index_source_layer_idx = max(index_sources, default=None)
+        candidate_source = int(getattr(config, "v41_candidate_source_layer_id", -1))
+        self.candidate_source_layer_idx = (
+            candidate_source if 0 <= candidate_source <= layer_idx else None
+        )
         if self.is_kv_source:
             self.compressor = DeepseekV41Compressor(config, self.compress_ratio)
         if self.is_index_source:
@@ -352,13 +373,26 @@ def _v41_decoder_layer_forward(
 
 
 class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
-    """Four-layer V4.1 backbone with optional native vision input support."""
+    """Depth-configurable V4.1 backbone with optional native vision support."""
 
     def __init__(self, config: Any) -> None:
-        """Create the four-layer backbone and attach active V4.1 modules."""
+        """Create the cropped backbone and attach active V4.1 modules."""
         super().__init__(config)
-        if config.num_hidden_layers != 4:
-            raise ValueError("DeepseekV41CroppedModel requires exactly 4 decoder layers")
+        if config.num_hidden_layers < 1:
+            raise ValueError("DeepseekV41CroppedModel requires at least one decoder layer")
+        if len(config.v41_compress_ratios) != config.num_hidden_layers:
+            raise ValueError(
+                "v41_compress_ratios must contain one entry per decoder layer, "
+                f"got {len(config.v41_compress_ratios)} for {config.num_hidden_layers} layers"
+            )
+        shared_layer_count = sum(
+            ratio > 0 and layer_idx not in config.v41_kv_source_layer_ids
+            for layer_idx, ratio in enumerate(config.v41_compress_ratios)
+        )
+        config.num_kv_shared_layers = max(
+            int(getattr(config, "num_kv_shared_layers", 0)),
+            shared_layer_count,
+        )
         assets_path = Path(config.v41_engram_assets_path)
         with assets_path.open("r", encoding="utf-8") as assets_file:
             assets = json.load(assets_file)
@@ -577,7 +611,7 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
 
 
 class DeepseekV41CroppedForCausalLM(DeepseekV4ForCausalLM):
-    """Causal-LM facade for the four-layer V4.1 validation backbone."""
+    """Causal-LM facade for the depth-configurable V4.1 validation backbone."""
 
     def __init__(self, config: Any) -> None:
         """Create the cropped backbone and unchanged causal-LM facade."""

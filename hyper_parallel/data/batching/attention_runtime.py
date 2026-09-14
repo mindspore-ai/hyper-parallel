@@ -17,10 +17,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
+
+from hyper_parallel.data.batching.runtime_input import (
+    RuntimeInputAdapter,
+    RuntimeInputContext,
+)
 
 
 def build_dense_attention_masks(
@@ -74,15 +79,35 @@ def build_dense_attention_masks(
     return attention_mask, swa_mask
 
 
-class AttentionRuntimeAdapter(ABC):
-    """Build backend-owned metadata for compressed packed attention.
+class AttentionRuntimeAdapter(RuntimeInputAdapter, ABC):
+    """Compatibility adapter for the former attention-only interface.
 
-    Dense attention bypasses this interface and materializes its attention
-    masks locally. A compressed backend derives FA and CP runtime metadata
-    from the global sequence boundaries without changing the batch contract.
-    The concrete adapter owns backend-specific physical layouts such as
-    ``thd`` or ``TND``.
+    New model integrations should implement :class:`RuntimeInputAdapter`
+    directly. This class keeps existing third-party adapters working while
+    the framework configuration migrates from ``attention_runtime_adapter``
+    to ``runtime_input_adapter``.
     """
+
+    def build_runtime_inputs(
+            self,
+            *,
+            batch: Mapping[str, Any],
+            context: RuntimeInputContext,
+    ) -> Mapping[str, Any]:
+        """Bridge the generic runtime contract to ``build_packed_seq_params``."""
+        options = context.options
+        if options.get("attention_mode") != "compressed":
+            return {}
+        packed_seq_params = self.build_packed_seq_params(
+            cu_seq_lens=batch["cu_seq_lens"],
+            local_input_shape=context.local_input_shape,
+            cp_rank=context.parallel_ranks.get("cp", 0),
+            cp_size=context.parallel_sizes.get("cp", 1),
+            cp_algorithm=str(options.get("cp_algorithm", "ulysses")),
+            causal=bool(options.get("causal", True)),
+            sliding_window=options.get("sliding_window"),
+        )
+        return {"packed_seq_params": packed_seq_params}
 
     @abstractmethod
     def build_packed_seq_params(

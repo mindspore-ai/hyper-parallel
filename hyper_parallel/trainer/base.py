@@ -666,7 +666,7 @@ class BaseTrainer(Stateful, ABC):
         # Optimizer and scheduler step
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
         for optimizer in optimizers:
-            with SkipDTensorDispatch():
+            with SkipDTensorDispatch(no_skip={torch.zeros_like}):
                 optimizer.step()
             optimizer.zero_grad()
 

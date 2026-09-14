@@ -26,7 +26,7 @@ keeps validation independent of optional NPU packages.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -57,12 +57,90 @@ class _DeferredSequenceGather:
 
 @dataclass
 class SharedCompressedAttentionState:
-    """Cross-layer tensors published by one compressed-attention source."""
+    """Autograd-bearing CSA2 state scoped to one training forward.
 
-    compressed_kv: torch.Tensor | None = None
-    index_key: torch.Tensor | None = None
-    topk_indices: torch.Tensor | None = None
-    candidate_blocks: torch.Tensor | None = None
+    State is addressed by the layer that produced it instead of using one
+    mutable "latest value" slot. This matters for the released V4.1 topology,
+    which has several Full/Reindex groups, and makes a consumer's dependency
+    explicit when activation recomputation revisits modules out of forward
+    order.
+    """
+
+    compressed_kv_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
+    index_key_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
+    topk_indices_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
+    candidate_blocks_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
+
+    @staticmethod
+    def _require(
+            values: dict[int, torch.Tensor],
+            source_layer: int | None,
+            value_name: str,
+            consumer_layer: int,
+    ) -> torch.Tensor:
+        """Return one published tensor or report the broken layer dependency."""
+        if source_layer is None or source_layer not in values:
+            raise RuntimeError(
+                f"layer {consumer_layer} requires {value_name} from source "
+                f"layer {source_layer}, but that source has not run in this forward"
+            )
+        return values[source_layer]
+
+    def publish_compressed_kv(self, source_layer: int, value: torch.Tensor) -> None:
+        """Publish compressed K=V while preserving its autograd graph."""
+        self.compressed_kv_by_source[source_layer] = value
+
+    def require_compressed_kv(self, source_layer: int | None, consumer_layer: int) -> torch.Tensor:
+        """Read compressed K=V from the consumer's configured Full layer."""
+        return self._require(
+            self.compressed_kv_by_source,
+            source_layer,
+            "compressed K=V",
+            consumer_layer,
+        )
+
+    def publish_index_key(self, source_layer: int, value: torch.Tensor) -> None:
+        """Publish the Full Indexer's shared key tensor."""
+        self.index_key_by_source[source_layer] = value
+
+    def require_index_key(self, source_layer: int | None, consumer_layer: int) -> torch.Tensor:
+        """Read the Indexer key associated with a compressed-KV source."""
+        return self._require(
+            self.index_key_by_source,
+            source_layer,
+            "Indexer key",
+            consumer_layer,
+        )
+
+    def publish_topk_indices(self, source_layer: int, value: torch.Tensor) -> None:
+        """Publish one Full/Reindex layer's token selection."""
+        self.topk_indices_by_source[source_layer] = value
+
+    def require_topk_indices(self, source_layer: int | None, consumer_layer: int) -> torch.Tensor:
+        """Read the latest configured Full/Reindex selection."""
+        return self._require(
+            self.topk_indices_by_source,
+            source_layer,
+            "Top-K indices",
+            consumer_layer,
+        )
+
+    def publish_candidate_blocks(self, source_layer: int, value: torch.Tensor) -> None:
+        """Publish hierarchical candidate blocks from the configured source."""
+        self.candidate_blocks_by_source[source_layer] = value
+
+    def require_candidate_blocks(
+            self,
+            source_layer: int | None,
+            consumer_layer: int,
+    ) -> torch.Tensor:
+        """Read hierarchical candidates for a later Reindex layer."""
+        return self._require(
+            self.candidate_blocks_by_source,
+            source_layer,
+            "candidate blocks",
+            consumer_layer,
+        )
 
 
 @dataclass
@@ -1021,6 +1099,9 @@ class SharedCompressedDSAAttention(nn.Module):
         self.compress_ratio = module.compress_ratio
         self.is_kv_source = module.is_kv_source
         self.is_index_source = module.is_index_source
+        self.kv_source_layer_idx = module.kv_source_layer_idx
+        self.index_source_layer_idx = module.index_source_layer_idx
+        self.candidate_source_layer_idx = module.candidate_source_layer_idx
         self.head_dim = module.head_dim
         self.rope_head_dim = module.config.qk_rope_head_dim
         self.sliding_window = module.sliding_window
@@ -1078,7 +1159,7 @@ class SharedCompressedDSAAttention(nn.Module):
         batch_size, sequence_length, _ = hidden_states.shape
         query_residual = self.q_a_norm(self.q_a_proj(hidden_states))
         query = self.q_b_proj(query_residual).view(batch_size, sequence_length, -1, self.head_dim)
-        query = self.q_b_norm(query.transpose(1, 2))
+        query = query.transpose(1, 2)
         return query_residual, _apply_v41_rope(query, cos, sin)
 
     def forward(
@@ -1166,36 +1247,50 @@ class SharedCompressedDSAAttention(nn.Module):
         latent = None
         if self.is_kv_source:
             latent, compressed = self.compressor(hidden_states, position_embeddings["compress"])
-            shared_state.index_key = None
-            shared_state.candidate_blocks = None
             if cp_context is None:
-                shared_state.compressed_kv = compressed
+                shared_state.publish_compressed_kv(self.layer_idx, compressed)
             else:
                 compressed_handle = cp_context.launch(compressed, 1)
 
         indexer_output = None
         if self.is_index_source:
+            index_key = (
+                None
+                if self.indexer.owns_key
+                else shared_state.require_index_key(self.kv_source_layer_idx, self.layer_idx)
+            )
+            candidate_blocks = (
+                shared_state.require_candidate_blocks(
+                    self.candidate_source_layer_idx,
+                    self.layer_idx,
+                )
+                if self.indexer.uses_candidates else None
+            )
             indexer_output = self.indexer(
                 hidden_states,
                 query_residual,
                 latent,
                 position_embeddings["compress"],
-                index_key=shared_state.index_key,
-                candidate_blocks=shared_state.candidate_blocks,
+                index_key=index_key,
+                candidate_blocks=candidate_blocks,
                 cp_context=cp_context,
                 tp_context=tp_context,
                 query_offset=query_offset,
                 minimum_key_indices=minimum_key_indices,
             )
-            shared_state.index_key = indexer_output.index_key
-            shared_state.topk_indices = indexer_output.topk_indices
+            if self.indexer.owns_key:
+                shared_state.publish_index_key(self.layer_idx, indexer_output.index_key)
+            shared_state.publish_topk_indices(self.layer_idx, indexer_output.topk_indices)
             if indexer_output.candidate_blocks is not None:
-                shared_state.candidate_blocks = indexer_output.candidate_blocks
+                shared_state.publish_candidate_blocks(
+                    self.layer_idx,
+                    indexer_output.candidate_blocks,
+                )
 
         if raw_kv_handle is not None:
             key_value = raw_kv_handle.wait()
         if compressed_handle is not None:
-            shared_state.compressed_kv = compressed_handle.wait()
+            shared_state.publish_compressed_kv(self.layer_idx, compressed_handle.wait())
         if key_value is None:
             raise RuntimeError("raw KV all-gather did not produce a tensor")
 
@@ -1209,12 +1304,19 @@ class SharedCompressedDSAAttention(nn.Module):
         )
         if segment_starts is not None:
             window.masked_fill_(window < segment_starts.unsqueeze(-1), -1)
+        compressed_kv = None
         if self.compress_ratio:
-            if shared_state.compressed_kv is None or shared_state.topk_indices is None:
-                raise RuntimeError(f"layer {self.layer_idx} consumed shared attention before its source ran")
-            combined_key_value = torch.cat((key_value, shared_state.compressed_kv.unsqueeze(1)), dim=2)
-            compressed_indices = shared_state.topk_indices.long() + global_sequence_length
-            compressed_indices.masked_fill_(shared_state.topk_indices < 0, -1)
+            compressed_kv = shared_state.require_compressed_kv(
+                self.kv_source_layer_idx,
+                self.layer_idx,
+            )
+            topk_indices = shared_state.require_topk_indices(
+                self.index_source_layer_idx,
+                self.layer_idx,
+            )
+            combined_key_value = torch.cat((key_value, compressed_kv.unsqueeze(1)), dim=2)
+            compressed_indices = topk_indices.long() + global_sequence_length
+            compressed_indices.masked_fill_(topk_indices < 0, -1)
             sparse_indices = torch.cat((window, compressed_indices), dim=-1)
         else:
             combined_key_value = key_value
@@ -1224,14 +1326,14 @@ class SharedCompressedDSAAttention(nn.Module):
                 indexer_output is not None
                 and self.training
                 and self.indexer.loss_coeff
-                and shared_state.compressed_kv is not None
+                and compressed_kv is not None
         ):
             indexer_loss = shared_compressed_indexer_kl_loss(
                 indexer_output.index_query,
                 indexer_output.index_key,
                 indexer_output.merge_weight,
                 query,
-                shared_state.compressed_kv,
+                compressed_kv,
                 indexer_output.topk_indices,
                 self.sinks,
                 attention_scale=self.scaling,

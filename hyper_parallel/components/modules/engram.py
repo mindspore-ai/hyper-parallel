@@ -109,10 +109,11 @@ class NgramHashMapping(nn.Module):
             segment_ids = starts.to(torch.long).cumsum(dim=1)
 
         tokens = []
+        blocked = torch.zeros_like(positions, dtype=torch.bool)
         for shift in range(self.max_ngram_size):
             source_positions = (positions - shift).clamp_min(0)
             source = compressed.gather(1, source_positions)
-            blocked = positions < shift
+            blocked = blocked | (positions < shift)
             if segment_ids is not None:
                 source_segments = segment_ids.gather(1, source_positions)
                 blocked = blocked | (source_segments != segment_ids)
