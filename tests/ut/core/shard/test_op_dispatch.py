@@ -893,6 +893,13 @@ class TestRandomOpReturnsSelf(unittest.TestCase):
 
         self.assertIn("erfinv_", OpDispatcher._INPLACE_BYPASS_OPS)
 
+    def test_fused_optimizer_inplace_ops_bypass_layout_dispatch(self):
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        for op_name in ("_fused_adamw_", "_fused_adam_"):
+            with self.subTest(op_name=op_name):
+                self.assertIn(op_name, OpDispatcher._INPLACE_BYPASS_OPS)
+
     def test_func_dropout_ext_inplace_via_args(self):
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
 

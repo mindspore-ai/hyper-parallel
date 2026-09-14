@@ -258,7 +258,22 @@ class OpDispatcher:
     # next op that adds a DTensor to it (e.g. grad-accumulation `loss += micro_loss`).
     # Class-level so it stays available on instances built via __new__ (e.g. tests).
     _INPLACE_BYPASS_OPS = frozenset(
-        {"InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv", "erfinv_", "clamp_"})
+        {
+            "InplaceAddExt",
+            "InplaceSubExt",
+            "InplaceMul",
+            "InplaceDiv",
+            "erfinv_",
+            "clamp_",
+            # torch_npu fused optimizers mutate parameter/state tensors in
+            # place.  They do not have a DTensor layout-infer implementation;
+            # unwrap their (possibly nested) tensor lists and execute the
+            # native kernel locally, preserving the original DTensor wrapper
+            # for the first argument where applicable.
+            "_fused_adamw_",
+            "_fused_adam_",
+        }
+    )
 
     # MindSpore random kernels that always mutate an existing tensor in place.
     # Out-of-place random kernels belong in _random_ms_ops only, not here.
