@@ -52,6 +52,7 @@ class DynamicPackingPlanner:
             seq_len: int,
             local_batch_size: int,
             oversized_policy: OversizedPolicy = "error",
+            min_balance_gain: float = 0.0,
     ) -> None:
         """Initialize fixed constructor dimensions.
 
@@ -70,10 +71,14 @@ class DynamicPackingPlanner:
                 raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
         if oversized_policy not in ("error", "single"):
             raise ValueError("oversized_policy must be 'error' or 'single'.")
+        if not isinstance(min_balance_gain, (int, float)) or isinstance(min_balance_gain, bool) \
+                or not 0.0 <= min_balance_gain < 1.0:
+            raise ValueError("min_balance_gain must be in [0, 1).")
         self.data_parallel_size = data_parallel_size
         self.seq_len = seq_len
         self.local_batch_size = local_batch_size
         self.oversized_policy = oversized_policy
+        self.min_balance_gain = float(min_balance_gain)
 
     @property
     def distributed_bin_count(self) -> int:
@@ -109,6 +114,8 @@ class DynamicPackingPlanner:
         ]
         rank_costs = [WorkloadCost() for _ in range(self.data_parallel_size)]
         bins, rank_costs = self._place_samples(selection, ordered, bins, rank_costs)
+        if self.min_balance_gain and self._reference_is_better(selection, rank_costs):
+            bins, rank_costs = self._reference_bins_in_order(selection)
         constructors = self._freeze_bins(bins, rank_costs)
         self._validate_conservation(constructors, selection)
         plan_id = self._plan_id(step, constructors)
@@ -120,6 +127,33 @@ class DynamicPackingPlanner:
             data_parallel_size=self.data_parallel_size,
             constructors=constructors,
         )
+
+    def _reference_bins_in_order(
+            self, selection: StepSampleSelection,
+    ) -> tuple[list[_MutableBin], list[WorkloadCost]]:
+        """Materialize the canonical bins in their original rank order."""
+        samples_by_key = {item.key: item for item in selection.samples}
+        bins: list[_MutableBin] = []
+        rank_costs = [WorkloadCost() for _ in range(self.data_parallel_size)]
+        rank_tokens = [0] * self.data_parallel_size
+        for index, key_bin in enumerate(selection.reference_bins):
+            data_rank = index // self.local_batch_size
+            packing_bin = _MutableBin(data_rank=data_rank, pack_index=index % self.local_batch_size)
+            for key in key_bin:
+                self._place(packing_bin, samples_by_key[key], rank_costs, rank_tokens)
+            bins.append(packing_bin)
+        return bins, rank_costs
+
+    def _reference_is_better(
+            self, selection: StepSampleSelection, balanced_costs: Sequence[WorkloadCost],
+    ) -> bool:
+        _, reference_costs = self._reference_bins_in_order(selection)
+        reference_max = max((cost.dominant for cost in reference_costs), default=0.0)
+        balanced_max = max((cost.dominant for cost in balanced_costs), default=0.0)
+        if reference_max <= 0.0:
+            return True
+        gain = (reference_max - balanced_max) / reference_max
+        return gain < self.min_balance_gain
 
     def _validate_plan_request(
             self,

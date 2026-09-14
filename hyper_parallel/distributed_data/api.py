@@ -137,6 +137,7 @@ class DistributedDatasetConfig:
     prefetch_factor: int | None = None
     persistent_workers: bool = False
     double_buffer: bool = False
+    min_balance_gain: float = 0.0
     cpu_backend: str = "gloo"
     payload_backend: str | None = None
 
@@ -181,6 +182,13 @@ class DistributedDatasetConfig:
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be boolean.")
+        if (
+            not isinstance(self.min_balance_gain, (int, float))
+            or isinstance(self.min_balance_gain, bool)
+            or not math.isfinite(self.min_balance_gain)
+            or not 0.0 <= self.min_balance_gain < 1.0
+        ):
+            raise ValueError("min_balance_gain must be in [0, 1).")
         if not self.drop_last:
             raise ValueError(
                 "Dynamic distributed packing currently requires drop_last=True so every DP rank receives the "
@@ -691,6 +699,7 @@ def _populate_build_state(
         seq_len=config.seq_len,
         local_batch_size=config.local_batch_size,
         oversized_policy=config.oversized_policy,
+        min_balance_gain=config.min_balance_gain,
     )
     if batch_sampler is None:
         state.step_sample_selector = StepSampleSelector(

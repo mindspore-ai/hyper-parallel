@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import copy
-import pickle
 from collections.abc import Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -564,6 +563,23 @@ class DistributedDataLoader(Iterator[Any]):
         if self._metadata_mode and not self._metadata_payload_exchange:
             return self._produce_metadata_batch(plan)
 
+        # VeOmni's external reader has already selected and packed this exact
+        # step.  Reuse it when balancing kept every bin on its canonical owner;
+        # moved steps continue through the normal payload exchange.
+        canonical_match = False
+        if self._external_step_mode and self._topology.is_constructor:
+            reader = self._dataset_reader
+            constructor_plan = plan.constructor_for(self._topology.data_rank)
+            matches = getattr(reader, "canonical_plan_matches", None)
+            canonical_match = callable(matches) and matches(constructor_plan, self._topology.data_rank)
+        if self._external_step_mode and self._data_plane.is_member:
+            canonical_match = self._data_plane.all_ranks_true(canonical_match)
+        if canonical_match and self._topology.is_constructor:
+            canonical_batch = getattr(self._dataset_reader, "canonical_batch", None)
+            if callable(canonical_batch):
+                local_batch = canonical_batch()
+                return ConstructedBatch(step=plan.step, plan_id=plan.plan_id, data=local_batch)
+
         outgoing = self._prepare_outgoing(plan, local_selected_keys)
         received_payloads = self._data_plane.exchange_prepared(outgoing)
         return self._construct_received_payloads(plan, received_payloads)
@@ -588,7 +604,6 @@ class DistributedDataLoader(Iterator[Any]):
         if self._topology.is_constructor:
             constructor_plan = plan.constructor_for(self._topology.data_rank)
             local_batch = self._data_constructor.construct(constructor_plan, received_payloads)
-            pickle.dumps(local_batch, protocol=pickle.HIGHEST_PROTOCOL)
         elif received_payloads:
             raise ValueError(
                 f"Non-constructor rank {self._topology.global_rank} received unexpected sample payloads."

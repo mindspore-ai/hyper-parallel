@@ -540,6 +540,17 @@ class DataPlaneTransport:
         dist.all_gather_object(gathered, value, group=self._control_group)
         return tuple(gathered)
 
+    def all_ranks_true(self, value: bool) -> bool:
+        """Return whether every data-plane rank supplied ``True``."""
+        self._require_member()
+        if not isinstance(value, bool):
+            raise ValueError("all_ranks_true expects a boolean value.")
+        if len(self._ranks) == 1:
+            return value
+        flag = torch.tensor([int(value)], dtype=torch.int32, device="cpu")
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self._control_group)
+        return bool(flag.item())
+
     def gather_object_to_planner(self, value: Any) -> tuple[Any, ...] | None:
         """Gather Dataset Reader metadata only on the Planner rank.
 
