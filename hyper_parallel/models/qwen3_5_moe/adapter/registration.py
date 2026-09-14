@@ -29,12 +29,14 @@ def _load_init_weights():
 QWEN3_5_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5MoeForConditionalGeneration",
     model_type="qwen3_5_moe",
+    min_transformers_version="5.2.0",
     init_weights=_load_init_weights,
 )
 
 QWEN3_5_MOE_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5MoeForCausalLM",
     model_type="qwen3_5_moe_text",
+    min_transformers_version="5.2.0",
     init_weights=_load_init_weights,
 )
 

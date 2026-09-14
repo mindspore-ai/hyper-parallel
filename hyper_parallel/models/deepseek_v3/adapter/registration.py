@@ -61,6 +61,7 @@ def _load_sharding_rules():
 DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV3ForCausalLM",
     model_type="deepseek_v3",
+    min_transformers_version="4.51.0",
     replacements=_load_replacements,
     sharding_rules=_load_sharding_rules,
 )
@@ -71,6 +72,7 @@ register_model_adapter(DEEPSEEK_V3_ADAPTER_SPEC)
 DEEPSEEK_V2_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV2ForCausalLM",
     model_type="deepseek_v2",
+    min_transformers_version="4.54.0",
     sharding_rules=_load_sharding_rules,
 )
 register_model_adapter(DEEPSEEK_V2_ADAPTER_SPEC)

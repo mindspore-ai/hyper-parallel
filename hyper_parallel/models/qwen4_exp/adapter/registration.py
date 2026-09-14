@@ -29,12 +29,14 @@ def _load_init_weights():
 QWEN4_EXP_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen4ExpForConditionalGeneration",
     model_type="qwen4_exp",
+    min_transformers_version="5.16.0",
     init_weights=_load_init_weights,
 )
 
 QWEN4_EXP_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen4ExpForCausalLM",
     model_type="qwen4_exp_text",
+    min_transformers_version="5.16.0",
     init_weights=_load_init_weights,
 )
 

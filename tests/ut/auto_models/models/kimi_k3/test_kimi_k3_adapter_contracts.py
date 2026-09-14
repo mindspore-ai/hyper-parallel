@@ -19,6 +19,7 @@ import inspect
 import os
 import tempfile
 import unittest
+from importlib.metadata import version
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,6 +28,7 @@ from unittest.mock import patch
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 from torch import nn
+from packaging.version import Version
 
 from hyper_parallel.components.modules import KimiDeltaAttention
 from hyper_parallel.distributed._builder.forward_rewriter import (
@@ -118,10 +120,13 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_top_level_and_text_specs_share_kda_providers(self):
-        """Both official Kimi config identities discover the same KDA rules."""
+        """Supported Kimi config identities discover the same KDA rules."""
         top_spec = get_model_adapter("KimiK3ForConditionalGeneration")
         text_spec = get_model_adapter("KimiLinearForCausalLM")
         self.assertIsNotNone(top_spec)
+        if Version(version("transformers")) < Version("5.17.0"):
+            self.assertIsNone(text_spec)
+            return
         self.assertIsNotNone(text_spec)
         self.assertIs(
             top_spec.context_parallel(),

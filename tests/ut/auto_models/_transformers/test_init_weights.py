@@ -14,6 +14,7 @@
 # ============================================================================
 """Model-family shard-aware initialization contracts."""
 
+from importlib import import_module
 from types import SimpleNamespace
 from unittest import mock
 
@@ -24,12 +25,6 @@ from torch import nn
 from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.models._transformers.model_builder import _initialize_model_weights
-from hyper_parallel.models.qwen3_5.adapter.init_weights import initialize_weights as initialize_qwen3_5_weights
-from hyper_parallel.models.qwen3_5_moe.adapter.init_weights import (
-    initialize_weights as initialize_qwen3_5_moe_weights,
-)
-from hyper_parallel.models.qwen3_next.adapter.init_weights import initialize_weights as initialize_qwen3_next_weights
-from hyper_parallel.models.qwen4_exp.adapter.init_weights import initialize_weights as initialize_qwen4_exp_weights
 
 
 class _FakeGatedDeltaNet(nn.Module):
@@ -65,34 +60,40 @@ class _FakeModel(nn.Module):
 
 _QWEN_INITIALIZERS = [
     (
-        initialize_qwen3_5_weights,
-        "hyper_parallel.models.qwen3_5.adapter.init_weights.Qwen3_5GatedDeltaNet",
+        "hyper_parallel.models.qwen3_5.adapter.init_weights",
+        "Qwen3_5GatedDeltaNet",
     ),
     (
-        initialize_qwen3_5_moe_weights,
-        "hyper_parallel.models.qwen3_5_moe.adapter.init_weights.Qwen3_5MoeGatedDeltaNet",
+        "hyper_parallel.models.qwen3_5_moe.adapter.init_weights",
+        "Qwen3_5MoeGatedDeltaNet",
     ),
     (
-        initialize_qwen3_next_weights,
-        "hyper_parallel.models.qwen3_next.adapter.init_weights.Qwen3NextGatedDeltaNet",
+        "hyper_parallel.models.qwen3_next.adapter.init_weights",
+        "Qwen3NextGatedDeltaNet",
     ),
     (
-        initialize_qwen4_exp_weights,
-        "hyper_parallel.models.qwen4_exp.adapter.init_weights.Qwen4ExpTextGatedDeltaNet",
+        "hyper_parallel.models.qwen4_exp.adapter.init_weights",
+        "Qwen4ExpTextGatedDeltaNet",
     ),
 ]
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
           card_mark="onecard", essential_mark="essential")
-@pytest.mark.parametrize("initializer,module_type_path", _QWEN_INITIALIZERS)
-def test_qwen_initializer_uses_local_parameter_shape(initializer, module_type_path):
+@pytest.mark.parametrize("module_path,module_type_name", _QWEN_INITIALIZERS)
+def test_qwen_initializer_uses_local_parameter_shape(module_path, module_type_name):
     """Each Qwen family initializes the local gated-delta shard before native state."""
     model = _FakeModel()
+    try:
+        init_weights_module = import_module(module_path)
+    except ModuleNotFoundError as error:
+        if error.name and error.name.startswith("transformers.models."):
+            pytest.skip(f"optional Transformers model is unavailable: {error.name}")
+        raise
 
     torch.manual_seed(1234)
-    with mock.patch(module_type_path, _FakeGatedDeltaNet):
-        initializer(model)
+    with mock.patch.object(init_weights_module, module_type_name, _FakeGatedDeltaNet):
+        init_weights_module.initialize_weights(model)
 
     assert model.gated_delta.A_log.shape == (4,), "case: local_shape"
     assert torch.equal(model.gated_delta.dt_bias, torch.ones(4)), "case: dt_bias"
