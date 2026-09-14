@@ -108,6 +108,16 @@ def apply_sharding_plan(
     # injection fails fast here, BEFORE any parameter is touched
     _preflight_compute_injection(plan, mesh, model=models[0])
 
+    tied_pairs = list(plan.tied_pairs)
+    known_tied_pairs = {frozenset(pair) for pair in tied_pairs}
+    for part in models:
+        for pair in detect_tied_weights(part):
+            pair_key = frozenset(pair)
+            if pair_key not in known_tied_pairs:
+                tied_pairs.append(pair)
+                known_tied_pairs.add(pair_key)
+    plan.tied_pairs = tied_pairs
+
     expert_mesh, dense_source_mesh, expert_source_mesh = (
         _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh)
     )
@@ -136,8 +146,7 @@ def apply_sharding_plan(
         _apply_phase_c(part, plan, mesh, validate_mode, expert_mesh=expert_mesh)
 
     # ====== Phase D: tied weights ======
-    tied_pairs = list(plan.tied_pairs) or detect_tied_weights(models[0])
     for part in models:
-        _replicate_tied_weights(part, tied_pairs)
+        _replicate_tied_weights(part, plan.tied_pairs)
 
     return model, source_shard_info

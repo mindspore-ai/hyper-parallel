@@ -22,19 +22,23 @@ contracts (Gate-1: no process group):
   with the production/validate branch selected by ``validate_mode``;
 * the entry point fails fast on a missing device mesh and on injection /
   ``region_dispatch`` contract violations, before any forward is touched;
-* tied-weight detection and storage sharing keep parameter identity.
+* tied-weight detection and Phase-D rebinding restore parameter identity.
 """
-# pylint: disable=wrong-import-position
+# pylint: disable=wrong-import-position,abstract-method
 
 import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch
 from torch import nn
 
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.distributed.apply import (
     apply_sharding_plan,
 )
@@ -77,6 +81,21 @@ class _TiedModel(nn.Module):
         self.lm_head = nn.Linear(4, 8, bias=False)
         if share:
             self.lm_head.weight = self.embed_tokens.weight
+
+
+class _DeclaredTiedModel(nn.Module):
+    """Transformers-style model declaring multiple tied targets."""
+
+    def __init__(self) -> None:
+        """Create independent parameters and target-to-source declarations."""
+        super().__init__()
+        self.embed_tokens = nn.Embedding(8, 4)
+        self.lm_head = nn.Linear(4, 8, bias=False)
+        self.decoder = nn.Linear(4, 8, bias=False)
+        self.all_tied_weights_keys = {
+            "lm_head.weight": "embed_tokens.weight",
+            "decoder.weight": "embed_tokens.weight",
+        }
 
 
 def _boundary_plan():
@@ -190,13 +209,17 @@ class TestForwardInstall(unittest.TestCase):
 
 
 class TestTiedWeights(unittest.TestCase):
-    """Tied-weight detection and within-rank storage sharing."""
+    """Tied-weight detection and within-rank Parameter rebinding."""
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_detect_tied_weights(self):
-        """tie_word_embeddings + shared parameter yields the (embed, lm_head) pair."""
-        model = _TiedModel(tie_word_embeddings=True, share=True)
+        """
+        Feature: Legacy tied-weight detection.
+        Description: Enable the legacy config on an initially untied model.
+        Expectation: The canonical embedding and head FQNs form one pair.
+        """
+        model = _TiedModel(tie_word_embeddings=True, share=False)
         self.assertEqual(
             detect_tied_weights(model),
             [("embed_tokens.weight", "lm_head.weight")],
@@ -204,15 +227,53 @@ class TestTiedWeights(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_detect_tied_weights_disabled(self):
-        """No tied pairs when the config does not tie word embeddings."""
+    def test_detect_tied_weights_uses_parameter_identity_without_config(self):
+        """
+        Feature: Identity-based tied-weight detection.
+        Description: Inspect shared Parameters without a Transformers config declaration.
+        Expectation: Existing aliases are detected by Parameter identity.
+        """
         model = _TiedModel(tie_word_embeddings=False, share=True)
+        self.assertEqual(
+            detect_tied_weights(model),
+            [("embed_tokens.weight", "lm_head.weight")],
+        )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_detect_tied_weights_returns_empty_without_alias_or_declaration(self):
+        """
+        Feature: Untied model detection.
+        Description: Inspect independent Parameters without tied-weight declarations.
+        Expectation: Detection returns no tied pairs.
+        """
+        model = _TiedModel(tie_word_embeddings=False, share=False)
         self.assertEqual(detect_tied_weights(model), [])
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_replicate_tied_weights_shares_storage(self):
-        """End B's data is rebound to end A's storage; parameter objects stay."""
+    def test_detect_tied_weights_uses_transformers_declaration_direction(self):
+        """
+        Feature: Transformers tied-weight declarations.
+        Description: Inspect target-to-source declarations with two targets.
+        Expectation: Detection emits source-to-target pairs in declaration order.
+        """
+        self.assertEqual(
+            detect_tied_weights(_DeclaredTiedModel()),
+            [
+                ("embed_tokens.weight", "lm_head.weight"),
+                ("embed_tokens.weight", "decoder.weight"),
+            ],
+        )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_replicate_tied_weights_restores_parameter_identity(self):
+        """
+        Feature: Tied Parameter rebinding.
+        Description: Restore a declared pair whose two Parameters are independent.
+        Expectation: The target is replaced by the canonical source object.
+        """
         model = _TiedModel(tie_word_embeddings=False, share=False)
         embed_param = model.embed_tokens.weight
         head_param = model.lm_head.weight
@@ -221,10 +282,97 @@ class TestTiedWeights(unittest.TestCase):
             model, [("embed_tokens.weight", "lm_head.weight")]
         )
         self.assertIs(model.embed_tokens.weight, embed_param)
-        self.assertIs(model.lm_head.weight, head_param)
-        self.assertEqual(
-            model.lm_head.weight.data_ptr(), model.embed_tokens.weight.data_ptr()
+        self.assertIsNot(model.lm_head.weight, head_param)
+        self.assertIs(model.lm_head.weight, embed_param)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_replicate_tied_weights_rejects_shape_mismatch(self):
+        """
+        Feature: Tied Parameter shape validation.
+        Description: Rebind a target whose global shape differs from its source.
+        Expectation: Rebinding rejects the incompatible pair.
+        """
+        model = _TiedModel(tie_word_embeddings=False, share=False)
+        model.lm_head = nn.Linear(4, 7, bias=False)
+
+        with self.assertRaisesRegex(ValueError, "matching shapes"):
+            _replicate_tied_weights(
+                model, [("embed_tokens.weight", "lm_head.weight")]
+            )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_replicate_tied_weights_rejects_dtype_mismatch(self):
+        """
+        Feature: Tied Parameter dtype validation.
+        Description: Rebind a target whose dtype differs from its source.
+        Expectation: Rebinding rejects the incompatible pair.
+        """
+        model = _TiedModel(tie_word_embeddings=False, share=False)
+        model.lm_head.to(dtype=torch.float64)
+
+        with self.assertRaisesRegex(ValueError, "matching dtypes"):
+            _replicate_tied_weights(
+                model, [("embed_tokens.weight", "lm_head.weight")]
+            )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_replicate_tied_weights_rejects_dtensor_placement_mismatch(self):
+        """
+        Feature: Tied DTensor placement validation.
+        Description: Rebind DTensors with shard and replicate placements.
+        Expectation: Rebinding rejects the incompatible layouts.
+        """
+        model = _TiedModel(tie_word_embeddings=False, share=False)
+        with patch(
+            "hyper_parallel.core.dtensor.device_mesh.dist.get_rank",
+            return_value=0,
+        ):
+            mesh = DeviceMesh(
+                "cpu",
+                [0],
+                mesh_dim_names=("tp",),
+                _init_backend=False,
+            )
+        model.embed_tokens.weight = nn.Parameter(
+            DTensor.from_local(torch.ones(8, 4), mesh, (Shard(0),))
         )
+        model.lm_head.weight = nn.Parameter(
+            DTensor.from_local(torch.ones(8, 4), mesh, (Replicate(),))
+        )
+
+        with self.assertRaisesRegex(ValueError, "matching placements"):
+            _replicate_tied_weights(
+                model, [("embed_tokens.weight", "lm_head.weight")]
+            )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_apply_merges_explicit_and_declared_tied_pairs(self):
+        """
+        Feature: Sharding-plan tied-pair merging.
+        Description: Apply a plan containing one of two declared aliases.
+        Expectation: The plan retains the explicit pair and adds the missing declaration.
+        """
+        model = _DeclaredTiedModel()
+        plan = ShardingPlan(
+            mesh_dim_names=(),
+            tied_pairs=[("embed_tokens.weight", "lm_head.weight")],
+        )
+
+        apply_sharding_plan(model, plan, FakeDeviceMesh())
+
+        self.assertEqual(
+            plan.tied_pairs,
+            [
+                ("embed_tokens.weight", "lm_head.weight"),
+                ("embed_tokens.weight", "decoder.weight"),
+            ],
+        )
+        self.assertIs(model.lm_head.weight, model.embed_tokens.weight)
+        self.assertIs(model.decoder.weight, model.embed_tokens.weight)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

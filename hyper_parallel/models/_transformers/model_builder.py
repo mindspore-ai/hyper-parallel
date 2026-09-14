@@ -276,7 +276,77 @@ def _move_model_to_device(
         return model
 
     model.to_empty(device=device)
+    _restore_tied_weights_after_materialization(model)
     return model
+
+
+def _declared_tied_parameters(
+    model: nn.Module,
+) -> list[tuple[str, str, nn.Parameter, nn.Parameter]]:
+    """Resolve declared tied pairs that are present in the local module tree."""
+    tied_mapping = getattr(model, "all_tied_weights_keys", {}) or {}
+    parameters = dict(model.named_parameters(remove_duplicate=False))
+    return [
+        (target_name, source_name, parameters[target_name], parameters[source_name])
+        for target_name, source_name in tied_mapping.items()
+        if target_name in parameters and source_name in parameters
+    ]
+
+
+def _validate_declared_tied_parameters(model: nn.Module) -> None:
+    """Validate that each local declared pair shares one Parameter identity."""
+    for target_name, source_name, target, source in _declared_tied_parameters(model):
+        if tuple(target.shape) != tuple(source.shape):
+            raise ValueError(
+                "Tied parameters must have matching shapes: "
+                f"{target_name}={tuple(target.shape)} vs {source_name}={tuple(source.shape)}"
+            )
+        if target is not source:
+            raise ValueError(
+                "Tied parameters do not share Parameter identity: "
+                f"{target_name} and {source_name}"
+            )
+
+
+def _tie_model_weights(model: nn.Module) -> None:
+    """Restore declared Transformers tied weights through the model contract."""
+    tied_mapping = getattr(model, "all_tied_weights_keys", {}) or {}
+    if not tied_mapping:
+        return
+    tie_weights = getattr(model, "tie_weights", None)
+    if not callable(tie_weights):
+        raise ValueError("Model declares tied weights but has no callable tie_weights()")
+    tie_weights()
+    _validate_declared_tied_parameters(model)
+
+
+def _tie_model_weights_before_sharding(model: nn.Module) -> None:
+    """Ensure declared Transformers weights are tied before parameter sharding."""
+    _tie_model_weights(model)
+
+
+def _unique_hsdp_states(model: nn.Module) -> list[Any]:
+    """Collect unique HSDP states exposed by the model tree."""
+    states = []
+    visited_state_ids = set()
+    for module in model.modules():
+        hsdp_state = get_hsdp_state(module)
+        if hsdp_state is None or id(hsdp_state) in visited_state_ids:
+            continue
+        visited_state_ids.add(id(hsdp_state))
+        states.append(hsdp_state)
+    return states
+
+
+def _restore_tied_weights_after_materialization(model: nn.Module) -> None:
+    """Restore HSDP canonical parameters and declared aliases after ``to_empty``."""
+    hsdp_states = _unique_hsdp_states(model)
+    if hsdp_states:
+        for hsdp_state in hsdp_states:
+            hsdp_state.lazy_init()
+    else:
+        _tie_model_weights(model)
+    _validate_declared_tied_parameters(model)
 
 
 def _initialize_model_weights(model: nn.Module) -> None:
@@ -341,6 +411,7 @@ def _apply_pre_sharding_features(
     fp8_config: Optional[Any],
 ) -> None:
     """Apply or report optional features that precede sharding."""
+    del model  # Reserved for feature implementations that transform the model.
     if peft_config is not None:
         logger.warning("PEFT injection not implemented in stub")
     if qat_config is not None:
@@ -394,6 +465,7 @@ def _materialize_and_load_model(
         _finalize_model_loading(model, load_report, strict=True)
     else:
         _initialize_model_weights(model)
+    _validate_declared_tied_parameters(model)
     return model
 
 
@@ -426,7 +498,34 @@ def apply_model_infrastructure(
     materialization/loading -> per-layer compile. Placement validation keeps
     the DTensor placement path and skips compile, while FSDP2 consumes DTensor
     parameter layouts in both modes.
+
+    Args:
+        model: Model to prepare for distributed execution.
+        mesh: Optional runtime topology and mesh domains.
+        sharding_planner: Optional planner for parameter and activation layouts.
+        fsdp2_manager: Optional manager that applies nested FSDP2 wrapping.
+        peft_config: Optional parameter-efficient fine-tuning configuration.
+        qat_config: Optional quantization-aware training configuration.
+        fp8_config: Optional FP8 configuration.
+        freeze_config: Optional parameter-freezing configuration.
+        compile_config: Optional compilation configuration.
+        activation_checkpoint: Activation-checkpointing mode.
+        activation_swap: Activation-swap mode.
+        swap_inputs: Whether activation checkpointing swaps module inputs.
+        is_meta_device: Whether model parameters currently use the meta device.
+        is_hf_model: Whether the model is a native Transformers model.
+        device: Device on which to materialize or move the model.
+        load_base_model: Whether to load pretrained weights after materialization.
+        pretrained_path: Optional path or identifier for pretrained weights.
+        validate_placement: Whether to preserve DTensors for placement validation.
+        low_precision_config: Optional low-precision module replacement configuration.
+        model_init_dtype: Optional final floating-point initialization dtype.
+        **kwargs: Additional normalized build context, including ``distributed_setup``.
+
+    Returns:
+        The prepared model.
     """
+    # #lizard forgive - Keep the fixed infrastructure order visible in one orchestration function.
 
     distributed_setup = kwargs.get("distributed_setup")
 
@@ -446,6 +545,7 @@ def apply_model_infrastructure(
         context=_build_replacement_context(distributed_setup, low_precision_config),
         capture_checkpoint_metadata=load_base_model,
     )
+    _tie_model_weights_before_sharding(model)
 
     if freeze_config is not None:
         logger.warning("Parameter freezing not implemented in stub")
@@ -458,6 +558,7 @@ def apply_model_infrastructure(
         is_hf_model,
         validate_placement,
     )
+    _validate_declared_tied_parameters(model)
 
     model = _apply_activation_features(
         model,
@@ -542,12 +643,7 @@ def _dtensor_layouts(model: nn.Module) -> Dict[int, tuple[Any, tuple[Any, ...]]]
 
 def _refresh_hsdp_precision_state(model: nn.Module) -> None:
     """Refresh FSDP storage and dtype metadata after model conversion."""
-    visited_states = set()
-    for module in model.modules():
-        hsdp_state = get_hsdp_state(module)
-        if hsdp_state is None or id(hsdp_state) in visited_states:
-            continue
-        visited_states.add(id(hsdp_state))
+    for hsdp_state in _unique_hsdp_states(model):
         for hsdp_param in hsdp_state.hsdp_params:
             hsdp_param.reset_sharded_param()
             hsdp_param.init_dtype_attrs(hsdp_state.mp_policy)

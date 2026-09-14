@@ -17,8 +17,8 @@
 Owns parameter placement/localize/stack (merged from the legacy
 ``components/distributed/sharding/apply.py`` — there is exactly one parameter
 sharding implementation), source-mesh resolution, runtime source_shard_info
-construction, and the tied-weights replication pass (same-rank shared
-storage, no cross-rank shard broadcast).
+construction, and tied-parameter rebinding (same-rank Parameter identity, no
+cross-rank shard broadcast).
 """
 
 import logging
@@ -357,24 +357,39 @@ def _shard_module_params(module, param_specs, mesh, mesh_dim_names):
 # ────────────────────────────────────────────────────────────────────────────
 
 def detect_tied_weights(model: Any) -> List[Tuple[str, str]]:
-    """Detect tied-weight pairs (embed_tokens.weight <-> lm_head.weight).
+    """Detect same-rank tied-parameter pairs before parameter sharding.
 
-    In PP scenarios cross-stage pairs cannot be detected; the user must
-    explicitly declare plan.tied_pairs.
+    Transformers ``all_tied_weights_keys`` declarations are authoritative.
+    Other models are detected by shared Parameter identity, with the legacy
+    embedding/head convention retained as a compatibility fallback. In PP
+    scenarios, cross-stage pairs must still be declared in ``plan.tied_pairs``.
 
     Args:
-        model: The model to inspect (an HF-style ``nn.Module`` with a
-            ``config`` carrying ``tie_word_embeddings``).
+        model: The model to inspect.
 
     Returns:
-        A list of ``(embed_fqn, lm_head_fqn)`` tied-parameter FQN pairs.
+        A list of ``(source_fqn, target_fqn)`` tied-parameter FQN pairs.
     """
-    tied = []
+    declared_mapping = getattr(model, "all_tied_weights_keys", None)
+    if declared_mapping:
+        return [
+            (source_fqn, target_fqn)
+            for target_fqn, source_fqn in declared_mapping.items()
+        ]
+
+    names_by_parameter = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        names_by_parameter.setdefault(id(parameter), []).append(name)
+    tied = [
+        (names[0], target_fqn)
+        for names in names_by_parameter.values()
+        for target_fqn in names[1:]
+    ]
+    if tied:
+        return tied
+
     if getattr(getattr(model, "config", None), "tie_word_embeddings", False):
         embed_fqn = lm_head_fqn = None
-        # remove_duplicate=False: under the default dedup of named_parameters
-        # a tied parameter appears only once; duplicates must be explicitly
-        # retained to discover the FQNs of both ends.
         for name, _ in model.named_parameters(remove_duplicate=False):
             if name.endswith("embed_tokens.weight"):
                 embed_fqn = name
@@ -385,35 +400,73 @@ def detect_tied_weights(model: Any) -> List[Tuple[str, str]]:
     return tied
 
 
-def _broadcast_tied_param(model, tied_pair):
-    """A tied-weight pair shares storage within this rank (end A's storage is authoritative; end B shares it).
+def _validate_tied_parameter_compatibility(
+    source_fqn: str,
+    source,
+    target_fqn: str,
+    target,
+) -> None:
+    """Validate that a tied target can safely alias its canonical source."""
+    if tuple(source.shape) != tuple(target.shape):
+        raise ValueError(
+            f"Tied parameters must have matching shapes: {source_fqn}={tuple(source.shape)} vs "
+            f"{target_fqn}={tuple(target.shape)}"
+        )
+    if source.dtype != target.dtype:
+        raise ValueError(
+            f"Tied parameters must have matching dtypes: {source_fqn}={source.dtype} vs "
+            f"{target_fqn}={target.dtype}"
+        )
 
-    Cross-rank broadcast would be **wrong**: a tied pair (embed/lm_head) is
-    usually Shard(0)-sharded on both ends, and each rank's local shard carries
-    a different vocab interval -- broadcasting rank0's shard to rank1 would
-    corrupt rank1's sharding. Tied semantics require that **within the same
-    rank** the two ends are the same physical parameter (shared gradients),
-    not cross-rank consistency (sharding is naturally consistent: same global
-    source, same placement).
+    source_is_dtensor = isinstance(source, DTensor)
+    target_is_dtensor = isinstance(target, DTensor)
+    if source_is_dtensor != target_is_dtensor:
+        raise ValueError(
+            "Tied parameters must both be DTensors or both be local Parameters: "
+            f"{source_fqn}={type(source).__name__}, {target_fqn}={type(target).__name__}"
+        )
+    if not source_is_dtensor:
+        return
+    if source.device_mesh != target.device_mesh:
+        raise ValueError(
+            f"Tied DTensors must use the same device mesh: {source_fqn} and {target_fqn}"
+        )
+    if tuple(source.placements) != tuple(target.placements):
+        raise ValueError(
+            f"Tied DTensors must use matching placements: {source_fqn}={tuple(source.placements)} vs "
+            f"{target_fqn}={tuple(target.placements)}"
+        )
+
+
+def _rebind_tied_param(model: nn.Module, tied_pair: Tuple[str, str]) -> None:
+    """Register one canonical Parameter object at both tied FQNs.
+
+    This is a same-rank alias operation, not a collective broadcast. Pairs
+    split across pipeline stages are skipped when either FQN is not local.
     """
-    fqn_a, fqn_b = tied_pair
+    source_fqn, target_fqn = tied_pair
     try:
-        param_a = _get_attr_by_path(model, fqn_a)
-        param_b = _get_attr_by_path(model, fqn_b)
+        source = _get_attr_by_path(model, source_fqn)
+        target = _get_attr_by_path(model, target_fqn)
     except AttributeError:
         return
-    if param_a is None or param_b is None:
+    if source is None or target is None:
         return
-    tensor_a = param_a.to_local() if isinstance(param_a, DTensor) else param_a.data
-    # B shares storage with A (a tied weight is the same physical parameter)
-    if isinstance(param_b, DTensor):
-        param_b._local_tensor = tensor_a  # pylint: disable=protected-access
-    else:
-        param_b.data = tensor_a
+    _validate_tied_parameter_compatibility(
+        source_fqn,
+        source,
+        target_fqn,
+        target,
+    )
+    _set_param_by_path(model, target_fqn, source)
+    if _get_attr_by_path(model, target_fqn) is not source:
+        raise ValueError(
+            f"Failed to restore tied Parameter identity: {source_fqn} and {target_fqn}"
+        )
 
 
 def _replicate_tied_weights(model, tied_pairs=None):
-    """Phase D: replicate tied weights across ranks."""
+    """Phase D: restore same-rank Parameter identity for tied weights."""
     for tied_pair in (tied_pairs if tied_pairs is not None
                       else detect_tied_weights(model)):
-        _broadcast_tied_param(model, tied_pair)
+        _rebind_tied_param(model, tied_pair)
