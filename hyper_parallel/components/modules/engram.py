@@ -21,10 +21,10 @@ from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
-import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed.expert_parallel.collectives import ep_all_to_all
+from hyper_parallel.models.materialization import register_rebuildable_buffer
 from hyper_parallel.models.replacement import module_replacement
 
 
@@ -64,21 +64,14 @@ class NgramHashMapping(nn.Module):
         if multipliers.numel() != self.max_ngram_size:
             raise ValueError("Engram multiplier count must equal max_ngram_size")
         self.logical_num_embeddings = int(flattened_primes.sum().item())
-        self._initial_buffers = {
+        initial_buffers = {
             "token_map": token_map,
             "primes": primes,
             "offsets": offsets,
             "multipliers": multipliers,
         }
-        for name, value in self._initial_buffers.items():
-            self.register_buffer(name, value.clone(), persistent=False)
-        self._hp_reset_after_materialization = True
-
-    @torch.no_grad()
-    def reset_parameters(self) -> None:
-        """Restore hash metadata after meta-device materialization."""
-        for name, value in self._initial_buffers.items():
-            getattr(self, name).copy_(value.to(getattr(self, name).device))
+        for name, value in initial_buffers.items():
+            register_rebuildable_buffer(self, name, value=value, persistent=False)
 
     def forward(
         self,
@@ -109,10 +102,11 @@ class NgramHashMapping(nn.Module):
             segment_ids = starts.to(torch.long).cumsum(dim=1)
 
         tokens = []
+        blocked = torch.zeros_like(positions, dtype=torch.bool)
         for shift in range(self.max_ngram_size):
             source_positions = (positions - shift).clamp_min(0)
             source = compressed.gather(1, source_positions)
-            blocked = positions < shift
+            blocked = blocked | (positions < shift)
             if segment_ids is not None:
                 source_segments = segment_ids.gather(1, source_positions)
                 blocked = blocked | (source_segments != segment_ids)
@@ -191,7 +185,7 @@ class EngramModule(nn.Module):
     @staticmethod
     def _sparse_lookup(
         hash_ids: torch.Tensor,
-        weight: torch.Tensor,
+        embedding: nn.Embedding,
         *,
         ep_group: Any,
         ep_rank: int,
@@ -222,9 +216,12 @@ class EngramModule(nn.Module):
         sorted_ids = flat_ids.index_select(0, sort_indices)
         received_ids = ep_all_to_all(sorted_ids, send_counts, recv_counts, ep_group)
         local_ids = received_ids - row_start
-        if local_ids.numel() and (int(local_ids.min()) < 0 or int(local_ids.max()) >= weight.shape[0]):
+        if local_ids.numel() and (int(local_ids.min()) < 0 or int(local_ids.max()) >= num_local_rows):
             raise IndexError("Engram EP routing delivered a row to the wrong owner")
-        values = F.embedding(local_ids, weight)
+        # Call the child module instead of reading ``embedding.weight``
+        # directly. This preserves the FSDP pre/post-forward lifecycle when
+        # the EP table is wrapped independently from the dense Engram gates.
+        values = embedding(local_ids)
         returned = ep_all_to_all(values, recv_counts, send_counts, ep_group)
         restored = torch.zeros_like(returned)
         restored.scatter_add_(
@@ -232,7 +229,7 @@ class EngramModule(nn.Module):
             sort_indices.unsqueeze(1).expand(-1, returned.shape[1]),
             returned,
         )
-        return restored.view(*hash_ids.shape, weight.shape[1])
+        return restored.view(*hash_ids.shape, embedding.embedding_dim)
 
     def _aligned_hash_ids(
         self,
@@ -323,7 +320,7 @@ class EngramModule(nn.Module):
         )
         embeddings = self._sparse_lookup(
             hash_ids,
-            self.embed.weight,
+            self.embed,
             ep_group=ep_group,
             ep_rank=ep_rank,
             ep_size=ep_size,

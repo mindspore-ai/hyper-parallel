@@ -52,7 +52,7 @@ data:
   tokenizer_path: /home/ma-user/work/y00512198/DeepSeek-V4.1-Flash
   sequence_length: 4096
   packing: online_best_fit_with_compact_sample_boundaries
-  sample_alignment: 2
+  compression_alignment: 2
   create_attention_mask_in_dataloader: true
   labels_are_shifted: true
   offline_dataset_path: null

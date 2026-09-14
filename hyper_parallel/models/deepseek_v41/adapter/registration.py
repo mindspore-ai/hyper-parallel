@@ -17,6 +17,9 @@
 from typing import Any
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.deepseek_v41.adapter.checkpoint import (
+    register_deepseek_v41_checkpoint_mapping,
+)
 from hyper_parallel.models.registry import (
     register_custom_model,
     register_model_adapter,
@@ -78,12 +81,12 @@ def _get_visual_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
 
 
 def _get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
-    """Return visual units and mixed-mesh Engram execution units."""
+    """Return visual units and homogeneous-mesh Engram child units."""
     module_by_fqn = dict(model.named_modules())
     engram_units = tuple(
         module_fqn
         for module_fqn in module_by_fqn
-        if module_fqn.endswith(".engram") or module_fqn.endswith(".engram.wkv")
+        if module_fqn.endswith(".engram.embed") or module_fqn.endswith(".engram.wkv")
     )
     return _get_visual_fsdp_wrap_modules(model) + engram_units
 
@@ -112,7 +115,7 @@ def _get_fsdp_execution_order(
     )
     for layer_fqn in layer_fqns:
         execution_order.append(layer_fqn)
-        for suffix in ("engram", "engram.wkv", "mlp.experts"):
+        for suffix in ("engram.embed", "engram.wkv", "mlp.experts"):
             child_fqn = f"{layer_fqn}.{suffix}"
             if child_fqn in selected_fqns:
                 execution_order.append(child_fqn)
@@ -127,6 +130,7 @@ register_custom_model(
     "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
     "DeepseekV41CroppedForCausalLM",
 )
+register_deepseek_v41_checkpoint_mapping()
 
 DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV41ForCausalLM",

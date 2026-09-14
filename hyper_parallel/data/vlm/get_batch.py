@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Temporary self-contained VLM batch preparation."""
+"""Model-neutral VLM batch preparation."""
 
 from __future__ import annotations
 
@@ -21,47 +21,22 @@ from typing import Any
 
 import torch
 
-from hyper_parallel.data.batching.attention_runtime import AttentionRuntimeAdapter
+from hyper_parallel.data.batching.runtime_input import (
+    RuntimeInputAdapter,
+    RuntimeInputContext,
+)
 
 
-_MODEL_INPUT_FIELDS = {
-    "input_ids",
-    "labels",
-    "attention_mask",
-    "position_ids",
-    "text_position_ids",
-    "router_attention_mask",
-    "mm_token_type_ids",
-    "token_types",
-    "pixel_values",
-    "pixel_values_videos",
-    "input_features",
-    "audio_features",
-    "audio_attention_mask",
-    "audio_feature_lengths",
-    "image_mask",
-    "video_mask",
-    "audio_mask",
-    "image_grid_hw",
-    "image_grid_thw",
-    "image_patch_offsets",
-    "image_vit_grid_hw",
-    "image_llm_grid_hw",
-    "image_batch_indices",
-    "image_token_starts",
-    "packed_seq_params",
-    "video_grid_thw",
-    "video_timestamp",
-}
 _LOSS_INPUT_FIELDS = {"labels", "loss_mask", "stream_loss_mask"}
+_LOSS_ONLY_FIELDS = _LOSS_INPUT_FIELDS.difference({"labels"})
 
 
 class VLMBatchProcessor:
-    """Normalize and classify one VLM batch without shared LLM adapters."""
+    """Normalize and classify one VLM batch without model field allowlists."""
 
     @staticmethod
     def normalize_source_batch(source_batch: Mapping[str, Any]) -> dict[str, Any]:
-        """Normalize one collated batch into the temporary VLM contract."""
+        """Normalize one collated batch into the VLM training contract."""
         batch = dict(source_batch)
         if "input_ids" not in batch:
             raise ValueError("VLM batch must contain 'input_ids'")
@@ -73,14 +48,18 @@ class VLMBatchProcessor:
 
     @staticmethod
     def prepare_batch(batch: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Split device-resident VLM fields into model and loss inputs."""
-        model_inputs = {field: value for field, value in batch.items() if field in _MODEL_INPUT_FIELDS}
+        """Send adapter-defined fields to the model and isolate loss-only metadata."""
+        model_inputs = {
+            field: value
+            for field, value in batch.items()
+            if field not in _LOSS_ONLY_FIELDS
+        }
         loss_inputs = {field: value for field, value in batch.items() if field in _LOSS_INPUT_FIELDS}
         return model_inputs, loss_inputs
 
 
 class VLMGetBatch:
-    """Prepare VLM batches for the temporary TP=CP=PP=1 training path."""
+    """Prepare VLM batches for the TP=CP=PP=1 training path."""
 
     def __init__(
             self,
@@ -89,12 +68,12 @@ class VLMGetBatch:
             device: Any,
             pp_shared_data: bool = False,
             attention_mode: str = "dense",
-            attention_runtime_adapter: AttentionRuntimeAdapter | None = None,
+            runtime_input_adapter: RuntimeInputAdapter | None = None,
             cp_algorithm: str = "ulysses",
             causal: bool = True,
             sliding_window: int | None = None,
     ) -> None:
-        """Validate the temporary VLM parallel boundary and store the device.
+        """Validate the VLM parallel boundary and store the device.
 
         Args:
             mesh_context: Trainer mesh exposing TP, CP, and PP sizes.
@@ -102,8 +81,7 @@ class VLMGetBatch:
             pp_shared_data: Whether pipeline stages share the source batch.
             attention_mode: ``dense`` preserves the source mask; ``compressed``
                 converts right-padding into compact sequence boundaries.
-            attention_runtime_adapter: Model-owned adapter used for compressed
-                attention metadata.
+            runtime_input_adapter: Model-owned forward-input extension.
             cp_algorithm: Context-parallel algorithm passed to the adapter.
             causal: Whether the model uses causal attention.
             sliding_window: Optional local-attention window passed to the adapter.
@@ -119,19 +97,19 @@ class VLMGetBatch:
         unsupported_sizes = {name: size for name, size in parallel_sizes.items() if size != 1}
         if unsupported_sizes:
             raise NotImplementedError(
-                "The temporary VLM batch path requires TP=CP=PP=1, but got "
+                "The VLM batch path requires TP=CP=PP=1, but got "
                 + ", ".join(f"{name}={size}" for name, size in unsupported_sizes.items())
             )
         if pp_shared_data:
-            raise NotImplementedError("The temporary VLM batch path does not support pp_shared_data")
+            raise NotImplementedError("The VLM batch path does not support pp_shared_data")
         if attention_mode not in {"dense", "compressed"}:
             raise ValueError(f"unsupported VLM attention_mode: {attention_mode!r}")
-        if attention_mode == "compressed" and attention_runtime_adapter is None:
-            raise ValueError("compressed VLM attention requires attention_runtime_adapter")
+        if attention_mode == "compressed" and runtime_input_adapter is None:
+            raise ValueError("compressed VLM attention requires runtime_input_adapter")
         self.device = device
         self.processor = VLMBatchProcessor()
         self.attention_mode = attention_mode
-        self.attention_runtime_adapter = attention_runtime_adapter
+        self.runtime_input_adapter = runtime_input_adapter
         self.cp_algorithm = cp_algorithm
         self.causal = causal
         self.sliding_window = sliding_window
@@ -161,12 +139,22 @@ class VLMGetBatch:
             for field, value in normalized_batch.items()
         }
         if self.attention_mode == "compressed":
-            device_batch["packed_seq_params"] = self._build_packed_seq_params(device_batch)
+            runtime_inputs = self._build_runtime_inputs(device_batch)
             device_batch.pop("attention_mask", None)
-        return self.processor.prepare_batch(device_batch)
+        else:
+            runtime_inputs = {}
+        model_inputs, loss_inputs = self.processor.prepare_batch(device_batch)
+        collisions = set(model_inputs).intersection(runtime_inputs)
+        if collisions:
+            raise ValueError(
+                "runtime inputs cannot replace framework-owned VLM inputs: "
+                f"{sorted(collisions)}"
+            )
+        model_inputs.update(runtime_inputs)
+        return model_inputs, loss_inputs
 
-    def _build_packed_seq_params(self, batch: Mapping[str, Any]) -> object:
-        """Convert right-padding into compact causal-attention boundaries."""
+    def _build_runtime_inputs(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Expose right-padding boundaries to the model-owned runtime adapter."""
         input_ids = batch["input_ids"]
         attention_mask = batch.get("attention_mask")
         if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
@@ -193,15 +181,30 @@ class VLMGetBatch:
             raise ValueError("compressed VLM attention failed to cover the physical token batch")
 
         cu_seq_lens = torch.tensor(boundaries, dtype=torch.int64, device=input_ids.device)
-        return self.attention_runtime_adapter.build_packed_seq_params(
-            cu_seq_lens=cu_seq_lens,
+        adapter_batch = dict(batch)
+        adapter_batch["cu_seq_lens"] = cu_seq_lens
+        context = RuntimeInputContext(
+            source_type="online",
             local_input_shape=input_ids.shape,
-            cp_rank=0,
-            cp_size=1,
-            cp_algorithm=self.cp_algorithm,
-            causal=self.causal,
-            sliding_window=self.sliding_window,
+            parallel_ranks={"tp": 0, "cp": 0, "pp": 0},
+            parallel_sizes={"tp": 1, "cp": 1, "pp": 1},
+            options={
+                "attention_mode": self.attention_mode,
+                "cp_algorithm": self.cp_algorithm,
+                "causal": self.causal,
+                "sliding_window": self.sliding_window,
+            },
         )
+        runtime_inputs = self.runtime_input_adapter.build_runtime_inputs(
+            batch=adapter_batch,
+            context=context,
+        )
+        if not isinstance(runtime_inputs, Mapping):
+            raise TypeError(
+                "RuntimeInputAdapter.build_runtime_inputs must return a mapping, "
+                f"got {type(runtime_inputs).__name__}"
+            )
+        return dict(runtime_inputs)
 
 
 def build_vlm_get_batch(
@@ -210,7 +213,7 @@ def build_vlm_get_batch(
         device: Any,
         pp_shared_data: bool = False,
         attention_mode: str = "dense",
-        attention_runtime_adapter: AttentionRuntimeAdapter | None = None,
+        runtime_input_adapter: RuntimeInputAdapter | None = None,
         cp_algorithm: str = "ulysses",
         causal: bool = True,
         sliding_window: int | None = None,
@@ -222,7 +225,7 @@ def build_vlm_get_batch(
         device: Destination model device.
         pp_shared_data: Reserved pipeline batch-sharing option.
         attention_mode: Dense or compact compressed-attention input format.
-        attention_runtime_adapter: Optional model-owned compact metadata adapter.
+        runtime_input_adapter: Optional model-owned forward-input extension.
         cp_algorithm: Context-parallel algorithm selected by the model recipe.
         causal: Whether compact attention is causal.
         sliding_window: Optional compact sliding window.
@@ -235,7 +238,7 @@ def build_vlm_get_batch(
         device=device,
         pp_shared_data=pp_shared_data,
         attention_mode=attention_mode,
-        attention_runtime_adapter=attention_runtime_adapter,
+        runtime_input_adapter=runtime_input_adapter,
         cp_algorithm=cp_algorithm,
         causal=causal,
         sliding_window=sliding_window,

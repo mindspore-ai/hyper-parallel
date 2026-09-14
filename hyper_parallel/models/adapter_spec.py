@@ -48,6 +48,9 @@ class ModelAdapterSpec:
             (parameter names, mask/cache/forward adaptation).
         checkpoint: provider returning family-specific checkpoint
             key/layout mappings, when the generic mapping is insufficient.
+        materialization: provider accepting the constructed model and registering
+            deterministic derived buffers or state hooks before sharding and
+            ``to_empty()``. This supports unmodified native HF model classes.
         context_parallel: provider returning the family's CP wrappers.
         expert_parallel: provider returning the family's EP compute
             factories.
@@ -77,6 +80,7 @@ class ModelAdapterSpec:
     replacements: Optional[Callable[..., Any]] = None
     attention: Optional[Callable[..., Any]] = None
     checkpoint: Optional[Callable[..., Any]] = None
+    materialization: Optional[Callable[..., Any]] = None
     context_parallel: Optional[Callable[..., Any]] = None
     expert_parallel: Optional[Callable[..., Any]] = None
     sharding_rules: Optional[Callable[..., Any]] = None

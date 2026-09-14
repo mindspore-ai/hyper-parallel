@@ -55,7 +55,12 @@ from hyper_parallel.trainer.config import (
     save_configs,
 )
 from hyper_parallel.data.dataset_logging import enable_dataset_logging
-from hyper_parallel.data.batching import build_dataloader
+from hyper_parallel.data.batching import (
+    DataBatchAdapter,
+    DataBatchContext,
+    build_dataloader,
+    get_sequence_parallel_size,
+)
 from hyper_parallel.trainer.runtime.distributed import (
     get_global_rank_safe,
     get_local_rank_safe,
@@ -219,6 +224,7 @@ class BaseTrainer(Stateful, ABC):
         self._build_model_assets()
         self._build_data_transform()
         self._build_dataset()
+        self._build_data_batch_adapter()
         self._build_collate_fn()
         self._build_dataloader()
         self._compute_train_iters()
@@ -356,6 +362,50 @@ class BaseTrainer(Stateful, ABC):
         """Require a concrete Trainer to build its micro-batch collator."""
         raise NotImplementedError("Concrete Trainer must implement _build_collate_fn")
 
+    def _build_data_batch_adapter(self) -> None:
+        """Build one model-owned adapter shared by the data-batch lifecycle."""
+        dataloader_config = self.config.dataloader
+        if dataloader_config is None:
+            raise ValueError("dataloader must define a build target")
+
+        dataset_data_config = getattr(self.config.dataset, "data_config", {})
+        source_type = None
+        if isinstance(dataset_data_config, dict):
+            source_type = dataset_data_config.get("source_type")
+        if source_type is None and dataloader_config.get_batch is not None:
+            source_type = getattr(dataloader_config.get_batch, "source_type", None)
+        if source_type is None:
+            source_type = "online"
+
+        max_seq_len = getattr(self.data_transform, "max_seq_len", None)
+        token_budget = (
+            None
+            if max_seq_len is None
+            else self.config.training.micro_batch_size * int(max_seq_len)
+        )
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(self.model_config, "pad_token_id", None)
+        self.data_batch_context = DataBatchContext(
+            source_type=str(source_type),
+            sequence_parallel_size=get_sequence_parallel_size(self.mesh),
+            token_budget=token_budget,
+            pad_token_id=pad_token_id,
+        )
+
+        adapter_target = dataloader_config.batch_adapter
+        if adapter_target is None:
+            self.data_batch_adapter = DataBatchAdapter()
+            return
+        self.data_batch_adapter = adapter_target.build(
+            model_config=self.model_config,
+            tokenizer=self.tokenizer,
+            mesh_context=self.mesh,
+            context=self.data_batch_context,
+        )
+        if not isinstance(self.data_batch_adapter, DataBatchAdapter):
+            raise TypeError("dataloader.batch_adapter must build a DataBatchAdapter")
+
     def _build_dataloader(self) -> None:
         """Build and assign train, validation, and test dataloaders."""
         split_names = ("train", "valid", "test")
@@ -366,6 +416,8 @@ class BaseTrainer(Stateful, ABC):
             collate_fn=self.collate_fn,
             mesh_context=self.mesh,
             training_config=self.config.training,
+            batch_adapter=self.data_batch_adapter,
+            batch_context=self.data_batch_context,
             max_seq_len=getattr(self.data_transform, "max_seq_len", None),
             default_seed=self.default_seed,
         )
@@ -713,7 +765,7 @@ class BaseTrainer(Stateful, ABC):
         # Optimizer and scheduler step
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
         for optimizer in optimizers:
-            with SkipDTensorDispatch():
+            with SkipDTensorDispatch(no_skip={torch.zeros_like}):
                 optimizer.step()
             optimizer.zero_grad()
 

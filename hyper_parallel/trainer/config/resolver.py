@@ -633,6 +633,7 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         raise ConfigResolutionError(path, "DataLoader configuration must be a YAML mapping")
 
     target_node = dict(node)
+    batch_adapter_node = target_node.pop("batch_adapter", None)
     collate_node = target_node.pop("collate_fn", None)
     get_batch_node = target_node.pop("get_batch", None)
     dataloader_type = normalize_value(
@@ -647,6 +648,11 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         path=f"{path}.data_sharding",
     )
     target = _resolve_target(target_node, path=path)
+    batch_adapter = (
+        None
+        if batch_adapter_node is None
+        else _resolve_target(batch_adapter_node, path=f"{path}.batch_adapter")
+    )
     collate_fn = (
         None
         if collate_node is None
@@ -659,6 +665,7 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
     )
     return DataLoaderConfig(
         target=target,
+        batch_adapter=batch_adapter,
         collate_fn=collate_fn,
         get_batch=get_batch,
         dataloader_type=dataloader_type,

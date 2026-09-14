@@ -23,7 +23,7 @@ Phase 2  communication boundary grouping (two passes: first group by owning
 Phase 3  semantic role inference (explicit FQN patterns > structural guards
          > parameter role combinations)
 Phase 4  template lookup to generate spec (_build_spec_from_template)
-Phase 4.5 user plan_overrides merge (_merge_plan_overrides, 05 §3.6.7)
+Phase 4.5 user plan_overrides merge/insert (_merge_plan_overrides, 05 §3.6.7)
 Phase 5  _is_terminal marking only (D-14, 05 §13: compile-time chain
          propagation/validation removed — specs are fully self-declared and
          each module vouches for its own propagation in validate mode)
@@ -133,8 +133,11 @@ class ShardingPlanner:
       inserted as-is and must be fully self-declared — an override with
       empty params AND empty contracts fails fast ("no template matched");
     - **glob keys** (containing ``*``/``?``/``[``): merge-applied to every
-      matching boundary; a pattern hitting nothing warns loudly. Glob keys
-      never insert new boundaries.
+      matching boundary. A glob with a concrete parameter or I/O contract
+      also expands against the final model tree and inserts unmatched modules
+      with the same validation as exact insert mode. Partial globs carrying
+      only injection/attribute changes remain merge-only and fail if they
+      target a model module for which no boundary was derived.
 
     The YAML transport (``hyper_parallel.trainer.config.PlanOverride``) is
     converted to this dict by ``entries_to_plan_overrides()`` on the trainer
@@ -363,8 +366,8 @@ class ShardingPlanner:
             param_ndims=param_ndims,
         )
 
-        # Phase 4.5: unified override pass — merge mode (unset fields inherit
-        # the derived spec) / insert mode (fully self-declared only) / glob.
+        # Phase 4.5: merge derived matches and expand fully declared globs
+        # against the final model tree to insert new boundaries.
         self._finalize_boundary_specs(
             plan,
             model,

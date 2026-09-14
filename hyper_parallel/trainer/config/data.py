@@ -61,6 +61,7 @@ class DataLoaderConfig:
     """DataLoader target and its text-batch assembly components."""
 
     target: Target[Any]
+    batch_adapter: Optional[Target[Any]] = None
     collate_fn: Optional[Target[Any]] = None
     get_batch: Optional[Target[Any]] = None
     dataloader_type: Literal["single", "cyclic"] = "single"
@@ -78,6 +79,7 @@ class DataLoaderConfig:
     def to_dict(self) -> dict[str, Any]:
         """Serialize components in their compact nested YAML shape."""
         config = self.target.to_dict()
+        config["batch_adapter"] = _serialize_config_value(self.batch_adapter)
         config["collate_fn"] = _serialize_config_value(self.collate_fn)
         config["get_batch"] = _serialize_config_value(self.get_batch)
         config["dataloader_type"] = self.dataloader_type

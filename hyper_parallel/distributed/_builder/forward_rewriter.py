@@ -337,6 +337,17 @@ def _maybe_add_deferred_biases(module, spec, output):
     return output
 
 
+def _unwrap_dtensor_outputs(output):
+    """Return local tensors while preserving tuple/list output structure."""
+    if isinstance(output, DTensor):
+        return output.to_local()
+    if isinstance(output, tuple):
+        return tuple(_unwrap_dtensor_outputs(item) for item in output)
+    if isinstance(output, list):
+        return [_unwrap_dtensor_outputs(item) for item in output]
+    return output
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Production/validate boundary wrappers and output-contract validation
 # ────────────────────────────────────────────────────────────────────────────
@@ -469,13 +480,7 @@ def _wrap_validate_forward(
         # unbroken; the outermost boundary exit unwraps.
         if nested or keep_output_dtensor:
             return outputs
-        if isinstance(outputs, DTensor):
-            outputs = outputs.to_local()
-        elif isinstance(outputs, (tuple, list)):
-            outputs = tuple(
-                t.to_local() if isinstance(t, DTensor) else t for t in outputs
-            )
-        return outputs
+        return _unwrap_dtensor_outputs(outputs)
 
     module.forward = validate_forward
 
@@ -590,20 +595,19 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
                                exclude_subtrees=()):
     """Generic local-region forward wrapper (D-03', formerly the _wrap_moe_forward skeleton).
 
-    Structure: boundary entry -> local region -> re-wrap per the declared
-    out_src -> boundary exit. Applies to any module containing data-dependent
-    logic that DTensor dispatch cannot express (e.g. MoE all-to-all) --
-    injected by _apply_phase_c when _resolve_local_compute_fn resolves to
-    non-None (derived gate, 05 §4.4.3).
+    Structure: boundary entry -> local region -> boundary exit. Applies to any
+    module containing data-dependent logic that DTensor dispatch cannot express
+    (e.g. MoE all-to-all) -- injected by _apply_phase_c when
+    _resolve_local_compute_fn resolves to non-None (derived gate, 05 §4.4.3).
 
     production: parameters were permanently unpacked at build time and inputs
-    are local (boundary passthrough); validate: inputs are DTensors ->
-    to_local -> temporarily unwrap parameters -> local computation -> re-wrap
-    the output per the declared out_src via from_local (for data-dependent
-    modules out_src is declarative validation -- the data dependence of
-    all-to-all makes the placement underivable; this is an inherent
-    limitation). Both modes share the same wrapper code (local_region
-    tolerant passthrough semantics).
+    are local (boundary passthrough), and the output stays local for lowered
+    boundary operations; validate: inputs are DTensors -> to_local ->
+    temporarily unwrap parameters -> local computation -> re-wrap the output
+    per the declared out_src via from_local (for data-dependent modules out_src
+    is declarative validation -- the data dependence of all-to-all makes the
+    placement underivable; this is an inherent limitation). Both modes share
+    the same wrapper code (local_region tolerant passthrough semantics).
 
     compute_fn: the function actually executed inside the region; defaults to
     the module's own forward. Resolved uniformly by
@@ -619,12 +623,6 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
     if compute_fn is None:
         compute_fn = original_forward
 
-
-    out_src_placements = None  # pylint: disable=unused-variable
-    if spec.out_src:
-        out_src_named = next(iter(spec.out_src.values()))
-        out_src_placements = tuple(resolve_placements(out_src_named, mesh_dim_names))
-
     dispatch_through = bool(getattr(spec, "region_dispatch", None))
     if validate_mode and not dispatch_through:
         install_local_compute_forward_adapters(module, exclude=exclude_subtrees)
@@ -632,8 +630,7 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
     @functools.wraps(original_forward)
     def local_region_forward(*args: Any, **kwargs: Any) -> Any:
         """Local-region forward: boundary entry → local region computation →
-        re-wrap per the declared out_src → boundary exit (both modes share
-        this wrapper)."""
+        validate re-wrap → boundary exit (both modes share this wrapper)."""
         # Step 1: PrecompiledBoundary entry (e.g. TP all-gather; identity passthrough)
         args, kwargs = boundary.redistribute_inputs(
             args, kwargs, as_dtensor=validate_mode)
@@ -672,20 +669,19 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
         else:
             output = compute_fn(*args, **kwargs)
 
-        # Step 3: local -> DTensor (re-wrap per the declared out_src, restoring
-        # the DTensor metadata broken by all-to-all; under production the
-        # boundary exit needs the same contract)
-        if not isinstance(output, DTensor):
+        # Step 3: validate restores the DTensor metadata broken by all-to-all.
+        # Production keeps the output local so lowered boundary operations can
+        # execute directly; an unlowerable transition wraps only in its
+        # necessary DTensor fallback inside RedistOp.
+        if validate_mode and not isinstance(output, DTensor):
             output = _rewrap_local_outputs(
                 output, spec, mesh, mesh_dim_names, type(module).__name__)
 
         # Step 4: PrecompiledBoundary exit (e.g. TP reduce-scatter)
         output = boundary.redistribute_outputs(
             output, as_dtensor_input=validate_mode)
-        # The final boundary exit is always local (when out_plan is empty, the
-        # from_local wrap from Step 3 must also be unwrapped here)
-        if isinstance(output, DTensor):
-            output = output.to_local()
+        # The final boundary exit is always local.
+        output = _unwrap_dtensor_outputs(output)
         # D-22: deferred rowwise biases — added once after the exit reduction
         return _maybe_add_deferred_biases(module, spec, output)
 

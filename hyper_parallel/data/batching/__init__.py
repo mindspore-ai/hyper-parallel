@@ -19,13 +19,16 @@ Rebuilt from ``components/datasets/batching`` plus
 in stage 6 (05 §11.2).
 """
 
-from hyper_parallel.data.batching.attention_runtime import AttentionRuntimeAdapter
 from hyper_parallel.data.batching.build_collate_fn import (
+    BatchConstraints,
+    DataBatchAdapter,
+    DataBatchContext,
     DataCollator,
     MainCollator,
     TextPackingCollator,
     build_indexed_collate_fn,
     build_online_text_collate_fn,
+    get_sequence_parallel_size,
 )
 from hyper_parallel.data.batching.build_dataloader import (
     DynamicBatchDataLoader,
@@ -37,13 +40,19 @@ from hyper_parallel.data.batching.build_dataloader import (
 from hyper_parallel.data.batching.data_collator import MakeMicroBatchCollator
 from hyper_parallel.data.batching.dataloader import DataLoader
 from hyper_parallel.data.batching.get_batch import ParallelBatch
+from hyper_parallel.data.batching.runtime_input import (
+    RuntimeInputAdapter,
+    RuntimeInputContext,
+)
 from hyper_parallel.data.batching.sequence_boundaries import (
     IndexedBoundaryResolver,
     OnlineBoundaryResolver,
 )
 
 __all__ = [
-    "AttentionRuntimeAdapter",
+    "BatchConstraints",
+    "DataBatchAdapter",
+    "DataBatchContext",
     "DataCollator",
     "DataLoader",
     "DynamicBatchDataLoader",
@@ -53,10 +62,13 @@ __all__ = [
     "MakeMicroBatchCollator",
     "OnlineBoundaryResolver",
     "ParallelBatch",
+    "RuntimeInputAdapter",
+    "RuntimeInputContext",
     "TextPackingCollator",
     "TextTokenBatcher",
     "build_dataloader",
     "build_indexed_collate_fn",
     "build_online_text_collate_fn",
     "calculate_num_micro_batches",
+    "get_sequence_parallel_size",
 ]

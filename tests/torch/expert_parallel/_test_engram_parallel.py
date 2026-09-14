@@ -78,6 +78,10 @@ def test_engram_ep_lookup_cp_hash_gloo():
         rows_per_rank = parallel.padded_num_embeddings // world_size
         local_weight = full_weight[rank * rows_per_rank:(rank + 1) * rows_per_rank]
         parallel.embed.weight = nn.Parameter(local_weight.clone())
+        embedding_calls = []
+        parallel.embed.register_forward_hook(
+            lambda _module, _inputs, _output: embedding_calls.append(True)
+        )
 
         global_ids = torch.arange(3, 19, dtype=torch.long).view(1, -1)
         local_ids = global_ids[:, rank * 4:(rank + 1) * 4].contiguous()
@@ -95,6 +99,7 @@ def test_engram_ep_lookup_cp_hash_gloo():
             cp_rank=rank,
             cp_size=world_size,
         )
+        assert embedding_calls == [True]
         full_hashes = reference.hash_mapping(global_ids)
         local_hashes = full_hashes[:, rank * 4:(rank + 1) * 4]
         expected = reference._fuse(  # pylint: disable=protected-access

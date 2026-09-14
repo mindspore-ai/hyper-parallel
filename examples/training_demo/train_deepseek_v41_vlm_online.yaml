@@ -48,7 +48,6 @@ fsdp_config:
   mix_precision:
     param_dtype: bfloat16
     reduce_dtype: float32
-    output_dtype: bfloat16
     cast_forward_inputs: false
   reshard_after_forward: true
   reshard_after_backward: true
@@ -59,26 +58,16 @@ fsdp_config:
 
 plan_overrides:
   - match:
-      - "model.layers.0.attn_hc"
-      - "model.layers.0.ffn_hc"
-      - "model.layers.1.attn_hc"
-      - "model.layers.1.ffn_hc"
-      - "model.layers.2.attn_hc"
-      - "model.layers.2.ffn_hc"
-      - "model.layers.3.attn_hc"
-      - "model.layers.3.ffn_hc"
+      - "model.layers.*.attn_hc"
+      - "model.layers.*.ffn_hc"
     module_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4HyperConnection
     replace_module:
       _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
-  - match: "model.layers.1.engram"
+  - match: "model.layers.*.engram"
     module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41EngramPlaceholder
     replace_module:
       _target_: hyper_parallel.components.modules.engram.EngramModule
-  - match:
-      - "model.layers.0.self_attn"
-      - "model.layers.1.self_attn"
-      - "model.layers.2.self_attn"
-      - "model.layers.3.self_attn"
+  - match: "model.layers.*.self_attn"
     module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41AttentionPlaceholder
     replace_module:
       _target_: hyper_parallel.models.deepseek_v41.adapter.replacements.replace_deepseek_v41_shared_attention
@@ -97,59 +86,51 @@ plan_overrides:
       image_start: {tp: replicate}
       image_end: {tp: replicate}
       image_newline: {tp: replicate}
-  # mHC coefficients are pointwise full-hidden parameters. They remain
-  # replicated over TP while FSDP shards their optimizer state.
-  - match: "model.layers.0.attn_hc"
+  # Fully declared globs create the mHC/Engram boundaries from the final
+  # replaced model tree, independent of model depth and Engram layer IDs.
+  - match: "model.layers.*.*_hc"
+    region_dispatch: false
     params:
       fn: {tp: replicate}
       base: {tp: replicate}
       scale: {tp: replicate}
-  - match: "model.layers.0.ffn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "model.layers.1.attn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "model.layers.1.ffn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "model.layers.1.engram"
+    in_src:
+      hidden_streams: {tp: replicate, cp: "shard(1)", ep: replicate}
+    in_dst:
+      hidden_streams: {tp: replicate, cp: "shard(1)", ep: replicate}
+    out_src:
+      pre: {tp: replicate, cp: "shard(1)", ep: replicate}
+      post: {tp: replicate, cp: "shard(1)", ep: replicate}
+      residual: {tp: replicate, cp: "shard(1)", ep: replicate}
+    out_dst:
+      pre: {tp: replicate, cp: "shard(1)", ep: replicate}
+      post: {tp: replicate, cp: "shard(1)", ep: replicate}
+      residual: {tp: replicate, cp: "shard(1)", ep: replicate}
+  - match: "model.layers.*.*_hc"
+    when: sequence_parallel
+    in_src:
+      hidden_streams: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+    in_dst:
+      hidden_streams: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+    out_src:
+      pre: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+      post: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+      residual: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+    out_dst:
+      pre: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+      post: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+      residual: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+  - match: "model.layers.*.engram"
     params:
       q_weight: {tp: replicate}
       k_weight: {tp: replicate}
       embed.weight: {ep: "shard(0)"}
       wkv.weight: {tp: replicate}
-  - match: "model.layers.1.engram"
+  - match: "model.layers.*.engram"
     when: ep
     region_dispatch: false
     local_compute_fn:
       _target_: hyper_parallel.models.deepseek_v41.adapter.expert_parallel.deepseek_v41_engram_compute_fn
-  - match: "model.layers.2.attn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "model.layers.2.ffn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "model.layers.3.attn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "model.layers.3.ffn_hc"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
   # The native vision crop is TP1 in this recipe. Declare its custom linear
   # weights explicitly so FSDP owns them, and keep them out of decoder-MoE EP.
   - match: "model.vision.patch_embed.proj"
@@ -193,7 +174,7 @@ dataset:
     chat_template: null
     tokenizer: null
   data_transform:
-    _target_: hyper_parallel.data.vlm.deepseek_v41.build_deepseek_v41_vlm_data_transform
+    _target_: hyper_parallel.models.deepseek_v41.adapter.vlm_data.build_deepseek_v41_vlm_data_transform
     config_path: /path/to/DeepSeek-V4.1-Flash
     max_seq_len: 4096
     # Keep the released preprocessing semantics while bounding this cropped
@@ -207,14 +188,14 @@ dataset:
 
 dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  batch_adapter:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.vlm_data.DeepseekV41VLMBatchAdapter
   collate_fn:
     _target_: hyper_parallel.data.vlm.collator.build_vlm_collator
   get_batch:
     _target_: hyper_parallel.data.vlm.get_batch.build_vlm_get_batch
     attention_mode: compressed
     cp_algorithm: colossal
-    attention_runtime_adapter:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.packed_sequence.DeepseekV41AttentionRuntimeAdapter
   dataloader_type: cyclic
   data_rearrange_map: null
   data_sharding: false

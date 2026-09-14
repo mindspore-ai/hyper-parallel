@@ -881,7 +881,7 @@ def _apply_full_checkpointing(
         implementation was enabled instead, in which case no per-layer wrapping
         happened and swap prefetch chains must not be registered.
     """
-    if _should_use_hf_native_gradient_checkpointing(
+    if not has_kv_sharing and _should_use_hf_native_gradient_checkpointing(
         model,
         ac_layers,
         enable_compile=enable_compile,

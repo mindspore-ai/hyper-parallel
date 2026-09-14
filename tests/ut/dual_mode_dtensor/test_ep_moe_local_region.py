@@ -18,6 +18,8 @@ assertions carrying a case-identification message; atomic assertions
 # pylint: disable=unused-argument,protected-access
 
 import functools
+from unittest import mock
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -103,6 +105,11 @@ class _TinyModel(nn.Module):
 
     def forward(self, x):
         return self.mod(x)
+
+
+class _TinyMultiOutputMod(nn.Module):
+    def forward(self, x):
+        return x, x + 1, x + 2
 
 
 def _identity_spec():
@@ -490,7 +497,11 @@ def test_custom_compute_fn_executes_in_region(make_mesh):
     _wrap_region(mod, spec, mesh, validate_mode=False)
 
     x = torch.randn(2, 4)
-    out = mod(x)
+    with mock.patch.object(
+            DTensor, "from_local",
+            side_effect=AssertionError("production local-region must not re-wrap output")) as from_local:
+        out = mod(x)
+    from_local.assert_not_called()
     assert calls and calls[0][0] is mod, "case: custom_compute_fn_runs_in_region"
     torch.testing.assert_close(out, mod.lin(x) * 2,
                                msg="case: custom_compute_fn_runs_in_region")
@@ -523,6 +534,31 @@ def test_custom_compute_fn_executes_in_region(make_mesh):
         "case: custom_compute_fn_validate_mode"   # skeleton exit always unwraps
     torch.testing.assert_close(out, mod.lin(x),
                                msg="case: custom_compute_fn_validate_mode")
+
+    # ── case: test_multi_output_validate_mode_returns_local_structure ──
+    # Every declared output is rewrapped for placement accounting inside the
+    # boundary, then recursively unwrapped before the local-region call returns.
+    mod = _TinyMultiOutputMod()
+    layout = {TP: Shard(1)}
+    spec = ModuleShardingSpec(
+        in_src={"x": layout},
+        in_dst={"x": layout},
+        out_src={"first": layout, "second": layout, "nested": layout},
+        out_dst={"first": layout, "second": layout, "nested": layout},
+        region_dispatch=False,
+    )
+    _wrap_region(mod, spec, mesh, validate_mode=True)
+
+    first, second, third = mod(x)
+    assert not isinstance(first, DTensor), \
+        "case: multi_output_validate_mode_returns_local_structure"
+    assert not isinstance(second, DTensor), \
+        "case: multi_output_validate_mode_returns_local_structure"
+    assert not isinstance(third, DTensor), \
+        "case: multi_output_validate_mode_returns_local_structure"
+    torch.testing.assert_close(first, x)
+    torch.testing.assert_close(second, x + 1)
+    torch.testing.assert_close(third, x + 2)
 
 
 # ==========================================================================

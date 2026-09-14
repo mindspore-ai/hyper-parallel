@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Build the four-layer DeepSeek-V4.1 validation crop from local assets."""
+"""Build a depth-configurable DeepSeek-V4.1 validation crop from local assets."""
 
 from __future__ import annotations
 
@@ -45,16 +45,19 @@ def build_deepseek_v41_validation_config(
     Args:
         config_path: Local DeepSeek-V4.1 repository.
         engram_assets_path: Scaled Engram assets prepared from its tokenizer.
-        num_hidden_layers: Crop depth; currently fixed at four so both the
-            shared-attention source and its first consumer execute.
+        num_hidden_layers: Crop depth. Four layers are the minimum supported
+            smoke topology; deeper crops retain every released source role
+            whose layer index falls inside the crop.
         vision_num_hidden_layers: Optional visual-tower crop depth. ``None``
             keeps the released 32-layer vision tower; a positive value enables
             native image inputs for a clearly labeled validation crop.
         num_routed_experts: Optional routed-expert crop. A positive value no
             larger than the released count preserves expert routing while
             reducing validation-smoke initialization and memory cost.
-        exercise_post_training_indexer: Remap the released decoder Full and
-            Reindex roles onto crop layers 2 and 3, including candidates.
+        exercise_post_training_indexer: Exercise candidate/Reindex behavior.
+            Short crops remap the released hierarchy onto their final two
+            eligible layers; crops reaching the released hierarchy keep its
+            native layer indices.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient. The released
             report does not disclose its production value.
 
@@ -64,8 +67,6 @@ def build_deepseek_v41_validation_config(
     Raises:
         ValueError: If the source, crop, or scaled assets are inconsistent.
     """
-    if num_hidden_layers != 4:
-        raise ValueError("DeepSeek-V4.1 Engram/shared-attention validation requires 4 layers")
     model_dir = Path(config_path).expanduser().resolve()
     assets_path = Path(engram_assets_path).expanduser().resolve()
     with (model_dir / "config.json").open("r", encoding="utf-8") as config_file:
@@ -83,6 +84,12 @@ def build_deepseek_v41_validation_config(
         raise ValueError("Engram assets and model crop use different layer counts")
 
     text = source["text_config"]
+    released_hidden_layers = int(text["num_hidden_layers"])
+    if not 4 <= num_hidden_layers <= released_hidden_layers:
+        raise ValueError(
+            "DeepSeek-V4.1 validation crop depth must be in [4, "
+            f"{released_hidden_layers}], got {num_hidden_layers}"
+        )
     released_routed_experts = int(text["n_routed_experts"])
     resolved_routed_experts = (
         released_routed_experts if num_routed_experts is None else int(num_routed_experts)
@@ -156,26 +163,29 @@ def build_deepseek_v41_validation_config(
     config.v41_candidate_block_size = int(text.get("candidate_block_size", 1))
     config.v41_indexer_loss_coeff = float(indexer_loss_coeff)
     if exercise_post_training_indexer:
-        source_layer = config.v41_kv_source_layer_ids[-1]
-        reindex_layer = num_hidden_layers - 1
-        if reindex_layer <= source_layer:
-            raise ValueError("the validation crop has no layer available for Reindex")
-        config.v41_index_source_layer_ids = sorted(
-            set(config.v41_index_source_layer_ids + [reindex_layer])
-        )
-        config.v41_candidate_source_layer_id = source_layer
         # At 4K with ratio 2 this retains 1024 candidates for Top-512. The
         # released 2048-block value would retain every key in this short crop.
         config.v41_candidate_topk_blocks = min(config.v41_candidate_topk_blocks, 128)
-        config.v41_validation_reindex_remap = {
-            "released_full_layer": int(text["candidate_source_layer_id"]),
-            "released_reindex_layer": next(
-                layer_id for layer_id in text["index_source_layer_ids"]
-                if layer_id > text["candidate_source_layer_id"]
-            ),
-            "crop_full_layer": source_layer,
-            "crop_reindex_layer": reindex_layer,
-        }
+        released_candidate_layer = int(text["candidate_source_layer_id"])
+        released_reindex_layer = next(
+            layer_id for layer_id in text["index_source_layer_ids"]
+            if layer_id > released_candidate_layer
+        )
+        if released_reindex_layer >= num_hidden_layers:
+            source_layer = config.v41_kv_source_layer_ids[-1]
+            reindex_layer = num_hidden_layers - 1
+            if reindex_layer <= source_layer:
+                raise ValueError("the validation crop has no layer available for Reindex")
+            config.v41_index_source_layer_ids = sorted(
+                set(config.v41_index_source_layer_ids + [reindex_layer])
+            )
+            config.v41_candidate_source_layer_id = source_layer
+            config.v41_validation_reindex_remap = {
+                "released_full_layer": released_candidate_layer,
+                "released_reindex_layer": released_reindex_layer,
+                "crop_full_layer": source_layer,
+                "crop_reindex_layer": reindex_layer,
+            }
     config.v41_engram_layer_ids = list(assets["layer_ids"])
     config.v41_engram_num_embeddings = list(assets["num_embeddings"])
     config.v41_engram_bucket_base = int(assets["bucket_base"])

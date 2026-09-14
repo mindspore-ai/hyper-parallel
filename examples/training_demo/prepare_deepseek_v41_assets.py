@@ -105,12 +105,16 @@ def prepare_deepseek_v41_assets(
         source_config = json.load(config_file)
     if source_config.get("model_type") != "deepseek_v41":
         raise ValueError("model_dir must contain a DeepSeek-V4.1 config.json")
-    if num_hidden_layers != 4:
-        raise ValueError("the validation integration currently requires exactly 4 decoder layers")
     if table_pad_multiple < 1:
         raise ValueError("table_pad_multiple must be positive")
 
     text_config = source_config["text_config"]
+    released_hidden_layers = int(text_config["num_hidden_layers"])
+    if not 4 <= num_hidden_layers <= released_hidden_layers:
+        raise ValueError(
+            "DeepSeek-V4.1 validation crop depth must be in [4, "
+            f"{released_hidden_layers}], got {num_hidden_layers}"
+        )
     layer_ids = [
         layer_id for layer_id in text_config["engram_layer_ids"]
         if layer_id < num_hidden_layers
