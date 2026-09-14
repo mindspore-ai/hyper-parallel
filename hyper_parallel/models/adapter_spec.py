@@ -40,6 +40,9 @@ class ModelAdapterSpec:
             their own model class name here.
         model_type: HF ``config.model_type`` (e.g. ``"qwen3_moe"``) — the
             registry lookup key.
+        min_transformers_version: minimum Transformers release containing
+            the model family. ``None`` keeps registration independent of the
+            installed Transformers version for custom or remote-code models.
         replacements: provider returning the family's module-replacement
             declarations (pointing at the generic high-performance
             ``modules`` entries — never re-implementing kernels).
@@ -64,6 +67,7 @@ class ModelAdapterSpec:
 
     architecture: str
     model_type: str
+    min_transformers_version: Optional[str] = None
     replacements: Optional[Callable[..., Any]] = None
     attention: Optional[Callable[..., Any]] = None
     checkpoint: Optional[Callable[..., Any]] = None

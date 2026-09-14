@@ -29,8 +29,11 @@ pin the M1 additions (adjust doc §8 M1 门禁):
 
 import subprocess
 import sys
+from importlib.metadata import version
+from unittest import mock
 
 import pytest
+from packaging.version import Version
 
 from tests.common.mark_utils import arg_mark
 
@@ -88,23 +91,41 @@ def test_lazy_family_discovery():
 @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
           card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize(
-    "identity, expected_model_type",
+    "identity, expected_model_type, minimum_version",
     [
-        ("qwen3_next", "qwen3_next"),
-        ("Qwen3_5ForCausalLM", "qwen3_5"),
-        ("qwen3_5_moe_text", "qwen3_5_moe_text"),
-        ("Qwen4ExpForConditionalGeneration", "qwen4_exp"),
-        ("qwen4_exp_text", "qwen4_exp_text"),
+        ("qwen3_next", "qwen3_next", "4.57.0"),
+        ("Qwen3_5ForCausalLM", "qwen3_5", "5.2.0"),
+        ("qwen3_5_moe_text", "qwen3_5_moe_text", "5.2.0"),
+        ("Qwen4ExpForConditionalGeneration", "qwen4_exp", "5.16.0"),
+        ("qwen4_exp_text", "qwen4_exp_text", "5.16.0"),
     ],
 )
-def test_shard_aware_init_adapter_discovery(identity, expected_model_type):
-    """Affected model identities lazily resolve an init-weights provider."""
+def test_shard_aware_init_adapter_discovery(identity, expected_model_type, minimum_version):
+    """Affected models register only on supported Transformers releases."""
     spec = get_model_adapter(identity)
+    if Version(version("transformers")) < Version(minimum_version):
+        assert spec is None, f"case: unsupported_version, identity={identity}"
+        return
     assert spec is not None, f"case: spec_exists, identity={identity}"
     assert spec.model_type == expected_model_type, (
         f"case: model_type, identity={identity}, actual={spec.model_type}"
     )
     assert callable(spec.init_weights), f"case: init_weights, identity={identity}"
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_register_model_adapter_skips_unsupported_transformers_version():
+    """The registry excludes specs requiring a newer Transformers release."""
+    spec = ModelAdapterSpec(
+        architecture="_FutureArch",
+        model_type="_future_probe",
+        min_transformers_version="99.0.0",
+    )
+    with mock.patch("hyper_parallel.models.registry.version", return_value="5.13.0"):
+        register_model_adapter(spec)
+
+    assert "_future_probe" not in MODEL_ADAPTER_REGISTRY, "case: unsupported_not_registered"
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",

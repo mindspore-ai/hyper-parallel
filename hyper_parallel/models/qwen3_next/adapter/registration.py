@@ -29,6 +29,7 @@ def _load_init_weights():
 QWEN3_NEXT_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3NextForCausalLM",
     model_type="qwen3_next",
+    min_transformers_version="4.57.0",
     init_weights=_load_init_weights,
 )
 

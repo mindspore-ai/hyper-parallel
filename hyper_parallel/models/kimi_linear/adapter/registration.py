@@ -25,6 +25,7 @@ from hyper_parallel.models.registry import register_model_adapter
 KIMI_LINEAR_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="KimiLinearForCausalLM",
     model_type="kimi_linear",
+    min_transformers_version="5.17.0",
     context_parallel=_load_context_parallel,
     sharding_rules=_load_sharding_rules,
 )
