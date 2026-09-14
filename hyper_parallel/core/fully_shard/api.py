@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """hybrid shard data parallel interface"""
+import warnings
 from collections import namedtuple
 from typing import Any, List, Mapping, cast, Optional, Union
 
@@ -318,6 +319,55 @@ class HSDPModule:
     def set_is_last_backward(self, is_last_backward: bool):
         """set is_last_backward flag"""
         self.hsdp_scheduler.scheduler_ctx.is_last_backward = is_last_backward
+
+    def set_reduce_comm_interval(self, interval: int = 1) -> None:
+        """Configure how many subsequent HSDP units may overlap reduce-scatter.
+
+        The configuration belongs to the root module's scheduler context and
+        therefore applies to the entire HSDP module tree. Only non-fused HSDP
+        units count toward the interval. An interval of one preserves the
+        default behavior: a unit's reduce-scatter is waited after the next unit
+        finishes backward computation. Larger values retain more communication
+        inputs, outputs, and gradients on the device until that many subsequent
+        units have completed backward.
+
+        Configure the root module before its first forward. This method only
+        updates configuration and does not wait in-flight work. The root
+        backward hook drains intervals larger than the module-tree depth before
+        reduced gradients are applied.
+
+        Args:
+            interval: Number of subsequent HSDP units between reduce-scatter
+                waits. Must be a positive integer.
+
+        Raises:
+            NotImplementedError: If the active platform is not PyTorch.
+            ValueError: If ``interval`` is not a positive integer or the module
+                has not been initialized by ``fully_shard``, or if the root
+                module has already started its first forward.
+
+        Note:
+            Intervals greater than one do not support communication fusion. If
+            ``comm_fusion=True``, a warning is emitted and the interval remains
+            forced to one so fused communication keeps its single-work lifecycle.
+        """
+        if platform.platform_type != PlatformType.PYTORCH:
+            raise NotImplementedError("set_reduce_comm_interval is only supported on PyTorch")
+        if isinstance(interval, bool) or not isinstance(interval, int) or interval < 1:
+            raise ValueError(f"interval must be a positive int, but got {interval!r}.")
+        if self.hsdp_scheduler is None:
+            raise ValueError("call fully_shard before setting reduce communication interval")
+        if self.hsdp_scheduler.scheduler_ctx.lazy_init_done:
+            raise ValueError("set reduce communication interval before the root module's first forward")
+        if self.hsdp_scheduler.comm_fusion_policy.enable_comm_fusion and interval > 1:
+            warnings.warn(
+                "reduce communication intervals greater than one are not supported when "
+                "comm_fusion=True; using interval=1.",
+                UserWarning,
+                stacklevel=2,
+            )
+            interval = 1
+        self.hsdp_scheduler.scheduler_ctx.per_param_comm_ctx.reduce_interval = interval
 
     def reset_iter_state(self, recursive: bool = True) -> None:
         """Reset fully_shard iteration bookkeeping without clearing optimizer gradients.

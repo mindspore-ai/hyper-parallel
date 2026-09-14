@@ -257,7 +257,8 @@ class TestBackwardCommunication(MindSporeFullyShardUnitTest):
         state._issue_reduce_scatter_for_current_module()
 
         fsdp_param.reduce_scatter_grad.assert_called_once_with(reduce_op="avg")
-        self.assertEqual(state.scheduler_ctx.pre_reduce_scatter_params, [fsdp_param])
+        per_param_comm_ctx = state.scheduler_ctx.per_param_comm_ctx
+        self.assertEqual(list(per_param_comm_ctx.pre_reduce_scatter_params), [[fsdp_param]])
         mock_group_cls.assert_called_once_with(
             replicate_group="dp",
             hsdp_params=[hsdp_param],
@@ -268,7 +269,17 @@ class TestBackwardCommunication(MindSporeFullyShardUnitTest):
             reduce_op="avg",
             output_buffer=all_reduce_group.get_param_buffer_view.return_value,
         )
-        self.assertEqual(state.scheduler_ctx.pre_all_reduce_groups, [all_reduce_group])
+        self.assertEqual(list(per_param_comm_ctx.pre_all_reduce_groups), [[all_reduce_group]])
+
+    def test_issue_reduce_scatter_records_empty_unit(self):
+        """A unit without gradients should still occupy one communication slot."""
+        state = _new_state()
+
+        state._issue_reduce_scatter_for_current_module()
+
+        per_param_comm_ctx = state.scheduler_ctx.per_param_comm_ctx
+        self.assertEqual(list(per_param_comm_ctx.pre_reduce_scatter_params), [[]])
+        self.assertEqual(list(per_param_comm_ctx.pre_all_reduce_groups), [[]])
 
     def test_wait_fsdp_reduce_scatter_retains_final_output_for_root(self):
         """Final synchronized RS output should remain in the parameter context."""
@@ -277,9 +288,8 @@ class TestBackwardCommunication(MindSporeFullyShardUnitTest):
         param.reduce_scatter_output.return_value = reduced_grad
         param.reduce_scatter_comm_ctx.reduce_scatter_output = reduced_grad
         state = _new_state([param])
-        state.scheduler_ctx.pre_reduce_scatter_params.append(param)
 
-        state._wait_prev_reduce_scatter_without_all_reduce()
+        state._wait_prev_reduce_scatter_without_all_reduce([param])
 
         self.assertIs(param.reduce_scatter_comm_ctx.reduce_scatter_output, reduced_grad)
         self.assertIsNone(param.unsharded_param.grad)
@@ -291,24 +301,71 @@ class TestBackwardCommunication(MindSporeFullyShardUnitTest):
         param.reduce_scatter_output.return_value = reduced_grad
         state = _new_state([param])
         state.requires_all_reduce = False
-        state.scheduler_ctx.pre_reduce_scatter_params.append(param)
 
-        state._wait_prev_reduce_scatter_without_all_reduce()
+        state._wait_prev_reduce_scatter_without_all_reduce([param])
 
         self.assertIs(param.reduce_partial_output, reduced_grad)
         param.clear_reduce_scatter_output.assert_called_once_with()
 
     def test_fused_all_reduce_group_is_waited_and_split(self):
-        """Tree-local pending groups should expose outputs before root applies grads."""
+        """Tree-local all-reduce work should expose outputs before root applies grads."""
         group = MagicMock(spec=AllReduceParamGroup)
         group.hsdp_params = []
         state = _new_state()
-        state.scheduler_ctx.pending_all_reduce_groups.append(group)
+        per_param_comm_ctx = state.scheduler_ctx.per_param_comm_ctx
+        per_param_comm_ctx.all_reduce_work_groups.append(group)
 
         state.wait_and_split_all_reduce_work_groups()
 
         group.wait_and_split_grads.assert_called_once_with()
-        self.assertEqual(state.scheduler_ctx.pending_all_reduce_groups, [])
+        self.assertEqual(per_param_comm_ctx.all_reduce_work_groups, [])
+
+    def test_issue_prev_fused_all_reduce_records_work_for_root(self):
+        """A completed grouped reduce-scatter should launch and retain its all-reduce work."""
+        group = MagicMock(spec=AllReduceParamGroup)
+        group.hsdp_params = []
+        state = _new_state()
+
+        state._issue_prev_fused_all_reduce([group])
+
+        group.accumulate_reduce_partial_outputs.assert_called_once_with()
+        group.issue_async_allreduce.assert_called_once_with()
+        self.assertEqual(state.scheduler_ctx.per_param_comm_ctx.all_reduce_work_groups, [group])
+
+    def test_post_backward_expires_one_unit_before_launching_current_reduce_scatter(self):
+        """MindSpore should retain its one-unit per-parameter pipeline ordering."""
+        state = _new_state()
+        state.shard = MagicMock()
+        expired_param = MagicMock()
+        expired_group = MagicMock()
+        per_param_comm_ctx = state.scheduler_ctx.per_param_comm_ctx
+        per_param_comm_ctx.pre_reduce_scatter_params.append([expired_param])
+        per_param_comm_ctx.pre_all_reduce_groups.append([expired_group])
+        events = []
+        state._wait_prev_reduce_scatter = MagicMock(
+            side_effect=lambda groups: events.append(("wait_group", groups))
+        )
+        state._wait_prev_reduce_scatter_without_all_reduce = MagicMock(
+            side_effect=lambda params: events.append(("wait_param", params))
+        )
+        state._issue_reduce_scatter_for_current_module = MagicMock(
+            side_effect=lambda: events.append(("issue_rs", None))
+        )
+        state._issue_prev_fused_all_reduce = MagicMock(
+            side_effect=lambda groups: events.append(("issue_ar", groups))
+        )
+
+        state.post_backward()
+
+        self.assertEqual(
+            events,
+            [
+                ("wait_group", [expired_group]),
+                ("wait_param", [expired_param]),
+                ("issue_rs", None),
+                ("issue_ar", [expired_group]),
+            ],
+        )
 
     def test_comm_fusion_drains_previous_stages_and_launches_current(self):
         """Fused communication should pipeline AR wait, RS wait, then current RS."""
@@ -365,13 +422,16 @@ class TestStateConfiguration(MindSporeFullyShardUnitTest):
         param = _fake_param()
         param.sharded_param.grad = "optimizer-grad"
         state = _new_state([param])
-        state.scheduler_ctx.pre_reduce_scatter_params.append(param)
-        state.scheduler_ctx.pending_all_reduce_groups.append(MagicMock())
+        per_param_comm_ctx = state.scheduler_ctx.per_param_comm_ctx
+        per_param_comm_ctx.pre_reduce_scatter_params.append([param])
+        per_param_comm_ctx.pre_all_reduce_groups.append([])
+        per_param_comm_ctx.all_reduce_work_groups.append(MagicMock())
 
         state.reset_iter_state()
 
-        self.assertEqual(state.scheduler_ctx.pre_reduce_scatter_params, [])
-        self.assertEqual(state.scheduler_ctx.pending_all_reduce_groups, [])
+        self.assertEqual(list(per_param_comm_ctx.pre_reduce_scatter_params), [])
+        self.assertEqual(list(per_param_comm_ctx.pre_all_reduce_groups), [])
+        self.assertEqual(per_param_comm_ctx.all_reduce_work_groups, [])
         self.assertEqual(param.sharded_param.grad, "optimizer-grad")
         self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_output)
         self.assertIsNone(param.all_reduce_comm_ctx.all_reduce_output)

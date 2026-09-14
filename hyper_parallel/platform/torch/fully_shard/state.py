@@ -289,27 +289,39 @@ class TorchHSDPStateV2(HSDPState):
             # Reshard before gradient communication to reduce backward memory peak.
             self.shard()
         if not self.comm_fusion_policy.enable_comm_fusion:
-            # Step 1: wait previous reduce-scatter (for params needing all-reduce)
-            prev_group = self._wait_prev_reduce_scatter()
+            expired_reduce_scatter_params = []
+            expired_all_reduce_groups = []
+            if (
+                len(self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params)
+                >= self.scheduler_ctx.per_param_comm_ctx.reduce_interval
+            ):
+                expired_reduce_scatter_params = (
+                    self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params.popleft()
+                )
+                expired_all_reduce_groups = (
+                    self.scheduler_ctx.per_param_comm_ctx.pre_all_reduce_groups.popleft()
+                )
+                self._wait_prev_reduce_scatter(expired_all_reduce_groups)
+                self._wait_prev_reduce_scatter_without_all_reduce(
+                    expired_reduce_scatter_params
+                )
 
-            # Step 2: wait previous reduce-scatter outputs that skip replicate all-reduce
-            self._wait_prev_reduce_scatter_without_all_reduce()
-
-            # Step 3: issue current reduce_scatter
             self._issue_reduce_scatter_for_current_module()
-
-            # Step 4: issue previous fused all-reduce asynchronously
-            self._issue_prev_fused_all_reduce(prev_group)
+            self._issue_prev_fused_all_reduce(expired_all_reduce_groups)
         else:
             self.post_backward_for_comm_fusion()
 
-    def _issue_reduce_scatter_for_current_module(self):
+    def _issue_reduce_scatter_for_current_module(self) -> None:
         """Issue reduce_scatter for current module's parameters with fused all-reduce support.
 
         This method groups parameters by their replicate_process_group and:
         1. For params without all_reduce needs: issue reduce_scatter directly
         2. For params with all_reduce needs: allocate fused buffer and issue reduce_scatter
            into aligned views, enabling zero-copy fused all_reduce later.
+
+        One entry is appended to each per-parameter communication deque even
+        when this unit has no active gradient. This preserves interval distance
+        in HSDP units without storing duplicate communication handles.
         """
         # Collect parameters that need gradient reduction
         params_to_reduce = []
@@ -326,8 +338,8 @@ class TorchHSDPStateV2(HSDPState):
                 continue
             params_to_reduce.append(hsdp_param)
 
-        if not params_to_reduce:
-            return
+        params_without_all_reduce = []
+        all_reduce_groups = []
 
         # Group by replicate process group and reduction dtype so every fused
         # all-reduce buffer has one communication group and one element type.
@@ -351,7 +363,7 @@ class TorchHSDPStateV2(HSDPState):
                 hsdp_param.reduce_scatter_grad(
                     reduce_op=self.reduce_op_type,
                 )
-                self.scheduler_ctx.pre_reduce_scatter_params.append(hsdp_param)
+                params_without_all_reduce.append(hsdp_param)
 
         # Handle params that need all_reduce (HSDP with multiple replicas)
         for group_key, hsdp_params in groups_by_comm.items():
@@ -381,104 +393,120 @@ class TorchHSDPStateV2(HSDPState):
                     output_buffer=buffer_view,
                 )
 
-            # Save the group so the next module hook can wait RS and launch AR.
-            self.scheduler_ctx.pre_all_reduce_groups.append(group)
+            all_reduce_groups.append(group)
 
-    def _wait_prev_reduce_scatter(self) -> List[AllReduceParamGroup]:
-        """Step 1: wait prev reduce_scatter.
+        self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params.append(
+            params_without_all_reduce
+        )
+        self.scheduler_ctx.per_param_comm_ctx.pre_all_reduce_groups.append(all_reduce_groups)
+
+    def _wait_prev_reduce_scatter(
+        self,
+        all_reduce_groups: List[AllReduceParamGroup],
+    ) -> None:
+        """Wait a previous unit's reduce-scatter work that feeds all-reduce.
 
         This enables overlapping:
-        - Layer N-1's reduce_scatter wait with Layer N's backward compute
+        - Layer N's reduce_scatter wait with later layers' backward compute.
 
-        Returns:
-            List of previous AllReduceParamGroups (one per communication group).
+        Args:
+            all_reduce_groups: Groups whose reduce-scatter outputs are ready to
+                consume after their handles are waited.
         """
-        if self.scheduler_ctx.pre_all_reduce_groups:
-            prev_groups = list(self.scheduler_ctx.pre_all_reduce_groups)
-            self.scheduler_ctx.pre_all_reduce_groups.clear()
-            for prev_group in prev_groups:
-                logger.debug(
-                    "post_backward module=%s wait=fused_reduce_scatter group_params=%s",
-                    self,
-                    prev_group.hsdp_params,
-                )
-                for hsdp_param in prev_group.hsdp_params:
-                    hsdp_param.reduce_scatter_output()
-                    hsdp_param.clear_reduce_scatter_output()
-                    if hsdp_param.unsharded_accumulated_grad_data is not None:
-                        hsdp_param.unsharded_accumulated_grad = None
-                    elif hsdp_param.unsharded_param.grad is not None:
-                        hsdp_param.unsharded_param.grad = None
-            return prev_groups
-        return []
+        for all_reduce_group in all_reduce_groups:
+            logger.debug(
+                "post_backward module=%s wait=fused_reduce_scatter group_params=%s",
+                self,
+                all_reduce_group.hsdp_params,
+            )
+            for hsdp_param in all_reduce_group.hsdp_params:
+                hsdp_param.reduce_scatter_output()
+                hsdp_param.clear_reduce_scatter_output()
+                if hsdp_param.unsharded_accumulated_grad_data is not None:
+                    hsdp_param.unsharded_accumulated_grad = None
+                elif hsdp_param.unsharded_param.grad is not None:
+                    hsdp_param.unsharded_param.grad = None
 
-    def _issue_prev_fused_all_reduce(self, prev_groups: List[AllReduceParamGroup]) -> None:
-        """Step 4: issue the previous module's fused all-reduce asynchronously.
+    def _issue_prev_fused_all_reduce(
+        self,
+        all_reduce_groups: List[AllReduceParamGroup],
+    ) -> None:
+        """Issue a previous unit's fused all-reduce after its source RS wait.
 
-        The all-reduce work is collected in ``pending_all_reduce_groups``
+        The all-reduce work is collected in ``all_reduce_work_groups``
         and is waited in the root backward hook.
 
         Args:
-            prev_groups: Previous parameter groups whose all-reduce should be issued.
+            all_reduce_groups: Parameter groups whose all-reduce should be issued.
         """
-        for prev_group in prev_groups:
-            prev_group.accumulate_reduce_partial_outputs()
+        for all_reduce_group in all_reduce_groups:
+            all_reduce_group.accumulate_reduce_partial_outputs()
             logger.debug(
                 "post_backward module=%s launch=fused_all_reduce group_params=%s",
                 self,
-                prev_group.hsdp_params,
+                all_reduce_group.hsdp_params,
             )
-            prev_group.issue_async_allreduce()
-            self.scheduler_ctx.pending_all_reduce_groups.append(prev_group)
+            all_reduce_group.issue_async_allreduce()
+            self.scheduler_ctx.per_param_comm_ctx.all_reduce_work_groups.append(all_reduce_group)
 
-    def _wait_prev_reduce_scatter_without_all_reduce(self) -> None:
-        """Wait previous RS outputs that do not enter a replicate all-reduce.
+    def _wait_prev_reduce_scatter_without_all_reduce(
+        self,
+        hsdp_params: List[TorchHSDPParamV2],
+    ) -> None:
+        """Wait a previous unit's RS outputs that skip replicate all-reduce.
 
         When the current micro-step disables all-reduce, outputs accumulate in
         ``reduce_partial_output`` without being cast or applied to the parameter.
         On the final synchronized micro-step, the partial result is merged into
         the current RS output and retained for root-hook finalization.
+
+        Args:
+            hsdp_params: Parameters whose reduce-scatter work should be waited.
+
+        Note:
+            The public gradient-accumulation API configures
+            ``requires_all_reduce`` recursively for the whole module tree. The
+            root hook relies on that invariant when it drains child slots
+            through the root state.
         """
-        while self.scheduler_ctx.pre_reduce_scatter_params:
-            pre_hsdp_param = self.scheduler_ctx.pre_reduce_scatter_params.pop(0)
+        for hsdp_param in hsdp_params:
             logger.debug(
                 "post_backward module=%s wait=reduce_scatter param=%s",
                 self,
-                pre_hsdp_param,
+                hsdp_param,
             )
-            reduced_grad = pre_hsdp_param.reduce_scatter_output()
+            reduced_grad = hsdp_param.reduce_scatter_output()
             if not self.requires_all_reduce:
-                if pre_hsdp_param.reduce_partial_output is None:
-                    pre_hsdp_param.reduce_partial_output = reduced_grad
+                if hsdp_param.reduce_partial_output is None:
+                    hsdp_param.reduce_partial_output = reduced_grad
                 else:
-                    pre_hsdp_param.reduce_partial_output.add_(reduced_grad)
-                pre_hsdp_param.clear_reduce_scatter_output()
-            elif pre_hsdp_param.reduce_partial_output is not None:
-                reduced_grad.add_(pre_hsdp_param.reduce_partial_output)
-                pre_hsdp_param.reduce_partial_output = None
+                    hsdp_param.reduce_partial_output.add_(reduced_grad)
+                hsdp_param.clear_reduce_scatter_output()
+            elif hsdp_param.reduce_partial_output is not None:
+                reduced_grad.add_(hsdp_param.reduce_partial_output)
+                hsdp_param.reduce_partial_output = None
 
-            if pre_hsdp_param.unsharded_accumulated_grad_data is not None:
-                pre_hsdp_param.unsharded_accumulated_grad = None
-            elif pre_hsdp_param.unsharded_param.grad is not None:
-                pre_hsdp_param.unsharded_param.grad = None
+            if hsdp_param.unsharded_accumulated_grad_data is not None:
+                hsdp_param.unsharded_accumulated_grad = None
+            elif hsdp_param.unsharded_param.grad is not None:
+                hsdp_param.unsharded_param.grad = None
 
     def wait_and_split_all_reduce_work_groups(self) -> None:
         """Wait fused all-reduce work and expose each parameter result."""
-        for group in self.scheduler_ctx.pending_all_reduce_groups:
+        for group in self.scheduler_ctx.per_param_comm_ctx.all_reduce_work_groups:
             logger.debug(
                 "post_backward module=%s wait=fused_all_reduce group_params=%s",
                 self,
                 group.hsdp_params,
             )
             group.wait_and_split_grads()
-        self.scheduler_ctx.pending_all_reduce_groups.clear()
+        self.scheduler_ctx.per_param_comm_ctx.all_reduce_work_groups.clear()
 
     def reset_iter_state(self) -> None:
         """Clear Torch communication bookkeeping without clearing optimizer gradients."""
-        self.scheduler_ctx.pre_reduce_scatter_params.clear()
-        self.scheduler_ctx.pre_all_reduce_params.clear()
-        self.scheduler_ctx.pre_all_reduce_groups.clear()
-        self.scheduler_ctx.pending_all_reduce_groups.clear()
+        self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params.clear()
+        self.scheduler_ctx.per_param_comm_ctx.pre_all_reduce_groups.clear()
+        self.scheduler_ctx.per_param_comm_ctx.all_reduce_work_groups.clear()
         if self.param_group is not None:
             self.param_group.reset_iter_state()
         for hsdp_param in self.hsdp_params:
