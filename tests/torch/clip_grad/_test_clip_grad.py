@@ -71,11 +71,11 @@ def _get_fsdp_kwargs(mesh):
     }
 
 
-def _gather_full(model, attr="grad", include_replicate=False):
-    """All-gather sharded tensors to reconstruct full values.
+def _gather_full(model, attr="grad"):
+    """All-gather managed tensors to reconstruct full values.
 
-    When ``include_replicate=True`` also walks ``replicate_params``;
-    their local tensor is already the global value after all-reduce.
+    Replicated parameters are part of ``hsdp_params`` and have shard world
+    size one, so their local tensor is already the global value.
     """
     result = []
     for module in model.modules():
@@ -84,10 +84,7 @@ def _gather_full(model, attr="grad", include_replicate=False):
         hsdp_state = module.hsdp_scheduler.hsdp_state
         if hsdp_state is None:
             continue
-        params = list(hsdp_state.hsdp_params)
-        if include_replicate:
-            params.extend(hsdp_state.replicate_params)
-        for hp in params:
+        for hp in hsdp_state.hsdp_params:
             if not hp.sharded_param.requires_grad:
                 continue
             if attr == "grad":
@@ -423,7 +420,7 @@ def test_clip_grad_norm_replicate_params():  # pylint: disable=R0914
         loss.backward(torch.tensor(1.0 / world_size).npu())
 
     saved = _save_grads(model)
-    full_grads = _gather_full(model, "grad", include_replicate=True)
+    full_grads = _gather_full(model, "grad")
     ref_norm, ref_clipped = _ref_clip(full_grads, _MAX_NORM, 2.0)
 
     _restore_grads(model, saved)
@@ -437,7 +434,7 @@ def test_clip_grad_norm_replicate_params():  # pylint: disable=R0914
         f"shard_world_size={world_size}"
     )
 
-    our_clipped = _gather_full(model, "grad", include_replicate=True)
+    our_clipped = _gather_full(model, "grad")
     for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped)):
         assert _close(og, rg), (
             f"[rank={rank}] replicate clipped grad[{i}] mismatch: "
