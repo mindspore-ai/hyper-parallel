@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -31,6 +33,8 @@ from hyper_parallel.distributed_data.schema import (
     StepSampleSelection,
     WorkloadCost,
 )
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class _MutableBin:
@@ -114,10 +118,48 @@ class DynamicPackingPlanner:
         ]
         rank_costs = [WorkloadCost() for _ in range(self.data_parallel_size)]
         bins, rank_costs = self._place_samples(selection, ordered, bins, rank_costs)
-        if self.min_balance_gain and self._reference_is_better(selection, rank_costs):
+        candidate_rank_costs = list(rank_costs)
+        reference_costs = None
+        if self.min_balance_gain or os.environ.get("PR1371_COST_DEBUG"):
+            _, reference_costs = self._reference_bins_in_order(selection)
+        reference_is_better = (
+            self.min_balance_gain
+            and self._reference_is_better(selection, rank_costs)
+        )
+        if reference_is_better:
             bins, rank_costs = self._reference_bins_in_order(selection)
         constructors = self._freeze_bins(bins, rank_costs)
         self._validate_conservation(constructors, selection)
+        if os.environ.get("PR1371_COST_DEBUG"):
+            ref_costs = reference_costs or []
+            ref_max = max((cost.dominant for cost in ref_costs), default=0.0)
+            candidate_max = max((cost.dominant for cost in candidate_rank_costs), default=0.0)
+            candidate_gain = ((ref_max - candidate_max) / ref_max) if ref_max else 0.0
+            final_max = max((cost.dominant for cost in rank_costs), default=0.0)
+            sample_costs = [item.metadata.cost.dominant for item in ordered]
+            sample_tokens = [item.metadata.pack_tokens for item in ordered]
+            logger.warning(
+                "[HP cost] step=%d samples=%d placement=%s min_gain=%.4f "
+                "reference_max=%.4f candidate_max=%.4f candidate_gain=%.4f "
+                "final_max=%.4f "
+                "sample_dominant(min/mean/max)=%.4f/%.4f/%.4f "
+                "sample_tokens(min/max)=%d/%d candidate_ranks=%s final_ranks=%s",
+                step,
+                len(ordered),
+                "canonical" if reference_is_better else "balanced",
+                self.min_balance_gain,
+                ref_max,
+                candidate_max,
+                candidate_gain,
+                final_max,
+                min(sample_costs, default=0.0),
+                sum(sample_costs) / len(sample_costs) if sample_costs else 0.0,
+                max(sample_costs, default=0.0),
+                min(sample_tokens, default=0),
+                max(sample_tokens, default=0),
+                [round(cost.dominant, 3) for cost in candidate_rank_costs],
+                [round(cost.dominant, 3) for cost in rank_costs],
+            )
         plan_id = self._plan_id(step, constructors)
         return DistributedPackingPlan(
             plan_id=plan_id,
