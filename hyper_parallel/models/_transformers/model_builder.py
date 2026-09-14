@@ -23,7 +23,7 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 """
 
 import logging
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Callable, Dict, Literal, Optional, Union
 
 import torch
 from torch import nn
@@ -58,7 +58,7 @@ from hyper_parallel.distributed._builder.fsdp_adapter import (
 from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
-from hyper_parallel.models.registry import _resolve_custom_model_cls
+from hyper_parallel.models.registry import _resolve_custom_model_cls, get_model_adapter
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
 
 logger = logging.getLogger(__name__)
@@ -279,13 +279,12 @@ def _move_model_to_device(
     return model
 
 
-def _initialize_model_weights(model: nn.Module) -> None:
-    """Initialize materialized state through the model's native contract."""
-    for module in model.modules():
-        module._is_hf_initialized = False  # pylint: disable=W0212
-    for tensor in (*model.parameters(), *model.buffers()):
-        tensor._is_hf_initialized = False  # pylint: disable=W0212
+def _run_native_model_initialization(model: nn.Module) -> bool:
+    """Run the model's native initialization contract.
 
+    Returns:
+        Whether a model-level native initializer was called.
+    """
     initialize_weights = getattr(model, "initialize_weights", None)
     native_initialization = callable(initialize_weights)
     if callable(initialize_weights):
@@ -300,6 +299,41 @@ def _initialize_model_weights(model: nn.Module) -> None:
                 reset_parameters = getattr(module, "reset_parameters", None)
                 if callable(reset_parameters):
                     reset_parameters()
+    return native_initialization
+
+
+def _get_init_weights_provider(model: nn.Module) -> Optional[Callable[..., Any]]:
+    """Resolve the first init-weights provider declared by the model family."""
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    architectures = getattr(config, "architectures", None) or ()
+    identities = [model_type, *architectures]
+    for identity in identities:
+        if not identity:
+            continue
+        adapter_spec = get_model_adapter(identity)
+        if adapter_spec is not None and adapter_spec.init_weights is not None:
+            return adapter_spec.init_weights
+    return None
+
+
+def _initialize_model_weights(model: nn.Module) -> None:
+    """Initialize materialized state through a family or native contract."""
+    for module in model.modules():
+        module._is_hf_initialized = False  # pylint: disable=W0212
+    for tensor in (*model.parameters(), *model.buffers()):
+        tensor._is_hf_initialized = False  # pylint: disable=W0212
+
+    provider = _get_init_weights_provider(model)
+    if provider is None:
+        native_initialization = _run_native_model_initialization(model)
+    else:
+        initializer = provider()
+        if not callable(initializer):
+            raise TypeError("ModelAdapterSpec.init_weights provider must return a callable initializer")
+        initializer(model)
+        native_initialization = True
+
     if native_initialization:
         for module in model.modules():
             if not getattr(module, "_hp_reset_after_materialization", False):
@@ -307,7 +341,7 @@ def _initialize_model_weights(model: nn.Module) -> None:
             reset_parameters = getattr(module, "reset_parameters", None)
             if callable(reset_parameters):
                 reset_parameters()
-    logger.info("Initialized model state with model-native random initialization")
+    logger.info("Initialized model state")
 
 
 def _build_replacement_context(

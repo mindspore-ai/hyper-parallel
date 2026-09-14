@@ -86,6 +86,28 @@ def test_lazy_family_discovery():
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+@pytest.mark.parametrize(
+    "identity, expected_model_type",
+    [
+        ("qwen3_next", "qwen3_next"),
+        ("Qwen3_5ForCausalLM", "qwen3_5"),
+        ("qwen3_5_moe_text", "qwen3_5_moe_text"),
+        ("Qwen4ExpForConditionalGeneration", "qwen4_exp"),
+        ("qwen4_exp_text", "qwen4_exp_text"),
+    ],
+)
+def test_shard_aware_init_adapter_discovery(identity, expected_model_type):
+    """Affected model identities lazily resolve an init-weights provider."""
+    spec = get_model_adapter(identity)
+    assert spec is not None, f"case: spec_exists, identity={identity}"
+    assert spec.model_type == expected_model_type, (
+        f"case: model_type, identity={identity}, actual={spec.model_type}"
+    )
+    assert callable(spec.init_weights), f"case: init_weights, identity={identity}"
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
          card_mark="onecard", essential_mark="essential")
 def test_unknown_family_resolves_to_none():
     """No class-name guessing: an unknown model_type finds no adapter."""

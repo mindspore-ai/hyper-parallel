@@ -22,8 +22,8 @@ they never branch on model class names themselves (05 §15.9 step 1,
 adjust doc §4/§7.2). This module holds only the data contract, never
 model-class-name branches.
 
-Provider fields stay ``None`` until the family's adapter modules land
-(Qwen3-MoE: replacements/attention in M2, distributed rules in M3).
+Provider fields are lazy callables so registry discovery does not import
+model implementations or optional Transformers model packages.
 """
 
 from dataclasses import dataclass
@@ -57,6 +57,9 @@ class ModelAdapterSpec:
             never carries per-family knowledge.
         loss: provider returning model-family output-loss adapters that must
             intercept the model before a full terminal output is materialized.
+        init_weights: provider returning a model-family initializer with the
+            signature ``initializer(model)``. When present, the initializer
+            owns the complete weight-initialization contract for that family.
     """
 
     architecture: str
@@ -68,3 +71,4 @@ class ModelAdapterSpec:
     expert_parallel: Optional[Callable[..., Any]] = None
     sharding_rules: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
+    init_weights: Optional[Callable[..., Any]] = None
