@@ -108,7 +108,7 @@ def _run_case(dataset: object, mesh: object, *, double_buffer: bool, workers: in
             actual_step_gradient = expected_step_gradient = torch.tensor(0.0, dtype=torch.float64)
         if round_idx == 0:
             plan = loader.last_plan
-            costs = [constructor.cost.encoder for constructor in plan.constructors]
+            costs = [cost.encoder for cost in plan.rank_costs]
             assert max(costs) < 144, f"Expected encoder imbalance below native [144, 4], got {costs}"
             checkpoint = loader.state_dict()
             cursor = checkpoint["dataset_reader"]["sampler"]["consumed_samples"]

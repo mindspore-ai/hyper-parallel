@@ -140,7 +140,7 @@ def _run_cost_balance(mesh: object) -> None:
     )
     next(loader)
     plan = _gather(loader.last_plan)[0]
-    actual_costs = [constructor.cost.llm for constructor in plan.constructors]
+    actual_costs = [cost.llm for cost in plan.rank_costs]
     assert actual_costs == [10, 10], f"Expected costs=[10, 10] instead of native [18, 2], got costs={actual_costs}"
     actual_indices = sorted(key.dataset_index for key in plan.selected_keys)
     assert actual_indices == [0, 1, 2, 3], f"Cost balancing changed the native round: indices={actual_indices}"

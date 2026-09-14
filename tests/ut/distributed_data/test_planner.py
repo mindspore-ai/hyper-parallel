@@ -136,10 +136,10 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         plan = planner.plan(selection, step=0)
 
         self.assertEqual(set(plan.selected_keys), {candidate.key for candidate in candidates})
-        for constructor in plan.constructors:
-            packing_bin = constructor.bins[0]
+        for local_batch in plan.local_batches:
+            packing_bin = local_batch[0]
             self.assertEqual(packing_bin.pack_tokens, 10)
-            self.assertEqual(len(packing_bin.samples), 2)
+            self.assertEqual(len(packing_bin.sample_keys), 2)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_workload_cost_changes_placement_not_step_membership(self) -> None:
@@ -163,7 +163,7 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         second_plan = planner.plan(second_selection, step=0)
 
         self.assertEqual(set(first_plan.selected_keys), set(second_plan.selected_keys))
-        self.assertNotEqual(first_plan.constructor_for(0).sample_keys, second_plan.constructor_for(0).sample_keys)
+        self.assertNotEqual(first_plan.local_sample_keys(0), second_plan.local_sample_keys(0))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_falls_back_to_reference_packing_without_dropping_samples(self) -> None:
@@ -178,10 +178,10 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         plan = planner.plan(selection, step=3)
 
         self.assertEqual(set(plan.selected_keys), {candidate.key for candidate in candidates})
-        self.assertEqual([packing_bin.pack_tokens for packing_bin in plan.constructors[0].bins], [10, 10])
+        self.assertEqual([packing_bin.pack_tokens for packing_bin in plan.local_batches[0]], [10, 10])
         self.assertEqual(
-            tuple(tuple(sample.key.dataset_index for sample in packing_bin.samples)
-                  for packing_bin in plan.constructors[0].bins),
+            tuple(tuple(key.dataset_index for key in packing_bin.sample_keys)
+                  for packing_bin in plan.local_batches[0]),
             ((0, 1, 2), (3, 4, 5)),
         )
 
@@ -258,11 +258,11 @@ class TestDynamicPackingPlanner(unittest.TestCase):
 
         plan = planner.plan(selection, step=0)
 
-        packing_bin = plan.constructors[0].bins[0]
+        packing_bin = plan.local_batches[0][0]
         self.assertTrue(packing_bin.oversized)
         self.assertEqual(packing_bin.pack_tokens, 12)
-        self.assertEqual(packing_bin.samples[0].key, SampleKey(0, 0))
-        self.assertEqual(len(packing_bin.samples), 1)
+        self.assertEqual(packing_bin.sample_keys[0], SampleKey(0, 0))
+        self.assertEqual(len(packing_bin.sample_keys), 1)
 
 
 if __name__ == "__main__":

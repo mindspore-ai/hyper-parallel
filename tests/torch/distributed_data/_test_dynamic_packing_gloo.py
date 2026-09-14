@@ -157,11 +157,11 @@ def _assert_exactly_once(outputs: tuple[Any, ...]) -> None:
 def _assert_plan_matches_outputs(plan: DistributedPackingPlan, outputs: tuple[Any, ...]) -> None:
     routes = []
     for data_rank, constructor_rank in enumerate(_CONSTRUCTOR_RANKS):
-        constructor = plan.constructor_for(data_rank)
+        local_batch = plan.local_batch_for(data_rank)
         planned_sample_ids = tuple(
-            sample.key.dataset_index
-            for packing_bin in constructor.bins
-            for sample in packing_bin.samples
+            key.dataset_index
+            for packing_bin in local_batch
+            for key in packing_bin.sample_keys
         )
         output_sample_ids = tuple(
             sample_id
@@ -173,9 +173,9 @@ def _assert_plan_matches_outputs(plan: DistributedPackingPlan, outputs: tuple[An
             f"rank={constructor_rank}, expected={planned_sample_ids!r}, got={output_sample_ids!r}."
         )
         routes.extend(
-            (sample.key.reader_rank, constructor_rank)
-            for packing_bin in constructor.bins
-            for sample in packing_bin.samples
+            (key.reader_rank, constructor_rank)
+            for packing_bin in local_batch
+            for key in packing_bin.sample_keys
         )
 
     assert any(reader_rank != target_rank for reader_rank, target_rank in routes), (

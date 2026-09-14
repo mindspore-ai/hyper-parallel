@@ -26,7 +26,6 @@ from torch.utils.data import DataLoader, Dataset, Sampler  # pylint: disable=for
 
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
-    DataConstructorPlan,
     SampleKey,
     SampleMetadata,
 )
@@ -324,18 +323,16 @@ class PlannedSampleLoader:
             **worker_options,
         )
 
-    def fetch(self, plan: DataConstructorPlan) -> dict[SampleKey, Any]:
-        """Fetch constructor-assigned Dataset indices in deterministic plan order.
+    def fetch(self, sample_keys: Sequence[SampleKey]) -> dict[SampleKey, Any]:
+        """Fetch assigned Dataset indices in deterministic plan order.
 
         Args:
-            plan: Plan for this rank's Data Constructor.
+            sample_keys: Sample keys assigned to this Data Constructor.
 
         Returns:
             Mapping from planned sample keys to materialized payloads.
         """
-        if not isinstance(plan, DataConstructorPlan):
-            raise ValueError(f"plan must be DataConstructorPlan, but got {type(plan)}.")
-        return self.fetch_keys(plan.sample_keys)
+        return self.fetch_keys(sample_keys)
 
     def fetch_keys(self, sample_keys: Sequence[SampleKey]) -> dict[SampleKey, Any]:
         """Fetch an ordered sequence of sample keys from this loader's Dataset.

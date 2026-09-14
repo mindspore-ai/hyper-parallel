@@ -211,7 +211,6 @@ class DistributedDataLoader(Iterator[Any]):
         self._prefetch_result: _PrefetchResult | None = None
         self._prefetch_requested = False
         self._prefetch_in_flight = False
-        self._prefetch_shutdown = False
         self._prefetch_stream: Any = None
 
     def __iter__(self) -> "DistributedDataLoader":
@@ -273,8 +272,6 @@ class DistributedDataLoader(Iterator[Any]):
     def _start_prefetch(self) -> None:
         """Submit one background transaction to the persistent prefetch thread."""
         with self._prefetch_condition:
-            if self._prefetch_shutdown:
-                raise RuntimeError("The distributed DataLoader prefetch thread is shut down.")
             if self._prefetch_in_flight:
                 raise ValueError("A distributed local-batch prefetch is already in flight.")
             if self._prefetch_thread is None:
@@ -290,16 +287,14 @@ class DistributedDataLoader(Iterator[Any]):
             self._prefetch_condition.notify()
 
     def _run_prefetch(self) -> None:
-        """Run submitted transactions until the loader is explicitly shut down."""
+        """Run submitted transactions on a persistent daemon thread."""
         # Accelerator device context is thread-local on CUDA/NPU. Bind it once
         # on the persistent worker instead of repeating it for every step.
         device_bound = False
         while True:
             with self._prefetch_condition:
-                while not self._prefetch_requested and not self._prefetch_shutdown:
+                while not self._prefetch_requested:
                     self._prefetch_condition.wait()
-                if self._prefetch_shutdown:
-                    return
                 self._prefetch_requested = False
             try:
                 if not device_bound:
@@ -561,9 +556,9 @@ class DistributedDataLoader(Iterator[Any]):
         canonical_match = False
         if self._external_step_mode and self._topology.is_constructor:
             reader = self._dataset_reader
-            constructor_plan = plan.constructor_for(self._topology.data_rank)
+            local_batch_plan = plan.local_batch_for(self._topology.data_rank)
             matches = getattr(reader, "canonical_plan_matches", None)
-            canonical_match = callable(matches) and matches(constructor_plan, self._topology.data_rank)
+            canonical_match = callable(matches) and matches(local_batch_plan, self._topology.data_rank)
         if self._external_step_mode and self._data_plane.is_member:
             canonical_match = self._data_plane.all_ranks_true(canonical_match)
         if canonical_match and self._topology.is_constructor:
@@ -582,8 +577,9 @@ class DistributedDataLoader(Iterator[Any]):
         if self._topology.is_constructor:
             if self._direct_sample_loader is None:
                 raise ValueError("A metadata Data Constructor has no plan-aware sample loader.")
-            constructor_plan = plan.constructor_for(self._topology.data_rank)
-            received_payloads = self._direct_sample_loader.fetch(constructor_plan)
+            received_payloads = self._direct_sample_loader.fetch(
+                plan.local_sample_keys(self._topology.data_rank)
+            )
         return self._construct_received_payloads(plan, received_payloads)
 
     def _construct_received_payloads(
@@ -594,8 +590,8 @@ class DistributedDataLoader(Iterator[Any]):
         """Construct one local batch and return it on the Data Constructor rank."""
         local_batch = None
         if self._topology.is_constructor:
-            constructor_plan = plan.constructor_for(self._topology.data_rank)
-            local_batch = self._data_constructor.construct(constructor_plan, received_payloads)
+            local_batch_plan = plan.local_batch_for(self._topology.data_rank)
+            local_batch = self._data_constructor.construct(local_batch_plan, received_payloads)
         elif received_payloads:
             raise ValueError(
                 f"Non-constructor rank {self._topology.global_rank} received unexpected sample payloads."
@@ -615,7 +611,10 @@ class DistributedDataLoader(Iterator[Any]):
         """Refill internally until a plan is ready, or return None at end of stream."""
         attempt = 1
         while True:
-            local_snapshot = self._fill_local_reader(attempt)
+            read_ahead_attempt = (
+                None if self._batch_sampler_mode or self._external_step_mode else attempt
+            )
+            local_snapshot = self._fill_local_reader(read_ahead_attempt)
             snapshots = self._data_plane.gather_object_to_planner(local_snapshot)
             planner_control = None
             if self._topology.global_rank == self._data_plane.planner_rank:
@@ -625,9 +624,13 @@ class DistributedDataLoader(Iterator[Any]):
             plan, need_more = self._data_plane.broadcast_from_planner(planner_control)
             if not need_more:
                 return plan
+            if self._batch_sampler_mode or self._external_step_mode:
+                raise ValueError(
+                    "An external step reader must provide one complete local step per fill call."
+                )
             attempt += 1
 
-    def _fill_local_reader(self, attempt: int) -> _ReaderSnapshot:
+    def _fill_local_reader(self, attempt: int | None) -> _ReaderSnapshot:
         is_reader = self._topology.global_rank in self._dataset_reader_ranks
         if not is_reader:
             return _ReaderSnapshot(
@@ -645,35 +648,41 @@ class DistributedDataLoader(Iterator[Any]):
             raise ValueError(f"Dataset Reader rank {self._topology.global_rank} did not provide its reader.")
 
         reader_count = len(self._dataset_reader_ranks)
-        sample_target = _scaled_buffer_target(
-            self._planner.distributed_bin_count,
-            self._max_buffered_samples,
-            self._buffer_size_multiplier,
-            attempt,
-            reader_count,
-        )
-        token_target = _scaled_buffer_target(
-            self._planner.distributed_token_budget,
-            self._max_buffered_samples * self._planner.seq_len,
-            self._buffer_size_multiplier,
-            attempt,
-            reader_count,
-        )
+        if attempt is None:
+            sample_target = token_target = 1
+        else:
+            sample_target = _scaled_buffer_target(
+                self._planner.distributed_bin_count,
+                self._max_buffered_samples,
+                self._buffer_size_multiplier,
+                attempt,
+                reader_count,
+            )
+            token_target = _scaled_buffer_target(
+                self._planner.distributed_token_budget,
+                self._max_buffered_samples * self._planner.seq_len,
+                self._buffer_size_multiplier,
+                attempt,
+                reader_count,
+            )
         planning_reader.fill(
             min_samples=max(1, sample_target),
             min_tokens=max(1, token_target),
             max_samples=self._max_buffered_samples,
         )
+        can_read_more = False
+        if not self._batch_sampler_mode and not self._external_step_mode:
+            can_read_more = (
+                not planning_reader.exhausted
+                and planning_reader.buffer_size < self._max_buffered_samples
+            )
         return _ReaderSnapshot(
             rank=self._topology.global_rank,
             step=self._step,
             stopped=self._stopped,
             is_reader=True,
             exhausted=planning_reader.exhausted,
-            can_read_more=(
-                not planning_reader.exhausted
-                and planning_reader.buffer_size < self._max_buffered_samples
-            ),
+            can_read_more=can_read_more,
             metadata=planning_reader.metadata(),
             batch_position=getattr(planning_reader, "batch_position", None),
             reference_bins=tuple(getattr(planning_reader, "reference_bins", ())),
@@ -832,10 +841,10 @@ class DistributedDataLoader(Iterator[Any]):
                     raise ValueError("A planned Dataset Reader rank has no Dataset Reader.")
                 payloads = self._dataset_reader.selected_payloads(local_selected_keys)
             target_by_key = {
-                sample.key: self._topology.constructor_ranks[constructor.target_data_rank]
-                for constructor in plan.constructors
-                for packing_bin in constructor.bins
-                for sample in packing_bin.samples
+                key: self._topology.constructor_ranks[data_rank]
+                for data_rank, local_batch in enumerate(plan.local_batches)
+                for packing_bin in local_batch
+                for key in packing_bin.sample_keys
             }
             for key, payload in payloads:
                 outgoing.setdefault(target_by_key[key], []).append((key, payload))

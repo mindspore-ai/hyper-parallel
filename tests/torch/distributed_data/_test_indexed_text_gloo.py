@@ -203,8 +203,8 @@ def _run_native_sampler(prefix: str, mesh_context: object) -> None:
         actual_ids = sorted(key.dataset_index for key in plans[0].selected_keys)
         expected = sorted(expected_ids[0] + expected_ids[2])
         assert actual_ids == expected, f"Native GPT membership differs: actual={actual_ids}, expected={expected}"
-        constructor = plans[0].constructor_for(mesh_context.dp_rank)
-        reference = collate_fn([datasets[0][key.dataset_index] for key in constructor.sample_keys])
+        local_sample_keys = plans[0].local_sample_keys(mesh_context.dp_rank)
+        reference = collate_fn([datasets[0][key.dataset_index] for key in local_sample_keys])
         for field, expected_value in reference.items():
             torch.testing.assert_close(batch[field], expected_value, rtol=0, atol=0)
     exhausted = False

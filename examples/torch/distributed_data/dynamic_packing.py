@@ -102,15 +102,17 @@ def main() -> None:
     """Initialize Gloo and print every rank's constructed batches."""
     dist.init_process_group("gloo")
     rank = dist.get_rank()
+    dataset = TokenDataset()
+    metadata = [metadata_fn(sample) for sample in dataset._samples]
     loader = build_distributed_dataloader(
-        TokenDataset(),
+        dataset,
         _Mesh(),
         DistributedDatasetConfig(
             seq_len=16,
             local_batch_size=2,
             dataset_reader_ranks=(0, 1, 2, 3),
         ),
-        metadata_fn=metadata_fn,
+        metadata=metadata,
         pack_fn=pack_fn,
         collate_fn=collate_fn,
     )

@@ -25,11 +25,9 @@ from typing import Sequence
 
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
-    DataConstructorPlan,
     DistributedPackingPlan,
     OversizedPolicy,
     PackingBinPlan,
-    PlannedSample,
     StepSampleSelection,
     WorkloadCost,
 )
@@ -128,8 +126,8 @@ class DynamicPackingPlanner:
         )
         if reference_is_better:
             bins, rank_costs = self._reference_bins_in_order(selection)
-        constructors = self._freeze_bins(bins, rank_costs)
-        self._validate_conservation(constructors, selection)
+        local_batches = self._freeze_bins(bins)
+        self._validate_conservation(local_batches, selection)
         if os.environ.get("PR1371_COST_DEBUG"):
             ref_costs = reference_costs or []
             ref_max = max((cost.dominant for cost in ref_costs), default=0.0)
@@ -160,14 +158,13 @@ class DynamicPackingPlanner:
                 [round(cost.dominant, 3) for cost in candidate_rank_costs],
                 [round(cost.dominant, 3) for cost in rank_costs],
             )
-        plan_id = self._plan_id(step, constructors)
+        plan_id = self._plan_id(step, local_batches)
         return DistributedPackingPlan(
             plan_id=plan_id,
             step=step,
             seq_len=self.seq_len,
-            local_batch_size=self.local_batch_size,
-            data_parallel_size=self.data_parallel_size,
-            constructors=constructors,
+            local_batches=local_batches,
+            rank_costs=tuple(rank_costs),
         )
 
     def _reference_bins_in_order(
@@ -291,12 +288,17 @@ class DynamicPackingPlanner:
 
     @staticmethod
     def _validate_conservation(
-            constructors: Sequence[DataConstructorPlan],
+            local_batches: Sequence[Sequence[PackingBinPlan]],
             selection: StepSampleSelection,
     ) -> None:
         """Reject any balanced plan that drops or duplicates a selected key."""
         selected_keys = tuple(item.key for item in selection.samples)
-        planned_keys = tuple(key for constructor in constructors for key in constructor.sample_keys)
+        planned_keys = tuple(
+            key
+            for local_batch in local_batches
+            for packing_bin in local_batch
+            for key in packing_bin.sample_keys
+        )
         if len(planned_keys) != len(set(planned_keys)) or set(planned_keys) != set(selected_keys):
             missing = sorted(set(selected_keys) - set(planned_keys))
             unexpected = sorted(set(planned_keys) - set(selected_keys))
@@ -381,41 +383,25 @@ class DynamicPackingPlanner:
     def _freeze_bins(
             self,
             bins: Sequence[_MutableBin],
-            rank_costs: Sequence[WorkloadCost],
-    ) -> tuple[DataConstructorPlan, ...]:
-        constructors = []
+    ) -> tuple[tuple[PackingBinPlan, ...], ...]:
+        local_batches = []
         for data_rank in range(self.data_parallel_size):
             rank_bins = []
             for packing_bin in bins:
                 if packing_bin.data_rank != data_rank:
                     continue
-                planned_samples = tuple(
-                    PlannedSample(
-                        key=item.key,
-                        metadata=item.metadata,
-                        target_data_rank=data_rank,
-                        pack_index=packing_bin.pack_index,
-                        order=order,
-                    )
-                    for order, item in enumerate(packing_bin.samples)
-                )
                 rank_bins.append(PackingBinPlan(
-                    pack_index=packing_bin.pack_index,
-                    samples=planned_samples,
+                    sample_keys=tuple(item.key for item in packing_bin.samples),
                     pack_tokens=packing_bin.pack_tokens,
                     oversized=packing_bin.oversized,
                 ))
-            constructors.append(DataConstructorPlan(
-                target_data_rank=data_rank,
-                bins=tuple(rank_bins),
-                cost=rank_costs[data_rank],
-            ))
-        return tuple(constructors)
+            local_batches.append(tuple(rank_bins))
+        return tuple(local_batches)
 
     def _plan_id(
             self,
             step: int,
-            constructors: tuple[DataConstructorPlan, ...],
+            local_batches: tuple[tuple[PackingBinPlan, ...], ...],
     ) -> str:
         stable_plan = {
             "step": step,
@@ -424,25 +410,25 @@ class DynamicPackingPlanner:
             "data_parallel_size": self.data_parallel_size,
             "bins": [
                 {
-                    "data_rank": constructor.target_data_rank,
+                    "data_rank": data_rank,
                     "packs": [
                         {
-                            "pack_index": packing_bin.pack_index,
                             "samples": [
-                                [sample.key.reader_rank, sample.key.dataset_index]
-                                for sample in packing_bin.samples
+                                [key.reader_rank, key.dataset_index]
+                                for key in packing_bin.sample_keys
                             ],
                         }
-                        for packing_bin in constructor.bins
+                        for packing_bin in local_batch
                     ],
                 }
-                for constructor in constructors
+                for data_rank, local_batch in enumerate(local_batches)
             ],
         }
         positions = [
             key.global_sample_position
-            for constructor in constructors
-            for key in constructor.sample_keys
+            for local_batch in local_batches
+            for packing_bin in local_batch
+            for key in packing_bin.sample_keys
         ]
         if any(positions):
             stable_plan["global_sample_positions"] = positions

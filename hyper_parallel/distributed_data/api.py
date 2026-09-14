@@ -40,7 +40,7 @@ from hyper_parallel.distributed_data.distributed_dataloader import DistributedDa
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner, OversizedPolicy
 from hyper_parallel.distributed_data.schema import SampleMetadata
 from hyper_parallel.distributed_data.metadata import MetadataReader, PlannedSampleLoader
-from hyper_parallel.distributed_data.dataset_reader import DatasetReader, _validate_worker_options
+from hyper_parallel.distributed_data.dataset_reader import _validate_worker_options
 from hyper_parallel.distributed_data.step_sample_selection import StepSampleSelector
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import (
@@ -406,6 +406,27 @@ def _build_fingerprint(topology: DataTopology, config_fingerprint: str) -> str:
     return hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()[:24]
 
 
+def _resolve_metadata_mode(
+        metadata_fn: Callable[[Any], SampleMetadata] | None,
+        metadata: Sequence[SampleMetadata] | None,
+        external_step_reader: Any | None,
+) -> bool:
+    """Resolve one metadata-mode flag when external Readers are rank-local."""
+    local_flags = (external_step_reader is not None, metadata is not None)
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if not distributed:
+        external_present = local_flags[0]
+        metadata_present = local_flags[1]
+    else:
+        gathered = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, local_flags)
+        external_present = any(item[0] for item in gathered)
+        metadata_present = any(item[1] for item in gathered)
+    if external_present:
+        return False
+    return metadata_fn is None or metadata_present
+
+
 @dataclass
 class _BuildState:
     """Rank-local components and partial validation results needed across build stages."""
@@ -414,7 +435,7 @@ class _BuildState:
     topology: DataTopology | None = None
     dataset_reader_ranks: tuple[int, ...] | None = None
     planner_rank: int | None = None
-    dataset_reader: DatasetReader | BatchSamplerReader | None = None
+    dataset_reader: Any | BatchSamplerReader | None = None
     metadata_reader: MetadataReader | BatchSamplerReader | None = None
     direct_sample_loader: PlannedSampleLoader | None = None
     planner: DynamicPackingPlanner | None = None
@@ -477,7 +498,7 @@ def _validate_builder_callbacks(
     if metadata_fn is not None and not callable(metadata_fn):
         raise ValueError("metadata_fn must be callable or None.")
     if metadata_fn is not None and metadata is not None:
-        raise ValueError("Provide either online metadata_fn or metadata, but not both.")
+        raise ValueError("Provide either metadata or metadata_fn, but not both.")
     if pack_fn is not None and not callable(pack_fn):
         raise ValueError("pack_fn must be callable or None.")
     if collate_fn is not None and not callable(collate_fn):
@@ -521,34 +542,6 @@ def _configure_metadata_reader(
         )
 
 
-def _configure_online_reader(
-        state: _BuildState,
-        dataset: Any | None,
-        metadata_fn: Callable[[Any], SampleMetadata] | None,
-        config: DistributedDatasetConfig,
-        reader_idx: int,
-        loader_options: dict[str, Any],
-) -> None:
-    if dataset is None or state.topology is None or state.dataset_reader_ranks is None:
-        rank = None if state.topology is None else state.topology.global_rank
-        raise ValueError(f"Online Dataset Reader rank {rank} must provide a Dataset.")
-    if metadata_fn is None:
-        raise ValueError("Online Dataset Reader requires metadata_fn.")
-    state.dataset_reader = DatasetReader(
-        dataset,
-        metadata_fn,
-        reader_rank=state.topology.global_rank,
-        reader_idx=reader_idx,
-        reader_count=len(state.dataset_reader_ranks),
-        seq_len=config.seq_len,
-        shuffle=config.shuffle,
-        seed=config.seed,
-        dataset_already_sharded=config.dataset_already_sharded,
-        **loader_options,
-    )
-    state.reader_size = state.dataset_reader.dataset_size
-
-
 def _configure_local_data_sources(
         state: _BuildState,
         dataset: Any | None,
@@ -559,8 +552,8 @@ def _configure_local_data_sources(
         external_step_reader: Any | None = None,
 ) -> None:
     if external_step_reader is not None:
-        if state.metadata_mode:
-            raise ValueError("external_step_reader requires online metadata_fn mode.")
+        if metadata is not None or metadata_fn is not None:
+            raise ValueError("external_step_reader cannot be combined with metadata or metadata_fn.")
         if not state.is_reader:
             raise ValueError("external_step_reader may only be provided on Dataset Reader ranks.")
         required_methods = (
@@ -573,19 +566,27 @@ def _configure_local_data_sources(
             "set_epoch",
         )
         missing = [name for name in required_methods if not callable(getattr(external_step_reader, name, None))]
-        if not hasattr(external_step_reader, "reference_bins"):
-            missing.append("reference_bins")
+        for name in ("exhausted", "batch_position", "reference_bins"):
+            if not hasattr(external_step_reader, name):
+                missing.append(name)
         if missing:
             raise ValueError(f"external_step_reader is missing methods: {missing}")
         state.dataset_reader = external_step_reader
         state.external_step_mode = True
         return
+    if not state.metadata_mode:
+        if not state.is_reader:
+            return
+        raise ValueError(
+            "Online mode requires external_step_reader; provide a Reader that emits one complete local step."
+        )
     if state.is_reader:
+        if metadata is None:
+            raise ValueError(
+                "No metadata is available for online loading; provide metadata or external_step_reader."
+            )
         reader_idx = state.dataset_reader_ranks.index(state.topology.global_rank)
-        if state.metadata_mode:
-            _configure_metadata_reader(state, dataset, metadata, config, reader_idx, loader_options)
-        else:
-            _configure_online_reader(state, dataset, metadata_fn, config, reader_idx, loader_options)
+        _configure_metadata_reader(state, dataset, metadata, config, reader_idx, loader_options)
     if not state.metadata_mode or config.dataset_already_sharded or not state.topology.is_constructor:
         return
     if dataset is None:
@@ -661,7 +662,12 @@ def _populate_build_state(
 ) -> None:
     if not isinstance(config, DistributedDatasetConfig):
         raise ValueError(f"config must be DistributedDatasetConfig, but got {type(config)}.")
-    metadata = _infer_dataset_metadata(dataset, metadata_fn, metadata)
+    if external_step_reader is not None and batch_sampler is not None:
+        raise ValueError("external_step_reader and batch_sampler are mutually exclusive.")
+    if external_step_reader is None:
+        metadata = _infer_dataset_metadata(dataset, metadata_fn, metadata)
+    elif metadata is not None or metadata_fn is not None:
+        raise ValueError("external_step_reader cannot be combined with metadata or metadata_fn.")
     _validate_builder_callbacks(metadata_fn, metadata, pack_fn, collate_fn)
     normalized_options, dataloader_fingerprint = _normalize_dataloader_kwargs(
         config,
@@ -701,7 +707,7 @@ def _populate_build_state(
         oversized_policy=config.oversized_policy,
         min_balance_gain=config.min_balance_gain,
     )
-    if batch_sampler is None:
+    if batch_sampler is None and external_step_reader is None:
         state.step_sample_selector = StepSampleSelector(
             seq_len=config.seq_len,
             distributed_bin_count=state.planner.distributed_bin_count,
@@ -782,31 +788,31 @@ def build_distributed_dataloader(
         batch_sampler: Any = None,
         external_step_reader: Any | None = None,
 ) -> DistributedDataLoader:
-    """Build a sample-balanced distributed DataLoader from a raw Dataset.
+    """Build a sample-balanced distributed DataLoader.
 
-    Both modes first perform Step Sample Selection in deterministic Dataset
-    stream order, then balance only that frozen sample set. Online mode uses
-    ``metadata_fn`` after a Dataset Reader materializes each sample and routes
-    selected payloads to target Data Constructors. Metadata mode uses
-    ``metadata`` before any Dataset read. With a shared index space, target
-    constructors directly read assigned indices and skip payload A2A. With
-    pre-sharded inputs, each Reader reads selected local indices and routes the
-    payloads to target constructors through A2A.
+    Online mode requires ``external_step_reader``. The external Reader must
+    emit one complete local step, including metadata and canonical pack
+    boundaries; this loader then freezes the union of those samples, balances
+    them across Data Constructors, and routes payloads when necessary.
+    Metadata mode uses ``metadata`` before any Dataset read. With a shared
+    index space, target constructors directly read assigned indices and skip
+    payload A2A. With pre-sharded inputs, each Reader reads selected local
+    indices and routes the payloads to target constructors through A2A.
 
     With ``batch_sampler``, native HP sampling replaces stream-based selection:
     one sampler yield per DP Constructor fixes one forward/backward round.
     Complete Dataset outputs are balanced without repacking their contents.
 
     Args:
-        dataset: Online mode requires a mapping or iterable Dataset on Dataset
-            Reader ranks. Shared-index metadata mode requires a mapping Dataset
+        dataset: Metadata mode requires a mapping Dataset
             on Data Constructor ranks; pre-sharded metadata mode requires one on
-            Dataset Reader ranks. Other ranks may pass the same object or
-            ``None``.
+            Dataset Reader ranks. In online mode, the external Reader owns data
+            loading and ``dataset`` may be ``None``. Other ranks may pass the
+            same object or ``None``.
         mesh: Named root HyperParallel or native DeviceMesh.
         config: Dynamic packing, service-rank, and worker configuration.
-        metadata_fn: Convert one materialized raw sample to SampleMetadata in
-            online mode. Mutually exclusive with ``metadata``.
+        metadata_fn: Only used by ``batch_sampler`` mode to derive metadata
+            from each Dataset output. It cannot be used by external-step mode.
         metadata: Optional precomputed metadata sequence on Dataset Reader ranks. Indexed
             source Datasets that implement ``get_sample_metadata`` provide this
             automatically when both metadata arguments are omitted. It is a
@@ -833,12 +839,14 @@ def build_distributed_dataloader(
             be omitted. Metadata entries must describe these Dataset indices,
             not underlying document indices. Checkpoint through this loader,
             not through the sampler's speculative prefetch cursor.
-        external_step_reader: Optional rank-local external producer. It must
+        external_step_reader: Required for online mode. It is an optional
+            rank-local external producer that must
             expose ``fill``, ``metadata``, ``reference_bins``,
-            ``selected_payloads``, ``commit``, and checkpoint/epoch methods.
+            ``selected_payloads``, ``commit``, ``exhausted``,
+            ``batch_position``, and checkpoint/epoch methods.
             One call to ``fill`` supplies exactly one already-selected local
-            VeOmni step. HP preserves that step's union and only rebalances
-            its target ranks.
+            step. HP preserves that step's union and only rebalances its target
+            ranks.
 
     Returns:
         Stateful collective iterator yielding constructed local batches.
@@ -879,7 +887,8 @@ def _build_distributed_dataloader_impl(
         batch_sampler: Any = None,
         external_step_reader: Any | None = None,
 ) -> DistributedDataLoader:
-    state = _BuildState(metadata_mode=metadata_fn is None)
+    metadata_mode = _resolve_metadata_mode(metadata_fn, metadata, external_step_reader)
+    state = _BuildState(metadata_mode=metadata_mode)
     try:
         _populate_build_state(
             state,

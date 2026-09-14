@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from hyper_parallel.distributed_data.schema import DataConstructorPlan, SampleKey
+from hyper_parallel.distributed_data.schema import PackingBinPlan, SampleKey
 
 
 def default_pack_fn(samples: Sequence[Any], seq_len: int) -> tuple[Any, ...]:
@@ -82,7 +82,7 @@ class PackingDataConstructor:
 
     def construct(
             self,
-            plan: DataConstructorPlan,
+            plan: Sequence[PackingBinPlan],
             payloads: Mapping[SampleKey, Any],
     ) -> Any:
         """Construct one target-rank local batch.
@@ -95,9 +95,15 @@ class PackingDataConstructor:
         Returns:
             User-collated rank-local batch.
         """
-        if not isinstance(plan, DataConstructorPlan):
-            raise ValueError(f"plan must be DataConstructorPlan, but got {type(plan)}.")
-        expected_keys = plan.sample_keys
+        if not isinstance(plan, Sequence) or isinstance(plan, (str, bytes)):
+            raise ValueError(f"plan must be a sequence of PackingBinPlan values, but got {type(plan)}.")
+        if any(not isinstance(packing_bin, PackingBinPlan) for packing_bin in plan):
+            raise ValueError("plan must contain PackingBinPlan values.")
+        expected_keys = tuple(
+            key
+            for packing_bin in plan
+            for key in packing_bin.sample_keys
+        )
         if len(payloads) != len(expected_keys) or set(payloads) != set(expected_keys):
             missing = set(expected_keys) - set(payloads)
             unexpected = set(payloads) - set(expected_keys)
@@ -107,13 +113,13 @@ class PackingDataConstructor:
             )
 
         packed_sequences = []
-        for packing_bin in plan.bins:
+        for pack_index, packing_bin in enumerate(plan):
             if packing_bin.pack_tokens > self._seq_len and not packing_bin.oversized:
                 raise ValueError(
-                    f"Packing bin {packing_bin.pack_index} has {packing_bin.pack_tokens} tokens, "
+                    f"Packing bin {pack_index} has {packing_bin.pack_tokens} tokens, "
                     f"exceeding seq_len={self._seq_len}."
                 )
-            raw_samples = [payloads[sample.key] for sample in packing_bin.samples]
+            raw_samples = [payloads[key] for key in packing_bin.sample_keys]
             packed_sequences.append(self._pack_fn(raw_samples, self._seq_len))
         return self._collate_fn(packed_sequences)
 

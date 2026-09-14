@@ -21,10 +21,8 @@ from hyper_parallel.distributed_data.device_prefetch import DeviceBatchPrefetche
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
-    DataConstructorPlan,
     DistributedPackingPlan,
     PackingBinPlan,
-    PlannedSample,
     SampleKey,
     SampleMetadata,
     WorkloadCost,
@@ -32,13 +30,11 @@ from hyper_parallel.distributed_data.schema import (
 
 __all__ = [
     "BufferedSampleMetadata",
-    "DataConstructorPlan",
     "DeviceBatchPrefetcher",
     "DistributedDataLoader",
     "DistributedDatasetConfig",
     "DistributedPackingPlan",
     "PackingBinPlan",
-    "PlannedSample",
     "SampleKey",
     "SampleMetadata",
     "WorkloadCost",

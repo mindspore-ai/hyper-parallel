@@ -424,9 +424,9 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         self.assertEqual(batch, ((dataset.samples[0], dataset.samples[1]), (dataset.samples[2], dataset.samples[3])))
         self.assertEqual(read_indices, [0, 1, 2, 3])
         planned_indices = [
-            sample.key.dataset_index
-            for packing_bin in loader.last_plan.constructor_for(0).bins
-            for sample in packing_bin.samples
+            key.dataset_index
+            for packing_bin in loader.last_plan.local_batches[0]
+            for key in packing_bin.sample_keys
         ]
         self.assertEqual(read_indices, planned_indices)
 
@@ -539,10 +539,10 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             result = []
             for _ in loader:
                 result.append({
-                    sample.metadata.sample_id
-                    for constructor in loader.last_plan.constructors
-                    for packing_bin in constructor.bins
-                    for sample in packing_bin.samples
+                    key.dataset_index
+                    for local_batch in loader.last_plan.local_batches
+                    for packing_bin in local_batch
+                    for key in packing_bin.sample_keys
                 })
             return result
 
