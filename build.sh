@@ -9,7 +9,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-set -euo pipefail
+set -xeuo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 NATIVE_ROOT="${PROJECT_ROOT}/build/native"
