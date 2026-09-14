@@ -20,8 +20,8 @@ import copy
 from collections.abc import Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
-from threading import Thread
-from typing import Any, Literal
+from threading import Condition, Thread
+from typing import Any
 
 import torch
 
@@ -43,8 +43,6 @@ from hyper_parallel.distributed_data.transport import (
     ModelParallelTransport,
     PreparedPayloadExchange,
 )
-
-_ControlKind = Literal["plan", "need_more", "stop"]
 
 
 def _scaled_buffer_target(
@@ -76,12 +74,6 @@ class _ReaderSnapshot:
     # External-step readers provide the legacy producer's already selected
     # local pack boundaries.  Stream readers leave this empty.
     reference_bins: tuple[tuple[BufferedSampleMetadata, ...], ...] = ()
-
-
-@dataclass(frozen=True)
-class _PlanControl:
-    kind: _ControlKind
-    plan: DistributedPackingPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -215,7 +207,11 @@ class DistributedDataLoader(Iterator[Any]):
         self._pending_local_keys: set[SampleKey] = set()
         self._pending_plan: DistributedPackingPlan | None = None
         self._prefetch_thread: Thread | None = None
+        self._prefetch_condition = Condition()
         self._prefetch_result: _PrefetchResult | None = None
+        self._prefetch_requested = False
+        self._prefetch_in_flight = False
+        self._prefetch_shutdown = False
         self._prefetch_stream: Any = None
 
     def __iter__(self) -> "DistributedDataLoader":
@@ -275,32 +271,50 @@ class DistributedDataLoader(Iterator[Any]):
         return received
 
     def _start_prefetch(self) -> None:
-        """Start one background transaction for the current iterator step."""
-        if self._prefetch_thread is not None:
-            raise ValueError("A distributed local-batch prefetch is already in flight.")
-        self._prefetch_result = None
-        self._prefetch_thread = Thread(
-            target=self._run_prefetch,
-            name=f"hp-data-prefetch-rank-{self._topology.global_rank}",
-            daemon=True,
-        )
-        self._prefetch_thread.start()
+        """Submit one background transaction to the persistent prefetch thread."""
+        with self._prefetch_condition:
+            if self._prefetch_shutdown:
+                raise RuntimeError("The distributed DataLoader prefetch thread is shut down.")
+            if self._prefetch_in_flight:
+                raise ValueError("A distributed local-batch prefetch is already in flight.")
+            if self._prefetch_thread is None:
+                self._prefetch_thread = Thread(
+                    target=self._run_prefetch,
+                    name=f"hp-data-prefetch-rank-{self._topology.global_rank}",
+                    daemon=True,
+                )
+                self._prefetch_thread.start()
+            self._prefetch_result = None
+            self._prefetch_requested = True
+            self._prefetch_in_flight = True
+            self._prefetch_condition.notify()
 
     def _run_prefetch(self) -> None:
-        """Produce one result without allowing exceptions to strand the consumer."""
-        try:
-            # Accelerator device context is thread-local on CUDA/NPU.  A
-            # background prefetch thread otherwise falls back to device 0,
-            # which makes HCCL/NCCL communicator creation see duplicate
-            # physical devices across ranks.
-            self._bind_prefetch_device()
-            with self._prefetch_stream_context():
-                self._prefetch_result = _PrefetchResult(
-                    batch=self._prepare_next_batch(),
-                    completed=True,
-                )
-        except BaseException as exc:  # The foreground re-raises failures at the next iterator boundary.
-            self._prefetch_result = _PrefetchResult(exception=exc)
+        """Run submitted transactions until the loader is explicitly shut down."""
+        # Accelerator device context is thread-local on CUDA/NPU. Bind it once
+        # on the persistent worker instead of repeating it for every step.
+        device_bound = False
+        while True:
+            with self._prefetch_condition:
+                while not self._prefetch_requested and not self._prefetch_shutdown:
+                    self._prefetch_condition.wait()
+                if self._prefetch_shutdown:
+                    return
+                self._prefetch_requested = False
+            try:
+                if not device_bound:
+                    self._bind_prefetch_device()
+                    device_bound = True
+                with self._prefetch_stream_context():
+                    result = _PrefetchResult(
+                        batch=self._prepare_next_batch(),
+                        completed=True,
+                    )
+            except BaseException as exc:  # The foreground re-raises failures at the next iterator boundary.
+                result = _PrefetchResult(exception=exc)
+            with self._prefetch_condition:
+                self._prefetch_result = result
+                self._prefetch_condition.notify_all()
 
     def _bind_prefetch_device(self) -> None:
         """Bind the rank-local accelerator for collectives in the prefetch thread."""
@@ -325,15 +339,15 @@ class DistributedDataLoader(Iterator[Any]):
 
     def _take_prefetched(self) -> Any:
         """Wait for and return the current background result."""
-        if self._prefetch_thread is None:
+        if not self._prefetch_in_flight:
             self._start_prefetch()
-        prefetch_thread = self._prefetch_thread
-        if prefetch_thread is None:
-            raise ValueError("Double buffering did not create a prefetch thread.")
-        prefetch_thread.join()
-        self._prefetch_thread = None
-        result = self._prefetch_result
-        self._prefetch_result = None
+        with self._prefetch_condition:
+            while self._prefetch_result is None:
+                self._prefetch_condition.wait()
+            result = self._prefetch_result
+            self._prefetch_result = None
+            self._prefetch_in_flight = False
+            self._prefetch_condition.notify_all()
         if result is None:
             raise ValueError("Double buffering completed without a prefetch result.")
         if result.exception is not None:
@@ -353,8 +367,9 @@ class DistributedDataLoader(Iterator[Any]):
         All ranks must call this at the same consumed-batch boundary. The
         prepared result remains available to the next iterator call.
         """
-        if self._prefetch_thread is not None:
-            self._prefetch_thread.join()
+        with self._prefetch_condition:
+            while self._prefetch_in_flight and self._prefetch_result is None:
+                self._prefetch_condition.wait()
 
     @property
     def last_plan(self) -> DistributedPackingPlan | None:
@@ -363,7 +378,7 @@ class DistributedDataLoader(Iterator[Any]):
 
     def state_dict(self) -> dict[str, Any]:
         """Return rank-local state at a completed distributed-batch boundary."""
-        restart_prefetch = self._prefetch_thread is not None
+        restart_prefetch = self._prefetch_in_flight
         if restart_prefetch:
             self._take_prefetched()
             # Prefetch is speculative until the trainer requests the batch.
@@ -419,7 +434,7 @@ class DistributedDataLoader(Iterator[Any]):
             self._step != 0
             or bool(self._pending_local_keys)
             or self._pending_plan is not None
-            or self._prefetch_thread is not None
+            or self._prefetch_in_flight
         )
         if active_state:
             raise ValueError("load_state_dict must run before distributed iteration starts.")
@@ -507,7 +522,7 @@ class DistributedDataLoader(Iterator[Any]):
             raise ValueError(f"epoch must be a non-negative integer, but got {epoch!r}.")
         if self._step != 0 and not self._stopped:
             raise ValueError("set_epoch requires a fresh or exhausted Distributed DataLoader.")
-        if self._prefetch_thread is not None:
+        if self._prefetch_in_flight:
             raise ValueError("set_epoch cannot run while a double-buffer prefetch is in flight.")
         if self._dataset_reader is not None:
             self._dataset_reader.set_epoch(epoch)
@@ -523,13 +538,10 @@ class DistributedDataLoader(Iterator[Any]):
         self._pending_plan = None
 
     def _produce_on_data_plane(self) -> Any:
-        control = self._next_plan_control()
-        if control.kind == "stop":
+        plan = self._next_plan_control()
+        if plan is None:
             return None
-        if control.kind != "plan" or control.plan is None:
-            raise ValueError("Planner returned an invalid control message.")
 
-        plan = control.plan
         if plan.step != self._step:
             raise ValueError(
                 f"Planner returned step {plan.step}, but this rank expects step {self._step}."
@@ -599,7 +611,8 @@ class DistributedDataLoader(Iterator[Any]):
             raise ValueError("The Data Constructor must return a non-None batch.")
         return local_batch
 
-    def _next_plan_control(self) -> _PlanControl:
+    def _next_plan_control(self) -> DistributedPackingPlan | None:
+        """Refill internally until a plan is ready, or return None at end of stream."""
         attempt = 1
         while True:
             local_snapshot = self._fill_local_reader(attempt)
@@ -609,11 +622,9 @@ class DistributedDataLoader(Iterator[Any]):
                 if snapshots is None:
                     raise RuntimeError("Planner did not receive Dataset Reader snapshots.")
                 planner_control = self._build_plan_control(snapshots)
-            control = self._data_plane.broadcast_from_planner(planner_control)
-            if not isinstance(control, _PlanControl):
-                raise RuntimeError("Planner broadcast an invalid control message.")
-            if control.kind != "need_more":
-                return control
+            plan, need_more = self._data_plane.broadcast_from_planner(planner_control)
+            if not need_more:
+                return plan
             attempt += 1
 
     def _fill_local_reader(self, attempt: int) -> _ReaderSnapshot:
@@ -668,11 +679,11 @@ class DistributedDataLoader(Iterator[Any]):
             reference_bins=tuple(getattr(planning_reader, "reference_bins", ())),
         )
 
-    def _build_plan_control(self, snapshots: tuple[Any, ...]) -> _PlanControl:
+    def _build_plan_control(self, snapshots: tuple[Any, ...]) -> tuple[DistributedPackingPlan | None, bool]:
+        """Return (plan, need_more) for broadcast; (None, False) means end of stream."""
         normalized = self._normalize_reader_snapshots(snapshots)
-        state_control = self._snapshot_state_control(normalized)
-        if state_control is not None:
-            return state_control
+        if self._snapshots_stopped(normalized):
+            return None, False
         return self._plan_reader_snapshots(normalized)
 
     def _normalize_reader_snapshots(
@@ -698,7 +709,7 @@ class DistributedDataLoader(Iterator[Any]):
             )
         return tuple(normalized)
 
-    def _snapshot_state_control(self, normalized: tuple[_ReaderSnapshot, ...]) -> _PlanControl | None:
+    def _snapshots_stopped(self, normalized: tuple[_ReaderSnapshot, ...]) -> bool:
         steps = {snapshot.step for snapshot in normalized}
         stopped_states = {snapshot.stopped for snapshot in normalized}
         if len(steps) != 1 or self._step not in steps:
@@ -707,11 +718,11 @@ class DistributedDataLoader(Iterator[Any]):
             )
         if len(stopped_states) != 1:
             raise ValueError("Data-plane ranks have inconsistent stopped checkpoint state.")
-        if stopped_states == {True}:
-            return _PlanControl("stop")
-        return None
+        return stopped_states == {True}
 
-    def _plan_reader_snapshots(self, normalized: tuple[_ReaderSnapshot, ...]) -> _PlanControl:
+    def _plan_reader_snapshots(
+            self, normalized: tuple[_ReaderSnapshot, ...],
+    ) -> tuple[DistributedPackingPlan | None, bool]:
         reader_snapshots = [snapshot for snapshot in normalized if snapshot.is_reader]
         candidates = tuple(metadata for snapshot in reader_snapshots for metadata in snapshot.metadata)
         if self._batch_sampler_mode:
@@ -725,11 +736,11 @@ class DistributedDataLoader(Iterator[Any]):
             )
         plan = None if selection is None else self._planner.plan(selection, step=self._step)
         if plan is not None:
-            return _PlanControl("plan", plan=plan)
+            return plan, False
         if all(snapshot.exhausted for snapshot in reader_snapshots):
-            return _PlanControl("stop")
+            return None, False
         if any(snapshot.can_read_more for snapshot in reader_snapshots):
-            return _PlanControl("need_more")
+            return None, True
         raise ValueError(
             f"Dataset Reader buffers reached max_buffered_samples={self._max_buffered_samples} before "
             f"Step Sample Selection could form {self._planner.distributed_bin_count} complete packing bins."

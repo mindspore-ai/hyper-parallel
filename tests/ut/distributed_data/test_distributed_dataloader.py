@@ -15,9 +15,10 @@
 """Standalone end-to-end tests for Dataset Reader to Data Constructor flow."""
 
 import unittest
+from dataclasses import replace
 from threading import Event
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from hyper_parallel.distributed_data import (
     DistributedDataLoader,
@@ -27,6 +28,7 @@ from hyper_parallel.distributed_data import (
     default_collate_fn,
     default_pack_fn,
 )
+from hyper_parallel.distributed_data.schema import DistributedPackingPlan
 from tests.common.mark_utils import arg_mark
 
 
@@ -100,6 +102,65 @@ def _drain(loader: DistributedDataLoader) -> tuple[list[Any], list[str]]:
 
 class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
     """Verify the collective orchestration in its one-rank reference mode."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_next_plan_control_returns_plan_after_internal_refill(self) -> None:
+        """Feature: Plan-only return contract.
+        Description: Supply incomplete metadata followed by a complete packing bin.
+        Expectation: Refill stays internal and callers receive the actual plan in both data modes.
+        """
+        samples = [{"id": 0, "tokens": 6}, {"id": 1, "tokens": 4}]
+        metadata = [SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"]) for sample in samples]
+        config = DistributedDatasetConfig(seq_len=10, local_batch_size=1, buffer_size_multiplier=1.0)
+        for metadata_mode in (False, True):
+            with self.subTest(metadata_mode=metadata_mode):
+                loader = (
+                    build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata)
+                    if metadata_mode else _build_standard_loader(samples, config, [])
+                )
+                complete = loader._fill_local_reader(1)
+                incomplete = replace(complete, metadata=complete.metadata[:1])
+                with patch.object(loader, "_fill_local_reader", side_effect=(incomplete, complete)) as fill:
+                    plan = loader._next_plan_control()
+
+                self.assertIsInstance(plan, DistributedPackingPlan)
+                self.assertEqual([key.dataset_index for key in plan.selected_keys], [0, 1])
+                self.assertEqual(fill.call_args_list, [call(1), call(2)])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_next_plan_control_returns_none_at_end_and_after_restore(self) -> None:
+        """Feature: Plan end-of-stream return contract.
+        Description: Exhaust an empty source or an incomplete tail, then restore its stopped state.
+        Expectation: End-of-stream returns None and restored stopped readers do not run the Planner.
+        """
+        config = DistributedDatasetConfig(seq_len=10, local_batch_size=2, buffer_size_multiplier=1.0)
+        for samples in ([], [{"id": 0, "tokens": 4}]):
+            with self.subTest(samples=samples):
+                loader = _build_standard_loader(samples, config, [])
+                self.assertIsNone(loader._next_plan_control())
+                self.assertEqual(list(loader), [])
+                resumed = _build_standard_loader(samples, config, [])
+                resumed.load_state_dict(loader.state_dict())
+                with patch.object(resumed, "_plan_reader_snapshots") as plan_snapshots:
+                    self.assertIsNone(resumed._next_plan_control())
+                plan_snapshots.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_next_plan_control_raises_planner_exception_before_broadcast(self) -> None:
+        """Feature: Local Planner exceptions.
+        Description: Fail planning after successful metadata selection.
+        Expectation: The original exception is raised locally instead of being broadcast as control data.
+        """
+        loader = _build_standard_loader(
+            [{"id": 0, "tokens": 10}], DistributedDatasetConfig(seq_len=10, local_batch_size=1), [],
+        )
+        failure = ValueError("injected planner failure")
+        with patch.object(loader._planner, "plan", side_effect=failure), \
+                patch.object(loader._data_plane, "broadcast_from_planner") as broadcast:
+            with self.assertRaises(ValueError) as raised:
+                loader._next_plan_control()
+        self.assertIs(raised.exception, failure)
+        broadcast.assert_not_called()
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_default_callbacks_return_planned_bins_of_raw_samples(self) -> None:

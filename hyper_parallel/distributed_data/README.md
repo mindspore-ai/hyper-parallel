@@ -384,6 +384,7 @@ use `shuffle=False` in this configuration.
 With `double_buffer=True`, the first iterator call constructs its batch before
 returning. After each batch is returned, a background thread prepares exactly
 one subsequent distributed batch while the trainer consumes the current batch.
+The prefetch worker is created once and reused for subsequent steps.
 `_prepare_next_batch()` runs on that thread using the dedicated data control and
 payload process groups. `_broadcast_batch()` runs on the caller thread using the
 dedicated model-parallel batch group, then `_consume_batch()` handles the
