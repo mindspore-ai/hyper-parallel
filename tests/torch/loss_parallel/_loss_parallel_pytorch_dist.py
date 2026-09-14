@@ -153,24 +153,56 @@ class TestLossParallelAccuracyPyTorch:
 
         print(f"[Rank {dist.get_rank()}] Context manager tests passed")
 
-    def test_gradient_correctness_with_loss_parallel(self):
-        """Verify gradients are correct when using loss_parallel context.
+    def _reference_gradients(self, input_np, weight_np, targets_np, reduction, weight, ignore_index):
+        """Compute single-card reference gradients on the full (un-sharded) logits.
 
-        Expected: Gradients from loss_parallel path should match reference gradients.
+        Args:
+            input_np: Input of shape [N, H].
+            weight_np: Full vocab weight of shape [V, H].
+            targets_np: Target class indices of shape [N].
+            reduction: 'mean', 'sum' or 'none'.
+            weight: Optional class weights of shape [V].
+            ignore_index: Index to ignore.
+
+        Returns:
+            Tuple of (weight_grad, input_grad) from the reference model.
+        """
+        input_ref = torch.from_numpy(input_np).requires_grad_(True)
+        weight_ref = torch.from_numpy(weight_np).requires_grad_(True)
+        targets_ref = torch.from_numpy(targets_np)
+
+        logits_ref = _simple_linear_layer_torch(input_ref, weight_ref)
+        loss_ref = F.cross_entropy(
+            logits_ref,
+            targets_ref,
+            weight=weight,
+            ignore_index=ignore_index,
+            reduction=reduction,
+        )
+        if reduction == "none":
+            loss_ref.backward(torch.ones_like(loss_ref))
+        else:
+            loss_ref.backward()
+        return weight_ref.grad, input_ref.grad
+
+    def _distributed_gradients(self, input_np, weight_shard_np, targets_np, reduction, weight, ignore_index):
+        """Compute distributed loss_parallel gradients on this rank's vocab shard.
+
+        Args:
+            input_np: Replicated input of shape [N, H].
+            weight_shard_np: This rank's vocab shard of shape [V/world, H].
+            targets_np: Target class indices of shape [N].
+            reduction: 'mean', 'sum' or 'none'.
+            weight: Optional class weights of shape [V].
+            ignore_index: Index to ignore.
+
+        Returns:
+            Tuple of (weight_shard_grad, input_grad) from the loss_parallel model.
         """
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-
-        vocab_size = _VOCAB_SIZE * world_size
-
-        np.random.seed(123)
-        weight_np = np.random.randn(vocab_size, _HIDDEN_SIZE).astype(np.float32) * 0.1
-        input_np = np.random.randn(_BATCH_SIZE * _SEQ_LEN, _HIDDEN_SIZE).astype(np.float32) * 0.1
-        targets_np = np.random.randint(0, vocab_size, (_BATCH_SIZE * _SEQ_LEN,)).astype(np.int64)
-
         mesh = init_device_mesh("cpu", (world_size,))
 
-        weight_shard_np = weight_np[rank * _VOCAB_SIZE:(rank + 1) * _VOCAB_SIZE, :]
         weight_shard = torch.from_numpy(weight_shard_np.copy()).requires_grad_(True)
         input_shard = torch.from_numpy(input_np.copy()).requires_grad_(True)
         targets_shard = torch.from_numpy(targets_np.copy())
@@ -180,16 +212,122 @@ class TestLossParallelAccuracyPyTorch:
             logits_dtensor = DTensor.from_local(logits_shard, mesh, [Shard(-1)])
 
             with loss_parallel(mesh=mesh):
-                loss = F.cross_entropy(logits_dtensor, targets_shard, reduction='mean')
-            return loss
+                return F.cross_entropy(
+                    logits_dtensor,
+                    targets_shard,
+                    weight=weight,
+                    ignore_index=ignore_index,
+                    reduction=reduction,
+                )
 
         loss = forward_with_loss_parallel()
-        loss.backward()
+        if reduction == "none":
+            # reduction="none" returns each rank's local loss vector; sum across
+            # ranks to reconstruct the full loss before backprop.
+            full_loss = loss.clone()
+            dist.all_reduce(full_loss)
+            full_loss.backward(torch.ones_like(full_loss))
+        else:
+            loss.backward()
+        return weight_shard.grad, input_shard.grad
 
-        print(f"[Rank {rank}] Loss computed successfully: {loss.item():.6f}")
-        print(f"[Rank {rank}] Weight gradient norm: {weight_shard.grad.norm().item():.6f}")
-        print(f"[Rank {rank}] Input gradient norm: {input_shard.grad.norm().item():.6f}")
-        print(f"[Rank {rank}] Gradient test passed")
+    def _assert_gradients_match(self, label, input_np, weight_np, weight_shard_np, targets_np,
+                                reduction, weight, ignore_index):
+        """Assert distributed gradients match the single-card reference on every rank."""
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        weight_ref_grad, input_ref_grad = self._reference_gradients(
+            input_np, weight_np, targets_np, reduction, weight, ignore_index
+        )
+        weight_dist_grad, input_dist_grad = self._distributed_gradients(
+            input_np, weight_shard_np, targets_np, reduction, weight, ignore_index
+        )
+
+        # The weight gradient is sharded by vocab: compare this rank's slice.
+        shard_start = rank * _VOCAB_SIZE
+        expected_weight = weight_ref_grad[shard_start:shard_start + _VOCAB_SIZE, :]
+        np.testing.assert_allclose(
+            weight_dist_grad.numpy(),
+            expected_weight.numpy(),
+            rtol=1e-3,
+            atol=1e-5,
+            err_msg=f"{label}: weight gradient mismatch on rank {rank}",
+        )
+
+        # The input is replicated; all-reduce the per-rank partial gradients to
+        # reconstruct the full input gradient before comparing with the reference.
+        input_full_grad = input_dist_grad.clone()
+        dist.all_reduce(input_full_grad)
+        np.testing.assert_allclose(
+            input_full_grad.numpy(),
+            input_ref_grad.numpy(),
+            rtol=1e-3,
+            atol=1e-5,
+            err_msg=f"{label}: input gradient mismatch on rank {rank}",
+        )
+        print(f"[Rank {rank}] {label}: gradients match single-card reference", flush=True)
+
+    def test_gradient_correctness_with_loss_parallel(self):
+        """Verify gradients from the loss_parallel path match single-card references.
+
+        Expected: The loss_parallel backward must reproduce the reference gradients
+        (softmax - one_hot, scaled by weight/total_weight) for every rank's vocab
+        shard, across mean/sum/none reductions, optional class weights and
+        ignore_index.
+        """
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        vocab_size = _VOCAB_SIZE * world_size
+        batch_size = _BATCH_SIZE * _SEQ_LEN
+
+        np.random.seed(123)
+        weight_np = np.random.randn(vocab_size, _HIDDEN_SIZE).astype(np.float32) * 0.1
+        input_np = np.random.randn(batch_size, _HIDDEN_SIZE).astype(np.float32) * 0.1
+        targets_np = np.random.randint(0, vocab_size, (batch_size,)).astype(np.int64)
+
+        weight_shard_np = weight_np[rank * _VOCAB_SIZE:(rank + 1) * _VOCAB_SIZE, :]
+
+        # Force some targets to be ignored so the ignore path is exercised.
+        ignored_targets = targets_np.copy()
+        ignored_targets[0] = -100
+        ignored_targets[1] = -100
+
+        # Derived from the seeded numpy RNG so the weight vector is identical on
+        # every rank (the distributed loss mixes per-rank shards).
+        class_weight = torch.from_numpy(np.random.rand(vocab_size).astype(np.float32) + 0.5)
+
+        self._assert_gradients_match(
+            "mean", input_np, weight_np, weight_shard_np, targets_np,
+            reduction="mean", weight=None, ignore_index=-100,
+        )
+        self._assert_gradients_match(
+            "sum", input_np, weight_np, weight_shard_np, targets_np,
+            reduction="sum", weight=None, ignore_index=-100,
+        )
+        self._assert_gradients_match(
+            "none", input_np, weight_np, weight_shard_np, targets_np,
+            reduction="none", weight=None, ignore_index=-100,
+        )
+        self._assert_gradients_match(
+            "mean+weight", input_np, weight_np, weight_shard_np, targets_np,
+            reduction="mean", weight=class_weight, ignore_index=-100,
+        )
+        self._assert_gradients_match(
+            "sum+weight", input_np, weight_np, weight_shard_np, targets_np,
+            reduction="sum", weight=class_weight, ignore_index=-100,
+        )
+        self._assert_gradients_match(
+            "mean+ignore", input_np, weight_np, weight_shard_np, ignored_targets,
+            reduction="mean", weight=None, ignore_index=-100,
+        )
+        self._assert_gradients_match(
+            "mean+weight+ignore", input_np, weight_np, weight_shard_np, ignored_targets,
+            reduction="mean", weight=class_weight, ignore_index=-100,
+        )
+
+        print(f"[Rank {rank}] Gradient test passed (7 configurations)")
 
 
 def test_single_vs_multi_card_loss_parity():

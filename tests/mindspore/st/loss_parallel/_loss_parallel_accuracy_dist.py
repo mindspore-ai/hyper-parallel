@@ -189,41 +189,59 @@ class TestLossParallelAccuracy:
         print(f"[Rank {D.get_rank()}] Context manager tests passed")
 
     def test_gradient_correctness_with_loss_parallel(self):
-        """Verify gradients are correct when using loss_parallel context.
+        """Verify gradients from the loss_parallel path match the single-card reference.
 
-        Expected: Gradients from loss_parallel path should match reference gradients.
-        Note: This test focuses on verifying that gradients can be computed,
-              not exact numerical matching due to MindSpore autograd limitations.
+        Expected: The loss_parallel backward (softmax - one_hot, normalized by total
+        weight) must reproduce the reference gradient for this rank's vocab shard.
+        Note: Requires Ascend NPU; executed via msrun in CI.
         """
         rank = D.get_rank()
         world_size = D.get_group_size()
 
         vocab_size = _VOCAB_SIZE * world_size
+        batch_size = _BATCH_SIZE * _SEQ_LEN
 
         np.random.seed(123)
         weight_np = np.random.randn(vocab_size, _HIDDEN_SIZE).astype(np.float32) * 0.1
-        input_np = np.random.randn(_BATCH_SIZE * _SEQ_LEN, _HIDDEN_SIZE).astype(np.float32) * 0.1
-        targets_np = np.random.randint(0, vocab_size, (_BATCH_SIZE * _SEQ_LEN,)).astype(np.int32)
+        input_np = np.random.randn(batch_size, _HIDDEN_SIZE).astype(np.float32) * 0.1
+        targets_np = np.random.randint(0, vocab_size, (batch_size,)).astype(np.int32)
+
+        # Single-card reference gradient on the full vocab weight.
+        def reference_forward(weight):
+            logits_ref = _simple_linear_layer(Tensor(input_np), weight)
+            return _cross_entropy_loss(logits_ref, Tensor(targets_np))
+
+        weight_ref = Tensor(weight_np)
+        grad_ref = ms.grad(reference_forward, grad_position=(0,))(weight_ref)
+        expected_shard = grad_ref[rank * _VOCAB_SIZE:(rank + 1) * _VOCAB_SIZE, :]
 
         mesh = init_device_mesh("npu", (world_size,))
 
         weight_shard_np = weight_np[rank * _VOCAB_SIZE:(rank + 1) * _VOCAB_SIZE, :]
-        weight_shard = Parameter(Tensor(weight_shard_np.copy()), name='weight_shard_grad')
+        weight_shard = Tensor(weight_shard_np.copy())
         input_shard = Tensor(input_np.copy())
         targets_shard = Tensor(targets_np.copy())
 
-        def forward_with_loss_parallel():
-            logits_shard = _simple_linear_layer(input_shard, weight_shard)
+        def forward_with_loss_parallel(weight):
+            logits_shard = _simple_linear_layer(input_shard, weight)
             logits_dtensor = DTensor.from_local(logits_shard, mesh, [Shard(-1)])
 
             with loss_parallel(mesh=mesh):
-                loss = _distributed_cross_entropy_dtensor(logits_dtensor, targets_shard)
-            return loss
+                return _distributed_cross_entropy_dtensor(logits_dtensor, targets_shard)
 
-        loss = forward_with_loss_parallel()
+        loss = forward_with_loss_parallel(weight_shard)
+        grad_shard = ms.grad(forward_with_loss_parallel, grad_position=(0,))(weight_shard)
+
+        np.testing.assert_allclose(
+            grad_shard.asnumpy(),
+            expected_shard.asnumpy(),
+            rtol=1e-3,
+            atol=1e-5,
+            err_msg=f"[Rank {rank}] weight gradient mismatch vs single-card reference",
+        )
 
         print(f"[Rank {rank}] Loss computed successfully: {loss.asnumpy().item():.6f}")
-        print(f"[Rank {rank}] Gradient test passed (loss computation verified)")
+        print(f"[Rank {rank}] Weight gradient matches single-card reference")
 
 
 def test_single_vs_multi_card_loss_parity():

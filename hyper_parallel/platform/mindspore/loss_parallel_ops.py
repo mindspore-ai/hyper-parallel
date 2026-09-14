@@ -293,7 +293,14 @@ class DistributedCrossEntropyFunction(_Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[Optional[Tensor], ...]:
-        """Backward pass (vectorized implementation)."""
+        """Backward pass (vectorized, dynamic-index-free implementation).
+
+        The gradient is ``softmax - one_hot(target)`` (scaled by ``grad_output``
+        and, for ``mean`` reduction, ``total_weight``). Instead of scattering the
+        ``-1`` onto the target columns with indexed in-place adds (slow dynamic
+        indexing), a one-hot mask is built with a broadcast equality comparison and
+        applied with a vectorized Select, keeping everything fully vectorized.
+        """
         (
             _,
             log_probs_local,
@@ -306,66 +313,53 @@ class DistributedCrossEntropyFunction(_Function):
 
         reduction = ctx.reduction
         ignore_index = ctx.ignore_index
-        _ = ctx.local_vocab_size
         vocab_start = ctx.vocab_start
         vocab_end = ctx.vocab_end
         _ = ctx.mesh
         _ = ctx.mesh_dim
 
-        batch_size = target.numel()
         target_flat = target.flatten()
+        local_vocab_size = log_probs_local.shape[-1]
 
         softmax_local = log_probs_local.exp()
 
         ignore_mask = target_flat != ignore_index
+        in_vocab_mask = (target_flat >= vocab_start) & (target_flat < vocab_end) & ignore_mask
 
         if weight is not None:
-            sample_weights = weight[target_flat]
+            # Ignored rows are zeroed out below, so route them to index 0 to keep
+            # the gather in-bounds even when ignore_index is negative.
+            safe_targets = mint.where(ignore_mask, target_flat, mint.zeros_like(target_flat))
+            sample_weights = weight[safe_targets]
         else:
             sample_weights = None
 
         if reduction == "mean":
-            grad_scale = grad_output / total_weight.clamp(min=1e-12)
+            grad_scale = (grad_output / total_weight.clamp(min=1e-12)).reshape(1)
         elif reduction == "sum":
-            grad_scale = grad_output
+            grad_scale = grad_output.reshape(1)
         else:
             grad_scale = grad_output.flatten()
 
-        in_vocab_mask = (target_flat >= vocab_start) & (target_flat < vocab_end) & ignore_mask
+        # Per-row gradient scale: grad_output/total_weight * class weight (if any).
+        if sample_weights is not None:
+            grad_scale = grad_scale * sample_weights
 
-        if reduction == "none":
-            grad_scale_expanded = grad_scale.unsqueeze(-1)
-            if sample_weights is not None:
-                grad_scale_expanded = grad_scale_expanded * sample_weights.unsqueeze(-1)
-            grad_input = softmax_local * grad_scale_expanded
-        else:
-            if sample_weights is not None:
-                grad_scale = grad_scale * sample_weights.unsqueeze(-1)
-            grad_input = softmax_local * grad_scale.unsqueeze(-1)
+        grad_input = softmax_local * grad_scale.unsqueeze(-1)
 
-        local_targets = mint.where(in_vocab_mask, target_flat - vocab_start, mint.zeros_like(target_flat))
+        # Build a one-hot mask at each row's target column with a broadcast
+        # equality comparison, and subtract grad_scale there. Rows whose target is
+        # outside this vocab shard (or ignored) are excluded by in_vocab_mask.
+        col_indices = mint.arange(local_vocab_size, dtype=ms.int64)
+        local_targets = target_flat - vocab_start
+        one_hot = (local_targets.unsqueeze(-1) == col_indices.unsqueeze(0)) & in_vocab_mask.unsqueeze(-1)
+        grad_input = mint.where(one_hot, grad_input - grad_scale.unsqueeze(-1), grad_input)
 
-        if in_vocab_mask.any():
-            row_indices = mint.arange(batch_size, dtype=ms.int64)
-
-            if reduction == "none":
-                if sample_weights is not None:
-                    grad_values = -grad_scale * sample_weights
-                else:
-                    grad_values = -grad_scale
-            else:
-                grad_values = -grad_scale.expand_as(target_flat)
-
-            grad_input = grad_input.contiguous()
-            grad_input[row_indices[in_vocab_mask], local_targets[in_vocab_mask]] += grad_values[in_vocab_mask]
-
+        # Zero out ignored rows.
         if not ignore_mask.all():
-            ignore_indices = ~ignore_mask
-            if reduction == "none":
-                grad_input[ignore_indices] = 0.0
-            else:
-                ignore_indices_expanded = ignore_indices.unsqueeze(-1).expand_as(grad_input)
-                grad_input = mint.where(ignore_indices_expanded, grad_input, mint.zeros_like(grad_input))
+            grad_input = mint.where(
+                ignore_mask.unsqueeze(-1), grad_input, mint.zeros_like(grad_input)
+            )
 
         return grad_input, None, None, None, None, None, None, None
 
