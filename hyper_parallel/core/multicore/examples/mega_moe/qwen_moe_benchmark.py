@@ -38,7 +38,7 @@ import torch_npu
 from qwen_moe_model import QwenMoeConfig, QwenMoeModel
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
-from hyper_parallel.auto_models.components.optim import (
+from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor

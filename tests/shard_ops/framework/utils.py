@@ -62,6 +62,18 @@ def match_filter(
     return True
 
 
+def _numpy_dtype(name: str):
+    """Map an ``InputSpec.dtype`` name to a numpy dtype.
+
+    numpy has no native ``bfloat16``, but the backends re-apply the final
+    dtype when wrapping the array (``_to_ms_dtype`` / ``_to_torch_dtype``),
+    so a float32 carrier is sufficient for the intermediate array.
+    """
+    if name == "bfloat16":
+        return np.dtype("float32")
+    return np.dtype(name)
+
+
 def build_numpy(spec: InputSpec) -> np.ndarray:
     """Construct a numpy array from an ``InputSpec`` with deterministic seed.
 
@@ -74,9 +86,9 @@ def build_numpy(spec: InputSpec) -> np.ndarray:
                 f"InputSpec.data.shape={spec.data.shape} != "
                 f"InputSpec.shape={spec.shape}"
             )
-        return spec.data.astype(np.dtype(spec.dtype))
+        return spec.data.astype(_numpy_dtype(spec.dtype))
     rng = np.random.RandomState(spec.seed if spec.seed is not None else 0)
-    dtype = np.dtype(spec.dtype)
+    dtype = _numpy_dtype(spec.dtype)
     if spec.init == "randn":
         return rng.standard_normal(spec.shape).astype(dtype)
     if spec.init == "uniform":
