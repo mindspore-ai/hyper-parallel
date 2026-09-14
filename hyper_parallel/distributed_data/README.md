@@ -386,8 +386,9 @@ returning. After each batch is returned, a background thread prepares exactly
 one subsequent distributed batch while the trainer consumes the current batch.
 `_prepare_next_batch()` runs on that thread using the dedicated data control and
 payload process groups. `_broadcast_batch()` runs on the caller thread using the
-dedicated model-parallel batch group, then `_consume_batch()` validates the result,
-commits Reader progress, and returns the training data. These operations do not
+dedicated model-parallel batch group, then `_consume_batch()` handles the
+end-of-stream sentinel, commits Reader progress, and returns the training data.
+These operations do not
 issue collectives on the trainer's process groups. The default is `False`.
 
 With this option enabled, `metadata_fn`, `pack_fn`, and `collate_fn` run on the

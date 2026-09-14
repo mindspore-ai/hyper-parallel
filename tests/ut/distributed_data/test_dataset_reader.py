@@ -134,9 +134,7 @@ class TestDatasetReader(unittest.TestCase):
             reader_count=3,
         )
 
-        error = reader.fill(min_samples=4, min_tokens=100, max_samples=10)
-
-        self.assertIsNone(error)
+        reader.fill(min_samples=4, min_tokens=100, max_samples=10)
         self.assertTrue(reader.exhausted)
         self.assertEqual(
             events,
@@ -327,10 +325,10 @@ class TestDatasetReader(unittest.TestCase):
         )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_metadata_callback_failure_is_returned_with_reader_context(self) -> None:
+    def test_metadata_callback_failure_is_raised_with_reader_context(self) -> None:
         """Feature: Metadata callback error handling.
         Description: Return invalid metadata from the online callback.
-        Expectation: The error includes Dataset Reader context for collective propagation.
+        Expectation: The local reader raises with Dataset Reader context.
         """
         events: list[tuple[str, int]] = []
         dataset = _RecordingDataset([3], events)
@@ -341,16 +339,10 @@ class TestDatasetReader(unittest.TestCase):
             return sample
 
         reader = _dataset_reader(dataset, invalid_metadata, reader_rank=7)
-        error = reader.fill(min_samples=1, min_tokens=1, max_samples=1)
-
-        self.assertIn("Dataset Reader rank 7 failed", error)
-        self.assertIn("metadata_fn must return SampleMetadata", error)
+        with self.assertRaisesRegex(RuntimeError, "Dataset Reader rank 7 failed.*metadata_fn must return SampleMetadata"):
+            reader.fill(min_samples=1, min_tokens=1, max_samples=1)
         self.assertEqual(events, [("getitem", 0), ("metadata", 0)])
         self.assertEqual(reader.buffer_size, 0)
-
-        repeated_error = reader.fill(min_samples=1, min_tokens=1, max_samples=1)
-        self.assertEqual(repeated_error, error)
-        self.assertEqual(events, [("getitem", 0), ("metadata", 0)])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_indexed_payload_participates_in_recursive_pin_memory_walk(self) -> None:
@@ -542,7 +534,7 @@ class TestSharedReaderState(unittest.TestCase):
                 baseline = reader.state_dict()
                 corruptions = (
                     {"version": 0}, {"reader_idx": 0}, {"epoch": True}, {"next_ordinal": -1},
-                    {"exhausted": 1}, {"error": ""}, {"buffer": ()}, {"buffer": [object()]},
+                    {"exhausted": 1}, {"buffer": ()}, {"buffer": [object()]},
                     {"buffer": baseline["buffer"] * 2},
                 )
                 for changes in corruptions:

@@ -128,30 +128,6 @@ def _run_case(
         assert remaining == delivered[1:], f"Native replay differs: actual={remaining}, expected={delivered[1:]}"
 
 
-def _run_invalid_round(mesh: object, *, uneven_exhaustion: bool) -> None:
-    """Fail every model peer together if native sampler rounds disagree."""
-    sampler = _sampler("single", False)
-    if not uneven_exhaustion and dist.get_rank() // 2 == 1:
-        sampler.consumed_samples = 4
-    stop_early = uneven_exhaustion and dist.get_rank() // 2 == 0
-    changed_iterator = patch.object(type(sampler), "__iter__", return_value=iter(()))
-    with changed_iterator if stop_early else nullcontext():
-        loader = build_distributed_dataloader(
-            _Dataset(), mesh, DistributedDatasetConfig(seq_len=8, local_batch_size=2),
-            batch_sampler=sampler, metadata_fn=_metadata,
-        )
-        failure = None
-        try:
-            next(loader)
-        except RuntimeError as exc:
-            failure = str(exc)
-    expected = "exhausted at different" if uneven_exhaustion else "inconsistent consumed_samples"
-    errors = _gather(failure)
-    assert all(error is not None and expected in error for error in errors), (
-        f"Expected collective {expected!r} error on all ranks, got errors={errors}"
-    )
-
-
 def _run_cost_balance(mesh: object) -> None:
     """Redistribute unequal native samples while keeping the selected four outputs."""
     sampler = build_dataset_batch_sampler(
@@ -180,8 +156,6 @@ def test_native_batch_sampler_dp2_tp2_gloo() -> None:
                 for sampler_type, data_sharding in (("single", False), ("cyclic", False), ("cyclic", True)):
                     _run_case(mesh, metadata_mode=metadata_mode, double_buffer=double_buffer,
                               sampler_type=sampler_type, data_sharding=data_sharding)
-        _run_invalid_round(mesh, uneven_exhaustion=False)
-        _run_invalid_round(mesh, uneven_exhaustion=True)
         _run_cost_balance(mesh)
         dist.barrier()
     finally:

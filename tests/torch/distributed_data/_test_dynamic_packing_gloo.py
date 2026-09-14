@@ -100,12 +100,6 @@ def _metadata_fn(sample: dict[str, int]) -> SampleMetadata:
     )
 
 
-def _failing_metadata_fn(sample: dict[str, int]) -> SampleMetadata:
-    if sample["sample_id"] == 1:
-        raise ValueError("injected metadata failure")
-    return _metadata_fn(sample)
-
-
 def _pack_fn(samples: Sequence[dict[str, int]], seq_len: int) -> dict[str, Any]:
     token_count = sum(sample["pack_tokens"] for sample in samples)
     if token_count > seq_len:
@@ -346,94 +340,6 @@ def _assert_explicit_default_pack_is_equivalent(mesh: Any) -> None:
         **callback_options,
     )
     _assert_collective_stop(loader)
-
-
-def _assert_checkpoint_step_error_is_collective(mesh: Any) -> None:
-    loader = build_distributed_dataloader(
-        _RawDataset(),
-        mesh,
-        DistributedDatasetConfig(
-            seq_len=4,
-            local_batch_size=1,
-            dp_dim_names=("dp",),
-            dataset_reader_ranks=(0, 1, 2, 3),
-            buffer_size_multiplier=1.0,
-            max_buffered_samples=8,
-            cpu_backend="gloo",
-        ),
-        metadata_fn=_metadata_fn,
-        pack_fn=_pack_fn,
-        collate_fn=_collate_fn,
-    )
-    state = loader.state_dict()
-    if dist.get_rank() == _WORLD_SIZE - 1:
-        state["step"] = 1
-    loader.load_state_dict(state)
-
-    error_type = None
-    error_message = None
-    try:
-        next(loader)
-    except Exception as exc:  # The collective contract is asserted after every rank exits.
-        error_type = type(exc).__name__
-        error_message = str(exc)
-    statuses = _all_gather_object((error_type, error_message))
-    error_types = tuple(status[0] for status in statuses)
-    assert all(error_type == error_types[0] and error_type is not None for error_type in error_types), (
-        f"Every rank must receive the same checkpoint-step error type: error_types={error_types!r}."
-    )
-    messages = tuple(status[1] for status in statuses)
-    assert all(message == messages[0] for message in messages), (
-        f"Every rank must receive the same checkpoint-step error: messages={messages!r}."
-    )
-    assert "step" in messages[0].lower(), (
-        f"The synchronized checkpoint error must identify the step mismatch: error={messages[0]!r}."
-    )
-    dist.monitored_barrier(timeout=timedelta(seconds=30))
-
-
-def _assert_model_peer_checkpoint_step_error_is_local(mesh: Any) -> None:
-    rank = dist.get_rank()
-    loader = build_distributed_dataloader(
-        _RawDataset() if rank in _CONSTRUCTOR_RANKS else None,
-        mesh,
-        DistributedDatasetConfig(
-            seq_len=4,
-            local_batch_size=1,
-            dp_dim_names=("dp",),
-            dataset_reader_ranks=None,
-            buffer_size_multiplier=1.0,
-            max_buffered_samples=8,
-            cpu_backend="gloo",
-        ),
-        metadata_fn=_metadata_fn,
-        pack_fn=_pack_fn,
-        collate_fn=_collate_fn,
-    )
-    state = loader.state_dict()
-    if rank == 1:
-        state["step"] = 1
-    loader.load_state_dict(state)
-
-    error_type = None
-    error_message = None
-    try:
-        next(loader)
-    except Exception as exc:  # A divergent model peer exits locally in fail-fast deployments.
-        error_type = type(exc).__name__
-        error_message = str(exc)
-    statuses = _all_gather_object((error_type, error_message))
-    assert statuses[1][0] == "ValueError", (
-        f"The rank with divergent model state must fail locally: statuses={statuses!r}."
-    )
-    assert "step" in statuses[1][1].lower(), (
-        f"The local model-state error must identify the step mismatch: statuses={statuses!r}."
-    )
-    assert all(status[0] is None for index, status in enumerate(statuses) if index != 1), (
-        f"Model peers without divergent state must not receive an application-level error: statuses={statuses!r}."
-    )
-
-    dist.monitored_barrier(timeout=timedelta(seconds=30))
 
 
 def _run_epoch(mesh: Any, dataset_reader_ranks: tuple[int, ...] | None) -> None:
@@ -691,38 +597,6 @@ def _run_pre_sharded_metadata_epoch(mesh: Any) -> None:
     _assert_collective_stop(loader)
 
 
-def _assert_metadata_error_is_collective(mesh: Any) -> None:
-    loader = build_distributed_dataloader(
-        _RawDataset(),
-        mesh,
-        DistributedDatasetConfig(
-            seq_len=4,
-            local_batch_size=1,
-            dp_dim_names=("dp",),
-            dataset_reader_ranks=(0, 1, 2, 3),
-            buffer_size_multiplier=1.0,
-            max_buffered_samples=8,
-            cpu_backend="gloo",
-        ),
-        metadata_fn=_failing_metadata_fn,
-        pack_fn=_pack_fn,
-        collate_fn=_collate_fn,
-    )
-    error = None
-    try:
-        next(loader)
-    except RuntimeError as exc:
-        error = str(exc)
-    errors = _all_gather_object(error)
-    assert all(message == errors[0] for message in errors), (
-        f"Every model rank must receive the same Dataset Reader error: errors={errors!r}."
-    )
-    assert "injected metadata failure" in errors[0], (
-        f"The collective failure must retain its root cause: error={errors[0]!r}."
-    )
-    dist.monitored_barrier(timeout=timedelta(seconds=30))
-
-
 def test_dynamic_packing_dp2_mp2_gloo() -> None:
     """Verify sample reading, planning, construction, and MP batch broadcast on DP=2/MP=2."""
     dist.init_process_group(backend="gloo")
@@ -745,12 +619,7 @@ def test_dynamic_packing_dp2_mp2_gloo() -> None:
         # same callback mode as omitting pack_fn on the other WORLD ranks.
         _assert_explicit_default_pack_is_equivalent(mesh)
 
-        # Rank 1 is a pure MP peer in the default Dataset Reader topology. Its
-        # divergent checkpoint state fails locally; K8s terminates the Job in production.
-        _assert_model_peer_checkpoint_step_error_is_local(mesh)
-
-        # A fresh default loader must remain usable immediately after the
-        # synchronized MP-state failure, proving collective order was preserved.
+        # A fresh default loader remains usable after the preflight tests.
         _run_epoch(mesh, dataset_reader_ranks=None)
 
         # Without construction callbacks, the built-in constructor returns
@@ -777,13 +646,6 @@ def test_dynamic_packing_dp2_mp2_gloo() -> None:
         # Data Constructor before their constructed batches return over MP.
         _run_epoch(mesh, dataset_reader_ranks=(0, 1, 2, 3))
 
-        # A single Dataset Reader callback failure must reach every model rank before
-        # any participant enters payload or MP collectives in a different order.
-        _assert_metadata_error_is_collective(mesh)
-
-        # Rank-local checkpoints may be loaded independently, but iteration
-        # must reject a divergent step collectively before planning or routing.
-        _assert_checkpoint_step_error_is_collective(mesh)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

@@ -726,7 +726,7 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
     build_fingerprint = None
     if state.topology is not None and state.config_fingerprint is not None:
         build_fingerprint = _build_fingerprint(state.topology, state.config_fingerprint)
-    # Invalid configs must still participate in WORLD error synchronization.
+    # Invalid configs must still participate in WORLD build preflight synchronization.
     dataset_already_sharded = isinstance(config, DistributedDatasetConfig) and config.dataset_already_sharded
     is_direct_reader = state.metadata_mode and state.topology is not None and (
         state.is_reader if dataset_already_sharded else state.topology.is_constructor

@@ -30,7 +30,6 @@ from hyper_parallel.distributed_data.batch_sampler import BatchSamplerReader
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
-    ConstructedBatch,
     DistributedPackingPlan,
     SampleKey,
     StepSampleSelection,
@@ -45,7 +44,7 @@ from hyper_parallel.distributed_data.transport import (
     PreparedPayloadExchange,
 )
 
-_ControlKind = Literal["plan", "need_more", "stop", "error"]
+_ControlKind = Literal["plan", "need_more", "stop"]
 
 
 def _scaled_buffer_target(
@@ -73,7 +72,6 @@ class _ReaderSnapshot:
     exhausted: bool
     can_read_more: bool
     metadata: tuple[BufferedSampleMetadata, ...]
-    error: str | None = None
     batch_position: int | None = None
     # External-step readers provide the legacy producer's already selected
     # local pack boundaries.  Stream readers leave this empty.
@@ -84,13 +82,12 @@ class _ReaderSnapshot:
 class _PlanControl:
     kind: _ControlKind
     plan: DistributedPackingPlan | None = None
-    error: str | None = None
 
 
 @dataclass(frozen=True)
 class _PrefetchResult:
-    batch: ConstructedBatch | None = None
-    error: BaseException | None = None
+    batch: Any = None
+    exception: BaseException | None = None
     completed: bool = False
 
 
@@ -236,48 +233,32 @@ class DistributedDataLoader(Iterator[Any]):
             self._start_prefetch()
         return data
 
-    def _prepare_and_broadcast_batch(self) -> ConstructedBatch:
+    def _prepare_and_broadcast_batch(self) -> Any:
         """Prepare the next batch and broadcast it to model-parallel peers."""
-        was_stopped = self._stopped
         constructed_batch = None
         if self._data_plane.is_member:
             constructed_batch = self._produce_on_data_plane()
-        received = self._model_transport.broadcast(constructed_batch)
-        if was_stopped and not received.stopped:
-            raise ValueError("Distributed DataLoader stopped state differs across model-parallel peers.")
-        return received
+        return self._model_transport.broadcast(constructed_batch)
 
-    def _prepare_next_batch(self) -> ConstructedBatch | None:
+    def _prepare_next_batch(self) -> Any:
         """Select, balance, route, and construct samples without model-group broadcast."""
         if self._data_plane.is_member:
             return self._produce_on_data_plane()
         return None
 
-    def _broadcast_batch(self, constructed_batch: ConstructedBatch | None) -> ConstructedBatch:
+    def _broadcast_batch(self, constructed_batch: Any) -> Any:
         """Broadcast the constructed batch to model-parallel peers on the caller thread."""
-        was_stopped = self._stopped
-        received = self._model_transport.broadcast(constructed_batch)
-        if was_stopped and not received.stopped:
-            raise ValueError("Distributed DataLoader stopped state differs across model-parallel peers.")
-        return received
+        return self._model_transport.broadcast(constructed_batch)
 
-    def _consume_batch(self, received: ConstructedBatch) -> Any:
+    def _consume_batch(self, received: Any) -> Any:
         """Validate the batch, commit Reader progress, and return its training data."""
-        if received.error is not None:
-            raise RuntimeError(received.error)
-        if received.step != self._step:
-            raise ValueError(
-                f"Constructed batch step mismatch: expected {self._step}, got {received.step}."
-            )
-        if received.stopped:
+        if received is None:
             self._stopped = True
+            self._pending_local_keys.clear()
             self._pending_plan = None
             raise StopIteration
-        if not received.plan_id:
-            raise ValueError("An active constructed batch must include a plan_id.")
-        if self._data_plane.is_member:
-            if self._pending_plan is None or self._pending_plan.plan_id != received.plan_id:
-                raise ValueError("Received batch does not match the pending distributed packing plan.")
+        if self._data_plane.is_member and self._pending_plan is None:
+            raise ValueError("Received an active batch without a pending distributed packing plan.")
 
         # Dataset Reader buffers are committed only after construction and broadcast
         # have both succeeded, leaving checkpoint boundaries unambiguous.
@@ -285,12 +266,13 @@ class DistributedDataLoader(Iterator[Any]):
         if planning_reader is not None:
             planning_reader.commit(self._pending_local_keys)
         self._pending_local_keys.clear()
-        self._last_plan_id = received.plan_id
-        self._last_plan = self._pending_plan
+        if self._pending_plan is not None:
+            self._last_plan_id = self._pending_plan.plan_id
+            self._last_plan = self._pending_plan
         self._pending_plan = None
         self._stopped = False
         self._step += 1
-        return received.data
+        return received
 
     def _start_prefetch(self) -> None:
         """Start one background transaction for the current iterator step."""
@@ -318,7 +300,7 @@ class DistributedDataLoader(Iterator[Any]):
                     completed=True,
                 )
         except BaseException as exc:  # The foreground re-raises failures at the next iterator boundary.
-            self._prefetch_result = _PrefetchResult(error=exc)
+            self._prefetch_result = _PrefetchResult(exception=exc)
 
     def _bind_prefetch_device(self) -> None:
         """Bind the rank-local accelerator for collectives in the prefetch thread."""
@@ -341,7 +323,7 @@ class DistributedDataLoader(Iterator[Any]):
         # the collective omits the send buffer's producer dependency.
         return device_module.stream(self._prefetch_stream)
 
-    def _take_prefetched(self) -> ConstructedBatch | None:
+    def _take_prefetched(self) -> Any:
         """Wait for and return the current background result."""
         if self._prefetch_thread is None:
             self._start_prefetch()
@@ -354,8 +336,8 @@ class DistributedDataLoader(Iterator[Any]):
         self._prefetch_result = None
         if result is None:
             raise ValueError("Double buffering completed without a prefetch result.")
-        if result.error is not None:
-            raise result.error
+        if result.exception is not None:
+            raise result.exception
         if not result.completed:
             raise ValueError("Double buffering completed without a finished prefetch result.")
         return result.batch
@@ -540,19 +522,17 @@ class DistributedDataLoader(Iterator[Any]):
         self._last_plan = None
         self._pending_plan = None
 
-    def _produce_on_data_plane(self) -> ConstructedBatch | None:
+    def _produce_on_data_plane(self) -> Any:
         control = self._next_plan_control()
         if control.kind == "stop":
-            return self._constructor_envelope(stopped=True)
-        if control.kind == "error":
-            return self._constructor_envelope(error=control.error or "Distributed data planning failed.")
+            return None
         if control.kind != "plan" or control.plan is None:
-            return self._constructor_envelope(error="Planner returned an invalid control message.")
+            raise ValueError("Planner returned an invalid control message.")
 
         plan = control.plan
         if plan.step != self._step:
-            return self._constructor_envelope(
-                error=f"Planner returned step {plan.step}, but this rank expects step {self._step}."
+            raise ValueError(
+                f"Planner returned step {plan.step}, but this rank expects step {self._step}."
             )
         self._pending_plan = plan
         selected_keys = set(plan.selected_keys)
@@ -578,13 +558,13 @@ class DistributedDataLoader(Iterator[Any]):
             canonical_batch = getattr(self._dataset_reader, "canonical_batch", None)
             if callable(canonical_batch):
                 local_batch = canonical_batch()
-                return ConstructedBatch(step=plan.step, plan_id=plan.plan_id, data=local_batch)
+                return self._require_batch(local_batch)
 
         outgoing = self._prepare_outgoing(plan, local_selected_keys)
         received_payloads = self._data_plane.exchange_prepared(outgoing)
         return self._construct_received_payloads(plan, received_payloads)
 
-    def _produce_metadata_batch(self, plan: DistributedPackingPlan) -> ConstructedBatch | None:
+    def _produce_metadata_batch(self, plan: DistributedPackingPlan) -> Any:
         """Directly read constructor-assigned shared indices without payload A2A."""
         received_payloads: dict[SampleKey, Any] = {}
         if self._topology.is_constructor:
@@ -598,7 +578,7 @@ class DistributedDataLoader(Iterator[Any]):
             self,
             plan: DistributedPackingPlan,
             received_payloads: dict[SampleKey, Any],
-    ) -> ConstructedBatch | None:
+    ) -> Any:
         """Construct one local batch and return it on the Data Constructor rank."""
         local_batch = None
         if self._topology.is_constructor:
@@ -610,7 +590,14 @@ class DistributedDataLoader(Iterator[Any]):
             )
         if not self._topology.is_constructor:
             return None
-        return ConstructedBatch(step=plan.step, plan_id=plan.plan_id, data=local_batch)
+        return self._require_batch(local_batch)
+
+    @staticmethod
+    def _require_batch(local_batch: Any) -> Any:
+        """Reject ``None`` because it is reserved for distributed end-of-stream."""
+        if local_batch is None:
+            raise ValueError("The Data Constructor must return a non-None batch.")
+        return local_batch
 
     def _next_plan_control(self) -> _PlanControl:
         attempt = 1
@@ -620,12 +607,11 @@ class DistributedDataLoader(Iterator[Any]):
             planner_control = None
             if self._topology.global_rank == self._data_plane.planner_rank:
                 if snapshots is None:
-                    planner_control = _PlanControl("error", error="Planner did not receive Dataset Reader snapshots.")
-                else:
-                    planner_control = self._build_plan_control(snapshots)
+                    raise RuntimeError("Planner did not receive Dataset Reader snapshots.")
+                planner_control = self._build_plan_control(snapshots)
             control = self._data_plane.broadcast_from_planner(planner_control)
             if not isinstance(control, _PlanControl):
-                return _PlanControl("error", error="Planner broadcast an invalid control message.")
+                raise RuntimeError("Planner broadcast an invalid control message.")
             if control.kind != "need_more":
                 return control
             attempt += 1
@@ -645,17 +631,7 @@ class DistributedDataLoader(Iterator[Any]):
             )
         planning_reader = self._planning_reader()
         if planning_reader is None:
-            return _ReaderSnapshot(
-                rank=self._topology.global_rank,
-                step=self._step,
-                stopped=self._stopped,
-                is_reader=True,
-                exhausted=False,
-                can_read_more=False,
-                metadata=(),
-                reference_bins=(),
-                error=f"Dataset Reader rank {self._topology.global_rank} did not provide its reader.",
-            )
+            raise ValueError(f"Dataset Reader rank {self._topology.global_rank} did not provide its reader.")
 
         reader_count = len(self._dataset_reader_ranks)
         sample_target = _scaled_buffer_target(
@@ -672,7 +648,7 @@ class DistributedDataLoader(Iterator[Any]):
             attempt,
             reader_count,
         )
-        error = planning_reader.fill(
+        planning_reader.fill(
             min_samples=max(1, sample_target),
             min_tokens=max(1, token_target),
             max_samples=self._max_buffered_samples,
@@ -688,15 +664,12 @@ class DistributedDataLoader(Iterator[Any]):
                 and planning_reader.buffer_size < self._max_buffered_samples
             ),
             metadata=planning_reader.metadata(),
-            error=error,
             batch_position=getattr(planning_reader, "batch_position", None),
             reference_bins=tuple(getattr(planning_reader, "reference_bins", ())),
         )
 
     def _build_plan_control(self, snapshots: tuple[Any, ...]) -> _PlanControl:
-        normalized, validation_error = self._normalize_reader_snapshots(snapshots)
-        if validation_error is not None:
-            return validation_error
+        normalized = self._normalize_reader_snapshots(snapshots)
         state_control = self._snapshot_state_control(normalized)
         if state_control is not None:
             return state_control
@@ -705,44 +678,35 @@ class DistributedDataLoader(Iterator[Any]):
     def _normalize_reader_snapshots(
             self,
             snapshots: tuple[Any, ...],
-    ) -> tuple[tuple[_ReaderSnapshot, ...], _PlanControl | None]:
+    ) -> tuple[_ReaderSnapshot, ...]:
         normalized = []
         for snapshot in snapshots:
             if not isinstance(snapshot, _ReaderSnapshot):
-                error = _PlanControl("error", error="A data-plane rank contributed an invalid reader snapshot.")
-                return (), error
+                raise ValueError("A data-plane rank contributed an invalid reader snapshot.")
             expected_reader = snapshot.rank in self._dataset_reader_ranks
             if snapshot.is_reader != expected_reader:
-                error = _PlanControl(
-                    "error",
-                    error=f"Rank {snapshot.rank} reported inconsistent Dataset Reader ownership.",
+                raise ValueError(
+                    f"Rank {snapshot.rank} reported inconsistent Dataset Reader ownership."
                 )
-                return (), error
             normalized.append(snapshot)
         contributed_ranks = [snapshot.rank for snapshot in normalized]
         if len(contributed_ranks) != len(set(contributed_ranks)) or set(contributed_ranks) != set(
                 self._data_plane.ranks
         ):
-            error = _PlanControl(
-                "error",
-                error=f"Data-plane reader snapshots have invalid rank coverage {contributed_ranks}.",
+            raise ValueError(
+                f"Data-plane reader snapshots have invalid rank coverage {contributed_ranks}."
             )
-            return (), error
-        errors = sorted((snapshot.rank, snapshot.error) for snapshot in normalized if snapshot.error is not None)
-        if errors:
-            return (), _PlanControl("error", error=errors[0][1])
-        return tuple(normalized), None
+        return tuple(normalized)
 
     def _snapshot_state_control(self, normalized: tuple[_ReaderSnapshot, ...]) -> _PlanControl | None:
         steps = {snapshot.step for snapshot in normalized}
         stopped_states = {snapshot.stopped for snapshot in normalized}
         if len(steps) != 1 or self._step not in steps:
-            return _PlanControl(
-                "error",
-                error=f"Data-plane ranks have inconsistent checkpoint steps {sorted(steps)}.",
+            raise ValueError(
+                f"Data-plane ranks have inconsistent checkpoint steps {sorted(steps)}."
             )
         if len(stopped_states) != 1:
-            return _PlanControl("error", error="Data-plane ranks have inconsistent stopped checkpoint state.")
+            raise ValueError("Data-plane ranks have inconsistent stopped checkpoint state.")
         if stopped_states == {True}:
             return _PlanControl("stop")
         return None
@@ -750,31 +714,25 @@ class DistributedDataLoader(Iterator[Any]):
     def _plan_reader_snapshots(self, normalized: tuple[_ReaderSnapshot, ...]) -> _PlanControl:
         reader_snapshots = [snapshot for snapshot in normalized if snapshot.is_reader]
         candidates = tuple(metadata for snapshot in reader_snapshots for metadata in snapshot.metadata)
-        try:
-            if self._batch_sampler_mode:
-                selection = self._select_native_batch(reader_snapshots)
-            elif self._external_step_mode:
-                selection = self._select_external_step(reader_snapshots)
-            else:
-                selection = self._step_sample_selector.select(
-                    candidates,
-                    end_of_stream=all(snapshot.exhausted for snapshot in reader_snapshots),
-                )
-            plan = None if selection is None else self._planner.plan(selection, step=self._step)
-        except Exception as exc:
-            return _PlanControl("error", error=self._format_error("Step Sample Selection or Planner", exc))
+        if self._batch_sampler_mode:
+            selection = self._select_native_batch(reader_snapshots)
+        elif self._external_step_mode:
+            selection = self._select_external_step(reader_snapshots)
+        else:
+            selection = self._step_sample_selector.select(
+                candidates,
+                end_of_stream=all(snapshot.exhausted for snapshot in reader_snapshots),
+            )
+        plan = None if selection is None else self._planner.plan(selection, step=self._step)
         if plan is not None:
             return _PlanControl("plan", plan=plan)
         if all(snapshot.exhausted for snapshot in reader_snapshots):
             return _PlanControl("stop")
         if any(snapshot.can_read_more for snapshot in reader_snapshots):
             return _PlanControl("need_more")
-        return _PlanControl(
-            "error",
-            error=(
-                f"Dataset Reader buffers reached max_buffered_samples={self._max_buffered_samples} before "
-                f"Step Sample Selection could form {self._planner.distributed_bin_count} complete packing bins."
-            ),
+        raise ValueError(
+            f"Dataset Reader buffers reached max_buffered_samples={self._max_buffered_samples} before "
+            f"Step Sample Selection could form {self._planner.distributed_bin_count} complete packing bins."
         )
 
     def _select_external_step(self, snapshots: list[_ReaderSnapshot]) -> StepSampleSelection | None:
@@ -877,22 +835,5 @@ class DistributedDataLoader(Iterator[Any]):
         if self._dataset_reader is not None:
             return self._dataset_reader
         return self._metadata_reader
-
-    def _constructor_envelope(
-            self,
-            *,
-            stopped: bool = False,
-            error: str | None = None,
-    ) -> ConstructedBatch | None:
-        self._pending_local_keys.clear()
-        self._pending_plan = None
-        if not self._topology.is_constructor:
-            return None
-        return ConstructedBatch(step=self._step, plan_id=None, stopped=stopped, error=error)
-
-    @staticmethod
-    def _format_error(stage: str, exception: Exception) -> str:
-        return f"{stage} failed: {type(exception).__name__}: {exception}"
-
 
 __all__ = ["DistributedDataLoader"]

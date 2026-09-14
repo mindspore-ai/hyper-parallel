@@ -25,7 +25,7 @@ from typing import Any, Mapping, Sequence
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.distributed_data.schema import ConstructedBatch, SampleKey
+from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.distributed_data.topology import DataTopology
 
 _FRAME_MAGIC = b"HPDDP1"
@@ -459,18 +459,17 @@ def _allocate_received_tensor(
         output_splits: Sequence[int],
         send_tensor: torch.Tensor,
         expected_split_count: int,
-) -> tuple[torch.Tensor | None, str | None]:
+) -> torch.Tensor:
     try:
         if len(output_splits) != expected_split_count or any(size < 0 for size in output_splits):
             raise ValueError(f"Sample all-to-all returned invalid payload sizes {list(output_splits)}.")
-        received_tensor = torch.empty(
+        return torch.empty(
             (sum(output_splits),),
             dtype=torch.uint8,
             device=send_tensor.device,
         )
     except Exception as exc:
-        return None, f"Payload receive allocation failed: {type(exc).__name__}: {exc}"
-    return received_tensor, None
+        raise ValueError(f"Payload receive allocation failed: {type(exc).__name__}: {exc}") from exc
 
 
 def _decode_received_payloads(received_bytes: bytes, output_splits: Sequence[int]) -> dict[SampleKey, Any]:
@@ -648,15 +647,11 @@ class DataPlaneTransport:
 
         input_splits = list(prepared.input_splits)
         output_splits = _exchange_payload_sizes(input_splits, self._control_group)
-        received_tensor, allocation_error = _allocate_received_tensor(
+        received_tensor = _allocate_received_tensor(
             output_splits,
             prepared.send_tensor,
             len(self._ranks),
         )
-        if allocation_error is not None:
-            raise ValueError(allocation_error)
-        if received_tensor is None:
-            raise ValueError("Payload receive allocation did not produce a tensor.")
         data_work = dist.all_to_all_single(
             received_tensor,
             prepared.send_tensor,
@@ -688,32 +683,30 @@ class ModelParallelTransport:
         self._global_rank = topology.global_rank
         self._distributed = groups.distributed
 
-    def broadcast(self, batch: ConstructedBatch | None) -> ConstructedBatch:
-        """Return the constructor's batch envelope on every model-parallel peer.
+    def broadcast(self, batch: Any) -> Any:
+        """Return the constructor's batch data on every model-parallel peer.
+
+        ``None`` is reserved as the end-of-stream sentinel. A constructor
+        therefore must not return ``None`` as a valid training batch.
 
         Args:
             batch: Constructor batch or ``None`` on consumer-only peers.
 
         Returns:
-            The constructor's batch envelope.
+            The constructor's batch data, or ``None`` at end of stream.
         """
         is_constructor = self._global_rank == self._constructor_rank
         if len(self._ranks) == 1:
-            if not is_constructor or not isinstance(batch, ConstructedBatch):
-                raise ValueError("A singleton model group requires a local ConstructedBatch.")
+            if not is_constructor:
+                raise ValueError("A singleton model group requires the Data Constructor rank.")
             return batch
         if not self._distributed or self._group is None:
             raise ValueError("Multi-rank model broadcast requires an initialized process group.")
-        if is_constructor and not isinstance(batch, ConstructedBatch):
-            raise ValueError("The Data Constructor must provide a ConstructedBatch.")
         if not is_constructor and batch is not None:
             raise ValueError("Only the Data Constructor may provide the model-group batch.")
         payload = [batch]
         dist.broadcast_object_list(payload, src=self._constructor_rank, group=self._group)
-        received = payload[0]
-        if not isinstance(received, ConstructedBatch):
-            raise ValueError("Model-parallel broadcast did not contain a ConstructedBatch.")
-        return received
+        return payload[0]
 
 
 __all__ = [

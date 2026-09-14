@@ -321,14 +321,3 @@ class DistributedPackingPlan:
         if not valid_rank or not 0 <= data_rank < self.data_parallel_size:
             raise ValueError(f"data_rank must be in [0, {self.data_parallel_size}), but got {data_rank!r}.")
         return self.constructors[data_rank]
-
-
-@dataclass(frozen=True)
-class ConstructedBatch:
-    """Constructor result containing batch data or stop/error status for MP broadcast."""
-
-    step: int
-    plan_id: str | None
-    data: Any = None
-    stopped: bool = False
-    error: str | None = None

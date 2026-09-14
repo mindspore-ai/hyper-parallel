@@ -107,7 +107,6 @@ class BatchSamplerReader:
         self._buffer: tuple[BufferedSampleMetadata, ...] = ()
         self._payloads: dict[SampleKey, Any] = {}
         self._exhausted = False
-        self._error: str | None = None
 
     @property
     def exhausted(self) -> bool:
@@ -124,11 +123,11 @@ class BatchSamplerReader:
         """Return the native global cursor before this pending round."""
         return self._committed_state["consumed_samples"]
 
-    def fill(self, *, min_samples: int, min_tokens: int, max_samples: int) -> str | None:
+    def fill(self, *, min_samples: int, min_tokens: int, max_samples: int) -> None:
         """Prepare exactly one sampler yield, ignoring dynamic-packing targets."""
         del min_samples, min_tokens, max_samples
-        if self._buffer or self._exhausted or self._error is not None:
-            return self._error
+        if self._buffer or self._exhausted:
+            return None
         try:
             if self._iterator is None:
                 self._iterator = iter(self._sampler)
@@ -156,8 +155,10 @@ class BatchSamplerReader:
                 for key, item in zip(keys, metadata)
             )
         except Exception as exc:
-            self._error = f"Native BatchSampler Reader failed: {type(exc).__name__}: {exc}"
-        return self._error
+            raise RuntimeError(
+                f"Native BatchSampler Reader failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        return None
 
     def _sample_keys(self, indices: Sequence[int]) -> tuple[SampleKey, ...]:
         if len(indices) != self._sampler.micro_batch_size:
@@ -229,4 +230,3 @@ class BatchSamplerReader:
         self._buffer = ()
         self._payloads = {}
         self._exhausted = False
-        self._error = None

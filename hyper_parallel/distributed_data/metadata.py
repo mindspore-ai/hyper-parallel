@@ -100,7 +100,6 @@ class MetadataReader:
         self._buffer: list[BufferedSampleMetadata] = []
         self._iterator: Iterator[int] | None = None
         self._exhausted = False
-        self._error: str | None = None
 
     @property
     def exhausted(self) -> bool:
@@ -117,7 +116,7 @@ class MetadataReader:
         """Return buffered tokens, capping singleton overflow at ``seq_len``."""
         return sum(min(item.metadata.pack_tokens, self._seq_len) for item in self._buffer)
 
-    def fill(self, *, min_samples: int, min_tokens: int, max_samples: int) -> str | None:
+    def fill(self, *, min_samples: int, min_tokens: int, max_samples: int) -> None:
         """Fill the planning buffer without materializing Dataset samples.
 
         Args:
@@ -126,13 +125,11 @@ class MetadataReader:
             max_samples: Hard bound on resident metadata entries.
 
         Returns:
-            Formatted metadata access error, or ``None`` on success/exhaustion.
+            ``None`` after the local buffer has been filled or metadata is exhausted.
         """
         for name, value in (("min_samples", min_samples), ("min_tokens", min_tokens), ("max_samples", max_samples)):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
-        if self._error is not None:
-            return self._error
         try:
             while (
                     not self._exhausted
@@ -155,10 +152,10 @@ class MetadataReader:
                     ),
                 ))
                 self._next_ordinal += 1
-        except Exception as exc:  # The collective caller propagates the same failure to every rank.
-            self._error = f"Metadata Dataset Reader rank {self._reader_rank} failed: {type(exc).__name__}: {exc}"
-            return self._error
-        return None
+        except Exception as exc:
+            raise RuntimeError(
+                f"Metadata Dataset Reader rank {self._reader_rank} failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def metadata(self) -> tuple[BufferedSampleMetadata, ...]:
         """Return the current lightweight planning candidates."""
@@ -179,7 +176,6 @@ class MetadataReader:
             "epoch": self._epoch,
             "next_ordinal": self._next_ordinal,
             "exhausted": self._exhausted,
-            "error": self._error,
             "buffer": self._buffer,
         }
         try:
@@ -197,13 +193,12 @@ class MetadataReader:
             state = copy.deepcopy(dict(state_dict))
         except Exception as exc:
             raise ValueError(f"Metadata state is not copyable: {exc}") from exc
-        epoch, next_ordinal, exhausted, error, buffer = _validate_reader_checkpoint(
+        epoch, next_ordinal, exhausted, buffer = _validate_reader_checkpoint(
             state, self._checkpoint_identity(), BufferedSampleMetadata, owner="Metadata",
         )
         self._epoch = epoch
         self._next_ordinal = next_ordinal
         self._exhausted = exhausted
-        self._error = error
         self._buffer = buffer
         self._iterator = None
 
@@ -231,7 +226,6 @@ class MetadataReader:
         self._epoch = epoch
         self._next_ordinal = 0
         self._exhausted = False
-        self._error = None
         self._iterator = None
 
     def _read_one_index(self) -> int | None:

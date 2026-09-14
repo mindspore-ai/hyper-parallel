@@ -173,7 +173,7 @@ class TestNativeBatchSampler(unittest.TestCase):
         self.assertEqual(loader.state_dict()["epoch"], 2)
 
     def test_metadata_failure_does_not_look_like_exhaustion(self) -> None:
-        """StopIteration from a metadata callback is a synchronized error, not EOF."""
+        """StopIteration from a metadata callback is a reader error, not EOF."""
         def broken_metadata(sample: object) -> SampleMetadata:
             """Raise an accidental StopIteration outside sampler advancement."""
             del sample

@@ -156,7 +156,7 @@ def _commit_reader_buffer(
 
 def _validate_reader_checkpoint(
         state: Mapping[str, Any], identity: Mapping[str, Any], entry_type: type[_BufferEntry], *, owner: str,
-) -> tuple[int, int, bool, str | None, list[_BufferEntry]]:
+) -> tuple[int, int, bool, list[_BufferEntry]]:
     """Validate both reader formats before applying any restored state."""
     for name, expected_value in identity.items():
         if state.get(name) != expected_value:
@@ -164,7 +164,6 @@ def _validate_reader_checkpoint(
     epoch = state.get("epoch")
     next_ordinal = state.get("next_ordinal")
     exhausted = state.get("exhausted")
-    error = state.get("error")
     buffer = state.get("buffer")
     if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in (epoch, next_ordinal)):
         raise ValueError(f"{owner} epoch and next_ordinal must be non-negative integers.")
@@ -172,12 +171,10 @@ def _validate_reader_checkpoint(
             not isinstance(item, entry_type) for item in buffer
     ):
         raise ValueError(f"{owner} checkpoint contains invalid exhausted or buffer state.")
-    if error is not None and (not isinstance(error, str) or not error):
-        raise ValueError(f"{owner} checkpoint contains an invalid error state.")
     keys = [item.key for item in buffer]
     if len(keys) != len(set(keys)):
         raise ValueError(f"{owner} checkpoint buffer contains duplicate SampleKey values.")
-    return epoch, next_ordinal, exhausted, error, buffer
+    return epoch, next_ordinal, exhausted, buffer
 
 
 class _IndexedDataset(Dataset):
@@ -357,7 +354,6 @@ class DatasetReader:
         self._buffer: list[_BufferedSample] = []
         self._iterator: Iterator[Any] | None = None
         self._exhausted = False
-        self._error: str | None = None
         self._sampler = None
         self._worker_generator = torch.Generator().manual_seed(self._seed + self._epoch)
         self._data_loader = self._create_data_loader(dataloader_kwargs)
@@ -446,7 +442,7 @@ class DatasetReader:
         """Return read-ahead tokens, capping singleton overflow at seq_len."""
         return sum(min(item.metadata.pack_tokens, self._seq_len) for item in self._buffer)
 
-    def fill(self, *, min_samples: int, min_tokens: int, max_samples: int) -> str | None:
+    def fill(self, *, min_samples: int, min_tokens: int, max_samples: int) -> None:
         """Read samples until both planning targets are satisfied.
 
         Args:
@@ -455,13 +451,11 @@ class DatasetReader:
             max_samples: Hard bound on resident payload count.
 
         Returns:
-            Formatted callback/read error, or ``None`` on success/exhaustion.
+            ``None`` after the local buffer has been filled or the source is exhausted.
         """
         for name, value in (("min_samples", min_samples), ("min_tokens", min_tokens), ("max_samples", max_samples)):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
-        if self._error is not None:
-            return self._error
         try:
             while (
                     not self._exhausted
@@ -490,10 +484,10 @@ class DatasetReader:
                     payload=payload,
                 ))
                 self._next_ordinal += 1
-        except Exception as exc:  # The collective caller propagates the same failure to every rank.
-            self._error = f"Dataset Reader rank {self._reader_rank} failed: {type(exc).__name__}: {exc}"
-            return self._error
-        return None
+        except Exception as exc:
+            raise RuntimeError(
+                f"Dataset Reader rank {self._reader_rank} failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def metadata(self) -> tuple[BufferedSampleMetadata, ...]:
         """Return lightweight planner candidates without payloads."""
@@ -539,7 +533,6 @@ class DatasetReader:
             "epoch": self._epoch,
             "next_ordinal": self._next_ordinal,
             "exhausted": self._exhausted,
-            "error": self._error,
             # Preserve stateful interleave/filter cursors for online iterable
             # sources. Worker-local state is avoided by the training adapter.
             "dataset_state": (
@@ -566,13 +559,12 @@ class DatasetReader:
             state = copy.deepcopy(dict(state_dict))
         except Exception as exc:
             raise ValueError(f"Dataset Reader state is not copyable: {exc}") from exc
-        epoch, next_ordinal, exhausted, error, buffer = _validate_reader_checkpoint(
+        epoch, next_ordinal, exhausted, buffer = _validate_reader_checkpoint(
             state, self._checkpoint_identity(), _BufferedSample, owner="Dataset Reader",
         )
         self._epoch = epoch
         self._next_ordinal = next_ordinal
         self._exhausted = exhausted
-        self._error = error
         self._buffer = buffer
         dataset_state = state.get("dataset_state")
         if dataset_state is not None and callable(getattr(self._dataset, "load_state_dict", None)):
@@ -606,7 +598,6 @@ class DatasetReader:
         self._epoch = epoch
         self._next_ordinal = 0
         self._exhausted = False
-        self._error = None
         self._iterator = None
 
     def _read_one(self) -> Any | None:
