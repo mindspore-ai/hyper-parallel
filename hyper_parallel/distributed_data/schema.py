@@ -17,11 +17,53 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Literal
+from collections.abc import Mapping, Sequence
+from dataclasses import InitVar, dataclass, field
+from typing import Any, Literal
 
 
 OversizedPolicy = Literal["error", "single"]
+
+
+def _validate_nonnegative_costs(values: Mapping[str, float], name: str) -> None:
+    """Validate named finite, non-negative scalar costs or budgets."""
+    if not isinstance(values, Mapping):
+        raise ValueError(f"{name} must be a mapping of non-empty strings to finite, non-negative numbers.")
+    for key, value in values.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"{name} keys must be non-empty strings, but got {key!r}.")
+        if (
+                type(value) not in (int, float)
+                or (isinstance(value, float) and not math.isfinite(value))
+                or value < 0
+        ):
+            raise ValueError(f"{name}[{key!r}] must be finite and non-negative, but got {value!r}.")
+
+
+def _validate_feature(value: Any, name: str, ancestors: set[int]) -> None:
+    """Reject tensors, arbitrary objects, cycles, and non-finite feature values."""
+    if value is None:
+        return
+    if type(value) not in (bool, int, float, str, dict, list, tuple):
+        raise ValueError(f"{name} must contain only CPU-serializable basic types, but got {type(value)}.")
+    if isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite, but got {value!r}.")
+        return
+    if id(value) in ancestors:
+        raise ValueError(f"{name} must not contain reference cycles.")
+    ancestors.add(id(value))
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{name} keys must be strings, but got {key!r}.")
+            _validate_feature(child, f"{name}[{key!r}]", ancestors)
+    else:
+        for index, child in enumerate(value):
+            _validate_feature(child, f"{name}[{index}]", ancestors)
+    ancestors.remove(id(value))
 
 
 @dataclass(frozen=True)
@@ -99,14 +141,21 @@ class SampleMetadata:
         cost: Optional normalized multimodal workload estimate.
         sample_id: Optional user-facing identifier used for diagnostics. The
             runtime uses :class:`SampleKey` for routing and uniqueness.
+        features: CPU metadata for workload estimation. Values may recursively
+            contain ``None``, booleans, integers, finite floats, strings, lists,
+            tuples, and dictionaries with string keys. Tensors are rejected.
+        packing_costs: Named finite, non-negative physical packing footprints.
+            These are independent of ``cost`` and enforce per-bin hard budgets.
     """
 
     pack_tokens: int
     cost: WorkloadCost = WorkloadCost()
     sample_id: int | str | None = None
+    features: dict[str, Any] = field(default_factory=dict)
+    packing_costs: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Validate token count and optional identifier."""
+        """Validate identity, workload, and lightweight packing metadata."""
         if not isinstance(self.pack_tokens, int) or isinstance(self.pack_tokens, bool) or self.pack_tokens < 1:
             raise ValueError(f"SampleMetadata.pack_tokens must be a positive integer, but got {self.pack_tokens!r}.")
         if not isinstance(self.cost, WorkloadCost):
@@ -117,6 +166,12 @@ class SampleMetadata:
                 raise ValueError("SampleMetadata.sample_id must be a non-negative integer, non-empty string, or None.")
             if isinstance(self.sample_id, str) and not self.sample_id:
                 raise ValueError("SampleMetadata.sample_id string must not be empty.")
+        if not isinstance(self.features, dict):
+            raise ValueError("SampleMetadata.features must be a dictionary.")
+        _validate_feature(self.features, "SampleMetadata.features", set())
+        if not isinstance(self.packing_costs, dict):
+            raise ValueError("SampleMetadata.packing_costs must be a dictionary.")
+        _validate_nonnegative_costs(self.packing_costs, "SampleMetadata.packing_costs")
 
 
 @dataclass(frozen=True, order=True)
@@ -161,6 +216,92 @@ class BufferedSampleMetadata:
 
 
 @dataclass(frozen=True)
+class PackingConstraints:
+    """Shared packing feasibility contract for selection and balanced placement.
+
+    Args:
+        seq_len: Token capacity of a regular bin.
+        oversized_policy: Permit token overflow only for a singleton when
+            ``single``. Named stage budgets never permit singleton overflow.
+        packing_budgets: Per-bin additive hard caps. Every configured name must
+            be explicitly present in each sample's ``packing_costs``, including
+            zero-cost stages. ``None`` retains token-only packing.
+    """
+
+    seq_len: int
+    oversized_policy: OversizedPolicy = "error"
+    packing_budgets: Mapping[str, float] | None = None
+
+    def __post_init__(self) -> None:
+        """Validate token and stage capacities and copy the caller's mapping."""
+        if not isinstance(self.seq_len, int) or isinstance(self.seq_len, bool) or self.seq_len < 1:
+            raise ValueError(f"seq_len must be a positive integer, but got {self.seq_len!r}.")
+        if self.oversized_policy not in ("error", "single"):
+            raise ValueError("oversized_policy must be 'error' or 'single'.")
+        budgets = {} if self.packing_budgets is None else self.packing_budgets
+        _validate_nonnegative_costs(budgets, "packing_budgets")
+        object.__setattr__(self, "packing_budgets", dict(budgets))
+
+    def validate_sample(self, item: BufferedSampleMetadata) -> None:
+        """Reject samples that cannot occupy even an otherwise empty bin."""
+        for name, budget in self.packing_budgets.items():
+            if name not in item.metadata.packing_costs:
+                raise ValueError(f"Sample {item.key} is missing packing_costs[{name!r}] required by packing_budgets.")
+            value = item.metadata.packing_costs[name]
+            if value > budget:
+                raise ValueError(
+                    f"Sample {item.key} requires packing_costs[{name!r}]={value}, "
+                    f"exceeding packing_budgets[{name!r}]={budget}. Stage budgets do not permit singleton overflow."
+                )
+        if item.metadata.pack_tokens > self.seq_len and self.oversized_policy == "error":
+            raise ValueError(
+                f"Sample {item.key} requires {item.metadata.pack_tokens} tokens, exceeding seq_len={self.seq_len}. "
+                "Set oversized_policy='single' only when the packer supports singleton overflow."
+            )
+
+    def fits(
+            self,
+            pack_tokens: int,
+            packing_costs: Mapping[str, float],
+            item: BufferedSampleMetadata,
+    ) -> bool:
+        """Return whether an individually valid sample fits the current bin."""
+        if item.metadata.pack_tokens > self.seq_len:
+            token_fit = pack_tokens == 0 and self.oversized_policy == "single"
+        else:
+            token_fit = pack_tokens + item.metadata.pack_tokens <= self.seq_len
+        return token_fit and all(
+            packing_costs.get(name, 0) + item.metadata.packing_costs[name] <= budget
+            for name, budget in self.packing_budgets.items()
+        )
+
+    def add_costs(
+            self,
+            packing_costs: Mapping[str, float],
+            item: BufferedSampleMetadata,
+    ) -> dict[str, float]:
+        """Return accumulated physical costs for the constrained stages."""
+        return {
+            name: packing_costs.get(name, 0) + item.metadata.packing_costs[name]
+            for name in self.packing_budgets
+        }
+
+    def validate_bin(self, items: Sequence[BufferedSampleMetadata]) -> None:
+        """Validate a reference or final bin against the same placement rules."""
+        pack_tokens = 0
+        packing_costs: dict[str, float] = {}
+        for item in items:
+            self.validate_sample(item)
+            if not self.fits(pack_tokens, packing_costs, item):
+                raise ValueError(
+                    f"Packing bin cannot admit sample {item.key} within seq_len={self.seq_len} "
+                    f"and packing_budgets={dict(self.packing_budgets)}."
+                )
+            pack_tokens += item.metadata.pack_tokens
+            packing_costs = self.add_costs(packing_costs, item)
+
+
+@dataclass(frozen=True)
 class StepSampleSelection:
     """Frozen sample membership and a known-feasible reference packing.
 
@@ -168,13 +309,19 @@ class StepSampleSelection:
     ``reference_bins`` records the canonical streaming packing or native
     BatchSampler singleton grouping. Balanced placement may change those bins, but it must
     conserve every selected key exactly once.
+
+    ``validate=False`` skips repeated scans for internally constructed, trusted
+    selections. The option is construction-only and is not serialized.
     """
 
     samples: tuple[BufferedSampleMetadata, ...]
     reference_bins: tuple[tuple[SampleKey, ...], ...]
+    validate: InitVar[bool] = True
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, validate: bool) -> None:
         """Validate sample identity, stream order, and reference conservation."""
+        if not validate:
+            return
         if not self.samples:
             raise ValueError("StepSampleSelection.samples must not be empty.")
         if any(not isinstance(item, BufferedSampleMetadata) for item in self.samples):
@@ -197,14 +344,21 @@ class StepSampleSelection:
 
 @dataclass(frozen=True)
 class PackingBinPlan:
-    """One ordered packed sequence assigned to a Data Constructor."""
+    """Ordered raw samples that one Data Constructor passes to ``pack_fn``.
+
+    ``validate=False`` skips repeated scans for internally constructed, trusted
+    bins. The option is construction-only and is not serialized.
+    """
 
     sample_keys: tuple[SampleKey, ...]
     pack_tokens: int
     oversized: bool = False
+    validate: InitVar[bool] = True
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, validate: bool) -> None:
         """Validate one non-empty sequence-packing bin."""
+        if not validate:
+            return
         if not self.sample_keys:
             raise ValueError("PackingBinPlan.sample_keys must not be empty.")
         if any(not isinstance(key, SampleKey) for key in self.sample_keys):
@@ -219,16 +373,23 @@ class PackingBinPlan:
 
 @dataclass(frozen=True)
 class DistributedPackingPlan:
-    """Deterministic sample-to-constructor plan for one distributed yield."""
+    """Deterministic sample-to-constructor plan for one distributed yield.
+
+    ``validate=False`` skips repeated scans for internally constructed, trusted
+    plans. The option is construction-only and is not serialized.
+    """
 
     plan_id: str
     step: int
     seq_len: int
     local_batches: tuple[tuple[PackingBinPlan, ...], ...]
     rank_costs: tuple[WorkloadCost, ...]
+    validate: InitVar[bool] = True
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, validate: bool) -> None:
         """Validate plan dimensions, slots, and unique sample assignments."""
+        if not validate:
+            return
         self._validate_dimensions()
         keys = self._validate_local_batches()
         if len(keys) != len(set(keys)):

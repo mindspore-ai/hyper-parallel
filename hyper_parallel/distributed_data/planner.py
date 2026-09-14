@@ -19,20 +19,26 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
+from collections.abc import Mapping, Sequence
+from copy import copy
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Literal
 
+from hyper_parallel.distributed_data.cost_model import CostModel, DefaultCostModel
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
     DistributedPackingPlan,
     OversizedPolicy,
     PackingBinPlan,
+    PackingConstraints,
     StepSampleSelection,
     WorkloadCost,
 )
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class _MutableBin:
@@ -40,6 +46,7 @@ class _MutableBin:
     pack_index: int
     samples: list[BufferedSampleMetadata] = field(default_factory=list)
     pack_tokens: int = 0
+    packing_costs: dict[str, float] = field(default_factory=dict)
     cost: WorkloadCost = WorkloadCost()
     oversized: bool = False
 
@@ -54,6 +61,9 @@ class DynamicPackingPlanner:
             seq_len: int,
             local_batch_size: int,
             oversized_policy: OversizedPolicy = "error",
+            packing_budgets: Mapping[str, float] | None = None,
+            cost_model: CostModel | None = None,
+            validate: bool = True,
             min_balance_gain: float = 0.0,
     ) -> None:
         """Initialize fixed constructor dimensions.
@@ -63,6 +73,14 @@ class DynamicPackingPlanner:
             seq_len: Capacity of one packed sequence.
             local_batch_size: Packed sequences produced by each constructor.
             oversized_policy: ``error`` or explicit singleton overflow.
+            packing_budgets: Additive hard caps on each bin's named
+                ``SampleMetadata.packing_costs``; independent of cost estimates.
+            cost_model: Deterministic CPU callback evaluated only on the frozen
+                step samples. Defaults to their metadata-provided workload cost.
+            validate: Audit metadata types and generated plan membership/order.
+                Disable for trusted local packing; placement capacities still apply.
+            min_balance_gain: Minimum relative reduction in the maximum dominant
+                rank cost before replacing the canonical reference packing.
         """
         for name, value in (
                 ("data_parallel_size", data_parallel_size),
@@ -80,6 +98,11 @@ class DynamicPackingPlanner:
         self.seq_len = seq_len
         self.local_batch_size = local_batch_size
         self.oversized_policy = oversized_policy
+        self._validate = validate
+        self._constraints = PackingConstraints(seq_len, oversized_policy, packing_budgets)
+        self.cost_model = DefaultCostModel() if cost_model is None else cost_model
+        if not callable(self.cost_model):
+            raise ValueError("cost_model must be callable: SampleMetadata -> WorkloadCost.")
         self.min_balance_gain = float(min_balance_gain)
 
     @property
@@ -108,6 +131,7 @@ class DynamicPackingPlanner:
         Returns:
             Full plan containing exactly the selected sample keys.
         """
+        selection = self._estimate_selection(selection)
         ordered = self._validate_plan_request(selection, step)
         bins = [
             _MutableBin(data_rank=data_rank, pack_index=pack_index)
@@ -117,17 +141,19 @@ class DynamicPackingPlanner:
         rank_costs = [WorkloadCost() for _ in range(self.data_parallel_size)]
         bins, rank_costs = self._place_samples(selection, ordered, bins, rank_costs)
         candidate_rank_costs = list(rank_costs)
+        reference_bins = None
         reference_costs = None
         if self.min_balance_gain or os.environ.get("PR1371_COST_DEBUG"):
-            _, reference_costs = self._reference_bins_in_order(selection)
+            reference_bins, reference_costs = self._reference_bins_in_order(selection)
         reference_is_better = (
             self.min_balance_gain
-            and self._reference_is_better(selection, rank_costs)
+            and self._reference_is_better(reference_costs, rank_costs)
         )
         if reference_is_better:
-            bins, rank_costs = self._reference_bins_in_order(selection)
+            bins, rank_costs = reference_bins, reference_costs
         local_batches = self._freeze_bins(bins)
-        self._validate_conservation(local_batches, selection)
+        if self._validate:
+            self._validate_conservation(local_batches, selection)
         if os.environ.get("PR1371_COST_DEBUG"):
             ref_costs = reference_costs or []
             ref_max = max((cost.dominant for cost in ref_costs), default=0.0)
@@ -165,7 +191,28 @@ class DynamicPackingPlanner:
             seq_len=self.seq_len,
             local_batches=local_batches,
             rank_costs=tuple(rank_costs),
+            validate=self._validate,
         )
+
+    def _estimate_selection(self, selection: StepSampleSelection) -> StepSampleSelection:
+        """Attach balancing estimates without mutating the reader's metadata."""
+        if self._validate and not isinstance(selection, StepSampleSelection):
+            raise ValueError(f"selection must be StepSampleSelection, but got {type(selection)}.")
+        estimated_samples = []
+        for item in selection.samples:
+            cost = self.cost_model(item.metadata)
+            if self._validate and not isinstance(cost, WorkloadCost):
+                raise ValueError(f"cost_model must return WorkloadCost for sample {item.key}, but got {type(cost)}.")
+            # Physical metadata and membership are unchanged from the input.
+            # Only cost changes; do not replay recursive feature/key validation.
+            metadata = copy(item.metadata)
+            object.__setattr__(metadata, "cost", cost)
+            estimated_item = copy(item)
+            object.__setattr__(estimated_item, "metadata", metadata)
+            estimated_samples.append(estimated_item)
+        estimated_selection = copy(selection)
+        object.__setattr__(estimated_selection, "samples", tuple(estimated_samples))
+        return estimated_selection
 
     def _reference_bins_in_order(
             self, selection: StepSampleSelection,
@@ -184,9 +231,8 @@ class DynamicPackingPlanner:
         return bins, rank_costs
 
     def _reference_is_better(
-            self, selection: StepSampleSelection, balanced_costs: Sequence[WorkloadCost],
+            self, reference_costs: Sequence[WorkloadCost], balanced_costs: Sequence[WorkloadCost],
     ) -> bool:
-        _, reference_costs = self._reference_bins_in_order(selection)
         reference_max = max((cost.dominant for cost in reference_costs), default=0.0)
         balanced_max = max((cost.dominant for cost in balanced_costs), default=0.0)
         if reference_max <= 0.0:
@@ -199,10 +245,8 @@ class DynamicPackingPlanner:
             selection: StepSampleSelection,
             step: int,
     ) -> tuple[BufferedSampleMetadata, ...]:
-        if not isinstance(step, int) or isinstance(step, bool) or step < 0:
+        if self._validate and (not isinstance(step, int) or isinstance(step, bool) or step < 0):
             raise ValueError(f"step must be a non-negative integer, but got {step!r}.")
-        if not isinstance(selection, StepSampleSelection):
-            raise ValueError(f"selection must be StepSampleSelection, but got {type(selection)}.")
         if len(selection.reference_bins) != self.distributed_bin_count:
             raise ValueError(
                 f"Step selection expected {self.distributed_bin_count} reference bins, "
@@ -311,32 +355,21 @@ class DynamicPackingPlanner:
             self,
             candidates: Sequence[BufferedSampleMetadata],
     ) -> tuple[BufferedSampleMetadata, ...]:
-        if any(not isinstance(item, BufferedSampleMetadata) for item in candidates):
-            raise ValueError("Every planner candidate must be BufferedSampleMetadata.")
-        keys = [item.key for item in candidates]
-        if len(keys) != len(set(keys)):
-            raise ValueError("Planner candidates must have unique SampleKey values.")
-        oversized = [item for item in candidates if item.metadata.pack_tokens > self.seq_len]
-        if oversized and self.oversized_policy == "error":
-            first = min(oversized, key=lambda item: item.key)
-            raise ValueError(
-                f"Sample {first.key} requires {first.metadata.pack_tokens} tokens, exceeding seq_len={self.seq_len}. "
-                "Set oversized_policy='single' only when the packer supports singleton overflow."
-            )
-        return tuple(sorted(
-            candidates,
-            key=lambda item: (
-                -item.metadata.pack_tokens,
-                -item.metadata.cost.dominant,
-                -item.metadata.cost.total,
-                item.key,
-            ),
-        ))
+        for item in candidates:
+            self._constraints.validate_sample(item)
+        return tuple(sorted(candidates, key=self._ordering_key))
+
+    @staticmethod
+    def _ordering_key(item: BufferedSampleMetadata) -> tuple:
+        return (
+            -item.metadata.pack_tokens,
+            -item.metadata.cost.dominant,
+            -item.metadata.cost.total,
+            item.key,
+        )
 
     def _fits(self, packing_bin: _MutableBin, item: BufferedSampleMetadata) -> bool:
-        if packing_bin.oversized or item.metadata.pack_tokens > self.seq_len:
-            return False
-        return packing_bin.pack_tokens + item.metadata.pack_tokens <= self.seq_len
+        return self._constraints.fits(packing_bin.pack_tokens, packing_bin.packing_costs, item)
 
     def _placement_score(
             self,
@@ -372,8 +405,11 @@ class DynamicPackingPlanner:
             rank_costs: list[WorkloadCost],
             rank_tokens: list[int],
     ) -> None:
+        if not self._fits(packing_bin, item):
+            raise ValueError(f"Sample {item.key} cannot fit within this bin's token and stage budgets.")
         packing_bin.samples.append(item)
         packing_bin.pack_tokens += item.metadata.pack_tokens
+        packing_bin.packing_costs = self._constraints.add_costs(packing_bin.packing_costs, item)
         packing_bin.cost = packing_bin.cost + item.metadata.cost
         packing_bin.oversized = packing_bin.pack_tokens > self.seq_len
         data_rank = packing_bin.data_rank
@@ -394,6 +430,7 @@ class DynamicPackingPlanner:
                     sample_keys=tuple(item.key for item in packing_bin.samples),
                     pack_tokens=packing_bin.pack_tokens,
                     oversized=packing_bin.oversized,
+                    validate=self._validate,
                 ))
             local_batches.append(tuple(rank_bins))
         return tuple(local_batches)
@@ -436,4 +473,138 @@ class DynamicPackingPlanner:
         return hashlib.sha256(encoded).hexdigest()[:24]
 
 
-__all__ = ["DynamicPackingPlanner", "OversizedPolicy"]
+class LPTPackingPlanner(DynamicPackingPlanner):
+    """Balance backbone FLOPs with capacity-constrained longest-processing-time.
+
+    ``WorkloadCost.llm`` is the only balancing objective; other workload stages
+    do not affect ordering or placement. Token and named packing budgets remain
+    hard constraints. Reference bins must be rank-major, with exactly
+    ``local_batch_size`` consecutive bins belonging to each input data rank.
+
+    ``balance`` compares variance, load range, then maximum load (the default).
+    ``makespan`` compares maximum load first, then variance and load range.
+    The original rank-local packing is retained if greedy repacking fails or
+    does not improve the selected objective. A mere permutation of the same
+    rank loads therefore never causes an exchange. Both modes are heuristics,
+    not globally optimal schedulers.
+    """
+
+    def __init__(
+            self,
+            *,
+            data_parallel_size: int,
+            seq_len: int,
+            local_batch_size: int,
+            oversized_policy: OversizedPolicy = "error",
+            packing_budgets: Mapping[str, float] | None = None,
+            cost_model: CostModel | None = None,
+            validate: bool = True,
+            min_balance_gain: float = 0.0,
+            objective: Literal["balance", "makespan"] = "balance",
+    ) -> None:
+        """Initialize capacity-constrained LPT and its plan-selection objective.
+
+        Args:
+            data_parallel_size: Independent DP ranks to balance.
+            seq_len: Token capacity of one packed sequence.
+            local_batch_size: Packed sequences produced by each rank.
+            oversized_policy: ``error`` or explicit singleton overflow.
+            packing_budgets: Additive hard caps independent of workload estimates.
+            cost_model: CPU callback estimating per-sample workload.
+            validate: Audit metadata and output plans; capacities always apply.
+            min_balance_gain: Additional inherited maximum-dominant-cost gain gate.
+            objective: ``balance`` for similar loads, or ``makespan`` to prioritize
+                the lowest maximum estimated backbone cost across ranks.
+        """
+        if objective not in ("balance", "makespan"):
+            raise ValueError("objective must be 'balance' or 'makespan'.")
+        super().__init__(
+            data_parallel_size=data_parallel_size,
+            seq_len=seq_len,
+            local_batch_size=local_batch_size,
+            oversized_policy=oversized_policy,
+            packing_budgets=packing_budgets,
+            cost_model=cost_model,
+            validate=validate,
+            min_balance_gain=min_balance_gain,
+        )
+        self.objective = objective
+
+    @staticmethod
+    def _ordering_key(item: BufferedSampleMetadata) -> tuple:
+        return (-item.metadata.cost.llm, -item.metadata.pack_tokens, item.key)
+
+    def _placement_score(
+            self,
+            packing_bin: _MutableBin,
+            item: BufferedSampleMetadata,
+            rank_costs: Sequence[WorkloadCost],
+            rank_tokens: Sequence[int],
+            *,
+            seeding: bool,
+    ) -> tuple[float, ...]:
+        data_rank = packing_bin.data_rank
+        remaining_capacity = self.seq_len - min(
+            self.seq_len, packing_bin.pack_tokens + item.metadata.pack_tokens,
+        )
+        # The item has the same cost on every rank. Choosing the lightest
+        # feasible rank minimizes both the next peak load and variance increase.
+        # The objectives differ when accepting a completed constrained plan.
+        return (
+            rank_costs[data_rank].llm,
+            float(remaining_capacity),
+            float(rank_tokens[data_rank]),
+            float(data_rank),
+            float(packing_bin.pack_index),
+        )
+
+    def _place_samples(
+            self,
+            selection: StepSampleSelection,
+            ordered: Sequence[BufferedSampleMetadata],
+            bins: list[_MutableBin],
+            rank_costs: list[WorkloadCost],
+    ) -> tuple[list[_MutableBin], list[WorkloadCost]]:
+        reference_bins, reference_costs = self._place_reference_bins(selection)
+        bins, rank_costs = super()._place_samples(selection, ordered, bins, rank_costs)
+        # Use the same scale for both candidates so normalization cannot change
+        # which raw FLOPs variance is smaller, even for very large cost units.
+        scale = max((cost.llm for cost in (*reference_costs, *rank_costs)), default=0.0)
+        if self._objective_score(rank_costs, scale) < self._objective_score(reference_costs, scale):
+            return bins, rank_costs
+        return reference_bins, reference_costs
+
+    def _place_reference_bins(
+            self,
+            selection: StepSampleSelection,
+    ) -> tuple[list[_MutableBin], list[WorkloadCost]]:
+        """Keep the exact pre-balancing ownership, grouping, and sample order."""
+        samples_by_key = {item.key: item for item in selection.samples}
+        rank_costs = [WorkloadCost() for _ in range(self.data_parallel_size)]
+        rank_tokens = [0 for _ in range(self.data_parallel_size)]
+        bins = []
+        for index, key_bin in enumerate(selection.reference_bins):
+            data_rank, pack_index = divmod(index, self.local_batch_size)
+            packing_bin = _MutableBin(data_rank=data_rank, pack_index=pack_index)
+            for key in key_bin:
+                self._place(packing_bin, samples_by_key[key], rank_costs, rank_tokens)
+            bins.append(packing_bin)
+        return bins, rank_costs
+
+    @staticmethod
+    def _imbalance_score(rank_costs: Sequence[WorkloadCost], scale: float) -> tuple[float, ...]:
+        if scale == 0.0:
+            return (0.0, 0.0, 0.0)
+        loads = [cost.llm / scale for cost in rank_costs]
+        mean = math.fsum(loads) / len(loads)
+        variance = math.fsum((load - mean) ** 2 for load in loads) / len(loads)
+        return (variance, max(loads) - min(loads), max(loads))
+
+    def _objective_score(self, rank_costs: Sequence[WorkloadCost], scale: float) -> tuple[float, ...]:
+        variance, spread, peak = self._imbalance_score(rank_costs, scale)
+        if self.objective == "makespan":
+            return (peak, variance, spread)
+        return (variance, spread, peak)
+
+
+__all__ = ["DynamicPackingPlanner", "LPTPackingPlanner", "OversizedPolicy"]

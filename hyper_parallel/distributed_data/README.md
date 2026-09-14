@@ -603,3 +603,10 @@ balancing unit.
   Every training rank must save and restore its own loader state.
 - Elastic resharding and structured zero-copy tensor transport are separate
   extensions.
+
+## Buffered node-local balancing
+
+For automatic Host/H2D double buffering around an existing rank-local loader,
+v1 cost estimation, Gloo node-local LPT balancing and rank-zero DP logs, see
+[the reference configuration](NODE_LOCAL_BALANCING.md). This is a separate
+opt-in builder; the native pipeline and its checkpoint path above are unchanged.

@@ -408,10 +408,12 @@ def _create_model_parallel_process_groups(topology: DataTopology, cpu_backend: s
     return model_parallel_group
 
 
-def _encode_payload_segment(items: Sequence[tuple[SampleKey, Any]]) -> bytes:
-    """Serialize one target route with an integrity digest."""
+def _encode_payload_segment(items: Sequence[tuple[SampleKey, Any]], *, validate: bool = True) -> bytes:
+    """Serialize one target route, optionally with integrity validation."""
     if not items:
         return b""
+    if not validate:
+        return pickle.dumps(tuple(items), protocol=pickle.HIGHEST_PROTOCOL)
     keys = [key for key, _ in items]
     if any(not isinstance(key, SampleKey) for key in keys) or len(keys) != len(set(keys)):
         raise ValueError("A payload segment must contain unique SampleKey values.")
@@ -420,10 +422,12 @@ def _encode_payload_segment(items: Sequence[tuple[SampleKey, Any]]) -> bytes:
     return _FRAME_MAGIC + digest + payload
 
 
-def _decode_payload_segment(frame: bytes) -> tuple[tuple[SampleKey, Any], ...]:
-    """Validate and deserialize one target route."""
+def _decode_payload_segment(frame: bytes, *, validate: bool = True) -> tuple[tuple[SampleKey, Any], ...]:
+    """Deserialize one target route using its selected validation mode."""
     if not frame:
         return ()
+    if not validate:
+        return pickle.loads(frame)
     header_size = len(_FRAME_MAGIC) + _DIGEST_SIZE
     if len(frame) < header_size or frame[:len(_FRAME_MAGIC)] != _FRAME_MAGIC:
         raise ValueError("Distributed sample payload has an invalid frame header.")
@@ -472,17 +476,25 @@ def _allocate_received_tensor(
         raise ValueError(f"Payload receive allocation failed: {type(exc).__name__}: {exc}") from exc
 
 
-def _decode_received_payloads(received_bytes: bytes, output_splits: Sequence[int]) -> dict[SampleKey, Any]:
+def _decode_received_payloads(
+        received_bytes: bytes,
+        output_splits: Sequence[int],
+        *,
+        validate: bool = True,
+) -> dict[SampleKey, Any]:
     payloads: dict[SampleKey, Any] = {}
     cursor = 0
     for segment_size in output_splits:
-        segment_items = _decode_payload_segment(received_bytes[cursor:cursor + segment_size])
-        for key, payload in segment_items:
-            if key in payloads:
-                raise ValueError(f"Data Constructor received duplicate payload for {key}.")
-            payloads[key] = payload
+        segment_items = _decode_payload_segment(received_bytes[cursor:cursor + segment_size], validate=validate)
+        if validate:
+            for key, payload in segment_items:
+                if key in payloads:
+                    raise ValueError(f"Data Constructor received duplicate payload for {key}.")
+                payloads[key] = payload
+        else:
+            payloads.update(segment_items)
         cursor += segment_size
-    if cursor != len(received_bytes):
+    if validate and cursor != len(received_bytes):
         raise ValueError("Sample all-to-all returned trailing payload bytes.")
     return payloads
 
@@ -523,16 +535,18 @@ class DataPlaneTransport:
         """Return the rank-local accelerator used by payload collectives."""
         return self._communication_device
 
-    def all_gather_object(self, value: Any) -> tuple[Any, ...]:
+    def all_gather_object(self, value: Any, *, validate: bool = True) -> tuple[Any, ...]:
         """Gather small control objects on every data-plane rank.
 
         Args:
             value: Rank-local control value.
+            validate: Whether to check process-group membership before gathering.
 
         Returns:
             Values in data-plane rank order.
         """
-        self._require_member()
+        if validate:
+            self._require_member()
         if len(self._ranks) == 1:
             return (value,)
         gathered = [None] * len(self._ranks)
@@ -573,18 +587,20 @@ class DataPlaneTransport:
         )
         return tuple(gathered) if gathered is not None else None
 
-    def broadcast_from_planner(self, value: Any) -> Any:
+    def broadcast_from_planner(self, value: Any, *, validate: bool = True) -> Any:
         """Broadcast one control object from the configured Planner.
 
         Args:
             value: Planner value or a placeholder on other ranks.
+            validate: Whether to check process-group and singleton planner membership.
 
         Returns:
             The Planner value on every data-plane rank.
         """
-        self._require_member()
+        if validate:
+            self._require_member()
         if len(self._ranks) == 1:
-            if self._global_rank != self._planner_rank:
+            if validate and self._global_rank != self._planner_rank:
                 raise ValueError("A singleton data plane must contain the Planner rank.")
             return value
         payload = [value if self._global_rank == self._planner_rank else None]
@@ -594,20 +610,25 @@ class DataPlaneTransport:
     def prepare_exchange(
             self,
             outgoing: Mapping[int, Sequence[tuple[SampleKey, Any]]],
+            *,
+            validate: bool = True,
     ) -> PreparedPayloadExchange:
         """Serialize and allocate the send buffer before collective entry.
 
         Args:
             outgoing: Per-target sample keys and payloads.
+            validate: Whether to check routes and frame payloads with a checksum.
+                Must match ``exchange_prepared`` on all participating ranks.
 
         Returns:
             Serialized payload splits and their send tensor.
         """
-        self._require_member()
-        unexpected = set(outgoing) - set(self._ranks)
-        if unexpected:
-            raise ValueError(f"Payload routes target ranks outside the data plane: {sorted(unexpected)}.")
-        segments = tuple(_encode_payload_segment(outgoing.get(rank, ())) for rank in self._ranks)
+        if validate:
+            self._require_member()
+            unexpected = set(outgoing) - set(self._ranks)
+            if unexpected:
+                raise ValueError(f"Payload routes target ranks outside the data plane: {sorted(unexpected)}.")
+        segments = tuple(_encode_payload_segment(outgoing.get(rank, ()), validate=validate) for rank in self._ranks)
         input_splits = tuple(len(segment) for segment in segments)
         send_storage = bytearray(sum(input_splits))
         cursor = 0
@@ -628,30 +649,46 @@ class DataPlaneTransport:
             local_segment=segments[local_index],
         )
 
-    def exchange_prepared(self, prepared: PreparedPayloadExchange) -> dict[SampleKey, Any]:
-        """Exchange framed sample payloads with variable-split payload A2A.
+    def exchange_prepared(
+            self,
+            prepared: PreparedPayloadExchange,
+            *,
+            validate: bool = True,
+    ) -> dict[SampleKey, Any]:
+        """Exchange serialized sample payloads with variable-split payload A2A.
 
         Args:
             prepared: Preallocated payload exchange state.
+            validate: Whether to validate routing, payloads, and receive
+                allocation sizes. Must match ``prepare_exchange`` on all ranks.
+                Local failures propagate without notifying peers.
 
         Returns:
             Received payloads keyed by their source identities.
         """
-        self._require_member()
-        if not isinstance(prepared, PreparedPayloadExchange) or len(prepared.input_splits) != len(self._ranks):
-            raise ValueError(f"Expected a prepared exchange for {len(self._ranks)} data-plane ranks.")
+        if validate:
+            self._require_member()
+            if not isinstance(prepared, PreparedPayloadExchange) or len(prepared.input_splits) != len(self._ranks):
+                raise ValueError(f"Expected a prepared exchange for {len(self._ranks)} data-plane ranks.")
         if len(self._ranks) == 1:
-            return dict(_decode_payload_segment(prepared.local_segment))
-        if self._payload_group is None:
+            return dict(_decode_payload_segment(prepared.local_segment, validate=validate))
+        if validate and self._payload_group is None:
             raise ValueError("Sample payload exchange requires a payload process group.")
 
         input_splits = list(prepared.input_splits)
         output_splits = _exchange_payload_sizes(input_splits, self._control_group)
-        received_tensor = _allocate_received_tensor(
-            output_splits,
-            prepared.send_tensor,
-            len(self._ranks),
-        )
+        if validate:
+            received_tensor = _allocate_received_tensor(
+                output_splits,
+                prepared.send_tensor,
+                len(self._ranks),
+            )
+        else:
+            received_tensor = torch.empty(
+                (sum(output_splits),),
+                dtype=torch.uint8,
+                device=prepared.send_tensor.device,
+            )
         data_work = dist.all_to_all_single(
             received_tensor,
             prepared.send_tensor,
@@ -663,7 +700,7 @@ class DataPlaneTransport:
         if data_work is not None:
             data_work.wait()
         received_bytes = received_tensor.cpu().numpy().tobytes()
-        return _decode_received_payloads(received_bytes, output_splits)
+        return _decode_received_payloads(received_bytes, output_splits, validate=validate)
 
     def _require_member(self) -> None:
         if not self._is_member:

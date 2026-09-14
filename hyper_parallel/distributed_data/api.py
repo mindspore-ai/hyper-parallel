@@ -38,7 +38,7 @@ from hyper_parallel.distributed_data.data_constructor import (
 )
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner, OversizedPolicy
-from hyper_parallel.distributed_data.schema import SampleMetadata
+from hyper_parallel.distributed_data.schema import PackingConstraints, SampleMetadata
 from hyper_parallel.distributed_data.metadata import MetadataReader, PlannedSampleLoader
 from hyper_parallel.distributed_data.dataset_reader import _validate_worker_options
 from hyper_parallel.distributed_data.step_sample_selection import StepSampleSelector
@@ -118,6 +118,10 @@ class DistributedDatasetConfig:
         payload_backend: Optional payload A2A backend. With an
             accelerator communication device, the WORLD backend is used by default;
             otherwise this falls back to ``cpu_backend``.
+        packing_budgets: Optional per-packed-sequence additive hard limits for
+            ``build_local_balancing_dataloader``. Each configured stage must
+            occur in every sample's packing_costs. These limits are independent
+            of cost-model balancing scores.
     """
 
     seq_len: int
@@ -140,6 +144,7 @@ class DistributedDatasetConfig:
     min_balance_gain: float = 0.0
     cpu_backend: str = "gloo"
     payload_backend: str | None = None
+    packing_budgets: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         """Validate topology-independent configuration boundaries."""
@@ -151,6 +156,7 @@ class DistributedDatasetConfig:
         self._validate_name_tuple(self.dp_dim_names, "dp_dim_names")
         self._validate_planner_rank()
         self._validate_backends()
+        PackingConstraints(self.seq_len, self.oversized_policy, self.packing_budgets)
 
     def _validate_integer_fields(self) -> None:
         for name in ("seq_len", "local_batch_size", "max_buffered_samples"):
@@ -378,6 +384,10 @@ def _config_fingerprint(
         uses_default_collate: bool,
 ) -> str:
     stable_config = asdict(config)
+    if config.packing_budgets is None:
+        stable_config.pop("packing_budgets")
+    else:
+        stable_config["packing_budgets"] = tuple(sorted(config.packing_budgets.items()))
     for name in _CONFIG_DATALOADER_KWARGS:
         stable_config.pop(name)
     stable_config["dataloader_options"] = dataloader_fingerprint

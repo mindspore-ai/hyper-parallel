@@ -15,32 +15,54 @@
 """Dataset Reader, Planner, and Data Constructor distributed data pipeline."""
 
 from hyper_parallel.distributed_data.api import DistributedDatasetConfig, build_distributed_dataloader
+from hyper_parallel.distributed_data.balance_logging import format_balance_stats, log_balance_stats
+from hyper_parallel.distributed_data.cost_model import BackboneFlopsConfig, CostModel, DefaultCostModel
 from hyper_parallel.distributed_data.data_constructor import default_collate_fn, default_pack_fn
-from hyper_parallel.distributed_data.indexed_text import collate_indexed_text_sequences, pack_indexed_text_samples
-from hyper_parallel.distributed_data.device_prefetch import DeviceBatchPrefetcher
+from hyper_parallel.distributed_data.device_prefetch import (
+    DeviceBatchPrefetcher,
+    DevicePrefetchedStep,
+    DeviceStepPrefetcher,
+)
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
+from hyper_parallel.distributed_data.indexed_text import collate_indexed_text_sequences, pack_indexed_text_samples
+from hyper_parallel.distributed_data.locality import create_locality_groups
+from hyper_parallel.distributed_data.packed_balancing import LocalBalancingDataLoader, build_local_balancing_dataloader
+from hyper_parallel.distributed_data.planner import LPTPackingPlanner
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
     DistributedPackingPlan,
     PackingBinPlan,
+    PackingConstraints,
     SampleKey,
     SampleMetadata,
     WorkloadCost,
 )
 
 __all__ = [
+    "BackboneFlopsConfig",
     "BufferedSampleMetadata",
+    "CostModel",
+    "DefaultCostModel",
     "DeviceBatchPrefetcher",
+    "DevicePrefetchedStep",
+    "DeviceStepPrefetcher",
     "DistributedDataLoader",
     "DistributedDatasetConfig",
     "DistributedPackingPlan",
+    "LocalBalancingDataLoader",
+    "LPTPackingPlanner",
     "PackingBinPlan",
+    "PackingConstraints",
     "SampleKey",
     "SampleMetadata",
     "WorkloadCost",
     "build_distributed_dataloader",
+    "build_local_balancing_dataloader",
     "collate_indexed_text_sequences",
+    "create_locality_groups",
     "default_collate_fn",
     "default_pack_fn",
+    "format_balance_stats",
+    "log_balance_stats",
     "pack_indexed_text_samples",
 ]
