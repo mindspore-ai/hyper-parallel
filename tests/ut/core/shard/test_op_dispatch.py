@@ -888,6 +888,11 @@ class TestRandomOpReturnsSelf(unittest.TestCase):
 
         self.assertFalse(OpDispatcher._random_op_returns_self("InplaceAddExt", (), {}))
 
+    def test_erfinv_inplace_bypasses_layout_dispatch(self):
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        self.assertIn("erfinv_", OpDispatcher._INPLACE_BYPASS_OPS)
+
     def test_func_dropout_ext_inplace_via_args(self):
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
 
