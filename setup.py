@@ -201,7 +201,7 @@ if __name__ == '__main__':
     }
     setup(
         name='hyper_parallel',
-        version='0.1.0',
+        version='1.0.0',
         author='The MindSpore Authors',
         author_email='contact@mindspore.cn',
         url='https://www.mindspore.cn',
