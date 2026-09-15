@@ -237,7 +237,6 @@ class TestDeviceBatchPrefetcher(unittest.TestCase):
                 seq_len=8,
                 local_batch_size=1,
                 buffer_size_multiplier=1.0,
-                max_buffered_samples=1,
                 double_buffer=True,
             ),
             metadata_fn=metadata_fn,

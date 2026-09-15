@@ -124,7 +124,6 @@ class DistributedDataLoader(Iterator[Any]):
             data_constructor: PackingDataConstructor,
             data_plane: DataPlaneTransport,
             model_transport: ModelParallelTransport,
-            max_buffered_samples: int,
             double_buffer: bool,
             config_fingerprint: str,
             batch_sampler_mode: bool = False,
@@ -155,7 +154,6 @@ class DistributedDataLoader(Iterator[Any]):
         self._data_constructor = data_constructor
         self._data_plane = data_plane
         self._model_transport = model_transport
-        self._max_buffered_samples = max_buffered_samples
         self._double_buffer = double_buffer
         self._config_fingerprint = config_fingerprint
         self._batch_sampler_mode = batch_sampler_mode
@@ -601,11 +599,7 @@ class DistributedDataLoader(Iterator[Any]):
             raise ValueError(f"Dataset Reader rank {self._topology.global_rank} did not provide its reader.")
 
         # Step sources own membership; token targets must not pull a future step.
-        planning_reader.fill(
-            min_samples=1,
-            min_tokens=1,
-            max_samples=self._max_buffered_samples,
-        )
+        planning_reader.prepare_next_step()
         return _ReaderSnapshot(
             rank=self._topology.global_rank,
             exhausted=planning_reader.exhausted,

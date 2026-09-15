@@ -98,8 +98,6 @@ class DistributedDatasetConfig:
             Data Constructor rank.
         buffer_size_multiplier: Legacy compatibility option. Step boundaries
             are supplied by BatchSampler or external readers, not read-ahead.
-        max_buffered_samples: Limit forwarded to external readers' fill method.
-            Native BatchSampler ignores this limit and emits its complete batch.
         oversized_policy: ``error`` by default; ``single`` explicitly permits
             one oversized sample to occupy a bin alone.
         drop_last: Whether to drop a tail with fewer than one sample per global
@@ -132,7 +130,6 @@ class DistributedDatasetConfig:
     dataset_already_sharded: bool = False
     planner_rank: int | None = None
     buffer_size_multiplier: float = 2.0
-    max_buffered_samples: int = 10_000
     oversized_policy: OversizedPolicy = "error"
     drop_last: bool = True
     shuffle: bool = False
@@ -160,7 +157,7 @@ class DistributedDatasetConfig:
         PackingConstraints(self.seq_len, self.oversized_policy, self.packing_budgets)
 
     def _validate_integer_fields(self) -> None:
-        for name in ("seq_len", "local_batch_size", "max_buffered_samples"):
+        for name in ("seq_len", "local_batch_size"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
@@ -520,7 +517,7 @@ def _configure_external_step_reader(
         if not state.is_reader:
             raise ValueError("external_step_reader may only be provided on Dataset Reader ranks.")
         required_methods = (
-            "fill",
+            "prepare_next_step",
             "metadata",
             "selected_payloads",
             "commit",
@@ -529,7 +526,7 @@ def _configure_external_step_reader(
             "set_epoch",
         )
         missing = [name for name in required_methods if not callable(getattr(external_step_reader, name, None))]
-        for name in ("exhausted", "batch_position", "reference_bins"):
+        for name in ("exhausted", "reference_bins"):
             if not hasattr(external_step_reader, name):
                 missing.append(name)
         if missing:
@@ -774,10 +771,9 @@ def build_distributed_dataloader(
             not through the sampler's speculative prefetch cursor.
         external_step_reader: Required for online mode without ``batch_sampler``. It is a
             rank-local external producer that must
-            expose ``fill``, ``metadata``, ``reference_bins``,
-            ``selected_payloads``, ``commit``, ``exhausted``,
-            ``batch_position``, and checkpoint/epoch methods.
-            One call to ``fill`` supplies exactly one already-selected local
+            expose ``prepare_next_step``, ``metadata``, ``reference_bins``,
+            ``selected_payloads``, ``commit``, ``exhausted``, and checkpoint/epoch methods.
+            One call to ``prepare_next_step`` supplies exactly one already-selected local
             step. HP preserves that step's union and only rebalances its target
             ranks.
 
@@ -869,7 +865,6 @@ def _build_distributed_dataloader_impl(
             communication_device=state.communication_device,
         ),
         model_transport=ModelParallelTransport(state.topology, groups),
-        max_buffered_samples=config.max_buffered_samples,
         double_buffer=config.double_buffer,
         config_fingerprint=state.config_fingerprint,
     )

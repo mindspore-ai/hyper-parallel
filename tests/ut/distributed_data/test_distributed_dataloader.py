@@ -41,7 +41,7 @@ class _StepReader:
         self.position = 0
         self.exhausted = False
         self.reference_bins = ()
-        self.fill_calls = 0
+        self.prepare_calls = 0
         self.payloads = {}
 
     @property
@@ -49,9 +49,9 @@ class _StepReader:
         """Return the committed local-step cursor."""
         return self.position
 
-    def fill(self, **_targets: int) -> None:
+    def prepare_next_step(self) -> None:
         """Expose a whole pending step without consuming a future one."""
-        self.fill_calls += 1
+        self.prepare_calls += 1
         if self.reference_bins or self.exhausted:
             return
         if self.position == len(self.steps):
@@ -228,12 +228,12 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         Expectation: Each fill exposes one whole step regardless of read-ahead settings.
         """
         reader = _StepReader(_steps())
-        loader = _external_loader(reader, buffer_size_multiplier=1e308, max_buffered_samples=1)
+        loader = _external_loader(reader, buffer_size_multiplier=1e308)
         for position in range(3):
             batch = next(loader)
             self.assertEqual(sorted(sample["id"] for row in batch for sample in row),
                              [position * 2, position * 2 + 1])
-            self.assertEqual(reader.fill_calls, position + 1)
+            self.assertEqual(reader.prepare_calls, position + 1)
         self.assertFalse(hasattr(loader, "_step_sample_selector"))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
@@ -246,7 +246,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         loader = _external_loader(reader)
         with self.assertRaisesRegex(ValueError, "emitted 0 local packs"):
             next(loader)
-        self.assertEqual(reader.fill_calls, 1)
+        self.assertEqual(reader.prepare_calls, 1)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_planner_exception_propagates_before_broadcast(self) -> None:

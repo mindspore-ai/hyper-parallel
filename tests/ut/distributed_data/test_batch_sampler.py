@@ -205,7 +205,7 @@ class TestNativeBatchSampler(unittest.TestCase):
             policy_fingerprint=native_sampler_fingerprint(sampler, data_rank=0, dp_size=1, local_batch_size=2),
             metadata=[SampleMetadata(1)] * 10, metadata_fn=None, sample_loader=None,
         )
-        self.assertIsNone(reader.fill(min_samples=99, min_tokens=999, max_samples=100))
+        self.assertIsNone(reader.prepare_next_step())
         saved = copy.deepcopy(reader.state_dict())
         self.assertEqual(saved["sampler"]["consumed_samples"], 0)
         with self.assertRaisesRegex(ValueError, "complete pending"):

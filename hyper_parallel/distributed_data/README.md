@@ -50,7 +50,7 @@ should contain; there is no refill/`attempt` loop.
   including special tokens and reserved image placeholders. If sample-level
   placement fails, the Planner falls back to the known-feasible reference bins.
 - `buffer_size_multiplier` remains accepted for compatibility but does not affect
-  these paths. `max_buffered_samples` is forwarded to external readers; native
+  these paths. External readers prepare one complete local step; native
   BatchSampler always emits its complete batch.
 
 ## Public API
@@ -425,9 +425,9 @@ loader = build_distributed_dataloader(
 )
 ```
 
-The Reader exposes `fill`, `metadata`, `reference_bins`, `selected_payloads`,
-`commit`, `exhausted`, `batch_position`, `state_dict`, `load_state_dict`, and
-`set_epoch`. Each fill produces **one complete local step**, not a read-ahead
+The Reader exposes `prepare_next_step`, `metadata`, `reference_bins`, `selected_payloads`,
+`commit`, `exhausted`, `state_dict`, `load_state_dict`, and `set_epoch`. Each
+`prepare_next_step` produces **one complete local step**, not a read-ahead
 candidate window. HP does not apply a second stride or manage this external
 producer's DataLoader workers; configure those on the producer itself.
 `metadata` and `metadata_fn` must be omitted because the Reader owns extraction.

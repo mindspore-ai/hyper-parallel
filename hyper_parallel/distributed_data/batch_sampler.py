@@ -123,9 +123,8 @@ class BatchSamplerReader:
         """Return the native global cursor before this pending round."""
         return self._committed_state["consumed_samples"]
 
-    def fill(self, *, min_samples: int, min_tokens: int, max_samples: int) -> None:
-        """Prepare exactly one sampler yield, ignoring dynamic-packing targets."""
-        del min_samples, min_tokens, max_samples
+    def prepare_next_step(self) -> None:
+        """Prepare exactly one sampler yield for the next distributed step."""
         if self._buffer or self._exhausted:
             return None
         try:
