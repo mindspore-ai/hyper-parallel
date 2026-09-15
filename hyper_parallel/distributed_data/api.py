@@ -528,9 +528,10 @@ def _configure_external_step_reader(
             "set_epoch",
         )
         missing = [name for name in required_methods if not callable(getattr(external_step_reader, name, None))]
-        for name in ("exhausted", "reference_bins"):
-            if not hasattr(external_step_reader, name):
-                missing.append(name)
+        if not hasattr(external_step_reader, "exhausted"):
+            missing.append("exhausted")
+        if not any(hasattr(external_step_reader, name) for name in ("original_metadatas", "reference_bins")):
+            missing.append("original_metadatas")
         if missing:
             raise ValueError(f"external_step_reader is missing methods: {missing}")
         state.dataset_reader = external_step_reader
@@ -881,7 +882,7 @@ def build_distributed_dataloader(
             not through the sampler's speculative prefetch cursor.
         external_step_reader: Required for online mode without ``batch_sampler``. It is a
             legacy rank-local Reader that must
-            expose ``prepare_next_step``, ``metadata``, ``reference_bins``,
+            expose ``prepare_next_step``, ``metadata``, ``original_metadatas`` (or legacy ``reference_bins``),
             ``selected_payloads``, ``commit``, ``exhausted``, and checkpoint/epoch methods.
             One call to ``prepare_next_step`` supplies exactly one already-selected local
             step. HP preserves that step's union and only rebalances its target

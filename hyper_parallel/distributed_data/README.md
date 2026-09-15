@@ -468,13 +468,14 @@ loader = build_distributed_dataloader(
 )
 ```
 
-The legacy Reader exposes `prepare_next_step`, `metadata`, `reference_bins`,
+The legacy Reader exposes `prepare_next_step`, `metadata`, `original_metadatas`,
 `selected_payloads`, `commit`, `exhausted`, `state_dict`, `load_state_dict`,
 and `set_epoch`. Each `prepare_next_step` produces **one complete local step**,
 not a read-ahead candidate window. HP does not apply a second stride or manage
 this external producer's DataLoader workers; configure those on the producer
 itself. `metadata` and `metadata_fn` must be omitted because the legacy Reader
-owns extraction.
+owns extraction. `original_metadatas` groups sample metadata by the source's
+original packs; the legacy attribute name `reference_bins` is also accepted.
 
 The default packer and collator preserve the structure as a tuple of bins,
 each containing the raw samples. Custom callbacks must be consistent across

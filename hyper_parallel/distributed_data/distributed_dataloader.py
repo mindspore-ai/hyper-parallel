@@ -50,7 +50,7 @@ class _ReaderSnapshot:
     metadata: tuple[BufferedSampleMetadata, ...]
     # External-step readers provide the legacy producer's already selected
     # local pack boundaries. Native BatchSampler uses singleton bins instead.
-    reference_bins: tuple[tuple[BufferedSampleMetadata, ...], ...] = ()
+    original_metadatas: tuple[tuple[BufferedSampleMetadata, ...], ...] = ()
 
 
 _PREFETCH_PENDING = object()
@@ -595,7 +595,7 @@ class DistributedDataLoader(Iterator[Any]):
                 rank=self._topology.global_rank,
                 exhausted=True,
                 metadata=(),
-                reference_bins=(),
+                original_metadatas=(),
             )
         planning_reader = self._planning_reader()
         if planning_reader is None:
@@ -603,11 +603,14 @@ class DistributedDataLoader(Iterator[Any]):
 
         # Step sources own membership; token targets must not pull a future step.
         planning_reader.prepare_next_step()
+        original_metadatas = getattr(planning_reader, "original_metadatas", None)
+        if original_metadatas is None:
+            original_metadatas = getattr(planning_reader, "reference_bins", ())
         return _ReaderSnapshot(
             rank=self._topology.global_rank,
             exhausted=planning_reader.exhausted,
             metadata=planning_reader.metadata(),
-            reference_bins=tuple(getattr(planning_reader, "reference_bins", ())),
+            original_metadatas=tuple(original_metadatas),
         )
 
     def _build_plan_control(self, snapshots: tuple[Any, ...]) -> DistributedPackingPlan | None:
@@ -652,7 +655,7 @@ class DistributedDataLoader(Iterator[Any]):
 
         Each Dataset Reader has already run its local VeOmni selector for the
         current step.  We preserve that union and let the HP planner only
-        change target-rank placement.  The reference bins are used solely to
+        change target-rank placement.  The original metadata groups are used to
         validate that every local producer emitted the expected number of
         packs; the planner is still free to repack the frozen samples.
         """
@@ -664,14 +667,14 @@ class DistributedDataLoader(Iterator[Any]):
         if any(snapshot.exhausted for snapshot in reader_snapshots):
             raise ValueError("External-step readers exhausted at different forward/backward steps.")
         expected_bins = self._planner.distributed_bin_count
-        reference_bins = tuple(
+        original_metadatas = tuple(
             packing_bin
             for snapshot in sorted(reader_snapshots, key=lambda item: item.rank)
-            for packing_bin in snapshot.reference_bins
+            for packing_bin in snapshot.original_metadatas
         )
-        if len(reference_bins) != expected_bins:
+        if len(original_metadatas) != expected_bins:
             raise ValueError(
-                f"External-step producers emitted {len(reference_bins)} local packs, "
+                f"External-step producers emitted {len(original_metadatas)} local packs, "
                 f"expected {expected_bins}."
             )
         samples = tuple(
@@ -692,7 +695,7 @@ class DistributedDataLoader(Iterator[Any]):
             samples=external_samples,
             reference_bins=tuple(
                 tuple(item.key for item in packing_bin)
-                for packing_bin in reference_bins
+                for packing_bin in original_metadatas
             ),
         )
 

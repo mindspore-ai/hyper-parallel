@@ -97,7 +97,7 @@ class ExternalStepAdapter:
         self._exhausted = False
         self._buffer: tuple[BufferedSampleMetadata, ...] = ()
         self._payloads: dict[SampleKey, Any] = {}
-        self._reference_bins: tuple[tuple[BufferedSampleMetadata, ...], ...] = ()
+        self._original_metadatas: tuple[tuple[BufferedSampleMetadata, ...], ...] = ()
         self._original_step_samples: tuple[tuple[Any, ...], ...] = ()
 
     @property
@@ -116,9 +116,9 @@ class ExternalStepAdapter:
         return self._step
 
     @property
-    def reference_bins(self) -> tuple[tuple[BufferedSampleMetadata, ...], ...]:
-        """Return the source's current reference bins."""
-        return self._reference_bins
+    def original_metadatas(self) -> tuple[tuple[BufferedSampleMetadata, ...], ...]:
+        """Return metadata grouped by the source step's original packs."""
+        return self._original_metadatas
 
     def prepare_next_step(self) -> None:
         """Read and stage exactly one source step without committing it."""
@@ -136,7 +136,7 @@ class ExternalStepAdapter:
             )
 
         metadata = []
-        reference_bins = []
+        original_metadatas = []
         original_step_samples = []
         for packed_samples in local_step:
             if not isinstance(packed_samples, (list, tuple)) or not packed_samples:
@@ -157,9 +157,9 @@ class ExternalStepAdapter:
                 bin_metadata.append(entry)
                 self._payloads[key] = sample
                 self._sample_ordinal += 1
-            reference_bins.append(tuple(bin_metadata))
+            original_metadatas.append(tuple(bin_metadata))
         self._buffer = tuple(metadata)
-        self._reference_bins = tuple(reference_bins)
+        self._original_metadatas = tuple(original_metadatas)
         self._original_step_samples = tuple(original_step_samples)
 
     def metadata(self) -> tuple[BufferedSampleMetadata, ...]:
@@ -188,7 +188,7 @@ class ExternalStepAdapter:
             raise ValueError("External source commit must consume every selected sample exactly once.")
         self._payloads.clear()
         self._buffer = ()
-        self._reference_bins = ()
+        self._original_metadatas = ()
         self._original_step_samples = ()
         self._step += 1
 
@@ -201,7 +201,7 @@ class ExternalStepAdapter:
         """
         if getattr(constructor_plan, "target_data_rank", data_rank) != int(data_rank):
             return False
-        expected = tuple(tuple(item.key for item in packing_bin) for packing_bin in self._reference_bins)
+        expected = tuple(tuple(item.key for item in packing_bin) for packing_bin in self._original_metadatas)
         bins = getattr(constructor_plan, "bins", constructor_plan)
         actual = tuple(
             tuple(getattr(item, "key", item) for item in getattr(packing_bin, "sample_keys", packing_bin))
@@ -228,8 +228,8 @@ class ExternalStepAdapter:
             "source": self._source.state_dict(),
             "buffer": self._buffer,
             "payloads": self._payloads,
-            "reference_bins": self._reference_bins,
-            # Preserve the serialized key for existing adapter checkpoints.
+            # Preserve serialized keys for existing adapter checkpoints.
+            "reference_bins": self._original_metadatas,
             "canonical_step": self._original_step_samples,
         })
 
@@ -250,7 +250,7 @@ class ExternalStepAdapter:
         self._exhausted = bool(state["exhausted"])
         self._buffer = state.get("buffer", ())
         self._payloads = state.get("payloads", {})
-        self._reference_bins = state.get("reference_bins", ())
+        self._original_metadatas = state.get("reference_bins", ())
         self._original_step_samples = state.get("canonical_step", ())
 
     def set_epoch(self, epoch: int) -> None:
@@ -267,7 +267,7 @@ class ExternalStepAdapter:
         self._exhausted = False
         self._buffer = ()
         self._payloads = {}
-        self._reference_bins = ()
+        self._original_metadatas = ()
         self._original_step_samples = ()
 
 
