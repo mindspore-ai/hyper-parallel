@@ -96,6 +96,12 @@ class TestExternalStepAdapter(unittest.TestCase):
         resumed.load_state_dict(state)
         self.assertEqual(next(resumed), [({"id": 1, "tokens": 5},)])
 
+        legacy_state = copy.deepcopy(state)
+        legacy_state["dataset_reader"].pop("payloads")
+        legacy_resumed = _build(_Source())
+        legacy_resumed.load_state_dict(legacy_state)
+        self.assertEqual(next(legacy_resumed), [({"id": 1, "tokens": 5},)])
+
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_source_requires_checkpoint_hooks(self) -> None:
         """Feature: External source lifecycle validation.

@@ -95,10 +95,8 @@ class ExternalStepAdapter:
         self._step = 0
         self._sample_ordinal = 0
         self._exhausted = False
-        self._buffer: tuple[BufferedSampleMetadata, ...] = ()
         self._payloads: dict[SampleKey, Any] = {}
         self._original_metadatas: tuple[tuple[BufferedSampleMetadata, ...], ...] = ()
-        self._original_step_samples: tuple[tuple[Any, ...], ...] = ()
 
     @property
     def exhausted(self) -> bool:
@@ -108,7 +106,7 @@ class ExternalStepAdapter:
     @property
     def buffer_size(self) -> int:
         """Return the number of pending raw samples."""
-        return len(self._buffer)
+        return sum(len(packing_bin) for packing_bin in self._original_metadatas)
 
     @property
     def batch_position(self) -> int:
@@ -122,7 +120,7 @@ class ExternalStepAdapter:
 
     def prepare_next_step(self) -> None:
         """Read and stage exactly one source step without committing it."""
-        if self._buffer or self._exhausted:
+        if self._original_metadatas or self._exhausted:
             return
         try:
             local_step = next(self._iterator)
@@ -135,14 +133,11 @@ class ExternalStepAdapter:
                 f"External source emitted {emitted} local packs, expected {self._local_batch_size}."
             )
 
-        metadata = []
         original_metadatas = []
-        original_step_samples = []
         for packed_samples in local_step:
             if not isinstance(packed_samples, (list, tuple)) or not packed_samples:
                 raise ValueError("External source emitted an empty or non-sequence local pack.")
             original_samples = tuple(packed_samples)
-            original_step_samples.append(original_samples)
             bin_metadata = []
             for sample in original_samples:
                 key = SampleKey(self._reader_rank, self._sample_ordinal)
@@ -153,18 +148,19 @@ class ExternalStepAdapter:
                         f"but got {type(sample_metadata)}."
                     )
                 entry = BufferedSampleMetadata(key, sample_metadata, self._sample_ordinal)
-                metadata.append(entry)
                 bin_metadata.append(entry)
                 self._payloads[key] = sample
                 self._sample_ordinal += 1
             original_metadatas.append(tuple(bin_metadata))
-        self._buffer = tuple(metadata)
         self._original_metadatas = tuple(original_metadatas)
-        self._original_step_samples = tuple(original_step_samples)
 
     def metadata(self) -> tuple[BufferedSampleMetadata, ...]:
         """Return metadata for the pending source step."""
-        return self._buffer
+        return tuple(
+            entry
+            for packing_bin in self._original_metadatas
+            for entry in packing_bin
+        )
 
     def selected_payloads(self, selected_keys: set[SampleKey]) -> tuple[tuple[SampleKey, Any], ...]:
         """Return selected payloads without rereading the external source.
@@ -175,7 +171,11 @@ class ExternalStepAdapter:
         if not selected_keys.issubset(self._payloads):
             missing = selected_keys - set(self._payloads)
             raise ValueError(f"External source is missing selected keys: {sorted(missing)}")
-        return tuple((entry.key, self._payloads[entry.key]) for entry in self._buffer if entry.key in selected_keys)
+        return tuple(
+            (entry.key, self._payloads[entry.key])
+            for entry in self.metadata()
+            if entry.key in selected_keys
+        )
 
     def commit(self, selected_keys: set[SampleKey]) -> None:
         """Commit exactly the complete pending source step.
@@ -183,13 +183,11 @@ class ExternalStepAdapter:
         Args:
             selected_keys: Complete set of keys consumed from this Reader.
         """
-        expected = {entry.key for entry in self._buffer}
+        expected = {entry.key for entry in self.metadata()}
         if selected_keys != expected:
             raise ValueError("External source commit must consume every selected sample exactly once.")
         self._payloads.clear()
-        self._buffer = ()
         self._original_metadatas = ()
-        self._original_step_samples = ()
         self._step += 1
 
     def canonical_plan_matches(self, constructor_plan: Any, data_rank: int) -> bool:
@@ -211,9 +209,12 @@ class ExternalStepAdapter:
 
     def canonical_batch(self) -> Any:
         """Materialize the unchanged source bins through HP's callbacks."""
-        if not self._original_step_samples:
+        if not self._original_metadatas:
             raise RuntimeError("No canonical external source step is buffered.")
-        packed = [self._pack_fn(samples, self._seq_len) for samples in self._original_step_samples]
+        packed = [
+            self._pack_fn(samples, self._seq_len)
+            for samples in self._pending_samples()
+        ]
         return self._collate_fn(packed)
 
     def state_dict(self) -> dict[str, Any]:
@@ -226,11 +227,13 @@ class ExternalStepAdapter:
             "sample_ordinal": self._sample_ordinal,
             "exhausted": self._exhausted,
             "source": self._source.state_dict(),
-            "buffer": self._buffer,
+            # Preserve the serialized field for existing adapter checkpoints.
+            "buffer": self.metadata(),
             "payloads": self._payloads,
             # Preserve serialized keys for existing adapter checkpoints.
             "reference_bins": self._original_metadatas,
-            "canonical_step": self._original_step_samples,
+            # Preserve the serialized field for existing adapter checkpoints.
+            "canonical_step": self._pending_samples(),
         })
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -248,10 +251,10 @@ class ExternalStepAdapter:
         self._step = int(state["step"])
         self._sample_ordinal = int(state["sample_ordinal"])
         self._exhausted = bool(state["exhausted"])
-        self._buffer = state.get("buffer", ())
         self._payloads = state.get("payloads", {})
         self._original_metadatas = state.get("reference_bins", ())
-        self._original_step_samples = state.get("canonical_step", ())
+        if not self._payloads and self._original_metadatas:
+            self._restore_payloads_from_checkpoint(state.get("canonical_step", ()))
 
     def set_epoch(self, epoch: int) -> None:
         """Reset the source and discard any speculative step.
@@ -265,10 +268,25 @@ class ExternalStepAdapter:
         self._step = 0
         self._sample_ordinal = 0
         self._exhausted = False
-        self._buffer = ()
         self._payloads = {}
         self._original_metadatas = ()
-        self._original_step_samples = ()
+
+    def _pending_samples(self) -> tuple[tuple[Any, ...], ...]:
+        """Return pending raw samples in their original source pack order."""
+        return tuple(
+            tuple(self._payloads[item.key] for item in packing_bin)
+            for packing_bin in self._original_metadatas
+        )
+
+    def _restore_payloads_from_checkpoint(self, canonical_step: Any) -> None:
+        """Restore payloads from checkpoints written before payload caching."""
+        if len(canonical_step) != len(self._original_metadatas):
+            raise ValueError("External source checkpoint has inconsistent pending sample groups.")
+        for metadata_bin, sample_bin in zip(self._original_metadatas, canonical_step):
+            if len(metadata_bin) != len(sample_bin):
+                raise ValueError("External source checkpoint has inconsistent pending sample counts.")
+            for entry, sample in zip(metadata_bin, sample_bin):
+                self._payloads[entry.key] = sample
 
 
 __all__ = ["ExternalStepAdapter", "ExternalStepSource"]
