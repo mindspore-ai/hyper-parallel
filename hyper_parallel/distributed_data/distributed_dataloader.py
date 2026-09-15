@@ -47,12 +47,8 @@ from hyper_parallel.distributed_data.transport import (
 @dataclass(frozen=True)
 class _ReaderSnapshot:
     rank: int
-    step: int
-    stopped: bool
-    is_reader: bool
     exhausted: bool
     metadata: tuple[BufferedSampleMetadata, ...]
-    batch_position: int | None = None
     # External-step readers provide the legacy producer's already selected
     # local pack boundaries. Native BatchSampler uses singleton bins instead.
     reference_bins: tuple[tuple[BufferedSampleMetadata, ...], ...] = ()
@@ -596,9 +592,6 @@ class DistributedDataLoader(Iterator[Any]):
         if not is_reader:
             return _ReaderSnapshot(
                 rank=self._topology.global_rank,
-                step=self._step,
-                stopped=self._stopped,
-                is_reader=False,
                 exhausted=True,
                 metadata=(),
                 reference_bins=(),
@@ -615,20 +608,14 @@ class DistributedDataLoader(Iterator[Any]):
         )
         return _ReaderSnapshot(
             rank=self._topology.global_rank,
-            step=self._step,
-            stopped=self._stopped,
-            is_reader=True,
             exhausted=planning_reader.exhausted,
             metadata=planning_reader.metadata(),
-            batch_position=getattr(planning_reader, "batch_position", None),
             reference_bins=tuple(getattr(planning_reader, "reference_bins", ())),
         )
 
     def _build_plan_control(self, snapshots: tuple[Any, ...]) -> DistributedPackingPlan | None:
         """Return the current step's plan; None means end of stream."""
         normalized = self._normalize_reader_snapshots(snapshots)
-        if self._snapshots_stopped(normalized):
-            return None
         return self._plan_reader_snapshots(normalized)
 
     def _normalize_reader_snapshots(
@@ -639,11 +626,8 @@ class DistributedDataLoader(Iterator[Any]):
         for snapshot in snapshots:
             if not isinstance(snapshot, _ReaderSnapshot):
                 raise ValueError("A data-plane rank contributed an invalid reader snapshot.")
-            expected_reader = snapshot.rank in self._dataset_reader_ranks
-            if snapshot.is_reader != expected_reader:
-                raise ValueError(
-                    f"Rank {snapshot.rank} reported inconsistent Dataset Reader ownership."
-                )
+            if snapshot.rank not in self._data_plane.ranks:
+                raise ValueError(f"Rank {snapshot.rank} is outside the configured data plane.")
             normalized.append(snapshot)
         contributed_ranks = [snapshot.rank for snapshot in normalized]
         if len(contributed_ranks) != len(set(contributed_ranks)) or set(contributed_ranks) != set(
@@ -654,21 +638,12 @@ class DistributedDataLoader(Iterator[Any]):
             )
         return tuple(normalized)
 
-    def _snapshots_stopped(self, normalized: tuple[_ReaderSnapshot, ...]) -> bool:
-        steps = {snapshot.step for snapshot in normalized}
-        stopped_states = {snapshot.stopped for snapshot in normalized}
-        if len(steps) != 1 or self._step not in steps:
-            raise ValueError(
-                f"Data-plane ranks have inconsistent checkpoint steps {sorted(steps)}."
-            )
-        if len(stopped_states) != 1:
-            raise ValueError("Data-plane ranks have inconsistent stopped checkpoint state.")
-        return stopped_states == {True}
-
     def _plan_reader_snapshots(
             self, normalized: tuple[_ReaderSnapshot, ...],
     ) -> DistributedPackingPlan | None:
-        reader_snapshots = [snapshot for snapshot in normalized if snapshot.is_reader]
+        reader_snapshots = [
+            snapshot for snapshot in normalized if snapshot.rank in self._dataset_reader_ranks
+        ]
         if self._batch_sampler_mode:
             selection = self._select_native_batch(reader_snapshots)
         else:
@@ -687,9 +662,6 @@ class DistributedDataLoader(Iterator[Any]):
         reader_snapshots = snapshots
         if not reader_snapshots:
             return None
-        positions = {snapshot.batch_position for snapshot in reader_snapshots}
-        if len(positions) != 1 or self._step not in positions:
-            raise ValueError("External-step readers have inconsistent producer step cursors.")
         if all(snapshot.exhausted for snapshot in reader_snapshots):
             return None
         if any(snapshot.exhausted for snapshot in reader_snapshots):
@@ -729,9 +701,6 @@ class DistributedDataLoader(Iterator[Any]):
 
     def _select_native_batch(self, snapshots: list[_ReaderSnapshot]) -> StepSampleSelection | None:
         """Freeze this forward/backward round exactly as native DP samplers selected it."""
-        positions = {snapshot.batch_position for snapshot in snapshots}
-        if len(positions) != 1 or None in positions:
-            raise ValueError("Native BatchSampler ranks have inconsistent consumed_samples cursors.")
         if all(snapshot.exhausted for snapshot in snapshots):
             return None
         if any(snapshot.exhausted for snapshot in snapshots):
