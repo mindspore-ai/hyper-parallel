@@ -33,8 +33,6 @@ from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,
     SampleMetadata,
     build_distributed_dataloader,
-    collate_indexed_text_sequences,
-    pack_indexed_text_samples,
 )
 
 logger = get_dataset_logger(__name__)
@@ -152,62 +150,6 @@ def _build_distributed_packing_config(
         dataset_already_sharded=False,
         **options,
     )
-
-
-def _build_distributed_packing_splits(
-        dataloader_target: Any,
-        datasets: Sequence[Any | None],
-        mesh_context: Any,
-        training_config: Any,
-        data_config: Mapping[str, Any],
-        *,
-        sampler_type: str,
-        seed: int,
-        data_sharding: bool,
-        rearrangement_map: Any,
-) -> tuple[tuple[Any | None, ...], tuple[None, None, None]]:
-    """Build collective source-sample DataLoaders for enabled splits."""
-    if data_sharding:
-        raise ValueError("Distributed Indexed packing owns DP routing and does not support data_sharding=True")
-    if rearrangement_map is not None:
-        raise ValueError("Distributed Indexed packing does not support data_rearrange_map")
-    if mesh_context is None or getattr(mesh_context, "device_mesh", None) is None:
-        raise ValueError("Distributed Indexed packing requires mesh_context.device_mesh")
-    if int(getattr(mesh_context, "pp_size", 1)) != 1:
-        raise ValueError("Distributed Indexed packing does not support pipeline parallelism in this version")
-
-    config = _build_distributed_packing_config(
-        dataloader_target,
-        data_config,
-        micro_batch_size=training_config.micro_batch_size,
-        sampler_type=sampler_type,
-        seed=seed,
-    )
-    worker_kwargs = {
-        name: getattr(dataloader_target, name)
-        for name in ("timeout", "worker_init_fn", "multiprocessing_context", "pin_memory_device", "in_order")
-        if getattr(dataloader_target, name, None) is not None
-    }
-    dataloaders = []
-    for split_name, dataset in zip(("train", "valid", "test"), datasets):
-        if dataset is None:
-            dataloaders.append(None)
-            continue
-        if not bool(getattr(dataset, "requires_distributed_packing", False)):
-            raise ValueError(
-                f"Dataset split {split_name!r} does not expose unpacked Indexed source samples"
-            )
-        dataloader = build_distributed_dataloader(
-            dataset,
-            mesh_context.device_mesh,
-            config,
-            dataloader_kwargs=worker_kwargs,
-            pack_fn=pack_indexed_text_samples,
-            collate_fn=collate_indexed_text_sequences,
-        )
-        dataloaders.append(dataloader)
-        logger.debug("Built distributed Indexed packing DataLoader split=%s", split_name)
-    return tuple(dataloaders), (None, None, None)
 
 
 def _normalize_source_samples(source_item: Any) -> list[Mapping[str, Any]]:
@@ -404,20 +346,11 @@ def build_dataloader(
     if load_balance not in (None, "native_batch_sampler"):
         raise ValueError("data_config.load_balance must be 'native_batch_sampler' or omitted")
     native_balance = load_balance == "native_batch_sampler"
-    if native_balance and _uses_distributed_packing(data_config):
-        raise ValueError("Native BatchSampler balancing must retain packing_stage='dataset'")
-
     if _uses_distributed_packing(data_config):
-        return _build_distributed_packing_splits(
-            dataloader_target,
-            datasets,
-            mesh_context,
-            training_config,
-            data_config,
-            sampler_type=sampler_type,
-            seed=seed,
-            data_sharding=data_sharding,
-            rearrangement_map=rearrangement_map,
+        raise ValueError(
+            "packing_stage='distributed_dataloader' streaming selection has been removed. "
+            "Use packing_stage='dataset' with load_balance='native_batch_sampler', "
+            "or supply an external_step_reader to the distributed data API."
         )
 
     dataloaders: list[Any | None] = [None] * len(datasets)

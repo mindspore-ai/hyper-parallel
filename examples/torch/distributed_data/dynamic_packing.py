@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Four-process CPU example of sample-level balancing and dynamic packing.
+"""Four-process CPU example of sampler-defined, metadata-first sample balancing.
 
 Run from the repository root:
 
@@ -28,6 +28,7 @@ from typing import Any, Sequence
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,
     SampleMetadata,
@@ -69,7 +70,11 @@ class _Mesh:
 
 
 def metadata_fn(sample: dict[str, Any]) -> SampleMetadata:
-    """Describe packing length and a synthetic multimodal encoder cost."""
+    """Describe packing length and a synthetic multimodal encoder cost.
+
+    Args:
+        sample: A complete variable-length source sample.
+    """
     return SampleMetadata(
         pack_tokens=int(sample["input_ids"].numel()),
         cost=WorkloadCost(encoder=sample["vision_cost"]),
@@ -77,24 +82,20 @@ def metadata_fn(sample: dict[str, Any]) -> SampleMetadata:
     )
 
 
-def pack_fn(samples: Sequence[dict[str, Any]], seq_len: int) -> dict[str, Any]:
-    """Concatenate one planned bin and pad it to the configured capacity."""
-    tokens = torch.cat([sample["input_ids"] for sample in samples])
-    padded = torch.full((seq_len,), -1, dtype=tokens.dtype)
-    padded[:tokens.numel()] = tokens
+def collate_fn(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Pad complete samples to equal widths without cross-sample packing.
+
+    Args:
+        samples: Whole Dataset outputs assigned to this Constructor.
+    """
+    padded = torch.full((len(samples), 16), -1, dtype=torch.int64)
+    for row, sample in enumerate(samples):
+        tokens = sample["input_ids"]
+        padded[row, :tokens.numel()] = tokens
     return {
         "input_ids": padded,
         "sample_ids": tuple(sample["sample_id"] for sample in samples),
-        "valid_tokens": int(tokens.numel()),
-    }
-
-
-def collate_fn(packed_sequences: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Stack the constructor's planned sequence bins into one local batch."""
-    return {
-        "input_ids": torch.stack([sequence["input_ids"] for sequence in packed_sequences]),
-        "sample_ids": tuple(sequence["sample_ids"] for sequence in packed_sequences),
-        "valid_tokens": tuple(sequence["valid_tokens"] for sequence in packed_sequences),
+        "valid_tokens": tuple(sample["input_ids"].numel() for sample in samples),
     }
 
 
@@ -103,22 +104,25 @@ def main() -> None:
     dist.init_process_group("gloo")
     rank = dist.get_rank()
     dataset = TokenDataset()
-    metadata = [metadata_fn(sample) for sample in dataset._samples]
+    metadata = [metadata_fn(dataset[index]) for index in range(len(dataset))]
+    batch_sampler = build_dataset_batch_sampler(
+        total_samples=len(dataset), micro_batch_size=2, global_batch_size=4,
+        dp_world_size=2, dp_rank=rank // 2,
+    )
     loader = build_distributed_dataloader(
         dataset,
         _Mesh(),
         DistributedDatasetConfig(
             seq_len=16,
             local_batch_size=2,
-            dataset_reader_ranks=(0, 1, 2, 3),
         ),
         metadata=metadata,
-        pack_fn=pack_fn,
+        batch_sampler=batch_sampler,
         collate_fn=collate_fn,
     )
     for step, batch in enumerate(loader):
         print(
-            f"rank={rank} step={step} plan={loader.last_plan_id} "
+            f"rank={rank} step={step} plan={loader.last_plan.plan_id} "
             f"sample_ids={batch['sample_ids']} valid_tokens={batch['valid_tokens']}",
             flush=True,
         )

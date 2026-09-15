@@ -39,9 +39,8 @@ from hyper_parallel.distributed_data.data_constructor import (
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner, OversizedPolicy
 from hyper_parallel.distributed_data.schema import PackingConstraints, SampleMetadata
-from hyper_parallel.distributed_data.metadata import MetadataReader, PlannedSampleLoader
+from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
 from hyper_parallel.distributed_data.dataset_reader import _validate_worker_options
-from hyper_parallel.distributed_data.step_sample_selection import StepSampleSelector
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import (
     DataPlaneTransport,
@@ -92,19 +91,21 @@ class DistributedDatasetConfig:
         dataset_reader_ranks: Optional Dataset Reader ranks. They read raw
             samples online or metadata only in metadata mode. Defaults to the
             Data Constructor ranks.
-        dataset_already_sharded: Whether each Dataset Reader receives its own
-            rank-local sample stream instead of one shared strided index space.
+        dataset_already_sharded: Legacy external-reader configuration flag.
+            Native BatchSampler requires False because it owns DP slicing;
+            external readers manage their own partitioning.
         planner_rank: Optional centralized Planner rank. Defaults to the lowest
             Data Constructor rank.
-        buffer_size_multiplier: Read-ahead token/sample target relative to one
-            distributed batch. Larger values can reduce metadata planning
-            rounds at higher Host-memory cost, but never change step membership.
-        max_buffered_samples: Per-reader candidate safety bound.
+        buffer_size_multiplier: Legacy compatibility option. Step boundaries
+            are supplied by BatchSampler or external readers, not read-ahead.
+        max_buffered_samples: Limit forwarded to external readers' fill method.
+            Native BatchSampler ignores this limit and emits its complete batch.
         oversized_policy: ``error`` by default; ``single`` explicitly permits
             one oversized sample to occupy a bin alone.
         drop_last: Whether to drop a tail with fewer than one sample per global
             packing bin. Only ``True`` is supported in this first version.
-        shuffle: Whether Dataset Readers share one deterministic shuffled order.
+        shuffle: Must be False with native BatchSampler, which owns shuffling.
+            External readers also manage their own order.
         seed: Dataset Reader order and worker seed.
         num_workers: PyTorch workers per online Dataset Reader or plan-aware
             sample loader in metadata mode.
@@ -253,13 +254,6 @@ def _resolve_service_ranks(
     data_plane_ranks = set(dataset_reader_ranks) | set(topology.constructor_ranks)
     if planner_rank not in data_plane_ranks:
         raise ValueError(f"planner_rank {planner_rank} must be a Dataset Reader or Data Constructor rank.")
-    required_bins = topology.data_parallel_size * config.local_batch_size
-    total_buffer_capacity = len(dataset_reader_ranks) * config.max_buffered_samples
-    if total_buffer_capacity < required_bins:
-        raise ValueError(
-            f"Dataset Reader buffers can hold {total_buffer_capacity} samples, but one distributed yield requires at "
-            f"least {required_bins}. Increase max_buffered_samples or Dataset Reader count."
-        )
     return dataset_reader_ranks, planner_rank
 
 
@@ -446,10 +440,9 @@ class _BuildState:
     dataset_reader_ranks: tuple[int, ...] | None = None
     planner_rank: int | None = None
     dataset_reader: Any | BatchSamplerReader | None = None
-    metadata_reader: MetadataReader | BatchSamplerReader | None = None
+    metadata_reader: BatchSamplerReader | None = None
     direct_sample_loader: PlannedSampleLoader | None = None
     planner: DynamicPackingPlanner | None = None
-    step_sample_selector: StepSampleSelector | None = None
     constructor: PackingDataConstructor | None = None
     config_fingerprint: str | None = None
     communication_device: torch.device | None = None
@@ -515,50 +508,10 @@ def _validate_builder_callbacks(
         raise ValueError("collate_fn must be callable or None.")
 
 
-def _configure_metadata_reader(
+def _configure_external_step_reader(
         state: _BuildState,
-        dataset: Any | None,
-        metadata: Sequence[SampleMetadata] | None,
-        config: DistributedDatasetConfig,
-        reader_idx: int,
-        loader_options: dict[str, Any],
-) -> None:
-    if metadata is None or state.topology is None or state.dataset_reader_ranks is None:
-        rank = None if state.topology is None else state.topology.global_rank
-        raise ValueError(f"Metadata Dataset Reader rank {rank} must provide metadata.")
-    state.metadata_reader = MetadataReader(
-        metadata,
-        reader_rank=state.topology.global_rank,
-        reader_idx=reader_idx,
-        reader_count=len(state.dataset_reader_ranks),
-        seq_len=config.seq_len,
-        shuffle=config.shuffle,
-        seed=config.seed,
-        dataset_already_sharded=config.dataset_already_sharded,
-    )
-    state.reader_size = len(metadata)
-    if not config.dataset_already_sharded:
-        return
-    if dataset is None:
-        raise ValueError(
-            f"Pre-sharded metadata Dataset Reader rank {state.topology.global_rank} must provide a Dataset."
-        )
-    state.direct_sample_loader = PlannedSampleLoader(dataset, seed=config.seed, **loader_options)
-    state.direct_dataset_size = len(dataset)
-    if state.reader_size != state.direct_dataset_size:
-        raise ValueError(
-            f"Pre-sharded metadata length {state.reader_size} does not match local Dataset "
-            f"length {state.direct_dataset_size}."
-        )
-
-
-def _configure_local_data_sources(
-        state: _BuildState,
-        dataset: Any | None,
         metadata_fn: Callable[[Any], SampleMetadata] | None,
         metadata: Sequence[SampleMetadata] | None,
-        config: DistributedDatasetConfig,
-        loader_options: dict[str, Any],
         external_step_reader: Any | None = None,
 ) -> None:
     if external_step_reader is not None:
@@ -584,28 +537,15 @@ def _configure_local_data_sources(
         state.dataset_reader = external_step_reader
         state.external_step_mode = True
         return
-    if not state.metadata_mode:
-        if not state.is_reader:
-            return
+    if state.metadata_mode:
         raise ValueError(
-            "Online mode requires external_step_reader; provide a Reader that emits one complete local step."
+            "Metadata mode requires batch_sampler to define step/sample boundaries; "
+            "metadata-only streaming selection has been removed. "
+            "For online loading, provide external_step_reader."
         )
     if state.is_reader:
-        if metadata is None:
-            raise ValueError(
-                "No metadata is available for online loading; provide metadata or external_step_reader."
-            )
-        reader_idx = state.dataset_reader_ranks.index(state.topology.global_rank)
-        _configure_metadata_reader(state, dataset, metadata, config, reader_idx, loader_options)
-    if not state.metadata_mode or config.dataset_already_sharded or not state.topology.is_constructor:
-        return
-    if dataset is None:
-        raise ValueError(f"Metadata Data Constructor rank {state.topology.global_rank} must provide a Dataset.")
-    state.direct_sample_loader = PlannedSampleLoader(dataset, seed=config.seed, **loader_options)
-    state.direct_dataset_size = len(dataset)
-    if state.reader_size is not None and state.reader_size != state.direct_dataset_size:
         raise ValueError(
-            f"Metadata length {state.reader_size} does not match Dataset length {state.direct_dataset_size}."
+            "Online mode requires external_step_reader; provide a Reader that emits one complete local step."
         )
 
 
@@ -702,8 +642,8 @@ def _populate_build_state(
     state.dataset_reader_ranks, state.planner_rank = _resolve_service_ranks(state.topology, config)
     batch_sampler_fingerprint = None
     if batch_sampler is None:
-        _configure_local_data_sources(
-            state, dataset, metadata_fn, metadata, config, loader_options,
+        _configure_external_step_reader(
+            state, metadata_fn, metadata,
             external_step_reader=external_step_reader,
         )
     else:
@@ -717,12 +657,6 @@ def _populate_build_state(
         oversized_policy=config.oversized_policy,
         min_balance_gain=config.min_balance_gain,
     )
-    if batch_sampler is None and external_step_reader is None:
-        state.step_sample_selector = StepSampleSelector(
-            seq_len=config.seq_len,
-            distributed_bin_count=state.planner.distributed_bin_count,
-            oversized_policy=config.oversized_policy,
-        )
     state.constructor = PackingDataConstructor(effective_pack_fn, effective_collate_fn, seq_len=config.seq_len)
     state.config_fingerprint = _config_fingerprint(
         config,
@@ -744,9 +678,7 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
         build_fingerprint = _build_fingerprint(state.topology, state.config_fingerprint)
     # Invalid configs must still participate in WORLD build preflight synchronization.
     dataset_already_sharded = isinstance(config, DistributedDatasetConfig) and config.dataset_already_sharded
-    is_direct_reader = state.metadata_mode and state.topology is not None and (
-        state.is_reader if dataset_already_sharded else state.topology.is_constructor
-    )
+    is_direct_reader = state.metadata_mode and state.topology is not None and state.topology.is_constructor
     state.external_step_mode = synchronize_build_preflight(
         build_fingerprint=build_fingerprint,
         is_reader=state.is_reader,
@@ -764,12 +696,7 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
         state.config_fingerprint += ":external_step"
 
 
-def _require_build_state(
-        state: _BuildState,
-        *,
-        batch_sampler_mode: bool,
-        external_step_mode: bool,
-) -> None:
+def _require_build_state(state: _BuildState) -> None:
     required_components = (
         state.topology,
         state.dataset_reader_ranks,
@@ -778,8 +705,6 @@ def _require_build_state(
         state.constructor,
         state.config_fingerprint,
     )
-    if not batch_sampler_mode and not external_step_mode:
-        required_components += (state.step_sample_selector,)
     if any(component is None for component in required_components):
         raise ValueError("Distributed DataLoader build preflight completed without validated components.")
 
@@ -800,34 +725,32 @@ def build_distributed_dataloader(
 ) -> DistributedDataLoader:
     """Build a sample-balanced distributed DataLoader.
 
-    Online mode requires ``external_step_reader``. The external Reader must
+    Online mode without ``batch_sampler`` requires ``external_step_reader``. The external Reader must
     emit one complete local step, including metadata and canonical pack
     boundaries; this loader then freezes the union of those samples, balances
     them across Data Constructors, and routes payloads when necessary.
-    Metadata mode uses ``metadata`` before any Dataset read. With a shared
-    index space, target constructors directly read assigned indices and skip
-    payload A2A. With pre-sharded inputs, each Reader reads selected local
-    indices and routes the payloads to target constructors through A2A.
+    Metadata mode requires ``batch_sampler`` to define step/sample boundaries.
+    It looks up ``metadata[index]`` before any Dataset read; target constructors
+    then directly read their assigned indices from the shared Dataset and skip
+    payload A2A. Metadata-only streaming selection is not supported.
 
-    With ``batch_sampler``, native HP sampling replaces stream-based selection:
+    With ``batch_sampler``, native HP sampling owns step selection:
     one sampler yield per DP Constructor fixes one forward/backward round.
     Complete Dataset outputs are balanced without repacking their contents.
 
     Args:
-        dataset: Metadata mode requires a mapping Dataset
-            on Data Constructor ranks; pre-sharded metadata mode requires one on
-            Dataset Reader ranks. In online mode, the external Reader owns data
+        dataset: BatchSampler mode requires a shared mapping Dataset
+            on Data Constructor ranks. In external-step mode, the Reader owns data
             loading and ``dataset`` may be ``None``. Other ranks may pass the
             same object or ``None``.
         mesh: Named root HyperParallel or native DeviceMesh.
         config: Dynamic packing, service-rank, and worker configuration.
         metadata_fn: Only used by ``batch_sampler`` mode to derive metadata
             from each Dataset output. It cannot be used by external-step mode.
-        metadata: Optional precomputed metadata sequence on Dataset Reader ranks. Indexed
+        metadata: Precomputed metadata for BatchSampler mode on Dataset Reader ranks. Indexed
             source Datasets that implement ``get_sample_metadata`` provide this
             automatically when both metadata arguments are omitted. It is a
-            shared global sequence by default and a rank-local sequence when
-            ``dataset_already_sharded=True``. Entry ``metadata[index]`` must
+            shared global sequence. Entry ``metadata[index]`` must
             describe the corresponding ``dataset[index]``.
         dataloader_kwargs: Optional DataLoader execution options. These
             override the worker options retained in ``config``. Sampling,
@@ -849,7 +772,7 @@ def build_distributed_dataloader(
             be omitted. Metadata entries must describe these Dataset indices,
             not underlying document indices. Checkpoint through this loader,
             not through the sampler's speculative prefetch cursor.
-        external_step_reader: Required for online mode. It is an optional
+        external_step_reader: Required for online mode without ``batch_sampler``. It is a
             rank-local external producer that must
             expose ``fill``, ``metadata``, ``reference_bins``,
             ``selected_payloads``, ``commit``, ``exhausted``,
@@ -863,10 +786,9 @@ def build_distributed_dataloader(
 
     Note:
         Checkpoint replay requires a deterministic online stream for a given
-        epoch; arbitrary worker-side RNG state is not captured. Unsharded
-        Dataset Readers must expose equal logical Dataset or metadata lengths.
-        Pre-sharded metadata and Dataset lengths must match locally on
-        each Reader rank.
+        epoch; arbitrary worker-side RNG state is not captured. Metadata and
+        Dataset lengths must agree across all Data Constructor ranks. Metadata
+        entries must describe deterministic, rank-independent Dataset outputs.
     """
     return _build_distributed_dataloader_impl(
         dataset,
@@ -918,12 +840,7 @@ def _build_distributed_dataloader_impl(
         state.local_error = f"{type(exc).__name__}: {exc}"
 
     _synchronize_build_state(state, config)
-    _require_build_state(
-        state,
-        batch_sampler_mode=batch_sampler is not None,
-        external_step_mode=state.external_step_mode,
-    )
-    metadata_payload_exchange = state.metadata_mode and config.dataset_already_sharded
+    _require_build_state(state)
     groups = create_data_groups(
         state.topology,
         state.dataset_reader_ranks,
@@ -931,7 +848,7 @@ def _build_distributed_dataloader_impl(
         cpu_backend=config.cpu_backend,
         payload_backend=config.payload_backend,
         communication_device=state.communication_device,
-        enable_payload_exchange=not state.metadata_mode or metadata_payload_exchange,
+        enable_payload_exchange=not state.metadata_mode,
     )
 
     return DistributedDataLoader(
@@ -944,8 +861,6 @@ def _build_distributed_dataloader_impl(
         metadata_reader=state.metadata_reader,
         direct_sample_loader=state.direct_sample_loader,
         metadata_mode=state.metadata_mode,
-        metadata_payload_exchange=metadata_payload_exchange,
-        step_sample_selector=state.step_sample_selector,
         planner=state.planner,
         data_constructor=state.constructor,
         data_plane=DataPlaneTransport(
@@ -954,7 +869,6 @@ def _build_distributed_dataloader_impl(
             communication_device=state.communication_device,
         ),
         model_transport=ModelParallelTransport(state.topology, groups),
-        buffer_size_multiplier=config.buffer_size_multiplier,
         max_buffered_samples=config.max_buffered_samples,
         double_buffer=config.double_buffer,
         config_fingerprint=state.config_fingerprint,

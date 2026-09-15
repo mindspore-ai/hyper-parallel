@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 from hyper_parallel import distributed_data
 from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
-from hyper_parallel.distributed_data.step_sample_selection import StepSampleSelector
+from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import synchronize_build_preflight
 from tests.common.mark_utils import arg_mark
@@ -156,29 +156,31 @@ class TestDistributedDataBuildState(unittest.TestCase):
         """Return a standalone mesh that needs no distributed initialization."""
         return SimpleNamespace(mesh_shape=(1,), mesh_dim_names=("dp",), rank_list=(0,))
 
-    def test_stream_modes_construct_selector_and_report_reader_roles(self) -> None:
-        """Online and both metadata variants still select and deliver packed samples."""
+    def test_sampler_modes_report_reader_roles(self) -> None:
+        """Sampler online and metadata modes retain their distinct payload ownership."""
         samples = [0, 1]
         metadata = [SampleMetadata(pack_tokens=4, sample_id=index) for index in samples]
-        for metadata_mode, sharded in ((False, False), (False, True), (True, False), (True, True)):
-            config = DistributedDatasetConfig(seq_len=8, local_batch_size=1, dataset_already_sharded=sharded)
+        for metadata_mode in (False, True):
+            config = DistributedDatasetConfig(seq_len=8, local_batch_size=1)
             callbacks = {"metadata": metadata} if metadata_mode else {"metadata_fn": metadata.__getitem__}
-            with self.subTest(metadata_mode=metadata_mode, sharded=sharded), patch(
-                    "hyper_parallel.distributed_data.api.StepSampleSelector", wraps=StepSampleSelector,
-            ) as selector_type, patch(
+            with self.subTest(metadata_mode=metadata_mode), patch(
                     "hyper_parallel.distributed_data.api.synchronize_build_preflight",
                     wraps=synchronize_build_preflight,
             ) as preflight:
-                loader = build_distributed_dataloader(samples, self._mesh(), config, **callbacks)
-                self.assertEqual(next(loader), ((0, 1),))
-                selector_type.assert_called_once_with(seq_len=8, distributed_bin_count=1, oversized_policy="error")
+                sampler = build_dataset_batch_sampler(
+                    total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,
+                )
+                loader = build_distributed_dataloader(
+                    samples, self._mesh(), config, batch_sampler=sampler, **callbacks,
+                )
+                self.assertEqual(next(loader), (0,))
                 preflight.assert_called_once()
                 status = preflight.call_args.kwargs
                 self.assertTrue(status["is_reader"])
                 self.assertEqual(status["reader_size"], len(samples))
                 self.assertEqual(status["is_direct_reader"], metadata_mode)
                 self.assertEqual(status["direct_dataset_size"], len(samples) if metadata_mode else None)
-                self.assertEqual(status["dataset_already_sharded"], sharded)
+                self.assertFalse(status["dataset_already_sharded"])
                 self.assertIsNone(status["local_error"])
 
     def test_invalid_config_reaches_preflight_before_group_creation(self) -> None:
@@ -199,7 +201,7 @@ class TestDistributedDataBuildState(unittest.TestCase):
         cases = (
             ({"dataloader_kwargs": {"num_workers": -1}}, "num_workers"),
             ({"communication_device": "invalid-device"}, "communication_device"),
-            ({"metadata": [SampleMetadata(pack_tokens=1)]}, "[Mm]etadata length"),
+            ({"metadata": [SampleMetadata(pack_tokens=1)]}, "Metadata mode requires batch_sampler"),
         )
         for sharded in (False, True):
             config = DistributedDatasetConfig(seq_len=8, local_batch_size=1, dataset_already_sharded=sharded)
@@ -216,8 +218,8 @@ class TestDistributedDataBuildState(unittest.TestCase):
                     self.assertRegex(status["local_error"], message)
                     if "metadata" in kwargs:
                         self.assertTrue(status["is_direct_reader"])
-                        self.assertEqual(status["reader_size"], 1)
-                        self.assertEqual(status["direct_dataset_size"], 2)
+                        self.assertIsNone(status["reader_size"])
+                        self.assertIsNone(status["direct_dataset_size"])
                     create_groups.assert_not_called()
 
 

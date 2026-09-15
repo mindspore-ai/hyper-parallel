@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from threading import Condition, Thread
 from typing import Any
 
-import torch
+import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed_data.data_constructor import PackingDataConstructor
 from hyper_parallel.distributed_data.batch_sampler import BatchSamplerReader
@@ -34,8 +34,7 @@ from hyper_parallel.distributed_data.schema import (
     SampleKey,
     StepSampleSelection,
 )
-from hyper_parallel.distributed_data.step_sample_selection import StepSampleSelector
-from hyper_parallel.distributed_data.metadata import MetadataReader, PlannedSampleLoader
+from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
 from hyper_parallel.distributed_data.dataset_reader import DatasetReader
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import (
@@ -45,22 +44,6 @@ from hyper_parallel.distributed_data.transport import (
 )
 
 
-def _scaled_buffer_target(
-        base_target: int,
-        max_target: int,
-        multiplier: int | float,
-        attempt: int,
-        reader_count: int,
-) -> int:
-    """Scale and saturate a read-ahead target without floating-point overflow."""
-    multiplier_numerator, multiplier_denominator = multiplier.as_integer_ratio()
-    denominator = multiplier_denominator * reader_count
-    numerator = base_target * multiplier_numerator * attempt
-    if numerator >= max_target * denominator:
-        return max_target
-    return max(1, (numerator + denominator - 1) // denominator)
-
-
 @dataclass(frozen=True)
 class _ReaderSnapshot:
     rank: int
@@ -68,11 +51,10 @@ class _ReaderSnapshot:
     stopped: bool
     is_reader: bool
     exhausted: bool
-    can_read_more: bool
     metadata: tuple[BufferedSampleMetadata, ...]
     batch_position: int | None = None
     # External-step readers provide the legacy producer's already selected
-    # local pack boundaries.  Stream readers leave this empty.
+    # local pack boundaries. Native BatchSampler uses singleton bins instead.
     reference_bins: tuple[tuple[BufferedSampleMetadata, ...], ...] = ()
 
 
@@ -84,18 +66,13 @@ def _validate_loader_components(
         topology: DataTopology,
         dataset_reader_ranks: tuple[int, ...],
         dataset_reader: DatasetReader | BatchSamplerReader | None,
-        metadata_reader: MetadataReader | BatchSamplerReader | None,
+        metadata_reader: BatchSamplerReader | None,
         direct_sample_loader: PlannedSampleLoader | None,
         metadata_mode: bool,
-        metadata_payload_exchange: bool,
         double_buffer: bool,
 ) -> None:
     if not isinstance(metadata_mode, bool):
         raise ValueError("metadata_mode must be boolean.")
-    if not isinstance(metadata_payload_exchange, bool):
-        raise ValueError("metadata_payload_exchange must be boolean.")
-    if metadata_payload_exchange and not metadata_mode:
-        raise ValueError("metadata_payload_exchange requires metadata mode.")
     if metadata_mode and dataset_reader is not None:
         raise ValueError("Metadata mode must not configure an online Dataset Reader.")
     if not metadata_mode and (metadata_reader is not None or direct_sample_loader is not None):
@@ -106,9 +83,7 @@ def _validate_loader_components(
         raise ValueError("Dataset Reader ownership does not match dataset_reader_ranks.")
     _validate_metadata_loader_owner(
         topology,
-        is_reader=is_reader,
         metadata_mode=metadata_mode,
-        metadata_payload_exchange=metadata_payload_exchange,
         direct_sample_loader=direct_sample_loader,
     )
     if not isinstance(double_buffer, bool):
@@ -118,17 +93,13 @@ def _validate_loader_components(
 def _validate_metadata_loader_owner(
         topology: DataTopology,
         *,
-        is_reader: bool,
         metadata_mode: bool,
-        metadata_payload_exchange: bool,
         direct_sample_loader: PlannedSampleLoader | None,
 ) -> None:
     if not metadata_mode:
         return
-    expected_loader_owner = is_reader if metadata_payload_exchange else topology.is_constructor
-    if expected_loader_owner != (direct_sample_loader is not None):
-        owner_name = "Dataset Reader" if metadata_payload_exchange else "Data Constructor"
-        raise ValueError(f"Every metadata {owner_name} must own one plan-aware sample loader.")
+    if topology.is_constructor != (direct_sample_loader is not None):
+        raise ValueError("Every metadata Data Constructor must own one plan-aware sample loader.")
 
 
 class DistributedDataLoader(Iterator[Any]):
@@ -141,22 +112,22 @@ class DistributedDataLoader(Iterator[Any]):
     after the current batch has been returned to the trainer.
     """
 
+    # HP Trainer and batch adapters must advance this loader on every model peer.
+    collective_source = True
+
     def __init__(
             self,
             *,
             topology: DataTopology,
             dataset_reader_ranks: tuple[int, ...],
             dataset_reader: DatasetReader | BatchSamplerReader | None,
-            metadata_reader: MetadataReader | BatchSamplerReader | None,
+            metadata_reader: BatchSamplerReader | None,
             direct_sample_loader: PlannedSampleLoader | None,
             metadata_mode: bool,
-            metadata_payload_exchange: bool,
-            step_sample_selector: StepSampleSelector | None,
             planner: DynamicPackingPlanner,
             data_constructor: PackingDataConstructor,
             data_plane: DataPlaneTransport,
             model_transport: ModelParallelTransport,
-            buffer_size_multiplier: float,
             max_buffered_samples: int,
             double_buffer: bool,
             config_fingerprint: str,
@@ -165,8 +136,10 @@ class DistributedDataLoader(Iterator[Any]):
             initial_epoch: int = 0,
     ) -> None:
         """Store the fully validated runtime components."""
-        if not batch_sampler_mode and not external_step_mode and step_sample_selector is None:
-            raise ValueError("Stream-based loading requires a StepSampleSelector.")
+        if batch_sampler_mode == external_step_mode:
+            raise ValueError("Provide exactly one step source: batch_sampler or external_step_reader.")
+        if metadata_mode and not batch_sampler_mode:
+            raise ValueError("Metadata mode requires batch_sampler to define step/sample boundaries.")
         _validate_loader_components(
             topology=topology,
             dataset_reader_ranks=dataset_reader_ranks,
@@ -174,7 +147,6 @@ class DistributedDataLoader(Iterator[Any]):
             metadata_reader=metadata_reader,
             direct_sample_loader=direct_sample_loader,
             metadata_mode=metadata_mode,
-            metadata_payload_exchange=metadata_payload_exchange,
             double_buffer=double_buffer,
         )
         self._topology = topology
@@ -183,13 +155,10 @@ class DistributedDataLoader(Iterator[Any]):
         self._metadata_reader = metadata_reader
         self._direct_sample_loader = direct_sample_loader
         self._metadata_mode = metadata_mode
-        self._metadata_payload_exchange = metadata_payload_exchange
-        self._step_sample_selector = step_sample_selector
         self._planner = planner
         self._data_constructor = data_constructor
         self._data_plane = data_plane
         self._model_transport = model_transport
-        self._buffer_size_multiplier = buffer_size_multiplier
         self._max_buffered_samples = max_buffered_samples
         self._double_buffer = double_buffer
         self._config_fingerprint = config_fingerprint
@@ -551,7 +520,7 @@ class DistributedDataLoader(Iterator[Any]):
             key for key in selected_keys if key.reader_rank == self._topology.global_rank
         }
         self._pending_local_keys = local_selected_keys
-        if self._metadata_mode and not self._metadata_payload_exchange:
+        if self._metadata_mode:
             return self._produce_metadata_batch(plan)
 
         # VeOmni's external reader has already selected and packed this exact
@@ -612,29 +581,17 @@ class DistributedDataLoader(Iterator[Any]):
         return local_batch
 
     def _next_plan_control(self) -> DistributedPackingPlan | None:
-        """Refill internally until a plan is ready, or return None at end of stream."""
-        attempt = 1
-        while True:
-            read_ahead_attempt = (
-                None if self._batch_sampler_mode or self._external_step_mode else attempt
-            )
-            local_snapshot = self._fill_local_reader(read_ahead_attempt)
-            snapshots = self._data_plane.gather_object_to_planner(local_snapshot)
-            planner_control = None
-            if self._topology.global_rank == self._data_plane.planner_rank:
-                if snapshots is None:
-                    raise RuntimeError("Planner did not receive Dataset Reader snapshots.")
-                planner_control = self._build_plan_control(snapshots)
-            plan, need_more = self._data_plane.broadcast_from_planner(planner_control)
-            if not need_more:
-                return plan
-            if self._batch_sampler_mode or self._external_step_mode:
-                raise ValueError(
-                    "An external step reader must provide one complete local step per fill call."
-                )
-            attempt += 1
+        """Plan exactly one source-selected step, or return None at end of stream."""
+        local_snapshot = self._fill_local_reader()
+        snapshots = self._data_plane.gather_object_to_planner(local_snapshot)
+        plan = None
+        if self._topology.global_rank == self._data_plane.planner_rank:
+            if snapshots is None:
+                raise RuntimeError("Planner did not receive Dataset Reader snapshots.")
+            plan = self._build_plan_control(snapshots)
+        return self._data_plane.broadcast_from_planner(plan)
 
-    def _fill_local_reader(self, attempt: int | None) -> _ReaderSnapshot:
+    def _fill_local_reader(self) -> _ReaderSnapshot:
         is_reader = self._topology.global_rank in self._dataset_reader_ranks
         if not is_reader:
             return _ReaderSnapshot(
@@ -643,7 +600,6 @@ class DistributedDataLoader(Iterator[Any]):
                 stopped=self._stopped,
                 is_reader=False,
                 exhausted=True,
-                can_read_more=False,
                 metadata=(),
                 reference_bins=(),
             )
@@ -651,52 +607,28 @@ class DistributedDataLoader(Iterator[Any]):
         if planning_reader is None:
             raise ValueError(f"Dataset Reader rank {self._topology.global_rank} did not provide its reader.")
 
-        reader_count = len(self._dataset_reader_ranks)
-        if attempt is None:
-            sample_target = token_target = 1
-        else:
-            sample_target = _scaled_buffer_target(
-                self._planner.distributed_bin_count,
-                self._max_buffered_samples,
-                self._buffer_size_multiplier,
-                attempt,
-                reader_count,
-            )
-            token_target = _scaled_buffer_target(
-                self._planner.distributed_token_budget,
-                self._max_buffered_samples * self._planner.seq_len,
-                self._buffer_size_multiplier,
-                attempt,
-                reader_count,
-            )
+        # Step sources own membership; token targets must not pull a future step.
         planning_reader.fill(
-            min_samples=max(1, sample_target),
-            min_tokens=max(1, token_target),
+            min_samples=1,
+            min_tokens=1,
             max_samples=self._max_buffered_samples,
         )
-        can_read_more = False
-        if not self._batch_sampler_mode and not self._external_step_mode:
-            can_read_more = (
-                not planning_reader.exhausted
-                and planning_reader.buffer_size < self._max_buffered_samples
-            )
         return _ReaderSnapshot(
             rank=self._topology.global_rank,
             step=self._step,
             stopped=self._stopped,
             is_reader=True,
             exhausted=planning_reader.exhausted,
-            can_read_more=can_read_more,
             metadata=planning_reader.metadata(),
             batch_position=getattr(planning_reader, "batch_position", None),
             reference_bins=tuple(getattr(planning_reader, "reference_bins", ())),
         )
 
-    def _build_plan_control(self, snapshots: tuple[Any, ...]) -> tuple[DistributedPackingPlan | None, bool]:
-        """Return (plan, need_more) for broadcast; (None, False) means end of stream."""
+    def _build_plan_control(self, snapshots: tuple[Any, ...]) -> DistributedPackingPlan | None:
+        """Return the current step's plan; None means end of stream."""
         normalized = self._normalize_reader_snapshots(snapshots)
         if self._snapshots_stopped(normalized):
-            return None, False
+            return None
         return self._plan_reader_snapshots(normalized)
 
     def _normalize_reader_snapshots(
@@ -735,29 +667,13 @@ class DistributedDataLoader(Iterator[Any]):
 
     def _plan_reader_snapshots(
             self, normalized: tuple[_ReaderSnapshot, ...],
-    ) -> tuple[DistributedPackingPlan | None, bool]:
+    ) -> DistributedPackingPlan | None:
         reader_snapshots = [snapshot for snapshot in normalized if snapshot.is_reader]
-        candidates = tuple(metadata for snapshot in reader_snapshots for metadata in snapshot.metadata)
         if self._batch_sampler_mode:
             selection = self._select_native_batch(reader_snapshots)
-        elif self._external_step_mode:
-            selection = self._select_external_step(reader_snapshots)
         else:
-            selection = self._step_sample_selector.select(
-                candidates,
-                end_of_stream=all(snapshot.exhausted for snapshot in reader_snapshots),
-            )
-        plan = None if selection is None else self._planner.plan(selection, step=self._step)
-        if plan is not None:
-            return plan, False
-        if all(snapshot.exhausted for snapshot in reader_snapshots):
-            return None, False
-        if any(snapshot.can_read_more for snapshot in reader_snapshots):
-            return None, True
-        raise ValueError(
-            f"Dataset Reader buffers reached max_buffered_samples={self._max_buffered_samples} before "
-            f"Step Sample Selection could form {self._planner.distributed_bin_count} complete packing bins."
-        )
+            selection = self._select_external_step(reader_snapshots)
+        return None if selection is None else self._planner.plan(selection, step=self._step)
 
     def _select_external_step(self, snapshots: list[_ReaderSnapshot]) -> StepSampleSelection | None:
         """Freeze the exact sample set emitted by an external legacy producer.
@@ -768,7 +684,7 @@ class DistributedDataLoader(Iterator[Any]):
         validate that every local producer emitted the expected number of
         packs; the planner is still free to repack the frozen samples.
         """
-        reader_snapshots = [snapshot for snapshot in snapshots if snapshot.is_reader]
+        reader_snapshots = snapshots
         if not reader_snapshots:
             return None
         positions = {snapshot.batch_position for snapshot in reader_snapshots}
@@ -835,15 +751,9 @@ class DistributedDataLoader(Iterator[Any]):
     ) -> PreparedPayloadExchange:
         outgoing: dict[int, list[tuple[SampleKey, Any]]] = {}
         if local_selected_keys:
-            if self._metadata_payload_exchange:
-                if self._direct_sample_loader is None:
-                    raise ValueError("A pre-sharded metadata Reader has no plan-aware sample loader.")
-                ordered_keys = tuple(key for key in plan.selected_keys if key in local_selected_keys)
-                payloads = tuple(self._direct_sample_loader.fetch_keys(ordered_keys).items())
-            else:
-                if self._dataset_reader is None:
-                    raise ValueError("A planned Dataset Reader rank has no Dataset Reader.")
-                payloads = self._dataset_reader.selected_payloads(local_selected_keys)
+            if self._dataset_reader is None:
+                raise ValueError("A planned Dataset Reader rank has no Dataset Reader.")
+            payloads = self._dataset_reader.selected_payloads(local_selected_keys)
             target_by_key = {
                 key: self._topology.constructor_ranks[data_rank]
                 for data_rank, local_batch in enumerate(plan.local_batches)
@@ -854,7 +764,7 @@ class DistributedDataLoader(Iterator[Any]):
                 outgoing.setdefault(target_by_key[key], []).append((key, payload))
         return self._data_plane.prepare_exchange(outgoing)
 
-    def _planning_reader(self) -> DatasetReader | MetadataReader | BatchSamplerReader | None:
+    def _planning_reader(self) -> DatasetReader | BatchSamplerReader | None:
         """Return this rank's online or metadata-only Dataset Reader."""
         if self._dataset_reader is not None:
             return self._dataset_reader

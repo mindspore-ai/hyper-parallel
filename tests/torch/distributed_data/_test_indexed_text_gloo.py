@@ -32,6 +32,10 @@ from hyper_parallel.data.indexed.indexed_data_reader import IndexedDataReader
 from hyper_parallel.data.indexed.io import IndexedDatasetBuilder
 from hyper_parallel.data.text.build_dataset import build_indexed_text_dataset
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
+from hyper_parallel.distributed_data import (
+    DistributedDatasetConfig, build_distributed_dataloader,
+    collate_indexed_text_sequences, pack_indexed_text_samples,
+)
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 
@@ -98,6 +102,11 @@ def _assert_loss_gradient_parity(
     torch.testing.assert_close(weight.grad, reference_weight.grad, rtol=1e-8, atol=1e-10)
 
 
+def _collate_sources(samples):
+    """Keep native Dataset samples separate and pad each to the model width."""
+    return collate_indexed_text_sequences([pack_indexed_text_samples([sample], 8) for sample in samples])
+
+
 def _run_epoch(prefix: str, mesh_context: object, double_buffer: bool) -> None:
     """Check metadata-only Readers, direct Constructor reads, and TP batch broadcast."""
     rank = dist.get_rank()
@@ -107,7 +116,7 @@ def _run_epoch(prefix: str, mesh_context: object, double_buffer: bool) -> None:
         "data_lazy_load": True, "distributed_walk": False,
         "reset_position_ids": True,
         "packing_stage": "distributed_dataloader",
-        "distributed_dataloader": {"dataset_reader_ranks": (1, 3), "double_buffer": double_buffer},
+        "distributed_dataloader": {"double_buffer": double_buffer},
     }
     payload_reads = []
     allow_payload_reads = False
@@ -132,17 +141,21 @@ def _run_epoch(prefix: str, mesh_context: object, double_buffer: bool) -> None:
             data_path=prefix, data_config=config, tokenizer=_Tokenizer(),
             train_valid_test_num_samples=(1, 0, 0), mesh_context=mesh_context,
         )
-        loaders, _ = build_dataloader(
-            SimpleNamespace(), datasets=datasets, collate_fn=None, mesh_context=mesh_context,
-            training_config=SimpleNamespace(micro_batch_size=1, global_batch_size=2, seed=7),
-            data_config=config,
+        sampler = build_dataset_batch_sampler(
+            total_samples=len(datasets[0]), micro_batch_size=4, global_batch_size=8,
+            dp_world_size=2, dp_rank=mesh_context.dp_rank, seed=7,
+        )
+        loader = build_distributed_dataloader(
+            datasets[0], mesh_context.device_mesh,
+            DistributedDatasetConfig(seq_len=8, local_batch_size=4, double_buffer=double_buffer),
+            batch_sampler=sampler, collate_fn=_collate_sources,
         )
         runtime = ParallelBatch(
             mesh_context=mesh_context, device="cpu", tokenizer=_Tokenizer(),
             data_config=config, pp_shared_data=False, source_type="indexed_source",
         )
         allow_payload_reads = True
-        model_inputs, loss_inputs = runtime(loaders[0])
+        model_inputs, loss_inputs = runtime(loader)
         gathered = _all_gather_object((model_inputs["input_ids"].tolist(), payload_reads))
         assert gathered[0][0] == gathered[1][0] and gathered[2][0] == gathered[3][0], (
             f"TP peers received different token batches: gathered={gathered}"
@@ -152,22 +165,24 @@ def _run_epoch(prefix: str, mesh_context: object, double_buffer: bool) -> None:
             f"Expected each source read once, got indices={read_indices}, expected={list(range(len(_LENGTHS)))}"
         )
         expected_tokens = sorted(token for token, length in enumerate(_LENGTHS, 1) for _ in range(length))
-        actual_tokens = sorted(token for token in gathered[0][0][0] + gathered[2][0][0] if token != 0)
+        actual_tokens = sorted(token for batch in (gathered[0][0], gathered[2][0]) for row in batch
+                               for token in row if token != 0)
         assert actual_tokens == expected_tokens, (
             f"Token conservation: actual={actual_tokens}, expected={expected_tokens}"
         )
         valid_tokens = loss_inputs["loss_mask"].sum().item()
-        assert valid_tokens in (7, 8), (
-            f"Expected seven or eight valid tokens per DP rank, got count={valid_tokens}"
+        global_tokens = sum(_all_gather_object(valid_tokens)[::2])
+        assert global_tokens == sum(_LENGTHS), (
+            f"Token counts changed: actual={global_tokens}, expected={sum(_LENGTHS)}"
         )
         _assert_loss_gradient_parity(model_inputs, loss_inputs, mesh_context.device_mesh)
         exhausted = False
         try:
-            runtime(loaders[0])
+            runtime(loader)
         except StopIteration:
             exhausted = True
         assert exhausted, f"Expected a collective end of the source epoch, got exhausted={exhausted}"
-        loaders[0].wait_for_prefetch()
+        loader.wait_for_prefetch()
 
 
 def _run_native_sampler(prefix: str, mesh_context: object) -> None:

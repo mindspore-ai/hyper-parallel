@@ -14,12 +14,15 @@
 # ============================================================================
 """Tests for user-supplied PyTorch DataLoader execution options."""
 
+import hashlib
 import inspect
 import unittest
+from dataclasses import asdict
 from unittest.mock import patch
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,
     SampleMetadata,
@@ -105,13 +108,16 @@ class TestDataLoaderKwargs(unittest.TestCase):
     def test_online_source_forwards_execution_options_to_native_dataloader(self) -> None:
         """Online Dataset Readers should pass normalized options to PyTorch."""
         supplied = self._execution_options()
-        with patch("hyper_parallel.distributed_data.dataset_reader.DataLoader") as dataloader_type:
+        with patch("hyper_parallel.distributed_data.metadata.DataLoader") as dataloader_type:
             build_distributed_dataloader(
                 self._samples(),
                 _StandaloneMesh(),
                 self._config(),
                 metadata_fn=_metadata_fn,
                 dataloader_kwargs=supplied,
+                batch_sampler=build_dataset_batch_sampler(
+                    total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,
+                ),
             )
 
         forwarded = dataloader_type.call_args.kwargs
@@ -134,6 +140,9 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 self._config(),
                 metadata=metadata,
                 dataloader_kwargs=supplied,
+                batch_sampler=build_dataset_batch_sampler(
+                    total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,
+                ),
             )
 
         forwarded = dataloader_type.call_args.kwargs
@@ -243,16 +252,21 @@ class TestDataLoaderKwargs(unittest.TestCase):
         self.assertNotEqual(string_fingerprint, no_callback_fingerprint)
 
     def test_metadata_rename_preserves_checkpoint_fingerprints(self) -> None:
-        """Online and metadata modes keep fingerprints recorded before the rename."""
+        """The metadata rename retains the legacy serialized key with current config fields."""
         config = DistributedDatasetConfig(
             seq_len=10, local_batch_size=1, buffer_size_multiplier=2.0, shuffle=True,
         )
         _, options = _normalize_dataloader_kwargs(config, None)
-        expected_fingerprints = {
-            False: "6215fac83468cbad291e011f",
-            True: "7158276c0d917999d845ce05",
-        }
-        for metadata_mode, expected in expected_fingerprints.items():
+        legacy_config = asdict(config)
+        for name in ("num_workers", "pin_memory", "prefetch_factor", "persistent_workers", "packing_budgets"):
+            legacy_config.pop(name)
+        legacy_config.update(
+            dataloader_options=options, dataset_reader_ranks=(0,), planner_rank=0,
+            communication_device_type=None, uses_default_pack=True, uses_default_collate=True,
+        )
+        for metadata_mode in (False, True):
+            legacy_config["sidecar_mode"] = metadata_mode
+            expected = hashlib.sha256(repr(sorted(legacy_config.items())).encode("utf-8")).hexdigest()[:24]
             with self.subTest(metadata_mode=metadata_mode):
                 actual = _config_fingerprint(
                     config, (0,), 0, dataloader_fingerprint=options, metadata_mode=metadata_mode,

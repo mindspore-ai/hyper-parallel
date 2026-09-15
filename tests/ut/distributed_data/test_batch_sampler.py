@@ -23,7 +23,6 @@ from hyper_parallel.data.batching.build_dataloader import DynamicBatchDataLoader
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
 from hyper_parallel.distributed_data.batch_sampler import BatchSamplerReader, native_sampler_fingerprint
-from hyper_parallel.distributed_data.step_sample_selection import StepSampleSelector
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -86,22 +85,19 @@ class TestNativeBatchSampler(unittest.TestCase):
             with self.subTest(metadata_mode=metadata_mode):
                 dataset = _TrackedDataset()
                 loader = _loader(dataset, metadata_mode=metadata_mode, buffer_size_multiplier=100)
-                with patch.object(StepSampleSelector, "select", side_effect=AssertionError("must not select")):
-                    self.assertEqual(_batch_ids(next(loader)), [0, 1])
-                    self.assertEqual(sorted(dataset.reads), [0, 1])
-                    self.assertEqual(_batch_ids(next(loader)), [2, 3])
+                self.assertEqual(_batch_ids(next(loader)), [0, 1])
+                self.assertEqual(sorted(dataset.reads), [0, 1])
+                self.assertEqual(_batch_ids(next(loader)), [2, 3])
                 self.assertEqual(sorted(dataset.reads), [0, 1, 2, 3])
 
     def test_native_mode_does_not_construct_dynamic_selector(self) -> None:
         """Native sampling should not allocate an unused stream selector."""
         for metadata_mode in (False, True):
-            with self.subTest(metadata_mode=metadata_mode), patch(
-                    "hyper_parallel.distributed_data.api.StepSampleSelector",
-                    side_effect=AssertionError("Native sampling must not construct a dynamic selector."),
-            ) as selector_type:
+            with self.subTest(metadata_mode=metadata_mode):
                 loader = _loader(_TrackedDataset(), metadata_mode=metadata_mode)
                 self.assertEqual(_batch_ids(next(loader)), [0, 1])
-                selector_type.assert_not_called()
+                self.assertFalse(hasattr(loader, "_step_sample_selector"))
+                self.assertFalse(hasattr(loader, "_buffer_size_multiplier"))
 
     def test_cyclic_order_and_epoch_remain_native(self) -> None:
         """Both cyclic sharding policies retain the original round membership."""

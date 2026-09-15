@@ -12,23 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Standalone end-to-end tests for Dataset Reader to Data Constructor flow."""
+"""Regression tests for source-selected steps, direct reads, and prefetch."""
 
+import copy
 import unittest
-from dataclasses import replace
-from threading import Event
 from typing import Any
-from unittest.mock import call, patch
+from unittest.mock import patch
 
-from hyper_parallel.distributed_data import (
-    DistributedDataLoader,
-    DistributedDatasetConfig,
-    SampleMetadata,
-    build_distributed_dataloader,
-    default_collate_fn,
-    default_pack_fn,
-)
-from hyper_parallel.distributed_data.schema import DistributedPackingPlan
+from hyper_parallel.data.parallel import build_dataset_batch_sampler
+from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
+from hyper_parallel.distributed_data.schema import BufferedSampleMetadata, DistributedPackingPlan, SampleKey
 from tests.common.mark_utils import arg_mark
 
 
@@ -38,736 +31,303 @@ class _StandaloneMesh:
     rank_list = (0,)
 
 
-class _IterOnlyDataset:
-    """Provide a finite online stream without index access."""
+class _StepReader:
+    """Model a user-owned producer with explicitly selected pack boundaries."""
 
-    def __init__(self, samples: list[dict[str, Any]]) -> None:
-        """Store samples yielded by ``__iter__``."""
-        self._samples = samples
+    def __init__(self, steps: list[list[list[dict[str, int]]]]) -> None:
+        """Store externally selected step boundaries for deterministic replay."""
+        self.steps = steps
+        self.epoch = 0
+        self.position = 0
+        self.exhausted = False
+        self.reference_bins = ()
+        self.fill_calls = 0
+        self.payloads = {}
 
-    def __len__(self) -> int:
-        """Return the finite stream length."""
-        return len(self._samples)
+    @property
+    def batch_position(self) -> int:
+        """Return the committed local-step cursor."""
+        return self.position
 
-    def __iter__(self) -> Any:
-        """Yield raw samples in source order."""
-        return iter(self._samples)
+    def fill(self, **_targets: int) -> None:
+        """Expose a whole pending step without consuming a future one."""
+        self.fill_calls += 1
+        if self.reference_bins or self.exhausted:
+            return
+        if self.position == len(self.steps):
+            self.exhausted = True
+            return
+        bins = []
+        for samples in self.steps[self.position]:
+            items = []
+            for sample in samples:
+                key = SampleKey(0, sample["id"], len(self.payloads))
+                self.payloads[key] = sample
+                items.append(BufferedSampleMetadata(
+                    key, SampleMetadata(sample["tokens"], sample_id=sample["id"]), len(self.payloads) - 1,
+                ))
+            bins.append(tuple(items))
+        self.reference_bins = tuple(bins)
+
+    def metadata(self) -> tuple[BufferedSampleMetadata, ...]:
+        """Return only the current step's metadata."""
+        return tuple(item for packing_bin in self.reference_bins for item in packing_bin)
+
+    def selected_payloads(self, keys: set[SampleKey]) -> tuple[tuple[SampleKey, Any], ...]:
+        """Route buffered payloads without reading by Dataset index."""
+        return tuple((key, self.payloads[key]) for key in keys)
+
+    def commit(self, keys: set[SampleKey]) -> None:
+        """Advance only after the entire selected step was consumed."""
+        if keys != set(self.payloads):
+            raise ValueError("Step commit must preserve every selected occurrence.")
+        self.position += 1
+        self.reference_bins = ()
+        self.payloads = {}
+
+    def state_dict(self) -> dict[str, int]:
+        """Exclude speculative fills from the saved cursor."""
+        return {"epoch": self.epoch, "position": self.position}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        """Restore the committed cursor and discard pending data."""
+        self.set_epoch(state["epoch"])
+        self.position = state["position"]
+
+    def set_epoch(self, epoch: int) -> None:
+        """Restart the deterministic source."""
+        self.epoch = epoch
+        self.position = 0
+        self.exhausted = False
+        self.reference_bins = ()
+        self.payloads = {}
 
 
-def _build_standard_loader(
-        samples: list[dict[str, Any]],
-        config: DistributedDatasetConfig,
-        events: list[tuple[str, Any]],
-) -> DistributedDataLoader:
-    def metadata_fn(sample: dict[str, Any]) -> SampleMetadata:
-        """Derive planner metadata from a test sample."""
-        events.append(("metadata", sample["id"]))
-        return SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
+def _steps():
+    return [
+        [[{"id": 0, "tokens": 6}, {"id": 1, "tokens": 4}]],
+        [[{"id": 2, "tokens": 6}, {"id": 3, "tokens": 4}]],
+        [[{"id": 4, "tokens": 6}, {"id": 5, "tokens": 4}]],
+    ]
 
-    def pack_fn(raw_samples: list[dict[str, Any]], seq_len: int) -> dict[str, Any]:
-        """Record and combine samples in one planned bin."""
-        sample_ids = tuple(sample["id"] for sample in raw_samples)
-        token_count = sum(sample["tokens"] for sample in raw_samples)
-        if token_count > seq_len:
-            raise ValueError(f"test pack received {token_count} tokens for seq_len={seq_len}")
-        events.append(("pack", sample_ids))
-        return {"sample_ids": sample_ids, "tokens": token_count}
 
-    def collate_fn(packed_sequences: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
-        """Record and return one immutable local batch."""
-        events.append(("collate", len(packed_sequences)))
-        return tuple(packed_sequences)
-
+def _external_loader(reader=None, **options):
+    reader = _StepReader(_steps()) if reader is None else reader
     return build_distributed_dataloader(
-        samples,
-        _StandaloneMesh(),
-        config,
-        metadata_fn=metadata_fn,
-        pack_fn=pack_fn,
-        collate_fn=collate_fn,
+        None, _StandaloneMesh(), DistributedDatasetConfig(seq_len=10, local_batch_size=1, **options),
+        external_step_reader=reader,
     )
 
 
-def _drain(loader: DistributedDataLoader) -> tuple[list[Any], list[str]]:
-    batches = []
-    plan_ids = []
-    while True:
-        try:
-            batches.append(next(loader))
-        except StopIteration:
-            break
-        plan_ids.append(loader.last_plan_id)
-    return batches, plan_ids
+def _sampler(size=6, local_batch_size=2):
+    return build_dataset_batch_sampler(
+        total_samples=size, micro_batch_size=local_batch_size, global_batch_size=local_batch_size,
+        dp_world_size=1, dp_rank=0,
+    )
 
 
 class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
-    """Verify the collective orchestration in its one-rank reference mode."""
+    """Verify that each plan consumes one externally determined step."""
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_next_plan_control_returns_plan_after_internal_refill(self) -> None:
-        """Feature: Plan-only return contract.
-        Description: Supply incomplete metadata followed by a complete packing bin.
-        Expectation: Refill stays internal and callers receive the actual plan in both data modes.
+    def test_explicit_and_inferred_metadata_require_batch_sampler(self) -> None:
+        """Feature: Producer-defined step boundaries.
+        Description: Metadata alone cannot activate a streaming selector, even for an empty Dataset.
+        Expectation: Missing step boundaries fail before metadata or payload reads.
         """
-        samples = [{"id": 0, "tokens": 6}, {"id": 1, "tokens": 4}]
-        metadata = [SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"]) for sample in samples]
-        config = DistributedDatasetConfig(seq_len=10, local_batch_size=1, buffer_size_multiplier=1.0)
-        for metadata_mode in (False, True):
-            with self.subTest(metadata_mode=metadata_mode):
-                loader = (
-                    build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata)
-                    if metadata_mode else _build_standard_loader(samples, config, [])
-                )
-                complete = loader._fill_local_reader(1)
-                incomplete = replace(complete, metadata=complete.metadata[:1])
-                with patch.object(loader, "_fill_local_reader", side_effect=(incomplete, complete)) as fill:
-                    plan = loader._next_plan_control()
+        class Dataset:
+            requires_distributed_packing = True
 
-                self.assertIsInstance(plan, DistributedPackingPlan)
-                self.assertEqual([key.dataset_index for key in plan.selected_keys], [0, 1])
-                self.assertEqual(fill.call_args_list, [call(1), call(2)])
+            def __len__(self) -> int:
+                """Return the aligned Dataset length."""
+                return 2
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_next_plan_control_returns_none_at_end_and_after_restore(self) -> None:
-        """Feature: Plan end-of-stream return contract.
-        Description: Exhaust an empty source or an incomplete tail, then restore its stopped state.
-        Expectation: End-of-stream returns None and restored stopped readers do not run the Planner.
-        """
-        config = DistributedDatasetConfig(seq_len=10, local_batch_size=2, buffer_size_multiplier=1.0)
-        for samples in ([], [{"id": 0, "tokens": 4}]):
-            with self.subTest(samples=samples):
-                loader = _build_standard_loader(samples, config, [])
-                self.assertIsNone(loader._next_plan_control())
-                self.assertEqual(list(loader), [])
-                resumed = _build_standard_loader(samples, config, [])
-                resumed.load_state_dict(loader.state_dict())
-                with patch.object(resumed, "_plan_reader_snapshots") as plan_snapshots:
-                    self.assertIsNone(resumed._next_plan_control())
-                plan_snapshots.assert_not_called()
+            def __getitem__(self, index: int) -> Any:
+                """Expose payload access independently from metadata lookup."""
+                raise AssertionError("Build must not read payloads.")
+
+            def get_sample_metadata(self, index: int) -> SampleMetadata:
+                """Reject metadata reads before validating the step source."""
+                raise AssertionError("Rejected build must not scan metadata.")
+
+        for dataset, options in (
+                ([0, 1], {"metadata": [SampleMetadata(1)] * 2}),
+                ([], {"metadata": []}),
+                (Dataset(), {}),
+        ):
+            with self.subTest(dataset=type(dataset).__name__), patch(
+                    "hyper_parallel.distributed_data.api.create_data_groups",
+            ) as groups:
+                with self.assertRaisesRegex(ValueError, "Metadata mode requires batch_sampler"):
+                    build_distributed_dataloader(
+                        dataset, _StandaloneMesh(), DistributedDatasetConfig(seq_len=10, local_batch_size=1),
+                        **options,
+                    )
+                groups.assert_not_called()
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_next_plan_control_raises_planner_exception_before_broadcast(self) -> None:
-        """Feature: Local Planner exceptions.
-        Description: Fail planning after successful metadata selection.
-        Expectation: The original exception is raised locally instead of being broadcast as control data.
+    def test_online_dataset_still_requires_external_reader(self) -> None:
+        """Feature: Producer-defined step boundaries.
+        Description: Removing metadata streaming must not re-enable implicit online selection.
+        Expectation: Raw online datasets cannot trigger implicit step selection.
         """
-        loader = _build_standard_loader(
-            [{"id": 0, "tokens": 10}], DistributedDatasetConfig(seq_len=10, local_batch_size=1), [],
+        with self.assertRaisesRegex(ValueError, "requires external_step_reader"):
+            build_distributed_dataloader(
+                [0], _StandaloneMesh(), DistributedDatasetConfig(seq_len=10, local_batch_size=1),
+                metadata_fn=lambda _: SampleMetadata(1),
+            )
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_native_metadata_plans_before_reads_without_payload_exchange(self) -> None:
+        """Feature: Producer-defined step boundaries.
+        Description: One sampler yield supplies indices; only assigned samples are materialized.
+        Expectation: Only planned indices are read and payload exchange is unused.
+        """
+        events = []
+
+        class Dataset:
+            def __len__(self) -> int:
+                """Return the aligned Dataset length."""
+                return 6
+
+            def __getitem__(self, index: int) -> Any:
+                """Expose payload access independently from metadata lookup."""
+                events.append(("read", index))
+                return {"id": index}
+
+        loader = build_distributed_dataloader(
+            Dataset(), _StandaloneMesh(), DistributedDatasetConfig(seq_len=10, local_batch_size=2),
+            batch_sampler=_sampler(), metadata=[SampleMetadata(1)] * 6,
         )
-        failure = ValueError("injected planner failure")
-        with patch.object(loader._planner, "plan", side_effect=failure), \
-                patch.object(loader._data_plane, "broadcast_from_planner") as broadcast:
-            with self.assertRaises(ValueError) as raised:
-                loader._next_plan_control()
-        self.assertIs(raised.exception, failure)
+        original_plan = loader._planner.plan
+
+        def plan(*args: Any, **kwargs: Any) -> DistributedPackingPlan:
+            """Record planning before the first payload read."""
+            events.append(("plan", None))
+            return original_plan(*args, **kwargs)
+
+        with patch.object(loader._planner, "plan", side_effect=plan), patch.object(
+                loader._data_plane, "exchange_prepared", side_effect=AssertionError("metadata must skip A2A"),
+        ), patch.object(
+                loader._data_plane, "gather_object_to_planner",
+                wraps=loader._data_plane.gather_object_to_planner,
+        ) as gather, patch.object(
+                loader._data_plane, "broadcast_from_planner", wraps=loader._data_plane.broadcast_from_planner,
+        ) as broadcast:
+            self.assertEqual(sorted(sample["id"] for sample in next(loader)), [0, 1])
+        self.assertEqual(events[0][0], "plan")
+        self.assertEqual(sorted(index for kind, index in events if kind == "read"), [0, 1])
+        gather.assert_called_once()
+        broadcast.assert_called_once()
+        self.assertEqual(len(broadcast.call_args.args[0].selected_keys), 2)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_external_steps_do_not_borrow_future_samples(self) -> None:
+        """Feature: Producer-defined step boundaries.
+        Description: Complete pack boundaries, not seq_len or lookahead, control membership.
+        Expectation: Each fill exposes one whole step regardless of read-ahead settings.
+        """
+        reader = _StepReader(_steps())
+        loader = _external_loader(reader, buffer_size_multiplier=1e308, max_buffered_samples=1)
+        for position in range(3):
+            batch = next(loader)
+            self.assertEqual(sorted(sample["id"] for row in batch for sample in row),
+                             [position * 2, position * 2 + 1])
+            self.assertEqual(reader.fill_calls, position + 1)
+        self.assertFalse(hasattr(loader, "_step_sample_selector"))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_incomplete_external_step_fails_without_refill(self) -> None:
+        """Feature: Producer-defined step boundaries.
+        Description: An invalid step must not be completed by reading samples from the next step.
+        Expectation: An incomplete external step raises without retrying fill.
+        """
+        reader = _StepReader([[]])
+        loader = _external_loader(reader)
+        with self.assertRaisesRegex(ValueError, "emitted 0 local packs"):
+            next(loader)
+        self.assertEqual(reader.fill_calls, 1)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_planner_exception_propagates_before_broadcast(self) -> None:
+        """Feature: Producer-defined step boundaries.
+        Description: Planner failure must not be turned into a refill request.
+        Expectation: Planning failure is raised directly instead of broadcasting control data.
+        """
+        loader = _external_loader()
+        with patch.object(loader._planner, "plan", side_effect=ValueError("bad plan")), patch.object(
+                loader._data_plane, "broadcast_from_planner",
+        ) as broadcast:
+            with self.assertRaisesRegex(ValueError, "bad plan"):
+                next(loader)
         broadcast.assert_not_called()
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_default_callbacks_return_planned_bins_of_raw_samples(self) -> None:
-        """Feature: Default distributed data construction.
-        Description: Omit packing and collation callbacks for raw samples.
-        Expectation: Raw samples retain planned bin boundaries and capacity limits.
+    def test_end_of_stream_and_epoch_reset(self) -> None:
+        """Feature: Producer-defined step boundaries.
+        Description: None denotes EOF; a fresh epoch replays the same explicitly selected steps.
+        Expectation: Exhaustion remains stable and set_epoch replays source-defined steps.
         """
-        samples = [
-            {"id": 0, "tokens": 7},
-            {"id": 1, "tokens": 3},
-            {"id": 2, "tokens": 6},
-            {"id": 3, "tokens": 4},
-        ]
+        for double_buffer in (False, True):
+            with self.subTest(double_buffer=double_buffer):
+                loader = _external_loader(double_buffer=double_buffer)
+                expected = list(loader)
+                with self.assertRaises(StopIteration):
+                    next(loader)
+                loader.set_epoch(1)
+                self.assertEqual(list(loader), expected)
 
-        def metadata_fn(sample: dict[str, Any]) -> SampleMetadata:
-            """Expose the raw sample's packing footprint."""
-            return SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
-
-        loader = build_distributed_dataloader(
-            samples,
-            _StandaloneMesh(),
-            DistributedDatasetConfig(seq_len=10, local_batch_size=2, buffer_size_multiplier=1.0),
-            metadata_fn=metadata_fn,
-        )
-
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_double_buffer_reuses_worker_and_preserves_pending_result(self) -> None:
+        """Feature: Producer-defined step boundaries.
+        Description: The background producer prepares exactly one next step while training consumes.
+        Expectation: The same worker prepares the next uncommitted step.
+        """
+        reader = _StepReader(_steps())
+        loader = _external_loader(reader, double_buffer=True)
+        next(loader)
+        thread = loader._prefetch_thread
+        loader.wait_for_prefetch()
+        self.assertEqual(reader.position, 1)
         batch = next(loader)
-
-        self.assertEqual(batch, ((samples[0], samples[1]), (samples[2], samples[3])))
-        self.assertIsInstance(batch, tuple)
-        self.assertTrue(all(isinstance(packing_bin, tuple) for packing_bin in batch))
-        self.assertTrue(all(sum(sample["tokens"] for sample in packing_bin) <= 10 for packing_bin in batch))
+        self.assertEqual(sorted(sample["id"] for row in batch for sample in row), [2, 3])
+        self.assertIs(loader._prefetch_thread, thread)
+        list(loader)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_online_iter_only_dataset_does_not_require_getitem(self) -> None:
-        """Feature: Iterable online loading.
-        Description: Build a distributed loader over a source without index access.
-        Expectation: Planning consumes materialized iterator samples without rereading them.
+    def test_background_error_is_raised_by_foreground(self) -> None:
+        """Feature: Producer-defined step boundaries.
+        Description: A producer exception wakes the consuming thread instead of hanging it.
+        Expectation: The consumer receives the original background exception.
         """
-        samples = [{"id": index, "tokens": 4} for index in range(2)]
-
-        def metadata_fn(sample: dict[str, Any]) -> SampleMetadata:
-            """Expose the materialized sample's token footprint."""
-            return SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
-
-        loader = build_distributed_dataloader(
-            _IterOnlyDataset(samples),
-            _StandaloneMesh(),
-            DistributedDatasetConfig(
-                seq_len=8,
-                local_batch_size=1,
-                buffer_size_multiplier=1.0,
-                dataset_already_sharded=True,
-            ),
-            metadata_fn=metadata_fn,
-        )
-
-        self.assertEqual(list(loader), [((samples[0], samples[1]),)])
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_double_buffer_prepares_next_batch_while_trainer_consumes_current(self) -> None:
-        """Feature: Host double buffering.
-        Description: Hold the second read while the first batch is delivered.
-        Expectation: The second transaction finishes before its foreground next call.
-        """
-        samples = [{"id": 0, "tokens": 8}, {"id": 1, "tokens": 8}]
-        second_started = Event()
-        release_second = Event()
-        second_ready = Event()
-
-        def metadata_fn(sample: dict[str, int]) -> SampleMetadata:
-            """Hold the second sample so overlap is directly observable."""
-            if sample["id"] == 1:
-                second_started.set()
-                if not release_second.wait(timeout=5):
-                    raise ValueError("test timed out waiting to release the second sample")
-            return SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
-
-        def collate_fn(packed_sequences: list[tuple[dict[str, int], ...]]) -> tuple[Any, ...]:
-            """Signal when background construction of the second batch completes."""
-            if packed_sequences[0][0]["id"] == 1:
-                second_ready.set()
-            return tuple(packed_sequences)
-
-        loader = build_distributed_dataloader(
-            samples,
-            _StandaloneMesh(),
-            DistributedDatasetConfig(
-                seq_len=8,
-                local_batch_size=1,
-                buffer_size_multiplier=1.0,
-                max_buffered_samples=1,
-                double_buffer=True,
-            ),
-            metadata_fn=metadata_fn,
-            collate_fn=collate_fn,
-        )
-
-        try:
-            self.assertEqual(next(loader), ((samples[0],),))
-            first_plan_id = loader.last_plan_id
-            self.assertTrue(second_started.wait(timeout=2))
-            release_second.set()
-            self.assertTrue(second_ready.wait(timeout=2))
-            self.assertEqual(loader.last_plan_id, first_plan_id)
-
-            self.assertEqual(next(loader), ((samples[1],),))
-            self.assertNotEqual(loader.last_plan_id, first_plan_id)
-            with self.assertRaises(StopIteration):
+        loader = _external_loader(double_buffer=True)
+        with patch.object(loader, "_prepare_next_batch", side_effect=RuntimeError("reader failed")):
+            with self.assertRaisesRegex(RuntimeError, "reader failed"):
                 next(loader)
-        finally:
-            release_second.set()
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_double_buffer_checkpoint_replays_discarded_prefetch(self) -> None:
-        """Feature: Double-buffer checkpoint recovery.
-        Description: Save state after speculative preparation has begun.
-        Expectation: Uncommitted prefetched samples replay after restoration.
+    def test_metadata_and_external_checkpoints_replay_pending_step(self) -> None:
+        """Feature: Producer-defined step boundaries.
+        Description: Saved progress describes delivered steps, not speculative reads.
+        Expectation: A resumed loader reproduces the same remaining steps.
         """
-        samples = [{"id": index, "tokens": 6 if index % 2 == 0 else 4} for index in range(6)]
-        config = DistributedDatasetConfig(
-            seq_len=10,
-            local_batch_size=1,
-            buffer_size_multiplier=2.0,
-            double_buffer=True,
-        )
-        baseline = _build_standard_loader(samples, config, [])
-        first_batch = next(baseline)
-        checkpoint = baseline.state_dict()
-        expected_batches, expected_plan_ids = _drain(baseline)
+        samples = [sample for step in _steps() for row in step for sample in row]
 
-        resumed = _build_standard_loader(samples, config, [])
-        resumed.load_state_dict(checkpoint)
-        actual_batches, actual_plan_ids = _drain(resumed)
-
-        self.assertEqual(first_batch, ({"sample_ids": (0, 1), "tokens": 10},))
-        self.assertEqual(actual_batches, expected_batches)
-        self.assertEqual(actual_plan_ids, expected_plan_ids)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_double_buffer_surfaces_background_reader_errors_on_next(self) -> None:
-        """Feature: Double-buffer error propagation.
-        Description: Inject a failure into the speculative background transaction.
-        Expectation: The failure surfaces on the next call without corrupting the delivered batch.
-        """
-        samples = [{"id": 0, "tokens": 8}, {"id": 1, "tokens": 8}]
-
-        def metadata_fn(sample: dict[str, int]) -> SampleMetadata:
-            """Fail only in the second background transaction."""
-            if sample["id"] == 1:
-                raise ValueError("injected background metadata failure")
-            return SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
-
-        loader = build_distributed_dataloader(
-            samples,
-            _StandaloneMesh(),
-            DistributedDatasetConfig(
-                seq_len=8,
-                local_batch_size=1,
-                buffer_size_multiplier=1.0,
-                max_buffered_samples=1,
-                double_buffer=True,
-            ),
-            metadata_fn=metadata_fn,
-        )
-
-        self.assertEqual(next(loader), ((samples[0],),))
-        with self.assertRaisesRegex(RuntimeError, "injected background metadata failure"):
-            next(loader)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_dynamically_packs_samples_then_collates_local_sequences(self) -> None:
-        """Feature: Dynamic sample packing.
-        Description: Apply explicit callbacks to each planned bin and local batch.
-        Expectation: Samples pack to capacity before local sequences are collated.
-        """
-        samples = [
-            {"id": 0, "tokens": 6},
-            {"id": 1, "tokens": 4},
-            {"id": 2, "tokens": 6},
-            {"id": 3, "tokens": 4},
-        ]
-        events: list[tuple[str, Any]] = []
-        config = DistributedDatasetConfig(
-            seq_len=10,
-            local_batch_size=2,
-            buffer_size_multiplier=1.0,
-        )
-        loader = _build_standard_loader(samples, config, events)
-
-        batch = next(loader)
-
-        self.assertEqual(
-            batch,
-            (
-                {"sample_ids": (0, 1), "tokens": 10},
-                {"sample_ids": (2, 3), "tokens": 10},
-            ),
-        )
-        self.assertEqual(
-            events,
-            [
-                ("metadata", 0),
-                ("metadata", 1),
-                ("metadata", 2),
-                ("metadata", 3),
-                ("pack", (0, 1)),
-                ("pack", (2, 3)),
-                ("collate", 2),
-            ],
-        )
-        self.assertIsNotNone(loader.last_plan_id)
-        with self.assertRaises(StopIteration):
-            next(loader)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_metadata_plans_before_direct_reads_and_skips_payload_a2a(self) -> None:
-        """Feature: Metadata-guided direct sample reads.
-        Description: Plan from metadata before materializing Dataset payloads.
-        Expectation: Only assigned indices are read and payload A2A is skipped.
-        """
-        read_indices = []
-
-        class _RecordingDataset:
-            def __init__(self) -> None:
-                """Store four deterministic raw samples."""
-                self.samples = [
-                    {"id": 0, "tokens": 6},
-                    {"id": 1, "tokens": 4},
-                    {"id": 2, "tokens": 6},
-                    {"id": 3, "tokens": 4},
-                ]
-
-            def __len__(self) -> int:
-                """Return the shared metadata index-space size."""
-                return len(self.samples)
-
-            def __getitem__(self, index: int) -> dict[str, int]:
-                """Record each direct read performed after planning."""
-                read_indices.append(index)
-                return self.samples[index]
-
-        dataset = _RecordingDataset()
-        metadata = [
-            SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
-            for sample in dataset.samples
-        ]
-        loader = build_distributed_dataloader(
-            dataset,
-            _StandaloneMesh(),
-            DistributedDatasetConfig(seq_len=10, local_batch_size=2, buffer_size_multiplier=1.0),
-            metadata=metadata,
-        )
-        self.assertEqual(read_indices, [])
-
-        with (
-                patch.object(loader._data_plane, "prepare_exchange", side_effect=AssertionError("unexpected A2A")),
-                patch.object(loader._data_plane, "exchange_prepared", side_effect=AssertionError("unexpected A2A")),
-        ):
-            batch = next(loader)
-
-        self.assertEqual(batch, ((dataset.samples[0], dataset.samples[1]), (dataset.samples[2], dataset.samples[3])))
-        self.assertEqual(read_indices, [0, 1, 2, 3])
-        planned_indices = [
-            key.dataset_index
-            for packing_bin in loader.last_plan.local_batches[0]
-            for key in packing_bin.sample_keys
-        ]
-        self.assertEqual(read_indices, planned_indices)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_pre_sharded_metadata_reads_on_reader_then_uses_payload_exchange(self) -> None:
-        """Feature: Pre-sharded metadata routing.
-        Description: Plan from local metadata before loading selected payloads.
-        Expectation: Selected local payloads pass through the payload exchange path.
-        """
-        samples = [{"id": 0, "tokens": 4}, {"id": 1, "tokens": 4}]
-        metadata = [SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"]) for sample in samples]
-        loader = build_distributed_dataloader(
-            samples,
-            _StandaloneMesh(),
-            DistributedDatasetConfig(
-                seq_len=8,
-                local_batch_size=1,
-                buffer_size_multiplier=1.0,
-                dataset_already_sharded=True,
-            ),
-            metadata=metadata,
-        )
-
-        with (
-                patch.object(
-                    loader._data_plane,
-                    "prepare_exchange",
-                    wraps=loader._data_plane.prepare_exchange,
-                ) as prepare_exchange,
-                patch.object(
-                    loader._data_plane,
-                    "exchange_prepared",
-                    wraps=loader._data_plane.exchange_prepared,
-                ) as exchange_prepared,
-        ):
-            batch = next(loader)
-
-        self.assertEqual(batch, ((samples[0], samples[1]),))
-        prepare_exchange.assert_called_once()
-        exchange_prepared.assert_called_once()
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_lookahead_does_not_change_online_step_sample_ids(self) -> None:
-        """Feature: Online step sample selection.
-        Description: Compare step membership across different lookahead sizes.
-        Expectation: Read-ahead buffers future payloads without admitting them early.
-        """
-        samples = [
-            {"id": index, "tokens": tokens}
-            for index, tokens in enumerate((6, 6, 4, 4, 2, 8))
-        ]
-
-        def metadata_fn(sample: dict[str, int]) -> SampleMetadata:
-            """Expose deterministic streaming-packing footprints."""
-            return SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
-
-        def step_ids(multiplier: float) -> list[frozenset[int]]:
-            """Drain one read-ahead configuration into per-step ID sets."""
-            loader = build_distributed_dataloader(
-                samples,
-                _StandaloneMesh(),
-                DistributedDatasetConfig(
-                    seq_len=10,
-                    local_batch_size=2,
-                    buffer_size_multiplier=multiplier,
-                ),
-                metadata_fn=metadata_fn,
+        def metadata_loader() -> Any:
+            """Build a metadata-first sampler loader for checkpoint replay."""
+            return build_distributed_dataloader(
+                samples, _StandaloneMesh(),
+                DistributedDatasetConfig(seq_len=10, local_batch_size=2, double_buffer=True),
+                metadata=[SampleMetadata(sample["tokens"]) for sample in samples], batch_sampler=_sampler(),
             )
-            return [
-                frozenset(sample["id"] for packing_bin in batch for sample in packing_bin)
-                for batch in loader
-            ]
 
-        expected = [frozenset({0, 1, 2}), frozenset({3, 4, 5})]
-        self.assertEqual(step_ids(1.0), expected)
-        self.assertEqual(step_ids(3.0), expected)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_metadata_and_online_modes_select_the_same_canonical_steps(self) -> None:
-        """Feature: Canonical step sample selection.
-        Description: Compare ahead-of-fetch metadata planning with online planning.
-        Expectation: Both modes produce identical stream step membership.
-        """
-        samples = [
-            {"id": index, "tokens": tokens}
-            for index, tokens in enumerate((6, 6, 4, 4, 2, 8))
-        ]
-        metadata = [
-            SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
-            for sample in samples
-        ]
-        config = DistributedDatasetConfig(
-            seq_len=10,
-            local_batch_size=2,
-            buffer_size_multiplier=3.0,
-        )
-        online = build_distributed_dataloader(
-            samples,
-            _StandaloneMesh(),
-            config,
-            metadata_fn=lambda sample: SampleMetadata(
-                pack_tokens=sample["tokens"],
-                sample_id=sample["id"],
-            ),
-        )
-        metadata_loader = build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata)
-
-        def selected_step_ids(loader: DistributedDataLoader) -> list[set[int]]:
-            """Return frozen sample IDs from every delivered packing plan."""
-            result = []
-            for _ in loader:
-                result.append({
-                    key.dataset_index
-                    for local_batch in loader.last_plan.local_batches
-                    for packing_bin in local_batch
-                    for key in packing_bin.sample_keys
-                })
-            return result
-
-        self.assertEqual(selected_step_ids(online), [{0, 1, 2}, {3, 4, 5}])
-        self.assertEqual(selected_step_ids(metadata_loader), [{0, 1, 2}, {3, 4, 5}])
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_metadata_checkpoint_replays_metadata_buffer_without_payloads(self) -> None:
-        """Feature: Metadata checkpoint recovery.
-        Description: Restore a metadata buffer without storing raw payloads.
-        Expectation: Future plans remain stable and only selected indices are reread.
-        """
-        samples = [{"id": index, "tokens": 6 if index % 2 == 0 else 4} for index in range(6)]
-        metadata = [
-            SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
-            for sample in samples
-        ]
-        config = DistributedDatasetConfig(
-            seq_len=10,
-            local_batch_size=1,
-            buffer_size_multiplier=2.0,
-            shuffle=True,
-        )
-
-        baseline = build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata)
-        baseline.set_epoch(3)
-        first_batch = next(baseline)
-        self.assertEqual(len(first_batch), 1)
-        checkpoint = baseline.state_dict()
-        self.assertNotIn("sidecar_reader", checkpoint)
-        self.assertEqual(checkpoint["epoch"], 3)
-        self.assertEqual(checkpoint["metadata_reader"]["epoch"], 3)
-        self.assertEqual(checkpoint["direct_sample_loader"]["epoch"], 3)
-        buffered_metadata = checkpoint["metadata_reader"]["buffer"]
-        selected_keys = set(baseline.last_plan.selected_keys)
-        self.assertTrue(buffered_metadata)
-        self.assertTrue(selected_keys.isdisjoint(item.key for item in buffered_metadata))
-        self.assertEqual(min(item.global_sample_position for item in buffered_metadata), len(selected_keys))
-        expected_batches, expected_plan_ids = _drain(baseline)
-
-        for reader_key in ("metadata_reader", "sidecar_reader"):
-            with self.subTest(reader_key=reader_key):
-                restored_state = dict(checkpoint)
-                restored_state[reader_key] = restored_state.pop("metadata_reader")
-                resumed = build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata)
-                resumed.load_state_dict(restored_state)
-                actual_batches, actual_plan_ids = _drain(resumed)
-
-                self.assertEqual(actual_batches, expected_batches)
-                self.assertEqual(actual_plan_ids, expected_plan_ids)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_builder_rejects_ambiguous_or_misaligned_metadata(self) -> None:
-        """Feature: Builder metadata validation.
-        Description: Provide ambiguous or length-misaligned metadata inputs.
-        Expectation: Online and metadata modes remain exclusive and index-aligned.
-        """
-        samples = [{"id": 0, "tokens": 4}]
-        metadata = [SampleMetadata(pack_tokens=4, sample_id=0)]
-        config = DistributedDatasetConfig(seq_len=4, local_batch_size=1)
-
-        with self.assertRaisesRegex(ValueError, "either online metadata_fn or metadata"):
-            build_distributed_dataloader(
-                samples,
-                _StandaloneMesh(),
-                config,
-                metadata_fn=lambda sample: metadata[0],
-                metadata=metadata,
-            )
-        with self.assertRaisesRegex(ValueError, "must provide metadata"):
-            build_distributed_dataloader(samples, _StandaloneMesh(), config)
-        with self.assertRaisesRegex(ValueError, "does not match Dataset length"):
-            build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata * 2)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_prepacked_sample_can_be_one_complete_local_batch(self) -> None:
-        """Feature: Prepacked sample construction.
-        Description: Treat one full-length raw sample as a complete local batch.
-        Expectation: The sample remains in a singleton constructor bin.
-        """
-        samples = [
-            {"id": 0, "tokens": 8, "batch": {"input_ids": [10, 11]}},
-            {"id": 1, "tokens": 8, "batch": {"input_ids": [20, 21]}},
-        ]
-        pack_inputs: list[tuple[int, ...]] = []
-
-        def metadata_fn(sample: dict[str, Any]) -> SampleMetadata:
-            """Describe an already packed sample as one full sequence."""
-            return SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
-
-        def pack_fn(raw_samples: list[dict[str, Any]], seq_len: int) -> dict[str, Any]:
-            """Unwrap the singleton prepacked batch."""
-            self.assertEqual(seq_len, 8)
-            pack_inputs.append(tuple(sample["id"] for sample in raw_samples))
-            self.assertEqual(len(raw_samples), 1)
-            return raw_samples[0]["batch"]
-
-        def collate_fn(packed_sequences: list[dict[str, Any]]) -> dict[str, Any]:
-            """Return the one already complete local batch."""
-            self.assertEqual(len(packed_sequences), 1)
-            return packed_sequences[0]
-
-        loader = build_distributed_dataloader(
-            samples,
-            _StandaloneMesh(),
-            DistributedDatasetConfig(seq_len=8, local_batch_size=1, buffer_size_multiplier=1.0),
-            metadata_fn=metadata_fn,
-            pack_fn=pack_fn,
-            collate_fn=collate_fn,
-        )
-
-        self.assertEqual(list(loader), [{"input_ids": [10, 11]}, {"input_ids": [20, 21]}])
-        self.assertEqual(pack_inputs, [(0,), (1,)])
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_checkpoint_resume_matches_uninterrupted_batches_and_plan_ids(self) -> None:
-        """Feature: Distributed loader checkpoint recovery.
-        Description: Resume buffered iteration and compare with uninterrupted loading.
-        Expectation: Batches and plan IDs continue without duplication or drift.
-        """
-        samples = [{"id": index, "tokens": 6 if index % 2 == 0 else 4} for index in range(6)]
-        config = DistributedDatasetConfig(
-            seq_len=10,
-            local_batch_size=1,
-            buffer_size_multiplier=2.0,
-        )
-        baseline_events: list[tuple[str, Any]] = []
-        baseline = _build_standard_loader(samples, config, baseline_events)
-        first_batch = next(baseline)
-        checkpoint = baseline.state_dict()
-        expected_batches, expected_plan_ids = _drain(baseline)
-
-        resumed_events: list[tuple[str, Any]] = []
-        resumed = _build_standard_loader(samples, config, resumed_events)
-        resumed.load_state_dict(checkpoint)
-        actual_batches, actual_plan_ids = _drain(resumed)
-
-        self.assertEqual(first_batch, ({"sample_ids": (0, 1), "tokens": 10},))
-        self.assertEqual(actual_batches, expected_batches)
-        self.assertEqual(actual_plan_ids, expected_plan_ids)
-        remaining_ids = [
-            sample_id
-            for batch in actual_batches
-            for packed in batch
-            for sample_id in packed["sample_ids"]
-        ]
-        self.assertEqual(remaining_ids, [2, 3, 4, 5])
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_checkpoint_fingerprint_canonicalizes_default_callback_mode(self) -> None:
-        """Feature: Constructor callback checkpoint identity.
-        Description: Restore state with omitted, explicit-default, and custom callbacks.
-        Expectation: Equivalent defaults match while custom construction is incompatible.
-        """
-        samples = [{"id": index, "tokens": 6 if index % 2 == 0 else 4} for index in range(4)]
-        config = DistributedDatasetConfig(seq_len=10, local_batch_size=1, buffer_size_multiplier=1.0)
-
-        def metadata_fn(sample: dict[str, Any]) -> SampleMetadata:
-            """Expose the sample token footprint for all three loaders."""
-            return SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
-
-        omitted_defaults = build_distributed_dataloader(
-            samples,
-            _StandaloneMesh(),
-            config,
-            metadata_fn=metadata_fn,
-        )
-        self.assertEqual(next(omitted_defaults), ((samples[0], samples[1]),))
-        checkpoint = omitted_defaults.state_dict()
-
-        explicit_defaults = build_distributed_dataloader(
-            samples,
-            _StandaloneMesh(),
-            config,
-            metadata_fn=metadata_fn,
-            pack_fn=default_pack_fn,
-            collate_fn=default_collate_fn,
-        )
-        explicit_defaults.load_state_dict(checkpoint)
-        self.assertEqual(next(explicit_defaults), ((samples[2], samples[3]),))
-
-        custom_callbacks = _build_standard_loader(samples, config, [])
-        with self.assertRaisesRegex(ValueError, "config_fingerprint"):
-            custom_callbacks.load_state_dict(checkpoint)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_eof_drops_a_tail_that_cannot_fill_every_local_bin(self) -> None:
-        """Feature: End-of-stream tail handling.
-        Description: Exhaust the source before every local bin can be populated.
-        Expectation: The default drop-last contract stops before construction callbacks.
-        """
-        events: list[tuple[str, Any]] = []
-        loader = _build_standard_loader(
-            [{"id": 0, "tokens": 4}],
-            DistributedDatasetConfig(seq_len=10, local_batch_size=2, buffer_size_multiplier=1.0),
-            events,
-        )
-
-        self.assertEqual(list(loader), [])
-        self.assertEqual(events, [("metadata", 0)])
-        self.assertIsNone(loader.last_plan)
-        with self.assertRaises(StopIteration):
-            next(loader)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_extreme_finite_buffer_multiplier_does_not_overflow_fill_targets(self) -> None:
-        """Feature: Bounded read-ahead target arithmetic.
-        Description: Use an extreme finite multiplier with a sample-count cap.
-        Expectation: Fill targets remain bounded and the batch is delivered.
-        """
-        events: list[tuple[str, Any]] = []
-        loader = _build_standard_loader(
-            [{"id": 0, "tokens": 8}],
-            DistributedDatasetConfig(
-                seq_len=8,
-                local_batch_size=1,
-                buffer_size_multiplier=1e308,
-                max_buffered_samples=1,
-            ),
-            events,
-        )
-
-        self.assertEqual(next(loader), ({"sample_ids": (0,), "tokens": 8},))
-        self.assertEqual(events, [("metadata", 0), ("pack", (0,)), ("collate", 1)])
-
-
-if __name__ == "__main__":
-    unittest.main()
+        for build in (metadata_loader, lambda: _external_loader(double_buffer=True)):
+            with self.subTest(build=build):
+                loader = build()
+                next(loader)
+                loader.wait_for_prefetch()
+                state = copy.deepcopy(loader.state_dict())
+                expected = list(loader)
+                resumed = build()
+                resumed.load_state_dict(state)
+                self.assertEqual(list(resumed), expected)

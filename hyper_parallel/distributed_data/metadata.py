@@ -17,235 +17,19 @@
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch.utils.data import DataLoader, Dataset, Sampler  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.distributed_data.schema import (
-    BufferedSampleMetadata,
-    SampleKey,
-    SampleMetadata,
-)
+from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.distributed_data.dataset_reader import (
     _IndexedDataset,
     _IndexedPayload,
-    _ReaderIndexSampler,
     _build_worker_options,
-    _commit_reader_buffer,
     _identity,
-    _validate_reader_checkpoint,
-    _validate_reader_partition,
 )
-
-
-class MetadataReader:
-    """Expose one deterministic reader partition without reading sample payloads."""
-
-    VERSION = 3
-
-    def __init__(
-            self,
-            metadata: Sequence[SampleMetadata],
-            *,
-            reader_rank: int,
-            reader_idx: int,
-            reader_count: int,
-            seq_len: int,
-            shuffle: bool,
-            seed: int,
-            dataset_already_sharded: bool = False,
-    ) -> None:
-        """Initialize a metadata-only Dataset Reader.
-
-        Args:
-            metadata: Shared or rank-local metadata entries aligned one-to-one
-                with the corresponding Dataset indices.
-            reader_rank: Global rank owning this metadata reader.
-            reader_idx: Position in the configured Dataset Reader rank tuple.
-            reader_count: Number of metadata Dataset Readers.
-            seq_len: Sequence capacity used for buffered-token accounting.
-            shuffle: Whether to shuffle this metadata sequence per epoch.
-            seed: Base shuffle seed.
-            dataset_already_sharded: Whether this Reader already receives only
-                its rank-local metadata and must not apply another stride.
-        """
-        if not hasattr(metadata, "__len__") or not callable(getattr(metadata, "__getitem__", None)):
-            raise ValueError("metadata must support __len__ and integer __getitem__ access.")
-        metadata_size = len(metadata)
-        if not isinstance(metadata_size, int) or isinstance(metadata_size, bool) or metadata_size < 0:
-            raise ValueError(f"metadata length must be a non-negative integer, but got {metadata_size!r}.")
-        _validate_reader_partition(
-            reader_rank=reader_rank,
-            reader_idx=reader_idx,
-            reader_count=reader_count,
-            seq_len=seq_len,
-            seed=seed,
-            dataset_already_sharded=dataset_already_sharded,
-            shuffle=shuffle,
-        )
-        self._metadata = metadata
-        self._reader_rank = reader_rank
-        self._reader_idx = reader_idx
-        self._reader_count = reader_count
-        self._seq_len = seq_len
-        self._shuffle = shuffle
-        self._seed = seed
-        self._dataset_already_sharded = dataset_already_sharded
-        self._epoch = 0
-        self._next_ordinal = 0
-        self._buffer: list[BufferedSampleMetadata] = []
-        self._iterator: Iterator[int] | None = None
-        self._exhausted = False
-
-    @property
-    def exhausted(self) -> bool:
-        """Return whether this reader has scanned its metadata partition."""
-        return self._exhausted
-
-    @property
-    def buffer_size(self) -> int:
-        """Return the number of uncommitted metadata candidates."""
-        return len(self._buffer)
-
-    @property
-    def effective_buffer_tokens(self) -> int:
-        """Return buffered tokens, capping singleton overflow at ``seq_len``."""
-        return sum(min(item.metadata.pack_tokens, self._seq_len) for item in self._buffer)
-
-    def fill(self, *, min_samples: int, min_tokens: int, max_samples: int) -> None:
-        """Fill the planning buffer without materializing Dataset samples.
-
-        Args:
-            min_samples: Minimum buffered candidate count.
-            min_tokens: Minimum effective buffered token count.
-            max_samples: Hard bound on resident metadata entries.
-
-        Returns:
-            ``None`` after the local buffer has been filled or metadata is exhausted.
-        """
-        for name, value in (("min_samples", min_samples), ("min_tokens", min_tokens), ("max_samples", max_samples)):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
-        try:
-            while (
-                    not self._exhausted
-                    and len(self._buffer) < max_samples
-                    and (len(self._buffer) < min_samples or self.effective_buffer_tokens < min_tokens)
-            ):
-                dataset_index = self._read_one_index()
-                if dataset_index is None:
-                    break
-                metadata = self._metadata[dataset_index]
-                if not isinstance(metadata, SampleMetadata):
-                    raise ValueError(
-                        f"metadata must contain SampleMetadata, but got {type(metadata)} at index {dataset_index}."
-                    )
-                self._buffer.append(BufferedSampleMetadata(
-                    key=SampleKey(self._reader_rank, dataset_index),
-                    metadata=metadata,
-                    global_sample_position=(
-                        self._reader_idx + self._next_ordinal * self._reader_count
-                    ),
-                ))
-                self._next_ordinal += 1
-        except Exception as exc:
-            raise RuntimeError(
-                f"Metadata Dataset Reader rank {self._reader_rank} failed: {type(exc).__name__}: {exc}"
-            ) from exc
-
-    def metadata(self) -> tuple[BufferedSampleMetadata, ...]:
-        """Return the current lightweight planning candidates."""
-        return tuple(self._buffer)
-
-    def commit(self, selected_keys: set[SampleKey]) -> None:
-        """Remove selected metadata only after batch construction and broadcast succeed.
-
-        Args:
-            selected_keys: Keys of successfully consumed samples.
-        """
-        self._buffer = _commit_reader_buffer(self._buffer, selected_keys, owner="metadata")
-
-    def state_dict(self) -> dict[str, Any]:
-        """Return the metadata cursor and uncommitted planning buffer."""
-        state = {
-            **self._checkpoint_identity(),
-            "epoch": self._epoch,
-            "next_ordinal": self._next_ordinal,
-            "exhausted": self._exhausted,
-            "buffer": self._buffer,
-        }
-        try:
-            return copy.deepcopy(state)
-        except Exception as exc:
-            raise ValueError(f"Metadata buffer is not checkpointable: {exc}") from exc
-
-    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
-        """Restore a checkpoint produced on the same metadata reader rank.
-
-        Args:
-            state_dict: State produced by :meth:`state_dict`.
-        """
-        try:
-            state = copy.deepcopy(dict(state_dict))
-        except Exception as exc:
-            raise ValueError(f"Metadata state is not copyable: {exc}") from exc
-        epoch, next_ordinal, exhausted, buffer = _validate_reader_checkpoint(
-            state, self._checkpoint_identity(), BufferedSampleMetadata, owner="Metadata",
-        )
-        self._epoch = epoch
-        self._next_ordinal = next_ordinal
-        self._exhausted = exhausted
-        self._buffer = buffer
-        self._iterator = None
-
-    def _checkpoint_identity(self) -> dict[str, Any]:
-        return {
-            "version": self.VERSION,
-            "reader_rank": self._reader_rank,
-            "reader_idx": self._reader_idx,
-            "reader_count": self._reader_count,
-            "dataset_already_sharded": self._dataset_already_sharded,
-            "metadata_size": len(self._metadata),
-        }
-
-    def set_epoch(self, epoch: int) -> None:
-        """Reset this metadata partition for a deterministic epoch.
-
-        Args:
-            epoch: Non-negative epoch used in the shuffle seed.
-        """
-        if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
-            raise ValueError(f"epoch must be a non-negative integer, but got {epoch!r}.")
-        if self._buffer and not self._exhausted:
-            raise ValueError("Cannot change epoch while an active metadata buffer is non-empty.")
-        self._buffer.clear()
-        self._epoch = epoch
-        self._next_ordinal = 0
-        self._exhausted = False
-        self._iterator = None
-
-    def _read_one_index(self) -> int | None:
-        if self._iterator is None:
-            self._iterator = self._build_iterator()
-        try:
-            return next(self._iterator)
-        except StopIteration:
-            self._exhausted = True
-            return None
-
-    def _build_iterator(self) -> Iterator[int]:
-        return iter(_ReaderIndexSampler(
-            dataset_size=len(self._metadata),
-            reader_idx=0 if self._dataset_already_sharded else self._reader_idx,
-            reader_count=1 if self._dataset_already_sharded else self._reader_count,
-            start_ordinal=self._next_ordinal,
-            shuffle=self._shuffle,
-            seed=self._seed,
-            epoch=self._epoch,
-        ))
 
 
 class _MutableIndexSampler(Sampler[int]):
@@ -419,4 +203,4 @@ class PlannedSampleLoader:
         self._worker_generator.manual_seed(self._seed + epoch)
 
 
-__all__ = ["MetadataReader", "PlannedSampleLoader"]
+__all__ = ["PlannedSampleLoader"]

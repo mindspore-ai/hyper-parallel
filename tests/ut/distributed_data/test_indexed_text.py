@@ -18,6 +18,7 @@ import unittest
 
 import numpy as np
 
+from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,
     SampleMetadata,
@@ -100,15 +101,15 @@ class TestIndexedTextConstruction(unittest.TestCase):
         loader = build_distributed_dataloader(
             dataset,
             _StandaloneMesh(),
-            DistributedDatasetConfig(seq_len=6, local_batch_size=1),
-            pack_fn=pack_indexed_text_samples,
-            collate_fn=collate_indexed_text_sequences,
+            DistributedDatasetConfig(seq_len=6, local_batch_size=2),
+            batch_sampler=build_dataset_batch_sampler(
+                total_samples=2, micro_batch_size=2, global_batch_size=2, dp_world_size=1, dp_rank=0,
+            ),
         )
 
         batch = next(loader)
 
-        self.assertEqual(sorted(batch["input_ids"].flatten().tolist()), [1, 2, 3, 4, 5, 6])
-        self.assertEqual(batch["cu_seq_lens"].tolist(), [0, 4, 6])
+        self.assertEqual(sorted(sample["input_ids"].tolist() for sample in batch), [[1, 2], [3, 4, 5, 6]])
         self.assertEqual(dataset.metadata_reads, 2)
         self.assertEqual(dataset.payload_reads, 2)
-        self.assertTrue(loader.collective_source)
+        self.assertEqual(sorted(key.dataset_index for key in loader.last_plan.selected_keys), [0, 1])

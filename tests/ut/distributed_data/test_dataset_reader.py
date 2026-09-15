@@ -25,7 +25,6 @@ from torch.utils.data._utils.pin_memory import (  # pylint: disable=forbidden-ba
 from torch.utils.data import Dataset  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed_data.schema import SampleKey, SampleMetadata
-from hyper_parallel.distributed_data.metadata import MetadataReader
 from hyper_parallel.distributed_data.dataset_reader import DatasetReader, _IndexedPayload
 from tests.common.mark_utils import arg_mark
 
@@ -339,7 +338,9 @@ class TestDatasetReader(unittest.TestCase):
             return sample
 
         reader = _dataset_reader(dataset, invalid_metadata, reader_rank=7)
-        with self.assertRaisesRegex(RuntimeError, "Dataset Reader rank 7 failed.*metadata_fn must return SampleMetadata"):
+        with self.assertRaisesRegex(
+                RuntimeError, "Dataset Reader rank 7 failed.*metadata_fn must return SampleMetadata",
+        ):
             reader.fill(min_samples=1, min_tokens=1, max_samples=1)
         self.assertEqual(events, [("getitem", 0), ("metadata", 0)])
         self.assertEqual(reader.buffer_size, 0)
@@ -414,103 +415,12 @@ class TestDatasetReader(unittest.TestCase):
         )
 
 
-class TestMetadataReader(unittest.TestCase):
-    """Verify metadata reader partitions never materialize Dataset payloads."""
-
-    @staticmethod
-    def _reader(
-            metadata: list[SampleMetadata],
-            reader_idx: int,
-            *,
-            dataset_already_sharded: bool = False,
-    ) -> MetadataReader:
-        return MetadataReader(
-            metadata,
-            reader_rank=reader_idx + 4,
-            reader_idx=reader_idx,
-            reader_count=2,
-            seq_len=16,
-            shuffle=False,
-            seed=23,
-            dataset_already_sharded=dataset_already_sharded,
-        )
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_reader_idxs_cover_metadata_indices_without_payload_reads(self) -> None:
-        """Feature: Metadata partitioning.
-        Description: Read metadata entries through complementary Dataset Reader strides.
-        Expectation: The strides form a complete disjoint index partition without payload reads.
-        """
-        metadata = [SampleMetadata(pack_tokens=index + 1, sample_id=f"sample-{index}") for index in range(6)]
-        first = self._reader(metadata, 0)
-        second = self._reader(metadata, 1)
-
-        self.assertIsNone(first.fill(min_samples=6, min_tokens=100, max_samples=6))
-        self.assertIsNone(second.fill(min_samples=6, min_tokens=100, max_samples=6))
-
-        self.assertEqual([item.key.dataset_index for item in first.metadata()], [0, 2, 4])
-        self.assertEqual([item.key.dataset_index for item in second.metadata()], [1, 3, 5])
-        self.assertEqual([item.global_sample_position for item in first.metadata()], [0, 2, 4])
-        self.assertEqual([item.global_sample_position for item in second.metadata()], [1, 3, 5])
-        self.assertEqual(
-            {item.key.dataset_index for item in first.metadata() + second.metadata()},
-            set(range(6)),
-        )
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_checkpoint_preserves_unselected_metadata_buffer(self) -> None:
-        """Feature: Metadata recovery.
-        Description: Commit one candidate and restore the remaining reader buffer.
-        Expectation: Skipped candidates and the reader cursor are preserved.
-        """
-        metadata = [SampleMetadata(pack_tokens=1, sample_id=index) for index in range(8)]
-        original = self._reader(metadata, 0)
-        self.assertIsNone(original.fill(min_samples=3, min_tokens=3, max_samples=3))
-        selected_key = original.metadata()[1].key
-        original.commit({selected_key})
-        state = original.state_dict()
-
-        restored = self._reader(metadata, 0)
-        restored.load_state_dict(state)
-        self.assertEqual(restored.metadata(), original.metadata())
-
-        self.assertIsNone(original.fill(min_samples=4, min_tokens=4, max_samples=4))
-        self.assertIsNone(restored.fill(min_samples=4, min_tokens=4, max_samples=4))
-        self.assertEqual(restored.metadata(), original.metadata())
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_pre_sharded_reader_exposes_every_local_metadata_entry(self) -> None:
-        """Feature: Pre-sharded metadata.
-        Description: Read local metadata with secondary striding disabled.
-        Expectation: Every local metadata entry is exposed exactly once.
-        """
-        metadata = [SampleMetadata(pack_tokens=index + 1, sample_id=index) for index in range(3)]
-        reader = self._reader(metadata, 1, dataset_already_sharded=True)
-
-        self.assertIsNone(reader.fill(min_samples=3, min_tokens=6, max_samples=3))
-
-        self.assertEqual([item.key for item in reader.metadata()], [SampleKey(5, 0), SampleKey(5, 1), SampleKey(5, 2)])
-        self.assertEqual([item.global_sample_position for item in reader.metadata()], [1, 3, 5])
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_active_metadata_buffer_rejects_epoch_change(self) -> None:
-        """Feature: Metadata epoch transitions.
-        Description: Change epoch while the metadata planning buffer is active.
-        Expectation: The reader rejects silently discarding in-progress candidates.
-        """
-        reader = self._reader([SampleMetadata(pack_tokens=1, sample_id=index) for index in range(4)], 0)
-        self.assertIsNone(reader.fill(min_samples=1, min_tokens=1, max_samples=1))
-
-        with self.assertRaisesRegex(ValueError, "active metadata buffer"):
-            reader.set_epoch(1)
-
-
 class TestSharedReaderState(unittest.TestCase):
     """Protect buffer transactions and shared shuffle/stride semantics."""
 
     @staticmethod
-    def _readers(sharded: bool) -> tuple[DatasetReader, MetadataReader]:
-        """Create online and metadata readers over the same logical sample order."""
+    def _readers(sharded: bool) -> tuple[DatasetReader, ...]:
+        """Create an online reader with an independently replayable sample order."""
         events: list[tuple[str, int]] = []
         tokens = list(range(1, 10))
         options = {
@@ -521,13 +431,10 @@ class TestSharedReaderState(unittest.TestCase):
             _RecordingDataset(tokens, events), _metadata_callback(events),
             num_workers=0, pin_memory=False, prefetch_factor=None, persistent_workers=False, **options,
         )
-        metadata_reader = MetadataReader(
-            [SampleMetadata(pack_tokens=value, sample_id=index) for index, value in enumerate(tokens)], **options,
-        )
-        return online, metadata_reader
+        return (online,)
 
     def test_failed_restore_and_commit_leave_buffer_unchanged(self) -> None:
-        """Both formats reject corrupt state and missing keys before mutating live data."""
+        """Reject corrupt state and missing keys before mutating live data."""
         for reader in self._readers(False):
             with self.subTest(reader=type(reader).__name__):
                 self.assertIsNone(reader.fill(min_samples=2, min_tokens=1, max_samples=2))
@@ -548,7 +455,7 @@ class TestSharedReaderState(unittest.TestCase):
                 baseline["buffer"].clear()
                 self.assertEqual(reader.buffer_size, 2)
 
-    def test_shuffle_and_resume_match_between_reader_modes(self) -> None:
+    def test_shuffle_and_resume_match(self) -> None:
         """Sharded and unsharded streams retain identical metadata order across recovery."""
         for sharded in (False, True):
             with self.subTest(sharded=sharded):
@@ -562,7 +469,6 @@ class TestSharedReaderState(unittest.TestCase):
                     self.assertIsNone(reader.fill(min_samples=9, min_tokens=100, max_samples=9))
                     self.assertIsNone(resumed.fill(min_samples=9, min_tokens=100, max_samples=9))
                     self.assertEqual(resumed.state_dict(), reader.state_dict())
-                self.assertEqual(readers[0].metadata(), readers[1].metadata())
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import (
     DeviceBatchPrefetcher,
     DistributedDatasetConfig,
@@ -240,6 +241,9 @@ class TestDeviceBatchPrefetcher(unittest.TestCase):
                 double_buffer=True,
             ),
             metadata_fn=metadata_fn,
+            batch_sampler=build_dataset_batch_sampler(
+                total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,
+            ),
         )
         events: list[tuple[str, object]] = []
         with patch(
@@ -255,8 +259,8 @@ class TestDeviceBatchPrefetcher(unittest.TestCase):
             prefetcher.prefetch(next(loader))
             second = prefetcher.wait()
 
-        self.assertEqual(first["host_batch"], ((samples[0],),))
-        self.assertEqual(second["host_batch"], ((samples[1],),))
+        self.assertEqual(first["host_batch"], (samples[0],))
+        self.assertEqual(second["host_batch"], (samples[1],))
         with self.assertRaises(StopIteration):
             next(loader)
 

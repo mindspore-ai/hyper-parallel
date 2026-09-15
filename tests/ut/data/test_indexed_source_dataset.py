@@ -16,6 +16,7 @@
 
 import unittest
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -34,7 +35,10 @@ from hyper_parallel.data.indexed.io import IndexedDatasetBuilder
 from hyper_parallel.data.text.build_dataset import build_indexed_text_dataset
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.trainer.text_trainer import TextTrainer
-from hyper_parallel.distributed_data import SampleMetadata, build_distributed_dataloader
+from hyper_parallel.distributed_data import (
+    DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader,
+    collate_indexed_text_sequences, pack_indexed_text_samples,
+)
 from tests.common.mark_utils import arg_mark
 
 
@@ -99,17 +103,28 @@ def _provider_config(**overrides: object) -> dict[str, object]:
     }
 
 
-def _build_source_loader(datasets: tuple, data_config: dict, **worker_options: object) -> object:
-    """Use the same DataLoader builder and derived sizes as TextTrainer."""
-    mesh_context = SimpleNamespace(device_mesh=_StandaloneMesh(), dp_rank=0, dp_size=1)
-    training_config = SimpleNamespace(micro_batch_size=1, global_batch_size=1, seed=7)
-    loaders, samplers = build_dataloader(
-        SimpleNamespace(**worker_options), datasets=datasets, collate_fn=None, mesh_context=mesh_context,
-        training_config=training_config, data_config=data_config,
+def _collate_source_samples(samples, seq_len):
+    """Pad each native source output independently, without cross-sample packing."""
+    return collate_indexed_text_sequences([pack_indexed_text_samples([sample], seq_len) for sample in samples])
+
+
+def _build_source_loader(datasets: tuple, data_config: dict, *, local_batch_size=1, **worker_options: object) -> object:
+    """Use source-aligned metadata with explicitly sampler-defined step boundaries."""
+    dataset = datasets[0]
+    sampler = build_dataset_batch_sampler(
+        total_samples=len(dataset), micro_batch_size=local_batch_size, global_batch_size=local_batch_size,
+        dp_world_size=1, dp_rank=0, seed=7,
     )
-    if samplers != (None, None, None):
-        raise ValueError("Distributed packing must own the sample schedule")
-    return loaders[0]
+    return build_distributed_dataloader(
+        dataset, _StandaloneMesh(),
+        DistributedDatasetConfig(
+            seq_len=data_config["seq_length"], local_batch_size=local_batch_size, seed=7,
+            **data_config.get("distributed_dataloader", {}),
+        ),
+        batch_sampler=sampler,
+        collate_fn=partial(_collate_source_samples, seq_len=data_config["seq_length"]),
+        dataloader_kwargs=worker_options,
+    )
 
 
 def _source_config(sequence_length: int = 8) -> GPTDatasetConfig:
@@ -156,9 +171,9 @@ class TestIndexedSourceDataset(unittest.TestCase):
         self.assertEqual(low_level_dataset.payload_reads, 1)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_real_indexed_files_through_trainer_batch_adapter(self) -> None:
+    def test_sampler_metadata_with_real_indexed_files(self) -> None:
         """Feature: Indexed source runtime fields.
-        Description: Build and collate two real binary source records.
+        Description: Select two binary source records through a native BatchSampler and pad each separately.
         Expectation: Metadata precedes reads; labels, positions, attention, and padding match document boundaries.
         """
         with TemporaryDirectory() as directory:
@@ -169,21 +184,26 @@ class TestIndexedSourceDataset(unittest.TestCase):
                     data_path=prefix, data_config=config, tokenizer=_Tokenizer(),
                     train_valid_test_num_samples=(1, 0, 0),
                 )
-                loader = _build_source_loader(datasets, config)
+                loader = _build_source_loader(datasets, config, local_batch_size=2)
                 self.assertEqual(len(datasets[0]), 2)
                 self.assertEqual(datasets[0].get_sample_metadata(1).pack_tokens, 3)
 
             batch = next(loader)
-            self.assertEqual(batch["input_ids"].tolist(), [[3, 4, 5, 1, 2, 0, 0, 0]])
-            self.assertEqual(batch["labels"].tolist(), [[4, 5, 9, 2, 9, -100, -100, -100]])
-            self.assertEqual(batch["cu_seq_lens"].tolist(), [0, 3, 5, 8])
+            self.assertEqual(batch["input_ids"].tolist(), [[3, 4, 5, 0, 0, 0, 0, 0], [1, 2, 0, 0, 0, 0, 0, 0]])
+            self.assertEqual(
+                batch["labels"].tolist(),
+                [[4, 5, 9, -100, -100, -100, -100, -100], [2, 9, -100, -100, -100, -100, -100, -100]],
+            )
+            self.assertEqual(batch["cu_seq_lens"].tolist(), [0, 3, 8, 10, 16])
             runtime = ParallelBatch(
                 mesh_context=None, device="cpu", tokenizer=_Tokenizer(),
                 data_config=config, source_type="indexed_source", pp_shared_data=False,
             )
             model_inputs, loss_inputs = runtime(iter([batch]))
-            self.assertEqual(model_inputs["position_ids"].tolist(), [[0, 1, 2, 0, 1, 0, 1, 2]])
-            self.assertEqual(loss_inputs["loss_mask"].tolist(), [[1, 1, 1, 1, 1, 0, 0, 0]])
+            self.assertEqual(
+                model_inputs["position_ids"].tolist(), [[0, 1, 2, 0, 1, 2, 3, 4], [0, 1, 0, 1, 2, 3, 4, 5]],
+            )
+            self.assertEqual(loss_inputs["loss_mask"].tolist(), [[1, 1, 1, 0, 0, 0, 0, 0], [1, 1, 0, 0, 0, 0, 0, 0]])
             self.assertTrue(torch.equal(model_inputs["shift_labels"], batch["labels"]))
             mask = model_inputs["attention_mask"][0, 0]
             self.assertFalse(bool(mask[3, 2]))
@@ -271,7 +291,7 @@ class TestIndexedSourceDataset(unittest.TestCase):
                 "multiprocessing_context": "spawn", "timeout": 60,
             }
             with patch(
-                "hyper_parallel.data.batching.build_dataloader.build_distributed_dataloader",
+                __name__ + ".build_distributed_dataloader",
                 wraps=build_distributed_dataloader,
             ) as builder:
                 loader = _build_source_loader(datasets, config, **options)
@@ -297,7 +317,21 @@ class TestIndexedSourceDataset(unittest.TestCase):
         """
         config = _provider_config(distributed_dataloader={"dataset_already_sharded": True})
         with self.assertRaisesRegex(ValueError, "dataset_already_sharded"):
-            _build_source_loader((SimpleNamespace(), None, None), config)
+            _build_source_loader(([0, 1], None, None), config)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_trainer_rejects_removed_streaming_packing_stage(self) -> None:
+        """Feature: Metadata streaming removal.
+        Description: Build the old Trainer distributed-packing shortcut.
+        Expectation: A migration error replaces implicit step selection.
+        """
+        with self.assertRaisesRegex(ValueError, "streaming selection has been removed"):
+            build_dataloader(
+                SimpleNamespace(), datasets=([0, 1], None, None), collate_fn=None,
+                mesh_context=SimpleNamespace(dp_rank=0, dp_size=1),
+                training_config=SimpleNamespace(micro_batch_size=1, global_batch_size=1, seed=7),
+                data_config=_provider_config(),
+            )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_indexed_source_requires_boundary_aware_attention(self) -> None:
