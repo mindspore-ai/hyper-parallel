@@ -17,9 +17,17 @@ external_step_reader emits a complete local step, metadata, reference_bins
   -> payload A2A when redistributed -> pack_fn -> collate_fn
 
 both paths
-  -> broadcast the local batch to model-parallel peers
+  -> broadcast the local batch to model-parallel peers (schema object + direct tensor leaves)
   -> commit consumed progress -> Trainer
 ```
+
+Model-parallel batch broadcast uses one small `broadcast_object_list` call for
+the Python structure and non-tensor values. Tensor leaves in dictionaries,
+lists, and tuples use `dist.broadcast` directly, avoiding pickle copies. CPU
+loads use the existing Gloo model group; when an accelerator
+`communication_device` is supplied, a matching HCCL/NCCL model tensor group is
+created and tensor leaves stay on device. Unsupported custom containers retain
+the regular object-broadcast behavior.
 
 There is no metadata-only streaming mode. Passing only `metadata` (including
 Dataset-inferred metadata) without `batch_sampler` fails at build time.

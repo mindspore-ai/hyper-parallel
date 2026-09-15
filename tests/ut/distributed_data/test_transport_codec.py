@@ -20,11 +20,16 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
+import torch
+
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import (
     DataGroups,
     DataPlaneTransport,
+    ModelParallelTransport,
+    _decode_model_batch,
+    _encode_model_batch,
     create_data_groups,
     _decode_payload_segment,
     _encode_payload_segment,
@@ -178,6 +183,44 @@ class TestDataPlaneTransport(unittest.TestCase):
 
         self.assertEqual(received, expected)
         self.assertEqual(collective_groups, ["control", "payload"])
+
+
+class TestModelParallelTransport(unittest.TestCase):
+    """Verify tensor leaves use direct collectives while metadata stays serialized."""
+
+    @staticmethod
+    def _topology() -> DataTopology:
+        return DataTopology.from_layout(
+            mesh_shape=(1, 2), mesh_dim_names=("dp", "mp"), rank_list=(0, 1),
+            global_rank=0, dp_dim_names=("dp",),
+        )
+
+    def test_codec_preserves_nested_structure_and_tensor_values(self) -> None:
+        """Tensor leaves are removed from the object payload and restored in order."""
+        batch = {"input_ids": torch.tensor([[1, 2]]), "meta": ["caption", None]}
+
+        schema, tensors = _encode_model_batch(batch)
+        restored = _decode_model_batch(schema, [tensor.clone() for tensor in tensors])
+
+        self.assertEqual(restored["meta"], ["caption", None])
+        self.assertTrue(torch.equal(restored["input_ids"], batch["input_ids"]))
+
+    def test_broadcast_sends_tensor_leaves_directly(self) -> None:
+        """Model-group object broadcast carries only structure and direct broadcast carries tensor data."""
+        groups = DataGroups(
+            data_plane_ranks=(0, 1), control_group=None, payload_group=None,
+            model_parallel_group="model", planner_rank=0, distributed=True,
+        )
+        transport = ModelParallelTransport(self._topology(), groups)
+        with patch("hyper_parallel.distributed_data.transport.dist.broadcast_object_list") as object_broadcast, \
+                patch("hyper_parallel.distributed_data.transport.dist.broadcast") as tensor_broadcast, \
+                patch("hyper_parallel.distributed_data.transport.dist.get_backend", return_value="gloo"):
+            transport.broadcast({"input_ids": torch.tensor([1, 2]), "label": "text"})
+
+        object_broadcast.assert_called_once()
+        tensor_broadcast.assert_called_once()
+        self.assertEqual(object_broadcast.call_args.kwargs["group"], "model")
+        self.assertEqual(tensor_broadcast.call_args.kwargs["group"], "model")
 
 
 if __name__ == "__main__":

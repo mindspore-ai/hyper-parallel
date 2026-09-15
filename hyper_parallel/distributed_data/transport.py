@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU control and configurable payload data planes for dynamic packing."""
+"""CPU control, direct tensor broadcast, and configurable payload data planes."""
 # This distributed-data package is intentionally PyTorch-only.
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ class DataGroups:
     model_parallel_group: Any
     planner_rank: int
     distributed: bool
+    model_parallel_tensor_group: Any = None
 
 
 @dataclass(frozen=True)
@@ -288,8 +289,13 @@ def create_data_groups(
         reuse_control_group=reuse_control_group,
         enable_payload_exchange=enable_payload_exchange,
     )
-    model_parallel_group = _create_model_parallel_process_groups(topology, cpu_backend)
-    return DataGroups(data_plane_ranks, control_group, payload_group, model_parallel_group, planner_rank, True)
+    model_parallel_group, model_parallel_tensor_group = _create_model_parallel_process_groups(
+        topology, cpu_backend, _resolve_model_tensor_backend(communication_device, payload_backend),
+    )
+    return DataGroups(
+        data_plane_ranks, control_group, payload_group, model_parallel_group, planner_rank, True,
+        model_parallel_tensor_group,
+    )
 
 
 def _single_rank_data_groups(
@@ -299,7 +305,7 @@ def _single_rank_data_groups(
 ) -> DataGroups:
     if len(topology.rank_list) != 1:
         raise ValueError("torch.distributed must be initialized for a mesh containing more than one rank.")
-    return DataGroups(data_plane_ranks, None, None, None, planner_rank, False)
+    return DataGroups(data_plane_ranks, None, None, None, planner_rank, False, None)
 
 
 def _validate_distributed_topology(topology: DataTopology) -> None:
@@ -397,15 +403,38 @@ def _create_data_plane_process_groups(
     return control_group, created_payload_group if is_member else None
 
 
-def _create_model_parallel_process_groups(topology: DataTopology, cpu_backend: str) -> Any:
+def _resolve_model_tensor_backend(communication_device: Any, payload_backend: str | None) -> str | None:
+    """Select an accelerator backend for tensor model-group broadcasts when available."""
+    if communication_device is None:
+        return None
+    device = torch.device(communication_device)
+    if device.type == "cpu":
+        return None
+    candidate = payload_backend or str(dist.get_backend())
+    normalized = candidate.lower()
+    if "hccl" not in normalized and "nccl" not in normalized:
+        return None
+    return candidate
+
+
+def _create_model_parallel_process_groups(
+        topology: DataTopology,
+        cpu_backend: str,
+        tensor_backend: str | None,
+) -> tuple[Any, Any]:
     model_parallel_group = None
+    model_parallel_tensor_group = None
     for rank_group in topology.model_parallel_rank_groups:
         if len(rank_group) == 1:
             continue
         created_group = dist.new_group(ranks=list(rank_group), backend=cpu_backend)
         if topology.global_rank in rank_group:
             model_parallel_group = created_group
-    return model_parallel_group
+        if tensor_backend is not None:
+            created_tensor_group = dist.new_group(ranks=list(rank_group), backend=tensor_backend)
+            if topology.global_rank in rank_group:
+                model_parallel_tensor_group = created_tensor_group
+    return model_parallel_group, model_parallel_tensor_group
 
 
 def _encode_payload_segment(items: Sequence[tuple[SampleKey, Any]], *, validate: bool = True) -> bytes:
@@ -448,6 +477,89 @@ def _decode_payload_segment(frame: bytes, *, validate: bool = True) -> tuple[tup
     if len(keys) != len(set(keys)):
         raise ValueError("Distributed sample payload contains duplicate SampleKey values.")
     return items
+
+
+def _encode_model_batch(value: Any) -> tuple[Any, list[torch.Tensor]]:
+    """Replace tensor leaves with descriptors before object broadcast."""
+    tensors: list[torch.Tensor] = []
+
+    def _encode(item: Any) -> Any:
+        if torch.is_tensor(item):
+            index = len(tensors)
+            tensors.append(item)
+            return ("__hp_tensor__", index, tuple(item.shape), item.dtype, item.device.type)
+        if isinstance(item, Mapping):
+            return ("__hp_mapping__", tuple((key, _encode(child)) for key, child in item.items()))
+        if isinstance(item, tuple):
+            return ("__hp_tuple__", tuple(_encode(child) for child in item))
+        if isinstance(item, list):
+            return ("__hp_list__", tuple(_encode(child) for child in item))
+        return ("__hp_value__", item)
+
+    return _encode(value), tensors
+
+
+def _decode_model_batch(schema: Any, tensors: Sequence[torch.Tensor]) -> Any:
+    """Reconstruct a batch from a broadcast structure and tensor leaves."""
+    if not isinstance(schema, tuple) or not schema:
+        raise ValueError("Model batch broadcast received an invalid structure descriptor.")
+    kind = schema[0]
+    if kind == "__hp_tensor__":
+        index = schema[1]
+        if not isinstance(index, int) or index < 0 or index >= len(tensors):
+            raise ValueError(f"Model batch tensor descriptor has invalid index {index!r}.")
+        return tensors[index]
+    if kind == "__hp_mapping__":
+        return {key: _decode_model_batch(child, tensors) for key, child in schema[1]}
+    if kind == "__hp_tuple__":
+        return tuple(_decode_model_batch(child, tensors) for child in schema[1])
+    if kind == "__hp_list__":
+        return [_decode_model_batch(child, tensors) for child in schema[1]]
+    if kind == "__hp_value__":
+        return schema[1]
+    raise ValueError(f"Model batch broadcast received unknown descriptor kind {kind!r}.")
+
+
+def _tensor_specs(schema: Any) -> list[tuple[tuple[int, ...], torch.dtype, str]]:
+    """Collect tensor descriptors in the same order used by the encoder."""
+    if not isinstance(schema, tuple) or not schema:
+        raise ValueError("Model batch broadcast received an invalid structure descriptor.")
+    kind = schema[0]
+    if kind == "__hp_tensor__":
+        if len(schema) != 5 or not isinstance(schema[1], int):
+            raise ValueError("Model batch broadcast received an invalid tensor descriptor.")
+        return [(tuple(schema[2]), schema[3], schema[4])]
+    if kind == "__hp_mapping__":
+        children = (child for _, child in schema[1])
+    elif kind in ("__hp_tuple__", "__hp_list__"):
+        children = iter(schema[1])
+    elif kind == "__hp_value__":
+        return []
+    else:
+        raise ValueError(f"Model batch broadcast received unknown descriptor kind {kind!r}.")
+    specs = []
+    for child in children:
+        specs.extend(_tensor_specs(child))
+    return specs
+
+
+def _tensor_device(device_type: str, group: Any) -> torch.device:
+    """Resolve the receiver's local device for a tensor model-group broadcast."""
+    backend = str(dist.get_backend(group)).lower()
+    if "hccl" in backend:
+        expected_type = "npu"
+    elif "nccl" in backend:
+        expected_type = "cuda"
+    else:
+        expected_type = "cpu"
+    if device_type != expected_type:
+        raise ValueError(
+            f"Model batch tensor device {device_type!r} is incompatible with {backend!r} model broadcast."
+        )
+    if expected_type == "cpu":
+        return torch.device("cpu")
+    module = torch.npu if expected_type == "npu" else torch.cuda
+    return torch.device(expected_type, module.current_device())
 
 
 def _exchange_payload_sizes(input_splits: Sequence[int], control_group: Any) -> list[int]:
@@ -710,12 +822,13 @@ class DataPlaneTransport:
 
 
 class ModelParallelTransport:
-    """Broadcast a constructed CPU batch to peers in one model replica."""
+    """Broadcast a constructed batch with direct tensor leaves when possible."""
 
     def __init__(self, topology: DataTopology, groups: DataGroups) -> None:
         """Store the current model-consumer group."""
         self._ranks = topology.model_parallel_ranks
-        self._group = groups.model_parallel_group
+        self._object_group = groups.model_parallel_group
+        self._accelerator_tensor_group = groups.model_parallel_tensor_group
         self._constructor_rank = topology.constructor_rank
         self._global_rank = topology.global_rank
         self._distributed = groups.distributed
@@ -723,8 +836,9 @@ class ModelParallelTransport:
     def broadcast(self, batch: Any) -> Any:
         """Return the constructor's batch data on every model-parallel peer.
 
-        ``None`` is reserved as the end-of-stream sentinel. A constructor
-        therefore must not return ``None`` as a valid training batch.
+        ``None`` is reserved as the end-of-stream sentinel. Standard dict,
+        list, and tuple containers retain their structure while tensor leaves
+        use a direct tensor broadcast instead of pickle serialization.
 
         Args:
             batch: Constructor batch or ``None`` on consumer-only peers.
@@ -737,13 +851,39 @@ class ModelParallelTransport:
             if not is_constructor:
                 raise ValueError("A singleton model group requires the Data Constructor rank.")
             return batch
-        if not self._distributed or self._group is None:
+        if not self._distributed or self._object_group is None:
             raise ValueError("Multi-rank model broadcast requires an initialized process group.")
         if not is_constructor and batch is not None:
             raise ValueError("Only the Data Constructor may provide the model-group batch.")
-        payload = [batch]
-        dist.broadcast_object_list(payload, src=self._constructor_rank, group=self._group)
-        return payload[0]
+        schema, source_tensors = _encode_model_batch(batch) if is_constructor else (None, [])
+        payload = [schema]
+        dist.broadcast_object_list(payload, src=self._constructor_rank, group=self._object_group)
+        if not isinstance(payload[0], tuple):
+            raise ValueError("Model batch broadcast received an invalid structure descriptor.")
+        tensor_specs = _tensor_specs(payload[0])
+        if is_constructor:
+            for spec in tensor_specs:
+                _tensor_device(spec[2], self._group_for_tensor(spec[2]))
+        received_tensors = []
+        for index, spec in enumerate(tensor_specs):
+            tensor_group = self._group_for_tensor(spec[2])
+            if is_constructor:
+                tensor = source_tensors[index]
+                if tuple(tensor.shape) != spec[0] or tensor.dtype != spec[1]:
+                    raise ValueError("Model batch tensor metadata changed during broadcast.")
+            else:
+                tensor = torch.empty(spec[0], dtype=spec[1], device=_tensor_device(spec[2], tensor_group))
+            dist.broadcast(tensor, src=self._constructor_rank, group=tensor_group)
+            received_tensors.append(tensor)
+        return batch if is_constructor else _decode_model_batch(payload[0], received_tensors)
+
+    def _group_for_tensor(self, device_type: str) -> Any:
+        """Choose Gloo for host tensors and the accelerator group for device tensors."""
+        if device_type == "cpu":
+            return self._object_group
+        if self._accelerator_tensor_group is None:
+            return self._object_group
+        return self._accelerator_tensor_group
 
 
 __all__ = [
