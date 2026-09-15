@@ -141,10 +141,10 @@ class ExternalStepAdapter:
         for packed_samples in local_step:
             if not isinstance(packed_samples, (list, tuple)) or not packed_samples:
                 raise ValueError("External source emitted an empty or non-sequence local pack.")
-            canonical_samples = tuple(packed_samples)
-            original_step_samples.append(canonical_samples)
+            original_samples = tuple(packed_samples)
+            original_step_samples.append(original_samples)
             bin_metadata = []
-            for sample in canonical_samples:
+            for sample in original_samples:
                 key = SampleKey(self._reader_rank, self._sample_ordinal)
                 sample_metadata = self._metadata_fn(sample)
                 if not isinstance(sample_metadata, SampleMetadata):
