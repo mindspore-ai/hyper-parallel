@@ -24,6 +24,7 @@ from hyper_parallel.distributed_data.device_prefetch import (
     DeviceStepPrefetcher,
 )
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
+from hyper_parallel.distributed_data.external_step import ExternalStepAdapter, ExternalStepSource
 from hyper_parallel.distributed_data.indexed_text import collate_indexed_text_sequences, pack_indexed_text_samples
 from hyper_parallel.distributed_data.locality import create_locality_groups
 from hyper_parallel.distributed_data.packed_balancing import LocalBalancingDataLoader, build_local_balancing_dataloader
@@ -49,6 +50,8 @@ __all__ = [
     "DistributedDataLoader",
     "DistributedDatasetConfig",
     "DistributedPackingPlan",
+    "ExternalStepAdapter",
+    "ExternalStepSource",
     "LocalBalancingDataLoader",
     "LPTPackingPlanner",
     "PackingBinPlan",

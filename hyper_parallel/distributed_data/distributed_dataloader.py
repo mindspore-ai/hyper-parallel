@@ -35,7 +35,6 @@ from hyper_parallel.distributed_data.schema import (
     StepSampleSelection,
 )
 from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
-from hyper_parallel.distributed_data.dataset_reader import DatasetReader
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import (
     DataPlaneTransport,
@@ -61,7 +60,7 @@ def _validate_loader_components(
         *,
         topology: DataTopology,
         dataset_reader_ranks: tuple[int, ...],
-        dataset_reader: DatasetReader | BatchSamplerReader | None,
+        dataset_reader: Any | None,
         metadata_reader: BatchSamplerReader | None,
         direct_sample_loader: PlannedSampleLoader | None,
         metadata_mode: bool,
@@ -77,6 +76,10 @@ def _validate_loader_components(
     planning_reader = metadata_reader if metadata_mode else dataset_reader
     if is_reader != (planning_reader is not None):
         raise ValueError("Dataset Reader ownership does not match dataset_reader_ranks.")
+    if not metadata_mode and planning_reader is not None and not callable(
+            getattr(planning_reader, "prepare_next_step", None)
+    ):
+        raise ValueError("Online Dataset Reader must provide prepare_next_step().")
     _validate_metadata_loader_owner(
         topology,
         metadata_mode=metadata_mode,
@@ -116,7 +119,7 @@ class DistributedDataLoader(Iterator[Any]):
             *,
             topology: DataTopology,
             dataset_reader_ranks: tuple[int, ...],
-            dataset_reader: DatasetReader | BatchSamplerReader | None,
+            dataset_reader: Any | None,
             metadata_reader: BatchSamplerReader | None,
             direct_sample_loader: PlannedSampleLoader | None,
             metadata_mode: bool,
@@ -727,7 +730,7 @@ class DistributedDataLoader(Iterator[Any]):
                 outgoing.setdefault(target_by_key[key], []).append((key, payload))
         return self._data_plane.prepare_exchange(outgoing)
 
-    def _planning_reader(self) -> DatasetReader | BatchSamplerReader | None:
+    def _planning_reader(self) -> Any | None:
         """Return this rank's online or metadata-only Dataset Reader."""
         if self._dataset_reader is not None:
             return self._dataset_reader

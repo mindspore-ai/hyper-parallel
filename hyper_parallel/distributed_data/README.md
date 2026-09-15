@@ -12,8 +12,8 @@ native BatchSampler selects this step's Dataset-index occurrences
                   -> Planner -> payload A2A when redistributed
   -> preserve complete Dataset outputs -> collate_fn
 
-external_step_reader emits a complete local step, metadata, reference_bins
-  -> freeze the union of Reader samples -> Planner
+external_step_source emits a complete local step of raw-sample bins
+  -> HP derives metadata and freezes the source step -> Planner
   -> payload A2A when redistributed -> pack_fn -> collate_fn
 
 both paths
@@ -43,7 +43,9 @@ should contain; there is no refill/`attempt` loop.
 - One synchronized iterator step covers `local_batch_size * dp_size` bins.
   Gradient accumulation and optimizer global batch size remain Trainer concerns.
 - Native BatchSampler fixes index occurrences and uses singleton reference bins;
-  `external_step_reader` fixes samples and supplies the original packing bins.
+  `external_step_source` fixes samples and lets HP preserve the original packing
+  bins. The legacy `external_step_reader` interface remains available for
+  existing integrations.
   Balancing may only rearrange that frozen sample set. It cannot skip expensive
   samples, borrow future samples, or change step membership.
 - In external mode, the packer must agree with metadata token accounting,
@@ -51,7 +53,9 @@ should contain; there is no refill/`attempt` loop.
   placement fails, the Planner falls back to the known-feasible reference bins.
 - `buffer_size_multiplier` remains accepted for compatibility but does not affect
   these paths. External readers prepare one complete local step; native
-  BatchSampler always emits its complete batch.
+  BatchSampler always emits its complete batch. An external source emits one
+  complete local step; HP owns metadata extraction, payload caching, commit,
+  checkpointing, and final packing/collation.
 
 ## Public API
 
@@ -66,8 +70,8 @@ from hyper_parallel.distributed_data import (
 ### Native HP BatchSampler: preserve each forward/backward round
 
 Pass `batch_sampler=` to keep the native HP sampling policy. This is required
-for ahead-of-fetch metadata. For online iterable pipelines, use
-`external_step_reader` instead.
+for ahead-of-fetch metadata. For online iterable pipelines, use the preferred
+`external_step_source` API instead.
 
 ```python
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
@@ -273,8 +277,11 @@ it does **not** rebalance document fragments inside a packed GPT sequence.
 
 The lower-level Indexed source Dataset and text packing helpers remain available
 for custom producers. To retain dynamic packing across raw source samples, that
-producer must define complete steps and provide an `external_step_reader`.
-HP no longer infers step boundaries by scanning source metadata.
+producer must define complete steps and provide an `external_step_source`.
+The source only iterates raw local steps; HP derives metadata, caches payloads,
+tracks commit/checkpoint state, and applies packing/collation. The legacy
+`external_step_reader` remains supported as a compatibility interface. HP no
+longer infers step boundaries by scanning source metadata.
 
 With `double_buffer=True`, the first iterator call constructs its batch before
 returning. After each batch is returned, a background thread prepares exactly
@@ -410,6 +417,42 @@ order, then let the native BatchSampler own DP slicing and shuffling.
 
 ### External online steps
 
+The preferred API separates the external producer from HP's distributed data
+semantics. The source only iterates complete local steps and implements the
+checkpoint/epoch hooks:
+
+```python
+class MyStepSource:
+    def __iter__(self): ...  # yields local_batch_size raw-sample bins
+    def state_dict(self): ...
+    def load_state_dict(self, state): ...
+    def set_epoch(self, epoch): ...
+```
+
+Pass it as `external_step_source`. HP calls `metadata_fn` for each raw sample,
+keeps payloads until the step commits, performs distributed placement, and
+then invokes `pack_fn` and `collate_fn` on the final Constructor batch:
+
+```python
+loader = build_distributed_dataloader(
+    None,
+    mesh,
+    config,
+    external_step_source=source,  # only Dataset Reader ranks supply an instance
+    metadata_fn=metadata_for_sample,
+    pack_fn=pack_one_sequence,
+    collate_fn=collate_packed_sequences,
+    communication_device=torch.device("npu", local_rank),
+)
+```
+
+The source must yield exactly `local_batch_size` non-empty raw-sample bins per
+step. HP owns metadata, payload, commit, checkpoint, and placement state. The
+source must not implement those HP concerns.
+
+For existing integrations, the compatibility API below accepts a legacy
+`external_step_reader` that already exposes HP's reader lifecycle methods.
+
 An external Reader may use an IterableDataset or any existing local pipeline;
 random indexed access is unnecessary:
 
@@ -418,19 +461,20 @@ loader = build_distributed_dataloader(
     None,
     mesh,
     config,
-    external_step_reader=reader,  # only Dataset Reader ranks supply an instance
+    external_step_reader=reader,  # legacy compatibility API
     pack_fn=pack_one_sequence,
     collate_fn=collate_packed_sequences,
     communication_device=torch.device("npu", local_rank),
 )
 ```
 
-The Reader exposes `prepare_next_step`, `metadata`, `reference_bins`, `selected_payloads`,
-`commit`, `exhausted`, `state_dict`, `load_state_dict`, and `set_epoch`. Each
-`prepare_next_step` produces **one complete local step**, not a read-ahead
-candidate window. HP does not apply a second stride or manage this external
-producer's DataLoader workers; configure those on the producer itself.
-`metadata` and `metadata_fn` must be omitted because the Reader owns extraction.
+The legacy Reader exposes `prepare_next_step`, `metadata`, `reference_bins`,
+`selected_payloads`, `commit`, `exhausted`, `state_dict`, `load_state_dict`,
+and `set_epoch`. Each `prepare_next_step` produces **one complete local step**,
+not a read-ahead candidate window. HP does not apply a second stride or manage
+this external producer's DataLoader workers; configure those on the producer
+itself. `metadata` and `metadata_fn` must be omitted because the legacy Reader
+owns extraction.
 
 The default packer and collator preserve the structure as a tuple of bins,
 each containing the raw samples. Custom callbacks must be consistent across
@@ -446,7 +490,8 @@ bypasses payload transport entirely.
 ## Current boundaries
 
 - Native BatchSampler requires a mapping Dataset; metadata also requires shared indices.
-- Iterable/streaming online data requires an external complete-step Reader.
+- Iterable/streaming online data requires an external complete-step source
+  (or the compatibility Reader API).
 - At most one in-flight background batch when `double_buffer=True`; the first
   batch and non-double-buffer mode wait synchronously.
 - Gloo control plane and correctness-first framed pickle payloads; online A2A

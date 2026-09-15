@@ -37,6 +37,7 @@ from hyper_parallel.distributed_data.data_constructor import (
     default_pack_fn,
 )
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
+from hyper_parallel.distributed_data.external_step import ExternalStepAdapter, ExternalStepSource
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner, OversizedPolicy
 from hyper_parallel.distributed_data.schema import PackingConstraints, SampleMetadata
 from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
@@ -411,9 +412,10 @@ def _resolve_metadata_mode(
         metadata_fn: Callable[[Any], SampleMetadata] | None,
         metadata: Sequence[SampleMetadata] | None,
         external_step_reader: Any | None,
+        external_step_source: ExternalStepSource | None,
 ) -> bool:
     """Resolve one metadata-mode flag when external Readers are rank-local."""
-    local_flags = (external_step_reader is not None, metadata is not None)
+    local_flags = (external_step_reader is not None or external_step_source is not None, metadata is not None)
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     if not distributed:
         external_present = local_flags[0]
@@ -546,6 +548,35 @@ def _configure_external_step_reader(
         )
 
 
+def _configure_external_step_source(
+        state: _BuildState,
+        source: ExternalStepSource | None,
+        metadata_fn: Callable[[Any], SampleMetadata] | None,
+        pack_fn: Callable[[Sequence[Any], int], Any],
+        collate_fn: Callable[[Sequence[Any]], Any],
+        config: DistributedDatasetConfig,
+) -> None:
+    """Wrap a source-only producer with HP's generic Reader lifecycle."""
+    if source is None:
+        if state.is_reader:
+            raise ValueError("Dataset Reader ranks must provide external_step_source.")
+        return
+    if not state.is_reader:
+        raise ValueError("external_step_source may only be provided on Dataset Reader ranks.")
+    if metadata_fn is None:
+        raise ValueError("external_step_source requires metadata_fn.")
+    state.dataset_reader = ExternalStepAdapter(
+        source,
+        reader_rank=state.topology.global_rank,
+        local_batch_size=config.local_batch_size,
+        seq_len=config.seq_len,
+        metadata_fn=metadata_fn,
+        pack_fn=pack_fn,
+        collate_fn=collate_fn,
+    )
+    state.external_step_mode = True
+
+
 def _configure_batch_sampler_sources(
         state: _BuildState,
         dataset: Any,
@@ -593,40 +624,12 @@ def _configure_batch_sampler_sources(
     return sampler_fingerprint
 
 
-def _populate_build_state(
-        state: _BuildState,
-        dataset: Any | None,
-        mesh: Any,
-        config: DistributedDatasetConfig,
-        metadata_fn: Callable[[Any], SampleMetadata] | None,
-        metadata: Sequence[SampleMetadata] | None,
-        dataloader_kwargs: Mapping[str, Any] | None,
+def _resolve_constructor_callbacks(
+        batch_sampler: Any,
         pack_fn: Callable[[Sequence[Any], int], Any] | None,
         collate_fn: Callable[[Sequence[Any]], Any] | None,
-        communication_device: Any,
-        batch_sampler: Any = None,
-        external_step_reader: Any | None = None,
-) -> None:
-    if not isinstance(config, DistributedDatasetConfig):
-        raise ValueError(f"config must be DistributedDatasetConfig, but got {type(config)}.")
-    if external_step_reader is not None and batch_sampler is not None:
-        raise ValueError("external_step_reader and batch_sampler are mutually exclusive.")
-    if external_step_reader is None:
-        metadata = _infer_dataset_metadata(dataset, metadata_fn, metadata)
-    elif metadata is not None or metadata_fn is not None:
-        raise ValueError("external_step_reader cannot be combined with metadata or metadata_fn.")
-    _validate_builder_callbacks(metadata_fn, metadata, pack_fn, collate_fn)
-    normalized_options, dataloader_fingerprint = _normalize_dataloader_kwargs(
-        config,
-        dataloader_kwargs,
-    )
-    loader_options = {name: normalized_options[name] for name in _CONFIG_DATALOADER_KWARGS}
-    loader_options["dataloader_kwargs"] = {
-        name: value
-        for name, value in normalized_options.items()
-        if name not in _CONFIG_DATALOADER_KWARGS
-    }
-    state.communication_device = _normalize_communication_device(communication_device)
+) -> tuple[Callable[[Sequence[Any], int], Any], Callable[[Sequence[Any]], Any], bool, bool]:
+    """Resolve constructor callbacks and their stable fingerprint flags."""
     uses_default_pack = pack_fn is None or pack_fn is default_pack_fn
     uses_default_collate = collate_fn is None or collate_fn is default_collate_fn
     effective_pack_fn = default_pack_fn if uses_default_pack else pack_fn
@@ -635,18 +638,55 @@ def _populate_build_state(
             raise ValueError("Native batch_sampler preserves Dataset outputs; pack_fn must be omitted.")
         effective_pack_fn = preserve_sample
     effective_collate_fn = default_collate_fn if uses_default_collate else collate_fn
-    state.topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
-    state.dataset_reader_ranks, state.planner_rank = _resolve_service_ranks(state.topology, config)
-    batch_sampler_fingerprint = None
+    return effective_pack_fn, effective_collate_fn, uses_default_pack, uses_default_collate
+
+
+def _configure_step_sources(
+        state: _BuildState,
+        dataset: Any | None,
+        metadata_fn: Callable[[Any], SampleMetadata] | None,
+        metadata: Sequence[SampleMetadata] | None,
+        config: DistributedDatasetConfig,
+        loader_options: dict[str, Any],
+        effective_pack_fn: Callable[[Sequence[Any], int], Any],
+        effective_collate_fn: Callable[[Sequence[Any]], Any],
+        batch_sampler: Any,
+        external_step_reader: Any | None,
+        external_step_source: ExternalStepSource | None,
+) -> str | None:
+    """Configure one mutually exclusive online or native step source."""
     if batch_sampler is None:
-        _configure_external_step_reader(
-            state, metadata_fn, metadata,
-            external_step_reader=external_step_reader,
-        )
-    else:
-        batch_sampler_fingerprint = _configure_batch_sampler_sources(
-            state, dataset, metadata_fn, metadata, config, batch_sampler, loader_options,
-        )
+        if external_step_source is not None:
+            _configure_external_step_source(
+                state,
+                external_step_source,
+                metadata_fn,
+                effective_pack_fn,
+                effective_collate_fn,
+                config,
+            )
+        else:
+            _configure_external_step_reader(
+                state, metadata_fn, metadata,
+                external_step_reader=external_step_reader,
+            )
+        return None
+    return _configure_batch_sampler_sources(
+        state, dataset, metadata_fn, metadata, config, batch_sampler, loader_options,
+    )
+
+
+def _finalize_build_state(
+        state: _BuildState,
+        config: DistributedDatasetConfig,
+        dataloader_fingerprint: str,
+        effective_pack_fn: Callable[[Sequence[Any], int], Any],
+        effective_collate_fn: Callable[[Sequence[Any]], Any],
+        uses_default_pack: bool,
+        uses_default_collate: bool,
+        batch_sampler_fingerprint: str | None,
+) -> None:
+    """Create the planner/constructor and stable build fingerprint."""
     state.planner = DynamicPackingPlanner(
         data_parallel_size=state.topology.data_parallel_size,
         seq_len=config.seq_len,
@@ -667,6 +707,74 @@ def _populate_build_state(
     )
     if batch_sampler_fingerprint is not None:
         state.config_fingerprint += ":batch_sampler:" + batch_sampler_fingerprint
+
+
+def _populate_build_state(
+        state: _BuildState,
+        dataset: Any | None,
+        mesh: Any,
+        config: DistributedDatasetConfig,
+        metadata_fn: Callable[[Any], SampleMetadata] | None,
+        metadata: Sequence[SampleMetadata] | None,
+        dataloader_kwargs: Mapping[str, Any] | None,
+        pack_fn: Callable[[Sequence[Any], int], Any] | None,
+        collate_fn: Callable[[Sequence[Any]], Any] | None,
+        communication_device: Any,
+        batch_sampler: Any = None,
+        external_step_reader: Any | None = None,
+        external_step_source: ExternalStepSource | None = None,
+) -> None:
+    if not isinstance(config, DistributedDatasetConfig):
+        raise ValueError(f"config must be DistributedDatasetConfig, but got {type(config)}.")
+    if (external_step_reader is not None or external_step_source is not None) and batch_sampler is not None:
+        raise ValueError("external step sources and batch_sampler are mutually exclusive.")
+    if external_step_reader is None and external_step_source is None:
+        metadata = _infer_dataset_metadata(dataset, metadata_fn, metadata)
+    elif metadata is not None or metadata_fn is not None:
+        if external_step_reader is not None:
+            raise ValueError("external_step_reader cannot be combined with metadata or metadata_fn.")
+        if metadata is not None:
+            raise ValueError("external_step_source cannot be combined with precomputed metadata.")
+    _validate_builder_callbacks(metadata_fn, metadata, pack_fn, collate_fn)
+    normalized_options, dataloader_fingerprint = _normalize_dataloader_kwargs(
+        config,
+        dataloader_kwargs,
+    )
+    loader_options = {name: normalized_options[name] for name in _CONFIG_DATALOADER_KWARGS}
+    loader_options["dataloader_kwargs"] = {
+        name: value
+        for name, value in normalized_options.items()
+        if name not in _CONFIG_DATALOADER_KWARGS
+    }
+    state.communication_device = _normalize_communication_device(communication_device)
+    effective_pack_fn, effective_collate_fn, uses_default_pack, uses_default_collate = _resolve_constructor_callbacks(
+        batch_sampler, pack_fn, collate_fn,
+    )
+    state.topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
+    state.dataset_reader_ranks, state.planner_rank = _resolve_service_ranks(state.topology, config)
+    batch_sampler_fingerprint = _configure_step_sources(
+        state,
+        dataset,
+        metadata_fn,
+        metadata,
+        config,
+        loader_options,
+        effective_pack_fn,
+        effective_collate_fn,
+        batch_sampler,
+        external_step_reader,
+        external_step_source,
+    )
+    _finalize_build_state(
+        state,
+        config,
+        dataloader_fingerprint,
+        effective_pack_fn,
+        effective_collate_fn,
+        uses_default_pack,
+        uses_default_collate,
+        batch_sampler_fingerprint,
+    )
 
 
 def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfig) -> None:
@@ -719,13 +827,14 @@ def build_distributed_dataloader(
         communication_device: Any = None,
         batch_sampler: Any = None,
         external_step_reader: Any | None = None,
+        external_step_source: ExternalStepSource | None = None,
 ) -> DistributedDataLoader:
     """Build a sample-balanced distributed DataLoader.
 
-    Online mode without ``batch_sampler`` requires ``external_step_reader``. The external Reader must
-    emit one complete local step, including metadata and canonical pack
-    boundaries; this loader then freezes the union of those samples, balances
-    them across Data Constructors, and routes payloads when necessary.
+    Online mode without ``batch_sampler`` requires an external step source or
+    the legacy ``external_step_reader``. The source emits one complete local
+    step of raw-sample bins; HP derives metadata, freezes the sample union,
+    balances it across Data Constructors, and routes payloads when necessary.
     Metadata mode requires ``batch_sampler`` to define step/sample boundaries.
     It looks up ``metadata[index]`` before any Dataset read; target constructors
     then directly read their assigned indices from the shared Dataset and skip
@@ -742,8 +851,9 @@ def build_distributed_dataloader(
             same object or ``None``.
         mesh: Named root HyperParallel or native DeviceMesh.
         config: Dynamic packing, service-rank, and worker configuration.
-        metadata_fn: Only used by ``batch_sampler`` mode to derive metadata
-            from each Dataset output. It cannot be used by external-step mode.
+        metadata_fn: Derives metadata from each Dataset output in
+            ``batch_sampler`` mode or each raw sample emitted by
+            ``external_step_source``.
         metadata: Precomputed metadata for BatchSampler mode on Dataset Reader ranks. Indexed
             source Datasets that implement ``get_sample_metadata`` provide this
             automatically when both metadata arguments are omitted. It is a
@@ -770,12 +880,18 @@ def build_distributed_dataloader(
             not underlying document indices. Checkpoint through this loader,
             not through the sampler's speculative prefetch cursor.
         external_step_reader: Required for online mode without ``batch_sampler``. It is a
-            rank-local external producer that must
+            legacy rank-local Reader that must
             expose ``prepare_next_step``, ``metadata``, ``reference_bins``,
             ``selected_payloads``, ``commit``, ``exhausted``, and checkpoint/epoch methods.
             One call to ``prepare_next_step`` supplies exactly one already-selected local
             step. HP preserves that step's union and only rebalances its target
             ranks.
+        external_step_source: Preferred source-only API for online mode. It must
+            be an iterable whose next value is one complete local step, represented
+            as ``local_batch_size`` raw-sample bins, and implement checkpoint and
+            epoch methods. HP supplies metadata, payload caching, commit, packing,
+            collation, and distributed placement through ``metadata_fn``,
+            ``pack_fn``, and ``collate_fn``.
 
     Returns:
         Stateful collective iterator yielding constructed local batches.
@@ -798,6 +914,7 @@ def build_distributed_dataloader(
         communication_device=communication_device,
         batch_sampler=batch_sampler,
         external_step_reader=external_step_reader,
+        external_step_source=external_step_source,
     )
 
 
@@ -814,8 +931,11 @@ def _build_distributed_dataloader_impl(
         communication_device: Any,
         batch_sampler: Any = None,
         external_step_reader: Any | None = None,
+        external_step_source: ExternalStepSource | None = None,
 ) -> DistributedDataLoader:
-    metadata_mode = _resolve_metadata_mode(metadata_fn, metadata, external_step_reader)
+    if external_step_reader is not None and external_step_source is not None:
+        raise ValueError("external_step_reader and external_step_source are mutually exclusive.")
+    metadata_mode = _resolve_metadata_mode(metadata_fn, metadata, external_step_reader, external_step_source)
     state = _BuildState(metadata_mode=metadata_mode)
     try:
         _populate_build_state(
@@ -831,6 +951,7 @@ def _build_distributed_dataloader_impl(
             communication_device,
             batch_sampler,
             external_step_reader,
+            external_step_source,
         )
     except Exception as exc:  # Every WORLD rank must fail before subgroup creation.
         state.local_error = f"{type(exc).__name__}: {exc}"
