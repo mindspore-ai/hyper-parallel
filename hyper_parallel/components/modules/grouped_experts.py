@@ -323,6 +323,9 @@ class GroupedExperts(nn.Module):
         if self.has_gate and not self.is_concatenated:
             raise ValueError("GroupedExperts requires concatenated gate/up expert weights")
         self.is_transposed = True
+        # Keep HF native initialization order stable; this replacement module
+        # resets its packed expert parameters after materialization instead.
+        self._hp_reset_after_materialization = True
         self.train(module.training)
 
     def reset_parameters(self) -> None:

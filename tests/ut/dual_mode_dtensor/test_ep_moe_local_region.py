@@ -18,6 +18,8 @@ assertions carrying a case-identification message; atomic assertions
 # pylint: disable=unused-argument,protected-access
 
 import functools
+from unittest import mock
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -490,7 +492,12 @@ def test_custom_compute_fn_executes_in_region(make_mesh):
     _wrap_region(mod, spec, mesh, validate_mode=False)
 
     x = torch.randn(2, 4)
-    out = mod(x)
+    with mock.patch.object(
+        DTensor, "from_local",
+        side_effect=AssertionError("production local-region must not re-wrap output"),
+    ) as from_local:
+        out = mod(x)
+        from_local.assert_not_called()
     assert calls and calls[0][0] is mod, "case: custom_compute_fn_runs_in_region"
     torch.testing.assert_close(out, mod.lin(x) * 2,
                                msg="case: custom_compute_fn_runs_in_region")
