@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 from hyper_parallel.trainer.callbacks import TqdmCallback
 from hyper_parallel.trainer.state import TrainerState
+from tests.common.mark_utils import arg_mark
 
 
 class _FakeTqdm:
@@ -48,8 +49,19 @@ class TestTqdmCallback(unittest.TestCase):
             step_env_metrics={"performance/tokens_per_second": 128.1254},
         )
 
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
     def test_redirected_stream_writes_one_snapshot_per_step(self) -> None:
-        """Emit one newline and no carriage returns when stderr is not a TTY."""
+        """Emit one newline and no carriage returns when stderr is not a TTY.
+
+        Feature: Redirected Trainer progress output.
+        Description: Complete one step with a structured log message on a non-TTY stream.
+        Expectation: Exactly one finalized newline-terminated progress snapshot is written.
+        """
         stream = StringIO()
         callback = TqdmCallback(self._build_trainer())
         state = TrainerState(global_step=0, epoch=0)

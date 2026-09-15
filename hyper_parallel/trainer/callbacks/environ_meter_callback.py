@@ -14,6 +14,8 @@
 # ============================================================================
 """Training and environment metric collection callback."""
 
+from __future__ import annotations
+
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -42,7 +44,7 @@ class EnvironMeterCallback(Callback):
         """
         super().__init__(trainer)
         self._step_start_time = 0.0
-        self._local_step_tokens = 0
+        self._local_step_tokens: Any = None
         self._local_step_samples = 0
         self._consumed_tokens = 0
         self._consumed_samples = 0
@@ -80,11 +82,15 @@ class EnvironMeterCallback(Callback):
         return int(numel())
 
     @classmethod
-    def _batch_tokens(cls, batch: Mapping[str, Any]) -> int:
-        """Count text tokens in one micro-batch without mutating it."""
+    def _batch_tokens(cls, batch: Mapping[str, Any]) -> Any:
+        """Count text tokens without synchronizing a device scalar to the host."""
+        token_count = batch.get("token_count")
+        if token_count is not None:
+            return token_count
+
         labels = batch.get("labels")
         if labels is not None and callable(getattr(labels, "sum", None)):
-            return int((labels != IGNORE_INDEX).sum().item())
+            return (labels != IGNORE_INDEX).sum()
 
         attention_mask = batch.get("attention_mask")
         attention_mask_shape = getattr(attention_mask, "shape", ())
@@ -93,7 +99,7 @@ class EnvironMeterCallback(Callback):
             and attention_mask is not None
             and callable(getattr(attention_mask, "sum", None))
         ):
-            return int(attention_mask.sum().item())
+            return attention_mask.sum()
 
         input_ids = batch.get("input_ids")
         input_numel = cls._tensor_numel(input_ids)
@@ -149,12 +155,40 @@ class EnvironMeterCallback(Callback):
             return None
         return dp_cp_mesh.get_group()
 
-    def _reduce(self, value: float | int, op: str) -> float:
+    def _reduce(self, value: Any, op: str) -> float:
         """Reduce one scalar metric, with a single-process no-op fallback."""
         if get_world_size_safe() <= 1:
             return float(value)
         reduced = all_reduce(value, op=op, group=self._metric_group())
         return float(reduced)
+
+    def _accumulate_batches(self, value: Any) -> None:
+        """Accumulate batch metrics without retaining input tensor references."""
+        for batch in self._micro_batches(value):
+            token_count = self._batch_tokens(batch)
+            if callable(getattr(token_count, "detach", None)):
+                token_count = token_count.detach()
+            if self._local_step_tokens is None:
+                if callable(getattr(token_count, "clone", None)):
+                    token_count = token_count.clone()
+                self._local_step_tokens = token_count
+            else:
+                self._local_step_tokens = self._local_step_tokens + token_count
+            self._local_step_samples += self._batch_samples(batch)
+
+    def _global_samples(self) -> int:
+        """Reduce samples across DP+CP while removing CP replicas."""
+        cp_size = int(getattr(self.trainer.mesh, "cp_size", 1))
+        if cp_size < 1:
+            raise ValueError(f"mesh.cp_size must be positive, but got {cp_size}")
+        reduced_samples = self._reduce(self._local_step_samples, op="sum")
+        global_samples = reduced_samples / cp_size
+        if not global_samples.is_integer():
+            raise ValueError(
+                "Reduced sample count must be divisible by cp_size, "
+                f"but got reduced_samples={reduced_samples} and cp_size={cp_size}"
+            )
+        return int(global_samples)
 
     def _current_lr(self) -> float:
         """Return the maximum learning rate across scheduler or optimizer groups."""
@@ -226,12 +260,34 @@ class EnvironMeterCallback(Callback):
         micro_batches: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> None:
-        """Start timing and count local input tokens and samples."""
+        """Start timing and count local input tokens and samples.
+
+        Args:
+            state: Current training progress.
+            micro_batches: Batches available before the step starts.
+            **kwargs: Unused callback context.
+        """
         del state, kwargs
-        batches = self._micro_batches(micro_batches)
-        self._local_step_tokens = sum(self._batch_tokens(batch) for batch in batches)
-        self._local_step_samples = sum(self._batch_samples(batch) for batch in batches)
+        self._local_step_tokens = None
+        self._local_step_samples = 0
         self._step_start_time = time.perf_counter()
+        self._accumulate_batches(micro_batches)
+
+    def on_micro_step_begin(
+        self,
+        state: TrainerState,
+        micro_batch: dict[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        """Accumulate metrics for one prepared micro-batch.
+
+        Args:
+            state: Current training progress.
+            micro_batch: Prepared inputs and lightweight metric metadata.
+            **kwargs: Unused callback context.
+        """
+        del state, kwargs
+        self._accumulate_batches(micro_batch)
 
     def on_step_end(
         self,
@@ -241,12 +297,23 @@ class EnvironMeterCallback(Callback):
         grad_norm: float,
         **kwargs: Any,
     ) -> None:
-        """Reduce and publish metrics for one completed optimizer step."""
+        """Reduce and publish metrics for one completed optimizer step.
+
+        Args:
+            state: Current training progress.
+            loss: Aggregated loss for the optimizer step.
+            loss_dict: Named loss values for the optimizer step.
+            grad_norm: Gradient norm measured before the optimizer update.
+            **kwargs: Unused callback context.
+        """
         del state, kwargs
         step_time = max(time.perf_counter() - self._step_start_time, 0.0)
         global_step_time = self._reduce(step_time, op="max")
-        global_tokens = int(self._reduce(self._local_step_tokens, op="sum"))
-        global_samples = int(self._reduce(self._local_step_samples, op="sum"))
+        local_step_tokens = 0 if self._local_step_tokens is None else self._local_step_tokens
+        global_tokens = int(self._reduce(local_step_tokens, op="sum"))
+        global_samples = self._global_samples()
+        self._local_step_tokens = None
+        self._local_step_samples = 0
         self._consumed_tokens += global_tokens
         self._consumed_samples += global_samples
 
