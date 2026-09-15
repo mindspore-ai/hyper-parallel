@@ -98,7 +98,7 @@ class ExternalStepAdapter:
         self._buffer: tuple[BufferedSampleMetadata, ...] = ()
         self._payloads: dict[SampleKey, Any] = {}
         self._reference_bins: tuple[tuple[BufferedSampleMetadata, ...], ...] = ()
-        self._canonical_step: tuple[tuple[Any, ...], ...] = ()
+        self._original_step_samples: tuple[tuple[Any, ...], ...] = ()
 
     @property
     def exhausted(self) -> bool:
@@ -137,12 +137,12 @@ class ExternalStepAdapter:
 
         metadata = []
         reference_bins = []
-        canonical_step = []
+        original_step_samples = []
         for packed_samples in local_step:
             if not isinstance(packed_samples, (list, tuple)) or not packed_samples:
                 raise ValueError("External source emitted an empty or non-sequence local pack.")
             canonical_samples = tuple(packed_samples)
-            canonical_step.append(canonical_samples)
+            original_step_samples.append(canonical_samples)
             bin_metadata = []
             for sample in canonical_samples:
                 key = SampleKey(self._reader_rank, self._sample_ordinal)
@@ -160,7 +160,7 @@ class ExternalStepAdapter:
             reference_bins.append(tuple(bin_metadata))
         self._buffer = tuple(metadata)
         self._reference_bins = tuple(reference_bins)
-        self._canonical_step = tuple(canonical_step)
+        self._original_step_samples = tuple(original_step_samples)
 
     def metadata(self) -> tuple[BufferedSampleMetadata, ...]:
         """Return metadata for the pending source step."""
@@ -189,7 +189,7 @@ class ExternalStepAdapter:
         self._payloads.clear()
         self._buffer = ()
         self._reference_bins = ()
-        self._canonical_step = ()
+        self._original_step_samples = ()
         self._step += 1
 
     def canonical_plan_matches(self, constructor_plan: Any, data_rank: int) -> bool:
@@ -211,9 +211,9 @@ class ExternalStepAdapter:
 
     def canonical_batch(self) -> Any:
         """Materialize the unchanged source bins through HP's callbacks."""
-        if not self._canonical_step:
+        if not self._original_step_samples:
             raise RuntimeError("No canonical external source step is buffered.")
-        packed = [self._pack_fn(samples, self._seq_len) for samples in self._canonical_step]
+        packed = [self._pack_fn(samples, self._seq_len) for samples in self._original_step_samples]
         return self._collate_fn(packed)
 
     def state_dict(self) -> dict[str, Any]:
@@ -229,7 +229,8 @@ class ExternalStepAdapter:
             "buffer": self._buffer,
             "payloads": self._payloads,
             "reference_bins": self._reference_bins,
-            "canonical_step": self._canonical_step,
+            # Preserve the serialized key for existing adapter checkpoints.
+            "canonical_step": self._original_step_samples,
         })
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -250,7 +251,7 @@ class ExternalStepAdapter:
         self._buffer = state.get("buffer", ())
         self._payloads = state.get("payloads", {})
         self._reference_bins = state.get("reference_bins", ())
-        self._canonical_step = state.get("canonical_step", ())
+        self._original_step_samples = state.get("canonical_step", ())
 
     def set_epoch(self, epoch: int) -> None:
         """Reset the source and discard any speculative step.
@@ -267,7 +268,7 @@ class ExternalStepAdapter:
         self._buffer = ()
         self._payloads = {}
         self._reference_bins = ()
-        self._canonical_step = ()
+        self._original_step_samples = ()
 
 
 __all__ = ["ExternalStepAdapter", "ExternalStepSource"]
