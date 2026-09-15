@@ -76,11 +76,7 @@ class _ReaderSnapshot:
     reference_bins: tuple[tuple[BufferedSampleMetadata, ...], ...] = ()
 
 
-@dataclass(frozen=True)
-class _PrefetchResult:
-    batch: Any = None
-    exception: BaseException | None = None
-    completed: bool = False
+_PREFETCH_PENDING = object()
 
 
 def _validate_loader_components(
@@ -208,7 +204,10 @@ class DistributedDataLoader(Iterator[Any]):
         self._pending_plan: DistributedPackingPlan | None = None
         self._prefetch_thread: Thread | None = None
         self._prefetch_condition = Condition()
-        self._prefetch_result: _PrefetchResult | None = None
+        # ``None`` is a valid result (it signals end of stream), so a unique
+        # sentinel distinguishes "not ready" from a completed empty batch.
+        self._prefetch_result: Any = _PREFETCH_PENDING
+        self._prefetch_error: BaseException | None = None
         self._prefetch_requested = False
         self._prefetch_in_flight = False
         self._prefetch_stream: Any = None
@@ -281,7 +280,8 @@ class DistributedDataLoader(Iterator[Any]):
                     daemon=True,
                 )
                 self._prefetch_thread.start()
-            self._prefetch_result = None
+            self._prefetch_result = _PREFETCH_PENDING
+            self._prefetch_error = None
             self._prefetch_requested = True
             self._prefetch_in_flight = True
             self._prefetch_condition.notify()
@@ -301,14 +301,14 @@ class DistributedDataLoader(Iterator[Any]):
                     self._bind_prefetch_device()
                     device_bound = True
                 with self._prefetch_stream_context():
-                    result = _PrefetchResult(
-                        batch=self._prepare_next_batch(),
-                        completed=True,
-                    )
+                    batch = self._prepare_next_batch()
             except BaseException as exc:  # The foreground re-raises failures at the next iterator boundary.
-                result = _PrefetchResult(exception=exc)
+                with self._prefetch_condition:
+                    self._prefetch_error = exc
+                    self._prefetch_condition.notify_all()
+                continue
             with self._prefetch_condition:
-                self._prefetch_result = result
+                self._prefetch_result = batch
                 self._prefetch_condition.notify_all()
 
     def _bind_prefetch_device(self) -> None:
@@ -337,19 +337,19 @@ class DistributedDataLoader(Iterator[Any]):
         if not self._prefetch_in_flight:
             self._start_prefetch()
         with self._prefetch_condition:
-            while self._prefetch_result is None:
+            while self._prefetch_result is _PREFETCH_PENDING and self._prefetch_error is None:
                 self._prefetch_condition.wait()
             result = self._prefetch_result
-            self._prefetch_result = None
+            error = self._prefetch_error
+            self._prefetch_result = _PREFETCH_PENDING
+            self._prefetch_error = None
             self._prefetch_in_flight = False
             self._prefetch_condition.notify_all()
-        if result is None:
-            raise ValueError("Double buffering completed without a prefetch result.")
-        if result.exception is not None:
-            raise result.exception
-        if not result.completed:
+        if error is not None:
+            raise error
+        if result is _PREFETCH_PENDING:
             raise ValueError("Double buffering completed without a finished prefetch result.")
-        return result.batch
+        return result
 
     @property
     def last_plan_id(self) -> str | None:
@@ -363,7 +363,11 @@ class DistributedDataLoader(Iterator[Any]):
         prepared result remains available to the next iterator call.
         """
         with self._prefetch_condition:
-            while self._prefetch_in_flight and self._prefetch_result is None:
+            while (
+                    self._prefetch_in_flight
+                    and self._prefetch_result is _PREFETCH_PENDING
+                    and self._prefetch_error is None
+            ):
                 self._prefetch_condition.wait()
 
     @property
