@@ -48,14 +48,6 @@ Verification strategy:
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent
-# Required for direct script execution (``torchrun expert_parallel_example.py``)
-# so that ``from model import ...`` resolves within this package directory.
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
