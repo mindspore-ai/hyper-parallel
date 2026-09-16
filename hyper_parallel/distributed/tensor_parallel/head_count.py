@@ -85,6 +85,11 @@ _QKV_WEIGHT_SUFFIXES = (
 )
 
 
+def _is_plain_int(value: Any) -> bool:
+    """Return whether a value is an integer but not a boolean."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _is_head_sharded(spec, mesh_dim_names) -> bool:
     """True when the spec column-wise shards any q/k/v projection on the TP axis."""
     if "tp" not in mesh_dim_names:
@@ -127,7 +132,7 @@ def update_module_head_counts(module: Any, tp_size: int, module_fqn: str = "") -
         if attr in originals:
             continue
         value = getattr(module, attr, None)
-        if not isinstance(value, int) or isinstance(value, bool):
+        if not _is_plain_int(value):
             continue
         originals[attr] = value
         if value % tp_size != 0:
@@ -151,8 +156,7 @@ def collect_auto_head_attrs(
         return ()
     return tuple(
         attr for attr in Q_HEAD_ATTRS + KV_HEAD_ATTRS
-        if isinstance(getattr(module, attr, None), int)
-        and not isinstance(getattr(module, attr), bool)
+        if _is_plain_int(getattr(module, attr, None))
     )
 
 
@@ -183,7 +187,7 @@ def normalize_tp_divide_attrs(
                 f"{module_fqn}: tp_divide_attrs contains duplicate {attr!r}")
         seen.add(attr)
         value = getattr(module, attr, None)
-        if not isinstance(value, int) or isinstance(value, bool):
+        if not _is_plain_int(value):
             actual = type(value).__name__ if hasattr(module, attr) else "missing"
             raise ValueError(
                 f"{module_fqn}: tp_divide_attrs attribute {attr!r} must "
@@ -237,7 +241,7 @@ def _update_user_tp_attrs(
                     f"(expected {expected})")
             continue
         value = getattr(module, attr)
-        if not isinstance(value, int) or isinstance(value, bool):
+        if not _is_plain_int(value):
             raise ValueError(
                 f"{module_fqn}: tp_divide_attrs attribute {attr!r} must "
                 f"exist and be a plain int, got {type(value).__name__}")
