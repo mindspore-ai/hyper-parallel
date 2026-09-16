@@ -345,7 +345,7 @@ def _normalize_hf_sdpa_gqa(
     return query, key, value, normalized_kwargs
 
 
-def _bind_qkv_invocation(
+def _bind_qkv_invocation(  # pylint: disable=too-many-locals
         original_forward: Callable[..., Any], args: tuple[Any, ...],
         kwargs: dict[str, Any], wrapper_name: str):
     """Bind a QKV call once and return a local-tensor attention callback."""
@@ -714,10 +714,12 @@ def sdpa_hf_load_balance_cp_wrapper(
             keep_kwargs, peer_kwargs = _prepare_head_tail_sdpa_kwargs(
                 call_kwargs, q, k, cp_mesh
             )
+
+            def _call_sdpa(query, key, value, attention_kwargs):
+                return original_sdpa(query, key, value, **attention_kwargs)
+
             return head_tail_load_balance_attention(
-                lambda query, key, value, attention_kwargs: original_sdpa(
-                    query, key, value, **attention_kwargs
-                ),
+                _call_sdpa,
                 q,
                 k,
                 v,
@@ -998,12 +1000,12 @@ def sdpa_hf_hybrid_cp_wrapper(
                 cp_mesh,
                 ulysses_degree,
             )
+
+            def _call_sdpa(call_query, call_key, call_value, call_kwargs):
+                return original_sdpa(call_query, call_key, call_value, **call_kwargs)
+
             return hybrid_cp_attention(
-                lambda call_query, call_key, call_value, call_kwargs: (
-                    original_sdpa(
-                        call_query, call_key, call_value, **call_kwargs
-                    )
-                ),
+                _call_sdpa,
                 query,
                 key,
                 value,
@@ -1051,12 +1053,14 @@ def flex_hf_hybrid_cp_wrapper(
                 **attention_kwargs: Any) -> Any:
             """Route one intercepted FlexAttention call through Hybrid CP."""
             fired["hit"] = True
+
+            def _call_flex(call_query, call_key, call_value, call_kwargs):
+                return original_flex_attention(
+                    call_query, call_key, call_value, **call_kwargs
+                )
+
             return hybrid_cp_attention(
-                lambda call_query, call_key, call_value, call_kwargs: (
-                    original_flex_attention(
-                        call_query, call_key, call_value, **call_kwargs
-                    )
-                ),
+                _call_flex,
                 query,
                 key,
                 value,
@@ -1153,7 +1157,7 @@ def _validate_ulysses_requirements(target_module, cp_size):
 
 
 @inner_wrapper
-def mla_dsa_ulysses_cp_wrapper(  # pylint: disable=inconsistent-return-statements
+def mla_dsa_ulysses_cp_wrapper(  # pylint: disable=inconsistent-return-statements,too-many-locals
         target_module: Module, mesh: Any, tp_mesh: Any,
         cp_mesh: Any, ep_mesh: Any) -> Any:
     """Configure input, MoME, MLA and DSA Ulysses adaptations."""

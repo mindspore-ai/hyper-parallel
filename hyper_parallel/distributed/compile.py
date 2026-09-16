@@ -14,6 +14,12 @@
 # ============================================================================
 """Compile Transformer decoder layers as independent graph segments."""
 
+__all__ = [
+    "apply_compile",
+    "get_compile_layers",
+    "resolve_compile_kwargs",
+]
+
 import logging
 from collections.abc import Iterable, Mapping
 from typing import Any, Optional, Union
@@ -44,6 +50,15 @@ def _get_attribute(root: Any, path: str) -> Any:
     return value
 
 
+def _is_named_layer(item: Any) -> bool:
+    """Return whether an item is a valid ``(fqn, module)`` pair."""
+    if not isinstance(item, tuple):
+        return False
+    if len(item) != 2:
+        return False
+    return isinstance(item[0], str) and isinstance(item[1], nn.Module)
+
+
 def _normalize_declared_layers(declared: Any) -> list[tuple[str, nn.Module]]:
     """Normalize the model-owned decoder-layer contract."""
     if isinstance(declared, nn.ModuleList):
@@ -59,12 +74,7 @@ def _normalize_declared_layers(declared: Any) -> list[tuple[str, nn.Module]]:
         if isinstance(item, nn.Module):
             layers.append((str(index), item))
             continue
-        if (
-            isinstance(item, tuple)
-            and len(item) == 2
-            and isinstance(item[0], str)
-            and isinstance(item[1], nn.Module)
-        ):
+        if _is_named_layer(item):
             layers.append(item)
             continue
         raise TypeError(
@@ -209,13 +219,6 @@ def apply_compile(model: nn.Module, config: CompileConfig) -> nn.Module:
         config.fullgraph,
     )
     return model
-
-
-__all__ = [
-    "apply_compile",
-    "get_compile_layers",
-    "resolve_compile_kwargs",
-]
 
 
 def _resolve_compile_config(

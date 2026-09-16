@@ -15,7 +15,9 @@
 """End-to-end context-parallel generate check."""
 import argparse
 import json
+import logging
 import math
+import sys
 from pathlib import Path
 
 import torch
@@ -23,6 +25,8 @@ import torch.distributed as dist
 from torch import nn
 
 from hyper_parallel.infer import GenerationConfig, generate, get_sequence_shard_info
+
+logger = logging.getLogger(__name__)
 
 
 def _init_weights(module: nn.Module, vocab_size: int) -> None:
@@ -86,7 +90,7 @@ class ContextParallelTinyAttentionLM(FullTinyAttentionLM):
         self.rank = rank
         self.world_size = world_size
 
-    def forward(
+    def forward(  # pylint: disable=too-many-locals
         self,
         input_ids,
         position_ids=None,
@@ -124,7 +128,7 @@ class ContextParallelTinyAttentionLM(FullTinyAttentionLM):
             "sequence_shard_info": shard_info,
         }
 
-    def _gather_full_cache(self, past_key_values, sequence_shard_info):
+    def _gather_full_cache(self, past_key_values, sequence_shard_info):  # pylint: disable=too-many-locals
         """Gather local CP cache shards into full-sequence cache."""
         if sequence_shard_info is None:
             raise ValueError("sequence_shard_info is required for CP cached decode")
@@ -144,19 +148,18 @@ class ContextParallelTinyAttentionLM(FullTinyAttentionLM):
         dist.all_gather(gathered_keys, padded_key)
         dist.all_gather(gathered_values, padded_value)
 
-        gathered = sorted(
-            (
-                int(rank_start.item()),
-                key.narrow(-2, 0, int(rank_len.item())),
-                value.narrow(-2, 0, int(rank_len.item())),
+        gathered = []
+        shards = zip(starts, lengths, gathered_keys, gathered_values)
+        for rank_start, rank_len, key, value in shards:
+            shard_len = int(rank_len.item())
+            gathered.append(
+                (
+                    int(rank_start.item()),
+                    key.narrow(-2, 0, shard_len),
+                    value.narrow(-2, 0, shard_len),
+                )
             )
-            for rank_start, rank_len, key, value in zip(
-                starts,
-                lengths,
-                gathered_keys,
-                gathered_values,
-            )
-        )
+        gathered.sort()
         full_key = torch.cat([item[1] for item in gathered], dim=-2)
         full_value = torch.cat([item[2] for item in gathered], dim=-2)
         return full_key, full_value
@@ -187,7 +190,7 @@ def _parse_args():
     return parser.parse_args()
 
 
-def main():
+def main():  # pylint: disable=too-many-locals
     """Run the distributed CP generate check."""
     args = _parse_args()
     if not dist.is_initialized():
@@ -274,7 +277,8 @@ def main():
                 for output in gathered_prefix_outputs
             ),
         }
-        print(json.dumps(result, indent=2))
+        logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+        logger.info("%s", json.dumps(result, indent=2))
         if args.output:
             output_path = Path(args.output)
             output_path.parent.mkdir(parents=True, exist_ok=True)

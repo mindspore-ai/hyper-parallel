@@ -251,7 +251,7 @@ class DTensor(DTensorBase):
     _device_mesh: DeviceMesh
     _placements: Sequence[Placement]
 
-    def __init_data__(
+    def _init_data(
         self,
         local_tensor: Tensor,
         device_mesh: DeviceMesh,
@@ -406,13 +406,13 @@ class DTensor(DTensorBase):
 
         Unlike :meth:`from_local`, this does NOT rebuild the layout via
         ``_build_layout`` — it hands the already-built ``layout`` straight to
-        ``__init_data__``. Intended for hot paths (e.g. ``wrap_output``) where the
+        ``_init_data``. Intended for hot paths (e.g. ``wrap_output``) where the
         output Layout was already inferred and cached by ``infer_layout``, so
         recomputing ``device_mesh.to_hash()`` / ``tuple(placements)`` / the layout
         cache lookup on every output is pure waste.
 
         ``layout.placements`` (a plain attribute) is passed only to satisfy the
-        constructor's non-None check; ``__init_data__`` ignores it when ``layout``
+        constructor's non-None check; ``_init_data`` ignores it when ``layout``
         is supplied.
         """
         return DTensor(

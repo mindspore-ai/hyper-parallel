@@ -42,7 +42,7 @@ def _make_mock_dtensor(mesh="fake_mesh", placements=None, alias_placements=None,
     """Build a mock DTensor for unit testing without hardware.
 
     Returns a ``SimpleNamespace`` whose attributes mimic the internal state
-    set by ``DTensor.__init_data__``.  ``_local_tensor`` is a ``Mock`` so
+    set by ``DTensor._init_data``.  ``_local_tensor`` is a ``Mock`` so
     that ``.to()`` / ``.float()`` / ``.type_as()`` never touch real hardware.
 
     Because ``DTensor.to()`` calls ``self.__class__(...)``, the returned

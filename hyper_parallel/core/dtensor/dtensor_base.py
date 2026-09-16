@@ -34,7 +34,7 @@ class DTensorBase(Tensor):
             local_tensor: The local tensor shard or another DTensorBase instance.
             device_mesh: The device mesh describing the device topology.
             placements: The placement strategy for each mesh dimension.
-            layout: Optional pre-built Layout reused directly by ``__init_data__``
+            layout: Optional pre-built Layout reused directly by ``_init_data``
                 (skips ``_build_layout``; see ``DTensor.from_local_with_layout``).
             shape: Optional logical global tensor shape.
         """
@@ -42,7 +42,7 @@ class DTensorBase(Tensor):
             # Copy from existing DTensorBase — use alias_placements to preserve multi-axis ordering
             t = Tensor._make_subclass(cls, local_tensor._local_tensor, local_tensor._local_tensor.requires_grad)
             copy_placements = local_tensor.layout.alias_placements if local_tensor.layout else local_tensor.placements
-            t.__init_data__(
+            t._init_data(
                 local_tensor._local_tensor,
                 local_tensor.device_mesh,
                 copy_placements,
@@ -57,12 +57,12 @@ class DTensorBase(Tensor):
 
         # Create Tensor subclass instance, sharing local_tensor's underlying storage
         t = Tensor._make_subclass(cls, local_tensor, local_tensor.requires_grad)
-        t.__init_data__(local_tensor, device_mesh, placements, layout, shape)
+        t._init_data(local_tensor, device_mesh, placements, layout, shape)
         return t
 
     # pylint: disable=W0613, G.NAM.05
     @classmethod
-    def __torch_function__(
+    def __torch_function__(  # pylint: disable=H2105
         cls,
         func: torch._C._FunctionBase,
         types: Tuple[type, ...],
@@ -376,7 +376,7 @@ class DTensorBase(Tensor):
         """
         new_local = self._local_tensor.to(*args, **kwargs)
         new_dt = Tensor._make_subclass(type(self), new_local, new_local.requires_grad)
-        new_dt.__init_data__(
+        new_dt._init_data(
             new_local,
             self._device_mesh,
             self._alias_placements(),

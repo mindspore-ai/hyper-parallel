@@ -14,6 +14,12 @@
 # ============================================================================
 """Lower TP placement transitions to differentiable local-tensor collectives."""
 
+__all__ = [
+    "TPCollectiveLowerer",
+    "TPExecutionOp",
+    "create_tp_collective_lowerer",
+]
+
 import logging
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
@@ -162,10 +168,3 @@ def create_tp_collective_lowerer(
         group_rank=tp_mesh.get_local_rank(),
         backend=str(backend).lower(),
     )
-
-
-__all__ = [
-    "TPCollectiveLowerer",
-    "TPExecutionOp",
-    "create_tp_collective_lowerer",
-]

@@ -50,7 +50,8 @@ class Placement:
         # pylint: disable=W0613
         return False
 
-    def is_ragged_shard(self) -> bool:
+    @staticmethod
+    def is_ragged_shard() -> bool:
         """Return whether this placement represents non-uniform contiguous sharding."""
         return False
 
@@ -217,7 +218,8 @@ class RaggedShard(Placement):
         """Return the relative allocation for ranks on the ragged mesh axis."""
         return self._local_units
 
-    def is_ragged_shard(self) -> bool:
+    @staticmethod
+    def is_ragged_shard() -> bool:
         """Return true for RaggedShard placements."""
         return True
 

@@ -324,7 +324,9 @@ def _register_hook(model: nn.Module, sharding_plan: Dict):
 
         set_inputs_layout = suffix == "input"
         set_outputs_layout = not set_inputs_layout
-        register_cell = cell_dict[prefix]
+        register_cell = cell_dict.get(prefix)
+        if register_cell is None:
+            raise KeyError(f"Cannot find cell {prefix!r} in sharded cell.")
 
         _set_layouts(register_cell, value, set_inputs_layout, set_outputs_layout)
         _register_cell_hook(register_cell, set_inputs_layout, set_outputs_layout)

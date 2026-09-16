@@ -55,7 +55,7 @@ def _normalize_global_shape(shape: Sequence[int]) -> tuple[int, ...]:
     return tuple(int(size) for size in normalized)
 
 
-def _compute_ragged_slice(
+def _compute_ragged_slice(  # pylint: disable=too-many-locals
     global_shape: Sequence[int],
     layout: Layout,
     local_rank: Optional[int] = None,

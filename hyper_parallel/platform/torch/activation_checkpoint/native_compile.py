@@ -14,6 +14,8 @@
 # ============================================================================
 """Adapters for using PyTorch-native selective checkpointing under compile."""
 
+__all__ = ["create_native_selective_checkpoint_contexts"]
+
 from functools import partial
 from typing import Any, Callable, Tuple
 
@@ -72,6 +74,3 @@ def create_native_selective_checkpoint_contexts(policy_fn: Callable) -> Tuple[An
     return torch_checkpoint.create_selective_checkpoint_contexts(
         partial(_torch_policy_adapter, policy_fn)
     )
-
-
-__all__ = ["create_native_selective_checkpoint_contexts"]

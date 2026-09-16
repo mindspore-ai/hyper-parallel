@@ -250,7 +250,7 @@ class _AsyncAllGatherWait(torch.autograd.Function):
         return _move_dim_from_front(output, gather_dim)
 
     @staticmethod
-    def backward(
+    def backward(  # pylint: disable=H3405
         ctx: Any,
         grad_output: Tensor,
     ) -> tuple[Tensor, None, None, None, None, None]:
@@ -296,7 +296,7 @@ class _AsyncUlyssesWait(torch.autograd.Function):
         return _reconstruct_all_to_all(output, seq_dim)
 
     @staticmethod
-    def backward(
+    def backward(  # pylint: disable=H3405
         ctx: Any,
         grad_output: Tensor,
     ) -> tuple[Tensor, None, None, None, None, None, None]:

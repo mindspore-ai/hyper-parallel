@@ -524,7 +524,7 @@ class Layout:
                 readable_map.append(_map_dim(item))
         return tuple(readable_map)
 
-    def tensor_map_to_placement(self):
+    def tensor_map_to_placement(self):  # pylint: disable=too-many-locals
         """
         Transform tensor map to placement.
 
@@ -753,7 +753,7 @@ class Layout:
         if self.is_dev_axis_apply_shard(axis):
             raise ValueError("Partial dim must be replicate.")
         self._partial[self._mesh.axis_index(axis)] = op
-        self.tensor_map_to_placement()
+        _ = self.tensor_map_to_placement()
         self.update_compact_str()
 
     def get_partial_by_dev_id(self, axis):
@@ -786,7 +786,7 @@ class Layout:
     def reset_partial(self):
         """Clear all partial statuses and regenerate placements from the tensor map."""
         self._partial = [None] * len(self.mesh_shape)
-        self.tensor_map_to_placement()
+        _ = self.tensor_map_to_placement()
         self.update_compact_str()
 
     def is_partial(self):

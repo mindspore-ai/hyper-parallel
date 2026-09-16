@@ -635,7 +635,7 @@ def generate(
             outputs = _decode(model, context, next_tokens, use_cached_decode)
             if use_cached_decode:
                 _update_cache(context["cache"], outputs)
-            logits = _required_logits(outputs)
+            logits = _required_logits(outputs)  # pylint: disable=H3407
 
         return _finalize_sequences(
             context["sequences"],

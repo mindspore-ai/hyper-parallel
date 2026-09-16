@@ -82,7 +82,7 @@ class _AsyncA2AWait(torch.autograd.Function):
         return _a2a_reconstruct(out_perm, concat_dim)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=H3405
         """Launch the reverse all-to-all when overlap was requested."""
         if ctx.handle_box is not None:
             grad_output = grad_output.contiguous()
@@ -118,7 +118,7 @@ class _AsyncAllGatherWait(torch.autograd.Function):
         return _move_dim_from_front(out_perm, gather_dim)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=H3405
         """Reduce-scatter the gathered gradient."""
         grad_perm = _move_dim_to_front(grad_output.contiguous(), ctx.gather_dim)
         output_shape = list(grad_perm.shape)

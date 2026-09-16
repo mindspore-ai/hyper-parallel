@@ -150,7 +150,7 @@ class _BaseHyperAutoModelClass:
         )
 
     @classmethod
-    def from_config(  # pylint: disable=unused-argument
+    def from_config(  # pylint: disable=unused-argument,too-many-locals
         cls,
         config: PretrainedConfig,
         *model_args: Any,

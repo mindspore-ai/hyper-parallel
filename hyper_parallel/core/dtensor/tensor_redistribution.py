@@ -111,7 +111,7 @@ class TensorRedistribution:
         return _utils.chunk(x, split_dim, split_size, idx)
 
     @staticmethod
-    def _construct_all_to_all(x, *args):
+    def _construct_all_to_all(x, *args):  # pylint: disable=too-many-locals
         """args: (split_dim, concat_dim, permute_size, group)"""
         split_dim, concat_dim, split_count, rank_list = args
         group = _utils.create_group(rank_list)
