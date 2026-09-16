@@ -260,11 +260,11 @@ grep `get_model_adapter()` 的**全部调用点**，实际被读的 provider：
 **这解释了为什么 YAML 必须写 `_target_`：provider 那条路根本没通。**
 所以「把 YAML 指向改成 provider」这个方向不成立——**provider 机制本身要先接线，或者删掉。**
 
-同类死字段（累计 3 处）：
+同类死字段（标注重构分支的接线状态）：
 
 | 字段 | 状态 |
 |---|---|
-| `InlineSpecBundle.external_state_classes` | 声明了，无人读（runtime 硬编码 frozenset） |
+| `InlineSpecBundle.external_state_classes` | ✅ 已接线（重构分支 ④）：生成期落到 `codegen_meta.json`，runtime 读 meta 而非硬编码副本 |
 | `ModelAdapterSpec.attention` 等 5 个 | 声明了，无人读（见上表） |
 
 ### 4.6 `attention_interface` 的调用链：硬编码，不经过任何机制
@@ -610,3 +610,42 @@ _PRIMITIVE_PREFIXES = (
    ——需要找原作者的判断依据。
 4. **S1 启动时机**：建议等 commits 1–3 与 129 验证完成后再启动（逐字节等价的基准需要先有可跑通的产物）。
 5. **§4.5 的 5 个死 provider**：接线还是删除。
+
+---
+
+## 13. ③（边界归属 + 产物 TP 形态统一）的已定设计
+
+**已定（用户确认）：产物里的 TP 访问方式统一到「产物自带的平台直连版 `TPOperators`」。**
+
+现状是两套并存，读者无法判断「这个模型的 TP 到底怎么开的」：
+
+| | runtime 版 | 产物版 |
+|---|---|---|
+| 位置 | `codegen/runtime.py` 的 `class TPOperators` | `codegen/inline/templates.py` 的 `TP_OPERATORS_CLASS` |
+| 构造 | `TPOperators(lowerer)` | `TPOperators(tp_group, tp_size, tp_rank, backend)` |
+| 内部 | `self._lowerer.execution_op(kind, dim).execute(tensor)` | `get_platform().differentiable_*`（直连） |
+| 访问路径 | `self._hyper_tp`（由 `_install_static_tp_operators` 绑定） | `get_parallel_state().tp`（inline 模板在用） |
+
+目标：**`self._hyper_tp` 绑定产物自带那个实例**，inline 模板从 `ps.tp.<op>` 改写为
+`self._hyper_tp.<op>`，产物里直接可见 `platform.differentiable_all_gather_concat` 等真实
+collective —— 与 `preview_modeling_veomni_style.py` 的写法一致（「no black box」）。
+
+因此删除：
+
+- runtime 版 `TPOperators`（lowerer 包装）
+- `_install_static_tp_operators`、`_wrap_static_fallback_forward`
+- 产物里的 `_hyper_boundary_form = "tp_collective"` 标记与该族的 live-mesh 重校验
+- `emit/parallel.py` 的 `FORM_TP_COLLECTIVE` 渲染（`_render_tp_collective_forward`）
+- 随之失去引用的 `hyper_to_local_if_dtensor`（`_render_local_compute` 的 identity 分支）
+
+代价（已知并接受）：失去「live mesh 与生成期 plan 不一致就自动回退通用 redistribute 引擎」
+这层安全网 —— TP 边界的合法性改由生成期 plan 保证；产物在错误 mesh 上直接报错而不是静默
+降级，与 §5.5「识别失败必须硬失败」一致。
+
+保留 `InstalledBoundary` / `self._hyper_boundary.redistribute_*` —— 它仍服务**无法重写的
+导入类**边界（`nn.Embedding` / `nn.Linear` / `nn.LayerNorm`），这些类没有源码 span 可改写。
+
+**这一项会改变产物字节**（这也是它与 ①②④ 的区别：①②④ 只动运行时死代码与声明归属）。
+落地顺序：先改 `templates.py` + 绑定通路（`InlineParallelState.tp` → `module._hyper_tp`），
+再删 static 族，最后删 `emit/parallel.py` 的 `FORM_TP_COLLECTIVE` 分支 —— 每步 `tests/codegen`
+须保持全绿。

@@ -1,4 +1,4 @@
-﻿# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,13 +20,14 @@ import json
 import logging
 import os
 import time
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from hyper_parallel.codegen import manager
+from hyper_parallel.codegen import manager, runtime
 from hyper_parallel.codegen.artifact import (
     artifact_exists,
     clean_temp_artifacts,
@@ -36,7 +37,11 @@ from hyper_parallel.codegen.artifact import (
 )
 from hyper_parallel.codegen.check.preflight import verify_output_hashes
 from hyper_parallel.codegen.hash import canonical_json, signature_from_spec
-from hyper_parallel.codegen.meta import CodegenMeta, load_codegen_meta
+from hyper_parallel.codegen.meta import (
+    CodegenMeta,
+    load_codegen_meta,
+    validate_meta_schema,
+)
 from hyper_parallel.codegen.modeling_backend import (
     ModelingBackend,
     resolve_modeling_backend,
@@ -88,6 +93,58 @@ def _bundle_files(layout: object) -> dict[str, str]:
         os.path.basename(layout.diff_path): "--- source\n+++ generated\n",
         "__init__.py": "",
     }
+
+
+def test_external_state_classes_travel_from_the_adapter_to_the_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runtime reads the artifact's record, not a hardcoded class list.
+
+    Feature: codegen-external-state
+    Description: ``meta.external_state_classes`` is filled from the adapter
+        render spec at generation time; ``runtime`` records it per generated
+        module and consults that record when deciding whether an inlined
+        generated class takes its parallel state externally.
+    Expectation: The declared class is recognised, an undeclared sibling of the
+        same generated module is not, a same-named class defined outside the
+        generated file is not, an artifact that declares nothing recognises
+        nothing, and a non-list meta value fails schema validation.
+    """
+    # pylint: disable=protected-access
+    bundle = SimpleNamespace(external_state_classes=("GroupedExperts",))
+    monkeypatch.setattr(manager, "get_inline_spec_bundle", lambda identity: bundle)
+
+    meta = _meta()
+    meta.source = {"architecture": "Qwen3MoeForCausalLM"}
+    manager._record_inline_declarations(meta)
+    assert meta.external_state_classes == ["GroupedExperts"]
+
+    generated = types.ModuleType("hyper_parallel_generated.external_state")
+    declared = type("GroupedExperts", (), {"__module__": generated.__name__})
+    sibling = type("UndeclaredBlock", (), {"__module__": generated.__name__})
+    foreign = type("GroupedExperts", (), {"__module__": "transformers.models.qwen3_moe"})
+
+    runtime.register_external_state_classes(generated, meta.external_state_classes)
+    assert runtime._is_external_state_inline_module(declared(), generated)
+    assert not runtime._is_external_state_inline_module(sibling(), generated)
+    # A same-named class defined outside the generated file is never external.
+    assert not runtime._is_external_state_inline_module(foreign(), generated)
+
+    untouched = types.ModuleType("hyper_parallel_generated.undeclared")
+    runtime.register_external_state_classes(untouched, [])
+    scoped = type("GroupedExperts", (), {"__module__": untouched.__name__})
+    assert not runtime._is_external_state_inline_module(scoped(), untouched)
+
+    with pytest.raises(TypeError):
+        validate_meta_schema(
+            {
+                "codegen_version": "3",
+                "signature": "sig",
+                "yaml_path": "train.yaml",
+                "yaml_sha256": "yaml-sha",
+                "external_state_classes": {"GroupedExperts": True},
+            }
+        )
 
 
 def test_artifact_layout_uses_example_generated_dir_and_safe_model_name(

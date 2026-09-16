@@ -66,8 +66,32 @@
 - `manager.py` 产物签名始终包含 adapter 声明，不再受环境变量控制。
 - 移除 3 项 `_HYPER_MODULE_OVERRIDES` 字面量断言测试：该产物面已不存在，
   其端到端替换语义由 `test_inline_adapters.py` 的 adapter 驱动用例覆盖。
-- `tests/codegen` 105 passed。
 
-后续（同一分支）：删除已无调用者的字面量发射器；删除 runtime 只服务 generic
-形态的 boundary/rewrap 一族（保留 `hyper_bind_compute`，它仍负责 EP factory 副作用）；
-external-state 类收归 adapter 声明。
+**① 删除 generic literal 发射器**（`emit/modeling.py` 869 → 359 行、
+`emit/replacement.py` 302 → 153 行）：
+
+- `emit/modeling.py`：`render_python_literal` 及渲染辅助、`inject_codegen_imports`、
+  `inject_param_plan_literals`、`group_injection_rules`、`build_boundary_manifest`、
+  `_plan_field` / `_PLAN_FIELD_EMPTY`、`inject_hyper_parallelize`、
+  `_rewrite_init_for_overrides`、`_inject_module_override_literals`。
+- `emit/replacement.py`：`group_override_records`、`inject_module_override_literals`、
+  `rewrite_init_for_overrides`；保留生成期的 `compile_overrides_for_meta`。
+- 删除 `plan/slim.py` 与只覆盖该字面量面的 `tests/codegen/test_artifact_slim.py`。
+- 链路已确认：inline 产物不定义 `hyper_parallelize` 时，
+  `runtime.parallelize_from_generated` 回退到 `_parallelize_inline_from_meta`，直接从
+  `codegen_meta.json` 读计划 —— 产物不依赖任何模块级字面量。
+
+**④ external-state 类收归声明**：`external_state_classes` 由模型 render spec 声明，
+生成期经 `manager._record_inline_declarations` 落入 `codegen_meta.json`，runtime 在
+`parallelize_from_generated` 里按 generated module 注册后读取。runtime 不再自带
+`_EXTERNAL_STATE_INLINE_CLASSES` 硬编码副本（DeepSeek 漏加就是这种漂移的后果）。
+
+**② 收掉 runtime 的 per-call boundary/rewrap 死符号**：删除 `hyper_redistribute`、
+`hyper_rewrap_outputs`、`_wrap_module_boundary_forward`、`hyper_wrap_module_boundaries`
+及其 `__all__` 条目。保留 `InstalledBoundary` / `_compile_boundary` /
+`_FrozenBoundarySpec` / `_build_rewrap_plan` / `_rewrap_execute` /
+`_install_static_tp_operators`（仍在 install 路径上）、`hyper_bind_compute`（EP factory
+副作用）、`hyper_to_local_if_dtensor`（`emit/parallel.py` 的 local-region 模板仍会把它
+发射进产物，属 ③ 边界归属的范围）。
+
+`tests/codegen` 95 passed（删掉的用例只覆盖已删符号）。

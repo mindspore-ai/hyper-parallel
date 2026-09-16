@@ -19,10 +19,10 @@ The generated runtime compiles every frozen boundary once
 module instance; the generated forwards call
 ``self._hyper_boundary.redistribute_inputs/outputs`` with no per-call
 re-resolution.  These tests lock the binding behavior and — critically — the
-install-time mesh routing: it must match ``hyper_redistribute``'s per-call
-routing (empty-active-axes no-op, changing-ep expert-mesh compile, dense-mesh
-compile with ep keys dropped), because that routing is runtime-conditional
-and must never be baked into generated source text.
+install-time mesh routing: it must reproduce the runtime-conditional branches
+(empty-active-axes no-op, changing-ep expert-mesh compile, dense-mesh compile
+with ep keys dropped), because that routing must never be baked into generated
+source text.
 """
 
 from __future__ import annotations
@@ -383,8 +383,8 @@ def test_install_does_not_build_default_position_ids_without_sequence_shard(monk
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
-def test_install_routing_matches_hyper_redistribute(monkeypatch):
-    """Lock the install-time routing against hyper_redistribute's branches.
+def test_install_routing_covers_runtime_conditional_branches(monkeypatch):
+    """Lock the install-time routing's four runtime-conditional branches.
 
     Runtime-conditional mesh routing must stay in ``hyper_install_boundaries``
     (never baked into source text): with active axes everything compiles on
@@ -403,8 +403,8 @@ def test_install_routing_matches_hyper_redistribute(monkeypatch):
         active axes but expert mesh with a changing ep placement →
         expert-mesh compile; (4) expert mesh with only identity ep keys →
         no-op passthrough.
-    Expectation: Compiled-boundary mesh/dims match hyper_redistribute's routing
-        in all four branches; no-op passthrough returns payloads unchanged.
+    Expectation: Compiled-boundary mesh/dims follow the documented branch in
+        all four cases; no-op passthrough returns payloads unchanged.
     """
     from hyper_parallel.distributed._builder import tp_collective_lowering
 
@@ -492,15 +492,15 @@ def test_install_routing_matches_hyper_redistribute(monkeypatch):
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
-def test_installed_rewrap_matches_hyper_rewrap_outputs(monkeypatch):
-    """The install-time rewrap uses the same parsed plan as the per-call helper.
+def test_installed_rewrap_uses_declared_out_placements(monkeypatch):
+    """The install-time rewrap re-homes local outputs to the declared layout.
 
     Feature: boundary-install
-    Description: ``InstalledBoundary.rewrap_outputs`` must parse ``out_src``
-        placements identically to ``hyper_rewrap_outputs`` so that local region
-        outputs are re-wrapped with the same DTensor layout.
-    Expectation: Both paths produce the same ``(Shard(1), Shard(1))`` placements
-        when given the same frozen entry and mesh.
+    Description: ``InstalledBoundary.rewrap_outputs`` parses ``out_src`` into
+        the boundary's exit placements, so a local-region forward's bare tensors
+        are re-wrapped with the layout the frozen plan declares.
+    Expectation: A ``{"cp": S(1), "ep": R, "tp": S(1)}`` entry wraps to
+        ``(Shard(1), Shard(1))`` on the active ``tp``/``cp`` axes.
     """
     from hyper_parallel.distributed._builder import tp_collective_lowering
 
@@ -534,13 +534,10 @@ def test_installed_rewrap_matches_hyper_rewrap_outputs(monkeypatch):
         ),
     )
     installed = runtime.InstalledBoundary(entry, FakeMesh(), ("tp", "cp"))
-    local = torch.randn(2, 16, 8)
 
-    installed.rewrap_outputs(local)
-    runtime.hyper_rewrap_outputs(local, entry, FakeMesh(), ("tp", "cp"))
+    installed.rewrap_outputs(torch.randn(2, 16, 8))
 
     assert captured[0][2] == (Shard(1), Shard(1))
-    assert captured[0][2] == captured[1][2]
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
@@ -549,7 +546,7 @@ def test_installed_redistribute_inputs_takes_pair_payload(monkeypatch):
     """Generated forwards call ``redistribute_inputs((args, kwargs))`` — one pair.
 
     The lowered forward builds ``((hidden_states,), {})`` and passes it as a
-    single positional argument, mirroring ``hyper_redistribute``'s first arg.
+    single positional argument, and the runtime consumes it as one.
     A signature drift to ``redistribute_inputs(args, kwargs)`` (two positional
     args) breaks every imported-class boundary forward at runtime with
     ``TypeError: missing 1 required positional argument: 'kwargs'``; this test
@@ -585,31 +582,6 @@ def test_installed_redistribute_inputs_takes_pair_payload(monkeypatch):
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
-def test_legacy_wrap_alias_still_covers_unlowered_boundaries(monkeypatch):
-    """``hyper_wrap_module_boundaries`` delegates to the install entry.
-
-    Feature: boundary-install
-    Description: The legacy ``hyper_wrap_module_boundaries`` entry point must
-        delegate to ``hyper_install_boundaries`` so that callers using the old
-        API still get the compiled-boundary binding.
-    Expectation: After calling the legacy wrapper, the module has
-        ``_codegen_boundary_wrapped`` set and its forward dispatches through the
-        installed boundary.
-    """
-    model = Root()
-    monkeypatch.setattr(runtime, "InstalledBoundary", TagBoundary)
-
-    runtime.hyper_wrap_module_boundaries(
-        model,
-        {"embed_tokens": _entry()},
-        mesh_context="mesh",
-        mesh_dim_names=("tp",),
-    )
-
-    assert getattr(model.embed_tokens, "_codegen_boundary_wrapped") is True
-    assert model.embed_tokens("original") == ("output-redist", ("compute", "input-redist"))
-
-
 # ---------------------------------------------------------------------------
 # static tp_collective validation / fallback
 # ---------------------------------------------------------------------------

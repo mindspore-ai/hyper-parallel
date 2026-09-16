@@ -668,71 +668,6 @@ def _boundary_for_entry(entry: dict[str, Any], mesh: Any, mesh_dim_names=None):
     return boundary
 
 
-def hyper_redistribute(
-    tensor,
-    plan_entry: dict[str, Any],
-    mesh_context,
-    mesh_dim_names: Optional[tuple[str, ...]] = None,
-    *,
-    module: Any = None,
-) -> Any:
-    """Execute the frozen boundary layout conversion for one tensor / arg set.
-
-    ``plan_entry`` is one frozen ``param_plan`` boundary entry (its
-    ``in_src`` / ``in_dst`` / ``out_src`` / ``out_dst`` fields).  The
-    conversion reuses ``PrecompiledBoundary`` — no new redistribution is
-    written here.
-
-    The call shape selects the side: a ``(args, kwargs)`` pair runs the input
-    plan, anything else runs the output plan.  The mesh is derived from
-    ``mesh_context`` (the dense active mesh — the same one the parameters
-    sharded across, sliced to ``mesh_dim_names`` when given), so generated
-    forward code needs no mesh plumbing.
-
-    ``module`` (optional) binds the input plan's ops to the forward signature's
-    positional indices (``sharding_applier._bind_input_indices``).  Generated
-    forwarded code passes ``module=self`` on the input side; inter-module calls
-    are positional, so without the binding the ``(args, kwargs)`` pair would
-    silently skip redistribution on the ``in_src`` boundary.  Omitted on the
-    output side, where the callable signature is irrelevant, and for callers
-    that omit the optional module argument.
-    """
-    dense_mesh, _, expert_mesh, active_dim_names = (
-        _resolve_runtime_meshes(mesh_context, mesh_dim_names)
-    )
-    if dense_mesh is None:
-        raise ValueError(
-            "hyper_redistribute requires a DeviceMesh / MeshContext to redistribute against"
-        )
-    # When the frozen plan declares no active TP/CP axes
-    # (mesh_dim_names is empty — tp=1/cp=1), boundary placements on
-    # tp/cp are identity. Two sub-cases:
-    #   - No expert mesh (ep=1): all placements are identity → no-op.
-    #   - Expert mesh exists (ep>1): EP-boundary entries (whose ``ep``
-    #     placement actually *changes* — the shared ``boundary_forms``
-    #     criterion; an identity ``R -> R`` key is not EP dependence) must
-    #     still redistribute on the expert mesh (which has no FSDP axes,
-    #     avoiding the uneven-shard NotImplementedError).  Non-EP entries
-    #     are still identity → no-op.
-    if not active_dim_names:
-        if expert_mesh is not None and _entry_has_ep_placement(plan_entry):
-            boundary = _boundary_for_entry(plan_entry, expert_mesh, None)
-        else:
-            return tensor
-    else:
-        boundary = _boundary_for_entry(plan_entry, dense_mesh, active_dim_names)
-    if module is not None:
-        from hyper_parallel.distributed._builder.forward_rewriter import (
-            _bind_input_indices,
-        )
-
-        _bind_input_indices(boundary, module)
-    if isinstance(tensor, tuple) and len(tensor) == 2 and isinstance(tensor[1], dict):
-        args, kwargs = tensor
-        return boundary.redistribute_inputs(args, kwargs)
-    return boundary.redistribute_outputs(tensor)
-
-
 #: Output names are not retained on the frozen entry; a local-region forward
 #: wraps its local results per ``out_src`` before the boundary exit, so read the
 #: declared order off the same place ``_rewrap_local_outputs`` does.
@@ -742,57 +677,14 @@ def _declared_out_names(entry: dict[str, Any]) -> list[str]:
     return list(out_names)
 
 
-def hyper_rewrap_outputs(
-    output,
-    plan_entry: dict[str, Any],
-    mesh_context,
-    mesh_dim_names: Optional[tuple[str, ...]] = None,
-) -> Any:
-    """Wrap a local-region forward's local tensors into DTensors.
-
-    Mirrors ``sharding_applier._rewrap_local_outputs``: every non-DTensor
-    Tensor that ``out_src`` names is re-homed to the boundary's exit mesh with
-    its declared placement, so ``hyper_redistribute`` (the boundary exit) sees
-    a sharded tensor rather than a bare local one.
-
-    Works on a tuple/list/scalar the same way the applier does; a declared
-    output that is already a DTensor (or ``None``) is passed through.  The mesh
-    is derived from ``mesh_context`` like ``hyper_redistribute``.
-
-    Parsing and execution are split (:func:`_build_rewrap_plan` /
-    :func:`_rewrap_execute`) so the install-time ``InstalledBoundary`` runs
-    the exact same resolution once instead of re-parsing per forward.
-    """
-    declared = plan_entry.get("out_src") or {}
-    if not declared:
-        return output
-    dense_mesh, _, _, active_dim_names = (
-        _resolve_runtime_meshes(mesh_context, mesh_dim_names)
-    )
-    if dense_mesh is None:
-        raise ValueError(
-            "hyper_rewrap_outputs requires a DeviceMesh / MeshContext to rewrap against"
-        )
-    # Placements must line up with the dense sub-mesh's own axis order, exactly
-    # like the boundary compile in ``hyper_redistribute`` (which falls back to
-    # the mesh's declared axes when the plan names none).
-    dim_names = (
-        active_dim_names
-        or tuple(getattr(dense_mesh, "mesh_dim_names", ()) or ())
-    )
-    rewrap_plan = _build_rewrap_plan(plan_entry, dim_names)
-    return _rewrap_execute(output, rewrap_plan, dense_mesh)
-
-
 def _build_rewrap_plan(
     plan_entry: dict[str, Any],
     dim_names: tuple[str, ...],
 ) -> list[tuple[int, str, tuple]]:
     """Pre-parse one frozen entry's ``out_src`` into executable rewrap ops.
 
-    Returns ``[(output_index, out_name, placements), ...]``.  Shared by
-    :func:`hyper_rewrap_outputs` (parse per call) and ``InstalledBoundary``
-    (parse once at install time), so both run the same placement resolution.
+    Returns ``[(output_index, out_name, placements), ...]``.  ``InstalledBoundary``
+    resolves once at install time so the per-forward path never re-parses.
     """
     from hyper_parallel.codegen.plan.freeze import parse_named_placement
     from hyper_parallel.distributed.recipe_spec import resolve_placements
@@ -805,7 +697,7 @@ def _build_rewrap_plan(
         index = name_to_idx.get(out_name)
         if index is None:
             raise ValueError(
-                f"hyper_rewrap_outputs: out_src declares output {out_name!r}, "
+                f"InstalledBoundary.rewrap_outputs: out_src declares output {out_name!r}, "
                 f"but out_names={out_names!r} does not contain it"
             )
         # Out_src is a frozen JSON contract: its placement leaves are
@@ -816,7 +708,7 @@ def _build_rewrap_plan(
         # contract declares 3 axes ({cp,ep,tp}) but the dense mesh carries only
         # 2, so resolving leaves 2 strings against a 3-D (B,S,H) output and
         # fails.  Parse the leaves back into real Placement objects first (the
-        # same step _FrozenBoundarySpec applies for hyper_redistribute / the
+        # same step _FrozenBoundarySpec applies for the boundary compile / the
         # native _rewrap_local_outputs runs on already-object contracts); the
         # non-alias path then maps the 2-axis MeshPlacement onto the 3-D
         # tensor, padding the unpredicted dim with Replicate().
@@ -847,7 +739,7 @@ def _rewrap_execute(
     for index, out_name, placements in rewrap_plan:
         if index >= len(items):
             raise ValueError(
-                f"hyper_rewrap_outputs: out_src maps output {out_name!r} to index "
+                f"InstalledBoundary.rewrap_outputs: out_src maps output {out_name!r} to index "
                 f"{index}, but forward returned only {len(items)} output(s)"
             )
         item = items[index]
@@ -857,7 +749,7 @@ def _rewrap_execute(
             continue
         if not isinstance(item, torch.Tensor):
             raise TypeError(
-                f"hyper_rewrap_outputs: declared output {out_name!r} at index "
+                f"InstalledBoundary.rewrap_outputs: declared output {out_name!r} at index "
                 f"{index} must be a Tensor or None, got {type(item).__name__}"
             )
         items[index] = DTensor.from_local(item, mesh, placements)
@@ -868,14 +760,19 @@ def _rewrap_execute(
         return items
     if len(items) != 1:
         raise ValueError(
-            f"hyper_rewrap_outputs: scalar forward output cannot satisfy "
+            f"InstalledBoundary.rewrap_outputs: scalar forward output cannot satisfy "
             f"{len(rewrap_plan)} declared out_src entries"
         )
     return items[0]
 
 
 def hyper_to_local_if_dtensor(output):
-    """Convert a local-region boundary output back to a local tensor after exit."""
+    """Convert a local-region boundary output back to a local tensor after exit.
+
+    Named by the emitted local-region forward template (``emit.parallel``), so
+    it stays until that template goes away — see the boundary-ownership item in
+    the restructuring plan.
+    """
     to_local = getattr(output, "to_local", None)
     if callable(to_local):
         return to_local()
@@ -916,12 +813,12 @@ def _compile_boundary(entry: dict[str, Any], mesh: Any, mesh_dim_names):
 class InstalledBoundary:
     """One boundary's compiled redistribute plan, bound to a module instance.
 
-    ``hyper_install_boundaries`` resolves at install time everything
-    ``hyper_redistribute`` re-derived on every forward call: the dense/expert
-    mesh routing (the empty-active-axes no-op, the ep-entry expert-mesh
-    compile, the ep-key drop when the dense mesh is active), the active-axis
-    slicing, the rank-order/backend lowerer validation, and the input-index
-    binding.  Generated forwards then call
+    ``hyper_install_boundaries`` resolves everything once, at install time
+    rather than on every forward call: the dense/expert mesh routing (the
+    empty-active-axes no-op, the ep-entry expert-mesh compile, the ep-key drop
+    when the dense mesh is active), the active-axis slicing, the
+    rank-order/backend lowerer validation, and the input-index binding.
+    Generated forwards then call
     ``self._hyper_boundary.redistribute_inputs/outputs`` with zero per-call
     resolution; the execution semantics — identity passthrough, DTensor
     unwrap on identity ops, local collectives, ``DTensor.redistribute``
@@ -955,8 +852,8 @@ class InstalledBoundary:
             if expert_mesh is not None and _entry_has_ep_placement(entry):
                 self._boundary = _compile_boundary(entry, expert_mesh, None)
             else:
-                # Exact ``hyper_redistribute`` semantics for this branch: the
-                # payload is returned untouched (no DTensor unwrap either).
+                # Boundary-exit semantics for this branch: the payload is
+                # returned untouched (no DTensor unwrap either).
                 self.noop = True
         else:
             self._boundary = _compile_boundary(entry, dense_mesh, active_dim_names)
@@ -978,11 +875,11 @@ class InstalledBoundary:
             self._rewrap_mesh = dense_mesh
 
     def redistribute_inputs(self, payload):
-        """Run the input plan (mirrors ``hyper_redistribute``'s pair shape).
+        """Run the input plan on the ``(args, kwargs)`` pair.
 
-        Accepts the ``(args, kwargs)`` pair the generated forward builds —
-        ``hyper_redistribute`` takes the same pair as its first positional
-        argument, so the install-time form keeps the call sites identical.
+        Accepts the pair the generated forward builds and takes it as one
+        positional argument, so the lowered call sites stay uniform across
+        boundary forms.
         """
         if self.noop:
             return payload
@@ -990,13 +887,13 @@ class InstalledBoundary:
         return self._boundary.redistribute_inputs(args, kwargs)
 
     def redistribute_outputs(self, outputs):
-        """Run the output plan (mirrors ``hyper_redistribute``'s tensor shape)."""
+        """Run the output plan on the forward's tensor output."""
         if self.noop:
             return outputs
         return self._boundary.redistribute_outputs(outputs)
 
     def rewrap_outputs(self, output):
-        """Re-wrap local region outputs per ``out_src`` (``hyper_rewrap_outputs``)."""
+        """Re-wrap local region outputs into DTensors per ``out_src``."""
         if self._rewrap_plan is None:
             return output
         return _rewrap_execute(output, self._rewrap_plan, self._rewrap_mesh)
@@ -1075,9 +972,11 @@ class InlineParallelState:
 
 _EMPTY_INLINE_PARALLEL_STATE = InlineParallelState()
 _INLINE_PARALLEL_STATE_BY_MODULE: dict[str, InlineParallelState] = {}
-_EXTERNAL_STATE_INLINE_CLASSES = frozenset(
-    {"GQAAttention", "Qwen3MoeSparseMoeBlock", "DeepseekV3MoE"}
-)
+#: Generated class names whose forward is fully inlined and therefore takes its
+#: parallel state from ``get_parallel_state()`` rather than a bound boundary.
+#: Filled per generated module from ``meta.external_state_classes`` — the model
+#: adapter's render spec is the only declaration site.
+_EXTERNAL_STATE_CLASSES_BY_MODULE: dict[str, frozenset[str]] = {}
 
 
 def get_inline_parallel_state(module_name: str) -> InlineParallelState:
@@ -1142,22 +1041,32 @@ def _mesh_group(mesh: Any, name: str) -> Any:
         return mesh.get_group()
 
 
+def register_external_state_classes(generated_module: Any, class_names: Any) -> None:
+    """Record which generated classes take their parallel state externally."""
+    if generated_module is None:
+        return
+    _EXTERNAL_STATE_CLASSES_BY_MODULE[generated_module.__name__] = frozenset(
+        class_names or ()
+    )
+
+
 def _is_external_state_inline_module(module: Any, generated_module: Any = None) -> bool:
     """Whether this generated class gets state from ``get_parallel_state()``."""
     if generated_module is None:
         return False
+    module_name = getattr(generated_module, "__name__", None)
+    class_names = _EXTERNAL_STATE_CLASSES_BY_MODULE.get(module_name)
+    if not class_names:
+        return False
     cls = type(module)
-    return (
-        cls.__module__ == getattr(generated_module, "__name__", None)
-        and cls.__name__ in _EXTERNAL_STATE_INLINE_CLASSES
-    )
+    return cls.__module__ == module_name and cls.__name__ in class_names
 
 
 def _wrap_installed_boundary_forward(module: Any, installed: InstalledBoundary) -> None:
     """Install native-style boundary entry/exit redistribution on one module.
 
-    Same wrapper shape as the per-forward ``hyper_redistribute`` form, but the
-    compiled plan is captured instead of being re-derived on every call.
+    The compiled plan is captured once at install time instead of being
+    re-derived on every call.
     """
     if getattr(module, "_codegen_boundary_wrapped", False):
         return
@@ -1260,8 +1169,8 @@ def hyper_install_boundaries(
 ) -> None:
     """Compile every frozen boundary once and bind it to its module instance.
 
-    Replaces the per-forward ``hyper_wrap_module_boundaries`` +
-    ``hyper_redistribute`` routing: each boundary's mesh selection (dense vs
+    Owns the per-boundary install the removed per-forward wrappers used to do:
+    each boundary's mesh selection (dense vs
     expert, the empty-active-axes no-op), rank-order/backend lowering checks,
     and input-index binding run once here, and the compiled
     ``InstalledBoundary`` is stored as ``module._hyper_boundary`` — the
@@ -1651,41 +1560,6 @@ def _wrap_codegen_vocab_parallel_embedding(module: Any, tp_mesh: Any) -> None:
     module._codegen_original_vocab_parallel_forward = original_forward
 
 
-def _wrap_module_boundary_forward(
-    module: Any,
-    entry: dict[str, Any],
-    mesh_context: Any,
-    mesh_dim_names: Optional[tuple[str, ...]],
-) -> None:
-    """Deprecated per-forward wrapper: compile once, then delegate.
-
-    Kept for callers of the pre-install era.  New code goes through
-    :func:`hyper_install_boundaries`, which binds the compiled plan to the
-    module instead of re-routing through ``hyper_redistribute`` per call.
-    """
-    installed = InstalledBoundary(entry, mesh_context, mesh_dim_names, module=module)
-    _wrap_installed_boundary_forward(module, installed)
-
-
-def hyper_wrap_module_boundaries(
-    model: Any,
-    param_plan: dict[str, Any],
-    mesh_context: Any,
-    mesh_dim_names: Optional[tuple[str, ...]] = None,
-) -> None:
-    """Deprecated alias of :func:`hyper_install_boundaries`.
-
-    AST lowering rewrites classes defined in the copied modeling file
-    and marks them with ``_forward_impl``.  Imported module classes such as
-    ``nn.Embedding`` / ``nn.Linear`` have no source span to rewrite, but their
-    frozen entries can still carry real boundary communication, for example
-    embedding's TP sequence-parallel ``Partial -> Shard`` output transition.
-    The install entry keeps covering those contracts; the generated
-    ``hyper_parallelize`` now calls :func:`hyper_install_boundaries` directly.
-    """
-    hyper_install_boundaries(model, param_plan, mesh_context, mesh_dim_names)
-
-
 # ---------------------------------------------------------------------------
 # Generated entry-point dispatch
 # ---------------------------------------------------------------------------
@@ -1714,6 +1588,10 @@ def parallelize_from_generated(
     if hf_config is not None:
         verify_codegen_signature(meta, hf_config)
     module = import_generated_module(artifact_dir)
+    # The artifact's own record of which generated classes take their parallel
+    # state externally — declared once by the adapter render spec and carried
+    # here in ``meta``.
+    register_external_state_classes(module, meta.external_state_classes)
     entry_name = meta.entrypoints.get("parallelize")
     entry = getattr(module, entry_name, None) if entry_name else None
     if entry is not None:
@@ -1878,12 +1756,9 @@ __all__ = [
     "hyper_bind_compute",
     "hyper_build_tp_grad_info",
     "hyper_install_boundaries",
-    "hyper_redistribute",
     "hyper_replicate_tied",
-    "hyper_rewrap_outputs",
     "hyper_shard_params",
     "hyper_to_local_if_dtensor",
-    "hyper_wrap_module_boundaries",
     "import_generated_module",
     "load_codegen_meta",
     "parallelize_from_generated",

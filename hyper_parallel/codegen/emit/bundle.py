@@ -109,11 +109,6 @@ def emit_init_file(layout: ArtifactLayout) -> str:
     )
 
 
-def emit_modeling_file_text(meta: Any) -> str:
-    """Render the generated modeling file text (see ``emit.modeling``)."""
-    return emit_modeling_file(meta)
-
-
 def emit_diff(original_text: str, generated_text: str, layout: ArtifactLayout) -> str:
     """Render the unified diff from the original source to the generated file.
 

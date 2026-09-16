@@ -1,11 +1,12 @@
-﻿# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 # Licensed under the Apache License, Version 2.0
 # ============================================================================
 """AST patch toolkit for generated forward lowering.
 
 The lowerer finds each boundary class's ``forward`` and re-implements it as an
-explicit call to the codegen runtime (``hyper_redistribute`` plus an inner
-wrapper or local compute function).
+explicit call to the codegen runtime (the module's bound
+``self._hyper_boundary`` redistribution plus an inner wrapper or local compute
+function).
 This package owns that structural patch:
 
 - :mod:`index` — parse the source once and answer "where is class X's

@@ -105,8 +105,7 @@ def lower_forward_boundaries(
     """Rewrite each boundary class's ``forward`` to call the codegen runtime.
 
     ``frozen_plan`` is the meta/param-plan dict or a ``CodegenMeta``; the
-    literal entries are read via ``_plan_field`` (same shape as the literals
-    already appended by ``inject_param_plan_literals``).  ``boundary_classes``
+    plan entries are read via ``_plan_field``.  ``boundary_classes``
     is the FQN -> class name map (``meta.boundary_classes``); when omitted it
     degrades to the class name looked up from the source index itself, which is
     only correct if every boundary FQN's leaf class name equals the key's tail —
@@ -297,7 +296,7 @@ def _group_boundaries_by_class(
     ``embed_tokens`` / ``lm_head`` / ``norm``) — has no ``def forward`` span
     to rewrite, so its FQN is dropped from the grouping and the boundary is
     left un-rewritten here.  Its boundary contract is still executed at runtime
-    by ``hyper_wrap_module_boundaries``: the in/out
+    by ``hyper_install_boundaries``: the in/out
     redistribution for an imported class is installed as a forward wrapper on
     the live module, so the contract is not dropped.  Skipping the rewrite here
     is exactly what lets the real plan (which marks ``embed_tokens`` /
@@ -322,7 +321,7 @@ def _group_boundaries_by_class(
             )
         if index.find_class(class_name) is None:
             # Imported class (Embedding/Linear/LayerNorm): no source ``forward``
-            # to rewrite; runtime ``hyper_wrap_module_boundaries`` installs the
+            # to rewrite; runtime ``hyper_install_boundaries`` installs the
             # in/out boundary wrapper. Not added to ``groups``.
             continue
         groups.setdefault(class_name, []).append((fqn, entry))

@@ -149,43 +149,13 @@ def test_rewritten_forwards_bind_instance_boundary_plans():
 
     # The rewritten forwards reference the instance-bound compiled plan that
     # ``hyper_install_boundaries`` installs — no per-boundary global constants
-    # and no forward-time globals.  Module-level plan literals
-    # (``_HYPER_PARAM_PLAN`` and friends) may still exist in the artifact;
-    # they are install-time data consumed once by ``hyper_parallelize`` and
-    # are never read inside a forward.
+    # and no forward-time globals.  The artifact carries no plan literals at
+    # all: the runtime reads the frozen plan from ``codegen_meta.json``.
     assert "_HYPER_BOUNDARY_" not in text
     assert "mesh_context" not in text
     assert "_forward_impl" in text
     assert text.count("self._hyper_boundary.redistribute_inputs") >= 2
     assert text.count("self._hyper_boundary.redistribute_outputs") >= 2
-
-
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
-def test_generated_parallelize_installs_boundaries_without_globals():
-    """The generated ``hyper_parallelize`` calls install, not per-call runtime.
-
-    Feature: codegen-lowering
-    Description: ``inject_hyper_parallelize`` emits a function body that calls
-        ``hyper_install_boundaries`` before ``hyper_bind_compute`` and contains
-        no ``globals()`` or legacy wrapper calls.
-    Expectation: The emitted body references ``hyper_install_boundaries``,
-        has no ``globals()``, and no ``hyper_wrap_module_boundaries``.
-    """
-    from hyper_parallel.codegen.emit.modeling import (
-        inject_codegen_imports,
-        inject_hyper_parallelize,
-    )
-
-    source = "import torch\n"
-    text = inject_hyper_parallelize(inject_codegen_imports(source), {"param_plan": {}})
-
-    body = text[text.index("def hyper_parallelize"):]
-
-    assert "hyper_install_boundaries" in body
-    assert body.index("hyper_install_boundaries") < body.index("hyper_bind_compute")
-    assert "globals()" not in body
-    assert "hyper_wrap_module_boundaries" not in body
 
 
 def _tp_collective_entry() -> dict:

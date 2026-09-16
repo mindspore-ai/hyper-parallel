@@ -104,6 +104,7 @@ def ensure_codegen_artifact(
     )
     meta = _build_meta(config, layout, signature, hf_config=hf_config)
     _fill_plan_fields(meta, config, layout)
+    _record_inline_declarations(meta)
     if emit_fn is not None:
         files = emit_fn(layout, meta)
     else:
@@ -514,10 +515,11 @@ def _build_meta(
         model_name=_model_name(config, hf_config),
         model_class=_model_class(config, hf_config),
         # COVERED_DEFAULTS is the starting copy; _fill_plan_fields sets
-        # covered.sharding_plan
-        # True once the plan is frozen, so a real artifact short-circuits to
-        # the generated hyper_parallelize.  The entrypoint name is the
-        # contract the runtime dispatches on.
+        # covered.sharding_plan True once the plan is frozen, so a real
+        # artifact short-circuits the planner and the runtime shards it.  The
+        # entrypoint name is the contract the runtime dispatches on; an inline
+        # artifact that defines no such function is parallelized from meta by
+        # ``runtime._parallelize_inline_from_meta``.
         covered=dict(COVERED_DEFAULTS),
         not_covered=list(NOT_COVERED_DEFAULT),
         entrypoints={"parallelize": "hyper_parallelize"},
@@ -575,17 +577,33 @@ def _fill_plan_fields(meta: CodegenMeta, config: Any, layout: ArtifactLayout) ->
     meta.mesh_dim_names = list(frozen.mesh_dim_names) or None
 
     meta.module_overrides = replace_meta
-    # The artifact owns ``replace_module`` after it is sunk into
-    # ``_HYPER_MODULE_OVERRIDES`` and applied by the generated ``__init__``.
-    # Declare coverage so the trainer's HF replacement step is skipped on the
-    # gen path — but only when something was actually sunk.  ``covered`` is
-    # always a COVERED_DEFAULTS copy, so the key is present either way.
+    # The inline pipeline lowers the matched replacements into the generated
+    # file, so the artifact owns ``replace_module``.  Declare coverage so the
+    # trainer's HF replacement step is skipped on the gen path — but only when
+    # something was actually matched.  ``covered`` is always a
+    # COVERED_DEFAULTS copy, so the key is present either way.
     meta.covered["module_overrides"] = bool(replace_meta)
 
-    # A non-empty frozen plan carries the full parallel logic and injects
-    # ``hyper_parallelize``, allowing the generated module to own sharding.
-    # ``covered`` is always a COVERED_DEFAULTS copy, so the key is present.
+    # A non-empty frozen plan is the artifact's full parallel logic; the
+    # runtime shards from ``codegen_meta.json``.  ``covered`` is always a
+    # COVERED_DEFAULTS copy, so the key is present either way.
     meta.covered["sharding_plan"] = True
+
+
+def _record_inline_declarations(meta: CodegenMeta) -> None:
+    """Copy the adapter's inline declarations into ``meta``.
+
+    The render spec is the single declaration site for the facts the *runtime*
+    also needs — today the class names whose forwards are fully inlined and
+    take their parallel state externally.  Recording them in ``meta`` (the file
+    the runtime loads at training time) is what keeps the runtime from carrying
+    its own copy that drifts when a family adds a model.
+    """
+    identity = (meta.source or {}).get("architecture")
+    bundle = get_inline_spec_bundle(identity) if identity else None
+    if bundle is None:
+        return
+    meta.external_state_classes = sorted(bundle.external_state_classes)
 
 
 def _apply_generation_replacements(

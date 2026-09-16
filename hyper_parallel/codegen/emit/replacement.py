@@ -1,34 +1,25 @@
 # Copyright 2026 Huawei Technologies Co., Ltd
+#
 # Licensed under the Apache License, Version 2.0
 # ============================================================================
-"""Sink ``replace_module`` overrides into the generated artifact.
+"""Compile ``replace_module`` overrides against the generation-time meta model.
 
 The trainer's hf backend applies ``plan_overrides.replace_module`` by
 desugaring each entry into a :class:`ModuleReplacementSpec` and running
-``apply_module_replacements`` on the live model.  The gen backend must carry
-the same contract in the *generated file* so a codegen artifact and its HF
-counterpart swap the same module:
+``apply_module_replacements`` on the live model.  Generation must reject the
+same bad rules up front: the manager compiles the spec against the
+generation-time meta model so conflicts, type mismatches and unmatched
+patterns fail here rather than at runtime inside the built model, and records
+the resulting FQN set in ``meta.module_overrides``.
 
-* the generated module carries a ``_HYPER_MODULE_OVERRIDES`` literal — one
-  record per matched target, each holding the ``match`` patterns, the source
-  ``module_type``, the raw replacement factory, ``exact_type``, and every FQN
-  the target was aliased under;
-* the model entry class's ``__init__`` tail calls ``hyper_apply_replacements``
-  (the runtime helper in ``codegen.runtime``) so the replacements install as
-  soon as a model instance is built.
-
-The manager compiles the spec against the generation-time meta model to expose
-conflicts / type errors / unmatched patterns *at generation time* (fail-fast),
-and records the resulting FQN set in ``meta.module_overrides``. The literal,
-metadata record, and a recompile on the meta model must agree on that set.
+The inline pipeline lowers the surviving replacements into the generated
+file's module bodies, and ``meta.covered["module_overrides"]`` tells the
+trainer to skip its own replacement step.
 """
 from __future__ import annotations
 
 import fnmatch
 from typing import Any, Sequence
-
-from hyper_parallel.codegen.astkit.edits import TextEdit, apply_edits
-from hyper_parallel.codegen.astkit.index import build_source_index
 
 
 # ---------------------------------------------------------------------------
@@ -158,145 +149,4 @@ def _type_path(module_type: type) -> str:
     return f"{module_type.__module__}.{module_type.__qualname__}"
 
 
-# ---------------------------------------------------------------------------
-# literal emission
-# ---------------------------------------------------------------------------
-
-def group_override_records(
-    records: Sequence[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Collapse per-target replacement records into per-spec grouped records.
-
-    ``compile_overrides_for_meta`` emits one record per matched FQN; records
-    from the same spec (identical ``factory`` / ``module_type`` /
-    ``exact_type`` / ``match`` patterns) differ only in their single-element
-    ``fqns`` list.  Grouping merges them into one record whose ``fqns`` is the
-    sorted union — a 48-layer model's 65+ records collapse to the handful of
-    specs the user actually declared.
-
-    ``meta.module_overrides`` keeps the per-target form (the recompile-agree
-    verification compares FQN sets, not record shapes); only the emitted
-    literal is grouped.  ``hyper_apply_replacements`` already prefers
-    ``record["fqns"]`` over ``match`` / ``fqn``, so the grouped shape is
-    executed exactly like the expanded one.
-    """
-    groups: dict[tuple[str, str, bool, tuple[str, ...]], set[str]] = {}
-    for record in records:
-        fqns = record.get("fqns") or (
-            [record["fqn"]] if record.get("fqn") else []
-        )
-        key = (
-            record["factory"],
-            record["module_type"],
-            bool(record.get("exact_type", False)),
-            tuple(record.get("match") or ()),
-        )
-        groups.setdefault(key, set()).update(fqns)
-    grouped: list[dict[str, Any]] = []
-    for factory, module_type, exact_type, _match in sorted(groups):
-        grouped.append(
-            {
-                "factory": factory,
-                "module_type": module_type,
-                "exact_type": exact_type,
-                "fqns": sorted(groups[(factory, module_type, exact_type, _match)]),
-            }
-        )
-    return grouped
-
-
-def inject_module_override_literals(text: str, module_overrides: Sequence[dict[str, Any]]) -> str:
-    """Append the ``_HYPER_MODULE_OVERRIDES`` literal after ``text``.
-
-    The literal is a module-level frozen record list that the runtime rebuilds
-    ``ModuleReplacementSpec``\\ s from (``runtime.hyper_apply_replacements``);
-    records are grouped per spec (see :func:`group_override_records`).
-    Empty when no replacement rule matched — the runtime treats that as a no-op.
-    """
-    from hyper_parallel.codegen.emit.modeling import render_python_literal
-
-    rendered = render_python_literal(group_override_records(module_overrides))
-    block = (
-        "# Frozen module replacements applied by\n"
-        "# ``hyper_apply_replacements`` when the model ``__init__`` runs.\n"
-        "# [HYPER MODULE REPLACEMENT]\n"
-        "_HYPER_MODULE_OVERRIDES = " + rendered + "\n"
-    )
-    return text.rstrip() + "\n\n" + block
-
-
-# ---------------------------------------------------------------------------
-# entry class rewrite
-# ---------------------------------------------------------------------------
-
-def rewrite_init_for_overrides(text: str, module_overrides: Sequence[dict[str, Any]], *, model_class: str) -> str:
-    """Insert the ``hyper_apply_replacements(self, _HYPER_MODULE_OVERRIDES)`` call.
-
-    ``model_class`` is the top-level model class name (the architecture name,
-    e.g. ``AnthropicV3ForCausalLM``) whose ``__init__`` receives the call.  The
-    insertion is a zero-width edit just past the ``__init__`` body (or, when the
-    body has no replaceable span, past the ``pass``/single statement the class
-    already calls at construction).  The literal is passed explicitly (not read
-    from frame globals) so the generated module stays self-contained.  A model
-    with no replacement records is left untouched — the runtime call is only
-    emitted when there is actually a literal to apply.
-    """
-    if not module_overrides:
-        return text
-
-    index = build_source_index(text)
-    cls = index.find_class(model_class)
-    if cls is None:
-        raise ValueError(
-            f"codegen: cannot rewrite __init__ for module overrides — generated "
-            f"source has no class {model_class!r}"
-        )
-    init = cls.methods.get("__init__")
-    if init is None:
-        raise ValueError(
-            f"codegen: cannot sink module overrides — {model_class!r} has no __init__"
-        )
-
-    anchor, indent = _init_tail_anchor(text, init)
-    if anchor is None or indent is None:
-        raise ValueError(
-            f"codegen: cannot locate the tail of {model_class}.__init__ body"
-        )
-
-    edit = TextEdit(anchor, anchor, f"\n{indent}hyper_apply_replacements(self, _HYPER_MODULE_OVERRIDES)\n")
-    return apply_edits(text, [edit])
-
-
-def _init_tail_anchor(text: str, init: Any) -> tuple[int | None, str | None]:
-    """``(insert_offset, indent)`` for appending a statement to ``__init__``.
-
-    ``body_end`` is the byte just past the body's trailing newline; the byte
-    immediately before it is that newline, so inserting ``\\n<stmt>`` there lands
-    the statement on its own line at the method's body indentation.  The indent
-    must come from ``body_start`` — ``body_end`` may sit at the *class* indent
-    when ``__init__`` is followed by another method (the offset past the last
-    statement's newline is the next line's start, not the function's nesting).
-    A body without a replaceable span (a single ``pass`` / ``...``) has
-    ``body_end`` ``None`` — fall back to anchoring after the ``def`` line's
-    ``:`` and synthesize the method indent.
-    """
-    if init.body_end is not None:
-        indent = _leading_indent(text, init.body_start)
-        return init.body_end, indent
-    if init.def_offset is not None and init.body_start is None:
-        # Single-line/pass body: anchor at the end of the ``def`` header line.
-        line_end = text.find("\n", init.def_offset)
-        anchor = line_end if line_end != -1 else len(text)
-        return anchor, _leading_indent(text, anchor)
-    return None, None
-
-
-def _leading_indent(text: str, offset: int) -> str:
-    """The whitespace indenting the line containing ``offset`` (or blank)."""
-    if offset <= 0 or offset > len(text):
-        return ""
-    line_start = text.rfind("\n", 0, offset) + 1
-    idx = line_start
-    while idx < len(text) and text[idx] in " \t":
-        idx += 1
-    return text[line_start:idx]
+__all__ = ["compile_overrides_for_meta"]

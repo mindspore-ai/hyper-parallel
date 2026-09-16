@@ -1,4 +1,4 @@
-﻿# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -57,12 +57,19 @@ class CodegenMeta:
     entrypoints: dict[str, str] = field(default_factory=dict)
     #: Sunk ``replace_module`` overrides: one JSON-safe record per
     #: matched target, ``{match, fqn, fqns, module_type, factory, exact_type}``.
-    #: The record's FQN set must equal the generated
-    #: ``_HYPER_MODULE_OVERRIDES`` literal's FQN set.
+    #: The inline pipeline lowers them into the generated file, and the record
+    #: is what lets the trainer skip its own HF replacement step
+    #: (``covered["module_overrides"]``).
     module_overrides: list[dict[str, Any]] = field(default_factory=list)
-    #: Entry model class name (the architecture name, e.g. ``AnthropicV3ForCausalLM``)
-    #: whose ``__init__`` tail receives the ``hyper_apply_replacements(self)`` call.
+    #: Entry model class name (the architecture name, e.g. ``AnthropicV3ForCausalLM``).
+    #: The inline pipeline resolves the model's adapter from it.
     model_class: Optional[str] = None
+    #: Generated class names whose forward is fully inlined and therefore takes
+    #: its parallel state from ``get_parallel_state()`` instead of a bound
+    #: boundary.  Declared by the model adapter's render spec and copied here so
+    #: the runtime reads the artifact's own record rather than a second copy
+    #: that has to be kept in sync by hand.
+    external_state_classes: list[str] = field(default_factory=list)
     #: ``covered`` must always carry a bool ``sharding_plan``,
     #: so the default mirrors ``COVERED_DEFAULTS`` rather than ``{}`` — a bare
     #: ``CodegenMeta`` round-trips through ``load_codegen_meta`` instead of
@@ -84,14 +91,12 @@ class CodegenMeta:
 
 #: Stages the generated artifact declares it covers.  ``sharding_plan`` starts
 #: as the default here (False, kept for metas that predate the field), but
-#: ``_fill_plan_fields`` (manager.py) sets it True once the plan is frozen.
-#: The generated module carries the parallel logic and injects
-#: ``hyper_parallelize``. When True,
-#: the trainer short-circuits the planner+applier and runs the generated
-#: ``hyper_parallelize``.  ``module_overrides`` turns True only once the
-#: generated artifact sinks ``replace_module`` as ``_HYPER_MODULE_OVERRIDES``
-#: so the trainer's HF replacement step is skipped, because
-#: the generated ``__init__`` already applied it.
+#: ``_fill_plan_fields`` (manager.py) sets it True once the plan is frozen:
+#: the artifact carries the parallel logic and the runtime shards from
+#: ``codegen_meta.json``.  When True, the trainer short-circuits the
+#: planner+applier and runs the artifact's own parallelize step.
+#: ``module_overrides`` turns True once generation sunk ``replace_module``, so
+#: the trainer's HF replacement step is skipped.
 COVERED_DEFAULTS = {
     "sharding_plan": False,
     "module_overrides": False,
@@ -181,6 +186,14 @@ def validate_meta_schema(data: dict[str, Any]) -> None:
             isinstance(item, str) for item in siblings
         ):
             raise TypeError("codegen_meta field 'remote_siblings' must be a list[str]")
+    if "external_state_classes" in data:
+        class_names = data["external_state_classes"]
+        if not isinstance(class_names, list) or not all(
+            isinstance(item, str) for item in class_names
+        ):
+            raise TypeError(
+                "codegen_meta field 'external_state_classes' must be a list[str]"
+            )
 
 
 def record_output_hashes(
