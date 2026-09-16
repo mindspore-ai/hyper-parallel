@@ -35,6 +35,7 @@ ensure_mindspore_platform_for_fully_shard()
 import mindspore as ms
 from mindspore import ops
 
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import FullyShardParamMode, GroupInfo
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, MixedPrecisionPolicy
@@ -53,7 +54,7 @@ def _make_state():
     state.hsdp_params = []
     state.replicate_params = []
     state.sharded_hsdp_params = []
-    state.mp_policy = SimpleNamespace(param_dtype=None, reduce_dtype=None)
+    state.mp_policy = MixedPrecisionPolicy()
     state.offload_policy = None
     state.device = UT_RUNTIME_DEVICE
     state.config = SimpleNamespace(
@@ -827,6 +828,263 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         state.reduce_op_type = ops.ReduceOp.AVG
         state.set_reduce_op_type("sum")
         self.assertEqual(state._resolve_reduce_op(), ops.ReduceOp.SUM)
+
+
+def _make_pipeline_param(name, replicate_group):
+    """Build a sharded HSDP param stub that participates in the fused RS/AR pipeline."""
+    grad = ms.Tensor(np.ones((4,), dtype=np.float32))
+    unsharded = SimpleNamespace(grad=grad)
+    return SimpleNamespace(
+        name=name,
+        accumulate_unsharded_grad_if_needed=MagicMock(),
+        param_mode=FullyShardParamMode.LOCAL_PARAM,
+        enable_fsdp_shard=True,
+        is_sharded=True,
+        sharded_param=SimpleNamespace(requires_grad=True, grad=grad, main_grad=grad),
+        sharded_size=(2,),
+        _unsharded_param=unsharded,
+        unsharded_param=unsharded,
+        unsharded_accumulated_grad=None,
+        unsharded_accumulated_grad_data=None,
+        unsharded_grad_data=grad,
+        unsharded_group_info=GroupInfo("group", replicate_group, 2),
+        orig_dtype="float32",
+        reduce_dtype=None,
+        shard_size=2,
+        dp_size=2,
+        shard_world_size=2,
+        replicate_world_size=2,
+        reduce_scatter_grad=MagicMock(),
+        reduce_scatter_output=MagicMock(return_value=grad),
+        clear_reduce_scatter_output=MagicMock(),
+        all_reduce_grad=MagicMock(),
+        apply_reduced_grad=MagicMock(return_value=False),
+        accumulated_allreduced_grad=True,
+    )
+
+
+class TestPipelineReduceGradStages(MindSporeFullyShardUnitTest):
+    """Test the pipelined gradient reduction used by pipeline parallelism."""
+
+    def tearDown(self):
+        HSDPState.pre_reduce_scatter_params.clear()
+        HSDPState.pre_all_reduce_params.clear()
+        MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
+        MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
+        MindSporeHSDPStateV2.pending_all_reduce_groups.clear()
+
+    def test_launch_issues_reduce_scatter_and_leaves_every_wait_pending(self):
+        """A launch should issue this chunk's reduce-scatter and wait on nothing."""
+        state = _make_state()
+        param = _make_pipeline_param("p0", "replicate-group")
+        state.hsdp_params = [param]
+
+        state.launch_pipeline_reduce_grad()
+
+        self.assertEqual(param.accumulate_unsharded_grad_if_needed.call_count, 1)
+        param.reduce_scatter_grad.assert_called_once()
+        self.assertTrue(param.reduce_scatter_grad.call_args.kwargs["async_op"])
+        # Both the RS wait and the all-reduce wait are deferred to the terminal drain.
+        param.reduce_scatter_output.assert_not_called()
+        self.assertEqual(len(MindSporeHSDPStateV2.pre_all_reduce_groups), 1)
+        self.assertEqual(MindSporeHSDPStateV2.pending_all_reduce_groups, [])
+        group = MindSporeHSDPStateV2.pre_all_reduce_groups[0]
+        self.assertEqual(group.hsdp_params, [param])
+
+    def test_next_chunk_releases_previous_all_reduce_after_its_own_reduce_scatter(self):
+        """Chunk N+1 must issue its RS and only then release chunk N's all-reduce."""
+        state = _make_state()
+        first = _make_pipeline_param("p0", "replicate-group-0")
+        second = _make_pipeline_param("p1", "replicate-group-1")
+        state.hsdp_params = [first]
+
+        state.launch_pipeline_reduce_grad()
+        first_group = MindSporeHSDPStateV2.pre_all_reduce_groups[0]
+        self.assertEqual(len(MindSporeHSDPStateV2.pre_all_reduce_groups), 1)
+        self.assertEqual(MindSporeHSDPStateV2.pending_all_reduce_groups, [])
+
+        # The next chunk's launch drains the first group's RS, applies it, and starts
+        # the first group's all-reduce so it runs alongside the second chunk's RS.
+        state.hsdp_params = [second]
+        state.launch_pipeline_reduce_grad()
+
+        # The previous chunk's group is released while this chunk's own group takes
+        # its place in the RS queue — that replacement is what keeps the two in flight.
+        self.assertEqual(MindSporeHSDPStateV2.pending_all_reduce_groups, [first_group])
+        first.reduce_scatter_output.assert_called_once_with()
+        first.clear_reduce_scatter_output.assert_called_once_with()
+        second.reduce_scatter_grad.assert_called_once()
+        self.assertEqual(len(MindSporeHSDPStateV2.pre_all_reduce_groups), 1)
+        second_group = MindSporeHSDPStateV2.pre_all_reduce_groups[0]
+        self.assertIsNot(second_group, first_group)
+        self.assertEqual([p.name for p in second_group.hsdp_params], ["p1"])
+
+    def test_repeated_launch_without_pending_grad_does_not_reissue(self):
+        """Compensating an already-triggered chunk must not re-issue its collectives."""
+        state = _make_state()
+        param = _make_pipeline_param("p0", "replicate-group")
+        state.hsdp_params = [param]
+        state.launch_pipeline_reduce_grad()
+        first_group = MindSporeHSDPStateV2.pre_all_reduce_groups[0]
+
+        # The chunk already fired: its unsharded grad was consumed, so the sweep finds
+        # nothing to reduce-scatter and only releases the still-queued group.
+        param.unsharded_param.grad = None
+        param.unsharded_accumulated_grad = None
+        param.unsharded_grad_data = None
+        param.sharded_param.grad = None
+        state.launch_pipeline_reduce_grad()
+
+        param.reduce_scatter_grad.assert_called_once()
+        self.assertEqual(MindSporeHSDPStateV2.pre_all_reduce_groups, [])
+        self.assertEqual(MindSporeHSDPStateV2.pending_all_reduce_groups, [first_group])
+        param.reduce_scatter_output.assert_called_once_with()
+
+    def test_launch_is_a_noop_for_untouched_chunk(self):
+        """A chunk whose backward never ran has no grad, so its sweep is a no-op."""
+        state = _make_state()
+        param = _make_pipeline_param("p0", "replicate-group")
+        state.hsdp_params = [param]
+
+        param.unsharded_param.grad = None
+        param.unsharded_accumulated_grad = None
+        param.unsharded_grad_data = None
+        param.sharded_param.grad = None
+        state.launch_pipeline_reduce_grad()
+
+        param.reduce_scatter_grad.assert_not_called()
+        param.reduce_scatter_output.assert_not_called()
+        param.accumulate_unsharded_grad_if_needed.assert_called_once_with()
+        self.assertEqual(MindSporeHSDPStateV2.pre_all_reduce_groups, [])
+        self.assertEqual(MindSporeHSDPStateV2.pending_all_reduce_groups, [])
+
+    def test_terminal_drain_applies_every_reduced_grad(self):
+        """The terminal drain must apply each pending group's grad exactly once."""
+        state = _make_state()
+        param = _make_pipeline_param("p0", "replicate-group")
+        state.hsdp_params = [param]
+        state.launch_pipeline_reduce_grad()
+
+        # The launch for the chunk after this one both releases this group's
+        # reduce-scatter and starts its all-reduce — the terminal drain pays the wait.
+        state.hsdp_params = []
+        state.launch_pipeline_reduce_grad()
+        param.reduce_scatter_output.assert_called_once_with()
+        MindSporeHSDPStateV2.delay_apply_reduce_grads()
+
+        param.apply_reduced_grad.assert_called_once()
+        self.assertEqual(param.apply_reduced_grad.call_args.args[1], "float32")
+        self.assertEqual(HSDPState.pre_reduce_scatter_params, [])
+        self.assertEqual(HSDPState.pre_all_reduce_params, [])
+        self.assertEqual(MindSporeHSDPStateV2.pending_all_reduce_groups, [])
+
+    def test_flush_starts_the_queued_all_reduce_without_waiting_it(self):
+        """A stage's last chunk is released by the flush, not by the terminal drain."""
+        state = _make_state()
+        param = _make_pipeline_param("p0", "replicate-group")
+        state.hsdp_params = [param]
+        state.launch_pipeline_reduce_grad()
+        group = MindSporeHSDPStateV2.pre_all_reduce_groups[0]
+
+        state.flush_pipeline_reduce_grad()
+
+        # The group is in flight for the rest of the schedule; only its wait
+        # stays with the terminal drain.
+        self.assertEqual(MindSporeHSDPStateV2.pre_all_reduce_groups, [])
+        self.assertEqual(MindSporeHSDPStateV2.pending_all_reduce_groups, [group])
+        param.reduce_scatter_output.assert_called_once_with()
+        param.clear_reduce_scatter_output.assert_called_once_with()
+        group.wait_and_apply_grads = MagicMock()
+        self.assertEqual(group.wait_and_apply_grads.call_count, 0)
+
+    def test_flush_is_idempotent_so_the_drain_compensation_is_free(self):
+        """After a flush the queues are empty, so a second flush must issue nothing."""
+        state = _make_state()
+        param = _make_pipeline_param("p0", "replicate-group")
+        state.hsdp_params = [param]
+        state.launch_pipeline_reduce_grad()
+
+        state.flush_pipeline_reduce_grad()
+        pending = list(MindSporeHSDPStateV2.pending_all_reduce_groups)
+        param.reduce_scatter_output.reset_mock()
+        state.flush_pipeline_reduce_grad()
+
+        param.reduce_scatter_output.assert_not_called()
+        self.assertEqual(MindSporeHSDPStateV2.pending_all_reduce_groups, pending)
+
+    def test_flush_is_a_noop_without_a_queued_group(self):
+        """A stage whose launch never queued a group must not touch the queues."""
+        state = _make_state()
+        param = _make_pipeline_param("p0", "replicate-group")
+        state.hsdp_params = [param]
+
+        param.unsharded_param.grad = None
+        param.unsharded_accumulated_grad = None
+        param.unsharded_grad_data = None
+        param.sharded_param.grad = None
+        state.launch_pipeline_reduce_grad()
+        state.flush_pipeline_reduce_grad()
+
+        param.reduce_scatter_output.assert_not_called()
+        self.assertEqual(MindSporeHSDPStateV2.pending_all_reduce_groups, [])
+
+    def test_pipeline_launch_rejects_comm_fusion(self):
+        """The pipelined path owns the chunk ordering, so comm_fusion must be rejected explicitly."""
+        state = _make_state()
+        state.comm_fusion = True
+
+        with self.assertRaisesRegex(NotImplementedError, "comm_fusion"):
+            state.launch_pipeline_reduce_grad()
+
+    def test_shared_queue_state_is_class_wide_across_states(self):
+        """A launch on one state must release a group queued by another state."""
+        first_state = _make_state()
+        second_state = _make_state()
+        param = _make_pipeline_param("p0", "replicate-group")
+        first_state.hsdp_params = [param]
+
+        first_state.launch_pipeline_reduce_grad()
+        group = MindSporeHSDPStateV2.pre_all_reduce_groups[0]
+        second_state.launch_pipeline_reduce_grad()
+
+        self.assertEqual(MindSporeHSDPStateV2.pre_all_reduce_groups, [])
+        self.assertEqual(MindSporeHSDPStateV2.pending_all_reduce_groups, [group])
+        param.reduce_scatter_output.assert_called_once_with()
+
+    def test_scheduler_delegates_pipeline_launch_to_state(self):
+        """The scheduler façade should forward the launch to the state without extra work."""
+        scheduler = SimpleNamespace(
+            hsdp_state=SimpleNamespace(launch_pipeline_reduce_grad=MagicMock())
+        )
+
+        HSDPSchedulerV2.launch_reduce_grad_for_pipeline(scheduler)
+
+        scheduler.hsdp_state.launch_pipeline_reduce_grad.assert_called_once_with()
+
+    def test_scheduler_delegates_pipeline_flush_to_state(self):
+        """The scheduler façade should forward the flush to the state without extra work."""
+        scheduler = SimpleNamespace(
+            hsdp_state=SimpleNamespace(flush_pipeline_reduce_grad=MagicMock())
+        )
+
+        HSDPSchedulerV2.flush_reduce_grad_for_pipeline(scheduler)
+
+        scheduler.hsdp_state.flush_pipeline_reduce_grad.assert_called_once_with()
+
+    def test_base_state_rejects_unimplemented_pipeline_launch(self):
+        """Backends without a pipelined implementation must fail loudly, not silently skip."""
+        state = object.__new__(HSDPState)
+
+        with self.assertRaises(NotImplementedError):
+            state.launch_pipeline_reduce_grad()
+
+    def test_base_state_rejects_unimplemented_pipeline_flush(self):
+        """Backends without a pipelined implementation must fail loudly, not silently skip."""
+        state = object.__new__(HSDPState)
+
+        with self.assertRaises(NotImplementedError):
+            state.flush_pipeline_reduce_grad()
+
 
 if __name__ == "__main__":
     unittest.main()

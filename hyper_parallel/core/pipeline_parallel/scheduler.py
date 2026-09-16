@@ -48,6 +48,7 @@ class MetaStepType(Enum):
     FSDP_UNSHARD = auto()
     FSDP_RESHARD = auto()
     FSDP_REDUCE_GRAD = auto()
+    FSDP_FLUSH_REDUCE_GRAD = auto()
     FSDP_WAIT_REDUCE_GRAD = auto()
     SWAP_SET_GROUP = auto()
     SWAP_LAUNCH_OFFLOAD = auto()
@@ -241,23 +242,54 @@ def _exec_fsdp_reshard(stage):
             module.reshard()
 
 
-def _exec_fsdp_reduce_grad(stage):
-    """Launch HSDP reduction after the stage's final backward."""
+def _exec_fsdp_reduce_grad(schedule, stage):
+    """Trigger this chunk's HSDP reduction; both collectives are left in flight."""
+    del schedule
     stage.launch_reduce_grad()
 
 
-def _exec_fsdp_wait_reduce_grad(stage):
-    """Drain the final pending HSDP reduction tail."""
+def _exec_fsdp_flush_reduce_grad(schedule, stage):
+    """Issue the all-reduces this stage's last launch left queued for the terminal drain.
+
+    The stage's last ``launch`` has no following backward to fence it: its
+    reduce-scatter owns one fused all-reduce group that nothing has released
+    yet.  Releasing it here starts the all-reduce for the schedule tail while
+    the schedule keeps running — the wait stays with the terminal
+    ``FSDP_WAIT_REDUCE_GRAD``, so this step never blocks.
+    """
+    del schedule
+    stage.flush_reduce_grad()
+
+
+def _exec_fsdp_wait_reduce_grad(schedule, stage):
+    """Compensate any stage whose reduction never fired, then drain once.
+
+    Stages that reached their final backward already triggered their reduction;
+    re-triggering them is a no-op, since they have no gradient left to reduce.
+    A stage that never got there — the schedule has no following backward to
+    hang a launch on — still owes its reduce-scatter, and gets it here, the same
+    way the root backward hook compensates a module the hook never reached.
+    Every launch made in this loop is compensated immediately: the last one has
+    no following fence either, and this drain is the last chance to start its
+    all-reduce before waiting on it.
+    """
+    for managed_stage in schedule.stages:
+        if isinstance(managed_stage.submodule, HSDPModule):
+            managed_stage.launch_reduce_grad()
+            managed_stage.flush_reduce_grad()
+    # Every fused group is in flight by now; this drain pays every wait, so all
+    # all-reduce waits land at the end of the schedule.
     stage.wait_reduce_grad()
 
 
-# FSDP control MetaStep -> handler(stage). Membership also marks which
+# FSDP control MetaStep -> handler(schedule, stage). Membership also marks which
 # MetaStepTypes are FSDP control steps, so the runtime loop dispatches with a
 # single table lookup instead of re-switching on the step type.
 _FSDP_STEP_HANDLERS = {
-    MetaStepType.FSDP_UNSHARD: _exec_fsdp_unshard,
-    MetaStepType.FSDP_RESHARD: _exec_fsdp_reshard,
+    MetaStepType.FSDP_UNSHARD: lambda schedule, stage: _exec_fsdp_unshard(stage),
+    MetaStepType.FSDP_RESHARD: lambda schedule, stage: _exec_fsdp_reshard(stage),
     MetaStepType.FSDP_REDUCE_GRAD: _exec_fsdp_reduce_grad,
+    MetaStepType.FSDP_FLUSH_REDUCE_GRAD: _exec_fsdp_flush_reduce_grad,
     MetaStepType.FSDP_WAIT_REDUCE_GRAD: _exec_fsdp_wait_reduce_grad,
 }
 
@@ -962,7 +994,7 @@ class PipelineScheduleRuntime(ABC):
             # is a no-op here (composite/custom types are handled upstream).
             fsdp_handler = _FSDP_STEP_HANDLERS.get(step_type)
             if fsdp_handler is not None:
-                fsdp_handler(stage)
+                fsdp_handler(self, stage)
 
     def _exec_pipeline_swap_step(self, cur_step, arg_mbs, kwarg_mbs):
         """Execute a pipeline activation-swap control step."""
@@ -2479,12 +2511,21 @@ def add_fsdp_unshard_reshard(actions, managed_stage_indices, max_active_stages=3
 
 
 def add_fsdp_reduce_grad(actions, managed_stage_indices, micro_batch_num):
-    """Launch reduction after each final backward and drain after all local stages."""
+    """Launch reductions after final backwards and drain them at schedule end.
+
+    Every launch runs the same sequence as a post-backward hook, so chunk N+1
+    issues its reduce-scatter before releasing chunk N's asynchronous
+    all-reduce — the two are then in flight together.  A stage's last chunk has
+    no such successor, so its queued all-reduce is issued by an
+    ``FSDP_FLUSH_REDUCE_GRAD`` once every launch for that stage is behind us:
+    the trailing all-reduce is then in flight for the rest of the schedule.
+    Nothing waits inside the loop: the single terminal wait drains every queue.
+    """
     if not managed_stage_indices:
         return actions
 
     fsdp_actions = []
-    last_reduced_stage_index = None
+    launched_stages = []
     for action in actions:
         fsdp_actions.append(action)
         reduced_stage_indices = []
@@ -2501,13 +2542,24 @@ def add_fsdp_reduce_grad(actions, managed_stage_indices, micro_batch_num):
             fsdp_actions.append(
                 MetaStep(None, MetaStepType.FSDP_REDUCE_GRAD, stage_index)
             )
-            last_reduced_stage_index = stage_index
-    if last_reduced_stage_index is not None:
+            launched_stages.append(stage_index)
+    if launched_stages:
+        # One flush per stage that launched: the outermost unit's last launch
+        # owns the tail group the terminal drain would otherwise have to wait
+        # for serially.
+        flushed_stages = set()
+        for stage_index in launched_stages:
+            if stage_index in flushed_stages:
+                continue
+            flushed_stages.add(stage_index)
+            fsdp_actions.append(
+                MetaStep(None, MetaStepType.FSDP_FLUSH_REDUCE_GRAD, stage_index)
+            )
         fsdp_actions.append(
             MetaStep(
                 None,
                 MetaStepType.FSDP_WAIT_REDUCE_GRAD,
-                last_reduced_stage_index,
+                launched_stages[-1],
             )
         )
     return fsdp_actions

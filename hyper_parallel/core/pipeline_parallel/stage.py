@@ -517,23 +517,43 @@ class PipelineStage(PipelineStageBase):
         rg_infos = [info for info in self.args_recv_info[micro_index] if info.requires_grad]
         return [("isend", cur_out, info.global_rank) for cur_out, info in zip(out, rg_infos)]
 
+    def reduce_grad_units(self):
+        """Yield the HSDP units in this stage's submodule tree, outermost first."""
+        if not isinstance(self.submodule, HSDPModule):
+            return
+        for _, submodule in platform.get_cells_and_names(self.submodule):
+            if isinstance(submodule, HSDPModule):
+                yield submodule
+
     def launch_reduce_grad(self) -> None:
-        """Launch HSDP reduction after this stage's final backward."""
+        """Trigger this stage's gradient reduction after its final backward.
+
+        Each HSDP unit runs the same reduction sequence as its post-backward
+        hook, so this chunk's reduce-scatter is issued first and the previous
+        chunk's all-reduce released after it — the two are then in flight
+        together.  The all-reduce waits stay deferred: the schedule pays them
+        once, through :meth:`wait_reduce_grad`.
+        """
         if not isinstance(self.submodule, HSDPModule):
             return
         fsdp_module = self.submodule
         fsdp_module.set_is_last_backward(True)
         fsdp_module.set_reshard_after_backward(True)
         fsdp_module.set_requires_gradient_sync(True)
-        for _, submodule in platform.get_cells_and_names(self.submodule):
-            if not isinstance(submodule, HSDPModule):
-                continue
-            hsdp_state = submodule.hsdp_scheduler.hsdp_state
-            hsdp_state.post_backward()
-            hsdp_state.reduce_params()
+        for submodule in self.reduce_grad_units():
+            submodule.hsdp_scheduler.launch_reduce_grad_for_pipeline()
+
+    def flush_reduce_grad(self) -> None:
+        """Issue the all-reduces this stage's last launch left queued.
+
+        Called after a launch when no following backward will fence this chunk.
+        The drain itself stays with :meth:`wait_reduce_grad`.
+        """
+        for submodule in self.reduce_grad_units():
+            submodule.hsdp_scheduler.flush_reduce_grad_for_pipeline()
 
     def wait_reduce_grad(self) -> None:
-        """Wait for gradient reductions launched by the pipeline schedule."""
+        """Drain the reductions the schedule triggered, at the end of the run."""
         if not isinstance(self.submodule, HSDPModule):
             return
         self.submodule.hsdp_scheduler.wait_for_pending_reductions()

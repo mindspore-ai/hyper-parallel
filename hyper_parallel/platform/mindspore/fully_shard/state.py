@@ -613,30 +613,7 @@ class MindSporeHSDPStateV2(HSDPState):
             return
         if not self.comm_fusion:
             self.reduce_params()
-            for hsdp_param in self._iter_managed_params():
-                # replicate_params are queued once by _queue_replicate_params_allreduce().
-                if not getattr(hsdp_param, "enable_fsdp_shard", True):
-                    continue
-                if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
-                    if self._can_direct_all_reduce_compat_grad(hsdp_param):
-                        self._queue_direct_compat_all_reduce(hsdp_param)
-                    continue
-                if not hasattr(hsdp_param, "sharded_param") or not hsdp_param.sharded_param.requires_grad:
-                    continue
-                if not self._has_pending_unsharded_grad(hsdp_param):
-                    continue
-                if hsdp_param.shard_size <= 1:
-                    if self._should_run_all_reduce(hsdp_param):
-                        self._queue_compat_all_reduce(hsdp_param)
-                    else:
-                        # No-communication path (shard_size == 1, no all-reduce):
-                        # this leg owns the scaling since the grad never goes through
-                        # reduce_scatter_grad / all_reduce_grad.
-                        need_synchronize = self._apply_pending_unsharded_grad_locally(
-                            hsdp_param
-                        )
-                        self._synchronize_current_stream_if_needed(need_synchronize)
-
+            self._classify_managed_grads()
             if self._needs_overlap_post_backward_steps():
                 self._run_overlap_post_backward_steps()
             self._queue_replicate_params_allreduce()
@@ -644,6 +621,68 @@ class MindSporeHSDPStateV2(HSDPState):
             self.post_backward_for_comm_fusion()
         if self.reshard_after_backward:
             self.shard()
+
+    def launch_pipeline_reduce_grad(self) -> None:
+        """Trigger this module's gradient reduction for the pipeline schedule.
+
+        Runs the same sequence as the overlap branch of :meth:`post_backward`:
+        this module's reduce-scatter is issued and the previous module's fused
+        all-reduce is released right after it, so the two overlap.  Both waits
+        stay deferred to the terminal ``wait_for_pending_reductions``.
+        """
+        if self.comm_fusion:
+            raise NotImplementedError(
+                "Pipelined HSDP gradient reduction does not support comm_fusion=True."
+            )
+        for hsdp_param in self._iter_managed_params():
+            hsdp_param.accumulate_unsharded_grad_if_needed()
+        self.reduce_params()
+        self._classify_managed_grads()
+        if self._needs_overlap_post_backward_steps():
+            self._run_overlap_post_backward_steps()
+        self._queue_replicate_params_allreduce()
+
+    def flush_pipeline_reduce_grad(self) -> None:
+        """Issue the all-reduces of the reduce-scatters queued by a pipeline launch.
+
+        A rank's last chunk has no following launch to fence it, so its
+        reduce-scatter would otherwise hold its all-reduce back until the
+        terminal drain -- paying the reduce-scatter serially and only then
+        starting the all-reduce.  Issuing the all-reduce now puts it in flight
+        for the rest of the schedule.  Waiting is deliberately left to the
+        terminal drain, which is the only place that may block on an all-reduce.
+        """
+        self._issue_prev_fused_allreduce(self._wait_prev_reduce_scatter())
+
+    def _classify_managed_grads(self):
+        """Queue all-reduces the current module owns, without touching the reduce-scatter.
+
+        Split out of :meth:`post_backward` so the pipelined path can run the same
+        classification without the synchronous drains.
+        """
+        for hsdp_param in self._iter_managed_params():
+            # replicate_params are queued once by _queue_replicate_params_allreduce().
+            if not getattr(hsdp_param, "enable_fsdp_shard", True):
+                continue
+            if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
+                if self._can_direct_all_reduce_compat_grad(hsdp_param):
+                    self._queue_direct_compat_all_reduce(hsdp_param)
+                continue
+            if not hasattr(hsdp_param, "sharded_param") or not hsdp_param.sharded_param.requires_grad:
+                continue
+            if not self._has_pending_unsharded_grad(hsdp_param):
+                continue
+            if hsdp_param.shard_size <= 1:
+                if self._should_run_all_reduce(hsdp_param):
+                    self._queue_compat_all_reduce(hsdp_param)
+                else:
+                    # No-communication path (shard_size == 1, no all-reduce):
+                    # this leg owns the scaling since the grad never goes through
+                    # reduce_scatter_grad / all_reduce_grad.
+                    need_synchronize = self._apply_pending_unsharded_grad_locally(
+                        hsdp_param
+                    )
+                    self._synchronize_current_stream_if_needed(need_synchronize)
 
     def set_requires_grad_sync(self, requires_grad_sync):
         """set requires grad sync flag to control gradient sync."""

@@ -155,3 +155,25 @@ class HSDPState:
     def _iter_managed_params(self):
         """Return all fully_shard-managed parameters, including replicate_params."""
         return [*self.hsdp_params, *self.replicate_params]
+
+    def launch_pipeline_reduce_grad(self) -> None:
+        """Trigger this module's gradient reduction for the pipeline schedule.
+
+        Pipeline parallelism calls this once, after a module's final backward,
+        in place of the module's post-backward hook.  The reduction sequence is
+        the same as the hook's, so the module's reduce-scatter is issued first
+        and the previous module's cross-replica all-reduce is released after it —
+        the two then run concurrently.  Every wait is left pending for the
+        terminal scheduler drain.
+        """
+        raise NotImplementedError("HSDPState subclasses must implement launch_pipeline_reduce_grad")
+
+    def flush_pipeline_reduce_grad(self) -> None:
+        """Issue the all-reduces of the reduce-scatters still queued, without waiting one.
+
+        Pipeline parallelism calls this right after a launch: the last chunk of a
+        rank has no following backward to fence it, so without a flush its
+        all-reduce would leave the queue only in the terminal drain.  The
+        all-reduce waits stay deferred to that drain.
+        """
+        raise NotImplementedError("HSDPState subclasses must implement flush_pipeline_reduce_grad")

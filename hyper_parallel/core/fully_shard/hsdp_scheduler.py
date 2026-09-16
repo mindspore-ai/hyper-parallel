@@ -160,6 +160,21 @@ class HSDPSchedulerV2:
             "HSDPScheduler subclasses must implement wait_for_pending_reductions."
         )
 
+    def launch_reduce_grad_for_pipeline(self) -> None:
+        """Trigger this unit's gradient reduction for the pipeline schedule.
+
+        Runs the same reduction sequence as the unit's post-backward hook, so the
+        reduce-scatter and the cross-replica all-reduce are both left in flight.
+        The schedule pays every wait once, in ``wait_for_pending_reductions``.
+        """
+        if self.hsdp_state is not None:
+            self.hsdp_state.launch_pipeline_reduce_grad()
+
+    def flush_reduce_grad_for_pipeline(self) -> None:
+        """Issue the all-reduces the unit's pipeline launch left queued."""
+        if self.hsdp_state is not None:
+            self.hsdp_state.flush_pipeline_reduce_grad()
+
     # pylint: disable=W0613
     def _hsdp_forward_pre_hook(self, cell, args, kwargs):
         """Forward pre hook to unsharded parameter for forward process."""
