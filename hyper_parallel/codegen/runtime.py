@@ -1075,7 +1075,9 @@ class InlineParallelState:
 
 _EMPTY_INLINE_PARALLEL_STATE = InlineParallelState()
 _INLINE_PARALLEL_STATE_BY_MODULE: dict[str, InlineParallelState] = {}
-_EXTERNAL_STATE_INLINE_CLASSES = frozenset({"GQAAttention", "Qwen3MoeSparseMoeBlock"})
+_EXTERNAL_STATE_INLINE_CLASSES = frozenset(
+    {"GQAAttention", "Qwen3MoeSparseMoeBlock", "DeepseekV3MoE"}
+)
 
 
 def get_inline_parallel_state(module_name: str) -> InlineParallelState:
@@ -1429,10 +1431,15 @@ def hyper_bind_compute(
         entry = (param_plan or {}).get(fqn, {})
         spec = _FrozenBoundarySpec(entry, rule)
         module = _resolve_module(model, fqn)
-        if _is_external_state_inline_module(module, generated_module):
-            continue
         compute_fn = _resolve_local_compute_fn(
             module, spec, dense_mesh, active_dim_names, expert_mesh)
+        # External-state inline modules (e.g. Qwen3MoeSparseMoeBlock) carry an
+        # inlined forward and must not receive __hyper_compute__, but the local
+        # compute factory above still has to run: it installs companion state
+        # such as ``experts.local_expert_count`` and the bound experts.forward
+        # that the inlined forward relies on.
+        if _is_external_state_inline_module(module, generated_module):
+            continue
         # _resolve_local_compute_fn returns module.forward for the
         # region_dispatch=False gate; that path is not a bound compute (the
         # generated forward already calls _forward_impl), so it must not be
