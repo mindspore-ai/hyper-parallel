@@ -1,7 +1,23 @@
 # Copyright 2026 Huawei Technologies Co., Ltd
-# Licensed under the Apache License, Version 2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
-"""DeepSeek-V3 inline Codegen declarations."""
+"""DeepSeek-V3 render spec: source-level declarations for the inline pipeline.
+
+Declares what the inline pipeline must render for this family: which strategy
+bodies are inlined into the generated artifact. Consumed through
+``ModelAdapterSpec.inline_codegen``.
+"""
 
 from __future__ import annotations
 
@@ -91,10 +107,10 @@ _INLINE_SPEC_BUNDLE = InlineSpecBundle(
 )
 
 
-def get_inline_spec_bundle() -> InlineSpecBundle:
-    """Return DeepSeek-V3 inline Codegen declarations."""
+def get_render_spec() -> InlineSpecBundle:
+    """Return the DeepSeek-V3 render spec."""
 
     return _INLINE_SPEC_BUNDLE
 
 
-__all__ = ["get_inline_spec_bundle"]
+__all__ = ["get_render_spec"]

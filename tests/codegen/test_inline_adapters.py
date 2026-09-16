@@ -17,20 +17,19 @@
 import ast
 from copy import deepcopy
 import importlib.util
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from hyper_parallel.codegen.emit.modeling import _try_inline_modeling
+from hyper_parallel.codegen.emit.modeling import _apply_inline_modeling
 from hyper_parallel.codegen import manager
 from hyper_parallel.codegen.inline.ir import (
     ForwardExtractPatch, ImportPatch, InlinePatchSet, InlineRule, ModuleSnippetPatch,
 )
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
-from hyper_parallel.codegen.inline.pipeline import try_render_inline_modeling
+from hyper_parallel.codegen.inline.pipeline import render_inline_modeling
 from hyper_parallel.codegen.inline.spec_bundle import InlineSpecBundle, MetaNormalizer, ReplacementSpec, StrategySpec
 from hyper_parallel.codegen.inline.specs import replacement_spec, strategy_spec
 from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
@@ -79,13 +78,7 @@ def _execute_source(source):
 
 
 class TestInlineAdapters(unittest.TestCase):
-    """Exercise discovery, compatibility, fallback and model-independent emission."""
-
-    def setUp(self) -> None:
-        """Enable inline generation for each independent test."""
-        self.environment = patch.dict(os.environ, {"HYPER_CODEGEN_INLINE_PATCH": "1"})
-        self.environment.start()
-        self.addCleanup(self.environment.stop)
+    """Exercise discovery, coverage enforcement and model-independent emission."""
 
     def test_legacy_and_explicit_qwen_identity(self):
         """Legacy target lookup and architecture aliases resolve the same specs."""
@@ -97,29 +90,33 @@ class TestInlineAdapters(unittest.TestCase):
         self.assertIsNone(strategy_spec(CP).body_template)
 
     def test_unknown_identity_does_not_select_qwen(self):
-        """An explicit unsupported identity falls back without mutating metadata."""
+        """An explicit unsupported identity fails loudly without mutating metadata."""
         meta = _meta()
         before = deepcopy(vars(meta))
-        self.assertIsNone(try_render_inline_modeling(SOURCE, meta, "unregistered_model"))
+        with self.assertRaisesRegex(RuntimeError, "no inline declaration"):
+            render_inline_modeling(SOURCE, meta, "unregistered_model")
         self.assertEqual(vars(meta), before)
         self.assertIsNone(replacement_spec(ATTENTION, "unregistered_model"))
         self.assertIsNone(replacement_spec("unknown.replace"))
         self.assertIsNone(strategy_spec(None))
 
-    def test_unknown_target_and_gate_preserve_metadata(self):
-        """Incomplete rule coverage and the disabled gate retain the generic path."""
+    def test_unknown_target_fails_and_ruleless_plan_passes_through(self):
+        """Incomplete coverage fails loudly; a ruleless plan returns the source."""
         meta = _meta(injections=[{"local_compute_fn": "unknown.strategy"}])
         before = deepcopy(vars(meta))
-        self.assertIsNone(try_render_inline_modeling(SOURCE, meta))
+        with self.assertRaisesRegex(RuntimeError, "no inline declaration"):
+            render_inline_modeling(SOURCE, meta)
         self.assertEqual(vars(meta), before)
-        with patch.dict(os.environ, {"HYPER_CODEGEN_INLINE_PATCH": "0"}):
-            self.assertIsNone(try_render_inline_modeling(SOURCE, _meta()))
+        ruleless = _meta(injections=())
+        ruleless.module_overrides = []
+        self.assertEqual(render_inline_modeling(SOURCE, ruleless), SOURCE)
 
     def test_both_strategy_targets_require_coverage(self):
         """Known local compute targets cannot hide unsupported inner wrappers."""
         meta = _meta(injections=[{"local_compute_fn": EP, "inner_wrapper": "unknown.wrapper"}])
         before = deepcopy(vars(meta))
-        self.assertIsNone(try_render_inline_modeling(SOURCE, meta))
+        with self.assertRaisesRegex(RuntimeError, "unknown.wrapper"):
+            render_inline_modeling(SOURCE, meta)
         self.assertEqual(vars(meta), before)
 
     def test_conflicting_strategy_bodies_fail(self):
@@ -153,8 +150,8 @@ class Model:
 """
         meta = _meta(injections=[{"local_compute_fn": EP}, {"inner_wrapper": CP}])
         expected_meta = deepcopy(meta)
-        legacy = try_render_inline_modeling(source, meta)
-        explicit = try_render_inline_modeling(source, expected_meta, "qwen3_moe")
+        legacy = render_inline_modeling(source, meta)
+        explicit = render_inline_modeling(source, expected_meta, "qwen3_moe")
         self.assertEqual(legacy, explicit)
         self.assertEqual(vars(meta), vars(expected_meta))
         self.assertIn("class GQAAttention", explicit)
@@ -168,7 +165,7 @@ class Model:
             "blocks.0.proj.k_proj.weight", "blocks.0.proj.q_proj.weight",
             "blocks.0.proj.v_proj.weight", "embedding.weight",
         ])
-        self.assertEqual(try_render_inline_modeling(source, meta, "qwen3_moe"), explicit)
+        self.assertEqual(render_inline_modeling(source, meta, "qwen3_moe"), explicit)
 
     def test_new_adapter_generates_executable_source(self):
         """A registered non-Qwen adapter supplies constructors, methods and metadata."""
@@ -191,7 +188,7 @@ class Model:
                 CUSTOM_REPLACEMENT, {"linear_qkv.weight": ("projection.weight",)},
             ),),
         )
-        provider = SimpleNamespace(get_inline_spec_bundle=lambda: bundle)
+        provider = SimpleNamespace(get_render_spec=lambda: bundle)
         adapter = ModelAdapterSpec("ToyForCausalLM", "toy", inline_codegen=lambda: provider)
         with patch.dict(registry.MODEL_ADAPTER_REGISTRY), patch.dict(registry._FAMILY_ALIASES):
             registry.register_model_adapter(adapter)
@@ -199,7 +196,7 @@ class Model:
                 {"local_compute_fn": CUSTOM_STRATEGY}, {"local_compute_fn": CUSTOM_STRATEGY},
             ])
             meta.model_class = "ToyForCausalLM"
-            emitted = _try_inline_modeling(SOURCE, meta)
+            emitted = _apply_inline_modeling(SOURCE, meta)
         namespace = _execute_source(emitted)
         self.assertEqual(namespace["ToyBlock"]().forward(4), 11)
         self.assertEqual(emitted.count("def _forward_impl"), 1)
@@ -211,7 +208,7 @@ class Model:
         absent = ModelAdapterSpec("BareForCausalLM", "bare")
         bad = ModelAdapterSpec(
             "BadForCausalLM", "bad",
-            inline_codegen=lambda: SimpleNamespace(get_inline_spec_bundle=lambda: {}),
+            inline_codegen=lambda: SimpleNamespace(get_render_spec=lambda: {}),
         )
         with patch.dict(registry.MODEL_ADAPTER_REGISTRY, {"bare": absent, "bad": bad}):
             self.assertIsNone(replacement_spec(ATTENTION, "bare"))
@@ -244,10 +241,7 @@ class Model:
         ):
             before = manager._compute_signature(config, None)
             after = manager._compute_signature(config, None)
-            with patch.dict(os.environ, {"HYPER_CODEGEN_INLINE_PATCH": "0"}):
-                disabled = manager._compute_signature(config, None)
         self.assertNotEqual(before, after)
-        self.assertNotEqual(after, disabled)
 
     def test_declared_method_name_preserves_original_implementation(self):
         """Non-forward strategy methods retain an executable original method."""

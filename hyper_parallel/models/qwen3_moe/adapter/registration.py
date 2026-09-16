@@ -66,11 +66,11 @@ def _load_loss():
     return chunk_loss
 
 
-def _load_inline():
-    """Load source declarations lazily to keep adapter discovery lightweight."""
-    from hyper_parallel.models.qwen3_moe.adapter import inline  # pylint: disable=C0415
+def _load_render_spec():
+    """Load the render spec lazily to keep adapter discovery lightweight."""
+    from hyper_parallel.models.qwen3_moe.adapter import render_spec  # pylint: disable=C0415
 
-    return inline
+    return render_spec
 
 
 QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(
@@ -81,7 +81,7 @@ QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     context_parallel=_load_context_parallel,
     expert_parallel=_load_expert_parallel,
     loss=_load_loss,
-    inline_codegen=_load_inline,
+    inline_codegen=_load_render_spec,
 )
 
 register_model_adapter(QWEN3_MOE_ADAPTER_SPEC)

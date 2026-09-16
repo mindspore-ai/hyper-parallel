@@ -34,7 +34,7 @@ def get_inline_spec_bundle(model_type: str | None = None, target: str | None = N
     adapter = get_model_adapter(model_type)
     if adapter is None or adapter.inline_codegen is None:
         return None
-    bundle = adapter.inline_codegen().get_inline_spec_bundle()
+    bundle = adapter.inline_codegen().get_render_spec()
     if not isinstance(bundle, InlineSpecBundle):
         raise TypeError(f"Inline provider for {model_type!r} must return InlineSpecBundle")
     return bundle

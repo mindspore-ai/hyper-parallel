@@ -5,6 +5,13 @@
 > **2026-09-16 进度**：Phase 1 已实现并完成本地回归；129 NPU 验证因 SSH 超时待执行。
 > 实现差异与验证记录见 [整改状态](codegen_inline_generalization_status.md)。
 
+> **注意（阅读本文前请先看）**：本文记录的是当时的实现方案。此后在
+> `codegen_restructure` 分支上发生了两处变更，本文正文未同步：
+> 1. `adapter/inline.py` 已重命名为 `adapter/render_spec.py`（访问函数改为 `get_render_spec`）；
+> 2. codegen 泛化的方向已由「adapter 声明」演进为「结构识别 + 递归展开」，
+>    见 [结构驱动方案](codegen_structure_driven_plan.md)。
+> 本文保留为历史记录，不作为当前设计依据。
+
 ---
 
 ## 1. 背景与问题

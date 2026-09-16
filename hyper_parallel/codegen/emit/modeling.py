@@ -703,9 +703,9 @@ def emit_modeling_file(meta: Any) -> str:
     """Assemble the full generated modeling file text.
 
     Returns the text (not written to disk) so the caller can compute a diff
-    first. The header banner carries the generation provenance;
-    the source is copied verbatim; then the runtime import, literals, and the
-    parallel entry are appended.
+    first. The header banner carries the generation provenance; the source is
+    copied verbatim, rewritten by the adapter-driven inline pipeline, and then
+    lowered at the boundary classes.
     """
     text = copy_original_modeling(meta.source)
     # Stale-source sanitize: a trust-remote-code modeling file ships with the
@@ -722,45 +722,20 @@ def emit_modeling_file(meta: Any) -> str:
         else getattr(meta.source, "module_name", "")
     )
     text = rewrite_relative_imports(text, module_name)
-    inline_text = _try_inline_modeling(text, meta)
-    if inline_text is not None:
-        inline_text = _lower_forward_boundaries(inline_text, meta, module_name)
-        return _banner(meta) + inline_text
+    text = _apply_inline_modeling(text, meta)
     text = _lower_forward_boundaries(text, meta, module_name)
-    # The entry class's ``__init__`` tail gets the
-    # ``hyper_apply_replacements(self)`` call so replacements install as soon
-    # as a model instance is built.  Runs on the source BEFORE the banner /
-    # import / literal appends — all of which shift byte offsets.
-    text = _rewrite_init_for_overrides(text, meta)
-    text = _banner(meta) + text
-    text = inject_codegen_imports(text, has_region=_meta_has_region(meta))
-    text = inject_param_plan_literals(text, meta)
-    text = _inject_module_override_literals(text, meta)
-    text = inject_hyper_parallelize(text, meta)
-    return text
+    return _banner(meta) + text
 
 
-def _try_inline_modeling(text: str, meta: Any) -> str | None:
-    """Run the YAML-driven inline pipeline when it is explicitly enabled."""
+def _apply_inline_modeling(text: str, meta: Any) -> str:
+    """Render the artifact through the adapter-driven inline source pipeline."""
 
-    from hyper_parallel.codegen.inline import try_render_inline_modeling
+    from hyper_parallel.codegen.inline import render_inline_modeling
 
     source = getattr(meta, "source", None)
     architecture = source.get("architecture") if isinstance(source, dict) else getattr(source, "architecture", None)
     model_type = getattr(meta, "model_class", None) or architecture
-    return try_render_inline_modeling(text, meta, model_type=model_type)
-
-
-def _meta_has_region(meta: Any) -> bool:
-    """Whether any frozen injection declares a local-region compute fn.
-
-    Drives ``inject_codegen_imports``: only a local-region artifact needs the
-    ``hyper_to_local_if_dtensor`` helper import in the generated file.
-    """
-    return any(
-        rule.get("local_compute_fn") is not None
-        for rule in (getattr(meta, "injections", None) or [])
-    )
+    return render_inline_modeling(text, meta, model_type=model_type)
 
 
 def _lower_forward_boundaries(text: str, meta: Any, module_name: str) -> str:

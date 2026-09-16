@@ -16,8 +16,7 @@
 
 from __future__ import annotations
 
-import os
-from typing import Any, Optional
+from typing import Any
 
 from hyper_parallel.codegen.inline.ir import InlinePatchSet
 from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
@@ -28,20 +27,19 @@ from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
 from hyper_parallel.codegen.inline.yaml_rules import collect_inline_rules
 
 
-def try_render_inline_modeling(source_text: str, meta: Any, model_type: str | None = None) -> Optional[str]:
-    """Render an inline-patched modeling file when the current rules are covered.
+def render_inline_modeling(source_text: str, meta: Any, model_type: str | None = None) -> str:
+    """Render the inline-patched modeling file for a frozen plan.
 
-    This development path is intentionally gated by ``HYPER_CODEGEN_INLINE_PATCH``.
-    The existing generic Codegen path remains the default until the inline
-    replacement and strategy passes cover every active YAML target required by
-    the generated artifact.
+    This is the only artifact route. A YAML target with no adapter declaration
+    is a hard error rather than a silent fallback, so an inline coverage gap
+    surfaces at generation time instead of degrading the artifact. A plan with
+    no inline rules needs no patch and the source is returned unchanged.
     """
 
-    if os.environ.get("HYPER_CODEGEN_INLINE_PATCH") != "1":
-        return None
     rules = collect_inline_rules(meta)
-    if not rules or not _can_inline(rules, model_type):
-        return None
+    if not rules:
+        return source_text
+    _require_inline_coverage(rules, model_type)
     replacement_patches = build_replacement_patches(rules, model_type)
     strategy_patches = build_strategy_patches(rules, model_type)
     patch_set = _merge_patch_sets(replacement_patches, strategy_patches)
@@ -50,14 +48,27 @@ def try_render_inline_modeling(source_text: str, meta: Any, model_type: str | No
     return rendered
 
 
-def _can_inline(rules: tuple[Any, ...], model_type: str | None = None) -> bool:
+def _require_inline_coverage(rules: tuple[Any, ...], model_type: str | None = None) -> None:
+    """Fail when a YAML rule has no adapter declaration behind it.
+
+    Covers both rule kinds: a replacement target needs a ``ReplacementSpec``,
+    and every strategy target needs a ``StrategySpec``. Reporting all gaps at
+    once keeps one fix cycle from hiding the next gap.
+    """
+
+    uncovered: list[str] = []
     for rule in rules:
         if rule.replace_target is not None and replacement_spec(rule.replace_target, model_type) is None:
-            return False
+            uncovered.append(rule.replace_target)
         for target in (rule.local_compute_target, rule.inner_wrapper_target):
             if target is not None and strategy_spec(target, model_type) is None:
-                return False
-    return True
+                uncovered.append(target)
+    if uncovered:
+        raise RuntimeError(
+            f"codegen: no inline declaration for {sorted(set(uncovered))} "
+            f"(model_type={model_type!r}); declare each target in the model "
+            "adapter's inline provider"
+        )
 
 
 def _merge_patch_sets(*sets: InlinePatchSet) -> InlinePatchSet:

@@ -451,12 +451,11 @@ def _project_spec(
         "version": CODEGEN_VERSION,
         "sha256": _codegen_implementation_digest(),
     }
-    if os.environ.get("HYPER_CODEGEN_INLINE_PATCH") == "1":
-        identity = payload.get("source", {}).get("architecture")
-        bundle = get_inline_spec_bundle(identity) if identity else None
-        # Adapter declarations live outside the codegen implementation tree;
-        # their templates and mappings must also invalidate cached artifacts.
-        payload["inline_codegen"] = {"enabled": True, "specs": asdict(bundle) if bundle is not None else None}
+    identity = payload.get("source", {}).get("architecture")
+    bundle = get_inline_spec_bundle(identity) if identity else None
+    # Adapter declarations live outside the codegen implementation tree;
+    # their templates and mappings must also invalidate cached artifacts.
+    payload["inline_codegen"] = {"specs": asdict(bundle) if bundle is not None else None}
 
     return payload
 

@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Qwen3-MoE inline Codegen declarations."""
+"""Qwen3-MoE render spec: source-level declarations for the inline pipeline.
+
+Declares what the inline pipeline must render for this family: which source
+classes are replaced by which fused modules, how their constructors are
+rewritten, and which strategy bodies are inlined into the generated artifact.
+Consumed through ``ModelAdapterSpec.inline_codegen``.
+"""
 
 from __future__ import annotations
 
@@ -122,10 +128,10 @@ _INLINE_SPEC_BUNDLE = InlineSpecBundle(
 )
 
 
-def get_inline_spec_bundle() -> InlineSpecBundle:
-    """Return Qwen3-MoE inline Codegen declarations."""
+def get_render_spec() -> InlineSpecBundle:
+    """Return the Qwen3-MoE render spec."""
 
     return _INLINE_SPEC_BUNDLE
 
 
-__all__ = ["get_inline_spec_bundle"]
+__all__ = ["get_render_spec"]
