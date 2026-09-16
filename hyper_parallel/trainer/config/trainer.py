@@ -78,7 +78,7 @@ class TrainerConfig:
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
-    profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+    profiler: ProfilingConfig = field(default_factory=ProfilingConfig)
     magi: Optional[Any] = None
     peft: Optional[Any] = None
 

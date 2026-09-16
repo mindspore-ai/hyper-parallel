@@ -125,7 +125,7 @@ CLI override 在 YAML 已经解析为 `TrainerConfig` 后执行，使用 `--fiel
 --training.train_iters=100
 --model.pretrained_model_name_or_path=/path/to/model
 --optimizer.adamw_config.adamw_lr=2.0e-5
---profiling.enabled=true
+--profiler.enabled=true
 ```
 
 Value 先由 `yaml.safe_load()` 解析，再按照目标节点的类型转换：
@@ -133,7 +133,7 @@ Value 先由 `yaml.safe_load()` 解析，再按照目标节点的类型转换：
 ```bash
 --optimizer.no_decay_params='[bias, norm, ln_]'
 --compile.options='{trace.enabled: true}'
---profiling.enabled=true
+--profiler.enabled=true
 --checkpoint.restore_from=null
 ```
 

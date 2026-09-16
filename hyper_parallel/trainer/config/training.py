@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Training-loop, debug, wandb and profiling configuration sections.
-
-Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5);
-class names, fields and defaults are unchanged.
-"""
+"""Training-loop, debug, profiler, and remote-logging configuration sections."""
 
 from dataclasses import dataclass, field
 from typing import Literal, Optional
@@ -69,14 +65,36 @@ class WandbConfig:
 
 @dataclass
 class ProfilingConfig:
-    """Lightweight per-step profiler settings."""
+    """Configure bounded PyTorch profiler collection during training.
+
+    HyperParallel groups these options under ``TrainerConfig.profiler``, so
+    their names describe only the option itself rather than repeating a
+    ``profile_`` prefix.
+
+    Args:
+        enabled: Whether profiler collection is enabled.
+        start_step: First training step included in the profile.
+        stop_step: Last training step included in the profile.
+        start_on_init: Whether collection starts at ``on_train_begin`` rather than the first step.
+        memory: Whether tensor memory events are collected.
+        rank_ids: Explicit ranks that collect a profile. ``None`` or an empty list selects all ranks.
+        pipeline_stage_leaders: Whether the first rank of every pipeline stage also collects a profile.
+        output_path: Output root. Each rank writes under ``profile/rank_<rank>``.
+        level: Ascend collection level, from 0 through 2. ``None`` selects level 0.
+        with_stack: Whether Python stack traces are collected.
+        data_simplification: Whether torch-npu removes selected auxiliary CANN data after export.
+        mstx: Whether torch-npu records explicit step ranges.
+    """
 
     enabled: bool = False
-    start_step: int = 3
-    end_step: int = 4
-    trace_dir: str = "./outputs/profiling"
-    record_shapes: bool = False
-    profile_memory: bool = False
+    start_step: int = 1
+    stop_step: int = 10
+    start_on_init: bool = False
+    memory: bool = True
+    rank_ids: Optional[list[int]] = None
+    pipeline_stage_leaders: bool = False
+    output_path: Optional[str] = None
+    level: Optional[int] = 1
     with_stack: bool = False
-    with_modules: bool = False
-    rank: int = 0
+    data_simplification: bool = False
+    mstx: bool = False

@@ -95,7 +95,7 @@ from hyper_parallel.trainer.callbacks import (
     EvaluateCallback,
     GarbageCollectionCallback,
     LoggingCallback,
-    ProfilingCallback,
+    ProfilerCallback,
     TqdmCallback,
     CheckpointerCallback,
     TrainerState,
@@ -494,14 +494,14 @@ class BaseTrainer(Stateful, ABC):
         self.logging_callback = LoggingCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.garbage_collection_callback = GarbageCollectionCallback(self)
-        self.profiling_callback = ProfilingCallback(self)
+        self.profiler_callback = ProfilerCallback(self)
         self._callbacks = [
             self.environ_meter_callback,
             self.logging_callback,
             self.tqdm_callback,
             self.evaluate_callback,
             self.garbage_collection_callback,
-            self.profiling_callback,
+            self.profiler_callback,
         ]
         # Registered to save, to restore, or both --- the two are independent, so
         # a run that only loads an existing checkpoint still needs the callback.
