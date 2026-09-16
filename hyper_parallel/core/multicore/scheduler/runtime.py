@@ -20,8 +20,10 @@ from functools import lru_cache
 
 from hyper_parallel.core.multicore.scheduler.config import (
     ATOMIC_ADD_VALUE_LEN,
-    MAX_GROUP_LIST,
+    GROUP_LIST_CACHE_LINE_BYTES,
     MIN_EVENT_CAPACITY,
+    MIN_GROUP_LIST_CAPACITY,
+    NUM_WORKERS_CUBE,
     DynamicDataC,
     EventDescC,
     RuntimeConfigC,
@@ -31,7 +33,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
 RUNTIME_HEADER_BYTES = ctypes.sizeof(RuntimeConfigC)
 TASK_DESC_SIZE = ctypes.sizeof(TaskDescC)
 RUNTIME_FIXED_BYTES = (
-    RUNTIME_HEADER_BYTES + 16 + ctypes.sizeof(DynamicDataC) + MAX_GROUP_LIST * 8 + ATOMIC_ADD_VALUE_LEN * 4
+    RUNTIME_HEADER_BYTES + 16 + ctypes.sizeof(DynamicDataC) + ATOMIC_ADD_VALUE_LEN * 4
 )
 
 
@@ -41,26 +43,46 @@ def _check_capacity(value: int, name: str, minimum: int = 0) -> None:
         raise ValueError(f"{name} must be an integer >= {minimum} aligned to 16, got {value!r}.")
 
 
-def runtime_config_serialized_size(task_capacity: int, event_capacity: int = MIN_EVENT_CAPACITY) -> int:
+def grouped_matmul_group_list_capacity(local_experts: int) -> int:
+    """Return scratch int64 slots for isolated, cache-line-aligned worker lists.
+
+    Args:
+        local_experts: Entries per worker, or zero for a graph without groups.
+
+    Returns:
+        Total slots, including padding to align the first worker's list.
+    """
+    if not isinstance(local_experts, int) or isinstance(local_experts, bool) or not 0 <= local_experts < 1 << 32:
+        raise ValueError(f"local_experts must fit uint32, got {local_experts!r}.")
+    alignment = GROUP_LIST_CACHE_LINE_BYTES // 8
+    stride = (max(1, local_experts) + alignment - 1) // alignment * alignment
+    return max(MIN_GROUP_LIST_CAPACITY, NUM_WORKERS_CUBE * stride + alignment)
+
+
+def runtime_config_serialized_size(
+    task_capacity: int, event_capacity: int = MIN_EVENT_CAPACITY, local_experts: int = 0
+) -> int:
     """Return dense wire bytes for the single graph-sized runtime layout.
 
     Args:
         task_capacity: Number of task and per-kind queue slots, aligned to 16.
         event_capacity: Number of event slots, aligned to 16 and at least 1024.
+        local_experts: Number of group-list entries required per worker.
 
     Returns:
         Image size representable by the device's uint32 byte offsets.
     """
     _check_capacity(task_capacity, "task_capacity")
     _check_capacity(event_capacity, "event_capacity", MIN_EVENT_CAPACITY)
-    size = RUNTIME_FIXED_BYTES + event_capacity * 20 + task_capacity * (TASK_DESC_SIZE + 12)
+    scratch_bytes = grouped_matmul_group_list_capacity(local_experts) * 8
+    size = RUNTIME_FIXED_BYTES + event_capacity * 20 + task_capacity * (TASK_DESC_SIZE + 12) + scratch_bytes
     if size >= 1 << 32:
         raise ValueError("runtime descriptor exceeds uint32 device byte offsets")
     return size
 
 
 @lru_cache(maxsize=16)
-def _runtime_config_type(task_capacity: int, event_capacity: int) -> type:
+def _runtime_config_type(task_capacity: int, event_capacity: int, group_list_capacity: int) -> type:
     """Create one contiguous Host image sized for the graph's arrays."""
     return type("SizedRuntimeConfigC", (RuntimeConfigC,), {
         "_fields_": [
@@ -72,18 +94,21 @@ def _runtime_config_type(task_capacity: int, event_capacity: int) -> type:
             ("vector_task_indices", ctypes.c_int32 * task_capacity),
             ("mix_task_indices", ctypes.c_int32 * task_capacity),
             ("dynamic_data", DynamicDataC),
-            ("grouped_matmul_group_list", ctypes.c_int64 * MAX_GROUP_LIST),
+            ("grouped_matmul_group_list", ctypes.c_int64 * group_list_capacity),
             ("atomic_add_values", ctypes.c_int32 * ATOMIC_ADD_VALUE_LEN),
         ],
     })
 
 
-def allocate_runtime_config(task_capacity: int, event_capacity: int = MIN_EVENT_CAPACITY) -> RuntimeConfigC:
+def allocate_runtime_config(
+    task_capacity: int, event_capacity: int = MIN_EVENT_CAPACITY, local_experts: int = 0
+) -> RuntimeConfigC:
     """Allocate enough host task, queue and event slots before filling a graph.
 
     Args:
         task_capacity: Required task/queue slots, including termination.
         event_capacity: Event slots, including atomic-write padding.
+        local_experts: Group-list entries per worker, used to size scratch.
 
     Returns:
         A zero-initialized ctypes image with sufficient array bounds.
@@ -91,10 +116,11 @@ def allocate_runtime_config(task_capacity: int, event_capacity: int = MIN_EVENT_
     if not isinstance(task_capacity, int) or isinstance(task_capacity, bool) or task_capacity < 0:
         raise ValueError(f"task_capacity must be a nonnegative integer, got {task_capacity!r}.")
     capacity = (task_capacity + 15) // 16 * 16
-    runtime_config_serialized_size(capacity, event_capacity)
-    cfg = _runtime_config_type(capacity, event_capacity)()
+    runtime_config_serialized_size(capacity, event_capacity, local_experts)
+    cfg = _runtime_config_type(capacity, event_capacity, grouped_matmul_group_list_capacity(local_experts))()
     cfg.task_capacity = capacity
     cfg.event_capacity = event_capacity
+    cfg.dynamic_data.dynamic_group_size = local_experts
     return cfg
 
 
@@ -140,7 +166,11 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
     event_capacity = len(cfg.all_event_num_triggers)
     if len(cfg.all_events) != event_capacity:
         raise ValueError("runtime event and trigger arrays must have equal capacity")
-    expected = runtime_config_serialized_size(capacity, event_capacity)
+    local_experts = cfg.dynamic_data.dynamic_group_size
+    group_list_capacity = grouped_matmul_group_list_capacity(local_experts)
+    if len(cfg.grouped_matmul_group_list) < group_list_capacity:
+        raise ValueError("runtime group-list scratch is too small for dynamic_group_size")
+    expected = runtime_config_serialized_size(capacity, event_capacity, local_experts)
     layout = type(cfg)
     address = ctypes.addressof(cfg)
     prefix = struct.pack(
@@ -164,7 +194,9 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
         (layout.cube_task_indices.offset, capacity * 4),
         (layout.vector_task_indices.offset, capacity * 4),
         (layout.mix_task_indices.offset, capacity * 4),
-        (layout.dynamic_data.offset, ctypes.sizeof(cfg) - layout.dynamic_data.offset),
+        (layout.dynamic_data.offset, ctypes.sizeof(DynamicDataC)),
+        (layout.grouped_matmul_group_list.offset, group_list_capacity * 8),
+        (layout.atomic_add_values.offset, ATOMIC_ADD_VALUE_LEN * 4),
     ]
     data = prefix + b"".join(ctypes.string_at(address + offset, size) for offset, size in sections)
     if len(data) != expected:

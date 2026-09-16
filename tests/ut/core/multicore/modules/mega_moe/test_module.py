@@ -81,7 +81,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         for overrides, message in (
             ({"local_num_tokens": 129}, "divisible"),
             ({"expert_capacity_factor": 0.999}, "expert_capacity_factor"),
-            ({"num_experts": 34}, "device scratch capacity"),
+            ({"num_experts": 35}, "divisible"),
         ):
             with (
                 self.subTest(overrides=overrides),
@@ -98,6 +98,20 @@ class TestMegaMoeExperts(unittest.TestCase):
                 )
 
         mock_create_parameters.assert_not_called()
+
+    def test_constructor_accepts_more_than_sixteen_local_experts(self) -> None:
+        """Create all expert parameters without a fixed scratch-derived limit."""
+        for local_experts in (17, 33, 128):
+            with self.subTest(local_experts=local_experts):
+                experts = MegaMoeExperts(
+                    local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                    num_experts=2 * local_experts, top_k=2, ep_size=2,
+                )
+                try:
+                    self.assertEqual(tuple(experts.gate_up_weight.shape), (local_experts, 16, 16))
+                    self.assertEqual(tuple(experts.down_weight.shape), (local_experts, 8, 16))
+                finally:
+                    experts.close()
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")

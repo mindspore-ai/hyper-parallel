@@ -442,14 +442,15 @@ aic_profile_record_capacity、aiv_profile_record_capacity；再两个为 complet
 用于等待所有参与 worker 完成，随后跨 rank 确认 source 可安全复用。
 task capacity 覆盖计算 task、terminate、队列长度和所有引用的最大 task ID，并按 16 对齐，没有固定 task 数上限。
 event capacity 至少为 1024，并覆盖无融合图、ready/completion 事件和 atomic-write 尾部。布局大小为
-`4224 + 588 × task_capacity + 20 × event_capacity` 字节，必须能用 uint32 字节偏移寻址。
+`128 + 588 × task_capacity + 20 × event_capacity + group_list_bytes` 字节，必须能用 uint32 字节偏移寻址。
 在线 plan 与离线工具共用 `serialize_runtime_config()`；Device 检查协议版本以及存储与索引边界。
 普通事件区占 `event_capacity × 4` 字节；EP 大于 1 时，其后预留 `2 × (EP + 1) × 64` 字节持久 ready/completion 状态。
 每次调用只清零普通事件区，首次使用才初始化持久区并执行 Host barrier。
 
-grouped-matmul 的各 AIC scratch 在现有 group-list 预留区内按 128 字节对齐，每核步长为 128 字节。
-完整 cache line 写回不会覆盖相邻核的专家计数；对齐余量由现有预留区提供，不改变上述布局大小。
-每 rank 的专家数上限仍为 16。
+grouped-matmul 的各 AIC scratch 按 128 字节对齐，每核步长为 `ceil(local_experts × 8 / 128) × 128` 字节。
+`group_list_bytes = max(4096, 24 × 每核步长 + 128)`，包含首地址对齐余量，完整 cache line 写回不会覆盖相邻核。
+每 rank 不再有固定的 16 专家上限；Host 分配、序列化与 Device 偏移均使用实际专家数。
+16 个以内保持原布局大小，更多专家按需扩大 scratch，仍受 uint32 偏移与实际内存限制。
 
 ### 6.1 正向
 

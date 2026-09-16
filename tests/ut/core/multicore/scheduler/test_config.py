@@ -17,8 +17,6 @@
 import unittest
 
 from hyper_parallel.core.multicore.scheduler.config import (
-    MAX_EXPERT_NUM_PER_RANK,
-    MAX_GROUP_LIST,
     NUM_WORKERS_CUBE,
     TaskSplitValue,
     TaskType,
@@ -45,14 +43,17 @@ class TestTaskSplitValue(unittest.TestCase):
             top_k=8,
         )
 
-        self.assertEqual(values.single_rank_expert_num, MAX_EXPERT_NUM_PER_RANK)
-        self.assertLessEqual(
-            NUM_WORKERS_CUBE * values.single_rank_expert_num,
-            MAX_GROUP_LIST,
-        )
+        self.assertEqual(values.single_rank_expert_num, 16)
+
+    def test_accepts_experts_above_former_scratch_limit(self) -> None:
+        """Allow topology sizes whose scratch is allocated with the graph."""
+        for local_experts in (17, 32, 33, 64, 128, 256):
+            with self.subTest(local_experts=local_experts):
+                values = TaskSplitValue(ep=2, all_expert_num=2 * local_experts)
+                self.assertEqual(values.single_rank_expert_num, local_experts)
 
     def test_rejects_values_that_break_runtime_arithmetic(self) -> None:
-        """Reject zero divisors, uneven partitions, and oversized scratch use."""
+        """Reject zero divisors and uneven partitions."""
         cases = (
             ({"tp": 0}, "tp must be a positive integer"),
             ({"ep": 0}, "ep must be a positive integer"),
@@ -61,7 +62,6 @@ class TestTaskSplitValue(unittest.TestCase):
             ({"top_k": 0}, "top_k must be a positive integer"),
             ({"all_expert_num": 4, "top_k": 5}, "cannot exceed"),
             ({"ep": 3}, "must be divisible"),
-            ({"ep": 1, "all_expert_num": 17}, "device scratch capacity"),
         )
         defaults = {
             "tp": 4,

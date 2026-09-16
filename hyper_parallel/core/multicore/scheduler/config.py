@@ -32,8 +32,8 @@ MAX_OUTPUTS_PER_TASK = 4
 MIN_EVENT_CAPACITY  = 1024
 NUM_WORKERS_VECTOR   = 48
 NUM_WORKERS_CUBE     = 24
-MAX_GROUP_LIST       = 512
-MAX_EXPERT_NUM_PER_RANK = 16
+MIN_GROUP_LIST_CAPACITY = 512
+GROUP_LIST_CACHE_LINE_BYTES = 128
 ATOMIC_ADD_VALUE_LEN = 8
 READY_CACHE_LINE_BYTES = 64
 INVALID_PROFILE_DESC_ID  = 0xFFFFFFFF
@@ -271,11 +271,6 @@ class TaskSplitValue:
         if self.all_expert_num % self.ep:
             raise ValueError(
                 f"all_expert_num ({self.all_expert_num}) must be divisible by ep ({self.ep})."
-            )
-        if self.single_rank_expert_num > MAX_EXPERT_NUM_PER_RANK:
-            raise ValueError(
-                "single_rank_expert_num cannot exceed the device scratch capacity "
-                f"({MAX_EXPERT_NUM_PER_RANK}), got {self.single_rank_expert_num}."
             )
 
     # ── Derived properties ────────────────────────────────────────────────────

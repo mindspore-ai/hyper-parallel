@@ -49,11 +49,16 @@ class KernelWorkerBase {
     uint64_t runtime_bytes = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 6);
     uint64_t event_bytes = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 7);
     uint32_t ep_size = static_cast<uint32_t>(getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1));
-    if (!isRuntimeStorageValid(runtimeConfigPtr, runtime_bytes, event_bytes, ep_size)) {
+    uint64_t local_experts = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 2) / ep_size;
+    if (!isRuntimeStorageValid(runtimeConfigPtr, runtime_bytes, event_bytes, ep_size, local_experts)) {
       AscendC::Trap();
     }
     this->runtime_task_capacity = getRuntimeTaskCapacity(runtimeConfigPtr);
     this->runtime_event_capacity = getRuntimeEventCapacity(runtimeConfigPtr);
+#ifdef __DAV_C220_CUBE__
+    // The worker's scratch region is fixed for the lifetime of this task graph.
+    this->grouped_matmul_group_list_offset_ = getGroupedMatmulGroupListOffsetById(runtimeConfigPtr, worker_id);
+#endif
     all_event_counters.SetGlobalBuffer((__gm__ int32_t *)(input_list[Derived::EVENT_IDX]), runtime_event_capacity);
 
     all_event_num_triggers.SetGlobalBuffer((__gm__ int32_t *)(runtimeConfigPtr + getAllEventNumTriggersOffset()),
@@ -376,6 +381,7 @@ class KernelWorkerBase {
 
   bool pull_protocol_ = false;
   uint32_t worker_id_ = 0;
+  uint32_t grouped_matmul_group_list_offset_ = 0;
   uint32_t task_num = 0;
   uint32_t runtime_task_capacity = 0;
   uint32_t runtime_event_capacity = 0;

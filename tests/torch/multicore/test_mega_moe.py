@@ -285,13 +285,14 @@ def test_mega_moe_large_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     essential_mark="unessential",
 )
 def test_mega_moe_group_list_isolation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Feature: Isolated grouped-matmul scratch for up to 16 experts per rank.
+    """Feature: Graph-sized grouped-matmul scratch beyond 16 experts per rank.
 
-    Description: Repeat balanced, empty-expert, skew and single-destination routes with 10 to 16 local experts.
+    Description: Repeat balanced, empty-expert, skew and single-destination routes with 10 to 128 local experts.
     Expectation: Forward, all gradients and SGD updates match common MoE over eight steps per shape.
     """
     _run_acceptance_worker(
         monkeypatch, tmp_path, "test_mega_moe_group_list_isolation", 2, "_test_mega_moe_runtime.py",
+        heap_bytes=128 * 1024 * 1024,
     )
 
 

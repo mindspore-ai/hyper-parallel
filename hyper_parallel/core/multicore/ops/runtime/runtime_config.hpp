@@ -18,17 +18,11 @@ constexpr uint32_t MAX_OUTPUTS_PER_TASK = 4;
 constexpr uint32_t MIN_EVENT_CAPACITY = 1024;
 constexpr uint32_t NUM_WORKERS_VECTOR = 48;
 constexpr uint32_t NUM_WORKERS_CUBE = 24;
-constexpr uint32_t MAX_GROUP_LIST = 512;
-constexpr uint32_t MAX_EXPERT_NUM_PER_RANK = 16;
+constexpr uint32_t MIN_GROUP_LIST_CAPACITY = 512;
 constexpr uint32_t ATOMIC_ADD_VALUE_LEN = 8;
 constexpr uint32_t RUNTIME_PROTOCOL_VERSION = 1;
 
 constexpr uint32_t GROUP_LIST_CACHE_LINE_BYTES = 128;
-static_assert(MAX_EXPERT_NUM_PER_RANK * sizeof(int64_t) % GROUP_LIST_CACHE_LINE_BYTES == 0,
-              "Grouped-list worker stride must preserve cache-line alignment.");
-static_assert((GROUP_LIST_CACHE_LINE_BYTES - 1) + NUM_WORKERS_CUBE * MAX_EXPERT_NUM_PER_RANK * sizeof(int64_t) <=
-                MAX_GROUP_LIST * sizeof(int64_t),
-              "Grouped-list scratch slots exceed the runtime-config buffer.");
 
 constexpr uint32_t UB_32B_ALIGN = 32;
 constexpr uint32_t DATA_CACHE_LINE_SIZE = 64;
@@ -333,15 +327,31 @@ __aicore__ inline uint32_t getGroupedMatmulGroupListOffset(__gm__ uint8_t *tilin
   return getDynamicDataOffset(tiling) + 4 * UINT32_T_SIZE;
 }
 
+__aicore__ inline uint32_t getDynamicGroupSize(__gm__ uint8_t *tiling) {
+  return *reinterpret_cast<__gm__ uint32_t *>(tiling + getDynamicDataOffset(tiling) + 2 * UINT32_T_SIZE);
+}
+
+__aicore__ inline uint64_t getGroupedMatmulGroupListStride(__gm__ uint8_t *tiling) {
+  const uint64_t groups = getDynamicGroupSize(tiling);
+  const uint64_t bytes = (groups == 0 ? 1 : groups) * INT64_T_SIZE;
+  return (bytes + GROUP_LIST_CACHE_LINE_BYTES - 1) / GROUP_LIST_CACHE_LINE_BYTES * GROUP_LIST_CACHE_LINE_BYTES;
+}
+
+__aicore__ inline uint64_t getGroupedMatmulGroupListBytes(__gm__ uint8_t *tiling) {
+  const uint64_t bytes = NUM_WORKERS_CUBE * getGroupedMatmulGroupListStride(tiling) + GROUP_LIST_CACHE_LINE_BYTES;
+  const uint64_t minimum = MIN_GROUP_LIST_CAPACITY * INT64_T_SIZE;
+  return bytes > minimum ? bytes : minimum;
+}
+
 __aicore__ inline uint32_t getGroupedMatmulGroupListOffsetById(__gm__ uint8_t *tiling, uint32_t worker_id) {
   // Each worker must own complete cache lines when publishing its group list.
   const uint32_t aligned_offset = (getGroupedMatmulGroupListOffset(tiling) + GROUP_LIST_CACHE_LINE_BYTES - 1) /
                                   GROUP_LIST_CACHE_LINE_BYTES * GROUP_LIST_CACHE_LINE_BYTES;
-  return aligned_offset + MAX_EXPERT_NUM_PER_RANK * INT64_T_SIZE * worker_id;
+  return aligned_offset + static_cast<uint32_t>(getGroupedMatmulGroupListStride(tiling)) * worker_id;
 }
 
 __aicore__ inline uint32_t getAtomicAddValuesOffset(__gm__ uint8_t *tiling) {
-  return getGroupedMatmulGroupListOffset(tiling) + MAX_GROUP_LIST * INT64_T_SIZE;
+  return getGroupedMatmulGroupListOffset(tiling) + static_cast<uint32_t>(getGroupedMatmulGroupListBytes(tiling));
 }
 
 __aicore__ inline bool isCycleProfileEnabled(__gm__ uint8_t *tiling) {
@@ -358,6 +368,22 @@ __aicore__ inline uint32_t getAivProfileRecordCapacity(__gm__ uint8_t *tiling) {
 
 __aicore__ inline int64_t getExtraValueFromTiling(__gm__ uint8_t *tiling, uint32_t index) {
   return (*(__gm__ int64_t *)(tiling + index * INT64_T_SIZE));
+}
+
+// Call after validating the header, before accessing dynamic metadata or scratch.
+__aicore__ inline bool isRuntimeTailValid(__gm__ uint8_t *tiling, uint64_t runtime_bytes, uint64_t local_experts) {
+  uint64_t capacity = getRuntimeTaskCapacity(tiling);
+  uint64_t events = getRuntimeEventCapacity(tiling);
+  uint64_t prefix = sizeof(RuntimeHeader) + events * (INT32_T_SIZE + sizeof(EventDesc)) +
+                    capacity * (sizeof(TaskDesc) + 3 * INT32_T_SIZE) + 4 * INT32_T_SIZE + sizeof(DynamicData);
+  if (prefix >= (1ULL << 32) || runtime_bytes < prefix) {
+    return false;
+  }
+  if (local_experts != 0 && getDynamicGroupSize(tiling) != local_experts) {
+    return false;
+  }
+  uint64_t required = prefix + getGroupedMatmulGroupListBytes(tiling) + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
+  return required < (1ULL << 32) && runtime_bytes >= required;
 }
 
 __aicore__ inline bool isRuntimeHandshakeValid(__gm__ uint8_t *tiling, uint64_t events, uint64_t event_bytes,
@@ -377,7 +403,7 @@ __aicore__ inline bool isRuntimeHandshakeValid(__gm__ uint8_t *tiling, uint64_t 
 
 // Check byte and index bounds before reading variable-sized arrays.
 __aicore__ inline bool isRuntimeStorageValid(__gm__ uint8_t *tiling, uint64_t runtime_bytes, uint64_t event_bytes,
-                                             uint32_t ep_size = 1) {
+                                             uint32_t ep_size = 1, uint64_t local_experts = 0) {
   if (runtime_bytes < sizeof(RuntimeHeader) || runtime_bytes >= (1ULL << 32)) {
     return false;
   }
@@ -393,10 +419,7 @@ __aicore__ inline bool isRuntimeStorageValid(__gm__ uint8_t *tiling, uint64_t ru
   if (!isRuntimeHandshakeValid(tiling, events, event_bytes, ep_size)) {
     return false;
   }
-  uint64_t required = sizeof(RuntimeHeader) + events * (INT32_T_SIZE + sizeof(EventDesc)) +
-                      capacity * (sizeof(TaskDesc) + 3 * INT32_T_SIZE) + 4 * INT32_T_SIZE + sizeof(DynamicData) +
-                      MAX_GROUP_LIST * INT64_T_SIZE + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
-  if (required >= (1ULL << 32) || runtime_bytes < required) {
+  if (!isRuntimeTailValid(tiling, runtime_bytes, local_experts)) {
     return false;
   }
   __gm__ int32_t *counts = reinterpret_cast<__gm__ int32_t *>(tiling + getTaskIndexNumOffset(tiling));

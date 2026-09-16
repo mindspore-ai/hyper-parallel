@@ -36,7 +36,6 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
     build_forward_graph,
 )
 from hyper_parallel.core.multicore.scheduler.config import (
-    MAX_EXPERT_NUM_PER_RANK,
     NUM_WORKERS_CUBE,
     RuntimeConfigC,
     TaskDescC,
@@ -49,6 +48,7 @@ from hyper_parallel.core.multicore.scheduler.runtime import (
     RUNTIME_HEADER_BYTES,
     TASK_DESC_SIZE,
     allocate_runtime_config,
+    grouped_matmul_group_list_capacity,
     runtime_config_serialized_size,
     runtime_config_task_capacity,
     serialize_runtime_config,
@@ -190,6 +190,31 @@ class TestRuntimeSerialization(unittest.TestCase):
                 image = serialize_runtime_config(cfg)
                 self.assertEqual(struct.unpack_from("<I", image, 12)[0], 1104)
 
+    def test_graphs_allocate_expert_scratch_above_former_limit(self) -> None:
+        """Both production generators size scratch for their actual expert count."""
+        for experts in (17, 33, 128):
+            for graph_builder, config_builder in (
+                (build_forward_graph, build_forward_config), (build_backward_graph, build_backward_config),
+            ):
+                with self.subTest(experts=experts, graph=graph_builder.__name__):
+                    values = TaskSplitValue(tp=1, ep=2, seq_size=128, all_expert_num=2 * experts, top_k=2)
+                    graph = graph_builder(values, hidden_size=128, intermediate_size=128, num_cube_cores=20)
+                    graph.propagate_splits(values)
+                    cfg = config_builder(graph, values, 0, 20)
+                    self.assertEqual(len(cfg.grouped_matmul_group_list), grouped_matmul_group_list_capacity(experts))
+                    self.assertEqual(len(serialize_runtime_config(cfg)), runtime_config_serialized_size(
+                        runtime_config_task_capacity(cfg), cfg.event_capacity, experts))
+
+    def test_expert_scratch_bounds_are_checked_before_allocation_or_copy(self) -> None:
+        """Reject overflow and metadata whose lists exceed the host allocation."""
+        for experts in (-1, True, 1.5, 1 << 32, (1 << 32) - 1):
+            with self.subTest(experts=experts), self.assertRaises(ValueError):
+                allocate_runtime_config(16, local_experts=experts)
+        cfg = allocate_runtime_config(16)
+        cfg.dynamic_data.dynamic_group_size = 17
+        with self.assertRaisesRegex(ValueError, "group-list scratch"):
+            serialize_runtime_config(cfg)
+
 
 class TestRuntimeCppReader(unittest.TestCase):
     """Round-trip ctypes records through the exact production header."""
@@ -213,6 +238,8 @@ class TestRuntimeCppReader(unittest.TestCase):
         cls.reader.valid_runtime.restype = ctypes.c_bool
         cls.reader.valid_ready_runtime.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint32]
         cls.reader.valid_ready_runtime.restype = ctypes.c_bool
+        cls.reader.valid_expert_runtime.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
+        cls.reader.valid_expert_runtime.restype = ctypes.c_bool
         cls.reader.read_ready_event.argtypes = [ctypes.c_void_p]
         cls.reader.read_ready_event.restype = ctypes.c_uint32
         cls.reader.read_protocol_profile.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -263,16 +290,22 @@ class TestRuntimeCppReader(unittest.TestCase):
 
     def test_dense_runtime_round_trip(self) -> None:
         """Decode small, large and event-expanded graphs using one layout."""
-        for tasks, events in ((1, 1024), (17, 1024), (25601, 1024), (17, 2048)):
-            with self.subTest(tasks=tasks, events=events):
-                cfg = allocate_runtime_config(tasks, events)
-                cfg.task_num = tasks
-                self._round_trip(cfg)
+        for experts in (0, 16, 17, 32, 33, 128, 257):
+            for tasks, events in ((1, 1024), (17, 1024), (25601, 1024), (17, 2048)):
+                with self.subTest(experts=experts, tasks=tasks, events=events):
+                    cfg = allocate_runtime_config(tasks, events, experts)
+                    cfg.task_num = tasks
+                    self._round_trip(cfg)
 
     def test_group_lists_own_complete_cache_lines_within_existing_storage(self) -> None:
         """Prevent adjacent workers' full-line writebacks from corrupting expert counts."""
+        for experts in (1, 16, 17, 31, 32, 33, 64, 128, 257):
+            self._check_group_list_isolation(experts)
+
+    def _check_group_list_isolation(self, experts: int) -> None:
+        """Bound every worker's list at both cache-line widths and offset residues."""
         for tasks, events in ((1, 1024), (17, 1024), (25601, 1024), (17, 1040), (17, 2048)):
-            cfg = allocate_runtime_config(tasks, events)
+            cfg = allocate_runtime_config(tasks, events, experts)
             cfg.task_num = tasks
             image = serialize_runtime_config(cfg)
             buffer = ctypes.create_string_buffer(image)
@@ -281,18 +314,34 @@ class TestRuntimeCppReader(unittest.TestCase):
             scratch_begin = layout[7] + 16
             scratch_end = layout[9]
             for line_bytes in (64, 128):
-                with self.subTest(tasks=tasks, events=events, line_bytes=line_bytes):
+                with self.subTest(experts=experts, tasks=tasks, events=events, line_bytes=line_bytes):
                     owned_lines = set()
                     for worker in range(NUM_WORKERS_CUBE):
                         begin = self.reader.group_list_offset(buffer, worker)
-                        end = begin + MAX_EXPERT_NUM_PER_RANK * 8
+                        end = begin + experts * 8
                         self.assertEqual(begin % line_bytes, 0)
                         self.assertGreaterEqual(begin, scratch_begin)
                         self.assertLessEqual(end, scratch_end)
                         lines = set(range(begin // line_bytes, (end + line_bytes - 1) // line_bytes))
                         self.assertTrue(owned_lines.isdisjoint(lines))
                         owned_lines.update(lines)
-            self.assertEqual(len(image), runtime_config_serialized_size(cfg.task_capacity, events))
+            self.assertEqual(len(image), runtime_config_serialized_size(cfg.task_capacity, events, experts))
+
+    def test_rejects_invalid_expert_scratch_metadata(self) -> None:
+        """Guard truncated/overflowed scratch and a mismatched native expert count."""
+        cfg = allocate_runtime_config(17, local_experts=33)
+        cfg.task_num = 17
+        data = serialize_runtime_config(cfg)
+        buffer = ctypes.create_string_buffer(data)
+        self.assertTrue(self.reader.valid_expert_runtime(buffer, len(data), 4096, 33))
+        self.assertFalse(self.reader.valid_expert_runtime(buffer, len(data), 4096, 32))
+        group_offset = type(cfg).dynamic_data.offset + 8
+        for groups in (65, 0xFFFFFFFF):
+            invalid = bytearray(data)
+            struct.pack_into("<I", invalid, group_offset, groups)
+            self.assertFalse(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(invalid)), len(invalid), 4096))
+        for size in (type(cfg).dynamic_data.offset, group_offset, len(data) - 1):
+            self.assertFalse(self.reader.valid_runtime(buffer, size, 4096))
 
     def test_rejects_invalid_storage_bounds(self) -> None:
         """Reject insufficient storage and invalid capacities/queue counts."""

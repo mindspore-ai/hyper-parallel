@@ -45,6 +45,10 @@ extern "C" bool valid_ready_runtime(uint8_t *image, uint64_t bytes, uint64_t eve
   return isRuntimeStorageValid(image, bytes, event_bytes, ep_size);
 }
 
+extern "C" bool valid_expert_runtime(uint8_t *image, uint64_t bytes, uint64_t event_bytes, uint64_t local_experts) {
+  return isRuntimeStorageValid(image, bytes, event_bytes, 1, local_experts);
+}
+
 extern "C" uint32_t read_ready_event(uint8_t *image) {
   ReadyHandshakeMeta meta;
   getReadyHandshakeMeta(image, &meta);

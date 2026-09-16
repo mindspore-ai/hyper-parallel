@@ -72,11 +72,11 @@ def test_mega_moe_large_runtime() -> None:
 
 
 def test_mega_moe_group_list_isolation() -> None:
-    """Compare repeated routes at the local-expert cache-line boundary and limit."""
+    """Compare repeated routes across dynamic per-worker group-list boundaries."""
     start_shmem_lifetime()
     records = []
     patterns = ("balanced", "zero_token_experts", "skew", "single_destination") * 2
-    for local_experts in (10, 11, 12, 13, 16):
+    for local_experts in (10, 11, 12, 13, 16, 17, 31, 32, 33, 64, 128):
         shape = baseline.MoeShape(local_num_tokens=128 * local_experts, num_experts=2 * local_experts)
         hidden, upstream = baseline.make_data(shape)
         mega, common = baseline.new_layers(shape)
