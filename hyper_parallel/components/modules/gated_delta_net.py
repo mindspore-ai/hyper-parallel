@@ -16,6 +16,8 @@
 # pylint: disable=forbidden-backend-import,missing-public-type-hints
 # pylint: disable=missing-public-docstring,not-callable
 
+__all__ = ["chunk_gated_delta_rule", "is_triton_gdn_available", "torch_chunk_gated_delta_rule"]
+
 import importlib
 import importlib.metadata
 import importlib.util
@@ -138,11 +140,11 @@ def torch_chunk_gated_delta_rule(
 
 def _parse_version(version_text: str) -> tuple[int, int, int]:
     """Return a three-component numeric version tuple."""
-    parts = [
-        int(match.group())
-        for part in version_text.split("+")[0].split(".")[:3]
-        if (match := re.match(r"\d+", part)) is not None
-    ]
+    parts = []
+    for part in version_text.split("+")[0].split(".")[:3]:
+        match = re.match(r"\d+", part)
+        if match is not None:
+            parts.append(int(match.group()))
     return tuple((parts + [0, 0, 0])[:3])
 
 
@@ -154,7 +156,7 @@ def _is_triton_gdn_input_supported(
     beta: Optional[torch.Tensor],
 ) -> bool:
     """Check the fixed Qwen3.5 GDN contract validated by this backend."""
-    if key is None or value is None or g is None or beta is None:
+    if any(tensor is None for tensor in (key, value, g, beta)):
         return False
     if not (
         query.device.type == "npu"
@@ -259,7 +261,3 @@ def chunk_gated_delta_rule(
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         chunk_size=chunk_size,
     )
-
-
-
-__all__ = ["chunk_gated_delta_rule", "is_triton_gdn_available", "torch_chunk_gated_delta_rule"]

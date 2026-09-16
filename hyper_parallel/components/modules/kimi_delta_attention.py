@@ -23,6 +23,19 @@ context-parallel wrappers.
 # pylint: disable=forbidden-backend-import
 from __future__ import annotations
 
+__all__ = [
+    "KimiDeltaAttention",
+    "KimiRMSNormGated",
+    "chunk_kda",
+    "is_triton_kda_available",
+    "torch_apply_kda_state_summary",
+    "torch_chunk_kda",
+    "torch_compose_kda_state_summaries",
+    "torch_kda_gate",
+    "torch_kda_state_summary",
+    "torch_recurrent_kda",
+]
+
 from typing import Any, Optional
 
 import torch
@@ -33,6 +46,31 @@ from torch.nn import functional as F
 _KDA_BACKENDS = frozenset({"eager", "triton"})
 _TRITON_KDA_HEAD_DIM = 128
 _TRITON_KDA_CHUNK_SIZE = 64
+
+
+def _has_triton_kda_shapes(
+    query: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    chunk_size: int,
+) -> bool:
+    """Check the fixed dense shapes accepted by the Triton KDA path."""
+    batch_size, sequence_length, num_query_heads, key_dim = query.shape
+    num_value_heads, value_dim = value.shape[2:]
+    return all((
+        value.shape[:2] == (batch_size, sequence_length),
+        gate.shape == (batch_size, sequence_length, num_value_heads, key_dim),
+        beta.shape == (batch_size, sequence_length, num_value_heads),
+        num_value_heads % num_query_heads == 0,
+        a_log.numel() == num_value_heads,
+        dt_bias.numel() == num_value_heads * key_dim,
+        key_dim == value_dim == _TRITON_KDA_HEAD_DIM,
+        chunk_size == _TRITON_KDA_CHUNK_SIZE,
+        sequence_length % chunk_size == 0,
+    ))
 
 
 def _is_triton_kda_input_supported(
@@ -65,21 +103,11 @@ def _is_triton_kda_input_supported(
     if not all(basic_contract):
         return False
 
-    batch_size, sequence_length, num_query_heads, key_dim = query.shape
-    num_value_heads, value_dim = value.shape[2:]
-    shape_contract = (
-        value.shape[:2] == (batch_size, sequence_length),
-        gate.shape == (batch_size, sequence_length, num_value_heads, key_dim),
-        beta.shape == (batch_size, sequence_length, num_value_heads),
-        num_value_heads % num_query_heads == 0,
-        a_log.numel() == num_value_heads,
-        dt_bias.numel() == num_value_heads * key_dim,
-        key_dim == value_dim == _TRITON_KDA_HEAD_DIM,
-        chunk_size == _TRITON_KDA_CHUNK_SIZE,
-        sequence_length % chunk_size == 0,
-        -5.0 <= lower_bound < 0,
+    shape_supported = _has_triton_kda_shapes(
+        query, value, gate, beta, a_log, dt_bias, chunk_size
     )
-    if not all(shape_contract):
+    lower_bound_supported = -5.0 <= lower_bound < 0
+    if not (shape_supported and lower_bound_supported):
         return False
     return all(tensor.device == query.device for tensor in operands)
 
@@ -125,7 +153,7 @@ def _validate_kda_inputs(
     beta: torch.Tensor,
 ) -> tuple[int, int, int, int, int, int]:
     """Validate dense token-first KDA inputs and return their dimensions."""
-    if query.dim() != 4 or key.dim() != 4 or value.dim() != 4 or gate.dim() != 4:
+    if (query.dim(), key.dim(), value.dim(), gate.dim()) != (4, 4, 4, 4):
         raise ValueError("query, key, value, and gate must be rank-4 tensors.")
     if beta.dim() != 3:
         raise ValueError("beta must be a rank-3 tensor.")
@@ -920,17 +948,3 @@ class KimiDeltaAttention(nn.Module):
         )
         output = self.o_norm(output, output_gate)
         return self.o_proj(output.reshape(batch_size, sequence_length, self.value_dim))
-
-
-__all__ = [
-    "KimiDeltaAttention",
-    "KimiRMSNormGated",
-    "chunk_kda",
-    "is_triton_kda_available",
-    "torch_apply_kda_state_summary",
-    "torch_chunk_kda",
-    "torch_compose_kda_state_summaries",
-    "torch_kda_gate",
-    "torch_kda_state_summary",
-    "torch_recurrent_kda",
-]

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 # pylint: disable=line-too-long,missing-public-type-hints,missing-public-docstring
@@ -274,7 +273,8 @@ def chunk_gated_delta_rule_fwd_h(
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
     else:
         N, NT, chunk_offsets = len(cu_seqlens) - 1, len(chunk_indices), prepare_chunk_offsets(cu_seqlens, BT)
-    assert K <= 256, "current kernel does not support head dimension larger than 256."
+    if K > 256:
+        raise ValueError("current kernel does not support head dimension larger than 256.")
 
     h = k.new_empty(B, NT, H, K, V).permute(0, 2, 1, 3, 4).contiguous()
     final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
@@ -550,7 +550,8 @@ def chunk_gated_delta_rule_bwd_dhu(
     B, T, H, K, V = *q.shape, do.shape[-1]
     # N: the actual number of sequences in the batch with either equal or variable lengths
     BT = 64
-    assert K <= 256, "current kernel does not support head dimension being larger than 256."
+    if K > 256:
+        raise ValueError("current kernel does not support head dimension being larger than 256.")
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)

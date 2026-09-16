@@ -20,6 +20,8 @@
 # pylint: disable=abstract-method,arguments-differ
 from __future__ import annotations
 
+__all__ = ["GatedDeltaNetP2PCP", "GatedDeltaNetUlyssesCP"]
+
 from typing import NamedTuple, Optional
 
 import torch
@@ -449,6 +451,7 @@ class _RecvInitialStateP2PFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_state: Optional[torch.Tensor]):
+        """Return the incoming state gradient to the preceding CP rank."""
         if grad_state is None:
             raise RuntimeError("linear attention P2P backward missing initial-state grad.")
         dist.send(grad_state.contiguous(), dst=ctx.prev_rank, group=ctx.cp_group)
@@ -475,6 +478,7 @@ class _SendFinalStateP2PFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_token: torch.Tensor):
+        """Receive the final-state gradient from the succeeding CP rank."""
         grad_state = torch.empty(
             ctx.state_shape,
             device=grad_token.device,
@@ -1365,7 +1369,3 @@ class GatedDeltaNetP2PCP(nn.Module):
         if hasattr(base, "out_proj_input"):
             core_attn_out = base.out_proj_input(core_attn_out)
         return base.out_proj(core_attn_out)
-
-
-
-__all__ = ["GatedDeltaNetP2PCP", "GatedDeltaNetUlyssesCP"]

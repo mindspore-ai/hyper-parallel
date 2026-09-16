@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # Copyright (c) 2023-2025, By Triton_Ascend & sglang_ascend
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.

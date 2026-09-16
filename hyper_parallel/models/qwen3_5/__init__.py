@@ -14,9 +14,9 @@
 # ============================================================================
 """Qwen3.5 model-family integration."""
 
-from typing import Any
-
 __all__ = ["get_adapter_spec"]
+
+from typing import Any
 
 
 def get_adapter_spec() -> Any:

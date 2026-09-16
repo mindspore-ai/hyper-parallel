@@ -14,6 +14,13 @@
 # ============================================================================
 """Affine KDA state summary built from prepared WY intermediates."""
 
+__all__ = [
+    "apply_kda_state_gradient_summary",
+    "apply_kda_state_summary",
+    "kda_state_gradient_summary_from_prepared",
+    "kda_state_summary_forward_from_prepared",
+]
+
 from typing import Optional
 
 import torch
@@ -28,7 +35,7 @@ def _validate_prepared_summary_inputs(
     chunk_size: int,
 ) -> tuple[int, int, int, int, int]:
     """Validate the fixed Kimi K3 summary contract and return dimensions."""
-    if key.ndim != 4 or w.ndim != 4 or u.ndim != 4 or gate.ndim != 4:
+    if (key.ndim, w.ndim, u.ndim, gate.ndim) != (4, 4, 4, 4):
         raise ValueError("KDA prepared summary expects rank-4 key/w/u/gate tensors.")
     batch, sequence_length, heads, key_dim = key.shape
     value_dim = u.shape[-1]
@@ -340,11 +347,3 @@ def apply_kda_state_gradient_summary(
         torch.matmul(transition.transpose(-2, -1), grad_final_state.float())
         + grad_state_ext
     )
-
-
-__all__ = [
-    "apply_kda_state_gradient_summary",
-    "apply_kda_state_summary",
-    "kda_state_gradient_summary_from_prepared",
-    "kda_state_summary_forward_from_prepared",
-]

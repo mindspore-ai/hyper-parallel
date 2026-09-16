@@ -15,6 +15,11 @@
 """Planner-injected Context Parallel wrappers for Qwen3.5 Gated DeltaNet."""
 # pylint: disable=forbidden-backend-import
 
+__all__ = [
+    "qwen3_5_gdn_p2p_cp_wrapper",
+    "qwen3_5_gdn_ulysses_cp_wrapper",
+]
+
 from functools import wraps
 from typing import Any, Type
 
@@ -123,9 +128,3 @@ def qwen3_5_gdn_p2p_cp_wrapper(
         backend=backend,
         chunk_size=chunk_size,
     )
-
-
-__all__ = [
-    "qwen3_5_gdn_p2p_cp_wrapper",
-    "qwen3_5_gdn_ulysses_cp_wrapper",
-]

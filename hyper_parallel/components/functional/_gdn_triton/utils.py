@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 # pylint: disable=no-name-in-module,consider-using-from-import,pointless-string-statement
@@ -130,11 +129,13 @@ def assert_close(prefix, ref, tri, ratio, warning=False, err_atol=1e-6):
     error_rate = get_err_ratio(ref, tri)
     if abs_atol <= err_atol:
         return
-    if warning or (FLA_CI_ENV and (error_rate < 0.01 or abs_atol <= 0.3)):
+    allow_warning = warning or (FLA_CI_ENV and (error_rate < 0.01 or abs_atol <= 0.3))
+    if allow_warning:
         if error_rate > ratio:
             warnings.warn(msg)
     else:
-        assert error_rate < ratio, msg
+        if not error_rate < ratio:
+            raise AssertionError(msg)
 
 
 if hasattr(triton.language, '_experimental_make_tensor_descriptor'):
@@ -213,7 +214,8 @@ if check_pytorch_version('2.4'):
     def custom_device_ctx(index: int):
         return device_torch_lib.device(index)
 else:
-    assert device == 'cuda', 'Only cuda device is supported for PyTorch version < 2.4.0.'
+    if device != 'cuda':
+        raise AssertionError('Only cuda device is supported for PyTorch version < 2.4.0.')
     autocast_custom_fwd = device_torch_lib.amp.custom_fwd
     autocast_custom_bwd = device_torch_lib.amp.custom_bwd
 

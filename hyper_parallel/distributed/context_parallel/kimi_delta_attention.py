@@ -16,6 +16,13 @@
 # pylint: disable=forbidden-backend-import
 from __future__ import annotations
 
+__all__ = [
+    "KimiDeltaAttentionLayerP2PCP",
+    "KimiDeltaAttentionLayerUlyssesCP",
+    "KimiDeltaAttentionP2PCP",
+    "KimiDeltaAttentionUlyssesCP",
+]
+
 from typing import Any, Optional
 
 import torch
@@ -202,6 +209,32 @@ def _all_to_all_previous_rank_halo(
     return exchange_output.permute(1, 0, 2).contiguous()
 
 
+def _run_causal_short_conv(
+    tensor: torch.Tensor,
+    convolution: nn.Conv1d,
+    halo: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Apply one local ShortConv, optionally with a preceding-rank halo."""
+    if halo is None:
+        conv_input = tensor.transpose(1, 2)
+        padding = convolution.padding
+    else:
+        conv_input = torch.cat((halo, tensor), dim=1).transpose(1, 2)
+        padding = 0
+    output = F.conv1d(  # pylint: disable=not-callable
+        input=conv_input,
+        weight=convolution.weight,
+        bias=convolution.bias,
+        stride=convolution.stride,
+        padding=padding,
+        dilation=convolution.dilation,
+        groups=convolution.groups,
+    )
+    if halo is None:
+        output = output[:, :, : tensor.shape[1]]
+    return F.silu(output).transpose(1, 2)
+
+
 def _causal_short_convs_with_cp_halo(
     projected: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     convolutions: tuple[nn.Conv1d, nn.Conv1d, nn.Conv1d],
@@ -217,19 +250,10 @@ def _causal_short_convs_with_cp_halo(
         raise ValueError("KDA P2P requires Q/K/V ShortConv halo widths to match.")
     halo_width = halo_widths.pop()
     if halo_width == 0 or cp_size == 1:
-        outputs = []
-        for tensor, convolution in zip(projected, convolutions):
-            output = F.conv1d(  # pylint: disable=not-callable
-                input=tensor.transpose(1, 2),
-                weight=convolution.weight,
-                bias=convolution.bias,
-                stride=convolution.stride,
-                padding=convolution.padding,
-                dilation=convolution.dilation,
-                groups=convolution.groups,
-            )
-            outputs.append(F.silu(output[:, :, : tensor.shape[1]]).transpose(1, 2))
-        return tuple(outputs)
+        return tuple(
+            _run_causal_short_conv(tensor, convolution)
+            for tensor, convolution in zip(projected, convolutions)
+        )
     if projected[0].shape[1] < halo_width:
         raise ValueError(
             "KDA P2P ShortConv requires local_seq_len >= halo width, got "
@@ -248,20 +272,10 @@ def _causal_short_convs_with_cp_halo(
         cp_size,
     )
     halos = torch.split(packed_halo, channel_sizes, dim=-1)
-    outputs = []
-    for tensor, halo, convolution in zip(projected, halos, convolutions):
-        conv_input = torch.cat((halo, tensor), dim=1).transpose(1, 2)
-        output = F.conv1d(  # pylint: disable=not-callable
-            input=conv_input,
-            weight=convolution.weight,
-            bias=convolution.bias,
-            stride=convolution.stride,
-            padding=0,
-            dilation=convolution.dilation,
-            groups=convolution.groups,
-        )
-        outputs.append(F.silu(output).transpose(1, 2))
-    return tuple(outputs)
+    return tuple(
+        _run_causal_short_conv(tensor, convolution, halo)
+        for tensor, halo, convolution in zip(projected, halos, convolutions)
+    )
 
 
 def _slice_local_heads(
@@ -554,7 +568,7 @@ class KimiDeltaAttentionUlyssesCP(nn.Module):
         dt_bias: torch.Tensor,
     ) -> None:
         """Validate the projected-tensor boundary and Ulysses divisibility."""
-        if query.dim() != 4 or key.dim() != 4 or value.dim() != 4 or gate.dim() != 4:
+        if (query.dim(), key.dim(), value.dim(), gate.dim()) != (4, 4, 4, 4):
             raise ValueError("query, key, value, and gate must be rank-4 tensors.")
         if beta.dim() != 3:
             raise ValueError("beta must be a rank-3 tensor.")
@@ -1219,11 +1233,3 @@ class KimiDeltaAttentionLayerP2PCP(KimiDeltaAttentionP2PCP):
             a_log=a_log,
             dt_bias=dt_bias,
         )
-
-
-__all__ = [
-    "KimiDeltaAttentionLayerP2PCP",
-    "KimiDeltaAttentionLayerUlyssesCP",
-    "KimiDeltaAttentionP2PCP",
-    "KimiDeltaAttentionUlyssesCP",
-]

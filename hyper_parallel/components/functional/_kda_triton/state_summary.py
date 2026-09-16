@@ -19,6 +19,11 @@
 
 """Fixed-shape Triton-Ascend kernel for a packed KDA state summary."""
 
+__all__ = [
+    "kda_split_state_summary_kernel",
+    "kda_state_grad_ext_kernel",
+]
+
 import triton
 import triton.language as tl
 
@@ -352,9 +357,3 @@ def kda_state_grad_ext_kernel(
         state2.to(output2_ptr.dtype.element_ty),
         boundary_check=(0, 1),
     )
-
-
-__all__ = [
-    "kda_split_state_summary_kernel",
-    "kda_state_grad_ext_kernel",
-]

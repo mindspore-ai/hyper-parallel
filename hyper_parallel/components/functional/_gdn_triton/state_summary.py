@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-# -*- coding: utf-8 -*-
 #
 # The state-summary decomposition follows the MIT-licensed context-parallel
 # implementation in flash-linear-attention/fla/ops/cp/chunk_delta_h.py.
@@ -20,6 +19,8 @@
 # pylint: disable=missing-public-type-hints,invalid-name
 
 """Fixed-shape Triton-Ascend kernels for GDN state summaries."""
+
+__all__ = ["gdn_packed_state_summary_kernel", "gdn_state_grad_ext_kernel"]
 
 import triton
 import triton.language as tl
@@ -260,6 +261,3 @@ def gdn_state_grad_ext_kernel(
     )
     tl.store(p_out1, b_dh1, boundary_check=(0, 1))
     tl.store(p_out2, b_dh2, boundary_check=(0, 1))
-
-
-__all__ = ["gdn_packed_state_summary_kernel", "gdn_state_grad_ext_kernel"]

@@ -15,6 +15,13 @@
 """Lazy adapter for the external FLA Triton-Ascend KDA backend."""
 from __future__ import annotations
 
+__all__ = [
+    "FLAKDAStagedOps",
+    "get_fla_kda_staged_ops",
+    "is_fla_triton_kda_available",
+    "run_fla_chunk_kda",
+]
+
 import importlib
 import importlib.util
 import re
@@ -270,11 +277,3 @@ def run_fla_chunk_kda(
         lower_bound=lower_bound,
         chunk_size=chunk_size,
     )
-
-
-__all__ = [
-    "FLAKDAStagedOps",
-    "get_fla_kda_staged_ops",
-    "is_fla_triton_kda_available",
-    "run_fla_chunk_kda",
-]

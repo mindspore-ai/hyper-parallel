@@ -18,6 +18,7 @@ import torch
 
 from hyper_parallel.components.modules.kimi_delta_attention import (
     KimiDeltaAttention,
+    _has_triton_kda_shapes,
     chunk_kda,
     torch_apply_kda_state_summary,
     torch_chunk_kda,
@@ -26,6 +27,20 @@ from hyper_parallel.components.modules.kimi_delta_attention import (
     torch_kda_state_summary,
     torch_recurrent_kda,
 )
+
+
+def test_triton_kda_shape_contract_accepts_only_valid_dense_chunks():
+    """Check the shape-only part of the fused backend contract on CPU."""
+    query = torch.empty(1, 64, 2, 128)
+    value = torch.empty(1, 64, 4, 128)
+    gate = torch.empty(1, 64, 4, 128)
+    beta = torch.empty(1, 64, 4)
+    a_log = torch.empty(4)
+    dt_bias = torch.empty(4, 128)
+    operands = (query, value, gate, beta, a_log, dt_bias)
+    assert _has_triton_kda_shapes(*operands, 64)
+    assert not _has_triton_kda_shapes(query, value[:, :-1], gate, beta, a_log, dt_bias, 64)
+    assert not _has_triton_kda_shapes(*operands, 32)
 
 
 def test_kimi_delta_attention_layer_runs_eager_training_forward_backward():

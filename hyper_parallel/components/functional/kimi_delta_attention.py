@@ -15,6 +15,8 @@
 """Dense Triton-Ascend KDA execution boundaries for Torch training."""
 from __future__ import annotations
 
+__all__ = ["fused_chunk_kda", "fused_chunk_kda_p2p"]
+
 from typing import Any, Optional
 
 import torch
@@ -29,20 +31,15 @@ from .kimi_delta_attention_state_summary import (
 )
 
 
-def _validate_local_inputs(
+def _validate_local_shapes(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     gate: torch.Tensor,
     beta: torch.Tensor,
-    a_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    *,
-    chunk_size: int,
-    lower_bound: float,
-) -> None:
-    """Validate the fixed-shape local KDA backend before compiling kernels."""
-    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4 or gate.ndim != 4:
+) -> tuple[int, int, int, int]:
+    """Validate local KDA tensor shapes and return dimensions used by later checks."""
+    if (query.ndim, key.ndim, value.ndim, gate.ndim) != (4, 4, 4, 4):
         raise ValueError("Fused KDA expects rank-4 query/key/value/gate tensors.")
     if beta.ndim != 3:
         raise ValueError("Fused KDA expects a rank-3 beta tensor.")
@@ -58,6 +55,25 @@ def _validate_local_inputs(
         raise ValueError("Fused KDA beta has an incompatible shape.")
     if num_value_heads % num_query_heads:
         raise ValueError("Fused KDA value heads must be divisible by query heads.")
+    return sequence_length, key_dim, value_dim, num_value_heads
+
+
+def _validate_local_inputs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    chunk_size: int,
+    lower_bound: float,
+) -> None:
+    """Validate the fixed-shape local KDA backend before compiling kernels."""
+    sequence_length, key_dim, value_dim, num_value_heads = _validate_local_shapes(
+        query, key, value, gate, beta
+    )
     if not (
         query.dtype == key.dtype == value.dtype == gate.dtype == beta.dtype
         == torch.bfloat16
@@ -583,6 +599,3 @@ def fused_chunk_kda_p2p(
         cp_rank,
         cp_size,
     )
-
-
-__all__ = ["fused_chunk_kda", "fused_chunk_kda_p2p"]
