@@ -31,6 +31,7 @@ def build_strategy_patches(rules: tuple[InlineRule, ...], model_type: str | None
             if spec is None:
                 continue
             patch_set.imports.extend(spec.imports)
+            patch_set.module_snippets.extend(spec.snippets)
             if spec.target_class is None:
                 continue
             key = (spec.target_class, spec.method_name)

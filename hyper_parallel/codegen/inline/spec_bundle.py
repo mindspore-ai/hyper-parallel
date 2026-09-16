@@ -44,6 +44,8 @@ class StrategySpec:
     target_class: str | None = None
     method_name: str = "forward"
     body_template: str | None = None
+    snippets: tuple[ModuleSnippetPatch, ...] = ()
+    strip_boundary_subpatterns: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Require a complete method patch or an imports-only declaration."""

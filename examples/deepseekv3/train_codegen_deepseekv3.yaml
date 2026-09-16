@@ -14,10 +14,10 @@ accelerator:
 
 model:
   _target_: hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3-0324
+  pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
   trust_remote_code: true
   torch_dtype: bfloat16
-  attn_implementation: flash_attention_2
+  attn_implementation: eager
   local_files_only: true
   load_base_model: false
   force_hf: false
@@ -59,7 +59,7 @@ training:
   empty_cache_steps: 500
 
 fsdp_config:
-  dp_shard_size: 1
+  dp_shard_size: 8
   edp_shard_size: 1
   replicate_params: []
   reshard_after_forward: true
@@ -80,7 +80,7 @@ dataset:
     chat_template: null
     tokenizer:
       _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
-      pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3-0324
+      pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
       trust_remote_code: true
       local_files_only: true
       use_fast: true
@@ -91,27 +91,31 @@ dataset:
     text_keys: text
     max_seq_len: 8192
 
-  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
   data_path: null
   data_config:
-    dataset_type: iterable
-    hf_dataset_name: fineweb_100BT
-    hf_config_name: null
-    cache_dir: null
-    create_attention_mask_in_dataloader: false
+    seq_length: 128
+    split: "1, 0, 0"
+    mock_data: true
+    distributed_walk: true
+    is_dataset_from_mr: false
+    simple_blend: "no"
+    data_lazy_load: true
+    skip_data_check: true
     labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+    create_ltor_fields_in_dataloader: false
 
 dataloader:
-  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
-  min_buffered_samples: 200
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
   collate_fn:
-    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
   get_batch:
     _target_: hyper_parallel.data.batching.ParallelBatch
-    source_type: online
+    source_type: indexed
     attention_mode: dense
     cp_algorithm: ulysses
-  dataloader_type: cyclic
+  dataloader_type: single
   data_rearrange_map: null
   data_sharding: false
   drop_last: true

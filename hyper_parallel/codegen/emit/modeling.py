@@ -724,6 +724,7 @@ def emit_modeling_file(meta: Any) -> str:
     text = rewrite_relative_imports(text, module_name)
     inline_text = _try_inline_modeling(text, meta)
     if inline_text is not None:
+        inline_text = _lower_forward_boundaries(inline_text, meta, module_name)
         return _banner(meta) + inline_text
     text = _lower_forward_boundaries(text, meta, module_name)
     # The entry class's ``__init__`` tail gets the

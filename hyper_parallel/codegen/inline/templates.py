@@ -111,6 +111,13 @@ class GQAAttention(nn.Module):
 '''
 
 
+PARALLEL_STATE_ACCESSOR = '''
+def get_parallel_state():
+    """Return the externally installed codegen parallel state."""
+    return get_inline_parallel_state(__name__)
+'''
+
+
 TP_OPERATORS_CLASS = '''
 def get_parallel_state():
     """Return the externally installed codegen parallel state."""

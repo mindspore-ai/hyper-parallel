@@ -79,6 +79,8 @@ _STRATEGY_SPECS = {
                 ("MOE_ROUTER_ADAPTERS",),
             ),
         ),
+        snippets=(ModuleSnippetPatch(PARALLEL_STATE_ACCESSOR),),
+        strip_boundary_subpatterns=("experts.*", "shared_experts"),
     ),
 }
 
@@ -88,20 +90,11 @@ _INLINE_SPEC_BUNDLE = InlineSpecBundle(
     external_state_classes=("DeepseekV3MoE",),
 )
 
-_INLINE_SPEC_BUNDLE.strategy_specs[
-    "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn"
-].imports
-
 
 def get_inline_spec_bundle() -> InlineSpecBundle:
     """Return DeepSeek-V3 inline Codegen declarations."""
 
-    return InlineSpecBundle(
-        replacement_specs=_INLINE_SPEC_BUNDLE.replacement_specs,
-        strategy_specs=_INLINE_SPEC_BUNDLE.strategy_specs,
-        module_snippets=(ModuleSnippetPatch(PARALLEL_STATE_ACCESSOR),),
-        external_state_classes=_INLINE_SPEC_BUNDLE.external_state_classes,
-    )
+    return _INLINE_SPEC_BUNDLE
 
 
 __all__ = ["get_inline_spec_bundle"]
