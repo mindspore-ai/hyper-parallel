@@ -99,8 +99,9 @@ def _iter_wrappable_callable_attrs(module: nn.Module) -> Iterator[tuple[str, Cal
 
 
 def _mark_wrapped(obj: Any) -> None:
+    """Tag ``obj`` as already wrapped, ignoring objects that reject new attributes."""
     try:
-        obj._is_wrapped = True  # pylint: disable=W0212
+        setattr(obj, "_is_wrapped", True)
     except (AttributeError, TypeError):
         pass
 

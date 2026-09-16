@@ -26,6 +26,8 @@ import uuid
 import warnings
 import weakref
 from collections import defaultdict
+from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Callable, DefaultDict, Dict, Generator, Iterator, List, Optional, Tuple
 
 import torch
@@ -440,6 +442,91 @@ def _native_checkpoint(
         )
 
 
+@dataclass
+class _ExecutionState:
+    """Device, RNG, and autocast state captured before a checkpointed forward.
+
+    Bundles the values that both the forward pass and every later recomputation
+    must agree on, so the generator that owns the checkpoint lifetime can hand
+    them around as one object instead of a dozen loose locals.
+    """
+
+    device_type: str
+    device_module: Any
+    forward_context: Any
+    recompute_context: Any
+    device_autocast_kwargs: Optional[Dict[str, Any]]
+    cpu_autocast_kwargs: Dict[str, Any]
+    device_was_initialized: bool = False
+    device_ids: List[int] = field(default_factory=list)
+    device_states: List[Any] = field(default_factory=list)
+    cpu_state: Any = None
+
+    @classmethod
+    def capture(cls, context_fn: Callable, preserve_rng_state: bool, args: Tuple[Any, ...]) -> "_ExecutionState":
+        """Resolve contexts and capture RNG state before the forward pass runs."""
+        device_type = _infer_device_type(*args)
+        device_module = _get_device_module(device_type)
+        forward_context, recompute_context = _resolve_contexts(context_fn)
+        device_autocast_kwargs, cpu_autocast_kwargs = _get_autocast_kwargs(device_type)
+
+        # Device RNG is captured only when the device is already initialized;
+        # otherwise the device indexes its state lazily at first use.
+        device_initialized = preserve_rng_state and getattr(device_module, "_initialized", False)
+        device_ids, device_states = _get_device_states(device_type, *args) if device_initialized else ([], [])
+
+        return cls(
+            device_type=device_type,
+            device_module=device_module,
+            forward_context=forward_context,
+            recompute_context=recompute_context,
+            device_autocast_kwargs=device_autocast_kwargs,
+            cpu_autocast_kwargs=cpu_autocast_kwargs,
+            device_was_initialized=device_initialized,
+            device_ids=device_ids,
+            device_states=device_states,
+            cpu_state=torch.get_rng_state() if preserve_rng_state else None,
+        )
+
+    def check_device_state_preserved(self, preserve_rng_state: bool) -> None:
+        """Fail when the device was first initialized inside the checkpointed forward."""
+        device_initialized = getattr(self.device_module, "_initialized", False)
+        if preserve_rng_state and not self.device_was_initialized and device_initialized:
+            raise RuntimeError(
+                "The device state was initialized inside a Hyper checkpoint forward, so its initial RNG state "
+                "could not be preserved. Initialize the device before entering checkpoint."
+            )
+
+    def recompute_fn(self, function: Callable, *inputs: Any) -> None:
+        """Restore execution state and rerun the checkpointed ``function``."""
+        function_kwargs, *function_args = inputs
+        with torch.random.fork_rng(
+            devices=self.device_ids,
+            enabled=self.cpu_state is not None,
+            device_type=self.device_type,
+        ):
+            if self.cpu_state is not None:
+                torch.set_rng_state(self.cpu_state)
+                if self.device_was_initialized:
+                    _set_device_states(self.device_type, self.device_ids, self.device_states)
+
+            device_autocast_context = contextlib.nullcontext()
+            if self.device_autocast_kwargs is not None:
+                device_autocast_context = torch.amp.autocast(
+                    device_type=self.device_type, **self.device_autocast_kwargs
+                )
+            with device_autocast_context, torch.amp.autocast("cpu", **self.cpu_autocast_kwargs), self.recompute_context:
+                function(*function_args, **function_kwargs)
+
+
+def _resolve_contexts(context_fn: Callable) -> Tuple[Any, Any]:
+    """Validate and unpack the (forward, recompute) context tuple from ``context_fn``."""
+    contexts = context_fn()
+    if not isinstance(contexts, tuple) or len(contexts) != 2:
+        raise ValueError("context_fn must return a (forward_context, recompute_context) tuple.")
+    return contexts[0], contexts[1]
+
+
 def _checkpoint_without_reentrant_generator(
     function: Callable,
     preserve_rng_state: bool,
@@ -450,52 +537,10 @@ def _checkpoint_without_reentrant_generator(
     **kwargs: Any,
 ) -> Generator[None, None, None]:
     """Set up eager checkpoint state around the caller's forward execution."""
-    metadata_functions = {_DEFAULT_DETERMINISM_MODE: _default_metadata_fn, "none": lambda tensor: None}
-    if determinism_check not in metadata_functions:
-        raise ValueError(
-            f"determinism_check must be one of {list(metadata_functions)}, but got {determinism_check!r}."
-        )
-    metadata_fn = metadata_functions[determinism_check]
+    metadata_fn = _resolve_metadata_fn(determinism_check)
+    state = _ExecutionState.capture(context_fn, preserve_rng_state, args)
 
-    device_type = _infer_device_type(*args)
-    device_module = _get_device_module(device_type)
-    contexts = context_fn()
-    if not isinstance(contexts, tuple) or len(contexts) != 2:
-        raise ValueError("context_fn must return a (forward_context, recompute_context) tuple.")
-    forward_context, recompute_context = contexts
-    device_autocast_kwargs, cpu_autocast_kwargs = _get_autocast_kwargs(device_type)
-
-    had_device_in_forward = False
-    forward_devices: List[int] = []
-    forward_device_states: List[Any] = []
-    forward_cpu_state = None
-    if preserve_rng_state:
-        forward_cpu_state = torch.get_rng_state()
-        if getattr(device_module, "_initialized", False):
-            had_device_in_forward = True
-            forward_devices, forward_device_states = _get_device_states(device_type, *args)
-
-    def recompute_fn(*inputs: Any) -> None:
-        """Restore execution state and rerun the checkpointed function."""
-        function_kwargs, *function_args = inputs
-        rng_devices = forward_devices if preserve_rng_state and had_device_in_forward else []
-        with torch.random.fork_rng(
-            devices=rng_devices,
-            enabled=preserve_rng_state,
-            device_type=device_type,
-        ):
-            if preserve_rng_state:
-                torch.set_rng_state(forward_cpu_state)
-                if had_device_in_forward:
-                    _set_device_states(device_type, forward_devices, forward_device_states)
-
-            device_autocast_context = contextlib.nullcontext()
-            if device_autocast_kwargs is not None:
-                device_autocast_context = torch.amp.autocast(device_type=device_type, **device_autocast_kwargs)
-            with device_autocast_context, torch.amp.autocast("cpu", **cpu_autocast_kwargs), recompute_context:
-                function(*function_args, **function_kwargs)
-
-    frame = _CheckpointFrame(recompute_fn, early_stop, metadata_fn)
+    frame = _CheckpointFrame(partial(state.recompute_fn, function), early_stop, metadata_fn)
     dummy = torch.empty((0,), requires_grad=True)
     frame.input_saver = _NoopSaveInputs.apply(dummy, kwargs, *args)
 
@@ -503,27 +548,31 @@ def _checkpoint_without_reentrant_generator(
         yield
         return
 
-    activation = _RECOMPUTE_SESSION.get()
-    if activation is not None:
+    if _RECOMPUTE_SESSION.get() is not None:
         raise CheckpointError("Nested checkpoint is not supported during scheduled recomputation.")
 
     collector = _RECOMPUTE_COLLECTOR.get()
     if collector is not None:
         collector.append(frame)
     try:
-        with _create_checkpoint_hooks(frame), forward_context:
+        with _create_checkpoint_hooks(frame), state.forward_context:
             yield
         frame.forward_completed = True
-
-        if getattr(device_module, "_initialized", False) and preserve_rng_state and not had_device_in_forward:
-            raise RuntimeError(
-                "The device state was initialized inside a Hyper checkpoint forward, so its initial RNG state "
-                "could not be preserved. Initialize the device before entering checkpoint."
-            )
+        state.check_device_state_preserved(preserve_rng_state)
     except BaseException:
         if collector is not None and frame in collector:
             collector.remove(frame)
         raise
+
+
+def _resolve_metadata_fn(determinism_check: str) -> Callable:
+    """Return the metadata extractor implementing ``determinism_check``."""
+    metadata_functions = {_DEFAULT_DETERMINISM_MODE: _default_metadata_fn, "none": lambda tensor: None}
+    if determinism_check not in metadata_functions:
+        raise ValueError(
+            f"determinism_check must be one of {list(metadata_functions)}, but got {determinism_check!r}."
+        )
+    return metadata_functions[determinism_check]
 
 
 def checkpoint(

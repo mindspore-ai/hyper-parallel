@@ -13,14 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Activation checkpointing related interfaces"""
-import contextlib
-from functools import partial
-from typing import Any, Callable, Optional, Tuple
-
-import torch
-
-from .policy import CheckpointPolicy
-from .recompute_state import create_recompute_contexts
 
 __all__ = [
     "CheckpointPolicy",
@@ -42,6 +34,15 @@ __all__ = [
     "noop_context_fn",
     "is_compiling",
 ]
+
+import contextlib
+from functools import partial
+from typing import Any, Callable, Optional, Tuple
+
+import torch
+
+from .policy import CheckpointPolicy
+from .recompute_state import create_recompute_contexts
 
 
 class _StackedCtx:

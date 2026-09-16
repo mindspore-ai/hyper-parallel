@@ -14,6 +14,12 @@
 # ============================================================================
 """Attention activation swap support for Hugging Face models."""
 
+__all__ = [
+    "apply_attention_swap",
+    "attention_swap_policy",
+    "validate_attention_swap",
+]
+
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -169,10 +175,3 @@ def apply_attention_swap(model: nn.Module, activation_swap: str) -> nn.Module:
         type(model).__name__,
     )
     return model
-
-
-__all__ = [
-    "apply_attention_swap",
-    "attention_swap_policy",
-    "validate_attention_swap",
-]
