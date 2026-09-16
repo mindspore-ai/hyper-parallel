@@ -55,6 +55,31 @@ class DebugConfig:
 
 
 @dataclass
+class MemoryConfig:
+    """Configure allocator memory-history snapshots during training.
+
+    Args:
+        enable: Whether allocator history recording is enabled.
+        start_step: Session-relative step at which recording starts.
+        end_step: Session-relative step at which the snapshot is dumped.
+        save_path: Directory used for snapshot files.
+        dump_ranks: Global ranks that write snapshot files.
+        stacks: Stack information recorded by the allocator.
+        max_entries: Maximum allocator history entries, or ``None`` for no limit.
+        mem_info: Whether peak allocator statistics are logged before each step.
+    """
+
+    enable: bool = False
+    start_step: int = 1
+    end_step: int = 2
+    save_path: str = "./memory_snapshot"
+    dump_ranks: list[int] = field(default_factory=lambda: [0])
+    stacks: Literal["python", "all"] = "all"
+    max_entries: Optional[int] = None
+    mem_info: bool = False
+
+
+@dataclass
 class WandbConfig:
     """WandB remote-logging parameters (03 §4.2.5: read by build_callback_manager)."""
 

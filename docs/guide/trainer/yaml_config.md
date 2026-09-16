@@ -117,6 +117,9 @@ self.model = HyperAutoModelForCausalLM.from_pretrained(
 
 基于 `_target_` 接入外部模型和训练组件的方法见 [AutoModels 二次开发指南](custom_component.md)。
 
+Allocator memory history 使用根节点 `memory` 配置。字段、step 边界和异常清理语义见
+[Memory snapshot 配置](memory_profiler.md)。
+
 ## 3. CLI Dotted Override
 
 CLI override 在 YAML 已经解析为 `TrainerConfig` 后执行，使用 `--field.path=value` 定位并替换配置树中的值：

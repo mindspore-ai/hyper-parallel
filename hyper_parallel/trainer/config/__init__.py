@@ -48,6 +48,7 @@ from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.config.trainer import TrainerConfig, save_configs
 from hyper_parallel.trainer.config.training import (
     DebugConfig,
+    MemoryConfig,
     ProfilingConfig,
     TrainingConfig,
     WandbConfig,
@@ -61,6 +62,7 @@ __all__ = [
     "DatasetConfig",
     "DebugConfig",
     "FSDP2Config",
+    "MemoryConfig",
     "MixedPrecisionConfig",
     "OptimizerConfig",
     "ProfilingConfig",

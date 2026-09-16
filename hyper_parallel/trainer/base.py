@@ -83,6 +83,7 @@ from hyper_parallel.trainer.runtime import fsdp as fsdp_runtime
 from hyper_parallel.trainer.runtime.data_iterator import HyperIter
 from hyper_parallel.trainer.runtime.logging import enable_third_party_logging
 from hyper_parallel.trainer.runtime.memory import empty_cache, print_device_mem_info
+from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
 from hyper_parallel.trainer.runtime.random import enable_high_precision_for_bf16, set_seed
 from hyper_parallel.trainer.runtime.device import (  # pylint: disable=syntax-error
     get_device_type,
@@ -204,35 +205,45 @@ class BaseTrainer(Stateful, ABC):
         # ``_build_distributed_setup`` remains a reserved backend hook; the
         # trainer only defines its contract here.
         self._setup()
+        try:
+            memory_profiler.reset(
+                self.config.memory,
+                global_rank=self.global_rank,
+                tp_rank=self.mesh.tp_rank,
+                dp_rank=self.mesh.dp_rank,
+            )
 
-        # Reserved atomic model-build interface.
-        #
-        # Owner:
-        #   - ``../_transformers/auto_model.py::HyperAutoModel*.from_pretrained``
-        #   - ``../_transformers/model_builder.py`` for materialization,
-        #     checkpoint loading, PEFT/quantization, and parallelize.
-        #
-        # Contract:
-        #   - consume the ``DistributedSetup`` created above;
-        #   - set ``model`` and the resolved checkpoint ``model_config``;
-        #   - return a materialized, weight-loaded, already-parallelized model;
-        #   - never call a second trainer-side ``build_parallelize_model``.
-        self._build_model()
-        self._build_loss()
+            # Reserved atomic model-build interface.
+            #
+            # Owner:
+            #   - ``../_transformers/auto_model.py::HyperAutoModel*.from_pretrained``
+            #   - ``../_transformers/model_builder.py`` for materialization,
+            #     checkpoint loading, PEFT/quantization, and parallelize.
+            #
+            # Contract:
+            #   - consume the ``DistributedSetup`` created above;
+            #   - set ``model`` and the resolved checkpoint ``model_config``;
+            #   - return a materialized, weight-loaded, already-parallelized model;
+            #   - never call a second trainer-side ``build_parallelize_model``.
+            self._build_model()
+            self._build_loss()
 
-        # Build trainer-owned data components after the model finalizes parameters and sharding.
-        self._build_model_assets()
-        self._build_data_transform()
-        self._build_dataset()
-        self._build_data_batch_adapter()
-        self._build_collate_fn()
-        self._build_dataloader()
-        self._compute_train_iters()
+            # Build trainer-owned data components after the model finalizes parameters and sharding.
+            self._build_model_assets()
+            self._build_data_transform()
+            self._build_dataset()
+            self._build_data_batch_adapter()
+            self._build_collate_fn()
+            self._build_dataloader()
+            self._compute_train_iters()
 
-        self._build_optimizer()
-        self._build_lr_scheduler()
-        self._build_training_context()
-        self._init_callbacks()
+            self._build_optimizer()
+            self._build_lr_scheduler()
+            self._build_training_context()
+            self._init_callbacks()
+        except BaseException:
+            memory_profiler.abort()
+            raise
 
     def _setup(self):
         """Initialize logging, distributed state, and the local device."""
@@ -678,7 +689,12 @@ class BaseTrainer(Stateful, ABC):
             self,
             data_iterator: Any,
     ) -> Dict[str, float]:
-        """Execute one optimizer update from the next dataloader batch."""
+        """Execute one optimizer update from the next dataloader batch.
+
+        Args:
+            data_iterator: Iterator providing the next group of micro-batches.
+        """
+        memory_profiler.step()
         config = self.config
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
@@ -751,47 +767,52 @@ class BaseTrainer(Stateful, ABC):
     def train(self) -> None:
         """Run the configured training loop."""
         config: TrainerConfig = self.config
-        self.on_train_begin()
-        self.data_iterator = HyperIter(
-            self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
-        )
-        logger.info(
-            "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
-            self.local_rank, self.state.global_step, self.train_iters, self.state.epoch, self.train_epochs,
-        )
+        try:
+            self.on_train_begin()
+            self.data_iterator = HyperIter(
+                self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
+            )
+            logger.info(
+                "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
+                self.local_rank, self.state.global_step, self.train_iters, self.state.epoch, self.train_epochs,
+            )
 
-        start_epoch = self.state.epoch
-        for epoch in range(start_epoch, self.train_epochs):
-            if epoch != start_epoch:
-                self.train_dataloader.set_epoch(epoch)
-                self.data_iterator = HyperIter(
-                    self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
-                )
-            self.state.epoch = epoch
-
-            self.on_epoch_begin()
-
-            start_step = self.state.global_step - epoch * self.train_steps
-            train_steps = min(self.train_steps, self.train_iters - epoch * self.train_steps)
-            for _ in range(start_step, train_steps):
-                try:
-                    self.train_step(self.data_iterator)
-                except StopIteration:
-                    logger.info(
-                        "epoch:%s Dataloader finished with drop_last %s",
-                        epoch,
-                        config.dataloader.drop_last,
+            start_epoch = self.state.epoch
+            for epoch in range(start_epoch, self.train_epochs):
+                if epoch != start_epoch:
+                    self.train_dataloader.set_epoch(epoch)
+                    self.data_iterator = HyperIter(
+                        self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
                     )
-                    break
+                self.state.epoch = epoch
 
-            self.on_epoch_end()
-            self.state.epoch = epoch + 1
+                self.on_epoch_begin()
 
-            print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+                start_step = self.state.global_step - epoch * self.train_steps
+                train_steps = min(self.train_steps, self.train_iters - epoch * self.train_steps)
+                for _ in range(start_step, train_steps):
+                    try:
+                        self.train_step(self.data_iterator)
+                    except StopIteration:
+                        logger.info(
+                            "epoch:%s Dataloader finished with drop_last %s",
+                            epoch,
+                            config.dataloader.drop_last,
+                        )
+                        break
 
-            if config.dataloader.use_background_prefetcher:
-                self.data_iterator.stop()
+                self.on_epoch_end()
+                self.state.epoch = epoch + 1
 
+                print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+
+                if config.dataloader.use_background_prefetcher:
+                    self.data_iterator.stop()
+        except BaseException:
+            memory_profiler.abort()
+            raise
+
+        memory_profiler.stop()
         self.on_train_end()
 
         if config.dataloader.use_background_prefetcher:

@@ -37,6 +37,7 @@ from hyper_parallel.trainer.config.parallelism import (
 from hyper_parallel.trainer.config.target import Target, _serialize_config_value
 from hyper_parallel.trainer.config.training import (
     DebugConfig,
+    MemoryConfig,
     ProfilingConfig,
     TrainingConfig,
     WandbConfig,
@@ -77,6 +78,7 @@ class TrainerConfig:
 
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profiler: ProfilingConfig = field(default_factory=ProfilingConfig)
     magi: Optional[Any] = None

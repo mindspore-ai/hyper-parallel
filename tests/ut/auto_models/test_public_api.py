@@ -213,7 +213,12 @@ class TestTrainerConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_trainer_config_module_all(self):
-        """trainer.config ``__all__`` stays unchanged."""
+        """Verify the trainer configuration package exports supported sections.
+
+        Feature: Trainer configuration public API.
+        Description: Inspect the ordered names declared by the package.
+        Expectation: MemoryConfig appears alongside the existing configuration classes.
+        """
         from hyper_parallel.trainer import config as trainer_config
 
         self.assertEqual(
@@ -226,6 +231,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 "DatasetConfig",
                 "DebugConfig",
                 "FSDP2Config",
+                "MemoryConfig",
                 "MixedPrecisionConfig",
                 "OptimizerConfig",
                 "ProfilingConfig",
