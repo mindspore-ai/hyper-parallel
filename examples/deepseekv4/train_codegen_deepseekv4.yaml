@@ -1,0 +1,161 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+# Licensed under the Apache License, Version 2.0
+# ============================================================================
+# DeepSeek-V4-Flash-Base Codegen demo converted from the VeOmni
+# configs/text/deepseek_v4.yaml example.
+#
+# Parallel shape follows the DeepSeek-V4 CP Tulu3 recipe style:
+#   dp(4) * tp(1) * pp(4) * cp(8) = 128 ranks
+#   ep_size(32) shards experts within the dp * cp group.
+
+accelerator:
+  tp_size: 1
+  cp_size: 8
+  ep_size: 32
+  pp_size: 4
+  sequence_parallel: false
+  loss_parallel: true
+
+model:
+  _target_: hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: DeepSeek-V4-Flash-Base
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: eager
+  local_files_only: true
+  load_base_model: false
+  force_hf: false
+
+# VeOmni source mapping:
+#   ulysses_size -> cp_size
+#   ep_size -> ep_size
+#   fsdp2 -> fsdp_config
+#   gradient_checkpointing.enable -> activation_checkpoint.mode
+#   model.ops_implementation.* -> current hyperparallel modules or model remote code
+# Current repository has DeepSeek-V2/V3 MLA sharding rules and a DeepSeek-V3
+# style EP recipe. DeepSeek-V4-specific inline expanders are not declared here
+# until the corresponding Codegen source-level rules are implemented.
+plan_overrides:
+  - match: "*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
+  - match: "*.self_attn"
+    when: cp
+    region_dispatch: false
+    inner_target: self
+    inner_wrapper: sdpa_hf
+
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  no_decay_params: [bias, norm, ln_]
+  muon_config:
+    muon_lr: 3.0e-4
+    muon_weight_decay: 0.01
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: gram_quack
+  adamw_config:
+    adamw_lr: 3.0e-4
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+training:
+  train_iters: 100
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 256
+  micro_batch_size: 4
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: false
+  empty_cache_steps: 500
+
+fsdp_config:
+  dp_shard_size: 4
+  edp_shard_size: 32
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+mixed_precision:
+  enabled: true
+
+activation_checkpoint:
+  mode: full
+
+dataset:
+  model_assets:
+    chat_template: chatml
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: DeepSeek-V4-Flash-Base
+      trust_remote_code: true
+      local_files_only: true
+      use_fast: true
+
+  data_transform:
+    _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
+    data_type: conversation
+    text_keys: messages
+    max_seq_len: 2048
+
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
+  data_path: null
+  data_config:
+    dataset_type: mapping
+    hf_dataset_name: tulu-3-sft-mixture
+    hf_config_name: null
+    cache_dir: null
+    create_attention_mask_in_dataloader: true
+    labels_are_shifted: true
+
+dataloader:
+  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
+  min_buffered_samples: 200
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.ParallelBatch
+    source_type: online
+    attention_mode: dense
+    cp_algorithm: ulysses
+  dataloader_type: cyclic
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 3.0e-4
+    lr_warmup_steps: 7
+    min_lr: 3.0e-4
+
+checkpoint:
+  save_ckpt: true
+  checkpoint_dir: deepseek_v4_flash_base_tulu_sft
+  restore_from: null
+  save_steps: 100
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
+
+codegen: true
+modeling_backend: gen

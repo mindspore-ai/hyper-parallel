@@ -23,6 +23,7 @@ and whether it passes preflight before training starts.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import asdict
 import logging
 import os
 from typing import Any, Optional
@@ -37,6 +38,7 @@ from hyper_parallel.codegen.artifact import (
 )
 from hyper_parallel.codegen.emit import emit_bundle
 from hyper_parallel.codegen.hash import canonical_json, signature_from_spec
+from hyper_parallel.codegen.inline.specs import get_inline_spec_bundle
 from hyper_parallel.codegen.meta import (
     CodegenMeta,
     load_codegen_meta,
@@ -449,6 +451,12 @@ def _project_spec(
         "version": CODEGEN_VERSION,
         "sha256": _codegen_implementation_digest(),
     }
+    if os.environ.get("HYPER_CODEGEN_INLINE_PATCH") == "1":
+        identity = payload.get("source", {}).get("architecture")
+        bundle = get_inline_spec_bundle(identity) if identity else None
+        # Adapter declarations live outside the codegen implementation tree;
+        # their templates and mappings must also invalidate cached artifacts.
+        payload["inline_codegen"] = {"enabled": True, "specs": asdict(bundle) if bundle is not None else None}
 
     return payload
 

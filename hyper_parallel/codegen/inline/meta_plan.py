@@ -1,5 +1,16 @@
 # Copyright 2026 Huawei Technologies Co., Ltd
-# Licensed under the Apache License, Version 2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
 """Normalize frozen meta so it matches the inline-generated source shape."""
 
@@ -9,48 +20,30 @@ from copy import deepcopy
 from typing import Any
 
 from hyper_parallel.codegen.inline.ir import InlineRule
+from hyper_parallel.codegen.inline.specs import get_inline_spec_bundle
 
 
-QWEN3_MOE_FLASH_ATTENTION_REPLACEMENT = (
-    "hyper_parallel.models.qwen3_moe.adapter.replacements."
-    "replace_qwen3_moe_flash_attention"
-)
-
-QWEN3_MOE_FUSED_QKV_PARAM_RENAMES = {
-    "linear_qkv.weight": ("q_proj.weight", "k_proj.weight", "v_proj.weight"),
-    "linear_qkv.bias": ("q_proj.bias", "k_proj.bias", "v_proj.bias"),
-}
-
-
-def normalize_inline_meta(meta: Any, rules: tuple[InlineRule, ...]) -> None:
-    """Mutate ``meta`` to match the source form emitted by inline patches.
-
-    The generic frozen plan is derived after runtime module replacements, so
-    Qwen3 MoE attention records the adapter's fused ``linear_qkv`` parameter.
-    The inline product intentionally expands that adapter back into readable
-    HF-style ``q_proj`` / ``k_proj`` / ``v_proj`` modules.  The generated
-    ``codegen_meta.json`` must therefore use the same parameter names as the
-    generated ``modeling`` file, otherwise preflight correctly reports a stale
-    artifact before training starts.
-    """
-
-    _normalize_qwen3_moe_attention_plan(meta, rules)
-
-
-def _normalize_qwen3_moe_attention_plan(meta: Any, rules: tuple[InlineRule, ...]) -> None:
-    attention_fqns = _replacement_fqns(rules, QWEN3_MOE_FLASH_ATTENTION_REPLACEMENT)
-    if not attention_fqns:
-        return
-    _rewrite_param_plan(
-        getattr(meta, "param_plan", None) or {},
-        attention_fqns,
-        QWEN3_MOE_FUSED_QKV_PARAM_RENAMES,
-    )
-    meta.frozen_sharded_params = _rewrite_frozen_param_names(
-        getattr(meta, "frozen_sharded_params", None) or [],
-        attention_fqns,
-        QWEN3_MOE_FUSED_QKV_PARAM_RENAMES,
-    )
+def normalize_inline_meta(meta: Any, rules: tuple[InlineRule, ...], model_type: str | None = None) -> None:
+    """Align frozen parameter names with adapter-declared source replacements."""
+    seen_targets: set[str] = set()
+    for rule in rules:
+        target = rule.replace_target
+        if target is None or target in seen_targets:
+            continue
+        seen_targets.add(target)
+        bundle = get_inline_spec_bundle(model_type, target)
+        if bundle is None:
+            continue
+        for normalizer in bundle.meta_normalizers:
+            if normalizer.target != target:
+                continue
+            fqns = _replacement_fqns(rules, target)
+            if not fqns:
+                continue
+            _rewrite_param_plan(getattr(meta, "param_plan", None) or {}, fqns, normalizer.param_renames)
+            meta.frozen_sharded_params = _rewrite_frozen_param_names(
+                getattr(meta, "frozen_sharded_params", None) or [], fqns, normalizer.param_renames,
+            )
 
 
 def _replacement_fqns(rules: tuple[InlineRule, ...], target: str) -> set[str]:

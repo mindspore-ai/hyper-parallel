@@ -1,5 +1,16 @@
 # Copyright 2026 Huawei Technologies Co., Ltd
-# Licensed under the Apache License, Version 2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
 """Lower the frozen parallel plan into explicit forward code.
 
@@ -476,7 +487,7 @@ def _build_forward_impl_edit(
     func: FunctionInfo,
     prefix: Optional[str] = None,
 ) -> Optional[TextEdit]:
-    """Build an edit that extracts ``forward`` as ``_forward_impl``.
+    """Build an edit that extracts a method as ``_forward_impl``.
 
     The original method (signature + body) is copied out of the source and
     inserted as the private ``_forward_impl`` right before the rewritten
@@ -518,8 +529,8 @@ def _build_forward_impl_edit(
     # re-indenting, and the copy can never drift from the original source.
     for i, line in enumerate(lines):
         stripped = line.lstrip()
-        if stripped.startswith("def forward("):
-            lines[i] = line.replace("def forward(", "def _forward_impl(", 1)
+        if stripped.startswith(f"def {func.name}("):
+            lines[i] = line.replace(f"def {func.name}(", "def _forward_impl(", 1)
             break
     impl = "".join(lines)
     # The copy ends at ``body_end``, which is clamped to EOF for a final

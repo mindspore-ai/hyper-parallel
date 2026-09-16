@@ -58,11 +58,19 @@ def _load_sharding_rules():
     ]
 
 
+def _load_inline():
+    """Load source declarations lazily to keep adapter discovery lightweight."""
+    from hyper_parallel.models.deepseek_v3.adapter import inline  # pylint: disable=C0415
+
+    return inline
+
+
 DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV3ForCausalLM",
     model_type="deepseek_v3",
     replacements=_load_replacements,
     sharding_rules=_load_sharding_rules,
+    inline_codegen=_load_inline,
 )
 register_model_adapter(DEEPSEEK_V3_ADAPTER_SPEC)
 

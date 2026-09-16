@@ -1,125 +1,56 @@
 # Copyright 2026 Huawei Technologies Co., Ltd
-# Licensed under the Apache License, Version 2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
-"""Built-in inline patch semantics keyed by YAML target paths."""
+"""Discover inline declarations through model adapters."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
-
-from hyper_parallel.codegen.inline.ir import ImportPatch, ModuleSnippetPatch
-from hyper_parallel.codegen.inline.templates import QWEN3_GQA_ATTENTION_CLASS, TP_OPERATORS_CLASS
+from hyper_parallel.codegen.inline.spec_bundle import InlineSpecBundle, ReplacementSpec, StrategySpec
+from hyper_parallel.models.registry import get_model_adapter
 
 
-@dataclass(frozen=True)
-class ReplacementSpec:
-    """Source-level form of one ``replace_module`` target."""
+def get_inline_spec_bundle(model_type: str | None = None, target: str | None = None) -> InlineSpecBundle | None:
+    """Resolve declarations, inferring legacy identity from the target path.
 
-    old_ctor: str
-    new_ctor: str
-    imports: tuple[ImportPatch, ...]
-    mode: str = "name"
-    keyword_args: tuple[str, ...] = ()
-    snippets: tuple[ModuleSnippetPatch, ...] = ()
-    #: When True the original HF class definition is removed from the generated
-    #: file (and any surviving bare reference is rewritten to ``new_ctor``).
-    #: Must be False for ``wrap_source`` replacements because the original
-    #: class is still instantiated as the inner module of the fused wrapper.
-    remove_class: bool = True
-    #: User-facing note emitted into the generated modeling file.
-    replacement_note: str | None = None
-
-
-@dataclass(frozen=True)
-class StrategySpec:
-    """Source-level form of one parallel strategy target."""
-
-    kind: str
-    imports: tuple[ImportPatch, ...]
+    Explicit identity is authoritative: unsupported models never fall back to
+    another family. Legacy callers use the models/<family>/adapter convention.
+    """
+    if model_type is None:
+        parts = (target or "").split(".")
+        if len(parts) < 5 or parts[:2] != ["hyper_parallel", "models"] or parts[3] != "adapter":
+            return None
+        model_type = parts[2]
+    adapter = get_model_adapter(model_type)
+    if adapter is None or adapter.inline_codegen is None:
+        return None
+    bundle = adapter.inline_codegen().get_inline_spec_bundle()
+    if not isinstance(bundle, InlineSpecBundle):
+        raise TypeError(f"Inline provider for {model_type!r} must return InlineSpecBundle")
+    return bundle
 
 
-REPLACEMENT_SPECS = {
-    "hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_rms_norm": ReplacementSpec(
-        old_ctor="Qwen3MoeRMSNorm",
-        new_ctor="RMSNorm",
-        imports=(ImportPatch("hyper_parallel.components.modules", ("RMSNorm",)),),
-        replacement_note="RMSNorm replaces Qwen3MoeRMSNorm.",
-    ),
-    "hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_flash_attention": ReplacementSpec(
-        old_ctor="Qwen3MoeAttention",
-        new_ctor="GQAAttention",
-        imports=(
-            ImportPatch("hyper_parallel.codegen.runtime", ("get_inline_parallel_state",)),
-            ImportPatch("hyper_parallel.components.modules", ("RMSNorm",)),
-            ImportPatch(
-                "hyper_parallel.models.qwen3_moe.adapter.attention",
-                ("run_qwen3_moe_flash_attention",),
-            ),
-            ImportPatch("hyper_parallel.platform", ("get_platform",)),
-        ),
-        snippets=(
-            ModuleSnippetPatch(TP_OPERATORS_CLASS),
-            ModuleSnippetPatch(QWEN3_GQA_ATTENTION_CLASS),
-        ),
-        replacement_note="GQAAttention replaces Qwen3MoeAttention.",
-    ),
-    "hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_grouped_experts": ReplacementSpec(
-        old_ctor="Qwen3MoeExperts",
-        new_ctor="GroupedExperts",
-        mode="wrap_source",
-        keyword_args=("module_fqn=''", "context=None"),
-        imports=(ImportPatch("hyper_parallel.components.modules", ("GroupedExperts",)),),
-        remove_class=False,
-        replacement_note=(
-            "GroupedExperts wraps Qwen3MoeExperts; the original class is kept "
-            "as the wrapper input."
-        ),
-    ),
-}
-
-
-STRATEGY_SPECS = {
-    "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn": StrategySpec(
-        kind="qwen3_moe_ep_routed_forward",
-        imports=(
-            ImportPatch(
-                "hyper_parallel.distributed.expert_parallel.experts",
-                ("_prepare_ep_dispatch", "ep_all_to_all"),
-            ),
-            ImportPatch(
-                "hyper_parallel.distributed.expert_parallel.routing",
-                ("MOE_ROUTER_ADAPTERS",),
-            ),
-        ),
-    ),
-    "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_wrapper": StrategySpec(
-        kind="qwen3_moe_cp_attention",
-        imports=(
-            ImportPatch(
-                "hyper_parallel.distributed.context_parallel",
-                ("flex_cp_allgather",),
-            ),
-            ImportPatch(
-                "hyper_parallel.distributed.context_parallel.attention",
-                ("_cp_offset_causal_mask",),
-            ),
-        ),
-    ),
-}
-
-
-def replacement_spec(target: Optional[str]) -> Optional[ReplacementSpec]:
-    """Return the built-in replacement spec for ``target``."""
-
+def replacement_spec(target: str | None, model_type: str | None = None) -> ReplacementSpec | None:
+    """Return the adapter's replacement declaration for a YAML target."""
     if target is None:
         return None
-    return REPLACEMENT_SPECS.get(target)
+    bundle = get_inline_spec_bundle(model_type, target)
+    return bundle.replacement_specs.get(target) if bundle is not None else None
 
 
-def strategy_spec(target: Optional[str]) -> Optional[StrategySpec]:
-    """Return the built-in strategy spec for ``target``."""
-
+def strategy_spec(target: str | None, model_type: str | None = None) -> StrategySpec | None:
+    """Return the adapter's parallel-strategy declaration for a YAML target."""
     if target is None:
         return None
-    return STRATEGY_SPECS.get(target)
+    bundle = get_inline_spec_bundle(model_type, target)
+    return bundle.strategy_specs.get(target) if bundle is not None else None
