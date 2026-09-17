@@ -50,6 +50,18 @@ def _holder_with(block: nn.Module) -> nn.Module:
     return holder
 
 
+def _holder_with_layers(blocks: list[nn.Module]) -> nn.Module:
+    """A decoder-shaped holder: ``layers.<i>.mlp`` per block."""
+    holder = nn.Module()
+    layers = nn.ModuleList()
+    for block in blocks:
+        layer = nn.Module()
+        layer.mlp = block
+        layers.append(layer)
+    holder.layers = layers
+    return holder
+
+
 class TestPlanTargetInference(unittest.TestCase):
     """S3 mapping and equivalence over real Qwen3-MoE source contracts."""
 
@@ -145,6 +157,52 @@ class TestPlanTargetInference(unittest.TestCase):
         manager._fill_inferred_ep_targets(_holder_with(self._qwen3_block()), overrides)
         spec = overrides["layers.0"]
         self.assertIsNone(spec.local_compute_fn)
+
+    def test_homogeneous_layers_share_one_inferred_factory(self):
+        """Several structurally identical MoE layers are not an ambiguity.
+
+        Regression: the scan used to compare ``Target`` objects, and since each
+        target wraps a fresh closure (``Target`` defines no equality) any model
+        with two MoE boundaries matched by one glob looked ambiguous.
+        """
+        from hyper_parallel.trainer.config import (  # pylint: disable=C0415,import-outside-toplevel
+            PlanOverride,
+            entries_to_plan_overrides,
+        )
+
+        overrides = entries_to_plan_overrides(
+            [PlanOverride(match="layers.*.mlp", when="ep", region_dispatch=False)],
+            ep_size=2,
+        )
+        holder = _holder_with_layers([self._qwen3_block(), self._qwen3_block()])
+        manager._fill_inferred_ep_targets(holder, overrides)
+
+        self.assertEqual(
+            overrides["layers.*.mlp"].local_compute_fn.to_dict()["_target_"], EP_PATH
+        )
+
+    def test_conflicting_factories_still_raise(self):
+        """Two different factories behind one glob must stay a hard failure."""
+        from hyper_parallel.trainer.config import (  # pylint: disable=C0415,import-outside-toplevel
+            PlanOverride,
+            Target,
+            entries_to_plan_overrides,
+        )
+
+        paths = iter(["some.pkg.first_factory", "some.pkg.second_factory"])
+        original = manager._import_ep_target_for
+        manager._import_ep_target_for = lambda module, match: Target(
+            _stub_factory, target_path=next(paths)
+        )
+        self.addCleanup(setattr, manager, "_import_ep_target_for", original)
+
+        overrides = entries_to_plan_overrides(
+            [PlanOverride(match="layers.*.mlp", when="ep", region_dispatch=False)],
+            ep_size=2,
+        )
+        holder = _holder_with_layers([self._qwen3_block(), self._qwen3_block()])
+        with self.assertRaisesRegex(UnsupportedModuleStructure, "different EP compute"):
+            manager._fill_inferred_ep_targets(holder, overrides)
 
     def test_unrecognized_structure_raises_with_escape_hatch(self):
         """An unknown MoE structure must fail hard, never guess a factory."""

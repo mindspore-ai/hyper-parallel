@@ -774,15 +774,21 @@ def _infer_ep_compute_for_match(
     ``_target_``.
     """
     candidate = None
+    candidate_path = None
     for fqn, module in model.named_modules():
         if not fnmatchcase(fqn, match):
             continue
         if not _looks_like_moe_boundary(module):
             continue
         target = _import_ep_target_for(module, match)
+        # Compare the serialized factory path, never the Target objects: every
+        # ``_build_ep_target`` call wraps a fresh closure and ``Target`` defines no
+        # equality, so identity would make any model with two MoE boundaries look
+        # ambiguous even when they share one factory.
+        path = _target_path(target)
         if candidate is None:
-            candidate = target
-        elif candidate != target:
+            candidate, candidate_path = target, path
+        elif path != candidate_path:
             from hyper_parallel.distributed.expert_parallel.structure import (  # pylint: disable=C0415
                 UnsupportedModuleStructure,
             )
