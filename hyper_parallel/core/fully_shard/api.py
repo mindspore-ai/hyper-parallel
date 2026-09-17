@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,47 +16,46 @@
 from collections import namedtuple
 from typing import Any, List, Mapping, cast, Optional, Union
 
-from hyper_parallel.platform.platform import PlatformType
+import torch
+from torch import Tensor, nn
+
 from hyper_parallel.core.fully_shard.utils import (
-    CPUOffloadPolicy,
     MixedPrecisionPolicy,
     OffloadPolicy,
     SourceShardMetaInfo,
+    get_cells_and_names,
+    get_device_handle,
+    get_world_size,
+    load_into_param,
+    parameters_dict,
+    wait_grad_handle,
+)
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
+from hyper_parallel.core.fully_shard.state_dict_utils import (
+    get_model_state_dict as get_model_state_dict_impl,
+    set_model_state_dict as set_model_state_dict_impl,
 )
 from hyper_parallel import DeviceMesh, init_device_mesh
-from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     get_managed_modules_parameters,
 )
 
-platform = get_platform()
-ModuleClass = platform.Module
-TensorClass = platform.Tensor
-ParameterClass = platform.Parameter
-
 origin_class_to_extend_class = {}
 
 
 def _resolve_comm_fusion_zero_copy_default(
-    platform_type: PlatformType,
     comm_fusion: bool,
     comm_fusion_zero_copy: Optional[bool],
 ) -> bool:
-    """Resolve backend-specific default for the comm_fusion zero-copy path."""
+    """Resolve the default for the comm_fusion zero-copy path."""
     if comm_fusion_zero_copy is not None:
         return comm_fusion_zero_copy
-    if not comm_fusion:
-        return False
-    if platform_type == PlatformType.PYTORCH:
-        return True
-    if platform_type == PlatformType.MINDSPORE:
-        return False
-    return False
+    return comm_fusion
 
 
 def _check_strict_keys(
-    module: ModuleClass, state_dict: Mapping[str, Any],
+    module: nn.Module, state_dict: Mapping[str, Any],
 ) -> None:
     """Raise ``RuntimeError`` if *state_dict* keys do not match *module*."""
     expected_keys = set(module.state_dict().keys())
@@ -80,8 +79,8 @@ def _check_strict_keys(
 
 
 def _resolve_local_tensor(
-    key: str, val: TensorClass, target: DTensor,
-) -> TensorClass:
+    key: str, val: Tensor, target: DTensor,
+) -> Tensor:
     """Return the local shard tensor to be loaded into *target*."""
     if isinstance(val, DTensor):
         return val.to_local()
@@ -125,36 +124,23 @@ class _UnshardHandle:
 class HSDPModule:
     """
     The hsdp block of neural networks with hsdp interface.
-
-    Supported Platforms:
-        ``MindSpore`` ``torch``
     """
 
     def __init__(self):
         """Initialize HSDPModule."""
         self.hsdp_scheduler = None  # Initialized in hsdp_init()
 
-    # pylint: disable=C0415
-    def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
+    def hsdp_init(self, module, mesh, reshard_after_forward,
                   shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device,
                   comm_fusion, comm_fusion_zero_copy: Optional[bool] = None,
-                  source_shard_infos: Optional[Mapping[ParameterClass, SourceShardMetaInfo]] = None):
+                  source_shard_infos: Optional[Mapping[nn.Parameter, SourceShardMetaInfo]] = None):
         """init hsdp2 scheduler."""
-        scheduler_class = None
-        if platform_type == PlatformType.MINDSPORE:
-            from hyper_parallel.platform.mindspore.fully_shard.scheduler import MindSporeHSDPSchedulerV2
-            scheduler_class = MindSporeHSDPSchedulerV2
-        else:
-            from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
-            scheduler_class = TorchHSDPSchedulerV2
-
         resolved_comm_fusion_zero_copy = _resolve_comm_fusion_zero_copy_default(
-            platform_type,
             comm_fusion,
             comm_fusion_zero_copy,
         )
 
-        self.hsdp_scheduler = scheduler_class(module,
+        self.hsdp_scheduler = HSDPSchedulerV2(module,
                                               mesh,
                                               reshard_after_forward,
                                               shard_placement_fn,
@@ -181,7 +167,7 @@ class HSDPModule:
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call hsdp interface first.")
 
-        for _, module in platform.get_cells_and_names(self):
+        for _, module in get_cells_and_names(self):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_requires_grad_sync(requires_grad_sync)
 
@@ -189,11 +175,7 @@ class HSDPModule:
         """zero accumunication grads"""
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call hsdp interface first.")
-        if platform.platform_type == PlatformType.PYTORCH:
-            return super().zero_grad()
-        for _, module in platform.get_cells_and_names(self):
-            if isinstance(module, HSDPModule):
-                module.hsdp_scheduler.zero_grad()
+        return super().zero_grad()
 
     def set_modules_to_forward_prefetch(self, modules):
         """set forward prefetch module list to prefetch all gather for unsharded parameters"""
@@ -283,10 +265,10 @@ class HSDPModule:
             isinstance(val, DTensor) for val in state_dict.values()
         ):
             return super().load_state_dict(state_dict, strict=strict, assign=True)
-        self_module = cast(ModuleClass, self)
+        self_module = cast(nn.Module, self)
 
-        target_map: dict[str, TensorClass] = {}
-        for name, p in platform.parameters_dict(self_module):
+        target_map: dict[str, Tensor] = {}
+        for name, p in parameters_dict(self_module):
             target_map[name] = p
         for name, b in self_module.named_buffers():
             target_map[name] = b
@@ -294,7 +276,7 @@ class HSDPModule:
         if strict:
             _check_strict_keys(self_module, state_dict)
 
-        with platform.no_grad():
+        with torch.no_grad():
             for key, val in state_dict.items():
                 target = target_map.get(key)
                 if target is None:
@@ -302,7 +284,7 @@ class HSDPModule:
 
                 if isinstance(target, DTensor):
                     val = _resolve_local_tensor(key, val, target)
-                platform.load_into_param(target, val)
+                load_into_param(target, val)
 
         # Trigger load_state_dict post-hooks so that HSDP internal
         # bookkeeping (e.g. _sharded_param_data) stays in sync.
@@ -310,7 +292,7 @@ class HSDPModule:
         # so external hooks can safely read .missing_keys/.unexpected_keys.
         _IK = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
         incompatible_keys = _IK([], [])
-        for _, module in platform.get_cells_and_names(self_module):
+        for _, module in get_cells_and_names(self_module):
             hooks = module._load_state_dict_post_hooks  # pylint: disable=protected-access
             for hook in hooks.values():
                 hook(module, incompatible_keys)
@@ -334,9 +316,9 @@ class HSDPModule:
         """
         if not isinstance(recursive, bool):
             raise ValueError(f"recursive should be a bool, got {type(recursive)}")
-        self_module = cast(ModuleClass, self)
+        self_module = cast(nn.Module, self)
         modules = (
-            [module for _, module in platform.get_cells_and_names(self_module)]
+            [module for _, module in get_cells_and_names(self_module)]
             if recursive
             else [self_module]
         )
@@ -355,8 +337,8 @@ class HSDPModule:
                 "Currently impl is equal to recurse=True, "
                 "need support module_param mapping."
             )
-        self_module = cast(ModuleClass, self)
-        for _, module in platform.get_cells_and_names(self_module):
+        self_module = cast(nn.Module, self)
+        for _, module in get_cells_and_names(self_module):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_requires_all_reduce(requires_all_reduce)
 
@@ -371,8 +353,8 @@ class HSDPModule:
                 "Currently impl is equal to recurse=True, "
                 "need support module_param mapping."
             )
-        self_module = cast(ModuleClass, self)
-        for _, module in platform.get_cells_and_names(self_module):
+        self_module = cast(nn.Module, self)
+        for _, module in get_cells_and_names(self_module):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_forward(reshard_after_forward)
 
@@ -387,8 +369,8 @@ class HSDPModule:
                 "Currently impl is equal to recurse=True, "
                 "need support module_param mapping."
             )
-        self_module = cast(ModuleClass, self)
-        for _, module in platform.get_cells_and_names(self_module):
+        self_module = cast(nn.Module, self)
+        for _, module in get_cells_and_names(self_module):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_backward(reshard_after_backward)
 
@@ -397,9 +379,9 @@ class HSDPModule:
         set reduce_op_type for all reduce operations in HSDP
         support reduce_op_type "avg" and "sum", default is "avg"
         """
-        self_module = cast(ModuleClass, self)
+        self_module = cast(nn.Module, self)
         if recurse:
-            sub_modules = [m for _, m in platform.get_cells_and_names(self_module)]
+            sub_modules = [m for _, m in get_cells_and_names(self_module)]
         else:
             sub_modules = [self_module]
         for module in sub_modules:
@@ -420,7 +402,7 @@ class HSDPModule:
         ``mul_`` is launched on the hot path.
 
         Args:
-            factor (None | float | int | platform.Tensor): Scaling coefficient.
+            factor (None | float | int | torch.Tensor): Scaling coefficient.
                 Use ``None`` to disable scaling.
 
         Raises:
@@ -433,7 +415,7 @@ class HSDPModule:
                     f"gradient_scaling_factor must be None, float, int or a 1-element Tensor, "
                     f"but got bool {factor}."
                 )
-            if isinstance(factor, platform.Tensor):
+            if isinstance(factor, Tensor):
                 if factor.numel() != 1:
                     raise ValueError(
                         f"gradient_scaling_factor tensor must have exactly 1 element, "
@@ -459,7 +441,7 @@ def _extend_module_with_hsdp_interface(module):
     module.__class__ = extend_class
 
 
-def _get_root_modules(modules: List[ModuleClass]) -> List[ModuleClass]:
+def _get_root_modules(modules: List[nn.Module]) -> List[nn.Module]:
     """
     Returns the modules in ``modules`` that are root modules (i.e. parent-less)
     with respect to the set ``modules``. In other words, these are the modules
@@ -467,14 +449,12 @@ def _get_root_modules(modules: List[ModuleClass]) -> List[ModuleClass]:
 
     Aligned with PyTorch torch.distributed.utils._get_root_modules.
     """
-    root_modules: List[ModuleClass] = []
+    root_modules: List[nn.Module] = []
 
     def _get_submodules(mod):
-        if platform.platform_type == PlatformType.MINDSPORE:
-            return set(c for _, c in mod.cells_and_names())
         return set(mod.modules())
 
-    module_to_modules: dict[ModuleClass, set] = {
+    module_to_modules: dict[nn.Module, set] = {
         m: _get_submodules(m) for m in modules
     }
     for candidate in modules:
@@ -488,35 +468,29 @@ def _get_root_modules(modules: List[ModuleClass]) -> List[ModuleClass]:
     return root_modules
 
 
-def _check_module_valid(platform_type, module):
+def _check_module_valid(module):
     """check module valid"""
-    if platform_type == PlatformType.MINDSPORE:
-        from mindspore.nn.cell import Cell
-        if not isinstance(module, Cell):
-            raise ValueError(f"module's type must be nn.cell but got {type(module)}.")
-    else:
-        from torch.nn import Module
-        if not isinstance(module, Module):
-            raise ValueError(f"module's type must be nn.Module but got {type(module)}.")
+    if not isinstance(module, nn.Module):
+        raise ValueError(f"module's type must be nn.Module but got {type(module)}.")
 
 
 def _validate_module_for_fully_shard(
-    module: Union[ModuleClass, List[ModuleClass]], platform_type
+    module: Union[nn.Module, List[nn.Module]]
 ) -> None:
-    """Validate module(s) for fully_shard. Platform-aware for single module."""
+    """Validate module(s) for fully_shard."""
     if isinstance(module, list):
         if len(module) == 0:
             raise ValueError("fully_shard does not support empty list of modules.")
         for i, m in enumerate(module):
             try:
-                _check_module_valid(platform_type, m)
+                _check_module_valid(m)
             except ValueError:
                 raise ValueError(
                     f"fully_shard expects nn.Module or list[nn.Module], "
                     f"but got list with {type(m).__name__} at index {i}."
                 ) from None
     else:
-        _check_module_valid(platform_type, module)
+        _check_module_valid(module)
 
 
 HsdpValidationOptions = namedtuple(
@@ -552,20 +526,15 @@ def _validate_hsdp_optimizer_level(optimizer_level: str) -> None:
         )
 
 
-def _validate_hsdp_reduce_dtype(platform_type: PlatformType, reduce_dtype) -> None:
-    if platform_type == PlatformType.MINDSPORE:
-        from mindspore._c_expression.typing import Type
-        if reduce_dtype is not None and not isinstance(reduce_dtype, Type):
-            raise ValueError(f"reduce_dtype must be mindspore.dtype but got {reduce_dtype}.")
-        return
-    import torch
+def _validate_hsdp_reduce_dtype(reduce_dtype) -> None:
+    """Check ``reduce_dtype`` is a torch dtype or ``None``."""
     if reduce_dtype is not None and not isinstance(reduce_dtype, torch.dtype):
         raise ValueError(f"reduce_dtype must be torch.dtype but got {reduce_dtype}.")
 
 
-def _check_hsdp_input_valid(platform_type, module, options: HsdpValidationOptions):
+def _check_hsdp_input_valid(module, options: HsdpValidationOptions):
     """check hsdp input valid"""
-    _check_module_valid(platform_type, module)
+    _check_module_valid(module)
     _validate_hsdp_shard_size(options.shard_size)
     _validate_hsdp_threshold(options.threshold)
     _validate_hsdp_optimizer_level(options.optimizer_level)
@@ -575,7 +544,7 @@ def _check_hsdp_input_valid(platform_type, module, options: HsdpValidationOption
         )
     if not isinstance(options.grad_scale, float):
         raise ValueError(f"grad_scale must be float but got {options.grad_scale}.")
-    _validate_hsdp_reduce_dtype(platform_type, options.reduce_dtype)
+    _validate_hsdp_reduce_dtype(options.reduce_dtype)
     if not isinstance(options.comm_async, bool):
         raise ValueError(f"comm_async must be bool but got {options.comm_async}.")
     if not isinstance(options.comm_fusion, bool):
@@ -597,24 +566,20 @@ def _get_device_from_mesh(mesh: DeviceMesh):
             f"hyper_parallel.fully_shard support device in [torch.npu, torch.cuda], "
             f"but got '{device_type}'"
         )
-    if platform.platform_type == PlatformType.PYTORCH:
-        device_handle = platform.get_device_handle(device_type)
-        if device_handle is None:
-            raise ValueError(
-                f"hyper_parallel.fully_shard can't find device_handle of "
-                f"'torch.{device_type}', check the environment."
-            )
-        if device_handle.is_available():
-            import torch
-            device = torch.device(device_handle.current_device())
-    else:
-        device = device_type
+    device_handle = get_device_handle(device_type)
+    if device_handle is None:
+        raise ValueError(
+            f"hyper_parallel.fully_shard can't find device_handle of "
+            f"'torch.{device_type}', check the environment."
+        )
+    if device_handle.is_available():
+        device = torch.device(device_handle.current_device())
     return device
 
 
 def _normalize_replicate_params(
-    replicate_params: Optional[set[platform.Parameter]],
-) -> set[platform.Parameter]:
+    replicate_params: Optional[set[nn.Parameter]],
+) -> set[nn.Parameter]:
     """
     Normalize replicate_params for fully_shard
     Args:
@@ -626,7 +591,7 @@ def _normalize_replicate_params(
         return set()
     out = set(replicate_params)
     for p in out:
-        if not isinstance(p, (platform.Parameter, DTensor)):
+        if not isinstance(p, (nn.Parameter, DTensor)):
             raise TypeError(
                 "replicate_params must contain only nn.Parameter or DTensor, "
                 f"got {type(p).__name__}."
@@ -639,8 +604,8 @@ def _get_modules_parameters(modules, ignored_params=None):
     return get_managed_modules_parameters(modules, ignored_params)
 
 def _validate_managed_params_source_shard_infos(
-    managed_parameters: set[ParameterClass],
-    source_shard_infos: Optional[Mapping[ParameterClass, SourceShardMetaInfo]],
+    managed_parameters: set[nn.Parameter],
+    source_shard_infos: Optional[Mapping[nn.Parameter, SourceShardMetaInfo]],
 ) -> None:
     """Validate the parameter-identity metadata consumed by one fully_shard unit."""
     if source_shard_infos is None:
@@ -686,19 +651,19 @@ def _validate_managed_params_source_shard_infos(
 
 
 def fully_shard(
-        module: Union[ModuleClass, List[ModuleClass]],
+        module: Union[nn.Module, List[nn.Module]],
         *,
         mesh: Optional[DeviceMesh] = None,
         reshard_after_forward: bool = True,
         shard_placement_fn: None = None,
         mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
         offload_policy: OffloadPolicy = OffloadPolicy(),
-        ignored_params: Optional[set[platform.Parameter]] = None,
-        replicate_params: Optional[set[platform.Parameter]] = None,
+        ignored_params: Optional[set[nn.Parameter]] = None,
+        replicate_params: Optional[set[nn.Parameter]] = None,
         comm_fusion: bool = False,
         comm_fusion_zero_copy: Optional[bool] = None,
-        source_shard_infos: Optional[Mapping[ParameterClass, SourceShardMetaInfo]] = None,
-) -> Union[ModuleClass, List[ModuleClass]]:
+        source_shard_infos: Optional[Mapping[nn.Parameter, SourceShardMetaInfo]] = None,
+) -> Union[nn.Module, List[nn.Module]]:
 
     """
     Apply fully_shard to a module (or list of modules) for distributed training with parameter sharding.
@@ -710,7 +675,7 @@ def fully_shard(
     management.
 
     When a list of modules is passed, they are treated as one FSDP unit (parameters
-    grouped together). Both PyTorch and MindSpore platforms support list input.
+    grouped together).
 
     Parameters:
         module (nn.Module or List[nn.Module]):
@@ -738,7 +703,6 @@ def fully_shard(
 
         offload_policy (OffloadPolicy, default=OffloadPolicy()):
             Memory offload policy for reducing device memory usage.
-            ``CPUOffloadPolicy`` is currently unsupported on MindSpore.
 
         ignored_params (Optional[set[nn.Parameter]], default=None):
             Set of parameters to exclude from fully_shard management entirely.
@@ -760,42 +724,19 @@ def fully_shard(
 
         comm_fusion_zero_copy (Optional[bool], default=None):
             Whether allow the experimental zero-copy path for
-            ``comm_fusion``. When set to ``None``, fully_shard uses a backend-specific
-            default:
-            - PyTorch: enabled automatically when ``comm_fusion=True``
-            - MindSpore: disabled automatically even when ``comm_fusion=True``
+            ``comm_fusion``. When set to ``None``, fully_shard enables it
+            automatically whenever ``comm_fusion=True``.
             When enabled, fully_shard may rebase sharded local parameter storage
             into one shared flat buffer so fused all-gather can read directly from
             contiguous memory. This path depends on optimizer compatibility with
-            view-backed parameters. MindSpore rejects an explicit ``True`` value
-            because its optimizers do not update view-backed Parameter storage.
+            view-backed parameters.
         source_shard_infos (Optional[Mapping[nn.Parameter, SourceShardMetaInfo]]):
             Source TP/EP mesh and placements for the plain-parameter dual mode.
-            This interface is currently supported by the Torch backend only.
 
     Returns:
         nn.Module or List[nn.Module]: The input module(s) with HSDP capabilities added.
     """
-    platform_type = platform.platform_type
-    _validate_module_for_fully_shard(module, platform_type)
-
-    if source_shard_infos is not None and platform_type != PlatformType.PYTORCH:
-        raise NotImplementedError("source_shard_infos is currently supported only on the Torch backend")
-    if platform_type == PlatformType.MINDSPORE:
-        if comm_fusion_zero_copy:
-            raise NotImplementedError(
-                "comm_fusion_zero_copy=True is not supported on MindSpore because its optimizers "
-                "do not update view-backed Parameter storage. Omit comm_fusion_zero_copy or set it "
-                "to False to use copy-in communication fusion."
-            )
-        if isinstance(offload_policy, CPUOffloadPolicy):
-            raise NotImplementedError(
-                "CPUOffloadPolicy is not supported by fully_shard on MindSpore because operator "
-                "outputs do not preserve CPU tensor storage."
-            )
-        from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
-
-        enable_mindspore_backward_compat()
+    _validate_module_for_fully_shard(module)
 
     arg_module = module
     if isinstance(module, list):
@@ -808,13 +749,12 @@ def fully_shard(
 
     params = _get_modules_parameters(modules, ignored_params)
     has_dtensor_param = any(isinstance(param, DTensor) for param in params)
-    if platform_type == PlatformType.PYTORCH:
-        _validate_managed_params_source_shard_infos(set(params), source_shard_infos)
+    _validate_managed_params_source_shard_infos(set(params), source_shard_infos)
 
     replicate_params = _normalize_replicate_params(replicate_params)
 
     if mesh is None:
-        mesh = init_device_mesh(device_type="npu", mesh_shape=(platform.get_world_size(),))
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(get_world_size(),))
         if has_dtensor_param:
             raise ValueError(
                 "fully_shard does not support mesh=None with a native DTensor parameter; "
@@ -824,7 +764,6 @@ def fully_shard(
 
     init_modules = modules
     modules[0].hsdp_init(
-        platform_type,
         init_modules,
         mesh,
         reshard_after_forward,
@@ -846,10 +785,7 @@ def fully_shard(
 
 
 def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
-    """Get model state dict with platform-specific implementation.
-
-    Delegates to the platform-specific implementation at runtime.
-    Users import from here instead of platform internals.
+    """Get the model state dict of a fully_shard-managed model.
 
     Args:
         model: The model whose state dict to retrieve.
@@ -862,15 +798,14 @@ def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
         ``full_state_dict=True`` values are full Tensors (CPU on rank 0 only
         when ``cpu_offload=True``).
     """
-    return platform.get_model_state_dict(model, options=options)
+    return get_model_state_dict_impl(model, options=options)
 
 
 def set_model_state_dict(model: Any, model_state_dict: dict[str, Any], *, options: Any = None) -> None:
-    """Set model state dict with platform-specific implementation.
+    """Load ``model_state_dict`` into a fully_shard-managed model.
 
-    Delegates to the platform-specific implementation at runtime. Full tensors
-    are scattered into DTensor shards matching the model's layout before the
-    in-place load.
+    Full tensors are scattered into DTensor shards matching the model's layout
+    before the in-place load.
 
     Args:
         model: The model to load state into.
@@ -883,9 +818,9 @@ def set_model_state_dict(model: Any, model_state_dict: dict[str, Any], *, option
     Returns:
         None.
     """
-    return platform.set_model_state_dict(model, model_state_dict, options=options)
+    return set_model_state_dict_impl(model, model_state_dict, options=options)
 
 
 def hsdp_sync_stream():
     """Wait for hsdp gradient handle to be completed."""
-    platform.wait_grad_handle()
+    wait_grad_handle()

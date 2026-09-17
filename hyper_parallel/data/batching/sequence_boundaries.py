@@ -25,7 +25,8 @@ import torch
 class OnlineBoundaryResolver:
     """Read global cumulative sequence boundaries emitted by Online packing."""
 
-    def resolve(self, canonical_batch: Mapping[str, Any]) -> Any:
+    @staticmethod
+    def resolve(canonical_batch: Mapping[str, Any]) -> Any:
         """Read leading-zero ``cu_seq_lens`` from an Online batch.
 
         Args:

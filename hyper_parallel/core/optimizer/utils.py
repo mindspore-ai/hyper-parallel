@@ -31,18 +31,21 @@ def _get_rank() -> int:
 
 
 def info_rank0(self, msg, *args, **kwargs) -> None:
+    """Log an informational message only on rank zero."""
     if _get_rank() == 0:
         kwargs.setdefault("stacklevel", 2)
         self.info(msg, *args, **kwargs)
 
 
 def warning_rank0(self, msg, *args, **kwargs) -> None:
+    """Log a warning message only on rank zero."""
     if _get_rank() == 0:
         kwargs.setdefault("stacklevel", 2)
         self.warning(msg, *args, **kwargs)
 
 
 def debug_rank0(self, msg, *args, **kwargs) -> None:
+    """Log a debug message only on rank zero."""
     if _get_rank() == 0:
         kwargs.setdefault("stacklevel", 2)
         self.debug(msg, *args, **kwargs)

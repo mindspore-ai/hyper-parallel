@@ -147,7 +147,8 @@ class ParallelizeLayer:
                 Hard.highest_power_of_2_divisor(self.config.ccfg.a)
             )
 
-    def filtered_out(self, _: Any) -> bool:
+    @staticmethod
+    def filtered_out(_: Any) -> bool:
         """Manual conditions to remove config patterns"""
         # if parallel_config.has_dim(Dim.EP):
         #     if self.config.dim_val(Dim.EP, parallel_config) < 8:

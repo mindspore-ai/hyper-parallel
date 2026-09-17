@@ -85,8 +85,8 @@ from typing import Any, Callable
 
 import torch  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F
+from torch.nn import Module
 
-from hyper_parallel.platform import get_platform
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _ForwardRewriteRequest,
 )
@@ -112,8 +112,6 @@ from hyper_parallel.distributed.recipe_spec import (
 )
 
 logger = logging.getLogger(__name__)
-platform = get_platform()
-Module = platform.Module
 
 
 # ────────────────────────────────────────────────────────────────────────────

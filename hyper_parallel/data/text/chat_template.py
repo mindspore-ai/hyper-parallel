@@ -142,6 +142,7 @@ class Registry(MutableMapping):
         """Return the list of all registered keys."""
         return list(self.keys())
 
+
 CHAT_TEMPLATE_REGISTRY = Registry("ChatTemplate")
 
 
@@ -505,6 +506,7 @@ class JanusTemplate(ChatTemplate):
         Raises:
             ValueError: If a message role or image placeholder count is invalid.
         """
+        # pylint: disable=too-many-locals
         input_ids, attention_mask, labels = [], [], []
         images_seq_mask, images_emb_mask = [], []
         assistant_count = 0

@@ -14,6 +14,8 @@
 # ============================================================================
 """Temporary self-contained VLM batch preparation."""
 
+__all__ = ["VLMBatchProcessor", "VLMGetBatch", "build_vlm_get_batch"]
+
 from collections.abc import Mapping
 from typing import Any
 
@@ -142,6 +144,3 @@ def build_vlm_get_batch(
         Callable VLM batch adapter.
     """
     return VLMGetBatch(mesh_context=mesh_context, device=device, pp_shared_data=pp_shared_data)
-
-
-__all__ = ["VLMBatchProcessor", "VLMGetBatch", "build_vlm_get_batch"]

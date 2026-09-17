@@ -244,7 +244,6 @@ def destroy_process_group() -> None:
         from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP  # pylint: disable=C0415
         from hyper_parallel.core.dtensor.dtensor import _LAYOUT_CACHE  # pylint: disable=C0415
         from hyper_parallel.core.dtensor.tensor_redistribution import _tensor_redistribution  # pylint: disable=C0415
-        from hyper_parallel.core.fully_shard.hsdp_param import _GROUP_INFO_CACHE  # pylint: disable=C0415
         from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS  # pylint: disable=C0415
         from hyper_parallel.core.pipeline_parallel._p2p import (  # pylint: disable=C0415
             _P2P_MULTI_STREAM_GROUPS,
@@ -254,7 +253,6 @@ def destroy_process_group() -> None:
         _P2P_MULTI_STREAM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
-        _GROUP_INFO_CACHE.clear()
         _HYBRID_MESH_CACHE.clear()
         _tensor_redistribution._transform_cache.clear()  # pylint: disable=protected-access
         _tensor_redistribution.is_init = False

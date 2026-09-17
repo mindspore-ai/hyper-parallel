@@ -20,6 +20,7 @@ Demonstrates how to use HyperParallel Graph Mode for training a simple model.
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 from typing import Iterator, Tuple
@@ -29,13 +30,17 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
 
 from hyper_parallel.compile import (  # pylint: disable=C0413
     GraphTrainer,
     PassConfig,
     PassPlan,
 )
+
+_LOG = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,8 +122,9 @@ def train_fn(
     return loss
 
 
-def main() -> None:
+def main() -> None:  # pylint: disable=too-many-locals
     """Run single/multi-card FSDP training on the dummy model."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
     config = load_config(args.config)
 
@@ -128,12 +134,12 @@ def main() -> None:
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    print("=" * 80)
-    print("Simple Model Training with HyperParallel Graph Mode")
-    print("=" * 80)
-    print(f"Rank: {rank}/{world_size}")
-    print(f"FSDP: {world_size}")
-    print("=" * 80)
+    _LOG.info("=" * 80)
+    _LOG.info("Simple Model Training with HyperParallel Graph Mode")
+    _LOG.info("=" * 80)
+    _LOG.info("Rank: %s/%s", rank, world_size)
+    _LOG.info("FSDP: %s", world_size)
+    _LOG.info("=" * 80)
 
     # Create dummy model (example)
     class DummyModel(torch.nn.Module):
@@ -186,11 +192,11 @@ def main() -> None:
             labels = g_labels
             yield input_ids, labels
 
-    print("\nStarting training...")
+    _LOG.info("\nStarting training...")
     trainer.train(data_iter(), max_steps=max_steps, log_interval=log_interval)
-    print("\n" + "=" * 80)
-    print("Training completed!")
-    print("=" * 80)
+    _LOG.info("\n%s", "=" * 80)
+    _LOG.info("Training completed!")
+    _LOG.info("=" * 80)
 
     # Cleanup distributed training
     cleanup_distributed()

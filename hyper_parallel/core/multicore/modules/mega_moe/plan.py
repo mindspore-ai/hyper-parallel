@@ -19,9 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import torch
-
 import numpy as np
+import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import (
     build_config_for_rank as build_backward_config,
@@ -47,10 +46,14 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
+from hyper_parallel.core.multicore.profiler.profiling import (
+    _PreparedMegaKernelRuntime,
+    _prepare_mega_kernel_runtime_config,
+)
+from hyper_parallel.core.multicore.profiler.profiler import _enable_runtime_config_tensor
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 
 from .spec import MegaMoeSpec
-
 
 
 @dataclass(frozen=True)
@@ -58,16 +61,26 @@ class MegaMoePlan:
     """Rank-local schedules and tiling tensors for forward and backward."""
 
     spec: MegaMoeSpec
-    fwd_runtime_config: Any
+    fwd_runtime: _PreparedMegaKernelRuntime
     up_proj_tiling: Any
     swiglu_tiling: Any
     down_proj_tiling: Any
-    bwd_runtime_config: Any
+    bwd_runtime: _PreparedMegaKernelRuntime
     act_grad_tiling: Any
     gate_grad_tiling: Any
     w1_grad_tiling: Any
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
+
+    @property
+    def fwd_runtime_config(self) -> Any:
+        """Return the disabled forward RuntimeConfig for compatibility."""
+        return self.fwd_runtime.normal_tensor
+
+    @property
+    def bwd_runtime_config(self) -> Any:
+        """Return the disabled backward RuntimeConfig for compatibility."""
+        return self.bwd_runtime.normal_tensor
 
 
 def _tensor_from_bytes(data: bytes, device: Any) -> torch.Tensor:
@@ -103,17 +116,8 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
     )
 
 
-def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
-    """Build the current legacy forward/backward ABI without fusion slots.
-
-    Args:
-        spec: Validated local-token and expert topology specification.
-        device: NPU device receiving serialized descriptors and tiling tensors.
-
-    Returns:
-        Rank-local forward and backward runtime resources.
-    """
-    task_values = _build_task_values(spec)
+def _build_runtime_configs(spec: MegaMoeSpec, task_values: TaskSplitValue) -> tuple[Any, Any, Any, Any]:
+    """Build forward/backward graphs and their serialized RuntimeConfig objects."""
     forward_graph = build_forward_graph(
         task_values,
         dispatch_sv=spec.dispatch_split,
@@ -130,7 +134,6 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         spec.rank_id,
         spec.num_cube_cores,
     )
-
     backward_graph = build_backward_graph(
         task_values,
         dispatch_sv=spec.dispatch_split,
@@ -147,7 +150,21 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         spec.rank_id,
         spec.num_cube_cores,
     )
+    return forward_graph, forward_data, backward_graph, backward_data
 
+
+def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
+    """Build trimmed dense forward/backward runtime images without fusion slots.
+
+    Args:
+        spec: Validated local-token and expert topology specification.
+        device: NPU device receiving serialized descriptors and tiling tensors.
+
+    Returns:
+        Rank-local forward and backward runtime resources.
+    """
+    task_values = _build_task_values(spec)
+    forward_graph, forward_data, backward_graph, backward_data = _build_runtime_configs(spec, task_values)
     gmm_options = {
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
@@ -162,9 +179,31 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     w1_grad = backward_graph.get_op("w1_grad")
     w2_grad = backward_graph.get_op("w2_grad")
     swiglu_grad = backward_graph.get_op("swiglu_grad")
+    device_id = device.index
+    if device_id is None:
+        device_id = torch.npu.current_device()
+
+    def tensor_factory(data: bytes) -> torch.Tensor:
+        """Copy serialized Host runtime data to the plan's NPU device."""
+        return _tensor_from_bytes(data, device)
+
+    fwd_runtime = _prepare_mega_kernel_runtime_config(
+        forward_data,
+        tensor_factory=tensor_factory,
+        profile_tensor_factory=_enable_runtime_config_tensor,
+        rank=spec.rank_id,
+        device_id=device_id,
+    )
+    bwd_runtime = _prepare_mega_kernel_runtime_config(
+        backward_data,
+        tensor_factory=tensor_factory,
+        profile_tensor_factory=_enable_runtime_config_tensor,
+        rank=spec.rank_id,
+        device_id=device_id,
+    )
     return MegaMoePlan(
         spec=spec,
-        fwd_runtime_config=_tensor_from_bytes(bytes(forward_data), device),
+        fwd_runtime=fwd_runtime,
         up_proj_tiling=_tensor_from_bytes(
             get_up_proj_tiling_bytes(up_proj.split_value, **gmm_options), device
         ),
@@ -181,7 +220,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         down_proj_tiling=_tensor_from_bytes(
             get_down_proj_tiling_bytes(down_proj.split_value, **gmm_options), device
         ),
-        bwd_runtime_config=_tensor_from_bytes(bytes(backward_data), device),
+        bwd_runtime=bwd_runtime,
         act_grad_tiling=_tensor_from_bytes(
             get_act_grad_tiling_bytes(act_grad.split_value, **gmm_options), device
         ),

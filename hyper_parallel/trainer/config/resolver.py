@@ -16,6 +16,14 @@
 
 from __future__ import annotations
 
+__all__ = [
+    "ConfigResolutionError",
+    "coerce_value",
+    "import_target",
+    "resolve_component",
+    "resolve_root",
+]
+
 import dataclasses
 import importlib
 import inspect
@@ -187,6 +195,42 @@ def _coerce_literal(value: object, choices: tuple, *, path: str) -> object:
     raise _fail(path, f"expected one of ({expected}), got {value!r}")
 
 
+# Annotations whose payload is a container of other values.
+_COLLECTION_TYPES: tuple[type, ...] = (list, tuple, dict, Mapping)
+
+
+def _coerce_collection(
+    value: object,
+    annotation: object,
+    origin: object,
+    args: tuple,
+    *,
+    path: str,
+) -> object:
+    """Normalize a list, tuple, or mapping annotation."""
+
+    if origin is list or annotation is list:
+        return _normalize_list(value, args[0] if args else Any, path=path)
+    if origin is tuple or annotation is tuple:
+        return _normalize_tuple(value, args, path=path)
+    if not isinstance(value, Mapping):
+        raise _fail(path, f"expected mapping, got {type(value).__name__}")
+    return dict(value)
+
+
+def _coerce_class(value: object, annotation: object, *, path: str) -> object:
+    """Normalize a value against a concrete class annotation."""
+
+    if not isinstance(annotation, type):
+        raise _fail(path, f"unsupported type annotation {_type_name(annotation)}")
+    if isinstance(value, annotation):
+        return value
+    raise _fail(
+        path,
+        f"expected {_type_name(annotation)}, got {type(value).__name__}",
+    )
+
+
 def coerce_value(value: object, annotation: object, *, path: str) -> object:
     """Validate and normalize one target argument or typed CLI override."""
 
@@ -205,30 +249,13 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
     args = get_args(annotation)
     if origin is Literal:
         return _coerce_literal(value, args, path=path)
-    if origin is list or annotation is list:
-        return _normalize_list(
-            value,
-            args[0] if args else Any,
-            path=path,
-        )
-    if origin is tuple or annotation is tuple:
-        return _normalize_tuple(value, args, path=path)
-    if origin in (dict, Mapping) or annotation in (dict, Mapping):
-        if not isinstance(value, Mapping):
-            raise _fail(path, f"expected mapping, got {type(value).__name__}")
-        return dict(value)
+    if origin in _COLLECTION_TYPES or annotation in _COLLECTION_TYPES:
+        return _coerce_collection(value, annotation, origin, args, path=path)
     if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
         # Nested dataclass items resolve from mappings in the same way as
         # top-level dataclass components.
         return _resolve_dataclass(value, annotation, path=path)
-    if isinstance(annotation, type):
-        if isinstance(value, annotation):
-            return value
-        raise _fail(
-            path,
-            f"expected {_type_name(annotation)}, got {type(value).__name__}",
-        )
-    raise _fail(path, f"unsupported type annotation {_type_name(annotation)}")
+    return _coerce_class(value, annotation, path=path)
 
 
 def _resolve_union(node: object, annotation: object, *, path: str) -> object:
@@ -264,13 +291,12 @@ def _resolve_dataclass(node: object, config_type: type, *, path: str) -> object:
     if unknown:
         raise _fail(path, f"unknown configuration fields: {unknown}")
 
-    missing = [
+    required = [
         field.name
         for field in config_fields.values()
-        if field.name not in node
-        and field.default is MISSING
-        and field.default_factory is MISSING
+        if field.default is MISSING and field.default_factory is MISSING
     ]
+    missing = [name for name in required if name not in node]
     if missing:
         raise _fail(path, f"missing required configuration fields: {missing}")
 
@@ -508,13 +534,12 @@ def resolve_root(raw: object) -> TrainerConfig:
     if unknown:
         raise _fail("$", f"unknown configuration fields: {unknown}")
 
-    missing = [
+    required = [
         field.name
         for field in root_fields.values()
-        if field.name not in raw
-        and field.default is MISSING
-        and field.default_factory is MISSING
+        if field.default is MISSING and field.default_factory is MISSING
     ]
+    missing = [name for name in required if name not in raw]
     if missing:
         raise _fail("$", f"missing required configuration fields: {missing}")
 
@@ -531,12 +556,3 @@ def resolve_root(raw: object) -> TrainerConfig:
         return TrainerConfig(**resolved)
     except TypeError as exc:
         raise _fail("$", f"could not construct TrainerConfig: {exc}") from exc
-
-
-__all__ = [
-    "ConfigResolutionError",
-    "coerce_value",
-    "import_target",
-    "resolve_component",
-    "resolve_root",
-]

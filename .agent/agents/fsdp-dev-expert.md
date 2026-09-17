@@ -1,8 +1,9 @@
 ---
 name: fsdp-dev-expert
 description: >
-  HyperParallel fully_shard / HSDP — scheduler, param lifecycle, grad reduce,
-  Torch vs MindSpore. Details in fsdp-dev-guide.md; hard rules in distributed.md.
+  HyperParallel fully_shard / HSDP (torch-only) — scheduler, param lifecycle,
+  grad reduce, comm fusion. Details in fsdp-dev-guide.md; hard rules in
+  distributed.md.
 model: default
 tools:
   - Read
@@ -13,8 +14,9 @@ tools:
 
 # FSDP Expert Agent
 
-Domain expert for Fully / Hybrid Sharded Data Parallel. Ground answers in
-current code under `core/fully_shard/` and `platform/{torch,mindspore}/fully_shard/`.
+Domain expert for Fully / Hybrid Sharded Data Parallel. FSDP is **torch-only**
+and lives entirely under `core/fully_shard/`; the platform abstraction and the
+MindSpore backend have been removed.
 
 ## Load on demand
 
@@ -26,14 +28,19 @@ current code under `core/fully_shard/` and `platform/{torch,mindspore}/fully_sha
 
 | Area | Paths |
 |------|--------|
-| Public API | `core/fully_shard/api.py` (`fully_shard`, `HSDPModule`) |
-| Shared scheduler/state | `hsdp_scheduler.py`, `hsdp_state.py`, `hsdp_utils.py`, `utils.py` |
-| Torch | `platform/torch/fully_shard/{scheduler,state,param,hook_function}.py` |
-| MindSpore | `platform/mindspore/fully_shard/{scheduler,state,param,hook_function}.py` |
+| Public API | `core/fully_shard/api.py` (`fully_shard`, `HSDPModule`, state-dict get/set, `hsdp_sync_stream`) |
+| Scheduler | `core/fully_shard/hsdp_scheduler.py` (`HSDPSchedulerV2`, `HSDPSchedulerContext`, `ParamGroupCommCtx`) |
+| State | `core/fully_shard/hsdp_state.py` (`HSDPState`) + `core/fully_shard/state.py` (`TorchHSDPStateV2`) |
+| Param | `core/fully_shard/hsdp_param.py` (`HSDPParamV2`) + `core/fully_shard/param.py` (`TorchHSDPParamV2`) |
+| Comm fusion | `core/fully_shard/param_group.py` (`HSDPParamGroup`, `AllReduceParamGroup`) |
+| Autograd glue | `core/fully_shard/hook_function.py` (`PostBackwardFunction`) |
+| Shared helpers | `core/fully_shard/hsdp_utils.py`, `core/fully_shard/utils.py` (policies, mesh info, process groups, grad handle) |
+| State dict | `core/fully_shard/state_dict_utils.py` |
 
 Mesh: `ndim==1` → FSDP; `ndim==2` → HSDP (shard dim 1, replicate dim 0).
 
 ## When consulted
 
 Unshard/reshard bugs, grad reduce order, shared-param pointer desync,
-AG buffer leaks / CPU offload sync, prefetch/hook ordering, torch↔ms parity.
+AG buffer leaks / CPU offload sync, prefetch/hook ordering, comm-fusion
+staging, and torch process-group caching.

@@ -39,6 +39,7 @@ from hyper_parallel.data.parallel import (
 
 logger = get_dataset_logger(__name__)
 
+
 class ParallelBatch:
     """Define the DataLoader-to-forward-batch processing boundary.
 
@@ -83,6 +84,7 @@ class ParallelBatch:
             eod_mask_loss: Whether EOD tokens are excluded from the loss.
             attention_runtime_adapter: Compressed Attention/CP metadata adapter.
         """
+        # pylint: disable=too-many-locals
 
         self.parallel_context: DataLoaderParallelContext = create_dataloader_parallel_context(
             mesh_context,
@@ -146,25 +148,7 @@ class ParallelBatch:
             cp_local_batch,
             cu_seq_lens,
         )
-        if not self._batch_flow_logged:
-            source_shape = None if canonical_batch is None else tuple(canonical_batch["input_ids"].shape)
-            local_shape = tuple(parallel_batch["input_ids"].shape)
-            num_boundaries = 0 if parallel_batch["cu_seq_lens"] is None else parallel_batch["cu_seq_lens"].numel()
-            logger.debug(
-                "Parallel batch flow: source=%s, tp_rank=%d/%d, cp_rank=%d/%d, "
-                "source_owner=%s, source_shape=%s, local_shape=%s, global_boundaries=%d",
-                self.source_type,
-                self.parallel_context.tp_rank,
-                self.parallel_context.tp_world_size,
-                self.parallel_context.cp_rank,
-                self.parallel_context.cp_world_size,
-                canonical_batch is not None,
-                source_shape,
-                local_shape,
-                num_boundaries,
-                enabled=True,
-            )
-            self._batch_flow_logged = True
+        self._log_batch_flow(canonical_batch, parallel_batch)
 
         position_ids = self._build_local_position_ids(
             parallel_batch["input_ids"],
@@ -184,6 +168,32 @@ class ParallelBatch:
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(parallel_batch)
 
         return model_inputs, loss_inputs
+
+    def _log_batch_flow(
+            self,
+            canonical_batch: Mapping[str, Any] | None,
+            parallel_batch: Mapping[str, Any],
+    ) -> None:
+        """Log the resolved source and parallel batch shapes once."""
+        if not self._batch_flow_logged:
+            source_shape = None if canonical_batch is None else tuple(canonical_batch["input_ids"].shape)
+            local_shape = tuple(parallel_batch["input_ids"].shape)
+            num_boundaries = 0 if parallel_batch["cu_seq_lens"] is None else parallel_batch["cu_seq_lens"].numel()
+            logger.debug(
+                "Parallel batch flow: source=%s, tp_rank=%d/%d, cp_rank=%d/%d, "
+                "source_owner=%s, source_shape=%s, local_shape=%s, global_boundaries=%d",
+                self.source_type,
+                self.parallel_context.tp_rank,
+                self.parallel_context.tp_world_size,
+                self.parallel_context.cp_rank,
+                self.parallel_context.cp_world_size,
+                canonical_batch is not None,
+                source_shape,
+                local_shape,
+                num_boundaries,
+                enabled=True,
+            )
+            self._batch_flow_logged = True
 
     def _read_source_batch(self, data_iterator: Any) -> Mapping[str, Any] | None:
         """Read one complete batch on TP rank zero of each CP coordinate."""
@@ -230,6 +240,7 @@ class ParallelBatch:
         Packed boundaries define the position semantics. CP only determines
         which global sequence interval is materialized by this rank.
         """
+        # pylint: disable=too-many-locals
         batch_size, local_seq_len = input_ids.shape
         cp_size = self.parallel_context.cp_world_size
         global_seq_len = local_seq_len * cp_size

@@ -88,12 +88,16 @@ class TextPackingCollator(DataCollator):
             values = [model_sample[field] for model_sample in model_samples]
             packed_batch[field] = torch.cat(values, dim=-1).unsqueeze(0)
 
-        packed_seq_len = packed_batch["input_ids"].shape[-1]
+        input_ids = packed_batch.get("input_ids")
+        if input_ids is None or packed_batch.get("labels") is None:
+            raise ValueError("packed batch requires input_ids and labels")
+
+        packed_seq_len = input_ids.shape[-1]
         pad_len = (-packed_seq_len) % self.sequence_parallel_size
         if pad_len:
-            input_padding = packed_batch["input_ids"].new_zeros((1, pad_len))
+            input_padding = input_ids.new_zeros((1, pad_len))
             label_padding = packed_batch["labels"].new_full((1, pad_len), IGNORE_INDEX)
-            packed_batch["input_ids"] = torch.cat((packed_batch["input_ids"], input_padding), dim=-1)
+            packed_batch["input_ids"] = torch.cat((input_ids, input_padding), dim=-1)
             packed_batch["labels"] = torch.cat((packed_batch["labels"], label_padding), dim=-1)
 
         seq_lens = model_samples[0]["input_ids"].new_tensor(

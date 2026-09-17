@@ -15,6 +15,7 @@
 """performance estimation"""
 import json
 from copy import deepcopy
+from typing import Any, Callable, NamedTuple, Optional
 import numpy as np
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
@@ -508,11 +509,23 @@ def apply_regression_coefficients(coeffs, debugger, old_perf):
     return perf
 
 
+class _EstimateArgs(NamedTuple):
+    """Resolved inputs of estimate_performance, unpackable as a tuple."""
+
+    cfg: CostModelConfig
+    stages: Optional[list]
+    extra_custom_func: Optional[Callable]
+    ccfg: Any
+    debugger: Any
+    device_type: Any
+    memory: Any
+
+
 def _resolve_estimate_args(args, kwargs):
     """Resolve positional/keyword inputs for estimate_performance.
 
     Returns:
-        Tuple of (cfg, stages, extra_custom_func, ccfg, debugger,
+        _EstimateArgs of (cfg, stages, extra_custom_func, ccfg, debugger,
         device_type, memory).
     """
     cfg_input = args[0]
@@ -531,7 +544,7 @@ def _resolve_estimate_args(args, kwargs):
         "device_type", args[5] if len(args) > 5 else Hard.device_map["A2"]
     )
     memory = kwargs.get("memory", args[6] if len(args) > 6 else None)
-    return cfg, stages, extra_custom_func, ccfg, debugger, device_type, memory
+    return _EstimateArgs(cfg, stages, extra_custom_func, ccfg, debugger, device_type, memory)
 
 
 def _finalize_perf(perf, cache_file, debugger, memory):

@@ -4,6 +4,7 @@ project(hyper_parallel_multicore_torch LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/hardening.cmake)
 
 if(NOT HP_MULTICORE_VENDOR_ROOT OR
     NOT EXISTS "${HP_MULTICORE_VENDOR_ROOT}/op_api/include")
@@ -95,11 +96,6 @@ target_include_directories(hyper_parallel_mega_moe_torch PRIVATE
     ${HP_MULTICORE_VENDOR_ROOT}/op_api/include)
 target_link_libraries(hyper_parallel_mega_moe_torch PRIVATE
     ${TORCH_LINK_LIBRARIES})
-target_link_options(hyper_parallel_mega_moe_torch PRIVATE
-    "-Wl,--enable-new-dtags")
-set(MULTICORE_VENDOR_RUNPATH
-    "$ORIGIN/../../vendors/hyper_parallel_multicore_nn/op_api/lib")
-set_target_properties(hyper_parallel_mega_moe_torch PROPERTIES
-    INSTALL_RPATH "${MULTICORE_VENDOR_RUNPATH}")
+hp_enable_elf_hardening(hyper_parallel_mega_moe_torch)
 
 install(TARGETS hyper_parallel_mega_moe_torch DESTINATION .)

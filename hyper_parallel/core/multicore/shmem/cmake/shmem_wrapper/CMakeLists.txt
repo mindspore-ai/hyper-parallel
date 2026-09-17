@@ -15,6 +15,7 @@
 
 cmake_minimum_required(VERSION 3.18)
 project(hyper_parallel_shmem_wrapper LANGUAGES NONE)
+include(${CMAKE_CURRENT_LIST_DIR}/../../../cmake/hardening.cmake)
 
 if(NOT DEFINED HP_SHMEM_SOURCE_DIR OR NOT EXISTS "${HP_SHMEM_SOURCE_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "HP_SHMEM_SOURCE_DIR must identify the prepared SHMEM source tree")
@@ -24,7 +25,6 @@ endif()
 # policy and deliberately applies it after upstream has declared every target.
 add_subdirectory("${HP_SHMEM_SOURCE_DIR}" shmem-upstream)
 
-set(CMAKE_SKIP_RPATH FALSE)
 set_target_properties(shmem PROPERTIES OUTPUT_NAME hyper_parallel_shmem)
 set_target_properties(shmem_utils PROPERTIES OUTPUT_NAME hyper_parallel_shmem_utils)
 foreach(target_name
@@ -34,16 +34,6 @@ foreach(target_name
         aclshmem_bootstrap_config_store
         aclshmem_bootstrap_mpi)
     if(TARGET ${target_name})
-        set_target_properties(${target_name} PROPERTIES
-            SKIP_BUILD_RPATH FALSE
-            SKIP_INSTALL_RPATH FALSE
-            BUILD_WITH_INSTALL_RPATH TRUE
-            BUILD_RPATH "$ORIGIN"
-            INSTALL_RPATH "$ORIGIN")
-        # The upstream SHMEM source sets CMAKE_SKIP_RPATH in its child directory. LINK_FLAGS
-        # is used here so the packaging policy remains outside upstream and the
-        # Makefile receives one literal $ORIGIN rather than $$ORIGIN.
-        set_property(TARGET ${target_name} APPEND_STRING PROPERTY LINK_FLAGS
-            " -Wl,--enable-new-dtags,-rpath,'$ORIGIN'")
+        hp_enable_elf_hardening(${target_name})
     endif()
 endforeach()

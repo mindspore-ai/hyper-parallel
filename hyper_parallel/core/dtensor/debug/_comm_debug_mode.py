@@ -22,6 +22,11 @@ Public API mirrors ``torch.distributed.tensor.debug.CommDebugMode``:
     get_sharding_info()
     generate_comm_debug_tracing_table(noise_level)
     log_comm_debug_tracing_table_to_file(file_name, noise_level)
+
+Record retention is bounded on purpose. A traced step appends one node per
+DTensor op, so an unbounded tree would grow with the step count and pin host
+memory for the whole process lifetime. Use :meth:`CommDebugMode.clear` to
+release the collected records as soon as they have been consumed.
 """
 # pylint: disable=C9006,C9007
 import json
@@ -62,6 +67,17 @@ _COLLECTIVE_GROUP_ARG_INDEX: Dict[str, int] = {
     "differentiable_all_to_all_single_async": 3,
 }
 
+# Hard ceiling on the number of live record nodes. Tracing an entire training
+# run is not a supported use case — the resulting table is unreadable and the
+# nodes cost host memory — so past this point records are counted and dropped
+# instead of retained. The counters (comm_counts, dropped count) stay exact.
+_MAX_RECORDS = 200000
+
+# Deepest call nesting that still gets a node. Deeper calls are counted but not
+# retained, which also stops recursion in the rendering helpers from growing
+# with the traced program's call depth.
+_MAX_DEPTH = 128
+
 
 class CommDebugMode:
     """Context manager that records DTensor operator dispatches and collective
@@ -74,6 +90,32 @@ class CommDebugMode:
         print(mode.generate_comm_debug_tracing_table())
         print(mode.get_comm_counts())
 
+    Long-running training:
+        Tracing keeps one record node per dispatched op, so a mode object that
+        spans a whole training loop retains every op of every step. Trace a
+        bounded slice instead, read the results, then release them::
+
+            mode = CommDebugMode()
+            for step in range(total_steps):
+                # Re-entering resets the previous window, so this alone stays
+                # bounded — but only if each window is read before the next.
+                if step % report_every == 0:
+                    with mode:
+                        loss = train_step()
+                    print(f"step {step}: {mode.get_comm_counts()}")
+                    mode.clear()          # release this window's records now
+                else:
+                    loss = train_step()
+
+        ``clear()`` is what actually releases the memory; without it the last
+        window stays resident until the next ``__enter__``. Entries returned by
+        ``get_parameter_info()`` alias the model's parameter storages, so they
+        pin the model in memory for as long as they are held — ``clear()``
+        drops those too. If a window is left traced too long, records are
+        dropped once the budget is exhausted; ``get_dropped_record_count()``
+        reports how many, and both the counters and a ``logger.warning`` stay
+        accurate, but the rendered table will be incomplete.
+
     Args:
         module: Optional ``nn.Module`` to track forward enter/exit events.
     """
@@ -84,6 +126,8 @@ class CommDebugMode:
         # ---- tracing state ----
         self._call_stack: List[DebugCall] = []
         self._root_records: List[DebugCall] = []
+        self._record_count = 0
+        self._dropped_records = 0
         self._comm_counts: Dict[str, int] = defaultdict(int)
         # ---- module-level info (populated when module is provided) ----
         self._parameter_info: Dict[str, Dict[str, Any]] = {}
@@ -92,7 +136,11 @@ class CommDebugMode:
         # ---- internal handles ----
         self._collective_tracer: Optional[CollectiveTracer] = None
         self._module_tracker: Optional[ModuleTracker] = None
-        self._observer_token = None
+        # Tokens are pushed in ``__enter__`` and popped LIFO in ``__exit__``, so
+        # out-of-order exits restore the observer that was actually active
+        # before this instance took over rather than a stale token.
+        self._observer_tokens: List = []
+        self._active = False
 
     # ------------------------------------------------------------------
     # Context manager protocol
@@ -102,13 +150,12 @@ class CommDebugMode:
         # pylint: disable=C0415
         from hyper_parallel.core.shard._op_dispatch import _debug_mode_observer
 
-        self._comm_counts.clear()
-        self._root_records.clear()
-        self._call_stack.clear()
-        self._parameter_info.clear()
-        self._sharding_info.clear()
+        # Release anything left over from a previous window before collecting
+        # into a fresh tree.
+        self._reset_records()
 
-        self._observer_token = _debug_mode_observer.set(self)
+        self._observer_tokens.append(_debug_mode_observer.set(self))
+        self._active = True
 
         self._collective_tracer = CollectiveTracer(self._on_collective_call)
         self._collective_tracer.install()
@@ -124,6 +171,12 @@ class CommDebugMode:
         # pylint: disable=C0415
         from hyper_parallel.core.shard._op_dispatch import _debug_mode_observer
 
+        # Leaving the window stops collection. Anything that reads results
+        # (get_comm_counts, generate_comm_debug_tracing_table, ...) keeps
+        # working afterwards, so the records themselves are not dropped here —
+        # call clear() once they have been consumed.
+        self._active = False
+
         if self._module_tracker is not None:
             self._module_tracker.uninstall()
             self._module_tracker = None
@@ -132,9 +185,33 @@ class CommDebugMode:
             self._collective_tracer.uninstall()
             self._collective_tracer = None
 
-        if self._observer_token is not None:
-            _debug_mode_observer.reset(self._observer_token)
-            self._observer_token = None
+        if self._observer_tokens:
+            _debug_mode_observer.reset(self._observer_tokens.pop())
+
+        # The stack is expected to be empty here. Unwinding it matters when a
+        # traced call raised: the matching exit callback never ran, so the
+        # leftovers would otherwise swallow every record of the next window.
+        self._call_stack.clear()
+
+        return False
+
+    def clear(self):
+        """Release all collected records and counters.
+
+        Safe to call at any point, including while the context is active.
+        The observer/hook installation is left untouched — only the data.
+        """
+        self._reset_records()
+
+    def _reset_records(self):
+        """Drop records, counters and module info."""
+        self._call_stack.clear()
+        self._root_records.clear()
+        self._record_count = 0
+        self._dropped_records = 0
+        self._comm_counts.clear()
+        self._parameter_info.clear()
+        self._sharding_info.clear()
 
     def __repr__(self):
         return f"CommDebugMode(get_total_counts()={self.get_total_counts()})"
@@ -145,32 +222,67 @@ class CommDebugMode:
 
     def _on_op_dispatch_enter(self, op_name: str, op_call, args, kwargs):  # pylint: disable=W0613
         """Called by OpDispatcher.dispatch() before the op executes."""
-        depth = len(self._call_stack)
-        record = OpCall(
-            call_depth=depth,
+        if not self._active:
+            return
+
+        record = self._make_record(
+            OpCall,
             op_name=op_name,
             input_infos=self._extract_tensor_infos(args),
         )
+        if record is None:
+            return
 
-        if self._call_stack:
-            self._call_stack[-1].children.append(record)
-        else:
-            self._root_records.append(record)
-
-        self._call_stack.append(record)
+        self._attach(record)
 
     def _on_op_dispatch_exit(self, op_name, result):  # pylint: disable=W0613
         """Called by OpDispatcher.dispatch() after the op executes."""
         if not self._call_stack:
             return
 
+        # Peek before popping: a nested scope that never saw an enter must not
+        # pop someone else's frame off the stack.
+        if not isinstance(self._call_stack[-1], OpCall):
+            return
+
         record = self._call_stack.pop()
-        if isinstance(record, OpCall):
-            record.output_infos = self._extract_tensor_infos((result,))
+        record.output_infos = self._extract_tensor_infos((result,))
 
     # Keep old names as aliases for backward compatibility with tests.
     on_op_dispatch_enter = _on_op_dispatch_enter
     on_op_dispatch_exit = _on_op_dispatch_exit
+
+    # ------------------------------------------------------------------
+    # Record bookkeeping
+    # ------------------------------------------------------------------
+
+    def _make_record(self, record_cls, **fields) -> Optional[DebugCall]:
+        """Build a record node, or return None when it must not be retained.
+
+        Returns:
+            Optional[DebugCall]: The node, or None when the depth or node budget
+            is exhausted. Callers must not push anything onto ``_call_stack``
+            in that case.
+        """
+        depth = len(self._call_stack)
+        if depth >= _MAX_DEPTH or self._record_count >= _MAX_RECORDS:
+            self._dropped_records += 1
+            return None
+
+        self._record_count += 1
+        return record_cls(call_depth=depth, **fields)
+
+    def _attach(self, record: DebugCall):
+        """Link *record* under the current frame (or the roots) and open it."""
+        if self._call_stack:
+            self._call_stack[-1].children.append(record)
+        else:
+            self._root_records.append(record)
+        self._call_stack.append(record)
+
+    def get_dropped_record_count(self) -> int:
+        """Returns how many records were discarded because the budget ran out."""
+        return self._dropped_records
 
     # ------------------------------------------------------------------
     # Collective tracer callback
@@ -178,7 +290,12 @@ class CommDebugMode:
 
     def _on_collective_call(self, method_name: str, args, kwargs, result):  # pylint: disable=W0613
         """Invoked by CollectiveTracer after a collective op completes."""
-        depth = len(self._call_stack)
+        # The counter is authoritative and stays exact even once records are
+        # being dropped, so it is updated before anything else.
+        self._comm_counts[method_name] += 1
+
+        if not self._active:
+            return
 
         input_shape = None
         input_dtype = ""
@@ -203,8 +320,8 @@ class CommDebugMode:
                 except Exception:  # pylint: disable=W0703
                     pass
 
-        record = CollectiveCall(
-            call_depth=depth,
+        record = self._make_record(
+            CollectiveCall,
             collective_type=method_name,
             group_size=group_size,
             group=group_str,
@@ -212,13 +329,15 @@ class CommDebugMode:
             output_shape=output_shape,
             input_dtype=input_dtype,
         )
+        if record is None:
+            return
 
+        # A collective is a leaf: it is linked but never pushed, so it cannot
+        # swallow the enclosing op's exit.
         if self._call_stack:
             self._call_stack[-1].children.append(record)
         else:
             self._root_records.append(record)
-
-        self._comm_counts[method_name] += 1
 
     # ------------------------------------------------------------------
     # Module tracker callback
@@ -226,29 +345,37 @@ class CommDebugMode:
 
     def _on_module_event(self, module_fqn: str, event_type: str):
         """Invoked by ModuleTracker on forward enter/exit."""
-        depth = len(self._call_stack)
-        record = AnnotateCall(
-            call_depth=depth,
+        if not self._active:
+            return
+
+        if event_type == "exit":
+            # Only unwind a frame this tracer opened.
+            if self._call_stack and isinstance(self._call_stack[-1], AnnotateCall):
+                self._call_stack.pop()
+            return
+
+        record = self._make_record(
+            AnnotateCall,
             module_fqn=module_fqn,
             event_type=event_type,
         )
+        if record is None:
+            return
 
-        if event_type == "enter":
-            if self._call_stack:
-                self._call_stack[-1].children.append(record)
-            else:
-                self._root_records.append(record)
-            self._call_stack.append(record)
-        else:  # "exit"
-            if self._call_stack:
-                self._call_stack.pop()
+        self._attach(record)
 
     # ------------------------------------------------------------------
     # Module info collection
     # ------------------------------------------------------------------
 
     def _collect_module_info(self):
-        """Collect parameter and sharding info from the tracked module."""
+        """Collect parameter and sharding info from the tracked module.
+
+        Note:
+            ``get_parameter_info()`` returns the parameter *storages* (via
+            ``param.data``), not copies, so the model stays pinned in memory
+            while those entries are held. Call :meth:`clear` to release them.
+        """
         from hyper_parallel.core.dtensor.dtensor import (  # pylint: disable=C0415
             DTensor, _distribute_module_named_modules, _distribute_module_named_parameters,
         )
@@ -319,7 +446,8 @@ class CommDebugMode:
 
         Returns:
             Dict mapping module FQN to a dict of ``{param_name: param_data}``.
-            Only available when a *module* was passed to the constructor.
+            The values are the live parameter storages, not copies. Only
+            available when a *module* was passed to the constructor.
         """
         return self._parameter_info
 
@@ -344,6 +472,13 @@ class CommDebugMode:
         """
         if noise_level is None:
             noise_level = 1
+
+        if self._dropped_records:
+            logger.warning(
+                "%d record(s) were dropped because the record budget was exhausted; "
+                "the table is incomplete. Only trace a bounded number of steps.",
+                self._dropped_records,
+            )
 
         if noise_level >= 2 and self._module is None:
             logger.warning(
@@ -439,6 +574,9 @@ class CommDebugMode:
             "records": [],
         }
 
+        if self._dropped_records:
+            data["dropped_records"] = self._dropped_records
+
         if self._sharding_info:
             data["sharding_info"] = {k: str(v) for k, v in self._sharding_info.items()}
 
@@ -459,14 +597,27 @@ class CommDebugMode:
 
     def _collect_table_lines(self, record: DebugCall, lines: List[str],
                              noise_level: int, indent: int):
-        """Recursively append formatted lines for *record* and its children."""
+        """Recursively append one formatted table line per record in the subtree.
+
+        Collectives are always emitted; ``OpCall`` and ``AnnotateCall`` lines are
+        gated on *noise_level* so that lowering verbosity drops them while still
+        descending into their children.
+
+        Args:
+            record: Subtree root to render.
+            lines: Accumulator the formatted lines are appended to; passed through
+                the recursion rather than returned, so the caller can seed it.
+            noise_level: 0 = collectives only, 1 = ops + collectives,
+                2 = module annotations as well.
+            indent: Current nesting level; each level adds two leading spaces.
+        """
         prefix = "  " * indent
         if isinstance(record, CollectiveCall):
-            lines.append(f"{prefix}{'Collective':<20} {record._render_self()}")
+            lines.append(f"{prefix}{'Collective':<20} {record.render_self()}")
         elif isinstance(record, OpCall) and noise_level >= 1:
-            lines.append(f"{prefix}{'Op':<20} {record._render_self()}")
+            lines.append(f"{prefix}{'Op':<20} {record.render_self()}")
         elif isinstance(record, AnnotateCall) and noise_level >= 2:
-            lines.append(f"{prefix}{'Module':<20} {record._render_self()}")
+            lines.append(f"{prefix}{'Module':<20} {record.render_self()}")
 
         for child in record.children:
             self._collect_table_lines(child, lines, noise_level, indent + 1)

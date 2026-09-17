@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,18 +15,27 @@
 """Unit tests for hyper_parallel.core.dtensor.debug.CommDebugMode."""
 
 import os
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-
 import unittest
-from unittest.mock import MagicMock, Mock, patch
+from typing import Any
+from unittest.mock import Mock
 
-import torch
+# Must be set before hyper_parallel is imported: it selects the backend at
+# import time, and every assertion below assumes the Torch backend.
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"  # pylint: disable=wrong-import-position
 
-from hyper_parallel.core.dtensor.debug import CommDebugMode
-from hyper_parallel.core.dtensor.debug._call_records import CollectiveCall, OpCall, TensorInfo
-from hyper_parallel.core.dtensor.debug._collective_tracer import CollectiveTracer
-from hyper_parallel.core.shard._op_dispatch import _debug_mode_observer
+import torch  # pylint: disable=wrong-import-position
+
+from hyper_parallel.core.dtensor import _utils  # pylint: disable=wrong-import-position
+from hyper_parallel.core.dtensor.debug import CommDebugMode  # pylint: disable=wrong-import-position
+from hyper_parallel.core.dtensor.debug._call_records import (  # pylint: disable=wrong-import-position
+    CollectiveCall,
+    OpCall,
+    TensorInfo,
+)
+from hyper_parallel.core.dtensor.debug._collective_tracer import (  # pylint: disable=wrong-import-position
+    CollectiveTracer,
+)
+from hyper_parallel.core.shard._op_dispatch import _debug_mode_observer  # pylint: disable=wrong-import-position
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +47,7 @@ class TestCallRecords(unittest.TestCase):
     def test_op_call_render(self):
         """
         Feature: OpCall rendering
-        Description: OpCall._render_self() produces a human-readable single line.
+        Description: OpCall.render_self() produces a human-readable single line.
         Expectation: The rendered string contains op name and tensor info.
         """
         record = OpCall(
@@ -53,7 +62,7 @@ class TestCallRecords(unittest.TestCase):
                            placements=("Replicate()",), mesh_shape=(2,)),
             ],
         )
-        text = record._render_self()
+        text = record.render_self()
         self.assertIn("aten.mm.default", text)
         self.assertIn("DTensor", text)
         self.assertIn("[4, 8]", text)
@@ -61,7 +70,7 @@ class TestCallRecords(unittest.TestCase):
     def test_collective_call_render(self):
         """
         Feature: CollectiveCall rendering
-        Description: CollectiveCall._render_self() shows collective type and shapes.
+        Description: CollectiveCall.render_self() shows collective type and shapes.
         Expectation: Rendered string contains the collective type and group size.
         """
         record = CollectiveCall(
@@ -71,7 +80,7 @@ class TestCallRecords(unittest.TestCase):
             output_shape=(8, 16),
             input_dtype="torch.float32",
         )
-        text = record._render_self()
+        text = record.render_self()
         self.assertIn("differentiable_all_reduce", text)
         self.assertIn("group_size=4", text)
 
@@ -104,8 +113,6 @@ class TestCollectiveTracer(unittest.TestCase):
         Description: After uninstall(), platform methods are exactly restored.
         Expectation: Function identity matches the original before patching.
         """
-        from hyper_parallel.core.dtensor import _utils
-
         # Save originals (raw module attributes).
         originals = {}
         for name in ("differentiable_all_reduce", "differentiable_all_gather_concat"):
@@ -135,8 +142,6 @@ class TestCollectiveTracer(unittest.TestCase):
         Description: The callback fires when a patched method is called.
         Expectation: Callback receives (method_name, args, kwargs, result).
         """
-        from hyper_parallel.core.dtensor import _utils
-
         if not hasattr(_utils, "differentiable_all_reduce"):
             self.skipTest("differentiable_all_reduce not available")
 
@@ -163,12 +168,11 @@ class TestCollectiveTracer(unittest.TestCase):
         Description: A failing callback does not affect the original function.
         Expectation: The patched method still returns the original result.
         """
-        from hyper_parallel.core.dtensor import _utils
-
         if not hasattr(_utils, "differentiable_all_reduce"):
             self.skipTest("differentiable_all_reduce not available")
 
-        def bad_callback(*args):
+        def bad_callback(*args: Any, **kwargs: Any) -> None:
+            """Raise on every call to exercise the tracer's fault isolation."""
             raise RuntimeError("boom")
 
         tracer = CollectiveTracer(bad_callback)
@@ -223,8 +227,6 @@ class TestCommDebugModeContextManager(unittest.TestCase):
         Description: After CommDebugMode exits, all platform methods are restored.
         Expectation: cls.__dict__ entries match originals.
         """
-        from hyper_parallel.core.dtensor import _utils
-
         originals = {}
         for name in ("differentiable_all_reduce", "differentiable_reduce_scatter"):
             if hasattr(_utils, name):

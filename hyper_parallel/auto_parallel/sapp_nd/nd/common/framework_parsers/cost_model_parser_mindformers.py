@@ -206,6 +206,56 @@ class CostModelParserMindformers(_CostModelParser):
             else (self.ccfg.t * self.ccfg.d)
         )
 
+    def __config_parse_yaml_fp_bytes(self):
+        """FP byte storages of parameters, activations and softmax outputs."""
+        self.ccfg.bytes_p = self.ccfg.fp_bytes(
+            self.config.model.model_config.param_init_type,
+        )  # parameters
+        if not self.ccfg.bytes_p:
+            self.ccfg.bytes_p = self.ccfg.fp_bytes(
+                self.config.model.model_config.params_dtype
+            )
+        self.ccfg.bytes_compute = self.ccfg.fp_bytes(
+            self.config.model.model_config.compute_dtype
+        )  # activations
+        self.ccfg.bytes_softmax = self.ccfg.fp_bytes(
+            self.config.model.model_config.softmax_compute_type
+        )  # softmax output
+        if not self.ccfg.bytes_softmax:
+            self.ccfg.bytes_softmax = self.ccfg.fp_bytes(
+                self.config.model.model_config.softmax_compute_dtype
+            )
+        if not self.ccfg.bytes_p:
+            raise AttributeError("bytes_p not positive")
+        if not self.ccfg.bytes_compute:
+            raise AttributeError("bytes_compute not positive")
+
+    def __config_parse_yaml_shard_factors(self):
+        """Optimizer, embedding, recompute and flash attention factors."""
+        # Optimizer parallel factors
+        if self.ccfg.op_weight_shard:
+            self.ccfg.os_max_shard = self.ccfg.op_weight_shard
+        elif self.ccfg.has_op:
+            self.ccfg.os_max_shard = self.ccfg.d * self.ccfg.t
+        else:
+            self.ccfg.os_max_shard = 1
+        self.config_optimizer_shard(self.ccfg)
+
+        # Other factors
+        self.config_shard_emb()
+        self.ccfg.shard_output_activ = 1
+        self.ccfg.shard_recompute_input = (
+            self.ccfg.t
+            if self.config.recompute_config.recompute_slice_activation
+            else 1
+        )
+        self.ccfg.s_fa = (
+            self.ccfg.s
+            if not self.config.model.model_config.use_flash_attention
+            else self.ccfg.s / self.ccfg.a
+        )  # flash attention factor [HYPOTHESIS]
+        self.config_comm_flag(self.ccfg)
+
     def __config_parse_yaml(self):
         """MindFormer format for unimodal"""
         self.ccfg.config_format = "yaml"
@@ -241,53 +291,8 @@ class CostModelParserMindformers(_CostModelParser):
         self.__config_parse_yaml_parallelism()
         self.__config_parse_yaml_hyperparameters()
         self.__config_parse_yaml_moe()
-
-        # FP byte storages
-        self.ccfg.bytes_p = self.ccfg.fp_bytes(
-            self.config.model.model_config.param_init_type,
-        )  # parameters
-        if not self.ccfg.bytes_p:
-            self.ccfg.bytes_p = self.ccfg.fp_bytes(
-                self.config.model.model_config.params_dtype
-            )
-        self.ccfg.bytes_compute = self.ccfg.fp_bytes(
-            self.config.model.model_config.compute_dtype
-        )  # activations
-        self.ccfg.bytes_softmax = self.ccfg.fp_bytes(
-            self.config.model.model_config.softmax_compute_type
-        )  # softmax output
-        if not self.ccfg.bytes_softmax:
-            self.ccfg.bytes_softmax = self.ccfg.fp_bytes(
-                self.config.model.model_config.softmax_compute_dtype
-            )
-        if not self.ccfg.bytes_p:
-            raise AttributeError("bytes_p not positive")
-        if not self.ccfg.bytes_compute:
-            raise AttributeError("bytes_compute not positive")
-
-        # Optimizer parallel factors
-        if self.ccfg.op_weight_shard:
-            self.ccfg.os_max_shard = self.ccfg.op_weight_shard
-        elif self.ccfg.has_op:
-            self.ccfg.os_max_shard = self.ccfg.d * self.ccfg.t
-        else:
-            self.ccfg.os_max_shard = 1
-        self.config_optimizer_shard(self.ccfg)
-
-        # Other factors
-        self.config_shard_emb()
-        self.ccfg.shard_output_activ = 1
-        self.ccfg.shard_recompute_input = (
-            self.ccfg.t
-            if self.config.recompute_config.recompute_slice_activation
-            else 1
-        )
-        self.ccfg.s_fa = (
-            self.ccfg.s
-            if not self.config.model.model_config.use_flash_attention
-            else self.ccfg.s / self.ccfg.a
-        )  # flash attention factor [HYPOTHESIS]
-        self.config_comm_flag(self.ccfg)
+        self.__config_parse_yaml_fp_bytes()
+        self.__config_parse_yaml_shard_factors()
         self.ccfg.gbs = self.ccfg.b * self.ccfg.d * self.ccfg.m
         self.ccfg.n_mtp = (
             self.config.model.model_config.mtp_depth

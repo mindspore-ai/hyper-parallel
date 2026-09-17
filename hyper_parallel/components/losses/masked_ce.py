@@ -14,6 +14,8 @@
 # ============================================================================
 """Directly configurable masked cross-entropy callable."""
 
+__all__ = ["MaskedCrossEntropy"]
+
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -82,6 +84,3 @@ class MaskedCrossEntropy:
             loss = loss / num_label_tokens
 
         return loss
-
-
-__all__ = ["MaskedCrossEntropy"]

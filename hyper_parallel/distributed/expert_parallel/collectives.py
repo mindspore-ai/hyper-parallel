@@ -24,7 +24,8 @@ computation).
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
-from typing import Any, Callable, Optional
+from typing import Any
+
 import torch
 import torch.distributed as dist
 

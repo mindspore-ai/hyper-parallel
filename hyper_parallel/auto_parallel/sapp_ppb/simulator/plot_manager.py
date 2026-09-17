@@ -202,8 +202,7 @@ class PlotMgr:
     def draw_comm_loop(self, lines: List[List[BlockSim]], loop: List[BlockSim],
                        ax_index: int = 0) -> "PlotMgr":
         """Highlight a dependency loop in the send-receive graph."""
-        draw_result = self.draw(lines, ax_index, True, True, True, 'joint', phase=True)
-        if draw_result is not self:
+        if self.draw(lines, ax_index, True, True, True, 'joint', phase=True) is not self:
             raise RuntimeError("Unexpected draw result.")
         block_index = self._get_block_indices(lines, mode='joint', equal_wide=True)
         msg = 'dependency loop: '

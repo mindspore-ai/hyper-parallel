@@ -21,6 +21,8 @@ can rely on ``enable_overlap`` / ``fsdp_enabled`` / ``fsdp_degree``
 / ``tp_size`` being present without each pass re-declaring the contract.
 """
 
+__all__ = ["GraphPass"]
+
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
@@ -65,6 +67,3 @@ class GraphPass(ABC):
     def __repr__(self) -> str:
         """Return a developer-facing representation of the pass."""
         return f"{self.__class__.__name__}(name={self.name})"
-
-
-__all__ = ["GraphPass"]

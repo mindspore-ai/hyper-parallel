@@ -15,6 +15,12 @@
 # ============================================================================
 """Distributed-checkpoint (DCP) backend for :class:`CheckpointerBase`."""
 
+__all__ = [
+    "STEP_PREFIX",
+    "DistributedCheckpointer",
+    "initialize_optimizer_state",
+]
+
 import gc
 import logging
 import os
@@ -669,10 +675,3 @@ class DistributedCheckpointer(CheckpointerBase):
             )
         logger.info("Read extra_state embedded in the DCP state dict")
         return extra
-
-
-__all__ = [
-    "STEP_PREFIX",
-    "DistributedCheckpointer",
-    "initialize_optimizer_state",
-]

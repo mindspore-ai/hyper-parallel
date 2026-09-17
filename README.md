@@ -1,6 +1,21 @@
-<h1 align="center">HyperParallel</h1>
+<div align="center">
+  <img src="docs/images/hyperparallel-logo.png" alt="HyperParallel Logo" title="HyperParallel logo" width="50%">
 
-<p align="center"><strong>昇腾超节点亲和的分布式并行加速库</strong></p>
+[![WeChat 微信交流群](https://img.shields.io/badge/WeChat-64A519?style=flat&logo=wechat&logoColor=07C160)](#parallel-training-system-sig)
+[![小红书 HyperParallel（小红书号：hyperparallel）](https://img.shields.io/badge/%E5%B0%8F%E7%BA%A2%E4%B9%A6-FF2442?style=flat&logo=xiaohongshu&logoColor=white)](#xiaohongshu-qrcode)
+[![Document 文档中心](https://img.shields.io/badge/Document-0088CC?style=flat&logo=readthedocs&logoColor=white)](docs/index.md)
+
+  <h3>简化超节点编程 &nbsp;·&nbsp; 释放并行算力</h3>
+  <p><sub>昇腾超节点亲和的分布式并行加速库</sub></p>
+
+  <p>
+    <a href="#-快速开始">快速开始</a>
+    &emsp;·&emsp;
+    <a href="docs/index.md">文档中心</a>
+    &emsp;·&emsp;
+    <a href="docs/api/api_reference.md">API 参考</a>
+  </p>
+</div>
 
 ---
 
@@ -172,6 +187,13 @@ HyperParallel/
 扫描下方二维码加入 Parallel Training System SIG 微信交流群，与社区开发者交流使用经验、技术方案和项目进展。
 
 <img src="./docs/images/parallel_training_system_sig_wechat.png" alt="Parallel Training System SIG 微信交流群二维码" width="220" />
+
+### HyperParallel 技术博客
+
+扫描下方二维码关注 HyperParallel 小红书账号（小红书号：`hyperparallel`），获取技术博客与实践分享。
+
+<a id="xiaohongshu-qrcode"></a>
+<img src="./docs/images/hyperparallel_xiaohongshu.png" alt="HyperParallel 小红书技术博客二维码" width="220" />
 
 ---
 

@@ -41,7 +41,8 @@ class _PPB:
         self._inner_dynamic_mem = inner_dyn_fun
         self.mb = EvalUtils.mb
 
-    def add_to_ppb_list(self, ppb_lay_desc: list, desc: dict) -> None:
+    @staticmethod
+    def add_to_ppb_list(ppb_lay_desc: list, desc: dict) -> None:
         """layer description list preparation"""
         if desc:
             already_comp = False
@@ -63,11 +64,10 @@ class _PPB:
 
     def lay_ppb(self, ccfg: CostModelConfig, ctx: Context, res_stat: float) -> dict:
         """layer description preparation"""
+        desc = {"model_name": ccfg.model_name}
         original_enable_node_log = ctx.enable_node_log
         ctx.enable_node_log = False
         try:
-            desc = {}
-            desc["model_name"] = ccfg.model_name
             if ctx.current_node == ctx.head_node:
                 d_emb = self.mb(sum(self._inner_dynamic_mem(ppb=True)))
                 desc["type"] = "HEAD"
@@ -137,11 +137,10 @@ class _PPB:
 
     def lay_ppb_new(self, ccfg: CostModelConfig, ctx: Context, res_stat: float) -> dict:
         """layer description preparation"""
+        desc = {"model_name": ccfg.model_name}
         original_enable_node_log = ctx.enable_node_log
         ctx.enable_node_log = False
         try:
-            desc = {}
-            desc["model_name"] = ccfg.model_name
             if ctx.current_node == ctx.head_node:
                 desc["memory_activation"] = {"NONE": 0, "FULL": 0}
                 d_emb = self.mb(sum(self._inner_dynamic_mem(ppb=True)))
@@ -160,71 +159,84 @@ class _PPB:
                 desc["backward_time"] = {"NONE": 1, "FULL": 1}
             else:
                 desc["memory_activation"] = {"NONE": 0, "COMM": 0, "SLCT": 0, "BOTH": 0, "FULL": 0}
-                original_current_node = ctx.current_node
-                synthetic_rec_op = False
-                if not hasattr(ccfg, 'rec_op'):
-                    ccfg.rec_op = SimpleNamespace(
-                        attBMM=1, headCast=1, dropout=1, softmax=1, normOp=1, gather=1, ffAct=1
-                    )
-                    synthetic_rec_op = True
-                original_rec_op = {}
-                rec_op_keys = ['attBMM', 'headCast', 'dropout', 'softmax', 'normOp', 'gather', 'ffAct']
-                for key in rec_op_keys:
-                    original_rec_op[key] = getattr(ccfg.rec_op, key, 1)
-                try:
-                    # NOT_REC_LAYER: No recompute (save all activations)
-                    ctx.current_node = LayerType.NOT_REC_LAYER
-                    for key in rec_op_keys:
-                        setattr(ccfg.rec_op, key, 1)
-                    dyn_nrec = self._inner_dynamic_mem(ppb=True)
-
-                    # SLCT recompute: Recompute operators only (saves ~4% memory)
-                    # rec_op=0 means recompute (saves memory), rec_op=1 means don't recompute (uses memory)
-                    ctx.current_node = LayerType.SEL_REC_LAYER
-                    for key in ['attBMM', 'headCast', 'dropout', 'softmax', 'normOp', 'ffAct']:
-                        setattr(ccfg.rec_op, key, 0)
-                    setattr(ccfg.rec_op, 'gather', 1)
-                    dyn_srec = self._inner_dynamic_mem(ppb=True)
-
-                    # COMM recompute: Recompute communication only (saves ~12.5% memory)
-                    ctx.current_node = LayerType.SEL_REC_LAYER
-                    for key in ['attBMM', 'headCast', 'dropout', 'softmax', 'normOp', 'ffAct']:
-                        setattr(ccfg.rec_op, key, 1)
-                    setattr(ccfg.rec_op, 'gather', 0)
-                    dyn_comm = self._inner_dynamic_mem(ppb=True)
-
-                    # BOTH recompute: Recompute both operators and communication
-                    ctx.current_node = LayerType.SEL_REC_LAYER
-                    for key in rec_op_keys:
-                        setattr(ccfg.rec_op, key, 0)
-                    dyn_both = self._inner_dynamic_mem(ppb=True)
-
-                    # FULL_REC_LAYER: Full recompute
-                    ctx.current_node = LayerType.FULL_REC_LAYER
-                    dyn_frec = self._inner_dynamic_mem(ppb=True)
-                finally:
-                    for key, val in original_rec_op.items():
-                        setattr(ccfg.rec_op, key, val)
-                    if synthetic_rec_op:
-                        delattr(ccfg, 'rec_op')
-                    ctx.current_node = original_current_node
-
-                c = max(dyn_nrec[1], dyn_srec[1], dyn_comm[1], dyn_both[1], dyn_frec[1])
+                dyn = self._dyn_mem_per_recompute_option(ccfg, ctx)
+                c = max(dyn["NONE"][1], dyn["SLCT"][1], dyn["COMM"][1], dyn["BOTH"][1], dyn["FULL"][1])
                 desc["memory_parameter"] = self.mb(res_stat)
                 desc["memory_parameter"] += self.mb(c)
-                desc["memory_activation"]["NONE"] = self.mb(dyn_nrec[0])
-                desc["memory_activation"]["COMM"] = self.mb(dyn_comm[0])
-                desc["memory_activation"]["SLCT"] = self.mb(dyn_srec[0])
-                desc["memory_activation"]["BOTH"] = self.mb(dyn_both[0])
-                desc["memory_activation"]["FULL"] = self.mb(dyn_frec[0])
+                desc["memory_activation"]["NONE"] = self.mb(dyn["NONE"][0])
+                desc["memory_activation"]["COMM"] = self.mb(dyn["COMM"][0])
+                desc["memory_activation"]["SLCT"] = self.mb(dyn["SLCT"][0])
+                desc["memory_activation"]["BOTH"] = self.mb(dyn["BOTH"][0])
+                desc["memory_activation"]["FULL"] = self.mb(dyn["FULL"][0])
                 desc["type"] = "BODY"
                 desc["options"] = ["NONE", "COMM", "SLCT", "BOTH", "FULL"]
                 desc["forward_time"] = {"NONE": 1, "COMM": 1, "SLCT": 1, "BOTH": 1, "FULL": 1}
                 desc["backward_time"] = {"NONE": 1, "COMM": 1, "SLCT": 1, "BOTH": 1, "FULL": 1}
-            desc["time"] = 1
         finally:
             ctx.enable_node_log = original_enable_node_log
+        desc["time"] = 1
         return desc
+
+    def _dyn_mem_per_recompute_option(self, ccfg: CostModelConfig, ctx: Context) -> dict:
+        """Dynamic memory of the current body layer under each recompute option.
+
+        Temporarily rewrites ctx.current_node and ccfg.rec_op, and restores both
+        before returning.
+
+        Returns:
+            Dict mapping NONE, SLCT, COMM, BOTH and FULL to the dynamic memory
+            pair returned by the inner dynamic memory function.
+        """
+        original_current_node = ctx.current_node
+        synthetic_rec_op = False
+        if not hasattr(ccfg, 'rec_op'):
+            ccfg.rec_op = SimpleNamespace(
+                attBMM=1, headCast=1, dropout=1, softmax=1, normOp=1, gather=1, ffAct=1
+            )
+            synthetic_rec_op = True
+        original_rec_op = {}
+        rec_op_keys = ['attBMM', 'headCast', 'dropout', 'softmax', 'normOp', 'gather', 'ffAct']
+        for key in rec_op_keys:
+            original_rec_op[key] = getattr(ccfg.rec_op, key, 1)
+        dyn = {}
+        try:
+            # NOT_REC_LAYER: No recompute (save all activations)
+            ctx.current_node = LayerType.NOT_REC_LAYER
+            for key in rec_op_keys:
+                setattr(ccfg.rec_op, key, 1)
+            dyn["NONE"] = self._inner_dynamic_mem(ppb=True)
+
+            # SLCT recompute: Recompute operators only (saves ~4% memory)
+            # rec_op=0 means recompute (saves memory), rec_op=1 means don't recompute (uses memory)
+            ctx.current_node = LayerType.SEL_REC_LAYER
+            for key in ['attBMM', 'headCast', 'dropout', 'softmax', 'normOp', 'ffAct']:
+                setattr(ccfg.rec_op, key, 0)
+            setattr(ccfg.rec_op, 'gather', 1)
+            dyn["SLCT"] = self._inner_dynamic_mem(ppb=True)
+
+            # COMM recompute: Recompute communication only (saves ~12.5% memory)
+            ctx.current_node = LayerType.SEL_REC_LAYER
+            for key in ['attBMM', 'headCast', 'dropout', 'softmax', 'normOp', 'ffAct']:
+                setattr(ccfg.rec_op, key, 1)
+            setattr(ccfg.rec_op, 'gather', 0)
+            dyn["COMM"] = self._inner_dynamic_mem(ppb=True)
+
+            # BOTH recompute: Recompute both operators and communication
+            ctx.current_node = LayerType.SEL_REC_LAYER
+            for key in rec_op_keys:
+                setattr(ccfg.rec_op, key, 0)
+            dyn["BOTH"] = self._inner_dynamic_mem(ppb=True)
+
+            # FULL_REC_LAYER: Full recompute
+            ctx.current_node = LayerType.FULL_REC_LAYER
+            dyn["FULL"] = self._inner_dynamic_mem(ppb=True)
+        finally:
+            for key, val in original_rec_op.items():
+                setattr(ccfg.rec_op, key, val)
+            if synthetic_rec_op:
+                delattr(ccfg, 'rec_op')
+            ctx.current_node = original_current_node
+        return dyn
 
     def ppb_combine_bodies_new(self, ppb_lay_desc: list) -> None:
         """combine descriptions into a new body"""

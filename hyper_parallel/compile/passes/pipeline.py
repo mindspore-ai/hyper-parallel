@@ -35,6 +35,8 @@ The backend compilation slot (InductorPass) is intentionally not wired yet;
 add it here when an inductor backend integration lands.
 """
 
+__all__ = ["PassPipeline"]
+
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from ..pass_config import PassConfig
@@ -162,6 +164,3 @@ class CanonicalizeGraphPass(GraphPass):
         graph_module.graph.lint()
         graph_module.recompile()
         return graph_module
-
-
-__all__ = ["PassPipeline"]

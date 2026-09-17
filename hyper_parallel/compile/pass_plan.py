@@ -30,6 +30,13 @@ Note:
     with a real consumer.
 """
 
+__all__ = [
+    "PassPlan",
+    "FSDPModuleConfig",
+    "create_pass_plan_from_yaml",
+    "create_simple_pass_plan",
+]
+
 import fnmatch
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,13 +45,6 @@ from typing import Dict, List, Optional
 import yaml
 
 DEFAULT_CONFIG_DIR = Path(__file__).parent / "examples"
-
-__all__ = [
-    "PassPlan",
-    "FSDPModuleConfig",
-    "create_pass_plan_from_yaml",
-    "create_simple_pass_plan",
-]
 
 
 @dataclass

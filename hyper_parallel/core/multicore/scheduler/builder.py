@@ -21,9 +21,27 @@ graph-specific post-processing (add_terminate, revise_task_queue, etc.) — call
 build_config_for_rank() from a model's gen_runtime_data.py for full generation.
 """
 from hyper_parallel.core.multicore.scheduler.config import (
-    TaskSplitValue, init_task_split_value, RuntimeConfigC, QUEUE_CAPACITY,
+    RuntimeConfigC,
+    TaskSplitValue,
+    init_task_split_value,
+    mega_moe_event_capacity,
 )
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
+from hyper_parallel.core.multicore.scheduler.runtime import allocate_runtime_config
+
+
+def allocate_graph_config(graph: ComputeGraph, tsv: TaskSplitValue) -> RuntimeConfigC:
+    """Allocate graph tasks plus the terminal before any fill operation.
+
+    Args:
+        graph: Graph after split propagation.
+        tsv: Topology whose experts determine event storage.
+
+    Returns:
+        Zero-initialized runtime with sufficient task, queue and event slots.
+    """
+    required = 1 + sum(op.task_num for op in graph.topological_sort())
+    return allocate_runtime_config(required, mega_moe_event_capacity(tsv.all_expert_num, tsv.ep))
 
 
 def build_runtime_config(graph: ComputeGraph, tsv: TaskSplitValue,
@@ -39,11 +57,10 @@ def build_runtime_config(graph: ComputeGraph, tsv: TaskSplitValue,
         num_cube_cores: Number of AIC cube cores (910B=24).
 
     Returns:
-        RuntimeConfigC ready to be serialized with bytes(cfg).
+        RuntimeConfigC ready to be serialized with serialize_runtime_config(cfg).
     """
-    cfg = RuntimeConfigC()
+    cfg = allocate_graph_config(graph, tsv)
     cfg.num_workers    = 2 * num_cube_cores
-    cfg.queue_capacity = QUEUE_CAPACITY
 
     init_task_split_value(tsv)
     tsv.rank_id = rank_id

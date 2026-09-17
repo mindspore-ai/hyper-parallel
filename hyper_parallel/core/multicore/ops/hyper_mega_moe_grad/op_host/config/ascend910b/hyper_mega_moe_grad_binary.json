@@ -326,6 +326,17 @@
             -2
           ],
           "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "profile_buffer",
+          "index": 29,
+          "dtype": "uint8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
         }
       ],
       "outputs": [

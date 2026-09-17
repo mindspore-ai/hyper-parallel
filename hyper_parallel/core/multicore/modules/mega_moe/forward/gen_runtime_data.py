@@ -24,7 +24,7 @@ Outputs (rank-independent):
     <output_dir>/up_proj_tiling.bin
     <output_dir>/swiglu_tiling.bin
     <output_dir>/down_proj_tiling.bin
-    <output_dir>/all_event_counters.bin   1024×int32 zeros (4 KB)
+    <output_dir>/all_event_counters.bin   graph-sized int32 zeros (at least 4 KB)
     <output_dir>/gmm_workspace.bin        256 MiB zeros
 
 Outputs (per rank):
@@ -32,21 +32,31 @@ Outputs (per rank):
 """
 import argparse
 import os
-import numpy as np
 
-from hyper_parallel.core.multicore.scheduler.config import (
-    RuntimeConfigC, QUEUE_CAPACITY,
-    TaskSplitValue, init_task_split_value, validate_runtime_config,
+from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
+    build_forward_graph,
 )
-from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
-from hyper_parallel.core.multicore.scheduler.scheduler import revise_task_queue
-from hyper_parallel.core.multicore.tasks.utils import add_terminate, add_dynamic_data
 from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import (
-    get_up_proj_tiling_bytes,
     get_down_proj_tiling_bytes,
     get_swiglu_tiling_bytes,
+    get_up_proj_tiling_bytes,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
+from hyper_parallel.core.multicore.modules.mega_moe.profiling import (
+    _configure_mega_moe_profile_metadata,
+)
+from hyper_parallel.core.multicore.scheduler.builder import allocate_graph_config
+from hyper_parallel.core.multicore.scheduler.config import (
+    RuntimeConfigC,
+    TaskSplitValue,
+    configure_ready_handshake,
+    event_workspace_bytes,
+    init_task_split_value,
+    validate_runtime_config,
+)
+from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
+from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
+from hyper_parallel.core.multicore.scheduler.scheduler import revise_task_queue
+from hyper_parallel.core.multicore.tasks.utils import add_dynamic_data, add_terminate
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,9 +83,8 @@ def parse_args() -> argparse.Namespace:
 def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
                           num_cube_cores: int = 24) -> RuntimeConfigC:
     """Build RuntimeConfig for a single rank."""
-    cfg = RuntimeConfigC()
+    cfg = allocate_graph_config(graph, tsv)
     cfg.num_workers    = 2 * num_cube_cores   # NUM_WORKERS_VECTOR = 2 × NUM_WORKERS_CUBE
-    cfg.queue_capacity = QUEUE_CAPACITY
 
     init_task_split_value(tsv)
     tsv.rank_id = rank_id   # C++ forward never sets rank_id; all ranks use default 0
@@ -96,7 +105,15 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
 
     cfg.task_num = task_num_all
     cfg.atomic_add_values[0] = 1
+    configure_ready_handshake(cfg, tsv)
     validate_runtime_config(cfg, tsv, num_cube_cores)
+    _configure_mega_moe_profile_metadata(
+        cfg,
+        graph,
+        tsv,
+        num_cube_cores=num_cube_cores,
+        is_backward=False,
+    )
     return cfg
 
 
@@ -162,9 +179,9 @@ def main() -> None:
     write_bin(os.path.join(out, 'down_proj_tiling.bin'), down_proj_bytes)
 
     # ── Event counters + workspace (rank-independent) ─────────────────────────
-    # all_event_counters: 1024×int32_t zeros — matches C++ reference gen_data
+    # Reserve the same event capacity as the online workspace and runtime.
     write_bin(os.path.join(out, 'all_event_counters.bin'),
-              np.zeros(1024, dtype=np.int32).tobytes())
+              bytes(event_workspace_bytes(tsv.ep, tsv.all_expert_num)))
     # gmm_workspace: 256 MiB zeros — kernel-internal scratch buffer
     write_bin(os.path.join(out, 'gmm_workspace.bin'),
               bytes(256 * 1024 * 1024))
@@ -172,7 +189,7 @@ def main() -> None:
     # ── RuntimeConfig files (one per rank) ───────────────────────────────────
     for rank_id in range(args.ep):
         cfg  = build_config_for_rank(graph, tsv, rank_id, num_cube_cores=args.num_cube_cores)
-        data = bytes(cfg)
+        data = serialize_runtime_config(cfg)
         path = os.path.join(out, f'runtime_config_input_rank_{rank_id}.bin')
         write_bin(path, data)
 

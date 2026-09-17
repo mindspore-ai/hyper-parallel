@@ -300,6 +300,11 @@ class TestSappSolver:
             assert param_val is not None and param_val >= 0
             assert act_val is not None and act_val >= 0
 
+    def test_simulator_is_unavailable_until_simulation(self):
+        """A freshly constructed pipeline reports no simulator instead of raising."""
+        pipeline = SappPipeline("unit", 2, 2, 128, _make_layers())
+        assert pipeline.simulator is None, f"Expected no simulator before simulation, got {pipeline.simulator}"
+
     def test_sapp_pipeline_wrappers_and_manual_strategy(self, monkeypatch, tmp_path):
         """SappPipeline wrapper methods handle fake problem outputs and manual strategies."""
         pipe, body = _make_pipeline()

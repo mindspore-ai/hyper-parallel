@@ -44,6 +44,13 @@ contains the explicit backward ops, and a redundant autograd graph on top
 would keep every forward intermediate alive via ``grad_fn`` references.
 """
 
+__all__ = [
+    "JointGraph",
+    "trace_model_graph",
+    "run_traced_graph",
+    "extract_module_state",
+]
+
 import contextlib
 import copy
 import inspect
@@ -388,7 +395,7 @@ def _input_meta(x: Any) -> Any:
     return x
 
 
-def trace_model_graph(
+def trace_model_graph(  # pylint: disable=too-many-locals
     model: torch.nn.Module,
     train_fn: Callable,
     sample_input: torch.Tensor,
@@ -601,11 +608,3 @@ def run_traced_graph(
     else:
         loss, grads = outputs, []
     return loss, grads
-
-
-__all__ = [
-    "JointGraph",
-    "trace_model_graph",
-    "run_traced_graph",
-    "extract_module_state",
-]

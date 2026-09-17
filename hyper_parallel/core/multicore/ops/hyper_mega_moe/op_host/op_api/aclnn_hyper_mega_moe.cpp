@@ -37,6 +37,7 @@ aclnnStatus aclnnHyperMegaMoeGetWorkspaceSize(
   const aclTensor *combine_target_off, const aclTensor *combine_src_off, const aclTensor *combine_size,
   const aclTensor *gmm_workspace, const aclTensor *up_proj_tiling, const aclTensor *swiglu_tiling,
   const aclTensor *down_proj_tiling, const aclTensor *runtime_config, const aclTensor *all_event_counters,
+  const aclTensor *profile_buffer,
   int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, uint64_t *workspaceSize,
   aclOpExecutor **executor) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
@@ -45,7 +46,7 @@ aclnnStatus aclnnHyperMegaMoeGetWorkspaceSize(
     DFX_IN(dispatch_target, dispatch_target_off, dispatch_src, dispatch_src_off, dispatch_size, weight, up_proj_glist,
            y, swiglu_out, down_proj_weight, down_proj_glist, down_proj_y, combine_target, combine_target_off,
            combine_src_off, combine_size, gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
-           runtime_config, all_event_counters, rankId, ep, expert_num, hidden_size, seq_size),
+           runtime_config, all_event_counters, profile_buffer, rankId, ep, expert_num, hidden_size, seq_size),
     DFX_OUT(dispatch_target, y, swiglu_out, down_proj_y, combine_target));
   auto uniqueExecutor = CREATE_EXECUTOR();
   aclOpExecutor *executorPtr = uniqueExecutor.get();
@@ -77,6 +78,7 @@ aclnnStatus aclnnHyperMegaMoeGetWorkspaceSize(
   MAKE_CONTIGUOUS_CHECK(down_proj_tiling);
   MAKE_CONTIGUOUS_CHECK(runtime_config);
   MAKE_CONTIGUOUS_CHECK(all_event_counters);
+  MAKE_CONTIGUOUS_CHECK(profile_buffer);
 
 #undef MAKE_CONTIGUOUS_CHECK
 
@@ -84,6 +86,7 @@ aclnnStatus aclnnHyperMegaMoeGetWorkspaceSize(
     dispatch_target, dispatch_target_off, dispatch_src, dispatch_src_off, dispatch_size, weight, up_proj_glist, y,
     swiglu_out, down_proj_weight, down_proj_glist, down_proj_y, combine_target, combine_target_off, combine_src_off,
     combine_size, gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling, runtime_config, all_event_counters,
+    profile_buffer,
     rankId, ep, expert_num, hidden_size, seq_size, uniqueExecutor.get());
   bool fwd_output_success = std::all_of(fwd_output.begin(), fwd_output.end(), [](const aclTensor* ptr) {
     return ptr != nullptr;

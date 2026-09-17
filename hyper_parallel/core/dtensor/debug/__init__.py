@@ -20,6 +20,6 @@ Public API:
 Internal modules (_call_records, _collective_tracer, _module_tracker) are implementation details and
 should not be imported directly by user code.
 """
-from hyper_parallel.core.dtensor.debug._comm_debug_mode import CommDebugMode
-
 __all__ = ["CommDebugMode"]
+
+from hyper_parallel.core.dtensor.debug._comm_debug_mode import CommDebugMode

@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, TypeAlias
 
 from torch.utils.data import IterableDataset  # pylint: disable=forbidden-backend-import
@@ -257,7 +257,7 @@ def _wrap_llm_dataset(
         logger.debug("Wrapped mapping Dataset with transform=%s", type(transform).__name__)
         return transformed_dataset
 
-    if hasattr(dataset, "__iter__"):
+    if isinstance(dataset, Iterable):
         transformed_dataset = _LLMIterableTransformDataset(
             dataset,
             transform,

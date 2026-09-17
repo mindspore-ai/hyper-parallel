@@ -176,7 +176,9 @@ class HyperParallelArguments:
     @staticmethod
     def _validate_optional_positive_int(name: str, value: Optional[int], type_name: str) -> None:
         """Validate an optional parallel size."""
-        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+        if value is None:
+            return
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise ValueError(f"{name} must be a positive {type_name} when provided, got {value!r}.")
 
     def _validate_parallel_sizes(self) -> None:
@@ -468,6 +470,22 @@ def _move_model_to_meta(model: nn.Module) -> nn.Module:
     return model
 
 
+def _move_module_buffers_to_meta(
+    module: nn.Module,
+    meta_device: torch.device,
+    converted_buffers: dict[torch.Tensor, torch.Tensor],
+) -> None:
+    """Move direct buffers to meta while preserving aliases across modules."""
+    for name, buffer in module._buffers.items():  # pylint: disable=protected-access
+        if buffer is None:
+            continue
+        converted_buffer = converted_buffers.get(buffer)
+        if converted_buffer is None:
+            converted_buffer = buffer.to(meta_device)
+            converted_buffers[buffer] = converted_buffer
+        module._buffers[name] = converted_buffer  # pylint: disable=protected-access
+
+
 def _move_unwrapped_model_state_to_meta(model: nn.Module) -> nn.Module:
     """Move all model state to meta without invalidating nested HSDP state.
 
@@ -556,19 +574,7 @@ def _move_unwrapped_model_state_to_meta(model: nn.Module) -> nn.Module:
                 continue
             # Expert parameters already resolve from the cache; ordinary parameters convert here.
             module._parameters[name] = _convert_parameter(parameter)  # pylint: disable=protected-access
-        # Buffers are not represented by HSDPParam, so all modules follow this common path.
-        for name, buffer in module._buffers.items():  # pylint: disable=protected-access
-            # None is a valid registered placeholder and needs no conversion.
-            if buffer is None:
-                continue
-            # Preserve shared-buffer identity instead of allocating one meta tensor per slot.
-            converted_buffer = converted_buffers.get(buffer)
-            # Convert the first occurrence and cache it for any aliases.
-            if converted_buffer is None:
-                converted_buffer = buffer.to(meta_device)
-                converted_buffers[buffer] = converted_buffer
-            # Install the meta buffer into this direct module slot.
-            module._buffers[name] = converted_buffer  # pylint: disable=protected-access
+        _move_module_buffers_to_meta(module, meta_device, converted_buffers)
 
     # Re-establish architecture-declared ties such as input embeddings and LM head.
     if hasattr(model, "tie_weights"):

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (
+from hyper_parallel.core.fully_shard.state_dict_utils import (
     get_optim_state_dict as _get_optim_state_dict,
     set_optim_state_dict as _set_optim_state_dict,
 )

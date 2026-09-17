@@ -21,16 +21,15 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.scheduler.config import MAX_EXPERT_NUM_PER_RANK
-from hyper_parallel.core.multicore.shmem.lifecycle import acquire_symmetric_memory
 
 from ..module import MulticoreModule
-from .function import execute_mega_moe
+from .function import execute_mega_moe_with_permutation
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import _COMMUNICATION_SPLIT, bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace, configure_symmetric_heap
-
 
 __all__ = ["MegaMoeExperts"]
 
@@ -54,7 +53,7 @@ def _create_mega_moe_parameters(
 
 
 class _MegaMoeExecutionResources:
-    """Own one shape-bound plan, SHMEM handle, and workspace."""
+    """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
 
     def __init__(
         self,
@@ -67,27 +66,22 @@ class _MegaMoeExecutionResources:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
         configure_symmetric_heap(active_specifications, tensor)
-        self.symmetric_memory = acquire_symmetric_memory(self.spec.ep_group)
+        shmem.acquire(self.spec.ep_group)
         try:
             self.plan = build_mega_moe_plan(self.spec, tensor.device)
-            self.workspace = MegaMoeWorkspace(
-                symmetric_memory=self.symmetric_memory,
-                shared=shared,
-            )
+            self.workspace = MegaMoeWorkspace(shared=shared)
         except Exception:
-            self.symmetric_memory.close()
+            shmem.release()
             raise
         self._closed = False
 
     def close(self) -> None:
-        """Release the workspace and last-owned SHMEM lifecycle."""
+        """Release the workspace and leave the shared SHMEM lifecycle."""
         if self._closed:
             return
+        self.workspace.close()
+        shmem.release()
         self._closed = True
-        try:
-            self.workspace.close()
-        finally:
-            self.symmetric_memory.close()
 
 
 class MegaMoeExperts(MulticoreModule):
@@ -342,18 +336,23 @@ class MegaMoeExperts(MulticoreModule):
             tokens_per_expert,
         )
         resources = self._get_execution_resources(hidden_flat)
-        route = prepare_topk_route(
+        # The expert autograd bridge consumes permutation gradients before the
+        # workspace can be reused, so route preparation needs no separate node.
+        with torch.no_grad():
+            route = prepare_topk_route(
+                hidden_flat,
+                topk_ids,
+                topk_weights,
+                resources.spec,
+                tokens_per_expert,
+                workspace=resources.workspace,
+            )
+        expert_output = execute_mega_moe_with_permutation(
             hidden_flat,
             topk_ids,
-            topk_weights,
-            resources.spec,
-            tokens_per_expert,
-        )
-        expert_output = execute_mega_moe(
-            route.routed_tokens,
             self.gate_up_weight,
             self.down_weight,
-            route.metadata,
+            route,
             resources.plan,
             resources.workspace,
         )

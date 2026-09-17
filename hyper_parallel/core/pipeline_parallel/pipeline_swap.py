@@ -22,6 +22,7 @@ import itertools
 from typing import Any, ContextManager, FrozenSet, Iterable, List
 
 from hyper_parallel.core.activation_memory.swap import SwapManager
+from hyper_parallel.core.pipeline_parallel.utils import MetaStep, MetaStepType
 
 MIN_SWAP_GAP = 4
 
@@ -59,7 +60,12 @@ def unregister_layer_swap_hooks(stages: Iterable[Any]) -> int:
             if module_id in visited_modules:
                 continue
             visited_modules.add(module_id)
-            removed_count += manager.unregister_forward_prefetch_hooks(module)
+            # Full teardown, not just handle removal: also drops the module's
+            # swap group from the process-wide singleton plus the
+            # _swap_group_name/_swap_group_order/_swap_state attributes, so a
+            # permanently-removed layer does not leave an orphaned SwapGroup
+            # holding pinned host/device storage (see B.cache_no_eviction).
+            removed_count += manager.unregister_forward_prefetch_layer(module)
 
     if removed_count:
         warnings.warn(
@@ -139,8 +145,6 @@ class PipelineSwapSession:
 
 
 def _is_compute_step(step) -> bool:
-    from hyper_parallel.core.pipeline_parallel.scheduler import MetaStepType  # pylint: disable=C0415
-
     return step is not None and step.type in (
         MetaStepType.FWD,
         MetaStepType.BWD,
@@ -150,8 +154,6 @@ def _is_compute_step(step) -> bool:
 
 
 def _is_comm_step(step) -> bool:
-    from hyper_parallel.core.pipeline_parallel.scheduler import MetaStepType  # pylint: disable=C0415
-
     return step is not None and step.type in (
         MetaStepType.FWD_RECV,
         MetaStepType.FWD_SEND,
@@ -162,8 +164,6 @@ def _is_comm_step(step) -> bool:
 
 
 def _is_composite_compute_step(step) -> bool:
-    from hyper_parallel.core.pipeline_parallel.scheduler import MetaStepType  # pylint: disable=C0415
-
     return (
         step is not None
         and step.type in (MetaStepType.OVERLAP_F_B, MetaStepType.OVERLAP_B_F)
@@ -210,14 +210,6 @@ def _collect_compute_leaves(order):
     return leaves, container_by_compute_index
 
 
-def _append_after(after_steps, index, priority, step):
-    after_steps[index].append((priority, step))
-
-
-def _append_before(before_steps, index, priority, step):
-    before_steps[index].append((priority, step))
-
-
 def _iter_steps_by_priority(priority_steps):
     """Yield steps from high priority to low priority."""
     for _, step in sorted(priority_steps, key=lambda item: item[0], reverse=True):
@@ -238,8 +230,6 @@ def _comm_block_anchor(order, index):
 
 def _post_compute_anchor(order, index, leaf_step=None):
     """Return the safe index after which post-compute swap steps may run."""
-    from hyper_parallel.core.pipeline_parallel.scheduler import MetaStepType  # pylint: disable=C0415
-
     step = leaf_step if leaf_step is not None else order[index]
     fallback_anchor = _comm_block_anchor(order, index)
     if step.type == MetaStepType.FWD:
@@ -274,8 +264,6 @@ def _load_launch_anchor(
         order: List[Any], fwd_leaf: _ComputeLeaf, bwd_leaf: _ComputeLeaf,
         compute_between: List[int]) -> int:
     """Choose the latest safe H2D launch point for plain or FSDP execution."""
-    from hyper_parallel.core.pipeline_parallel.scheduler import MetaStepType  # pylint: disable=C0415
-
     has_fsdp_steps = any(
         step is not None and step.type in (
             MetaStepType.FSDP_UNSHARD,
@@ -297,19 +285,12 @@ def _load_launch_anchor(
     return bwd_leaf.container_index
 
 
-def inject_pipeline_swap_steps(order: List[Any]) -> List[Any]:
-    """Inject asynchronous transfer steps into one rank's pipeline order.
-
-    Forward collection is executed directly by the forward leaf executor.
-    Transfer launch/wait actions, including the H2D wait before the backward
-    consumer container, appear in the top-level order.
-    """
-    from hyper_parallel.core.pipeline_parallel.scheduler import MetaStep, MetaStepType  # pylint: disable=C0415
-
+def _index_compute_leaves(order):
+    """Index compute leaves by chunk key, separating FWD from BWD consumers."""
     fwd_index = {}
     bwd_index = {}
-    compute_leaves, container_by_compute_index = _collect_compute_leaves(order)
-    for leaf in compute_leaves:
+    leaves, container_by_compute_index = _collect_compute_leaves(order)
+    for leaf in leaves:
         step = leaf.step
         key = (step.stage_index, step.micro_index)
         if step.type == MetaStepType.FWD:
@@ -319,53 +300,89 @@ def inject_pipeline_swap_steps(order: List[Any]) -> List[Any]:
             # BWD_WEIGHT is intentionally excluded: it does not consume the
             # original forward activations restored by swap.
             bwd_index[key] = leaf
+    return fwd_index, bwd_index, container_by_compute_index
 
-    before_steps = defaultdict(list)
-    after_steps = defaultdict(list)
-    chunk_gaps = {
-        key: bwd_index[key].compute_index - fwd_leaf.compute_index
-        for key, fwd_leaf in fwd_index.items()
-        if key in bwd_index
-    }
+
+def _chunk_swap_actions(order, fwd_leaf, bwd_leaf, container_by_compute_index):
+    """Return the swap actions for one chunk as ``(before, after)`` entries.
+
+    Each entry is ``(anchor_index, priority, meta_step)``. Returns ``None``
+    when the chunk is not swappable.
+    """
+    if bwd_leaf.compute_index - fwd_leaf.compute_index < MIN_SWAP_GAP:
+        return None
+    compute_between = [
+        container_by_compute_index[index]
+        for index in range(fwd_leaf.compute_index + 1, bwd_leaf.compute_index)
+    ]
+    if not compute_between:
+        return None
+
+    stage_index = fwd_leaf.step.stage_index
+    micro_index = fwd_leaf.step.micro_index
+    # Always launch offload immediately after the FWD container so that the
+    # async D2H starts before any FSDP_RESHARD or FWD_SEND that may sit
+    # between the FWD and the next compute step.
+    after = [
+        (
+            _post_compute_launch_anchor(fwd_leaf),
+            _AfterActionPriority.LAUNCH_OFFLOAD,
+            MetaStep(micro_index, MetaStepType.SWAP_LAUNCH_OFFLOAD, stage_index),
+        ),
+        (
+            _post_compute_anchor(order, compute_between[0]),
+            _AfterActionPriority.WAIT_OFFLOAD,
+            MetaStep(micro_index, MetaStepType.SWAP_WAIT_OFFLOAD, stage_index),
+        ),
+    ]
+    before = [
+        (
+            _load_launch_anchor(order, fwd_leaf, bwd_leaf, compute_between),
+            _BeforeActionPriority.LAUNCH_LOAD,
+            MetaStep(micro_index, MetaStepType.SWAP_LAUNCH_LOAD, stage_index),
+        ),
+        (
+            bwd_leaf.container_index,
+            _BeforeActionPriority.WAIT_LOAD,
+            MetaStep(micro_index, MetaStepType.SWAP_WAIT_LOAD, stage_index),
+        ),
+    ]
+    return before, after
+
+
+def _collect_swap_actions(order):
+    """Bucket swap actions by the order index they attach to.
+
+    Returns a ``(before_pairs, after_pairs)`` tuple of
+    ``index -> [(priority, MetaStep), ...]`` maps. Each map holds the actions
+    to emit immediately before and immediately after the top-level step at
+    that index.
+    """
+    fwd_index, bwd_index, container_by_compute_index = _index_compute_leaves(order)
+
+    maps = (defaultdict(list), defaultdict(list))
     for key, fwd_leaf in fwd_index.items():
         bwd_leaf = bwd_index.get(key)
         if bwd_leaf is None:
             continue
-        if chunk_gaps[key] < MIN_SWAP_GAP:
+        actions = _chunk_swap_actions(order, fwd_leaf, bwd_leaf, container_by_compute_index)
+        if actions is None:
             continue
-        compute_between = [
-            container_by_compute_index[index]
-            for index in range(fwd_leaf.compute_index + 1, bwd_leaf.compute_index)
-        ]
-        if not compute_between:
-            continue
-        stage_index, micro_index = key
+        for bucket, action_group in enumerate(actions):
+            for anchor, priority, swap_step in action_group:
+                maps[bucket][anchor].append((priority, swap_step))
+    return maps
 
-        first_between_anchor = _post_compute_anchor(order, compute_between[0])
 
-        # Always launch offload immediately after the FWD container so that
-        # the async D2H starts before any FSDP_RESHARD or FWD_SEND that may
-        # sit between the FWD and the next compute step.
-        fwd_anchor = _post_compute_launch_anchor(fwd_leaf)
-        _append_after(
-            after_steps, fwd_anchor, _AfterActionPriority.LAUNCH_OFFLOAD,
-            MetaStep(micro_index, MetaStepType.SWAP_LAUNCH_OFFLOAD, stage_index),
-        )
+def inject_pipeline_swap_steps(order: List[Any]) -> List[Any]:
+    """Inject asynchronous transfer steps into one rank's pipeline order.
 
-        _append_after(
-            after_steps, first_between_anchor, _AfterActionPriority.WAIT_OFFLOAD,
-            MetaStep(micro_index, MetaStepType.SWAP_WAIT_OFFLOAD, stage_index),
-        )
+    Forward collection is executed directly by the forward leaf executor.
+    Transfer launch/wait actions, including the H2D wait before the backward
+    consumer container, appear in the top-level order.
+    """
+    before_steps, after_steps = _collect_swap_actions(order)
 
-        load_launch_anchor = _load_launch_anchor(order, fwd_leaf, bwd_leaf, compute_between)
-        _append_before(
-            before_steps, load_launch_anchor, _BeforeActionPriority.LAUNCH_LOAD,
-            MetaStep(micro_index, MetaStepType.SWAP_LAUNCH_LOAD, stage_index),
-        )
-        _append_before(
-            before_steps, bwd_leaf.container_index, _BeforeActionPriority.WAIT_LOAD,
-            MetaStep(micro_index, MetaStepType.SWAP_WAIT_LOAD, stage_index),
-        )
     injected = []
     for index, step in enumerate(order):
         injected.extend(_iter_steps_by_priority(before_steps[index]))

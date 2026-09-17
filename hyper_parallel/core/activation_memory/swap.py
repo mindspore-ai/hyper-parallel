@@ -22,7 +22,7 @@ import warnings
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Dict, Iterator, List, Optional, Set
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from . import _backend
@@ -278,21 +278,34 @@ class SwapTensor:
                 self._cpu_pool_buffer = self.cpu_pool.acquire(logical_bytes)
                 try:
                     self.val_cpu = self._cpu_pool_buffer.view(self.val.dtype).reshape(self.val.shape)
-                except Exception:
+                except Exception as exc:
+                    pool_buffer = self._cpu_pool_buffer
                     self.release_cpu_buffer()
-                    raise
+                    raise RuntimeError(
+                        "Failed to create a typed CPU-pool view for activation tensor "
+                        f"from {self.funcname!r}: shape={tuple(self.val.shape)}, dtype={self.val.dtype}, "
+                        f"logical_bytes={logical_bytes}, pool_buffer_shape={tuple(pool_buffer.shape)}, "
+                        f"pool_buffer_dtype={pool_buffer.dtype}. Original error: {exc}"
+                    ) from exc
         try:
             if self.cpu_pool is not None or self.is_slice_tensor:
                 self.val_cpu.copy_(self.val, non_blocking=True)
             else:
                 self.val_cpu.untyped_storage().copy_(self.val.untyped_storage(), non_blocking=True)
-        except Exception:
+        except Exception as exc:
             if self.cpu_pool is not None and self._cpu_pool_buffer is not None:
                 release_event = _backend.new_event()
                 release_event.record(_backend.get_current_stream())
                 self.release_cpu_buffer(release_event)
             self.val_cpu = None
-            raise
+            copy_mode = "tensor" if self.cpu_pool is not None or self.is_slice_tensor else "storage"
+            raise RuntimeError(
+                "Failed to offload activation tensor from device to CPU: "
+                f"source={self.funcname!r}, shape={tuple(self.val.shape)}, dtype={self.val.dtype}, "
+                f"device={self.val.device}, copy_mode={copy_mode}, "
+                f"cpu_pool={'enabled' if self.cpu_pool is not None else 'disabled'}. "
+                f"Original error: {exc}"
+            ) from exc
         self._state = self.STATE_D2H
 
     def wait_offload(self):
@@ -606,6 +619,63 @@ class SwapGroup:
         self._packed_by_bucket = packed_by_bucket
         return total_bytes
 
+    def _pack_device_buffers(self):
+        """Concatenate each packed bucket's tensors into one contiguous device buffer."""
+        group_device_bufs = {}
+        for bucket_key, swap_tensors in self._packed_by_bucket.items():
+            group_device_bufs[bucket_key] = _backend.cat(
+                [st.val.reshape(-1) for st in swap_tensors], dim=0
+            )
+        return group_device_bufs
+
+    def _offload_buckets_d2h(self, group_device_bufs, copy_stream):
+        """One-shot D2H per packed bucket."""
+        group_cpu_bufs = {}
+        active_bucket_key = None
+        try:
+            for bucket_key, bucket in self._packed_buckets.items():
+                active_bucket_key = bucket_key
+                dtype_key = bucket["dtype_key"]
+                numel = bucket["total_numel"]
+                cpu_pool = bucket["cpu_pool"]
+                if cpu_pool is None:
+                    cpu_buf = _get_cpu_pinned_buf(dtype_key, numel, bucket["dtype"])
+                else:
+                    raw_buf = cpu_pool.acquire(bucket["total_bytes"])
+                    try:
+                        cpu_buf = raw_buf.view(bucket["dtype"])
+                    except Exception as exc:
+                        cpu_pool.release(raw_buf)
+                        raise RuntimeError(
+                            "Failed to create a typed CPU-pool view for packed activation bucket: "
+                            f"group={self.group_name!r}, bucket={bucket_key!r}, "
+                            f"requested_dtype={bucket['dtype']}, total_numel={numel}, "
+                            f"total_bytes={bucket['total_bytes']}, raw_buffer_shape={tuple(raw_buf.shape)}, "
+                            f"raw_buffer_dtype={raw_buf.dtype}. Original error: {exc}"
+                        ) from exc
+                group_cpu_bufs[bucket_key] = cpu_buf
+                cpu_buf[:numel].copy_(group_device_bufs[bucket_key], non_blocking=True)
+        except Exception as exc:
+            release_event = _backend.new_event()
+            release_event.record(copy_stream)
+            for completed_bucket_key, cpu_buf in group_cpu_bufs.items():
+                bucket = self._packed_buckets[completed_bucket_key]
+                if bucket["cpu_pool"] is not None:
+                    bucket["cpu_pool"].release(cpu_buf, event=release_event)
+                else:
+                    _return_cpu_pinned_buf(cpu_buf)
+            failed_bucket = self._packed_buckets.get(active_bucket_key, {})
+            raise RuntimeError(
+                "Failed to offload packed activation bucket from device to CPU: "
+                f"group={self.group_name!r}, bucket={active_bucket_key!r}, "
+                f"dtype={failed_bucket.get('dtype', 'unknown')}, "
+                f"total_numel={failed_bucket.get('total_numel', 'unknown')}, "
+                f"total_bytes={failed_bucket.get('total_bytes', 'unknown')}, "
+                f"cpu_pool={'enabled' if failed_bucket.get('cpu_pool') is not None else 'disabled'}. "
+                f"Original error: {exc}"
+            ) from exc
+        return group_cpu_bufs
+
     def launch_offload(self, copy_stream):
         """Launch async offload for all storages in the group.
 
@@ -615,13 +685,7 @@ class SwapGroup:
         """
         total_bytes = self._collect_packable_tensors()
         with _backend.no_grad():
-            if total_bytes > 0:
-                group_device_bufs = {}
-                group_cpu_bufs = {}
-                for bucket_key, swap_tensors in self._packed_by_bucket.items():
-                    group_device_bufs[bucket_key] = _backend.cat(
-                        [st.val.reshape(-1) for st in swap_tensors], dim=0
-                    )
+            group_device_bufs = self._pack_device_buffers() if total_bytes > 0 else {}
 
         compute_event = _backend.new_event()
         compute_event.record(_backend.get_current_stream())
@@ -631,35 +695,8 @@ class SwapGroup:
             compute_event.wait(copy_stream)
 
             if total_bytes > 0:
-                # One-shot D2H per packed bucket. MindSpore requires tensor/storage dtype consistency.
-                try:
-                    for bucket_key, bucket in self._packed_buckets.items():
-                        dtype_key = bucket["dtype_key"]
-                        numel = bucket["total_numel"]
-                        cpu_pool = bucket["cpu_pool"]
-                        if cpu_pool is None:
-                            cpu_buf = _get_cpu_pinned_buf(dtype_key, numel, bucket["dtype"])
-                        else:
-                            raw_buf = cpu_pool.acquire(bucket["total_bytes"])
-                            try:
-                                cpu_buf = raw_buf.view(bucket["dtype"])
-                            except Exception:
-                                cpu_pool.release(raw_buf)
-                                raise
-                        group_cpu_bufs[bucket_key] = cpu_buf
-                        cpu_buf[:numel].copy_(group_device_bufs[bucket_key], non_blocking=True)
-                except Exception:
-                    release_event = _backend.new_event()
-                    release_event.record(copy_stream)
-                    for bucket_key, cpu_buf in group_cpu_bufs.items():
-                        bucket = self._packed_buckets[bucket_key]
-                        if bucket["cpu_pool"] is not None:
-                            bucket["cpu_pool"].release(cpu_buf, event=release_event)
-                        else:
-                            _return_cpu_pinned_buf(cpu_buf)
-                    raise
+                self._group_cpu_buf = self._offload_buckets_d2h(group_device_bufs, copy_stream)
                 self._group_device_buf = group_device_bufs
-                self._group_cpu_buf = group_cpu_bufs
 
             # Slice tensors use the existing per-tensor path.
             # Group-managed tensors are already STATE_D2H so async_offload is a no-op.
@@ -919,6 +956,37 @@ class SwapManager:
             removed_count += 1
         return removed_count
 
+    def unregister_forward_prefetch_layer(self, module: Any) -> int:
+        """Tear down prefetch wiring registered on ``module`` and its group.
+
+        Removes the four forward/backward swap hooks installed on ``module``
+        by :meth:`set_forward_prefetch_layer` and drops its swap group from the
+        process-wide singleton.  Mirrors the reverse of :meth:`set_forward_prefetch_layer`
+        so models destroyed in a long-lived process do not leave stale ``SwapGroup``
+        entries or hook handles behind (see the swap-inputs path in
+        ``distributed/activation_checkpoint.py``, which installs these hooks but
+        previously had no teardown).
+
+        Args:
+            module: A layer that participated in a prefetch chain.
+
+        Returns:
+            Number of removed hook handles.
+        """
+        removed_count = self.unregister_forward_prefetch_hooks(module)
+        group_name = getattr(module, "_swap_group_name", None)
+        if group_name is not None:
+            self.abort_group(group_name)
+            delattr(module, "_swap_group_name")
+            if hasattr(module, "_swap_group_order"):
+                delattr(module, "_swap_group_order")
+        # Also drop the swap state so a module re-registered through
+        # set_forward_prefetch_layer does not inherit a stale "pre_backward"
+        # flag that would short-circuit the new forward pre-hook.
+        if hasattr(module, "_swap_state"):
+            delattr(module, "_swap_state")
+        return removed_count
+
     def set_forward_prefetch_layer(self, first_layer, second_layer):
         """
         Configure prefetching and offloading order between two consecutive layers.
@@ -1091,3 +1159,25 @@ class SwapManager:
         if self._copy_stream is None:
             self._copy_stream = _backend.new_stream()
         return self._copy_stream
+
+
+def _teardown_wired_swap_layers(wired_modules: Iterable[Any]) -> None:
+    """Release swap groups and prefetch hooks for an iterable of wired layers.
+
+    Teardown for layers already registered through
+    :meth:`SwapManager.set_forward_prefetch_layer` (the swap-inputs paths in
+    ``distributed/activation_checkpoint.py`` and ``distributed/attention_swap.py``).
+    Those paths register the modules in the process-wide singleton and install
+    hook handles, but never otherwise tear them down, so a long-lived process
+    that rebuilds or discards models leaks ``SwapGroup`` entries and hook
+    handles.  This is called from each path's life-cycle finalizer with the wired
+    modules held directly, because the model container is unreachable at that
+    point and its module tree can no longer be traversed.  Idempotent: a module
+    with no ``_swap_group_name`` (already released) is a no-op.
+
+    Args:
+        wired_modules: Layers that participated in a swap prefetch chain.
+    """
+    manager = SwapManager()
+    for module in wired_modules:
+        manager.unregister_forward_prefetch_layer(module)

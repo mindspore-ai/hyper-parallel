@@ -33,6 +33,7 @@ PLATFORM_ALLOWED_PARTS = ("hyper_parallel/platform/", "tests/", "scripts/", ".ag
 TORCH_ONLY_CORE_PARTS = (
     "hyper_parallel/core/distributed_checkpoint/",
     "hyper_parallel/core/dtensor/",
+    "hyper_parallel/core/fully_shard/",
     "hyper_parallel/core/multicore/",
     "hyper_parallel/core/pipeline_parallel/",
     "hyper_parallel/core/shard/dfunction.py",

@@ -50,6 +50,8 @@ Microbatch gradients are un-normalized sums while sweeping, then divided by
 semantics of a full-batch mean loss.
 """
 
+__all__ = ["ScheduleGPipe"]
+
 from typing import Any, List, Sequence, Tuple
 
 import torch
@@ -307,6 +309,3 @@ class ScheduleGPipe(nn.Module):
         if self.pp_group is None:
             return stage_idx
         return dist.get_global_rank(self.pp_group, stage_idx)
-
-
-__all__ = ["ScheduleGPipe"]

@@ -14,7 +14,7 @@
 # ============================================================================
 """Body module"""
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
@@ -32,6 +32,64 @@ if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
     from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context
     from typing import Tuple
+
+# Bytes per element of the attention tensors that CP shards.
+_CP_ATTENTION_SCORES_BYTES = 4
+_CP_SOFTMAX_OUTPUTS_BYTES = 4
+_CP_DROPOUT_MASK_BYTES = 1
+_CP_KV_BYTES = 2 * 2  # fp16 key and value
+
+
+class _CPAttentionTerms(NamedTuple):
+    """Attention memory of one layer under CP, and what CP saves."""
+
+    kv_cache_memory: float
+    attention_scores_memory: float
+    softmax_outputs_memory: float
+    dropout_mask_memory: float
+    s2_reduction: float
+    kv_reduction: float
+
+
+def _ulysses_cp_attention_terms(
+    s: float, b: float, cp: float, kv_dim: float, a_per_rank: float
+) -> _CPAttentionTerms:
+    """Ulysses CP: each rank holds all s tokens but a/(t*cp) heads."""
+    a_per_cp_rank = a_per_rank / cp
+    kv_dim_per_cp_rank = kv_dim / cp
+    s2_items_no_cp = (
+        (_CP_ATTENTION_SCORES_BYTES + _CP_SOFTMAX_OUTPUTS_BYTES + _CP_DROPOUT_MASK_BYTES)
+        * s * s * b * a_per_rank
+    )
+    s2_items_with_cp = (
+        (_CP_ATTENTION_SCORES_BYTES + _CP_SOFTMAX_OUTPUTS_BYTES + _CP_DROPOUT_MASK_BYTES)
+        * s * s * b * a_per_cp_rank
+    )
+    return _CPAttentionTerms(
+        kv_cache_memory=_CP_KV_BYTES * s * b * kv_dim_per_cp_rank,
+        attention_scores_memory=_CP_ATTENTION_SCORES_BYTES * s * s * b * a_per_cp_rank,
+        softmax_outputs_memory=_CP_SOFTMAX_OUTPUTS_BYTES * s * s * b * a_per_cp_rank,
+        dropout_mask_memory=_CP_DROPOUT_MASK_BYTES * s * s * b * a_per_cp_rank,
+        s2_reduction=s2_items_no_cp - s2_items_with_cp,
+        kv_reduction=_CP_KV_BYTES * s * b * kv_dim * ((cp - 1) / cp),
+    )
+
+
+def _ring_cp_attention_terms(
+    s: float, b: float, cp: float, kv_dim: float, a_per_rank: float
+) -> _CPAttentionTerms:
+    """Ring CP: each rank holds s/cp tokens and a/t heads, KV is all-gathered."""
+    return _CPAttentionTerms(
+        kv_cache_memory=_CP_KV_BYTES * (s / cp) * b * kv_dim,
+        attention_scores_memory=_CP_ATTENTION_SCORES_BYTES * (s / cp) * s * b * a_per_rank,
+        softmax_outputs_memory=_CP_SOFTMAX_OUTPUTS_BYTES * (s / cp) * s * b * a_per_rank,
+        dropout_mask_memory=_CP_DROPOUT_MASK_BYTES * (s / cp) * s * b * a_per_rank,
+        s2_reduction=(
+            (_CP_ATTENTION_SCORES_BYTES + _CP_SOFTMAX_OUTPUTS_BYTES + _CP_DROPOUT_MASK_BYTES)
+            * s * s * b * a_per_rank * ((cp - 1) / cp)
+        ),
+        kv_reduction=_CP_KV_BYTES * s * b * kv_dim * ((cp - 1) / cp),
+    )
 
 
 class EvalBody:
@@ -196,62 +254,30 @@ class EvalBody:
         attention_type = detect_attention_type(ccfg)
         cp_algo = _resolve_cp_algo(ccfg)
 
-        attention_scores_bytes = 4
-        softmax_outputs_bytes = 4
-        dropout_mask_bytes = 1
-        fp16_bytes = 2
-        kv_bytes = fp16_bytes * 2
-
         kv_dim = compute_kv_dim(ccfg)
         a_per_rank = a / t
 
         if cp_algo == CPAlgo.ULYSSES_CP:
-            a_per_cp_rank = a_per_rank / cp
-            kv_dim_per_cp_rank = kv_dim / cp
-
-            kv_cache_memory = kv_bytes * s * b * kv_dim_per_cp_rank
-            attention_scores_memory = attention_scores_bytes * s * s * b * a_per_cp_rank
-            softmax_outputs_memory = softmax_outputs_bytes * s * s * b * a_per_cp_rank
-            dropout_mask_memory = dropout_mask_bytes * s * s * b * a_per_cp_rank
-
-            s2_items_no_cp = (
-                (attention_scores_bytes + softmax_outputs_bytes + dropout_mask_bytes)
-                * s * s * b * a_per_rank
-            )
-            s2_items_with_cp = (
-                (attention_scores_bytes + softmax_outputs_bytes + dropout_mask_bytes)
-                * s * s * b * a_per_cp_rank
-            )
-            s2_items_reduction = s2_items_no_cp - s2_items_with_cp
-            kv_reduction = kv_bytes * s * b * kv_dim * ((cp - 1) / cp)
+            terms = _ulysses_cp_attention_terms(s, b, cp, kv_dim, a_per_rank)
         else:
-            kv_cache_memory = kv_bytes * (s / cp) * b * kv_dim
-            attention_scores_memory = attention_scores_bytes * (s / cp) * s * b * a_per_rank
-            softmax_outputs_memory = softmax_outputs_bytes * (s / cp) * s * b * a_per_rank
-            dropout_mask_memory = dropout_mask_bytes * (s / cp) * s * b * a_per_rank
-
-            s2_items_reduction = (
-                (attention_scores_bytes + softmax_outputs_bytes + dropout_mask_bytes)
-                * s * s * b * a_per_rank * ((cp - 1) / cp)
-            )
-            kv_reduction = kv_bytes * s * b * kv_dim * ((cp - 1) / cp)
+            terms = _ring_cp_attention_terms(s, b, cp, kv_dim, a_per_rank)
 
         comm_buffer = EvalLayerComm.cp_comm_buffer(ccfg, ctx)
 
         total_memory = (
-            kv_cache_memory + attention_scores_memory +
-            softmax_outputs_memory + dropout_mask_memory + comm_buffer
+            terms.kv_cache_memory + terms.attention_scores_memory +
+            terms.softmax_outputs_memory + terms.dropout_mask_memory + comm_buffer
         )
-        total_reduction = s2_items_reduction + kv_reduction - comm_buffer
+        total_reduction = terms.s2_reduction + terms.kv_reduction - comm_buffer
 
         return CPMemoryBreakdown(
-            kv_cache_memory=kv_cache_memory,
-            attention_scores_memory=attention_scores_memory,
-            softmax_outputs_memory=softmax_outputs_memory,
-            dropout_mask_memory=dropout_mask_memory,
+            kv_cache_memory=terms.kv_cache_memory,
+            attention_scores_memory=terms.attention_scores_memory,
+            softmax_outputs_memory=terms.softmax_outputs_memory,
+            dropout_mask_memory=terms.dropout_mask_memory,
             comm_buffer_memory=comm_buffer,
-            kv_reduction=kv_reduction,
-            s2_reduction=s2_items_reduction,
+            kv_reduction=terms.kv_reduction,
+            s2_reduction=terms.s2_reduction,
             total_reduction=total_reduction,
             total_memory=total_memory,
             cp_degree=int(cp),

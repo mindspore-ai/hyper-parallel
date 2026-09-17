@@ -16,11 +16,16 @@
 
 from __future__ import annotations
 
+__all__ = [
+    "load_training_config",
+    "parse_training_args",
+]
+
 import argparse
 import difflib
 import inspect
 import types
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence, Union, get_args, get_origin, get_type_hints
@@ -99,6 +104,12 @@ def _target_hints(target: object, *, path: str) -> dict[str, object]:
         ) from exc
 
 
+def _suggestion(name: str, candidates: Iterable[str]) -> str:
+    """Build a ``did you mean`` hint for an unknown configuration name."""
+    matches = difflib.get_close_matches(name, candidates, n=1)
+    return f"; did you mean {matches[0]!r}?" if matches else ""
+
+
 def _replace_target_path(
     config: Target[Any],
     parts: list[str],
@@ -114,7 +125,7 @@ def _replace_target_path(
             f"CLI.{full_path}: changing _target_ through an override is not supported"
         )
 
-    signature = inspect.signature(config._target_)
+    signature = inspect.signature(config.callable)
     parameter = signature.parameters.get(name)
     has_var_kwargs = any(
         item.kind is inspect.Parameter.VAR_KEYWORD
@@ -124,16 +135,10 @@ def _replace_target_path(
         candidates = [
             item.name
             for item in signature.parameters.values()
-            if item.kind not in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.VAR_POSITIONAL,
-                inspect.Parameter.VAR_KEYWORD,
-            )
+            if item.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
         ]
-        matches = difflib.get_close_matches(name, candidates, n=1)
-        suggestion = f"; did you mean {matches[0]!r}?" if matches else ""
         raise ConfigResolutionError(
-            f"CLI.{full_path}: unknown target argument {name!r}{suggestion}"
+            f"CLI.{full_path}: unknown target argument {name!r}{_suggestion(name, candidates)}"
         )
 
     if len(parts) > 1:
@@ -143,12 +148,11 @@ def _replace_target_path(
             raise ConfigResolutionError(
                 f"CLI.{full_path}: target argument is not configured"
             ) from exc
-        updated_child = _replace_path(child, parts[1:], value, path=full_path)
-        return config.replace(**{name: updated_child})
+        return config.replace(**{name: _replace_path(child, parts[1:], value, path=full_path)})
 
     normalized = value
     if parameter is not None:
-        annotation = _target_hints(config._target_, path=path).get(
+        annotation = _target_hints(config.callable, path=path).get(
             name,
             parameter.annotation,
         )
@@ -172,12 +176,9 @@ def _replace_path(config: object, parts: list[str], value: object, *, path: str)
         full_path = f"{path}.{name}" if path else name
         if name not in config:
             raise ConfigResolutionError(f"CLI.{path}: unknown mapping key {name!r}")
-        updated = dict(config)
         if len(parts) == 1:
-            updated[name] = value
-        else:
-            updated[name] = _replace_path(config[name], parts[1:], value, path=full_path)
-        return updated
+            return {**config, name: value}
+        return {**config, name: _replace_path(config[name], parts[1:], value, path=full_path)}
 
     location = f"CLI.{path}" if path else "CLI"
     if not is_dataclass(config):
@@ -190,12 +191,10 @@ def _replace_path(config: object, parts: list[str], value: object, *, path: str)
     if name not in config_fields:
         target = getattr(config, "target", None)
         if isinstance(target, Target):
-            updated_target = _replace_target_path(target, parts, value, path=path)
-            return replace(config, target=updated_target)
-        matches = difflib.get_close_matches(name, config_fields, n=1)
-        suggestion = f"; did you mean {matches[0]!r}?" if matches else ""
+            return replace(config, target=_replace_target_path(target, parts, value, path=path))
         raise ConfigResolutionError(
-            f"{location}: unknown field {name!r} on {type(config).__name__}{suggestion}"
+            f"{location}: unknown field {name!r} on {type(config).__name__}"
+            f"{_suggestion(name, config_fields)}"
         )
 
     full_path = f"{path}.{name}" if path else name
@@ -211,8 +210,7 @@ def _replace_path(config: object, parts: list[str], value: object, *, path: str)
         raise ConfigResolutionError(
             f"CLI.{full_path}: component was not selected by the YAML"
         )
-    updated_child = _replace_path(child, parts[1:], value, path=full_path)
-    return replace(config, **{name: updated_child})
+    return replace(config, **{name: _replace_path(child, parts[1:], value, path=full_path)})
 
 
 def _apply_typed_overrides(
@@ -288,9 +286,3 @@ def parse_training_args(argv: Sequence[str] | None = None) -> TrainerConfig:
     parser.add_argument("config_file", help="Path to the YAML training config")
     args, overrides = parser.parse_known_args(argv)
     return load_training_config(args.config_file, overrides)
-
-
-__all__ = [
-    "load_training_config",
-    "parse_training_args",
-]

@@ -19,6 +19,8 @@ Parameter-name and parameter-group logic lives in
 algorithm implementations stay in ``hyper_parallel.core.optimizer``.
 """
 
+__all__ = ["AdamW", "Muon"]
+
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -187,6 +189,3 @@ class Muon:
     def get_optimizer(self) -> Any:
         """Return the core chained optimizer runtime."""
         return self.optimizer
-
-
-__all__ = ["AdamW", "Muon"]

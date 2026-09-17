@@ -123,7 +123,7 @@ def _load_yaml_to_inject(original_yaml_path: str) -> Dict[str, Any]:
     else:
         if "train" not in data or not isinstance(data["train"], dict):
             data["train"] = {}
-        if "accelerator" not in data["train"] or not isinstance(data["train"]["accelerator"], dict):
+        if not isinstance(data["train"].get("accelerator"), dict):
             data["train"]["accelerator"] = {}
     return data
 

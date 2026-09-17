@@ -15,6 +15,13 @@
 
 """Shard function of muon."""
 
+__all__ = [
+    "build_param_shard_metadata_for_group",
+    "build_pad_ns_inputs",
+    "chunk_update_by_layout",
+    "fused_allgather_dtensor_params",
+]
+
 import math
 import logging
 
@@ -31,14 +38,6 @@ from hyper_parallel.core.optimizer.sharding_category import (
     ParamShardMeta,
     ParamShardStageMeta,
 )
-
-__all__ = [
-    "_debug_param_shard_metadata",
-    "build_param_shard_metadata_for_group",
-    "build_pad_ns_inputs",
-    "chunk_update_by_layout",
-    "fused_allgather_dtensor_params",
-]
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +93,11 @@ def _get_local_shape_kinds(global_shape: Tuple[int, ...], shard_meta: ParamShard
     unique_shape_kinds = []
     seen = set()
     for shape_kind in shape_kinds:
-        shape_tuple = tuple(shape_kind)
-        if shape_tuple in seen:
+        shape_kind = tuple(shape_kind)
+        if shape_kind in seen:
             continue
-        seen.add(shape_tuple)
-        unique_shape_kinds.append(shape_tuple)
+        seen.add(shape_kind)
+        unique_shape_kinds.append(shape_kind)
     return unique_shape_kinds
 
 
@@ -151,6 +150,7 @@ def build_param_shard_metadata_for_group(
         hsdp_group: HSDPCommGroup,
 ) -> Dict[torch.Tensor, ParamShardMeta]:
     """Build per-parameter shard metadata before HSDP batching."""
+    # pylint: disable=too-many-locals
     layout_spec = hsdp_group.layout_spec
     shard_pgs = hsdp_group.shard_pgs
     if layout_spec is None or not layout_spec.shard_axes or not hsdp_group.records:
@@ -166,7 +166,7 @@ def build_param_shard_metadata_for_group(
         cur_rank = dist.get_rank(shard_pg) if shard_pg is not None and shard_size > 1 else 0
         next_shapes: List[Tuple[int, ...]] = []
 
-        for record_idx, record in enumerate(hsdp_group.records):
+        for record_idx, _ in enumerate(hsdp_group.records):
             rank_shapes = tuple(
                 tuple(gathered_shapes[rank_idx][record_idx])
                 for rank_idx in range(shard_size)
@@ -277,10 +277,7 @@ def chunk_update_by_layout(
                 min(full_chunk_size, max(local_update.size(tensor_dim) - rank * full_chunk_size, 0))
                 for rank in range(num_chunks)
             )
-
-        start = sum(split_sizes[:local_rank])
-        chunk_size = split_sizes[local_rank]
-        local_update = local_update.narrow(tensor_dim, start, chunk_size)
+        local_update = local_update.narrow(tensor_dim, sum(split_sizes[:local_rank]), split_sizes[local_rank])
 
     if not local_update.is_contiguous():
         local_update = local_update.contiguous()
@@ -341,39 +338,33 @@ def _prepare_gather_inputs(
     param_meta: List[_GatherParamMeta] = []
     total_padded_numel = 0
 
-    for idx, t in enumerate(current_tensors):
-        tensor_dim_norm = tensor_dim % t.dim()
-
-        if tensor_dim_norm == 0 and t.is_contiguous():
-            gi = t
-        else:
-            gi = t.movedim(tensor_dim_norm, 0).contiguous()
-
+    for idx, gather_input in enumerate(current_tensors):
+        normalized_dim = tensor_dim % gather_input.dim()
+        if normalized_dim != 0 or not gather_input.is_contiguous():
+            gather_input = gather_input.movedim(normalized_dim, 0).contiguous()
         stage_meta = stage_metas[idx] if stage_metas is not None else None
-        actual_numel = gi.numel()
-        if stage_meta is not None:
-            split_sizes = stage_meta.split_sizes
-            pad_shape_moved = list(stage_meta.pad_shape)
-            if tensor_dim_norm != 0:
-                pad_shape_moved[0], pad_shape_moved[tensor_dim_norm] = pad_shape_moved[tensor_dim_norm], \
-                    pad_shape_moved[0]
-            padded_numel_raw = math.prod(pad_shape_moved)
+        if stage_meta is None:
+            split_sizes = tuple(gather_input.shape[0] for _ in range(shard_size))
+            padded_numel_raw = gather_input.numel()
         else:
-            split_sizes = tuple(gi.shape[0] for _ in range(shard_size))
-            padded_numel_raw = gi.numel()
-        padded_numel = ((padded_numel_raw + alignment_elements - 1) // alignment_elements) * alignment_elements
-
-        gather_inputs.append(gi)
+            split_sizes = stage_meta.split_sizes
+            pad_shape = list(stage_meta.pad_shape)
+            if normalized_dim != 0:
+                pad_shape[0], pad_shape[normalized_dim] = pad_shape[normalized_dim], pad_shape[0]
+            padded_numel_raw = math.prod(pad_shape)
         param_meta.append(
             _GatherParamMeta(
                 offset=total_padded_numel,
-                actual_numel=actual_numel,
-                padded_numel=padded_numel,
-                rest_shape=tuple(gi.shape[1:]),
+                actual_numel=gather_input.numel(),
+                padded_numel=(
+                    (padded_numel_raw + alignment_elements - 1) // alignment_elements * alignment_elements
+                ),
+                rest_shape=tuple(gather_input.shape[1:]),
                 split_sizes=split_sizes,
             )
         )
-        total_padded_numel += padded_numel
+        gather_inputs.append(gather_input)
+        total_padded_numel += param_meta[-1].padded_numel
 
     return gather_inputs, param_meta, total_padded_numel
 
@@ -390,9 +381,8 @@ def _pack_and_allgather(
         buffer_cache: Optional[Dict],
 ) -> torch.Tensor:
     """Pack local shards into one buffer, all-gather, return gathered view."""
-    cache_key = ("fused_allgather", axis_idx, dtype, device)
     pack_buffer = _get_or_alloc_buffer(
-        buffer_cache, cache_key, total_padded_numel,
+        buffer_cache, ("fused_allgather", axis_idx, dtype, device), total_padded_numel,
         dtype, device,
     )[:total_padded_numel]
 
@@ -400,12 +390,12 @@ def _pack_and_allgather(
     for gi, meta in zip(gather_inputs, param_meta):
         pack_buffer[meta.offset:meta.offset + meta.actual_numel].copy_(gi.view(-1))
 
-    gathered_numel = total_padded_numel * shard_size
-    cache_key_out = ("fused_allgather_out", axis_idx, dtype, device)
     gathered_buffer = _get_or_alloc_buffer(
-        buffer_cache, cache_key_out, gathered_numel,
+        buffer_cache,
+        ("fused_allgather_out", axis_idx, dtype, device),
+        total_padded_numel * shard_size,
         dtype, device,
-    )[:gathered_numel]
+    )[:total_padded_numel * shard_size]
 
     dist.all_gather_into_tensor(gathered_buffer, pack_buffer, group=shard_pg)
     return gathered_buffer.view(shard_size, total_padded_numel)

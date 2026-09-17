@@ -83,6 +83,7 @@ class OperatorNode:
     tiling_position: int
     fill_config:     Any                       # FillConfig subclass instance
     kernel_spec:     Any = None                # reserved for @MultiCore decorator path
+    diagnostic_name: Optional[str] = None      # optional Host-side profiling display name
 
     predecessors:    List['OperatorNode'] = field(default_factory=list)
     successors:      List['OperatorNode'] = field(default_factory=list)

@@ -24,10 +24,11 @@ using namespace AscendC;
 class KernelWorker : public KernelWorkerBase<KernelWorker> {
  public:
   // input_list layout for hyper_mega_moe (forward):
-  //   [23] = tiling params  [24] = all_event_counters  [11] = gmm_workspace
+  //   [23] = tiling params  [24] = all_event_counters  [25] = profile_buffer  [16] = gmm_workspace
   static constexpr uint32_t TILING_IDX   = 23;
   static constexpr uint32_t EVENT_IDX    = 24;
-  static constexpr uint32_t WORKSPACE_IDX = 11;
+  static constexpr uint32_t PROFILE_IDX  = 25;
+  static constexpr uint32_t WORKSPACE_IDX = 16;
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
     switch (task_desc.task_type) {
@@ -144,7 +145,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
 
         GM_ADDR grouped_list_real =
-          this->runtimeConfigPtr + getGroupedMatmulGroupListOffsetById(AscendC::GetBlockIdx());
+          this->runtimeConfigPtr + getGroupedMatmulGroupListOffsetById(this->runtimeConfigPtr, AscendC::GetBlockIdx());
         GlobalTensor<int64_t> grouped_list_tensor_real;
         grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
         uint32_t data_index = task_desc.task_index / this->core_num;

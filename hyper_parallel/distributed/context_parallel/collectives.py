@@ -42,13 +42,10 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.platform import get_platform
+from hyper_parallel.distributed import _collectives
 
 
 _ULYSSES_WRAPPED_FLAG = "_hyper_ulysses_wrapped"
-
-
-platform = get_platform()
 
 
 _HYBRID_MESH_CACHE = {}
@@ -306,8 +303,11 @@ class _AsyncUlyssesWait(torch.autograd.Function):
             scatter_dim=ctx.seq_dim,
             world_size=ctx.world_size,
         )
-        output, work = platform.all_to_all_single(
-            send, list(send.shape), ctx.group, async_op=True
+        output = torch.empty(
+            list(send.shape), device=send.device, dtype=send.dtype
+        )
+        work = dist.all_to_all_single(
+            output, send, group=ctx.group, async_op=True
         )
         work.wait()
         grad_input = _reconstruct_all_to_all(output, ctx.head_dim)
@@ -373,8 +373,11 @@ def async_cp_allgather_launch(
     output_shape = list(send.shape)
     output_shape[0] *= world_size
     group = cp_mesh.get_group()
-    output, work = platform.all_gather_single(
-        send, output_shape, group, async_op=True
+    output = torch.empty(
+        output_shape, device=send.device, dtype=send.dtype
+    )
+    work = dist.all_gather_into_tensor(
+        output, send, group=group, async_op=True
     )
     return AsyncCPCollective(
         tensor, work, output, group, world_size, "allgather", gather_dim
@@ -408,8 +411,11 @@ def async_ulysses_seq_to_head_launch(
         tensor.detach(), scatter_dim=head_dim, world_size=world_size
     )
     group = cp_mesh.get_group()
-    output, work = platform.all_to_all_single(
-        send, list(send.shape), group, async_op=True
+    output = torch.empty(
+        list(send.shape), device=send.device, dtype=send.dtype
+    )
+    work = dist.all_to_all_single(
+        output, send, group=group, async_op=True
     )
     return AsyncCPCollective(
         tensor,
@@ -461,7 +467,7 @@ def _ulysses_all_to_all(
         + list(range(scatter_dim + 1, split_ndim))
     )
     send = tensor.contiguous().reshape(split_shape).permute(permutation).contiguous()
-    received = platform.differentiable_all_to_all(
+    received = _collectives.differentiable_all_to_all(
         send, list(send.shape), cp_mesh.get_group())
     return _reconstruct_all_to_all(received, gather_dim)
 

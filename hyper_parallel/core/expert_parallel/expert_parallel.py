@@ -519,6 +519,29 @@ def _get_deredundency_mesh_info(device_mesh: DeviceMesh) -> _DeredundencyMeshInf
     )
 
 
+def _expert_offsets_by_source(tokens_per_expert_by_source):
+    """Return absolute expert-block offsets for every OEP source rank."""
+    source_totals = tokens_per_expert_by_source.sum(dim=1)
+    source_offsets = source_totals.cumsum(0) - source_totals
+    return (
+        tokens_per_expert_by_source.cumsum(dim=1)
+        - tokens_per_expert_by_source
+        + source_offsets.view(tokens_per_expert_by_source.shape[0], 1)
+    )
+
+
+def _expand_dispatch_blocks(block_counts, block_starts, device):
+    """Expand contiguous expert blocks into gather-view token indices."""
+    total = int(block_counts.sum())
+    if total == 0:
+        return block_counts.new_zeros(0, dtype=block_counts.dtype).long()
+    repeated_starts = block_starts.repeat_interleave(block_counts)
+    block_offsets = block_counts.cumsum(0) - block_counts
+    repeated_offsets = block_offsets.repeat_interleave(block_counts)
+    intra_block_offsets = torch.arange(0, total, device=device) - repeated_offsets
+    return (repeated_starts + intra_block_offsets).long()
+
+
 def _generate_deredundency_dispatch_indices(
     tokens_per_expert_by_source,
     expert_start: int,
@@ -535,17 +558,8 @@ def _generate_deredundency_dispatch_indices(
     rank-major → expert-major permutation.
     """
     oep_size = tokens_per_expert_by_source.shape[0]
-    experts_per_outer = iep_size * num_local_experts
-    expert_end = expert_start + experts_per_outer
-
-    source_totals = tokens_per_expert_by_source.sum(dim=1)
-    source_offsets = source_totals.cumsum(0) - source_totals
-    expert_offsets = (
-        tokens_per_expert_by_source.cumsum(dim=1)
-        - tokens_per_expert_by_source
-        + source_offsets.view(oep_size, 1)
-    )
-
+    expert_end = expert_start + iep_size * num_local_experts
+    expert_offsets = _expert_offsets_by_source(tokens_per_expert_by_source)
     selected_counts = tokens_per_expert_by_source[:, expert_start:expert_end].view(
         oep_size, iep_size, num_local_experts,
     )
@@ -557,16 +571,11 @@ def _generate_deredundency_dispatch_indices(
 
     block_counts = counts_by_destination.view(-1)
     token_counts_by_destination_expert = selected_counts.sum(dim=0).contiguous().view(-1)
-    total = int(block_counts.sum())
-    if total == 0:
-        return block_counts.new_zeros(0, dtype=block_counts.dtype).long(), token_counts_by_destination_expert
-
-    block_starts = offsets_by_destination.view(-1).repeat_interleave(block_counts)
-    block_offsets = block_counts.cumsum(0) - block_counts
-    block_offsets_per_token = block_offsets.repeat_interleave(block_counts)
-    intra = torch.arange(0, total, device=tokens_per_expert_by_source.device) - block_offsets_per_token
-
-    return (block_starts + intra).long(), token_counts_by_destination_expert
+    block_starts = offsets_by_destination.view(-1)
+    dispatch_indices = _expand_dispatch_blocks(
+        block_counts, block_starts, tokens_per_expert_by_source.device
+    )
+    return dispatch_indices, token_counts_by_destination_expert
 
 
 def _scale_by_router_coeff(tokens, router_coeff):

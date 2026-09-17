@@ -85,13 +85,16 @@ class AutoModelAdapterModel(nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([
-            AutoModelAdapterDecoderLayer(config)
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                AutoModelAdapterDecoderLayer(config)
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(config.hidden_size)
 
     def forward(self, input_ids, position_ids=None):
+        """Embed, run each decoder layer, then apply the final norm."""
         hidden_states = self.embed_tokens(input_ids)
         for layer in self.layers:
             hidden_states = layer(hidden_states, position_ids=position_ids)
@@ -156,6 +159,7 @@ class AutoModelAdapterForCausalLM(nn.Module):
 # SP data utilities
 # ============================================================================
 
+
 def shard_for_sp(tensor, tp_size, tp_rank):
     """Shard input tensor along sequence dimension (dim 1) for SP.
 
@@ -218,12 +222,10 @@ class DataSampler:
     def sample(self):
         """Return one (input_ids, labels) pair with full sequence length."""
         inp = torch.randint(
-            0, self.vocab_size,
-            (self.batch_size, self.seq_len), device=self.device
+            0, self.vocab_size, (self.batch_size, self.seq_len), device=self.device
         )
         lbl = torch.randint(
-            0, self.vocab_size,
-            (self.batch_size, self.seq_len), device=self.device
+            0, self.vocab_size, (self.batch_size, self.seq_len), device=self.device
         )
         return inp, lbl
 

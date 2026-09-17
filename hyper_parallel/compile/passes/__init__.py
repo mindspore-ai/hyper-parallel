@@ -16,7 +16,7 @@
 Graph Passes - Graph Transformation Passes
 """
 
+__all__ = ["GraphPass", "PassPipeline"]
+
 from .base import GraphPass
 from .pipeline import PassPipeline
-
-__all__ = ["GraphPass", "PassPipeline"]

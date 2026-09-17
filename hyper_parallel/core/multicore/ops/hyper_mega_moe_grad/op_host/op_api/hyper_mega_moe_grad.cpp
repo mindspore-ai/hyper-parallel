@@ -40,11 +40,13 @@ const std::array<const aclTensor *, 7> HyperMegaMoeGrad(
   const aclTensor *act_grad_tiling, const aclTensor *gate_grad_tiling, const aclTensor *w1_grad_tiling,
   const aclTensor *w2_grad_tiling, const aclTensor *swiglu_grad_tiling, const aclTensor *gmm_workspace,
   const aclTensor *swiglu_grad_workspace, const aclTensor *runtime_config, const aclTensor *all_event_counters,
-  int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, aclOpExecutor *executor) {
+  const aclTensor *profile_buffer, int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size,
+  int64_t seq_size, aclOpExecutor *executor) {
   L0_DFX(HyperMegaMoeGrad, dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size, hidden,
          hidden_dw, weight, y, gate, grad_gate, w1, gate_dx, grad_x, combine_target_off, combine_src_off, combine_size,
          permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
-         swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, rankId, ep,
+         swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, profile_buffer,
+         rankId, ep,
          expert_num, hidden_size, seq_size);
   auto dispatch_target_out = const_cast<aclTensor *>(dispatch_target);
   auto hidden_dw_out = const_cast<aclTensor *>(hidden_dw);
@@ -58,7 +60,7 @@ const std::array<const aclTensor *, 7> HyperMegaMoeGrad(
     OP_INPUT(dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size, hidden, hidden_dw, weight, y,
              gate, grad_gate, w1, gate_dx, grad_x, combine_target_off, combine_src_off, combine_size, permute_out,
              gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling, swiglu_grad_tiling,
-             gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters),
+             gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, profile_buffer),
     OP_OUTPUT(dispatch_target_out, hidden_dw_out, y_out, grad_gate_out, gate_dx_out, grad_x_out, gate_dw_out),
     OP_ATTR(rankId, ep, expert_num, hidden_size, seq_size));
   if (ret != ACL_SUCCESS) {

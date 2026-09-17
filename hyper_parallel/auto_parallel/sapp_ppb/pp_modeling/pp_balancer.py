@@ -90,8 +90,8 @@ class PPBalancer:
         """Solved SappPipeline instance (available after :meth:`balance_with_ilp`)."""
         return self._pipeline
 
+    @staticmethod
     def _make_infeasible_output(
-        self,
         reason: str,
         error: str = "",
         solver_status: Any = None,
@@ -118,8 +118,8 @@ class PPBalancer:
             infeasibility_details=details,
         )
 
+    @staticmethod
     def _build_feasible_output(
-        self,
         stage_partition: List[List[Tuple[int, RecomputeType]]],
         layer_offset: Optional[Dict[str, List[List[int]]]] = None,
         num_of_interleave: int = 1,
@@ -519,15 +519,14 @@ class PPBalancer:
                         f"Group '{group_name}' not found in solver variables. "
                         f"Available groups: {list(solver.variables_.keys())}"
                     )
-                body_lay = self._get_body_layer_by_name(group_name)
                 chunk_stage_rec = self._extract_chunk_stage_recompute(
-                    solver, group_name, inter, body_lay.recompute_considered_,
+                    solver, group_name, inter, self._get_body_layer_by_name(group_name).recompute_considered_,
                 )
                 for stage_id, rec_counts in enumerate(chunk_stage_rec):
                     for rec_type, count in rec_counts:
-                        vstage = inter * pp + stage_id
-                        for lid in range(current_layer_id, current_layer_id + count):
-                            stage_partition[vstage].append((lid, rec_type))
+                        stage_partition[inter * pp + stage_id].extend(
+                            (layer_id, rec_type) for layer_id in range(current_layer_id, current_layer_id + count)
+                        )
                         current_layer_id += count
 
         if current_layer_id != total_body + 1:

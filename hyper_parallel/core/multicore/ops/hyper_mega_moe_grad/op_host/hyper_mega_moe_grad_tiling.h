@@ -257,6 +257,8 @@ TILING_DATA_FIELD_DEF(int64_t, expertNum);
 TILING_DATA_FIELD_DEF(int64_t, hiddenSize);
 TILING_DATA_FIELD_DEF(int64_t, seqSize);
 TILING_DATA_FIELD_DEF(int64_t, coreNum);
+TILING_DATA_FIELD_DEF(int64_t, runtimeConfigBytes);
+TILING_DATA_FIELD_DEF(int64_t, eventCounterBytes);
 TILING_DATA_FIELD_DEF_STRUCT(TilingData, tilingData);
 TILING_DATA_FIELD_DEF_STRUCT(SwiGluTilingData, swiGluTilingData);
 TILING_DATA_FIELD_DEF_STRUCT(MatmulTilingData, matmulTilingData);

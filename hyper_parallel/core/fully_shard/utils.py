@@ -12,17 +12,294 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Common policy and mesh metadata for fully_shard APIs."""
-from dataclasses import dataclass
-from typing import Optional
+"""Torch helpers, policies and mesh metadata for fully_shard.
 
-from hyper_parallel.collectives.cc import get_group_local_rank
+The fully_shard core used to reach process-group management, module traversal and
+tensor plumbing through the platform abstraction layer. Only the torch backend is
+supported now, so those implementations live here and every caller calls them
+directly.
+"""
+# pylint: disable=C9006,C9007
+from __future__ import annotations
+
+from collections import OrderedDict
+from dataclasses import dataclass, fields, replace
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import torch
+from torch import Tensor, nn
+from torch._C._distributed_c10d import ProcessGroup
+from torch.nn.utils.rnn import PackedSequence
+
+import torch.distributed as dist
+
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Placement
-from hyper_parallel.platform import get_platform
 
-platform = get_platform()
-DType = platform.dtype
+DType = torch.dtype
+
+
+# ---------------------------------------------------------------------------
+# Process group helpers
+# ---------------------------------------------------------------------------
+
+def get_group_local_rank(group: Optional[ProcessGroup] = None) -> int:
+    """Return the current rank's index within ``group``.
+
+    Args:
+        group: The group to index into. ``None`` uses the default group.
+
+    Returns:
+        int: The rank of the current process inside ``group``.
+    """
+    return dist.get_rank(group=group)
+
+
+def get_world_size() -> int:
+    """Return the number of processes in the default distributed group.
+
+    Returns:
+        int: The world size.
+    """
+    return dist.get_world_size()
+
+
+# Module traversal
+# ---------------------------------------------------------------------------
+
+def get_cells_and_names(cell: nn.Module):
+    """Return every nested module and its name.
+
+    Args:
+        cell: The root module to traverse.
+
+    Returns:
+        An iterator of ``(name, module)`` pairs.
+    """
+    return cell.named_modules()
+
+
+def get_modules(module: nn.Module):
+    """Return every sub-module contained in ``module``.
+
+    Args:
+        module: The root module to traverse.
+
+    Returns:
+        An iterator over the module tree.
+    """
+    return module.modules()
+
+
+def parameters_dict(cell: nn.Module):
+    """Return every named parameter registered by the module tree.
+
+    Args:
+        cell: The root module to traverse.
+
+    Returns:
+        An iterator of ``(name, parameter)`` pairs.
+    """
+    return cell.named_parameters()
+
+
+def buffers_dict(cell: nn.Module):
+    """Return every named buffer registered by the module tree.
+
+    Args:
+        cell: The root module to traverse.
+
+    Returns:
+        An iterator of ``(name, buffer)`` pairs.
+    """
+    return cell.named_buffers()
+
+
+def get_device_handle(device_type: str = "npu"):
+    """Return the ``torch`` device module for ``device_type``.
+
+    Args:
+        device_type: Device backend name, e.g. ``"npu"`` or ``"cuda"``.
+
+    Returns:
+        The matching ``torch.<device_type>`` module.
+
+    Raises:
+        RuntimeError: If torch exposes no module for ``device_type``.
+    """
+    try:
+        handle = getattr(torch, device_type)
+    except AttributeError as e:
+        raise RuntimeError(f"Failed to resolve device handle: 'torch.{device_type}'.") from e
+    return handle
+
+
+# ---------------------------------------------------------------------------
+# Tensor plumbing
+# ---------------------------------------------------------------------------
+
+def load_into_param(param: Tensor, data: Tensor) -> None:
+    """Write ``data`` into ``param``, materialising a meta local tensor first.
+
+    Args:
+        param: The destination parameter, possibly a DTensor.
+        data: The data to write into it.
+    """
+    from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0415
+
+    if isinstance(param, DTensor):
+        local = param._local_tensor  # pylint: disable=protected-access
+        if local.is_meta:
+            orig_requires_grad = param.requires_grad
+            param._local_tensor = data  # pylint: disable=protected-access
+            if data.requires_grad != orig_requires_grad:
+                param.requires_grad_(orig_requires_grad)
+        else:
+            local.copy_(data)
+    else:
+        param.copy_(data)
+
+
+def cast_fp_tensor(dtype: DType, x: Any) -> Any:
+    """Cast a floating-point tensor to ``dtype``, leaving anything else alone.
+
+    Args:
+        dtype: The target dtype.
+        x: The candidate tensor.
+
+    Returns:
+        Any: The cast tensor, or ``x`` unchanged when it is not a floating-point tensor.
+    """
+    if not isinstance(x, Tensor) or not torch.is_floating_point(x) or x.dtype == dtype:
+        return x
+    return x.to(dtype)
+
+
+def apply_to_tensors(fn: Callable[[Tensor], Any], container: Any) -> Any:
+    """Recursively apply ``fn`` to every tensor inside ``container``.
+
+    Handles tensors, dataclasses, ordered and plain dicts, named tuples,
+    lists, tuples, sets and packed sequences.
+
+    Args:
+        fn: The callable applied to each tensor.
+        container: The structure to walk.
+
+    Returns:
+        Any: A structure of the same shape with every tensor replaced by ``fn``'s result.
+    """
+
+    def apply(x):
+        if isinstance(x, Tensor):
+            return fn(x)
+        if hasattr(x, "__dataclass_fields__"):
+            dc = replace(x)
+            changes = {f.name: apply(getattr(dc, f.name)) for f in fields(dc)}
+            return replace(dc, **changes)
+        if isinstance(x, OrderedDict):
+            od = x.__class__()
+            for key, value in x.items():
+                od[key] = apply(value)
+            return od
+        if isinstance(x, PackedSequence):
+            apply(x.data)
+            return x
+        if isinstance(x, dict):
+            return {key: apply(value) for key, value in x.items()}
+        if isinstance(x, tuple) and hasattr(x, "_asdict") and hasattr(x, "_fields"):
+            res = (apply(el) for el in x)
+            return type(x)(*res)
+        if isinstance(x, (list, tuple, set)):
+            return type(x)(apply(el) for el in x)
+        return x
+
+    return apply(container)
+
+
+def profiler_record(name: str):
+    """Return the torch profiler annotation context for ``name``.
+
+    Args:
+        name: Label shown in profiler traces for the enclosed region.
+
+    Returns:
+        A context manager that records the region when the profiler is active.
+    """
+    return torch.profiler.record_function(name)
+
+
+# ---------------------------------------------------------------------------
+# Gradient-ready stream
+# ---------------------------------------------------------------------------
+# The handle and its stream are per-process singletons: at most one gradient
+# reduction is in flight across the whole process, so the state belongs at
+# module scope rather than on any scheduler or parameter object.
+_GRAD_READY_STATE: Dict[str, Any] = {
+    "handle": None,
+    "post_process": None,
+    "stream": None,
+}
+
+
+def _process_pending_grad_handle() -> None:
+    """Wait for the in-flight gradient handle and run its post-process callback."""
+    handle = _GRAD_READY_STATE["handle"]
+    if handle is None:
+        return
+    handle.wait()
+    post_process = _GRAD_READY_STATE["post_process"]
+    if post_process is not None:
+        post_process()
+
+
+def _grad_ready_stream():
+    """Return the stream used to order gradient-handle waits, creating it lazily."""
+    if _GRAD_READY_STATE["stream"] is None:
+        _GRAD_READY_STATE["stream"] = get_device_handle().Stream()
+    return _GRAD_READY_STATE["stream"]
+
+
+def grad_ready_stream():
+    """Return the context manager that switches to the gradient-ready stream.
+
+    Returns:
+        The device stream context manager guarding the synchronisation stream.
+    """
+    return get_device_handle().stream(_grad_ready_stream())
+
+
+def set_grad_reduce_handle(handle: Any, post_process: Optional[Callable[[], None]] = None) -> None:
+    """Record a new in-flight gradient reduction handle.
+
+    Any previously recorded handle is waited on first, so at most one handle is
+    ever outstanding.
+
+    Args:
+        handle: The async work handle returned by the reduction collective.
+        post_process: Callback run once ``handle`` completes, or ``None``.
+    """
+    with grad_ready_stream():
+        _process_pending_grad_handle()
+    _GRAD_READY_STATE["handle"] = handle
+    _GRAD_READY_STATE["post_process"] = post_process
+
+
+def wait_grad_handle() -> None:
+    """Block until the in-flight gradient reduction handle completes and clear it."""
+    handle = _GRAD_READY_STATE["handle"]
+    if handle is None:
+        return
+    with grad_ready_stream():
+        _process_pending_grad_handle()
+        sync_event = _grad_ready_stream().record_event()
+    sync_event.wait()
+    _GRAD_READY_STATE["handle"] = None
+    _GRAD_READY_STATE["post_process"] = None
+
+
+# ---------------------------------------------------------------------------
+# Policies and mesh metadata
+# ---------------------------------------------------------------------------
 
 @dataclass
 class MixedPrecisionPolicy:

@@ -110,6 +110,7 @@ def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
     glist = specs[-1]
     dispatch = OperatorNode(
         name="dispatch", op_type=OpType.ALLTOALL,
+        diagnostic_name="DispatchGrad",
         inputs=[target_offset, src, src_offset, size_d], outputs=[target],
         param_positions=[1, 2, 3, 4, 0], split_value=dispatch_sv,
         split_spec=SplitSpec(
@@ -122,6 +123,7 @@ def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
     )
     act_grad = OperatorNode(
         name="act_grad", op_type=OpType.GMM,
+        diagnostic_name="ActGrad",
         inputs=[target, act_grad_weight, glist], outputs=[act_grad_y],
         param_positions=[0, 7, 19, 8], split_value=act_grad_sv,
         split_spec=SplitSpec(
@@ -134,6 +136,7 @@ def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
     )
     w2_grad = OperatorNode(
         name="w2_grad", op_type=OpType.GMM,
+        diagnostic_name="W2Grad",
         inputs=[w2_grad_x1, target, glist], outputs=[w2_grad_y],
         param_positions=[5, 0, 19, 6], split_value=w2_grad_sv,
         split_spec=SplitSpec(
@@ -147,6 +150,7 @@ def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
     )
     swiglu_grad = OperatorNode(
         name="swiglu_grad", op_type=OpType.SWIGLU_GRAD,
+        diagnostic_name="SwiGLUGrad",
         inputs=[act_grad_y, swiglu_dy], outputs=[swiglu_out],
         param_positions=[8, 9, 10], split_value=swiglu_sv,
         split_spec=SplitSpec(
@@ -166,6 +170,7 @@ def _build_bwd_ops_second(specs, *, gate_grad_sv, w1_grad_sv, combine_sv, num_cu
      w1_grad_x1, w1_grad_y, glist) = specs
     gate_grad = OperatorNode(
         name="gate_grad", op_type=OpType.GMM,
+        diagnostic_name="GateGrad",
         inputs=[swiglu_out, gate_grad_weight, glist], outputs=[gate_grad_y],
         param_positions=[10, 11, 19, 12], split_value=gate_grad_sv,
         split_spec=SplitSpec(
@@ -178,6 +183,7 @@ def _build_bwd_ops_second(specs, *, gate_grad_sv, w1_grad_sv, combine_sv, num_cu
     )
     combine = OperatorNode(
         name="combine", op_type=OpType.ALLTOALL,
+        diagnostic_name="CombineGrad",
         inputs=[target_offset_c, gate_grad_y, src_offset_c, size_c], outputs=[combine_out],
         param_positions=[14, 12, 15, 16, 13], split_value=combine_sv,
         split_spec=SplitSpec(
@@ -189,6 +195,7 @@ def _build_bwd_ops_second(specs, *, gate_grad_sv, w1_grad_sv, combine_sv, num_cu
     )
     w1_grad = OperatorNode(
         name="w1_grad", op_type=OpType.GMM,
+        diagnostic_name="W1Grad",
         inputs=[w1_grad_x1, swiglu_out, glist], outputs=[w1_grad_y],
         param_positions=[17, 10, 19, 18], split_value=w1_grad_sv,
         split_spec=SplitSpec(

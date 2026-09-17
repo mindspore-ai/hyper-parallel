@@ -32,6 +32,7 @@ the last stage).
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 from typing import Iterator, Tuple
@@ -42,7 +43,9 @@ from torch import nn
 import torch.nn.functional as F
 import yaml
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent.parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
 
 from hyper_parallel.compile import (  # pylint: disable=C0413,C0415,E0611
     GraphTrainer,
@@ -50,6 +53,8 @@ from hyper_parallel.compile import (  # pylint: disable=C0413,C0415,E0611
     PassPlan,
     create_pass_plan_from_yaml,
 )
+
+_LOG = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -150,8 +155,9 @@ def build_pass_plan(config_path: str) -> PassPlan:
     return create_pass_plan_from_yaml(config_path=config_path)
 
 
-def main() -> None:
+def main() -> None:  # pylint: disable=too-many-locals
     """Set up distributed PP training and run the trainer loop."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
     config = load_config(args.config)
 
@@ -172,13 +178,14 @@ def main() -> None:
 
     if rank == 0:
         stages = pass_plan.pp_module_fqns_per_stage or "auto (even by layers)"
-        print("=" * 72)
-        print(
-            f"PP demo: world_size={world_size} (stages), "
-            f"microbatch={pass_config.pp_microbatch_size}"
+        _LOG.info("=" * 72)
+        _LOG.info(
+            "PP demo: world_size=%s (stages), microbatch=%s",
+            world_size,
+            pass_config.pp_microbatch_size,
         )
-        print(f"Stage plan: {stages}")
-        print("=" * 72)
+        _LOG.info("Stage plan: %s", stages)
+        _LOG.info("=" * 72)
 
     trainer = GraphTrainer(
         model=model,
@@ -223,7 +230,11 @@ def main() -> None:
     # The real loss lives on the LAST stage (other stages return a zero
     # placeholder); report convergence from there.
     if rank == world_size - 1 and losses:
-        print(f"Last-stage loss: {losses[0].item():.4f} -> {losses[-1].item():.4f}")
+        _LOG.info(
+            "Last-stage loss: %.4f -> %.4f",
+            losses[0].item(),
+            losses[-1].item(),
+        )
 
     cleanup_distributed()
 

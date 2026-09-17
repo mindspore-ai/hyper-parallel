@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test TorchHSDPParamV2"""
+"""test HSDPParamV2"""
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 from tests.common.distributed_launcher import torchrun_case
@@ -148,7 +148,7 @@ def test_hsdp_param_group4_gloo():
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test DTensor param on 2D dp x tp mesh with fully_shard enabled.
     Expectation: assertion pass.
     """
@@ -161,7 +161,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout():
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout_gloo():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test DTensor param on 2D dp x tp mesh with fully_shard enabled.
     Expectation: assertion pass.
     """
@@ -174,7 +174,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout_gloo():
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test DTensor param on 2D dp x tp mesh when TP and fully_shard split the same tensor dim.
     Expectation: assertion pass.
     """
@@ -187,7 +187,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard():
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard_gloo():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test DTensor param on 2D dp x tp mesh when TP and fully_shard split the same tensor dim.
     Expectation: assertion pass.
     """
@@ -200,7 +200,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard_gloo():
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test DTensor param on 3D dp x tp x ep mesh.
     Expectation: assertion pass.
     """
@@ -213,7 +213,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim():
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim_gloo():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test DTensor param on 3D dp x tp x ep mesh.
     Expectation: assertion pass.
     """
@@ -226,7 +226,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim_gloo():
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test the DTensor compatibility mode without extra fully_shard parameter sharding.
     Expectation: assertion pass.
     """
@@ -239,7 +239,7 @@ def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce_gloo():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test the DTensor compatibility mode without extra fully_shard parameter sharding.
     Expectation: assertion pass.
     """
@@ -252,7 +252,7 @@ def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce_gloo():
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test pure TP compatibility mode keeps TP-sharded parameters out of all-reduce groups.
     Expectation: assertion pass.
     """
@@ -265,7 +265,7 @@ def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce():
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce_gloo():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test pure TP compatibility mode keeps TP-sharded parameters out of all-reduce groups.
     Expectation: assertion pass.
     """
@@ -278,7 +278,7 @@ def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce_gloo():
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test reordered unified mesh remaps shard/replicate dims and unsharded group construction.
     Expectation: assertion pass.
     """
@@ -291,7 +291,7 @@ def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor_gloo():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test reordered unified mesh remaps shard/replicate dims and unsharded group construction.
     Expectation: assertion pass.
     """
@@ -304,7 +304,7 @@ def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor_gloo():
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_same_dim_strided_non_dim0_backward():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test same-dim TP + fully_shard on dim=1 across the backward path.
     Expectation: assertion pass.
     """
@@ -318,7 +318,7 @@ def test_hsdp_param_v2_same_dim_strided_non_dim0_backward():
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_same_dim_strided_non_dim0_backward_gloo():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test same-dim TP + fully_shard on dim=1 across the backward path.
     Expectation: assertion pass.
     """

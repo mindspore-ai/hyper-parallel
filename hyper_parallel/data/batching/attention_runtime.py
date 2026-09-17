@@ -40,14 +40,16 @@ def build_dense_attention_masks(
     padding represented as a synthetic final sequence.
     """
     boundaries = [int(boundary) for boundary in cu_seq_lens.tolist()]
-    expected_total = micro_batch_size * seq_length
     if len(boundaries) < 2 or boundaries[0] != 0:
         raise ValueError("cu_seq_lens must contain a leading zero and at least one sequence")
+
     if any(end <= start for start, end in zip(boundaries[:-1], boundaries[1:])):
         raise ValueError("cu_seq_lens must be strictly increasing")
-    if boundaries[-1] != expected_total:
+
+    if boundaries[-1] != micro_batch_size * seq_length:
         raise ValueError(
-            f"cu_seq_lens must cover the physical batch length ({expected_total}), but got {boundaries[-1]}"
+            "cu_seq_lens must cover the physical batch length "
+            f"({micro_batch_size * seq_length}), but got {boundaries[-1]}"
         )
 
     # Attention mask (lower triangular).
@@ -65,10 +67,8 @@ def build_dense_attention_masks(
     swa_mask = None
     if sliding_window is not None:
         positions = torch.arange(seq_length, dtype=torch.int64, device=device)
-        query_positions = positions.unsqueeze(1)
-        key_positions = positions.unsqueeze(0)
-        token_distance = query_positions - key_positions
-        outside_window = token_distance > sliding_window
+        # Broadcast query and key positions to identify tokens outside the sliding window.
+        outside_window = positions.unsqueeze(1) - positions.unsqueeze(0) > sliding_window
         swa_mask = attention_mask & ~outside_window.unsqueeze(0).unsqueeze(0)
 
     return attention_mask, swa_mask

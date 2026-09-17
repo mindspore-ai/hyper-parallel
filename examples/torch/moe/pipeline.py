@@ -361,6 +361,7 @@ class MicrobatchLossPipelineStage(PipelineStage):
     """
 
     def forward_one_chunk(self, micro_index, args=None, kwargs=None):
+        """Forward one micro-batch after exposing its index to the submodule."""
         submodule = self.submodule
         if hasattr(submodule, "set_micro_index"):
             submodule.set_micro_index(micro_index)

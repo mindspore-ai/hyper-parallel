@@ -40,7 +40,9 @@ class RotaryEmbedding(nn.Module):
 
     def __init__(self, head_dim: int, max_seq_len: int = 2048, theta: float = 10000.0):
         super().__init__()
-        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        inv_freq = 1.0 / (
+            theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Pre-compute cos/sin for max_seq_len
@@ -76,7 +78,10 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary position embedding to query and key tensors."""
     # cos/sin: (seq_len, head_dim) -> (1, seq_len, 1, head_dim)
@@ -96,6 +101,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize in fp32 and rescale with the learned weight."""
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -118,10 +124,18 @@ class GroupQueryAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.num_kv_groups = self.num_heads // self.num_kv_heads
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
 
         self.rotary_emb = RotaryEmbedding(
             self.head_dim,
@@ -146,9 +160,15 @@ class GroupQueryAttention(nn.Module):
         """Forward: QKV proj -> RoPE (inside forward) -> attention -> output."""
         batch, seq_len, _ = hidden_states.shape
 
-        query = self.q_proj(hidden_states).view(batch, seq_len, self.num_heads, self.head_dim)
-        key = self.k_proj(hidden_states).view(batch, seq_len, self.num_kv_heads, self.head_dim)
-        value = self.v_proj(hidden_states).view(batch, seq_len, self.num_kv_heads, self.head_dim)
+        query = self.q_proj(hidden_states).view(
+            batch, seq_len, self.num_heads, self.head_dim
+        )
+        key = self.k_proj(hidden_states).view(
+            batch, seq_len, self.num_kv_heads, self.head_dim
+        )
+        value = self.v_proj(hidden_states).view(
+            batch, seq_len, self.num_kv_heads, self.head_dim
+        )
 
         # RoPE computed inside attention (after SP boundary all-gather)
         cos, sin = self.rotary_emb(seq_len, device=hidden_states.device)
@@ -164,7 +184,7 @@ class GroupQueryAttention(nn.Module):
         value = value.transpose(1, 2)
 
         # Scaled dot-product attention
-        scale = self.head_dim ** -0.5
+        scale = self.head_dim**-0.5
         attn_weights = torch.matmul(query, key.transpose(-2, -1)) * scale
         # Causal mask
         causal_mask = torch.triu(
@@ -172,7 +192,9 @@ class GroupQueryAttention(nn.Module):
             diagonal=1,
         )
         attn_weights = attn_weights.masked_fill(causal_mask, float("-inf"))
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+            query.dtype
+        )
         attn_output = torch.matmul(attn_weights, value)
 
         attn_output = attn_output.transpose(1, 2).reshape(batch, seq_len, -1)
@@ -188,9 +210,16 @@ class SwiGLUMLP(nn.Module):
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """SwiGLU: down(silu(gate(x)) * up(x))."""
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))

@@ -165,7 +165,9 @@ multicore/
 
 `TaskSplitValue` 封装拓扑超参数（tp、ep、seq_size、all_expert_num、top_k）和运行时计数器。
 
-`RuntimeConfigC` 是连接 Python 和 C++ 的数据桥梁，与 `ops/runtime/runtime_config.hpp` 中的 struct 定义一一对应（ctypes ↔ AscendC struct）。
+`RuntimeConfigC` 定义 64 字节的公共 header；`scheduler/runtime.py` 为每个图创建子类，追加按实际容量分配的
+task、queue 和 event 数组。Host 与 Device 使用同一套 dense 布局，TaskDesc 为 576 字节。
+所有图均使用此结构，不区分大小图，不包含旧格式分支、magic 或 version 字段。
 
 #### tasks/ — 任务填充策略层
 
@@ -189,7 +191,7 @@ FILL_CONFIG_REGISTRY: Dict[OpType, Type[FillConfig]] = {
 
 | 文件 | 职责 |
 |---|---|
-| `runtime_config.hpp` | 共享数据结构：`MAX_TASK_NUM`、`TaskDesc`、`EventDesc`、`TaskType` 枚举、所有 accessor 函数 |
+| `runtime_config.hpp` | 共享数据结构：`RuntimeHeader`、`TaskDesc`、`EventDesc`、`TaskType` 枚举、所有 accessor 函数 |
 | `worker_kernel.h` | `KernelWorkerBase<Derived>` CRTP 基类，含 `Process()`、`WaitForDependency()`、`TriggerEvent()` |
 
 **关键**：`ops/runtime/` 不会直接参与编译。[源码组装器](../_build/assemble_multicore_source.py)
@@ -433,6 +435,19 @@ trigger_event = all_event_num  （全局唯一 event）
 
 `RuntimeConfig` 是 Multicore MoE-FFN 的调度配置二进制，包含每个 task 的依赖 event、触发 event、tensor 地址偏移等信息，**按 rank 独立生成**。
 
+header 的前五个 uint32 字段依次为 task_num、num_workers、task_capacity、event_capacity、ready_event；
+ready_event 为 0 表示无需跨 rank ready，其余 44 字节用于对齐。
+task capacity 覆盖计算 task、terminate、队列长度和所有引用的最大 task ID，并按 16 对齐，没有固定 task 数上限。
+event capacity 至少为 1024，并覆盖无融合图、ready 事件和 atomic-write 尾部。布局大小为
+`4224 + 588 × task_capacity + 20 × event_capacity` 字节，必须能用 uint32 字节偏移寻址。
+在线 plan 与离线工具共用 `serialize_runtime_config()`；Device 直接读取容量，只检查存储与索引边界。
+普通事件区占 `event_capacity × 4` 字节；EP 大于 1 时，其后预留 `(EP + 1) × 64` 字节持久 ready 状态。
+每次调用只清零普通事件区，首次使用才初始化持久区并执行 Host barrier。
+
+grouped-matmul 的各 AIC scratch 在现有 group-list 预留区内按 128 字节对齐，每核步长为 128 字节。
+完整 cache line 写回不会覆盖相邻核的专家计数；对齐余量由现有预留区提供，不改变上述布局大小。
+每 rank 的专家数上限仍为 16。
+
 ### 6.1 正向
 
 ```bash
@@ -456,7 +471,7 @@ python -m hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_dat
 ├── up_proj_tiling.bin              # GMM1 tiling（各 rank 共用）
 ├── swiglu_tiling.bin               # SwiGLU tiling（各 rank 共用）
 ├── down_proj_tiling.bin            # GMM2 tiling（各 rank 共用）
-├── all_event_counters.bin          # 4096 uint8 zeros，4 KB（各 rank 共用，需 symmetric memory）
+├── all_event_counters.bin          # 普通事件计数器及持久 ready 状态（需 symmetric memory）
 ├── gmm_workspace.bin               # 256 MiB zeros（各 rank 共用）
 ├── runtime_config_input_rank_0.bin # Rank 0 调度配置
 ├── runtime_config_input_rank_1.bin
@@ -469,6 +484,7 @@ python -m hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_dat
 from hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_data import build_config_for_rank
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
+from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
 
 tsv   = TaskSplitValue(tp=4, ep=4, seq_size=8192, all_expert_num=32, top_k=8)
 graph = build_forward_graph(tsv, dispatch_sv=128, up_proj_sv=4096,
@@ -476,6 +492,7 @@ graph = build_forward_graph(tsv, dispatch_sv=128, up_proj_sv=4096,
                             hidden_size=7168, intermediate_size=2048)
 graph.propagate_splits(tsv)
 cfg = build_config_for_rank(graph, tsv, rank_id=0)   # 返回 RuntimeConfigC
+data = serialize_runtime_config(cfg)
 ```
 
 ### 6.2 反向
@@ -516,9 +533,9 @@ Multicore 组件入口负责依赖准备、私有 SHMEM、分 SoC vendor、vendo
 [HyperParallel 安装指南](../../../../docs/installation.md)。
 
 每个 SoC 的 CANN 构建同时生成 `HyperMegaMoe` 和 `HyperMegaMoeGrad`。组件会校验新构建及缓存 vendor，
-并在合并后再次校验四个 `aclnnHyperMegaMoe*` API、kernel object/metadata、SONAME、相对 RUNPATH 和运行时依赖。
-私有 SHMEM 库会校验专属 SONAME 和相对 RUNPATH；Torch adapter 还会校验 host ELF 架构、组件相对 RUNPATH
-和依赖边界。
+并在合并后再次校验四个 `aclnnHyperMegaMoe*` API、kernel object/metadata、SONAME 和运行时依赖。
+私有 SHMEM 库会校验专属 SONAME；所有随包 host 共享库均校验 ELF 架构、安全链接属性、无
+RPATH/RUNPATH 和依赖边界。动态库搜索路径由 `set_env.bash` 在启动 Python 前统一配置。
 
 Torch adapter 是由 CMake 构建、通过 `torch.ops.load_library()` 加载的 dispatcher 共享库，不生成
 `PyInit_*` 入口，也不链接 `libpython` 或 `libtorch_python`。adapter 运行时按组件相对路径定位并绝对加载

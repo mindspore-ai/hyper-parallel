@@ -84,7 +84,7 @@ class _FakeTPMesh:
 def _set_fake_group_ranks(monkeypatch, ranks=(0, 1)):
     monkeypatch.setattr(
         "hyper_parallel.distributed._builder.tp_collective_lowering."
-        "platform.get_process_group_ranks",
+        "dist.get_process_group_ranks",
         lambda _group: list(ranks),
     )
 

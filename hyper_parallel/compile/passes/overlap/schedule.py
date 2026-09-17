@@ -25,6 +25,8 @@ Optimization Strategies:
 - Allow communication to overlap with independent computation
 """
 
+__all__ = ["AutoOverlapPass"]
+
 from typing import Any, List
 from torch import fx
 
@@ -91,6 +93,3 @@ class AutoOverlapPass(GraphPass):
         """
         _ = wait_node  # intentional no-op until the scheduler lands
         return graph_module
-
-
-__all__ = ["AutoOverlapPass"]

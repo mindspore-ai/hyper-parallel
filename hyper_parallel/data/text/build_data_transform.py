@@ -60,7 +60,8 @@ class IdentityDataTransform:
         self.tokenizer = tokenizer
         self.chat_template = chat_template
 
-    def __call__(self, sample: Any) -> Any:
+    @staticmethod
+    def __call__(sample: Any) -> Any:
         """Return the input sample without modification."""
         return sample
 

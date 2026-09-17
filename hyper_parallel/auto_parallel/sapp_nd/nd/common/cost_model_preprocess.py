@@ -276,33 +276,24 @@ class CostModelConfig(PartitionGenerator):
                     **{**kwargs, "model_name": None}
                 )
             model_name = self.mm_main if self.mm_main else self.mm_order[-1]
-        dp = kwargs.get("dp", None)
-        tp = kwargs.get("mp", None)
-        cp = kwargs.get("cp", None)
-        ep = kwargs.get("ep", None)
         op = kwargs.get("op", None)
-        etp = kwargs.get("etp", None)
-        pp = kwargs.get("pp", None)
-        vpp = kwargs.get("vpp", None)
         off = kwargs.get("offset", None)
         fr = kwargs.get("full_rec", None)
         sr = kwargs.get("sel_rec", None)
-        m = kwargs.get("mb", None)
-        b = kwargs.get("mbs", None)
         target_ccfg = self.__strategy_target(model_name)
 
-        for attr, value in (
-            ("d", dp),
-            ("t", tp),
-            ("ep", ep),
-            ("etp", etp),
-            ("cp", cp),
-            ("vp", vpp),
-            ("p", pp),
-            ("m", m),
-            ("b", b),
+        for attr, key in (
+            ("d", "dp"),
+            ("t", "mp"),
+            ("ep", "ep"),
+            ("etp", "etp"),
+            ("cp", "cp"),
+            ("vp", "vpp"),
+            ("p", "pp"),
+            ("m", "mb"),
+            ("b", "mbs"),
         ):
-            self.__maybe_set_int(target_ccfg, attr, value)
+            self.__maybe_set_int(target_ccfg, attr, kwargs.get(key, None))
         target_ccfg.sp = target_ccfg.t
         if op is not None and isinstance(op, int):
             target_ccfg.os_max_shard = op
@@ -343,7 +334,7 @@ class CostModelConfig(PartitionGenerator):
                 f"full_rec {target_ccfg.full_rec} "
                 f"sel_rec {target_ccfg.sel_rec}"
             )
-        self.__maybe_set_int(target_ccfg, "cp", cp)
+        self.__maybe_set_int(target_ccfg, "cp", kwargs.get("cp", None))
 
     def get_strategy(self) -> Any:
         """return parallelism/recompute strategies"""

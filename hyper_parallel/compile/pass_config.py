@@ -25,6 +25,8 @@ mode. The explicit field fixes that. Pipeline-parallel (``pp_enabled``)
 follows the same contract: intent here, runtime guard in ``PpPass``.
 """
 
+__all__ = ["PassConfig"]
+
 from dataclasses import dataclass
 from typing import Optional
 
@@ -118,6 +120,3 @@ class PassConfig:
             raise ValueError(
                 f"pp_microbatch_size must be >= 1, got {self.pp_microbatch_size}"
             )
-
-
-__all__ = ["PassConfig"]

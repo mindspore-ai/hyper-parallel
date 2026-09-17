@@ -210,12 +210,12 @@ def resolve_data_paths(
     # 4. Prefer the numeric shard order encoded by the corpus filenames.
     # Unknown naming schemes remain usable in their original walk order.
     try:
-        file_paths.sort(
-            key=lambda path: (
-                int(os.path.basename(path).split("_")[2]),
-                int(os.path.basename(path).split("_")[-1]),
-            )
-        )
+        def numeric_shard_key(path: str) -> tuple[int, int]:
+            """Extract numeric corpus and shard identifiers from a path."""
+            path_parts = os.path.basename(path).split("_")
+            return int(path_parts[2]), int(path_parts[-1])
+
+        file_paths.sort(key=numeric_shard_key)
     except (IndexError, TypeError, ValueError):
         logger.warning("Cannot sort indexed files with the numeric filename rule; keeping walk order")
 

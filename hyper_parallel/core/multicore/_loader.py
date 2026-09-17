@@ -40,10 +40,12 @@ def require_multicore_environment() -> Path:
         )
     vendor_root = vendor_root.resolve()
     op_api_root = (vendor_root / "op_api" / "lib").resolve()
+    shmem_root = (component_root.parent / "shmem" / "lib").resolve()
+    required_library_roots = (op_api_root, shmem_root, shmem_root / "shmem")
     missing_variables = []
     if not _environment_contains_path("ASCEND_CUSTOM_OPP_PATH", vendor_root):
         missing_variables.append("ASCEND_CUSTOM_OPP_PATH")
-    if not _environment_contains_path("LD_LIBRARY_PATH", op_api_root):
+    if not all(_environment_contains_path("LD_LIBRARY_PATH", path) for path in required_library_roots):
         missing_variables.append("LD_LIBRARY_PATH")
     if missing_variables:
         set_env_script = component_root / "set_env.bash"

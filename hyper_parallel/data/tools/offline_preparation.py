@@ -20,6 +20,7 @@ import argparse
 import glob
 import gzip
 import json
+import logging
 import math
 import multiprocessing
 import os
@@ -44,6 +45,8 @@ except ImportError:
 
 # Store generated samples in the indexed ``.bin/.idx`` format.
 from hyper_parallel.data.tools import io as indexed_dataset
+
+logger = logging.getLogger(__name__)
 
 
 class CustomLanguageVars(PunktLanguageVars):
@@ -708,7 +711,9 @@ def _split_partitions(args: argparse.Namespace, workers: int, names: list[dict[s
         process = multiprocessing.Process(target=_split_sentences_worker, args=(args, workers, name, queue))
         process.start()
         processes.append(process)
-    _wait_for_processes(processes, queue)
+    split_results = _wait_for_processes(processes, queue)
+    if any(result is not None for result in split_results):
+        raise RuntimeError("Sentence-splitting workers returned unexpected results")
 
 
 def _encode_partitions(
@@ -742,7 +747,7 @@ def prepare_offline_dataset(args: argparse.Namespace) -> None:
     performance = {}
     input_files = _resolve_input_files(args.dataset_name_or_path)
     for workers in worker_candidates:
-        print(f"Processing data with {workers} workers.")
+        logger.info("Processing data with %s workers", workers)
         workers_per_partition = workers // args.partitions
 
         if args.split_sentences:

@@ -1043,6 +1043,16 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         self.assertTrue(torch.equal(dispatch_indices, expected_indices))
         self.assertTrue(torch.equal(node_counts_per_expert, expected_counts))
 
+        empty_indices, empty_counts = _generate_deredundency_dispatch_indices(
+            torch.zeros_like(gathered_counts),
+            expert_start=0,
+            iep_size=2,
+            num_local_experts=2,
+        )
+        self.assertEqual(empty_indices.dtype, torch.long)
+        self.assertEqual(empty_indices.numel(), 0)
+        self.assertTrue(torch.equal(empty_counts, torch.zeros(4, dtype=torch.long)))
+
     @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
     @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
     def test_dispatch_1d_degenerates_to_standard_contract(self, mock_dist, mock_dist_func):

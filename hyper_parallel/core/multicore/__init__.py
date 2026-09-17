@@ -14,6 +14,7 @@
 # ============================================================================
 """Torch-only Multicore APIs, separate from the HyperParallel root exports."""
 
+from hyper_parallel.core.multicore import profiler
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 
-__all__ = ["MegaMoeExperts"]
+__all__ = ["MegaMoeExperts", "profiler"]

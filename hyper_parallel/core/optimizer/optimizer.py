@@ -423,7 +423,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
         # Cache Hit Check
         if cache_key in self._split_sub_pg_cache:
             sub_pg_map = self._split_sub_pg_cache[cache_key]
-            for sub_idx, sub_pg in sub_pg_map.items():
+            for sub_pg in sub_pg_map.values():
                 if sub_pg is not None:
                     try:
                         dist.get_rank(group=sub_pg)

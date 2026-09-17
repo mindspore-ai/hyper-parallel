@@ -52,4 +52,4 @@ def load_checkpoint_file(file_path: str, ckpt_format: str = "safetensors") -> di
     """
     if ckpt_format == "safetensors":
         return load_file(filename=file_path)
-    return torch.load(f=file_path)
+    return torch.load(f=file_path, weights_only=True)

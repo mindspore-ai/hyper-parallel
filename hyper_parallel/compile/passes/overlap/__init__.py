@@ -16,6 +16,6 @@
 Overlap Passes - Communication-Compute Overlap Optimization Passes
 """
 
-from .schedule import AutoOverlapPass
-
 __all__ = ["AutoOverlapPass"]
+
+from .schedule import AutoOverlapPass

@@ -71,6 +71,25 @@ def _topk_router_module(module, hidden_states):
     )
 
 
+def _mask_scores_by_group(scores, n_group, topk_group):
+    """Keep scores only in the highest-scoring expert groups."""
+    expert_count = scores.shape[-1]
+    group_scores = (
+        scores.view(-1, n_group, expert_count // n_group)
+        .topk(2, dim=-1)[0]
+        .sum(dim=-1)
+    )
+    group_indices = group_scores.topk(topk_group, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_indices, 1)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(-1, n_group, expert_count // n_group)
+        .reshape(-1, expert_count)
+    )
+    return scores.masked_fill(~score_mask.bool(), float("-inf"))
+
+
 def _sigmoid_group_router(module, hidden_states):
     """deepseekv3/glm4moe adapter: sigmoid + e_score_correction_bias +
     group-limited topk + (optional) normalization + routed_scaling_factor
@@ -97,7 +116,6 @@ def _sigmoid_group_router(module, hidden_states):
     if isinstance(logits, (tuple, list)):
         logits = logits[0]
     logits = logits.view(-1, logits.shape[-1]).float()
-    e_total = logits.shape[-1]
     scores = logits.sigmoid()
     bias = getattr(gate, "e_score_correction_bias", None)
     scores_for_choice = scores + bias if bias is not None else scores
@@ -106,17 +124,9 @@ def _sigmoid_group_router(module, hidden_states):
     topk_group = int(_attr("topk_group", 0) or 0)
     top_k = int(_attr("top_k", None) or _attr("num_experts_per_tok", 2))
     if n_group > 1 and topk_group > 0:
-        group_scores = (scores_for_choice
-                        .view(-1, n_group, e_total // n_group)
-                        .topk(2, dim=-1)[0].sum(dim=-1))
-        group_idx = group_scores.topk(topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
-        score_mask = (group_mask.unsqueeze(-1)
-                      .expand(-1, n_group, e_total // n_group)
-                      .reshape(-1, e_total))
-        scores_for_choice = scores_for_choice.masked_fill(
-            ~score_mask.bool(), float("-inf"))
+        scores_for_choice = _mask_scores_by_group(
+            scores_for_choice, n_group, topk_group
+        )
 
     topk_idx = scores_for_choice.topk(top_k, dim=-1, sorted=False)[1]
     topk_w = scores.gather(1, topk_idx)

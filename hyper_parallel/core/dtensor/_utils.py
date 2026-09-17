@@ -37,47 +37,6 @@ from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 # Small shared helpers
 # ---------------------------------------------------------------------------
 
-def _a2a_reconstruct(out_perm: torch.Tensor, concat_dim: int) -> torch.Tensor:
-    """Reconstruct A2A result from raw out_perm buffer.
-
-    ``out_perm`` has shape ``[ws, *rest_dims]``, chunk at ``concat_dim + 1``.
-    Returns tensor with merged chunk dimension.
-    """
-    new_ndim = out_perm.dim()
-    chunk_in_perm = concat_dim + 1
-    recon_perm = list(range(1, chunk_in_perm)) + [0] + list(range(chunk_in_perm, new_ndim))
-    x_recon = out_perm.permute(recon_perm).contiguous()
-    shape = list(x_recon.shape)
-    merged = shape[concat_dim] * shape[concat_dim + 1]
-    return x_recon.reshape(shape[:concat_dim] + [merged] + shape[concat_dim + 2:])
-
-
-def _normalize_dim(dim: int, ndim: int) -> int:
-    """Normalize a possibly negative dimension index."""
-    return dim + ndim if dim < 0 else dim
-
-
-def _move_dim_to_front(tensor: torch.Tensor, dim: int) -> torch.Tensor:
-    """Move ``dim`` to the front while keeping the other dimensions ordered."""
-    dim = _normalize_dim(dim, tensor.dim())
-    if dim == 0:
-        return tensor.contiguous()
-    perm = [dim] + [i for i in range(tensor.dim()) if i != dim]
-    return tensor.permute(perm).contiguous()
-
-
-def _move_dim_from_front(tensor: torch.Tensor, dim: int) -> torch.Tensor:
-    """Inverse of :func:`_move_dim_to_front`."""
-    dim = _normalize_dim(dim, tensor.dim())
-    if dim == 0:
-        return tensor.contiguous()
-    perm = [dim] + [i for i in range(tensor.dim()) if i != dim]
-    inverse = [0] * len(perm)
-    for idx, value in enumerate(perm):
-        inverse[value] = idx
-    return tensor.permute(inverse).contiguous()
-
-
 def _ensure_contiguous(x):
     """Return a contiguous copy of *x* if not already contiguous."""
     if torch.compiler.is_compiling():
@@ -260,7 +219,23 @@ def init_process_group(*args, **kwargs):
 # ---------------------------------------------------------------------------
 
 def _validate_intra_step(normalized_template: list[int], template_len: int) -> int:
-    """Verify consistent intra-group step and return intra_step."""
+    """Verify a normalized template has a uniform step between its members.
+
+    The step between adjacent members defines the stride of the groups built
+    from this template, so a template such as ``[0, 1, 3]`` (steps 1 then 2)
+    has no single well-defined stride and is rejected.
+
+    Args:
+        normalized_template: Template rebased so its first member is ``0``.
+        template_len: Number of members; ``normalized_template`` must hold at
+            least two for a step to exist.
+
+    Returns:
+        int: The step shared by every adjacent pair of members.
+
+    Raises:
+        ValueError: If any adjacent pair differs in step from the first pair.
+    """
     intra_step = normalized_template[1] - normalized_template[0]
     for i in range(1, template_len - 1):
         diff = normalized_template[i + 1] - normalized_template[i]
@@ -275,7 +250,20 @@ def _validate_intra_step(normalized_template: list[int], template_len: int) -> i
 
 
 def _compute_group_starts(world_size: int, block_size: int, inter_step: int) -> list[int]:
-    """Compute all valid block start positions."""
+    """Compute every block start position that fits inside ``world_size``.
+
+    Start positions are spaced ``inter_step`` apart, and a start is kept only
+    when the whole block fits, i.e. the last rank it can reach stays within
+    ``world_size``. Ranks past the final full block are left uncovered.
+
+    Args:
+        world_size: Total number of processes.
+        block_size: Ranks spanned by one block; used for the fit check.
+        inter_step: Distance between adjacent candidate starts.
+
+    Returns:
+        list[int]: Ascending start positions of the blocks that fit.
+    """
     return [s for s in range(0, world_size, inter_step) if s + block_size <= world_size]
 
 
@@ -287,7 +275,27 @@ def _build_groups_for_blocks(
     template_len: int,
     world_size: int,
 ) -> list[list[int]]:
-    """Build all groups from block starts."""
+    """Expand each block start into the groups the template can place there.
+
+    Within a block the template may be slid to offsets ``0 .. block_size -
+    template_span_int``; an offset's group is kept only when every rank it
+    produces lands inside ``world_size``. Groups are appended in start order,
+    then offset order, so every process building the same template sees the
+    same sequence before the caller sorts.
+
+    Args:
+        group_starts: Block start positions, as returned by
+            :func:`_compute_group_starts`.
+        block_size: Ranks spanned by one block.
+        template_span_int: Distance from the template's first member to its
+            last; bounds how far the template can slide within a block.
+        normalized_template: Template rebased so its first member is ``0``.
+        template_len: Number of members in the template.
+        world_size: Total number of processes.
+
+    Returns:
+        list[list[int]]: One rank list per (block, offset) pair that fits.
+    """
     all_groups = []
     for start_block in group_starts:
         max_offset = block_size - template_span_int
@@ -296,6 +304,23 @@ def _build_groups_for_blocks(
             if all(0 <= r < world_size for r in group):
                 all_groups.append(group)
     return all_groups
+
+
+def _report_template_stage(verbose: bool, my_rank: int, message: str) -> None:
+    """Print one ``generate_groups_from_template`` stage when *verbose* is set.
+
+    Each generated group must be identical across processes, so a template bug
+    shows up as a mismatch in the printed rank lists rather than as a crash.
+    This helper exists so those stage prints stay a single ``verbose`` check
+    each, keeping the caller's local-variable count down.
+
+    Args:
+        verbose: Whether the caller asked for debug output.
+        my_rank: Current process rank, prefixed to every line.
+        message: Stage-specific text; the caller formats it.
+    """
+    if verbose:
+        print(f"Rank {my_rank}: {message}")
 
 
 def generate_groups_from_template(
@@ -331,8 +356,7 @@ def generate_groups_from_template(
     my_rank = int(my_rank)
     template_len = len(template)
 
-    if verbose:
-        print(f"Rank {my_rank}: Original Template = {template}, World size = {world_size}")
+    _report_template_stage(verbose, my_rank, f"Original Template = {template}, World size = {world_size}")
 
     if template_len == 1:
         return [[i] for i in range(world_size)]
@@ -341,37 +365,27 @@ def generate_groups_from_template(
         raise ValueError(f"Template must have at least 2 ranks, got {template}")
 
     # 1. Template normalization: convert to 0-based template
-    template_base = template[0]  # original template start value
-    normalized_template = [x - template_base for x in template]  # normalize to 0-based
-    if verbose:
-        print(f"Rank {my_rank}: Normalized Template = {normalized_template}")
+    normalized_template = [x - template[0] for x in template]
+    _report_template_stage(verbose, my_rank, f"Normalized Template = {normalized_template}")
 
     # 2. Analyze normalized template core params
     # intra-step: spacing between elements in template
     intra_step = _validate_intra_step(normalized_template, template_len)
-    # template span: last - first element of normalized template
+    # block size: ranks per block; it is also the spacing between adjacent blocks
+    block_size = intra_step * template_len
     template_span = normalized_template[-1] - normalized_template[0]
-    # block size: ranks per block (determines inter-step)
-    block_size = int(intra_step * template_len)
-    # inter-step: spacing between adjacent blocks (equals block_size)
-    inter_step = block_size
-
-    if verbose:
-        print(
-            f"Rank {my_rank}: Template analysis - "
-            f"intra_step={intra_step}, template_span={template_span}, "
-            f"block_size={block_size}, inter_step={inter_step}"
-        )
+    _report_template_stage(
+        verbose, my_rank,
+        f"Template analysis - intra_step={intra_step}, template_span={template_span}, block_size={block_size}"
+    )
 
     # 3. Compute all valid block start positions
-    group_starts = _compute_group_starts(world_size, block_size, inter_step)
-    if verbose:
-        print(f"Rank {my_rank}: Possible block starts: {group_starts}")
+    group_starts = _compute_group_starts(world_size, block_size, block_size)
+    _report_template_stage(verbose, my_rank, f"Possible block starts: {group_starts}")
 
     # 4. Generate all valid sub-groups for each block
-    template_span_int = int(template_span)
     all_groups = _build_groups_for_blocks(
-        group_starts, block_size, template_span_int,
+        group_starts, block_size, template_span,
         normalized_template, template_len, world_size
     )
 
@@ -384,12 +398,11 @@ def generate_groups_from_template(
     # 6. Sort: ensure all processes generate groups in same order
     all_groups.sort(key=lambda x: (x[0], x[1] if len(x) > 1 else 0))
 
-    if verbose:
-        print(
-            f"Rank {my_rank}: Generated {len(all_groups)} groups, "
-            f"covering {len(unique_ranks)} unique ranks\n"
-            f"Final group list: {all_groups}"
-        )
+    _report_template_stage(
+        verbose, my_rank,
+        f"Generated {len(all_groups)} groups, covering {len(unique_ranks)} unique ranks\n"
+        f"Final group list: {all_groups}"
+    )
 
     return all_groups
 
@@ -479,82 +492,6 @@ class _TorchContiguousGrad(torch.autograd.Function):  # pylint: disable=abstract
         return grad_output.contiguous()
 
 
-class _TorchAsyncA2AFunction(torch.autograd.Function):
-    """Differentiable wrapper for pre-launched async all-to-all.
-
-    Forward: wait async handle, reconstruct A2A result.
-    Backward: launch async head→seq A2A and store handle in ``handle_box``
-    for the projection pre-hook to wait, achieving GEMM–A2A overlap.
-    """
-
-    @staticmethod
-    def forward(ctx, x, work, out_perm, group, world_size, concat_dim, split_dim,  # pylint: disable=arguments-differ
-                handle_box):
-        """Wait for pre-launched async A2A and return reconstructed output."""
-        ctx.group = group
-        ctx.world_size = world_size
-        ctx.concat_dim = concat_dim
-        ctx.split_dim = split_dim
-        ctx.handle_box = handle_box
-        ctx.x_shape = x.shape
-        work.wait()
-        return _a2a_reconstruct(out_perm, concat_dim)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Launch async head→seq A2A for backward overlap, or return zero grad."""
-        if ctx.handle_box is not None:
-            # Launch async head→seq A2A (reverse of forward seq→head)
-            g = grad_output.contiguous()
-            shape = list(g.shape)
-            seq_dim = ctx.concat_dim
-            s_full = shape[seq_dim]
-            ndim = len(shape) + 1
-            x_perm = g.reshape(
-                shape[:seq_dim] + [ctx.world_size, s_full // ctx.world_size] + shape[seq_dim + 1:]
-            ).permute(
-                [seq_dim] + list(range(seq_dim)) + list(range(seq_dim + 1, ndim))
-            ).contiguous()
-            out_perm = torch.empty_like(x_perm)
-            work = dist.all_to_all_single(out_perm, x_perm, group=ctx.group, async_op=True)
-            ctx.handle_box.append((work, out_perm))
-        return grad_output.new_zeros(ctx.x_shape), None, None, None, None, None, None, None
-
-
-class _TorchAsyncAllGatherFunction(torch.autograd.Function):
-    """Differentiable wrapper for pre-launched async all-gather."""
-
-    @staticmethod
-    def forward(ctx, x, work, out_perm, group, world_size, gather_dim, handle_box):  # pylint: disable=arguments-differ
-        """Wait for pre-launched all-gather and reconstruct the gathered tensor."""
-        ctx.group = group
-        ctx.world_size = world_size
-        ctx.gather_dim = gather_dim
-        ctx.handle_box = handle_box
-        ctx.x_shape = x.shape
-        work.wait()
-        return _move_dim_from_front(out_perm, gather_dim)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Launch reverse reduce-scatter for the all-gather."""
-        grad_perm = _move_dim_to_front(grad_output.contiguous(), ctx.gather_dim)
-        output_shape = list(grad_perm.shape)
-        if output_shape[0] % ctx.world_size != 0:
-            raise ValueError(
-                "all_gather backward expected gathered dimension to be divisible by world_size, "
-                f"got {output_shape[0]} and {ctx.world_size}."
-            )
-        output_shape[0] //= ctx.world_size
-        output = torch.empty(output_shape, dtype=grad_perm.dtype, device=grad_perm.device)
-        work = dist.reduce_scatter_tensor(output, grad_perm, group=ctx.group, async_op=True)
-        if ctx.handle_box is not None:
-            ctx.handle_box.append((work, output, ctx.gather_dim))
-            return grad_output.new_zeros(ctx.x_shape), None, None, None, None, None, None
-        work.wait()
-        return _move_dim_from_front(output, ctx.gather_dim), None, None, None, None, None, None
-
-
 class _AsyncA2ALazyBwd(torch.autograd.Function):
     """All-to-all whose forward AND backward return ``AsyncCollectiveTensor``.
 
@@ -593,124 +530,6 @@ class _AsyncA2ALazyBwd(torch.autograd.Function):
             grad_output, ctx.input_splits, ctx.output_splits, ctx.group,
         )
         return grad_input, None, None, None
-
-
-class _TorchSyncHookFunction(torch.autograd.Function):
-    """Autograd identity that fires HookCoordinator rendezvous on fwd/bwd.
-
-    Uses a **4-hook** design (``A``, ``B``, ``C``, ``D``) with pure
-    COMM / COMPUTE roles — no NONE role.  Every rendezvous is a strict
-    COMM + COMPUTE pair, guaranteeing NCCL-first dispatch ordering at
-    **all** points including layer boundaries.
-
-    Hook placement per MoE layer::
-
-        [A] → dispatch → [B] → module → [C] → combine → [D] → (Attention) → [A_next]
-
-    At layer boundaries (D / A hooks), the Attention that runs between
-    layers is treated as COMPUTE, and the combine / combine.bwd is treated
-    as COMM, so the coordinator enforces comm-first ordering even across
-    layer transitions.
-    """
-
-    # 4-hook role tables: (prev_role_idx, next_role_idx).
-    # Index encoding: 1 = COMM, 2 = COMPUTE.
-    #
-    # Only the four core hooks A/B/C/D + D_LAST sentinel are used.  CUDA
-    # streams are process-wide and Torch autograd is thread-safe, so no
-    # chunk-boundary hooks are needed.  Do not add CHUNK_START / CHUNK_END
-    # to these tables; if a future test does need them, copy the MS
-    # implementation and add the matching skip rules in ``forward`` /
-    # ``backward``.
-    _FWD_ROLES = {
-        #         (prev, next)      prev op          next op
-        "A": (2, 1),   # COMPUTE, COMM     Attention   | dispatch
-        "B": (1, 2),   # COMM, COMPUTE     dispatch    | module
-        "C": (2, 1),   # COMPUTE, COMM     module      | combine
-        "D": (1, 2),   # COMM, COMPUTE     combine     | Attention
-    }
-    _BWD_ROLES = {
-        "D": (2, 1),   # COMPUTE, COMM     Attn.bwd    | combine.bwd
-        "C": (1, 2),   # COMM, COMPUTE     combine.bwd | module.bwd
-        "B": (2, 1),   # COMPUTE, COMM     module.bwd  | dispatch.bwd
-        "A": (1, 2),   # COMM, COMPUTE     dispatch.bwd| Attn.bwd
-    }
-
-    _ROLE_CACHE = None
-
-    @staticmethod
-    def _role_enum(idx: int):
-        if _TorchSyncHookFunction._ROLE_CACHE is None:
-            from hyper_parallel.core.pipeline_parallel.hook_coordinator import (  # pylint: disable=C0415
-                HookRole,
-            )
-            _TorchSyncHookFunction._ROLE_CACHE = (None, HookRole.COMM, HookRole.COMPUTE)
-        return _TorchSyncHookFunction._ROLE_CACHE[idx]  # pylint: disable=E1136
-
-    @staticmethod
-    def forward(ctx, x, hook_name, coordinator):  # pylint: disable=arguments-differ
-        """Identity forward that fires a HookCoordinator rendezvous.
-
-        Notifies the previous op's role and rendezvouses for the next op's
-        role per the ``_FWD_ROLES`` table.  ``"D_LAST"`` is a sentinel
-        meaning "skip this rendezvous" (last layer's closing D — no
-        Attention follows).
-        """
-        ctx.hook_name = hook_name
-        ctx.coordinator = coordinator
-
-        if not coordinator.is_enabled():
-            return x
-
-        if hook_name == "D_LAST":
-            # ``D_LAST`` marks the last layer's closing D hook — no
-            # Attention follows in this chunk, so the rendezvous is
-            # meaningless and is skipped.  We still
-            # ``notify_dispatched(COMM)`` so the COMPUTE side of the
-            # preceding ``C`` rendezvous unblocks early, letting
-            # BWD's Attn.bwd_last overlap with FWD's post-combine
-            # work — Torch autograd is thread-safe so this concurrent
-            # FWD-record + BWD-replay is fine.
-            prev_idx, _ = _TorchSyncHookFunction._FWD_ROLES["D"]
-            role_of = _TorchSyncHookFunction._role_enum
-            coordinator.notify_dispatched(role_of(prev_idx))
-            return x
-
-        prev_idx, next_idx = _TorchSyncHookFunction._FWD_ROLES[hook_name]
-        role_of = _TorchSyncHookFunction._role_enum
-        coordinator.notify_dispatched(role_of(prev_idx))
-        coordinator.rendezvous(role_of(next_idx))
-        return x
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Identity backward that fires a HookCoordinator rendezvous.
-
-        Mirror of :meth:`forward` using the ``_BWD_ROLES`` table.
-        ``"D_LAST"`` skips the rendezvous because this is the first BWD
-        hook to fire and ``combine.bwd`` has already dispatched freely
-        before any rendezvous can happen.
-        """
-        hook_name = ctx.hook_name
-        coordinator = ctx.coordinator
-
-        if not coordinator.is_enabled():
-            return grad_output, None, None
-
-        if hook_name == "D_LAST":
-            # First BWD hook to fire; combine.bwd has already
-            # dispatched freely before any rendezvous can happen.
-            # Skipping here is safe on Torch because CUDA streams
-            # are process-wide and the NCCL FIFO order is consistent
-            # across ranks regardless of which thread launched
-            # combine.bwd.
-            return grad_output, None, None
-
-        prev_idx, next_idx = _TorchSyncHookFunction._BWD_ROLES[hook_name]
-        role_of = _TorchSyncHookFunction._role_enum
-        coordinator.notify_dispatched(role_of(prev_idx))
-        coordinator.rendezvous(role_of(next_idx))
-        return grad_output, None, None
 
 
 class _TorchP2PExchangeFunction(torch.autograd.Function):
@@ -913,22 +732,6 @@ def wait_async_tensor(tensor):
     from torch.distributed._functional_collectives import wait_tensor  # pylint: disable=C0415
     wait_tensor(tensor)
     return tensor
-
-
-def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,
-                                        handle_box=None):
-    """Wait async all-gather handle and reconstruct result (differentiable)."""
-    return _TorchAsyncAllGatherFunction.apply(
-        x, work, out_perm, group, world_size, gather_dim, handle_box
-    )
-
-
-def differentiable_async_a2a_wait(x, work, out_perm, group, world_size, concat_dim, split_dim,
-                                  handle_box=None):
-    """Wait async A2A handle and reconstruct result (differentiable)."""
-    return _TorchAsyncA2AFunction.apply(
-        x, work, out_perm, group, world_size, concat_dim, split_dim, handle_box
-    )
 
 
 def p2p_exchange(tensor, peer_rank: int, group=None):

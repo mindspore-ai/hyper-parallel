@@ -263,6 +263,8 @@ TILING_DATA_FIELD_DEF(int64_t, expertNum);
 TILING_DATA_FIELD_DEF(int64_t, hiddenSize);
 TILING_DATA_FIELD_DEF(int64_t, seqSize);
 TILING_DATA_FIELD_DEF(int64_t, coreNum);
+TILING_DATA_FIELD_DEF(int64_t, runtimeConfigBytes);
+TILING_DATA_FIELD_DEF(int64_t, eventCounterBytes);
 TILING_DATA_FIELD_DEF_STRUCT(TilingData, tilingData);
 TILING_DATA_FIELD_DEF_STRUCT(SwiGluTilingData, swiGluTilingData);
 TILING_DATA_FIELD_DEF_STRUCT(MatmulTilingData, matmulTilingData);
@@ -272,13 +274,3 @@ END_TILING_DATA_DEF;
 REGISTER_TILING_DATA_CLASS(HyperMegaMoe, HyperMegaMoeTilingData)
 }  // namespace optiling
 #endif  // HYPER_MEGA_MOE_TILING_H
-
-// BEGIN_TILING_DATA_DEF(Data)
-//   TILING_DATA_FIELD_DEF_ARR(uint32_t, MAX_EVENT_NUM, queues);
-// END_TILING_DATA_DEF;
-// REGISTER_TILING_DATA_CLASS(DataOp, Data);
-
-// BEGIN_TILING_DATA_DEF(DataConfig)
-//   TILING_DATA_FIELD_DEF_ARR(Data, MAX_TASK_NUM, all_tasks);
-// END_TILING_DATA_DEF;
-// REGISTER_TILING_DATA_CLASS(DataConfigOp, DataConfig);

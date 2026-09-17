@@ -25,10 +25,11 @@ using namespace AscendC;
 class KernelWorker : public KernelWorkerBase<KernelWorker> {
  public:
   // input_list layout for hyper_mega_moe_grad (backward):
-  //   [30] = tiling params  [31] = all_event_counters
+  //   [30] = tiling params  [31] = all_event_counters  [32] = profile_buffer
   //   [25] = gmm_workspace  [26] = swi_glu_grad_workspace
   static constexpr uint32_t TILING_IDX              = 30;
   static constexpr uint32_t EVENT_IDX               = 31;
+  static constexpr uint32_t PROFILE_IDX             = 32;
   static constexpr uint32_t WORKSPACE_IDX           = 25;
   static constexpr uint32_t SWIGLU_GRAD_WORKSPACE_IDX = 26;
 
@@ -158,7 +159,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
 
         GM_ADDR grouped_list_real =
-          this->runtimeConfigPtr + getGroupedMatmulGroupListOffsetById(AscendC::GetBlockIdx());
+          this->runtimeConfigPtr + getGroupedMatmulGroupListOffsetById(this->runtimeConfigPtr, AscendC::GetBlockIdx());
         GlobalTensor<int64_t> grouped_list_tensor_real;
         grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
         uint32_t data_index = task_desc.task_index / this->core_num;

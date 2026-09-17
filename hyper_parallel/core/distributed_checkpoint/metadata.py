@@ -19,6 +19,7 @@ from typing import Any, Optional, Union
 
 CHUNK_INFO = "chunk_info"
 
+
 @dataclass(frozen=True)
 class MetadataIndex:
     """

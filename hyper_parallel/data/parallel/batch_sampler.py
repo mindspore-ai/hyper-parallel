@@ -83,7 +83,8 @@ class _DatasetBatchSampler:
         self.epoch = 0
         self._resume_at_source_batch = False
 
-    def _validate_consumed_samples(self, consumed_samples: int, total_samples: int) -> None:
+    @staticmethod
+    def _validate_consumed_samples(consumed_samples: int, total_samples: int) -> None:
         """Allow sequential sampling to stop exactly at the epoch boundary."""
         if not 0 <= consumed_samples <= total_samples:
             raise ValueError("consumed_samples must be in [0, total_samples]")

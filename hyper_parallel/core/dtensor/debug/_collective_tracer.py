@@ -14,7 +14,7 @@
 # ============================================================================
 """Tracer for the collective communication operations of core.dtensor."""
 import threading
-from typing import Callable, Dict
+from typing import Any, Callable, Dict
 
 from hyper_parallel.core.dtensor import _utils
 
@@ -39,12 +39,25 @@ class CollectiveTracer:
 
     _patch_lock = threading.Lock()
 
-    def __init__(self, on_collective_call: Callable):
+    def __init__(self, on_collective_call: Callable) -> None:
+        """Record the callback and start with nothing patched.
+
+        Args:
+            on_collective_call: Callback invoked after each collective with
+                ``(method_name, args, kwargs, result)``.
+        """
         self._callback = on_collective_call
         self._originals: Dict[str, object] = {}
+        self._wrappers: Dict[str, object] = {}
 
-    def install(self):
-        """Replace the ``_utils`` collective functions with tracing wrappers."""
+    def install(self) -> None:
+        """Replace the ``_utils`` collective functions with tracing wrappers.
+
+        Names in :data:`_COLLECTIVE_METHODS` that ``_utils`` does not define are
+        skipped, so a missing collective degrades to no tracing rather than an
+        error. Installations are idempotent per name: a second tracer replaces
+        the first tracer's wrapper and saves that wrapper as its own original.
+        """
         with self._patch_lock:
             for name in _COLLECTIVE_METHODS:
                 if not hasattr(_utils, name):
@@ -56,8 +69,13 @@ class CollectiveTracer:
                 callback = self._callback
                 method_name = name
 
-                def _make_wrapper(orig, cb, mname):
-                    def wrapper(*args, **kwargs):
+                def _make_wrapper(orig: Callable, cb: Callable, mname: str) -> Callable:
+                    def wrapper(*args: Any, **kwargs: Any) -> Any:
+                        """Call the original collective, then notify the callback.
+
+                        A callback failure must never break the collective, so it
+                        is swallowed and the original result returned untouched.
+                        """
                         result = orig(*args, **kwargs)
                         try:
                             cb(mname, args, kwargs, result)
@@ -67,11 +85,19 @@ class CollectiveTracer:
                     return wrapper
 
                 wrapper = _make_wrapper(original_func, callback, method_name)
+                self._wrappers[name] = wrapper
                 setattr(_utils, name, wrapper)
 
-    def uninstall(self):
-        """Restore the original ``_utils`` collective functions."""
+    def uninstall(self) -> None:
+        """Restore the original ``_utils`` collective functions.
+
+        Only restores the attributes this tracer installed. If an inner tracer
+        patched the same name afterwards, restoring our saved original would
+        silently strip that tracer's wrapper, so it is left in place.
+        """
         with self._patch_lock:
             for name, original_func in self._originals.items():
-                setattr(_utils, name, original_func)
+                if getattr(_utils, name, None) is self._wrappers.get(name):
+                    setattr(_utils, name, original_func)
             self._originals.clear()
+            self._wrappers.clear()

@@ -35,6 +35,7 @@ tracer tests validate; only the trainer wiring is asserted here.
 """
 
 import io
+import logging
 import os
 import unittest
 from contextlib import redirect_stdout
@@ -181,19 +182,20 @@ class TestGraphTrainerTrainLoop(unittest.TestCase):
         self.assertFalse(torch.equal(before, tr.model.weight))
 
     def test_train_log_interval_prints_on_rank0(self):
-        """Test ``train`` prints a loss line on the log_interval (rank 0)."""
+        """Test ``train`` logs a loss line on the log_interval (rank 0)."""
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
             pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
-        buf = io.StringIO()
-        with redirect_stdout(buf):
+        with self.assertLogs(
+            "hyper_parallel.compile.trainer", level=logging.INFO
+        ) as captured:
             tr.train(_batches(4), log_interval=2)
 
-        out = buf.getvalue()
-        # Steps 2 and 4 are printed (rank 0 and step % log_interval == 0).
+        out = "\n".join(captured.output)
+        # Steps 2 and 4 are logged (rank 0 and step % log_interval == 0).
         self.assertIn("Step 2 | Loss:", out)
         self.assertIn("Step 4 | Loss:", out)
 

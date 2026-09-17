@@ -39,7 +39,7 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions
 from hyper_parallel import init_device_mesh, SkipDTensorDispatch
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.fully_shard.api import fully_shard, get_model_state_dict, set_model_state_dict
-from hyper_parallel.platform.torch.fully_shard.state import _to_dtype_if_needed
+from hyper_parallel.core.fully_shard.hsdp_state import _to_dtype_if_needed
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.common_net import FullyShardTestNet
 from tests.torch.utils import init_dist

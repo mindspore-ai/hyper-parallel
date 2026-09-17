@@ -75,6 +75,47 @@ class MuonPostUpdateContext:
     step: int
 
 
+_MUON_ADVANCED_DEFAULTS: Dict[str, Any] = {
+    "ns_coefficients": None,
+    "ns_epsilon": 1e-10,
+    "zeropower_fn": None,
+    "momentum_update_fn": None,
+    "reshape_fn": None,
+    "ns_transform_fn": None,
+    "post_update_fn": None,
+    "zero_rms_scale_mode": "zero",
+    "apply_lr_in_update": False,
+}
+
+
+@dataclass(frozen=True)
+class _MuonAdvancedOptions:
+    """Validated low-frequency Muon options."""
+
+    ns_coefficients: Optional[Sequence[Tuple[float, float, float]]]
+    ns_epsilon: float
+    zeropower_fn: Optional[Callable[..., torch.Tensor]]
+    momentum_update_fn: Optional[Callable[..., torch.Tensor]]
+    reshape_fn: Optional[Callable[..., Any]]
+    ns_transform_fn: Optional[Callable[..., Optional[NSInputTransform]]]
+    post_update_fn: Optional[Callable[..., None]]
+    zero_rms_scale_mode: str
+    apply_lr_in_update: bool
+
+
+def _resolve_muon_advanced_options(options: Dict[str, Any]) -> _MuonAdvancedOptions:
+    """Validate and fill low-frequency Muon keyword options."""
+    unknown = options.keys() - _MUON_ADVANCED_DEFAULTS.keys()
+    if unknown:
+        raise TypeError(f"Muon got unexpected keyword arguments: {', '.join(sorted(unknown))}")
+    resolved = dict(_MUON_ADVANCED_DEFAULTS)
+    resolved.update(options)
+    return _MuonAdvancedOptions(**resolved)
+
+
+_TransformNSState = Dict[str, Any]
+
+
 def zeropower_via_newtonschulz5(
         ns_inputs: torch.Tensor,
         steps: int,
@@ -154,6 +195,8 @@ class Muon(BaseDistributedOptimizer):
     sharded parameters.
     """
 
+    ADDITIONAL_CONFIG_KEYS = set(_MUON_ADVANCED_DEFAULTS)
+
     def __init__(
             self,
             params: Any,
@@ -164,16 +207,8 @@ class Muon(BaseDistributedOptimizer):
             nesterov: bool = True,
             ns_steps: int = 5,
             ns_variant: str = "asym5",
-            ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
-            ns_epsilon: float = 1e-10,
-            zeropower_fn: Optional[Callable[..., torch.Tensor]] = None,
-            momentum_update_fn: Optional[Callable[..., torch.Tensor]] = None,
-            reshape_fn: Optional[Callable[..., Any]] = None,
-            ns_transform_fn: Optional[Callable[..., Optional[NSInputTransform]]] = None,
-            post_update_fn: Optional[Callable[..., None]] = None,
-            zero_rms_scale_mode: str = "zero",
-            apply_lr_in_update: bool = False,
             hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
+            **advanced_options: Any,
     ) -> None:
         """Initialize Muon and build parameter-identity runtime caches.
 
@@ -197,18 +232,21 @@ class Muon(BaseDistributedOptimizer):
             apply_lr_in_update: Whether the update callback applies the learning rate.
             hsdp_replica_count: Optional optimizer-state replica group size.
         """
+        advanced = _resolve_muon_advanced_options(advanced_options)
         if ns_variant not in ("legacy", "asym5", "custom"):
             raise ValueError(
                 f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
             )
-        if ns_epsilon < 0.0 or not math.isfinite(ns_epsilon):
-            raise ValueError(f"ns_epsilon must be a finite non-negative value, got {ns_epsilon}")
-        if zero_rms_scale_mode not in ("zero", "use_lr"):
+        if advanced.ns_epsilon < 0.0 or not math.isfinite(advanced.ns_epsilon):
+            raise ValueError(f"ns_epsilon must be a finite non-negative value, got {advanced.ns_epsilon}")
+        if advanced.zero_rms_scale_mode not in ("zero", "use_lr"):
             raise ValueError(
                 "zero_rms_scale_mode must be 'zero' or 'use_lr', "
-                f"got {zero_rms_scale_mode!r}"
+                f"got {advanced.zero_rms_scale_mode!r}"
             )
-        normalized_coefficients = self._validate_ns_coefficients(ns_variant, ns_steps, ns_coefficients)
+        normalized_coefficients = self._validate_ns_coefficients(
+            ns_variant, ns_steps, advanced.ns_coefficients
+        )
         if not isinstance(momentum, (list, tuple)):
             momentum = [momentum]
         if len(momentum) == 1:
@@ -222,16 +260,16 @@ class Muon(BaseDistributedOptimizer):
             "ns_steps": ns_steps,
             "ns_variant": ns_variant,
             "ns_coefficients": normalized_coefficients,
-            "ns_epsilon": ns_epsilon,
-            "zero_rms_scale_mode": zero_rms_scale_mode,
-            "apply_lr_in_update": apply_lr_in_update,
+            "ns_epsilon": advanced.ns_epsilon,
+            "zero_rms_scale_mode": advanced.zero_rms_scale_mode,
+            "apply_lr_in_update": advanced.apply_lr_in_update,
         }
         super().__init__(params, defaults, is_muon=True, hsdp_replica_count=hsdp_replica_count)
-        self.reshape_fn = reshape_fn
-        self.zeropower_fn = zeropower_fn
-        self.momentum_update_fn = momentum_update_fn
-        self.ns_transform_fn = ns_transform_fn
-        self.post_update_fn = post_update_fn
+        self.reshape_fn = advanced.reshape_fn
+        self.zeropower_fn = advanced.zeropower_fn
+        self.momentum_update_fn = advanced.momentum_update_fn
+        self.ns_transform_fn = advanced.ns_transform_fn
+        self.post_update_fn = advanced.post_update_fn
         self.reset_optimizer_parameters()
 
     def reset_optimizer_parameters(self) -> None:
@@ -456,9 +494,12 @@ class Muon(BaseDistributedOptimizer):
             params: List[torch.Tensor],
     ) -> Dict[torch.nn.Parameter, torch.Tensor]:
         """Compute first-order momentum and return bfloat16 NS inputs."""
-        momentum1, momentum2 = group["momentum"]
-        nesterov = group['nesterov']
-
+        momentum = group["momentum"]
+        if not isinstance(momentum, (list, tuple)):
+            momentum = [momentum]
+        if len(momentum) == 1:
+            momentum = (momentum[0], momentum[0])
+        momentum1, momentum2 = momentum
         # Pre-filter params with valid grads and ensure momentum buffers exist
         valid_params = []
         grads = []
@@ -467,58 +508,46 @@ class Muon(BaseDistributedOptimizer):
             g = p.grad
             if g is None:
                 continue
-            state = self.state[p]
-            if "momentum_buffer" not in state:
-                state["momentum_buffer"] = torch.zeros_like(g)
+            if "momentum_buffer" not in self.state[p]:
+                self.state[p]["momentum_buffer"] = torch.zeros_like(g)
             valid_params.append(p)
             grads.append(g)
-            bufs.append(state["momentum_buffer"])
+            bufs.append(self.state[p]["momentum_buffer"])
 
         if not valid_params:
             return {}
 
+        grads = [to_local_if_dtensor(grad) for grad in grads]
+        bufs = [to_local_if_dtensor(buffer) for buffer in bufs]
         if self.momentum_update_fn is not None:
-            local_grads = [to_local_if_dtensor(grad) for grad in grads]
-            local_bufs = [to_local_if_dtensor(buffer) for buffer in bufs]
-            custom_updates = list(self.momentum_update_fn(
-                local_grads,
-                local_bufs,
-                momentum1,
-                momentum2,
-                nesterov,
-            ))
+            custom_updates = list(self.momentum_update_fn(grads, bufs, momentum1, momentum2, group["nesterov"]))
             if len(custom_updates) != len(valid_params):
                 raise ValueError(
                     "momentum_update_fn must return one update tensor per input gradient, "
                     f"got {len(custom_updates)} updates for {len(valid_params)} gradients"
                 )
             custom_updates = [update.to(torch.bfloat16) for update in custom_updates]
-            return dict(zip(valid_params, custom_updates))
+            param_updates = dict(zip(valid_params, custom_updates))
+            return param_updates
 
         # Match muon_update_core():
         # m_for_update = grad + momentum1 * m_old
         # m_new = grad + momentum2 * m_old
-        local_grads = [to_local_if_dtensor(g) for g in grads]
-        local_bufs = [to_local_if_dtensor(b) for b in bufs]
         # pylint: disable=protected-access
-        local_us = torch._foreach_add(local_grads, local_bufs, alpha=momentum1)
+        local_us = torch._foreach_add(grads, bufs, alpha=momentum1)
 
-        torch._foreach_mul_(local_bufs, momentum2)
-        torch._foreach_add_(local_bufs, local_grads)
+        torch._foreach_mul_(bufs, momentum2)
+        torch._foreach_add_(bufs, grads)
 
-        if nesterov:
+        if group["nesterov"]:
             torch._foreach_mul_(local_us, momentum1)
-            torch._foreach_add_(local_us, local_grads)
+            torch._foreach_add_(local_us, grads)
 
-        if local_us[0].dtype == torch.bfloat16:
-            local_us_bf = local_us
-        else:
-            local_us = list(local_us)
-            for i, u in enumerate(local_us):
-                local_us[i] = u.to(torch.bfloat16)
-            local_us_bf = local_us
+        if local_us[0].dtype != torch.bfloat16:
+            local_us = [update.to(torch.bfloat16) for update in local_us]
 
-        return dict(zip(valid_params, local_us_bf))
+        param_updates = dict(zip(valid_params, local_us))
+        return param_updates
 
     def _process_unshard_params(
             self,
@@ -734,9 +763,8 @@ class Muon(BaseDistributedOptimizer):
             )
 
         for reshaped_input in reshaped_inputs:
-            assert (
-                    reshaped_input.untyped_storage().data_ptr() == working_input.untyped_storage().data_ptr()
-            ), "reshape_fn must return views that share storage with the working NS input tensor."
+            if reshaped_input.untyped_storage().data_ptr() != working_input.untyped_storage().data_ptr():
+                raise ValueError("reshape_fn must return views that share storage with the working NS input tensor")
 
         return working_input, reshaped_inputs
 
@@ -796,16 +824,16 @@ class Muon(BaseDistributedOptimizer):
             ns_epsilon: float = 1e-10,
     ) -> List[torch.Tensor]:
         """Run batched NS on mixed-shape tensors and restore their original shapes."""
+
         if not tensor_list:
             return []
 
-        inputs_3d = []
-        slice_sizes = []
-        shapes_info = []
+        state = {"inputs_3d": [], "slice_sizes": [], "shapes_info": [], "restored_updates": [], "current_idx": 0}
 
         for tensor in tensor_list:
             origin_shape = tuple(tensor.shape)
             is_conv = False
+
             if len(origin_shape) == 2:
                 inp_3d = tensor.unsqueeze(0)
                 n_dim = 1
@@ -820,13 +848,13 @@ class Muon(BaseDistributedOptimizer):
                 inp_3d = tensor.reshape(-1, origin_shape[-2], origin_shape[-1])
                 n_dim = inp_3d.shape[0]
 
-            inputs_3d.append(inp_3d)
-            slice_sizes.append(n_dim)
-            shapes_info.append((origin_shape, is_conv))
+            state["inputs_3d"].append(inp_3d)
+            state["slice_sizes"].append(n_dim)
+            state["shapes_info"].append((origin_shape, is_conv))
 
-        merged_input = torch.cat(inputs_3d, dim=0)
-        squeeze_batch = merged_input.shape[0] == 1
-        if squeeze_batch:
+        merged_input = torch.cat(state["inputs_3d"], dim=0)
+
+        if merged_input.shape[0] == 1:
             merged_input = merged_input.squeeze(0)
 
         if self.zeropower_fn is None:
@@ -839,16 +867,14 @@ class Muon(BaseDistributedOptimizer):
             )
         else:
             merged_update = self.zeropower_fn(merged_input, steps=ns_steps)
+
+        if merged_input.dim() == 2:
+            merged_update = merged_update.unsqueeze(0)
         del merged_input
 
-        if squeeze_batch:
-            merged_update = merged_update.unsqueeze(0)
-
-        outputs = []
-        current_idx = 0
-        for n_dim, (origin_shape, is_conv) in zip(slice_sizes, shapes_info):
-            update = merged_update[current_idx: current_idx + n_dim]
-            current_idx += n_dim
+        for n_dim, (origin_shape, is_conv) in zip(state["slice_sizes"], state["shapes_info"]):
+            update = merged_update[state["current_idx"]:state["current_idx"] + n_dim]
+            state["current_idx"] += n_dim
 
             if is_conv:
                 update = update.squeeze(0).unsqueeze(1)
@@ -857,10 +883,10 @@ class Muon(BaseDistributedOptimizer):
             elif len(origin_shape) >= 4:
                 update = update.reshape(origin_shape)
 
-            outputs.append(update)
+            state["restored_updates"].append(update)
 
         del merged_update
-        return outputs
+        return state["restored_updates"]
 
     def _split_into_memory_safe_batches(
             self,
@@ -919,53 +945,42 @@ class Muon(BaseDistributedOptimizer):
             no_shard: bool = False,
     ) -> Dict[torch.nn.Parameter, torch.Tensor]:
         """Compute native reshape/view NS updates without transform bookkeeping."""
-        updates_dict = {}
         if not p_list:
-            return updates_dict
-
-        reshape_groups: Dict[Tuple[int, int], List[torch.Tensor]] = defaultdict(list)
-        origin_shapes: Dict[torch.nn.Parameter, Tuple[int, ...]] = {}
-        working_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
-
+            return {}
+        state = {"reshape_groups": defaultdict(list), "origin_shapes": {}, "working_inputs": {}, "restored": {}}
         for param in p_list:
             local_shape = getattr(param, "local_shape", None)
             if local_shape is None:
                 local_shape = to_local_if_dtensor(param.data).shape
-            origin_shape = tuple(local_shape) if no_shard else tuple(param.shape)
-            ns_input = ns_inputs[param].view(origin_shape)
-            origin_shapes[param] = origin_shape
-            working_input, reshaped_inputs = self._reshape_ns_input(param, ns_input)
-            working_inputs[param] = working_input
-            for reshaped_input in reshaped_inputs:
-                core_shape = self._shape_to_core_shape(tuple(reshaped_input.shape))
-                reshape_groups[core_shape].append(reshaped_input)
-
-        for tensor_list in reshape_groups.values():
-            reshaped_updates = self._compute_batched_ns_outputs_for_tensors(
-                tensor_list,
-                group["ns_steps"],
-                ns_variant=group["ns_variant"],
-                ns_coefficients=group["ns_coefficients"],
-                ns_epsilon=group["ns_epsilon"],
+            state["origin_shapes"][param] = tuple(local_shape) if no_shard else tuple(param.shape)
+            working_input, reshaped_inputs = self._reshape_ns_input(
+                param, ns_inputs[param].view(state["origin_shapes"][param])
             )
-            for reshaped_input, reshaped_update in zip(tensor_list, reshaped_updates):
-                slice_scale = compute_muon_slice_scale(
-                    reshaped_update,
-                    group["matched_adamw_rms"],
-                    zero_rms_scale_mode=group["zero_rms_scale_mode"],
+            state["working_inputs"][param] = working_input
+            for reshaped_input in reshaped_inputs:
+                state["reshape_groups"][self._shape_to_core_shape(tuple(reshaped_input.shape))].append(
+                    reshaped_input
+                )
+        for tensor_list in state["reshape_groups"].values():
+            updates = self._compute_batched_ns_outputs_for_tensors(
+                tensor_list, group["ns_steps"], group["ns_variant"], group["ns_coefficients"], group["ns_epsilon"]
+            )
+            for reshaped_input, update in zip(tensor_list, updates):
+                scale = compute_muon_slice_scale(
+                    update, group["matched_adamw_rms"], zero_rms_scale_mode=group["zero_rms_scale_mode"]
                 )
                 if group["apply_lr_in_update"]:
-                    slice_scale *= -group["lr"]
-                reshaped_update.mul_(slice_scale)
-                reshaped_input.copy_(reshaped_update.contiguous().view_as(reshaped_input))
+                    scale *= -group["lr"]
+                update.mul_(scale)
+                reshaped_input.copy_(update.contiguous().view_as(reshaped_input))
 
         for param in p_list:
-            ns_input = ns_inputs[param].view(origin_shapes[param])
-            working_input = working_inputs[param]
-            if working_input.untyped_storage().data_ptr() != ns_input.untyped_storage().data_ptr():
-                ns_input.copy_(working_input)
-            updates_dict[param] = ns_input
-        return updates_dict
+            update = ns_inputs[param].view(state["origin_shapes"][param])
+            working_input = state["working_inputs"][param]
+            if working_input.untyped_storage().data_ptr() != update.untyped_storage().data_ptr():
+                update.copy_(working_input)
+            state["restored"][param] = update
+        return state["restored"]
 
     def _compute_batched_ns_updates_with_transform(
             self,
@@ -980,74 +995,70 @@ class Muon(BaseDistributedOptimizer):
         NS iteration, then slices results back to original shapes.
 
         """
-        updates_dict = {}
 
         if not p_list:
-            return updates_dict
+            return {}
 
-        rms = group["matched_adamw_rms"]
-        ns_steps = group["ns_steps"]
-        ns_variant = group["ns_variant"]
-        ns_coefficients = group["ns_coefficients"]
-        ns_epsilon = group["ns_epsilon"]
-        zero_rms_scale_mode = group["zero_rms_scale_mode"]
-        apply_lr_in_update = group["apply_lr_in_update"]
-
-        reshape_groups: Dict[Any, List[Tuple[torch.Tensor, int, int]]] = defaultdict(list)
-        origin_shapes: Dict[torch.nn.Parameter, Tuple[int, ...]] = {}
-        working_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
-        transforms: List[NSInputTransform] = []
-        transform_updates: List[List[Optional[torch.Tensor]]] = []
+        state: _TransformNSState = {
+            "reshape_groups": defaultdict(list),
+            "origin_shapes": {},
+            "working_inputs": {},
+            "transforms": {},
+            "transform_updates": [],
+            "restored": {},
+        }
 
         for p in p_list:
-            origin_shape = tuple(to_local_if_dtensor(p.data).shape) if no_shard else tuple(p.shape)
-            ns_input = ns_inputs[p].view(origin_shape)
-            origin_shapes[p] = origin_shape
+            state["origin_shapes"][p] = (
+                tuple(to_local_if_dtensor(p.data).shape) if no_shard else tuple(p.shape)
+            )
+            prepared = self._prepare_ns_transform(p, ns_inputs[p].view(state["origin_shapes"][p]))
+            state["working_inputs"][p] = prepared[0]
+            state["transforms"][p] = prepared[1]
+            state["transform_updates"].append([None] * len(prepared[1].tensors))
 
-            working_input, transform = self._prepare_ns_transform(p, ns_input)
-            working_inputs[p] = working_input
-            transform_index = len(transforms)
-            transforms.append(transform)
-            transform_updates.append([None] * len(transform.tensors))
-            for tensor_index, transformed_input in enumerate(transform.tensors):
-                core_shape = self._shape_to_core_shape(tuple(transformed_input.shape))
-                reshape_groups[core_shape].append((transformed_input, transform_index, tensor_index))
+            for tensor_index, transformed_input in enumerate(prepared[1].tensors):
+                state["reshape_groups"][self._shape_to_core_shape(tuple(transformed_input.shape))].append(
+                    (transformed_input, len(state["transform_updates"]) - 1, tensor_index)
+                )
 
-        for _, tensor_records in reshape_groups.items():
-            tensor_list = [record[0] for record in tensor_records]
+        for tensor_records in state["reshape_groups"].values():
             reshaped_updates = self._compute_batched_ns_outputs_for_tensors(
-                tensor_list,
-                ns_steps,
-                ns_variant=ns_variant,
-                ns_coefficients=ns_coefficients,
-                ns_epsilon=ns_epsilon,
+                [record[0] for record in tensor_records],
+                group["ns_steps"],
+                ns_variant=group["ns_variant"],
+                ns_coefficients=group["ns_coefficients"],
+                ns_epsilon=group["ns_epsilon"],
             )
 
-            # scale updates
-            for (_, transform_index, tensor_index), reshaped_update in zip(tensor_records, reshaped_updates):
+            # Scale updates.
+            for record, reshaped_update in zip(tensor_records, reshaped_updates):
                 slice_scale = compute_muon_slice_scale(
                     reshaped_update,
-                    rms,
-                    zero_rms_scale_mode=zero_rms_scale_mode,
+                    group["matched_adamw_rms"],
+                    zero_rms_scale_mode=group["zero_rms_scale_mode"],
                 )
-                if apply_lr_in_update:
+
+                if group["apply_lr_in_update"]:
                     slice_scale *= -group["lr"]
                 reshaped_update.mul_(slice_scale)
-                transform_updates[transform_index][tensor_index] = reshaped_update
+                state["transform_updates"][record[1]][record[2]] = reshaped_update
 
-        for transform, updates, working_input in zip(transforms, transform_updates, working_inputs.values()):
-            if any(update is None for update in updates):
+        for p, reshaped_updates in zip(p_list, state["transform_updates"]):
+
+            if any(update is None for update in reshaped_updates):
                 raise RuntimeError("Missing Newton-Schulz update for a transformed input")
-            transform.restore(updates, working_input)
+            state["transforms"][p].restore(reshaped_updates, state["working_inputs"][p])
 
         for p in p_list:
-            ns_input = ns_inputs[p].view(origin_shapes[p])
-            working_input = working_inputs[p]
-            if working_input.untyped_storage().data_ptr() != ns_input.untyped_storage().data_ptr():
-                ns_input.copy_(working_input)
-            updates_dict[p] = ns_input
+            reshaped_update = ns_inputs[p].view(state["origin_shapes"][p])
 
-        return updates_dict
+            if (state["working_inputs"][p].untyped_storage().data_ptr()
+                    != reshaped_update.untyped_storage().data_ptr()):
+                reshaped_update.copy_(state["working_inputs"][p])
+            state["restored"][p] = reshaped_update
+
+        return state["restored"]
 
     def _fused_broadcast_and_apply(
             self,

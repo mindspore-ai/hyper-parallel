@@ -28,8 +28,10 @@ import functools
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
+from hyper_parallel.distributed import _collectives
 from hyper_parallel.distributed.context_parallel.collectives import (
     _ULYSSES_WRAPPED_FLAG,
     _gather_sequence,
@@ -38,7 +40,6 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     _sequence_to_head,
     _slice_sink,
     flex_cp_allgather,
-    platform,
 )
 
 
@@ -279,13 +280,13 @@ def head_tail_load_balance_attention(
         )
 
     rank_list = list(cp_mesh.rank_list)
-    local_rank = rank_list.index(platform.get_rank())
+    local_rank = rank_list.index(dist.get_rank())
     peer_index = cp_mesh.size() - 1 - local_rank
     peer_rank = rank_list[peer_index]
     half = local_q_len // 2
     query_keep = query.narrow(2, 0, half)
     query_tail = query.narrow(2, half, half)
-    query_peer = platform.p2p_exchange(query_tail, peer_rank)
+    query_peer = _collectives.p2p_exchange(query_tail, peer_rank)
     global_key, global_value = flex_cp_allgather(key, value, 2, cp_mesh)
 
     def run_half(
@@ -308,8 +309,8 @@ def head_tail_load_balance_attention(
         query_peer,
         attention_kwargs if peer_attention_kwargs is None else peer_attention_kwargs,
     )
-    tail_output = platform.p2p_exchange(peer_output, peer_rank)
-    return platform.cat([keep_output, tail_output], dim=2)
+    tail_output = _collectives.p2p_exchange(peer_output, peer_rank)
+    return torch.cat([keep_output, tail_output], dim=2)
 
 
 def _cp_offset_causal_mask(q_len: int, kv_len: int, lo: int,

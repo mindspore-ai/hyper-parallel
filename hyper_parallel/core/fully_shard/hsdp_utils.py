@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,13 +18,11 @@ from enum import auto, Enum
 from typing import Any, List, Optional, Sequence
 
 import numpy as np
+import torch
+from torch import nn
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.platform import PlatformType
-
-platform = get_platform()
 
 
 class ShardedState(Enum):
@@ -88,15 +86,15 @@ class ParamModuleInfo:
         shared_modules: List of other modules sharing this same parameter object.
         shared_param_names: Corresponding parameter names in shared_modules (aligned by index).
     """
-    module: platform.Module
+    module: nn.Module
     param_name: str
-    shared_modules: List[platform.Module] = field(default_factory=list)
+    shared_modules: List[nn.Module] = field(default_factory=list)
     shared_param_names: List[str] = field(default_factory=list)
 
 
 def _named_parameters_with_duplicates(
-    module: platform.Module, **kwargs: Any
-) -> list[tuple[str, platform.Parameter]]:
+    module: nn.Module, **kwargs: Any
+) -> list[tuple[str, nn.Parameter]]:
     """
     This API is required as some modules overwrite `named_parameters()` but do not support
     `remove_duplicate`.
@@ -105,22 +103,17 @@ def _named_parameters_with_duplicates(
         raise AssertionError(
             "_named_parameters_with_duplicates cannot be used with `remove_duplicate` argument."
         )
-
-    def get_named_parameters(module, **kwargs):
-        if platform.platform_type == PlatformType.PYTORCH:
-            return module.named_parameters(**kwargs)
-        return module.parameters_and_names(expand=False)
     kwargs["remove_duplicate"] = False
     try:
-        ret = list(get_named_parameters(module, **kwargs))
+        ret = list(module.named_parameters(**kwargs))
     except AssertionError:
         kwargs.pop("remove_duplicate")
-        ret = list(get_named_parameters(module, **kwargs))
+        ret = list(module.named_parameters(**kwargs))
     return ret
 
 
 def _get_param_module_infos(
-    params: list[platform.Parameter], modules: tuple[platform.Module, ...]
+    params: list[nn.Parameter], modules: tuple[nn.Module, ...]
 ) -> list['ParamModuleInfo']:
     """
     Shared parameter: lin1.weight = lin2.weight
@@ -129,15 +122,10 @@ def _get_param_module_infos(
     find shared modules' parameters and shared parameters within a module.
     """
     params_set = set(params)
-    param_to_module_info: dict[platform.Parameter, ParamModuleInfo] = {}
-
-    def get_named_modules(module):
-        if platform.platform_type == PlatformType.PYTORCH:
-            return module.named_modules(remove_duplicate=False)
-        return module.cells_and_names()
+    param_to_module_info: dict[nn.Parameter, ParamModuleInfo] = {}
 
     for module in modules:
-        for _, submodule in get_named_modules(module):
+        for _, submodule in module.named_modules(remove_duplicate=False):
             for param_name, param in _named_parameters_with_duplicates(
                 submodule, recurse=False
             ):
@@ -157,20 +145,20 @@ def _get_param_module_infos(
 
 
 def get_managed_modules_parameters(
-    modules: Sequence[platform.Module],
-    ignored_params: Optional[Sequence[platform.Parameter]] = None,
-) -> list[platform.Parameter]:
+    modules: Sequence[nn.Module],
+    ignored_params: Optional[Sequence[nn.Parameter]] = None,
+) -> list[nn.Parameter]:
     """Collect deduplicated parameters from ``modules`` while skipping ignored params.
 
     Parameters that were already initialized by an inner ``fully_shard`` instance
     are intentionally excluded so nested ``fully_shard(mesh=None)`` resolves mesh
     mode from the parameters that the current wrapper will actually manage.
     """
-    params: list[platform.Parameter] = []
+    params: list[nn.Parameter] = []
     ignored_params_set = set(ignored_params or ())
-    visited_params: set[platform.Parameter] = set()
+    visited_params: set[nn.Parameter] = set()
     for mod in modules:
-        for _, param in platform.parameters_dict(mod):
+        for _, param in mod.named_parameters():
             if param in ignored_params_set or param in visited_params:
                 continue
             if getattr(param, "_hsdp_param_initialized", False):
@@ -296,7 +284,7 @@ def apply_gradient_scaling_factor(reduced_grad: Any, factor: Any) -> None:
     """
     if factor is None:
         return
-    if isinstance(factor, platform.Tensor) and factor.dtype != reduced_grad.dtype:
+    if isinstance(factor, torch.Tensor) and factor.dtype != reduced_grad.dtype:
         factor = factor.to(reduced_grad.dtype)
     reduced_grad.mul_(factor)
     return None

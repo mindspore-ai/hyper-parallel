@@ -31,15 +31,11 @@ import torch  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.auto_models.components.models.qwen3_moe_attention_common import (
-    run_qwen3_moe_flash_attention,
-)
+from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb
+from hyper_parallel.components.modules import RMSNorm, SwiGLUMLP
 from hyper_parallel.core.multicore import MegaMoeExperts
-from hyper_parallel.models.modules import (
-    RMSNorm,
-    RotaryEmbedding,
-    SwiGLUMLP,
-    apply_rotary_pos_emb,
+from hyper_parallel.models.qwen3_moe.adapter.attention import (
+    run_qwen3_moe_flash_attention,
 )
 
 
@@ -98,6 +94,8 @@ class QwenMoeConfig:
                 f"num_attention_heads ({self.num_attention_heads}) must be divisible by "
                 f"num_key_value_heads ({self.num_key_value_heads})."
             )
+        if (self.hidden_size // self.num_attention_heads) % 2:
+            raise ValueError("Attention head dimension must be even for rotary embeddings.")
         if self.num_experts % self.ep_size:
             raise ValueError(
                 f"num_experts ({self.num_experts}) must be divisible by ep_size ({self.ep_size})."
@@ -129,11 +127,13 @@ class QwenAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = 0.0
         self.is_causal = True
-        self.rotary_emb = RotaryEmbedding(
-            self.head_dim,
-            config.max_seq_len,
-            config.rope_theta,
+        inverse_frequency = config.rope_theta ** (
+            -torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim
         )
+        angles = torch.outer(torch.arange(config.max_seq_len, dtype=torch.float32), inverse_frequency)
+        angles = torch.cat((angles, angles), dim=-1)
+        self.register_buffer("rotary_cos", angles.cos(), persistent=False)
+        self.register_buffer("rotary_sin", angles.sin(), persistent=False)
         self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.k_proj = nn.Linear(
             config.hidden_size,
@@ -184,7 +184,8 @@ class QwenAttention(nn.Module):
             )
             .transpose(1, 2)
         )
-        cos, sin = self.rotary_emb(hidden_states, position_ids)
+        cos = self.rotary_cos[position_ids].to(hidden_states.dtype)
+        sin = self.rotary_sin[position_ids].to(hidden_states.dtype)
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
         output, _ = run_qwen3_moe_flash_attention(
             self,
@@ -236,11 +237,11 @@ class QwenMoeBlock(nn.Module):
             ep_size=config.ep_size,
             ep_group=ep_group,
         )
-        self.shared_expert = SwiGLUMLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.shared_expert_intermediate_size,
-            bias=False,
-        )
+        shared_source = nn.Module()
+        shared_source.gate_proj = nn.Linear(config.hidden_size, config.shared_expert_intermediate_size, bias=False)
+        shared_source.up_proj = nn.Linear(config.hidden_size, config.shared_expert_intermediate_size, bias=False)
+        shared_source.down_proj = nn.Linear(config.shared_expert_intermediate_size, config.hidden_size, bias=False)
+        self.shared_expert = SwiGLUMLP(module=shared_source)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run learned routed experts and the always-active shared expert."""

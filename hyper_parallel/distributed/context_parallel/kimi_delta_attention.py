@@ -31,10 +31,9 @@ from hyper_parallel.components.modules.kimi_delta_attention import (
     torch_apply_kda_state_summary,
     torch_kda_state_summary,
 )
-from hyper_parallel.platform import get_platform
+from hyper_parallel.distributed import _collectives
 
 
-platform = get_platform()
 _KDA_BACKENDS = frozenset({"eager", "triton"})
 
 
@@ -191,7 +190,7 @@ def _all_to_all_previous_rank_halo(
     if cp_rank > 0:
         output_splits[rank_to_group_index[rank_list[cp_rank - 1]]] = halo_width
 
-    exchange_output = platform.differentiable_all_to_all_single(
+    exchange_output = _collectives.differentiable_all_to_all_single(
         exchange_input,
         input_splits,
         output_splits,
@@ -314,7 +313,7 @@ def _differentiable_all_to_all_shard(
 
     split_length = all_to_all_input.shape[0] // split_count
     splits = [split_length] * split_count
-    output = platform.differentiable_all_to_all_single(
+    output = _collectives.differentiable_all_to_all_single(
         all_to_all_input,
         splits,
         splits,

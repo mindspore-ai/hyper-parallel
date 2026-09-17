@@ -1,22 +1,44 @@
-# pylint: skip-file
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Skeleton of a memory estimation hook class.
+
+Copy the class, give @hook_runner the model name to hook, and replace the
+placeholder formula and cost model override.
+"""
+from typing import Any
+
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook, hook_runner
 
 
 class Template(MemEvalHook):
+    """Registers a placeholder for every hookable formula."""
 
-    # Formula to get hooked
     @staticmethod
-    def f(ccfg, ctx):
-        return None
+    def f(ccfg: Any, ctx: Any) -> None:
+        """Formula to get hooked. The placeholder returns None."""
+        del ccfg, ctx
 
-    # Overwriting cost model variable
     @staticmethod
-    def custom_ccfg(ccfg):
-        pass
+    def custom_ccfg(ccfg: Any) -> None:
+        """Cost model variables to overwrite. The placeholder changes nothing."""
+        del ccfg
 
     @staticmethod
     @hook_runner("model name")
-    def run_hooks(e):
+    def run_hooks(e: Any) -> None:
+        """Register the placeholders on the evaluator e."""
         c = Template
         e.set_ccfg(c.custom_ccfg)
         e.set_passes(vpp_less_mem=False, swap_os=False, dropless_tok_factor=1)

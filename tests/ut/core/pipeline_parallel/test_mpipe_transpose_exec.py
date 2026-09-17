@@ -337,6 +337,19 @@ class TestMPipeTransposeExecutorTransport(unittest.TestCase):
         executor.reset()
         assert not executor._inputs_for_explicit_forward and not executor._outputs_for_stage0
 
+    def test_reset_rejects_undrained_cache(self):
+        """
+        Feature: MPipe Transpose executor per-run cache check.
+        Description: Call ``reset`` while a per-micro cache still holds an entry
+            left over from the previous run.
+        Expectation: it raises ``RuntimeError`` naming the cache and the micro-batch.
+        """
+        executor = MPipeTransposeExecutor(_StubSchedule(torch.nn.Linear(4, 4)))
+        # pylint: disable=protected-access
+        executor._keep_grad[3] = torch.zeros(1)
+        with self.assertRaisesRegex(RuntimeError, r"'keep_grad' still holds micro-batches \[3\]"):
+            executor.reset()
+
     @patch.object(mpipe_base, "dist")
     def test_broadcast_params(self, mock_dist):
         """

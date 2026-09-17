@@ -16,6 +16,6 @@
 Tracer module
 """
 
-from .graph_tracer import JointGraph, trace_model_graph
-
 __all__ = ["JointGraph", "trace_model_graph"]
+
+from .graph_tracer import JointGraph, trace_model_graph

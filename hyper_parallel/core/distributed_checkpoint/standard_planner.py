@@ -94,6 +94,49 @@ def _own_plan_index(all_plans: Union[list[SavePlan], list[LoadPlan]], rank: int)
     return own_index
 
 
+def _compute_global_offsets(
+    global_shape: tuple[int, ...],
+    dtensor_layout: Layout,
+    current_rank: int,
+) -> tuple[int, ...]:
+    """
+    Compute the offsets of local tensor in global tensor based on layout.
+
+    Args:
+        global_shape (tuple[int, ...]): Global shape of the tensor.
+        dtensor_layout (Layout): Layout of the DTensor.
+        current_rank (int): Rank whose shard offsets are wanted.
+
+    Returns:
+        tuple[int, ...]: Tuple of offsets for each dimension.
+    """
+    if dtensor_layout is None:
+        # If layout is None, return all zeros (no sharding)
+        return tuple(0 for _ in global_shape)
+
+    # Validate layout attributes
+    if not hasattr(dtensor_layout, 'mesh_shape') or dtensor_layout.mesh_shape is None:
+        raise ValueError("Layout must have mesh_shape attribute")
+    if not hasattr(dtensor_layout, 'tensor_map') or dtensor_layout.tensor_map is None:
+        raise ValueError("Layout must have tensor_map attribute")
+    if not hasattr(dtensor_layout, 'rank_list') or dtensor_layout.rank_list is None:
+        raise ValueError("Layout must have rank_list attribute")
+
+    if current_rank not in dtensor_layout.rank_list:
+        raise ValueError(
+            f"Current rank {current_rank} not found in layout's rank_list {dtensor_layout.rank_list}")
+
+    inner_rank_id = dtensor_layout.rank_list.index(current_rank)
+    # Calculate slice area using infer_slice_area_by_rank
+    slice_area = infer_slice_area_by_layout(
+        dtensor_layout,
+        inner_rank_id,
+        global_shape,
+    )
+    # Extract offsets (start values) from slice_area
+    return tuple(start for start, _ in slice_area)
+
+
 @dataclass(frozen=True)
 class CachedSaveResult:
     """Cached finalized save result keyed by planner cache namespace."""
@@ -172,44 +215,6 @@ class StandardSavePlanner(SavePlanner):
         if self.state_dict is None:
             raise RuntimeError("Planner not set up")
 
-        def compute_global_offsets(global_shape: tuple[int, ...], dtensor_layout: Layout) -> tuple[int, ...]:
-            """
-            Compute the offsets of local tensor in global tensor based on layout.
-
-            Args:
-                global_shape (tuple[int, ...]): Global shape of the tensor.
-                dtensor_layout (Layout): Layout of the DTensor.
-
-            Returns:
-                tuple[int, ...]: Tuple of offsets for each dimension.
-            """
-            if dtensor_layout is None:
-                # If layout is None, return all zeros (no sharding)
-                return tuple(0 for _ in global_shape)
-
-            # Validate layout attributes
-            if not hasattr(dtensor_layout, 'mesh_shape') or dtensor_layout.mesh_shape is None:
-                raise ValueError("Layout must have mesh_shape attribute")
-            if not hasattr(dtensor_layout, 'tensor_map') or dtensor_layout.tensor_map is None:
-                raise ValueError("Layout must have tensor_map attribute")
-            if not hasattr(dtensor_layout, 'rank_list') or dtensor_layout.rank_list is None:
-                raise ValueError("Layout must have rank_list attribute")
-
-            current_rank = self.rank
-            if current_rank not in dtensor_layout.rank_list:
-                raise ValueError(
-                    f"Current rank {current_rank} not found in layout's rank_list {dtensor_layout.rank_list}")
-
-            inner_rank_id = dtensor_layout.rank_list.index(current_rank)
-            # Calculate slice area using infer_slice_area_by_rank
-            slice_area = infer_slice_area_by_layout(
-                dtensor_layout,
-                inner_rank_id,
-                global_shape,
-            )
-            # Extract offsets (start values) from slice_area
-            return tuple(start for start, _ in slice_area)
-
         items = []
         for fqn, obj in self.state_dict.items():
             # Check if it's a DTensor
@@ -223,7 +228,7 @@ class StandardSavePlanner(SavePlanner):
 
                 # Get chunk metadata with offsets
                 if layout:
-                    offsets = compute_global_offsets(obj.shape, layout)
+                    offsets = _compute_global_offsets(obj.shape, layout, self.rank)
                 else:
                     offsets = (0,) * len(local_tensor.shape)
 

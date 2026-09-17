@@ -152,7 +152,6 @@ class TestSwapOptimizerFacade(unittest.TestCase):
     def test_unsupported_optimizer_type_is_rejected(self):
         """Optimizers without an Adam/AdamW adapter fail fast."""
         param = torch.nn.Parameter(torch.ones(8))
-
         with self.assertRaisesRegex(ValueError, "only supports"):
             swap_optimizer(torch.optim.SGD([param], lr=0.01), SwapOptimizerConfig())
 

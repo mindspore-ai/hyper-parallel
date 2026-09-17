@@ -207,18 +207,6 @@ def build_dataloader(
     if dataloader_target is None:
         raise ValueError("dataloader_target must define a build target")
 
-    micro_batch_size = training_config.micro_batch_size
-    global_batch_size = training_config.global_batch_size
-    seed = training_config.seed if training_config.seed is not None else default_seed
-
-    dp_rank = mesh_context.dp_rank
-    dp_world_size = mesh_context.dp_size
-
-    sampler_type = getattr(dataloader_target, "dataloader_type", "single")
-    drop_last = getattr(dataloader_target, "drop_last", True)
-    rearrangement_map = getattr(dataloader_target, "data_rearrange_map", None)
-    data_sharding = getattr(dataloader_target, "data_sharding", False)
-
     dataloaders: list[Any | None] = [None] * len(datasets)
     batch_samplers: list[Any | None] = [None] * len(datasets)
 
@@ -229,28 +217,27 @@ def build_dataloader(
 
         batch_sampler = None
         if not _is_iterable_dataset(dataset):
-            total_samples = len(dataset)
             batch_sampler = build_dataset_batch_sampler(
-                total_samples=total_samples,
-                micro_batch_size=micro_batch_size,
-                global_batch_size=global_batch_size,
-                dp_world_size=dp_world_size,
-                dp_rank=dp_rank,
-                drop_last=drop_last,
-                data_rearrange_map=rearrangement_map,
-                sampler_type=sampler_type,
-                data_sharding=data_sharding,
-                seed=seed,
+                total_samples=len(dataset),
+                micro_batch_size=training_config.micro_batch_size,
+                global_batch_size=training_config.global_batch_size,
+                dp_world_size=mesh_context.dp_size,
+                dp_rank=mesh_context.dp_rank,
+                drop_last=getattr(dataloader_target, "drop_last", True),
+                data_rearrange_map=getattr(dataloader_target, "data_rearrange_map", None),
+                sampler_type=getattr(dataloader_target, "dataloader_type", "single"),
+                data_sharding=getattr(dataloader_target, "data_sharding", False),
+                seed=training_config.seed if training_config.seed is not None else default_seed,
             )
 
-        dataloader = dataloader_target.build(
+        dataloaders[split_index] = dataloader_target.build(
             dataset=dataset,
             collate_fn=collate_fn,
             batch_sampler=batch_sampler,
-            batch_size=micro_batch_size,
-            dp_world_size=dp_world_size,
+            batch_size=training_config.micro_batch_size,
+            dp_world_size=mesh_context.dp_size,
             max_seq_len=max_seq_len,
-            seed=seed,
+            seed=training_config.seed if training_config.seed is not None else default_seed,
         )
         logger.debug(
             "Built DataLoader split=%s, dataset=%s, batch_sampler=%s",
@@ -258,13 +245,10 @@ def build_dataloader(
             type(dataset).__name__,
             type(batch_sampler).__name__ if batch_sampler is not None else None,
         )
-        dataloaders[split_index] = dataloader
         batch_samplers[split_index] = batch_sampler
 
-    dataloader_splits = tuple(dataloaders)
-    batch_sampler_splits = tuple(batch_samplers)
     logger.debug("Finished building train/valid/test DataLoaders")
-    return dataloader_splits, batch_sampler_splits
+    return tuple(dataloaders), tuple(batch_samplers)
 
 
 class FixedBatchDataLoader(StatefulDataLoader):
@@ -404,14 +388,16 @@ class _IndexBufferDynamicBatchRuntime:
         """Store a Dataset that emits source items with stable output indices."""
         self.source_dataset = source_dataset
 
-    def put_source_item(self, source_item: Any, batcher: TextTokenBatcher) -> None:
+    @staticmethod
+    def put_source_item(source_item: Any, batcher: TextTokenBatcher) -> None:
         """Flatten one indexed source item and retain each sample index."""
         model_samples_item, output_index = source_item
         model_samples = _normalize_source_samples(model_samples_item)
         for sample_idx, model_sample in enumerate(model_samples):
             batcher.put_item(model_sample, (output_index, sample_idx))
 
-    def get_buffer_state(self, batcher: TextTokenBatcher) -> list[Any]:
+    @staticmethod
+    def get_buffer_state(batcher: TextTokenBatcher) -> list[Any]:
         """Return compact output-index entries for buffered ModelSamples."""
         if len(batcher.buffer) != len(batcher.buffer_output_indices):
             raise RuntimeError("Dynamic sample and output-index buffers are inconsistent")
@@ -448,13 +434,15 @@ class _FullBufferDynamicBatchRuntime:
         self.source_dataset = dataset
         self.replay_dataset = replay_dataset
 
-    def put_source_item(self, source_item: Any, batcher: TextTokenBatcher) -> None:
+    @staticmethod
+    def put_source_item(source_item: Any, batcher: TextTokenBatcher) -> None:
         """Flatten one streaming source item into the runtime buffer."""
         model_samples = _normalize_source_samples(source_item)
         for model_sample in model_samples:
             batcher.put_item(model_sample)
 
-    def get_buffer_state(self, batcher: TextTokenBatcher) -> list[Any]:
+    @staticmethod
+    def get_buffer_state(batcher: TextTokenBatcher) -> list[Any]:
         """Return full samples already pulled beyond the streaming cursor."""
         if len(batcher.buffer) != len(batcher.buffer_output_indices):
             raise RuntimeError("Dynamic sample and output-index buffers are inconsistent")
@@ -522,6 +510,7 @@ class DynamicBatchDataLoader:
             prefetch_factor: int | None = None,
     ) -> None:
         """Initialize source reading, token selection, and Online packing."""
+        # pylint: disable=too-many-locals
         if collate_fn is None:
             raise ValueError("DynamicBatchDataLoader requires a collate_fn")
 

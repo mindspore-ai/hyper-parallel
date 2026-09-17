@@ -28,12 +28,11 @@ import os
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
-# pylint: disable=wrong-import-position
+# pylint: disable=wrong-import-position,redefined-outer-name
 import logging
 
 import pytest
 import torch
-from torch import nn  # noqa: F401  (kept for parity with the original suite)
 
 from hyper_parallel.distributed._builder.local_region import local_region
 from hyper_parallel.distributed._builder.precompiled_boundary import (
@@ -84,7 +83,7 @@ class _FakeTPMesh:
 def _set_fake_group_ranks(monkeypatch, ranks=(0, 1)):
     monkeypatch.setattr(
         "hyper_parallel.distributed._builder.tp_collective_lowering."
-        "platform.get_process_group_ranks",
+        "dist.get_process_group_ranks",
         lambda _group: list(ranks),
     )
 
@@ -175,8 +174,8 @@ def test_redistribute_io(mesh, monkeypatch, caplog):
     tensor = torch.randn(2, 3)
     gathered = torch.randn(2, 6)
     monkeypatch.setattr(
-        "hyper_parallel.distributed._builder.tp_collective_lowering."
-        "platform.differentiable_all_gather_concat",
+        "hyper_parallel.distributed._collectives."
+        "differentiable_all_gather_concat",
         lambda *_args, **_kwargs: gathered,
     )
     monkeypatch.setattr(

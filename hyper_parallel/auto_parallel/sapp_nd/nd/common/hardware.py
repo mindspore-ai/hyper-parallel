@@ -72,45 +72,21 @@ class Type:
         # unless they also account for EP-in-DP convention.
         device_number = dp * tp * cp * pp * ep
         logger.debug("DP = %d, TP = %d, EP = %d, CP = %d, PP = %d", dp, tp, ep, cp, pp)
-        assignment = {}
-        assignment[Dim.TP] = []
-        assignment[Dim.EP] = []
-        assignment[Dim.CP] = []
-        assignment[Dim.DP] = []
-        assignment[Dim.PP] = []
+        # Order matters: each dim takes the devices the previous ones left.
+        degrees = {Dim.TP: tp, Dim.EP: ep, Dim.CP: cp, Dim.DP: dp, Dim.PP: pp}
+        assignment = {dim: [] for dim in degrees}
         for level in range(self.levels):
             bound = self.level_bound_number[level]
             if bound:
-                level_device_number = min(device_number, bound)
+                remaining_devices = max(min(device_number, bound), 1)
                 device_number = device_number // bound
             else:
-                level_device_number = device_number
-            remaining_devices = max(level_device_number, 1)
-
-            tp_level = min(tp, remaining_devices)
-            assignment[Dim.TP].append(tp_level)
-            tp = tp // tp_level
-            remaining_devices = remaining_devices // tp_level
-
-            ep_level = min(ep, remaining_devices)
-            assignment[Dim.EP].append(ep_level)
-            ep = ep // ep_level
-            remaining_devices = remaining_devices // ep_level
-
-            cp_level = min(cp, remaining_devices)
-            assignment[Dim.CP].append(cp_level)
-            cp = cp // cp_level
-            remaining_devices = remaining_devices // cp_level
-
-            dp_level = min(dp, remaining_devices)
-            assignment[Dim.DP].append(dp_level)
-            dp = dp // dp_level
-            remaining_devices = remaining_devices // dp_level
-
-            pp_level = min(pp, remaining_devices)
-            assignment[Dim.PP].append(pp_level)
-            pp = pp // pp_level
-            remaining_devices = remaining_devices // pp_level
+                remaining_devices = max(device_number, 1)
+            for dim, degree in degrees.items():
+                dim_level = min(degree, remaining_devices)
+                assignment[dim].append(dim_level)
+                degrees[dim] = degree // dim_level
+                remaining_devices = remaining_devices // dim_level
 
         return assignment
 

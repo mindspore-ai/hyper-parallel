@@ -39,12 +39,31 @@ class DebugCall:
     timestamp: float = field(default_factory=time.time)
     children: List["DebugCall"] = field(default_factory=list)
 
-    def _render_self(self) -> str:
+    def render_self(self) -> str:
+        """Render this record's own one-line summary, without its children.
+
+        Overridden by every subclass to describe its own payload; the base
+        version only reports the depth of a plain ``DebugCall``.
+
+        Returns:
+            str: A single line, typically wrapped in a class marker such as
+            ``Op(...)`` or ``Collective(...)``.
+        """
         return f"[DebugCall depth={self.call_depth}]"
 
     def render(self, indent: int = 0) -> str:
+        """Render this record and all of its descendants as an indented tree.
+
+        Args:
+            indent (int): Current nesting level; each level is rendered with two
+                extra leading spaces. Callers normally leave this at ``0`` and let
+                the recursion increment it.
+
+        Returns:
+            str: Newline-joined lines, one per record in the subtree.
+        """
         prefix = "  " * indent
-        lines = [f"{prefix}{self._render_self()}"]
+        lines = [f"{prefix}{self.render_self()}"]
         for child in self.children:
             lines.append(child.render(indent + 1))
         return "\n".join(lines)
@@ -57,7 +76,15 @@ class OpCall(DebugCall):
     input_infos: List[TensorInfo] = field(default_factory=list)
     output_infos: List[TensorInfo] = field(default_factory=list)
 
-    def _render_self(self) -> str:
+    def render_self(self) -> str:
+        """Render the dispatched operator's name and its tensor signatures.
+
+        Each tensor is tagged ``DTensor`` or ``Tensor`` and shown by shape, so a
+        plain tensor mixed into a DTensor op is visible at a glance.
+
+        Returns:
+            str: A line of the form ``Op(<name>) inputs=[...] outputs=[...]``.
+        """
         inputs_str = ", ".join(
             f"{'DTensor' if t.is_dtensor else 'Tensor'}{list(t.shape)}"
             for t in self.input_infos
@@ -79,7 +106,16 @@ class CollectiveCall(DebugCall):
     output_shape: Optional[Tuple[int, ...]] = None
     input_dtype: str = ""
 
-    def _render_self(self) -> str:
+    def render_self(self) -> str:
+        """Render the collective's type, its process group and its shapes.
+
+        ``group`` holds the traced group description when one was available at
+        trace time; when it is ``None`` the group's rank count is printed instead.
+
+        Returns:
+            str: A line of the form ``Collective(<type>) group=... input_shape=...
+            output_shape=...``.
+        """
         group_str = f"group={self.group}" if self.group is not None else f"group_size={self.group_size}"
         return (
             f"Collective({self.collective_type}) "
@@ -96,7 +132,12 @@ class RedistributeCall(DebugCall):
     dst_placements: Optional[Tuple] = None
     tensor_shape: Optional[Tuple[int, ...]] = None
 
-    def _render_self(self) -> str:
+    def render_self(self) -> str:
+        """Render the redistribution's tensor shape and its placement change.
+
+        Returns:
+            str: A line of the form ``Redistribute(shape=...) <src> -> <dst>``.
+        """
         return (
             f"Redistribute(shape={self.tensor_shape}) "
             f"{self.src_placements} -> {self.dst_placements}"
@@ -110,5 +151,10 @@ class AnnotateCall(DebugCall):
     module_fqn: str = ""
     event_type: str = ""  # "enter" or "exit"
 
-    def _render_self(self) -> str:
+    def render_self(self) -> str:
+        """Render the module boundary event and the module it belongs to.
+
+        Returns:
+            str: A line of the form ``Module(<fqn>) [<enter|exit>]``.
+        """
         return f"Module({self.module_fqn}) [{self.event_type}]"

@@ -610,8 +610,7 @@ class _Backbone:
                     self._ctx.current_chunk_id = chunk_id
                     self._ctx.current_lay_id = lay_id
                     self._ctx.current_node = node
-                    static_mem = self._inner_static_mem()
-                    sm["stat"][stage_id][chunk_id][lay_id] = static_mem
+                    sm["stat"][stage_id][chunk_id][lay_id] = self._inner_static_mem()
                     sm["dyn"][stage_id][chunk_id][lay_id] = sum(
                         self._inner_dynamic_mem()
                     )

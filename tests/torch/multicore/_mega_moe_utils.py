@@ -16,6 +16,7 @@
 
 import gc
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -27,21 +28,15 @@ import torch.distributed as dist
 import torch_npu
 
 from hyper_parallel.core.multicore._loader import get_multicore_paths
-from hyper_parallel.core.multicore.shmem._bindings import _require_library
-from hyper_parallel.core.multicore.shmem import lifecycle
 from tests.common.port_utils import allocate_port
 
 
 def start_shmem_lifetime() -> None:
-    """Isolate bootstrap state between independent acceptance scenarios."""
-    # Inspect the internal owner registry to catch leaks from a previous scenario.
-    assert not lifecycle._PROCESS_STATE.initialized, (  # pylint: disable=protected-access
-        "Previous scenario retained an active SHMEM owner."
-    )
+    """Coordinate a fresh SHMEM endpoint for one MegaMoe scenario."""
     dist.barrier()
     endpoint = [f"tcp://127.0.0.1:{allocate_port()}" if dist.get_rank() == 0 else None]
     dist.broadcast_object_list(endpoint, src=0)
-    os.environ["SHMEM_IP_PORT"] = endpoint[0]
+    os.environ["HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT"] = endpoint[0]
 
 
 def memory_sample() -> dict[str, int]:
@@ -53,7 +48,7 @@ def memory_sample() -> dict[str, int]:
         "reserved_bytes": torch.npu.memory_reserved(),
         "device_used_bytes": total_bytes - free_bytes,
         # The external SHMEM heap is absent from Torch allocator statistics.
-        "shmem_heap_bytes": lifecycle._PROCESS_STATE.heap_size or 0,  # pylint: disable=protected-access
+        "shmem_heap_bytes": int(os.environ.get("HYPER_PARALLEL_SHMEM_HEAP_SIZE", "0")),
     }
 
 
@@ -84,8 +79,10 @@ def environment_identity() -> dict:
         for path in version_files if path.is_file()
     }
     native_files = [adapter, *vendor.rglob("*.so"), *vendor.rglob("*.o")]
-    shmem_root = _require_library().parents[2]
-    native_files.extend(shmem_root.rglob("*.so"))
+    binding_spec = importlib.util.find_spec("hyper_parallel_shmem_torch")
+    if binding_spec is None or binding_spec.origin is None:
+        raise RuntimeError("hyper_parallel_shmem_torch native module is not importable.")
+    native_files.extend(Path(binding_spec.origin).parents[2].rglob("*.so"))
     return {
         "source_sha": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=root, text=True

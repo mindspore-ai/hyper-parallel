@@ -19,6 +19,9 @@ Users provide model code and parallel configuration.
 Framework automatically handles all parallel logic.
 """
 
+__all__ = ["GraphTrainer"]
+
+import logging
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 import torch
@@ -30,6 +33,8 @@ from .pass_config import PassConfig
 from .passes.pipeline import PassPipeline
 from .pass_plan import PassPlan
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
+
+_LOG = logging.getLogger(__name__)
 
 
 class GraphTrainer:
@@ -292,7 +297,7 @@ class GraphTrainer:
                 if log_fn is not None:
                     log_fn(step + 1, loss)
                 else:
-                    print(f"Step {step + 1} | Loss: {loss.item():.4f}")
+                    _LOG.info("Step %s | Loss: %.4f", step + 1, loss.item())
 
         return losses
 
@@ -390,6 +395,3 @@ class GraphTrainer:
             if param is not None and param.requires_grad:
                 trainable.append(param)
         return trainable
-
-
-__all__ = ["GraphTrainer"]
