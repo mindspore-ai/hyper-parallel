@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Compile and atomically apply structure-preserving module replacements."""
+"""Compile and incrementally apply structure-preserving module replacements."""
 
 from __future__ import annotations
 
 import fnmatch
 import inspect
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -73,11 +74,19 @@ class ModuleReplacementSpec:
 
 @dataclass(frozen=True)
 class ModuleReplacementTarget:
-    """One source module and every registered FQN that aliases it."""
+    """One source module's aliases without retaining its parameter storage."""
 
     module_fqns: tuple[str, ...]
-    source: nn.Module
+    source_ref: weakref.ReferenceType[nn.Module]
     spec: ModuleReplacementSpec
+
+    @property
+    def source(self) -> nn.Module:
+        """Resolve the original module or reject a plan whose source expired."""
+        source = self.source_ref()
+        if source is None:
+            raise ValueError(f"replacement target {self.module_fqns[0]!r} no longer exists")
+        return source
 
 
 @dataclass(frozen=True)
@@ -145,7 +154,7 @@ def _select_replacement_spec(
                 f"module replacement conflict for aliases {fqns}: "
                 "one source module may match only one factory"
             )
-        selected[module_id] = ModuleReplacementTarget(fqns, module, spec)
+        selected[module_id] = ModuleReplacementTarget(fqns, weakref.ref(module), spec)
     unmatched_patterns = [
         pattern for pattern, matched_ids in matched_ids_by_pattern.items() if not matched_ids
     ]
@@ -193,6 +202,15 @@ def _parent_and_name(model: nn.Module, fqn: str) -> tuple[nn.Module, str]:
     if not name or parent._modules.get(name) is None:  # pylint: disable=protected-access
         raise ValueError(f"replacement target {fqn!r} is no longer registered on its parent")
     return parent, name
+
+
+def _validate_target_binding(model: nn.Module, target: ModuleReplacementTarget) -> None:
+    """Check all aliases before installing any part of one replacement."""
+    source = target.source
+    for fqn in target.module_fqns:
+        parent, name = _parent_and_name(model, fqn)
+        if parent._modules[name] is not source:  # pylint: disable=protected-access
+            raise ValueError(f"replacement target {fqn!r} changed while plan was being applied")
 
 
 def _registered_names(module: nn.Module) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -375,19 +393,26 @@ def apply_module_replacements(
     context: Mapping[str, Any] | None = None,
     capture_checkpoint_metadata: bool = True,
 ) -> tuple[nn.Module, list[WeightRenaming | WeightConverter] | None]:
-    """Build all replacements, validate them, then install them atomically."""
+    """Build, validate, and install one target at a time to bound live storage.
 
-    factory_context = MappingProxyType(dict(context or {}))
-    prepared: list[tuple[ModuleReplacementTarget, nn.Module]] = []
+    Plans do not retain replaced source modules. A factory or validation
+    failure may leave earlier targets installed; callers must discard the
+    partially converted model and rebuild rather than retrying this plan.
+    """
+
+    context = MappingProxyType(dict(context or {}))
+    source_shapes = _named_tensor_shapes(model) if plan.targets and capture_checkpoint_metadata else None
     extra_transforms: list[WeightRenaming | WeightConverter] = []
     for target in plan.targets:
+        source = target.source
         replacement = target.spec.factory(
-            module=target.source,
+            module=source,
             module_fqn=target.module_fqns[0],
-            context=factory_context,
+            context=context,
         )
-        make_transforms = getattr(replacement, "make_transforms", None)
-        transforms = [] if make_transforms is None else make_transforms()
+        transforms = []
+        if getattr(replacement, "make_transforms", None) is not None:
+            transforms = replacement.make_transforms()
         if not isinstance(transforms, list) or any(
             not isinstance(transform, (WeightRenaming, WeightConverter))
             for transform in transforms
@@ -400,31 +425,25 @@ def apply_module_replacements(
             transform.scope_prefix = target.module_fqns[0]
             extra_transforms.append(transform)
         _validate_replacement(
-            target.source,
+            source,
             replacement,
             target.module_fqns[0],
             has_weight_transforms=bool(transforms),
         )
         if transforms and callable(getattr(replacement, "reset_parameters", None)):
             replacement._hp_reset_after_materialization = True  # pylint: disable=protected-access
-        prepared.append((target, replacement))
-
-    for target, _ in prepared:
-        for fqn in target.module_fqns:
-            parent, name = _parent_and_name(model, fqn)
-            if parent._modules[name] is not target.source:  # pylint: disable=protected-access
-                raise ValueError(f"replacement target {fqn!r} changed while plan was being applied")
-    if extra_transforms:
-        if weights_mapping is None:
+        _validate_target_binding(model, target)
+        if transforms and weights_mapping is None:
             raise ValueError(
                 "weights_mapping is required when a replacement defines make_transforms()"
             )
-        if capture_checkpoint_metadata:
-            model._hp_checkpoint_source_shapes = _named_tensor_shapes(model)  # pylint: disable=protected-access
-            model._hp_replacement_weight_conversions = extra_transforms  # pylint: disable=protected-access
-        weights_mapping[:0] = extra_transforms
-    for target, replacement in prepared:
         for fqn in target.module_fqns:
             parent, name = _parent_and_name(model, fqn)
             parent._modules[name] = replacement  # pylint: disable=protected-access
+        del source
+    if extra_transforms:
+        if capture_checkpoint_metadata:
+            model._hp_checkpoint_source_shapes = source_shapes  # pylint: disable=protected-access
+            model._hp_replacement_weight_conversions = extra_transforms  # pylint: disable=protected-access
+        weights_mapping[:0] = extra_transforms
     return model, weights_mapping

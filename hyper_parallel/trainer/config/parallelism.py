@@ -407,13 +407,11 @@ def entries_to_module_replacements(
 
 
 def _has_sharding_action(entry: PlanOverride) -> bool:
-    return any(
-        getattr(entry, name) is not None
-        for name in (
-            "local_compute_fn", "inner_target", "inner_wrapper", "inner_out_src",
-            "region_dispatch", "params", "in_src", "in_dst", "out_src", "out_dst",
-        )
+    action_names = (
+        "local_compute_fn", "inner_target", "inner_wrapper", "inner_out_src",
+        "region_dispatch", "params", "in_src", "in_dst", "out_src", "out_dst",
     )
+    return any(getattr(entry, name) is not None for name in action_names)
 
 
 def _validate_when(entry: PlanOverride) -> None:

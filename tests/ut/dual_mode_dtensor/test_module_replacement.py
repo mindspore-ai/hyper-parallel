@@ -20,9 +20,12 @@ each family runs its atomic checks sequentially with identifying messages.
 """
 
 import unittest
+import weakref
+from collections.abc import Mapping
+from typing import Any
 from unittest.mock import patch
 
-from torch import nn
+from torch import Tensor, nn
 
 # The generic replacement contract must not depend on a specific transformers
 # version: use the WeightRenaming exposed by hyper_parallel itself (which falls
@@ -47,6 +50,28 @@ from hyper_parallel.trainer.config import (
 
 class _ReplacementLinear(nn.Linear):
     """A Linear shell that retains all source state by identity."""
+
+
+@module_replacement
+class _AllocatedMappedLinear(nn.Module):
+    """Allocate replacement storage with a checkpoint weight-name mapping."""
+
+    def __init__(self, *, module: nn.Linear, module_fqn: str, context: Mapping[str, Any]) -> None:
+        """Copy source values into new storage without retaining the source."""
+        super().__init__()
+        del module_fqn, context
+        self.packed_weight = nn.Parameter(
+            module.weight.detach().clone(), requires_grad=module.weight.requires_grad
+        )
+        self.train(module.training)
+
+    def forward(self, input: Tensor) -> Tensor:  # pylint: disable=redefined-builtin
+        """Use the independently allocated weight."""
+        return input @ self.packed_weight.t()
+
+    def make_transforms(self) -> list[WeightRenaming]:
+        """Describe the source-to-target weight name conversion."""
+        return [WeightRenaming("weight", "packed_weight")]
 
 
 class _NestedModule(nn.Module):
@@ -365,9 +390,10 @@ class TestModuleReplacementPlan(unittest.TestCase):
         ):
             apply_module_replacements(model, plan)
 
-        # case: factory_failure_keeps_sources_installed
+        # case: factory_failure_keeps_completed_replacements
         @module_replacement
-        def fail_second(*, module, module_fqn, context):
+        def fail_second(*, module: nn.Linear, module_fqn: str, context: Mapping[str, Any]) -> nn.Module:
+            """Fail after the first target has already been installed."""
             if module_fqn == "1":
                 raise ValueError("factory failed")
             return _replace_linear(module=module, module_fqn=module_fqn, context=context)
@@ -382,15 +408,121 @@ class TestModuleReplacementPlan(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError,
             "factory failed",
-            msg="case: factory_failure_keeps_sources_installed",
+            msg="case: factory_failure_keeps_completed_replacements",
         ):
             apply_module_replacements(model, plan)
-        self.assertIs(
-            model[0], originals[0], "case: factory_failure_keeps_sources_installed"
+        self.assertIsInstance(
+            model[0],
+            _ReplacementLinear,
+            f"Expected completed replacement, got {type(model[0])}",
         )
         self.assertIs(
-            model[1], originals[1], "case: factory_failure_keeps_sources_installed"
+            model[1], originals[1],
+            f"Expected untouched failing target {originals[1]}, got {model[1]}",
         )
+
+    def test_releases_sources_before_building_next_replacement(self) -> None:
+        """Keeping the plan alive must not retain completed source weights."""
+
+        for device in ("cpu", "meta"):
+            with self.subTest(device=device):
+                model = nn.Module()
+                model.left = nn.Linear(4, 8, bias=False, device=device)
+                model.right = model.left
+                model.tail = nn.Linear(4, 8, bias=False, device=device)
+
+                source_refs = [weakref.ref(model.left), weakref.ref(model.tail)]
+                weight_refs = [weakref.ref(model.left.weight), weakref.ref(model.tail.weight)]
+
+                calls = []
+
+                @module_replacement
+                def replace_checked(
+                    *, module: nn.Linear, module_fqn: str, context: Mapping[str, Any]
+                ) -> nn.Module:
+                    """Require previous source storage to be gone before allocating."""
+                    for index in range(len(calls)):
+                        self.assertIsNone(
+                            source_refs[index](),
+                            f"Expected released source {index}, got {source_refs[index]()}"
+                        )
+                        self.assertIsNone(
+                            weight_refs[index](),
+                            f"Expected released weight {index}, got {weight_refs[index]()}"
+                        )
+                    calls.append(module_fqn)
+                    return _AllocatedMappedLinear(module=module, module_fqn=module_fqn, context=context)
+
+                spec = ModuleReplacementSpec(
+                    match=("*",), factory=replace_checked, module_type=nn.Linear, exact_type=True
+                )
+
+                plan = compile_module_replacements(model, [spec])
+                existing_mapping = WeightRenaming("old", "new")
+                weights_mapping = [existing_mapping]
+                result, result_mapping = apply_module_replacements(model, plan, weights_mapping=weights_mapping)
+
+                self.assertIs(result, model, f"Expected original model object {model}, got {result}")
+                self.assertIs(
+                    result_mapping, weights_mapping,
+                    f"Expected mapping {weights_mapping}, got {result_mapping}",
+                )
+                self.assertEqual(calls, ["left", "tail"], f"Expected ['left', 'tail'], got {calls}")
+                self.assertIs(model.left, model.right, f"Expected shared replacement {model.left}, got {model.right}")
+
+                for source_ref, weight_ref in zip(source_refs, weight_refs):
+                    self.assertIsNone(source_ref(), f"Expected released source, got {source_ref()}")
+                    self.assertIsNone(weight_ref(), f"Expected released weight, got {weight_ref()}")
+
+                shapes = model._hp_checkpoint_source_shapes  # pylint: disable=protected-access
+                expected_shapes = {"left.weight": (8, 4), "right.weight": (8, 4), "tail.weight": (8, 4)}
+                self.assertEqual(shapes, expected_shapes, f"Expected {expected_shapes}, got {shapes}")
+
+                scopes = [transform.scope_prefix for transform in weights_mapping[:2]]
+                self.assertEqual(scopes, ["left", "tail"], f"Expected ['left', 'tail'], got {scopes}")
+                self.assertIs(
+                    weights_mapping[-1], existing_mapping,
+                    f"Expected existing mapping {existing_mapping}, got {weights_mapping[-1]}",
+                )
+
+    def test_changed_plan_target_is_rejected_before_installation(self) -> None:
+        """Reject a stale target without undoing earlier replacements."""
+
+        for keep_source_alive in (False, True):
+            with self.subTest(keep_source_alive=keep_source_alive):
+                model = nn.Sequential(nn.Linear(4, 8), nn.Linear(4, 8))
+                plan = compile_module_replacements(model, [_spec("*")])
+                previous_source = model[1] if keep_source_alive else None
+                model[1] = nn.Linear(4, 8)
+                current_source = model[1]
+
+                with self.assertRaisesRegex(ValueError, "replacement target '1'"):
+                    apply_module_replacements(model, plan)
+
+                self.assertIsInstance(
+                    model[0], _ReplacementLinear,
+                    f"Expected completed replacement, got {type(model[0])}",
+                )
+                self.assertIs(
+                    model[1], current_source,
+                    f"Expected unchanged current target {current_source}, got {model[1]}",
+                )
+                del previous_source
+
+    def test_missing_weight_mapping_does_not_install_current_target(self) -> None:
+        """A transforming target is validated before it replaces its source."""
+
+        model = nn.Sequential(nn.Linear(4, 8, bias=False))
+        source = model[0]
+        spec = ModuleReplacementSpec(
+            match=("0",), factory=_AllocatedMappedLinear, module_type=nn.Linear, exact_type=True
+        )
+        plan = compile_module_replacements(model, [spec])
+
+        with self.assertRaisesRegex(ValueError, "weights_mapping is required"):
+            apply_module_replacements(model, plan)
+
+        self.assertIs(model[0], source, f"Expected original target {source}, got {model[0]}")
 
 
 # ==========================================================================
