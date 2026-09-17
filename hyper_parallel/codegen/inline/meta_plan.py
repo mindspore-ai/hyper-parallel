@@ -50,6 +50,21 @@ def normalize_inline_meta(meta: Any, rules: tuple[InlineRule, ...], model_type: 
     # and shared_experts) must be stripped — otherwise the shared class used
     # in both EP and TP contexts fails the single-contract invariant.
     _strip_ep_sub_boundaries(meta, rules, model_type)
+    _strip_external_state_boundaries(meta)
+
+
+def _strip_external_state_boundaries(meta: Any) -> None:
+    """Keep parameter sharding without duplicating inline-owned collectives."""
+    external_classes = set(getattr(meta, "external_state_classes", None) or ())
+    boundary_classes = getattr(meta, "boundary_classes", None) or {}
+    param_plan = getattr(meta, "param_plan", None) or {}
+    for fqn, class_name in list(boundary_classes.items()):
+        if class_name not in external_classes:
+            continue
+        entry = param_plan.get(fqn)
+        if isinstance(entry, dict):
+            entry["is_boundary"] = False
+        boundary_classes.pop(fqn)
 
 
 def _strip_ep_sub_boundaries(

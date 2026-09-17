@@ -28,6 +28,7 @@ from hyper_parallel.codegen import manager
 from hyper_parallel.codegen.inline.ir import (
     ForwardExtractPatch, ImportPatch, InlinePatchSet, InlineRule, ModuleSnippetPatch,
 )
+from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 from hyper_parallel.codegen.inline.pipeline import render_inline_modeling
 from hyper_parallel.codegen.inline.spec_bundle import InlineSpecBundle, MetaNormalizer, ReplacementSpec, StrategySpec
@@ -79,6 +80,24 @@ def _execute_source(source):
 
 class TestInlineAdapters(unittest.TestCase):
     """Exercise discovery, coverage enforcement and model-independent emission."""
+
+    def test_inline_owned_boundary_retains_sharding_without_double_wrapping(self):
+        """External-state forwards must never access an uninstalled boundary."""
+        attention = {"is_boundary": True, "params": {"q_proj.weight": {"tp": "S(0)"}}}
+        linear = {"is_boundary": True, "params": {"weight": {"tp": "S(0)"}}}
+        meta = SimpleNamespace(
+            external_state_classes=["GeneratedAttention"],
+            boundary_classes={"layers.0.attn": "GeneratedAttention", "head": "Linear"},
+            param_plan={"layers.0.attn": attention, "head": linear},
+        )
+        normalize_inline_meta(meta, ())
+        self.assertFalse(attention["is_boundary"])
+        self.assertEqual(attention["params"], {"q_proj.weight": {"tp": "S(0)"}})
+        self.assertTrue(linear["is_boundary"])
+        self.assertEqual(meta.boundary_classes, {"head": "Linear"})
+        before = deepcopy(vars(meta))
+        normalize_inline_meta(meta, ())
+        self.assertEqual(vars(meta), before)
 
     def test_legacy_and_explicit_qwen_identity(self):
         """Legacy target lookup and architecture aliases resolve the same specs."""
