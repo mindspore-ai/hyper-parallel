@@ -14,14 +14,34 @@
 # ============================================================================
 """Unit tests for the text Trainer step lifecycle."""
 
-from types import SimpleNamespace
+import importlib
+import sys
 import unittest
-from unittest.mock import Mock
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
-from hyper_parallel.trainer.text_trainer import TextTrainer
 from tests.common.mark_utils import arg_mark
+
+
+def _load_text_trainer() -> type:
+    """Load TextTrainer without requiring the unrelated stateful dataloader dependency."""
+    torchdata_module = ModuleType("torchdata")
+    stateful_dataloader_module = ModuleType("torchdata.stateful_dataloader")
+    stateful_dataloader_module.StatefulDataLoader = torch.utils.data.DataLoader
+    with patch.dict(
+            sys.modules,
+            {
+                "torchdata": torchdata_module,
+                "torchdata.stateful_dataloader": stateful_dataloader_module,
+            },
+    ):
+        trainer_module = importlib.import_module("hyper_parallel.trainer.text_trainer")
+    return trainer_module.TextTrainer
+
+
+TextTrainer = _load_text_trainer()
 
 
 class TestTextTrainer(unittest.TestCase):
