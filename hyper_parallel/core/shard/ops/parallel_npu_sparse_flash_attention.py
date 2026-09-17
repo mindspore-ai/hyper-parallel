@@ -19,6 +19,7 @@ from typing import Callable, Optional, Tuple
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
+from .dsa_cp_fold import dsa_cp_fold_enabled, fold_sparse_flash_attention
 from .parallel_npu_dense_lightning_indexer_softmax_lse import _adjust_bsnd_key, _adjust_tnd_seq_lens
 
 _MAX_INT64 = 9223372036854775807
@@ -406,8 +407,12 @@ class SparseFlashAttentionDistributedOp(DistributedOp):
                 # the full k directly; no truncation needed.
                 return None
             split_id = q_layout.get_split_id(1)
+            seq_shards = q_layout.get_dim_split_num(1)
 
             def _bsnd_cp_impl(*args, **kwargs):
+                if dsa_cp_fold_enabled():
+                    # Head-tail folded query: one call per block, each on its own causal prefix.
+                    return fold_sparse_flash_attention(func, split_id, seq_shards, *args, **kwargs)
                 local_q, local_k, local_v = args[0], args[1], args[2]
                 s1_local = local_q.shape[1]
                 sliced_k = _adjust_bsnd_key(local_k, s1_local, split_id)
@@ -425,8 +430,8 @@ class SparseFlashAttentionDistributedOp(DistributedOp):
         q_split = q_layout.get_dim_split_num(0)
         k_split = k_layout.get_dim_split_num(0)
         split_id = q_layout.get_split_id(0) if q_split > k_split else 0
-        cp_size = q_split // k_split if k_split > 0 else 1
-        cp_rank = split_id % cp_size if cp_size > 1 else 0
+        seq_shards = q_split // k_split if k_split > 0 else 1
+        seq_shard_id = split_id % seq_shards if seq_shards > 1 else 0
 
         def _tnd_cp_impl(*args, **kwargs):
             local_q, local_k = args[0], args[1]
@@ -436,7 +441,7 @@ class SparseFlashAttentionDistributedOp(DistributedOp):
                 return func(*args, **kwargs)
             adj_q, adj_k = _adjust_tnd_seq_lens(
                 local_q, local_k, qlen_tensor, klen_tensor,
-                cp_rank=cp_rank,
+                cp_rank=seq_shard_id,
             )
             return func(*args, **{
                 **kwargs,

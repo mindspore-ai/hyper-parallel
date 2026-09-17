@@ -43,6 +43,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
 from hyper_parallel.platform import get_platform
+from hyper_parallel.core.shard.ops.dsa_cp_fold import set_dsa_cp_fold
 
 platform = get_platform()
 Module = platform.Module
@@ -261,6 +262,24 @@ def _validate_loss_variant(loss_variant: str) -> str:
     return loss_variant
 
 
+def _enable_fold_if_requested(style_name: str, layout: str, load_balance: bool) -> bool:
+    """Validate ``load_balance`` and switch DSA kernels to head-tail folded blocks.
+
+    The caller must lay the CP input out in folded order (rank ``r`` holds chunks
+    ``2r`` and ``2N - 2r - 1``); see ``hyper_parallel.core.shard.ops.dsa_cp_fold``.
+    """
+    if not load_balance:
+        # Clear rather than leave alone: the flag is process-wide, so a style built without
+        # folding after one built with it (a second model in the same process, or a test
+        # sequence) would otherwise inherit the folded kernels.
+        set_dsa_cp_fold(False)
+        return False
+    if layout != "BSND":
+        raise ValueError(f"{style_name}(load_balance=True) supports only BSND layout, got {layout!r}.")
+    set_dsa_cp_fold(True)
+    return True
+
+
 def _query_stats_seq_dim(layout: str) -> int:
     """Return the sequence dimension used by query-side softmax stats."""
     return 2 if layout == "BSND" else 1
@@ -452,12 +471,14 @@ class DSAIndexerContextParallel(ParallelStyle):
             key_kwarg_name: Optional[str] = None,
             weights_kwarg_name: Optional[str] = None,
             use_local_output: bool = False,
+            load_balance: bool = False,
     ) -> None:
         super().__init__()
         layout, seq_dim = _validate_layout_and_mode(self.__class__.__name__, layout, mode)
         self.layout = layout
         self.mode = mode
         self.seq_dim = seq_dim
+        self.load_balance = load_balance
         self.query_index = query_index
         self.key_index = key_index
         self.weights_index = weights_index
@@ -509,6 +530,7 @@ class DSAIndexerContextParallel(ParallelStyle):
 
     def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
         """Register DSA indexer CP hooks on ``module`` and return it."""
+        _enable_fold_if_requested(self.__class__.__name__, self.layout, self.load_balance)
         cp_mesh = _ensure_1d(device_mesh)
         specs = self._build_specs(
             cp_mesh,
@@ -548,8 +570,10 @@ class DSASparseAttentionContextParallel(ParallelStyle):
             use_local_output: bool = False,
             shared_replicate_cache: Optional[DSASequenceReplicateCache] = None,
             share_key_value: bool = False,
+            load_balance: bool = False,
     ) -> None:
         super().__init__()
+        self.load_balance = load_balance
         _configure_sparse_attention_boundary(
             self,
             layout=layout,
@@ -580,6 +604,7 @@ class DSASparseAttentionContextParallel(ParallelStyle):
 
     def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
         """Register DSA sparse-attention CP hooks on ``module`` and return it."""
+        _enable_fold_if_requested(self.__class__.__name__, self.layout, self.load_balance)
         return _apply_sparse_attention_boundary(self, module, device_mesh)
 
 
@@ -637,10 +662,16 @@ class DSAIndexerLossContextParallel(ParallelStyle):
             key_rope_kwarg_name: Optional[str] = None,
             use_local_output: bool = False,
             shared_replicate_cache: Optional[DSASequenceReplicateCache] = None,
+            load_balance: bool = False,
     ) -> None:
         super().__init__()
         layout, seq_dim = _validate_layout_and_mode(self.__class__.__name__, layout, mode)
         loss_variant = _validate_loss_variant(loss_variant)
+        if load_balance and loss_variant == "dense":
+            raise NotImplementedError(
+                "DSAIndexerLossContextParallel(load_balance=True) supports the sparse loss only; "
+                "the dense warm-up loss is not folded yet.")
+        self.load_balance = load_balance
         is_dense = loss_variant == "dense"
         self.layout = layout
         self.mode = mode
@@ -808,6 +839,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
 
     def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
         """Register DSA indexer-loss CP hooks on ``module`` and return it."""
+        _enable_fold_if_requested(self.__class__.__name__, self.layout, self.load_balance)
         cp_mesh = _ensure_1d(device_mesh)
 
         def replicate(value: Any) -> Any:
