@@ -269,6 +269,9 @@ def _merge_into(derived: ModuleShardingSpec,
         value = getattr(user_spec, attr)
         if value is not None:
             setattr(derived, attr, value)
+    if getattr(user_spec, "_ep_gated", False):
+        # EP-gated intent is the user's (the derived spec never sets it).
+        derived._ep_gated = True  # pylint: disable=protected-access
     _normalize_out_fields(derived)
 
 
@@ -565,6 +568,15 @@ def _build_local_compute_factory(factory, module, mesh, mesh_dim_names,
     return compute_fn
 
 
+def _is_moe_boundary(module: Any) -> bool:
+    """Structural MoE-boundary gate, shared with the generation-time inference."""
+    from hyper_parallel.distributed.expert_parallel.structure import (  # pylint: disable=C0415
+        is_moe_boundary,
+    )
+
+    return is_moe_boundary(module)
+
+
 def _resolve_local_compute_fn(module, spec, mesh, mesh_dim_names,
                               expert_mesh):
     """Resolve the compute_fn of the local region (**single resolution chain**, 05 §4.4.3).
@@ -598,10 +610,22 @@ def _resolve_local_compute_fn(module, spec, mesh, mesh_dim_names,
     3. none of the above -> None (ordinary module; takes the
        validate/production path — and an EP-sharded boundary hitting this
        was already failed fast by _preflight_compute_injection).
+
+    An EP-active boundary with a declared ``local_compute_fn`` that is not a
+    MoE boundary (no experts/router) is skipped as well: an EP rule glob such
+    as ``*.mlp`` also matches the dense MLPs of a hybrid stack (DeepSeek-V3's
+    ``first_k_dense_replace`` layers), where expert parallelism has no meaning.
+    The generation-time inference skips the same modules, so both sides agree.
     """
     custom = getattr(spec, "local_compute_fn", None)
     if custom is not None:
         _require_region_dispatch(spec, source="spec.local_compute_fn")
+        if getattr(spec, "_ep_gated", False) and not _is_moe_boundary(module):
+            logger.info(
+                "EP-gated compute injection skipped on %s: it carries no "
+                "experts/router, so it cannot be an expert-parallel region",
+                type(module).__name__)
+            return None
         if _is_delayed_target(custom):
             _check_target_config_keys(custom, "local_compute_fn")
             factory = getattr(custom, "_target_", None)

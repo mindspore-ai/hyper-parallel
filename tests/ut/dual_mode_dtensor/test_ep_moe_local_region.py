@@ -433,6 +433,63 @@ def test_local_compute_fn_resolution(make_mesh):
         "case: config_keys_pass_through_untouched"  # explicit user config passes through
 
 
+def test_ep_injection_skips_non_moe_boundary(make_mesh):
+    """An EP rule glob also hits dense MLPs; the injection is skipped there.
+
+    ``match: "*.mlp"`` + ``when: ep`` marks every matched module as an EP
+    region, but a hybrid stack has dense MLPs in front of the MoE layers
+    (DeepSeek-V3's ``first_k_dense_replace``). Those cannot be expert-parallel
+    regions — no experts to shard, nothing to all-to-all — and the
+    generation-time inference already skips them. The apply path must skip them
+    the same way instead of failing its archetype interface assertion.
+    """
+    mesh = make_mesh((1,), ("tp",))
+
+    @local_compute
+    def ep_factory(mesh, tp_mesh, cp_mesh, ep_mesh):
+        def compute_fn(mod, x):
+            return x
+        return compute_fn
+
+    class _MoeShaped(nn.Module):
+        """Minimal module satisfying the MoE-boundary gate, with a forward."""
+
+        def __init__(self):
+            super().__init__()
+            self.gate = nn.Linear(4, 4, bias=False)
+            self.experts = nn.ModuleList([nn.Linear(4, 4)])
+
+        def forward(self, x):
+            return x
+
+    def _ep_spec():
+        spec = _identity_spec()
+        spec.local_compute_fn = ep_factory
+        spec.region_dispatch = False
+        spec._ep_gated = True
+        return spec
+
+    # ── case: dense_mlp_boundary_skipped ──
+    assert _resolve_local_compute_fn(
+        _TinyMod(), _ep_spec(), mesh, ("tp",), expert_mesh=None) is None, \
+        "case: dense_mlp_boundary_skipped"
+
+    # ── case: moe_boundary_still_resolves ──
+    assert _resolve_local_compute_fn(
+        _MoeShaped(), _ep_spec(), mesh, ("tp",), expert_mesh=None) is not None, \
+        "case: moe_boundary_still_resolves"
+
+    # ── case: non_ep_injection_stays_untouched ──
+    # Without EP active the same factory on the same dense module is a legitimate
+    # perf/kernel replacement and must NOT be skipped.
+    spec = _identity_spec()
+    spec.local_compute_fn = ep_factory
+    spec.region_dispatch = False
+    assert _resolve_local_compute_fn(
+        _TinyMod(), spec, mesh, ("tp",), expert_mesh=None) is not None, \
+        "case: non_ep_injection_stays_untouched"
+
+
 # ==========================================================================
 # Family 3: custom compute_fn executes inside the local region
 # (combination-scenario level, kept standalone)

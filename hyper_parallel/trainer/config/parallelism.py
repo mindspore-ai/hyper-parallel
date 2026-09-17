@@ -475,6 +475,11 @@ def entries_to_plan_overrides(
         if entry.replace_module is not None and not _has_sharding_action(entry):
             continue
         match, spec = entry.to_override()
+        if entry.when == "ep":
+            # EP-gated intent travels with the spec: the apply path uses it to
+            # skip boundaries an EP glob also hit but which cannot host experts
+            # (dense MLPs in a hybrid stack). Planner/applier-owned metadata.
+            spec._ep_gated = True  # pylint: disable=protected-access
         if match in overrides:
             prev = overrides[match]
             for name in ("local_compute_fn", "inner_target", "inner_wrapper",
@@ -485,6 +490,8 @@ def entries_to_plan_overrides(
                     setattr(prev, name, value)
             if spec.region_dispatch is not None:
                 prev.region_dispatch = spec.region_dispatch
+            if spec._ep_gated:  # pylint: disable=protected-access
+                prev._ep_gated = True  # pylint: disable=protected-access
         else:
             overrides[match] = spec
     return overrides

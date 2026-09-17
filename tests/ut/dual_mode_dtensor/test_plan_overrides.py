@@ -71,6 +71,30 @@ def _attn_override_spec(key="x"):
     )
 
 
+@pytest.mark.skipif(not _HAS_TRAINER_CONFIG,
+                    reason="trainer.config import chain needs newer transformers")
+def test_ep_gating_marker_travels_with_the_spec():
+    """``when: ep`` records an EP-gated marker on the produced spec.
+
+    An EP rule glob such as ``*.mlp`` also matches the dense MLPs of a hybrid
+    stack (DeepSeek-V3's ``first_k_dense_replace`` layers). The apply path skips
+    an EP-gated compute injection on those, so the intent must be visible on the
+    spec rather than only gating the desugar step. A non-EP override stays
+    unmarked — its injection is a legitimate local compute on any module.
+    """
+    gated = entries_to_plan_overrides(
+        [PlanOverride(match="layers.*.mlp", when="ep", region_dispatch=False)],
+        ep_size=2,
+    )
+    assert gated["layers.*.mlp"]._ep_gated is True, "case: ep_gated_marked"
+
+    ungated = entries_to_plan_overrides(
+        [PlanOverride(match="layers.*.mlp", region_dispatch=False)],
+        ep_size=2,
+    )
+    assert ungated["layers.*.mlp"]._ep_gated is False, "case: ungated_not_marked"
+
+
 def test_override_merge_full_declaration(tiny_llama, make_mesh):
     """merge semantics: a full user declaration is equivalent to wholesale
     replacement; _needs_cp_attn is inherited from the derived spec; the scalar

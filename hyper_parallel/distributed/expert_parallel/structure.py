@@ -145,3 +145,18 @@ def detect_moe_structure(module: Any) -> MoeStructure:
     else:
         raise _unsupported(module, f"ambiguous shared expert branches {sorted(shared_names)}")
     return MoeStructure(detect_router_kind(module), shared, storage, hasattr(module, "jitter_noise"))
+
+
+def is_moe_boundary(module: Any) -> bool:
+    """Cheap structural gate: does the module carry experts plus a router?
+
+    Shared by the generation-time EP target inference and the apply-time EP
+    compute injection. An EP rule glob such as ``*.mlp`` also matches modules
+    that cannot be an expert-parallel region -- most notably the dense MLPs of
+    a hybrid stack (DeepSeek-V3's ``first_k_dense_replace`` layers). Both sides
+    must skip those identically: there are no experts to shard and nothing to
+    all-to-all, so the injection has no meaning there.
+    """
+    return hasattr(module, "experts") and (
+        hasattr(module, "gate") or hasattr(module, "router")
+    )

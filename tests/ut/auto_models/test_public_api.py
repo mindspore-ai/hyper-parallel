@@ -85,6 +85,7 @@ class TestShardingConfigContracts(unittest.TestCase):
                 ("_resolved_inner_target", "None"),
                 ("_ep_stack", "<factory> {}"),
                 ("_ep_size", "0"),
+                ("_ep_gated", "False"),
             ],
         )
 
