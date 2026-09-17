@@ -25,7 +25,6 @@ from __future__ import annotations
 from hyper_parallel.codegen.inline.ir import ImportPatch, ModuleSnippetPatch
 from hyper_parallel.codegen.inline.spec_bundle import (
     InlineSpecBundle,
-    MetaNormalizer,
     ReplacementSpec,
     StrategySpec,
 )
@@ -92,15 +91,7 @@ _STRATEGY_SPECS = {
     ),
 }
 
-_META_NORMALIZERS = (
-    MetaNormalizer(
-        target=QWEN3_MOE_FLASH_ATTENTION_REPLACEMENT,
-        param_renames={
-            "linear_qkv.weight": ("q_proj.weight", "k_proj.weight", "v_proj.weight"),
-            "linear_qkv.bias": ("q_proj.bias", "k_proj.bias", "v_proj.bias"),
-        },
-    ),
-)
+_META_NORMALIZERS: tuple = ()
 
 def _build_attention_replacement_spec() -> ReplacementSpec:
     """Render the GQA attention class from real component source.
@@ -131,6 +122,18 @@ def _build_attention_replacement_spec() -> ReplacementSpec:
     return ReplacementSpec(
         old_ctor="Qwen3MoeAttention",
         new_ctor="GQAAttention",
+        # The generated class copies the real component's keyword-only ctor
+        # ``(*, module=..., attention_interface=...)``, so the decoder-layer
+        # call must wrap the source attention module exactly like the runtime
+        # ``replace_qwen3_moe_flash_attention`` does. The source class is kept
+        # (``remove_class=False``) so the wrapper input can be instantiated.
+        mode="wrap_source",
+        keyword_args=(
+            "module_fqn=''",
+            "context=None",
+            "attention_interface=run_qwen3_moe_flash_attention",
+        ),
+        remove_class=False,
         imports=(
             ImportPatch("hyper_parallel.codegen.runtime", ("get_inline_parallel_state",)),
             ImportPatch("hyper_parallel.components.modules", ("RMSNorm",)),

@@ -175,7 +175,16 @@ class Model:
         self.assertEqual(vars(meta), vars(expected_meta))
         self.assertIn("class GQAAttention", explicit)
         self.assertIn("def _forward_impl", explicit)
-        self.assertNotIn("class Qwen3MoeAttention", explicit)
+        # S4: the decoder-layer call wraps the source attention module with the
+        # generated class's keyword-only ctor (matching the real component /
+        # runtime replacement), so the source class is kept as the wrapper input.
+        self.assertNotIn("self.attn = GQAAttention()", explicit)
+        self.assertIn(
+            "GQAAttention(module=Qwen3MoeAttention(), module_fqn='', context=None, "
+            "attention_interface=run_qwen3_moe_flash_attention)",
+            explicit,
+        )
+        self.assertIn("class Qwen3MoeAttention", explicit)
         # S4: the attention class is generated from the real component — the
         # kernel entry is inlined and the construction keeps the fused QKV
         # layout (no independent q/k/v projection).
@@ -185,12 +194,13 @@ class Model:
         self.assertIn("InterleaveQKV", explicit)
         self.assertNotIn("self.q_proj =", explicit)
         ast.parse(explicit)
+        # The fused GQA model exposes the real param ``linear_qkv`` (not the
+        # source q/k/v), so the frozen plan anchors on it; checkpoint loading
+        # maps source q/k/v into it via make_transforms.
         params = meta.param_plan["blocks.0.proj"]["params"]
-        self.assertEqual(set(params), {"q_proj.weight", "k_proj.weight", "v_proj.weight"})
-        self.assertIsNot(params["q_proj.weight"], params["k_proj.weight"])
+        self.assertEqual(set(params), {"linear_qkv.weight"})
         self.assertEqual(meta.frozen_sharded_params, [
-            "blocks.0.proj.k_proj.weight", "blocks.0.proj.q_proj.weight",
-            "blocks.0.proj.v_proj.weight", "embedding.weight",
+            "blocks.0.proj.linear_qkv.weight", "embedding.weight",
         ])
         self.assertEqual(render_inline_modeling(source, meta, "qwen3_moe"), explicit)
 
