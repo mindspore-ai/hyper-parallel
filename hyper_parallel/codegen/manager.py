@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import asdict
+from fnmatch import fnmatchcase
 import logging
 import os
 from typing import Any, Optional
@@ -555,10 +556,17 @@ def _fill_plan_fields(meta: CodegenMeta, config: Any, layout: ArtifactLayout) ->
             "source in the YAML"
         )
     replace_meta = _apply_generation_replacements(meta, config, model, spec)
+    plan_overrides = build_plan_overrides(config, spec)
+    # S3: a plan override whose matched MoE boundary carries no explicit
+    # ``local_compute_fn`` has its EP compute factory inferred from structure
+    # (never by model name) and written into the spec so it lands in
+    # ``meta.injections``. An explicit ``_target_`` stays the opt-out escape
+    # hatch and is never overwritten.
+    _fill_inferred_ep_targets(model, plan_overrides)
     plan = derive_sharding_plan(
         model,
         spec,
-        plan_overrides=build_plan_overrides(config, spec),
+        plan_overrides=plan_overrides,
     )
     frozen = freeze_plan(plan, model)
     if not frozen.param_plan:
@@ -690,6 +698,134 @@ def _target_path(target: Any) -> Optional[str]:
         return None
     data = target.to_dict()
     return data.get("_target_") if isinstance(data, dict) else None
+
+
+#: Structure fingerprint -> model-family MoE EP compute factory.
+#:
+#: S3 maps a recognized ``MoeStructure`` (router / shared-expert branch /
+#: expert-storage) to the factory that would have been wired through a YAML
+#: ``local_compute_fn._target_``. This is deliberately per-family and named,
+#: NOT keyed by model identity: the fingerprint is the *only* discriminator,
+#: so a model with the same structure is covered without new registry work.
+#: The table is transitional — S4+ replaces the factory path with a
+#: self-contained archetype record; the path is today's meta transport.
+_EP_FACTORY_BY_STRUCTURE = {
+    ("topk_router_module", "none", "batched_parameters"):
+        "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel."
+        "qwen3moe_ep_compute_fn",
+    ("topk_router_module", "additive", "batched_parameters"):
+        "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
+}
+
+
+def _fill_inferred_ep_targets(model: Any, plan_overrides: dict[str, Any]) -> None:
+    """S3: fill a missing ``local_compute_fn`` on MoE EP overrides.
+
+    Every desugared plan override whose ``match`` resolves to a MoE boundary
+    but which declares no explicit ``local_compute_fn`` gets its EP compute
+    factory inferred from structure (``detect_moe_structure``) instead of a
+    YAML ``_target_``. Entries that already carry a ``local_compute_fn`` are
+    left untouched — the explicit ``_target_`` remains the escape hatch for
+    structures detection cannot cover. Ordinary (non-MoE) overrides are
+    untouched. This is a no-op on a struct construct; the ``plan_overrides``
+    dict's spec values are mutated in place so ``freeze_injections`` records
+    the inferred factory in ``meta.injections``.
+    """
+    for match, spec in plan_overrides.items():
+        if getattr(spec, "local_compute_fn", None) is not None:
+            continue
+        inferred = _infer_ep_compute_for_match(model, match)
+        if inferred is not None:
+            spec.local_compute_fn = inferred
+
+
+def _infer_ep_compute_for_match(
+    model: Any, match: str
+) -> Optional["Any"]:
+    """Return the EP compute ``_target_`` covering every MoE block ``match`` hits.
+
+    Resolves ``match`` (an FQN or FQN glob, ``fnmatchcase``) against the meta
+    model's module tree. Returns a ``Target`` for the structure-inferred EP
+    factory when at least one matched module is a MoE boundary; ``None`` when
+    ``match`` touches no MoE boundary (an ordinary sharding override needs no
+    compute injection). An unrecognized MoE structure raises
+    ``UnsupportedModuleStructure`` so the artifact never silently picks a wrong
+    strategy — the escape-hatch text points the user at writing an explicit
+    ``_target_``.
+    """
+    candidate = None
+    for fqn, module in model.named_modules():
+        if not fnmatchcase(fqn, match):
+            continue
+        if not _looks_like_moe_boundary(module):
+            continue
+        target = _import_ep_target_for(module, match)
+        if candidate is None:
+            candidate = target
+        elif candidate != target:
+            from hyper_parallel.distributed.expert_parallel.structure import (  # pylint: disable=C0415
+                UnsupportedModuleStructure,
+            )
+
+            raise UnsupportedModuleStructure(
+                f"{match!r} matched multiple MoE boundaries with different "
+                "EP compute factories; declare an explicit "
+                "local_compute_fn._target_ in the YAML"
+            )
+    return candidate
+
+
+def _looks_like_moe_boundary(module: Any) -> bool:
+    """Cheap gate: does the module carry an expert plus a router gate?"""
+    return hasattr(module, "experts") and (
+        hasattr(module, "gate") or hasattr(module, "router")
+    )
+
+
+def _import_ep_target_for(module: Any, match: str) -> "Any":
+    """Import the delayed target bound to the structure-inferred factory."""
+    from hyper_parallel.distributed.expert_parallel.structure import (  # pylint: disable=C0415
+        UnsupportedModuleStructure,
+        detect_moe_structure,
+    )
+
+    structure = detect_moe_structure(module)
+    fingerprint = (
+        structure.router,
+        structure.shared_experts,
+        structure.expert_storage,
+    )
+    factory_path = _EP_FACTORY_BY_STRUCTURE.get(fingerprint)
+    if factory_path is None:
+        raise UnsupportedModuleStructure(
+            f"{match!r} matched {type(module).__name__} with structure "
+            f"{fingerprint} that has no EP compute factory. Declare an "
+            "explicit local_compute_fn._target_ to opt out of structure "
+            "detection."
+        )
+    return _build_ep_target(factory_path)
+
+
+def _build_ep_target(factory_path: str) -> "Any":
+    """Build a delayed ``Target`` for the EP factory at ``factory_path``.
+
+    ``local_compute_fn`` is a *factory* Target — the framework calls
+    ``build()`` (which resolves the import) only at apply time, never during
+    generation. So the callable here resolves lazily; generation serializes
+    only the ``_target_`` path into meta, and the runtime re-resolves it from
+    that path. Deferring the import keeps codegen free of a hard dependency on
+    any concrete model package.
+    """
+    from hyper_parallel.trainer.config.target import Target  # pylint: disable=C0415
+
+    def _factory(**kwargs: Any) -> Any:
+        import importlib  # pylint: disable=C0415
+
+        module_path, _, attr = factory_path.rpartition(".")
+        fn = getattr(importlib.import_module(module_path), attr)
+        return fn(**kwargs)
+
+    return Target(_factory, target_path=factory_path)
 
 
 def _gen_backend(config: Any) -> bool:

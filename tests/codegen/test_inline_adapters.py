@@ -176,6 +176,14 @@ class Model:
         self.assertIn("class GQAAttention", explicit)
         self.assertIn("def _forward_impl", explicit)
         self.assertNotIn("class Qwen3MoeAttention", explicit)
+        # S4: the attention class is generated from the real component — the
+        # kernel entry is inlined and the construction keeps the fused QKV
+        # layout (no independent q/k/v projection).
+        self.assertIn("def run_qwen3_moe_flash_attention", explicit)
+        self.assertIn("torch_npu.npu_fusion_attention", explicit)
+        self.assertIn("self.linear_qkv", explicit)
+        self.assertIn("InterleaveQKV", explicit)
+        self.assertNotIn("self.q_proj =", explicit)
         ast.parse(explicit)
         params = meta.param_plan["blocks.0.proj"]["params"]
         self.assertEqual(set(params), {"q_proj.weight", "k_proj.weight", "v_proj.weight"})

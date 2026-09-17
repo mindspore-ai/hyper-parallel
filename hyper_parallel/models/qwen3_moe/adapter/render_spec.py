@@ -29,7 +29,7 @@ from hyper_parallel.codegen.inline.spec_bundle import (
     ReplacementSpec,
     StrategySpec,
 )
-from hyper_parallel.codegen.inline.templates import QWEN3_GQA_ATTENTION_CLASS, QWEN3_MOE_EP_FORWARD, TP_OPERATORS_CLASS
+from hyper_parallel.codegen.inline.templates import QWEN3_MOE_EP_FORWARD, TP_OPERATORS_CLASS
 
 
 QWEN3_MOE_FLASH_ATTENTION_REPLACEMENT = (
@@ -43,24 +43,6 @@ _REPLACEMENT_SPECS = {
         new_ctor="RMSNorm",
         imports=(ImportPatch("hyper_parallel.components.modules", ("RMSNorm",)),),
         replacement_note="RMSNorm replaces Qwen3MoeRMSNorm.",
-    ),
-    QWEN3_MOE_FLASH_ATTENTION_REPLACEMENT: ReplacementSpec(
-        old_ctor="Qwen3MoeAttention",
-        new_ctor="GQAAttention",
-        imports=(
-            ImportPatch("hyper_parallel.codegen.runtime", ("get_inline_parallel_state",)),
-            ImportPatch("hyper_parallel.components.modules", ("RMSNorm",)),
-            ImportPatch(
-                "hyper_parallel.models.qwen3_moe.adapter.attention",
-                ("run_qwen3_moe_flash_attention",),
-            ),
-            ImportPatch("hyper_parallel.platform", ("get_platform",)),
-        ),
-        snippets=(
-            ModuleSnippetPatch(TP_OPERATORS_CLASS),
-            ModuleSnippetPatch(QWEN3_GQA_ATTENTION_CLASS),
-        ),
-        replacement_note="GQAAttention replaces Qwen3MoeAttention.",
     ),
     "hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_grouped_experts": ReplacementSpec(
         old_ctor="Qwen3MoeExperts",
@@ -120,18 +102,72 @@ _META_NORMALIZERS = (
     ),
 )
 
-_INLINE_SPEC_BUNDLE = InlineSpecBundle(
-    replacement_specs=_REPLACEMENT_SPECS,
-    strategy_specs=_STRATEGY_SPECS,
-    meta_normalizers=_META_NORMALIZERS,
-    external_state_classes=("GQAAttention", "Qwen3MoeSparseMoeBlock"),
-)
+def _build_attention_replacement_spec() -> ReplacementSpec:
+    """Render the GQA attention class from real component source.
+
+    Build-time only: resolving the real ``GQAAttention`` component and calling
+    ``render_attention_class`` imports torch / torch_npu and the generic
+    component modules, so this must never run at module import. The kernel
+    entry ``run_qwen3_moe_flash_attention`` (previously imported) is inlined
+    into the artifact by the generator, so no import of it is needed here.
+    """
+    import importlib  # pylint: disable=C0415
+
+    from hyper_parallel.codegen.inline.attention import (  # pylint: disable=C0415
+        render_attention_class,
+    )
+
+    modules = importlib.import_module("hyper_parallel.components.modules")
+    adapter_attention = importlib.import_module(
+        "hyper_parallel.models.qwen3_moe.adapter.attention"
+    )
+    expanded = render_attention_class(
+        modules.GQAAttention,
+        interface=adapter_attention.run_qwen3_moe_flash_attention,
+    )
+    generated_imports = tuple(
+        ImportPatch(module="", names=(), raw=line) for line in expanded.imports
+    )
+    return ReplacementSpec(
+        old_ctor="Qwen3MoeAttention",
+        new_ctor="GQAAttention",
+        imports=(
+            ImportPatch("hyper_parallel.codegen.runtime", ("get_inline_parallel_state",)),
+            ImportPatch("hyper_parallel.components.modules", ("RMSNorm",)),
+            ImportPatch("hyper_parallel.platform", ("get_platform",)),
+            *generated_imports,
+        ),
+        snippets=(
+            ModuleSnippetPatch(TP_OPERATORS_CLASS),
+            ModuleSnippetPatch(expanded.source),
+        ),
+        replacement_note="GQAAttention replaces Qwen3MoeAttention.",
+    )
+
+
+_RENDER_SPEC_CACHE: InlineSpecBundle | None = None
 
 
 def get_render_spec() -> InlineSpecBundle:
-    """Return the Qwen3-MoE render spec."""
+    """Return the Qwen3-MoE render spec.
 
-    return _INLINE_SPEC_BUNDLE
+    The attention replacement is assembled lazily on first call (never at
+    module import) so ``render_spec`` itself does not pull torch / torch_npu or
+    the real component. The bundle is cached so callers see stable ``ReplacementSpec``
+    identity across lookups. All other declarations remain static.
+    """
+    global _RENDER_SPEC_CACHE  # pylint: disable=global-statement
+
+    if _RENDER_SPEC_CACHE is None:
+        replacement_specs = dict(_REPLACEMENT_SPECS)
+        replacement_specs[QWEN3_MOE_FLASH_ATTENTION_REPLACEMENT] = _build_attention_replacement_spec()
+        _RENDER_SPEC_CACHE = InlineSpecBundle(
+            replacement_specs=replacement_specs,
+            strategy_specs=_STRATEGY_SPECS,
+            meta_normalizers=_META_NORMALIZERS,
+            external_state_classes=("GQAAttention", "Qwen3MoeSparseMoeBlock"),
+        )
+    return _RENDER_SPEC_CACHE
 
 
 __all__ = ["get_render_spec"]
