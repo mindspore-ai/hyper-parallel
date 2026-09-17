@@ -773,12 +773,19 @@ def _infer_ep_compute_for_match(
     strategy — the escape-hatch text points the user at writing an explicit
     ``_target_``.
     """
+    # The gate is shared with the apply-time EP injection so both sides skip the
+    # same modules (an EP glob such as ``*.mlp`` also hits dense MLPs). Lazy: the
+    # structure package pulls torch, and codegen stays backend-free until it runs.
+    from hyper_parallel.distributed.expert_parallel.structure import (  # pylint: disable=C0415
+        is_moe_boundary,
+    )
+
     candidate = None
     candidate_path = None
     for fqn, module in model.named_modules():
         if not fnmatchcase(fqn, match):
             continue
-        if not _looks_like_moe_boundary(module):
+        if not is_moe_boundary(module):
             continue
         target = _import_ep_target_for(module, match)
         # Compare the serialized factory path, never the Target objects: every
@@ -799,13 +806,6 @@ def _infer_ep_compute_for_match(
                 "local_compute_fn._target_ in the YAML"
             )
     return candidate
-
-
-def _looks_like_moe_boundary(module: Any) -> bool:
-    """Cheap gate: does the module carry an expert plus a router gate?"""
-    return hasattr(module, "experts") and (
-        hasattr(module, "gate") or hasattr(module, "router")
-    )
 
 
 def _import_ep_target_for(module: Any, match: str) -> "Any":
