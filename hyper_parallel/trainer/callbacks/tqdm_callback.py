@@ -210,14 +210,24 @@ class TqdmCallback(Callback):
             initial=state.global_step,
         )
 
-    def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:
+    def on_step_end(
+        self,
+        state: TrainerState,
+        loss: float | None = None,
+        loss_dict: dict[str, float] | None = None,
+        grad_norm: float | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Publish shared metrics and advance once per completed global step.
 
         Args:
             state: Current training state.
+            loss: Aggregated loss for the completed step.
+            loss_dict: Named loss values for the completed step.
+            grad_norm: Gradient norm measured before the optimizer update.
             **kwargs: Additional callback arguments.
         """
-        del kwargs
+        del loss, loss_dict, grad_norm, kwargs
         if self._progress_bar is None or state.global_step <= self._last_updated_step:
             return
 

@@ -65,9 +65,9 @@ class TestEnvironMeterCallback(unittest.TestCase):
     )
     def test_micro_step_publishes_nonzero_token_throughput(
             self,
-            _mock_time: Mock,
-            _mock_world_size: Mock,
-            _mock_device_type: Mock,
+            mock_time: Mock,
+            mock_world_size: Mock,
+            mock_device_type: Mock,
     ) -> None:
         """Publish the accumulated micro-step token count as throughput.
 
@@ -75,6 +75,7 @@ class TestEnvironMeterCallback(unittest.TestCase):
         Description: Stream a prepared text micro-batch into the environment meter.
         Expectation: Step tokens and tokens per second are positive and scalar state is released.
         """
+        del mock_time, mock_world_size, mock_device_type
         trainer = self._build_trainer()
         callback = EnvironMeterCallback(trainer)
         state = TrainerState(global_step=1, epoch=0)
@@ -100,9 +101,10 @@ class TestEnvironMeterCallback(unittest.TestCase):
             3.0,
             f"expected three tokens per second, got={metrics['performance/tokens_per_second']}",
         )
+        step_tokens = vars(callback)["_local_step_tokens"]
         self.assertIsNone(
-            callback._local_step_tokens,
-            f"step token scalar must be released after publishing, got={callback._local_step_tokens!r}",
+            step_tokens,
+            f"step token scalar must be released after publishing, got={step_tokens!r}",
         )
 
     @arg_mark(
@@ -127,15 +129,17 @@ class TestEnvironMeterCallback(unittest.TestCase):
             {"token_count": _NoItemScalar()},
         )
 
+        step_tokens = vars(callback)["_local_step_tokens"]
         self.assertIsInstance(
-            callback._local_step_tokens,
+            step_tokens,
             _NoItemScalar,
-            f"expected detached scalar state, got={callback._local_step_tokens!r}",
+            f"expected detached scalar state, got={step_tokens!r}",
         )
         callback.on_step_begin(state)
+        step_tokens = vars(callback)["_local_step_tokens"]
         self.assertIsNone(
-            callback._local_step_tokens,
-            f"new step must release prior scalar state, got={callback._local_step_tokens!r}",
+            step_tokens,
+            f"new step must release prior scalar state, got={step_tokens!r}",
         )
 
     @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
@@ -150,10 +154,10 @@ class TestEnvironMeterCallback(unittest.TestCase):
     )
     def test_context_parallel_reduction_does_not_duplicate_samples(
             self,
-            _mock_time: Mock,
+            mock_time: Mock,
             mock_all_reduce: Mock,
-            _mock_world_size: Mock,
-            _mock_device_type: Mock,
+            mock_world_size: Mock,
+            mock_device_type: Mock,
     ) -> None:
         """Sum CP-sharded tokens while counting each logical sample once.
 
@@ -161,6 +165,7 @@ class TestEnvironMeterCallback(unittest.TestCase):
         Description: Reduce local token and sample counts over a mocked DP+CP group.
         Expectation: Tokens sum across ranks while CP-replicated samples are counted once.
         """
+        del mock_time, mock_world_size, mock_device_type
         mock_all_reduce.side_effect = lambda value, op, group: float(value) * 4 if op == "sum" else float(value)
         mesh = SimpleNamespace(dp_cp_mesh=None, cp_size=2)
         trainer = self._build_trainer(mesh=mesh)
