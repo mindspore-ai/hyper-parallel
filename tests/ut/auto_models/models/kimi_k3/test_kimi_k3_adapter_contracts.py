@@ -81,6 +81,7 @@ class _RecordingExecutor(nn.Module):
         *,
         chunk_size: int,
         backend: str,
+        **execution_options: Any,
     ) -> None:
         """Record the executor construction arguments."""
         super().__init__()
@@ -88,6 +89,7 @@ class _RecordingExecutor(nn.Module):
         self.mesh = mesh
         self.chunk_size = chunk_size
         self.backend = backend
+        self.execution_options = execution_options
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Return inputs so the wrapper remains callable in this metadata test."""
@@ -118,7 +120,11 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_top_level_and_text_specs_share_kda_providers(self):
-        """Both official Kimi config identities discover the same KDA rules."""
+        """Feature: Kimi K3 adapter and CP configuration.
+
+        Description: Both official Kimi config identities discover the same KDA rules.
+        Expectation: Both configuration identities resolve to the same KDA providers.
+        """
         top_spec = get_model_adapter("KimiK3ForConditionalGeneration")
         text_spec = get_model_adapter("KimiLinearForCausalLM")
         self.assertIsNotNone(top_spec)
@@ -135,7 +141,11 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_kda_specific_parameter_roles_override_generic_rules(self):
-        """ShortConv, recurrent-state and low-rank gate parameters are explicit."""
+        """Feature: Kimi K3 adapter and CP configuration.
+
+        Description: ShortConv, recurrent-state and low-rank gate parameters are explicit.
+        Expectation: Each KDA-specific parameter receives its declared sharding role.
+        """
         rules = get_model_adapter("kimi_k3").sharding_rules()
         classifier = ParameterClassifier()
         expected = {
@@ -154,7 +164,11 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_cp4_plan_retains_all_kda_params_and_injection(self):
-        """Planner derives one replicated CP boundary with the requested wrapper."""
+        """Feature: Kimi K3 adapter and CP configuration.
+
+        Description: Planner derives one replicated CP boundary with the requested wrapper.
+        Expectation: The CP4 plan retains all parameters and the requested forward wrapper.
+        """
         override = ModuleShardingSpec(
             inner_target="self",
             inner_wrapper=(
@@ -184,7 +198,11 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_yaml_cp_condition_and_wrapper_arguments(self):
-        """YAML resolution preserves KDA arguments and gates the rule on CP."""
+        """Feature: Kimi K3 adapter and CP configuration.
+
+        Description: YAML resolution preserves KDA arguments and gates the rule on CP.
+        Expectation: CP1 disables the rule and CP4 preserves its backend and chunk settings.
+        """
         yaml_text = """
 model:
   _target_: torch.nn.Identity
@@ -225,7 +243,11 @@ class TestKimiK3CpWrapperContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_wrappers_declare_context_and_configuration(self):
-        """Both modes use @inner_wrapper and expose backend/chunk configuration."""
+        """Feature: Kimi K3 adapter and CP configuration.
+
+        Description: Both modes use @inner_wrapper and expose backend/chunk configuration.
+        Expectation: Both wrappers expose the expected injection context and defaults.
+        """
         for name in _WRAPPER_NAMES:
             wrapper = getattr(adapter_context_parallel, name)
             with self.subTest(wrapper=name):
@@ -240,7 +262,11 @@ class TestKimiK3CpWrapperContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_wrappers_return_atomic_request_without_mutating_target(self):
-        """The generic rewriter, rather than the family adapter, owns mutation."""
+        """Feature: Kimi K3 adapter and CP configuration.
+
+        Description: The generic rewriter, rather than the family adapter, owns mutation.
+        Expectation: Construction returns an atomic request without replacing forward.
+        """
         cp_mesh = _FakeMesh(4)
         target = KimiDeltaAttention(
             hidden_size=32,
@@ -280,7 +306,11 @@ class TestKimiK3CpWrapperContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_wrapper_fail_fast_guards(self):
-        """Inactive CP, TPxCP and duplicate application fail before mutation."""
+        """Feature: Kimi K3 adapter and CP configuration.
+
+        Description: Inactive CP, TPxCP and duplicate application fail before mutation.
+        Expectation: Inactive CP, simultaneous TP/CP and duplicate injection are rejected.
+        """
         wrapper = adapter_context_parallel.kimi_delta_attention_p2p_cp_wrapper
         target = KimiDeltaAttention(
             hidden_size=16,
@@ -300,3 +330,31 @@ class TestKimiK3CpWrapperContracts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKDACombinedAdapter(unittest.TestCase):
+    """Pin the recipe options for all pairwise and three-way combinations."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_all_combinations_record_effective_options(self):
+        """Feature: Unified KDA CP recipe adapter.
+
+        Description: Construct AG and every two/three-way recipe using metadata-only executors.
+        Expectation: The forward rewrite preserves protocol, Ulysses and group-width choices.
+        """
+        cases = [("allgather", 1, 1), ("p2p", 2, 1), ("allgather", 2, 1),
+                 ("grouped_allgather_p2p", 1, 2), ("grouped_allgather_p2p", 2, 2)]
+        for protocol, ulysses, width in cases:
+            with self.subTest(protocol=protocol, ulysses=ulysses):
+                name = "KimiDeltaAttentionLayerHybridCP" if ulysses > 1 else "KimiDeltaAttentionLayerP2PCP"
+                model = _TinyKimiModel().self_attn
+                with patch.object(adapter_context_parallel, name, _RecordingExecutor):
+                    request = adapter_context_parallel.kimi_delta_attention_cp_wrapper(
+                        model, None, None, _FakeMesh(8), None, boundary_protocol=protocol,
+                        ulysses_degree=ulysses, group_size=width)
+                config = request.companion_attrs["_hp_kda_cp_config"]
+                self.assertEqual(config["boundary_protocol"], protocol)
+                self.assertEqual(config["group_size"], width)
+                self.assertEqual(config.get("ulysses_degree", 1), ulysses)
+                self.assertEqual(config["backend"], "triton")

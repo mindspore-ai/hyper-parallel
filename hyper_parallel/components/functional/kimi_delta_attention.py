@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Dense Triton-Ascend KDA execution boundaries for Torch training."""
+# This staged execution module is Torch-only, matching its autograd implementation.
+# pylint: disable=forbidden-backend-import
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -49,7 +51,7 @@ def _validate_local_inputs(
     if query.shape != key.shape:
         raise ValueError("Fused KDA query and key must have identical shapes.")
     batch, sequence_length, num_query_heads, key_dim = query.shape
-    num_value_heads, value_dim = value.shape[2:]
+    num_value_heads = value.shape[2]
     if value.shape[:2] != (batch, sequence_length):
         raise ValueError("Fused KDA value must match query batch and sequence dimensions.")
     if gate.shape != (batch, sequence_length, num_value_heads, key_dim):
@@ -58,6 +60,14 @@ def _validate_local_inputs(
         raise ValueError("Fused KDA beta has an incompatible shape.")
     if num_value_heads % num_query_heads:
         raise ValueError("Fused KDA value heads must be divisible by query heads.")
+    _validate_local_backend(query, key, value, gate, beta, a_log, dt_bias,
+                            chunk_size=chunk_size, lower_bound=lower_bound)
+
+
+def _validate_local_backend(query, key, value, gate, beta, a_log, dt_bias, *, chunk_size, lower_bound):
+    """Validate dtype/device and kernel constraints after the logical shapes."""
+    sequence_length, key_dim = query.shape[1], query.shape[-1]
+    num_value_heads, value_dim = value.shape[2:]
     if not (
         query.dtype == key.dtype == value.dtype == gate.dtype == beta.dtype
         == torch.bfloat16
@@ -134,7 +144,21 @@ def fused_chunk_kda(
     chunk_size: int = 64,
     safe_gate: bool = True,
 ) -> torch.Tensor:
-    """Run the local Triton-Ascend KDA backend without CP communication."""
+    """Run the local Triton-Ascend KDA backend without CP communication.
+
+    Args:
+        query: Local query tensor [B,T,H,K].
+        key: Matching local key tensor.
+        value: Local value tensor [B,T,HV,V].
+        gate: Per-token gate logits [B,T,HV,K].
+        beta: Per-token beta logits [B,T,HV].
+        a_log: Decay parameter with one value per value head.
+        dt_bias: Learned bias with one value per gate channel.
+        scale: Optional attention scaling factor.
+        lower_bound: Lower bound for the activated gate.
+        chunk_size: Tokens per local recurrence chunk.
+        safe_gate: Use the staged lower-bounded gate implementation.
+    """
     _validate_local_inputs(
         query,
         key,
@@ -184,8 +208,30 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         next_rank: int,
         cp_rank: int,
         cp_size: int,
+        boundary: Any,
     ) -> torch.Tensor:
-        """Prepare local KDA, propagate its state, and produce token outputs."""
+        """Prepare local KDA, propagate its state, and produce token outputs.
+
+        Args:
+            ctx: Autograd context holding tensors and communication metadata.
+            query: Local query tensor [B,T,H,K].
+            key: Matching local key tensor.
+            value: Local value tensor [B,T,HV,V].
+            gate_raw: Unactivated per-token gate logits.
+            beta_raw: Unactivated per-token beta logits.
+            a_log: Decay parameter with one value per value head.
+            dt_bias: Learned bias with one value per gate channel.
+            scale: Optional attention scaling factor.
+            lower_bound: Lower bound for the activated gate.
+            chunk_size: Tokens per local recurrence chunk.
+            safe_gate: Use the staged lower-bounded gate implementation.
+            cp_group: Precreated chronological CP process group.
+            prev_rank: Global rank of the preceding sequence partition.
+            next_rank: Global rank of the following sequence partition.
+            cp_rank: Chronological index within the CP group.
+            cp_size: Number of state partitions.
+            boundary: Optional gather executor; None selects P2P.
+        """
         ops = get_fla_kda_staged_ops()
 
         rcp_ln2 = 1.4426950408889634
@@ -198,90 +244,41 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         key, key_rstd = ops.l2norm_fwd(key)
         beta = ops.fused_beta_sigmoid(beta_raw)
         gate = ops.kda_gate_chunk_cumsum(
-            g=gate_raw,
-            A_log=a_log,
-            dt_bias=dt_bias,
-            scale=rcp_ln2,
-            chunk_size=chunk_size,
-            lower_bound=lower_bound,
+            g=gate_raw, A_log=a_log, dt_bias=dt_bias, scale=rcp_ln2, chunk_size=chunk_size, lower_bound=lower_bound,
         )
 
-        state_shape = (
-            query.shape[0],
-            value.shape[2],
-            query.shape[-1],
-            value.shape[-1],
-        )
+        state_shape = (query.shape[0], value.shape[2], query.shape[-1], value.shape[-1])
         initial_state = None
         recv_work = None
-        if cp_rank > 0:
-            initial_state = torch.empty(
-                state_shape,
-                device=query.device,
-                dtype=torch.float32,
-            )
-            recv_work = dist.irecv(
-                initial_state,
-                src=prev_rank,
-                group=cp_group,
-            )
+        if boundary is None and cp_rank > 0:
+            initial_state = torch.empty(state_shape, device=query.device, dtype=torch.float32)
+            recv_work = dist.irecv(initial_state, src=prev_rank, group=cp_group)
 
         w, u, _, kg, attention_qk, attention_kk = ops.chunk_kda_fwd_intra(
-            q=query,
-            k=key,
-            v=value,
-            gk=gate,
-            beta=beta,
-            scale=scale,
-            chunk_size=chunk_size,
-            safe_gate=safe_gate,
+            q=query, k=key, v=value, gk=gate, beta=beta, scale=scale, chunk_size=chunk_size, safe_gate=safe_gate,
             disable_recompute=True,
         )
         state_ext = None
         transition = None
-        if cp_rank < cp_size - 1:
-            state_ext, transition = kda_state_summary_forward_from_prepared(
-                kg,
-                w,
-                u,
-                gate,
-                chunk_size=chunk_size,
-            )
+        if boundary is not None or cp_rank < cp_size - 1:
+            state_ext, transition = kda_state_summary_forward_from_prepared(kg, w, u, gate, chunk_size=chunk_size)
         if recv_work is not None:
             recv_work.wait()
 
         send_work = None
         send_state = None
-        if cp_rank < cp_size - 1:
-            final_state = apply_kda_state_summary(
-                state_ext,
-                transition,
-                initial_state,
-            )
+        if boundary is not None:
+            initial_state = boundary.forward(state_ext, transition)
+        elif cp_rank < cp_size - 1:
+            final_state = apply_kda_state_summary(state_ext, transition, initial_state)
             send_state = final_state.contiguous()
-            send_work = dist.isend(
-                send_state,
-                dst=next_rank,
-                group=cp_group,
-            )
+            send_work = dist.isend(send_state, dst=next_rank, group=cp_group)
 
         states, value_new, _ = ops.chunk_gated_delta_rule_fwd_h(
-            k=kg,
-            w=w,
-            u=u,
-            gk=gate,
-            initial_state=initial_state,
-            output_final_state=False,
-            chunk_size=chunk_size,
+            k=kg, w=w, u=u, gk=gate, initial_state=initial_state, output_final_state=False, chunk_size=chunk_size,
         )
         output = ops.chunk_gla_fwd_o_gk(
-            q=query,
-            v=value_new,
-            g=gate,
-            A=attention_qk,
-            h=states,
-            scale=scale,
-            chunk_size=chunk_size,
+            q=query, v=value_new, g=gate, A=attention_qk, h=states, scale=scale, chunk_size=chunk_size,
         )
         if send_work is not None:
             send_work.wait()
@@ -290,19 +287,8 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         if saved_initial_state is None:
             saved_initial_state = query.new_empty(0, dtype=torch.float32)
         ctx.save_for_backward(
-            query,
-            query_rstd,
-            key,
-            key_rstd,
-            value,
-            gate_raw,
-            beta_raw,
-            a_log,
-            dt_bias,
-            attention_qk,
-            attention_kk,
-            transition if transition is not None else query.new_empty(0),
-            saved_initial_state,
+            query, query_rstd, key, key_rstd, value, gate_raw, beta_raw, a_log, dt_bias, attention_qk, attention_kk,
+            transition if transition is not None else query.new_empty(0), saved_initial_state,
         )
         ctx.scale = scale
         ctx.lower_bound = lower_bound
@@ -313,6 +299,7 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         ctx.next_rank = next_rank
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
+        ctx.boundary = boundary
         return output.to(value.dtype)
 
     @staticmethod
@@ -320,159 +307,76 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         ctx: Any,
         grad_output: torch.Tensor,
     ) -> tuple[Any, ...]:
-        """Reverse the state wavefront, then finish the fused local backward."""
+        """Reverse the state wavefront, then finish the fused local backward.
+
+        Args:
+            ctx: Autograd context holding tensors and communication metadata.
+            grad_output: Upstream gradient for the local token output.
+        """
         ops = get_fla_kda_staged_ops()
 
         rcp_ln2 = 1.4426950408889634
 
         (
-            query,
-            query_rstd,
-            key,
-            key_rstd,
-            value,
-            gate_raw,
-            beta_raw,
-            a_log,
-            dt_bias,
-            attention_qk,
-            attention_kk,
-            transition,
-            saved_initial_state,
+            query, query_rstd, key, key_rstd, value, gate_raw, beta_raw, a_log, dt_bias, attention_qk,
+            attention_kk, transition, saved_initial_state,
         ) = ctx.saved_tensors
         initial_state = saved_initial_state if saved_initial_state.numel() else None
         grad_output = grad_output.contiguous()
 
         grad_final_state = None
         recv_work = None
-        if ctx.cp_rank < ctx.cp_size - 1:
+        if ctx.boundary is None and ctx.cp_rank < ctx.cp_size - 1:
             grad_final_state = torch.empty(
-                (
-                    query.shape[0],
-                    value.shape[2],
-                    query.shape[-1],
-                    value.shape[-1],
-                ),
-                device=query.device,
+                (query.shape[0], value.shape[2], query.shape[-1], value.shape[-1]), device=query.device,
                 dtype=torch.float32,
             )
-            recv_work = dist.irecv(
-                grad_final_state,
-                src=ctx.next_rank,
-                group=ctx.cp_group,
-            )
+            recv_work = dist.irecv(grad_final_state, src=ctx.next_rank, group=ctx.cp_group)
 
         beta = ops.fused_beta_sigmoid(beta_raw)
         gate = ops.kda_gate_chunk_cumsum(
-            g=gate_raw,
-            A_log=a_log,
-            dt_bias=dt_bias,
-            scale=rcp_ln2,
-            chunk_size=ctx.chunk_size,
+            g=gate_raw, A_log=a_log, dt_bias=dt_bias, scale=rcp_ln2, chunk_size=ctx.chunk_size,
             lower_bound=ctx.lower_bound,
         )
         w, u, query_gated, key_gated = ops.recompute_w_u_fwd(
-            q=query,
-            k=key,
-            v=value,
-            beta=beta,
-            A=attention_kk,
-            gk=gate,
+            q=query, k=key, v=value, beta=beta, A=attention_kk, gk=gate,
         )
         states, value_new, _ = ops.chunk_gated_delta_rule_fwd_h(
-            k=key_gated,
-            w=w,
-            u=u,
-            gk=gate,
-            initial_state=initial_state,
-            output_final_state=False,
+            k=key_gated, w=w, u=u, gk=gate, initial_state=initial_state, output_final_state=False,
             chunk_size=ctx.chunk_size,
         )
         grad_attention_qk, grad_value_local = ops.chunk_kda_bwd_dav(
-            q=query,
-            k=key,
-            v=value_new,
-            do=grad_output,
-            A=attention_qk,
-            scale=ctx.scale,
-            chunk_size=ctx.chunk_size,
+            q=query, k=key, v=value_new, do=grad_output, A=attention_qk, scale=ctx.scale, chunk_size=ctx.chunk_size,
         )
         grad_state_ext = None
-        if ctx.cp_rank > 0:
+        if ctx.boundary is not None or ctx.cp_rank > 0:
             grad_state_ext = kda_state_gradient_summary_from_prepared(
-                query_gated,
-                key_gated,
-                w,
-                gate,
-                grad_output,
-                grad_value_local,
-                ctx.scale,
-                chunk_size=ctx.chunk_size,
+                query_gated, key_gated, w, gate, grad_output, grad_value_local, ctx.scale, chunk_size=ctx.chunk_size,
             )
         if recv_work is not None:
             recv_work.wait()
         send_work = None
         send_state_gradient = None
-        if ctx.cp_rank > 0:
-            grad_initial_state = apply_kda_state_gradient_summary(
-                grad_state_ext,
-                transition,
-                grad_final_state,
-            )
+        if ctx.boundary is not None:
+            grad_final_state = ctx.boundary.backward(grad_state_ext, transition)
+        elif ctx.cp_rank > 0:
+            grad_initial_state = apply_kda_state_gradient_summary(grad_state_ext, transition, grad_final_state)
             send_state_gradient = grad_initial_state.contiguous()
-            send_work = dist.isend(
-                send_state_gradient,
-                dst=ctx.prev_rank,
-                group=ctx.cp_group,
-            )
+            send_work = dist.isend(send_state_gradient, dst=ctx.prev_rank, group=ctx.cp_group)
 
         grad_states, _, grad_value = ops.chunk_gated_delta_rule_bwd_dhu(
-            q=query_gated,
-            k=key_gated,
-            w=w,
-            gk=gate,
-            h0=initial_state,
-            dht=grad_final_state,
-            do=grad_output,
-            dv=grad_value_local,
-            scale=ctx.scale,
-            chunk_size=ctx.chunk_size,
+            q=query_gated, k=key_gated, w=w, gk=gate, h0=initial_state, dht=grad_final_state, do=grad_output,
+            dv=grad_value_local, scale=ctx.scale, chunk_size=ctx.chunk_size,
         )
         (
-            grad_query,
-            grad_key,
-            grad_value,
-            grad_beta,
-            grad_gate,
-            grad_attention_kk,
+            grad_query, grad_key, grad_value, grad_beta, grad_gate, grad_attention_kk,
         ) = ops.chunk_kda_bwd_wy_dqkg_fused(
-            q=query,
-            k=key,
-            v=value,
-            v_new=value_new,
-            g=gate,
-            beta=beta,
-            A=attention_kk,
-            h=states,
-            do=grad_output,
-            dh=grad_states,
-            dv=grad_value,
-            scale=ctx.scale,
-            chunk_size=ctx.chunk_size,
+            q=query, k=key, v=value, v_new=value_new, g=gate, beta=beta, A=attention_kk, h=states, do=grad_output,
+            dh=grad_states, dv=grad_value, scale=ctx.scale, chunk_size=ctx.chunk_size,
         )
         grad_query, grad_key, grad_beta, grad_gate = ops.chunk_kda_bwd_intra(
-            q=query,
-            k=key,
-            g=gate,
-            beta=beta,
-            dAqk=grad_attention_qk,
-            dAkk=grad_attention_kk,
-            dq=grad_query,
-            dk=grad_key,
-            db=grad_beta,
-            dg=grad_gate,
-            chunk_size=ctx.chunk_size,
-            safe_gate=ctx.safe_gate,
+            q=query, k=key, g=gate, beta=beta, dAqk=grad_attention_qk, dAkk=grad_attention_kk, dq=grad_query,
+            dk=grad_key, db=grad_beta, dg=grad_gate, chunk_size=ctx.chunk_size, safe_gate=ctx.safe_gate,
         )
 
         num_query_heads = query.shape[2]
@@ -492,17 +396,9 @@ class _KDAStateP2PFunction(torch.autograd.Function):
                 grad_key.shape[-1],
             ).sum(dim=3)
 
-        grad_gate = ops.chunk_local_cumsum(
-            grad_gate,
-            chunk_size=ctx.chunk_size,
-            reverse=True,
-        )
+        grad_gate = ops.chunk_local_cumsum(grad_gate, chunk_size=ctx.chunk_size, reverse=True)
         grad_gate, grad_a_log, grad_dt_bias = ops.kda_gate_bwd(
-            g=gate_raw,
-            A_log=a_log,
-            dt_bias=dt_bias,
-            dyg=grad_gate,
-            lower_bound=ctx.lower_bound,
+            g=gate_raw, A_log=a_log, dt_bias=dt_bias, dyg=grad_gate, lower_bound=ctx.lower_bound,
         )
         grad_beta = ops.fused_beta_sigmoid_bwd(beta_raw, grad_beta)
         grad_query = ops.l2norm_bwd(query, query_rstd, grad_query)
@@ -511,22 +407,8 @@ class _KDAStateP2PFunction(torch.autograd.Function):
             send_work.wait()
 
         return (
-            grad_query,
-            grad_key,
-            grad_value,
-            grad_gate,
-            grad_beta,
-            grad_a_log,
-            grad_dt_bias,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            grad_query, grad_key, grad_value, grad_gate, grad_beta, grad_a_log, grad_dt_bias, None, None, None,
+            None, None, None, None, None, None, None,
         )
 
 
@@ -549,8 +431,32 @@ def fused_chunk_kda_p2p(
     lower_bound: float = -5.0,
     chunk_size: int = 64,
     safe_gate: bool = True,
+    boundary: Any = None,
 ) -> torch.Tensor:
-    """Run one sequence-sharded KDA segment with state P2P."""
+    """Run one sequence-sharded KDA segment with a selected state boundary.
+
+    Args:
+        query: Query input [B,T,H,K].
+        key: Matching key input.
+        value: Value input [B,T,HV,V].
+        gate: Per-token gate logits.
+        beta: Per-token beta logits.
+        a_log: FP32 decay parameter per value head.
+        dt_bias: FP32 gate-channel bias.
+        cp_group: Existing chronological state process group.
+        prev_rank: Global predecessor rank for P2P.
+        next_rank: Global successor rank for P2P.
+        cp_rank: Chronological index within the state group.
+        cp_size: Number of state partitions.
+        scale: Optional attention scale.
+        lower_bound: Lower bound for the activated gate.
+        chunk_size: Tokens per local chunk.
+        safe_gate: Enable the staged safe-gate path.
+        boundary: Optional stateless AG executor; None selects existing P2P.
+
+    Returns:
+        Output tokens in the local sequence layout.
+    """
     _validate_p2p_inputs(
         query,
         key,
@@ -582,6 +488,7 @@ def fused_chunk_kda_p2p(
         next_rank,
         cp_rank,
         cp_size,
+        boundary,
     )
 
 
