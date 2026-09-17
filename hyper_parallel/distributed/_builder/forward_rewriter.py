@@ -687,7 +687,8 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
         # Step 4: PrecompiledBoundary exit (e.g. TP reduce-scatter)
         output = boundary.redistribute_outputs(
             output, as_dtensor_input=validate_mode)
-        # The final boundary exit is always local.
+        # The final boundary exit is always local (when out_plan is empty, the
+        # from_local wrap from Step 3 must also be unwrapped here)
         if isinstance(output, DTensor):
             output = output.to_local()
         # D-22: deferred rowwise biases — added once after the exit reduction
