@@ -1,6 +1,7 @@
 # Push / pull 整合计划与验收
 
-基底：`origin/fix/megamoe-permute-grad-aclnn` (`947b4ed5`)。
+当前基底：`upstream/master` (`02c45634`)，2026-09-17 重新 fetch 后变基。
+首次整合基底为 `origin/fix/megamoe-permute-grad-aclnn` (`947b4ed5`)，其两个提交已线性重放。
 整合分支：`feat/megamoe-push-pull`，独立 worktree。
 原 push 分支 `98e3c833`，原 pull HEAD `706895ba` 及未提交显存改动已另存备份快照。
 
@@ -83,3 +84,39 @@ Qwen 示例使用 `--dispatch-mode push|pull`；模式在模块构造时确定�
 - 附加的三层 shared-workspace 生命周期 ST 曾因 Jenkins 占用卡5而中止；审计停止本轮子进程，
   等待空闲后单独补测通过（`st_lifecycle.log`）。总计6项设备回归通过。
 - 本轮未重跑 EP8、整网端到端性能或 HBM 峰值扫描；这里的真实 shape 结果是 EP4 正确性验收。
+
+## 变基 master 并整合独立功能
+
+变基前备份：`backup/megamoe-push-pull-before-master-20260917` (`a25939f7`)。
+`upstream/master..HEAD` 不包含 merge；master 自身已有的历史保持原样。
+原有四个提交的 `git range-diff` 均为 `=`，补丁内容完整保留。
+
+| 原提交 | 当前提交 | 内容 |
+| --- | --- | --- |
+| `cdaaf178` | `ea0e29b7` | metadata-only ACLNN permutation gradient |
+| `947b4ed5` | `3b337a56` | active-launch ready 故障注入测试 |
+| `616231dc` | `8ade7bb6` | push/pull 通用显存优化 |
+| `a25939f7` | `1b03f88c` | 可切换 push/pull 通信路径 |
+| `e63346d1` | `5cb09343` | 动态专家数和按实际专家数分配 group-list scratch |
+| `c8a44168` | `148bc6a3` | EP subgroup 独立 bootstrap 与流水线 |
+
+后两个功能分别来自 `origin/feat/megamoe-dynamic-experts` 和 `origin/megamoe-cluster`，
+保持为独立提交。cluster 分支的 merge `10fe5454` 没有引入，已包含的 ACLNN 修复没有重复添加。
+冲突解决同时保留动态 scratch、64 字节 profiler/completion header、两条通信路径及 subgroup 语义。
+
+本次证据目录：`build/validation/rebase_master_20260917`。
+CPU 回归通过 139 项测试、613 个子用例；完整 native Release 构建成功。
+设备 4–7 经协作锁和空闲检测后运行，8 项回归全部通过（451.66 秒）：
+
+- PP2 × EP2 的 push/pull × checkpoint 开/关，共4项。EP ranks 为 `[0, 2]` / `[1, 3]`，
+  验证错峰 bootstrap、每 stage 两层共享 workspace、4个 microbatch 的 FIFO 1F1B、
+  输出和全部梯度，以及 group-local 释放。
+- push/pull 的动态专家数各1项；每 rank 专家数为10、11、12、13、16、17、31、32、33、64、128。
+  每个 shape 执行均衡、空专家、偏斜、单目标路由各两轮，输出、全部梯度和 SGD 更新一致。
+- 同进程双模式共存1项，含 profiler 前反向记录、checkpoint、stream 和延迟 backward。
+- pull 小 heap 热点1项，验证固定 source heap 下的热点切换和所有梯度。
+
+本次运行未出现外部设备占用；实际导入路径已核对为当前 worktree。
+设备证据记录产品提交 `148bc6a3`、测试源码与 native 文件哈希；测试扩展另作后续独立提交。
+pylint、lizard、修改的 C++ runtime header 格式、Markdown、launcher 导入隔离及 AGENTS 目录检查通过。
+本轮未重跑整网性能或 HBM 峰值扫描。

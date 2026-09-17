@@ -101,6 +101,7 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor, name: str) -> No
 
 def _run_pipeline(use_checkpoint: bool) -> None:
     """Run warmup, FIFO 1F1B, cooldown and group-local teardown with shared resources."""
+    dispatch_mode = os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
     device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
     torch.npu.set_device(device)
     if not dist.is_initialized():
@@ -118,7 +119,7 @@ def _run_pipeline(use_checkpoint: bool) -> None:
     layers = [
         MegaMoeExperts(
             local_num_tokens=_TOKENS, hidden_size=_HIDDEN, intermediate_size=_INTERMEDIATE,
-            num_experts=_EXPERTS, top_k=_TOP_K, ep_size=2, ep_group=ep_group,
+            num_experts=_EXPERTS, top_k=_TOP_K, ep_size=2, ep_group=ep_group, dispatch_mode=dispatch_mode,
         ).to(device=device, dtype=torch.bfloat16)
         for _ in range(_LAYERS)
     ]
@@ -131,6 +132,7 @@ def _run_pipeline(use_checkpoint: bool) -> None:
     pending = {}
 
     def forward(batch: int, value: torch.Tensor) -> torch.Tensor:
+        """Save one microbatch graph and check its stage output."""
         x = value.detach().clone().requires_grad_()
         local_input, probabilities = x, []
         for index, layer in enumerate(layers):
@@ -147,6 +149,7 @@ def _run_pipeline(use_checkpoint: bool) -> None:
         return x
 
     def backward(batch: int, gradient: torch.Tensor) -> torch.Tensor:
+        """Consume the oldest graph and compare input and routing gradients."""
         value, output, probabilities = pending.pop(batch)
         output.backward(gradient)
         _assert_close(value.grad, expected_dx[batch][stage][rows], f"dX batch={batch}")
@@ -155,6 +158,7 @@ def _run_pipeline(use_checkpoint: bool) -> None:
         return value.grad
 
     def exchange(send: torch.Tensor, receive: torch.Tensor) -> None:
+        """Exchange stage activations and gradients without blocking launch order."""
         # Batch both directions so HCCL P2P launch order cannot deadlock the steady-state pair.
         requests = dist.batch_isend_irecv([
             dist.P2POp(dist.isend, send.detach().contiguous(), peer, pp_group),
@@ -193,7 +197,8 @@ def _run_pipeline(use_checkpoint: bool) -> None:
     assert shmem.debug_state()["reference_count"] == 0
     write_evidence({
         "rank": rank, "stage": stage, "ep_ranks": dist.get_process_group_ranks(ep_group),
-        "checkpoint": use_checkpoint, "microbatches": _MICROBATCHES, "shared_layers": _LAYERS,
+        "dispatch_mode": dispatch_mode, "checkpoint": use_checkpoint,
+        "microbatches": _MICROBATCHES, "shared_layers": _LAYERS,
         "outputs_and_all_gradients_match": True,
     })
     dist.destroy_process_group()

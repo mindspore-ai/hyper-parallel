@@ -14,6 +14,7 @@
 # ============================================================================
 """Execute large task graphs and expert counts with isolated runtime scratch."""
 
+import os
 import struct
 from dataclasses import asdict
 
@@ -74,12 +75,13 @@ def test_mega_moe_large_runtime() -> None:
 def test_mega_moe_group_list_isolation() -> None:
     """Compare repeated routes across dynamic per-worker group-list boundaries."""
     start_shmem_lifetime()
+    dispatch_mode = os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
     records = []
     patterns = ("balanced", "zero_token_experts", "skew", "single_destination") * 2
     for local_experts in (10, 11, 12, 13, 16, 17, 31, 32, 33, 64, 128):
         shape = baseline.MoeShape(local_num_tokens=128 * local_experts, num_experts=2 * local_experts)
         hidden, upstream = baseline.make_data(shape)
-        mega, common = baseline.new_layers(shape)
+        mega, common = baseline.new_layers(shape, dispatch_mode=dispatch_mode)
         try:
             for pattern in patterns:
                 ids, weights, counts = baseline._make_fixed_route(shape, pattern)  # pylint: disable=protected-access
@@ -90,4 +92,4 @@ def test_mega_moe_group_list_isolation() -> None:
                             "all_outputs_gradients_updates_match": True})
         finally:
             mega.close()
-    write_evidence({"cases": records, "memory": memory_sample()})
+    write_evidence({"dispatch_mode": dispatch_mode, "cases": records, "memory": memory_sample()})
