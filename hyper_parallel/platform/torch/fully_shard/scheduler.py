@@ -194,11 +194,17 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             comm_ctx.all_reduce_param_group = None
 
     def _finalize_per_param_reductions(self) -> None:
-        """Drain the module-tree-local comm_fusion=False RS/AR queues."""
-        # A fused root may own non-fused children, so always drain the tree queues.
-        last_all_reduce_groups = self.hsdp_state._wait_prev_reduce_scatter()
-        self.hsdp_state._wait_prev_reduce_scatter_without_all_reduce()
-        self.hsdp_state._issue_prev_fused_all_reduce(last_all_reduce_groups)
+        """Drain every residual non-fused RS unit before applying gradients."""
+        while self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params:
+            reduce_scatter_params = (
+                self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params.popleft()
+            )
+            all_reduce_groups = self.scheduler_ctx.per_param_comm_ctx.pre_all_reduce_groups.popleft()
+            self.hsdp_state._wait_prev_reduce_scatter(all_reduce_groups)
+            self.hsdp_state._wait_prev_reduce_scatter_without_all_reduce(
+                reduce_scatter_params
+            )
+            self.hsdp_state._issue_prev_fused_all_reduce(all_reduce_groups)
         self.hsdp_state.wait_and_split_all_reduce_work_groups()
 
     def launch_tp_replicate_reduce_and_apply(self) -> None:

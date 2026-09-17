@@ -125,6 +125,110 @@ class TestMixedPrecisionPolicy(unittest.TestCase):
         self.assertEqual(policy.output_dtype, torch.float16)
 
 
+class TestMixedPrecisionPolicyCustomParams(unittest.TestCase):
+    """Unit tests for the per-parameter overrides carried by custom_params."""
+
+    def setUp(self):
+        """Set up test fixtures before each test method."""
+        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+        self.high_precision_param = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
+        self.other_param = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
+
+    def test_unset_custom_params_falls_back_to_module_pair(self):
+        """Without custom_params every parameter uses the module-level dtypes.
+
+        description: Resolve dtypes on a policy that has no per-parameter overrides.
+        expectation: The module-level (param_dtype, reduce_dtype) pair is returned.
+        feature: MixedPrecisionPolicy.get_param_dtypes fallback.
+        """
+        # Arrange
+        policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+
+        # Act
+        resolved = policy.get_param_dtypes(self.high_precision_param)
+
+        # Assert
+        self.assertEqual(resolved, (torch.bfloat16, torch.float32))
+
+    def test_unlisted_param_falls_back_to_module_pair(self):
+        """A parameter absent from custom_params keeps the module-level dtypes.
+
+        description: Resolve a parameter that is not a key of custom_params.
+        expectation: The module-level pair is returned for the unlisted parameter.
+        feature: MixedPrecisionPolicy per-parameter override lookup.
+        """
+        # Arrange
+        policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            custom_params={self.high_precision_param: (torch.float32, torch.float32)},
+        )
+
+        # Act
+        resolved = policy.get_param_dtypes(self.other_param)
+
+        # Assert
+        self.assertEqual(resolved, (torch.bfloat16, torch.float32))
+
+    def test_listed_param_uses_its_override(self):
+        """A listed parameter resolves to its own dtype pair.
+
+        description: Resolve a parameter that carries an explicit override.
+        expectation: The override wins over the module-level pair.
+        feature: MixedPrecisionPolicy per-parameter override lookup.
+        """
+        # Arrange
+        policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            custom_params={self.high_precision_param: (torch.float32, torch.float32)},
+        )
+
+        # Act
+        resolved = policy.get_param_dtypes(self.high_precision_param)
+
+        # Assert
+        self.assertEqual(resolved, (torch.float32, torch.float32))
+
+    def test_override_may_disable_casting_with_none(self):
+        """None inside an override means "keep the parameter's own dtype".
+
+        description: Resolve an override whose entries are None.
+        expectation: None is returned unchanged rather than replaced by the module pair.
+        feature: MixedPrecisionPolicy per-parameter override lookup.
+        """
+        # Arrange
+        policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            custom_params={self.high_precision_param: (None, None)},
+        )
+
+        # Act
+        resolved = policy.get_param_dtypes(self.high_precision_param)
+
+        # Assert
+        self.assertEqual(resolved, (None, None))
+
+    def test_malformed_override_is_rejected(self):
+        """A malformed override is reported instead of being silently accepted.
+
+        description: Resolve an override that is not a two-element tuple.
+        expectation: ValueError naming the expected tuple shape.
+        feature: MixedPrecisionPolicy custom_params validation.
+        """
+        # Arrange
+        policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            custom_params={self.high_precision_param: torch.float32},
+        )
+
+        # Act / Assert
+        with self.assertRaises(ValueError):
+            policy.get_param_dtypes(self.high_precision_param)
+
+
 class TestOffloadPolicy(unittest.TestCase):
     """Unit tests for OffloadPolicy (base offload policy, no device-specific options)."""
 

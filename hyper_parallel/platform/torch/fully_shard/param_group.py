@@ -618,7 +618,7 @@ class HSDPParamGroup:
             else:
                 continue
             shard_group = (
-                hsdp_param.mesh_info.shard_process_group
+                hsdp_param.mesh_info.reduce_scatter_process_group
                 if isinstance(hsdp_param.mesh_info, FSDPMeshInfo)
                 else None
             )

@@ -14,7 +14,7 @@
 # ============================================================================
 """Common policy and mesh metadata for fully_shard APIs."""
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from hyper_parallel.collectives.cc import get_group_local_rank
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
@@ -36,12 +36,40 @@ class MixedPrecisionPolicy:
         param_dtype: Data type for parameter computation. If None, uses original dtype.
         reduce_dtype: Data type for gradient reduction. If None, uses param_dtype.
         output_dtype: Data type for module outputs. If None, no casting applied.
+        cast_forward_inputs: Whether to cast floating-point forward inputs to ``param_dtype``.
+        apply_grad_on_fp32_main_grad: Whether to accumulate reduced gradients into an
+            FP32 main_grad buffer.
+        custom_params: Per-parameter overrides, mapping a parameter to its
+            ``(param_dtype, reduce_dtype)`` pair. An override wins over
+            ``param_dtype`` / ``reduce_dtype`` for that parameter only, which keeps
+            a high-precision parameter inside its existing FSDP unit instead of
+            forcing it into a separate one. Casting of inputs and outputs stays a
+            module-level decision.
     """
     param_dtype: Optional[DType] = None
     reduce_dtype: Optional[DType] = None
     output_dtype: Optional[DType] = None
     cast_forward_inputs: bool = True
     apply_grad_on_fp32_main_grad: bool = False
+    custom_params: Optional[dict[platform.Parameter, tuple[Optional[DType], Optional[DType]]]] = None
+
+    def get_param_dtypes(self, param: platform.Parameter) -> tuple[Optional[DType], Optional[DType]]:
+        """Return the ``(param_dtype, reduce_dtype)`` pair that applies to ``param``.
+
+        Falls back to the module-level pair when ``param`` has no override.
+
+        Raises:
+            ValueError: If the stored override is not a two-element tuple.
+        """
+        if self.custom_params is None or param not in self.custom_params:
+            return self.param_dtype, self.reduce_dtype
+        custom_dtypes = self.custom_params[param]
+        if not isinstance(custom_dtypes, tuple) or len(custom_dtypes) != 2:
+            raise ValueError(
+                "MixedPrecisionPolicy custom_params values must be "
+                "(param_dtype, reduce_dtype) tuples."
+            )
+        return custom_dtypes
 
 
 @dataclass
@@ -91,12 +119,16 @@ class DataParallelMeshInfo:
 
 @dataclass
 class FSDPMeshInfo(DataParallelMeshInfo):
+    reduce_scatter_process_group: Optional[Any] = None
+
     def __post_init__(self):
         super().__post_init__()
         if self.shard_mesh_dim is None:
             raise AssertionError("Expects non-None shard_mesh_dim")
         self.shard_mesh_size: int = self.mesh.mesh_shape[self.shard_mesh_dim]
         self.shard_process_group = self.mesh.get_group(self.shard_mesh_dim)
+        if self.reduce_scatter_process_group is None:
+            self.reduce_scatter_process_group = self.shard_process_group
         self.shard_mesh_rank: int = get_group_local_rank(self.shard_process_group)
 
 

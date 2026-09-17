@@ -154,6 +154,12 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.orig_dtype = None
         self.param_dtype = None
         self.reduce_dtype = None
+        # Resolved here rather than in ``init_dtype_attrs``: the policy keys
+        # ``custom_params`` by the original parameter, and that object is replaced
+        # on the owning module by the sharded parameter later in this constructor.
+        self._policy_dtypes: Optional[tuple] = None
+        if mp_policy is not None and param in (mp_policy.custom_params or {}):
+            self._policy_dtypes = mp_policy.get_param_dtypes(param)
         self.offload_to_cpu: bool = isinstance(offload_policy, CPUOffloadPolicy)
         self.pin_memory = (
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
@@ -649,8 +655,16 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.reduce_dtype = None
 
     def init_dtype_attrs(self, mp_policy: MixedPrecisionPolicy) -> None:
-        """Initialize param_dtype and reduce_dtype from the mixed precision policy."""
-        param_dtype, reduce_dtype = (mp_policy.param_dtype, mp_policy.reduce_dtype)
+        """Initialize param_dtype and reduce_dtype from the mixed precision policy.
+
+        A per-parameter override captured at construction wins over the policy's
+        module-level pair. Both are read from ``mp_policy``, so callers must pass
+        the same policy the parameter was constructed with; the state does.
+        """
+        if self._policy_dtypes is None:
+            param_dtype, reduce_dtype = (mp_policy.param_dtype, mp_policy.reduce_dtype)
+        else:
+            param_dtype, reduce_dtype = self._policy_dtypes
         self.orig_dtype = self.sharded_param.dtype
         if reduce_dtype == param_dtype:
             reduce_dtype = None
@@ -777,17 +791,18 @@ class TorchHSDPParamV2(HSDPParamV2):
         """
         Converts a local tensor representing either the sharded parameter or
         sharded gradient to DTensor.
+
+        The parameter-owned sharding specification already contains the
+        logical shape, stride, dtype, and placements. Reusing it avoids the
+        metadata deepcopy performed by ``DTensor.from_local`` when explicit
+        shape and stride are supplied. The returned DTensor intentionally
+        shares this layout with the sharded parameter.
         """
-        sharded_dtensor = DTensor.from_local(
+        return DTensor.from_local_with_layout(
             tensor,
-            self._sharding_spec.mesh,
-            self._sharding_spec.placements,
+            self._sharding_spec,
             shape=self._sharding_spec.tensor_shape,
-            stride=self._sharding_spec.tensor_stride,
         )
-        sharded_dtensor._layout = self._sharding_spec
-        sharded_dtensor._placements = tuple(self._sharding_spec.placements)
-        return sharded_dtensor
 
     def to_accumulated_grad_if_needed(self) -> None:
         if self._unsharded_param.grad is None:
@@ -1135,7 +1150,11 @@ class TorchHSDPParamV2(HSDPParamV2):
             self._grad = self._grad.view(-1)
         apply_gradient_scaling_factor(self._grad, self.gradient_scaling_factor)
 
-        shard_process_group = self.mesh_info.shard_process_group if isinstance(self.mesh_info, FSDPMeshInfo) else None
+        shard_process_group = (
+            self.mesh_info.reduce_scatter_process_group
+            if isinstance(self.mesh_info, FSDPMeshInfo)
+            else None
+        )
         if shard_process_group is None or self.shard_world_size <= 1:
             if output_buffer is not None:
                 output_buffer.copy_(self._grad)

@@ -529,6 +529,7 @@ class TestCoreScheduler(unittest.TestCase):
         root_module.hsdp_scheduler = scheduler
         scheduler.cell = root_module
         scheduler.modules = [root_module]
+        scheduler.scheduler_ctx.per_param_comm_ctx.reduce_interval = 4
         child_ctx = HSDPSchedulerContext()
         child_state = SimpleNamespace(
             scheduler_ctx=child_ctx,
@@ -559,6 +560,7 @@ class TestCoreScheduler(unittest.TestCase):
         self.assertIs(child_scheduler.scheduler_ctx, scheduler.scheduler_ctx)
         self.assertIs(child_state.scheduler_ctx, scheduler.scheduler_ctx)
         self.assertIs(child_state.param_group.comm_ctx, scheduler.scheduler_ctx.param_group_comm_ctx)
+        self.assertEqual(child_scheduler.scheduler_ctx.per_param_comm_ctx.reduce_interval, 4)
         self.assertEqual(scheduler.scheduler_ctx.all_hsdp_schedulers, [scheduler, child_scheduler])
         self.assertEqual(scheduler.hsdp_state.module_name, "")
         self.assertEqual(child_state.module_name, "layer")

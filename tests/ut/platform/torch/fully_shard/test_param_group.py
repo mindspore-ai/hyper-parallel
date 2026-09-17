@@ -97,6 +97,8 @@ def _fake_param(
     sharded_param = _local_param(local_tensor.clone(), requires_grad)
     hsdp_param = MagicMock()
     hsdp_param.mesh_info = mesh_info or _mesh_info()
+    if isinstance(hsdp_param.mesh_info, FSDPMeshInfo):
+        hsdp_param.mesh_info.reduce_scatter_process_group = hsdp_param.mesh_info.shard_process_group
     hsdp_param.shard_world_size = (
         hsdp_param.mesh_info.shard_mesh_size
         if isinstance(hsdp_param.mesh_info, FSDPMeshInfo)
@@ -267,6 +269,22 @@ class TestAllGatherBuckets(unittest.TestCase):
         self.assertEqual(param_group.all_gather_buckets, [])
         hsdp_param.unshard.assert_called_once_with(True)
         hsdp_param.wait_for_unshard.assert_called_once_with()
+
+    def test_separated_group_changes_only_reduce_scatter_buckets(self):
+        """Fusion keeps AG on the original group and buckets RS by its selected group."""
+        original, separate = _FakeGroup(), _FakeGroup()
+        param_a = _fake_param([1.0, 2.0], mesh_info=_mesh_info(shard_group=original))
+        param_b = _fake_param([3.0, 4.0], mesh_info=_mesh_info(shard_group=original))
+        for param in (param_a, param_b):
+            param.mesh_info.reduce_scatter_process_group = separate
+            _set_unsharded_grad(param, torch.arange(4, dtype=torch.float32))
+        group = HSDPParamGroup([param_a, param_b], device=torch.device("cpu"))
+        group._init_all_gather_buckets()
+        buckets = group._build_reduce_scatter_buckets(dist.ReduceOp.SUM)
+        self.assertEqual(len(group.all_gather_buckets), 1)
+        self.assertIs(group.all_gather_buckets[0].shard_group, original)
+        self.assertEqual(len(buckets), 1)
+        self.assertIs(buckets[0].shard_group, separate)
 
     def test_flat_param_buffer_rebases_homogeneous_storage(self):
         """Zero-copy all-gather should rebase homogeneous parameter storage."""

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """hybrid shard data parallel interface"""
+import warnings
 from collections import namedtuple
 from typing import Any, List, Mapping, cast, Optional, Union
 
@@ -217,6 +218,46 @@ class HSDPModule:
             raise ValueError("call fully_shard interface first.")
         self.hsdp_scheduler.set_backward_prefetch_cells(modules)
 
+    def set_separated_shard_comm(self, enable_separated: bool = False) -> None:
+        """Use a separate shard communicator for ReduceScatter operations.
+
+        AllGather remains on the original shard communicator.  This can improve
+        overlap between forward parameter fetches and backward gradient
+        reductions at the cost of additional HCCL communicator buffers.
+        Applies recursively to already wrapped descendants. Call on all ranks
+        in a consistent module order before the first forward or manual unshard.
+        Overlapping shard groups must be configured in the same global order.
+
+        Args:
+            enable_separated: Enable a dedicated ReduceScatter group; defaults
+                to False. Disabling restores the original route but retains
+                created groups for reuse until process-group teardown.
+
+        Raises:
+            ValueError: If the argument is not bool, fully_shard has not run,
+                or a managed unit has already started execution.
+            NotImplementedError: If the backend is not PyTorch.
+        """
+        if not isinstance(enable_separated, bool):
+            raise ValueError("enable_separated must be bool")
+        if platform.platform_type != PlatformType.PYTORCH:
+            raise NotImplementedError("separated shard communication is only supported on PyTorch")
+        if self.hsdp_scheduler is None:
+            raise ValueError("call hsdp interface first")
+        states = []
+        seen = set()
+        for _, module in platform.get_cells_and_names(self):
+            if isinstance(module, HSDPModule) and module.hsdp_scheduler is not None:
+                scheduler = module.hsdp_scheduler
+                if id(scheduler) in seen:
+                    continue
+                seen.add(id(scheduler))
+                if scheduler.scheduler_ctx.lazy_init_done or not scheduler.hsdp_state.is_shard:
+                    raise ValueError("set separated shard communication before the first forward or unshard")
+                states.append(scheduler.hsdp_state)
+        for state in states:
+            state.set_separated_shard_comm(enable_separated)
+
     def reshard(self) -> None:
         """reshard all sharded parameters"""
         if not self.hsdp_scheduler:
@@ -318,6 +359,55 @@ class HSDPModule:
     def set_is_last_backward(self, is_last_backward: bool):
         """set is_last_backward flag"""
         self.hsdp_scheduler.scheduler_ctx.is_last_backward = is_last_backward
+
+    def set_reduce_comm_interval(self, interval: int = 1) -> None:
+        """Configure how many subsequent HSDP units may overlap reduce-scatter.
+
+        The configuration belongs to the root module's scheduler context and
+        therefore applies to the entire HSDP module tree. Only non-fused HSDP
+        units count toward the interval. An interval of one preserves the
+        default behavior: a unit's reduce-scatter is waited after the next unit
+        finishes backward computation. Larger values retain more communication
+        inputs, outputs, and gradients on the device until that many subsequent
+        units have completed backward.
+
+        Configure the root module before its first forward. This method only
+        updates configuration and does not wait in-flight work. The root
+        backward hook drains intervals larger than the module-tree depth before
+        reduced gradients are applied.
+
+        Args:
+            interval: Number of subsequent HSDP units between reduce-scatter
+                waits. Must be a positive integer.
+
+        Raises:
+            NotImplementedError: If the active platform is not PyTorch.
+            ValueError: If ``interval`` is not a positive integer or the module
+                has not been initialized by ``fully_shard``, or if the root
+                module has already started its first forward.
+
+        Note:
+            Intervals greater than one do not support communication fusion. If
+            ``comm_fusion=True``, a warning is emitted and the interval remains
+            forced to one so fused communication keeps its single-work lifecycle.
+        """
+        if platform.platform_type != PlatformType.PYTORCH:
+            raise NotImplementedError("set_reduce_comm_interval is only supported on PyTorch")
+        if isinstance(interval, bool) or not isinstance(interval, int) or interval < 1:
+            raise ValueError(f"interval must be a positive int, but got {interval!r}.")
+        if self.hsdp_scheduler is None:
+            raise ValueError("call fully_shard before setting reduce communication interval")
+        if self.hsdp_scheduler.scheduler_ctx.lazy_init_done:
+            raise ValueError("set reduce communication interval before the root module's first forward")
+        if self.hsdp_scheduler.comm_fusion_policy.enable_comm_fusion and interval > 1:
+            warnings.warn(
+                "reduce communication intervals greater than one are not supported when "
+                "comm_fusion=True; using interval=1.",
+                UserWarning,
+                stacklevel=2,
+            )
+            interval = 1
+        self.hsdp_scheduler.scheduler_ctx.per_param_comm_ctx.reduce_interval = interval
 
     def reset_iter_state(self, recursive: bool = True) -> None:
         """Reset fully_shard iteration bookkeeping without clearing optimizer gradients.
