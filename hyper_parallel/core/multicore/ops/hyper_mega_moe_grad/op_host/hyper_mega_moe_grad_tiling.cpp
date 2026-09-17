@@ -23,6 +23,9 @@ namespace optiling {
 const uint64_t BLOCK_SIZE = 32;
 const uint64_t BUFFER_NUM = 2;
 constexpr int64_t MAX_EXPERT_NUM_PER_RANK = 16;
+constexpr int64_t MIN_RUNTIME_CONFIG_BYTES = 64;
+constexpr int64_t MAX_RUNTIME_CONFIG_BYTES_EXCLUSIVE = int64_t{1} << 32;
+constexpr int64_t MIN_EVENT_COUNTER_BYTES = 4096;
 static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   OP_CHECK_NULL_WITH_CONTEXT(context, context);
   auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
@@ -32,8 +35,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     return ge::GRAPH_FAILED;
   }
   context->SetBlockDim(coreNum);
-  // OP_LOGE(context->GetNodeName(), "coreNum:%d", coreNum);
-
   auto input0Desc = context->GetInputDesc(0);
   OP_CHECK_NULL_WITH_CONTEXT(context, input0Desc);
   ge::DataType input0DType = input0Desc->GetDataType();
@@ -93,7 +94,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   OP_CHECK_NULL_WITH_CONTEXT(context, eventShape);
   int64_t runtimeBytes = runtimeShape->GetStorageShape().GetShapeSize();
   int64_t eventBytes = eventShape->GetStorageShape().GetShapeSize();
-  if (runtimeBytes < 64 || runtimeBytes >= (1LL << 32) || eventBytes < 4096) {
+  if (runtimeBytes < MIN_RUNTIME_CONFIG_BYTES || runtimeBytes >= MAX_RUNTIME_CONFIG_BYTES_EXCLUSIVE ||
+      eventBytes < MIN_EVENT_COUNTER_BYTES) {
     OP_LOGE(context->GetNodeName(), "Invalid runtime/event byte lengths: %ld/%ld.", runtimeBytes, eventBytes);
     return ge::GRAPH_FAILED;
   }

@@ -23,6 +23,8 @@
 
 namespace hyper_parallel::multicore::shmem::data_plane {
 
+inline constexpr uint64_t kMinimumRebalancedChunkCount = 2;
+
 /** @brief Consumer-selected limits for splitting one byte message into transfer Chunks. */
 struct ChunkPolicy {
   uint32_t max_chunk_bytes;
@@ -73,8 +75,9 @@ HP_SHMEM_CHUNKING_HOST_DEVICE ChunkPlan make_chunk_plan(uint64_t total_bytes, Ch
  */
 HP_SHMEM_CHUNKING_HOST_DEVICE TransferChunk get_chunk(const ChunkPlan &plan, uint64_t chunk_index) {
   const uint64_t tail_bytes = plan.total_bytes % plan.policy.max_chunk_bytes;
-  const bool rebalance_tail = plan.chunk_count >= 2 && tail_bytes != 0 && tail_bytes < plan.policy.minimum_tail_bytes;
-  if (rebalance_tail && chunk_index == plan.chunk_count - 2) {
+  const bool rebalance_tail = plan.chunk_count >= kMinimumRebalancedChunkCount && tail_bytes != 0 &&
+                              tail_bytes < plan.policy.minimum_tail_bytes;
+  if (rebalance_tail && chunk_index == plan.chunk_count - kMinimumRebalancedChunkCount) {
     return {chunk_index * plan.policy.max_chunk_bytes, plan.policy.max_chunk_bytes - plan.policy.minimum_tail_bytes};
   }
   if (rebalance_tail && chunk_index == plan.chunk_count - 1) {

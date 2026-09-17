@@ -11,7 +11,6 @@
 #include "cann/host.h"
 
 #include <algorithm>
-#include <cstring>
 #include <iterator>
 #include <string>
 #include <string_view>
@@ -94,9 +93,8 @@ runtime::Result<DeviceModel> NormalizeDeviceModel(const char *soc_name) {
 }
 
 runtime::Result<data_op_engine_type_t> DataEngineMask(runtime::DataEngine data_engine) {
-  switch (data_engine) {
-    case runtime::DataEngine::Mte:
-      return runtime::Result<data_op_engine_type_t>::Success(ACLSHMEM_DATA_OP_MTE);
+  if (data_engine == runtime::DataEngine::Mte) {
+    return runtime::Result<data_op_engine_type_t>::Success(ACLSHMEM_DATA_OP_MTE);
   }
   return runtime::Result<data_op_engine_type_t>::Failure(
     InvalidArgument("data_engine must be a supported Runtime DataEngine value"));
@@ -153,8 +151,8 @@ runtime::Status initialize(const InitOptions &options) {
   aclshmemx_init_attr_t attributes{};
   attributes.my_pe = options.root_rank;
   attributes.n_pes = options.root_size;
-  std::memcpy(attributes.ip_port, options.effective_bootstrap_endpoint.data(),
-              options.effective_bootstrap_endpoint.size());
+  std::copy_n(options.effective_bootstrap_endpoint.data(), options.effective_bootstrap_endpoint.size(),
+              attributes.ip_port);
   attributes.ip_port[options.effective_bootstrap_endpoint.size()] = '\0';
   attributes.local_mem_size = options.heap_size_bytes;
   attributes.option_attr.version = kInitOptionalAttrVersion;

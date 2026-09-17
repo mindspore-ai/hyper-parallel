@@ -16,6 +16,11 @@
 
 from __future__ import annotations
 
+__all__ = [
+    "_load_native",
+    "_torch_modules",
+]
+
 import importlib
 from typing import Any, Final
 
@@ -41,9 +46,3 @@ def _torch_modules() -> tuple[Any, Any]:
     import torch.distributed as dist  # pylint: disable=C0415
 
     return torch, dist
-
-
-__all__ = [
-    "_load_native",
-    "_torch_modules",
-]

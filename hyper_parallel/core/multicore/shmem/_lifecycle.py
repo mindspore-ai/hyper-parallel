@@ -16,6 +16,11 @@
 
 from __future__ import annotations
 
+__all__ = [
+    "acquire",
+    "release",
+]
+
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -70,13 +75,13 @@ def _describe_root(root_group: Any, dist: Any) -> tuple[int, int]:
 def acquire(root_group: ProcessGroup | None = None) -> None:
     """Acquire one reference to the Root-only process SHMEM Runtime.
 
-    The first reference initializes the Native Runtime. Later references with the same ordered complete Torch WORLD
+    The first reference initializes the Native Runtime. Later references with the same ordered complete process world
     share it. Every successful call must be paired with one :func:`release` call after the consumer has stopped using
     SHMEM and freed its Allocations.
 
     Args:
-        root_group: A ProcessGroup covering the complete Torch WORLD in global-rank order. ``None`` selects WORLD
-            when Torch distributed is initialized, or a one-PE Root otherwise.
+        root_group: A ProcessGroup covering the complete process world in global-rank order. ``None`` selects WORLD
+            when distributed communication is initialized, or a one-PE Root otherwise.
 
     Raises:
         RuntimeError: If the Root identity or framework state differs from the active lifecycle, or a previous Native
@@ -101,7 +106,9 @@ def acquire(root_group: ProcessGroup | None = None) -> None:
             if uses_distributed != _root_uses_distributed:
                 raise RuntimeError("torch.distributed state changed during the active SHMEM Runtime lifecycle")
             if uses_distributed and selected_group is not _root_group:
-                _describe_root(selected_group, dist)
+                _, selected_root_size = _describe_root(selected_group, dist)
+                if selected_root_size != _root_size:
+                    raise RuntimeError("SHMEM Root Group size changed during the active lifecycle")
             _users += 1
             return
 
@@ -150,19 +157,12 @@ def release() -> None:
         if _root_uses_distributed:
             dist.barrier(group=_root_group)
 
-        shutdown_succeeded = False
+        _shutdown_failed = True
         try:
             native._shutdown()  # pylint: disable=protected-access
-            shutdown_succeeded = True
         finally:
             _users = 0
             _root_group = None
             _root_uses_distributed = None
             _root_size = None
-            _shutdown_failed = not shutdown_succeeded
-
-
-__all__ = [
-    "acquire",
-    "release",
-]
+        _shutdown_failed = False

@@ -15,6 +15,8 @@
 #include "aclnn/aclnn_base.h"
 #include "aclnn_util.h"
 
+namespace hyper_parallel::multicore {
+
 template <typename T>
 struct HyperMegaMoeGradParamsBase {
   const T *hidden = nullptr;
@@ -23,6 +25,8 @@ struct HyperMegaMoeGradParamsBase {
   const T *weight = nullptr;  // w2
 };
 using HyperMegaMoeGradParams = HyperMegaMoeGradParamsBase<aclTensor>;
+
+}  // namespace hyper_parallel::multicore
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,10 +51,8 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
   int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, uint64_t *workspaceSize,
   aclOpExecutor **executor);
 
-/**
- */
 ACLNN_API aclnnStatus aclnnHyperMegaMoeGrad(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
-                                               aclrtStream stream);
+                                            aclrtStream stream);
 
 #ifdef __cplusplus
 }
