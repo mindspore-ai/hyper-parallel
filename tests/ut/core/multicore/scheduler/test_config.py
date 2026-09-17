@@ -29,6 +29,8 @@ from hyper_parallel.core.multicore.scheduler.config import (
 )
 from hyper_parallel.core.multicore.scheduler.runtime import allocate_runtime_config
 
+from tests.common.mark_utils import arg_mark
+
 
 class TestTaskSplitValue(unittest.TestCase):
     """Validate scheduler topology before runtime-config serialization."""
@@ -126,8 +128,14 @@ class TestValidateRuntimeConfig(unittest.TestCase):
 class TestReadyHandshakeConfig(unittest.TestCase):
     """Keep ready state inside the single graph-sized runtime contract."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_ready_event_uses_expanded_counter_capacity(self) -> None:
-        """Reserve the ready event and its atomic lanes beyond event 1024."""
+        """Feature: ready event uses expanded counter capacity.
+
+        Description: Configure ready events for 1024 experts distributed over 64 ranks.
+        Expectation: Reserve the ready event and its atomic lanes beyond event 1024.
+        """
         values = TaskSplitValue(tp=1, ep=64, seq_size=128, all_expert_num=1024, top_k=2)
         config = allocate_runtime_config(16, mega_moe_event_capacity(1024, 64))
         configure_ready_handshake(config, values)
@@ -135,7 +143,7 @@ class TestReadyHandshakeConfig(unittest.TestCase):
         self.assertEqual(rebuilt.ready_event, values.all_event_num + 3)
         self.assertGreater(rebuilt.ready_event, 1024)
         self.assertEqual(rebuilt.all_event_num_triggers[rebuilt.ready_event], 1)
-        self.assertEqual(event_workspace_bytes(64, 1024), 1088 * 4 + 65 * 64)
+        self.assertEqual(event_workspace_bytes(64, 1024), 1104 * 4 + 2 * 65 * 64)
         with self.assertRaisesRegex(ValueError, "event_capacity"):
             configure_ready_handshake(allocate_runtime_config(16), values)
 

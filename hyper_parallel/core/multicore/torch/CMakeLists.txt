@@ -83,7 +83,8 @@ add_library(hyper_parallel_mega_moe_torch SHARED
     csrc/registration.cpp
     csrc/mega_moe.cpp
     csrc/mega_moe_grad.cpp
-    csrc/moe_token_permute_grad.cpp)
+    csrc/moe_token_permute_grad.cpp
+    csrc/mega_moe_unpermute.cpp)
 target_compile_definitions(hyper_parallel_mega_moe_torch PRIVATE
     _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI})
 target_include_directories(hyper_parallel_mega_moe_torch PRIVATE

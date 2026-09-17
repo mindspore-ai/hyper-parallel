@@ -55,9 +55,7 @@ extern "C" uint32_t group_list_offset(uint8_t *image, uint32_t worker_id) {
   return getGroupedMatmulGroupListOffsetById(image, worker_id);
 }
 
-extern "C" void read_task(uint8_t *image, uint32_t index, TaskDesc *result) {
-  getTaskDesc(image, result, index);
-}
+extern "C" void read_task(uint8_t *image, uint32_t index, TaskDesc *result) { getTaskDesc(image, result, index); }
 
 extern "C" void read_layout(uint8_t *image, uint32_t *result) {
   result[0] = getAllEventNumTriggersOffset();
@@ -72,4 +70,14 @@ extern "C" void read_layout(uint8_t *image, uint32_t *result) {
   result[9] = getAtomicAddValuesOffset(image);
   result[10] = getRuntimeTaskCapacity(image);
   result[11] = getRuntimeEventCapacity(image);
+}
+
+extern "C" void read_protocol_profile(uint8_t *image, uint32_t *result) {
+  ReadyHandshakeMeta meta;
+  getReadyHandshakeMeta(image, &meta);
+  result[0] = meta.ready_event;
+  result[1] = meta.completion_event;
+  result[2] = isCycleProfileEnabled(image);
+  result[3] = getAicProfileRecordCapacity(image);
+  result[4] = getAivProfileRecordCapacity(image);
 }

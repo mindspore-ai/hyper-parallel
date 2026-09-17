@@ -30,8 +30,10 @@ The public `MegaMoeExperts` API and this benchmark default
 `expert_capacity_factor` to `None`, which reserves the maximum lossless receive
 capacity. An explicit factor such as `1.5` keeps the workspace bounded, but a
 route that exceeds that capacity fails before native execution with a clear
-error. Smaller lossless workspaces via in-kernel multi-wave execution are
-future work.
+error. Use `--dispatch-mode pull` to store only local source and combine rows in
+SHMEM while allocating received rows in ordinary HBM. The default is
+`--dispatch-mode push`; both choices retain the shared memory optimizations.
+The selected mode is included in the JSON model configuration.
 
 ## Workload
 

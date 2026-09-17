@@ -32,6 +32,8 @@ from hyper_parallel.core.multicore.modules.mega_moe.route import (
 )
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 
+from tests.common.mark_utils import arg_mark
+
 
 class TestMegaMoeRoute(unittest.TestCase):
     """Validate trusted Router counts and bounded capacity without hardware."""
@@ -179,8 +181,39 @@ class TestMegaMoeRoute(unittest.TestCase):
         self.assertTrue(torch.equal(metadata.group_list, torch.tensor([10, 22])))
         self.assertEqual(metadata.expert_capacity, 22)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_pull_metadata_addresses_each_source_peer(self) -> None:
+        """Feature: pull metadata addresses each source peer.
+
+        Description: Prepare rank-one pull offsets from asymmetric source histograms.
+        Expectation: Pull reads source prefixes and writes disjoint local expert-major rows.
+        """
+        spec = replace(self._spec(ep_size=2, rank_id=1), dispatch_mode="pull")
+        counts = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.int32)
+        hidden = torch.zeros((2, 4), dtype=torch.bfloat16)
+        ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+
+        def gather(output: Any, _input: Any, **_kwargs: Any) -> Mock:
+            """Supply rank counts without launching a collective."""
+            output.copy_(counts.reshape(-1))
+            return Mock()
+        with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather),
+              patch.object(route_module, "_permute_topk_input", return_value=(hidden, ids.reshape(-1)))):
+            route = prepare_topk_route(hidden, ids, torch.ones((2, 2)), spec, counts[1])
+        self.assertEqual(route.metadata.dispatch_src_off.tolist(), [3, 6, 11, 18])
+        self.assertEqual(route.metadata.dispatch_target_off.tolist(), [0, 10, 3, 14])
+        self.assertEqual(route.metadata.dispatch_size.tolist(), [3, 4, 7, 8])
+        self.assertEqual(route.maximum_received_slots, 22)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_local_capacity_tracks_routes_below_source_size_and_empty_ranks(self) -> None:
-        """Shrink destination intermediates independently of source or SHMEM size."""
+        """Feature: local capacity tracks routes below source size and empty ranks.
+
+        Description: Evaluate balanced, hot and empty destination histograms.
+        Expectation: Shrink destination intermediates independently of source or SHMEM size.
+        """
         spec = self._spec(ep_size=2, receive_capacity=256)
         routes = (
             ([[1, 1, 1, 1], [1, 1, 1, 1]], (4, 4)),
@@ -193,7 +226,7 @@ class TestMegaMoeRoute(unittest.TestCase):
                 with self.subTest(counts=counts, rank=rank):
                     rank_spec = replace(spec, rank_id=rank)
                     actual = _expert_capacity(torch.tensor(counts, dtype=torch.int32), rank_spec)
-                    self.assertEqual(actual, expected)
+                    self.assertEqual(actual, (expected, max(capacities)))
                     self.assertEqual(rank_spec.receive_capacity, 256)
                     self.assertEqual(rank_spec.routed_slots, 4)
 

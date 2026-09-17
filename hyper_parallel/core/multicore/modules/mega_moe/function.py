@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import torch_npu
 
 from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_call
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
@@ -33,6 +34,30 @@ def _workspace_tensor(tensor: Any | None, name: str) -> Any:
     if tensor is None:
         raise RuntimeError(f"MegaMoe workspace {name} is not initialized.")
     return tensor
+
+
+def _dispatch_and_source(spec: Any, workspace: Any, rows: Any, capacity: int) -> tuple[Any, Any]:
+    """Select transport storage while retaining a source-ready stream dependency."""
+    if getattr(spec, "dispatch_mode", "push") == "push":
+        return _workspace_tensor(workspace.expert_buffer, "expert_buffer"), rows
+    source = _workspace_tensor(workspace.source_buffer, "source_buffer")
+    source.copy_(rows)
+    dispatch = torch.empty((capacity, spec.hidden_size), dtype=rows.dtype, device=rows.device)
+    return dispatch, source
+
+
+def _stage_backward_source(ctx: Any, grad_output: Any, permutation_inputs: tuple[Any, ...]) -> tuple[Any, Any]:
+    """Write pull dY into SHMEM before expert scratch allocation."""
+    if getattr(ctx.plan.spec, "dispatch_mode", "push") == "push":
+        return grad_output, None
+    source = _workspace_tensor(ctx.workspace.source_buffer, "source_buffer")
+    if not ctx.has_unpermute:
+        source.copy_(grad_output)
+        return source, None
+    mapping, expert_output, probs = permutation_inputs
+    grad_probs = torch.empty_like(probs)
+    multicore_ops.mega_moe_unpermute_grad_out(expert_output, grad_output, mapping, probs, source, grad_probs)
+    return source, grad_probs.to(ctx.topk_dtype) if ctx.needs_input_grad[7] else None
 
 
 def _allocate_forward_intermediates(
@@ -262,6 +287,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         plan: MegaMoePlan,
         workspace: MegaMoeWorkspace,
         permutation: tuple[Any, Any, Any] | None,
+        topk_weights: torch.Tensor | None,
     ) -> Any:
         """Launch the legacy forward op and save owned backward inputs.
 
@@ -275,23 +301,27 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             workspace: Reusable directional execution buffers.
             permutation: Optional routed rows, expert IDs and inverse mapping
                 when the first tensor argument contains original token rows.
+            topk_weights: Optional Router weights for pull source-output gradients.
 
         Returns:
             Owned expert-major output rows.
         """
         spec = plan.spec
+        if topk_weights is not None and (spec.dispatch_mode != "pull" or permutation is None):
+            raise ValueError("Integrated output unpermutation requires pull dispatch and an input permutation.")
         metadata = route
         permutation_inputs = ()
         if permutation is not None:
             routed_tokens, _, unpermute_mapping = permutation
-            if ctx.needs_input_grad[0]:
+            if ctx.needs_input_grad[0] or topk_weights is not None:
                 permutation_inputs = (unpermute_mapping,)
         ctx.has_permutation = permutation is not None
+        ctx.has_unpermute = topk_weights is not None
         workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
         workspace.claim()
         profile_call = None
         try:
-            dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
+            dispatch, source = _dispatch_and_source(spec, workspace, routed_tokens, metadata.expert_capacity)
             combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
             events = workspace.prepare_event_counters(forward=True)
             profile_call = prepare_mega_kernel_call(
@@ -313,7 +343,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             _launch_forward_kernel(
                 plan,
                 metadata,
-                routed_tokens,
+                source,
                 weight1,
                 weight2,
                 dispatch,
@@ -323,15 +353,23 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 gmm_workspace,
             )
             profile_call.complete()
+            if getattr(spec, "dispatch_mode", "push") == "pull":
+                saved_dispatch = dispatch
+                del down_proj
+            else:
+                down_proj.copy_(dispatch[:capacity])
+                saved_dispatch = down_proj
             output = combine.clone()
-            # Combine has consumed down_proj on this stream. Retain its owned
-            # storage for backward before the next call reuses SHMEM dispatch.
-            down_proj.copy_(dispatch[:capacity])
+            if ctx.has_unpermute:
+                probs = topk_weights.float().contiguous()
+                ctx.topk_dtype = topk_weights.dtype
+                permutation_inputs += (output, probs)
+                output = torch_npu.npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
             _save_forward_state(
                 ctx,
                 plan,
                 workspace,
-                down_proj,
+                saved_dispatch,
                 up_proj,
                 activation,
                 weight1,
@@ -361,15 +399,23 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         workspace = ctx.workspace
         spec = plan.spec
         saved_tensors = ctx.saved_tensors
+        ctx.maybe_clear_saved_tensors()
         saved_dispatch = saved_tensors[0]
         weight1 = saved_tensors[3]
         weight2 = saved_tensors[4]
         permutation_inputs = saved_tensors[12:]
         kernel_saved_tensors = saved_tensors[:12]
+        del saved_tensors
         workspace.claim()
         profile_call = None
         try:
-            dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
+            source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
+            permutation_inputs = permutation_inputs[:1]
+            if getattr(spec, "dispatch_mode", "push") == "pull":
+                dispatch = torch.empty((saved_dispatch.shape[0], spec.hidden_size),
+                                       dtype=grad_output.dtype, device=grad_output.device)
+            else:
+                dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
             grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
             events = workspace.prepare_event_counters(forward=False)
             profile_call = prepare_mega_kernel_call(
@@ -402,7 +448,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             _launch_backward_kernel(
                 plan,
                 kernel_saved_tensors,
-                grad_output,
+                source,
                 dispatch,
                 grad_x,
                 (grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx),
@@ -413,9 +459,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             profile_call.complete()
             # Both kernels use the current stream. Release ordinary scratch
             # before allocating the owned token gradient; SHMEM stays leased.
-            del act_grad, swiglu_grad, gate_dx
+            del dispatch, act_grad, swiglu_grad, gate_dx
             grad_input = _restore_input_gradient(ctx, grad_x, permutation_inputs)
-            return grad_input, grad_weight1, grad_weight2, None, None, None, None
+            return grad_input, grad_weight1, grad_weight2, None, None, None, None, grad_topk_weights
         finally:
             if profile_call is not None:
                 profile_call.cancel()
@@ -443,7 +489,7 @@ def execute_mega_moe(
     Returns:
         Expert-major output rows with independent storage.
     """
-    return _MegaMoeFunction.apply(routed_tokens, weight1, weight2, route, plan, workspace, None)
+    return _MegaMoeFunction.apply(routed_tokens, weight1, weight2, route, plan, workspace, None, None)
 
 
 def execute_mega_moe_with_permutation(
@@ -454,6 +500,8 @@ def execute_mega_moe_with_permutation(
     route: PreparedTopKRoute,
     plan: MegaMoePlan,
     workspace: MegaMoeWorkspace,
+    *,
+    topk_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Include input permutation backward within the workspace lease.
 
@@ -465,10 +513,11 @@ def execute_mega_moe_with_permutation(
         route: Rows and metadata prepared without recording autograd operations.
         plan: Shape-specific native descriptors.
         workspace: Reusable communication buffers.
+        topk_weights: Optional Router probabilities for integrated pull output unpermutation.
 
     Returns:
-        Owned expert-major output rows, differentiable with respect to the
-        original token rows and local expert weights.
+        Owned expert-major rows, or token-major rows when topk_weights is provided,
+        differentiable with respect to input tokens, expert weights and Router probabilities.
     """
     return _MegaMoeFunction.apply(
         hidden_states,
@@ -478,4 +527,5 @@ def execute_mega_moe_with_permutation(
         plan,
         workspace,
         (route.routed_tokens, topk_ids, route.unpermute_mapping),
+        topk_weights,
     )

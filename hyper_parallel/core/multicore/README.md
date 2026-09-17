@@ -91,16 +91,27 @@ output = experts(
 )
 ```
 
-### 容量
+### 通信模式与容量
+
+构造时通过 `dispatch_mode="push"`（默认）或 `dispatch_mode="pull"` 选择 dispatch；
+两种模式的 combine 均使用 PUT。模式必须在所有 EP rank 上一致，运行中不可修改。
+不同模式可以在同一进程中串行使用，但不能共享同一 workspace。
 
 `expert_capacity_factor=None` 是默认值，接收容量为 `EP * T * K` 向上对齐到 128，保证 lossless。
-该容量用于各 rank 对称分配的 SHMEM 接收区。计算中间张量和待反向保存的 dispatch、
+push 将该容量用于各 rank 对称分配的 SHMEM 接收区。
+pull 将 `T * K` 行发送区放在 SHMEM，接收区改为普通 HBM，按实际接收量分配。计算中间张量和待反向保存的 dispatch、
 up-projection、activation 按本 rank 本次实际接收量分配；无接收时保留一行 ABI 占位。
 源端 permute/combine 输出仍为 `T * K` 行。每次 forward 保存独立的接收数据和容量，支持后续路由变化。
 
 分配前将已交换的各 rank 负载一次读取到 Host，同时用于本地定尺寸和全局溢出检查。
 这也适用于默认 lossless 模式，会增加一次 Device-to-Host 等待，以减少计算和保存区的容量余量。
-SHMEM heap 的预留仍由配置接收容量决定，不会随本次实际接收量缩小。
+push 的 SHMEM heap 由配置接收容量决定；pull 的 heap 由本地发送量决定。
+两者均包含 `T * K` 行 combine 区及事件区，并按 2 MiB 物理页取整。
+pull 仍需普通 HBM 容纳热点接收数据，不会消除计算激活的负载开销。
+
+pull 对 `T >= 4096` 启用自适应通信任务分块：全局最大接收量小于平均的 `65/64` 时，
+dispatch/combine 使用 `gcd(T, 1024)`；不超过 2 倍时使用 `128 / gcd(T, 512)`；
+其余使用 `128 / 128`。较小 T 和 push 保持 `128 / 128`。
 
 显式设置不小于 1 的有限 factor 时，容量改为 `ceil(T * K * factor)` 再对齐。
 超过容量时，所有 EP rank 在进入 native kernel 前报 `capacity overflow`。
@@ -115,7 +126,7 @@ MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in model.la
 ```
 
 共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
-checkpoint/recompute 和 `retain_graph=True` 暂未验证。所有 backward 完成后，各 rank 按相同顺序调用
+两条路径已验证 non-reentrant checkpoint 和 `retain_graph=True`。所有 backward 完成后，各 rank 按相同顺序调用
 每层的幂等 `close()`，并在销毁进程组前完成关闭。
 
 SHMEM Python层以进程级引用计数统一管理Runtime生命周期。每个MegaMoe执行资源组建立时配对调用一次

@@ -115,6 +115,7 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
         seq_size=spec.local_num_tokens,
         all_expert_num=spec.num_experts,
         top_k=spec.top_k,
+        dispatch_mode=spec.dispatch_mode,
     )
 
 

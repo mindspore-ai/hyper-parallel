@@ -17,9 +17,12 @@
 from __future__ import annotations
 
 import math
+import os
+from dataclasses import replace
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.scheduler.config import MAX_EXPERT_NUM_PER_RANK
@@ -28,7 +31,7 @@ from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
-from .spec import _COMMUNICATION_SPLIT, bind_mega_moe_spec
+from .spec import _COMMUNICATION_SPLIT, _balanced_communication_split, bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace, configure_symmetric_heap
 
 __all__ = ["MegaMoeExperts"]
@@ -52,6 +55,48 @@ def _create_mega_moe_parameters(
     return gate_up_weight, down_weight
 
 
+def _validate_resource_layout(specifications: tuple[Any, ...], tensor: torch.Tensor, spec: Any) -> None:
+    """Agree on every symmetric allocation before initializing the heap."""
+    if spec.ep_size == 1:
+        return
+    layout = (
+        str(tensor.dtype),
+        os.getenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE"),
+        tuple(tuple(sorted((key, value) for key, value in item.items() if key != "ep_group"))
+              for item in specifications),
+    )
+    layouts = [None] * spec.ep_size
+    dist.all_gather_object(layouts, layout, group=spec.ep_group)
+    if any(peer_layout != layout for peer_layout in layouts):
+        raise ValueError("MegaMoe static shapes, heap configuration and allocation order must match on all EP ranks.")
+
+
+def _select_plan(resources: Any, route: Any) -> Any:
+    """Keep coarse GET tasks only while the global receive load stays nearly uniform."""
+    balanced = resources.balanced_plan
+    if balanced is None:
+        return resources.plan
+    maximum_received = route.maximum_received_slots
+    if 64 * maximum_received < 65 * resources.spec.routed_slots:
+        return balanced
+    moderate = resources.moderate_plan
+    if maximum_received <= 2 * resources.spec.routed_slots:
+        return moderate
+    return resources.plan
+
+
+def _alternative_plans(spec: Any, device: Any, plan: Any) -> tuple[Any, Any]:
+    """Keep the pull scheduling policy independent of push resource allocation."""
+    balanced_split = _balanced_communication_split(spec.local_num_tokens)
+    if spec.dispatch_mode != "pull" or balanced_split <= _COMMUNICATION_SPLIT:
+        return None, None
+    balanced = build_mega_moe_plan(replace(spec, dispatch_split=balanced_split, combine_split=balanced_split), device)
+    moderate_split = math.gcd(spec.local_num_tokens, 512)
+    moderate = (build_mega_moe_plan(replace(spec, combine_split=moderate_split), device)
+                if moderate_split > _COMMUNICATION_SPLIT else plan)
+    return balanced, moderate
+
+
 class _MegaMoeExecutionResources:
     """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
 
@@ -65,10 +110,12 @@ class _MegaMoeExecutionResources:
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
+        _validate_resource_layout(active_specifications, tensor, self.spec)
         configure_symmetric_heap(active_specifications, tensor)
         shmem.acquire(self.spec.ep_group)
         try:
             self.plan = build_mega_moe_plan(self.spec, tensor.device)
+            self.balanced_plan, self.moderate_plan = _alternative_plans(self.spec, tensor.device, self.plan)
             self.workspace = MegaMoeWorkspace(shared=shared)
         except Exception:
             shmem.release()
@@ -103,6 +150,7 @@ class MegaMoeExperts(MulticoreModule):
         expert_capacity_factor: float | None = None,
         ep_size: int = 1,
         ep_group: Any | None = None,
+        dispatch_mode: str = "push",
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -116,11 +164,15 @@ class MegaMoeExperts(MulticoreModule):
                 ``None`` reserves the maximum lossless capacity. A finite value
                 of at least 1.0 reserves that multiple of the local routed rows
                 and raises a clear error if a route exceeds it.
+            dispatch_mode: Dispatch transport, either "push" (default) or "pull".
+                Construct separate modules to switch modes; sharing requires equal modes.
             ep_size: Expert-parallel degree. The current SHMEM path requires it
                 to cover the complete Torch distributed world.
             ep_group: Torch expert-parallel process group with the same rank
                 ordering as the complete distributed world.
         """
+        if dispatch_mode not in ("push", "pull"):
+            raise ValueError("dispatch_mode must be push or pull")
         self._validate_topology(
             local_num_tokens=local_num_tokens,
             hidden_size=hidden_size,
@@ -141,6 +193,7 @@ class MegaMoeExperts(MulticoreModule):
             "expert_capacity_factor": expert_capacity_factor,
             "ep_size": ep_size,
             "ep_group": ep_group,
+            "dispatch_mode": dispatch_mode,
         }
         compatibility_key = (
             local_num_tokens,
@@ -151,6 +204,7 @@ class MegaMoeExperts(MulticoreModule):
             expert_capacity_factor,
             ep_size,
             id(ep_group),
+            dispatch_mode,
         )
         super().__init__(
             resource_specification=specification,
@@ -163,6 +217,7 @@ class MegaMoeExperts(MulticoreModule):
         self.num_experts = num_experts
         self.top_k = top_k
         self.expert_capacity_factor = expert_capacity_factor
+        self.dispatch_mode = dispatch_mode
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
         self._ep_group = ep_group
@@ -353,9 +408,12 @@ class MegaMoeExperts(MulticoreModule):
             self.gate_up_weight,
             self.down_weight,
             route,
-            resources.plan,
+            _select_plan(resources, route),
             resources.workspace,
+            topk_weights=topk_weights if self.dispatch_mode == "pull" else None,
         )
+        if self.dispatch_mode == "pull":
+            return expert_output.reshape_as(hidden_states)
         output = restore_topk_output(
             expert_output,
             route.unpermute_mapping,

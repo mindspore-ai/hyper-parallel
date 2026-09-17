@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 
 _COMMUNICATION_SPLIT = 128
+_MAX_COMMUNICATION_SPLIT = 1024
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class MegaMoeSpec:
     ep_group: Any | None
     rank_id: int
     num_cube_cores: int
+    dispatch_mode: str = "push"
     dispatch_split: int = _COMMUNICATION_SPLIT
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
@@ -70,6 +72,14 @@ def _align_capacity(capacity: int) -> int:
         // _COMMUNICATION_SPLIT
         * _COMMUNICATION_SPLIT
     )
+
+
+def _balanced_communication_split(local_num_tokens: int) -> int:
+    """Reduce large balanced-route queues without dropping source tails."""
+    if local_num_tokens < 4096:
+        return _COMMUNICATION_SPLIT
+    # Graph task counts use integer division, so every source row must fit an exact tile.
+    return math.gcd(local_num_tokens, _MAX_COMMUNICATION_SPLIT)
 
 
 def _resolve_receive_capacity(
@@ -159,4 +169,5 @@ def bind_mega_moe_spec(
         ep_group=ep_group,
         rank_id=rank_id,
         num_cube_cores=num_cube_cores,
+        dispatch_mode=specification.get("dispatch_mode", "push"),
     )

@@ -52,6 +52,8 @@ def _load_native() -> None:
     preload_vendor_library(vendor_root)
     try:
         torch.ops.load_library(str(adapter_path))
+        if torch.ops.hyper_parallel.mega_moe_transport_version() != 1:
+            raise RuntimeError("adapter transport ABI mismatch; rebuild the Torch adapter")
         schema = torch.ops.hyper_parallel.mega_moe_grad.default._schema
         dispatch_alias = schema.arguments[0].alias_info.before_set
         input_grad_alias = schema.arguments[12].alias_info.before_set
@@ -68,6 +70,30 @@ def _load_native() -> None:
 # ---------------------------------------------------------------------------
 # Python wrappers — thin pass-through to the registered C++ ops
 # ---------------------------------------------------------------------------
+
+
+def mega_moe_unpermute_grad_out(
+    permuted_tokens: torch.Tensor,
+    grad_output: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    probs: torch.Tensor,
+    grad_permuted: torch.Tensor,
+    grad_probs: torch.Tensor,
+) -> None:
+    """Write routing gradients into owned outputs inside a workspace lease.
+
+    Args:
+        permuted_tokens: Independently saved expert-major forward outputs.
+        grad_output: Token-major output gradients.
+        sorted_indices: Flat INT32 inverse mapping from input permutation.
+        probs: Contiguous FP32 top-k probabilities saved by forward.
+        grad_permuted: Contiguous symmetric source receiving expert-major dY.
+        grad_probs: Independent FP32 output matching the probabilities.
+    """
+    _load_native()
+    torch.ops.hyper_parallel.mega_moe_unpermute_grad_out(
+        permuted_tokens, grad_output, sorted_indices, probs, grad_permuted, grad_probs,
+    )
 
 
 def mega_moe(

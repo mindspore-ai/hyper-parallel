@@ -306,3 +306,39 @@ def test_moe_token_permute_grad(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     _run_acceptance_worker(
         monkeypatch, tmp_path, "test_moe_token_permute_grad", 2, "_test_moe_token_permute_grad.py",
     )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="unessential")
+def test_mega_moe_transport_coexistence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Feature: mega moe transport coexistence.
+
+    Description: Alternate push and pull with hotspot routes, retained graphs, checkpoint and profiling.
+    Expectation: Compare both transports, retained gradients, checkpoint and instrumented execution.
+    """
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_push_pull_coexistence", 4,
+                           "_test_mega_moe_transport.py")
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="unessential")
+def test_mega_moe_pull_hotspot_small_heap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Feature: mega moe pull hotspot small heap.
+
+    Description: Move the full receive load between destinations on four ranks.
+    Expectation: Validate a four-rank hotspot in a heap smaller than push receive storage.
+    """
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_pull_hotspot_small_heap", 4,
+                           "_test_mega_moe_transport.py")
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="unessential")
+def test_mega_moe_transport_qwen_shape(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Feature: mega moe transport qwen shape.
+
+    Description: Compare both modes with common MoE at 1x, 1.25x and 2.5x receive loads.
+    Expectation: Validate H5120/I1792/E48/seq4096 on EP4 at 1x, 1.25x and 2.5x receive loads.
+    """
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_push_pull_qwen_shape", 4,
+                           "_test_mega_moe_transport.py")

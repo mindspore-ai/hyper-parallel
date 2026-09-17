@@ -41,6 +41,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
     RuntimeConfigC,
     TaskDescC,
     TaskSplitValue,
+    TaskType,
     configure_ready_handshake,
     event_workspace_bytes,
 )
@@ -52,6 +53,8 @@ from hyper_parallel.core.multicore.scheduler.runtime import (
     runtime_config_task_capacity,
     serialize_runtime_config,
 )
+
+from tests.common.mark_utils import arg_mark
 
 FORMER_TASK_LIMIT = 25600
 
@@ -133,8 +136,47 @@ class TestRuntimeSerialization(unittest.TestCase):
                 self.assertEqual(cfg.all_tasks[compute_tasks].task_type, 0)
                 self.assertTrue(serialize_runtime_config(cfg))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_both_transports_support_asymmetric_communication_splits(self) -> None:
+        """Feature: both transports support asymmetric communication splits.
+
+        Description: Generate forward and backward graphs with all three communication split pairs.
+        Expectation: Keep every GET/PUT scheduled exactly once with mode-specific completion.
+        """
+        for mode in ("push", "pull"):
+            for dispatch_split, combine_split in ((128, 128), (128, 512), (1024, 1024)):
+                for graph_builder, config_builder in (
+                    (build_forward_graph, build_forward_config), (build_backward_graph, build_backward_config),
+                ):
+                    with self.subTest(mode=mode, splits=(dispatch_split, combine_split), graph=graph_builder.__name__):
+                        values = TaskSplitValue(tp=1, ep=4, seq_size=4096, all_expert_num=48, top_k=8,
+                                               dispatch_mode=mode)
+                        graph = graph_builder(values, hidden_size=5120, intermediate_size=1792, num_cube_cores=20,
+                                              dispatch_sv=dispatch_split, combine_sv=combine_split)
+                        graph.propagate_splits(values)
+                        cfg = config_builder(graph, values, 3, 20)
+                        queues = [*cfg.cube_task_indices[:cfg.task_index_num[0]],
+                                  *cfg.vector_task_indices[:cfg.task_index_num[1]]]
+                        communication = [index for index in range(cfg.task_num) if cfg.all_tasks[index].task_type in
+                                         (TaskType.TASK_SHMEM_GET_MEM, TaskType.TASK_SHMEM_PUT_MEM_SIGNAL)]
+                        self.assertTrue(communication)
+                        self.assertTrue(all(queues.count(index) == 1 for index in communication))
+                        gets = sum(cfg.all_tasks[index].task_type == TaskType.TASK_SHMEM_GET_MEM
+                                   for index in communication)
+                        self.assertEqual(gets > 0, mode == "pull")
+                        self.assertEqual(cfg.protocol_version, int(mode == "pull"))
+                        self.assertEqual(cfg.completion_event > 0, mode == "pull")
+                        self.assertTrue(serialize_runtime_config(cfg))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_real_graphs_expand_event_storage(self) -> None:
-        """Expand events for a valid topology with 16 experts per rank."""
+        """Feature: real graphs expand event storage.
+
+        Description: Serialize forward and backward graphs for 16 experts per rank on EP64.
+        Expectation: Expand events for a valid topology with 16 experts per rank.
+        """
         for graph_builder, config_builder in (
             (build_forward_graph, build_forward_config), (build_backward_graph, build_backward_config),
         ):
@@ -143,10 +185,10 @@ class TestRuntimeSerialization(unittest.TestCase):
                 graph = graph_builder(values, hidden_size=128, intermediate_size=128, num_cube_cores=20)
                 graph.propagate_splits(values)
                 cfg = config_builder(graph, values, 63, 20)
-                self.assertEqual(len(cfg.all_event_num_triggers), 1088)
-                self.assertEqual(len(cfg.all_events), 1088)
+                self.assertEqual(len(cfg.all_event_num_triggers), 1104)
+                self.assertEqual(len(cfg.all_events), 1104)
                 image = serialize_runtime_config(cfg)
-                self.assertEqual(struct.unpack_from("<I", image, 12)[0], 1088)
+                self.assertEqual(struct.unpack_from("<I", image, 12)[0], 1104)
 
 
 class TestRuntimeCppReader(unittest.TestCase):
@@ -173,6 +215,7 @@ class TestRuntimeCppReader(unittest.TestCase):
         cls.reader.valid_ready_runtime.restype = ctypes.c_bool
         cls.reader.read_ready_event.argtypes = [ctypes.c_void_p]
         cls.reader.read_ready_event.restype = ctypes.c_uint32
+        cls.reader.read_protocol_profile.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         cls.reader.read_task.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
         cls.reader.read_layout.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         cls.reader.group_list_offset.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
@@ -269,17 +312,56 @@ class TestRuntimeCppReader(unittest.TestCase):
                 self.assertFalse(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(invalid)),
                                                          len(invalid), 4096))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_pull_completion_and_profiler_fields_do_not_overlap(self) -> None:
+        """Feature: pull completion and profiler fields do not overlap.
+
+        Description: Decode instrumented push and pull headers through the production C++ reader.
+        Expectation: Round-trip both protocols through production C++ with profiler enabled.
+        """
+        for mode in ("push", "pull"):
+            values = TaskSplitValue(tp=1, ep=4, seq_size=128, all_expert_num=8, top_k=2, dispatch_mode=mode)
+            cfg = allocate_runtime_config(16)
+            cfg.num_workers = 40
+            configure_ready_handshake(cfg, values)
+            cfg.cycle_profiling_enabled = 1
+            cfg.aic_profile_record_capacity = 101
+            cfg.aiv_profile_record_capacity = 203
+            image = serialize_runtime_config(cfg)
+            buffer = ctypes.create_string_buffer(image)
+            fields = (ctypes.c_uint32 * 5)()
+            self.reader.read_protocol_profile(buffer, fields)
+            self.assertEqual(list(fields), [cfg.ready_event, cfg.completion_event, 1, 101, 203])
+            self.assertTrue(self.reader.valid_ready_runtime(buffer, len(image), event_workspace_bytes(4, 8), 4))
+            invalid = bytearray(image)
+            struct.pack_into("<I", invalid, 36, 2)
+            self.assertFalse(self.reader.valid_ready_runtime(ctypes.create_string_buffer(bytes(invalid)),
+                                                           len(image), event_workspace_bytes(4, 8), 4))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_header_padding_has_no_format_semantics(self) -> None:
-        """The reader uses capacities directly and does not inspect format tags."""
+        """Feature: header padding has no format semantics.
+
+        Description: Fill only unused header padding with nonzero bytes.
+        Expectation: The reader uses capacities directly and does not inspect format tags.
+        """
         cfg = allocate_runtime_config(17)
         cfg.task_num = 17
         data = bytearray(serialize_runtime_config(cfg))
-        data[32:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 32)
+        data[40:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 40)
         self.assertTrue(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_ready_header_and_persistent_storage_bounds(self) -> None:
-        """Read ready metadata without tags and bound the persistent tail."""
-        for ep_size, experts, events in ((2, 4, 1024), (64, 1024, 1088)):
+        """Feature: ready header and persistent storage bounds.
+
+        Description: Decode valid and truncated persistent event arenas for small and large EP groups.
+        Expectation: Read ready metadata without tags and bound the persistent tail.
+        """
+        for ep_size, experts, events in ((2, 4, 1024), (64, 1024, 1104)):
             with self.subTest(ep_size=ep_size):
                 cfg = allocate_runtime_config(17, events)
                 cfg.task_num = 17

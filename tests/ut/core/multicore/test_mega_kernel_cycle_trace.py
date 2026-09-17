@@ -25,6 +25,8 @@ from hyper_parallel.core.multicore.profiler.profiling import (
     _profile_buffer_bytes_for_capacities,
 )
 
+from tests.common.mark_utils import arg_mark
+
 
 _AIC_CAPACITY = 16
 _AIV_CAPACITY = 16
@@ -140,13 +142,19 @@ class TestMegaKernelCycleTrace(unittest.TestCase):
                 self.assertEqual(event["name"], expected_name)
                 self.assertEqual(event["args"]["task_stage"], "GMM1")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_unknown_task_type_uses_generic_fallback(self):
-        """Keep a record readable when a concrete Kernel has no stage rule."""
-        trace = _parse(_profile_buffer(desc_id=0x20000 + 107))
+        """Feature: unknown task type uses generic fallback.
+
+        Description: Parse a cycle record containing an unregistered task identifier.
+        Expectation: Keep a record readable when a concrete Kernel has no stage rule.
+        """
+        trace = _parse(_profile_buffer(desc_id=0x20000 + 999))
         event = next(event for event in trace["traceEvents"] if event["ph"] == "X")
 
-        self.assertEqual(event["name"], "TaskType_107")
-        self.assertEqual(event["args"]["task_type"], 107)
+        self.assertEqual(event["name"], "TaskType_999")
+        self.assertEqual(event["args"]["task_type"], 999)
 
     def test_dropped_count_is_reported_without_overwriting_records(self):
         """Surface Device overflow in metadata and warnings."""

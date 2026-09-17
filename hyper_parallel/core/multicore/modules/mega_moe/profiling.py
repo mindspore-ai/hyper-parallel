@@ -78,6 +78,8 @@ def _resolve_expert_owner(
             raise ValueError("AllToAll profile owner resolved a zero task count per expert")
         expert_index = task_desc.task_index // task_count_per_expert
         if operator.name == "dispatch":
+            if topology.dispatch_mode == "pull":
+                return rank_owner_base + expert_index % topology.single_rank_expert_num
             return expert_index
         if operator.name == "combine":
             return rank_owner_base + expert_index % topology.single_rank_expert_num

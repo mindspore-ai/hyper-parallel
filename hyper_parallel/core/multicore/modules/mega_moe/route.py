@@ -52,6 +52,7 @@ class PreparedTopKRoute:
     tokens_per_expert: torch.Tensor
     received_counts: torch.Tensor
     metadata: RouteMetadata
+    maximum_received_slots: int = 0
 
 
 def _validate_topk_inputs(
@@ -141,7 +142,7 @@ def _finish_count_gather(
 def _expert_capacity(
     counts_by_source: torch.Tensor,
     spec: MegaMoeSpec,
-) -> int:
+) -> tuple[int, int]:
     """Validate the global bound and size rank-local computation tensors."""
     destination_loads = counts_by_source.reshape(
         spec.ep_size,
@@ -154,7 +155,7 @@ def _expert_capacity(
     _validate_bounded_capacity(max(loads), spec)
     # Keep a non-null ABI argument on ranks whose experts receive no tokens.
     # Source outputs and symmetric communication buffers retain their own sizes.
-    return max(1, loads[spec.rank_id])
+    return max(1, loads[spec.rank_id]), max(loads)
 
 
 def _validate_bounded_capacity(
@@ -221,11 +222,13 @@ def _compute_route_metadata(
     local_start = spec.rank_id * spec.local_experts
     local_end = local_start + spec.local_experts
     return RouteMetadata(
-        dispatch_src_off=source_prefix[spec.rank_id].to(torch.int64),
+        dispatch_src_off=(source_prefix[:, local_start:local_end].reshape(-1).to(torch.int64)
+                          if spec.dispatch_mode == "pull" else source_prefix[spec.rank_id].to(torch.int64)),
         dispatch_target_off=(
-            destination_prefix[:, :, spec.rank_id].reshape(-1).to(torch.int64)
+            local_destination_prefix.T.reshape(-1).to(torch.int64) if spec.dispatch_mode == "pull"
+            else destination_prefix[:, :, spec.rank_id].reshape(-1).to(torch.int64)
         ),
-        dispatch_size=counts_i32,
+        dispatch_size=received_counts.reshape(-1) if spec.dispatch_mode == "pull" else counts_i32,
         combine_src_off=local_destination_prefix.T.reshape(-1).to(torch.int64),
         combine_target_off=(
             source_prefix[:, local_start:local_end].reshape(-1).to(torch.int64)
@@ -266,12 +269,13 @@ def prepare_topk_route(
     counts_by_source, count_work = _start_count_gather(counts, spec)
     routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
     received_counts = _finish_count_gather(counts_by_source, count_work, spec)
-    expert_capacity = _expert_capacity(counts_by_source, spec)
+    expert_capacity, maximum_received_slots = _expert_capacity(counts_by_source, spec)
     return PreparedTopKRoute(
         routed_tokens=routed_tokens,
         unpermute_mapping=unpermute_mapping,
         tokens_per_expert=counts,
         received_counts=received_counts,
+        maximum_received_slots=maximum_received_slots,
         metadata=_compute_route_metadata(
             counts,
             counts_by_source,

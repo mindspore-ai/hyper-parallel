@@ -436,12 +436,15 @@ trigger_event = all_event_num  （全局唯一 event）
 `RuntimeConfig` 是 Multicore MoE-FFN 的调度配置二进制，包含每个 task 的依赖 event、触发 event、tensor 地址偏移等信息，**按 rank 独立生成**。
 
 header 的前五个 uint32 字段依次为 task_num、num_workers、task_capacity、event_capacity、ready_event；
-ready_event 为 0 表示无需跨 rank ready，其余 44 字节用于对齐。
+ready_event 为 0 表示无需跨 rank ready。接着三个 uint32 为 cycle_profiling_enabled、
+aic_profile_record_capacity、aiv_profile_record_capacity；再两个为 completion_event、protocol_version，
+最后 24 字节用于对齐。protocol_version=0 表示 push，=1 表示 pull；pull 的 completion_event
+用于等待所有参与 worker 完成，随后跨 rank 确认 source 可安全复用。
 task capacity 覆盖计算 task、terminate、队列长度和所有引用的最大 task ID，并按 16 对齐，没有固定 task 数上限。
-event capacity 至少为 1024，并覆盖无融合图、ready 事件和 atomic-write 尾部。布局大小为
+event capacity 至少为 1024，并覆盖无融合图、ready/completion 事件和 atomic-write 尾部。布局大小为
 `4224 + 588 × task_capacity + 20 × event_capacity` 字节，必须能用 uint32 字节偏移寻址。
-在线 plan 与离线工具共用 `serialize_runtime_config()`；Device 直接读取容量，只检查存储与索引边界。
-普通事件区占 `event_capacity × 4` 字节；EP 大于 1 时，其后预留 `(EP + 1) × 64` 字节持久 ready 状态。
+在线 plan 与离线工具共用 `serialize_runtime_config()`；Device 检查协议版本以及存储与索引边界。
+普通事件区占 `event_capacity × 4` 字节；EP 大于 1 时，其后预留 `2 × (EP + 1) × 64` 字节持久 ready/completion 状态。
 每次调用只清零普通事件区，首次使用才初始化持久区并执行 Host barrier。
 
 grouped-matmul 的各 AIC scratch 在现有 group-list 预留区内按 128 字节对齐，每核步长为 128 字节。

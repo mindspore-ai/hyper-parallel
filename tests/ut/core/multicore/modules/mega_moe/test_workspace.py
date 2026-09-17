@@ -32,6 +32,8 @@ from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
 )
 from hyper_parallel.core.multicore.scheduler.config import event_workspace_bytes
 
+from tests.common.mark_utils import arg_mark
+
 
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     """Validate SHMEM planning without allocating accelerator memory."""
@@ -92,6 +94,22 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                         actual = workspace_module.configure_symmetric_heap((spec,) * groups, reference)
                         self.assertEqual(actual, (groups * (expected_mib - 2) + 2) * 1024**2)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_pull_heap_is_independent_of_receive_capacity(self) -> None:
+        """Feature: pull heap is independent of receive capacity.
+
+        Description: Vary EP size and receive factor at fixed real-shape local source dimensions.
+        Expectation: Keep only source and return rows symmetric across EP and capacity bounds.
+        """
+        for ep in (4, 8):
+            for factor in (None, 1.0, 3.0):
+                with self.subTest(ep=ep, factor=factor), patch.dict(os.environ, {}, clear=True):
+                    spec = {"local_num_tokens": 4096, "hidden_size": 5120, "top_k": 8, "num_experts": 48,
+                            "ep_size": ep, "expert_capacity_factor": factor, "dispatch_mode": "pull"}
+                    actual = workspace_module.configure_symmetric_heap((spec,), torch.empty(0, dtype=torch.bfloat16))
+                    self.assertEqual(actual, 642 * 1024**2)
+
     def test_explicit_heap_requires_sufficient_aligned_capacity(self) -> None:
         """Accept page-aligned capacity while rejecting undersized and partial physical pages."""
         spec = {"local_num_tokens": 4096, "hidden_size": 5120, "top_k": 8, "num_experts": 48,
@@ -105,10 +123,16 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                     with self.assertRaises(error):
                         workspace_module.configure_symmetric_heap((spec,), reference)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
-        """Retain expanded event storage when allocating through the SHMEM API."""
+        """Feature: allocation covers dynamic events and ready tail.
+
+        Description: Allocate a workspace for a topology requiring more than 1024 event counters.
+        Expectation: Retain expanded event storage when allocating through the SHMEM API.
+        """
         spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16,
-                               ep_size=64, num_experts=1024)
+                               ep_size=64, num_experts=1024, dispatch_mode="push")
         workspace = MegaMoeWorkspace(shared=True)
         with (
             patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw: torch.empty(
@@ -119,7 +143,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
             workspace.ensure(spec, torch.float32, torch.device("cpu"))
         self.assertEqual(allocate.call_count, 4)
-        self.assertEqual(workspace.event_counter_bytes, 1088 * 4)
+        self.assertEqual(workspace.event_counter_bytes, 1104 * 4)
         for tensor in (workspace.forward_event_counters, workspace.backward_event_counters):
             self.assertEqual(tensor.numel(), event_workspace_bytes(spec.ep_size, spec.num_experts))
         for allocation in allocate.call_args_list:
@@ -156,9 +180,15 @@ class TestReadyEventWorkspace(unittest.TestCase):
 
     @patch.object(workspace_module.shmem, "free")
     @patch.object(workspace_module.shmem, "host_barrier")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_initializes_once_and_preserves_ready_tail_per_direction(self, mock_barrier, mock_free) -> None:
-        """Clear stale task counters without clearing a later peer signal."""
-        workspace = MegaMoeWorkspace(shared=True, event_counter_bytes=1088 * 4)
+        """Feature: initializes once and preserves ready tail per direction.
+
+        Description: Reset ordinary counters after initializing persistent generation banks.
+        Expectation: Clear stale task counters without clearing a later peer signal.
+        """
+        workspace = MegaMoeWorkspace(shared=True, event_counter_bytes=1104 * 4)
         events = [torch.full((event_workspace_bytes(64, 1024),), 123, dtype=torch.uint8) for _ in range(2)]
         workspace.forward_event_counters, workspace.backward_event_counters = events
         for forward, tensor in zip((True, False), events):
