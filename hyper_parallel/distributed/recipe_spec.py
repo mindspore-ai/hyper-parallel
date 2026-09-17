@@ -401,14 +401,6 @@ class ModuleShardingSpec:
     # compute must be injected explicitly (apply-time preflight fails fast
     # otherwise).
     _ep_size: int = 0
-    # Set when the override that produced this boundary was gated on EP
-    # (``when: ep``). An EP-gated compute injection only applies to boundaries
-    # that can host experts: an EP rule glob such as ``*.mlp`` also matches the
-    # dense MLPs of a hybrid stack (DeepSeek-V3's ``first_k_dense_replace``
-    # layers), where expert parallelism has no meaning. Generation-time
-    # inference skips the same modules; this flag carries that intent to the
-    # apply path so both sides agree.
-    _ep_gated: bool = False
 
 
 def resolve_placements(

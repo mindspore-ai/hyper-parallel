@@ -102,7 +102,6 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
         return
 
     module_names = {name for name, _ in model.named_modules()}
-    modules = dict(model.named_modules())
     for key, user_spec, source in entries:
         if not isinstance(user_spec, ModuleShardingSpec):
             raise TypeError(
@@ -130,17 +129,13 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
             for fqn in hits:
                 _warn_dropped_params(
                     source, key, fqn, plan.modules[fqn], user_spec)
-                _merge_into(
-                    plan.modules[fqn],
-                    _effective_override(user_spec, modules.get(fqn), fqn))
+                _merge_into(plan.modules[fqn], user_spec)
                 logger.info("%s: merge into %s (glob %r)",
                             source, fqn, key)
         elif key in plan.modules:
             _warn_dropped_params(
                 source, key, key, plan.modules[key], user_spec)
-            _merge_into(
-                plan.modules[key],
-                _effective_override(user_spec, modules.get(key), key))
+            _merge_into(plan.modules[key], user_spec)
             logger.info("%s: merge into the spec of module %s",
                         source, key)
         else:
@@ -259,37 +254,6 @@ def _warn_dropped_params(source, key, fqn, derived, user_spec) -> None:
                 "(params={} or 'none' explicitly clears all)",
                 source, key, fqn, len(dropped), dropped)
 
-def _effective_override(user_spec: ModuleShardingSpec, module: Any,
-                        fqn: str) -> ModuleShardingSpec:
-    """Drop an EP-gated compute injection the matched module cannot host.
-
-    An EP rule glob such as ``*.mlp`` also matches boundaries that have no
-    experts to shard — the dense MLPs of a hybrid stack (DeepSeek-V3's
-    ``first_k_dense_replace`` layers). Dropping the injection *here*, while the
-    plan is built, keeps every consumer consistent: the planner records no
-    injection, the emitter renders the boundary's ordinary form (a local-region
-    forward would call a compute that is never bound), and the applier never
-    resolves an EP factory against a non-MoE module. Fields the same entry
-    declares for other purposes still merge.
-
-    Only ``when: ep``-gated specs are affected: an ungated injection is a
-    legitimate local compute (a perf/kernel replacement) on any module.
-    """
-    if not getattr(user_spec, "_ep_gated", False) or module is None:
-        return user_spec
-    if _is_moe_boundary(module):
-        return user_spec
-    logger.info(
-        "plan_overrides: EP-gated compute injection dropped on %s — %s "
-        "carries no experts/router, so it cannot be an expert-parallel region",
-        fqn, type(module).__name__)
-    stripped = copy.copy(user_spec)
-    stripped.local_compute_fn = None
-    stripped.region_dispatch = None
-    stripped._ep_gated = False  # pylint: disable=protected-access
-    return stripped
-
-
 def _merge_into(derived: ModuleShardingSpec,
                 user_spec: ModuleShardingSpec) -> None:
     """Merge one user spec into an existing boundary spec (in place).
@@ -305,9 +269,6 @@ def _merge_into(derived: ModuleShardingSpec,
         value = getattr(user_spec, attr)
         if value is not None:
             setattr(derived, attr, value)
-    if getattr(user_spec, "_ep_gated", False):
-        # EP-gated intent is the user's (the derived spec never sets it).
-        derived._ep_gated = True  # pylint: disable=protected-access
     _normalize_out_fields(derived)
 
 
@@ -604,15 +565,6 @@ def _build_local_compute_factory(factory, module, mesh, mesh_dim_names,
     return compute_fn
 
 
-def _is_moe_boundary(module: Any) -> bool:
-    """Structural MoE-boundary gate, shared with the generation-time inference."""
-    from hyper_parallel.distributed.expert_parallel.structure import (  # pylint: disable=C0415
-        is_moe_boundary,
-    )
-
-    return is_moe_boundary(module)
-
-
 def _resolve_local_compute_fn(module, spec, mesh, mesh_dim_names,
                               expert_mesh):
     """Resolve the compute_fn of the local region (**single resolution chain**, 05 §4.4.3).
@@ -646,22 +598,10 @@ def _resolve_local_compute_fn(module, spec, mesh, mesh_dim_names,
     3. none of the above -> None (ordinary module; takes the
        validate/production path — and an EP-sharded boundary hitting this
        was already failed fast by _preflight_compute_injection).
-
-    An EP-active boundary with a declared ``local_compute_fn`` that is not a
-    MoE boundary (no experts/router) is skipped as well: an EP rule glob such
-    as ``*.mlp`` also matches the dense MLPs of a hybrid stack (DeepSeek-V3's
-    ``first_k_dense_replace`` layers), where expert parallelism has no meaning.
-    The generation-time inference skips the same modules, so both sides agree.
     """
     custom = getattr(spec, "local_compute_fn", None)
     if custom is not None:
         _require_region_dispatch(spec, source="spec.local_compute_fn")
-        if getattr(spec, "_ep_gated", False) and not _is_moe_boundary(module):
-            logger.info(
-                "EP-gated compute injection skipped on %s: it carries no "
-                "experts/router, so it cannot be an expert-parallel region",
-                type(module).__name__)
-            return None
         if _is_delayed_target(custom):
             _check_target_config_keys(custom, "local_compute_fn")
             factory = getattr(custom, "_target_", None)

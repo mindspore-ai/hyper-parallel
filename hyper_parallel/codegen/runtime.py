@@ -632,9 +632,6 @@ class _FrozenBoundarySpec:
         )
         self.out_names = list(entry["out_names"]) if entry.get("out_names") else None
         self.region_dispatch = entry.get("region_dispatch")
-        # EP-gating intent (``when: ep``) frozen with the injection: the
-        # resolution chain uses it to skip boundaries that cannot host experts.
-        self._ep_gated = bool((injection or {}).get("ep_gated"))
         for key in ("inner_wrapper", "inner_target", "inner_out_src", "local_compute_fn"):
             if injection is not None and key in injection:
                 setattr(self, key, _injection_target(injection[key]))

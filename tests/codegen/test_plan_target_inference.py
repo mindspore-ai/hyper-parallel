@@ -204,6 +204,61 @@ class TestPlanTargetInference(unittest.TestCase):
         with self.assertRaisesRegex(UnsupportedModuleStructure, "different EP compute"):
             manager._fill_inferred_ep_targets(holder, overrides)
 
+    def test_inferred_injection_is_dropped_on_a_non_moe_boundary(self):
+        """An inferred EP injection never stays on a boundary without experts.
+
+        The inference fills the factory once per ``match``; the planner's glob
+        merge then hands it to *every* matched boundary — including the dense
+        MLPs of a hybrid stack (DeepSeek-V3's ``first_k_dense_replace`` layers),
+        which cannot be expert-parallel regions. The artifact must not render a
+        local-region forward for those.
+        """
+        from types import SimpleNamespace  # pylint: disable=C0415
+
+        from hyper_parallel.distributed.recipe_spec import (  # pylint: disable=C0415
+            ModuleShardingSpec,
+        )
+        from hyper_parallel.trainer.config import Target  # pylint: disable=C0415
+
+        holder = _holder_with_layers([nn.Linear(4, 4), self._qwen3_block()])
+        plan = SimpleNamespace(
+            modules={
+                fqn: ModuleShardingSpec(
+                    local_compute_fn=Target(_stub_factory, target_path=EP_PATH),
+                    region_dispatch=False,
+                )
+                for fqn in ("layers.0.mlp", "layers.1.mlp")
+            }
+        )
+
+        manager._drop_inferred_ep_injections_on_non_moe(plan, holder, {EP_PATH})
+
+        dense, moe = plan.modules["layers.0.mlp"], plan.modules["layers.1.mlp"]
+        self.assertIsNone(dense.local_compute_fn)
+        self.assertIsNone(dense.region_dispatch)
+        self.assertIsNotNone(moe.local_compute_fn)
+        self.assertIs(moe.region_dispatch, False)
+
+    def test_user_declared_injection_is_never_dropped(self):
+        """A user-declared ``local_compute_fn`` is the escape hatch: never dropped."""
+        from types import SimpleNamespace  # pylint: disable=C0415
+
+        from hyper_parallel.distributed.recipe_spec import (  # pylint: disable=C0415
+            ModuleShardingSpec,
+        )
+        from hyper_parallel.trainer.config import Target  # pylint: disable=C0415
+
+        holder = _holder_with_layers([nn.Linear(4, 4)])
+        spec = ModuleShardingSpec(
+            local_compute_fn=Target(_stub_factory, target_path="user.own.factory"),
+            region_dispatch=False,
+        )
+        plan = SimpleNamespace(modules={"layers.0.mlp": spec})
+
+        manager._drop_inferred_ep_injections_on_non_moe(plan, holder, {EP_PATH})
+
+        self.assertIsNotNone(plan.modules["layers.0.mlp"].local_compute_fn)
+
     def test_unrecognized_structure_raises_with_escape_hatch(self):
         """An unknown MoE structure must fail hard, never guess a factory."""
         block = self._qwen3_block()

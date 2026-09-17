@@ -383,11 +383,6 @@ def freeze_injections(plan: Any) -> list[dict[str, Any]]:
             entry["ep_stack"] = dict(spec._ep_stack)
         if getattr(spec, "_ep_size", 0):
             entry["ep_size"] = spec._ep_size
-        if getattr(spec, "_ep_gated", False):
-            # ``when: ep`` gating: the apply path skips an EP compute injection
-            # on boundaries that cannot host experts (dense MLPs of a hybrid
-            # stack), so the intent must survive into the generated artifact.
-            entry["ep_gated"] = True
         if entry:
             injections.append({"match": fqn, **entry})
     return injections

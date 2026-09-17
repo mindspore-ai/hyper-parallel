@@ -568,12 +568,13 @@ def _fill_plan_fields(meta: CodegenMeta, config: Any, layout: ArtifactLayout) ->
     # (never by model name) and written into the spec so it lands in
     # ``meta.injections``. An explicit ``_target_`` stays the opt-out escape
     # hatch and is never overwritten.
-    _fill_inferred_ep_targets(model, plan_overrides)
+    inferred_ep_targets = _fill_inferred_ep_targets(model, plan_overrides)
     plan = derive_sharding_plan(
         model,
         spec,
         plan_overrides=plan_overrides,
     )
+    _drop_inferred_ep_injections_on_non_moe(plan, model, inferred_ep_targets)
     frozen = freeze_plan(plan, model)
     if not frozen.param_plan:
         raise RuntimeError(
@@ -738,7 +739,7 @@ def _ep_factory_table() -> dict[tuple[str, str, str], str]:
     return _EP_FACTORY_BY_STRUCTURE
 
 
-def _fill_inferred_ep_targets(model: Any, plan_overrides: dict[str, Any]) -> None:
+def _fill_inferred_ep_targets(model: Any, plan_overrides: dict[str, Any]) -> set[str]:
     """S3: fill a missing ``local_compute_fn`` on MoE EP overrides.
 
     Every desugared plan override whose ``match`` resolves to a MoE boundary
@@ -750,13 +751,24 @@ def _fill_inferred_ep_targets(model: Any, plan_overrides: dict[str, Any]) -> Non
     untouched. This is a no-op on a struct construct; the ``plan_overrides``
     dict's spec values are mutated in place so ``freeze_injections`` records
     the inferred factory in ``meta.injections``.
+
+    Returns:
+        The factory paths that were inferred. They identify the injections the
+        framework chose itself, which the plan build must keep off boundaries
+        that cannot host experts (see
+        ``_drop_inferred_ep_injections_on_non_moe``).
     """
+    inferred: set[str] = set()
     for match, spec in plan_overrides.items():
         if getattr(spec, "local_compute_fn", None) is not None:
             continue
-        inferred = _infer_ep_compute_for_match(model, match)
-        if inferred is not None:
-            spec.local_compute_fn = inferred
+        target = _infer_ep_compute_for_match(model, match)
+        if target is not None:
+            spec.local_compute_fn = target
+            path = _target_path(target)
+            if path:
+                inferred.add(path)
+    return inferred
 
 
 def _infer_ep_compute_for_match(
@@ -773,19 +785,12 @@ def _infer_ep_compute_for_match(
     strategy — the escape-hatch text points the user at writing an explicit
     ``_target_``.
     """
-    # The gate is shared with the apply-time EP injection so both sides skip the
-    # same modules (an EP glob such as ``*.mlp`` also hits dense MLPs). Lazy: the
-    # structure package pulls torch, and codegen stays backend-free until it runs.
-    from hyper_parallel.distributed.expert_parallel.structure import (  # pylint: disable=C0415
-        is_moe_boundary,
-    )
-
     candidate = None
     candidate_path = None
     for fqn, module in model.named_modules():
         if not fnmatchcase(fqn, match):
             continue
-        if not is_moe_boundary(module):
+        if not _looks_like_moe_boundary(module):
             continue
         target = _import_ep_target_for(module, match)
         # Compare the serialized factory path, never the Target objects: every
@@ -806,6 +811,47 @@ def _infer_ep_compute_for_match(
                 "local_compute_fn._target_ in the YAML"
             )
     return candidate
+
+
+def _drop_inferred_ep_injections_on_non_moe(
+    plan: Any, model: Any, inferred_targets: set[str]
+) -> None:
+    """Keep an *inferred* EP injection off boundaries that cannot host experts.
+
+    The S3 inference fills the factory once per ``match``; the planner's glob
+    merge then hands that spec to every matched boundary, including boundaries
+    with no experts to shard (DeepSeek-V3's dense ``first_k_dense_replace``
+    MLPs). Such a boundary cannot be an expert-parallel region — there is nothing
+    to all-to-all — and the artifact would render a local-region forward whose
+    compute the runtime never binds (the applier resolves an EP factory against a
+    non-MoE module and fails its interface assertion). Dropping the injection
+    here, while the plan is still codegen's own, keeps the artifact coherent.
+
+    Only targets the framework inferred are affected: a user-declared
+    ``local_compute_fn`` stays the escape hatch and is never dropped.
+    """
+    if not inferred_targets:
+        return
+    for fqn, spec in (getattr(plan, "modules", {}) or {}).items():
+        injection = getattr(spec, "local_compute_fn", None)
+        if injection is None or _target_path(injection) not in inferred_targets:
+            continue
+        module = model.get_submodule(fqn) if model is not None else None
+        if module is None or _looks_like_moe_boundary(module):
+            continue
+        logger.info(
+            "codegen: inferred EP injection dropped on %s — %s carries no "
+            "experts/router, so it cannot be an expert-parallel region",
+            fqn, type(module).__name__)
+        spec.local_compute_fn = None
+        spec.region_dispatch = None
+
+
+def _looks_like_moe_boundary(module: Any) -> bool:
+    """Cheap gate: does the module carry an expert plus a router gate?"""
+    return hasattr(module, "experts") and (
+        hasattr(module, "gate") or hasattr(module, "router")
+    )
 
 
 def _import_ep_target_for(module: Any, match: str) -> "Any":
