@@ -23,6 +23,8 @@ import unittest
 _EXPORT_MODULES = (
     "hyper_parallel.models._transformers.auto_model",
     "hyper_parallel.models._transformers.checkpoint_loader",
+    "hyper_parallel.models._transformers.checkpoint_conversion",
+    "hyper_parallel.models._transformers.hf_load_planner",
 )
 
 

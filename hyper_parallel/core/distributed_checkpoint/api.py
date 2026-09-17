@@ -521,6 +521,7 @@ def load(
         is_coordinator=is_coordinator,
         rank=rank,
         broadcast_replicated_tensors=broadcast_replicated_tensors,
+        use_collectives=use_collectives,
     )
 
     # Configure storage reader

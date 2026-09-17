@@ -14,18 +14,15 @@
 # ============================================================================
 """Checkpoint management for finalized HyperParallel models."""
 
-import json
 import logging
+import os
 import re
-from collections import Counter, OrderedDict, defaultdict
-from copy import deepcopy
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 import torch
-from huggingface_hub import snapshot_download
-from safetensors import safe_open
 from torch import nn
 from torch.distributed import is_available, is_initialized
 from hyper_parallel.components.checkpoint.weight_conversion import (
@@ -33,26 +30,59 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightRenaming,
     dot_natural_key,
     get_model_conversion_mapping,
-    rename_source_key,
     revert_weight_conversion,
 )
 
-from hyper_parallel import DTensor, Partial, distribute_tensor
+from hyper_parallel import DTensor
+from hyper_parallel.models._transformers.checkpoint_conversion import (
+    CheckpointIndex,
+    LoadGroup,
+    LoadReport,
+    SourceModelView,
+    alias_names_by_target,
+    base_weights_mapping,
+    build_load_groups,
+    build_load_targets,
+    build_replacement_routes,
+    convert_group,
+    copy_into_target,
+    join_fqn,
+    local_target_tensor,
+    make_tensor_loader,
+    resolve_checkpoint_index,
+    validate_load_result,
+)
 
 logger = logging.getLogger(__name__)
 
-_SAFE_WEIGHTS_NAME = "model.safetensors"
-_SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
-_SNAPSHOT_PATTERNS = ("*.safetensors", "*.safetensors.index.json")
+# Picks the pretrained loader when CheckpointManager.load_checkpoint is not told which one to use.
+HF_LOADER_ENV = "HYPER_PARALLEL_HF_LOADER"
+_HF_LOADERS = ("legacy", "dcp")
 
 
-@dataclass(frozen=True)
-class LoadReport:
-    """Summary of one pretrained-weight load."""
+def resolve_hf_loader(loader: str | None = None) -> str:
+    """
+    Name the pretrained loader to use.
 
-    loaded_keys: tuple[str, ...]
-    missing_keys: tuple[str, ...]
-    unexpected_keys: tuple[str, ...]
+    Args:
+        loader (str | None): ``"legacy"`` reads whole checkpoint tensors on every rank and shards them in
+            memory. ``"dcp"`` plans the same conversions as distributed checkpoint reads, so that each
+            rank reads only the regions of the checkpoint its shards need. Default None, which reads
+            ``HYPER_PARALLEL_HF_LOADER`` and falls back to ``"legacy"``.
+
+    Returns:
+        str: ``"legacy"`` or ``"dcp"``.
+
+    Raises:
+        ValueError: If the loader named is neither.
+    """
+    choice = (loader or os.environ.get(HF_LOADER_ENV) or "legacy").strip().lower()
+    if choice not in _HF_LOADERS:
+        raise ValueError(
+            f"Unknown pretrained loader {choice!r}; expected one of {', '.join(_HF_LOADERS)} "
+            f"(set through the loader argument or {HF_LOADER_ENV})"
+        )
+    return choice
 
 
 class DCPBackend(Protocol):
@@ -77,371 +107,6 @@ class DCPBackend(Protocol):
         """Save the supplied sharded state dict as DCP."""
 
 
-@dataclass(frozen=True)
-class _CheckpointIndex:
-    """Map checkpoint tensor names to their safetensors shard files."""
-
-    files_by_key: dict[str, Path]
-
-    def keys(self) -> tuple[str, ...]:
-        """Return checkpoint keys in deterministic natural order."""
-        return tuple(sorted(self.files_by_key, key=dot_natural_key))
-
-    def load_tensor(self, key: str) -> torch.Tensor:
-        """Materialize one checkpoint tensor on CPU."""
-        file_path = self.files_by_key.get(key)
-        if file_path is None:
-            raise ValueError(f"Checkpoint key is not indexed: {key}")
-        with safe_open(str(file_path), framework="pt", device="cpu") as checkpoint:
-            return checkpoint.get_tensor(key)
-
-
-@dataclass
-class _LoadGroup:
-    first_target_name: str
-    transform: WeightRenaming | WeightConverter
-
-
-@dataclass(frozen=True)
-class _TensorShape:
-    shape: torch.Size
-
-
-class _SourceModelView:
-    """Expose pre-replacement parameter shapes to Transformers conversion ops."""
-
-    def __init__(self, model: nn.Module, shapes: dict[str, tuple[int, ...]]) -> None:
-        """Build a lightweight model view from captured tensor shapes."""
-        self.config = getattr(model, "config", None)
-        self.base_model_prefix = getattr(model, "base_model_prefix", None)
-        self._targets = {
-            name: _TensorShape(torch.Size(shape)) for name, shape in shapes.items()
-        }
-
-    def get_parameter(self, name: str) -> _TensorShape:
-        """Return source parameter metadata used by shape-aware converters."""
-        try:
-            return self._targets[name]
-        except KeyError as exc:
-            raise AttributeError(f"source model has no parameter {name!r}") from exc
-
-
-@dataclass
-class _ReplacementLoadGroup:
-    group: _LoadGroup
-    expected: Counter[str]
-    received: Counter[str]
-    completed: bool = False
-
-
-def _index_single_file(file_path: Path) -> _CheckpointIndex:
-    with safe_open(str(file_path), framework="pt", device="cpu") as checkpoint:
-        files_by_key = {key: file_path for key in checkpoint.keys()}
-    return _CheckpointIndex(files_by_key)
-
-
-def _index_sharded_checkpoint(directory: Path, index_path: Path) -> _CheckpointIndex:
-    """Index tensors described by a sharded safetensors index file."""
-
-    try:
-        index_data = json.loads(index_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Failed to read safetensors index {index_path}: {exc}") from exc
-    weight_map = index_data.get("weight_map")
-    if not isinstance(weight_map, dict) or not weight_map:
-        raise ValueError(f"Safetensors index has no non-empty weight_map: {index_path}")
-
-    files_by_key = {}
-    for key, relative_path in weight_map.items():
-        file_path = directory / relative_path
-        if not file_path.is_file():
-            raise ValueError(f"Safetensors shard for {key} does not exist: {file_path}")
-        files_by_key[key] = file_path
-    return _CheckpointIndex(files_by_key)
-
-
-def _resolve_checkpoint_index(pretrained_path: str) -> _CheckpointIndex:
-    """Resolve a local or Hub checkpoint into a tensor-to-file index."""
-
-    path = Path(pretrained_path).expanduser()
-    if path.is_file():
-        if path.suffix != ".safetensors":
-            raise ValueError(f"MVP only supports safetensors checkpoints, got: {path}")
-        return _index_single_file(path)
-
-    if path.is_dir():
-        checkpoint_directory = path
-    else:
-        checkpoint_directory = Path(
-            snapshot_download(
-                repo_id=pretrained_path,
-                allow_patterns=list(_SNAPSHOT_PATTERNS),
-            )
-        )
-
-    index_path = checkpoint_directory / _SAFE_WEIGHTS_INDEX_NAME
-    if index_path.is_file():
-        return _index_sharded_checkpoint(checkpoint_directory, index_path)
-
-    single_file = checkpoint_directory / _SAFE_WEIGHTS_NAME
-    if single_file.is_file():
-        return _index_single_file(single_file)
-    raise ValueError(
-        "MVP requires model.safetensors or model.safetensors.index.json under "
-        f"{checkpoint_directory}"
-    )
-
-
-def _join_fqn(module_name: str, tensor_name: str) -> str:
-    return f"{module_name}.{tensor_name}" if module_name else tensor_name
-
-
-def _build_load_targets(model: nn.Module) -> dict[str, torch.Tensor]:
-    """Collect persistent parameters and buffers owned by the model."""
-
-    targets = {}
-    # Direct module registries preserve tied aliases and let us exclude
-    # non-persistent buffers without materializing an FSDP state_dict.
-    for module_name, module in model.named_modules(remove_duplicate=False):
-        for tensor_name, parameter in module._parameters.items():  # pylint: disable=W0212
-            if parameter is not None:
-                targets[_join_fqn(module_name, tensor_name)] = parameter
-        non_persistent = module._non_persistent_buffers_set  # pylint: disable=W0212
-        for tensor_name, buffer in module._buffers.items():  # pylint: disable=W0212
-            if buffer is not None and tensor_name not in non_persistent:
-                targets[_join_fqn(module_name, tensor_name)] = buffer
-    return targets
-
-
-def _make_tensor_loader(index: _CheckpointIndex, source_key: str) -> Callable[[], torch.Tensor]:
-    return lambda: index.load_tensor(source_key)
-
-
-def _build_load_groups(
-    model: nn.Module,
-    checkpoint_index: _CheckpointIndex,
-    targets: dict[str, torch.Tensor],
-    *,
-    weights_mapping: list[WeightRenaming | WeightConverter],
-) -> tuple[
-    tuple[_LoadGroup, ...],
-    tuple[str, ...],
-    list[WeightRenaming | WeightConverter],
-]:
-    """Build checkpoint conversion groups and report unmatched transforms."""
-
-    weight_mapping = weights_mapping
-    unsupported = [
-        transform
-        for transform in weight_mapping
-        if not isinstance(transform, (WeightRenaming, WeightConverter))
-    ]
-    if unsupported:
-        names = ", ".join(type(transform).__name__ for transform in unsupported)
-        raise ValueError(f"Unsupported Transformers weight transforms in MVP: {names}")
-
-    renamings = [transform for transform in weight_mapping if isinstance(transform, WeightRenaming)]
-    converters = [transform for transform in weight_mapping if isinstance(transform, WeightConverter)]
-    converters_by_pattern = defaultdict(list)
-    for converter in converters:
-        for pattern in converter.source_patterns:
-            converters_by_pattern[pattern].append(converter)
-    groups: OrderedDict[str, _LoadGroup] = OrderedDict()
-    unexpected_keys = []
-    base_model_prefix = getattr(model, "base_model_prefix", None)
-
-    for source_key in checkpoint_index.keys():
-        target_name, source_pattern = rename_source_key(
-            source_key,
-            renamings,
-            converters,
-            base_model_prefix=base_model_prefix,
-            meta_state_dict=targets,
-        )
-        if target_name not in targets and source_key in targets:
-            target_name, source_pattern = rename_source_key(
-                source_key,
-                [],
-                [],
-                base_model_prefix=base_model_prefix,
-                meta_state_dict=targets,
-            )
-        if target_name not in targets:
-            unexpected_keys.append(source_key)
-            continue
-
-        if source_pattern is None:
-            source_pattern = source_key
-            transform = WeightRenaming(source_patterns=source_key, target_patterns=target_name)
-        else:
-            candidates = converters_by_pattern.get(source_pattern, [])
-            scoped_candidates = [
-                converter
-                for converter in candidates
-                if converter.scope_prefix is not None
-                and (
-                    target_name == converter.scope_prefix
-                    or target_name.startswith(f"{converter.scope_prefix}.")
-                )
-            ]
-            if len(scoped_candidates) == 1:
-                converter = scoped_candidates[0]
-            else:
-                unscoped_candidates = [
-                    converter for converter in candidates if converter.scope_prefix is None
-                ]
-                converter = unscoped_candidates[0] if len(unscoped_candidates) == 1 else None
-            if converter is None:
-                raise ValueError(
-                    "No unique WeightConverter found for matched source pattern "
-                    f"{source_pattern!r} and target {target_name!r}"
-                )
-            transform = deepcopy(converter)
-
-        group = groups.setdefault(
-            target_name,
-            _LoadGroup(first_target_name=target_name, transform=transform),
-        )
-        group.transform.add_tensor(
-            target_name,
-            source_key,
-            source_pattern,
-            _make_tensor_loader(checkpoint_index, source_key),
-        )
-
-    return tuple(groups.values()), tuple(unexpected_keys), weight_mapping
-
-
-def _build_replacement_routes(
-    model: nn.Module,
-    source_names: tuple[str, ...],
-    targets: dict[str, torch.Tensor],
-    transforms: list[WeightRenaming | WeightConverter],
-) -> dict[str, tuple[_ReplacementLoadGroup, str, str]]:
-    """Route normalized Transformers parameters into replacement converters."""
-    routing_transforms = deepcopy(transforms)
-    renamings = [
-        transform
-        for transform in routing_transforms
-        if isinstance(transform, WeightRenaming)
-    ]
-    converters = [
-        transform
-        for transform in routing_transforms
-        if isinstance(transform, WeightConverter)
-    ]
-    converters_by_pattern = defaultdict(list)
-    for converter in converters:
-        for pattern in converter.source_patterns:
-            converters_by_pattern[pattern].append(converter)
-
-    groups: OrderedDict[str, _ReplacementLoadGroup] = OrderedDict()
-    routes = {}
-    base_model_prefix = getattr(model, "base_model_prefix", None)
-    for source_name in source_names:
-        target_name, source_pattern = rename_source_key(
-            source_name,
-            renamings,
-            converters,
-            base_model_prefix=base_model_prefix,
-            meta_state_dict=targets,
-        )
-        if source_pattern is None and target_name == source_name:
-            continue
-        if target_name not in targets:
-            continue
-
-        if source_pattern is None:
-            collected_pattern = source_name
-            transform: WeightRenaming | WeightConverter = WeightRenaming(
-                source_patterns=source_name,
-                target_patterns=target_name,
-            )
-        else:
-            collected_pattern = source_pattern
-            candidates = converters_by_pattern.get(source_pattern, [])
-            scoped_candidates = [
-                converter
-                for converter in candidates
-                if converter.scope_prefix is not None
-                and (
-                    target_name == converter.scope_prefix
-                    or target_name.startswith(f"{converter.scope_prefix}.")
-                )
-            ]
-            if len(scoped_candidates) != 1:
-                raise ValueError(
-                    "No unique replacement WeightConverter found for source "
-                    f"{source_name!r} and target {target_name!r}"
-                )
-            transform = deepcopy(scoped_candidates[0])
-
-        state = groups.get(target_name)
-        if state is None:
-            state = _ReplacementLoadGroup(
-                group=_LoadGroup(target_name, transform),
-                expected=Counter(),
-                received=Counter(),
-            )
-            groups[target_name] = state
-        state.expected[collected_pattern] += 1
-        routes[source_name] = (state, target_name, collected_pattern)
-    return routes
-
-
-def _local_target_tensor(target: torch.Tensor) -> torch.Tensor:
-    return target.to_local() if isinstance(target, DTensor) else target
-
-
-def _target_layout(target: torch.Tensor) -> Any:
-    if isinstance(target, DTensor) and target.layout is not None:
-        return target.layout
-    return getattr(target, "_sharding_spec", None)
-
-
-def _shard_for_target(target_name: str, full_tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Shard a full checkpoint tensor according to its target layout."""
-
-    layout = _target_layout(target)
-    if layout is None:
-        return full_tensor
-    if any(isinstance(placement, Partial) for placement in layout.placements):
-        raise ValueError(f"Partial placement is not supported for pretrained loading: {target_name}")
-
-    local_dtensor = distribute_tensor(
-        full_tensor,
-        layout.mesh,
-        layout.alias_placements,
-        src_data_rank=None,
-    )
-    return local_dtensor.to_local()
-
-
-def _copy_into_target(target_name: str, full_tensor: torch.Tensor, target: torch.Tensor) -> None:
-    """Copy a checkpoint tensor into its materialized local target."""
-
-    local_tensor = _shard_for_target(target_name, full_tensor, target)
-    destination = _local_target_tensor(target)
-    if destination.is_meta:
-        raise ValueError(f"Target must be materialized before loading: {target_name}")
-    if tuple(local_tensor.shape) != tuple(destination.shape):
-        raise ValueError(
-            f"Local shape mismatch for {target_name}: checkpoint shard "
-            f"{tuple(local_tensor.shape)} vs target {tuple(destination.shape)}"
-        )
-    local_tensor = local_tensor.to(device=destination.device, dtype=destination.dtype)
-    with torch.no_grad():
-        destination.copy_(local_tensor)
-    target._is_hf_initialized = True  # pylint: disable=W0212
-
-
-def _alias_names_by_target(targets: dict[str, torch.Tensor]) -> dict[int, set[str]]:
-    aliases = defaultdict(set)
-    for target_name, target in targets.items():
-        aliases[id(target)].add(target_name)
-    return aliases
-
-
 class CheckpointManager:
     """Manage pretrained and resumable checkpoints for one finalized model."""
 
@@ -461,10 +126,33 @@ class CheckpointManager:
         *,
         strict: bool = True,
         weights_mapping: list[WeightRenaming | WeightConverter] | None = None,
+        loader: str | None = None,
     ) -> LoadReport:
-        """Load complete Hugging Face weights into the finalized model."""
+        """
+        Load complete Hugging Face weights into the finalized model.
+
+        Args:
+            pretrained_path (str): A safetensors file, a checkpoint directory or a Hub repository id.
+            strict (bool): Raise if a model tensor is left unloaded. Default True.
+            weights_mapping (list[WeightRenaming | WeightConverter] | None): Rules renaming and converting
+                checkpoint tensors. Default None, for the model's Transformers conversion mapping.
+            loader (str | None): Which loader reads the weights; see :func:`resolve_hf_loader`.
+                Default None.
+
+        Returns:
+            LoadReport: What was loaded, what is missing and what the checkpoint holds beyond the model.
+        """
         if not pretrained_path:
             raise ValueError("pretrained_path must be provided when load_base_model=True")
+        if resolve_hf_loader(loader) == "dcp":
+            # Imported here: the planner module imports this one.
+            from hyper_parallel.models._transformers.hf_load_planner import (  # pylint: disable=C0415
+                load_hf_checkpoint,
+            )
+
+            return load_hf_checkpoint(
+                self.model, pretrained_path, weights_mapping=weights_mapping, strict=strict
+            )
         if weights_mapping is None:
             weights_mapping = get_model_conversion_mapping(
                 self.model,
@@ -472,8 +160,8 @@ class CheckpointManager:
                 hf_quantizer=None,
             )
 
-        checkpoint_index = _resolve_checkpoint_index(pretrained_path)
-        targets = _build_load_targets(self.model)
+        checkpoint_index = resolve_checkpoint_index(pretrained_path)
+        targets = build_load_targets(self.model)
         replacement_mapping = getattr(
             self.model,
             "_hp_replacement_weight_conversions",
@@ -494,13 +182,14 @@ class CheckpointManager:
                 pretrained_path,
                 strict,
             )
-        groups, unexpected_keys, weight_mapping = _build_load_groups(
+        groups, unexpected_keys, weight_mapping = build_load_groups(
             self.model,
-            checkpoint_index,
+            checkpoint_index.keys(),
             targets,
             weights_mapping=weights_mapping,
+            make_loader=partial(make_tensor_loader, checkpoint_index),
         )
-        aliases_by_target = _alias_names_by_target(targets)
+        aliases_by_target = alias_names_by_target(targets)
         loaded_keys = set()
         loaded_target_ids = set()
 
@@ -514,7 +203,7 @@ class CheckpointManager:
                 tensor = tensor[0] if isinstance(tensor, list) else tensor
                 target_id = id(target)
                 if target_id not in loaded_target_ids:
-                    _copy_into_target(target_name, tensor, target)
+                    copy_into_target(target_name, tensor, target)
                     loaded_target_ids.add(target_id)
                 loaded_keys.update(aliases_by_target[target_id])
 
@@ -537,7 +226,7 @@ class CheckpointManager:
 
     def _load_with_replacement_conversions(
         self,
-        checkpoint_index: _CheckpointIndex,
+        checkpoint_index: CheckpointIndex,
         targets: dict[str, torch.Tensor],
         weights_mapping: list[WeightRenaming | WeightConverter],
         replacement_mapping: list[WeightRenaming | WeightConverter],
@@ -546,26 +235,22 @@ class CheckpointManager:
         strict: bool,
     ) -> LoadReport:
         """Normalize original weights before applying replacement conversions."""
-        replacement_ids = {id(transform) for transform in replacement_mapping}
-        base_mapping = [
-            transform
-            for transform in weights_mapping
-            if id(transform) not in replacement_ids
-        ]
-        source_model = _SourceModelView(self.model, source_shapes)
-        base_groups, unexpected_keys, _ = _build_load_groups(
+        base_mapping = base_weights_mapping(weights_mapping, replacement_mapping)
+        source_model = SourceModelView(self.model, source_shapes)
+        base_groups, unexpected_keys, _ = build_load_groups(
             source_model,
-            checkpoint_index,
-            source_model._targets,  # pylint: disable=protected-access
+            checkpoint_index.keys(),
+            source_model.targets,
             weights_mapping=base_mapping,
+            make_loader=partial(make_tensor_loader, checkpoint_index),
         )
-        routes = _build_replacement_routes(
+        routes = build_replacement_routes(
             self.model,
             tuple(source_shapes),
             targets,
             replacement_mapping,
         )
-        aliases_by_target = _alias_names_by_target(targets)
+        aliases_by_target = alias_names_by_target(targets)
         loaded_keys = set()
         loaded_target_ids = set()
         used_replacements = []
@@ -581,7 +266,7 @@ class CheckpointManager:
                 tensor = tensor[0] if isinstance(tensor, list) else tensor
                 target_id = id(target)
                 if target_id not in loaded_target_ids:
-                    _copy_into_target(target_name, tensor, target)
+                    copy_into_target(target_name, tensor, target)
                     loaded_target_ids.add(target_id)
                 loaded_keys.update(aliases_by_target[target_id])
 
@@ -704,24 +389,12 @@ class CheckpointManager:
 
     def _convert_group(
         self,
-        group: _LoadGroup,
+        group: LoadGroup,
         *,
-        model: nn.Module | _SourceModelView | None = None,
+        model: nn.Module | SourceModelView | None = None,
     ) -> dict[str, torch.Tensor]:
         """Convert all checkpoint tensors belonging to one load group."""
-
-        try:
-            return group.transform.convert(
-                group.first_target_name,
-                model=self.model if model is None else model,
-                config=getattr(self.model if model is None else model, "config", None),
-                hf_quantizer=None,
-                loading_info=None,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to convert checkpoint tensors for {group.first_target_name}: {exc}"
-            ) from exc
+        return convert_group(group, self.model if model is None else model)
 
     @staticmethod
     def _validate_load_result(
@@ -730,19 +403,7 @@ class CheckpointManager:
         strict: bool,
     ) -> None:
         """Validate missing keys and report ignored checkpoint tensors."""
-
-        if strict and missing_keys:
-            preview = ", ".join(missing_keys[:10])
-            raise RuntimeError(
-                f"Checkpoint did not load {len(missing_keys)} owned model tensors; "
-                f"first keys: {preview}"
-            )
-        if unexpected_keys:
-            logger.warning(
-                "Ignored %d checkpoint tensors not owned by this model/rank; first keys: %s",
-                len(unexpected_keys),
-                ", ".join(unexpected_keys[:10]),
-            )
+        validate_load_result(missing_keys, unexpected_keys, strict)
 
     def _gather_full_state_dict(self, *, keep_state_dict: bool) -> dict[str, Any]:
         """Gather sharded model tensors into a full CPU state dictionary."""
@@ -807,14 +468,14 @@ def _build_finalize_targets(model: nn.Module) -> dict[str, _FinalizeTarget]:
         for tensor_name, parameter in module._parameters.items():  # pylint: disable=W0212
             if parameter is None:
                 continue
-            fqn = _join_fqn(module_name, tensor_name)
+            fqn = join_fqn(module_name, tensor_name)
             targets[fqn] = _FinalizeTarget(fqn, module, tensor_name, parameter, True, False)
 
         non_persistent = module._non_persistent_buffers_set  # pylint: disable=W0212
         for tensor_name, buffer in module._buffers.items():  # pylint: disable=W0212
             if buffer is None:
                 continue
-            fqn = _join_fqn(module_name, tensor_name)
+            fqn = join_fqn(module_name, tensor_name)
             targets[fqn] = _FinalizeTarget(
                 fqn,
                 module,
@@ -828,7 +489,7 @@ def _build_finalize_targets(model: nn.Module) -> dict[str, _FinalizeTarget]:
 
 def _validate_materialized(targets: list[_FinalizeTarget]) -> None:
     """Reject model state that remains on meta after storage materialization."""
-    meta_keys = [target.fqn for target in targets if _local_target_tensor(target.tensor).is_meta]
+    meta_keys = [target.fqn for target in targets if local_target_tensor(target.tensor).is_meta]
     if meta_keys:
         preview = ", ".join(meta_keys[:10])
         raise ValueError(
@@ -838,7 +499,7 @@ def _validate_materialized(targets: list[_FinalizeTarget]) -> None:
 
 def _snapshot_target(target: _FinalizeTarget) -> _TargetSnapshot:
     """Capture identity and shape invariants without copying tensor data."""
-    local_tensor = _local_target_tensor(target.tensor)
+    local_tensor = local_target_tensor(target.tensor)
     layout = getattr(target.tensor, "layout", None)
     if layout is None:
         layout = getattr(target.tensor, "_sharding_spec", None)
@@ -875,8 +536,8 @@ def _shares_local_storage(first: torch.Tensor, second: torch.Tensor) -> bool:
     """Return whether two tensors represent the same local parameter storage."""
     if first is second:
         return True
-    first_local = _local_target_tensor(first)
-    second_local = _local_target_tensor(second)
+    first_local = local_target_tensor(first)
+    second_local = local_target_tensor(second)
     return (
         first_local.device == second_local.device
         and first_local.untyped_storage().data_ptr() == second_local.untyped_storage().data_ptr()

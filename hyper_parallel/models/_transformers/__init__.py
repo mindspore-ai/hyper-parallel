@@ -27,6 +27,10 @@ if TYPE_CHECKING:
         DCPBackend,
         LoadReport,
     )
+    from hyper_parallel.models._transformers.hf_load_planner import (
+        HFLoadPlanner,
+        load_hf_checkpoint,
+    )
 
 
 # AutoModel and checkpoint modules load the full torch/Transformers runtime.
@@ -39,6 +43,8 @@ _LAZY_EXPORTS = {
     "CheckpointManager": ".checkpoint_loader",
     "DCPBackend": ".checkpoint_loader",
     "LoadReport": ".checkpoint_loader",
+    "HFLoadPlanner": ".hf_load_planner",
+    "load_hf_checkpoint": ".hf_load_planner",
 }
 
 
@@ -65,4 +71,6 @@ __all__ = [
     "CheckpointManager",
     "DCPBackend",
     "LoadReport",
+    "HFLoadPlanner",
+    "load_hf_checkpoint",
 ]
