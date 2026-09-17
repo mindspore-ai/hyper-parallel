@@ -234,6 +234,45 @@ class _GraphClassification:
     state_phs: List[fx.Node]
 
 
+@dataclass
+class _Boundaries:
+    """Boundary value lists crossing this stage's cuts.
+
+    All lists are in joint-graph topological order so the producer and
+    consumer of a cut agree on P2P ordering:
+
+    - ``act_in``: stage-(k-1) values consumed by stage k (tensors,
+      dynamic-shape scalars, parent-level views — everything a real ATen
+      graph pushes across a cut).
+    - ``act_out``: stage-k values consumed by stage k+1.
+    - ``grad_in``: stage-(k+1) backward values consumed by stage k.
+    - ``grad_out``: stage-k backward values consumed by stage k-1.
+    - ``saved``: forward-phase values referenced by this stage's backward
+      nodes — exported as forward outputs and replayed as backward inputs.
+    """
+
+    act_in: List[fx.Node]
+    act_out: List[fx.Node]
+    grad_in: List[fx.Node]
+    grad_out: List[fx.Node]
+    saved: List[fx.Node]
+
+
+@dataclass
+class _SubgraphBuilder:
+    """Accumulator for assembling one stage subgraph.
+
+    ``env`` maps already-copied same-slice nodes; ``foreign`` maps
+    boundary values to their placeholder stand-ins; ``used`` carries the
+    taken placeholder names for ``_unique``.
+    """
+
+    g: fx.Graph
+    used: Set[str]
+    env: Dict[fx.Node, fx.Node]
+    foreign: Dict[fx.Node, fx.Node]
+
+
 class PpPass(GraphPass):
     """Pipeline-parallel partitioning pass (graph-level stage split)."""
 
@@ -354,9 +393,8 @@ class PpPass(GraphPass):
 
         graph_cls = self._classify_graph(
             graph_module,
+            run_ctx,
             stage_of_fqn,
-            run_ctx.pp_degree,
-            run_ctx.stage_idx,
             state_fqns,
             num_state_inputs,
         )
@@ -386,15 +424,13 @@ class PpPass(GraphPass):
             stage_state_fqns=[state_fqns[i] for i in graph_cls.stage_state_indices],
         )
 
-    def _build_and_install_stage(  # pylint: disable=too-many-locals
+    def _build_and_install_stage(
         self,
         graph_module: fx.GraphModule,
         pass_config: PassConfig,
         run_ctx: _RunContext,
         split: _StageSplit,
-        boundaries: Tuple[
-            List[fx.Node], List[fx.Node], List[fx.Node], List[fx.Node], List[fx.Node]
-        ],
+        boundaries: _Boundaries,
     ) -> None:
         """Build the stage subgraphs, prune the live model, install the stub.
 
@@ -407,11 +443,8 @@ class PpPass(GraphPass):
             pass_config: Parallel configuration (microbatch size read).
             run_ctx: This rank's PP execution context.
             split: Stage plan and per-node classification.
-            boundaries: ``(act_in_list, act_out_list, grad_in_list,
-                grad_out_list, saved)`` from ``_find_boundaries``.
+            boundaries: Boundary value lists from ``_find_boundaries``.
         """
-        act_in_list, act_out_list, grad_in_list, grad_out_list, saved = boundaries
-
         trainable_indices = self._trainable_state_indices(
             split.state_fqns, split.state_is_param, run_ctx.model
         )
@@ -419,22 +452,7 @@ class PpPass(GraphPass):
         stage_trainable = [i for i in trainable_indices if i in stage_state_set]
 
         fwd_gm, bwd_gm = self._build_stage_graphs(
-            graph_module,
-            split.node_stage,
-            split.node_phase,
-            run_ctx.stage_idx,
-            run_ctx.pp_degree,
-            split.state_phs,
-            split.stage_state_indices,
-            split.stage_state_fqns,
-            split.input_ph,
-            split.label_ph,
-            act_in_list,
-            act_out_list,
-            grad_in_list,
-            grad_out_list,
-            saved,
-            trainable_indices,
+            graph_module, run_ctx, split, boundaries, trainable_indices
         )
 
         self._prune_live_model(run_ctx.model, split.stage_plan[run_ctx.stage_idx])
@@ -443,15 +461,10 @@ class PpPass(GraphPass):
             fwd_gm,
             bwd_gm,
             pass_config,
-            run_ctx.stage_idx,
-            run_ctx.pp_degree,
-            run_ctx.group,
-            len(split.stage_state_fqns),
+            run_ctx,
+            split,
             len(stage_trainable),
-            act_in_list,
-            act_out_list,
-            grad_in_list,
-            grad_out_list,
+            boundaries,
         )
         self._install_stub(
             graph_module,
@@ -467,59 +480,24 @@ class PpPass(GraphPass):
             run_ctx.stage_idx,
             len(split.stage_state_fqns),
             len(stage_trainable),
-            len(act_out_list),
-            len(grad_out_list),
+            len(boundaries.act_out),
+            len(boundaries.grad_out),
         )
 
-    def _build_stage_graphs(  # pylint: disable=too-many-locals,too-many-arguments
+    def _build_stage_graphs(
         self,
         graph_module: fx.GraphModule,
-        node_stage: Dict[fx.Node, int],
-        node_phase: Dict[fx.Node, str],
-        stage_idx: int,
-        pp_degree: int,
-        state_phs: List[fx.Node],
-        stage_state_indices: List[int],
-        stage_state_fqns: List[str],
-        input_ph: fx.Node,
-        label_ph: fx.Node,
-        act_in_list: List[fx.Node],
-        act_out_list: List[fx.Node],
-        grad_in_list: List[fx.Node],
-        grad_out_list: List[fx.Node],
-        saved: List[fx.Node],
+        run_ctx: _RunContext,
+        split: _StageSplit,
+        boundaries: _Boundaries,
         trainable_indices: List[int],
     ) -> Tuple[fx.GraphModule, fx.GraphModule]:
         """Build this stage's forward and backward subgraphs."""
         fwd_gm, fwd_out_orig = self._build_fwd_graph(
-            graph_module,
-            node_stage,
-            node_phase,
-            stage_idx,
-            pp_degree,
-            state_phs,
-            stage_state_indices,
-            stage_state_fqns,
-            input_ph,
-            label_ph,
-            act_in_list,
-            act_out_list,
-            self._loss_node(graph_module),
-            saved,
+            graph_module, run_ctx, split, boundaries
         )
         bwd_gm = self._build_bwd_graph(
-            graph_module,
-            node_stage,
-            node_phase,
-            stage_idx,
-            pp_degree,
-            state_phs,
-            stage_state_indices,
-            stage_state_fqns,
-            grad_in_list,
-            grad_out_list,
-            fwd_out_orig,
-            trainable_indices,
+            graph_module, run_ctx, split, boundaries, fwd_out_orig, trainable_indices
         )
         return fwd_gm, bwd_gm
 
@@ -690,9 +668,8 @@ class PpPass(GraphPass):
     def _classify_graph(  # pylint: disable=too-many-locals
         self,
         graph_module: fx.GraphModule,
+        run_ctx: _RunContext,
         stage_of_fqn: Dict[str, int],
-        num_stages: int,
-        stage_idx: int,
         state_fqns: Sequence[str],
         num_state_inputs: int,
     ) -> _GraphClassification:
@@ -723,6 +700,7 @@ class PpPass(GraphPass):
         graph = graph_module.graph
         placeholders = [n for n in graph.nodes if n.op == "placeholder"]
         state_ph_set = set(placeholders[:num_state_inputs])
+        num_stages = run_ctx.pp_degree
 
         node_stage: Dict[fx.Node, int] = {}
         node_phase: Dict[fx.Node, str] = {}
@@ -739,9 +717,8 @@ class PpPass(GraphPass):
             node_phase,
             state_fqns,
             stage_of_fqn,
-            num_stages,
             num_state_inputs,
-            stage_idx,
+            run_ctx,
         )
         self._classify_forward_nodes(
             graph, state_ph_set, stage_of_fqn, num_stages, node_stage, node_phase
@@ -754,7 +731,7 @@ class PpPass(GraphPass):
             state_phs,
             state_fqns,
             node_stage,
-            stage_idx,
+            run_ctx.stage_idx,
             stage_state_indices,
         )
 
@@ -778,9 +755,8 @@ class PpPass(GraphPass):
         node_phase: Dict[fx.Node, str],
         state_fqns: Sequence[str],
         stage_of_fqn: Dict[str, int],
-        num_stages: int,
         num_state_inputs: int,
-        stage_idx: int,
+        run_ctx: _RunContext,
     ) -> Tuple[
         List[fx.Node], List[int], List[int], Optional[fx.Node], Optional[fx.Node]
     ]:
@@ -804,14 +780,14 @@ class PpPass(GraphPass):
                     deferred_state.append(idx)
                 else:
                     node_stage[ph] = stage
-                    if stage == stage_idx:
+                    if stage == run_ctx.stage_idx:
                         stage_state_indices.append(idx)
             elif idx == num_state_inputs:
                 input_ph = ph
                 node_stage[ph] = 0
             else:
                 label_ph = ph
-                node_stage[ph] = num_stages - 1
+                node_stage[ph] = run_ctx.pp_degree - 1
             node_phase[ph] = _FWD
         return state_phs, deferred_state, stage_state_indices, input_ph, label_ph
 
@@ -1131,27 +1107,13 @@ class PpPass(GraphPass):
         node_phase: Dict[fx.Node, str],
         pp_degree: int,
         stage_idx: int,
-    ) -> Tuple[
-        List[fx.Node], List[fx.Node], List[fx.Node], List[fx.Node], List[fx.Node]
-    ]:
+    ) -> _Boundaries:
         """Locate the value lists crossing this stage's cuts.
 
         Returns:
-            ``(act_in_list, act_out_list, grad_in_list, grad_out_list,
-            saved)``, all in joint-graph topological order so the producer
-            and consumer of a cut agree on P2P ordering:
-
-            - ``act_in_list``: stage-(k-1) values consumed by stage k
-              (tensors, dynamic-shape scalars, parent-level views —
-              everything a real ATen graph pushes across a cut).
-            - ``act_out_list``: stage-k values consumed by stage k+1.
-            - ``grad_in_list``: stage-(k+1) backward values consumed by
-              stage k.
-            - ``grad_out_list``: stage-k backward values consumed by
-              stage k-1.
-            - ``saved``: forward-phase values referenced by this stage's
-              backward nodes — exported as forward outputs and replayed as
-              backward inputs.
+            The ``_Boundaries`` lists, all in joint-graph topological order
+            so the producer and consumer of a cut agree on P2P ordering.
+            See ``_Boundaries`` for the per-field semantics.
         """
         k = stage_idx
         is_last = k == pp_degree - 1
@@ -1225,7 +1187,13 @@ class PpPass(GraphPass):
             if node_phase[v] == _FWD and v not in seen:
                 seen.add(v)
                 saved.append(v)
-        return act_in_list, act_out_list, grad_in_list, grad_out_list, saved
+        return _Boundaries(
+            act_in=act_in_list,
+            act_out=act_out_list,
+            grad_in=grad_in_list,
+            grad_out=grad_out_list,
+            saved=saved,
+        )
 
     # ------------------------------------------------------------------
     # Subgraph construction
@@ -1244,17 +1212,16 @@ class PpPass(GraphPass):
 
     def _copy_node(
         self,
-        g: fx.Graph,
+        builder: _SubgraphBuilder,
         node: fx.Node,
-        env: Dict[fx.Node, fx.Node],
-        foreign: Dict[fx.Node, fx.Node],
     ) -> None:
-        """Copy ``node`` into ``g``, remapping args through env/foreign maps.
+        """Copy ``node`` into ``builder.g``, remapping args through the
+        builder's env/foreign maps.
 
         ``env`` maps already-copied same-slice nodes; ``foreign`` maps
         boundary values to their placeholder stand-ins. The copy is
-        registered under ``env[node]``; nothing is returned — callers
-        consume the copy through ``env`` / ``foreign``.
+        registered under ``builder.env[node]``; nothing is returned —
+        callers consume the copy through the builder's maps.
         """
         if node.op == "get_attr":
             raise ValueError(
@@ -1265,10 +1232,10 @@ class PpPass(GraphPass):
         def map_fn(a: Any) -> Any:
             """Remap a single arg: env first, then foreign placeholders."""
             if isinstance(a, fx.Node):
-                if a in env:
-                    return env[a]
-                if a in foreign:
-                    return foreign[a]
+                if a in builder.env:
+                    return builder.env[a]
+                if a in builder.foreign:
+                    return builder.foreign[a]
                 raise ValueError(
                     f"Node '{node.name}' references '{a.name}' which lies "
                     f"outside this stage's slice — boundary detection or "
@@ -1278,116 +1245,86 @@ class PpPass(GraphPass):
 
         new_args = fx.map_arg(node.args, map_fn)
         new_kwargs = fx.map_arg(node.kwargs, map_fn)
-        new_node = g.create_node(node.op, node.target, new_args, new_kwargs)
+        new_node = builder.g.create_node(node.op, node.target, new_args, new_kwargs)
         new_node.meta = dict(node.meta)
-        env[node] = new_node
+        builder.env[node] = new_node
 
-    def _build_fwd_graph(  # pylint: disable=too-many-locals,too-many-arguments
+    def _build_fwd_graph(
         self,
         graph_module: fx.GraphModule,
-        node_stage: Dict[fx.Node, int],
-        node_phase: Dict[fx.Node, str],
-        stage_idx: int,
-        pp_degree: int,
-        state_phs: List[fx.Node],
-        stage_state_indices: List[int],
-        stage_state_fqns: List[str],
-        input_ph: fx.Node,
-        label_ph: fx.Node,
-        act_in_list: List[fx.Node],
-        act_out_list: List[fx.Node],
-        loss_node: Optional[fx.Node],
-        saved: List[fx.Node],
+        run_ctx: _RunContext,
+        split: _StageSplit,
+        boundaries: _Boundaries,
     ) -> Tuple[fx.GraphModule, List[fx.Node]]:
         """Build this stage's forward subgraph.
 
-        Outputs: ``(*act_out_list, *saved)`` for non-last stages,
-        ``(loss, *saved)`` for the last stage — where ``saved`` contains
-        every forward-phase value the backward references that is not
-        already crossing. The schedule ships the crossing prefix and
-        replays the full output tuple into the backward subgraph.
+        Outputs: ``(*act_out, *saved)`` for non-last stages, ``(loss,
+        *saved)`` for the last stage — where ``saved`` contains every
+        forward-phase value the backward references that is not already
+        crossing. The schedule ships the crossing prefix and replays the
+        full output tuple into the backward subgraph.
 
         Returns:
             ``(fwd_gm, fwd_out_orig)`` — the subgraph module together with
             the ORIGINAL nodes at each output position, so the backward
             builder can key its placeholder mapping on them.
         """
-        graph = graph_module.graph
-        k = stage_idx
-        is_last = k == pp_degree - 1
-        g = fx.Graph()
-        env: Dict[fx.Node, fx.Node] = {}
-        foreign: Dict[fx.Node, fx.Node] = {}
-        used: Set[str] = set()
+        k = run_ctx.stage_idx
+        is_last = k == run_ctx.pp_degree - 1
+        builder = _SubgraphBuilder(g=fx.Graph(), used=set(), env={}, foreign={})
 
-        self._create_fwd_placeholders(
-            g,
-            used,
-            env,
-            foreign,
-            stage_state_fqns,
-            state_phs,
-            stage_state_indices,
-            act_in_list,
-            input_ph,
-            label_ph,
-            k,
-            is_last,
-        )
+        self._create_fwd_placeholders(builder, run_ctx, split, boundaries)
 
-        for node in graph.nodes:
+        for node in graph_module.graph.nodes:
             if node.op in ("placeholder", "output"):
                 continue
-            if node_phase[node] != _FWD or node_stage[node] != k:
+            if split.node_phase[node] != _FWD or split.node_stage[node] != k:
                 continue
-            self._copy_node(g, node, env, foreign)
+            self._copy_node(builder, node)
 
-        out_orig = self._resolve_fwd_outputs(act_out_list, saved, loss_node, is_last)
-        out_nodes = [env[n] if n in env else foreign[n] for n in out_orig]
-        g.output(tuple(out_nodes))
+        loss_node = self._loss_node(graph_module)
+        out_orig = self._resolve_fwd_outputs(
+            boundaries.act_out, boundaries.saved, loss_node, is_last
+        )
+        out_nodes = [
+            builder.env[n] if n in builder.env else builder.foreign[n] for n in out_orig
+        ]
+        builder.g.output(tuple(out_nodes))
+        return fx.GraphModule(nn.Module(), builder.g), out_orig
 
-        fwd_gm = fx.GraphModule(nn.Module(), g)
-        return fwd_gm, out_orig
-
-    def _create_fwd_placeholders(  # pylint: disable=too-many-locals,too-many-arguments
+    def _create_fwd_placeholders(
         self,
-        g: fx.Graph,
-        used: Set[str],
-        env: Dict[fx.Node, fx.Node],
-        foreign: Dict[fx.Node, fx.Node],
-        stage_state_fqns: List[str],
-        state_phs: List[fx.Node],
-        stage_state_indices: List[int],
-        act_in_list: List[fx.Node],
-        input_ph: fx.Node,
-        label_ph: fx.Node,
-        k: int,
-        is_last: bool,
+        builder: _SubgraphBuilder,
+        run_ctx: _RunContext,
+        split: _StageSplit,
+        boundaries: _Boundaries,
     ) -> None:
         """Create the fwd subgraph's placeholders (state / boundary / input).
 
         Incoming boundary values (stage k > 0) become placeholders; stage 0
         takes the full input and the last stage the label.
         """
-        for i, orig_idx in enumerate(stage_state_indices):
-            ph = g.placeholder(self._unique(_sanitize(stage_state_fqns[i]), used))
-            ph.meta = dict(state_phs[orig_idx].meta)
-            env[state_phs[orig_idx]] = ph
+        for i, orig_idx in enumerate(split.stage_state_indices):
+            ph = builder.g.placeholder(
+                self._unique(_sanitize(split.stage_state_fqns[i]), builder.used)
+            )
+            ph.meta = dict(split.state_phs[orig_idx].meta)
+            builder.env[split.state_phs[orig_idx]] = ph
 
-        for i, act in enumerate(act_in_list):
-            ph = g.placeholder(self._unique(f"pp_act_in_{i}", used))
+        for i, act in enumerate(boundaries.act_in):
+            ph = builder.g.placeholder(self._unique(f"pp_act_in_{i}", builder.used))
             ph.meta = dict(act.meta)
-            foreign[act] = ph
+            builder.foreign[act] = ph
 
-        if k == 0:
-            in_ph = g.placeholder(self._unique("pp_input", used))
-            in_ph.meta = dict(input_ph.meta)
-            env[input_ph] = in_ph
+        if run_ctx.stage_idx == 0:
+            in_ph = builder.g.placeholder(self._unique("pp_input", builder.used))
+            in_ph.meta = dict(split.input_ph.meta)
+            builder.env[split.input_ph] = in_ph
 
-        if is_last:
-            lbl_ph = g.placeholder(self._unique("pp_label", used))
-            lbl_ph.meta = dict(label_ph.meta)
-            env[label_ph] = lbl_ph
+        if run_ctx.stage_idx == run_ctx.pp_degree - 1:
+            lbl_ph = builder.g.placeholder(self._unique("pp_label", builder.used))
+            lbl_ph.meta = dict(split.label_ph.meta)
+            builder.env[split.label_ph] = lbl_ph
 
     @staticmethod
     def _resolve_fwd_outputs(
@@ -1416,18 +1353,12 @@ class PpPass(GraphPass):
             out_orig.append(node)
         return out_orig
 
-    def _build_bwd_graph(  # pylint: disable=too-many-locals,too-many-arguments
+    def _build_bwd_graph(
         self,
         graph_module: fx.GraphModule,
-        node_stage: Dict[fx.Node, int],
-        node_phase: Dict[fx.Node, str],
-        stage_idx: int,
-        pp_degree: int,
-        state_phs: List[fx.Node],
-        stage_state_indices: List[int],
-        stage_state_fqns: List[str],
-        grad_in_list: List[fx.Node],
-        grad_out_list: List[fx.Node],
+        run_ctx: _RunContext,
+        split: _StageSplit,
+        boundaries: _Boundaries,
         fwd_out_orig: List[fx.Node],
         trainable_indices: List[int],
     ) -> fx.GraphModule:
@@ -1439,75 +1370,65 @@ class PpPass(GraphPass):
         takes the gradient slots' place). Outputs: ``(*param_grads,)``
         plus the boundary gradients for every stage except stage 0.
         """
-        graph = graph_module.graph
-        k = stage_idx
-        g = fx.Graph()
-        env: Dict[fx.Node, fx.Node] = {}
-        foreign: Dict[fx.Node, fx.Node] = {}
-        used: Set[str] = set()
-
+        k = run_ctx.stage_idx
+        builder = _SubgraphBuilder(g=fx.Graph(), used=set(), env={}, foreign={})
         self._create_bwd_placeholders(
-            g,
-            used,
-            env,
-            foreign,
-            graph_module,
-            stage_state_fqns,
-            state_phs,
-            stage_state_indices,
-            grad_in_list,
-            fwd_out_orig,
-            k,
-            pp_degree,
+            builder, graph_module, run_ctx, split, boundaries, fwd_out_orig
         )
 
-        # Sets, not lists: membership is probed once per graph node below
-        # and real joint graphs carry tens of thousands of nodes.
-        stage_bwd_set = set()
-        for graph_node in graph.nodes:
-            if graph_node.op in ("placeholder", "output"):
-                continue
-            if node_phase[graph_node] == _BWD and node_stage[graph_node] == k:
-                stage_bwd_set.add(graph_node)
+        stage_bwd_set = self._collect_stage_bwd_nodes(
+            graph_module.graph, split.node_stage, split.node_phase, k
+        )
 
         # Gradient-output nodes of this stage's trainable params (by state
         # index identity, not module attribution — post-trace inserts like
         # zeros_like carry no module stack). A LIST — output order is the
         # positional gradient contract; only membership uses the set.
-        stage_state_set = set(stage_state_indices)
         stage_grad_nodes = self._stage_grad_nodes(
-            graph, trainable_indices, stage_state_set
+            graph_module.graph, trainable_indices, set(split.stage_state_indices)
         )
         stage_grad_set = set(stage_grad_nodes)
 
-        for node in graph.nodes:
+        for node in graph_module.graph.nodes:
             if node.op in ("placeholder", "output"):
                 continue
             if node not in stage_bwd_set and node not in stage_grad_set:
                 continue
-            self._copy_node(g, node, env, foreign)
+            self._copy_node(builder, node)
 
-        out_nodes = [env[gn] for gn in stage_grad_nodes]
-        out_nodes.extend(env[gn] for gn in grad_out_list)
-        g.output(tuple(out_nodes))
+        out_nodes = [builder.env[gn] for gn in stage_grad_nodes]
+        out_nodes.extend(builder.env[gn] for gn in boundaries.grad_out)
+        builder.g.output(tuple(out_nodes))
+        return fx.GraphModule(nn.Module(), builder.g)
 
-        bwd_gm = fx.GraphModule(nn.Module(), g)
-        return bwd_gm
+    @staticmethod
+    def _collect_stage_bwd_nodes(
+        graph: fx.Graph,
+        node_stage: Dict[fx.Node, int],
+        node_phase: Dict[fx.Node, str],
+        stage_idx: int,
+    ) -> Set[fx.Node]:
+        """Bwd-phase nodes owned by ``stage_idx``, as a set.
 
-    def _create_bwd_placeholders(  # pylint: disable=too-many-locals,too-many-arguments
+        Membership is probed once per graph node by ``_build_bwd_graph``
+        and real joint graphs carry tens of thousands of nodes.
+        """
+        return {
+            node
+            for node in graph.nodes
+            if node.op not in ("placeholder", "output")
+            and node_phase[node] == _BWD
+            and node_stage[node] == stage_idx
+        }
+
+    def _create_bwd_placeholders(
         self,
-        g: fx.Graph,
-        used: Set[str],
-        env: Dict[fx.Node, fx.Node],
-        foreign: Dict[fx.Node, fx.Node],
+        builder: _SubgraphBuilder,
         graph_module: fx.GraphModule,
-        stage_state_fqns: List[str],
-        state_phs: List[fx.Node],
-        stage_state_indices: List[int],
-        grad_in_list: List[fx.Node],
+        run_ctx: _RunContext,
+        split: _StageSplit,
+        boundaries: _Boundaries,
         fwd_out_orig: List[fx.Node],
-        k: int,
-        pp_degree: int,
     ) -> None:
         """Create the bwd subgraph's placeholders (state / grads / fwd outs).
 
@@ -1517,19 +1438,21 @@ class PpPass(GraphPass):
         ``foreign`` entries double as the remap for backward nodes
         referencing forward values.
         """
-        for i, orig_idx in enumerate(stage_state_indices):
-            ph = g.placeholder(self._unique(_sanitize(stage_state_fqns[i]), used))
-            ph.meta = dict(state_phs[orig_idx].meta)
-            env[state_phs[orig_idx]] = ph
+        for i, orig_idx in enumerate(split.stage_state_indices):
+            ph = builder.g.placeholder(
+                self._unique(_sanitize(split.stage_state_fqns[i]), builder.used)
+            )
+            ph.meta = dict(split.state_phs[orig_idx].meta)
+            builder.env[split.state_phs[orig_idx]] = ph
 
-        for i, grad in enumerate(grad_in_list):
-            ph = g.placeholder(self._unique(f"pp_grad_in_{i}", used))
+        for i, grad in enumerate(boundaries.grad_in):
+            ph = builder.g.placeholder(self._unique(f"pp_grad_in_{i}", builder.used))
             ph.meta = dict(grad.meta)
-            foreign[grad] = ph
-        if not grad_in_list and k == pp_degree - 1:
+            builder.foreign[grad] = ph
+        if not boundaries.grad_in and run_ctx.stage_idx == run_ctx.pp_degree - 1:
             # Last stage: the schedule feeds ones_like(loss) into the
             # single gradient slot.
-            ph = g.placeholder(self._unique("pp_grad_ones", used))
+            ph = builder.g.placeholder(self._unique("pp_grad_ones", builder.used))
             loss = self._loss_node(graph_module)
             if loss is not None:
                 ph.meta = dict(loss.meta)
@@ -1537,9 +1460,11 @@ class PpPass(GraphPass):
         # One placeholder per forward output, same order — the schedule
         # passes the forward outputs verbatim after the gradients.
         for orig in fwd_out_orig:
-            ph = g.placeholder(self._unique(f"pp_fwd_{orig.name}", used))
+            ph = builder.g.placeholder(
+                self._unique(f"pp_fwd_{orig.name}", builder.used)
+            )
             ph.meta = dict(orig.meta)
-            foreign[orig] = ph
+            builder.foreign[orig] = ph
 
     @staticmethod
     def _stage_grad_nodes(
@@ -1696,20 +1621,15 @@ class PpPass(GraphPass):
             )
         return spec
 
-    def _build_schedule(  # pylint: disable=too-many-arguments
+    def _build_schedule(
         self,
         fwd_gm: fx.GraphModule,
         bwd_gm: fx.GraphModule,
         pass_config: PassConfig,
-        stage_idx: int,
-        pp_degree: int,
-        group: Any,
-        num_state: int,
+        run_ctx: _RunContext,
+        split: _StageSplit,
         num_trainable: int,
-        act_in_list: List[fx.Node],
-        act_out_list: List[fx.Node],
-        grad_in_list: List[fx.Node],
-        grad_out_list: List[fx.Node],
+        boundaries: _Boundaries,
     ) -> ScheduleGPipe:
         """Assemble the ``ScheduleGPipe`` for this stage.
 
@@ -1717,26 +1637,26 @@ class PpPass(GraphPass):
         ``val`` metas; the send side packs by value type at runtime.
         """
         recv_spec = (
-            self._value_spec(act_in_list, stage_idx, "activation")
-            if stage_idx > 0
+            self._value_spec(boundaries.act_in, run_ctx.stage_idx, "activation")
+            if run_ctx.stage_idx > 0
             else []
         )
         grad_recv_spec = (
-            self._value_spec(grad_in_list, stage_idx, "gradient")
-            if stage_idx < pp_degree - 1
+            self._value_spec(boundaries.grad_in, run_ctx.stage_idx, "gradient")
+            if run_ctx.stage_idx < run_ctx.pp_degree - 1
             else []
         )
         return ScheduleGPipe(
             fwd_gm,
             bwd_gm,
-            stage_idx=stage_idx,
-            pp_degree=pp_degree,
-            num_state=num_state,
+            stage_idx=run_ctx.stage_idx,
+            pp_degree=run_ctx.pp_degree,
+            num_state=len(split.stage_state_fqns),
             num_trainable=num_trainable,
-            num_send=len(act_out_list),
-            grad_send_count=len(grad_out_list),
+            num_send=len(boundaries.act_out),
+            grad_send_count=len(boundaries.grad_out),
             microbatch_size=pass_config.pp_microbatch_size,
-            pp_group=group,
+            pp_group=run_ctx.group,
             recv_spec=recv_spec,
             grad_recv_spec=grad_recv_spec,
         )

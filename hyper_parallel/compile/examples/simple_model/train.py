@@ -126,10 +126,7 @@ def main() -> None:  # pylint: disable=too-many-locals
     """Run single/multi-card FSDP training on the dummy model."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
-    try:
-        config = load_config(args.config)
-    except (OSError, yaml.YAMLError) as exc:
-        raise ValueError(f"Failed to load config '{args.config}': {exc}") from exc
+    config = load_config(args.config)
 
     # Setup distributed training
     setup_distributed()
