@@ -34,8 +34,14 @@ back atomically.
 
 from __future__ import annotations
 
+__all__ = [
+    "qwen3_moe_async_colossal_cp_wrapper",
+    "qwen3_moe_async_hybrid_cp_wrapper",
+    "qwen3_moe_async_ulysses_cp_wrapper",
+]
+
 import functools
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import torch
 
@@ -197,6 +203,68 @@ def _finish_qwen3_moe_attention(module, attention_output, input_shape):
     return module.o_proj(output)
 
 
+class _PendingQKVA2A(NamedTuple):
+    query: Any
+    key: Any
+    value: Any
+
+
+def _launch_qwen3_moe_qkv_a2a(module, hidden_states, position_embeddings, cp_mesh):
+    """Launch each A2A before projecting the next tensor."""
+    hidden_shape = (*hidden_states.shape[:-1], -1, module.head_dim)
+    cos, sin = _qwen3_moe_position_terms(position_embeddings)
+    query = _qwen3_moe_project_query(module, hidden_states, hidden_shape, cos, sin)
+    query_pending = async_ulysses_seq_to_head_launch(
+        query, _QWEN3_MOE_SEQ_DIM, _QWEN3_MOE_HEAD_DIM, cp_mesh
+    )
+    key = _qwen3_moe_project_key(module, hidden_states, hidden_shape, cos, sin)
+    key_pending = async_ulysses_seq_to_head_launch(
+        key, _QWEN3_MOE_SEQ_DIM, _QWEN3_MOE_HEAD_DIM, cp_mesh
+    )
+    value = _qwen3_moe_project_value(module, hidden_states, hidden_shape)
+    value_pending = async_ulysses_seq_to_head_launch(
+        value, _QWEN3_MOE_SEQ_DIM, _QWEN3_MOE_HEAD_DIM, cp_mesh
+    )
+    return _PendingQKVA2A(query_pending, key_pending, value_pending)
+
+
+def _gather_hybrid_qkv(pending, colossal_mesh):
+    """Launch both K/V gathers before waiting for query and gather results."""
+    key = pending.key.wait()
+    key_gather = async_cp_allgather_launch(key, _QWEN3_MOE_SEQ_DIM, colossal_mesh)
+    value = pending.value.wait()
+    value_gather = async_cp_allgather_launch(value, _QWEN3_MOE_SEQ_DIM, colossal_mesh)
+    return pending.query.wait(), key_gather.wait(), value_gather.wait()
+
+
+def _finish_ulysses_qwen3_moe_attention(
+    module, query, key, value, attention_mask, kwargs, input_shape, cp_mesh
+):
+    """Restore local sequence layout after the fused attention call."""
+    attention_output, attention_weights = _run_qwen3_moe_fused_attention(
+        module, query, key, value, attention_mask, kwargs
+    )
+    output_bnsd = attention_output.transpose(1, 2).contiguous()
+    output_bnsd = ulysses_head_to_seq(
+        output_bnsd, _QWEN3_MOE_SEQ_DIM, _QWEN3_MOE_HEAD_DIM, cp_mesh
+    )
+    attention_output = output_bnsd.transpose(1, 2).contiguous()
+    return _finish_qwen3_moe_attention(module, attention_output, input_shape), attention_weights
+
+
+def _finish_colossal_qwen3_moe_attention(
+    module, query, key, value, attention_mask, kwargs, input_shape, query_offset
+):
+    """Apply the global-key causal mask before local output projection."""
+    attention_mask = _prepare_qwen3_moe_attention_mask(
+        attention_mask, query, key, query_offset
+    )
+    attention_output, attention_weights = _run_qwen3_moe_fused_attention(
+        module, query, key, value, attention_mask, kwargs
+    )
+    return _finish_qwen3_moe_attention(module, attention_output, input_shape), attention_weights
+
+
 def _qwen3_moe_async_colossal_forward(
     module: Any,
     hidden_states: torch.Tensor,
@@ -209,8 +277,7 @@ def _qwen3_moe_async_colossal_forward(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run Qwen3-MoE with async K/V AllGather and local Q."""
     _require_qwen3_moe_training_call(past_key_values)
-    input_shape = hidden_states.shape[:-1]
-    hidden_shape = (*input_shape, -1, module.head_dim)
+    hidden_shape = (*hidden_states.shape[:-1], -1, module.head_dim)
     cos, sin = _qwen3_moe_position_terms(position_embeddings)
 
     query = _qwen3_moe_project_query(module, hidden_states, hidden_shape, cos, sin)
@@ -221,19 +288,16 @@ def _qwen3_moe_async_colossal_forward(
 
     key = key_pending.wait()
     value = value_pending.wait()
-    query_offset = cp_mesh.get_local_rank() * query.shape[_QWEN3_MOE_SEQ_DIM]
-    attention_mask = _prepare_qwen3_moe_attention_mask(
-        attention_mask, query, key, query_offset
-    )
-    attention_output, attention_weights = _run_qwen3_moe_fused_attention(
+    return _finish_colossal_qwen3_moe_attention(
         module,
         query,
         key,
         value,
         attention_mask,
         kwargs,
+        hidden_states.shape[:-1],
+        cp_mesh.get_local_rank() * query.shape[_QWEN3_MOE_SEQ_DIM],
     )
-    return _finish_qwen3_moe_attention(module, attention_output, input_shape), attention_weights
 
 
 def _qwen3_moe_async_ulysses_forward(
@@ -249,42 +313,25 @@ def _qwen3_moe_async_ulysses_forward(
     """Run Qwen3-MoE with async Q/K/V sequence-to-head A2A."""
     _require_qwen3_moe_training_call(past_key_values)
     input_shape = hidden_states.shape[:-1]
-    hidden_shape = (*input_shape, -1, module.head_dim)
-    cos, sin = _qwen3_moe_position_terms(position_embeddings)
-
-    query = _qwen3_moe_project_query(module, hidden_states, hidden_shape, cos, sin)
-    query_pending = async_ulysses_seq_to_head_launch(
-        query, _QWEN3_MOE_SEQ_DIM, _QWEN3_MOE_HEAD_DIM, cp_mesh
+    pending = _launch_qwen3_moe_qkv_a2a(
+        module, hidden_states, position_embeddings, cp_mesh
     )
-    key = _qwen3_moe_project_key(module, hidden_states, hidden_shape, cos, sin)
-    key_pending = async_ulysses_seq_to_head_launch(
-        key, _QWEN3_MOE_SEQ_DIM, _QWEN3_MOE_HEAD_DIM, cp_mesh
-    )
-    value = _qwen3_moe_project_value(module, hidden_states, hidden_shape)
-    value_pending = async_ulysses_seq_to_head_launch(
-        value, _QWEN3_MOE_SEQ_DIM, _QWEN3_MOE_HEAD_DIM, cp_mesh
-    )
-
-    query = query_pending.wait()
-    key = key_pending.wait()
-    value = value_pending.wait()
+    query = pending.query.wait()
+    key = pending.key.wait()
+    value = pending.value.wait()
     attention_mask = _prepare_qwen3_moe_attention_mask(
         attention_mask, query, key, query_offset=0
     )
-    attention_output, attention_weights = _run_qwen3_moe_fused_attention(
+    return _finish_ulysses_qwen3_moe_attention(
         module,
         query,
         key,
         value,
         attention_mask,
         kwargs,
+        input_shape,
+        cp_mesh,
     )
-    output_bnsd = attention_output.transpose(1, 2).contiguous()
-    output_bnsd = ulysses_head_to_seq(
-        output_bnsd, _QWEN3_MOE_SEQ_DIM, _QWEN3_MOE_HEAD_DIM, cp_mesh
-    )
-    attention_output = output_bnsd.transpose(1, 2).contiguous()
-    return _finish_qwen3_moe_attention(module, attention_output, input_shape), attention_weights
 
 
 def _qwen3_moe_async_hybrid_forward(
@@ -304,52 +351,27 @@ def _qwen3_moe_async_hybrid_forward(
         cp_mesh, ulysses_degree
     )
     input_shape = hidden_states.shape[:-1]
-    hidden_shape = (*input_shape, -1, module.head_dim)
-    cos, sin = _qwen3_moe_position_terms(position_embeddings)
+    pending = _launch_qwen3_moe_qkv_a2a(
+        module, hidden_states, position_embeddings, ulysses_mesh
+    )
+    query, key, value = _gather_hybrid_qkv(pending, colossal_mesh)
 
-    query = _qwen3_moe_project_query(module, hidden_states, hidden_shape, cos, sin)
-    query_a2a = async_ulysses_seq_to_head_launch(
-        query, _QWEN3_MOE_SEQ_DIM, _QWEN3_MOE_HEAD_DIM, ulysses_mesh
-    )
-    key = _qwen3_moe_project_key(module, hidden_states, hidden_shape, cos, sin)
-    key_a2a = async_ulysses_seq_to_head_launch(
-        key, _QWEN3_MOE_SEQ_DIM, _QWEN3_MOE_HEAD_DIM, ulysses_mesh
-    )
-    value = _qwen3_moe_project_value(module, hidden_states, hidden_shape)
-    value_a2a = async_ulysses_seq_to_head_launch(
-        value, _QWEN3_MOE_SEQ_DIM, _QWEN3_MOE_HEAD_DIM, ulysses_mesh
-    )
-
-    key = key_a2a.wait()
-    key_gather = async_cp_allgather_launch(
-        key, _QWEN3_MOE_SEQ_DIM, colossal_mesh
-    )
-    value = value_a2a.wait()
-    value_gather = async_cp_allgather_launch(
-        value, _QWEN3_MOE_SEQ_DIM, colossal_mesh
-    )
-    query = query_a2a.wait()
-    key = key_gather.wait()
-    value = value_gather.wait()
-
-    query_offset = colossal_mesh.get_local_rank() * query.shape[_QWEN3_MOE_SEQ_DIM]
     attention_mask = _prepare_qwen3_moe_attention_mask(
-        attention_mask, query, key, query_offset
+        attention_mask,
+        query,
+        key,
+        colossal_mesh.get_local_rank() * query.shape[_QWEN3_MOE_SEQ_DIM],
     )
-    attention_output, attention_weights = _run_qwen3_moe_fused_attention(
+    return _finish_ulysses_qwen3_moe_attention(
         module,
         query,
         key,
         value,
         attention_mask,
         kwargs,
+        input_shape,
+        ulysses_mesh,
     )
-    output_bnsd = attention_output.transpose(1, 2).contiguous()
-    output_bnsd = ulysses_head_to_seq(
-        output_bnsd, _QWEN3_MOE_SEQ_DIM, _QWEN3_MOE_HEAD_DIM, ulysses_mesh
-    )
-    attention_output = output_bnsd.transpose(1, 2).contiguous()
-    return _finish_qwen3_moe_attention(module, attention_output, input_shape), attention_weights
 
 
 def _validate_qwen3_moe_cp_mesh(cp_mesh, wrapper_name):
@@ -460,10 +482,3 @@ def qwen3_moe_async_hybrid_cp_wrapper(
         cp_mesh=cp_mesh,
         ulysses_degree=ulysses_degree,
     )
-
-
-__all__ = [
-    "qwen3_moe_async_colossal_cp_wrapper",
-    "qwen3_moe_async_hybrid_cp_wrapper",
-    "qwen3_moe_async_ulysses_cp_wrapper",
-]
