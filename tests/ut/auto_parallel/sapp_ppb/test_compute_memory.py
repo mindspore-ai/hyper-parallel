@@ -356,13 +356,21 @@ class TestComputeMemory:
             config_utils.memory_parser(None)
 
         model_info = config_utils.ModelInfo("unit", 1, 2, 3, 4)
+        dump_file = tmp_path / "unit.json"
+        with pytest.raises(ValueError, match="Layer memory must be updated"):
+            model_info.dump_json(str(dump_file))
+        assert not dump_file.exists()
         model_info.set_stage_const_mem(9)
         model_info.layer_memory_update({Recompute.TYPE.NONE: 7, Recompute.TYPE.FULL: None}, 11, 13, 17)
-        dump_file = tmp_path / "unit.json"
         model_info.dump_json(str(dump_file))
         dumped = json.loads(dump_file.read_text(encoding="utf-8"))
         assert dumped["stage_const_mem"] == 9
         assert dumped["layers_description"][1]["memory_activation"] == 7
+        model_info.layer_memory_update({Recompute.TYPE.NONE: 8}, 11, 13, 17)
+        model_info.dump_json(str(dump_file))
+        updated = json.loads(dump_file.read_text(encoding="utf-8"))
+        assert updated["layers_description"][1]["memory_activation"] == 8
+        assert "to_json_" not in updated
 
         layer_folder = tmp_path / "layers"
         layer_folder.mkdir()

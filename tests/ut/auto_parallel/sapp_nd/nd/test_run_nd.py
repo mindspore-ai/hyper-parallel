@@ -560,6 +560,8 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(Debug.pastel("white"), (1.0, 1.0, 1.0))
         self.assertEqual(Debug.pastel("black"), (0.5, 0.5, 0.5))
         self.assertEqual(len(Debug.gen_colors(["FW_COMPUTE", "DP_COMM"])), 2)
+        with self.assertRaisesRegex(ValueError, "Unknown performance category: unknown"):
+            Debug.gen_colors(["unknown"])
         self.assertEqual(Debug.PerfParts.BW_COMPUTE.short_name(), "BW")
         self.assertEqual(Debug.PerfParts.RECOMPUTE.short_name(), "Rec")
         self.assertEqual(Debug.PerfParts.MP_COMM.short_name(), "MP")
@@ -840,6 +842,10 @@ class TestSappNDRunND(unittest.TestCase):
             classified = Debug.get_comm_classified_data(csv_path, plot_idle=True)
             self.assertEqual(classified[0][2]["IDLE"], -0.75)
             self.assertEqual(classified[0][2]["BUBBLE"], 1)
+            with open(csv_path, "w", encoding="utf-8") as csv_file:
+                csv_file.write("DP,MP,time,comp\n1,1,10,5\n")
+            with self.assertRaisesRegex(ValueError, "must include 'pp_wait'"):
+                Debug.get_comm_classified_data(csv_path)
 
         estimations = [1.0] * (max(part.value for part in Debug.PerfParts) - 1)
         real_parts = {part: [] for part in Debug.RealParts}
@@ -1009,6 +1015,7 @@ class TestSappNDRunND(unittest.TestCase):
                 patch.object(PerfEstimate, "estimate_comm", return_value=[1.0, 2.0]):
             cfg_for_perf = object.__new__(PerfEstimate.CostModelConfig)
             cfg_for_perf.__dict__.update(vars(cfg))
+            cfg_for_perf.__dict__.update({"n_headCast": 7, "n_ffAct": 9})
             perf_debugger = Debug.Debug(
                 Dim.Dimensions([(Dim.DP, 2), (Dim.MBS, 2)], all_dims=[Dim.DP, Dim.MBS]),
                 Debug.PerfParts,
@@ -1031,6 +1038,22 @@ class TestSappNDRunND(unittest.TestCase):
             )
             self.assertGreater(perf, 0)
             self.assertEqual(perf_debugger.info[Debug.PerfParts.MEMORY], 123)
+            self.assertEqual(getattr(cfg_for_perf, "n_headCast"), 1)
+            self.assertEqual(getattr(cfg_for_perf, "n_ffAct"), 1)
+
+            cfg_for_perf.__dict__.update({"n_headCast": 7, "n_ffAct": 9})
+            layer_perfs = PerfEstimate.estimate_layer_perf(
+                cfg_for_perf, Hard.Device_A2, extra_custom_func=lambda cost_cfg: None, ccfg=ccfg
+            )
+            self.assertEqual(len(layer_perfs), 2)
+            self.assertEqual(getattr(cfg_for_perf, "n_headCast"), 1)
+            self.assertEqual(getattr(cfg_for_perf, "n_ffAct"), 1)
+            operation_table = PerfEstimate.op_table(cfg_for_perf)
+            named_operations = {name: operation_table[name] for name in ("n_headCast", "n_ffAct")}
+            self.assertEqual(
+                PerfEstimate.get_table_quantity(cfg_for_perf, named_operations, LayerType.NOT_REC_LAYER, False),
+                sum(named_operations.values()),
+            )
 
     def test_comm_time_helpers(self) -> None:
         """
@@ -1149,6 +1172,13 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(hp_ccfg.model_name, "llama-unit")
             self.assertEqual(hp_ccfg.vp, 2)
             self.assertEqual(hp_ccfg.layer_custom_config, [(2, None)])
+            with open(source_path, "w", encoding="utf-8") as source_file:
+                source_file.write(
+                    "def get_train_spec():\n"
+                    "    return TrainSpec(model_args=missing_model_args)\n"
+                )
+            with self.assertRaisesRegex(ValueError, "Model arguments 'missing_model_args' are not assigned"):
+                CostModelParserHyperparallel(hp_ccfg).parse()
 
         ms_mod = {
             "model_id": "vision",

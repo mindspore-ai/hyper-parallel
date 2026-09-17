@@ -173,17 +173,22 @@ class SappPipeline:
             interleave_num: int = 1) -> List[List[float]]:
         """Return the per-stage activation memory for a user-supplied layer assignment."""
         memory_active = []
-        if self.has_some_memory_info():
-            for inter in range(interleave_num):
-                memory_active.append([])
-                for stage in range(self.num_of_stage_):
-                    memory_active[inter].append(sum(
-                        each_layer_per_recompute[layer][rec][inter][stage] *
-                        layer.memory_activation_rec_[rec]
-                        for layer in self.layers_sorted_[Layer.type_enum.BODY]
-                        for rec in Recompute.TYPE
-                        if rec not in Recompute.get_unused_list(each_layer_per_recompute[layer])
-                        and each_layer_per_recompute[layer][rec][inter][stage] > 0))
+        if not self.has_some_memory_info():
+            return memory_active
+        for inter in range(interleave_num):
+            memory_active.append([])
+            for stage in range(self.num_of_stage_):
+                stage_memory = 0
+                for layer in self.layers_sorted_[Layer.type_enum.BODY]:
+                    layer_assignment = each_layer_per_recompute[layer]
+                    unused_rec = Recompute.get_unused_list(layer_assignment)
+                    for rec in Recompute.TYPE:
+                        if rec in unused_rec:
+                            continue
+                        layer_count = layer_assignment[rec][inter][stage]
+                        if layer_count > 0:
+                            stage_memory += layer_count * layer.memory_activation_rec_[rec]
+                memory_active[inter].append(stage_memory)
         return memory_active
 
     def get_manual_memory_parameter(
@@ -194,13 +199,18 @@ class SappPipeline:
         memory_param_stage = [0] * self.num_of_stage_
         for inter in range(interleave_num):
             for stage in range(self.num_of_stage_):
-                memory_param_stage[stage] += sum(
-                    each_layer_per_recompute[layer][rec][inter][stage] *
-                    layer.memory_parameter_ for rec in Recompute.TYPE
-                    for layer in self.layers_sorted_[Layer.type_enum.BODY]
-                    if layer.memory_parameter_ is not None
-                    and rec not in Recompute.get_unused_list(each_layer_per_recompute[layer])
-                    and each_layer_per_recompute[layer][rec][inter][stage] > 0)
+                stage_memory = 0
+                for rec in Recompute.TYPE:
+                    for layer in self.layers_sorted_[Layer.type_enum.BODY]:
+                        if layer.memory_parameter_ is None:
+                            continue
+                        layer_assignment = each_layer_per_recompute[layer]
+                        if rec in Recompute.get_unused_list(layer_assignment):
+                            continue
+                        layer_count = layer_assignment[rec][inter][stage]
+                        if layer_count > 0:
+                            stage_memory += layer_count * layer.memory_parameter_
+                memory_param_stage[stage] += stage_memory
         for head in self.layers_sorted_[Layer.type_enum.HEAD]:
             if head.memory_parameter_ is not None:
                 memory_param_stage[0] += head.memory_parameter_
@@ -379,10 +389,13 @@ class SappPipeline:
             fig = plt.figure(figsize=(24, 8))
             sub_figs = fig.subfigures(1, 2, wspace=0.07)
             sub_figs[0].suptitle('Automatic', fontsize='x-large')
-            self.simulate(show=False, file_name=os.path.join(output_folder, "Auto_" + file_name), sub_fig=sub_figs[0])
+            automatic_time = self.simulate(
+                show=False, file_name=os.path.join(output_folder, "Auto_" + file_name), sub_fig=sub_figs[0]
+            )
 
             sub_figs[1].suptitle('Manual', fontsize='x-large')
-            self.simulate_yaml(yaml_data, False, interleave_num, full_file_name, sub_figs[1])
+            manual_time = self.simulate_yaml(yaml_data, False, interleave_num, full_file_name, sub_figs[1])
+            logger.info("Simulation comparison: automatic time=%s, manual time=%s", automatic_time, manual_time)
             plt.savefig(os.path.join(output_folder, "Comparison_" + file_name))
             if show:
                 plt.show()

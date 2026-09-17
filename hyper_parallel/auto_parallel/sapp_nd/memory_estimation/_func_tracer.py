@@ -123,7 +123,7 @@ class _FuncTracer:
                         if not node:
                             return self.line_tracer
                         line = ast.unparse(node)
-                    sign = next(o for o in op_equals if o in line)
+                    sign = next(op for op in op_equals if op in line)
                     left, right = line.split(sign, 1)
                     left, right = left.strip(), right.strip()
                     if sign != "=":

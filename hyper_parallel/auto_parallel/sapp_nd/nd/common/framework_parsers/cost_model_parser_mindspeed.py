@@ -215,7 +215,7 @@ class CostModelParserMindspeed(_CostModelParser):
     def __config_parse_json(self, mod):
         """MindSpeed format for unimodal"""
         # def mod_hook(M) :
-        cc = type(self.ccfg)({}) #CostModelConfig({})
+        cc = type(self.ccfg)({}) # CostModelConfig({})
         cc.parser = self
         cc.config_format = "json"
         cc.model_name = mod.model_id

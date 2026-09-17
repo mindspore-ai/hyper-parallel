@@ -229,8 +229,7 @@ class ParallelizeLayer:
         return configs
 
     def device_loops(self, space, pool):
-        """Exploration loop nest level 0:
-        parallel dimensions dividing devices"""
+        """Exploration loop nest level 0: parallel dimensions dividing devices"""
         for tp in self.config.space(Dim.TP, self.machine.number):
             for pp in self.config.space(Dim.PP, self.machine.number // tp):
                 for cp in self.config.space(
@@ -250,8 +249,7 @@ class ParallelizeLayer:
         return space
 
     def batch_loops(self, space, pool, dtpc_p):
-        """Exploration loop nest level 1:
-        dimensions dividing batch (except already processed DP)"""
+        """Exploration loop nest level 1: dimensions dividing batch (except already processed DP)"""
         dp, _, pp, _ = dtpc_p
         # if pp > 1:
         for mbs in self.config.space(
@@ -267,8 +265,7 @@ class ParallelizeLayer:
         return space
 
     def parallel_loops(self, space, pool, dims):
-        """Exploration loop nest level 2:
-        dimensions dependent on others"""
+        """Exploration loop nest level 2: dimensions dependent on others"""
         dtpc_p, mbsn = dims
         dp, tp, pp, _ = dtpc_p
         for ep in self.config.space(Dim.EP, dp * tp):
@@ -484,7 +481,7 @@ class ParallelizeLayer:
         )
         if self.enable_debug:
             file_path = os.path.dirname(os.path.realpath(__file__))
-            output_path = file_path + "/output/"
+            output_path = os.path.join(file_path, "output")
             if scored_space:
                 Debug.plot_nd(
                     scored_space,

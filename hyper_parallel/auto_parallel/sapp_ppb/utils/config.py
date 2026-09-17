@@ -69,6 +69,7 @@ class ModelInfo:
         """Record HEAD/BODY/TAIL timing and initialise the stage-constant memory to 0."""
         self.name = model_name
         self.stage_const_mem = 0
+        self.to_json_: Optional[Dict[str, Any]] = None
         self.layers_description = []
         self.layers_description.append(
             LayersDescription(Layer.type_enum.HEAD, head_time, 1, model_name)
@@ -111,6 +112,8 @@ class ModelInfo:
 
     def dump_json(self, file_name: str) -> None:
         """Write the current ``to_json_`` payload to ``file_name`` as indented JSON."""
+        if self.to_json_ is None:
+            raise ValueError("Layer memory must be updated before writing the model description")
         with open(file_name, "w", encoding="utf-8") as json_file:
             json.dump(self.to_json_, json_file, indent=4)
 

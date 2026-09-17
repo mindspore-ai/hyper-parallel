@@ -41,6 +41,7 @@ class PlotMgr:
                 ``>= num_plots``.
             sub_fig: Reuse this figure if given, otherwise create one of ``figsize``.
         """
+        self.msg = ""
         if sub_fig:
             self.fig = sub_fig
         else:
@@ -157,11 +158,14 @@ class PlotMgr:
         block_index = self._get_block_indices(blocks, mode=mode, equal_wide=equal_wide)
         width = max(np.max(block_index[p]) for p in range(pp)) if blocks[0][-1].end is None \
             else max(blocks[p][-1].end for p in range(pp))
-        self.draw_block(block_index, blocks, ax_index, equal_wide, width, phase=phase)
+        if self.draw_block(block_index, blocks, ax_index, equal_wide, width, phase=phase) is not self:
+            raise ValueError("Drawing blocks must return the current plot manager")
         if comm:
-            self.draw_comm(block_index, blocks, ax_index, equal_wide, mode)
+            if self.draw_comm(block_index, blocks, ax_index, equal_wide, mode) is not self:
+                raise ValueError("Drawing communications must return the current plot manager")
         if connect:
-            self.draw_connect(block_index, blocks, ax_index, equal_wide, mode)
+            if self.draw_connect(block_index, blocks, ax_index, equal_wide, mode) is not self:
+                raise ValueError("Drawing connections must return the current plot manager")
         self._set_block_ax(self.ax[ax_index], pp)
         self.ax[ax_index].set_xlim(0, width)
         self.ax[ax_index].set_xticks(np.linspace(0, width, 8))
@@ -171,7 +175,8 @@ class PlotMgr:
                   ax_index: int = 0, comm: bool = False, connect: bool = False,
                   equal_wide: bool = False) -> "PlotMgr":
         """Highlight a dependency loop (non-comm) with red arrows and a textual trace."""
-        self.draw(blocks, ax_index, comm, connect, equal_wide, phase=True)
+        if self.draw(blocks, ax_index, comm, connect, equal_wide, phase=True) is not self:
+            raise ValueError("Drawing a dependency loop must return the current plot manager")
         block_index = self._get_block_indices(blocks, equal_wide=equal_wide)
         msg = 'dependency loop: '
         for b in range(len(loop) - 1):
@@ -193,7 +198,8 @@ class PlotMgr:
     def draw_comm_loop(self, lines: List[List[BlockSim]], loop: List[BlockSim],
                        ax_index: int = 0) -> "PlotMgr":
         """Highlight a dependency loop in the send-receive graph."""
-        self.draw(lines, ax_index, True, True, True, 'joint', phase=True)
+        if self.draw(lines, ax_index, True, True, True, 'joint', phase=True) is not self:
+            raise ValueError("Drawing a communication loop must return the current plot manager")
         block_index = self._get_block_indices(lines, mode='joint', equal_wide=True)
         msg = 'dependency loop: '
         for b in range(len(loop) - 1):

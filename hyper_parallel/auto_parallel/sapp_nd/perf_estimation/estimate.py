@@ -15,6 +15,8 @@
 """performance estimation"""
 import json
 from copy import deepcopy
+from typing import Any
+
 import numpy as np
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
@@ -41,6 +43,14 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
 GENERALIZE_PIPELINE_CALCULATION = False
 MANUAL_P2P_RATIO = 0.002
 BACKWARD_RATIO = 2
+# Operation IDs are shared with op_table() and get_table_quantity().
+_OPERATION_COUNTS = {"n_headCast": 1, "n_ffAct": 1}
+
+
+def _initialize_operation_counts(cfg: Any) -> None:
+    """Initialize formula-symbol counts without renaming the operation IDs."""
+    for operation_name, count in _OPERATION_COUNTS.items():
+        setattr(cfg, operation_name, count)
 
 
 def op_table(cfg):
@@ -254,7 +264,8 @@ def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
     non_steady_perf = 0
     steady_perf = 0
     if cfg.p == 1:
-        assert len(stage_perfs) == 1
+        if len(stage_perfs) != 1:
+            raise ValueError("Expected exactly one stage performance")
         steady_perf = sum_time * cfg.m
     elif cfg.vp == 1:
         non_steady_perf = sum_time
@@ -419,8 +430,7 @@ def estimate_layer_perf(*args, **kwargs):
 
     cfg.n = cfg.d * cfg.t * cfg.p
 
-    cfg.n_headCast = 1
-    cfg.n_ffAct = 1
+    _initialize_operation_counts(cfg)
 
     logger.info(str(cfg))
     logger.info(stages)
@@ -474,7 +484,8 @@ def apply_regression_coefficients(coeffs, debugger, old_perf):
     """
     compute_ratio = coeffs.get("COMPUTE")
     for part, raw in list(debugger.info.items()):
-        if part in (PerfParts.TOTAL, PerfParts.MEMORY): continue
+        if part in (PerfParts.TOTAL, PerfParts.MEMORY):
+            continue
         if part in (PerfParts.FW_COMPUTE,
                    PerfParts.BW_COMPUTE,
                    PerfParts.RECOMPUTE):
@@ -487,7 +498,8 @@ def apply_regression_coefficients(coeffs, debugger, old_perf):
     max_idx = max(p.value for p in PerfParts) -1
     estimations = [0.0] * max_idx
     for part in PerfParts:
-        if part in (PerfParts.TOTAL, PerfParts.MEMORY): continue
+        if part in (PerfParts.TOTAL, PerfParts.MEMORY):
+            continue
         estimations[part.value - 1] = debugger.info.get(part) or 0.0
 
     real_buckets = {rp: [] for rp in RealParts}
@@ -544,8 +556,7 @@ def estimate_performance(*args, **kwargs):
     # print(stages)
 
     cfg.n = cfg.d * cfg.t * cfg.p
-    cfg.n_headCast = 1
-    cfg.n_ffAct = 1
+    _initialize_operation_counts(cfg)
 
     logger.debug(
         "perf_model: DP = %d, TP = %d, EP = %d, PP = %d, MB = %d",
