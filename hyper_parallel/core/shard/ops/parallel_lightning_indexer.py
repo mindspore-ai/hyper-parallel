@@ -19,6 +19,7 @@ from typing import Callable, Optional, Tuple
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
+from .dsa_cp_fold import dsa_cp_fold_enabled, fold_lightning_indexer
 from .parallel_npu_dense_lightning_indexer_softmax_lse import (
     _adjust_bsnd_key,
     _adjust_tnd_seq_lens,
@@ -307,8 +308,12 @@ class LightningIndexerDistributedOp(DistributedOp):
             if q_layout.tensor_map[1] == -1:
                 return None
             split_id = q_layout.get_split_id(1)
+            seq_shards = q_layout.get_dim_split_num(1)
 
             def _bsnd_cp_impl(*args, **kwargs):
+                if dsa_cp_fold_enabled():
+                    # Head-tail folded query: one call per block, each on its own causal prefix.
+                    return fold_lightning_indexer(func, split_id, seq_shards, *args, **kwargs)
                 local_q, local_k = args[0], args[1]
                 sliced_k = _adjust_bsnd_key(local_k, local_q.shape[1], split_id)
                 return func(local_q, sliced_k, *args[2:], **kwargs)
@@ -319,9 +324,9 @@ class LightningIndexerDistributedOp(DistributedOp):
         # requires token-level offset adjustment.
         dp_size = k_layout.get_dim_split_num(0)  # DP splits on k's T2
         split_id = q_layout.get_split_id(0)
-        cp_size = (q_layout.get_dim_split_num(0) // dp_size
+        seq_shards = (q_layout.get_dim_split_num(0) // dp_size
                    if dp_size > 0 else 1)
-        cp_rank = split_id % cp_size if cp_size > 1 else 0
+        seq_shard_id = split_id % seq_shards if seq_shards > 1 else 0
 
         def _tnd_impl(*args, **kwargs):
             local_q, local_k = args[0], args[1]
@@ -334,7 +339,7 @@ class LightningIndexerDistributedOp(DistributedOp):
 
             adj_q, adj_k = _adjust_tnd_seq_lens(
                 local_q, local_k, qlen_tensor, klen_tensor,
-                cp_rank=cp_rank,
+                cp_rank=seq_shard_id,
             )
 
             return func(*args, **{**kwargs, 'actual_seq_lengths_query': adj_q,
