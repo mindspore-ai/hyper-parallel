@@ -34,10 +34,8 @@ def _copy_tensor(destination: torch.Tensor, source: torch.Tensor) -> None:
     """Copy one local parameter shard without invoking DTensor dispatch."""
     destination_local = to_local_if_dtensor(destination)
     source_local = to_local_if_dtensor(source)
-    source_local = source_local.to(
-        device=destination_local.device,
-        dtype=destination_local.dtype,
-    )
+    # Convert directly into the existing parameter storage instead of keeping
+    # a full-sized conversion result alive for a second copy.
     destination_local.copy_(source_local)
 
 

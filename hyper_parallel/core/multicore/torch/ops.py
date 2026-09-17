@@ -52,7 +52,12 @@ def _load_native() -> None:
     preload_vendor_library(vendor_root)
     try:
         torch.ops.load_library(str(adapter_path))
-    except (OSError, RuntimeError) as error:
+        schema = torch.ops.hyper_parallel.mega_moe_grad.default._schema
+        dispatch_alias = schema.arguments[0].alias_info.before_set
+        input_grad_alias = schema.arguments[12].alias_info.before_set
+        if not dispatch_alias or dispatch_alias != input_grad_alias:
+            raise RuntimeError("adapter does not declare backward dispatch storage reuse; rebuild the Torch adapter")
+    except (AttributeError, OSError, RuntimeError) as error:
         raise NativeComponentUnavailableError(
             "[HP-NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED] component=multicore framework=torch "
             f"library={adapter_path} error={error}. "

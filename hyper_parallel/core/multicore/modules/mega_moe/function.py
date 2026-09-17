@@ -62,6 +62,7 @@ def _allocate_backward_intermediates(
     grad_output: Any,
     weight1: Any,
     weight2: Any,
+    reusable_dispatch: Any | None = None,
 ) -> tuple[Any, Any, Any, Any, Any]:
     """Allocate overwritten activations and zero-safe expert gradients."""
     grad_weight2 = torch.zeros_like(weight2)
@@ -75,7 +76,7 @@ def _allocate_backward_intermediates(
         dtype=grad_output.dtype,
         device=grad_output.device,
     )
-    gate_dx = torch.empty(
+    gate_dx = reusable_dispatch if reusable_dispatch is not None else torch.empty(
         (capacity, spec.hidden_size),
         dtype=grad_output.dtype,
         device=grad_output.device,
@@ -396,6 +397,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 grad_output,
                 weight1,
                 weight2,
+                dispatch[:capacity] if plan.reuse_backward_dispatch else None,
             )
             _launch_backward_kernel(
                 plan,
@@ -409,6 +411,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 swiglu_workspace,
             )
             profile_call.complete()
+            # Both kernels use the current stream. Release ordinary scratch
+            # before allocating the owned token gradient; SHMEM stays leased.
+            del act_grad, swiglu_grad, gate_dx
             grad_input = _restore_input_gradient(ctx, grad_x, permutation_inputs)
             return grad_input, grad_weight1, grad_weight2, None, None, None, None
         finally:

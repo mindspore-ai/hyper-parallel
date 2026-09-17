@@ -39,7 +39,9 @@ from .spec import MegaMoeSpec, _resolve_receive_capacity
 _GMM_WORKSPACE_BYTES = 512
 _SWIGLU_GRAD_WORKSPACE_BYTES = 512
 _WORKSPACE_ALIGNMENT = 512
-_HEAP_GRANULARITY_BYTES = 64 * 1024 * 1024
+# Physical SHMEM pages need 2 MiB alignment; the larger virtual-address
+# reservation granularity does not constrain the physical payload size.
+_HEAP_GRANULARITY_BYTES = 2 * 1024 * 1024
 
 
 def _round_up(value: int, granularity: int) -> int:
@@ -104,6 +106,8 @@ def configure_symmetric_heap(
             "HYPER_PARALLEL_SHMEM_HEAP_SIZE is too small for active MegaMoe resources: "
             f"configured {configured_bytes} bytes, requires at least {required_bytes} bytes."
         )
+    if configured_bytes % _HEAP_GRANULARITY_BYTES:
+        raise ValueError("HYPER_PARALLEL_SHMEM_HEAP_SIZE must be a multiple of the 2 MiB SHMEM physical page size.")
     return configured_bytes
 
 

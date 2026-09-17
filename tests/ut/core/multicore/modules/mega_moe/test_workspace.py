@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for MegaMoe workspace sizing and stream ordering."""
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -78,6 +79,31 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             ),
             384,
         )
+
+    def test_heap_rounding_preserves_push_receive_capacity(self) -> None:
+        """Round the full push receive/return capacity to physical pages for all resource groups."""
+        reference = torch.empty(0, dtype=torch.bfloat16)
+        for ep in (4, 8):
+            for factor, expected_mib in ((None, (ep + 1) * 320 + 2), (1.0, 642), (1.5, 802)):
+                for groups in (1, 2):
+                    with self.subTest(ep=ep, factor=factor, groups=groups), patch.dict(os.environ, {}, clear=True):
+                        spec = {"local_num_tokens": 4096, "hidden_size": 5120, "top_k": 8, "num_experts": 48,
+                                "ep_size": ep, "expert_capacity_factor": factor}
+                        actual = workspace_module.configure_symmetric_heap((spec,) * groups, reference)
+                        self.assertEqual(actual, (groups * (expected_mib - 2) + 2) * 1024**2)
+
+    def test_explicit_heap_requires_sufficient_aligned_capacity(self) -> None:
+        """Accept page-aligned capacity while rejecting undersized and partial physical pages."""
+        spec = {"local_num_tokens": 4096, "hidden_size": 5120, "top_k": 8, "num_experts": 48,
+                "ep_size": 4, "expert_capacity_factor": None}
+        reference = torch.empty(0, dtype=torch.bfloat16)
+        for mib, error in ((1602, None), (1664, None), (1600, RuntimeError), (1603, ValueError), (0, ValueError)):
+            with self.subTest(mib=mib), patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_HEAP_SIZE": str(mib * 1024**2)}):
+                if error is None:
+                    self.assertEqual(workspace_module.configure_symmetric_heap((spec,), reference), mib * 1024**2)
+                else:
+                    with self.assertRaises(error):
+                        workspace_module.configure_symmetric_heap((spec,), reference)
 
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Retain expanded event storage when allocating through the SHMEM API."""

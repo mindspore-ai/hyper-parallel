@@ -15,6 +15,7 @@
 """CPU storage-lifetime tests for the MegaMoe autograd bridge."""
 
 import unittest
+import weakref
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
@@ -29,21 +30,25 @@ class TestMegaMoeFunction(unittest.TestCase):
 
     def test_deferred_backward_keeps_local_owned_storage_after_workspace_reuse(self) -> None:
         """Retain each route's data and capacity across grow/shrink and reverse backward."""
-        self._check_deferred_backward(permuted=False)
+        for reuse in (False, True):
+            with self.subTest(reuse=reuse):
+                self._check_deferred_backward(permuted=False, reuse=reuse)
 
     def test_permutation_gradient_consumes_workspace_before_release(self) -> None:
         """Keep token gradients intact when release immediately poisons shared rows."""
-        self._check_deferred_backward(permuted=True)
+        for reuse in (False, True):
+            with self.subTest(reuse=reuse):
+                self._check_deferred_backward(permuted=True, reuse=reuse)
 
     def test_frozen_tokens_do_not_launch_a_permutation_gradient(self) -> None:
         """Compute expert weight gradients without an unused token reduction."""
-        self._check_deferred_backward(permuted=True, input_grad=False)
+        self._check_deferred_backward(permuted=True, input_grad=False, reuse=True)
 
-    def _check_deferred_backward(self, *, permuted: bool, input_grad: bool = True) -> None:
+    def _check_deferred_backward(self, *, permuted: bool, input_grad: bool = True, reuse: bool = False) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2)
-        plan = SimpleNamespace(spec=spec)
+        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=reuse)
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
@@ -63,6 +68,14 @@ class TestMegaMoeFunction(unittest.TestCase):
         weight2 = torch.ones(2, 2, 4, requires_grad=True)
         down_pointers = []
         backward_capacities = []
+        scratch_references = []
+        restore_gradient = function_module._restore_input_gradient  # pylint: disable=protected-access
+
+        def restore_without_scratch(*args: Any) -> Any:
+            """Require ordinary scratch and the optional SHMEM view to be released."""
+            self.assertTrue(scratch_references)
+            self.assertTrue(all(reference() is None for reference in scratch_references))
+            return restore_gradient(*args)
 
         def release_workspace() -> None:
             """Make accidental reads after the lease immediately observable."""
@@ -107,6 +120,9 @@ class TestMegaMoeFunction(unittest.TestCase):
             for tensor, width in ((args[8], 2), (args[10], 4), (args[12], 4)):
                 self.assertEqual(tuple(tensor.shape), (capacity, width))
             self.assertEqual(tuple(args[13].shape), (4, 4))
+            self.assertEqual(args[12].data_ptr() == args[0].data_ptr(), reuse)
+            self.assertNotEqual(saved_dispatch.data_ptr(), args[0].data_ptr())
+            scratch_references[:] = [weakref.ref(args[index]) for index in (8, 10, 12)]
             self.assertEqual(torch.count_nonzero(args[6]).item(), 0)
             self.assertEqual(torch.count_nonzero(args[18]).item(), 0)
             args[13].fill_(tag)
@@ -125,8 +141,9 @@ class TestMegaMoeFunction(unittest.TestCase):
             patch.object(
                 function_module.multicore_ops,
                 "mega_moe_grad_with_profile_buffer",
-                side_effect=backward_kernel,
+                new=backward_kernel,
             ),
+            patch.object(function_module, "_restore_input_gradient", new=restore_without_scratch),
             patch.object(function_module.multicore_ops, "moe_token_permute_grad",
                          side_effect=permutation_gradient) as mock_permutation,
         ):

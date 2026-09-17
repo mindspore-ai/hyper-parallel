@@ -194,6 +194,20 @@ def test_mega_moe_local_capacity_lifetime(monkeypatch: pytest.MonkeyPatch, tmp_p
     card_mark="allcards",
     essential_mark="unessential",
 )
+def test_mega_moe_push_memory_reuse(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Validate real receive/dX aliases and fallback with a minimally page-aligned heap."""
+    _run_acceptance_worker(
+        monkeypatch, tmp_path, "test_mega_moe_push_memory_reuse", 2, "_test_mega_moe_push_memory.py",
+        heap_bytes=2 * 1024 * 1024,
+    )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="unessential",
+)
 def test_mega_moe_poisoned_buffers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Require complete writes after NaN and stale-value poisoning across route changes."""
     _run_acceptance_worker(
