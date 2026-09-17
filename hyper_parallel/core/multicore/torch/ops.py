@@ -31,11 +31,12 @@ Forward and backward ACLNN symbols are packaged in one component-owned
 ``hyper_parallel_multicore_nn`` vendor. Source the packaged ``set_env.bash``
 before starting the application or framework Python process so CANN can discover that vendor.
 """
-__all__ = ["mega_moe", "mega_moe_grad"]
+__all__ = ["mega_moe", "mega_moe_grad", "moe_token_permute_grad"]
 
 from functools import lru_cache
+
 import torch
-import torch_npu  # pylint: disable=unused-import  # Registers native NPU operators.
+import torch_npu  # noqa: F401  # pylint: disable=unused-import  # Registers native NPU operators.
 
 from hyper_parallel.core.multicore._loader import (
     NativeComponentUnavailableError,
@@ -414,4 +415,27 @@ def mega_moe_grad_with_profile_buffer(
         expert_num,
         hidden_size,
         seq_size,
+    )
+
+
+def moe_token_permute_grad(
+    grad_permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Reduce dropless permuted gradients without retaining original token values.
+
+    Args:
+        grad_permuted_tokens: Expert-major gradients with shape [T * K, H].
+        sorted_indices: Int32 inverse mapping returned by token permutation.
+        num_tokens: Original token count T.
+        top_k: Number of routes K per token.
+
+    Returns:
+        Owned [T, H] gradients with the input gradient's dtype and device.
+    """
+    _load_native()
+    return torch.ops.hyper_parallel.moe_token_permute_grad(
+        grad_permuted_tokens, sorted_indices, num_tokens, top_k
     )

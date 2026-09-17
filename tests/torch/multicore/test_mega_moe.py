@@ -279,3 +279,16 @@ def test_mega_moe_group_list_isolation(monkeypatch: pytest.MonkeyPatch, tmp_path
     _run_acceptance_worker(
         monkeypatch, tmp_path, "test_mega_moe_group_list_isolation", 2, "_test_mega_moe_runtime.py",
     )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_moe_token_permute_grad(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Validate the metadata-only permutation backward on each device."""
+    _run_acceptance_worker(
+        monkeypatch, tmp_path, "test_moe_token_permute_grad", 2, "_test_moe_token_permute_grad.py",
+    )

@@ -71,11 +71,10 @@ class TestMegaMoeFunction(unittest.TestCase):
 
         workspace.release.side_effect = release_workspace
 
-        def permutation_gradient(grad: Any, mapping: Any, token_rows: int, dtype: Any, top_k: int) -> Any:
+        def permutation_gradient(grad: Any, mapping: Any, token_rows: int, top_k: int) -> Any:
             """Require direct consumption of shared rows and return owned token rows."""
             self.assertEqual(grad.data_ptr(), workspace.routed_buffer.data_ptr())
             self.assertEqual((token_rows, top_k), (2, 2))
-            self.assertEqual(dtype, torch.float32)
             self.assertEqual(mapping.tolist(), [0, 2, 1, 3])
             self.assertTrue(torch.isfinite(grad).all())
             return grad.reshape(token_rows, top_k, 4).sum(dim=1)
@@ -128,7 +127,7 @@ class TestMegaMoeFunction(unittest.TestCase):
                 "mega_moe_grad_with_profile_buffer",
                 side_effect=backward_kernel,
             ),
-            patch.object(function_module.torch_npu, "npu_moe_token_permute_grad_v2",
+            patch.object(function_module.multicore_ops, "moe_token_permute_grad",
                          side_effect=permutation_gradient) as mock_permutation,
         ):
             for tag, capacity in enumerate(capacities, start=1):
@@ -151,6 +150,8 @@ class TestMegaMoeFunction(unittest.TestCase):
                     output = function_module.execute_mega_moe(source, weight1, weight2, route, plan, workspace)
                 saved = output.grad_fn.saved_tensors
                 self.assertEqual(len(saved), 13 if permuted and input_grad else 12)
+                self.assertTrue(all(t.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+                                    for t in saved))
                 self.assertEqual(saved[0].data_ptr(), down_pointers[-1])
                 self.assertNotEqual(saved[0].data_ptr(), workspace.expert_buffer.data_ptr())
                 self.assertEqual(saved[0].untyped_storage().nbytes(), capacity * 4 * source.element_size())
