@@ -39,6 +39,10 @@ def build_deepseek_v41_validation_config(
         num_routed_experts: int | None = None,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        dspark_depth: int = 0,
+        dspark_target_layer_ids: list[int] | None = None,
+        dspark_loss_coeff: float = 1.0,
+        dspark_confidence_coeff: float = 0.1,
 ) -> DeepseekV4Config:
     """Translate the nested V4.1 text config into its validation config.
 
@@ -205,6 +209,27 @@ def build_deepseek_v41_validation_config(
     config.v41_vision_min_pixels = int(vision["min_pixels"])
     config.v41_vision_max_wh_ratio = vision["max_wh_ratio"]
     config.v41_image_token_id = int(source["image_token_id"])
+    config.v41_dspark_depth = int(dspark_depth)
+    if config.v41_dspark_depth > 0:
+        # Crop analogue of the released dspark_target_layer_ids [37, 38, 39]:
+        # the last three backbone layers feed main_proj.
+        default_targets = list(range(max(0, num_hidden_layers - 3), num_hidden_layers))
+        config.v41_dspark_target_layer_ids = list(dspark_target_layer_ids or default_targets)
+        config.v41_dspark_block_size = int(text.get("dspark_block_size", 5))
+        config.v41_dspark_markov_rank = int(text.get("dspark_markov_rank", 256))
+        config.v41_dspark_noise_token_id = int(text.get("dspark_noise_token_id", source["pad_token_id"]))
+        config.v41_dspark_n_routed_experts = min(
+            int(text.get("dspark_n_routed_experts", resolved_routed_experts)), resolved_routed_experts
+        )
+        config.v41_dspark_top_k = min(
+            int(text.get("dspark_num_experts_per_tok", 3)), config.v41_dspark_n_routed_experts
+        )
+        # Released drafter sliding window (report section 2.4.3).
+        config.v41_dspark_window = 128
+        config.v41_dspark_loss_coeff = float(dspark_loss_coeff)
+        config.v41_dspark_confidence_coeff = float(dspark_confidence_coeff)
+    else:
+        config.v41_dspark_target_layer_ids = []
     config._attn_implementation = "eager"  # pylint: disable=protected-access
     return config
 
@@ -217,6 +242,10 @@ def build_cropped_deepseek_v41(
         num_routed_experts: int | None = None,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        dspark_depth: int = 0,
+        dspark_target_layer_ids: list[int] | None = None,
+        dspark_loss_coeff: float = 1.0,
+        dspark_confidence_coeff: float = 0.1,
         torch_dtype: str = "bfloat16",
         validate_placement: bool = False,
         distributed_setup: DistributedSetup | None = None,
@@ -239,6 +268,13 @@ def build_cropped_deepseek_v41(
         exercise_post_training_indexer: Exercise hierarchical Full/Reindex
             semantics on layers 2 and 3.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
+        dspark_depth: Trainable DSpark stage count; 0 disables the
+            drafter (drafter plan overrides are dropped as well).
+        dspark_target_layer_ids: Backbone layers feeding the drafter
+            (``None`` selects the released deep-layer triplet).
+        dspark_loss_coeff: Drafter objective weight.
+        dspark_confidence_coeff: Confidence-head BCE weight inside
+            the drafter objective.
         torch_dtype: Forward dtype accepted by the model builder.
         validate_placement: Enable DTensor placement validation.
         distributed_setup: Trainer-provided parallel topology.
@@ -259,7 +295,21 @@ def build_cropped_deepseek_v41(
         num_routed_experts=num_routed_experts,
         exercise_post_training_indexer=exercise_post_training_indexer,
         indexer_loss_coeff=indexer_loss_coeff,
+        dspark_depth=dspark_depth,
+        dspark_target_layer_ids=dspark_target_layer_ids,
+        dspark_loss_coeff=dspark_loss_coeff,
+        dspark_confidence_coeff=dspark_confidence_coeff,
     )
+    if dspark_depth <= 0 and distributed_setup is not None:
+        overrides = getattr(distributed_setup, "plan_overrides", None)
+        if overrides:
+            # The demo recipe carries drafter plan coverage; with the
+            # drafter disabled those FQNs do not exist and the planner
+            # would reject the whole plan.
+            kept = {match: spec for match, spec in overrides.items()
+                    if match != "dspark" and not match.startswith("dspark.")}
+            if len(kept) != len(overrides):
+                distributed_setup.plan_overrides = kept
     return HyperAutoModelForCausalLM.from_config(
         config,
         distributed_setup=distributed_setup,

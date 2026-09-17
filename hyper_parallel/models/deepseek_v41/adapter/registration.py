@@ -55,6 +55,7 @@ def _load_sharding_rules():
         (["q_a_proj", "kv_proj", "compressor", "indexer.wk", "indexer.k_norm"],
          ParamRole.REPLICATED),
         (["engram", "attn_hc", "ffn_hc"], ParamRole.REPLICATED),
+        (["dspark"], ParamRole.REPLICATED),
         (["q_b_proj", "o_a_proj", "sinks"], ParamRole.COLWISE),
         ("o_b_proj", ParamRole.ROWWISE),
     ]
@@ -85,7 +86,20 @@ def _get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
         for module_fqn in module_by_fqn
         if module_fqn.endswith(".engram") or module_fqn.endswith(".engram.wkv")
     )
-    return _get_visual_fsdp_wrap_modules(model) + engram_units
+    dspark_units = tuple(
+        module_fqn
+        for module_fqn in module_by_fqn
+        if (module_fqn.startswith("dspark.stages.") and module_fqn.count(".") == 2)
+        or (module_fqn.startswith("dspark.stages.") and module_fqn.endswith(".mlp.experts"))
+    )
+    # The tied embedding and output head are the largest root-unit tensors;
+    # dedicated child units keep their fp32 gradient reduce-scatter buffers
+    # from materializing as one multi-GiB root allocation.
+    io_units = tuple(
+        module_fqn for module_fqn in ("model.embed_tokens", "lm_head")
+        if module_fqn in module_by_fqn
+    )
+    return _get_visual_fsdp_wrap_modules(model) + engram_units + dspark_units + io_units
 
 
 def _get_fsdp_excluded_subtrees(model: Any) -> tuple[str, ...]:
