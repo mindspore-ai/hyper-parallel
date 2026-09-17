@@ -168,6 +168,7 @@ class HiFloat8Tensor(HiFloat8TensorStorage, QuantizedTensor):
         """Initialize directional storage after wrapper allocation."""
 
         del device, requires_grad
+        QuantizedTensor.__init__(self)
         HiFloat8TensorStorage.__init__(
             self,
             shape,

@@ -80,6 +80,8 @@ class HiFloat8GroupedExperts(nn.Module):
         weight_quantizer: Optional[HiFloat8Quantizer],
         grad_output_quantizer: Optional[HiFloat8Quantizer],
     ) -> None:
+        """Use supplied quantizers or construct role-specific HiFloat8 defaults."""
+
         self.input_quantizer = input_quantizer or HiFloat8Quantizer(
             fp8_max=INPUT_WEIGHT_FORMAT_MAX
         )
