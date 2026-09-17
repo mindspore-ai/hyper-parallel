@@ -14,11 +14,21 @@
 # ============================================================================
 """Unit tests for trainer lifecycle cleanup."""
 
+import importlib
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from hyper_parallel.trainer import base as base_module
+from tests.common.mark_utils import arg_mark
+
+_BATCHING_MODULE = ModuleType("hyper_parallel.data.batching")
+_BATCHING_MODULE.build_dataloader = MagicMock()
+
+# This module tests the training lifecycle, not dataloader construction. Stub
+# that boundary so collecting the UT does not require the optional torchdata.
+with patch.dict(sys.modules, {"hyper_parallel.data.batching": _BATCHING_MODULE}):
+    base_module = importlib.import_module("hyper_parallel.trainer.base")
 
 
 class TestBaseTrainerCleanup(unittest.TestCase):
@@ -42,8 +52,18 @@ class TestBaseTrainerCleanup(unittest.TestCase):
         trainer.train_steps = 1
         return trainer
 
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="allcards",
+        essential_mark="essential",
+    )
     def test_train_stops_data_iterator_when_training_or_callback_raises(self) -> None:
-        """Non-StopIteration failures should stop prefetching and propagate unchanged."""
+        """
+        Feature: BaseTrainer lifecycle cleanup.
+        Description: Raise from training and callback hooks while background prefetching is enabled.
+        Expectation: The data iterator is stopped once and each original exception propagates unchanged.
+        """
         for failure_hook in ("train_step", "on_epoch_end"):
             with self.subTest(failure_hook=failure_hook):
                 trainer = self._make_trainer()
