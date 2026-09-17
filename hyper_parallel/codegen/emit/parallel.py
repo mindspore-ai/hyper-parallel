@@ -70,6 +70,7 @@ from typing import Any, Optional
 from hyper_parallel.codegen.astkit.edits import (
     TextEdit,
     apply_edits,
+    insert_after_imports,
     replace_function_body,
 )
 from hyper_parallel.codegen.astkit.index import (
@@ -120,6 +121,7 @@ def lower_forward_boundaries(
     at runtime — no per-boundary global constant is emitted.
     """
     edits: list[TextEdit] = []
+    needs_local_compute_import = False
     for class_name, form, emitted, func, injection in iter_emitted_forms(
         source_text,
         frozen_plan,
@@ -132,6 +134,13 @@ def lower_forward_boundaries(
             # to-local semantics with its generic wrapper, so leaving the
             # original forward untouched is behavior-preserving.
             continue
+        if injection and injection.get("local_compute_fn") is not None:
+            # The local-region body (``_render_local_compute``) calls
+            # ``hyper_to_local_if_dtensor``; that runtime helper is a
+            # dependency of this template, not of any declaration, so the
+            # lowerer must import it itself — otherwise the artifact is not
+            # self-contained.
+            needs_local_compute_import = True
         body = _build_forward_body(source_text, injection, func, form, emitted)
         # Keep the original forward as ``_forward_impl``. The
         # extracted method is inserted BEFORE the ``def forward`` (zero-width
@@ -153,7 +162,36 @@ def lower_forward_boundaries(
             "lower_forward_boundaries: edits overlap (circular class nesting); "
             "cannot safely rewrite: " + ", ".join(nested)
         )
-    return apply_edits(source_text, edits)
+    patched = apply_edits(source_text, edits)
+    if needs_local_compute_import:
+        patched = _add_local_compute_import(patched)
+    return patched
+
+
+#: Runtime helper the local-region forward template calls. The template (and
+#: this constant) must stay in sync — see ``_render_local_compute``.
+_LOCAL_COMPUTE_IMPORT = (
+    "from hyper_parallel.codegen.runtime import hyper_to_local_if_dtensor"
+)
+
+
+def _add_local_compute_import(source_text: str) -> str:
+    """Ensure the local-region template's runtime helper is imported.
+
+    The helper is a template dependency, so nothing in the declarations
+    contributes it; without this the generated artifact raises ``NameError`` at
+    the first forward call. No-op when the source already imports it.
+    """
+    if "import hyper_to_local_if_dtensor" in source_text:
+        return source_text
+    index = build_source_index(source_text)
+    edit = insert_after_imports(
+        source_text,
+        index.import_end,
+        _LOCAL_COMPUTE_IMPORT,
+        default_offset=index.docstring_end or 0,
+    )
+    return apply_edits(source_text, [edit]) if edit is not None else source_text
 
 
 #: Class attribute a ``tp_collective`` forward carries, naming its form so the

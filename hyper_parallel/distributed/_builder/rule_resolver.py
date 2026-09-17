@@ -102,6 +102,7 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
         return
 
     module_names = {name for name, _ in model.named_modules()}
+    modules = dict(model.named_modules())
     for key, user_spec, source in entries:
         if not isinstance(user_spec, ModuleShardingSpec):
             raise TypeError(
@@ -129,13 +130,17 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
             for fqn in hits:
                 _warn_dropped_params(
                     source, key, fqn, plan.modules[fqn], user_spec)
-                _merge_into(plan.modules[fqn], user_spec)
+                _merge_into(
+                    plan.modules[fqn],
+                    _effective_override(user_spec, modules.get(fqn), fqn))
                 logger.info("%s: merge into %s (glob %r)",
                             source, fqn, key)
         elif key in plan.modules:
             _warn_dropped_params(
                 source, key, key, plan.modules[key], user_spec)
-            _merge_into(plan.modules[key], user_spec)
+            _merge_into(
+                plan.modules[key],
+                _effective_override(user_spec, modules.get(key), key))
             logger.info("%s: merge into the spec of module %s",
                         source, key)
         else:
@@ -253,6 +258,37 @@ def _warn_dropped_params(source, key, fqn, derived, user_spec) -> None:
                 "the de-sharding is intentional, ignore this warning "
                 "(params={} or 'none' explicitly clears all)",
                 source, key, fqn, len(dropped), dropped)
+
+def _effective_override(user_spec: ModuleShardingSpec, module: Any,
+                        fqn: str) -> ModuleShardingSpec:
+    """Drop an EP-gated compute injection the matched module cannot host.
+
+    An EP rule glob such as ``*.mlp`` also matches boundaries that have no
+    experts to shard — the dense MLPs of a hybrid stack (DeepSeek-V3's
+    ``first_k_dense_replace`` layers). Dropping the injection *here*, while the
+    plan is built, keeps every consumer consistent: the planner records no
+    injection, the emitter renders the boundary's ordinary form (a local-region
+    forward would call a compute that is never bound), and the applier never
+    resolves an EP factory against a non-MoE module. Fields the same entry
+    declares for other purposes still merge.
+
+    Only ``when: ep``-gated specs are affected: an ungated injection is a
+    legitimate local compute (a perf/kernel replacement) on any module.
+    """
+    if not getattr(user_spec, "_ep_gated", False) or module is None:
+        return user_spec
+    if _is_moe_boundary(module):
+        return user_spec
+    logger.info(
+        "plan_overrides: EP-gated compute injection dropped on %s — %s "
+        "carries no experts/router, so it cannot be an expert-parallel region",
+        fqn, type(module).__name__)
+    stripped = copy.copy(user_spec)
+    stripped.local_compute_fn = None
+    stripped.region_dispatch = None
+    stripped._ep_gated = False  # pylint: disable=protected-access
+    return stripped
+
 
 def _merge_into(derived: ModuleShardingSpec,
                 user_spec: ModuleShardingSpec) -> None:

@@ -188,6 +188,41 @@ def _single_plan(entry: dict) -> tuple[dict, dict]:
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
+def test_local_region_lowering_imports_its_runtime_helper():
+    """The local-region template must bring its own runtime import.
+
+    ``_render_local_compute`` calls ``hyper_to_local_if_dtensor``, a helper that
+    no declaration contributes: it is a dependency of the *template*. Without the
+    lowerer registering it the artifact raises ``NameError`` at the first forward
+    call. Regression: only a non-inlined boundary carrying ``local_compute_fn``
+    renders this template — the Qwen3-MoE block is inlined whole as external
+    state, so DeepSeek-V3's dense MLP was the first to reach it.
+
+    Feature: codegen-lowering
+    Description: A boundary whose frozen injection declares ``local_compute_fn``
+        is lowered through ``lower_forward_boundaries``.
+    Expectation: The region body is rendered and the runtime helper is imported;
+        re-lowering the imported text does not duplicate the import.
+    """
+    plan, classes = _single_plan(_identity_entry())
+    plan["injections"] = [
+        {"match": "blocks.alpha", "local_compute_fn": {"_target_": "some.factory"}},
+    ]
+
+    text = lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
+
+    assert "HYPER LOCAL REGION" in text, "the region template must have run"
+    assert (
+        "from hyper_parallel.codegen.runtime import hyper_to_local_if_dtensor"
+        in text
+    ), "the region template's runtime helper must be imported"
+
+    again = lower_forward_boundaries(text, plan, boundary_classes=classes)
+    assert again.count("import hyper_to_local_if_dtensor") == 1
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
 def test_tp_collective_boundary_renders_static_operators():
     """A TP-lowerable boundary with a static signature renders bare operators.
 

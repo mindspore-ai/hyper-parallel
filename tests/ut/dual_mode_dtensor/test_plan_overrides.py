@@ -50,6 +50,11 @@ from tests.ut.dual_mode_dtensor.conftest import (
 )
 
 
+def _stub_factory(**kwargs):  # pylint: disable=unused-argument
+    """Inert compute factory: the plan only stores the reference."""
+    return None
+
+
 # ==========================================================================
 # Source: test_s1_plan_overrides.py
 # S1.13: ShardingPlanner(plan_overrides=...) —— unified override channel (05 §3.6.7 + unified refactor).
@@ -327,6 +332,25 @@ def test_glob_exact_merge_and_warnings(tiny_llama, make_mesh, caplog):
     with caplog.at_level(logging.WARNING):
         planner.plan(tiny_llama, mesh, tp_size=2)
     assert "hit no boundary spec" in caplog.text, f"case: {case}"
+
+    # ── case: ep_gated_injection_dropped_on_non_moe_boundary ─────────────
+    # An EP-gated rule (``when: ep``) glob such as ``*.mlp`` also matches the
+    # dense MLPs of a hybrid stack — there is nothing to shard as experts. The
+    # injection is dropped while the plan is built, so the emitter never renders
+    # a local-region forward whose compute the applier would never bind.
+    case = "ep_gated_injection_dropped_on_non_moe_boundary"
+    caplog.clear()
+    ep_spec = ModuleShardingSpec(
+        local_compute_fn=_stub_factory, region_dispatch=False)
+    ep_spec._ep_gated = True
+    with caplog.at_level(logging.INFO):
+        moe_less_plan = ShardingPlanner(plan_overrides={"*.mlp": ep_spec}).plan(
+            tiny_llama, mesh, tp_size=2)
+    for i in (0, 1):
+        spec = moe_less_plan.modules[f"model.layers.{i}.mlp"]
+        assert spec.local_compute_fn is None, f"case: {case}"
+        assert spec.region_dispatch is None, f"case: {case}"
+    assert "EP-gated compute injection dropped" in caplog.text, f"case: {case}"
 
     # ── case: partial_params_replace_warns ───────────────────────────────
     # partial override: dropped derived params are listed in a WARNING
