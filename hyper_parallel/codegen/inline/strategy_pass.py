@@ -27,7 +27,11 @@ def build_strategy_patches(rules: tuple[InlineRule, ...], model_type: str | None
     emitted: dict[tuple[str, str], str] = {}
     for rule in rules:
         for target in (rule.local_compute_target, rule.inner_wrapper_target):
-            spec = strategy_spec(target, model_type)
+            spec = strategy_spec(
+                target,
+                model_type,
+                inner_wrapper=target is not None and target == rule.inner_wrapper_target,
+            )
             if spec is None:
                 continue
             patch_set.imports.extend(spec.imports)

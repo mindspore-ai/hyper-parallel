@@ -71,6 +71,19 @@ class TestMoeStructure(unittest.TestCase):
         module.top_k = 2
         self.assertEqual(detect_router_kind(module), "softmax_topk")
 
+    def test_linear_sigmoid_group_markers_select_sigmoid(self):
+        """A bare-linear gate backed by sigmoid/group markers must not be
+        misread as a softmax top-k router (DeepSeek-V3 / GLM-4-MoE-style)."""
+        module = SimpleNamespace(
+            gate=nn.Linear(4, 8), top_k=2, routed_scaling_factor=2.0, n_group=2, topk_group=1
+        )
+        self.assertEqual(detect_router_kind(module), "sigmoid_group")
+
+    def test_linear_without_sigmoid_markers_stays_softmax(self):
+        """Plain linear top-k routers keep softmax semantics."""
+        module = SimpleNamespace(gate=nn.Linear(4, 8), top_k=2, norm_topk_prob=True)
+        self.assertEqual(detect_router_kind(module), "softmax_topk")
+
     def test_unknown_gate_fails_without_running(self):
         """The generation path never probes a forward with fabricated tensors."""
         class UnknownGate(nn.Module):

@@ -45,6 +45,9 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
 )
+from hyper_parallel.distributed.expert_parallel.routing import (
+    MOE_ROUTER_ADAPTERS,
+)
 
 
 def resolve_swiglu_weights(
@@ -366,6 +369,52 @@ def ep_routed_forward(
         source_token_indices,
         dispatch_order,
         (batch_size, sequence_length, hidden_size),
+    )
+
+
+def moe_ep_forward(
+    module: Any,
+    hidden_states: torch.Tensor,
+    *,
+    router_kind: str,
+    shared: str = "none",
+    ep_group: Any,
+) -> torch.Tensor:
+    """Shared routed-MoE forward surfaced to generated inline EP artifacts.
+
+    The single framework-generic EP body used across model families in
+    place of per-family strategy strings: runs the routed branch and merges
+    the shared branch according to ``shared``. Router semantics are selected
+    by ``router_kind`` — a STRUCTURAL key (``softmax_topk`` /
+    ``topk_router_module`` / ``sigmoid_group``), never a model name.
+
+    ``shared`` merge modes:
+      * ``"none"``     — routed output only.
+      * ``"additive"`` — ``routed + module.shared_experts(x)``
+                         (DeepSeek-V3 / GLM-4-MoE).
+      * ``"gated"``    — ``routed + sigmoid(module.shared_expert_gate(x)) *
+                         module.shared_expert(x)`` (Qwen2-MoE).
+
+    Keeps the same numeric contract as ``ep_routed_forward`` plus the
+    ``combine`` step of the runtime EP recipes.
+    """
+    routed = ep_routed_forward(
+        module,
+        hidden_states,
+        router_fn=MOE_ROUTER_ADAPTERS[router_kind],
+        ep_group=ep_group,
+    )
+    if shared == "none":
+        return routed
+    if shared == "additive":
+        return routed + module.shared_experts(hidden_states)
+    if shared == "gated":
+        return routed + torch.sigmoid(
+            module.shared_expert_gate(hidden_states)
+        ) * module.shared_expert(hidden_states)
+    raise ValueError(
+        f"moe_ep_forward: unknown shared merge mode {shared!r} "
+        "(expected 'none' | 'additive' | 'gated')"
     )
 
 

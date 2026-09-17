@@ -23,7 +23,6 @@ and whether it passes preflight before training starts.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import asdict
 from fnmatch import fnmatchcase
 import logging
 import os
@@ -39,7 +38,10 @@ from hyper_parallel.codegen.artifact import (
 )
 from hyper_parallel.codegen.emit import emit_bundle
 from hyper_parallel.codegen.hash import canonical_json, signature_from_spec
-from hyper_parallel.codegen.inline.specs import get_inline_spec_bundle
+from hyper_parallel.codegen.inline.framework_spec import (
+    declaration_summary,
+    external_state_classes_for,
+)
 from hyper_parallel.codegen.meta import (
     CodegenMeta,
     load_codegen_meta,
@@ -454,10 +456,14 @@ def _project_spec(
         "sha256": _codegen_implementation_digest(),
     }
     identity = payload.get("source", {}).get("architecture")
-    bundle = get_inline_spec_bundle(identity) if identity else None
-    # Adapter declarations live outside the codegen implementation tree;
-    # their templates and mappings must also invalidate cached artifacts.
-    payload["inline_codegen"] = {"specs": asdict(bundle) if bundle is not None else None}
+    # The declarations a target resolves to are derived from structure (the
+    # family's runtime factories + the framework archetype table), which live
+    # outside the codegen implementation tree; summarizing them here folds
+    # their content into the signature so a change to a factory's component or
+    # a strategy's body still regenerates an artifact.
+    payload["inline_declarations"] = {
+        "specs": declaration_summary(identity, payload.get("overrides")),
+    }
 
     return payload
 
@@ -599,19 +605,19 @@ def _fill_plan_fields(meta: CodegenMeta, config: Any, layout: ArtifactLayout) ->
 
 
 def _record_inline_declarations(meta: CodegenMeta) -> None:
-    """Copy the adapter's inline declarations into ``meta``.
+    """Record the facts the *runtime* also needs, derived from structure.
 
-    The render spec is the single declaration site for the facts the *runtime*
-    also needs — today the class names whose forwards are fully inlined and
-    take their parallel state externally.  Recording them in ``meta`` (the file
-    the runtime loads at training time) is what keeps the runtime from carrying
-    its own copy that drifts when a family adds a model.
+    The class names whose forwards are fully inlined and take their parallel
+    state externally are proven by this plan's own injections (the EP compute
+    factories it injects select their block class) plus the generated fused
+    attention class when this family builds one.  Recording them in ``meta``
+    (the file the runtime loads at training time) is what keeps the runtime
+    from carrying its own copy that drifts when a family adds a model.
     """
     identity = (meta.source or {}).get("architecture")
-    bundle = get_inline_spec_bundle(identity) if identity else None
-    if bundle is None:
-        return
-    meta.external_state_classes = sorted(bundle.external_state_classes)
+    meta.external_state_classes = list(
+        external_state_classes_for(identity, getattr(meta, "injections", None))
+    )
 
 
 def _apply_generation_replacements(
@@ -704,18 +710,32 @@ def _target_path(target: Any) -> Optional[str]:
 #:
 #: S3 maps a recognized ``MoeStructure`` (router / shared-expert branch /
 #: expert-storage) to the factory that would have been wired through a YAML
-#: ``local_compute_fn._target_``. This is deliberately per-family and named,
-#: NOT keyed by model identity: the fingerprint is the *only* discriminator,
-#: so a model with the same structure is covered without new registry work.
-#: The table is transitional — S4+ replaces the factory path with a
-#: self-contained archetype record; the path is today's meta transport.
-_EP_FACTORY_BY_STRUCTURE = {
-    ("topk_router_module", "none", "batched_parameters"):
-        "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel."
-        "qwen3moe_ep_compute_fn",
-    ("topk_router_module", "additive", "batched_parameters"):
-        "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
-}
+#: ``local_compute_fn._target_``. The mapping is not duplicated here: it is the
+#: same framework structure->archetype table the model adapters project from,
+#: so the fingerprint is the *only* discriminator and a model with the same
+#: structure is covered without new registry work. Built lazily (the archetype
+#: table lives in the distributed package) and cached for the module lifetime.
+_EP_FACTORY_BY_STRUCTURE: dict[tuple[str, str, str], str] | None = None
+
+
+def _build_ep_factory_table() -> dict[tuple[str, str, str], str]:
+    """Project the framework archetype table into a fingerprint->path map."""
+    from hyper_parallel.distributed.expert_parallel.archetypes import (  # pylint: disable=C0415
+        moe_archetypes,
+    )
+
+    return {
+        fingerprint: archetype.compute_factory
+        for fingerprint, archetype in moe_archetypes().items()
+    }
+
+
+def _ep_factory_table() -> dict[tuple[str, str, str], str]:
+    """Return the cached fingerprint->factory ``_target_`` map."""
+    global _EP_FACTORY_BY_STRUCTURE  # pylint: disable=global-statement
+    if _EP_FACTORY_BY_STRUCTURE is None:
+        _EP_FACTORY_BY_STRUCTURE = _build_ep_factory_table()
+    return _EP_FACTORY_BY_STRUCTURE
 
 
 def _fill_inferred_ep_targets(model: Any, plan_overrides: dict[str, Any]) -> None:
@@ -795,7 +815,7 @@ def _import_ep_target_for(module: Any, match: str) -> "Any":
         structure.shared_experts,
         structure.expert_storage,
     )
-    factory_path = _EP_FACTORY_BY_STRUCTURE.get(fingerprint)
+    factory_path = _ep_factory_table().get(fingerprint)
     if factory_path is None:
         raise UnsupportedModuleStructure(
             f"{match!r} matched {type(module).__name__} with structure "

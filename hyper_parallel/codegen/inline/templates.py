@@ -160,54 +160,26 @@ class TPOperators:
 '''
 
 
-QWEN3_MOE_EP_FORWARD = '''"""Inline EP routed MoE forward generated from the YAML local_compute_fn target."""
+MOE_EP_FORWARD_SHELL = '''"""Inline EP routed MoE forward (framework generic)."""
 ps = get_parallel_state()
 if not ps.ep_enabled:
     return self._forward_impl(hidden_states)
 
-ep_group = ps.ep_group
-ep_size = ep_group.size()
-ep_rank = torch.distributed.get_rank(group=ep_group)
-local_expert_count = self.experts.local_expert_count
-global_expert_count = local_expert_count * ep_size
-expert_offset = ep_rank * local_expert_count
-
-batch_size, sequence_length, hidden_size = hidden_states.shape
-topk_indices, topk_weights = MOE_ROUTER_ADAPTERS["qwen3moe"](self, hidden_states)
-(
-    source_token_indices,
-    flattened_expert_weights,
-    dispatch_order,
-    dispatched_states,
-    dispatched_expert_indices,
-    send_counts,
-    receive_counts,
-) = _prepare_ep_dispatch(
+return moe_ep_forward(
+    self,
     hidden_states,
-    topk_indices,
-    topk_weights,
-    local_expert_count=local_expert_count,
-    global_expert_count=global_expert_count,
-    ep_size=ep_size,
-    ep_group=ep_group,
+    router_kind={router_kind!r},
+    shared={shared!r},
+    ep_group=ps.ep_group,
 )
-
-received_states = ep_all_to_all(dispatched_states, send_counts, receive_counts, ep_group)
-received_indices = ep_all_to_all(
-    dispatched_expert_indices, send_counts, receive_counts, ep_group
-).squeeze(-1)
-local_outputs = self.experts(received_states, received_indices - expert_offset)
-combined_expert_outputs = ep_all_to_all(
-    local_outputs.contiguous(), receive_counts, send_counts, ep_group
-)
-
-weighted_outputs = combined_expert_outputs * flattened_expert_weights[dispatch_order].unsqueeze(-1)
-outputs = torch.zeros(
-    batch_size * sequence_length,
-    hidden_size,
-    dtype=weighted_outputs.dtype,
-    device=weighted_outputs.device,
-)
-outputs.index_add_(0, source_token_indices[dispatch_order], weighted_outputs)
-return outputs.view(batch_size, sequence_length, hidden_size)
 '''
+
+
+def moe_ep_forward_body(router_kind: str, shared: str) -> str:
+    """Return the thin inline EP forward body for the given structural keys.
+
+    A single shared body referenced by every MoE render spec. The only
+    inputs are the structure-selected router kind and shared merge mode, so
+    no model-family EP dispatch literal remains in any adapter.
+    """
+    return MOE_EP_FORWARD_SHELL.format(router_kind=router_kind, shared=shared)

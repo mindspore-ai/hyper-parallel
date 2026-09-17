@@ -59,7 +59,7 @@ class TestPlanTargetInference(unittest.TestCase):
 
     def test_fingerprint_registry_exposes_qwen3_ep_factory(self):
         """The Qwen3-MoE fingerprint resolves to its model-adapter factory."""
-        factory = manager._EP_FACTORY_BY_STRUCTURE[
+        factory = manager._ep_factory_table()[
             ("topk_router_module", "none", "batched_parameters")
         ]
         self.assertEqual(factory, EP_PATH)
@@ -127,7 +127,9 @@ class TestPlanTargetInference(unittest.TestCase):
         # The body_template is the exact EP-forward text inlined into the
         # artifact; assert on a real marker to prove it is the routed body.
         self.assertIn("get_parallel_state()", inferred_spec.body_template)
-        self.assertIn("MOE_ROUTER_ADAPTERS", inferred_spec.body_template)
+        # The dispatch literal has been retired into the framework-generic
+        # ``moe_ep_forward``; the inlined body is now a thin call to it.
+        self.assertIn("moe_ep_forward", inferred_spec.body_template)
 
     def test_non_moe_override_is_left_untouched(self):
         """An override that hits no MoE boundary gains no compute injection."""

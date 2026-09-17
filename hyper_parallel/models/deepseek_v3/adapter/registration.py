@@ -58,19 +58,11 @@ def _load_sharding_rules():
     ]
 
 
-def _load_render_spec():
-    """Load the render spec lazily to keep adapter discovery lightweight."""
-    from hyper_parallel.models.deepseek_v3.adapter import render_spec  # pylint: disable=C0415
-
-    return render_spec
-
-
 DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV3ForCausalLM",
     model_type="deepseek_v3",
     replacements=_load_replacements,
     sharding_rules=_load_sharding_rules,
-    inline_codegen=_load_render_spec,
 )
 register_model_adapter(DEEPSEEK_V3_ADAPTER_SPEC)
 

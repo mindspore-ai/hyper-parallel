@@ -73,6 +73,16 @@ def detect_router_kind(module: Any) -> str:
         if not any(getattr(owner, name, None) is not None
                    for owner in (module, config) for name in ("top_k", "num_experts_per_tok")):
             raise _unsupported(module, "linear router has no explicit top-k setting")
+        # A bare-linear gate feeds either softmax top-k routing or
+        # group-limited sigmoid routing; both gates are literally nn.Linear.
+        # The merge contract is told apart by the sigmoid/group markers the
+        # MOE declares on itself or its config (DeepSeek-V3 / GLM-4-MoE keep
+        # routed_scaling_factor + n_group + topk_group; plain softmax routers
+        # carry none). This mirrors the runtime router adapters, which key on
+        # the same attributes.
+        if any(getattr(owner, name, None) is not None
+               for owner in (module, config) for name in ("routed_scaling_factor", "n_group", "topk_group")):
+            return "sigmoid_group"
         return "softmax_topk"
     forward = _forward_tree(gate)
     returns = [node.value for node in ast.walk(forward) if isinstance(node, ast.Return)]

@@ -49,25 +49,31 @@ def render_inline_modeling(source_text: str, meta: Any, model_type: str | None =
 
 
 def _require_inline_coverage(rules: tuple[Any, ...], model_type: str | None = None) -> None:
-    """Fail when a YAML rule has no adapter declaration behind it.
+    """Fail when a YAML rule has no structural resolution behind it.
 
     Covers both rule kinds: a replacement target needs a ``ReplacementSpec``,
-    and every strategy target needs a ``StrategySpec``. Reporting all gaps at
+    and every strategy target needs a ``StrategySpec``.  Reporting all gaps at
     once keeps one fix cycle from hiding the next gap.
     """
 
     uncovered: list[str] = []
     for rule in rules:
-        if rule.replace_target is not None and replacement_spec(rule.replace_target, model_type) is None:
+        if (
+            rule.replace_target is not None
+            and replacement_spec(rule.replace_target, model_type, module_type=rule.module_type) is None
+        ):
             uncovered.append(rule.replace_target)
         for target in (rule.local_compute_target, rule.inner_wrapper_target):
-            if target is not None and strategy_spec(target, model_type) is None:
+            if (
+                target is not None
+                and strategy_spec(target, model_type, inner_wrapper=target == rule.inner_wrapper_target) is None
+            ):
                 uncovered.append(target)
     if uncovered:
         raise RuntimeError(
             f"codegen: no inline declaration for {sorted(set(uncovered))} "
-            f"(model_type={model_type!r}); declare each target in the model "
-            "adapter's inline provider"
+            f"(model_type={model_type!r}); the target names no known generic "
+            "component or framework strategy"
         )
 
 

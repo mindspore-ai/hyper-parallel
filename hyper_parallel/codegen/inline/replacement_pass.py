@@ -35,7 +35,7 @@ def build_replacement_patches(rules: tuple[InlineRule, ...], model_type: str | N
         target = rule.replace_target
         if target is None or target in seen_targets:
             continue
-        spec = replacement_spec(target, model_type)
+        spec = replacement_spec(target, model_type, module_type=rule.module_type)
         if spec is None:
             continue
         seen_targets.add(target)

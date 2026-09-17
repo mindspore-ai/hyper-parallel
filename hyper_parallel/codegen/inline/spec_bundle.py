@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Data contract for model-adapter provided inline Codegen specs."""
+"""Data contract for the inline pipeline's resolved source-level specs."""
 
 from __future__ import annotations
 
@@ -57,27 +57,7 @@ class StrategySpec:
             raise ValueError("Inline strategy method_name must be a Python identifier")
 
 
-@dataclass(frozen=True)
-class MetaNormalizer:
-    """Rewrite one replacement target's frozen parameter names for inline source."""
-
-    target: str
-    param_renames: dict[str, tuple[str, ...]]
-
-
-@dataclass(frozen=True)
-class InlineSpecBundle:
-    """All inline lowering declarations supplied by one model adapter."""
-
-    replacement_specs: dict[str, ReplacementSpec]
-    strategy_specs: dict[str, StrategySpec]
-    meta_normalizers: tuple[MetaNormalizer, ...] = ()
-    external_state_classes: tuple[str, ...] = ()
-
-
 __all__ = [
-    "InlineSpecBundle",
-    "MetaNormalizer",
     "ReplacementSpec",
     "StrategySpec",
 ]

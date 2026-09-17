@@ -95,34 +95,44 @@ def _bundle_files(layout: object) -> dict[str, str]:
     }
 
 
-def test_external_state_classes_travel_from_the_adapter_to_the_runtime(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_external_state_classes_travel_from_structure_to_the_runtime() -> None:
     """The runtime reads the artifact's record, not a hardcoded class list.
 
     Feature: codegen-external-state
-    Description: ``meta.external_state_classes`` is filled from the adapter
-        render spec at generation time; ``runtime`` records it per generated
-        module and consults that record when deciding whether an inlined
-        generated class takes its parallel state externally.
-    Expectation: The declared class is recognised, an undeclared sibling of the
-        same generated module is not, a same-named class defined outside the
-        generated file is not, an artifact that declares nothing recognises
+    Description: ``meta.external_state_classes`` is derived from structure at
+        generation time (the EP archetypes this plan injects plus the fused
+        attention class the family's factories build); ``runtime`` records it
+        per generated module and consults that record when deciding whether an
+        inlined generated class takes its parallel state externally.
+    Expectation: The derived classes are recognised, an undeclared sibling of
+        the same generated module is not, a same-named class defined outside
+        the generated file is not, an artifact that declares nothing recognises
         nothing, and a non-list meta value fails schema validation.
     """
     # pylint: disable=protected-access
-    bundle = SimpleNamespace(external_state_classes=("GroupedExperts",))
-    monkeypatch.setattr(manager, "get_inline_spec_bundle", lambda identity: bundle)
-
     meta = _meta()
     meta.source = {"architecture": "Qwen3MoeForCausalLM"}
+    meta.injections = [
+        {
+            "local_compute_fn": {
+                "_target_": (
+                    "hyper_parallel.models.qwen3_moe.adapter.distributed."
+                    "expert_parallel.qwen3moe_ep_compute_fn"
+                )
+            }
+        }
+    ]
     manager._record_inline_declarations(meta)
-    assert meta.external_state_classes == ["GroupedExperts"]
+    assert meta.external_state_classes == ["GQAAttention", "Qwen3MoeSparseMoeBlock"]
 
     generated = types.ModuleType("hyper_parallel_generated.external_state")
-    declared = type("GroupedExperts", (), {"__module__": generated.__name__})
+    declared = type("Qwen3MoeSparseMoeBlock", (), {"__module__": generated.__name__})
     sibling = type("UndeclaredBlock", (), {"__module__": generated.__name__})
-    foreign = type("GroupedExperts", (), {"__module__": "transformers.models.qwen3_moe"})
+    foreign = type(
+        "Qwen3MoeSparseMoeBlock",
+        (),
+        {"__module__": "transformers.models.qwen3_moe.modeling_qwen3_moe"},
+    )
 
     runtime.register_external_state_classes(generated, meta.external_state_classes)
     assert runtime._is_external_state_inline_module(declared(), generated)
@@ -132,7 +142,7 @@ def test_external_state_classes_travel_from_the_adapter_to_the_runtime(
 
     untouched = types.ModuleType("hyper_parallel_generated.undeclared")
     runtime.register_external_state_classes(untouched, [])
-    scoped = type("GroupedExperts", (), {"__module__": untouched.__name__})
+    scoped = type("Qwen3MoeSparseMoeBlock", (), {"__module__": untouched.__name__})
     assert not runtime._is_external_state_inline_module(scoped(), untouched)
 
     with pytest.raises(TypeError):
@@ -142,7 +152,7 @@ def test_external_state_classes_travel_from_the_adapter_to_the_runtime(
                 "signature": "sig",
                 "yaml_path": "train.yaml",
                 "yaml_sha256": "yaml-sha",
-                "external_state_classes": {"GroupedExperts": True},
+                "external_state_classes": {"Qwen3MoeSparseMoeBlock": True},
             }
         )
 

@@ -12,45 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Discover inline declarations through model adapters."""
+"""Resolve inline declarations for a YAML target.
+
+The declarations are *derived from structure* — the family's own runtime
+replacement factories and the framework archetype table — never read from a
+per-family render spec.  This module is the single lookup site the inline
+passes share, so the resolution rule is stated once.
+"""
 
 from __future__ import annotations
 
-from hyper_parallel.codegen.inline.spec_bundle import InlineSpecBundle, ReplacementSpec, StrategySpec
-from hyper_parallel.models.registry import get_model_adapter
+from hyper_parallel.codegen.inline.framework_spec import (
+    replacement_spec_for,
+    strategy_spec_for,
+)
+from hyper_parallel.codegen.inline.spec_bundle import ReplacementSpec, StrategySpec
 
 
-def get_inline_spec_bundle(model_type: str | None = None, target: str | None = None) -> InlineSpecBundle | None:
-    """Resolve declarations, inferring legacy identity from the target path.
+def replacement_spec(
+    target: str | None,
+    model_type: str | None = None,
+    *,
+    module_type: str | None = None,
+) -> ReplacementSpec | None:
+    """Resolve a YAML ``replace_module`` target to its component replacement.
 
-    Explicit identity is authoritative: unsupported models never fall back to
-    another family. Legacy callers use the models/<family>/adapter convention.
+    ``module_type`` is the rule's matched source type from the YAML; it names
+    the source class the generated artifact must model, so it is passed rather
+    than reconstructed.
     """
-    if model_type is None:
-        parts = (target or "").split(".")
-        if len(parts) < 5 or parts[:2] != ["hyper_parallel", "models"] or parts[3] != "adapter":
-            return None
-        model_type = parts[2]
-    adapter = get_model_adapter(model_type)
-    if adapter is None or adapter.inline_codegen is None:
-        return None
-    bundle = adapter.inline_codegen().get_render_spec()
-    if not isinstance(bundle, InlineSpecBundle):
-        raise TypeError(f"Inline provider for {model_type!r} must return InlineSpecBundle")
-    return bundle
+    return replacement_spec_for(target, model_type, module_type=module_type)
 
 
-def replacement_spec(target: str | None, model_type: str | None = None) -> ReplacementSpec | None:
-    """Return the adapter's replacement declaration for a YAML target."""
-    if target is None:
-        return None
-    bundle = get_inline_spec_bundle(model_type, target)
-    return bundle.replacement_specs.get(target) if bundle is not None else None
+def strategy_spec(
+    target: str | None,
+    model_type: str | None = None,
+    *,
+    inner_wrapper: bool = False,
+) -> StrategySpec | None:
+    """Resolve a YAML strategy target to its parallel strategy.
+
+    ``inner_wrapper`` marks the target as a ``plan_overrides.inner_wrapper``
+    declaration: only that position makes a CP attention wrapper a strategy
+    (a ``local_compute_fn`` in the same slot is not one).
+    """
+    return strategy_spec_for(target, model_type, inner_wrapper=inner_wrapper)
 
 
-def strategy_spec(target: str | None, model_type: str | None = None) -> StrategySpec | None:
-    """Return the adapter's parallel-strategy declaration for a YAML target."""
-    if target is None:
-        return None
-    bundle = get_inline_spec_bundle(model_type, target)
-    return bundle.strategy_specs.get(target) if bundle is not None else None
+__all__ = ["replacement_spec", "strategy_spec"]

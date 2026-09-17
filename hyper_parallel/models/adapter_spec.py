@@ -55,7 +55,6 @@ class ModelAdapterSpec:
             before the default naming rules in Phase 1 (e.g. DeepSeek MLA's
             replicated down-projections). Lives here so the generic planner
             never carries per-family knowledge.
-        inline_codegen: lazy provider of source-level inline Codegen declarations.
         loss: provider returning model-family output-loss adapters that must
             intercept the model before a full terminal output is materialized.
     """
@@ -69,4 +68,3 @@ class ModelAdapterSpec:
     expert_parallel: Optional[Callable[..., Any]] = None
     sharding_rules: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
-    inline_codegen: Optional[Callable[..., Any]] = None
