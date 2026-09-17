@@ -405,13 +405,17 @@ AllocationView TensorView(const at::Tensor &tensor) {
                         static_cast<int32_t>(tensor.device().index())};
 }
 
-void Initialize(int32_t root_rank, int32_t root_size) {
+py::bytes GetUniqueId() {
+  return py::bytes(UnwrapOperation(cann::host::get_unique_id(), "GetUniqueId"));
+}
+
+void Initialize(int32_t root_rank, int32_t root_size, const py::bytes &unique_id) {
   const auto config = runtime::LoadConfigFromEnvironment();
   if (!config.ok()) {
     ThrowStatus(config.error(), DfxOperation::Initialize, DfxPhase::Validation);
   }
   RequireOk(Runtime::Instance().Initialize(RootWorldInfo{root_rank, root_size}, config.value(),
-                                           config.value().bootstrap_endpoint_base),
+                                           config.value().bootstrap_endpoint_base, static_cast<std::string>(unique_id)),
             DfxOperation::Initialize);
 }
 
@@ -795,7 +799,9 @@ PYBIND11_MODULE(hyper_parallel_shmem_torch, module) {
   namespace bindings = hyper_parallel::multicore::shmem::bindings;
 
   module.doc() = "Private Torch binding for the Hyper-Parallel SHMEM Runtime";
-  module.def("_initialize", &bindings::Initialize, py::arg("root_rank"), py::arg("root_size"));
+  module.def("_get_unique_id", &bindings::GetUniqueId);
+  module.def("_initialize", &bindings::Initialize, py::arg("root_rank"), py::arg("root_size"),
+             py::arg("unique_id") = py::bytes());
   module.def("_empty", &bindings::Empty, py::arg("shape"), py::arg("dtype"), py::arg("alignment") = std::nullopt);
   module.def("_free", &bindings::Free, py::arg("tensor"));
   module.def("_barrier", &bindings::Barrier, py::kw_only(), py::arg("blocking") = true);

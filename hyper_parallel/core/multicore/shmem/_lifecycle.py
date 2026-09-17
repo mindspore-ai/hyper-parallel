@@ -30,6 +30,7 @@ _users = 0
 _root_group: Any | None = None
 _root_uses_distributed: bool | None = None
 _root_size: int | None = None
+_root_ranks: tuple[int, ...] | None = None
 # Set only when Native shutdown fails and leaves the process Runtime unsafe to reinitialize.
 _shutdown_failed = False
 
@@ -49,40 +50,61 @@ def _host_barrier() -> None:
         dist.barrier(group=_root_group)
 
 
-def _describe_root(root_group: Any, dist: Any) -> tuple[int, int]:
-    """Validate one complete Torch WORLD and return its CANN Root rank and size."""
+def _describe_root(root_group: Any, dist: Any) -> tuple[int, tuple[int, ...]]:
+    """Validate group membership and return group-local CANN coordinates."""
     world_size = int(dist.get_world_size())
-    expected_ranks = tuple(range(world_size))
-    global_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(root_group))
-    if global_ranks != expected_ranks:
-        raise RuntimeError(
-            "SHMEM Root Group must cover the complete Torch WORLD in global-rank order: "
-            f"expected={expected_ranks}, actual={global_ranks}"
-        )
     root_rank = int(dist.get_rank(root_group))
-    if root_rank < 0 or root_rank >= world_size:
+    if root_rank < 0:
+        raise RuntimeError(f"current process must belong to the SHMEM Root Group: root_rank={root_rank}")
+    global_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(root_group))
+    if (not global_ranks or len(set(global_ranks)) != len(global_ranks)
+            or any(rank < 0 or rank >= world_size for rank in global_ranks)):
         raise RuntimeError(
-            f"current process must belong to the SHMEM Root Group: root_rank={root_rank}, root_size={world_size}"
+            f"SHMEM Root Group has invalid ordered membership: {global_ranks}, world_size={world_size}"
         )
-    return root_rank, world_size
+    if root_rank >= len(global_ranks):
+        raise RuntimeError(
+            f"current process must belong to the SHMEM Root Group: root_rank={root_rank}, ranks={global_ranks}"
+        )
+    return root_rank, global_ranks
+
+
+def _subgroup_unique_id(native: Any, dist: Any, group: Any, rank: int, ranks: tuple[int, ...]) -> bytes:
+    """Broadcast an independent CANN bootstrap ID without involving other PP stages."""
+    payload = [None, None]
+    root_error = None
+    if rank == 0:
+        try:
+            payload[0] = native._get_unique_id()  # pylint: disable=protected-access
+        except Exception as error:  # All group members must observe a root bootstrap failure.
+            root_error = error
+            payload[1] = f"{type(error).__name__}: {error}"
+    dist.broadcast_object_list(payload, src=ranks[0], group=group)
+    if payload[1] is not None:
+        raise RuntimeError(f"SHMEM bootstrap failed for ranks={ranks}: {payload[1]}") from root_error
+    if not isinstance(payload[0], bytes) or not payload[0]:
+        raise RuntimeError(f"SHMEM bootstrap returned an invalid unique ID for ranks={ranks}")
+    return payload[0]
 
 
 def acquire(root_group: ProcessGroup | None = None) -> None:
     """Acquire one reference to the Root-only process SHMEM Runtime.
 
-    The first reference initializes the Native Runtime. Later references with the same ordered complete Torch WORLD
+    The first reference initializes the Native Runtime. Later references with the same ordered group membership
     share it. Every successful call must be paired with one :func:`release` call after the consumer has stopped using
     SHMEM and freed its Allocations.
 
     Args:
-        root_group: A ProcessGroup covering the complete Torch WORLD in global-rank order. ``None`` selects WORLD
-            when Torch distributed is initialized, or a one-PE Root otherwise.
+        root_group: The EP ProcessGroup, which may be a subgroup of Torch WORLD. ``None`` selects WORLD when
+            Torch distributed is initialized, or a one-PE Root otherwise. Disjoint groups initialize independently;
+            one process cannot participate in two different active SHMEM roots simultaneously.
 
     Raises:
         RuntimeError: If the Root identity or framework state differs from the active lifecycle, or a previous Native
             shutdown failed.
     """
     global _users, _root_group, _root_uses_distributed, _root_size  # pylint: disable=global-statement
+    global _root_ranks  # pylint: disable=global-statement
 
     with _lock:
         if _shutdown_failed:
@@ -101,21 +123,34 @@ def acquire(root_group: ProcessGroup | None = None) -> None:
             if uses_distributed != _root_uses_distributed:
                 raise RuntimeError("torch.distributed state changed during the active SHMEM Runtime lifecycle")
             if uses_distributed and selected_group is not _root_group:
-                _describe_root(selected_group, dist)
+                _, selected_ranks = _describe_root(selected_group, dist)
+                if selected_ranks != _root_ranks:
+                    raise RuntimeError(
+                        "SHMEM Root Group has different ordered membership from the active Runtime: "
+                        f"active={_root_ranks}, requested={selected_ranks}"
+                    )
             _users += 1
             return
 
         if uses_distributed:
-            root_rank, root_size = _describe_root(selected_group, dist)
+            root_rank, root_ranks = _describe_root(selected_group, dist)
+            root_size = len(root_ranks)
             dist.barrier(group=selected_group)
         else:
             root_rank, root_size = 0, 1
+            root_ranks = None
 
         # Native initialization failure is retryable and must not create a consumer reference.
-        _load_native()._initialize(root_rank, root_size)  # pylint: disable=protected-access
+        native = _load_native()
+        if uses_distributed and root_ranks != tuple(range(dist.get_world_size())):
+            unique_id = _subgroup_unique_id(native, dist, selected_group, root_rank, root_ranks)
+            native._initialize(root_rank, root_size, unique_id)  # pylint: disable=protected-access
+        else:
+            native._initialize(root_rank, root_size)  # pylint: disable=protected-access
         _root_group = selected_group
         _root_uses_distributed = uses_distributed
         _root_size = root_size
+        _root_ranks = root_ranks
         _users = 1
 
 
@@ -131,6 +166,7 @@ def release() -> None:
             shutdown fails.
     """
     global _users, _shutdown_failed, _root_group, _root_uses_distributed, _root_size  # pylint: disable=global-statement
+    global _root_ranks  # pylint: disable=global-statement
 
     with _lock:
         if _users <= 0:
@@ -159,6 +195,7 @@ def release() -> None:
             _root_group = None
             _root_uses_distributed = None
             _root_size = None
+            _root_ranks = None
             _shutdown_failed = not shutdown_succeeded
 
 

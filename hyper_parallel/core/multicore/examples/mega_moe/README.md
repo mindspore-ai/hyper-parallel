@@ -79,7 +79,19 @@ bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh
 `NNODES * NPROC_PER_NODE` must equal EP8. This minimal benchmark uses one
 SHMEM communicator over the full Torch world. The launcher sets
 `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT` from `SHMEM_HOST` (defaulting to `MASTER_ADDR`) and
-`SHMEM_PORT`; subgroup endpoint discovery is intentionally outside this PR.
+`SHMEM_PORT`. The public `MegaMoeExperts` API also accepts EP subgroups: each
+subgroup bootstraps with a CANN unique ID broadcast only among its members.
+`SHMEM_UID_SOCK_IFNAME` can select a host interface reachable by all EP members
+for multi-node UID bootstrap. Do not set a fixed `SHMEM_UID_SESSION_ID` for
+independent groups. No TP degree is passed to MegaMoE: the caller supplies
+rank-local tokens and the actual EP group.
+
+PP stages may retain multiple forward graphs while sharing serial execution
+resources; activations needed by delayed backward are owned by each graph.
+Close local experts after the pipeline drains and before destroying EP groups.
+Only one ordered EP membership may own SHMEM in a process at a time; separate
+disjoint PP/DP groups have independent runtimes. This example itself still uses
+one full-world EP group rather than a pipeline schedule.
 
 ## Output
 

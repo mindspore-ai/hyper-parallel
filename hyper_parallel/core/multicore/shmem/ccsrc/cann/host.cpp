@@ -132,6 +132,16 @@ int32_t CannCompareOp(CompareOp comparison) {
 
 }  // namespace
 
+runtime::Result<std::string> get_unique_id() {
+  aclshmemx_uniqueid_t unique_id{};
+  const int32_t status = aclshmemx_get_uniqueid(&unique_id);
+  if (status != ACLSHMEM_SUCCESS) {
+    return runtime::Result<std::string>::Failure(CannFailure("aclshmemx_get_uniqueid", status));
+  }
+  return runtime::Result<std::string>::Success(
+    std::string(reinterpret_cast<const char *>(&unique_id), sizeof(unique_id)));
+}
+
 runtime::Status initialize(const InitOptions &options) {
   if (options.effective_bootstrap_endpoint.empty() ||
       options.effective_bootstrap_endpoint.size() > kCannMaxEndpointBytes) {
@@ -166,7 +176,21 @@ runtime::Status initialize(const InitOptions &options) {
   attributes.comm_args = nullptr;
   attributes.instance_id = kDefaultInstanceId;
 
-  const int32_t init_status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
+  // The ID owns an independent rendezvous and uses EP-local PE coordinates, even for noncontiguous subgroups.
+  aclshmemx_uniqueid_t unique_id{};
+  if (!options.unique_id.empty()) {
+    if (options.unique_id.size() != sizeof(unique_id)) {
+      return InvalidArgument("unique_id has an invalid byte count: " + std::to_string(options.unique_id.size()));
+    }
+    std::memcpy(&unique_id, options.unique_id.data(), sizeof(unique_id));
+    const int32_t status = aclshmemx_set_attr_uniqueid_args(
+      options.root_rank, options.root_size, options.heap_size_bytes, &unique_id, &attributes);
+    if (status != ACLSHMEM_SUCCESS) {
+      return CannFailure("aclshmemx_set_attr_uniqueid_args", status);
+    }
+  }
+  const int32_t init_status = aclshmemx_init_attr(
+    options.unique_id.empty() ? ACLSHMEMX_INIT_WITH_DEFAULT : ACLSHMEMX_INIT_WITH_UNIQUEID, &attributes);
   return init_status == ACLSHMEM_SUCCESS ? Success() : CannFailure("aclshmemx_init_attr", init_status);
 }
 

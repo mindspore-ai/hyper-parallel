@@ -165,10 +165,11 @@ class MegaMoeExperts(MulticoreModule):
                 and raises a clear error if a route exceeds it.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
-            ep_size: Expert-parallel degree. The current SHMEM path requires it
-                to cover the complete Torch distributed world.
-            ep_group: Torch expert-parallel process group with the same rank
-                ordering as the complete distributed world.
+            ep_size: Expert-parallel degree, equal to the size of ep_group.
+            ep_group: Torch expert-parallel process group, possibly a subgroup of
+                WORLD. Expert ownership follows group-local rank order. Disjoint
+                PP/DP groups bootstrap independently; one process can have only
+                one ordered EP membership active in SHMEM at a time.
         """
         if dispatch_mode not in ("push", "pull"):
             raise ValueError("dispatch_mode must be push or pull")

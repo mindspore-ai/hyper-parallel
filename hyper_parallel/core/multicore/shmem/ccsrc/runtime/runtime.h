@@ -40,10 +40,12 @@ class Runtime final {
    * @param root Expected CANN Root WORLD rank and size.
    * @param config Validated Runtime configuration copied into Runtime state.
    * @param effective_bootstrap_endpoint Initialization-only TCP endpoint consumed synchronously by CANN.
+   * @param unique_id Optional opaque subgroup bootstrap ID, consumed synchronously instead of the TCP endpoint.
    * @return OK from Uninitialized. An initialization failure rolls Runtime back to Uninitialized so the caller can
    * retry; a clean Shutdown returns Runtime to Uninitialized for another lifecycle.
    */
-  Status Initialize(const RootWorldInfo &root, const Config &config, std::string_view effective_bootstrap_endpoint);
+  Status Initialize(const RootWorldInfo &root, const Config &config, std::string_view effective_bootstrap_endpoint,
+                    std::string_view unique_id = {});
 
   /** @brief Locally return the CANN Root WORLD rank while Ready, without CANN access or DFX updates. */
   Result<int32_t> RootRank() const;

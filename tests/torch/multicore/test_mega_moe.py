@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from tests.common.mark_utils import arg_mark
+from tests.common.distributed_launcher import torchrun_case
 from tests.common.parallel_case import TorchCase, parallel_run
 from tests.common.port_utils import allocate_port
 from tests.torch.multicore._test_env import (
@@ -75,6 +76,26 @@ def _run_precision_worker(monkeypatch) -> None:
 def test_mega_moe_level0_precision(monkeypatch) -> None:
     """Compare output, dX, route dW, W1 dW, and W2 dW with common MoE."""
     _run_precision_worker(monkeypatch)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential",
+)
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_mega_moe_subgroup_pipeline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, checkpointed: bool,
+) -> None:
+    """Compare PP2 x EP2 FIFO 1F1B with an unsharded dense oracle."""
+    _prepare_torch_multicore_test_environment()
+    case = "test_mega_moe_subgroup_pipeline" + ("_checkpoint" if checkpointed else "")
+    result_path = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path))) / f"{case}.json"
+    monkeypatch.setenv("HP_MEGA_MOE_LEVEL1_RESULT", str(result_path))
+    monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
+    # A single case must preserve the caller's reserved physical-device list.
+    with without_inherited_rank_environment():
+        torchrun_case(str(Path(__file__).with_name("_test_mega_moe_pipeline.py")), case, num_proc=4)
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert len(result["ranks"]) == 4
 
 
 def _run_performance_worker(monkeypatch, result_dir: Path) -> dict:

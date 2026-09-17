@@ -68,7 +68,7 @@ Runtime &Runtime::Instance() {
 }
 
 Status Runtime::Initialize(const RootWorldInfo &root, const Config &config,
-                           std::string_view effective_bootstrap_endpoint) {
+                           std::string_view effective_bootstrap_endpoint, std::string_view unique_id) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   if (state_ != State::Uninitialized) {
@@ -101,7 +101,7 @@ Status Runtime::Initialize(const RootWorldInfo &root, const Config &config,
   config_.emplace(config);
 
   const cann::InitOptions options{root.root_rank,         root.root_size,     config.heap_size_bytes,
-                                  config.timeout_seconds, config.data_engine, effective_bootstrap_endpoint};
+                                  config.timeout_seconds, config.data_engine, effective_bootstrap_endpoint, unique_id};
   HP_SM_LOG_DEBUG(root.root_rank, "op=Initialize call=aclshmemx_init_attr enter");
   const Status initialize_status = cann::host::initialize(options);
   if (initialize_status.error_code != ErrorCode::Ok) {
@@ -112,9 +112,10 @@ Status Runtime::Initialize(const RootWorldInfo &root, const Config &config,
   latest_failure_.reset();
   leaked_allocations_.clear();
   state_ = State::Ready;
-  HP_SM_LOG_INFO(root.root_rank, "op=Initialize ok root=%d/%d heap=%" PRIu64 " timeout=%u engine=%s endpoint=%.*s",
+  HP_SM_LOG_INFO(root.root_rank, "op=Initialize ok root=%d/%d heap=%" PRIu64
+                 " timeout=%u engine=%s bootstrap=%s endpoint=%.*s",
                  root.root_rank, root.root_size, config.heap_size_bytes, config.timeout_seconds,
-                 DataEngineName(config.data_engine),
+                 DataEngineName(config.data_engine), unique_id.empty() ? "endpoint" : "unique_id",
                  static_cast<int>(effective_bootstrap_endpoint.size()), effective_bootstrap_endpoint.data());
   return Status{};
 }

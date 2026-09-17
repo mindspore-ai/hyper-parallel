@@ -17,7 +17,12 @@ shmem.acquire()           # None 表示 dist.group.WORLD；首个引用初始化
 shmem.release()           # 释放当前引用；最后一个引用关闭Runtime
 ```
 
-- 仅支持覆盖整个 distributed world 且 rank 顺序一致的 group；`None` 选择 WORLD。
+- `None` selects Torch WORLD. An explicit EP group may be a noncontiguous subgroup;
+  CANN PE coordinates are the group's local ranks, not Torch global ranks.
+- Disjoint PP/DP groups bootstrap independently through group-local CANN unique-ID
+  exchange. Initialization, allocation ordering, reuse barriers and final release
+  involve only that group. One process supports one ordered active membership;
+  equivalent group handles may share it, but overlapping different roots are rejected.
 - 每次成功`acquire()`都必须对应一次`release()`。首个引用解析Root并初始化Native Runtime；后续等价Root
   只增加引用，不重复初始化；非最后一个`release()`只减少引用。
 - 最后一个引用释放前必须完成所有相关backward和设备操作、释放全部对称Allocation，并保持初始化时冻结的
@@ -27,6 +32,12 @@ shmem.release()           # 释放当前引用；最后一个引用关闭Runtime
 - shutdown 时仍有存活分配会导致关闭失败；所有 rank 必须以一致顺序完成关闭，再销毁 HCCL 进程组。
 
 ## 接口契约
+
+In the contracts below, **world** means the acquired CANN SHMEM root group,
+which may be smaller than Torch WORLD. Other PP stages do not participate.
+Expert parameters and forward activations are not symmetric workspace: multiple
+microbatch graphs may remain live while serial calls reuse the same workspace.
+Drain all backward/recompute work before closing experts or destroying groups.
 
 所有操作接口都要求调用方持有一个尚未释放的引用，并且不得与最后一个`release()`并发。Allocation、free、barrier和
 AllGather等collective路径必须由全world按一致顺序调用；单边Put/Get/Signal均为stream入队语义
@@ -107,12 +118,17 @@ Runtime在初始化时冻结当前NPU设备；`empty`、`barrier`、`signal`、`
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `HYPER_PARALLEL_SHMEM_HEAP_SIZE` | 1073741824（1 GiB） | 每进程堆字节数，正整数；生命周期内固定，修改值随下一生命周期首次`acquire()`生效 |
-| `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT` | `tcp://127.0.0.1:8662` | 引导端点；一个生命周期内各 rank 相同，重建生命周期时更换端口 |
+| `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT` | `tcp://127.0.0.1:8662` | Bootstrap endpoint for full Torch WORLD or non-distributed runs; subgroups use independent CANN unique IDs instead |
+| `SHMEM_UID_SOCK_IFNAME` | CANN automatic selection | Optional host interface for subgroup UID bootstrap; it must be reachable by all group members across nodes |
 | `HYPER_PARALLEL_SHMEM_TIMEOUT_SEC` | 120 | Runtime 超时秒数 |
 | `HYPER_PARALLEL_SHMEM_DATA_ENGINE` | `mte` | 数据搬移引擎，首版仅支持 `mte` |
 | `HYPER_PARALLEL_SHMEM_LOG_LEVEL` | 未设置即 `2` | Runtime 日志级别：`0`=Debug（最详细；`shmem.empty` 额外在 stderr 输出直接调用点，泄漏的 Allocation 可经 `allocation_base` 回溯到代码行）、`1`=Info、`2`=Error（仅错误）；非法值回退 `2` |
 
 ## 安全性
+
+Subgroup UID bootstrap also uses unencrypted host sockets. Do not configure a
+fixed `SHMEM_UID_SESSION_ID` for independent groups, since that bypasses unique
+rendezvous allocation. The existing WORLD endpoint settings remain unchanged.
 
 以下为 CANN `aclshmem` 实现层面的事实，部署前需据此评估威胁模型：
 

@@ -68,9 +68,15 @@ experts = MegaMoeExperts(
 output = experts(hidden_states, topk_ids, topk_weights)
 ```
 
+`ep_group` may also be a PP/DP-local EP subgroup: pass its size as `ep_size`.
+MegaMoE uses group-local expert ownership and does not take a TP-size argument.
+Subgroups exchange independent CANN bootstrap IDs internally and do not use a
+shared WORLD rendezvous port. See the [SHMEM lifecycle](docs/shmem.md) for
+cross-node interface selection and group-local shutdown requirements.
+
 ### 输入与权重
 
-- EP 必须覆盖整个默认 world；每 rank 的 token 数 `T` 固定且为 128 的倍数，专家数 `E` 可被 EP 整除。
+- EP may be WORLD or a subgroup; per-rank token count `T` is fixed and a multiple of 128, and `E` is divisible by EP.
   执行计划采用静态 tiling，构造后的 `T/H/I/E/K/EP` 固定；其他 shape、芯片及后端需单独验证。
 - `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，
   ID 使用全局专家编号。
