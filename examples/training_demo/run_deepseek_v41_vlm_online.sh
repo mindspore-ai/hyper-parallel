@@ -22,6 +22,8 @@ OUTPUT_DIR="${PROJECT_ROOT}/output/training_demo/deepseek_v41"
 ASSETS_PATH="${OUTPUT_DIR}/engram_validation.json"
 DEFAULT_DATA_PATH="${OUTPUT_DIR}/mm_data/deepseek_v41_messages/train.jsonl"
 RUN_NAME=${RUN_NAME:-vlm_tp1_ep16}
+PYTHON_BIN=${PYTHON_BIN:-python}
+NPROC_PER_NODE=${NPROC_PER_NODE:-16}
 
 if [[ ! ${RUN_NAME} =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "RUN_NAME may contain only letters, digits, dots, underscores, and hyphens" >&2
@@ -56,7 +58,10 @@ if [[ ! -s "${DATA_PATH}" ]]; then
     echo "V4.1 JSONL data is missing or empty: ${DATA_PATH}" >&2
     exit 1
 fi
-if ! python -c "from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config"; then
+if ! "${PYTHON_BIN}" -c \
+    "import hyper_parallel; from transformers.models.deepseek_v4 import DeepseekV4Config"; then
+    echo "The selected Python cannot import this HyperParallel checkout and " \
+        "Transformers DeepSeek-V4." >&2
     echo "Transformers DeepSeek-V4 support is unavailable." >&2
     echo "Prepare the shell with docs/guide/trainer/current_hf_model_environment.md" >&2
     exit 1
@@ -66,16 +71,16 @@ cd "${PROJECT_ROOT}"
 mkdir -p "${OUTPUT_DIR}"
 rm -f "${OUTPUT_DIR}/${RUN_NAME}.success"
 if [[ ! -s "${ASSETS_PATH}" ]]; then
-    python -m examples.training_demo.prepare_deepseek_v41_assets \
+    "${PYTHON_BIN}" -m examples.training_demo.prepare_deepseek_v41_assets \
         --model-dir "${MODEL_PATH}" \
         --output "${ASSETS_PATH}" \
         --bucket-base 4096 \
         --num-hidden-layers 4
 fi
 
-torchrun \
+"${PYTHON_BIN}" -m torch.distributed.run \
     --standalone \
-    --nproc_per_node=16 \
+    --nproc_per_node="${NPROC_PER_NODE}" \
     "${PROJECT_ROOT}/scripts/train_vl.py" \
     "${SCRIPT_DIR}/train_deepseek_v41_vlm_online.yaml" \
     --model.config_path="${MODEL_PATH}" \

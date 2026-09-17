@@ -21,6 +21,8 @@ PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 OUTPUT_DIR="${PROJECT_ROOT}/output/training_demo/deepseek_v41"
 ASSETS_PATH="${OUTPUT_DIR}/engram_validation.json"
 DATA_PATH="${OUTPUT_DIR}/online_4k.jsonl"
+PYTHON_BIN=${PYTHON_BIN:-python}
+NPROC_PER_NODE=${NPROC_PER_NODE:-16}
 
 if [[ $# -lt 2 ]]; then
     echo "Usage: $0 /path/to/DeepSeek-V4.1-Flash tp1|tp2|cp2 [trainer overrides...]" >&2
@@ -37,7 +39,10 @@ if [[ ! -s "${MODEL_PATH}/config.json" || ! -s "${MODEL_PATH}/tokenizer.json" ]]
     echo "Local V4.1 config/tokenizer assets are incomplete: ${MODEL_PATH}" >&2
     exit 1
 fi
-if ! python -c "from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config"; then
+if ! "${PYTHON_BIN}" -c \
+    "import hyper_parallel; from transformers.models.deepseek_v4 import DeepseekV4Config"; then
+    echo "The selected Python cannot import this HyperParallel checkout and " \
+        "Transformers DeepSeek-V4." >&2
     echo "Transformers DeepSeek-V4 support is unavailable." >&2
     echo "Prepare the shell with docs/guide/trainer/current_hf_model_environment.md" >&2
     exit 1
@@ -82,22 +87,22 @@ esac
 cd "${PROJECT_ROOT}"
 mkdir -p "${OUTPUT_DIR}"
 if [[ ! -s "${ASSETS_PATH}" ]]; then
-    python -m examples.training_demo.prepare_deepseek_v41_assets \
+    "${PYTHON_BIN}" -m examples.training_demo.prepare_deepseek_v41_assets \
         --model-dir "${MODEL_PATH}" \
         --output "${ASSETS_PATH}" \
         --bucket-base 4096 \
         --num-hidden-layers 4
 fi
 if [[ ! -s "${DATA_PATH}" ]]; then
-    python -m examples.training_demo.prepare_deepseek_v41_online_data \
+    "${PYTHON_BIN}" -m examples.training_demo.prepare_deepseek_v41_online_data \
         --output "${DATA_PATH}" \
         --num-samples 128 \
         --sequence-length 4096
 fi
 
-torchrun \
+"${PYTHON_BIN}" -m torch.distributed.run \
     --standalone \
-    --nproc_per_node=16 \
+    --nproc_per_node="${NPROC_PER_NODE}" \
     --module examples.training_demo.train_text \
     "${SCRIPT_DIR}/train_deepseek_v41_online.yaml" \
     --model.config_path="${MODEL_PATH}" \
