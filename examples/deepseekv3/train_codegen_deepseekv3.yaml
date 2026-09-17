@@ -15,7 +15,11 @@ accelerator:
 model:
   _target_: hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
-  trust_remote_code: true
+  # The remote-code implementation stores experts per-expert
+  # (gate_proj/up_proj/down_proj), while the built-in spec shards the fused
+  # gate_up_proj/down_proj; loading with remote code leaves the codegen param
+  # plan referencing parameters the model does not have.
+  trust_remote_code: false
   torch_dtype: bfloat16
   attn_implementation: eager
   local_files_only: true
