@@ -20,6 +20,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
+from .dsa_cp_fold import dsa_cp_fold_enabled, fold_dense_indexer_kl_loss
 from .parallel_ops import DistributedOp
 from .parallel_npu_dense_lightning_indexer_softmax_lse import (
     _adjust_bsnd_key,
@@ -377,6 +378,8 @@ class NpuDenseLightningIndexerGradKlLossDistributedOp(DistributedOp):
     ) -> Optional[Callable]:
         """Return a custom callable if context-parallel adjustments are needed.
 
+        BSND+CP (fold on): runs ``func`` once per folded block against that block's own
+                 causal key prefix and scatters d_key_index back onto the folded layout.
         BSND+CP: wraps ``func`` to slice key, key_index, and key_rope S2
                  dimensions to the causal window for this rank's S1 slice, then
                  zero-pads d_key_index back to the full S2 size so that each
@@ -401,8 +404,17 @@ class NpuDenseLightningIndexerGradKlLossDistributedOp(DistributedOp):
             if q_layout.tensor_map[1] == -1:
                 return None
             split_id = q_layout.get_split_id(1)
+            seq_shards = q_layout.get_dim_split_num(1)
 
             def _bsnd_cp_impl(*args, **kwargs):
+                if dsa_cp_fold_enabled():
+                    if len(args) <= 10 or kwargs:
+                        raise NotImplementedError(
+                            "DSA CP head-tail fold is implemented for the MindSpore positional "
+                            "signature of the dense indexer KL loss only.")
+                    # d_key_index comes back full-length on the folded layout, so the Partial
+                    # reduction and the local narrow in DSAIndexerLossContextParallel still apply.
+                    return fold_dense_indexer_kl_loss(func, split_id, seq_shards, *args)
                 local_q = args[0]
                 s1_local = local_q.shape[1]
                 s2_full = args[3].shape[1]

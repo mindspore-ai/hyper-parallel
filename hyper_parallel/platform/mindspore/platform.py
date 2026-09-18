@@ -378,6 +378,36 @@ class AsyncCollectiveTensor(Tensor):
         return iter(self._wait_and_unwrap())
 
 
+
+def _p2p_exchange_raw(tensor, peer_rank: int, group):
+    """One symmetric exchange: send ``tensor`` to the peer, return what the peer sent."""
+    # pylint: disable=C0415
+    from mindspore.mint.distributed import P2POp, batch_isend_irecv, isend, irecv
+    send_buf = tensor.contiguous()
+    recv_buf = mint.empty_like(send_buf)
+    handles = batch_isend_irecv([
+        P2POp(isend, send_buf, peer_rank, group),
+        P2POp(irecv, recv_buf, peer_rank, group),
+    ])
+    for handle in handles:
+        if handle is not None:
+            handle.wait()
+    return recv_buf
+
+
+class _MSP2PExchangeFunction(_Function):
+    """Symmetric bidirectional P2P; the gradient takes the same exchange back."""
+
+    @staticmethod
+    def forward(ctx, tensor, peer_rank: int, group):  # pylint: disable=arguments-differ
+        ctx.peer_rank, ctx.group = peer_rank, group
+        return _p2p_exchange_raw(tensor, peer_rank, group)
+
+    @staticmethod
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
+        return _p2p_exchange_raw(grad_output, ctx.peer_rank, ctx.group), None, None
+
+
 class _MSAsyncA2ALazyBwd(_Function):
     """Async all-to-all whose forward and backward both return
     :class:`AsyncCollectiveTensor`, deferring ``CommHandle.wait()``
@@ -1238,10 +1268,18 @@ class MindSporePlatform(Platform):
         return handles[0] if handles else None
 
     @staticmethod
-    def p2p_exchange(tensor, peer_rank: int, group=None):  # pylint: disable=unused-argument
-        raise NotImplementedError(
-            "p2p_exchange is not yet supported on the MindSpore platform."
-        )
+    def p2p_exchange(tensor, peer_rank: int, group=None):
+        """Differentiable symmetric P2P exchange (see the base class).
+
+        Used by the head-tail load-balanced Colossal CP path, which is how the DSA dense
+        warm-up's teacher attention balances its causal cost. Both directions go in one
+        ``batch_isend_irecv`` so the send and the receive overlap on the duplex link.
+        """
+        # ``peer_rank`` is a GLOBAL rank (that is what ``P2POp`` takes), so compare it with
+        # the global rank -- ``dist.get_rank(group)`` would be the rank *within* the group.
+        if peer_rank == get_rank_id():
+            return tensor
+        return _MSP2PExchangeFunction.apply(tensor, peer_rank, group)
 
     @staticmethod
     def send_object_list(obj_list, dst=None, group=None):

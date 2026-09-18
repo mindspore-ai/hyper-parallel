@@ -332,3 +332,115 @@ def test_unfold_prefix_pair_matches_single(cp_size, used):
         np.testing.assert_array_equal(p1.asnumpy(), fold.unfold_prefix(Tensor(x), r, cp_size, 1).asnumpy())
         np.testing.assert_allclose(ms.grad(pair_loss)(Tensor(x)).asnumpy(),
                                    ms.grad(single_loss)(Tensor(x)).asnumpy(), rtol=0, atol=1e-6)
+
+
+def toy_dense_lse(q_idx, k_idx, weights, *opts):
+    """Stand-in for the dense stage-1 softmax_lse forward: per-query stats over visible keys.
+
+    Returns ``(softmax_max_index, softmax_sum_index)`` as ``(B, 1, S1)``, the layout the
+    real kernel uses, so the fold has to stitch them on dim 2 rather than dim 1.
+    """
+    del opts
+    s1, s2 = q_idx.shape[1], k_idx.shape[1]
+    m = Tensor(_causal_mask(s1, s2).astype(np.float32))
+    k_tok = k_idx.sum(axis=(2, 3))                          # (B, S2)
+    seen = ops.matmul(k_tok, m.T)                           # (B, S1)
+    w_tok = weights.sum(axis=2)                             # (B, S1)
+    return (seen + w_tok).expand_dims(1), (seen * 2.0).expand_dims(1)
+
+
+def toy_dense_kl_loss(query, key, q_idx, k_idx, weights, smax, ssum,
+                      smax_idx, ssum_idx, scale, q_rope, k_rope, *opts):
+    """Stand-in for the fused dense indexer KL loss (18-arg MindSpore form).
+
+    Same contract as :func:`toy_kl_loss`, plus the two indexer statistics ``(B, 1, S1)``
+    folded into ``d_q_idx`` so a wrongly split stat shows up as a row mismatch.
+    """
+    del query, key, smax, ssum, scale, q_rope, k_rope, opts
+    s1, s2 = q_idx.shape[1], k_idx.shape[1]
+    m = Tensor(_causal_mask(s1, s2).astype(np.float32))
+    k_tok = k_idx.sum(axis=(2, 3))
+    q_tok = q_idx.sum(axis=(2, 3))
+    seen = ops.matmul(k_tok, m.T)                           # (B, S1)
+    stat = smax_idx[:, 0, :] + ssum_idx[:, 0, :]            # (B, S1)
+    d_q = q_idx * (seen + stat)[:, :, None, None]
+    d_k_tok = ops.matmul(q_tok, m)
+    d_k = ops.broadcast_to(d_k_tok[:, :, None, None], k_idx.shape)
+    loss = (seen + stat).sum().reshape((1,))
+    return d_q, d_k, weights * 1.0, loss
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 3, 4, 8])
+def test_folded_dense_lse_matches_full_sequence(cp_size):
+    """Stage-1 forward: both per-query statistics match the full call row by row."""
+    seq = 2 * cp_size * 3
+    rng = np.random.default_rng(11)
+    qi = rng.standard_normal((B, seq, N_HEADS, D)).astype(np.float32)
+    ki = rng.standard_normal((B, seq, 1, D)).astype(np.float32)
+    w = rng.standard_normal((B, seq, N_HEADS)).astype(np.float32)
+    opts = (None, None, "BSND", 3, 1, 1)
+
+    ref = toy_dense_lse(Tensor(qi), Tensor(ki), Tensor(w), *opts)
+    natural_ki = Tensor(ki)  # 一阶段只折 q 侧，key 是自然序
+    for r in range(cp_size):
+        local = lambda x, axis=1: Tensor(_fold_rows(x, r, cp_size, axis))
+        out = fold.fold_dense_lightning_indexer_softmax_lse(
+            toy_dense_lse, r, cp_size, local(qi), natural_ki, local(w), *opts)
+        pos = _rank_positions(seq, r, cp_size)
+        for got, want in zip(out, ref):
+            np.testing.assert_allclose(got.asnumpy(), want.asnumpy()[:, :, pos], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 3, 4, 8])
+def test_folded_dense_kl_loss_matches_full_sequence(cp_size):
+    """Stage-1 loss: query-side grads by row, key grad (natural order) and loss summed over ranks."""
+    seq = 2 * cp_size * 3
+    rng = np.random.default_rng(12)
+    q = rng.standard_normal((B, seq, N_HEADS, D)).astype(np.float32)
+    k = rng.standard_normal((B, seq, N_HEADS, D)).astype(np.float32)
+    qi = rng.standard_normal((B, seq, N_HEADS, D)).astype(np.float32)
+    ki = rng.standard_normal((B, seq, 1, D)).astype(np.float32)
+    w = rng.standard_normal((B, seq, N_HEADS)).astype(np.float32)
+    stats = rng.standard_normal((B, 1, seq, N_HEADS)).astype(np.float32)
+    idx_stats = rng.standard_normal((B, 1, seq)).astype(np.float32)
+    qr = rng.standard_normal((B, seq, N_HEADS, 2)).astype(np.float32)
+    kr = rng.standard_normal((B, seq, N_HEADS, 2)).astype(np.float32)
+    opts = (None, None, "BSND", 3, 1, 1)
+
+    ref = toy_dense_kl_loss(Tensor(q), Tensor(k), Tensor(qi), Tensor(ki), Tensor(w),
+                            Tensor(stats), Tensor(stats), Tensor(idx_stats), Tensor(idx_stats),
+                            0.5, Tensor(qr), Tensor(kr), *opts)
+    natural_k = [Tensor(x) for x in (k, ki, kr)]  # 一阶段只折 q 侧，key 是自然序
+    d_k_sum, loss_sum = 0, 0
+    for r in range(cp_size):
+        local = lambda x, axis=1: Tensor(_fold_rows(x, r, cp_size, axis))
+        d_q, d_k, d_w, loss = fold.fold_dense_indexer_kl_loss(
+            toy_dense_kl_loss, r, cp_size,
+            local(q), natural_k[0], local(qi), natural_k[1], local(w),
+            local(stats, 2), local(stats, 2), local(idx_stats, 2), local(idx_stats, 2),
+            0.5, local(qr), natural_k[2], *opts)
+        pos = _rank_positions(seq, r, cp_size)
+        np.testing.assert_allclose(d_q.asnumpy(), ref[0].asnumpy()[:, pos], rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(d_w.asnumpy(), ref[2].asnumpy()[:, pos], rtol=1e-5, atol=1e-5)
+        assert d_k.shape == ki.shape
+        d_k_sum = d_k_sum + d_k.asnumpy()
+        loss_sum = loss_sum + loss.asnumpy()
+    np.testing.assert_allclose(d_k_sum, ref[1].asnumpy(), rtol=1e-5, atol=1e-4)
+    np.testing.assert_allclose(loss_sum, ref[3].asnumpy(), rtol=1e-5, atol=1e-4)
+
+
+@pytest.mark.parametrize("wrapper,n_args", [
+    (fold.fold_dense_lightning_indexer_softmax_lse, 3),
+    (fold.fold_dense_indexer_kl_loss, 13),
+])
+def test_dense_fold_rejects_n_mismatch(wrapper, n_args):
+    """check_fold_shapes must fire when the slicer's N disagrees with the fold's."""
+    seq, cp_size = 24, 4
+    local_len = seq // cp_size
+    q = Tensor(np.zeros((B, local_len, N_HEADS, D), np.float32))
+    key = Tensor(np.zeros((B, seq, 1, D), np.float32))
+    args = [q, key] + [q] * (n_args - 2)
+    if n_args == 3:
+        args = [q, key, Tensor(np.zeros((B, local_len, N_HEADS), np.float32))]
+    with pytest.raises(ValueError, match="fold shape mismatch"):
+        wrapper(lambda *a, **k: None, 0, cp_size // 2, *args)

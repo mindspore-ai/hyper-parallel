@@ -21,6 +21,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, StridedShard
 from hyper_parallel.platform import get_platform
+from hyper_parallel.platform.platform import PlatformType
 
 platform = get_platform()
 Module = platform.Module
@@ -455,6 +456,9 @@ class ContextParallel(ParallelStyle):
                          composed CP+TP outputs and keep the non-CP layout.
         load_balance:    Enable Head-Tail Q-exchange load balancing.
                          Only valid with Pure Colossal AI (``ulysses_degree=1``).
+                         This is what the DSA dense warm-up's teacher attention uses: its
+                         sequence stays natural order (only the DSA kernels' query-side
+                         tensors are folded), so the runtime Q exchange applies unchanged.
 
                          **Important**: When ``load_balance=True``, ``q.shape[seq_dim]``
                          inside ``forward()`` returns ``S / 2`` (global shape / 2)
@@ -820,21 +824,32 @@ class ContextParallel(ParallelStyle):
     # Load-balance Colossal AI (Head-Tail Q-exchange)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _forward_attr() -> str:
+        """Which attribute holds a module's forward body on this platform.
+
+        MindSpore cells run ``construct`` (``Cell.__call__`` looks it up on the instance, so
+        an instance attribute shadows the class method and the hook machinery around it is
+        preserved); torch modules run ``forward``.
+        """
+        return "construct" if platform.platform_type == PlatformType.MINDSPORE else "forward"
+
     def _apply_lb_colossal(self, module: Module, co_submesh: DeviceMesh) -> None:
-        """Replace ``module.forward`` with the load-balanced two-sub-FA wrapper."""
+        """Replace the module's forward body with the load-balanced two-sub-FA wrapper."""
         ws = co_submesh.mesh.numel()
         rank_list = list(co_submesh.rank_list)
         local_idx = rank_list.index(platform.get_rank())
         target_idx = ws - 1 - local_idx
-        module.forward = partial(
+        forward_attr = self._forward_attr()
+        setattr(module, forward_attr, partial(
             self._lb_colossal_forward,
-            original_forward=module.forward,
+            original_forward=getattr(module, forward_attr),
             co_submesh=co_submesh,
             local_idx=local_idx,
             target_idx=target_idx,
             ws=ws,
             peer_rank=rank_list[target_idx],
-        )
+        ))
 
     def _lb_colossal_forward(  # pylint: disable=too-many-arguments,too-many-locals
         self,
@@ -883,6 +898,9 @@ class ContextParallel(ParallelStyle):
         k_full_dt = DTensor.from_local(k_full, co_submesh, (Replicate(),))
         v_full_dt = DTensor.from_local(v_full, co_submesh, (Replicate(),))
 
+        def _localize(value):
+            return value.to_local() if isinstance(value, DTensor) else value
+
         def _fa(q_half, split_id):
             new_args[q_idx] = DTensor.from_local(q_half, co_submesh, (Shard(seq_dim),))
             new_args[k_idx] = k_full_dt
@@ -890,10 +908,23 @@ class ContextParallel(ParallelStyle):
             _set_lb_override(split_id=split_id, split_num=2 * ws)
             out = original_forward(*new_args, **kwargs)
             _clear_lb_override()
-            return out.to_local() if isinstance(out, DTensor) else out
+            if isinstance(out, (tuple, list)):
+                return type(out)(_localize(item) for item in out)
+            return _localize(out)
 
         fa1_out = _fa(q_keep, split_id=2 * local_idx)
         fa2_out = _fa(q_peer, split_id=2 * target_idx + 1)
-        fa2_our = platform.p2p_exchange(fa2_out, peer_rank)
-        out = platform.cat([fa1_out, fa2_our], dim=seq_dim)
+        # A boundary may return several per-query tensors (the DSA dense teacher hands back
+        # attention_out plus its softmax statistics); every one of them belongs to the peer's
+        # query half and is stitched on the same sequence axis -- MindFormers canonicalises
+        # the statistics to the output's axes before they cross this boundary.
+        if isinstance(fa1_out, (tuple, list)):
+            fa2_our = [platform.p2p_exchange(item, peer_rank) for item in fa2_out]
+            out = type(fa1_out)(
+                platform.cat([first, second], dim=seq_dim)
+                for first, second in zip(fa1_out, fa2_our)
+            )
+        else:
+            fa2_our = platform.p2p_exchange(fa2_out, peer_rank)
+            out = platform.cat([fa1_out, fa2_our], dim=seq_dim)
         return _finalize_colossal_output(out, output_layout, co_submesh, seq_dim, self.use_local_output)

@@ -667,10 +667,6 @@ class DSAIndexerLossContextParallel(ParallelStyle):
         super().__init__()
         layout, seq_dim = _validate_layout_and_mode(self.__class__.__name__, layout, mode)
         loss_variant = _validate_loss_variant(loss_variant)
-        if load_balance and loss_variant == "dense":
-            raise NotImplementedError(
-                "DSAIndexerLossContextParallel(load_balance=True) supports the sparse loss only; "
-                "the dense warm-up loss is not folded yet.")
         self.load_balance = load_balance
         is_dense = loss_variant == "dense"
         self.layout = layout

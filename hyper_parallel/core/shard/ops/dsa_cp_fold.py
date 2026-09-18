@@ -61,6 +61,10 @@ __all__ = [
     "fold_lightning_indexer",
     "fold_sparse_flash_attention",
     "fold_sparse_indexer_kl_loss",
+    "natural_prefix",
+    "natural_prefix_grad",
+    "fold_dense_lightning_indexer_softmax_lse",
+    "fold_dense_indexer_kl_loss",
 ]
 
 # Folding is a property of how the data was sliced, so it is process-wide rather than
@@ -411,4 +415,98 @@ def fold_sparse_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: i
     d_qi1, d_ki1, d_w1, loss1 = _block(1)
     d_key_index = (fold_prefix_grad(d_ki0, seq_shard_id, seq_shards, 0, full_len)
                    + fold_prefix_grad(d_ki1, seq_shard_id, seq_shards, 1, full_len))
+    return _cat_pair(d_qi0, d_qi1, 1), d_key_index, _cat_pair(d_w0, d_w1, 1), loss0 + loss1
+
+
+
+# ---------------------------------------------------------------------------
+# Natural-order key helpers (stage 1). The dense warm-up does NOT fold the trunk --
+# only the query-side tensors entering the DSA kernels are folded (mirroring the
+# static graph's per-layer ``dsa_fold_q`` / ``dsa_fold_sm``), so the key side arrives
+# in natural order and a block's causal prefix is simply its first ``m`` chunks.
+# ---------------------------------------------------------------------------
+
+def natural_prefix(x, seq_shard_id: int, seq_shards: int, block_id: int, seq_dim: int = 1):
+    """One folded block's causal key prefix out of a natural-order full-length key.
+
+    Folded block ``b`` of rank ``r`` is natural chunk ``2r`` (b=0) or ``2N-2r-1`` (b=1),
+    whose causal prefix is a *contiguous* run from the start -- so this is a narrow, not
+    the ``index_select`` the folded-key path needs.
+    """
+    if x is None:
+        return None
+    twon = 2 * seq_shards
+    if x.shape[seq_dim] % twon != 0:
+        raise ValueError(
+            f"DSA CP fold needs the key sequence ({x.shape[seq_dim]}) to be a multiple of 2 * cp ({twon})."
+        )
+    sf = x.shape[seq_dim] // twon
+    return x.narrow(seq_dim, 0, balanced_prefix_chunks(seq_shard_id, seq_shards, block_id) * sf)
+
+
+def natural_prefix_grad(grad, full_len: int, seq_dim: int = 1):
+    """Pad a prefix-shaped key gradient back to full length with zeros at the tail.
+
+    The natural-order prefix is a leading slice, so unlike ``fold_prefix_grad`` nothing
+    has to be scattered: the positions the prefix did not cover are exactly the tail.
+    """
+    pad_len = full_len - grad.shape[seq_dim]
+    if pad_len <= 0:
+        return grad
+    pad_shape = list(grad.shape)
+    pad_shape[seq_dim] = pad_len
+    zero = platform.zeros(tuple(pad_shape), dtype=grad.dtype, device=grad.device)
+    return platform.cat([grad, zero], dim=seq_dim)
+
+
+def fold_dense_lightning_indexer_softmax_lse(func: Callable, seq_shard_id: int, seq_shards: int, *args, **kwargs):
+    """Dense (stage-1) indexer softmax statistics per block, BSND.
+
+    ``args``: query_index, key_index, weights, then scalars/options. The query side holds
+    this rank's two folded blocks; the key side is **natural order** (see
+    :func:`natural_prefix`). Both outputs are ``(B, Nidx2, S1)`` per-query statistics, so
+    they stitch on dim 2 while the query-side inputs split on dim 1.
+    """
+    check_fold_shapes(args[0], args[1], seq_shards)
+    q0, q1 = split_half(args[0], 1)
+    w0, w1 = split_half(args[2], 1)
+    rest = args[3:]
+    out0 = func(q0, natural_prefix(args[1], seq_shard_id, seq_shards, 0), w0, *rest, **kwargs)
+    out1 = func(q1, natural_prefix(args[1], seq_shard_id, seq_shards, 1), w1, *rest, **kwargs)
+    return type(out0)(_cat_pair(a, b, 2) for a, b in zip(out0, out1))
+
+
+def fold_dense_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: int, *args):
+    """Dense (stage-1) indexer KL loss per block, MindSpore positional form (18 args).
+
+    Layout of ``args``: query, key, query_index, key_index, weights, softmax_max,
+    softmax_sum, softmax_max_index, softmax_sum_index, scale, query_rope, key_rope,
+    then scalars/options. Unlike the sparse loss this one has no ``sparse_indices`` and
+    carries two extra query-side statistics (the indexer's own softmax max/sum, from
+    :func:`fold_dense_lightning_indexer_softmax_lse`), which are ``(B, Nidx2, S1)`` and
+    therefore split on dim 2 like the attention stats ``(B, N2, S1, G)``.
+
+    The key side is **natural order**: stage 1 folds only the query-side tensors, so each
+    block's causal prefix is a leading narrow and ``d_key_index`` pads back at the tail.
+
+    Returns ``(d_query_index, d_key_index, d_weights, loss)`` with ``d_key_index`` full
+    length and ``loss`` the sum over the two blocks.
+    """
+    q_side_dims = {0: 1, 2: 1, 4: 1, 5: 2, 6: 2, 7: 2, 8: 2, 10: 1}
+    key_side = (1, 3, 11)
+    full_len = args[3].shape[1]
+    check_fold_shapes(args[0], args[1], seq_shards)
+    halves = {i: split_half(args[i], d) for i, d in q_side_dims.items()}
+
+    def _block(block_id):
+        call = list(args)
+        for i in q_side_dims:
+            call[i] = halves[i][block_id]
+        for i in key_side:
+            call[i] = natural_prefix(args[i], seq_shard_id, seq_shards, block_id)
+        return func(*call)
+
+    d_qi0, d_ki0, d_w0, loss0 = _block(0)
+    d_qi1, d_ki1, d_w1, loss1 = _block(1)
+    d_key_index = (natural_prefix_grad(d_ki0, full_len) + natural_prefix_grad(d_ki1, full_len))
     return _cat_pair(d_qi0, d_qi1, 1), d_key_index, _cat_pair(d_w0, d_w1, 1), loss0 + loss1
