@@ -55,3 +55,17 @@
 /hyper_parallel/core/multicore/ @davidhe91 @Probiotics5333
 /tests/ut/core/multicore/ @davidhe91 @Probiotics5333
 /tests/torch/multicore/ @davidhe91 @Probiotics5333
+
+# Hyper-RL code and Qwen3 adapters.
+/hyper_parallel/rl/ @yangzhenzhang @suteng @yao_yf @yaoyifanx @bj-wang
+/hyper_parallel/models/qwen3/ @yangzhenzhang @suteng @yao_yf @yaoyifanx @bj-wang
+
+# Hyper-RL tests.
+/tests/ut/rl/ @liuchongming74 @bj-wang
+/tests/torch/rl/ @yangzhenzhang @bj-wang
+/tests/common/rl_st_cases.py @liuchongming74 @bj-wang
+
+# Hyper-RL documentation and development rules.
+/docs/rl-*.md @yangzhenzhang @gemini524 @bj-wang
+/.agent/rules/hyper-rl.md @yangzhenzhang @suteng @yao_yf @yaoyifanx @bj-wang
+/.agent/rules/rl/ @yangzhenzhang @suteng @yao_yf @yaoyifanx @bj-wang

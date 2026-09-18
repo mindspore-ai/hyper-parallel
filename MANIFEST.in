@@ -3,6 +3,7 @@ include README.md
 include README.en.md
 include LICENSE
 include build.sh
+include hyper_parallel/rl/pyproject.toml
 include hyper_parallel/data/indexed/csrc/Makefile
 include hyper_parallel/components/functional/GDN_LICENSE
 include hyper_parallel/components/functional/KDA_README.md

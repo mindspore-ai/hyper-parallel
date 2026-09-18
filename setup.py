@@ -21,7 +21,7 @@ import stat
 import platform
 import subprocess
 from importlib import import_module
-from setuptools import setup, find_packages, Distribution
+from setuptools import setup, find_packages, find_namespace_packages, Distribution
 from setuptools.command.egg_info import egg_info
 from setuptools.command.build_py import build_py
 from setuptools.command.install import install
@@ -246,7 +246,10 @@ if __name__ == '__main__':
         long_description=get_readme_content(),
         long_description_content_type="text/markdown",
         test_suite="tests",
-        packages=find_packages(exclude=["*tests*"]),
+        packages=find_packages(exclude=["*tests*"]) + find_namespace_packages(
+            include=["hyper_parallel.rl", "hyper_parallel.rl.rl", "hyper_parallel.rl.rl.*",
+                     "hyper_parallel.rl.examples", "hyper_parallel.rl.examples.*"],
+        ),
         platforms=[get_platform()],
         include_package_data=True,
         scripts=['hyper_parallel/core/multicore/scripts/hyper_parallel_multicore_set_env.bash'],

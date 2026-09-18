@@ -8,6 +8,15 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 
 ---
 
+## HyperParallel-RL Entry
+
+- For RL-owned code, tests, docs, or agent rules, start with [`.agent/rules/hyper-rl.md`](.agent/rules/hyper-rl.md). It is the sole RL entry.
+- RL rules do not apply to other HyperParallel modules. Handle a required main-project change separately under that module's rules.
+- Use the [RL architecture](docs/rl-architecture.md), [feature navigation](docs/rl-navigation.md), and [module map](.agent/rules/rl/module-map.md) to locate boundaries, implementation/test traces, and ownership.
+- RL unit tests live in `tests/ut/rl/`, system tests in `tests/torch/rl/`, and shared recipes in `tests/common/rl_st_cases.py`. Follow the repository testing rules as well.
+
+---
+
 ## Dev Commands
 
 ```bash
@@ -25,7 +34,9 @@ python3 .agent/skills/autogit/scripts/autogit.py check
 python3 .agent/skills/autogit/scripts/autogit.py commit -m "feat: ..."
 python3 .agent/skills/autogit/scripts/autogit.py pr
 
-# AGENTS.md Skills/Agents table vs disk (also in: autogit check / autogit commit)
+# AGENTS.md Skills/Agents table vs disk (also in: autogit check / autogit commit).
+# Non-zero exit is blocking. Run it whenever the diff touches *.md.
+# Check changed documentation links separately; this script only checks catalogs.
 python3 .agent/scripts/check_agents_catalog.py
 ```
 
@@ -50,6 +61,7 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 
 | Module | Location | Purpose |
 |--------|----------|---------|
+| **RL** | `hyper_parallel/rl/` | Synchronous LLM RL runtime with Qwen3, GRPO and PPO |
 | **DTensor** | `core/dtensor/` | Local shard + DeviceMesh + Placements; redistribution cache |
 | **Shard** | `core/shard/` | `custom_shard` / YAML ops + `parallel_*.py` |
 | **Tensor parallel** | `core/tensor_parallel/` | `parallelize_module()`, `ParallelStyle`, mesh context |
@@ -100,6 +112,7 @@ Highest-risk reminders (see rules for full text):
 
 - Conventional Commits (`feat:` / `fix:` / `docs:`), **~80-char** subject, imperative (see `.agent/rules/code-style.md` § Commit Convention; code line width is ~120)
 - Squash WIP before opening PR; use **autogit** for GitCode fork + upstream
+- Keep exactly one commit per PR. Amend subsequent fixes into that commit. Back up before rewriting history and use `--force-with-lease` with the expected remote SHA when updating the PR's own source branch.
 - Optional git hook: copy `.agent/hooks/commit-msg` → `.git/hooks/commit-msg` (rejects AI attribution trailers; `autogit` also checks)
 
 ---
@@ -171,4 +184,5 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **multi-platform-features** | `core/**` — list/collection API contracts |
 | **testing** | `tests/**` |
 | **unit-test** | `tests/ut/**` — hard constraints; how-to → skill `add-unit-test` |
+| **hyper-rl** | `hyper_parallel/rl/**`, RL docs and agent rules — sole RL entry; also consult it for migrated RL tests |
 | **distributed-op-dev** / **distributed-op-testing** / **test-assertion-style** | Op impl & tests (scoped) |

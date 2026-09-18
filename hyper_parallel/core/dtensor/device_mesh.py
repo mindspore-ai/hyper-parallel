@@ -1417,6 +1417,12 @@ class DeviceMesh:
 _DEVICE_MESH_MAP = {}
 
 
+def clear_device_mesh_cache() -> None:
+    """Discard cached meshes and groups after their distributed runtime is destroyed."""
+    _DEVICE_MESH_MAP.clear()
+    EXISTING_COMM_GROUPS.clear()
+
+
 def _device_mesh_map_key(
         mesh_shape: tuple[int, ...],
         mesh_dim_names: Union[tuple[str, ...], list[str], None],

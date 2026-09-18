@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hyper-parallel-rl"
+version = "0.1.0"
+description = "HyperParallel RL runtime and vLLM model registration"
+requires-python = ">=3.10,<3.13"
+
+[project.entry-points."vllm.general_plugins"]
+hyper_parallel = "rl.roles.rollout.vllm_plugin:register_hyper_models"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rl", "rl.*"]
