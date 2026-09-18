@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 # This package provides PyTorch-specific high-performance modules.
 # pylint: disable=forbidden-backend-import
@@ -37,6 +37,17 @@ from hyper_parallel.components.functional import (
     dsa_sparse_attention_rescale,
 )
 from hyper_parallel.components.functional.npu_fusion_attention import resolve_packed_sequence_lengths
+
+
+class _ProjectedAttentionStates(NamedTuple):
+    """Projected states shared by the DSA attention implementations."""
+
+    q_resid: torch.Tensor
+    absorbed_query: torch.Tensor
+    kv_nope: torch.Tensor
+    q_rot: torch.Tensor
+    k_rot: torch.Tensor
+    kv_weight: torch.Tensor
 
 
 def apply_mome(
@@ -142,6 +153,13 @@ def _restore_attention_projection(
     return output.view(num_heads, batch_size, seq_length, value_head_dim).permute(1, 2, 0, 3).reshape(
         batch_size, seq_length, -1
     )
+
+
+def _reshape_dsa_attention_states(
+    attention_states: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Flatten the batch and sequence dimensions for the DSA auxiliary loss."""
+    return tuple(tensor.reshape(-1, tensor.shape[2], tensor.shape[3]) for tensor in attention_states)
 
 
 @module_replacement
@@ -361,7 +379,7 @@ class DeepseekV32DSAAttention(nn.Module):
     def _project_attention_states(
         self,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> _ProjectedAttentionStates:
         """Project hidden states into absorbed-query and latent KV states."""
         batch_size, seq_length = hidden_states.shape[:-1]
         latent_states = self.linear_qkv(hidden_states)
@@ -385,7 +403,7 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         kv_nope = self.kv_a_layernorm(kv_nope).view(batch_size, seq_length, 1, self.kv_lora_rank)
         k_rot = k_rot.view(batch_size, seq_length, 1, self.qk_rope_head_dim)
-        return q_resid, absorbed_query, kv_nope, q_rot, k_rot, kv_weight
+        return _ProjectedAttentionStates(q_resid, absorbed_query, kv_nope, q_rot, k_rot, kv_weight)
 
     def _project_index_states(
         self,
@@ -424,15 +442,10 @@ class DeepseekV32DSAAttention(nn.Module):
         """Attach the DSA KL auxiliary loss when training enables it."""
         if not (self.training and not self.freeze_dsa and self.dsa_loss_coeff):
             return attn_output
-        index_query_tnd, index_key_tnd, merge_weight_tnd = index_states
-        query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
-            tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
-            for tensor in attention_states
-        )
-        softmax_max, softmax_sum = softmax_stats
+        attention_states_tnd = _reshape_dsa_attention_states(attention_states)
         aux_loss = dsa_kl_loss(
-            index_query_tnd, index_key_tnd, merge_weight_tnd, query_tnd, key_tnd,
-            topk_indices, softmax_max, softmax_sum, q_rot_tnd, k_rot_tnd,
+            *index_states, attention_states_tnd[0], attention_states_tnd[1],
+            topk_indices, *softmax_stats, attention_states_tnd[2], attention_states_tnd[3],
             actual_q_len, actual_kv_len, self.scaling, self.dsa_loss_coeff,
         )
         return aux_loss_auto_scale(attn_output, aux_loss)
@@ -450,73 +463,51 @@ class DeepseekV32DSAAttention(nn.Module):
         """Run causal or packed DSA with the NPU sparse-attention kernels."""
         batch_size, seq_length = hidden_states.shape[:-1]
         self._validate_forward_inputs(hidden_states, attention_mask, past_key_values, position_ids, kwargs)
-        q_resid, absorbed_query_states, kv_nope, q_rot, k_rot, kv_weight = self._project_attention_states(
-            hidden_states
+        attention_states = self._project_attention_states(hidden_states)
+        attention_states = (
+            attention_states[:3]
+            + _apply_attention_rope(
+                attention_states[3],
+                attention_states[4],
+                position_embeddings,
+                interleaved=self.rotary_interleaved,
+            )
+            + attention_states[5:]
         )
-        q_rot, k_rot = _apply_attention_rope(
-            q_rot, k_rot, position_embeddings, interleaved=self.rotary_interleaved
-        )
-        index_query, index_key, merge_weight = self._project_index_states(
-            hidden_states, q_resid, position_embeddings
-        )
-        packed_kwargs = dict(kwargs)
-        packed_kwargs["actual_seq_len"] = actual_seq_len
-        actual_q_len, actual_kv_len = resolve_packed_sequence_lengths(
-            packed_kwargs,
+        index_states = self._project_index_states(hidden_states, attention_states[0], position_embeddings)
+        actual_lengths = dict(kwargs)
+        actual_lengths["actual_seq_len"] = actual_seq_len
+        actual_q_len, actual_lengths = resolve_packed_sequence_lengths(
+            actual_lengths,
             batch_size * seq_length,
             batch_size * seq_length,
         )
-        actual_q_len = self._get_actual_seq_len(
-            actual_q_len,
-            batch_size,
-            seq_length,
-            hidden_states.device,
+        actual_lengths = tuple(
+            self._get_actual_seq_len(lengths, batch_size, seq_length, hidden_states.device)
+            for lengths in (actual_q_len, actual_lengths)
         )
-        actual_kv_len = self._get_actual_seq_len(
-            actual_kv_len,
-            batch_size,
-            seq_length,
-            hidden_states.device,
-        )
-        topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(
-            index_query,
-            index_key,
-            merge_weight,
-            actual_q_len,
-            actual_kv_len,
-            self.index_topk,
-        )
-        attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
-            absorbed_query_states,
-            kv_nope,
-            q_rot,
-            k_rot,
-            topk_indices,
-            self.scaling,
-            actual_q_len,
-            actual_kv_len,
+        index_states = dsa_indexer(*index_states, *actual_lengths, self.index_topk)
+        attn_output = dsa_sparse_attention(
+            *attention_states[1:5], index_states[0], self.scaling, *actual_lengths
         )
         attn_output = self._apply_auxiliary_loss(
-            attn_output,
-            (index_query_tnd, index_key_tnd, merge_weight_tnd),
-            (absorbed_query_states, kv_nope, q_rot, k_rot),
-            topk_indices,
-            (softmax_max, softmax_sum),
-            actual_q_len,
-            actual_kv_len,
+            attn_output[0],
+            index_states[1:],
+            attention_states[1:5],
+            index_states[0],
+            attn_output[1:],
+            *actual_lengths,
         )
-        value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)
         attn_output = _restore_attention_projection(
             attn_output,
-            value_up_weight,
+            attention_states[5][:, self.qk_nope_head_dim :].transpose(1, 2),
             num_heads=self.num_heads,
             batch_size=batch_size,
             seq_length=seq_length,
             kv_lora_rank=self.kv_lora_rank,
             value_head_dim=self.v_head_dim,
         )
-        attn_output = self.o_proj(attn_output)
-        return attn_output, None
+        return self.o_proj(attn_output), None
 
 
 @module_replacement
@@ -681,7 +672,7 @@ class DSAAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         mome_mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> _ProjectedAttentionStates:
         """Project hidden states into absorbed-query and latent KV states."""
         batch_size, seq_length = hidden_states.shape[:-1]
         latent_states, _ = self.linear_qkv(hidden_states)
@@ -709,7 +700,7 @@ class DSAAttention(nn.Module):
         )
         kv_nope = self.k_layernorm(kv_nope).view(batch_size, seq_length, 1, self.kv_lora_rank)
         k_rot = k_rot.view(batch_size, seq_length, 1, self.qk_rope_head_dim)
-        return q_resid, absorbed_query, kv_nope, q_rot, k_rot, kv_weight
+        return _ProjectedAttentionStates(q_resid, absorbed_query, kv_nope, q_rot, k_rot, kv_weight)
 
     def _project_index_states(
         self,
@@ -772,18 +763,86 @@ class DSAAttention(nn.Module):
         """Attach the DSA KL auxiliary loss when training enables it."""
         if not (self.training and not self.freeze_dsa and self.dsa_loss_coeff):
             return attn_output
-        index_query_tnd, index_key_tnd, merge_weight_tnd = index_states
-        query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
-            tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
-            for tensor in attention_states
-        )
-        softmax_max, softmax_sum = softmax_stats
+        attention_states_tnd = _reshape_dsa_attention_states(attention_states)
         aux_loss = dsa_kl_loss(
-            index_query_tnd, index_key_tnd, merge_weight_tnd, query_tnd, key_tnd,
-            topk_indices, softmax_max, softmax_sum, q_rot_tnd, k_rot_tnd,
+            *index_states, attention_states_tnd[0], attention_states_tnd[1],
+            topk_indices, *softmax_stats, attention_states_tnd[2], attention_states_tnd[3],
             actual_q_len, actual_kv_len, self.qk_head_dim**-0.5, self.dsa_loss_coeff,
         )
         return aux_loss_auto_scale(attn_output, aux_loss)
+
+    def _project_forward_output(
+        self,
+        attn_output: torch.Tensor,
+        return_bias: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply the output projection and select its bias result."""
+        output, bias = self.linear_proj(attn_output)
+        return (output, bias) if return_bias else (output, None)
+
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        actual_seq_len: torch.Tensor | Sequence[int] | None,
+        mome_mask: torch.Tensor | None,
+        return_bias: bool,
+        kwargs: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the validated DSA forward path."""
+        batch_size, seq_length = hidden_states.shape[:-1]
+        attention_states = self._project_attention_states(hidden_states, mome_mask)
+        attention_states = (
+            attention_states[:3]
+            + _apply_attention_rope(
+                attention_states[3],
+                attention_states[4],
+                position_embeddings,
+                interleaved=self.rotary_interleaved,
+            )
+            + attention_states[5:]
+        )
+        index_states = self._project_index_states(hidden_states, attention_states[0], position_embeddings)
+        actual_lengths = dict(kwargs)
+        actual_lengths["actual_seq_len"] = actual_seq_len
+        actual_q_len, actual_lengths = resolve_packed_sequence_lengths(
+            actual_lengths,
+            batch_size * seq_length,
+            batch_size * seq_length,
+        )
+        actual_lengths = tuple(
+            self._get_actual_seq_len(lengths, batch_size, seq_length, hidden_states.device)
+            for lengths in (actual_q_len, actual_lengths)
+        )
+        index_states = dsa_indexer(*index_states, *actual_lengths, self.index_topk)
+        attn_output = self._run_sparse_attention(
+            attention_states[1:5], index_states[0], *actual_lengths, batch_size, seq_length
+        )
+        attn_output = self._apply_auxiliary_loss(
+            attn_output[0],
+            index_states[1:],
+            attention_states[1:5],
+            index_states[0],
+            attn_output[1:],
+            *actual_lengths,
+        )
+        attn_output = _restore_attention_projection(
+            attn_output,
+            attention_states[5][:, self.qk_nope_head_dim :].transpose(1, 2),
+            num_heads=self.num_heads,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            kv_lora_rank=self.kv_lora_rank,
+            value_head_dim=self.v_head_dim,
+        )
+        if self.use_mome:
+            attn_output = apply_mome(
+                attn_output,
+                mome_mask,
+                self.o_conv,
+                fused=self.use_fused_mome,
+            )
+        return self._project_forward_output(attn_output, return_bias)
 
     def forward(
         self,
@@ -803,66 +862,11 @@ class DSAAttention(nn.Module):
         self._validate_forward_inputs(
             attention_mask, kv_reuse_states, past_key_values, cache_position, output_attentions
         )
-        batch_size, seq_length = hidden_states.shape[:-1]
-        q_resid, absorbed_query_states, kv_nope, q_rot, k_rot, kv_weight = self._project_attention_states(
-            hidden_states, mome_mask
+        return self._forward_impl(
+            hidden_states,
+            position_embeddings,
+            actual_seq_len,
+            mome_mask,
+            return_bias,
+            kwargs,
         )
-        q_rot, k_rot = _apply_attention_rope(
-            q_rot, k_rot, position_embeddings, interleaved=self.rotary_interleaved
-        )
-        index_query, index_key, merge_weight = self._project_index_states(
-            hidden_states, q_resid, position_embeddings
-        )
-        packed_kwargs = dict(kwargs)
-        packed_kwargs["actual_seq_len"] = actual_seq_len
-        actual_q_len, actual_kv_len = resolve_packed_sequence_lengths(
-            packed_kwargs,
-            batch_size * seq_length,
-            batch_size * seq_length,
-        )
-        actual_q_len = self._get_actual_seq_len(
-            actual_q_len, batch_size, seq_length, hidden_states.device
-        )
-        actual_kv_len = self._get_actual_seq_len(
-            actual_kv_len, batch_size, seq_length, hidden_states.device
-        )
-        topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(
-            index_query,
-            index_key,
-            merge_weight,
-            actual_q_len,
-            actual_kv_len,
-            self.index_topk,
-        )
-        attention_states = (absorbed_query_states, kv_nope, q_rot, k_rot)
-        attn_output, softmax_max, softmax_sum = self._run_sparse_attention(
-            attention_states, topk_indices, actual_q_len, actual_kv_len, batch_size, seq_length
-        )
-        attn_output = self._apply_auxiliary_loss(
-            attn_output,
-            (index_query_tnd, index_key_tnd, merge_weight_tnd),
-            attention_states,
-            topk_indices,
-            (softmax_max, softmax_sum),
-            actual_q_len,
-            actual_kv_len,
-        )
-        value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)
-        attn_output = _restore_attention_projection(
-            attn_output,
-            value_up_weight,
-            num_heads=self.num_heads,
-            batch_size=batch_size,
-            seq_length=seq_length,
-            kv_lora_rank=self.kv_lora_rank,
-            value_head_dim=self.v_head_dim,
-        )
-        if self.use_mome:
-            attn_output = apply_mome(
-                attn_output,
-                mome_mask,
-                self.o_conv,
-                fused=self.use_fused_mome,
-            )
-        output, bias = self.linear_proj(attn_output)
-        return (output, bias) if return_bias else (output, None)

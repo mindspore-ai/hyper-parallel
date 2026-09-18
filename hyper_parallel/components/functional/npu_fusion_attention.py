@@ -17,10 +17,21 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 import torch_npu
+
+
+class _AttentionInputs(NamedTuple):
+    """Inputs normalized for the NPU fusion-attention operator."""
+
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    input_layout: str
+    attention_mask: Optional[torch.Tensor]
+    sparse_mode: int
 
 
 def _npu_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -203,7 +214,7 @@ def _prepare_attention_inputs(
     is_causal: bool,
     sliding_window: Optional[int],
     sparse_mode: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str, Optional[torch.Tensor], int]:
+) -> _AttentionInputs:
     """Prepare QKV layout, mask, and sparse mode for the NPU operator."""
     if is_packed:
         query = query.transpose(1, 2).reshape(-1, query.shape[1], query.shape[-1])
@@ -214,11 +225,11 @@ def _prepare_attention_inputs(
             sparse_mode = 3
         else:
             npu_mask = None if attention_mask is None else _npu_attention_mask(attention_mask)
-        return query, key, value, "TND", npu_mask, sparse_mode
+        return _AttentionInputs(query, key, value, "TND", npu_mask, sparse_mode)
     if attention_mask is None and is_causal:
-        return query, key, value, "BNSD", _causal_attention_mask(query, key, sliding_window), 0
+        return _AttentionInputs(query, key, value, "BNSD", _causal_attention_mask(query, key, sliding_window), 0)
     npu_mask = None if attention_mask is None else _npu_attention_mask(attention_mask)
-    return query, key, value, "BNSD", npu_mask, sparse_mode
+    return _AttentionInputs(query, key, value, "BNSD", npu_mask, sparse_mode)
 
 
 def npu_fusion_attention_forward(
