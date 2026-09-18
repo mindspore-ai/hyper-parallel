@@ -67,6 +67,7 @@ class _FakeHSDPParam:
         self.shard_world_size = shard_size
         self.dp_size = dp_size
         self.replicate_world_size = dp_size
+        self.source_shard_info = SimpleNamespace(mesh=_FakeGroup(2))
         self.is_replicate_param = shard_size == 1
         mesh_info_type = DDPMeshInfo if self.is_replicate_param else HSDPMeshInfo
         self.mesh_info = object.__new__(mesh_info_type)
@@ -441,6 +442,64 @@ class TestHSDPStateV2(unittest.TestCase):
                     torch.distributed.ReduceOp.AVG,
                 )
                 param.apply_reduced_grad.assert_called_once_with(current_output)
+
+    def test_plain_fsdp_applies_completed_shard_before_root(self):
+        """Plain FSDP applies both micro-steps early without duplicating root accumulation."""
+        param = _FakeHSDPParam(dp_size=1)
+        param.source_shard_info = None
+        state = _new_state([param])
+        scheduler = _new_root_scheduler(state)
+        events = []
+
+        def apply_grad(grad):
+            events.append("apply")
+            if param.sharded_param.grad is None:
+                param.sharded_param.grad = grad
+            else:
+                param.sharded_param.grad.add_(grad)
+            return False
+
+        param.apply_reduced_grad.side_effect = apply_grad
+        for values in ([1.0, 2.0], [3.0, 4.0]):
+            output = torch.tensor(values)
+            param.reduce_scatter_comm_ctx.reduce_scatter_output = output
+
+            def wait_output():
+                events.append("wait")
+                return output
+
+            param.reduce_scatter_output.side_effect = wait_output
+            state.scheduler_ctx.pre_reduce_scatter_params.append(param)
+            state._wait_prev_reduce_scatter_without_all_reduce()
+            self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_output)
+            scheduler.launch_tp_replicate_reduce_and_apply()
+
+        self.assertEqual(events, ["wait", "apply", "wait", "apply"])
+        self.assertEqual(param.apply_reduced_grad.call_count, 2)
+        torch.testing.assert_close(param.sharded_param.grad, torch.tensor([4.0, 6.0]))
+        param.all_reduce_source_replicate_grad_inplace.assert_not_called()
+
+    def test_plain_fsdp_offload_sync_precedes_output_clear(self):
+        """Early application honors the existing offload synchronization request."""
+        param = _FakeHSDPParam(dp_size=1)
+        param.source_shard_info = None
+        param.apply_reduced_grad.return_value = True
+        state = _new_state([param])
+        state._sync_current_stream_if_needed = MagicMock()
+        state.scheduler_ctx.pre_reduce_scatter_params.append(param)
+        state._wait_prev_reduce_scatter_without_all_reduce()
+        state._sync_current_stream_if_needed.assert_called_once_with(True)
+        param.clear_reduce_scatter_output.assert_called_once()
+
+    def test_single_rank_source_mesh_applies_early(self):
+        """A singleton source mesh needs no additional collective before application."""
+        param = _FakeHSDPParam(dp_size=1)
+        param.source_shard_info = SimpleNamespace(mesh=_FakeGroup(1))
+        state = _new_state([param])
+        state.scheduler_ctx.pre_reduce_scatter_params.append(param)
+        state._wait_prev_reduce_scatter_without_all_reduce()
+        param.apply_reduced_grad.assert_called_once()
+        param.clear_reduce_scatter_output.assert_called_once()
 
     def test_all_reduce_group_consumes_partial_output_in_reduce_dtype(self):
         """The final HSDP AR buffer should consume partial RS output, not parameter grad."""

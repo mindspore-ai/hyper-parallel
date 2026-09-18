@@ -466,7 +466,8 @@ class HSDPStateV2:
         When the current micro-step disables all-reduce, outputs accumulate in
         ``reduce_partial_output`` without being cast or applied to the parameter.
         On the final synchronized micro-step, the partial result is merged into
-        the current RS output and retained for root-hook finalization.
+        the current RS output. Plain FSDP parameters apply completed outputs
+        eagerly; nontrivial source meshes retain root-hook finalization.
         """
         while self.scheduler_ctx.pre_reduce_scatter_params:
             pre_hsdp_param = self.scheduler_ctx.pre_reduce_scatter_params.pop(0)
@@ -485,6 +486,21 @@ class HSDPStateV2:
             elif pre_hsdp_param.reduce_partial_output is not None:
                 reduced_grad.add_(pre_hsdp_param.reduce_partial_output)
                 pre_hsdp_param.reduce_partial_output = None
+
+            if (
+                self.requires_all_reduce
+                and pre_hsdp_param.replicate_world_size == 1
+                and (
+                    pre_hsdp_param.source_shard_info is None
+                    or pre_hsdp_param.source_shard_info.mesh.size() == 1
+                )
+            ):
+                # Reuse the existing wait point without retaining a second
+                # gradient shard until root finalization. The first grad may
+                # alias this output, so only release the communication reference.
+                need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad)
+                self._sync_current_stream_if_needed(need_synchronize)
+                pre_hsdp_param.clear_reduce_scatter_output()
 
             if pre_hsdp_param.unsharded_accumulated_grad_data is not None:
                 pre_hsdp_param.unsharded_accumulated_grad = None

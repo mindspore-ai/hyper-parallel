@@ -25,8 +25,19 @@ import torch
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 
-TextDataType = Literal["plaintext", "conversation"]
+TextDataType = Literal["plaintext", "conversation", "instruction"]
 logger = get_dataset_logger(__name__)
+
+_SHAREGPT_ROLE_MAP = {
+    "system": "system",
+    "human": "user",
+    "user": "user",
+    "gpt": "assistant",
+    "assistant": "assistant",
+    "chatgpt": "assistant",
+    "model": "assistant",
+    "bot": "assistant",
+}
 
 
 def _get_record_value(sample: Mapping[str, Any], keys: str | Sequence[str]) -> Any:
@@ -39,6 +50,53 @@ def _get_record_value(sample: Mapping[str, Any], keys: str | Sequence[str]) -> A
         if key in sample:
             return sample[key]
     raise ValueError(f"Sample does not contain any configured text fields: {list(keys)!r}")
+
+
+def _normalize_conversation(messages: Any) -> list[dict[str, Any]]:
+    """Normalize OpenAI and ShareGPT messages to role/content records."""
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
+        raise ValueError("Conversation messages must be a sequence of mappings")
+
+    normalized_messages = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            raise ValueError("Every conversation message must be a mapping")
+
+        if "role" in message:
+            if "content" not in message:
+                raise ValueError("A role/content message must contain field 'content'")
+            normalized_message = dict(message)
+        elif "from" in message:
+            if "value" not in message:
+                raise ValueError("A ShareGPT from/value message must contain field 'value'")
+            source_role = message["from"]
+            try:
+                role = _SHAREGPT_ROLE_MAP[source_role]
+            except (KeyError, TypeError) as exc:
+                raise ValueError(f"Unsupported ShareGPT role: {source_role!r}") from exc
+            normalized_message = {
+                "role": role,
+                "content": message["value"],
+            }
+            if "loss_mask" in message:
+                normalized_message["loss_mask"] = message["loss_mask"]
+        else:
+            raise ValueError("A conversation message must use role/content or from/value fields")
+
+        normalized_messages.append(normalized_message)
+
+    return normalized_messages
+
+
+def _encode_messages(chat_template: Any, messages: Sequence[Mapping[str, Any]], max_seq_len: int) -> dict[str, Any]:
+    """Encode normalized messages into a shifted causal-language-model sample."""
+    encoded = chat_template.encode_messages(messages, max_seq_len=max_seq_len)
+    input_ids = torch.tensor(encoded["input_ids"], dtype=torch.int64)
+    labels = torch.tensor(encoded["labels"], dtype=torch.int64)
+    return {
+        "input_ids": input_ids[:-1],
+        "labels": labels[1:],
+    }
 
 
 class IdentityDataTransform:
@@ -86,16 +144,10 @@ class PlaintextTransform:
 
         transformed = []
         for start in range(0, len(token_ids) - 1, self.max_seq_len):
-            window = token_ids[start:start + self.max_seq_len + 1]
-            if (self.drop_ragged_tail and start > 0
-                    and len(window) < self.max_seq_len + 1):
-                # Opt-in for models whose packed-sample boundaries must stay
-                # aligned, such as the V4.1 CSA compression ratio and the
-                # context-parallel shard size: a short tail window violates
-                # both once it lands in a batch. Off by default, so every
-                # other model keeps the trailing partial window.
-                break
-            text = torch.tensor(window, dtype=torch.long)
+            text = torch.tensor(
+                token_ids[start:start + self.max_seq_len + 1],
+                dtype=torch.int64,
+            )
             model_sample = {
                 "input_ids": text[:-1],
                 "labels": text[1:],
@@ -129,19 +181,9 @@ class TextConversationTransform:
 
     def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Encode one conversation record."""
-        messages = _get_record_value(sample, self.text_keys)
-        encoded = self.chat_template.encode_messages(messages, max_seq_len=self.max_seq_len)
-        input_ids = torch.as_tensor(encoded["input_ids"], dtype=torch.long)
-        labels = torch.as_tensor(encoded["labels"], dtype=torch.long)
-        shifted_labels = labels[1:]
-        if not bool(shifted_labels.ne(IGNORE_INDEX).any()):
-            return []
-
-        model_sample = {
-            "input_ids": input_ids[:-1],
-            "labels": shifted_labels,
-        }
-        return [model_sample]
+        messages = _normalize_conversation(_get_record_value(sample, self.text_keys))
+        encoded = _encode_messages(self.chat_template, messages, self.max_seq_len)
+        return [encoded] if bool(encoded["labels"].ne(IGNORE_INDEX).any()) else []
 
     def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
         """Return whether one source record contains conversation messages."""
@@ -149,26 +191,92 @@ class TextConversationTransform:
         is_valid = bool(messages)
         return is_valid
 
+@dataclass
+class TextInstructionTransform:
+    """Convert column-mapped instruction records into conversation samples."""
+
+    chat_template: Any
+    max_seq_len: int
+    column_mapping: Mapping[str, str]
+    input_separator: str = "\n\n"
+
+    def __post_init__(self) -> None:
+        """Validate chat assets and logical-to-source column mappings."""
+        if self.chat_template is None:
+            raise ValueError("chat_template is required for instruction data")
+        if self.max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive")
+        if not isinstance(self.column_mapping, Mapping):
+            raise ValueError("column_mapping must be a mapping")
+        for required_key in ("instruction", "output"):
+            source_key = self.column_mapping.get(required_key)
+            if not isinstance(source_key, str) or not source_key:
+                raise ValueError(f"column_mapping must define a non-empty {required_key!r} source field")
+        input_key = self.column_mapping.get("input")
+        if input_key is not None and (not isinstance(input_key, str) or not input_key):
+            raise ValueError("column_mapping 'input' source field must be a non-empty string")
+        if not isinstance(self.input_separator, str):
+            raise ValueError("input_separator must be a string")
+
+    def _get_required_text(self, sample: Mapping[str, Any], logical_key: str) -> str:
+        """Return one required string field selected by the column mapping."""
+        source_key = self.column_mapping[logical_key]
+        try:
+            value = sample[source_key]
+        except KeyError as exc:
+            raise ValueError(f"Instruction sample does not contain field {source_key!r}") from exc
+        if not isinstance(value, str):
+            raise ValueError(f"Instruction field {source_key!r} must be a string")
+        if not value:
+            raise ValueError(f"Instruction field {source_key!r} must not be empty")
+        return value
+
+    def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Convert and encode one column-mapped instruction record."""
+        instruction = self._get_required_text(sample, "instruction")
+        output = self._get_required_text(sample, "output")
+
+        input_text = ""
+        input_key = self.column_mapping.get("input")
+        if input_key is not None:
+            input_text = sample.get(input_key, "")
+            if not isinstance(input_text, str):
+                raise ValueError(f"Instruction field {input_key!r} must be a string")
+
+        user_content = instruction
+        if input_text:
+            user_content = f"{instruction}{self.input_separator}{input_text}"
+
+        messages = [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": output},
+        ]
+        encoded = _encode_messages(self.chat_template, messages, self.max_seq_len)
+        return [encoded] if bool(encoded["labels"].ne(IGNORE_INDEX).any()) else []
+
 
 def build_text_transform(
-    data_type: TextDataType,
-    *,
-    tokenizer: Any = None,
-    chat_template: Any = None,
-    max_seq_len: int,
-    text_keys: str | Sequence[str] = "text",
-    drop_ragged_tail: bool = False,
+        data_type: TextDataType,
+        *,
+        tokenizer: Any = None,
+        chat_template: Any = None,
+        max_seq_len: int,
+        text_keys: str | Sequence[str] = "text",
+        drop_ragged_tail: bool = False,
+        column_mapping: Mapping[str, str] | None = None,
+        input_separator: str = "\n\n",
 ) -> Callable[[Any], Any]:
-    """Build the transform selected by the text data type.
+    """Build the transform selected by the LLM data type.
 
     Args:
-        data_type: Plaintext or conversation input format.
+        data_type: Plaintext, conversation, or column-mapped instruction format.
         tokenizer: Tokenizer used by plaintext transforms.
         chat_template: Chat template used by conversation transforms.
         max_seq_len: Maximum model sequence length.
         text_keys: Field or candidate fields containing the source text.
-        drop_ragged_tail: Drop the trailing partial window of a multi-window
-            plaintext record instead of emitting it as a shorter sample.
+        drop_ragged_tail: Drop trailing partial plaintext windows.
+        column_mapping: Logical instruction/input/output fields mapped to source columns.
+        input_separator: Separator inserted between non-empty instruction and input fields.
 
     Returns:
         The configured text sample transform.
@@ -181,6 +289,15 @@ def build_text_transform(
             tokenizer, max_seq_len, text_keys, drop_ragged_tail)
     elif data_type == "conversation":
         data_transform = TextConversationTransform(chat_template, max_seq_len, text_keys)
+    elif data_type == "instruction":
+        if column_mapping is None:
+            raise ValueError("column_mapping is required for instruction data")
+        data_transform = TextInstructionTransform(
+            chat_template,
+            max_seq_len,
+            column_mapping,
+            input_separator,
+        )
     else:
         raise ValueError(f"Unsupported text data type: {data_type!r}")
 

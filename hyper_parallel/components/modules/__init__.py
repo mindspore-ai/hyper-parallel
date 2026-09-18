@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
 
 _EXPORT_TO_MODULE = {
+    "replace_gdn_chunk_rule": "gdn_ascendc",
     "DeepseekV32DSAAttention": "dsa_attention",
     "DSAAttention": "dsa_attention",
     "GQAAttention": "gqa_attention",
