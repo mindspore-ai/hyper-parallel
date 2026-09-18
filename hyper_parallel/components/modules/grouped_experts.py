@@ -268,40 +268,55 @@ class GroupedExperts(nn.Module):
         self._group_list = None
         self._tokens_per_expert_gmm = None
 
+        self._initialize_projection_layout(
+            source_gate_up, source_down, source_is_transposed, gated_linear_unit
+        )
+        self._initialize_biases(module)
+
+        self.has_gate = gated_linear_unit
+        self.has_bias = self.add_bias
+        self.is_concatenated = bool(getattr(module, "is_concatenated", True))
+        if self.has_gate and not self.is_concatenated:
+            raise ValueError("GroupedExperts requires concatenated gate/up expert weights")
+        self.is_transposed = True
+        self.train(module.training)
+
+    def _initialize_projection_layout(
+        self, source_gate_up, source_down, source_is_transposed, gated_linear_unit,
+    ) -> None:
+        """Resolve expert weight layouts and initialize their target parameters."""
+        hidden_size = self.hidden_size
+        intermediate_size = self.intermediate_size
         fc1_output_size = intermediate_size
         if gated_linear_unit:
             fc1_output_size *= 2
-        fc1_output_size_per_partition = fc1_output_size
-
-        fc2_input_size = intermediate_size
-        fc2_input_size_per_partition = fc2_input_size
 
         npu_gate_up_shape = (
             self.num_local_experts,
             hidden_size,
-            fc1_output_size_per_partition,
+            fc1_output_size,
         )
         npu_down_shape = (
             self.num_local_experts,
-            fc2_input_size_per_partition,
+            intermediate_size,
             hidden_size,
         )
         transformers_gate_up_shape = (
             self.num_local_experts,
-            fc1_output_size_per_partition,
+            fc1_output_size,
             hidden_size,
         )
         transformers_down_shape = (
             self.num_local_experts,
             hidden_size,
-            fc2_input_size_per_partition,
+            intermediate_size,
         )
         experts_2d_gate_up_shape = (
             self.num_local_experts * hidden_size,
-            fc1_output_size_per_partition,
+            fc1_output_size,
         )
         experts_2d_down_shape = (
-            self.num_local_experts * fc2_input_size_per_partition,
+            self.num_local_experts * intermediate_size,
             hidden_size,
         )
         source_shapes = (tuple(source_gate_up.shape), tuple(source_down.shape))
@@ -315,15 +330,6 @@ class GroupedExperts(nn.Module):
         self._initialize_weights(
             source_gate_up, source_down, npu_gate_up_shape, npu_down_shape, gated_linear_unit
         )
-        self._initialize_biases(module)
-
-        self.has_gate = gated_linear_unit
-        self.has_bias = self.add_bias
-        self.is_concatenated = bool(getattr(module, "is_concatenated", True))
-        if self.has_gate and not self.is_concatenated:
-            raise ValueError("GroupedExperts requires concatenated gate/up expert weights")
-        self.is_transposed = True
-        self.train(module.training)
 
     def reset_parameters(self) -> None:
         """Initialize grouped weights with the source model's configured standard deviation."""

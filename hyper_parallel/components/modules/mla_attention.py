@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 # This package provides PyTorch-specific high-performance modules.
@@ -29,6 +30,16 @@ from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.functional import apply_rotary_pos_emb, apply_rotary_pos_emb_interleave
 from hyper_parallel.components.functional import npu_fusion_attention_forward
+
+
+@dataclass
+class _MLALatents:
+    batch_size: int
+    sequence_length: int
+    query_pass: torch.Tensor
+    query_rope: torch.Tensor
+    kv_nope: torch.Tensor
+    key_rope: torch.Tensor
 
 
 @module_replacement
@@ -186,6 +197,70 @@ class MLAAttention(nn.Module):
             )
         return transforms
 
+    def _project_latents(self, hidden_states: torch.Tensor) -> _MLALatents:
+        """Project hidden states into query and compressed KV latent states."""
+        batch_size, sequence_length = hidden_states.shape[:-1]
+        latent_states = self.linear_qkv(hidden_states)
+        query_latent, kv_nope, key_rope = torch.split(
+            latent_states,
+            (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim),
+            dim=-1,
+        )
+        query_states = self.q_b_proj(self.q_a_layernorm(query_latent)).view(
+            batch_size,
+            sequence_length,
+            self.num_heads,
+            self.qk_head_dim,
+        )
+        query_pass, query_rope = torch.split(
+            query_states,
+            (self.qk_nope_head_dim, self.qk_rope_head_dim),
+            dim=-1,
+        )
+        return _MLALatents(
+            batch_size,
+            sequence_length,
+            query_pass,
+            query_rope.transpose(1, 2),
+            self.kv_a_layernorm(kv_nope).view(
+                batch_size, 1, sequence_length, self.kv_lora_rank
+            ),
+            key_rope.view(batch_size, 1, sequence_length, self.qk_rope_head_dim),
+        )
+
+    def _project_attention_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        past_key_values: Any | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build query, key, and value tensors from compressed latent states."""
+        latents = self._project_latents(hidden_states)
+        query_rope, key_rope = latents.query_rope, latents.key_rope
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            rope_fn = apply_rotary_pos_emb_interleave if self.rotary_interleaved else apply_rotary_pos_emb
+            query_rope, key_rope = rope_fn(query_rope, key_rope, cos, sin)
+        kv_nope = latents.kv_nope
+        if past_key_values is not None:
+            kv_nope, key_rope = past_key_values.update(kv_nope, key_rope, self.layer_idx)
+        kv_states = self.kv_b_proj(kv_nope).view(
+            latents.batch_size,
+            kv_nope.shape[2],
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        ).transpose(1, 2)
+        key_nope, value_states = torch.split(
+            kv_states,
+            (self.qk_nope_head_dim, self.v_head_dim),
+            dim=-1,
+        )
+        return (
+            torch.cat((latents.query_pass.transpose(1, 2), query_rope), dim=-1),
+            torch.cat((key_nope, key_rope.expand(-1, self.num_heads, -1, -1)), dim=-1),
+            value_states,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -197,62 +272,11 @@ class MLAAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run MLA with the same external contract as Transformers attention."""
         batch_size, seq_length = hidden_states.shape[:-1]
-        latent_states = self.linear_qkv(hidden_states)
-        q_latent, kv_nope, k_rot = torch.split(
-            latent_states,
-            (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim),
-            dim=-1,
+        query_states, key_states, value_states = self._project_attention_inputs(
+            hidden_states,
+            position_embeddings,
+            past_key_values,
         )
-        q_resid = self.q_a_layernorm(q_latent)
-        q_states = self.q_b_proj(q_resid).view(
-            batch_size,
-            seq_length,
-            self.num_heads,
-            self.qk_head_dim,
-        )
-        q_pass, q_rot = torch.split(
-            q_states,
-            (self.qk_nope_head_dim, self.qk_rope_head_dim),
-            dim=-1,
-        )
-
-        kv_nope = self.kv_a_layernorm(kv_nope).view(
-            batch_size, 1, seq_length, self.kv_lora_rank
-        )
-        k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
-
-        q_rot = q_rot.transpose(1, 2)
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-            if self.rotary_interleaved:
-                q_rot, k_rot = apply_rotary_pos_emb_interleave(
-                    q_rot, k_rot, cos, sin
-                )
-            else:
-                q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
-
-        if past_key_values is not None:
-            kv_nope, k_rot = past_key_values.update(
-                kv_nope,
-                k_rot,
-                self.layer_idx,
-            )
-
-        kv_seq_length = kv_nope.shape[2]
-        kv_states = self.kv_b_proj(kv_nope).view(
-            batch_size,
-            kv_seq_length,
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-        ).transpose(1, 2)
-        k_nope, value_states = torch.split(
-            kv_states,
-            (self.qk_nope_head_dim, self.v_head_dim),
-            dim=-1,
-        )
-        k_rot = k_rot.expand(-1, self.num_heads, -1, -1)
-        query_states = torch.cat((q_pass.transpose(1, 2), q_rot), dim=-1)
-        key_states = torch.cat((k_nope, k_rot), dim=-1)
 
         attn_output, attn_weights = self.attention_interface(
             self,

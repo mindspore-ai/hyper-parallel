@@ -62,6 +62,41 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+def _apply_interleaved_rope(
+    tensor: torch.Tensor,
+    pass_through: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int,
+) -> torch.Tensor:
+    """Apply interleaved RoPE and append dimensions that bypass rotation."""
+    sequence_first = (
+        tensor.permute(2, 0, 1, 3)
+        if unsqueeze_dim == 1
+        else tensor.permute(1, 0, 2, 3)
+    )
+    seq_length, batch_size, num_heads, head_dim = sequence_first.shape
+    if batch_size > 1 and seq_length > 1:
+        rotated = torch_npu.npu_rotary_mul(
+            sequence_first.reshape(batch_size * seq_length, 1, num_heads, head_dim),
+            cos.reshape(batch_size * seq_length, 1, 1, head_dim),
+            sin.reshape(batch_size * seq_length, 1, 1, head_dim),
+            rotary_mode="interleave",
+        ).reshape(seq_length, batch_size, num_heads, head_dim)
+    else:
+        rotated = torch_npu.npu_rotary_mul(
+            sequence_first.clone(),
+            cos.unsqueeze(-2),
+            sin.unsqueeze(-2),
+            rotary_mode="interleave",
+        )
+    rotated = rotated.permute(1, 2, 0, 3)
+    rotated = torch.cat((rotated[..., 0::2], rotated[..., 1::2]), dim=-1)
+    if unsqueeze_dim == 2:
+        rotated = rotated.transpose(1, 2)
+    return torch.cat((rotated, pass_through), dim=-1)
+
+
 def apply_rotary_pos_emb_interleave(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -112,38 +147,7 @@ def apply_rotary_pos_emb_interleave(
     cos = cos.transpose(0, 1)
     sin = sin.transpose(0, 1)
 
-    rotated_tensors: list[torch.Tensor] = []
-    for tensor, pass_through in ((q_rot, q_pass), (k_rot, k_pass)):
-        # The interleave kernel requires sequence-first input when both batch
-        # and sequence dimensions are greater than one.
-        sequence_first = (
-            tensor.permute(2, 0, 1, 3)
-            if unsqueeze_dim == 1
-            else tensor.permute(1, 0, 2, 3)
-        )
-        seq_length, batch_size, num_heads, head_dim = sequence_first.shape
-        if batch_size > 1 and seq_length > 1:
-            rotated = torch_npu.npu_rotary_mul(
-                sequence_first.reshape(
-                    batch_size * seq_length, 1, num_heads, head_dim
-                ),
-                cos.reshape(batch_size * seq_length, 1, 1, head_dim),
-                sin.reshape(batch_size * seq_length, 1, 1, head_dim),
-                rotary_mode="interleave",
-            ).reshape(seq_length, batch_size, num_heads, head_dim)
-        else:
-            rotated = torch_npu.npu_rotary_mul(
-                sequence_first.clone(),
-                cos.unsqueeze(-2),
-                sin.unsqueeze(-2),
-                rotary_mode="interleave",
-            )
-
-        rotated = rotated.permute(1, 2, 0, 3)
-        # Restore the output ordering returned by Transformers.
-        rotated = torch.cat((rotated[..., 0::2], rotated[..., 1::2]), dim=-1)
-        if unsqueeze_dim == 2:
-            rotated = rotated.transpose(1, 2)
-        rotated_tensors.append(torch.cat((rotated, pass_through), dim=-1))
-
-    return rotated_tensors[0], rotated_tensors[1]
+    return (
+        _apply_interleaved_rope(q_rot, q_pass, cos, sin, unsqueeze_dim),
+        _apply_interleaved_rope(k_rot, k_pass, cos, sin, unsqueeze_dim),
+    )

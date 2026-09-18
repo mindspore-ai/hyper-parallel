@@ -23,6 +23,8 @@ GroupList = Optional[Union[torch.Tensor, list[int], tuple[int, ...]]]
 
 
 class GMMFunction(torch.autograd.Function):
+    """Autograd bridge for NPU grouped matrix multiplication."""
+
     @staticmethod
     def forward(
         ctx: Any,
@@ -71,7 +73,6 @@ class GMMFunction(torch.autograd.Function):
             x, weight, group_list = ctx.saved_tensors
 
         original_weight = ctx.original_weight
-        group_list_type = ctx.group_list_type
 
         if isinstance(group_list, (list, tuple)):
             group_list_tensor = torch.tensor(group_list, device=x.device, dtype=torch.int64)
@@ -85,7 +86,7 @@ class GMMFunction(torch.autograd.Function):
             group_list=group_list_tensor,
             split_item=3,
             group_type=0,
-            group_list_type=group_list_type
+            group_list_type=ctx.group_list_type
         )
         dx = dx_list[0]
 
@@ -97,8 +98,6 @@ class GMMFunction(torch.autograd.Function):
                     use_fusion = True
 
         if use_fusion:
-            actual_group_list = group_list_tensor
-
             n_size = original_weight.main_grad.shape[-1]
             main_grad_view = original_weight.main_grad.view(-1, n_size)
 
@@ -106,7 +105,7 @@ class GMMFunction(torch.autograd.Function):
                 main_grad_view,
                 x,
                 grad_outputs,
-                actual_group_list,
+                group_list_tensor,
                 transpose_x=True,
                 transpose_weight=False,
                 group_type=2
@@ -127,7 +126,7 @@ class GMMFunction(torch.autograd.Function):
                     group_list=group_list_tensor,
                     split_item=2,
                     group_type=2,
-                    group_list_type=group_list_type
+                    group_list_type=ctx.group_list_type
                 )
                 grad_weight = dw_list[0]
             else:

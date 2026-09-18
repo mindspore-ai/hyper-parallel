@@ -33,6 +33,7 @@ from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.functional import swiglu
 
+
 @module_replacement
 class SwiGLUMLP(nn.Module):
     """Transformers-compatible SwiGLU MLP using one fused Gate/Up matmul."""
@@ -176,7 +177,9 @@ class SwiGLUMLP(nn.Module):
         """Apply the fused Gate/Up projection, SwiGLU, and Down projection."""
         intermediate_parallel = self.linear_fc1(x)
         if intermediate_parallel.device.type == "npu":
-            intermediate_parallel = swiglu(intermediate_parallel)
+            intermediate_parallel = swiglu(  # pylint: disable=not-callable
+                intermediate_parallel
+            )
         else:
             gate, up = intermediate_parallel.chunk(2, dim=-1)
             intermediate_parallel = F.silu(gate) * up

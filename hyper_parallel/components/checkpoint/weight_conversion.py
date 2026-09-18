@@ -20,6 +20,17 @@
 
 from __future__ import annotations
 
+__all__ = [
+    "ConversionOps",
+    "Transpose",
+    "WeightConverter",
+    "WeightRenaming",
+    "dot_natural_key",
+    "get_model_conversion_mapping",
+    "rename_source_key",
+    "revert_weight_conversion",
+]
+
 import re
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -119,7 +130,14 @@ else:
     class Transpose(ConversionOps):
         """Transpose the first two configured dimensions."""
 
-        def __init__(self, dim0: int = 0, dim1: int = 1, check_dims: bool = False):
+        def __init__(self, dim0: int = 0, dim1: int = 1, check_dims: bool = False) -> None:
+            """Configure the transpose operation.
+
+            Args:
+                dim0: First dimension to transpose.
+                dim1: Second dimension to transpose.
+                check_dims: Skip transposition when the tensor already matches the target shape.
+            """
             self.dim0 = dim0
             self.dim1 = dim1
             self.check_dims = check_dims
@@ -132,6 +150,7 @@ else:
             target_patterns: list[str],
             **kwargs: Any,
         ) -> dict[str, torch.Tensor]:
+            """Transpose the collected tensor into the selected target layout."""
             if len(input_dict) != 1:
                 raise ValueError("Transpose requires exactly one collected source")
             if len(target_patterns) > 1:
@@ -155,6 +174,7 @@ else:
 
         @property
         def reverse_op(self) -> "ConversionOps":
+            """Return a transpose with the same dimensions to undo this operation."""
             return Transpose(self.dim0, self.dim1, self.check_dims)
 
 
@@ -166,6 +186,12 @@ else:
             source_patterns: str | list[str],
             target_patterns: str | list[str],
         ) -> None:
+            """Normalize the source and target patterns for reversible conversion.
+
+            Args:
+                source_patterns: Checkpoint key patterns collected by this transform.
+                target_patterns: Model key patterns produced by this transform.
+            """
             self.source_patterns = (
                 [source_patterns] if isinstance(source_patterns, str) else list(source_patterns)
             )
@@ -252,6 +278,14 @@ else:
             source_pattern: str,
             loader: Callable[[], torch.Tensor],
         ) -> None:
+            """Collect a lazy checkpoint tensor under its matched source pattern.
+
+            Args:
+                target_key: Target checkpoint key accepted for API compatibility.
+                source_key: Source checkpoint key accepted for API compatibility.
+                source_pattern: Pattern used to group tensors for conversion.
+                loader: Callable that materializes the source tensor.
+            """
             del target_key, source_key
             self.collected_tensors[source_pattern].append(loader)
 
@@ -315,6 +349,13 @@ else:
             target_patterns: str | list[str],
             operations: list[ConversionOps],
         ) -> None:
+            """Configure the operations applied to a collected checkpoint group.
+
+            Args:
+                source_patterns: Checkpoint key patterns collected by this converter.
+                target_patterns: Model key patterns produced by this converter.
+                operations: Nonempty sequence of conversion operations, applied in order.
+            """
             super().__init__(source_patterns, target_patterns)
             if not operations:
                 raise ValueError("WeightConverter requires at least one operation")
@@ -429,6 +470,58 @@ else:
         return normalized
 
 
+    def _collect_reverse_conversions(
+        state_dict: dict[str, torch.Tensor],
+        renamings: list[WeightRenaming],
+        converters: list[WeightConverter],
+    ) -> dict[str, _WeightTransform]:
+        """Collect reverse transforms and their source tensors."""
+        conversion_mapping = {}
+        for original_key, tensor in sorted(
+            state_dict.items(), key=lambda item: dot_natural_key(item[0])
+        ):
+            renamed_key = original_key
+            for renaming in renamings:
+                renamed_key, _ = renaming.rename_source_key(renamed_key)
+
+            source_pattern = None
+            matched_converter = None
+            for converter in converters:
+                renamed_key, source_pattern = converter.rename_source_key(renamed_key)
+                if source_pattern is not None:
+                    matched_converter = converter
+                    break
+
+            if matched_converter is not None:
+                transform = conversion_mapping.setdefault(
+                    renamed_key, deepcopy(matched_converter)
+                )
+            else:
+                transform = conversion_mapping.setdefault(
+                    renamed_key, WeightRenaming(original_key, renamed_key)
+                )
+                source_pattern = original_key
+            transform.add_tensor(renamed_key, original_key, source_pattern, tensor)
+        return conversion_mapping
+
+
+    def _materialize_reverse_conversions(
+        model: Any,
+        conversion_mapping: dict[str, _WeightTransform],
+    ) -> dict[str, torch.Tensor]:
+        """Apply collected reverse transforms to produce checkpoint tensors."""
+        converted_state_dict = {}
+        for first_param_name, reverse_conversion in conversion_mapping.items():
+            realized = reverse_conversion.convert(
+                first_param_name, model=model, config=model.config
+            )
+            for target_name, parameter in realized.items():
+                converted_state_dict[target_name] = (
+                    parameter[0] if isinstance(parameter, list) else parameter
+                )
+        return converted_state_dict
+
+
     def revert_weight_conversion(
         model: Any,
         state_dict: dict[str, torch.Tensor],
@@ -453,54 +546,7 @@ else:
             for conversion in reverse_conversions
             if isinstance(conversion, WeightConverter)
         ]
-        conversion_mapping = {}
-        for original_key, tensor in sorted(
-            state_dict.items(), key=lambda item: dot_natural_key(item[0])
-        ):
-            renamed_key = original_key
-            for renaming in renamings:
-                renamed_key, _ = renaming.rename_source_key(renamed_key)
-
-            source_pattern = None
-            matched_converter = None
-            for converter in converters:
-                renamed_key, source_pattern = converter.rename_source_key(renamed_key)
-                if source_pattern is not None:
-                    matched_converter = converter
-                    break
-
-            if matched_converter is not None:
-                mapping = conversion_mapping.setdefault(
-                    renamed_key, deepcopy(matched_converter)
-                )
-            else:
-                mapping = conversion_mapping.setdefault(
-                    renamed_key, WeightRenaming(original_key, renamed_key)
-                )
-                source_pattern = original_key
-            mapping.add_tensor(
-                renamed_key, original_key, source_pattern, tensor
-            )
-
-        converted_state_dict = {}
-        for first_param_name, reverse_conversion in conversion_mapping.items():
-            realized = reverse_conversion.convert(
-                first_param_name, model=model, config=model.config
-            )
-            for target_name, parameter in realized.items():
-                converted_state_dict[target_name] = (
-                    parameter[0] if isinstance(parameter, list) else parameter
-                )
-        return converted_state_dict
-
-
-__all__ = [
-    "ConversionOps",
-    "Transpose",
-    "WeightConverter",
-    "WeightRenaming",
-    "dot_natural_key",
-    "get_model_conversion_mapping",
-    "rename_source_key",
-    "revert_weight_conversion",
-]
+        conversion_mapping = _collect_reverse_conversions(
+            state_dict, renamings, converters
+        )
+        return _materialize_reverse_conversions(model, conversion_mapping)

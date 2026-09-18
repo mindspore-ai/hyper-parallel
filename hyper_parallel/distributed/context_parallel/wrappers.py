@@ -1144,8 +1144,8 @@ def _validate_ulysses_requirements(target_module, cp_size):
                 f"{name}={count} is not divisible by CP size {cp_size}")
     if getattr(text_config, "dsa_dense_warm_up", False):
         raise ValueError("MLA/DSA CP does not support DSA dense warm-up")
-    if not getattr(text_config, "apply_FA_rescale", False):
-        raise ValueError("MLA/DSA CP requires apply_FA_rescale=True")
+    if not getattr(text_config, "apply_fa_rescale", False):
+        raise ValueError("MLA/DSA CP requires apply_fa_rescale=True")
     if getattr(text_config, "use_fused_sink_fa", False):
         raise ValueError("MLA/DSA CP does not support fused sink FA")
 

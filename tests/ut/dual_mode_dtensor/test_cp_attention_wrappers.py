@@ -30,6 +30,7 @@ from hyper_parallel.distributed.context_parallel.collectives import (
 )
 from hyper_parallel.distributed.context_parallel.wrappers import (
     INNER_WRAPPER_REGISTRY,
+    _validate_ulysses_requirements,
     is_flex_attention,
     is_hf_style_attention,
     is_sdpa_attention,
@@ -1226,7 +1227,7 @@ class _ToyModel(nn.Module):
             num_attention_heads=heads,
             index_num_attention_heads=index_heads,
             dsa_dense_warm_up=False,
-            apply_FA_rescale=True,
+            apply_fa_rescale=True,
             use_fused_sink_fa=False,
         ))
 
@@ -1247,6 +1248,21 @@ def test_mla_dsa_handler_validation():
         mla_dsa_ulysses_cp_wrapper), "case: wrapper_is_registered"
     injection_meta = getattr(mla_dsa_ulysses_cp_wrapper, "_injection_meta")
     assert injection_meta.kind == "inner_wrapper", "case: wrapper_is_registered"
+
+    for options, enabled in (
+        ({"apply_fa_rescale": True}, True),
+        ({"apply_fa_rescale": False}, False),
+        ({}, False),
+    ):
+        model = _ToyModel()
+        del model.config.text_config.apply_fa_rescale
+        for name, value in options.items():
+            setattr(model.config.text_config, name, value)
+        if enabled:
+            _validate_ulysses_requirements(model, 2)
+        else:
+            _expect_raise("rescale_option", ValueError, "apply_fa_rescale=True",
+                          _validate_ulysses_requirements, model, 2)
 
     # ── case: requires_active_cp_mesh ── cp_mesh=None / size=1 → fail-fast
     for label, cp_mesh in (("None", None), ("size1", _FakeCPMesh(size=1))):
