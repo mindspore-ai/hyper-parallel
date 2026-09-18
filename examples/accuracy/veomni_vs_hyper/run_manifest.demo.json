@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "experiment_id": "synthetic-veomni-vs-hyper-protocol-demo",
+  "mode": "veomni-baseline",
+  "reference": {
+    "framework": "synthetic-veomni-contract",
+    "revision": "demo-only"
+  },
+  "candidate": {
+    "framework": "synthetic-hyper-parallel-contract",
+    "revision": "demo-only"
+  },
+  "model": {
+    "id": "synthetic-causal-lm",
+    "checkpoint": "demo-only"
+  },
+  "data": {
+    "revision": "demo-only",
+    "sample_ids": "synthetic-batch-0001..0020"
+  },
+  "training": {
+    "seed": 1234,
+    "dtype": "fp32",
+    "global_batch": 1,
+    "micro_batch": 1,
+    "gradient_accumulation": 1,
+    "optimizer_steps": 20,
+    "loss_formula": "global_loss_sum/global_valid_token_count"
+  },
+  "parallel": {
+    "dp": 1,
+    "fsdp": 1,
+    "tp": 1,
+    "cp": 1,
+    "ep": 1,
+    "pp": 1
+  },
+  "environment": {
+    "device": "cpu",
+    "purpose": "runner protocol demonstration; not accuracy evidence"
+  },
+  "tolerance_tier": "standard",
+  "commands": {
+    "baseline": [
+      "{python}",
+      "{repo_root}/examples/accuracy/veomni_vs_hyper/emit_demo_loss.py",
+      "--role",
+      "baseline",
+      "--output",
+      "{baseline_loss}"
+    ],
+    "candidate": [
+      "{python}",
+      "{repo_root}/examples/accuracy/veomni_vs_hyper/emit_demo_loss.py",
+      "--role",
+      "candidate",
+      "--output",
+      "{candidate_loss}"
+    ]
+  }
+}

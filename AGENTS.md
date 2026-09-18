@@ -137,6 +137,10 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **gate-doctor** | GitCode PR gate diagnose → autofix to green | 门禁 / autofix / `/retest` |
 | **parallel-strategy-analyzer** | DP/FSDP/TP/PP/EP/CP strategy + cost estimate | `/parallel-strategy-analyzer` |
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
+| **accuracy-validation** | VeOmni baseline, Trainer/parallel parity, loss tolerance and resume validation | 精度 / loss 对齐 / parity |
+| **benchmark-evaluation** | OpenCompass/VLMEvalKit capability evaluation and artifact contract | benchmark / MMLU / VLM eval |
+| **parallel-adaptation** | Standardized model-family TP/CP/EP onboarding and validation | TP/CP/EP 适配 / 通用化 |
+| **performance-module-dev** | High-performance module lifecycle, composition tests and default-on gates | fused kernel / 开箱性能 |
 
 ### Commands
 
@@ -164,6 +168,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **activation-dev** | Activation recompute/swap + LlamaFactory ordering (details in `activation-dev-guide.md`) |
 | **llamafactory-hp** | LlamaFactory integration surface (activation details → `activation-dev`) |
 | **parallel-strategy-analyzer** | Thin proxy → `skills/parallel-strategy-analyzer` |
+| **model-dev-verifier** | Accuracy, parallel, benchmark, and performance evidence runner |
 
 ### Rules (auto-applied by path)
 
@@ -177,3 +182,4 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **testing** | `tests/**` |
 | **unit-test** | `tests/ut/**` — hard constraints; how-to → skill `add-unit-test` |
 | **distributed-op-dev** / **distributed-op-testing** / **test-assertion-style** | Op impl & tests (scoped) |
+| **model-development-validation** | Trainer/model/distributed/component development evidence and comparison rules |
