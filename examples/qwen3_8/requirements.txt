@@ -1,0 +1,19 @@
+# Install from this directory with:
+# python -m pip install -r requirements.txt
+# Requires Python 3.10-3.12 and a matching Ascend driver and toolkit installation.
+
+torch==2.9.0
+torch-npu==2.9.0
+torchdata==0.11.0
+numpy==1.26.4
+PyYAML==6.0.3
+datasets==4.5.0
+psutil==7.2.2
+tqdm==4.70.0
+setuptools==82.0.1
+
+transformers==5.13.0
+safetensors==0.8.0
+huggingface-hub==1.22.0
+tokenizers==0.22.2
+einops==0.8.1

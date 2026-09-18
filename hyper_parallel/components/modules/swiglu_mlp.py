@@ -117,6 +117,7 @@ class SwiGLUMLP(nn.Module):
         module: nn.Module,
         module_fqn: str = "",
         context: Mapping[str, Any] | None = None,
+        use_fused_activation: bool = True,
     ) -> None:
         """Build the high-performance MLP from separate source projections.
 
@@ -124,6 +125,8 @@ class SwiGLUMLP(nn.Module):
             module: Source MLP exposing ``gate_proj``, ``up_proj``, and ``down_proj``.
             module_fqn: Fully qualified source-module name supplied by replacement.
             context: Replacement context supplied by Trainer.
+            use_fused_activation: Use fused SwiGLU on NPU. Set to False to
+                retain the original SiLU and multiplication operations.
 
         Raises:
             TypeError: If the source projection modules are missing or unsupported.
@@ -139,6 +142,7 @@ class SwiGLUMLP(nn.Module):
         if hidden_act is not None and hidden_act not in ("silu", "swiglu"):
             raise ValueError(f"SwiGLUMLP requires a SiLU activation, but got {hidden_act}")
         self.config = config
+        self.use_fused_activation = use_fused_activation
         self.hidden_size = gate_proj.in_features
         self.intermediate_size = gate_proj.out_features
 
@@ -175,7 +179,7 @@ class SwiGLUMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the fused Gate/Up projection, SwiGLU, and Down projection."""
         intermediate_parallel = self.linear_fc1(x)
-        if intermediate_parallel.device.type == "npu":
+        if self.use_fused_activation and intermediate_parallel.device.type == "npu":
             intermediate_parallel = swiglu(intermediate_parallel)
         else:
             gate, up = intermediate_parallel.chunk(2, dim=-1)

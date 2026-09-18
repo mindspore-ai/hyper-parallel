@@ -187,6 +187,10 @@ class VLMTrainer:
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
+        self.base.step_token_counts = defaultdict(int)
+        for _, loss_inputs in training_batches:
+            for name, token_count in count_loss_token(loss_inputs).items():
+                self.base.step_token_counts[name] += token_count
 
         for micro_step, batch in enumerate(training_batches):
             model_inputs, loss_inputs = batch
@@ -196,10 +200,6 @@ class VLMTrainer:
                 num_micro_steps,
             )
             self.base.current_token_counts = count_loss_token(loss_inputs)
-            self.base.step_token_counts = {
-                name: token_count * num_micro_steps
-                for name, token_count in self.base.current_token_counts.items()
-            }
             loss, loss_dict = self.base.forward_backward_step(model_inputs)
 
             # Release each device batch as soon as its backward pass completes;
