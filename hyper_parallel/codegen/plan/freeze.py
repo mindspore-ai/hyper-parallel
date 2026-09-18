@@ -347,6 +347,14 @@ def freeze_param_plan(plan: Any) -> dict[str, dict[str, Any]]:
             value = getattr(spec, field_name, None)
             if value is not None:
                 entry[field_name] = named_placement_to_dict(value)
+        # The declared output *order* is separate from the ``out_src`` dict's
+        # serialized key order.  Freeze it explicitly so the runtime resolves
+        # tuple indices against the spec's declared order (``_declared_out_names``
+        # prefers ``entry["out_names"]``), not a sorted/insertion key order that
+        # could swap e.g. ``hidden``/``aux`` and redistribute the wrong output.
+        out_names = getattr(spec, "out_names", None)
+        if out_names:
+            entry["out_names"] = list(out_names)
         for flag in ("is_boundary", "region_dispatch", "needs_cp_attn"):
             value = getattr(spec, flag, None)
             if value is not None:

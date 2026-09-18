@@ -168,7 +168,14 @@ def _active_mesh(mesh: Any, mesh_dim_names):
     active = tuple(n for n in names if n in mesh_dim_names)
     if not active:
         return mesh, ()
-    if active == tuple(mesh_dim_names):
+    # Only skip slicing when the mesh declares EXACTLY the plan's axes (in the
+    # same order).  Comparing against ``names`` (not the filtered ``active``)
+    # prevents a mesh that also carries non-plan axes -- e.g. a ('dp', 'tp')
+    # mesh vs a ('tp',) frozen plan -- from returning the unsliced 2-D mesh
+    # alongside a 1-D placement axis.  When the mesh carries any extra axis the
+    # plan does not shard on, it must be sliced down to ``active`` so the dense
+    # mesh dimension count always matches the placement tuple.
+    if tuple(names) == tuple(mesh_dim_names):
         return mesh, tuple(mesh_dim_names)
     if all(n in names for n in mesh_dim_names):
         return mesh[active], active
@@ -1731,6 +1738,21 @@ def hyper_apply_replacements(model: Any, overrides: list[dict[str, Any]]) -> Any
         module_type = _module_type_for_generated(model, record["module_type"])
         if module_type is None:
             module_type = _import_module_type(record["module_type"])
+        target_config = record.get("target_config")
+        if target_config:
+            # The record froze a YAML Target's static args alongside the
+            # factory path.  Re-pre-bind them exactly as the trainer's
+            # ``_target_replacement_factory`` does, so a configured arg is not
+            # dropped to its default (or lost as a required arg).  Falls back
+            # to the bare decorated factory when nothing was configured.
+            from hyper_parallel.trainer.config.parallelism import (  # pylint: disable=import-outside-toplevel
+                _target_replacement_factory,
+            )
+            from hyper_parallel.trainer.config.target import Target  # pylint: disable=import-outside-toplevel
+
+            factory = _target_replacement_factory(
+                Target(factory, target_path=record["factory"], **target_config)
+            )
         specs.append(
             ModuleReplacementSpec(
                 match=tuple(match),

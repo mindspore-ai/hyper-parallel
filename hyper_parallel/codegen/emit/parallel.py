@@ -621,13 +621,31 @@ def _render_input_redistribute(func: FunctionInfo) -> str:
     positional ``(args, kwargs)`` pair reaches the compiled plan as the
     boundary's input side.  Index binding happens once at install time
     (``hyper_install_boundaries`` → ``_bind_input_indices``); the pair is still
-    built from the signature's positional parameter names (not the plan's) —
-    for a ``def forward(self, hidden_states)`` that is ``((hidden_states,), {})``.
+    built from the signature's own parameter names (not the plan's) — for a
+    ``def forward(self, hidden_states)`` that is ``((hidden_states,), {})``.
+
+    The full parameter profile is preserved on the re-pass: positional names go
+    in the args tuple (a trailing ``*args`` expands into it), keyword-only
+    parameters and a fixed ``**kwargs`` go into the kwargs dict.  The boundary
+    plan rewrites only the args/kwargs it owns and forwards the rest through
+    unchanged, so ``self._forward_impl(*args, **kwargs)`` receives every
+    argument class the original call site used — a keyword-only ``required``
+    or an HF ``**kwargs`` pass-through no longer drops out.
     """
-    params = ", ".join(func.param_names)
+    args = list(func.param_names)
+    if func.vararg_name:
+        args.append(f"*{func.vararg_name}")
+    kwargs_parts = [f'"{name}": {name}' for name in func.kwonly_names]
+    if func.kwarg_name:
+        kwargs_parts.append(f"**{func.kwarg_name}")
+    kwargs_literal = "{" + ", ".join(kwargs_parts) + "}" if kwargs_parts else "{}"
+    # The args body is spliced into a tuple literal; a single element needs a
+    # trailing comma (also for a lone ``*vararg``) so it stays a tuple rather
+    # than parenthesized scalars / a generator expression.
+    args_body = ", ".join(args) + ("," if len(args) == 1 else "")
     return (
         "        args, kwargs = self._hyper_boundary.redistribute_inputs(\n"
-        f"            (({params},), {{}}),\n"
+        f"            (({args_body}), {kwargs_literal}),\n"
         "        )"
     )
 

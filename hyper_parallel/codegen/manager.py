@@ -435,7 +435,18 @@ def _project_spec(
         # leaves empty; record the actual env version whenever we resolved a
         # real file (an environment upgrade that changes the modeling file's
         # behavior must regenerate, not silently reuse).
-        payload["source"] = source.to_dict()
+        resolved = source.to_dict()
+        # ``SourceSpec.to_dict`` keeps only architecture / model_type / sha256 —
+        # neither the checkpoint identity nor its structural config.  Without
+        # them, two checkpoints that share a modeling file but differ in shape
+        # (e.g. the same architecture at different layer counts) would produce
+        # the same signature and silently reuse a frozen per-layer plan written
+        # for the other shape.  Fold the model id and a structural-config digest
+        # back in so a shape change invalidates the bundle.
+        resolved["model_id"] = model_id
+        if hf_config is not None:
+            resolved["structure"] = _structure_summary(hf_config)
+        payload["source"] = resolved
         payload["source"]["transformers_version"] = _transformers_version()
     elif is_gen:
         # codegen=True resolves to the ``gen`` backend, whose whole point is
@@ -466,6 +477,38 @@ def _project_spec(
     }
 
     return payload
+
+
+_STRUCTURE_FIELDS = (
+    # Architectural (shape-defining) config fields.  A change in any of these
+    # — most importantly the layer/experts counts a per-layer sharding plan is
+    # expanded against — must invalidate a generated bundle even when the
+    # underlying modeling file is unchanged.
+    "num_hidden_layers",
+    "num_layers",
+    "hidden_size",
+    "intermediate_size",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "num_experts",
+    "num_local_experts",
+    "n_routed_experts",
+    "first_k_dense_replace",
+    "moe_intermediate_size",
+    "n_group",
+    "topk_group",
+    "num_experts_per_tok",
+    "top_k",
+)
+
+
+def _structure_summary(hf_config: Any) -> dict[str, Any]:
+    """A stable digest of the config fields that define the model's structure."""
+    return {
+        name: getattr(hf_config, name)
+        for name in _STRUCTURE_FIELDS
+        if getattr(hf_config, name, None) is not None
+    }
 
 
 def _codegen_implementation_digest(package_dir: Optional[str] = None) -> str:
@@ -653,15 +696,31 @@ def _apply_generation_replacements(
     )
 
     specs = entries_to_module_replacements(raw_entries)
-    factory_paths = [
-        _target_path(getattr(entry, "replace_module", None))
-        for entry in raw_entries
-        if getattr(entry, "replace_module", None) is not None
-    ]
+    factory_paths = []
+    target_configs = []
+    for entry in raw_entries:
+        replace_module = getattr(entry, "replace_module", None)
+        if replace_module is None:
+            continue
+        factory_paths.append(_target_path(replace_module))
+        # Capture the YAML Target's static args so the runtime can rebuild the
+        # same pre-bound factory (see ``_target_replacement_factory``) instead
+        # of importing the bare ``@module_replacement`` fn — otherwise a
+        # configured arg would fall back to its default or fail to build.
+        target_configs.append(
+            {
+                name: value
+                for name, value in replace_module.to_dict().items()
+                if name != "_target_"
+            }
+        )
     records, skipped = compile_overrides_for_meta(
         model,
         specs,
         factory_paths=factory_paths,
+        configs_by_spec={
+            id(spec): config for spec, config in zip(specs, target_configs)
+        },
     )
     replace_meta = list(records)
     for item in skipped:

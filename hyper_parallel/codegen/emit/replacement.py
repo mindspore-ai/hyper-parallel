@@ -31,6 +31,7 @@ def compile_overrides_for_meta(
     specs: Sequence[Any],
     *,
     factory_paths: Sequence[str | None] = (),
+    configs_by_spec: dict[int, Any] | None = None,
 ) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
     """Match replacement specs against the generation-time meta model.
 
@@ -57,15 +58,22 @@ def compile_overrides_for_meta(
            "module_type": "<dotted path>",        # source module type
            "factory": "<dotted path>",            # the @module_replacement fn
            "exact_type": False,
+           "target_config": {...},                # optional YAML Target static args
        }
 
     The ``factory`` (and ``module_type``) are stored as import paths, not the
     live objects — the replacement factory is a per-entry closure that cannot
     be written as a Python literal, and the runtime re-imports the *raw*
-    decoration at those paths to rebuild equal specs.
+    decoration at those paths to rebuild equal specs.  When the YAML entry
+    bound extra static args to its replace-module Target, those must ride
+    along in ``configs_by_spec`` (keyed by ``id(spec)``) so the runtime can
+    re-pre-bind them onto the rebuilt factory instead of dropping to the
+    factory's defaults (or failing a required arg).
     """
     if not specs:
         return (), ()
+    if configs_by_spec is None:
+        configs_by_spec = {}
     from hyper_parallel.models.replacement import compile_module_replacements
 
     # ``compile_module_replacements`` raises when any pattern matches nothing,
@@ -88,7 +96,9 @@ def compile_overrides_for_meta(
         return (), tuple(skipped)
 
     plan = compile_module_replacements(meta_model, matched_specs)
-    records = [_record_for_target(target, paths_by_spec) for target in plan.targets]
+    records = [
+        _record_for_target(target, paths_by_spec, configs_by_spec) for target in plan.targets
+    ]
     return tuple(records), tuple(skipped)
 
 
@@ -126,7 +136,11 @@ def _partition_specs(
     return matched, skipped
 
 
-def _record_for_target(target: Any, paths_by_spec: dict[int, str]) -> dict[str, Any]:
+def _record_for_target(
+    target: Any,
+    paths_by_spec: dict[int, str],
+    configs_by_spec: dict[int, Any] | None = None,
+) -> dict[str, Any]:
     spec = target.spec
     factory_path = paths_by_spec.get(id(spec))
     if factory_path is None:
@@ -135,7 +149,7 @@ def _record_for_target(target: Any, paths_by_spec: dict[int, str]) -> dict[str, 
             "path — the gen backend needs a YAML Target-backed "
             "@module_replacement factory" % (spec.match,)
         )
-    return {
+    record = {
         "match": list(spec.match),
         "fqn": target.module_fqns[0],
         "fqns": list(target.module_fqns),
@@ -143,6 +157,10 @@ def _record_for_target(target: Any, paths_by_spec: dict[int, str]) -> dict[str, 
         "factory": factory_path,
         "exact_type": bool(spec.exact_type),
     }
+    config = (configs_by_spec or {}).get(id(spec))
+    if config:
+        record["target_config"] = config
+    return record
 
 
 def _type_path(module_type: type) -> str:
