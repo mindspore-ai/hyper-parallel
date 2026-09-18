@@ -33,6 +33,9 @@ import torch.distributed.nn.functional as dist_func
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
+_HCCL_OP_EXPANSION_MODE_AIV = 3
+
+
 # ---------------------------------------------------------------------------
 # Small shared helpers
 # ---------------------------------------------------------------------------
@@ -151,6 +154,19 @@ def set_rng_state(state, device=None, device_handle=None):  # pylint: disable=W0
     if device is None:
         return device_handle.set_rng_state(state)
     return device_handle.set_rng_state(state, device)
+
+
+def get_cp_hccl_process_group_options() -> Any:
+    """Build AIV HCCL process-group options for the CP communication group."""
+    # ``torch_npu`` is optional, so import it only for the NPU-specific CP group.
+    try:
+        from torch_npu._C._distributed_c10d import ProcessGroupHCCL  # pylint: disable=C0415
+    except ImportError as exc:
+        raise RuntimeError("Creating the 'cp' group with AIV requires torch_npu.") from exc
+
+    options = ProcessGroupHCCL.Options()
+    options.hccl_config = {"hccl_op_expansion_mode": _HCCL_OP_EXPANSION_MODE_AIV}
+    return options
 
 
 def get_created_group(rank_list: Union[list[int], tuple[int]]):
