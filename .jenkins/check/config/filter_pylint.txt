@@ -151,3 +151,6 @@
 #     public API and no get_platform() equivalent (mindspore has no FX-tracing
 #     surface); moving the package under platform/torch/ is tracked separately.
 "hyper-parallel/hyper_parallel/compile/"                                   "forbidden-backend-import"
+
+# 20. AutoModels Transformers facade — the public model builders are Torch/Transformers-specific.
+"hyper-parallel/hyper_parallel/models/_transformers/auto_model.py"         "forbidden-backend-import"

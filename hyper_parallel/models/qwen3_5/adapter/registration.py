@@ -39,18 +39,30 @@ def _load_sharding_rules():
     ]
 
 
+def _load_init_weights():
+    """Return the family's shard-aware weight initializer."""
+    from hyper_parallel.models.qwen3_5.adapter.init_weights import (  # pylint: disable=C0415
+        initialize_weights,
+    )
+    return initialize_weights
+
+
 QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5ForConditionalGeneration",
     model_type="qwen3_5",
+    min_transformers_version="5.2.0",
     context_parallel=_load_context_parallel,
     sharding_rules=_load_sharding_rules,
+    init_weights=_load_init_weights,
 )
 
 QWEN3_5_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5ForCausalLM",
     model_type="qwen3_5_text",
+    min_transformers_version="5.2.0",
     context_parallel=_load_context_parallel,
     sharding_rules=_load_sharding_rules,
+    init_weights=_load_init_weights,
 )
 
 register_model_adapter(QWEN3_5_ADAPTER_SPEC)

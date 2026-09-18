@@ -39,6 +39,7 @@ import importlib
 import logging
 from collections import OrderedDict
 from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -89,6 +90,8 @@ _FAMILY_ALIASES: Dict[str, str] = {}
 _FAMILY_DIR_ALIASES = {
     "deepseekv2": "deepseek_v3",
     "qwen35text": "qwen3_5",
+    "qwen35moetext": "qwen3_5_moe",
+    "qwen4exptext": "qwen4_exp",
 }
 
 # normalized family directory name → registration module path; built lazily.
@@ -134,8 +137,39 @@ def _discover_family_providers() -> Dict[str, str]:
     return _DISCOVERED_PROVIDERS
 
 
+def _supports_transformers_version(spec: ModelAdapterSpec) -> bool:
+    """Return whether the installed Transformers version supports a spec."""
+    minimum = spec.min_transformers_version
+    if minimum is None:
+        return True
+    try:
+        installed = version("transformers")
+    except PackageNotFoundError:
+        return False
+
+    # Packaging is an optional dependency here and is provided by Transformers.
+    from packaging.version import InvalidVersion, Version  # pylint: disable=C0415
+
+    try:
+        supported = Version(installed) >= Version(minimum)
+    except InvalidVersion:
+        logger.warning(
+            "Skipping model adapter %s because its Transformers version constraint cannot be evaluated: %s >= %s",
+            spec.model_type, installed, minimum,
+        )
+        return False
+    if not supported:
+        logger.info(
+            "Skipping model adapter %s: Transformers >= %s is required, found %s",
+            spec.model_type, minimum, installed,
+        )
+    return supported
+
+
 def register_model_adapter(spec: ModelAdapterSpec) -> None:
-    """Register one family's adapter spec (idempotent; conflicts fail fast)."""
+    """Register a supported family adapter spec; conflicts fail fast."""
+    if not _supports_transformers_version(spec):
+        return
     existing = MODEL_ADAPTER_REGISTRY.get(spec.model_type)
     if existing is not None and existing != spec:
         raise ValueError(
