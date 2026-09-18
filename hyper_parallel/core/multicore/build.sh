@@ -357,12 +357,14 @@ source "${PROJECT_ROOT}/scripts/check_gcc_version.sh"
 check_gcc_version || fail "UNSUPPORTED_GCC" "Host GCC is outside the supported build range." 6
 
 OPS_NN_SOURCE_DIR="${NATIVE_ROOT}/deps/ops_nn/src"
+OPS_NN_CLIPPED_SWIGLU_SOURCE_DIR="${NATIVE_ROOT}/deps/ops_nn_clipped_swiglu/src"
 OPS_TRANSFORMER_SOURCE_DIR="${NATIVE_ROOT}/deps/ops_transformer/src"
 MULTICORE_VENDOR_CMAKE="${PROJECT_ROOT}/hyper_parallel/core/multicore/cmake/vendor"
 
 CURRENT_REASON_CODE="MULTICORE_DEPENDENCY_PREPARATION_FAILED"
 "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_parallel/core/multicore/_build/prepare_dependencies.py" \
     --dependency ops_nn \
+    --dependency ops_nn_clipped_swiglu \
     --dependency ops_transformer
 
 CURRENT_REASON_CODE="SHMEM_SDK_HANDOFF_FAILED"
@@ -504,6 +506,7 @@ for cann_soc in "${CANN_SOCS[@]}"; do
     CURRENT_REASON_CODE="MULTICORE_SOURCE_ASSEMBLY_FAILED"
     "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_parallel/core/multicore/_build/assemble_multicore_source.py" \
         --ops-nn-source "${OPS_NN_SOURCE_DIR}" \
+        --ops-nn-clipped-swiglu-source "${OPS_NN_CLIPPED_SWIGLU_SOURCE_DIR}" \
         --ops-transformer-source "${OPS_TRANSFORMER_SOURCE_DIR}" \
         --work-dir "${ASSEMBLY_ROOT}"
 

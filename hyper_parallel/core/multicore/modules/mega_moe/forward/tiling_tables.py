@@ -23,6 +23,7 @@ import copy
 import ctypes
 
 from hyper_parallel.core.multicore.scheduler.config import (
+    ClippedSwiGluTilingDataC,
     SwiGluTilingDataC,
 )
 
@@ -42,6 +43,13 @@ def _expand_swiglu_struct(td: SwiGluTilingDataC) -> bytes:
     """Tile SwiGluTilingDataC 49 times (= 2 * 24 AI Cube cores + 1)."""
     one = bytes(td)
     return one * 49
+
+
+def _expand_clipped_swiglu_struct(td: ClippedSwiGluTilingDataC) -> bytes:
+    """Tile the official ClippedSwiglu ABI struct for every worker slot."""
+    if ctypes.sizeof(td) != 80:
+        raise RuntimeError("unexpected ClippedSwiglu tiling ABI size")
+    return bytes(td) * 49
 
 
 def _find_protected_positions(vals, active_map, split_value, is_weight_grad):
@@ -202,3 +210,42 @@ def get_swiglu_tiling_bytes(split_value: int, *,
     td = copy.copy(SWIGLU_TABLE[split_value])
     td.colLen = intermediate_size
     return _expand_swiglu_struct(td)
+
+
+def get_clipped_swiglu_tiling_bytes(
+    split_value: int,
+    *,
+    intermediate_size: int = 2048,
+    clamp_limit: float,
+) -> bytes:
+    """Return official ClippedSwiglu tiling for one fused vector task.
+
+    The MegaMoe worker runs one vector task per expert tile, so the CANN
+    operator is configured for one core and front/back input layout.
+
+    Args:
+        split_value: Number of expert rows handled by one task.
+        intermediate_size: Width of one SwiGLU branch.
+        clamp_limit: Positive clamp value encoded in the operator tiling.
+
+    Returns:
+        Serialized tiling records for all baseline worker slots.
+
+    Raises:
+        KeyError: If ``split_value`` is unsupported by the MegaMoe schedule.
+    """
+    if split_value not in SWIGLU_TABLE:
+        raise KeyError(f"ClippedSwiglu tiling: split_value={split_value} not found")
+    td = ClippedSwiGluTilingDataC()
+    td.core_num_all = 1
+    td.dim_batch_size = split_value
+    td.dim_2h = intermediate_size * 2
+    td.ub_max_pair = 2048
+    td.is_long_h = int(td.ub_max_pair * 2 < td.dim_2h)
+    td.is_group = 0
+    td.is_interleaved = 0
+    td.alpha = 1.0
+    td.limit = clamp_limit
+    td.bias = 0.0
+    td.group_num = 0
+    return _expand_clipped_swiglu_struct(td)

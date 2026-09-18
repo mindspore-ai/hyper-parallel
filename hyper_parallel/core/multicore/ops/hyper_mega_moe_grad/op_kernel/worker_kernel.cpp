@@ -14,8 +14,27 @@
  */
 
 #include "kernel_operator.h"
+
+// Matches the public CANN ClippedSwigluGrad tiling ABI. The forward and
+// backward records are layout-compatible but have different field names.
+struct ClippedSwigluGradTilingData {
+  int64_t coreNumAll;
+  int64_t dimBatchSize;
+  int64_t dim2H;
+  int64_t isLongH;
+  int64_t isGroup;
+  int64_t isInterleaved;
+  float alpha;
+  float limit;
+  float bias;
+  int64_t ubMaxPair;
+  int64_t groupNum;
+};
+static_assert(sizeof(ClippedSwigluGradTilingData) == 80);
+
 #include "swi_glu/swi_glu.cpp"
 #include "swi_glu_grad/swi_glu_grad.cpp"
+#include "clipped_swiglu_grad/clipped_swiglu_grad.h"
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
@@ -55,6 +74,55 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
  private:
+  __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
+    union {
+      uint32_t bits;
+      float value;
+    } encoded = {task_desc.extra_value_0};
+    return encoded.value;
+  }
+
+  __aicore__ inline void ExecuteClippedSwiGluGrad(
+      GM_ADDR grad_output, GM_ADDR input, GM_ADDR output, GM_ADDR tiling) {
+    GET_TILING_DATA_WITH_STRUCT(ClippedSwigluGradTilingData, tiling_data, tiling);
+    TPipe pipe;
+    if constexpr (std::is_same_v<DTYPE_DY, bfloat16_t>) {
+      ClippedSwigluGradOps::ClippedSwigluGradBase<bfloat16_t, false, false> op(&tiling_data, &pipe);
+      op.Init(grad_output, input, nullptr, output);
+      op.Process();
+    } else {
+      ClippedSwigluGradOps::ClippedSwigluGradBase<half, false, false> op(&tiling_data, &pipe);
+      op.Init(grad_output, input, nullptr, output);
+      op.Process();
+    }
+  }
+
+  __aicore__ inline void RunSwiGluGrad(
+      const TaskDesc &task_desc, GM_ADDR grad_output, GM_ADDR input, GM_ADDR output, GM_ADDR tiling) {
+    if (GetSwiGluClampLimit(task_desc) > 0.0f) {
+      ExecuteClippedSwiGluGrad(grad_output, input, output, tiling);
+      return;
+    }
+    swi_glu_grad(grad_output, input, output, input_list[SWIGLU_GRAD_WORKSPACE_IDX], tiling);
+  }
+
+  __aicore__ inline void SetDynamicSwiGluGradTiling(
+      const TaskDesc &task_desc, GM_ADDR tiling, int64_t row_count) {
+    if (GetSwiGluClampLimit(task_desc) > 0.0f) {
+      __gm__ ClippedSwigluGradTilingData *tiling_data =
+          reinterpret_cast<__gm__ ClippedSwigluGradTilingData *>(tiling);
+      tiling_data->dimBatchSize = row_count;
+      cacheWriteThrough(tiling, sizeof(ClippedSwigluGradTilingData));
+      return;
+    }
+    __gm__ SwiGluTilingData *tiling_data = reinterpret_cast<__gm__ SwiGluTilingData *>(tiling);
+    tiling_data->rowLen = row_count;
+    if (row_count < 19) {
+      tiling_data->baseRowLen = row_count;
+    }
+    cacheWriteThrough(tiling, 10);
+  }
+
   __aicore__ inline bool getTransposeData(uint32_t data) { return data == 1; }
 
   __aicore__ inline void ExecuteMatmul(const TaskDesc &task_desc) {}
@@ -115,30 +183,25 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                                     ? base_ptr_offset * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
                                     : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
         if (start + current_seq_end <= end) {
-          swi_glu_grad(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position] + input_1_offset,
-                       input_list[task_desc.outputs[0].input_position] + output_0_offset,
-                       input_list[SWIGLU_GRAD_WORKSPACE_IDX],
-                       input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
+          RunSwiGluGrad(task_desc,
+                         input_list[task_desc.inputs[0].input_position] + input_0_offset,
+                         input_list[task_desc.inputs[1].input_position] + input_1_offset,
+                         input_list[task_desc.outputs[0].input_position] + output_0_offset,
+                         input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
           return;
         } else {
           GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 80 * (AscendC::GetBlockIdx() + 1);
-          __gm__ SwiGluTilingData *tilingdata_data = reinterpret_cast<__gm__ SwiGluTilingData *>(tiling_data_addr);
-          tilingdata_data->rowLen = end - (start + current_seq_start);
-          if (tilingdata_data->rowLen == 0) {
+          int64_t row_count = end - (start + current_seq_start);
+          if (row_count == 0) {
             return;
           }
-          if (end - (start + current_seq_start) < 19) {
-            tilingdata_data->baseRowLen = end - (start + current_seq_start);
-          }
-          cacheWriteThrough(tiling_data_addr, 10);
+          SetDynamicSwiGluGradTiling(task_desc, tiling_data_addr, row_count);
           PipeBarrier<PIPE_ALL>();
 
-          swi_glu_grad(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position] + input_1_offset,
-                       input_list[task_desc.outputs[0].input_position] + output_0_offset,
-                       input_list[SWIGLU_GRAD_WORKSPACE_IDX],
-                       tiling_data_addr);
+          RunSwiGluGrad(task_desc,
+                         input_list[task_desc.inputs[0].input_position] + input_0_offset,
+                         input_list[task_desc.inputs[1].input_position] + input_1_offset,
+                         input_list[task_desc.outputs[0].input_position] + output_0_offset, tiling_data_addr);
         }
       }
       return;
