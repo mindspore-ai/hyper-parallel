@@ -14,13 +14,87 @@
 # ============================================================================
 """Terminal progress callback for Trainer."""
 
+from __future__ import annotations
+
 import logging
+import sys
+import time
 from typing import Any
 
 from .base import Callback, TrainerState
 
 
 logger = logging.getLogger(__name__)
+
+
+class _LogProgressBar:
+    """Write one finalized tqdm-formatted snapshot per step to a non-TTY stream."""
+
+    def __init__(
+        self,
+        tqdm_type: Any,
+        total: int,
+        initial: int,
+        stream: Any,
+    ) -> None:
+        """Initialize non-interactive progress state without emitting a line."""
+        self._tqdm_type = tqdm_type
+        self._initial = initial
+        self._start_time = time.monotonic()
+        self._postfix: dict[str, str] = {}
+        self._pending_message: str | None = None
+        self.total = total
+        self.n = initial
+        self.fp = stream
+
+    def set_postfix(self, postfix: dict[str, str], refresh: bool = True) -> None:
+        """Store the final metrics for the next completed-step snapshot.
+
+        Args:
+            postfix: Formatted metric names and values.
+            refresh: Accepted for compatibility with the tqdm API.
+        """
+        del refresh
+        self._postfix = dict(postfix)
+
+    def update(self, amount: int) -> None:
+        """Advance progress and write exactly one newline-terminated snapshot.
+
+        Args:
+            amount: Number of newly completed steps.
+        """
+        self.n += amount
+        elapsed = max(time.monotonic() - self._start_time, 0.0)
+        completed = self.n - self._initial
+        rate = completed / elapsed if elapsed > 0 else None
+        postfix = ", ".join(f"{name}={value}" for name, value in self._postfix.items())
+        progress_line = self._tqdm_type.format_meter(
+            n=self.n,
+            total=self.total,
+            elapsed=elapsed,
+            prefix="Training",
+            unit="step",
+            rate=rate,
+            postfix=postfix or None,
+        )
+        if self._pending_message:
+            progress_line = f"{progress_line} | {self._pending_message}"
+        self.fp.write(f"{progress_line}\n")
+        self.fp.flush()
+        self._pending_message = None
+
+    def write(self, message: str, file: Any = None) -> None:
+        """Attach one structured message to the next progress snapshot.
+
+        Args:
+            message: Structured log message for the current step.
+            file: Accepted for compatibility with the tqdm API.
+        """
+        del file
+        self._pending_message = message
+
+    def close(self) -> None:
+        """Close without writing a duplicate final progress line."""
 
 
 class TqdmCallback(Callback):
@@ -80,12 +154,22 @@ class TqdmCallback(Callback):
                 logger.warning("TqdmCallback: 'tqdm' is not installed; progress bar disabled")
                 self._missing_dependency_warned = True
             return None
+        stream = sys.stderr
+        isatty = getattr(stream, "isatty", None)
+        if not callable(isatty) or not isatty():
+            return _LogProgressBar(
+                tqdm_type=tqdm,
+                total=total,
+                initial=initial,
+                stream=stream,
+            )
         return tqdm(
             total=total,
             initial=initial,
             desc="Training",
             unit="step",
             dynamic_ncols=True,
+            file=stream,
         )
 
     def _postfix(self) -> dict[str, str]:
@@ -111,7 +195,12 @@ class TqdmCallback(Callback):
         return postfix
 
     def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
-        """Create a single full-training progress bar on global rank zero."""
+        """Create a single full-training progress bar on global rank zero.
+
+        Args:
+            state: Current training state.
+            **kwargs: Additional callback arguments.
+        """
         del kwargs
         self._last_updated_step = state.global_step
         if getattr(self.trainer, "global_rank", 0) != 0:
@@ -121,15 +210,30 @@ class TqdmCallback(Callback):
             initial=state.global_step,
         )
 
-    def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:
-        """Publish shared metrics and advance once per completed global step."""
-        del kwargs
+    def on_step_end(
+        self,
+        state: TrainerState,
+        loss: float | None = None,
+        loss_dict: dict[str, float] | None = None,
+        grad_norm: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Publish shared metrics and advance once per completed global step.
+
+        Args:
+            state: Current training state.
+            loss: Aggregated loss for the completed step.
+            loss_dict: Named loss values for the completed step.
+            grad_norm: Gradient norm measured before the optimizer update.
+            **kwargs: Additional callback arguments.
+        """
+        del loss, loss_dict, grad_norm, kwargs
         if self._progress_bar is None or state.global_step <= self._last_updated_step:
             return
 
         postfix = self._postfix()
         if postfix:
-            self._progress_bar.set_postfix(postfix)
+            self._progress_bar.set_postfix(postfix, refresh=False)
         self._progress_bar.update(state.global_step - self._last_updated_step)
         self._last_updated_step = state.global_step
 
@@ -148,7 +252,12 @@ class TqdmCallback(Callback):
         return True
 
     def on_train_end(self, state: TrainerState, **kwargs: Any) -> None:
-        """Close the global progress bar idempotently."""
+        """Close the global progress bar idempotently.
+
+        Args:
+            state: Final training state.
+            **kwargs: Additional callback arguments.
+        """
         del state, kwargs
         if self._progress_bar is not None:
             self._progress_bar.close()
