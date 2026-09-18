@@ -60,6 +60,31 @@ class TestPayloadCodec(unittest.TestCase):
         self.assertEqual(_decode_payload_segment(b""), ())
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_tensor_payload_uses_metadata_and_binary_buffer(self) -> None:
+        """Feature: Tensor-buffer payload serialization.
+        Description: Encode nested tensor and byte leaves without pickling data.
+        Expectation: The route round-trips and tensors retain dtype and values.
+        """
+        base = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        items = ((SampleKey(0, 8), {
+            "tokens": base[:, ::2],
+            "nested": [torch.tensor([True, False]), b"raw-image"],
+            "scalar": torch.tensor(17, dtype=torch.int64),
+            "shape": (3, 2),
+        }),)
+
+        encoded = _encode_payload_segment(items)
+        decoded = _decode_payload_segment(encoded)
+
+        self.assertTrue(encoded.startswith(b"HPB1"))
+        self.assertEqual(decoded[0][0], items[0][0])
+        torch.testing.assert_close(decoded[0][1]["tokens"], items[0][1]["tokens"])
+        torch.testing.assert_close(decoded[0][1]["nested"][0], items[0][1]["nested"][0])
+        torch.testing.assert_close(decoded[0][1]["scalar"], items[0][1]["scalar"])
+        self.assertEqual(decoded[0][1]["nested"][1], b"raw-image")
+        self.assertEqual(decoded[0][1]["shape"], (3, 2))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_wire_format_is_plain_pickle(self) -> None:
         """Feature: Payload serialization.
         Description: Encode a route with the transport codec.

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import pickle
+import struct
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -546,17 +547,197 @@ def _create_model_parallel_process_groups(
 
 
 def _encode_payload_segment(items: Sequence[tuple[SampleKey, Any]]) -> bytes:
-    """Serialize an internal route; the collective backend transports its bytes."""
+    """Serialize an internal route with metadata and a contiguous binary buffer.
+
+    Tensor and byte leaves are kept out of the metadata pickle.  The metadata
+    contains only the nested sample structure and descriptors pointing into a
+    contiguous byte region.  A legacy pickle route remains available for
+    payloads without binary leaves so old scalar-only unit/test routes retain
+    their wire compatibility.
+    """
     if not items:
         return b""
-    return pickle.dumps(tuple(items), protocol=pickle.HIGHEST_PROTOCOL)
+    if not any(_payload_contains_binary(payload) for _, payload in items):
+        return pickle.dumps(tuple(items), protocol=pickle.HIGHEST_PROTOCOL)
+    encoded_items = []
+    binary_chunks: list[bytes] = []
+    binary_offset = 0
+    for key, payload in items:
+        schema, binary_offset = _encode_payload_value(payload, binary_chunks, binary_offset)
+        encoded_items.append((key, schema))
+    metadata = pickle.dumps(tuple(encoded_items), protocol=pickle.HIGHEST_PROTOCOL)
+    binary = b"".join(binary_chunks)
+    return _PAYLOAD_HEADER.pack(_PAYLOAD_MAGIC, len(metadata), len(binary)) + metadata + binary
 
 
 def _decode_payload_segment(frame: bytes) -> tuple[tuple[SampleKey, Any], ...]:
     """Deserialize a route produced by peers running the same codec."""
     if not frame:
         return ()
-    return pickle.loads(frame)
+    if not frame.startswith(_PAYLOAD_MAGIC):
+        # Preserve compatibility with routes produced before the tensor-buffer
+        # codec was introduced.  This path is used only for scalar-only routes.
+        return pickle.loads(frame)
+    if len(frame) < _PAYLOAD_HEADER.size:
+        raise ValueError("Payload frame is truncated before its header.")
+    magic, metadata_size, binary_size = _PAYLOAD_HEADER.unpack_from(frame)
+    if magic != _PAYLOAD_MAGIC:
+        raise ValueError(f"Unknown payload frame magic {magic!r}.")
+    payload_offset = _PAYLOAD_HEADER.size
+    payload_size = metadata_size + binary_size
+    if payload_offset + payload_size != len(frame):
+        raise ValueError(
+            "Payload frame size does not match its metadata and binary descriptors."
+        )
+    metadata_end = payload_offset + metadata_size
+    encoded_items = pickle.loads(frame[payload_offset:metadata_end])
+    binary = bytearray(frame[metadata_end:])
+    decoded_items = []
+    for key, schema in encoded_items:
+        decoded_items.append((key, _decode_payload_value(schema, binary)))
+    return tuple(decoded_items)
+
+
+_PAYLOAD_MAGIC = b"HPB1"
+_PAYLOAD_HEADER = struct.Struct("!4sQQ")
+_TENSOR_TAG = "__hp_tensor__"
+_BYTES_TAG = "__hp_bytes__"
+_BYTEARRAY_TAG = "__hp_bytearray__"
+
+
+def _payload_contains_binary(value: Any) -> bool:
+    """Return whether a payload contains a tensor or raw byte leaf."""
+    if torch.is_tensor(value) or isinstance(value, (bytes, bytearray)):
+        return True
+    if isinstance(value, Mapping):
+        return any(_payload_contains_binary(child) for child in value.values())
+    if isinstance(value, (tuple, list)):
+        return any(_payload_contains_binary(child) for child in value)
+    return False
+
+
+def _encode_payload_value(
+        value: Any,
+        binary_chunks: list[bytes],
+        binary_offset: int,
+) -> tuple[Any, int]:
+    """Replace binary leaves with descriptors and append their bytes."""
+    if torch.is_tensor(value):
+        tensor = value.detach()
+        if tensor.device.type != "cpu":
+            tensor = tensor.cpu()
+        tensor = tensor.contiguous()
+        # Flatten first: PyTorch does not permit a scalar tensor to change
+        # dtype via ``view`` directly because it has no dimension to resize.
+        raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+        descriptor = (
+            _TENSOR_TAG,
+            str(tensor.dtype),
+            tuple(tensor.shape),
+            binary_offset,
+            len(raw),
+        )
+        binary_chunks.append(raw)
+        return descriptor, binary_offset + len(raw)
+    if isinstance(value, bytes):
+        raw = bytes(value)
+        descriptor = (_BYTES_TAG, binary_offset, len(raw))
+        binary_chunks.append(raw)
+        return descriptor, binary_offset + len(raw)
+    if isinstance(value, bytearray):
+        raw = bytes(value)
+        descriptor = (_BYTEARRAY_TAG, binary_offset, len(raw))
+        binary_chunks.append(raw)
+        return descriptor, binary_offset + len(raw)
+    if isinstance(value, Mapping):
+        encoded_items = []
+        for key, child in value.items():
+            encoded_child, binary_offset = _encode_payload_value(child, binary_chunks, binary_offset)
+            encoded_items.append((key, encoded_child))
+        return ("__hp_mapping__", tuple(encoded_items)), binary_offset
+    if isinstance(value, tuple):
+        encoded_items = []
+        for child in value:
+            encoded_child, binary_offset = _encode_payload_value(child, binary_chunks, binary_offset)
+            encoded_items.append(encoded_child)
+        return ("__hp_tuple__", tuple(encoded_items)), binary_offset
+    if isinstance(value, list):
+        encoded_items = []
+        for child in value:
+            encoded_child, binary_offset = _encode_payload_value(child, binary_chunks, binary_offset)
+            encoded_items.append(encoded_child)
+        return ("__hp_list__", tuple(encoded_items)), binary_offset
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return ("__hp_value__", value), binary_offset
+    raise TypeError(
+        "Payload tensor-buffer codec does not support a non-metadata value of "
+        f"type {type(value).__qualname__}."
+    )
+
+
+def _decode_payload_value(schema: Any, binary: bytearray) -> Any:
+    """Reconstruct one sample from metadata descriptors and binary storage."""
+    if not isinstance(schema, tuple) or not schema:
+        raise ValueError("Payload metadata contains an invalid schema node.")
+    tag = schema[0]
+    if tag == _TENSOR_TAG:
+        if len(schema) != 5:
+            raise ValueError("Tensor payload descriptor has an invalid field count.")
+        _, dtype_name, shape, offset, size = schema
+        dtype = _payload_dtype(dtype_name)
+        shape = tuple(shape)
+        if any(not isinstance(dim, int) or dim < 0 for dim in shape):
+            raise ValueError(f"Tensor payload descriptor has an invalid shape: {shape!r}.")
+        if not isinstance(offset, int) or not isinstance(size, int) or offset < 0 or size < 0:
+            raise ValueError("Tensor payload descriptor has an invalid byte range.")
+        end = offset + size
+        if end > len(binary):
+            raise ValueError("Tensor payload descriptor points outside the binary buffer.")
+        element_count = 1
+        for dim in shape:
+            element_count *= dim
+        expected_size = element_count * torch.empty((), dtype=dtype).element_size()
+        if expected_size != size:
+            raise ValueError(
+                f"Tensor payload byte size mismatch: expected {expected_size}, got {size}."
+            )
+        if size == 0:
+            return torch.empty(shape, dtype=dtype)
+        tensor = torch.frombuffer(memoryview(binary)[offset:end], dtype=dtype, count=element_count)
+        return tensor.reshape(shape)
+    if tag in (_BYTES_TAG, _BYTEARRAY_TAG):
+        if len(schema) != 3:
+            raise ValueError("Byte payload descriptor has an invalid field count.")
+        _, offset, size = schema
+        if not isinstance(offset, int) or not isinstance(size, int) or offset < 0 or size < 0:
+            raise ValueError("Byte payload descriptor has an invalid byte range.")
+        end = offset + size
+        if end > len(binary):
+            raise ValueError("Byte payload descriptor points outside the binary buffer.")
+        raw = bytes(binary[offset:end])
+        return bytearray(raw) if tag == _BYTEARRAY_TAG else raw
+    if tag == "__hp_mapping__":
+        return {
+            key: _decode_payload_value(child, binary)
+            for key, child in schema[1]
+        }
+    if tag == "__hp_tuple__":
+        return tuple(_decode_payload_value(child, binary) for child in schema[1])
+    if tag == "__hp_list__":
+        return [_decode_payload_value(child, binary) for child in schema[1]]
+    if tag == "__hp_value__":
+        return schema[1]
+    raise ValueError(f"Unknown payload metadata schema tag: {tag!r}.")
+
+
+def _payload_dtype(dtype_name: Any) -> torch.dtype:
+    """Resolve the stable string form emitted by ``str(torch.dtype)``."""
+    if not isinstance(dtype_name, str) or not dtype_name.startswith("torch."):
+        raise ValueError(f"Payload tensor descriptor has an invalid dtype: {dtype_name!r}.")
+    dtype = getattr(torch, dtype_name[6:], None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported payload tensor dtype: {dtype_name!r}.")
+    return dtype
 
 
 def _encode_model_batch(value: Any) -> tuple[Any, list[torch.Tensor]]:
