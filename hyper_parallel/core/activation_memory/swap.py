@@ -519,6 +519,55 @@ class SwapGroup:
         for storage in self._storages:
             storage.protect_alias_storage_ptrs(alias_storage_ptrs)
 
+    @staticmethod
+    def _bucket_tensor(candidate_buckets, dtype_key, x):
+        """Append ``x`` to its dtype bucket, opening a new bucket when full."""
+        dtype_buckets = candidate_buckets.setdefault(dtype_key, [])
+        if (not dtype_buckets or
+                dtype_buckets[-1]["total_bytes"] + x.storage_size > _GROUP_SWAP_MAX_BULK_COPY_BYTES):
+            dtype_buckets.append({
+                "bucket_key": f"{dtype_key}#{len(dtype_buckets)}",
+                "dtype": x.val.dtype,
+                "dtype_key": str(x.val.dtype),
+                "device": x.val.device,
+                "tensors": [],
+                "total_bytes": 0,
+                "total_numel": 0,
+                "cpu_pool": x.cpu_pool,
+            })
+        bucket = dtype_buckets[-1]
+        bucket["tensors"].append(x)
+        bucket["total_bytes"] += x.storage_size
+        bucket["total_numel"] += x.val.numel()
+        return x
+
+    def _finalize_packed_buckets(self, candidate_buckets, packed_info, packed_buckets, packed_by_bucket) -> int:
+        """Turn multi-tensor candidate buckets into packed buckets; return owned bytes."""
+        total_bytes = 0
+        for dtype_bucket_list in candidate_buckets.values():
+            for candidate_bucket in dtype_bucket_list:
+                tensors = candidate_bucket["tensors"]
+                if len(tensors) < 2:
+                    continue
+                bucket_key = candidate_bucket["bucket_key"]
+                packed_buckets[bucket_key] = {
+                    "dtype": candidate_bucket["dtype"],
+                    "dtype_key": candidate_bucket["dtype_key"],
+                    "device": candidate_bucket["device"],
+                    "total_numel": candidate_bucket["total_numel"],
+                    "total_bytes": candidate_bucket["total_bytes"],
+                    "cpu_pool": candidate_bucket["cpu_pool"],
+                }
+                element_offset = 0
+                for tensor in tensors:
+                    tensor._group_managed = True
+                    tensor._state = SwapTensor.STATE_D2H
+                    packed_info.append((tensor, bucket_key, element_offset))
+                    element_offset += tensor.val.numel()
+                packed_by_bucket[bucket_key] = tensors
+                total_bytes += candidate_bucket["total_bytes"]
+        return total_bytes
+
     def _collect_packable_tensors(self) -> int:
         """Identify tensors eligible for group packing and mark them for bulk copy.
 
@@ -546,7 +595,6 @@ class SwapGroup:
         packed_info: List = []
         packed_buckets: Dict[str, Dict[str, Any]] = {}
         packed_by_bucket: Dict[str, List] = {}
-        total_bytes = 0
 
         def _try_pack(x):
             if not isinstance(x, SwapTensor):
@@ -567,52 +615,16 @@ class SwapGroup:
                     f"preversion:{x.ver}, current version:{x.val._version}"
                 )
             dtype_key = (str(x.val.dtype), id(x.cpu_pool))
-            dtype_buckets = candidate_buckets.setdefault(dtype_key, [])
-            if (not dtype_buckets or
-                    dtype_buckets[-1]["total_bytes"] + x.storage_size > _GROUP_SWAP_MAX_BULK_COPY_BYTES):
-                dtype_buckets.append({
-                    "bucket_key": f"{dtype_key}#{len(dtype_buckets)}",
-                    "dtype": x.val.dtype,
-                    "dtype_key": str(x.val.dtype),
-                    "device": x.val.device,
-                    "tensors": [],
-                    "total_bytes": 0,
-                    "total_numel": 0,
-                    "cpu_pool": x.cpu_pool,
-                })
-            bucket = dtype_buckets[-1]
-            bucket["tensors"].append(x)
-            bucket["total_bytes"] += x.storage_size
-            bucket["total_numel"] += x.val.numel()
-            return x
+            return self._bucket_tensor(candidate_buckets, dtype_key, x)
 
         for storage in self._storages:
             for storage_list in storage.values():
                 for item in storage_list:
                     _backend.tree_map(_try_pack, item)
 
-        for dtype_bucket_list in candidate_buckets.values():
-            for candidate_bucket in dtype_bucket_list:
-                tensors = candidate_bucket["tensors"]
-                if len(tensors) < 2:
-                    continue
-                bucket_key = candidate_bucket["bucket_key"]
-                packed_buckets[bucket_key] = {
-                    "dtype": candidate_bucket["dtype"],
-                    "dtype_key": candidate_bucket["dtype_key"],
-                    "device": candidate_bucket["device"],
-                    "total_numel": candidate_bucket["total_numel"],
-                    "total_bytes": candidate_bucket["total_bytes"],
-                    "cpu_pool": candidate_bucket["cpu_pool"],
-                }
-                element_offset = 0
-                for tensor in tensors:
-                    tensor._group_managed = True
-                    tensor._state = SwapTensor.STATE_D2H
-                    packed_info.append((tensor, bucket_key, element_offset))
-                    element_offset += tensor.val.numel()
-                packed_by_bucket[bucket_key] = tensors
-                total_bytes += candidate_bucket["total_bytes"]
+        total_bytes = self._finalize_packed_buckets(
+            candidate_buckets, packed_info, packed_buckets, packed_by_bucket
+        )
 
         self._packed_tensor_info = packed_info
         self._packed_buckets = packed_buckets
@@ -628,6 +640,35 @@ class SwapGroup:
             )
         return group_device_bufs
 
+    def _acquire_bucket_cpu_buf(self, bucket_key, bucket):
+        """Acquire the pinned CPU buffer that receives one bucket's D2H copy."""
+        numel = bucket["total_numel"]
+        if bucket["cpu_pool"] is None:
+            return _get_cpu_pinned_buf(bucket["dtype_key"], numel, bucket["dtype"])
+        raw_buf = bucket["cpu_pool"].acquire(bucket["total_bytes"])
+        try:
+            return raw_buf.view(bucket["dtype"])
+        except Exception as exc:
+            bucket["cpu_pool"].release(raw_buf)
+            raise RuntimeError(
+                "Failed to create a typed CPU-pool view for packed activation bucket: "
+                f"group={self.group_name!r}, bucket={bucket_key!r}, "
+                f"requested_dtype={bucket['dtype']}, total_numel={numel}, "
+                f"total_bytes={bucket['total_bytes']}, raw_buffer_shape={tuple(raw_buf.shape)}, "
+                f"raw_buffer_dtype={raw_buf.dtype}. Original error: {exc}"
+            ) from exc
+
+    def _release_offloaded_bucket_bufs(self, group_cpu_bufs, copy_stream):
+        """Give back every buffer already filled before a failed D2H loop."""
+        release_event = _backend.new_event()
+        release_event.record(copy_stream)
+        for bucket_key, cpu_buf in group_cpu_bufs.items():
+            cpu_pool = self._packed_buckets[bucket_key]["cpu_pool"]
+            if cpu_pool is not None:
+                cpu_pool.release(cpu_buf, event=release_event)
+            else:
+                _return_cpu_pinned_buf(cpu_buf)
+
     def _offload_buckets_d2h(self, group_device_bufs, copy_stream):
         """One-shot D2H per packed bucket."""
         group_cpu_bufs = {}
@@ -635,35 +676,13 @@ class SwapGroup:
         try:
             for bucket_key, bucket in self._packed_buckets.items():
                 active_bucket_key = bucket_key
-                dtype_key = bucket["dtype_key"]
-                numel = bucket["total_numel"]
-                cpu_pool = bucket["cpu_pool"]
-                if cpu_pool is None:
-                    cpu_buf = _get_cpu_pinned_buf(dtype_key, numel, bucket["dtype"])
-                else:
-                    raw_buf = cpu_pool.acquire(bucket["total_bytes"])
-                    try:
-                        cpu_buf = raw_buf.view(bucket["dtype"])
-                    except Exception as exc:
-                        cpu_pool.release(raw_buf)
-                        raise RuntimeError(
-                            "Failed to create a typed CPU-pool view for packed activation bucket: "
-                            f"group={self.group_name!r}, bucket={bucket_key!r}, "
-                            f"requested_dtype={bucket['dtype']}, total_numel={numel}, "
-                            f"total_bytes={bucket['total_bytes']}, raw_buffer_shape={tuple(raw_buf.shape)}, "
-                            f"raw_buffer_dtype={raw_buf.dtype}. Original error: {exc}"
-                        ) from exc
+                cpu_buf = self._acquire_bucket_cpu_buf(bucket_key, bucket)
                 group_cpu_bufs[bucket_key] = cpu_buf
-                cpu_buf[:numel].copy_(group_device_bufs[bucket_key], non_blocking=True)
+                cpu_buf[:bucket["total_numel"]].copy_(
+                    group_device_bufs[bucket_key], non_blocking=True
+                )
         except Exception as exc:
-            release_event = _backend.new_event()
-            release_event.record(copy_stream)
-            for completed_bucket_key, cpu_buf in group_cpu_bufs.items():
-                bucket = self._packed_buckets[completed_bucket_key]
-                if bucket["cpu_pool"] is not None:
-                    bucket["cpu_pool"].release(cpu_buf, event=release_event)
-                else:
-                    _return_cpu_pinned_buf(cpu_buf)
+            self._release_offloaded_bucket_bufs(group_cpu_bufs, copy_stream)
             failed_bucket = self._packed_buckets.get(active_bucket_key, {})
             raise RuntimeError(
                 "Failed to offload packed activation bucket from device to CPU: "

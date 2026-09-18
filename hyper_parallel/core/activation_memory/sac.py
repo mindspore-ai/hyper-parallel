@@ -120,6 +120,12 @@ def _policy_from_bool(b):
     return CheckpointPolicy.MUST_SAVE if b else CheckpointPolicy.PREFER_RECOMPUTE
 
 
+def _make_swap_entry(x, *, has_alias, funcname, group_swap, cpu_pool):
+    return _SwapCacheEntry(
+        _maybe_detach(x, has_alias), funcname, group_swap=group_swap, cpu_pool=cpu_pool
+    )
+
+
 SAC_IGNORED_OPS = {
     # AC inserts different number of detach during forward and recompute.
     torch.ops.aten.detach.default,
@@ -185,10 +191,16 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
                 self.add_to_storage = True
             funcname = f"{self._group_prefix}{func}"
             group_swap = self.group_swap
+            cpu_pool = self.cpu_pool
             entries = tree_map(
-                lambda x: _SwapCacheEntry(
-                    _maybe_detach(x, has_alias), funcname, group_swap=group_swap, cpu_pool=self.cpu_pool
-                ), out,
+                lambda x: _make_swap_entry(
+                    x,
+                    has_alias=has_alias,
+                    funcname=funcname,
+                    group_swap=group_swap,
+                    cpu_pool=cpu_pool,
+                ),
+                out,
             )
             self.storage[func].append(tree_map(lambda x: x.save, entries))
             self.swap_storage[func].append(tree_map(lambda x: x.swap, entries))

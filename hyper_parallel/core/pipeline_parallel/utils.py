@@ -94,8 +94,11 @@ class MetaStep:
 
     @property
     def sub_steps(self):
-        """Sub-steps for composite types: ``(fwd, bwd)`` for OVERLAP_F_B,
-        ``(bwd, fwd)`` for OVERLAP_B_F, or ``None``."""
+        """Return this step's sub-steps.
+
+        ``(fwd, bwd)`` for OVERLAP_F_B, ``(bwd, fwd)`` for OVERLAP_B_F, or
+        ``None`` for every other type.
+        """
         return self._sub_steps
 
     @property

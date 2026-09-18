@@ -23,7 +23,7 @@ import inspect
 import itertools
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -660,7 +660,9 @@ class PipelineSwapRuntime:
         if not self._packed_enabled or not batches:
             return False
         units = itertools.chain.from_iterable(batches)
-        swappable_slots = [slot for unit in units for slot in unit.slots if slot.swappable]
+        swappable_slots = [
+            slot for unit in units for slot in unit.slots if slot.swappable
+        ]
         if not swappable_slots:
             return False
         devices = {slot.device for slot in swappable_slots}
@@ -691,13 +693,8 @@ class PipelineSwapRuntime:
     @staticmethod
     def _first_swappable_slot(batches: Sequence[Sequence[UpdateUnit]]) -> SwapSlot:
         """Return the first swappable slot across ``batches``, in iteration order."""
-        swappable = (
-            slot
-            for batch in batches
-            for unit in batch
-            for slot in unit.slots
-            if slot.swappable
-        )
+        units = itertools.chain.from_iterable(batches)
+        swappable = (slot for unit in units for slot in unit.slots if slot.swappable)
         return next(swappable)
 
     def begin_packed_step(self, batches: Sequence[Sequence[UpdateUnit]]) -> None:
@@ -943,6 +940,17 @@ class PipelineSwapRuntime:
         return dtype_layouts, self._align_bytes(byte_offset), device
 
 
+class GroupArgs(NamedTuple):
+    """Per-parameter argument lists one functional Adam/AdamW step consumes."""
+
+    params: List[Any]
+    grads: List[Any]
+    exp_avgs: List[Any]
+    exp_avg_sqs: List[Any]
+    max_exp_avg_sqs: List[Any]
+    state_steps: List[Any]
+
+
 class OptimizerSwapAdapter:
     """Common Torch Adam/AdamW adapter logic."""
 
@@ -1058,36 +1066,31 @@ class OptimizerSwapAdapter:
             self,
             units: Sequence[UpdateUnit],
             group: Dict[str, Any],
-    ) -> Tuple[List[Any], List[Any], List[Any], List[Any], List[Any], List[Any]]:
+    ) -> GroupArgs:
         """Gather the per-parameter argument lists one optimizer step needs.
 
         Units without a gradient are skipped.  ``max_exp_avg_sqs`` stays empty
         unless the group is amsgrad, and ``state_steps`` holds ``None`` for new
         AdamW, which advances the step counter itself.
         """
-        params: List[Any] = []
-        grads: List[Any] = []
-        exp_avgs: List[Any] = []
-        exp_avg_sqs: List[Any] = []
-        max_exp_avg_sqs: List[Any] = []
-        state_steps: List[Any] = []
+        args = GroupArgs([], [], [], [], [], [])
         for unit in units:
             if unit.grad is None:
                 continue
             state = self.optimizer.state[unit.param]
-            params.append(unit.param)
-            grads.append(unit.grad)
-            exp_avgs.append(self._slot_tensor(unit, "exp_avg", state["exp_avg"]))
-            exp_avg_sqs.append(self._slot_tensor(unit, "exp_avg_sq", state["exp_avg_sq"]))
+            args.params.append(unit.param)
+            args.grads.append(unit.grad)
+            args.exp_avgs.append(self._slot_tensor(unit, "exp_avg", state["exp_avg"]))
+            args.exp_avg_sqs.append(self._slot_tensor(unit, "exp_avg_sq", state["exp_avg_sq"]))
             if group.get("amsgrad", False):
-                max_exp_avg_sqs.append(
+                args.max_exp_avg_sqs.append(
                     self._slot_tensor(unit, "max_exp_avg_sq", state["max_exp_avg_sq"])
                 )
             if self.is_new_adamw:
-                state_steps.append(None)
+                args.state_steps.append(None)
             else:
-                state_steps.append(state["step"])
-        return params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps
+                args.state_steps.append(state["step"])
+        return args
 
     def step_batch(self, batch: List[UpdateUnit], step_context: Dict[str, Any]) -> None:
         """Run Torch functional Adam/AdamW for one batch."""
@@ -1100,15 +1103,21 @@ class OptimizerSwapAdapter:
 
     def _step_group(self, group: Dict[str, Any], units: List[UpdateUnit]) -> None:
         """Run one group's parameters through the matching functional Adam/AdamW."""
-        params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps = (
-            self._collect_group_args(units, group)
-        )
+        args = self._collect_group_args(units, group)
+        params = args.params
 
         if not params:
             return
 
         if self.is_new_adamw:
-            self._step_new_adamw(group, params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs)
+            self._step_new_adamw(
+                group,
+                args.params,
+                args.grads,
+                args.exp_avgs,
+                args.exp_avg_sqs,
+                args.max_exp_avg_sqs,
+            )
             return
 
         func = getattr(torch.optim._functional, self.functional_name)
@@ -1131,7 +1140,15 @@ class OptimizerSwapAdapter:
         if self.functional_name == "adam":
             if "decoupled_weight_decay" in inspect.signature(func).parameters:
                 kwargs["decoupled_weight_decay"] = self._decoupled_weight_decay(group)
-        func(params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps, **kwargs)
+        func(
+            args.params,
+            args.grads,
+            args.exp_avgs,
+            args.exp_avg_sqs,
+            args.max_exp_avg_sqs,
+            args.state_steps,
+            **kwargs,
+        )
 
     def _decoupled_weight_decay(self, group: Dict[str, Any]) -> bool:
         """Resolve the decoupled weight decay flag for one parameter group."""
@@ -1344,9 +1361,8 @@ class OptimizerSwapAdapter:
             for saved_group, current_group in zip(saved_groups, self.optimizer.param_groups)
             for saved_id in saved_group["params"]
         ]
-        current_params = [
-            param for current_group in self.optimizer.param_groups for param in current_group["params"]
-        ]
+        groups = self.optimizer.param_groups
+        current_params = [param for group in groups for param in group["params"]]
         for saved_id, param in zip(saved_ids, current_params):
             for key, saved_tensor in removed.get(saved_id, {}).items():
                 self._restore_swappable_entry(param, saved_id, saved_groups, key, saved_tensor)
@@ -1636,7 +1652,8 @@ class _StagingArena:
 
 def _iter_unique_slots(units: Sequence[UpdateUnit]) -> Iterable[SwapSlot]:
     """Yield slots once by object identity."""
-    return _iter_unique_slot_objects(slot for unit in units for slot in unit.slots)
+    slots = itertools.chain.from_iterable(unit.slots for unit in units)
+    return _iter_unique_slot_objects(slots)
 
 
 def _iter_unique_slot_objects(slots: Iterable[SwapSlot]) -> Iterable[SwapSlot]:
