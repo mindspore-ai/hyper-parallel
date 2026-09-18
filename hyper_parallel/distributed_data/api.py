@@ -23,7 +23,7 @@ import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from multiprocessing.context import BaseContext
-from typing import Any
+from typing import Any, Literal
 
 import torch  # pylint: disable=forbidden-backend-import
 
@@ -53,6 +53,7 @@ from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import (
     DataPlaneTransport,
     ModelParallelTransport,
+    all_gather_control_object,
     create_data_groups,
     synchronize_build_preflight,
 )
@@ -125,6 +126,10 @@ class DistributedDatasetConfig:
             Each configured stage must
             occur in every sample's packing_costs. These limits are independent
             of cost-model balancing scores.
+        communication_backend: Backend for HP data-plane collectives. ``hccl``
+            is the default for NPU training and serializes control objects into
+            accelerator tensors. ``gloo`` keeps control and CPU payload
+            communication on Gloo. HCCL requires an NPU communication device.
     """
 
     seq_len: int
@@ -144,6 +149,7 @@ class DistributedDatasetConfig:
     persistent_workers: bool = False
     min_balance_gain: float = 0.0
     packing_budgets: dict[str, float] | None = None
+    communication_backend: Literal["gloo", "hccl"] = "hccl"
 
     def __post_init__(self) -> None:
         """Validate topology-independent configuration boundaries."""
@@ -192,6 +198,8 @@ class DistributedDatasetConfig:
             or not 0.0 <= self.min_balance_gain < 1.0
         ):
             raise ValueError("min_balance_gain must be in [0, 1).")
+        if self.communication_backend not in ("gloo", "hccl"):
+            raise ValueError("communication_backend must be 'gloo' or 'hccl'.")
         if not self.drop_last:
             raise ValueError(
                 "Dynamic distributed packing currently requires drop_last=True so every DP rank receives the "
@@ -400,6 +408,8 @@ def _resolve_metadata_mode(
         metadata: Sequence[SampleMetadata] | None,
         external_step_reader: Any | None,
         external_step_source: ExternalStepSource | None,
+        communication_backend: str = "hccl",
+        communication_device: Any = None,
 ) -> bool:
     """Resolve one metadata-mode flag when external Readers are rank-local."""
     local_flags = (external_step_reader is not None or external_step_source is not None, metadata is not None)
@@ -408,8 +418,17 @@ def _resolve_metadata_mode(
         external_present = local_flags[0]
         metadata_present = local_flags[1]
     else:
-        gathered = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(gathered, local_flags)
+        startup_group = None
+        if communication_backend == "gloo":
+            startup_group = torch.distributed.new_group(
+                ranks=list(range(torch.distributed.get_world_size())), backend="gloo"
+            )
+        gathered = all_gather_control_object(
+            local_flags,
+            group=startup_group,
+            device=communication_device,
+            backend=communication_backend,
+        )
         external_present = any(item[0] for item in gathered)
         metadata_present = any(item[1] for item in gathered)
     if external_present:
@@ -802,6 +821,8 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
         dataset_already_sharded=dataset_already_sharded,
         local_error=state.local_error,
         external_step_mode=state.external_step_mode,
+        communication_backend=getattr(config, "communication_backend", "hccl"),
+        communication_device=state.communication_device,
     )
     # Consumer-only ranks have no reader object, but must share selection mode
     # and checkpoint identity with the ranks that produce their model batch.
@@ -884,8 +905,9 @@ def build_distributed_dataloader(
         collate_fn: Optionally collate ``local_batch_size`` packed sequences.
             The default preserves the bins as a tuple.
         device: Rank-local training device. Node-local balancing uses
-            it only for final H2D; metadata and raw samples always use Gloo.
-            The original path retains its device payload transport.
+            it for final H2D and for control/payload tensors when
+            ``communication_backend="hccl"``. Gloo keeps metadata and raw
+            sample communication on the host.
         batch_sampler: Optional native HP BatchSampler. Supply the rank-local
             sampler on every rank; only each DP Constructor advances it. Its
             next yield fixes local sample membership, with no second stride,
@@ -927,8 +949,11 @@ def build_distributed_dataloader(
         Dataset lengths must agree across all Data Constructor ranks. Metadata
         entries must describe deterministic, rank-independent Dataset outputs.
         A DistributedDataset or external_step_source uses pure DP, node-local
-        Gloo and buffered H2D. Every step evaluates a candidate; sample exchange
-        occurs only when its objective improves by more than min_balance_gain.
+        communication and buffered H2D. Every step evaluates a candidate; sample
+        exchange occurs only when its objective improves by more than
+        min_balance_gain. HCCL is the default backend; Gloo transports control
+        and CPU payloads on the host. HCCL transports control and payload
+        tensors on the rank-local NPU.
         Checkpoint/resume remains available only on the reader/sampler path.
         Stateful custom policies should expose configuration-versioned model_id
         or algorithm_id attributes for build/checkpoint identity.
@@ -1013,7 +1038,14 @@ def _build_distributed_dataloader_impl(
 ) -> DistributedDataLoader:
     if external_step_reader is not None and external_step_source is not None:
         raise ValueError("external_step_reader and external_step_source are mutually exclusive.")
-    metadata_mode = _resolve_metadata_mode(metadata_fn, metadata, external_step_reader, external_step_source)
+    metadata_mode = _resolve_metadata_mode(
+        metadata_fn,
+        metadata,
+        external_step_reader,
+        external_step_source,
+        communication_backend=getattr(config, "communication_backend", "hccl"),
+        communication_device=communication_device,
+    )
     state = _BuildState(
         metadata_mode=metadata_mode, model_config=model_config,
         cost_model=cost_model, balancing_algorithm=balancing_algorithm,
@@ -1043,9 +1075,11 @@ def _build_distributed_dataloader_impl(
         state.topology,
         state.dataset_reader_ranks,
         state.planner_rank,
-        cpu_backend="gloo",
-        payload_backend=None,
-        communication_device=state.communication_device,
+        cpu_backend=config.communication_backend,
+        payload_backend=config.communication_backend,
+        communication_device=(
+            state.communication_device if config.communication_backend == "hccl" else None
+        ),
         enable_payload_exchange=not state.metadata_mode,
     )
 
@@ -1064,9 +1098,17 @@ def _build_distributed_dataloader_impl(
         data_plane=DataPlaneTransport(
             groups,
             state.topology.global_rank,
-            communication_device=state.communication_device,
+            communication_device=(
+                state.communication_device if config.communication_backend == "hccl" else None
+            ),
         ),
-        model_transport=ModelParallelTransport(state.topology, groups),
+        model_transport=ModelParallelTransport(
+            state.topology,
+            groups,
+            communication_device=(
+                state.communication_device if config.communication_backend == "hccl" else None
+            ),
+        ),
         double_buffer=False,
         config_fingerprint=state.config_fingerprint,
     )

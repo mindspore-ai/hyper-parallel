@@ -50,6 +50,120 @@ class PreparedPayloadExchange:
     local_segment: bytes
 
 
+def _is_accelerator_backend(backend: str) -> bool:
+    return "hccl" in backend.lower() or "nccl" in backend.lower()
+
+
+def _control_backend(group: Any, backend: str | None = None) -> str:
+    if backend is not None:
+        return backend.lower()
+    try:
+        return str(dist.get_backend(group)).lower()
+    except (RuntimeError, ValueError):
+        # Lightweight unit-test groups and single-process fakes represent Gloo
+        # groups with opaque sentinels rather than registered ProcessGroups.
+        return "gloo"
+
+
+def _require_control_device(device: Any, backend: str) -> torch.device:
+    if device is None:
+        raise ValueError(f"{backend} control collectives require an accelerator communication_device.")
+    resolved = torch.device(device)
+    expected = "npu" if "hccl" in backend else "cuda"
+    if resolved.type != expected:
+        raise ValueError(f"{backend} control collectives require a {expected} device, got {resolved}.")
+    return resolved
+
+
+def _encode_control(value: Any, device: Any) -> tuple[torch.Tensor, int]:
+    encoded = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+    resolved = torch.device(device)
+    payload = torch.zeros((max(1, len(encoded)),), dtype=torch.uint8, device=resolved)
+    if encoded:
+        payload[:len(encoded)] = torch.tensor(list(encoded), dtype=torch.uint8, device=resolved)
+    return payload, len(encoded)
+
+
+def _decode_control(payload: torch.Tensor, size: int) -> Any:
+    encoded = payload[:size].cpu().numpy().tobytes()
+    return pickle.loads(encoded)
+
+
+def all_gather_control_object(
+        value: Any,
+        *,
+        group: Any = None,
+        device: Any = None,
+        backend: str | None = None,
+) -> tuple[Any, ...]:
+    """Gather a small control object with Gloo or an accelerator backend.
+
+    Args:
+        value: Rank-local serializable control value.
+        group: Process group whose ranks participate in the gather.
+        device: Rank-local accelerator used by HCCL/NCCL.
+        backend: Explicit backend for startup calls that use WORLD.
+
+    Returns:
+        Gathered values in process-group rank order.
+    """
+    effective_backend = _control_backend(group, backend)
+    if not _is_accelerator_backend(effective_backend):
+        gathered = [None] * dist.get_world_size(group)
+        dist.all_gather_object(gathered, value, group=group)
+        return tuple(gathered)
+    resolved = _require_control_device(device, effective_backend)
+    encoded, encoded_size = _encode_control(value, resolved)
+    local_size = torch.tensor([encoded_size], dtype=torch.int64, device=resolved)
+    sizes = [torch.empty_like(local_size) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(sizes, local_size, group=group)
+    max_size = max(int(item.item()) for item in sizes)
+    if encoded.numel() < max_size:
+        padded = torch.zeros((max_size,), dtype=torch.uint8, device=resolved)
+        padded[:encoded.numel()] = encoded
+        encoded = padded
+    gathered = [torch.empty_like(encoded) for _ in sizes]
+    dist.all_gather(gathered, encoded, group=group)
+    return tuple(_decode_control(payload, int(size.item())) for payload, size in zip(gathered, sizes))
+
+
+def broadcast_control_object(
+        value: Any,
+        *,
+        src: int,
+        group: Any = None,
+        device: Any = None,
+) -> Any:
+    """Broadcast a small control object with Gloo or an accelerator backend.
+
+    Args:
+        value: Source value or a placeholder on receivers.
+        src: Global source rank.
+        group: Process group whose ranks participate in the broadcast.
+        device: Rank-local accelerator used by HCCL/NCCL.
+
+    Returns:
+        The source value on every participating rank.
+    """
+    effective_backend = _control_backend(group)
+    if not _is_accelerator_backend(effective_backend):
+        payload = [value]
+        dist.broadcast_object_list(payload, src=src, group=group)
+        return payload[0]
+    resolved = _require_control_device(device, effective_backend)
+    rank = dist.get_rank()
+    encoded, encoded_size = _encode_control(value, resolved) if rank == src else (
+        torch.zeros((1,), dtype=torch.uint8, device=resolved), 0
+    )
+    size = torch.tensor([encoded_size], dtype=torch.int64, device=resolved)
+    dist.broadcast(size, src=src, group=group)
+    target_size = int(size.item())
+    if encoded.numel() < max(1, target_size):
+        encoded = torch.zeros((max(1, target_size),), dtype=torch.uint8, device=resolved)
+    dist.broadcast(encoded, src=src, group=group)
+    return _decode_control(encoded, target_size)
+
+
 def synchronize_build_preflight(
         *,
         build_fingerprint: str | None,
@@ -61,6 +175,8 @@ def synchronize_build_preflight(
         dataset_already_sharded: bool,
         local_error: str | None,
         external_step_mode: bool = False,
+        communication_backend: str = "hccl",
+        communication_device: Any = None,
 ) -> bool:
     """Validate rank-local build inputs on WORLD before creating subgroups.
 
@@ -105,8 +221,15 @@ def synchronize_build_preflight(
             raise ValueError(f"Distributed DataLoader build preflight failed on rank {rank}: {local_error}")
         return external_step_mode
 
-    gathered = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, status)
+    startup_group = None
+    if communication_backend == "gloo":
+        startup_group = dist.new_group(ranks=list(range(dist.get_world_size())), backend="gloo")
+    gathered = list(all_gather_control_object(
+        status,
+        group=startup_group,
+        device=communication_device,
+        backend=communication_backend,
+    ))
     _validate_build_errors_and_fingerprint(gathered)
     _validate_build_modes(gathered)
     dataset_reader_sizes = [(item[0], item[3]) for item in gathered if item[2]]
@@ -311,8 +434,8 @@ def _validate_group_backends(
 ) -> None:
     if not isinstance(cpu_backend, str) or not cpu_backend:
         raise ValueError("cpu_backend must be a non-empty backend name.")
-    if "hccl" in cpu_backend.lower() or "nccl" in cpu_backend.lower():
-        raise ValueError("cpu_backend must support CPU tensors and object collectives; use Gloo, not HCCL/NCCL.")
+    if cpu_backend.lower() not in ("gloo", "hccl"):
+        raise ValueError("cpu_backend must be 'gloo' or 'hccl'.")
     if payload_backend is not None and (not isinstance(payload_backend, str) or not payload_backend):
         raise ValueError("payload_backend must be a non-empty backend name or None.")
     if not isinstance(enable_payload_exchange, bool):
@@ -510,8 +633,14 @@ def _tensor_device(device_type: str, group: Any) -> torch.device:
     return torch.device(expected_type, module.current_device())
 
 
-def _exchange_payload_sizes(input_splits: Sequence[int], control_group: Any) -> list[int]:
-    size_input = torch.tensor(tuple(input_splits), dtype=torch.int64)
+def _exchange_payload_sizes(
+        input_splits: Sequence[int],
+        control_group: Any,
+        device: Any = None,
+) -> list[int]:
+    backend = _control_backend(control_group)
+    size_device = _require_control_device(device, backend) if _is_accelerator_backend(backend) else torch.device("cpu")
+    size_input = torch.tensor(tuple(input_splits), dtype=torch.int64, device=size_device)
     size_output = torch.empty_like(size_input)
     size_work = dist.all_to_all_single(size_output, size_input, group=control_group, async_op=True)
     if size_work is not None:
@@ -578,6 +707,11 @@ class DataPlaneTransport:
         """Return the rank-local accelerator used by payload collectives."""
         return self._communication_device
 
+    @property
+    def communication_backend(self) -> str:
+        """Return the backend used by this data-plane control group."""
+        return _control_backend(self._control_group)
+
     def all_gather_object(self, value: Any) -> tuple[Any, ...]:
         """Gather small control objects on every data-plane rank.
 
@@ -589,15 +723,30 @@ class DataPlaneTransport:
         """
         if len(self._ranks) == 1:
             return (value,)
-        gathered = [None] * len(self._ranks)
-        dist.all_gather_object(gathered, value, group=self._control_group)
-        return tuple(gathered)
+        return all_gather_control_object(
+            value,
+            group=self._control_group,
+            device=self._communication_device,
+        )
 
     def all_ranks_true(self, value: bool) -> bool:
-        """Return whether every data-plane rank supplied ``True``."""
+        """Return whether every data-plane rank supplied ``True``.
+
+        Args:
+            value: Rank-local boolean value.
+
+        Returns:
+            Whether every participating rank supplied ``True``.
+        """
         if len(self._ranks) == 1:
             return value
-        flag = torch.tensor([int(value)], dtype=torch.int32, device="cpu")
+        backend = _control_backend(self._control_group)
+        flag_device = (
+            _require_control_device(self._communication_device, backend)
+            if _is_accelerator_backend(backend)
+            else torch.device("cpu")
+        )
+        flag = torch.tensor([int(value)], dtype=torch.int32, device=flag_device)
         dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self._control_group)
         return bool(flag.item())
 
@@ -612,14 +761,12 @@ class DataPlaneTransport:
         """
         if len(self._ranks) == 1:
             return (value,)
-        gathered = [None] * len(self._ranks) if self._global_rank == self._planner_rank else None
-        dist.gather_object(
+        gathered = all_gather_control_object(
             value,
-            object_gather_list=gathered,
-            dst=self._planner_rank,
             group=self._control_group,
+            device=self._communication_device,
         )
-        return tuple(gathered) if gathered is not None else None
+        return gathered if self._global_rank == self._planner_rank else None
 
     def broadcast_from_planner(self, value: Any) -> Any:
         """Broadcast one control object from the configured Planner.
@@ -632,9 +779,12 @@ class DataPlaneTransport:
         """
         if len(self._ranks) == 1:
             return value
-        payload = [value if self._global_rank == self._planner_rank else None]
-        dist.broadcast_object_list(payload, src=self._planner_rank, group=self._control_group)
-        return payload[0]
+        return broadcast_control_object(
+            value if self._global_rank == self._planner_rank else None,
+            src=self._planner_rank,
+            group=self._control_group,
+            device=self._communication_device,
+        )
 
     def prepare_exchange(
             self,
@@ -689,7 +839,11 @@ class DataPlaneTransport:
             raise ValueError("Sample payload exchange requires a payload process group.")
 
         input_splits = list(prepared.input_splits)
-        output_splits = _exchange_payload_sizes(input_splits, self._control_group)
+        output_splits = _exchange_payload_sizes(
+            input_splits,
+            self._control_group,
+            device=self._communication_device,
+        )
         received_tensor = torch.empty(
             (sum(output_splits),),
             dtype=torch.uint8,
@@ -712,13 +866,16 @@ class DataPlaneTransport:
 class ModelParallelTransport:
     """Broadcast a constructed batch with direct tensor leaves when possible."""
 
-    def __init__(self, topology: DataTopology, groups: DataGroups) -> None:
+    def __init__(self, topology: DataTopology, groups: DataGroups, communication_device: Any = None) -> None:
         """Store the current model-consumer group."""
         self._ranks = topology.model_parallel_ranks
         self._object_group = groups.model_parallel_group
         self._accelerator_tensor_group = groups.model_parallel_tensor_group
         self._constructor_rank = topology.constructor_rank
         self._global_rank = topology.global_rank
+        self._communication_device = (
+            torch.device(communication_device) if communication_device is not None else None
+        )
         if len(self._ranks) > 1 and (not groups.distributed or self._object_group is None):
             raise ValueError("Multi-rank model broadcast requires an initialized process group.")
 
@@ -739,9 +896,19 @@ class ModelParallelTransport:
         if len(self._ranks) == 1:
             return batch
         schema, source_tensors = _encode_model_batch(batch) if is_constructor else (None, [])
-        payload = [schema]
-        dist.broadcast_object_list(payload, src=self._constructor_rank, group=self._object_group)
-        tensor_specs = _tensor_specs(payload[0])
+        backend = _control_backend(self._object_group)
+        if _is_accelerator_backend(backend):
+            received_schema = broadcast_control_object(
+                schema if is_constructor else None,
+                src=self._constructor_rank,
+                group=self._object_group,
+                device=self._communication_device,
+            )
+        else:
+            payload = [schema]
+            dist.broadcast_object_list(payload, src=self._constructor_rank, group=self._object_group)
+            received_schema = payload[0]
+        tensor_specs = _tensor_specs(received_schema)
         received_tensors = []
         for index, spec in enumerate(tensor_specs):
             tensor_group = self._group_for_tensor(spec[2])
@@ -752,7 +919,7 @@ class ModelParallelTransport:
                 tensor = torch.empty(spec[0], dtype=spec[1], device=device)
             dist.broadcast(tensor, src=self._constructor_rank, group=tensor_group)
             received_tensors.append(tensor)
-        return batch if is_constructor else _decode_model_batch(payload[0], received_tensors)
+        return batch if is_constructor else _decode_model_batch(received_schema, received_tensors)
 
     def _group_for_tensor(self, device_type: str) -> Any:
         """Choose Gloo for host tensors and the accelerator group for device tensors."""

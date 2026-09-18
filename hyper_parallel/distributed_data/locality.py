@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Create independent node-local Gloo data exchange groups."""
+"""Create independent node-local data exchange groups."""
 # This distributed-data package is intentionally PyTorch-only.
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed_data.topology import DataTopology
-from hyper_parallel.distributed_data.transport import DataGroups
+from hyper_parallel.distributed_data.transport import DataGroups, all_gather_control_object
 
 
 def _node_rank_groups(
@@ -64,12 +64,40 @@ def _validate_startup_statuses(
         raise ValueError("Local balancing configuration or root mesh differs across WORLD ranks.")
 
 
+def _validate_communication_config(backend: str, device: Any, distributed: bool) -> None:
+    """Validate the node-local collective backend and its rank-local device."""
+    if backend not in ("gloo", "hccl"):
+        raise ValueError("communication_backend must be 'gloo' or 'hccl'.")
+    if backend != "hccl":
+        return
+    if distributed and (device is None or getattr(device, "type", None) != "npu"):
+        raise ValueError("communication_backend='hccl' requires an NPU communication_device.")
+
+
+def _gather_startup_statuses(
+        status: Any,
+        *,
+        distributed: bool,
+        backend: str,
+        device: Any,
+) -> list[Any]:
+    """Gather startup state on an explicit Gloo group or HCCL WORLD."""
+    if not distributed:
+        return [status]
+    startup_group = None
+    if backend == "gloo":
+        startup_group = dist.new_group(ranks=list(range(dist.get_world_size())), backend="gloo")
+    return list(all_gather_control_object(status, group=startup_group, device=device, backend=backend))
+
+
 def _create_locality_groups(
         mesh: Any,
         *,
         dp_dim_names: tuple[str, ...] | None = None,
         build_identity: Any = None,
         local_error: str | None = None,
+        communication_backend: str = "hccl",
+        communication_device: Any = None,
 ) -> tuple[DataTopology, DataGroups]:
     """Resolve locality once and create all process groups in WORLD rank order.
 
@@ -87,6 +115,7 @@ def _create_locality_groups(
         FSDP process group is modified. All ranks must call this factory together.
     """
     distributed = dist.is_available() and dist.is_initialized()
+    _validate_communication_config(communication_backend, communication_device, distributed)
     rank = dist.get_rank() if distributed else 0
     world_size = dist.get_world_size() if distributed else 1
     topology = None
@@ -101,17 +130,19 @@ def _create_locality_groups(
     except Exception as exc:
         local_error = f"{type(exc).__name__}: {exc}"
     status = (rank, local_error, identity, selected_node)
-    statuses = [status]
-    if distributed:
-        statuses = [None] * world_size
-        dist.all_gather_object(statuses, status)
+    statuses = _gather_startup_statuses(
+        status,
+        distributed=distributed,
+        backend=communication_backend,
+        device=communication_device,
+    )
     _validate_startup_statuses(statuses, identity)
     rank_groups = _node_rank_groups(topology, {entry[0]: entry[3] for entry in statuses})
     own_groups = None
     for ranks in rank_groups:
         control_group = None
         if distributed and len(ranks) > 1:
-            control_group = dist.new_group(ranks=list(ranks), backend="gloo")
+            control_group = dist.new_group(ranks=list(ranks), backend=communication_backend)
         if rank in ranks:
             own_groups = DataGroups(ranks, control_group, control_group, None, min(ranks), distributed)
     return topology, own_groups

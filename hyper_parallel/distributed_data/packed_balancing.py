@@ -22,6 +22,8 @@ from dataclasses import asdict, dataclass
 from threading import Thread
 from typing import TYPE_CHECKING, Any
 
+import torch  # pylint: disable=forbidden-backend-import
+
 from hyper_parallel.distributed_data.balance_logging import log_balance_stats
 from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorithm, resolve_balancing_algorithm
 from hyper_parallel.distributed_data.cost_model import CostModel, resolve_cost_model
@@ -68,7 +70,16 @@ class _LocalBalancingIterator(Iterator[Any]):
             raise StopIteration
         try:
             if self._thread is None:
-                self._start_prefetch()
+                if self._loader._uses_synchronous_collectives:
+                    # HCCL/NCCL collectives from a producer thread can be
+                    # interleaved with model collectives in a different order
+                    # on different ranks.  Keep accelerator data collectives
+                    # on the training thread so every rank observes one
+                    # deterministic collective sequence.  Gloo keeps the
+                    # speculative one-step host/device buffer below.
+                    self._result = self._collect_batch()
+                else:
+                    self._start_prefetch()
             self.wait_for_prefetch()
             self._thread = None
             if self._error is not None:
@@ -82,7 +93,7 @@ class _LocalBalancingIterator(Iterator[Any]):
             raise
         self._step += 1
         self._loader.last_balance_stats = result.stats
-        if not self._limit_reached():
+        if not self._limit_reached() and not self._loader._uses_synchronous_collectives:
             self._start_prefetch()
         return self._loader._deliver_batch(result, self._step)
 
@@ -104,6 +115,17 @@ class _LocalBalancingIterator(Iterator[Any]):
 
     def _run_prefetch(self) -> None:
         try:
+            # ``torch.npu``/``torch.cuda`` keeps the current device per host
+            # thread.  The balancing producer performs HCCL/NCCL collectives
+            # from this background thread, so establish the same rank-local
+            # device here before constructing or staging the batch.
+            communication_device = getattr(self._loader._transport, "communication_device", None)
+            if communication_device is not None:
+                device = torch.device(communication_device)
+                if device.type == "npu":
+                    torch.npu.set_device(device)
+                elif device.type == "cuda":
+                    torch.cuda.set_device(device)
             self._result = self._collect_batch()
         except BaseException as exc:
             self._error = exc
@@ -169,6 +191,12 @@ class LocalBalancingDataLoader:
         self._device_prefetch = device_prefetch
         self._device_batch = None
         self._balance_stats_callback = balance_stats_callback
+
+    @property
+    def _uses_synchronous_collectives(self) -> bool:
+        """Whether data collectives must stay on the training thread."""
+        backend = getattr(self._transport, "communication_backend", "gloo").lower()
+        return "hccl" in backend or "nccl" in backend
 
     def __len__(self) -> int:
         """Return the configured step limit, or the source length when available."""
@@ -443,9 +471,10 @@ def build_local_balancing_dataloader(
         max_steps: Stop before prefetching beyond the requested training steps.
 
     Returns:
-        A local-step loader using node-local Gloo, automatic one-step buffering
-        and final H2D prefetch. Each step retains its source packs unless the
-        candidate improves its objective by more than min_balance_gain.
+        A local-step loader using the configured node-local communication
+        backend, automatic one-step buffering and final H2D prefetch. Each step
+        retains its source packs unless the candidate improves its objective by
+        more than min_balance_gain.
 
     Note:
         All ranks must consume the same number of steps. Checkpoint/resume and
@@ -486,11 +515,14 @@ def build_local_balancing_dataloader(
         }, sort_keys=True)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
+    communication_device = device if config.communication_backend == "hccl" else None
     topology, groups = _create_locality_groups(
         mesh,
         dp_dim_names=config.dp_dim_names,
         build_identity=identity,
         local_error=error,
+        communication_backend=config.communication_backend,
+        communication_device=communication_device,
     )
     planner = DynamicPackingPlanner(
         data_parallel_size=len(groups.data_plane_ranks),
@@ -510,7 +542,11 @@ def build_local_balancing_dataloader(
         pack_fn=pack_fn,
         collate_fn=collate_fn,
         planner=planner,
-        transport=DataPlaneTransport(groups, topology.global_rank),
+        transport=DataPlaneTransport(
+            groups,
+            topology.global_rank,
+            communication_device=communication_device,
+        ),
         global_rank=topology.global_rank,
         bin_stats_fn=bin_stats_fn,
         device_prefetch=device_prefetch,

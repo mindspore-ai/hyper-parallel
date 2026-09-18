@@ -1,12 +1,21 @@
 # Node-local balancing
 
 Dataset-owned or external raw-step loading uses default backbone FLOPs,
-capacity-constrained LPT, node-local Gloo, automatic one-step buffering and
-final H2D on a copy stream. There is no enable switch: every step evaluates a
-candidate, but raw samples move only when the candidate's relative objective
-improvement is strictly greater than `min_balance_gain` (default `0.0`).
-Equal, worse or insufficient-gain candidates retain the original distribution.
-Metadata gathering and planning still occur when sample exchange is skipped.
+capacity-constrained LPT, configurable node-local data exchange, automatic
+one-step buffering, and final H2D on a copy stream. Set
+`communication_backend="hccl"` (the default) with an NPU `device` to encode
+control objects as device tensors and route all data-plane collectives through
+HCCL. Set `communication_backend="gloo"` for CPU object/payload exchange.
+There is no enable switch: every step evaluates a candidate, but raw samples move only when
+the candidate's relative objective improvement is strictly greater than
+`min_balance_gain` (default `0.0`). Equal, worse or insufficient-gain candidates
+retain the original distribution. Metadata gathering and planning still occur
+when sample exchange is skipped.
+
+When HCCL or NCCL is selected, data-plane collectives stay on the training
+thread so their order cannot race model collectives issued by another thread.
+Gloo keeps the speculative one-step Host/H2D producer; accelerator backends
+still use the configured copy stream for H2D after their data collective.
 
 ## Dataset-based integration
 

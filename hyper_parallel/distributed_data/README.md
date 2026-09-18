@@ -22,13 +22,12 @@ native BatchSampler / legacy external_step_reader
   -> commit consumed progress -> Trainer
 ```
 
-Model-parallel batch broadcast uses one small `broadcast_object_list` call for
-the Python structure and non-tensor values. Tensor leaves in dictionaries,
+Model-parallel batch broadcast serializes the Python structure and non-tensor
+values once. Gloo uses `broadcast_object_list`; HCCL/NCCL transports the same
+schema as a byte tensor on the accelerator. Tensor leaves in dictionaries,
 lists, and tuples use `dist.broadcast` directly, avoiding pickle copies. CPU
-loads use the existing Gloo model group; when an accelerator
-`device` is supplied, a matching HCCL/NCCL model tensor group is
-created and tensor leaves stay on device. Unsupported custom containers retain
-the regular object-broadcast behavior.
+loads use the Gloo model group; accelerator tensor leaves stay on device.
+Unsupported custom containers remain inside the serialized schema.
 
 Configuration, callback results, sample conservation, packing capacities, and
 checkpoint compatibility remain validated at their boundaries. Fixed-group
@@ -333,9 +332,10 @@ longer infers step boundaries by scanning source metadata.
 
 Reader/sampler loading retains synchronous planning and its checkpoint
 contract. Dataset-owned and external raw-step loading automatically uses
-node-local Gloo, one-step buffering and H2D. Every path accepts independent
-cost and assignment policies; plans below the required relative improvement
-keep the original distribution. See [node-local balancing](NODE_LOCAL_BALANCING.md).
+node-local exchange, one-step buffering and H2D. The communication backend
+defaults to HCCL for NPU training and can be set to Gloo. Every path accepts independent cost and
+assignment policies; plans below the required relative improvement keep the
+original distribution. See [node-local balancing](NODE_LOCAL_BALANCING.md).
 
 For the reader/sampler path, Trainer-side H2D is a separate slot because CP-specific mask preparation and
 the accelerator copy stream are model-runtime concerns. `DeviceBatchPrefetcher`
@@ -539,9 +539,11 @@ device only for final H2D. Shared metadata mode bypasses payload transport entir
 
 ## Buffered node-local balancing
 
-For automatic Host/H2D double buffering around an existing rank-local loader,
-v1 cost estimation, Gloo node-local LPT balancing and rank-zero DP logs, see
+For automatic Host/H2D buffering around an existing rank-local loader, v1 cost
+estimation, node-local LPT balancing and rank-zero DP logs, see
 [the reference configuration](NODE_LOCAL_BALANCING.md). Supply `model_config`
 to use the default cost, or provide `cost_model`. A custom
 `balancing_algorithm` owns assignment and its scalar objective; Hyper applies
 the shared `min_balance_gain` acceptance threshold before sample exchange.
+Gloo uses a speculative producer thread; HCCL/NCCL keeps data collectives on
+the training thread to preserve ordering with model collectives.
