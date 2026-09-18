@@ -49,6 +49,11 @@ class MetaStepType(Enum):
     FSDP_RESHARD = auto()
     FSDP_REDUCE_GRAD = auto()
     FSDP_WAIT_REDUCE_GRAD = auto()
+    # fsdp_comm_first mode: async all-gather launch at the schedule head
+    # (masked by the VPP warmup bubble) + the blocking wait inserted right
+    # before each chunk's first compute step.
+    FSDP_UNSHARD_ASYNC = auto()
+    FSDP_UNSHARD_WAIT = auto()
     SWAP_SET_GROUP = auto()
     SWAP_LAUNCH_OFFLOAD = auto()
     SWAP_WAIT_OFFLOAD = auto()
@@ -234,6 +239,20 @@ def _exec_fsdp_unshard(stage):
             module.unshard()
 
 
+def _exec_fsdp_unshard_async(stage):
+    """Asynchronously launch the stage's HSDP all-gathers without a host wait."""
+    for _, module in platform.get_cells_and_names(stage.submodule):
+        if isinstance(module, HSDPModule):
+            module.unshard(async_op=True)
+
+
+def _exec_fsdp_unshard_wait(stage):
+    """Wait out the stage's in-flight async all-gathers and swap in unsharded views."""
+    for _, module in platform.get_cells_and_names(stage.submodule):
+        if isinstance(module, HSDPModule):
+            module.wait_for_unshard()
+
+
 def _exec_fsdp_reshard(stage):
     """Reshard every HSDPModule in the stage's submodule tree."""
     for _, module in platform.get_cells_and_names(stage.submodule):
@@ -259,6 +278,8 @@ _FSDP_STEP_HANDLERS = {
     MetaStepType.FSDP_RESHARD: _exec_fsdp_reshard,
     MetaStepType.FSDP_REDUCE_GRAD: _exec_fsdp_reduce_grad,
     MetaStepType.FSDP_WAIT_REDUCE_GRAD: _exec_fsdp_wait_reduce_grad,
+    MetaStepType.FSDP_UNSHARD_ASYNC: _exec_fsdp_unshard_async,
+    MetaStepType.FSDP_UNSHARD_WAIT: _exec_fsdp_unshard_wait,
 }
 
 
@@ -320,11 +341,16 @@ class PipelineScheduleRuntime(ABC):
                  output_concat_dim=None,
                  overlap_p2p=False,
                  swap=False,
-                 p2p_transport="auto"):
+                 p2p_transport="auto",
+                 fsdp_comm_first=False):
         if p2p_transport not in self._P2P_TRANSPORTS:
             raise ValueError(
                 f"p2p_transport must be one of {self._P2P_TRANSPORTS}, got "
                 f"{p2p_transport!r}"
+            )
+        if not isinstance(fsdp_comm_first, bool):
+            raise ValueError(
+                f"fsdp_comm_first should be a bool, got {type(fsdp_comm_first)}"
             )
         self.stages = self._check_stages(stages)
         self.micro_batch_num = micro_batch_num
@@ -339,6 +365,15 @@ class PipelineScheduleRuntime(ABC):
         self._stage_num = self.stages[0].stage_num
         self._stage_to_rank_index = None
         self._overlap_p2p = overlap_p2p
+        # ``fsdp_comm_first``: front-load every local chunk's HSDP parameter
+        # all-gather at the very head of this rank's schedule as async
+        # launches, so the comms are masked by the pipeline warmup bubble
+        # (VPP ranks sit idle waiting for their first activations there).
+        # A blocking wait is injected right before each chunk's first compute
+        # step; resharding happens once at the schedule tail.  Trades peak
+        # memory (all local chunks unsharded concurrently) for removing the
+        # mid-schedule unshard/reshard churn of the default windowed mode.
+        self._fsdp_comm_first = fsdp_comm_first
         self.exec_order = {}
         self._init_stages()
         self._build_stage_to_rank_index()
@@ -444,7 +479,10 @@ class PipelineScheduleRuntime(ABC):
         # micro-batch. The root API applies the setting recursively.
         for stage in self.stages:
             stage.submodule.set_reshard_after_forward(False)
-        rank_actions = add_fsdp_unshard_reshard(self.exec_order[current_rank], managed_stage_indices)
+        if getattr(self, "_fsdp_comm_first", False):
+            rank_actions = add_fsdp_comm_first(self.exec_order[current_rank], managed_stage_indices)
+        else:
+            rank_actions = add_fsdp_unshard_reshard(self.exec_order[current_rank], managed_stage_indices)
         self.exec_order[current_rank] = add_fsdp_reduce_grad(
             rank_actions,
             managed_stage_indices,
@@ -1705,13 +1743,15 @@ class ScheduleGPipe(PipelineScheduleRuntime):
                  args_batch_dim=None,
                  kwargs_batch_dim=None,
                  output_concat_dim=None,
-                 swap=False):
+                 swap=False,
+                 fsdp_comm_first=False):
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
                          kwargs_batch_dim=kwargs_batch_dim,
                          output_concat_dim=output_concat_dim,
-                         swap=swap)
+                         swap=swap,
+                         fsdp_comm_first=fsdp_comm_first)
         self.build_exec_order()
 
     def _build_stage_to_rank_index(self) -> None:
@@ -1749,13 +1789,15 @@ class Schedule1F1B(PipelineScheduleRuntime):
                  args_batch_dim=None,
                  kwargs_batch_dim=None,
                  output_concat_dim=None,
-                 swap=False):
+                 swap=False,
+                 fsdp_comm_first=False):
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
                          kwargs_batch_dim=kwargs_batch_dim,
                          output_concat_dim=output_concat_dim,
-                         swap=swap)
+                         swap=swap,
+                         fsdp_comm_first=fsdp_comm_first)
         self.build_exec_order()
 
     def _build_stage_to_rank_index(self) -> None:
@@ -1843,7 +1885,17 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
       issued once dx and the paired forward finish instead of waiting
       out the full backward.
 
-    The two overlap flags are independent and can be combined.
+    * ``fsdp_comm_first=True`` (HSDP stages only): front-load every
+      local chunk's HSDP parameter all-gather at the very head of the
+      rank's schedule as async launches, so the comms are masked by the
+      warmup bubble (the rank is idle waiting for its first activation
+      recv while the comm stream drains the all-gathers); a blocking
+      wait lands right before each chunk's first compute step and all
+      chunks stay unsharded until one tail reshard.  Trades peak memory
+      (all local chunks unsharded concurrently) for removing the
+      mid-schedule unshard/reshard churn of the default windowed mode.
+
+    The overlap flags are independent and can be combined.
 
     Example:
         >>> # Plain interleaved 1F1B
@@ -1862,7 +1914,8 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
                  overlap_b_f=False,
                  swap=False,
                  enable_dxdw_split=False,
-                 p2p_transport="auto"):
+                 p2p_transport="auto",
+                 fsdp_comm_first=False):
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
@@ -1870,7 +1923,8 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
                          output_concat_dim=output_concat_dim,
                          overlap_p2p=overlap_p2p,
                          swap=swap,
-                         p2p_transport=p2p_transport)
+                         p2p_transport=p2p_transport,
+                         fsdp_comm_first=fsdp_comm_first)
         # _overlap_b_f selects between plain F/B emission and OVERLAP_B_F
         # pairing in the 1F1B steady-state phase.  Must be set before
         # ``construct_stage_exec_order`` is called below.
@@ -2475,6 +2529,74 @@ def add_fsdp_unshard_reshard(actions, managed_stage_indices, max_active_stages=3
 
     while active_stages:
         fsdp_actions.append(MetaStep(None, MetaStepType.FSDP_RESHARD, active_stages.pop(0)))
+    return fsdp_actions
+
+
+def add_fsdp_comm_first(actions, managed_stage_indices):
+    """Front-load every managed chunk's HSDP all-gather at the schedule head.
+
+    ``fsdp_comm_first`` mode for VPP (interleaved) schedules.  The default
+    windowed injection (:func:`add_fsdp_unshard_reshard`) issues a *blocking*
+    unshard a few compute steps ahead of first use, which keeps the comm time
+    on the critical path; and with more local chunks than the lookahead window
+    it re-reshards/re-unshards chunks every round.  This mode instead:
+
+    * emits one ``FSDP_UNSHARD_ASYNC`` per managed chunk at the very head of
+      the rank's order — the launches are non-blocking, so while the rank sits
+      in its warmup bubble waiting for the first activation recv, the comm
+      stream is already draining the all-gathers;
+    * emits an ``FSDP_UNSHARD_WAIT`` immediately before each chunk's first
+      compute action, so compute only stalls if the bubble was shorter than
+      the comm;
+    * keeps every chunk unsharded through the whole run and reshards once at
+      the tail (no mid-schedule churn).
+
+    Trade-off: all local chunks' unsharded parameter buffers are resident
+    concurrently, so peak memory grows with the number of local chunks.
+    Gradient reduction stays where it must be (after each chunk's final
+    backward) and is unaffected.
+
+    Args:
+        actions: The rank's MetaStep list (send/recv + compute).
+        managed_stage_indices: Stage indices owned by this rank that are
+            HSDPModules.
+
+    Returns:
+        The rewritten MetaStep list with head async unshards, pre-compute
+        waits and tail reshards.
+    """
+    if not managed_stage_indices:
+        return actions
+
+    # Chunks in first-compute order (dict preserves insertion order).
+    first_compute_stage_indices = {}
+    for action in actions:
+        for leaf_step in iter_leaf_meta_steps(action):
+            if leaf_step.type not in _COMPUTE_META_STEP_TYPES:
+                continue
+            if leaf_step.stage_index in managed_stage_indices:
+                first_compute_stage_indices.setdefault(leaf_step.stage_index, True)
+
+    fsdp_actions = [
+        MetaStep(None, MetaStepType.FSDP_UNSHARD_ASYNC, stage_index)
+        for stage_index in first_compute_stage_indices
+    ]
+    waited_stage_indices = set()
+    for action in actions:
+        for leaf_step in iter_leaf_meta_steps(action):
+            if leaf_step.type not in _COMPUTE_META_STEP_TYPES:
+                continue
+            if leaf_step.stage_index not in first_compute_stage_indices:
+                continue
+            if leaf_step.stage_index in waited_stage_indices:
+                continue
+            waited_stage_indices.add(leaf_step.stage_index)
+            fsdp_actions.append(
+                MetaStep(None, MetaStepType.FSDP_UNSHARD_WAIT, leaf_step.stage_index)
+            )
+        fsdp_actions.append(action)
+    for stage_index in first_compute_stage_indices:
+        fsdp_actions.append(MetaStep(None, MetaStepType.FSDP_RESHARD, stage_index))
     return fsdp_actions
 
 
