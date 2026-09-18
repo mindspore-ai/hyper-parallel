@@ -16,6 +16,10 @@
 
 from __future__ import annotations
 
+import logging
+from collections import defaultdict
+from typing import Any
+
 from hyper_parallel.codegen.inline.ir import (
     ClassRemovalPatch,
     ConstructorReplacePatch,
@@ -25,20 +29,52 @@ from hyper_parallel.codegen.inline.ir import (
 )
 from hyper_parallel.codegen.inline.specs import replacement_spec
 
+logger = logging.getLogger(__name__)
+
 
 def build_replacement_patches(rules: tuple[InlineRule, ...], model_type: str | None = None) -> InlinePatchSet:
-    """Build constructor replacement patches from ``replace_module`` targets."""
+    """Build constructor replacement patches from ``replace_module`` targets.
+
+    The rule's settled FQNs (``rule.match``, recorded from the same plan the
+    native path applies) define the *scope* of each rewrite: only the
+    ``self.<attr>`` call sites those FQNs name are sunk.  A rule that matched no
+    module is not expanded at all -- generating a replacement the plan never
+    decided would make the artifact diverge from the trained model.
+
+    The plan records one entry per matched FQN, so the entries sharing a
+    ``replace_module`` target must be merged: taking only the first would scope
+    the rewrite to a single matched attribute (``input_layernorm``) and silently
+    leave its siblings (``post_attention_layernorm``, ``model.norm``) on the
+    original class.
+
+    Args:
+        rules: Inline rules recovered from the plan's frozen metadata.
+        model_type: Model family key used to resolve framework declarations.
+
+    Returns:
+        The constructor replacement patches for the matched rules.
+    """
 
     patch_set = InlinePatchSet()
-    seen_targets: set[str] = set()
+    scopes_by_target: dict[str, set[str]] = defaultdict(set)
+    specs_by_target: dict[str, Any] = {}
     for rule in rules:
         target = rule.replace_target
-        if target is None or target in seen_targets:
+        if target is None:
             continue
         spec = replacement_spec(target, model_type, module_type=rule.module_type)
         if spec is None:
             continue
-        seen_targets.add(target)
+        specs_by_target.setdefault(target, spec)
+        scopes_by_target[target].update(_scope_attrs(rule))
+    for target, spec in specs_by_target.items():
+        scope_attrs = tuple(sorted(scopes_by_target[target]))
+        if not scope_attrs:
+            logger.warning(
+                "codegen: replace_module %r matched no module and is not expanded",
+                target,
+            )
+            continue
         patch_set.imports.extend(spec.imports)
         if spec.replacement_note:
             patch_set.module_snippets.append(
@@ -51,6 +87,7 @@ def build_replacement_patches(rules: tuple[InlineRule, ...], model_type: str | N
                 new_ctor=spec.new_ctor,
                 mode=spec.mode,  # type: ignore[arg-type]
                 keyword_args=spec.keyword_args,
+                scope_attrs=scope_attrs,
             )
         )
         if spec.remove_class:
@@ -58,3 +95,15 @@ def build_replacement_patches(rules: tuple[InlineRule, ...], model_type: str | N
                 ClassRemovalPatch(old_name=spec.old_ctor, new_name=spec.new_ctor)
             )
     return patch_set
+
+
+def _scope_attrs(rule: InlineRule) -> tuple[str, ...]:
+    """Attribute names of the rule's settled FQNs, i.e. the rewrite scope.
+
+    ``model.layers.3.post_attention_layernorm`` scopes the rewrite to
+    ``self.post_attention_layernorm = <ctor>(...)`` assignments, which is the
+    granularity native's FQN matching produces.  ``model.norm`` is a sole-name
+    FQN, so the whole FQN is the attribute.
+    """
+
+    return tuple(sorted({fqn.rsplit(".", 1)[-1] for fqn in rule.match if fqn}))

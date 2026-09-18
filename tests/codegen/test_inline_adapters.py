@@ -38,6 +38,7 @@ from hyper_parallel.codegen.inline.specs import replacement_spec, strategy_spec
 from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models import registry
+from tests.common.mark_utils import arg_mark
 
 
 QWEN_ROOT = "hyper_parallel.models.qwen3_moe.adapter."
@@ -118,10 +119,10 @@ def _toy_adapter(name="toy", factory=None) -> ModelAdapterSpec:
     )
 
 
-def _meta(factory=ATTENTION, injections=(), module_type=ATTENTION_TYPE):
+def _meta(factory=ATTENTION, injections=(), module_type=ATTENTION_TYPE, fqns=("blocks.0.proj",)):
     return SimpleNamespace(
         module_overrides=[
-            {"factory": factory, "module_type": module_type, "fqns": ["blocks.0.proj"]}
+            {"factory": factory, "module_type": module_type, "fqns": list(fqns)}
         ],
         injections=list(injections),
         param_plan={"blocks.0.proj": {"params": {"linear_qkv.weight": {"tp": "S(0)"}}}},
@@ -143,8 +144,15 @@ def _execute_source(source):
 class TestInlineAdapters(unittest.TestCase):
     """Exercise structural resolution, coverage enforcement and model-independent emission."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_inline_owned_boundary_retains_sharding_without_double_wrapping(self):
-        """External-state forwards must never access an uninstalled boundary."""
+        """External-state forwards must never access an uninstalled boundary.
+
+        Feature: structure-driven inline source generation.
+        Description: External-state forwards must never access an uninstalled boundary.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
+        """
         attention = {"is_boundary": True, "params": {"q_proj.weight": {"tp": "S(0)"}}}
         linear = {"is_boundary": True, "params": {"weight": {"tp": "S(0)"}}}
         meta = SimpleNamespace(
@@ -161,11 +169,16 @@ class TestInlineAdapters(unittest.TestCase):
         normalize_inline_meta(meta, ())
         self.assertEqual(vars(meta), before)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_legacy_and_explicit_qwen_identity(self):
         """The adapter path infers the family; every alias selects the same spec.
-
         ``module_type`` is the rule's own declared source type, so it travels
         with the lookup rather than being reconstructed from the family name.
+
+        Feature: structure-driven inline source generation.
+        Description: The adapter path infers the family; every alias selects the same spec.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
         """
         legacy = replacement_spec(ATTENTION, module_type=ATTENTION_TYPE)
         self.assertIsNotNone(legacy)
@@ -179,8 +192,15 @@ class TestInlineAdapters(unittest.TestCase):
         self.assertIsNone(strategy_spec(CP))
         self.assertIsNone(strategy_spec(CP, inner_wrapper=True).body_template)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_unknown_identity_does_not_select_qwen(self):
-        """An explicit unsupported identity fails loudly without mutating metadata."""
+        """An explicit unsupported identity fails loudly without mutating metadata.
+
+        Feature: structure-driven inline source generation.
+        Description: An explicit unsupported identity fails loudly without mutating metadata.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
+        """
         meta = _meta()
         before = deepcopy(vars(meta))
         with self.assertRaisesRegex(RuntimeError, "no inline declaration"):
@@ -192,13 +212,27 @@ class TestInlineAdapters(unittest.TestCase):
         self.assertIsNone(replacement_spec("unknown.replace"))
         self.assertIsNone(strategy_spec(None))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_missing_module_type_cannot_name_a_source_class(self):
-        """Without the rule's source type there is no constructor call to target."""
+        """Without the rule's source type there is no constructor call to target.
+
+        Feature: structure-driven inline source generation.
+        Description: Without the rule's source type there is no constructor call to target.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
+        """
         self.assertIsNone(replacement_spec(ATTENTION))
         self.assertIsNone(replacement_spec(ATTENTION, "qwen3_moe"))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_unknown_target_fails_and_ruleless_plan_passes_through(self):
-        """Incomplete coverage fails loudly; a ruleless plan returns the source."""
+        """Incomplete coverage fails loudly; a ruleless plan returns the source.
+
+        Feature: structure-driven inline source generation.
+        Description: Incomplete coverage fails loudly; a ruleless plan returns the source.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
+        """
         meta = _meta(injections=[{"local_compute_fn": "unknown.strategy"}])
         before = deepcopy(vars(meta))
         with self.assertRaisesRegex(RuntimeError, "no inline declaration"):
@@ -208,16 +242,30 @@ class TestInlineAdapters(unittest.TestCase):
         ruleless.module_overrides = []
         self.assertEqual(render_inline_modeling(SOURCE, ruleless), SOURCE)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_both_strategy_targets_require_coverage(self):
-        """Known local compute targets cannot hide unsupported inner wrappers."""
+        """Known local compute targets cannot hide unsupported inner wrappers.
+
+        Feature: structure-driven inline source generation.
+        Description: Known local compute targets cannot hide unsupported inner wrappers.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
+        """
         meta = _meta(injections=[{"local_compute_fn": EP, "inner_wrapper": "unknown.wrapper"}])
         before = deepcopy(vars(meta))
         with self.assertRaisesRegex(RuntimeError, "unknown.wrapper"):
             render_inline_modeling(SOURCE, meta)
         self.assertEqual(vars(meta), before)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_conflicting_strategy_bodies_fail(self):
-        """Two targets cannot silently choose different bodies for one method."""
+        """Two targets cannot silently choose different bodies for one method.
+
+        Feature: structure-driven inline source generation.
+        Description: Two targets cannot silently choose different bodies for one method.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
+        """
         declarations = {
             "first": StrategySpec("one", (), "Block", body_template="return 1"),
             "second": StrategySpec("two", (), "Block", body_template="return 2"),
@@ -230,12 +278,17 @@ class TestInlineAdapters(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Conflicting inline strategies"):
                 build_strategy_patches(rules)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_repeated_rules_share_one_snippet_and_forward_patch(self):
         """One target matched by N rules contributes its snippets once.
-
         A plan freezes one rule per matched FQN, so without dedup a
         module-level snippet (the EP parallel-state accessor) is emitted once
         per layer — 61 identical copies for DeepSeek-V3.
+
+        Feature: structure-driven inline source generation.
+        Description: One target matched by N rules contributes its snippets once.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
         """
         snippet = ModuleSnippetPatch("def helper():\n    return 1")
         declaration = StrategySpec(
@@ -254,8 +307,15 @@ class TestInlineAdapters(unittest.TestCase):
         self.assertEqual(patches.module_snippets, [snippet])
         self.assertEqual(len(patches.forward_extracts), 1)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_qwen_metadata_and_source_remain_compatible(self):
-        """QKV expansion is scoped, independent and stable across re-emission."""
+        """QKV expansion is scoped, independent and stable across re-emission.
+
+        Feature: structure-driven inline source generation.
+        Description: QKV expansion is scoped, independent and stable across re-emission.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
+        """
         source = """
 class Qwen3MoeAttention:
     def forward(self, value):
@@ -272,6 +332,7 @@ class Model:
         meta = _meta(
             injections=[{"local_compute_fn": EP}, {"inner_wrapper": CP}],
             module_type="transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention",
+            fqns=("blocks.0.attn",),
         )
         expected_meta = deepcopy(meta)
         inferred = render_inline_modeling(source, meta)
@@ -314,13 +375,18 @@ class Model:
         ])
         self.assertEqual(render_inline_modeling(source, meta, "qwen3_moe"), explicit)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_family_factories_alone_are_enough(self):
         """A family with only runtime factories resolves, with no codegen code.
-
         This is the acceptance shape: a registered family whose replacement
         provider constructs the generic ``RMSNorm`` needs no declaration at
         all -- the inline pipeline derives the component wiring, the source
         class (from the rule's ``module_type``) and the artifact itself.
+
+        Feature: structure-driven inline source generation.
+        Description: A family with only runtime factories resolves, with no codegen code.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
         """
         adapter = _toy_adapter()
         with (
@@ -329,7 +395,7 @@ class Model:
             patch.dict(registry._DISCOVERED_PROVIDERS, {"toy": adapter.model_type}),
         ):
             registry.register_model_adapter(adapter)
-            meta = _meta(factory=TOY_NORM, module_type=TOY_NORM_TYPE)
+            meta = _meta(factory=TOY_NORM, module_type=TOY_NORM_TYPE, fqns=("blocks.0.norm",))
             meta.model_class = "ToyForCausalLM"
             emitted = _apply_inline_modeling(TOY_SOURCE, meta)
         namespace = _execute_source(emitted)
@@ -340,8 +406,15 @@ class Model:
         self.assertNotIn("Qwen", emitted)
         self.assertTrue(hasattr(namespace["ToyModel"](), "norm"))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_unrecognized_component_is_a_coverage_gap(self):
-        """A factory building a component the framework does not wire fails."""
+        """A factory building a component the framework does not wire fails.
+
+        Feature: structure-driven inline source generation.
+        Description: A factory building a component the framework does not wire fails.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
+        """
         adapter = _toy_adapter(factory=_toy_unknown_factory)
         with (
             patch.dict(registry.MODEL_ADAPTER_REGISTRY),
@@ -356,12 +429,17 @@ class Model:
             with self.assertRaisesRegex(RuntimeError, "no inline declaration"):
                 render_inline_modeling(TOY_SOURCE, meta, "toy")
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_component_kind_selects_the_wiring(self):
         """The same source class wired through different components differs.
-
         Recognition reads the *factory's* component, so two factories that
         both replace ``ToyNorm`` produce different artifacts -- the family
         never names the wiring.
+
+        Feature: structure-driven inline source generation.
+        Description: The same source class wired through different components differs.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
         """
         adapter = _toy_adapter(factory=_toy_grouped_experts_factory)
         with (
@@ -375,20 +453,32 @@ class Model:
         self.assertEqual(spec.mode, "wrap_source")
         self.assertFalse(spec.remove_class)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_incomplete_strategy_declarations_fail(self):
-        """A partial method patch cannot silently count as supported."""
+        """A partial method patch cannot silently count as supported.
+
+        Feature: structure-driven inline source generation.
+        Description: A partial method patch cannot silently count as supported.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
+        """
         with self.assertRaisesRegex(ValueError, "provided together"):
             StrategySpec("invalid", (), target_class="ToyBlock")
         with self.assertRaisesRegex(ValueError, "nonempty"):
             StrategySpec("invalid", (), target_class="ToyBlock", body_template="")
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_declarations_invalidate_cached_artifacts(self):
         """Changing what a target resolves to changes the artifact signature.
-
         The declarations are derived from the family's runtime factories
         (outside the codegen tree), so the signature must fold the *resolved*
         content in: a factory switched to a different generic component must
         regenerate rather than reuse the previous bundle.
+
+        Feature: structure-driven inline source generation.
+        Description: Changing what a target resolves to changes the artifact signature.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
         """
         projection = SimpleNamespace(
             to_dict=lambda: {
@@ -423,8 +513,15 @@ class Model:
             _signature(_toy_rms_norm_factory), _signature(_toy_grouped_experts_factory)
         )
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
     def test_declared_method_name_preserves_original_implementation(self):
-        """Non-forward strategy methods retain an executable original method."""
+        """Non-forward strategy methods retain an executable original method.
+
+        Feature: structure-driven inline source generation.
+        Description: Non-forward strategy methods retain an executable original method.
+        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
+        """
         source = "class Block:\n    def compute(self, value):\n        return value * 2\n"
         patches = InlinePatchSet(forward_extracts=[ForwardExtractPatch(
             "Block", "compute", "return self._forward_impl(value) + 3",
