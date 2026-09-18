@@ -30,6 +30,13 @@ DTensor wrapper are absorbed by :func:`_resolve_class_mesh_dim`.
 
 from __future__ import annotations
 
+__all__ = [
+    "vocab_parallel_cross_entropy_local",
+    "distributed_log_softmax",
+    "distributed_nll_loss_forward",
+    "DistributedCrossEntropyFunction",
+]
+
 from typing import Any, Optional, Tuple, TYPE_CHECKING
 
 import torch
@@ -41,13 +48,6 @@ if TYPE_CHECKING:
     from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 
 platform = get_platform()
-
-__all__ = [
-    "vocab_parallel_cross_entropy_local",
-    "distributed_log_softmax",
-    "distributed_nll_loss_forward",
-    "DistributedCrossEntropyFunction",
-]
 
 
 def _validate_target_type_base(is_floating: bool) -> None:
@@ -196,8 +196,7 @@ def distributed_nll_loss_forward(
 
     target_mask = (target_flat >= vocab_start) & (target_flat < vocab_end)
 
-    ignore_mask = target_flat != ignore_index
-    target_mask = target_mask & ignore_mask
+    target_mask = target_mask & (target_flat != ignore_index)
 
     if reduction == "none":
         loss = torch.zeros(batch_size, dtype=log_probs.dtype, device=log_probs.device)
@@ -209,15 +208,12 @@ def distributed_nll_loss_forward(
     if target_mask.any():
         local_target = target_flat[target_mask] - vocab_start
 
-        log_probs_2d = log_probs.reshape(-1, log_probs.shape[-1])
-
-        row_indices = torch.where(target_mask)[0]
-
-        selected_log_probs = log_probs_2d[row_indices, local_target]
+        selected_log_probs = log_probs.reshape(-1, log_probs.shape[-1])[
+            torch.where(target_mask)[0], local_target
+        ]
 
         if weight is not None:
-            global_target = target_flat[target_mask]
-            sample_weights = weight[global_target]
+            sample_weights = weight[target_flat[target_mask]]
             selected_log_probs = selected_log_probs * sample_weights
             total_weight = sample_weights.sum().reshape(1)
         else:
@@ -225,16 +221,16 @@ def distributed_nll_loss_forward(
                 target_mask.sum().item(), dtype=log_probs.dtype, device=log_probs.device
             ).reshape(1)
 
-        nll = -selected_log_probs
+        selected_log_probs = -selected_log_probs
 
         if reduction == "none":
-            loss_flat = torch.zeros(batch_size, dtype=log_probs.dtype, device=log_probs.device)
-            loss_flat[target_mask] = nll
-            loss = loss_flat.reshape(target.shape)
+            loss = torch.zeros(batch_size, dtype=log_probs.dtype, device=log_probs.device)
+            loss[target_mask] = selected_log_probs
+            loss = loss.reshape(target.shape)
         elif reduction == "sum":
-            loss = nll.sum().unsqueeze(0)
+            loss = selected_log_probs.sum().unsqueeze(0)
         else:
-            loss = nll.sum().unsqueeze(0)
+            loss = selected_log_probs.sum().unsqueeze(0)
     else:
         if reduction == "none":
             loss = torch.zeros(

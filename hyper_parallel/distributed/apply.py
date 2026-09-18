@@ -53,6 +53,46 @@ from hyper_parallel.distributed._builder.parameter_sharding import (
 )
 
 
+def _prepare_sharding_meshes(
+    model: Any,
+    plan: ShardingPlan,
+    mesh: Any,
+) -> Tuple[Any, Any, Any, Any, Any]:
+    """Resolve active and parameter source meshes before plan application."""
+    # Lazy import: components.distributed.__init__ re-exports this module, so
+    # a module-level import of the mesh module would cycle through the
+    # package __init__.
+    from hyper_parallel.distributed.mesh import (  # pylint: disable=C0415
+        MeshContext,
+    )
+    mesh_context = mesh if isinstance(mesh, MeshContext) else None
+    if mesh_context is None:
+        device_mesh = mesh
+    else:
+        device_mesh = mesh_context.device_mesh
+    if device_mesh is None:
+        raise ValueError("apply_sharding_plan requires a DeviceMesh")
+
+    mesh_dim_names = plan.mesh_dim_names
+    # Active sub-mesh: the planner strips size=1 axes (plan.mesh_dim_names), but the
+    # passed-in mesh may still contain those axes -- placements are resolved against
+    # plan.mesh_dim_names, so the dimensionality must align with the mesh, otherwise
+    # distribute_tensor will silently shard along the wrong axis.
+    full_mesh = device_mesh
+    active_mesh = _get_active_mesh(device_mesh, mesh_dim_names)
+    tp_mesh = _get_tp_submesh(active_mesh, mesh_dim_names)
+    models = model if isinstance(model, list) else [model]
+
+    # Explicit-injection guard: CP/EP sharding without an explicit compute
+    # injection fails fast here, BEFORE any parameter is touched
+    _preflight_compute_injection(plan, active_mesh, model=models[0])
+
+    expert_mesh, dense_source_mesh, expert_source_mesh = (
+        _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh)
+    )
+    return active_mesh, models, expert_mesh, dense_source_mesh, expert_source_mesh
+
+
 def apply_sharding_plan(
     model: Any,
     plan: ShardingPlan,
@@ -80,36 +120,8 @@ def apply_sharding_plan(
       experts from the expert mesh);
     - validate: no unwrap (parameters remain DTensors); source_shard_info is None.
     """
-    # Lazy import: components.distributed.__init__ re-exports this module, so
-    # a module-level import of the mesh module would cycle through the
-    # package __init__.
-    from hyper_parallel.distributed.mesh import (  # pylint: disable=C0415
-        MeshContext,
-    )
-    mesh_context = mesh if isinstance(mesh, MeshContext) else None
-    if mesh_context is None:
-        device_mesh = mesh
-    else:
-        device_mesh = mesh_context.device_mesh
-    if device_mesh is None:
-        raise ValueError("apply_sharding_plan requires a DeviceMesh")
-
-    mesh_dim_names = plan.mesh_dim_names
-    # Active sub-mesh: the planner strips size=1 axes (plan.mesh_dim_names), but the
-    # passed-in mesh may still contain those axes -- placements are resolved against
-    # plan.mesh_dim_names, so the dimensionality must align with the mesh, otherwise
-    # distribute_tensor will silently shard along the wrong axis.
-    full_mesh = device_mesh
-    mesh = _get_active_mesh(device_mesh, mesh_dim_names)
-    tp_mesh = _get_tp_submesh(mesh, mesh_dim_names)
-    models = model if isinstance(model, list) else [model]
-
-    # Explicit-injection guard: CP/EP sharding without an explicit compute
-    # injection fails fast here, BEFORE any parameter is touched
-    _preflight_compute_injection(plan, mesh, model=models[0])
-
-    expert_mesh, dense_source_mesh, expert_source_mesh = (
-        _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh)
+    mesh, models, expert_mesh, dense_source_mesh, expert_source_mesh = (
+        _prepare_sharding_meshes(model, plan, mesh)
     )
 
     # ====== Phase 0: normalize out_src/out_dst scalar shorthand (idempotent, covers user-injected paths) ======

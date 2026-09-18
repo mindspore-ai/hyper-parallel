@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 def _get_dim_module():
     """Lazy-import the sapp_nd dimensions module."""
     import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as dim_mod  # pylint: disable=C0415
@@ -76,6 +77,7 @@ def _search_dim_map():
         # so mapping it here is what lets ND search that dimension.
         "data_parallel_shard_degree": dim_mod.OP,
     }
+
 
 def _validate_before_search(config: NormalizedConfig) -> None:
     """Check required model fields are populated (>0) before search.
@@ -131,20 +133,9 @@ def _build_model_dict(model: Dict[str, Any]) -> Dict[str, Any]:
     return model_dict
 
 
-def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
-    """Build an AutoModels-shaped cost-model YAML dict from *config*.
-
-    Fixed dimensions (``constraint.fixed_*_degree``) are written directly
-    into the strategy sections. Dimensions with search-space candidates
-    use the first candidate as a placeholder -- the actual search is driven
-    by the ``dimensions`` parameter passed to :class:`Parallelize`.
-    """
-    model = config.model_spec
-    constraint = config.constraint
-    space = config.search_space
-
+def _build_strategy_dicts(config: NormalizedConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Build the ``accelerator`` and ``fsdp_config`` sections of the HP YAML."""
     accel: Dict[str, Any] = {}
-    fsdp: Dict[str, Any] = {}
 
     # Fixed dimensions -- write actual value.
     fixed_map = {
@@ -156,19 +147,12 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
         "fixed_etp_degree": ("expert_tensor_parallel_degree", "expert_tensor_parallel_degree", [0]),
     }
     for constraint_key, (accel_key, space_key, default) in fixed_map.items():
-        fixed_val = constraint.get(constraint_key)
+        fixed_val = config.constraint.get(constraint_key)
         if fixed_val is not None and fixed_val > 0:
             accel[accel_key] = fixed_val
         else:
-            candidates = space.get(space_key, default)
+            candidates = config.search_space.get(space_key, default)
             accel[accel_key] = candidates[0]
-
-    fixed_fsdp = constraint.get("fixed_fsdp_degree")
-    fsdp_candidates = space.get("data_parallel_shard_degree", [1])
-    fsdp["dp_shard_size"] = int(
-        fixed_fsdp if fixed_fsdp is not None and fixed_fsdp > 0
-        else fsdp_candidates[0]
-    )
 
     # CP algorithm: propagate to yaml so CostModelParserHyperV2 can read it.
     cp_algo = config.estimator.get("cp_algo")
@@ -176,12 +160,34 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
         accel["context_parallel_algo"] = cp_algo
 
     # Optional accelerator fields that affect memory estimation.
-    owss = model.get("optimizer_weight_shard_size")
+    owss = config.model_spec.get("optimizer_weight_shard_size")
     if owss and owss > 0:
         accel["optimizer_weight_shard_size"] = owss
 
-    use_sp = model.get("use_seq_parallel", True)
+    use_sp = config.model_spec.get("use_seq_parallel", True)
     accel.setdefault("sequence_parallel", bool(use_sp))
+    fixed_fsdp = config.constraint.get("fixed_fsdp_degree")
+    fsdp_candidates = config.search_space.get("data_parallel_shard_degree", [1])
+    fsdp = {
+        "dp_shard_size": int(
+            fixed_fsdp if fixed_fsdp is not None and fixed_fsdp > 0
+            else fsdp_candidates[0]
+        )
+    }
+    return accel, fsdp
+
+
+def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
+    """Build an AutoModels-shaped cost-model YAML dict from *config*.
+
+    Fixed dimensions (``constraint.fixed_*_degree``) are written directly
+    into the strategy sections. Dimensions with search-space candidates
+    use the first candidate as a placeholder -- the actual search is driven
+    by the ``dimensions`` parameter passed to :class:`Parallelize`.
+    """
+    model = config.model_spec
+    constraint = config.constraint
+    accel, fsdp = _build_strategy_dicts(config)
 
     recompute = config.estimator.get("recompute_strategy", "none")
 

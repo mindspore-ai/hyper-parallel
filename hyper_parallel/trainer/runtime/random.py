@@ -28,6 +28,7 @@ from transformers import set_seed as set_seed_func
 from hyper_parallel.models.build_options import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 if IS_NPU_AVAILABLE:
+    # Importing torch_npu preserves its torch.npu and HCCL registrations.
     import torch_npu  # noqa: F401
 
 

@@ -31,6 +31,7 @@ from hyper_parallel.distributed.tensor_parallel.param_role import (
     _match_any,
 )
 
+
 def _shard_gated_delta(module, param_name, mesh):
     """Custom TP sharding skeleton for gated_delta modules (SSM/Mamba-style
     modules, 05 §6.4.6).

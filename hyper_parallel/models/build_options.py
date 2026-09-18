@@ -27,6 +27,19 @@ device API (synchronize, cache/RNG management, ...) lives in
 ``hyper_parallel.trainer.runtime.device`` and re-uses these primitives.
 """
 
+__all__ = [
+    "CompileConfig",
+    "FSDP2Config",
+    "FSDP2MixedPrecisionConfig",
+    "ModelBuildOptions",
+    "normalize_build_options",
+    "IS_CUDA_AVAILABLE",
+    "IS_NPU_AVAILABLE",
+    "get_device_type",
+    "get_torch_device",
+    "get_device_id",
+]
+
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -279,17 +292,3 @@ def normalize_build_options(
         "build options must be a ModelBuildOptions, a mapping, or None; "
         f"got {type(value).__name__}"
     )
-
-
-__all__ = [
-    "CompileConfig",
-    "FSDP2Config",
-    "FSDP2MixedPrecisionConfig",
-    "ModelBuildOptions",
-    "normalize_build_options",
-    "IS_CUDA_AVAILABLE",
-    "IS_NPU_AVAILABLE",
-    "get_device_type",
-    "get_torch_device",
-    "get_device_id",
-]

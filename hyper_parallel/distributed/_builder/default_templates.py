@@ -307,6 +307,24 @@ def _placement_for_role(
     return None
 
 
+def _build_param_placements(
+    boundary_fqn: str, group: List[Tuple[str, ParamRole]],
+    template: ShardingTemplate, has_tp: bool, has_ep: bool,
+    param_ndims: Optional[Dict[str, int]],
+) -> Dict[str, NamedPlacement]:
+    """Build relative parameter paths and their resolved placements."""
+    params = {}
+    for param_fqn, role in group:
+        param_path = param_fqn[len(boundary_fqn) + 1:]
+        ndim = (param_ndims or {}).get(param_fqn, 2)
+        placement = _placement_for_role(
+            param_path, role, template, has_tp, has_ep, ndim=ndim,
+        )
+        if placement is not None:
+            params[param_path] = placement
+    return params
+
+
 def _build_spec_from_template(
     templates, boundary_fqn: str, group: List[Tuple[str, ParamRole]],
     template: ShardingTemplate, sequence_parallel: bool, loss_parallel: bool,
@@ -319,16 +337,9 @@ def _build_spec_from_template(
     # The derived spec is materialized directly with concrete dicts (None
     # is the "undeclared" semantics on the override input side; derived
     # artifacts always hold concrete values).
-    spec = ModuleShardingSpec(params={})
-
-    # Step 1: fill spec.params per ParamRole
-    for param_fqn, role in group:
-        param_path = param_fqn[len(boundary_fqn) + 1:]
-        ndim = (param_ndims or {}).get(param_fqn, 2)
-        placement = _placement_for_role(param_path, role, template,
-                                             has_tp, has_ep, ndim=ndim)
-        if placement is not None:
-            spec.params[param_path] = placement
+    spec = ModuleShardingSpec(params=_build_param_placements(
+        boundary_fqn, group, template, has_tp, has_ep, param_ndims,
+    ))
 
     # Step 2: select the I/O contract per the SP switch (deep copy, so
     # chain propagation cannot dirty the shared templates)

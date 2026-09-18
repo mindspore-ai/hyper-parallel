@@ -22,6 +22,8 @@ plan §1195-1196). The mesh objects themselves are AutoModels-side in
 ``hyper_parallel.distributed.mesh``.
 """
 
+__all__ = ["all_gather", "all_reduce"]
+
 import logging
 import os
 from typing import TYPE_CHECKING, Any, List, Literal, Optional, Union
@@ -72,7 +74,10 @@ def all_reduce(
         "max": dist.ReduceOp.MAX,
         "min": dist.ReduceOp.MIN,
     }
-    dist.all_reduce(data, op=reduce_ops[op], group=group)
+    reduce_op = reduce_ops.get(op)
+    if reduce_op is None:
+        raise ValueError("op must be one of: mean, sum, max, min")
+    dist.all_reduce(data, op=reduce_op, group=group)
     if op == "mean":  # ReduceOp.AVG is not supported by the NPU backend
         data /= dist.get_world_size(group=group)
 
@@ -81,7 +86,6 @@ def all_reduce(
     return data.tolist()
 
 
-__all__ = ["all_gather", "all_reduce"]
 def get_world_size_safe() -> int:
     """Return dist.get_world_size() if initialized, else 1."""
     if dist.is_initialized():
@@ -101,6 +105,8 @@ def get_local_rank_safe() -> int:
     if dist.is_initialized():
         return dist.get_node_local_rank()
     return 0
+
+
 def initialize_distributed(backend: str = "nccl") -> Any:
     """Initialize torch.distributed process group.
 
@@ -130,21 +136,14 @@ def initialize_distributed(backend: str = "nccl") -> Any:
     return dist
 
 
-def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
-    """Create DistributedSetup and build the configured mesh domains."""
-    accel = cfg.accelerator if cfg is not None and hasattr(cfg, "accelerator") else None
-    if accel is None:
-        return DistributedSetup(mesh_context=MeshContext())
-
-    fsdp_config = cfg.fsdp_config
-    dp_shard_size = max(1, fsdp_config.dp_shard_size)
-    edp_shard_size = max(1, fsdp_config.edp_shard_size)
-    tp_size = max(1, accel.tp_size)
-    cp_size = max(1, accel.cp_size)
-    pp_size = max(1, accel.pp_size)
-    ep_size = max(1, accel.ep_size)
-
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
+def _resolve_data_parallel_sizes(
+    world_size: int,
+    tp_size: int,
+    cp_size: int,
+    pp_size: int,
+    dp_shard_size: int,
+) -> tuple[int, int]:
+    """Validate parallel sizes and return DP and replicated-DP sizes."""
     non_dp_size = tp_size * cp_size * pp_size
     if world_size % non_dp_size != 0:
         raise ValueError(
@@ -158,28 +157,11 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
             f"{fsdp_data_parallel_size} is not divisible by FSDP shard size "
             f"{dp_shard_size}"
         )
-    dp_replicate_size = fsdp_data_parallel_size // dp_shard_size
-    mesh_context = MeshContext(
-        dp_size=dp_size,
-        dp_replicate_size=dp_replicate_size,
-        dp_shard_size=dp_shard_size,
-        edp_shard_size=edp_shard_size,
-        tp_size=tp_size,
-        cp_size=cp_size,
-        pp_size=pp_size,
-        ep_size=ep_size,
-        sequence_parallel=bool(accel.sequence_parallel),
-        loss_parallel=bool(accel.loss_parallel),
-    )
-    if dist.is_initialized():
-        mesh_context, _ = _build_device_mesh_from_accelerator(
-            accel,
-            dp_shard_size,
-            dp_replicate_size,
-            world_size,
-            edp_shard_size,
-        )
+    return dp_size, fsdp_data_parallel_size // dp_shard_size
 
+
+def _populate_mesh_ranks(mesh_context: MeshContext, dp_shard_size: int) -> None:
+    """Populate local mesh ranks after device-mesh construction."""
     def _local_rank(dim: str) -> int:
         if (
             mesh_context.device_mesh is None
@@ -211,6 +193,52 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
         if mesh_context.fsdp_moe_mesh is not None
         else 0
     )
+
+
+def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
+    """Create DistributedSetup and build the configured mesh domains."""
+    accel = cfg.accelerator if cfg is not None and hasattr(cfg, "accelerator") else None
+    if accel is None:
+        return DistributedSetup(mesh_context=MeshContext())
+
+    fsdp_config = cfg.fsdp_config
+    dp_shard_size = max(1, fsdp_config.dp_shard_size)
+    edp_shard_size = max(1, fsdp_config.edp_shard_size)
+    tp_size = max(1, accel.tp_size)
+    cp_size = max(1, accel.cp_size)
+    pp_size = max(1, accel.pp_size)
+    ep_size = max(1, accel.ep_size)
+
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    dp_size, dp_replicate_size = _resolve_data_parallel_sizes(
+        world_size,
+        tp_size,
+        cp_size,
+        pp_size,
+        dp_shard_size,
+    )
+    mesh_context = MeshContext(
+        dp_size=dp_size,
+        dp_replicate_size=dp_replicate_size,
+        dp_shard_size=dp_shard_size,
+        edp_shard_size=edp_shard_size,
+        tp_size=tp_size,
+        cp_size=cp_size,
+        pp_size=pp_size,
+        ep_size=ep_size,
+        sequence_parallel=bool(accel.sequence_parallel),
+        loss_parallel=bool(accel.loss_parallel),
+    )
+    if dist.is_initialized():
+        mesh_context, _ = _build_device_mesh_from_accelerator(
+            accel,
+            dp_shard_size,
+            dp_replicate_size,
+            world_size,
+            edp_shard_size,
+        )
+
+    _populate_mesh_ranks(mesh_context, dp_shard_size)
 
     fsdp_enabled = dist.is_initialized() and (
         dp_shard_size > 1 or dp_replicate_size > 1 or edp_shard_size > 1

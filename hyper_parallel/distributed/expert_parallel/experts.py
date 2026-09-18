@@ -233,23 +233,21 @@ def _prepare_ep_dispatch(
 ) -> _EPDispatch:
     """Sort routed tokens and exchange per-rank dispatch counts."""
     flattened_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-    token_count = flattened_states.shape[0]
-    experts_per_token = topk_indices.shape[1]
-    expert_indices = topk_indices.reshape(-1)
-    expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
     source_indices = torch.arange(
-        token_count, device=flattened_states.device
-    ).repeat_interleave(experts_per_token)
-    destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
-    dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort()
+        flattened_states.shape[0], device=flattened_states.device
+    ).repeat_interleave(topk_indices.shape[1])
+    topk_indices = topk_indices.reshape(-1)
+    topk_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
+    destination_ranks = torch.div(topk_indices, local_expert_count, rounding_mode="floor")
+    dispatch_order = (destination_ranks * global_expert_count + topk_indices).argsort()
     dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
-    dispatched_indices = expert_indices[dispatch_order].unsqueeze(-1).contiguous()
+    dispatched_indices = topk_indices[dispatch_order].unsqueeze(-1).contiguous()
     send_counts_tensor = torch.bincount(destination_ranks, minlength=ep_size)
     receive_counts_tensor = torch.empty_like(send_counts_tensor)
     dist.all_to_all_single(receive_counts_tensor, send_counts_tensor, group=ep_group)
     return _EPDispatch(
         source_indices=source_indices,
-        expert_weights=expert_weights,
+        expert_weights=topk_weights,
         dispatch_order=dispatch_order,
         states=dispatched_states,
         expert_indices=dispatched_indices,

@@ -142,12 +142,13 @@ def _validate_required_compute_parameters(
 ) -> None:
     """Require the compute function to accept every required forward parameter."""
     fn_names = {param.name for param in fn_params}
-    required = [
-        param.name
-        for param in fwd_params
-        if param.default is inspect.Parameter.empty
-        and param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-    ]
+    required = []
+    for param in fwd_params:
+        if param.default is not inspect.Parameter.empty:
+            continue
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        required.append(param.name)
     missing = [name for name in required if name not in fn_names]
     if missing:
         raise TypeError(
@@ -281,8 +282,8 @@ def _install_bias_suppression(module, spec):
             inside the region sees a bias-free Linear.
             """
             bias = __owner.bias
+            __owner._parameters["bias"] = None  # pylint: disable=protected-access
             try:
-                __owner._parameters["bias"] = None  # pylint: disable=protected-access
                 return __original(*args, **kwargs)
             finally:
                 __owner._parameters["bias"] = bias  # pylint: disable=protected-access
@@ -504,6 +505,16 @@ def _normalize_placements_ndim(placements, ndim):
     return tuple(out)
 
 
+def _validate_output_placement(tensor, expected_named, mesh_dim_names, module_name, stage):
+    """Validate one DTensor output's declared placement."""
+    ndim = len(tensor.shape)
+    expected = _normalize_placements_ndim(
+        tuple(resolve_placements(expected_named, mesh_dim_names)), ndim)
+    actual = _normalize_placements_ndim(tuple(tensor.placements), ndim)
+    if expected != actual:
+        raise PlacementMismatchError(module_name, expected, actual, stage)
+
+
 def _validate_outputs(outputs, spec, mesh_dim_names, module_name, stage):
     """Placement validation for single/multi outputs (shared by out_src / out_dst).
 
@@ -527,15 +538,9 @@ def _validate_outputs(outputs, spec, mesh_dim_names, module_name, stage):
         tensor = items[idx]
         if not isinstance(tensor, DTensor):
             continue
-        ndim = len(tensor.shape)
-        expected = _normalize_placements_ndim(
-            tuple(resolve_placements(expected_named, mesh_dim_names)), ndim)
-        actual = _normalize_placements_ndim(tuple(tensor.placements), ndim)
-        if expected != actual:
-            suffix = f"[{out_name}]" if len(declared) > 1 else ""
-            raise PlacementMismatchError(
-                module_name, expected, actual, f"{stage}{suffix}"
-            )
+        suffix = f"[{out_name}]" if len(declared) > 1 else ""
+        _validate_output_placement(
+            tensor, expected_named, mesh_dim_names, module_name, f"{stage}{suffix}")
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -938,18 +943,35 @@ def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
         module, spec, cp_mesh, mesh, tp_mesh=tp_mesh, ep_mesh=ep_mesh)
     if resolved is None:
         return None
-    name, target, apply_fn = resolved
-    if validate_mode and getattr(spec, "region_dispatch", None) is False:
-        # A black-box inner wrapper receives local tensors and local parameter
-        # shards in validate mode. Cached head counts must therefore match the
-        # TP-local projection widths, just as they already do in production.
-        maybe_update_head_counts(
-            target,
-            spec,
-            module_fqn or type(module).__name__,
-            mesh,
-            mesh_dim_names,
-        )
+    name, target = _apply_resolved_inner_wrapper(
+        module, resolved, spec, mesh, mesh_dim_names, validate_mode, module_fqn)
+    target_name = _inner_target_name(module, target)
+    if spec is not None:
+        spec._resolved_inner_wrapper = name  # pylint: disable=protected-access
+        spec._resolved_inner_target = target_name  # pylint: disable=protected-access
+    if name == "custom":
+        source = "custom callable"
+    elif spec is not None and isinstance(
+            getattr(spec, "inner_wrapper", None), str):
+        source = "explicitly specified (registry)"
+    else:
+        source = "explicitly specified (Target)"
+    logger.info("inner-wrap: %s target=%s <- wrapper %r (%s)",
+                type(module).__name__, target_name, name, source)
+    return name
+
+
+def _rollback_inner_rewrite(target, saved_state, committed_secondaries):
+    """Restore primary and secondary targets after a failed inner rewrite."""
+    for secondary_target, secondary_state in reversed(committed_secondaries):
+        for attr, saved in secondary_state.items():
+            _restore_attr(secondary_target, attr, saved)
+    for attr, saved in saved_state.items():
+        _restore_attr(target, attr, saved)
+
+
+def _prepare_inner_rewrite(target, apply_fn, name):
+    """Apply an inner wrapper and retain the state needed for rollback."""
     orig_forward = target.forward
     # Record the pre-rewrite state for failure rollback: an in-place wrapper
     # writes an instance attribute, so __dict__ holds the full mutation.
@@ -984,6 +1006,33 @@ def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
                 setattr(target, attr, value)
             new_forward = primary.forward
             replaced = True
+    except Exception:
+        _rollback_inner_rewrite(
+            target, saved_state, committed_secondaries)
+        raise
+    return (orig_forward, new_forward, replaced, saved_state,
+            committed_secondaries)
+
+
+def _apply_resolved_inner_wrapper(module, resolved, spec, mesh, mesh_dim_names,
+                                  validate_mode, module_fqn):
+    """Apply, validate, and atomically install a resolved inner wrapper."""
+    name, target, apply_fn = resolved
+    if validate_mode and getattr(spec, "region_dispatch", None) is False:
+        # A black-box inner wrapper receives local tensors and local parameter
+        # shards in validate mode. Cached head counts must therefore match the
+        # TP-local projection widths, just as they already do in production.
+        maybe_update_head_counts(
+            target,
+            spec,
+            module_fqn or type(module).__name__,
+            mesh,
+            mesh_dim_names,
+        )
+    (orig_forward, new_forward, replaced, saved_state,
+     committed_secondaries) = _prepare_inner_rewrite(
+         target, apply_fn, name)
+    try:
         if replaced:
             # Principle 1: the replaced forward must accept all inputs of the
             # original forward
@@ -999,28 +1048,10 @@ def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
                 target, new_forward, module, spec, mesh, mesh_dim_names, name,
                 validate_mode=validate_mode)
     except Exception:
-        # Failure rollback: restore every attribute written during the
-        # rewrite so a half-installed wrapper never survives.
-        for secondary_target, secondary_state in reversed(committed_secondaries):
-            for attr, saved in secondary_state.items():
-                _restore_attr(secondary_target, attr, saved)
-        for attr, saved in saved_state.items():
-            _restore_attr(target, attr, saved)
+        _rollback_inner_rewrite(
+            target, saved_state, committed_secondaries)
         raise
-    target_name = _inner_target_name(module, target)
-    if spec is not None:
-        spec._resolved_inner_wrapper = name  # pylint: disable=protected-access
-        spec._resolved_inner_target = target_name  # pylint: disable=protected-access
-    if name == "custom":
-        source = "custom callable"
-    elif spec is not None and isinstance(
-            getattr(spec, "inner_wrapper", None), str):
-        source = "explicitly specified (registry)"
-    else:
-        source = "explicitly specified (Target)"
-    logger.info("inner-wrap: %s target=%s <- wrapper %r (%s)",
-                type(module).__name__, target_name, name, source)
-    return name
+    return name, target
 
 
 # ────────────────────────────────────────────────────────────────────────────

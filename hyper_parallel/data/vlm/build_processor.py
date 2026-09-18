@@ -14,6 +14,8 @@
 # ============================================================================
 """Build the VLM processor."""
 
+__all__ = ["build_processor"]
+
 from typing import Any
 
 from transformers import AutoProcessor
@@ -42,6 +44,3 @@ def build_processor(pretrained_model_name_or_path: str, **kwargs: Any) -> Any:
         if tokenizer_chat_template is not None:
             processor.chat_template = tokenizer_chat_template
     return processor
-
-
-__all__ = ["build_processor"]

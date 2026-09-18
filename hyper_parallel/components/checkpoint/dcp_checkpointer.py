@@ -222,12 +222,12 @@ class _ModelStrictLoadPlanner(StandardLoadPlanner):
 
 def _optimizer_parameters(optimizer: Any) -> List[torch.Tensor]:
     """Return trainable parameters managed by an optimizer."""
-    return [
-        param
-        for group in optimizer.param_groups
-        for param in group["params"]
-        if param.requires_grad
-    ]
+    parameters = []
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param.requires_grad:
+                parameters.append(param)
+    return parameters
 
 
 def _prime_optimizer_state(

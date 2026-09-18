@@ -37,6 +37,34 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.data.parallel.dataloader_parallel import DataLoaderParallelContext
 
 
+def _pad_batch_for_cp(batch: dict[str, Any], pad_len: int) -> dict[str, Any]:
+    """Pad sequence-dimension tensor fields for context parallelism."""
+    padded = dict(batch)
+    if pad_len <= 0:
+        return padded
+
+    pad_values = {"labels": -100, "input_ids": 0, "attention_mask": 0}
+    for key, value in batch.items():
+        if key == "qkv_format" or not isinstance(value, torch.Tensor) or value.ndim < 1:
+            continue
+        if key in ("seq_lens", "seq_lens_padded"):
+            continue  # recomputed separately, not padded
+        if key == "position_ids":
+            # position_ids increment-pad: continue incrementing from the last value
+            last = value[..., -1:].to(torch.long)
+            increment = torch.arange(1, pad_len + 1, device=value.device,
+                                     dtype=value.dtype)
+            increment = increment.reshape(*([1] * (value.ndim - 1)), pad_len)
+            pad_block = increment.expand(*value.shape[:-1], pad_len) + last
+        else:
+            shape = list(value.shape)
+            shape[-1] = pad_len
+            pad_block = torch.full(shape, pad_values.get(key, 0),
+                                   dtype=value.dtype, device=value.device)
+        padded[key] = torch.cat([value, pad_block], dim=-1)
+    return padded
+
+
 def shard_batch_for_cp(batch: dict[str, Any], cp_mesh: DeviceMesh) -> dict[str, Any]:
     """Shard the sequence-dim tensors of a batch along the CP mesh
     (05 §6.3.4 canonical).
@@ -63,27 +91,7 @@ def shard_batch_for_cp(batch: dict[str, Any], cp_mesh: DeviceMesh) -> dict[str, 
     hi = lo + chunk
     slc = slice(lo, hi)
 
-    pad_values = {"labels": -100, "input_ids": 0, "attention_mask": 0}
-    padded = dict(batch)
-    if pad_len > 0:
-        for k, v in batch.items():
-            if k == "qkv_format" or not isinstance(v, torch.Tensor) or v.ndim < 1:
-                continue
-            if k in ("seq_lens", "seq_lens_padded"):
-                continue  # recomputed separately, not padded
-            if k == "position_ids":
-                # position_ids increment-pad: continue incrementing from the last value
-                last = v[..., -1:].to(torch.long)
-                inc = torch.arange(1, pad_len + 1, device=v.device,
-                                   dtype=v.dtype)
-                inc = inc.reshape(*([1] * (v.ndim - 1)), pad_len)
-                pad_block = inc.expand(*v.shape[:-1], pad_len) + last
-            else:
-                shape = list(v.shape)
-                shape[-1] = pad_len
-                pad_block = torch.full(shape, pad_values.get(k, 0),
-                                       dtype=v.dtype, device=v.device)
-            padded[k] = torch.cat([v, pad_block], dim=-1)
+    padded = _pad_batch_for_cp(batch, pad_len)
 
     out = {}
     for k, v in padded.items():
@@ -104,6 +112,28 @@ def shard_batch_for_cp(batch: dict[str, Any], cp_mesh: DeviceMesh) -> dict[str, 
     return out
 
 
+def _shard_seq_lens_row(row_lens, row_padded, lo, hi):
+    """Recompute one sample's pack lengths inside a CP shard."""
+    local_lens, local_padded = [], []
+    offset = 0
+    for raw_len, raw_pad in zip(row_lens, row_padded):
+        if raw_len == -1000:
+            break
+        pack_start = offset
+        pack_end = offset + raw_pad
+        offset = pack_end
+        inter_start = max(pack_start, lo)
+        inter_end = min(pack_end, hi)
+        if inter_start >= inter_end:
+            continue
+        local_actual = max(min(pack_start + raw_len, hi) - max(pack_start, lo), 0)
+        local_pad = inter_end - inter_start
+        if local_actual > 0 or local_pad > 0:
+            local_lens.append(local_actual)
+            local_padded.append(local_pad)
+    return local_lens, local_padded
+
+
 def _shard_seq_lens_for_cp(seq_lens, seq_lens_padded, *, cp_rank: int, chunk: int):
     """Recompute seq_lens/seq_lens_padded per CP shard (preserving the -1000
     sentinel semantics).
@@ -117,36 +147,15 @@ def _shard_seq_lens_for_cp(seq_lens, seq_lens_padded, *, cp_rank: int, chunk: in
     The output is shifted to the local coordinate system; when
     max_local_packs=0 it is set to 1 to avoid an empty tensor.
     """
-    batch_size = seq_lens.shape[0]
     lo = cp_rank * chunk
     hi = lo + chunk
-    device = seq_lens.device
-    sentinel = -1000
 
     local_lens_b, local_lens_padded_b = [], []
     max_local_packs = 0
-    for b in range(batch_size):
-        row_lens = seq_lens[b].tolist()
-        row_padded = seq_lens_padded[b].tolist()
-        local_lens, local_padded = [], []
-        offset = 0
-        for raw_len, raw_pad in zip(row_lens, row_padded):
-            if raw_len == sentinel:
-                break
-            pack_start = offset
-            pack_end = offset + raw_pad
-            offset = pack_end
-            inter_start = max(pack_start, lo)
-            inter_end = min(pack_end, hi)
-            if inter_start >= inter_end:
-                continue
-            actual_start = max(pack_start, lo)
-            actual_end = min(pack_start + raw_len, hi)
-            local_actual = max(actual_end - actual_start, 0)
-            local_pad = inter_end - inter_start
-            if local_actual > 0 or local_pad > 0:
-                local_lens.append(local_actual)
-                local_padded.append(local_pad)
+    for b in range(seq_lens.shape[0]):
+        local_lens, local_padded = _shard_seq_lens_row(
+            seq_lens[b].tolist(), seq_lens_padded[b].tolist(), lo, hi,
+        )
         local_lens_b.append(local_lens)
         local_lens_padded_b.append(local_padded)
         max_local_packs = max(max_local_packs, len(local_lens))
@@ -154,17 +163,17 @@ def _shard_seq_lens_for_cp(seq_lens, seq_lens_padded, *, cp_rank: int, chunk: in
     if max_local_packs == 0:
         max_local_packs = 1
 
-    out_lens = torch.full((batch_size, max_local_packs), sentinel,
-                          dtype=seq_lens.dtype, device=device)
-    out_padded = torch.full((batch_size, max_local_packs), sentinel,
-                            dtype=seq_lens_padded.dtype, device=device)
-    for b in range(batch_size):
+    out_lens = torch.full((seq_lens.shape[0], max_local_packs), -1000,
+                          dtype=seq_lens.dtype, device=seq_lens.device)
+    out_padded = torch.full((seq_lens.shape[0], max_local_packs), -1000,
+                            dtype=seq_lens_padded.dtype, device=seq_lens.device)
+    for b in range(seq_lens.shape[0]):
         n = len(local_lens_b[b])
         if n > 0:
             out_lens[b, :n] = torch.tensor(
-                local_lens_b[b], dtype=seq_lens.dtype, device=device)
+                local_lens_b[b], dtype=seq_lens.dtype, device=seq_lens.device)
             out_padded[b, :n] = torch.tensor(
-                local_lens_padded_b[b], dtype=seq_lens_padded.dtype, device=device)
+                local_lens_padded_b[b], dtype=seq_lens_padded.dtype, device=seq_lens.device)
     return out_lens, out_padded
 
 
