@@ -52,6 +52,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
  private:
+  __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
+    union {
+      uint32_t bits;
+      float value;
+    } encoded = {task_desc.extra_value_0};
+    return encoded.value;
+  }
+
   __aicore__ inline void ExecuteMatmul(const TaskDesc &task_desc) {}
 
   __aicore__ inline void cacheWriteThrough(__gm__ uint8_t *sourceAddr, int64_t length) {
@@ -105,7 +113,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         if (start + current_seq_end <= end) {
           swi_glu(input_list[task_desc.inputs[0].input_position] + input_0_offset,
                   input_list[task_desc.outputs[0].input_position] + output_0_offset, nullptr,
-                  input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
+                  input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
+                  GetSwiGluClampLimit(task_desc));
         } else {
           GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 80 * (AscendC::GetBlockIdx() + 1);
           __gm__ SwiGluTilingData *tilingdata_data = reinterpret_cast<__gm__ SwiGluTilingData *>(tiling_data_addr);
@@ -119,7 +128,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           cacheWriteThrough(tiling_data_addr, 10);
           PipeBarrier<PIPE_ALL>();
           swi_glu(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                  input_list[task_desc.outputs[0].input_position] + output_0_offset, nullptr, tiling_data_addr);
+                  input_list[task_desc.outputs[0].input_position] + output_0_offset, nullptr, tiling_data_addr,
+                  GetSwiGluClampLimit(task_desc));
         }
       }
       return;
@@ -128,7 +138,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
               task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type,
             input_list[task_desc.outputs[0].input_position] +
               task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type,
-            nullptr, input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
+            nullptr, input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
+            GetSwiGluClampLimit(task_desc));
   }
 
   __aicore__ inline void ExecuteGroupedMatmul(TaskDesc task_desc) {

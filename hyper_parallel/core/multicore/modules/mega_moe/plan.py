@@ -126,6 +126,7 @@ def _build_runtime_configs(spec: MegaMoeSpec, task_values: TaskSplitValue) -> tu
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
+        swiglu_limit=spec.swiglu_limit,
     )
     forward_graph.propagate_splits(task_values)
     forward_data = build_forward_config(
@@ -142,6 +143,7 @@ def _build_runtime_configs(spec: MegaMoeSpec, task_values: TaskSplitValue) -> tu
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
+        swiglu_limit=spec.swiglu_limit,
     )
     backward_graph.propagate_splits(task_values)
     backward_data = build_backward_config(

@@ -55,6 +55,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
  private:
+  __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
+    union {
+      uint32_t bits;
+      float value;
+    } encoded = {task_desc.extra_value_0};
+    return encoded.value;
+  }
+
   __aicore__ inline bool getTransposeData(uint32_t data) { return data == 1; }
 
   __aicore__ inline void ExecuteMatmul(const TaskDesc &task_desc) {}
@@ -119,7 +127,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                        input_list[task_desc.inputs[1].input_position] + input_1_offset,
                        input_list[task_desc.outputs[0].input_position] + output_0_offset,
                        input_list[SWIGLU_GRAD_WORKSPACE_IDX],
-                       input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
+                       input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
+                       GetSwiGluClampLimit(task_desc));
           return;
         } else {
           GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 80 * (AscendC::GetBlockIdx() + 1);
@@ -138,7 +147,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                        input_list[task_desc.inputs[1].input_position] + input_1_offset,
                        input_list[task_desc.outputs[0].input_position] + output_0_offset,
                        input_list[SWIGLU_GRAD_WORKSPACE_IDX],
-                       tiling_data_addr);
+                       tiling_data_addr, GetSwiGluClampLimit(task_desc));
         }
       }
       return;
