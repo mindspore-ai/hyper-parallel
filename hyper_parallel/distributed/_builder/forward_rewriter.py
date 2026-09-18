@@ -251,6 +251,22 @@ def validate_wrapped_forward(orig_forward: Callable[..., Any],
 # Boundary forward wrapping: bias suppression / deferred bias (05 §4.4)
 # ────────────────────────────────────────────────────────────────────────────
 
+def _make_bias_free_forward(owner: nn.Module, original: Callable[..., Any]) -> Callable[..., Any]:
+    """Create a forward wrapper that temporarily hides one module bias."""
+
+    @functools.wraps(original)
+    def bias_free_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the owner's forward with its bias temporarily hidden."""
+        bias = owner.bias
+        try:
+            owner._parameters["bias"] = None  # pylint: disable=protected-access
+            return original(*args, **kwargs)
+        finally:
+            owner._parameters["bias"] = bias  # pylint: disable=protected-access
+
+    return bias_free_forward
+
+
 def _install_bias_suppression(module, spec):
     """D-22: make each defer-listed Linear run bias-free inside the region.
 
@@ -266,28 +282,7 @@ def _install_bias_suppression(module, spec):
         owner_path = param_path.rpartition(".")[0]
         owner = module.get_submodule(owner_path) if owner_path else module
         original = owner.forward
-
-        @functools.wraps(original)  # pylint: disable=cell-var-from-loop
-        def bias_free_forward(
-            *args: Any,
-            __original: Callable[..., Any] = original,
-            __owner: nn.Module = owner,
-            **kwargs: Any,
-        ) -> Any:
-            """Run the owner's forward with its bias temporarily hidden.
-
-            The bias Parameter object is restored on exit (even on error), so
-            state_dict/optimizer visibility is unchanged; only ``F.linear``
-            inside the region sees a bias-free Linear.
-            """
-            bias = __owner.bias
-            try:
-                __owner._parameters["bias"] = None  # pylint: disable=protected-access
-                return __original(*args, **kwargs)
-            finally:
-                __owner._parameters["bias"] = bias  # pylint: disable=protected-access
-
-        owner.forward = bias_free_forward
+        owner.forward = _make_bias_free_forward(owner, original)
 
 
 def _add_bias_to_primary_output(output, bias, module_name):

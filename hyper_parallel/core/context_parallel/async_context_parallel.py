@@ -45,7 +45,6 @@ from hyper_parallel.core.context_parallel import utils
 from hyper_parallel.core.context_parallel.utils import Module, Tensor
 
 
-
 # ---------------------------------------------------------------------------
 # All-to-all helpers
 # ---------------------------------------------------------------------------

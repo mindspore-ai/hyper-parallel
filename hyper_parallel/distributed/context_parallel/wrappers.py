@@ -712,10 +712,12 @@ def sdpa_hf_load_balance_cp_wrapper(
             keep_kwargs, peer_kwargs = _prepare_head_tail_sdpa_kwargs(
                 call_kwargs, q, k, cp_mesh
             )
+
+            def _call_original_sdpa(query, key, value, attention_kwargs):
+                return original_sdpa(query, key, value, **attention_kwargs)
+
             return head_tail_load_balance_attention(
-                lambda query, key, value, attention_kwargs: original_sdpa(
-                    query, key, value, **attention_kwargs
-                ),
+                _call_original_sdpa,
                 q,
                 k,
                 v,
@@ -996,12 +998,14 @@ def sdpa_hf_hybrid_cp_wrapper(
                 cp_mesh,
                 ulysses_degree,
             )
+
+            def _call_original_sdpa(call_query, call_key, call_value, call_kwargs):
+                return original_sdpa(
+                    call_query, call_key, call_value, **call_kwargs
+                )
+
             return hybrid_cp_attention(
-                lambda call_query, call_key, call_value, call_kwargs: (
-                    original_sdpa(
-                        call_query, call_key, call_value, **call_kwargs
-                    )
-                ),
+                _call_original_sdpa,
                 query,
                 key,
                 value,
@@ -1049,12 +1053,14 @@ def flex_hf_hybrid_cp_wrapper(
                 **attention_kwargs: Any) -> Any:
             """Route one intercepted FlexAttention call through Hybrid CP."""
             fired["hit"] = True
+
+            def _call_original_flex(call_query, call_key, call_value, call_kwargs):
+                return original_flex_attention(
+                    call_query, call_key, call_value, **call_kwargs
+                )
+
             return hybrid_cp_attention(
-                lambda call_query, call_key, call_value, call_kwargs: (
-                    original_flex_attention(
-                        call_query, call_key, call_value, **call_kwargs
-                    )
-                ),
+                _call_original_flex,
                 query,
                 key,
                 value,

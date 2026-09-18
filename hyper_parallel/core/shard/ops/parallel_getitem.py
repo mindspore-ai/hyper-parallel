@@ -442,24 +442,31 @@ class GetItemDistributedOp(DistributedOp):
                 )
 
     @staticmethod
-    def _infer_shard_dim0_int(self_layout, expanded_actions, global_shape, kind):
-        """Return the owner-only RaggedShard layout and local index, if supported."""
-        placements = tuple(self_layout.placements)
-        placement = placements[0] if len(placements) == 1 else None
-        if (
-            kind != _BASIC
-            or len(global_shape) < 2
-            or len(self_layout.mesh_shape) != 1
-            or not expanded_actions
-            or expanded_actions[0][0] != "int"
-            or expanded_actions[0][-1] != 0
-            or not all(
+    def _supports_shard_dim0_int(
+            self_layout, expanded_actions, global_shape, kind, placement):
+        """Return whether integer indexing can preserve a Shard(0) layout."""
+        if kind != _BASIC or len(global_shape) < 2:
+            return False
+        if len(self_layout.mesh_shape) != 1 or not expanded_actions:
+            return False
+        first_action = expanded_actions[0]
+        if first_action[0] != "int" or first_action[-1] != 0:
+            return False
+        if not all(
                 _is_full_slice_action(action, global_shape)
                 for action in expanded_actions[1:]
-            )
-            or not isinstance(placement, Shard)
-            or isinstance(placement, StridedShard)
-            or not placement.is_shard(0)
+        ):
+            return False
+        if not isinstance(placement, Shard) or isinstance(placement, StridedShard):
+            return False
+        return placement.is_shard(0)
+
+    @staticmethod
+    def _infer_shard_dim0_int(self_layout, expanded_actions, global_shape, kind):
+        """Return the owner-only RaggedShard layout and local index, if supported."""
+        placement = self_layout.placements[0] if len(self_layout.placements) == 1 else None
+        if not GetItemDistributedOp._supports_shard_dim0_int(
+                self_layout, expanded_actions, global_shape, kind, placement
         ):
             return None
 
@@ -472,15 +479,16 @@ class GetItemDistributedOp(DistributedOp):
         if global_dim0 % mesh_size != 0:
             return None
 
-        normalized_index = index if index >= 0 else index + global_dim0
         rows_per_rank = global_dim0 // mesh_size
-        owner_rank = normalized_index // rows_per_rank
-        local_index = normalized_index % rows_per_rank
+        owner_rank, local_index = divmod(index % global_dim0, rows_per_rank)
         output_global_shape = tuple(global_shape[1:])
-        local_units = tuple(1 if rank == owner_rank else 0 for rank in range(mesh_size))
 
         output_layout = Layout.from_device_mesh(self_layout.mesh)
-        output_layout.set_placements((RaggedShard(tuple(range(len(output_global_shape))), local_units),))
+        ragged_shard = RaggedShard(
+            tuple(range(len(output_global_shape))),
+            tuple(1 if rank == owner_rank else 0 for rank in range(mesh_size)),
+        )
+        output_layout.set_placements((ragged_shard,))
         output_layout.placement_to_tensor_map(len(output_global_shape))
         return output_layout, (owner_rank, local_index, output_global_shape)
 
