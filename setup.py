@@ -48,6 +48,11 @@ MINDSPORE_REQUIRES = [
     "mindspore>=2.10",
 ]
 
+OPENCOMPASS_REQUIRES = [
+    "opencompass==0.5.4",
+]
+
+
 def _read_requirements(requirements_path: str) -> list[str]:
     """Read Python requirement lines from a repository-local file."""
     with open(os.path.join(ROOT_DIR, requirements_path), encoding='utf-8') as file:
@@ -111,6 +116,7 @@ def get_extra_requires() -> dict[str, list[str]]:
         "torch27": list(TORCH27_REQUIRES),
         "torch29": list(TORCH29_REQUIRES),
         "mindspore": list(MINDSPORE_REQUIRES),
+        "opencompass": list(OPENCOMPASS_REQUIRES),
         "all": TORCH29_REQUIRES + MINDSPORE_REQUIRES,
     }
 

@@ -6,6 +6,8 @@ This directory contains usage examples for the HyperParallel distributed trainin
 
 ```text
 examples/
+├── accuracy/           # Baseline/candidate accuracy validation examples
+├── evaluation/         # OpenCompass and VLMEvalKit integration contracts
 ├── torch/              # PyTorch examples
 │   ├── fully_shard/    # FSDP (Fully Sharded Data Parallel) examples
 │   ├── llama3/         # Llama3-style tensor parallel + sequence parallel
@@ -14,6 +16,9 @@ examples/
     ├── fully_shard/    # FSDP (Fully Sharded Data Parallel) examples
     └── llama3/         # Llama3-style tensor parallel + sequence parallel
 ```
+
+The executable VeOmni-vs-HyperParallel manifest and runner walkthrough is under
+`accuracy/veomni_vs_hyper/`.
 
 ## Environment Requirements
 
