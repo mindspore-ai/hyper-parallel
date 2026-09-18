@@ -14,6 +14,8 @@
 # ============================================================================
 """Build the VLM dataset from a LLaVA-style JSON list."""
 
+__all__ = ["VLMDataset", "build_vlm_dataset"]
+
 import json
 import os
 from collections.abc import Callable
@@ -145,6 +147,3 @@ def build_vlm_dataset(
     if data_path is None:
         raise ValueError("online VLM dataset requires data_path")
     return _TransformDataset(VLMDataset(data_path), transform)
-
-
-__all__ = ["VLMDataset", "build_vlm_dataset"]

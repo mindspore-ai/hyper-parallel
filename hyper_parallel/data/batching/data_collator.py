@@ -14,6 +14,11 @@
 # ============================================================================
 """Collators that produce the micro-batch groups consumed by Trainer."""
 
+__all__ = [
+    "MakeMicroBatchCollator",
+    "calculate_num_micro_batches",
+]
+
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -157,9 +162,3 @@ class MakeMicroBatchCollator:
             micro_batches.append(dict(collated_batch))
 
         return micro_batches
-
-
-__all__ = [
-    "MakeMicroBatchCollator",
-    "calculate_num_micro_batches",
-]
