@@ -1,5 +1,16 @@
-﻿# Copyright 2026 Huawei Technologies Co., Ltd
-# Licensed under the Apache License, Version 2.0
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
 """Import a generated modeling file and resolve its model class.
 
@@ -49,6 +60,12 @@ def find_generated_modeling_file(artifact_dir: str) -> str:
     Raises when absent or ambiguous rather than picking one — a bundle with two
     modeling files means generation left something stale behind, and silently
     choosing would produce a model that does not match the meta.
+
+    Args:
+        artifact_dir (str): Directory holding the generated bundle.
+
+    Returns:
+        str: Absolute path of the generated modeling file.
     """
     if not os.path.isdir(artifact_dir):
         raise FileNotFoundError(
@@ -77,6 +94,12 @@ def import_generated_module(artifact_dir: str) -> ModuleType:
     """Import the generated modeling module from ``artifact_dir``.
 
     Repeat calls for the same bundle return the cached module.
+
+    Args:
+        artifact_dir (str): Directory holding the generated bundle.
+
+    Returns:
+        ModuleType: The imported (and cached) generated modeling module.
     """
     modeling_path = find_generated_modeling_file(artifact_dir)
     stem = os.path.splitext(os.path.basename(modeling_path))[0]
@@ -180,6 +203,13 @@ def resolve_generated_model_class(module: ModuleType, hf_config: Any) -> type:
 
     The generated file keeps the original class names, so the architecture name
     from the HF config is the lookup key.
+
+    Args:
+        module (ModuleType): The imported generated modeling module.
+        hf_config (Any): HF config whose ``architectures`` names the class.
+
+    Returns:
+        type: The model class to instantiate.
     """
     architectures = getattr(hf_config, "architectures", None) or []
     if not architectures:
@@ -226,7 +256,9 @@ def _register_generated_model_conversions(model: Any) -> None:
     ``model_type`` (class-name lookup falls back to it), so registering the
     class name is not required for the root model.
     """
-    from transformers.conversion_mapping import USER_REGISTERED_MAPPINGS
+    from transformers.conversion_mapping import (  # pylint: disable=import-outside-toplevel
+        USER_REGISTERED_MAPPINGS,
+    )
 
     model_type = getattr(getattr(model, "config", None), "model_type", None)
     if model_type:
@@ -239,6 +271,90 @@ def _register_generated_model_conversions(model: Any) -> None:
                 "codegen: registered generated model_type %r for checkpoint "
                 "conversion mapping", model_type,
             )
+
+
+def _load_generated_checkpoint(
+    model_cls: type,
+    pretrained_path: str,
+    hf_config: Any,
+    model_args: tuple,
+    torch_dtype: Any,
+    kwargs: dict,
+) -> Any:
+    """Construct a generated model and load its weights with layout conversions.
+
+    The generated modeling file embeds the final (post-replacement) modules
+    directly -- notably ``GroupedExperts`` (expert weights stored transposed
+    relative to the checkpoint) and the fused ``GQAAttention`` (``linear_qkv``
+    built from ``q_proj``/``k_proj``/``v_proj``).  The native path records these
+    conversions through ``apply_module_replacements``; no replacement runs for
+    the generated artifact (the fused modules are literals in the generated
+    code), so synthesise the same wiring here: collect every module's
+    ``make_transforms()`` (scoped to its FQN) and publish the *pre-replacement*
+    parameter shapes, then let ``CheckpointManager`` apply the conversions
+    through the replacement-conversion route.
+    """
+    from hyper_parallel.models._transformers.checkpoint_loader import (  # pylint: disable=import-outside-toplevel
+        CheckpointManager,
+    )
+
+    model = model_cls._from_config(hf_config, *model_args, **kwargs)
+    _register_generated_model_conversions(model)
+
+    transforms: list[Any] = []
+    for module_fqn, module in model.named_modules():
+        make_transforms = getattr(module, "make_transforms", None)
+        if make_transforms is None:
+            continue
+        for transform in make_transforms():
+            transform.scope_prefix = module_fqn
+            transforms.append(transform)
+    if transforms:
+        model._hp_checkpoint_source_shapes = _source_model_shapes(hf_config)  # pylint: disable=protected-access
+        model._hp_replacement_weight_conversions = transforms  # pylint: disable=protected-access
+
+    # from_pretrained materializes meta tensors internally; _from_config
+    # does not. Materialize the meta model before loading so checkpoint
+    # copy targets are real tensors (init_device: meta in the training
+    # config). Downstream infra moves it to the accelerator afterwards.
+    if any(p.is_meta for p in model.parameters()):
+        model.to_empty(device="cpu")
+
+    CheckpointManager(model).load_checkpoint(pretrained_path, strict=False)
+    if torch_dtype not in (None, "auto"):
+        # ``torch_dtype`` may be the raw HF string (e.g. "bfloat16"); the native
+        # path resolves it before calling ``model.to(dtype=...)``.  Passing the
+        # bare string makes torch_npu's ``_parse_to`` treat it as a device name
+        # and raise "Invalid device string", so resolve it through the platform
+        # abstraction instead of importing the backend here.
+        from hyper_parallel.platform import get_platform  # pylint: disable=import-outside-toplevel
+
+        dtype = torch_dtype if "." in torch_dtype else f"torch.{torch_dtype}"
+        model.to(dtype=get_platform().str_to_dtype(dtype))
+    return model
+
+
+def _source_model_shapes(hf_config: Any) -> dict[str, tuple[int, ...]]:
+    """Capture the pre-replacement parameter shapes for the conversion route.
+
+    The native path records ``_named_tensor_shapes(model)`` *before* swapping in
+    the fused modules, so its converters are routed by the original parameter
+    names and layouts.  The generated artifact has the fused modules baked in
+    and no longer owns the converter source parameters (``q_proj``/``k_proj``/
+    ``v_proj`` exist only as converter source patterns), so rebuild the original
+    parameter tree from the config on the meta device -- no storage is
+    allocated -- and publish its shapes instead.
+    """
+    import transformers  # pylint: disable=import-outside-toplevel
+    from hyper_parallel.models.replacement import (  # pylint: disable=import-outside-toplevel
+        _named_tensor_shapes,
+    )
+    from hyper_parallel.platform import get_platform  # pylint: disable=import-outside-toplevel
+
+    platform = get_platform()
+    with platform.init_on_device(platform.meta_device):
+        source = transformers.AutoModelForCausalLM.from_config(hf_config)
+    return _named_tensor_shapes(source)
 
 
 def init_generated_model(
@@ -259,17 +375,30 @@ def init_generated_model(
     the check that catches a stale bundle: generation-time failures that degrade
     to an empty plan, or a model whose parameter tree drifted from what the plan
     records, fail here instead of training with a stale sharding contract.
+
+    Args:
+        artifact_dir (str): Directory holding the generated bundle.
+        pretrained_model_name_or_path (Optional[str]): Checkpoint to load, or
+            None to build from the config only.
+        hf_config (Any): HF config of the model being generated.
+        *model_args (Any): Extra positional args for the constructor.
+        torch_dtype (Any): Target dtype, an HF-style string, or "auto".
+        **kwargs (Any): Extra keyword args for the constructor.
+
+    Returns:
+        Any: The instantiated model with converted weights loaded.
     """
     module = import_generated_module(artifact_dir)
     model_cls = resolve_generated_model_class(module, hf_config)
 
     if pretrained_model_name_or_path is not None:
-        model = model_cls.from_pretrained(
+        model = _load_generated_checkpoint(
+            model_cls,
             pretrained_model_name_or_path,
-            *model_args,
-            config=hf_config,
-            torch_dtype=torch_dtype,
-            **kwargs,
+            hf_config,
+            model_args,
+            torch_dtype,
+            kwargs,
         )
     else:
         # transformers >= 5.14 removed ``PreTrainedModel.from_config`` in
@@ -280,11 +409,14 @@ def init_generated_model(
         # family's ``from_config`` (which the native path borrows) is just a
         # resolver that ultimately calls ``_from_config`` anyway.
         model = model_cls._from_config(hf_config, *model_args, **kwargs)
+        _register_generated_model_conversions(model)
 
-    _register_generated_model_conversions(model)
-
-    from hyper_parallel.codegen.check.preflight import verify_param_plan
-    from hyper_parallel.codegen.meta import load_codegen_meta
+    from hyper_parallel.codegen.check.preflight import (  # pylint: disable=import-outside-toplevel
+        verify_param_plan,
+    )
+    from hyper_parallel.codegen.meta import (  # pylint: disable=import-outside-toplevel
+        load_codegen_meta,
+    )
 
     meta = load_codegen_meta(os.path.join(artifact_dir, "codegen_meta.json"))
     if meta is None:
