@@ -42,6 +42,12 @@ def rms_norm_replacement(old_ctor: str) -> ReplacementSpec:
 
     Model RMS norms share the generic ``RMSNorm`` contract, so the wiring is
     fully framework-owned; only the matched source class differs per family.
+
+    Args:
+        old_ctor: Source RMSNorm class name the YAML rule matched.
+
+    Returns:
+        The replacement spec sinking the source class into ``RMSNorm``.
     """
     return ReplacementSpec(
         old_ctor=old_ctor,
@@ -57,6 +63,12 @@ def grouped_experts_replacement(old_ctor: str) -> ReplacementSpec:
     The source class is kept as the wrapper input, so the generated call is
     ``GroupedExperts(module=<source class instance>, module_fqn='', context=None)``
     -- the keyword shape every generic component wrapper shares.
+
+    Args:
+        old_ctor: Source experts class name the YAML rule matched.
+
+    Returns:
+        The replacement spec wrapping the source class in ``GroupedExperts``.
     """
     return ReplacementSpec(
         old_ctor=old_ctor,
@@ -100,7 +112,10 @@ def gqa_attention_replacement(
         imports=(
             ImportPatch("hyper_parallel.codegen.runtime", ("get_inline_parallel_state",)),
             ImportPatch(_COMPONENT_MODULES, ("RMSNorm",)),
-            ImportPatch("hyper_parallel.platform", ("get_platform",)),
+            ImportPatch(
+                "torch.distributed.nn.functional",
+                ("all_gather", "all_reduce", "reduce_scatter"),
+            ),
             *generated_imports,
         ),
         snippets=snippets,

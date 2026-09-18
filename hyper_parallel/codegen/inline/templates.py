@@ -41,26 +41,26 @@ class TPOperators:
     def all_gather(self, tensor, dim=None):
         if tensor is None:
             return None
-        platform = get_platform()
-        return platform.differentiable_all_gather_concat(
-            tensor, self._group, self._group_size, dim
-        )
+        gathered = all_gather(tensor.contiguous(), group=self._group)
+        return torch.cat(gathered, dim=dim)
 
     def all_reduce(self, tensor):
         if tensor is None:
             return None
-        platform = get_platform()
-        return platform.differentiable_all_reduce(tensor, "sum", self._group)
+        return all_reduce(
+            tensor.contiguous(), op=torch.distributed.ReduceOp.SUM, group=self._group
+        )
 
     def reduce_scatter(self, tensor, dim=None):
         if tensor is None:
             return None
-        platform = get_platform()
         if "gloo" in self._backend:
-            reduced = platform.differentiable_all_reduce(tensor, "sum", self._group)
-            return platform.chunk(reduced, dim, self._group_size, self._group_rank)
-        return platform.differentiable_reduce_scatter(
-            tensor, self._group_size, dim, "sum", self._group
+            reduced = self.all_reduce(tensor)
+            return torch.chunk(reduced, self._group_size, dim=dim)[self._group_rank]
+        chunks = torch.chunk(tensor.contiguous(), self._group_size, dim=dim)
+        output = torch.empty(chunks[0].shape, device=tensor.device, dtype=tensor.dtype)
+        return reduce_scatter(
+            output, chunks, op=torch.distributed.ReduceOp.SUM, group=self._group
         )
 '''
 
