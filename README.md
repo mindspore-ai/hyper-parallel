@@ -29,7 +29,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 - **模型与系统优化解耦**：HyperParallel 将并行、重计算和 Offload 等系统优化从模型代码中分离，并通过声明式接口注入模型；并行范式覆盖集群 SPMD、集群 MPMD 和芯片内多核 MPMD，面向大语言模型和多模态模型训练。
 
-- **兼容 Hugging Face 生态**：AutoModels 直接读取 Hugging Face 模型配置和预训练权重，并复用 Transformers 中已有的模型实现；模型创建后，由 HyperParallel 以声明式方式将并行、重计算和算子替换等分布式逻辑注入模型。
+- **兼容 Hugging Face 生态**：HyperPrallel 支持直接读取 Hugging Face 模型配置和预训练权重，并复用 Transformers 中已有的模型实现；模型创建后，由 HyperParallel 以声明式方式将并行、重计算和算子替换等分布式逻辑注入模型。
 
 - **全流程确定性**：HyperParallel 支持计算、通信、数据预处理和随机数等环节的确定性，并对已支持模型进行 bitwise 对齐验证。确定性模式可能带来性能开销，但有助于复现训练结果、发现 SDC 和定位问题。
 
@@ -45,9 +45,9 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 ## 使用入口
 
-### AutoModels
+### HyperParallel 模型训练
 
-> [AutoModels](hyper_parallel/models/README.md) 面向训练用户，通过 YAML 配置 Hugging Face 模型、数据、优化器、并行策略和保存与恢复方式。
+> [HyperParallel 模型](hyper_parallel/models/README.md) 面向训练用户，通过 YAML 配置 Hugging Face 模型、数据、优化器、并行策略以及保存与恢复方式。
 >
 > **支持模型**
 >
@@ -91,7 +91,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 ## 🚀 快速开始
 
-### 使用 AutoModels 启动训练
+### 使用 HyperParallel 启动模型训练
 
 运行仓库提供的单机 8 卡训练示例 [`hyper_parallel/models/qwen3_moe/recipes/train.yaml`](hyper_parallel/models/qwen3_moe/recipes/train.yaml)：
 
@@ -109,7 +109,7 @@ torchrun --standalone --nproc_per_node=8 \
   --training.train_iters=10
 ```
 
-配置结构、字段解析和更多训练示例见 [AutoModels](hyper_parallel/models/README.md)。
+字段定义与解析规则见 [训练配置与组件](hyper_parallel/models/README.md)。
 
 ### 使用 HyperParallel Core API
 
@@ -129,7 +129,7 @@ TP、CP、EP、PP 等组合方式见 [特性使用指南](docs/guide/)，公开�
 ## 📖 文档
 
 - [文档中心](./docs/index.md) — 文档索引与导航
-- [AutoModels](hyper_parallel/models/README.md) — YAML Trainer、训练组件与专题指南入口
+- [训练配置与组件](hyper_parallel/models/README.md) — TrainerConfig 字段、模块结构与组件文档入口
 - [安装指南](docs/installation.md) — 源码构建、依赖安装
 - [特性使用指南](./docs/guide/) — 并行与训练能力指南
 - [API 参考](./docs/api/api_reference.md) — 按特性模块组织的接口说明
@@ -145,33 +145,33 @@ TP、CP、EP、PP 等组合方式见 [特性使用指南](docs/guide/)，公开�
 ```text
 HyperParallel/
 ├── hyper_parallel/
-│   ├── models/                         # 模型族适配层与 recipes/train.yaml，对外入口 api.py
-│   │   └── _transformers/              # Transformers 模型构建与预训练权重加载
-│   ├── trainer/                        # TrainerConfig、TextTrainer/VLMTrainer 和训练生命周期
-│   ├── components/                     # 高性能 modules/functional、优化器、loss 和 checkpoint
-│   ├── data/                           # 数据集读取、样本转换与 dataloader
-│   ├── distributed/                    # 分布式模型构建、并行计划应用与激活管理
+│   ├── models/                                   # 模型族适配层与 recipes/train.yaml，对外入口 api.py
+│   │   └── _transformers/                        # Transformers 模型构建与预训练权重加载
+│   ├── trainer/                                  # TrainerConfig、TextTrainer/VLMTrainer 和训练生命周期
+│   ├── components/                               # 高性能 modules/functional、优化器、loss 和 checkpoint
+│   ├── data/                                     # 数据集读取、样本转换与 dataloader
+│   ├── distributed/                              # 分布式模型构建、并行计划应用与激活管理
 │   ├── core/
-│   │   ├── dtensor/                    # DeviceMesh、Layout、placement 和 DTensor
-│   │   ├── shard/                      # sharding plan、自定义 shard 和 DFunction
-│   │   ├── fully_shard/                # FSDP/HSDP 参数与执行调度
-│   │   ├── tensor_parallel/            # TP styles 与 loss parallel
-│   │   ├── context_parallel/           # Context Parallel
-│   │   ├── expert_parallel/            # Expert Parallel
-│   │   ├── pipeline_parallel/          # Pipeline stage 与调度
-│   │   └── distributed_checkpoint/     # 分布式保存、加载与 reshard
-│   ├── collectives/                    # 集合通信接口与实现
-│   └── platform/                       # PyTorch、MindSpore 与设备后端适配
+│   │   ├── dtensor/                              # DeviceMesh、Layout、placement 和 DTensor
+│   │   ├── shard/                                # sharding plan、自定义 shard 和 DFunction
+│   │   ├── fully_shard/                          # FSDP/HSDP 参数与执行调度
+│   │   ├── tensor_parallel/                      # TP styles 与 loss parallel
+│   │   ├── context_parallel/                     # Context Parallel
+│   │   ├── expert_parallel/                      # Expert Parallel
+│   │   ├── pipeline_parallel/                    # Pipeline stage 与调度
+│   │   └── distributed_checkpoint/               # 分布式保存、加载与 reshard
+│   ├── collectives/                              # 集合通信接口与实现
+│   └── platform/                                 # PyTorch、MindSpore 与设备后端适配
 ├── examples/
-│   ├── training_demo/                  # AutoModels 训练示例（数据准备、离线/在线 YAML）
-│   ├── data/                           # 数据准备脚本
-│   ├── generate/                       # 生成与精度对齐校验脚本
-│   ├── mindspore/                      # MindSpore 后端示例
-│   └── torch/                          # PyTorch 后端 Core API 组合示例
+│   ├── training_demo/                            # 训练示例（数据准备、离线/在线 YAML）
+│   ├── data/                                     # 数据准备脚本
+│   ├── generate/                                 # 生成与精度对齐校验脚本
+│   ├── mindspore/                                # MindSpore 后端示例
+│   └── torch/                                    # PyTorch 后端 Core API 组合示例
 ├── docs/
-│   ├── guide/                          # 使用指南
-│   └── api/                            # API 参考
-└── tests/                              # models、Core 和后端测试
+│   ├── guide/                                    # 使用指南
+│   └── api/                                      # API 参考
+└── tests/                                        # models、Core 和后端测试
 ```
 
 ---
