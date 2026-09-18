@@ -1,6 +1,6 @@
 # YAML Trainer 配置结构
 
-AutoModels 按 [`TrainerConfig`](../../../hyper_parallel/trainer/config/trainer.py#L47-L105) 的字段定义解析 YAML。字段名决定 YAML 可以包含哪些配置项，字段类型决定对应的值如何解析。解析完成后得到 `TrainerConfig` 对象，随后通过 CLI dotted overrides 更新配置字段。
+HyperParallel 模型训练按 [`TrainerConfig`](../../../hyper_parallel/trainer/config/trainer.py#L47-L105) 的字段定义解析 YAML。字段名决定 YAML 可以包含哪些配置项，字段类型决定对应的值如何解析。解析完成后得到 `TrainerConfig` 对象，随后通过 CLI dotted overrides 更新配置字段。
 
 ```python
 @dataclass

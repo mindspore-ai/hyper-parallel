@@ -1,6 +1,6 @@
-# AutoModels 二次开发指南
+# 二次开发指南
 
-AutoModels 将 YAML 解析为 `TrainerConfig`，再由任务 Trainer 构建运行对象。`Target` 和 CLI dotted override 的解析规则见 [YAML Trainer 配置结构](yaml_config.md)。
+HyperParallel 模型训练将 YAML 解析为 `TrainerConfig`，再由任务 Trainer 构建运行对象。`Target` 和 CLI dotted override 的解析规则见 [YAML Trainer 配置结构](yaml_config.md)。
 
 ## 扩展入口
 
@@ -165,7 +165,7 @@ optimizer:
 | `lr_scheduler` | [`BaseTrainer._build_lr_scheduler()`](../../../hyper_parallel/trainer/base.py#L415-L422) | `optimizer`、`train_iters` |
 | `loss_fn` | [`BaseTrainer._build_loss()`](../../../hyper_parallel/trainer/base.py#L315-L325) | 构建时无；可选生命周期接收模型、并行配置和 loss inputs |
 
-其他组件的配置与教程见 [AutoModels README](../../../hyper_parallel/models/README.md)。
+其他组件的配置与教程见 [HyperParallel 模型训练](../../../hyper_parallel/models/README.md)。
 
 ## 4. 新增任务 Trainer
 

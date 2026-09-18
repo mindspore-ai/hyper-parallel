@@ -59,7 +59,7 @@ from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
 )
 from hyper_parallel.trainer.runtime.device import get_device_type
-from hyper_parallel.trainer.config.manager import parse_training_args
+from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config import (
     TrainerConfig,
     normalize_distributed_setup_overrides,
