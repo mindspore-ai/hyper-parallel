@@ -54,9 +54,8 @@ class OneHotExtDistributedOp(DistributedOp):
         off_value_layout = off_value.layout if hasattr(off_value, '_layout') else None
 
         local_args = (indices_local, num_classes, on_value_local, off_value_local, axis)
-        local_kwargs = {}
         cache_values = [indices.layout, on_value_layout, off_value_layout, num_classes, axis]
-        return local_args, local_kwargs, cache_values
+        return local_args, {}, cache_values
 
     # pylint: disable=W0237
     def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
@@ -332,4 +331,3 @@ class OneHotExtDistributedOp(DistributedOp):
             alias_tensor_map.append(alias_name[len(alias_name) - 1 - dim])
 
         return tuple(alias_tensor_map)
-    

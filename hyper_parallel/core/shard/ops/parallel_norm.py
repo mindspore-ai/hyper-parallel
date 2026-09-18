@@ -91,9 +91,7 @@ class NormDistributedOp(DistributedOp):
         # Check partial inputs
         if not self._allow_partial_inputs:
             self._check_partial_inputs([x_layout, gamma_layout])
-        x_mesh_shape = x_layout.mesh_shape
-        gamma_mesh_shape = gamma_layout.mesh_shape
-        if x_mesh_shape != gamma_mesh_shape:
+        if x_layout.mesh_shape != gamma_layout.mesh_shape:
             raise ValueError(f"{self.op_name} inputs must have same mesh_shape")
         x_alias_map = x_layout.alias_tensor_map
         gamma_alias_map = gamma_layout.alias_tensor_map
@@ -109,7 +107,7 @@ class NormDistributedOp(DistributedOp):
                 if name == "None":
                     continue
                 axis_idx = x_layout.alias_name.index(name)
-                if x_mesh_shape[axis_idx] > 1:
+                if x_layout.mesh_shape[axis_idx] > 1:
                     raise ValueError(f"{self.op_name} is disabled to support the splitting after "
                                      f"begin_norm_axis {begin_norm_axis} for input 0.")
         if x_alias_map[begin_norm_axis:] != gamma_alias_map:

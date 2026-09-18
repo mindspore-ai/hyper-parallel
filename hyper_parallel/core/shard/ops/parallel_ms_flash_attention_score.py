@@ -123,6 +123,19 @@ class MsTndLayoutContext:
     is_dynamic: bool
 
 
+@dataclass
+class MsSeqSplitContext:
+    """Groups sequence-split adjustment parameters."""
+    sparse_mode: int
+    pre_tokens: int
+    next_tokens: int
+    actual_seq_qlen: Optional[List[int]]
+    actual_seq_kvlen: Optional[List[int]]
+    seq_split_num: int
+    lb_split_id: Optional[int]
+    lb_split_num: Optional[int]
+
+
 class FlashAttentionScoreDistributedOp(DistributedOp):
     """Distributed operator for mindspore.ops.flash_attention_score."""
 
@@ -990,9 +1003,16 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
             (adjusted_sparse_mode, adjusted_pre_tokens, adjusted_next_tokens,
              adjusted_actual_seq_qlen, adjusted_actual_seq_kvlen) = self._apply_seq_split_adjustments(
                 query, key, query_layout, key_layout, input_layout,
-                sparse_mode, pre_tokens, next_tokens,
-                actual_seq_qlen, actual_seq_kvlen,
-                seq_split_num, lb_split_id, lb_split_num,
+                MsSeqSplitContext(
+                    sparse_mode=sparse_mode,
+                    pre_tokens=pre_tokens,
+                    next_tokens=next_tokens,
+                    actual_seq_qlen=actual_seq_qlen,
+                    actual_seq_kvlen=actual_seq_kvlen,
+                    seq_split_num=seq_split_num,
+                    lb_split_id=lb_split_id,
+                    lb_split_num=lb_split_num,
+                ),
             )
 
             result = func(
@@ -1008,19 +1028,12 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
 
         return _expanded_impl
 
-    def _apply_seq_split_adjustments(  # pylint: disable=too-many-arguments,too-many-locals
+    def _apply_seq_split_adjustments(  # pylint: disable=too-many-locals
         self,
         query, key,
         query_layout, key_layout,
         input_layout: str,
-        sparse_mode: int,
-        pre_tokens: int,
-        next_tokens: int,
-        actual_seq_qlen,
-        actual_seq_kvlen,
-        seq_split_num: int,
-        lb_split_id,
-        lb_split_num: int,
+        context: MsSeqSplitContext,
     ):
         """Compute adjusted sparse params for sequence-dimension sharding.
 
@@ -1028,21 +1041,22 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
             Tuple of (adjusted_sparse_mode, adjusted_pre_tokens, adjusted_next_tokens,
                       adjusted_actual_seq_qlen, adjusted_actual_seq_kvlen).
         """
-        adjusted_sparse_mode = sparse_mode
-        adjusted_pre_tokens = pre_tokens
-        adjusted_next_tokens = next_tokens
-        adjusted_actual_seq_qlen = actual_seq_qlen
-        adjusted_actual_seq_kvlen = actual_seq_kvlen
+        adjusted_sparse_mode = context.sparse_mode
+        adjusted_pre_tokens = context.pre_tokens
+        adjusted_next_tokens = context.next_tokens
+        adjusted_actual_seq_qlen = context.actual_seq_qlen
+        adjusted_actual_seq_kvlen = context.actual_seq_kvlen
+        seq_split_num = context.seq_split_num
 
-        if seq_split_num > 1 or lb_split_id is not None:
+        if seq_split_num > 1 or context.lb_split_id is not None:
             dynamic_info = self._get_dynamic_shape_info(query, key, input_layout)
             is_dynamic = dynamic_info.get('is_dynamic', False)
 
-            if lb_split_id is not None:
-                if lb_split_num is None:
+            if context.lb_split_id is not None:
+                if context.lb_split_num is None:
                     raise ValueError("lb_split_num must not be None when lb_split_id is set")
-                split_id = lb_split_id
-                seq_split_num = lb_split_num
+                split_id = context.lb_split_id
+                seq_split_num = context.lb_split_num
             else:
                 split_id = self._get_split_id(query_layout, input_layout)
             seq_dim_idx = self._get_seq_dim_idx(self._layout_dims.get(input_layout, {}))
@@ -1066,7 +1080,7 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
              adjusted_pre_tokens,
              adjusted_next_tokens) = self._compute_adjusted_sparse_params(
                 query, key,
-                sparse_mode, pre_tokens, next_tokens,
+                context.sparse_mode, context.pre_tokens, context.next_tokens,
                 split_id, seq_split_num, seq_dim_idx,
                 kv_seq_split_num, is_dynamic,
             )
@@ -1080,10 +1094,10 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
                     query, key, query_layout, key_layout,
                     input_layout,
                     MsTndLayoutContext(
-                        sparse_mode=sparse_mode, pre_tokens=pre_tokens,
-                        next_tokens=next_tokens,
-                        actual_seq_qlen=actual_seq_qlen,
-                        actual_seq_kvlen=actual_seq_kvlen,
+                        sparse_mode=context.sparse_mode, pre_tokens=context.pre_tokens,
+                        next_tokens=context.next_tokens,
+                        actual_seq_qlen=context.actual_seq_qlen,
+                        actual_seq_kvlen=context.actual_seq_kvlen,
                         seq_split_num=seq_split_num, split_id=split_id,
                         kv_seq_split_num=kv_seq_split_num, is_dynamic=is_dynamic,
                     ),

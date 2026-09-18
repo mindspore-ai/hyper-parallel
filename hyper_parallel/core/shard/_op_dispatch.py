@@ -94,6 +94,12 @@ def get_dtensor_dispatch() -> bool:
     return not _dtensor_dispatch_disabled.get()
 
 
+def _stringify_cache_value(value) -> str:
+    """Return the cached compact string when available."""
+    compact_str = getattr(value, '_compact_str', None)
+    return compact_str if compact_str is not None else str(value)
+
+
 class LayoutCacheKey:
     """Immutable layout cache key."""
     __slots__ = ('_tuple', '_hash')
@@ -119,8 +125,7 @@ class LayoutCacheKey:
         # NOTE: the key stays a string tuple by design (cross-checked against manually
         # built legacy keys in the UTs); CPython caches each compact_str's hash on the
         # string object, so this is not the bottleneck a full integer key would target.
-        return cls([cs if (cs := getattr(v, '_compact_str', None)) is not None else str(v)
-                    for v in cache_values])
+        return cls([_stringify_cache_value(value) for value in cache_values])
 
     def __eq__(self, other):
         if not isinstance(other, LayoutCacheKey):
