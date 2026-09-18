@@ -243,6 +243,47 @@ def _drop_nested_edits(edits: list[TextEdit]) -> list[TextEdit]:
     return kept
 
 
+def drop_shadowed_definitions(text: str, imported_names: Iterable[str]) -> str:
+    """Remove definitions that shadow a library import of the same name.
+
+    The artifact imports the very helpers the native path calls, but the copied
+    modeling source defines its own module-level helpers with those names, and a
+    local definition wins over the import.  For a *decorated* helper that means
+    a different implementation runs: ``use_kernel_func_from_hub("rotary_pos_emb")``
+    resolves its kernel binding per module, and the generated module is not the
+    module the binding was registered for.  Both paths must therefore end up with
+    the imported implementation, so the shadowing copy is dropped.
+
+    Callers pass names that the *base source* already defines, so the classes and
+    snippets the inline passes render (which share names with library imports on
+    purpose) keep their definitions.
+
+    Args:
+        text: Source to drop the shadowing definitions from.
+        imported_names: Names the library imports bind in module scope.
+
+    Returns:
+        The source with the shadowing definitions removed.
+    """
+
+    names = {name for name in imported_names if name}
+    if not names:
+        return text
+    tree = ast.parse(text)
+    offsets = _line_offsets(text)
+    edits: list[TextEdit] = []
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if node.name not in names or not node.decorator_list:
+            continue
+        start, end = _node_span(node, offsets)
+        edits.append(TextEdit(start, _skip_trailing_blank_lines(text, end), ""))
+    if not edits:
+        return text
+    return apply_edits(text, edits)
+
+
 def _name_is_referenced(tree: ast.AST, name: str) -> bool:
     """Return whether ``name`` still appears as a reference in ``tree``."""
 
@@ -454,6 +495,13 @@ def _call_name(node: ast.AST) -> str | None:
 
 
 def _node_span(node: ast.AST, offsets: tuple[int, ...]) -> tuple[int, int]:
+    """Return the ``(start, end)`` source span of ``node``.
+
+    Decorators are part of the span: deleting only the ``def``/``class`` line
+    would leave a dangling decorator that then applies to whatever statement
+    follows the removed block.
+    """
+
     if (
         getattr(node, "lineno", None) is None
         or getattr(node, "col_offset", None) is None
@@ -461,7 +509,17 @@ def _node_span(node: ast.AST, offsets: tuple[int, ...]) -> tuple[int, int]:
         or getattr(node, "end_col_offset", None) is None
     ):
         raise ValueError(f"AST node has no source span: {type(node).__name__}")
-    start = offsets[node.lineno - 1] + node.col_offset
+    line = node.lineno
+    column = node.col_offset
+    decorators = getattr(node, "decorator_list", None)
+    if decorators:
+        first = min(decorators, key=lambda item: item.lineno)
+        if first.lineno < line:
+            # A decorator node starts at its expression, one column *after* the
+            # ``@``; the span must start at the ``@`` itself, otherwise deleting
+            # the block leaves a stray ``@`` behind.
+            line, column = first.lineno, max(0, first.col_offset - 1)
+    start = offsets[line - 1] + column
     end = offsets[node.end_lineno - 1] + node.end_col_offset
     return start, end
 
