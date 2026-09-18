@@ -38,6 +38,11 @@
             "path": "hyper_parallel/core/multicore/ops/swi_glu_fusion.patch",
             "sha256": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d",
             "purpose": "expose the selected SwiGLU and SwiGLUGrad kernels as inline HyperMegaMoe building blocks"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/swi_glu_clamp.patch",
+            "sha256": "8634bf4fc9fae2dd248d87eef7d4f63d43e8008a81313e6d61e7c15556e12a35",
+            "purpose": "add task-configured DeepSeek clipped SwiGLU forward and backward semantics"
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
