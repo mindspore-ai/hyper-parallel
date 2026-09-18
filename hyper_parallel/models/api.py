@@ -20,6 +20,15 @@ Transformers integration; this module never imports
 ``hyper_parallel.trainer`` or ``hyper_parallel.models.trainer``.
 """
 
+__all__ = [
+    "CompileConfig",
+    "FSDP2Config",
+    "FSDP2MixedPrecisionConfig",
+    "ModelBuildOptions",
+    "from_pretrained",
+    "normalize_options",
+]
+
 from typing import Any, Optional
 
 from hyper_parallel.models.build_options import (
@@ -54,13 +63,3 @@ def normalize_options(value: Optional[Any]) -> ModelBuildOptions:
     never constructs or accepts a Trainer DTO.
     """
     return normalize_build_options(value)
-
-
-__all__ = [
-    "CompileConfig",
-    "FSDP2Config",
-    "FSDP2MixedPrecisionConfig",
-    "ModelBuildOptions",
-    "from_pretrained",
-    "normalize_options",
-]

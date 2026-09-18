@@ -49,8 +49,10 @@ def _last_segment(fqn: str) -> str:
 
 _GLOB_CHARS = ("*", "?", "[")
 
+
 def _is_glob_key(key: str) -> bool:
     return any(c in key for c in _GLOB_CHARS)
+
 
 def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
                           derive: bool = True) -> None:
@@ -151,6 +153,7 @@ _CONTRACT_FIELDS = ("params", "in_src", "in_dst",
 #   "none" — explicitly clear (params/in_src/in_dst → {}, out_* → None)
 _CONTRACT_SENTINELS = ("auto", "none")
 
+
 def _iter_named_placements(spec: ModuleShardingSpec):
     """Yield (attr, name, named) for every concrete NamedPlacement in an
     override spec (skips sentinel strings/None/empty; out_* scalar
@@ -164,6 +167,7 @@ def _iter_named_placements(spec: ModuleShardingSpec):
         else:
             for name, named in value.items():
                 yield attr, name, named
+
 
 def _validate_override_axes(key, user_spec, source, plan) -> None:
     """Fail fast on typo'd placement axes / non-Placement values.
@@ -206,6 +210,7 @@ def _validate_override_axes(key, user_spec, source, plan) -> None:
                     f"An unknown axis is silently ignored by "
                     f"resolve_placements, so fail fast (suspected typo)")
 
+
 def _merge_contract_field(derived: ModuleShardingSpec,
                           user_spec: ModuleShardingSpec, attr: str) -> None:
     """Merge one contract field: "unset inherits, written is honored" (2026-08-05).
@@ -234,6 +239,7 @@ def _merge_contract_field(derived: ModuleShardingSpec,
         return
     setattr(derived, attr, copy.deepcopy(value))  # including {}: explicit empty (clear)
 
+
 def _warn_dropped_params(source, key, fqn, derived, user_spec) -> None:
     """Visibility safeguard: a field-granularity replacement of ``params``
     during merge strips the derived sharding from every parameter not
@@ -253,6 +259,7 @@ def _warn_dropped_params(source, key, fqn, derived, user_spec) -> None:
                 "the de-sharding is intentional, ignore this warning "
                 "(params={} or 'none' explicitly clears all)",
                 source, key, fqn, len(dropped), dropped)
+
 
 def _merge_into(derived: ModuleShardingSpec,
                 user_spec: ModuleShardingSpec) -> None:
@@ -286,6 +293,13 @@ def _normalize_contract_fields(plan: ShardingPlan) -> None:
                 setattr(spec, attr, {})
 
 
+def _is_required_keyword_parameter(parameter: inspect.Parameter) -> bool:
+    """Return whether a parameter is a required named input."""
+    return (parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                               inspect.Parameter.KEYWORD_ONLY)
+            and parameter.default is inspect.Parameter.empty)
+
+
 def _suggest_insert_skeleton(model, fqn: str) -> str:
     """Derive a draft contract skeleton from the module's forward
     signature (input names) and direct parameters — turns "write a
@@ -302,9 +316,7 @@ def _suggest_insert_skeleton(model, fqn: str) -> str:
             sig = inspect.signature(module.forward)
             names = [
                 p.name for p in sig.parameters.values()
-                if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                              inspect.Parameter.KEYWORD_ONLY)
-                and p.default is inspect.Parameter.empty  # required input parameters
+                if _is_required_keyword_parameter(p)
             ]
             if names:
                 in_names = names
@@ -356,8 +368,8 @@ def _insert_spec(plan: ShardingPlan, fqn: str,
                 "concrete dict for the sharding/contract, an explicit "
                 "empty {} for a boundary that shards no params (params "
                 "stay replicated) / has no such contract")
-    if all(getattr(user_spec, attr) is None for attr in
-           ("params", "in_src", "in_dst", "out_src", "out_dst")):
+    contract_values = (getattr(user_spec, attr) for attr in ("params", "in_src", "in_dst", "out_src", "out_dst"))
+    if all(value is None for value in contract_values):
         hint = ""
         if model is not None:
             hint = (
@@ -466,11 +478,11 @@ def _check_target_config_keys(target, kind):
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return
-    bindable = {
-        name for name, p in params.items()
-        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                      inspect.Parameter.KEYWORD_ONLY)
-    }
+    bindable = set()
+    for name, parameter in params.items():
+        if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                              inspect.Parameter.KEYWORD_ONLY):
+            bindable.add(name)
     unknown = sorted(set(configured) - bindable)
     if unknown:
         raise ValueError(
@@ -652,6 +664,41 @@ def _resolve_inner_target(module, spec=None):
         f"-- check the spelling in plan_overrides")
 
 
+def _resolve_delayed_inner_wrapper(custom, target, context,
+                                   apply_custom_inner_wrapper,
+                                   classify_rewrite_result):
+    """Resolve a delayed Target inner-wrapper declaration."""
+    fn = getattr(custom, "_target_", None)
+    source = (f"inner_wrapper Target "
+              f"{getattr(custom, '_target_path', custom)}")
+    meta = require_injection_meta(fn, INNER_WRAPPER, source=source)
+    _check_target_config_keys(custom, "inner_wrapper")
+
+    def _apply_target():
+        build_kwargs = fill_context_kwargs(
+            meta, context, getattr(custom, "_kwargs", {}), source=source)
+        result = custom.build(**build_kwargs)
+        if result is None:
+            return None   # in-place forward replacement (registry-style fn)
+        if callable(result):
+            if getattr(result, "_injection_meta", None) is not None:
+                # An @inner_wrapper-stamped custom wrapper: invoke it with
+                # its declared context (it replaces in place or returns
+                # its own replacement).
+                return apply_custom_inner_wrapper(result, context)
+            # 4d contract: the built-in wrapper already ran and RETURNED
+            # the replacement forward — hand it to the rewriter.
+        # Validate every supported rewriter result here as well, so a
+        # delayed Target accepts atomic _ForwardRewriteRequest objects
+        # while retaining the resolver's fail-fast behavior for invalid
+        # return values.
+        classify_rewrite_result(result, target, source)
+        return result
+
+    name = getattr(custom, "_target_path", None) or "custom"
+    return (name, target, _apply_target)
+
+
 def _resolve_inner_wrapper(module, spec, cp_mesh, mesh, tp_mesh=None,
                            ep_mesh=None):
     """Resolve one explicit inner-wrapper declaration without mutating modules.
@@ -705,35 +752,9 @@ def _resolve_inner_wrapper(module, spec, cp_mesh, mesh, tp_mesh=None,
         "ep_mesh": ep_mesh,
     }
     if _is_delayed_target(custom):
-        fn = getattr(custom, "_target_", None)
-        source = (f"inner_wrapper Target "
-                  f"{getattr(custom, '_target_path', custom)}")
-        meta = require_injection_meta(fn, INNER_WRAPPER, source=source)
-        _check_target_config_keys(custom, "inner_wrapper")
-
-        def _apply_target():
-            build_kwargs = fill_context_kwargs(
-                meta, context, getattr(custom, "_kwargs", {}), source=source)
-            result = custom.build(**build_kwargs)
-            if result is None:
-                return None   # in-place forward replacement (registry-style fn)
-            if callable(result):
-                if getattr(result, "_injection_meta", None) is not None:
-                    # An @inner_wrapper-stamped custom wrapper: invoke it with
-                    # its declared context (it replaces in place or returns
-                    # its own replacement).
-                    return _apply_custom_inner_wrapper(result, context)
-                # 4d contract: the built-in wrapper already ran and RETURNED
-                # the replacement forward — hand it to the rewriter.
-            # Validate every supported rewriter result here as well, so a
-            # delayed Target accepts atomic _ForwardRewriteRequest objects
-            # while retaining the resolver's fail-fast behavior for invalid
-            # return values.
-            _classify_rewrite_result(result, target, source)
-            return result
-
-        name = getattr(custom, "_target_path", None) or "custom"
-        return (name, target, _apply_target)
+        return _resolve_delayed_inner_wrapper(
+            custom, target, context,
+            _apply_custom_inner_wrapper, _classify_rewrite_result)
 
     if callable(custom):
         require_injection_meta(

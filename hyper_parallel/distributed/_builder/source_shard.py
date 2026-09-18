@@ -93,6 +93,23 @@ def _check_fsdp_owned_axes(full_fqn, named_placement):
             )
 
 
+def _normalize_tied_pair_placements(info, tied_pairs):
+    """Normalize tied parameters to the finer source placement."""
+    if not tied_pairs:
+        return
+    for a, b in tied_pairs:
+        if a in info and b in info:
+            pa, _ = info[a]
+            pb, _ = info[b]
+            if pa != pb and len(pa) == len(pb):
+                norm = tuple(
+                    x if isinstance(x, Shard) else y
+                    for x, y in zip(pa, pb)
+                )
+                info[a] = (norm, info[a][1])
+                info[b] = (norm, info[b][1])
+
+
 def build_source_shard_info(
     plan: ShardingPlan,
     dense_source_mesh: Any,
@@ -141,19 +158,10 @@ def build_source_shard_info(
                 placements = tuple(resolve_placements(named_placement, dense_source_dims))
                 info[full_fqn] = (placements, dense_mesh)
 
-    pairs = tied_pairs if tied_pairs is not None else plan.tied_pairs
-    if pairs:
-        for a, b in pairs:
-            if a in info and b in info:
-                pa, _ = info[a]
-                pb, _ = info[b]
-                if pa != pb and len(pa) == len(pb):
-                    norm = tuple(
-                        x if isinstance(x, Shard) else y
-                        for x, y in zip(pa, pb)
-                    )
-                    info[a] = (norm, info[a][1])
-                    info[b] = (norm, info[b][1])
+    _normalize_tied_pair_placements(
+        info,
+        tied_pairs if tied_pairs is not None else plan.tied_pairs,
+    )
     return info
 
 

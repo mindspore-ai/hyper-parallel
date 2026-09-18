@@ -161,22 +161,21 @@ class EnvironMeterCallback(Callback):
         schedulers = self.trainer.lr_scheduler
         if schedulers is not None:
             scheduler_list = schedulers if isinstance(schedulers, list) else [schedulers]
-            learning_rates = [
-                float(learning_rate)
-                for scheduler in scheduler_list
-                for learning_rate in scheduler.get_last_lr()
-            ]
+            learning_rates = []
+            for scheduler in scheduler_list:
+                for learning_rate in scheduler.get_last_lr():
+                    learning_rates.append(float(learning_rate))
             if learning_rates:
                 return max(learning_rates)
 
         optimizers = self.trainer.optimizer
         optimizer_list = optimizers if isinstance(optimizers, list) else [optimizers]
-        learning_rates = [
-            float(param_group["lr"])
-            for optimizer in optimizer_list
-            if optimizer is not None
-            for param_group in optimizer.param_groups
-        ]
+        learning_rates = []
+        for optimizer in optimizer_list:
+            if optimizer is None:
+                continue
+            for param_group in optimizer.param_groups:
+                learning_rates.append(float(param_group["lr"]))
         return max(learning_rates, default=0.0)
 
     def _memory_metrics(self) -> dict[str, float]:
@@ -259,11 +258,10 @@ class EnvironMeterCallback(Callback):
             metric_name = name if name.startswith("training/") else f"training/{name}"
             train_metrics[metric_name] = self._reduce(self._scalar(value, name), op="mean")
 
-        tokens_per_second = global_tokens / global_step_time if global_step_time > 0 else 0.0
         env_metrics = {
             **train_metrics,
             "performance/step_time": global_step_time,
-            "performance/tokens_per_second": tokens_per_second,
+            "performance/tokens_per_second": global_tokens / global_step_time if global_step_time > 0 else 0.0,
             "data/step_tokens": float(global_tokens),
             "data/consumed_tokens": float(self._consumed_tokens),
             "data/step_samples": float(global_samples),

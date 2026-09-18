@@ -23,7 +23,9 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 """
 
 import logging
-from typing import Any, Dict, Literal, Optional, Union
+from itertools import chain
+from types import SimpleNamespace
+from typing import Any, Dict, Literal, Optional
 
 import torch
 from torch import nn
@@ -38,7 +40,6 @@ from hyper_parallel.models._transformers.checkpoint_loader import (
     CheckpointManager,
     _finalize_model_loading,
 )
-from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
 )
@@ -51,7 +52,6 @@ from hyper_parallel.distributed.compile import (
     apply_compile,
 )
 from hyper_parallel.distributed._builder.fsdp_adapter import (
-    FSDP2Manager,
     _apply_fsdp2,
     _instantiate_fsdp2,
 )
@@ -224,11 +224,11 @@ def _plan_and_apply_sharding(
         mesh is not None
         and any(size > 1 for size in (mesh.tp_size, mesh.cp_size, mesh.ep_size))
     )
-    if (
-        sharding_planner is None
-        or mesh is None
-        or (is_hf_model and not model_sharding_requested)
-    ):
+    if sharding_planner is None:
+        return model, None
+    if mesh is None:
+        return model, None
+    if is_hf_model and not model_sharding_requested:
         return model, None
     if mesh.device_mesh is None:
         logger.warning("MeshContext has no device_mesh; skipping sharding")
@@ -397,27 +397,64 @@ def _materialize_and_load_model(
     return model
 
 
+_MODEL_INFRASTRUCTURE_DEFAULTS = {
+    "mesh": None,
+    "sharding_planner": None,
+    "fsdp2_manager": None,
+    "peft_config": None,
+    "qat_config": None,
+    "fp8_config": None,
+    "freeze_config": None,
+    "compile_config": None,
+    "activation_checkpoint": None,
+    "activation_swap": "none",
+    "swap_inputs": False,
+    "is_meta_device": False,
+    "is_hf_model": False,
+    "device": None,
+    "load_base_model": False,
+    "pretrained_path": None,
+    "validate_placement": False,
+    "low_precision_config": None,
+    "model_init_dtype": None,
+}
+
+
+def _parse_model_infrastructure_options(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> SimpleNamespace:
+    """Bind the legacy positional and keyword options without a wide signature."""
+    if len(args) > len(_MODEL_INFRASTRUCTURE_DEFAULTS):
+        raise TypeError(
+            "apply_model_infrastructure() takes from 1 to "
+            f"{len(_MODEL_INFRASTRUCTURE_DEFAULTS) + 1} positional arguments "
+            f"but {len(args) + 1} were given"
+        )
+
+    options = dict(_MODEL_INFRASTRUCTURE_DEFAULTS)
+    positional_names = tuple(options)[:len(args)]
+    options.update(zip(positional_names, args))
+    duplicated_name = next(
+        (name for name in positional_names if name in kwargs),
+        None,
+    )
+    if duplicated_name is not None:
+        raise TypeError(
+            "apply_model_infrastructure() got multiple values for argument "
+            f"'{duplicated_name}'"
+        )
+
+    extra_kwargs = dict(kwargs)
+    for name in options:
+        if name in extra_kwargs:
+            options[name] = extra_kwargs.pop(name)
+    return SimpleNamespace(**options, kwargs=extra_kwargs)
+
+
 def apply_model_infrastructure(
     model: nn.Module,
-    mesh: Optional[MeshContext] = None,
-    sharding_planner: Optional[ShardingPlanner] = None,
-    fsdp2_manager: Optional[FSDP2Manager] = None,
-    peft_config: Optional[Any] = None,
-    qat_config: Optional[Any] = None,
-    fp8_config: Optional[Any] = None,
-    freeze_config: Optional[Any] = None,
-    compile_config: Optional[Union[CompileConfig, dict]] = None,
-    activation_checkpoint: Optional[str] = None,
-    activation_swap: str = "none",
-    swap_inputs: bool = False,
-    is_meta_device: bool = False,
-    is_hf_model: bool = False,
-    device: Optional[torch.device] = None,
-    load_base_model: bool = False,
-    pretrained_path: Optional[str] = None,
-    validate_placement: bool = False,
-    low_precision_config: Optional[Any] = None,
-    model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+    *args: Any,
     **kwargs: Any,
 ) -> nn.Module:
     """Apply model infrastructure (sharding, recompute, FSDP2, and compile).
@@ -428,13 +465,19 @@ def apply_model_infrastructure(
     parameter layouts in both modes.
     """
 
-    distributed_setup = kwargs.get("distributed_setup")
+    options = _parse_model_infrastructure_options(args, kwargs)
+    distributed_setup = options.kwargs.get("distributed_setup")
 
-    compile_config, compile_for_execution = _resolve_compile_config(
-        compile_config, validate_placement, fsdp2_manager
+    options.compile_config, compile_for_execution = _resolve_compile_config(
+        options.compile_config,
+        options.validate_placement,
+        options.fsdp2_manager,
     )
     _apply_pre_sharding_features(
-        model, peft_config, qat_config, fp8_config
+        model,
+        options.peft_config,
+        options.qat_config,
+        options.fp8_config,
     )
 
     # Step 5.5: structure-preserving replacement before plan derivation.
@@ -443,55 +486,58 @@ def apply_model_infrastructure(
         model,
         getattr(distributed_setup, "module_replacements", None),
         weights_mapping=weights_mapping,
-        context=_build_replacement_context(distributed_setup, low_precision_config),
-        capture_checkpoint_metadata=load_base_model,
+        context=_build_replacement_context(
+            distributed_setup,
+            options.low_precision_config,
+        ),
+        capture_checkpoint_metadata=options.load_base_model,
     )
 
-    if freeze_config is not None:
+    if options.freeze_config is not None:
         logger.warning("Parameter freezing not implemented in stub")
 
     # Steps 7-8: plan and apply parameter/activation layouts.
     model, source_shard_info = _plan_and_apply_sharding(
         model,
-        mesh,
-        sharding_planner,
-        is_hf_model,
-        validate_placement,
+        options.mesh,
+        options.sharding_planner,
+        options.is_hf_model,
+        options.validate_placement,
     )
 
     model = _apply_activation_features(
         model,
-        activation_checkpoint,
-        activation_swap,
+        options.activation_checkpoint,
+        options.activation_swap,
         compile_for_execution,
-        mesh,
-        swap_inputs=swap_inputs,
+        options.mesh,
+        swap_inputs=options.swap_inputs,
     )
     # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
     # as DTensors, and FSDP derives their source layouts directly.
     model = _apply_fsdp2(
         model,
-        fsdp2_manager,
+        options.fsdp2_manager,
         source_shard_info,
     )
 
     # Steps 11-12: materialize model storage, then load or initialize weights.
     model = _materialize_and_load_model(
         model,
-        is_meta_device=is_meta_device,
-        device=device,
-        load_base_model=load_base_model,
-        pretrained_path=pretrained_path,
+        is_meta_device=options.is_meta_device,
+        device=options.device,
+        load_base_model=options.load_base_model,
+        pretrained_path=options.pretrained_path,
         weights_mapping=weights_mapping,
     )
 
     # Final dtype conversion belongs to the atomic build (05 stage-5 item
     # 5): the Trainer never patches model dtype after construction.
-    apply_model_init_dtype(model, model_init_dtype)
+    apply_model_init_dtype(model, options.model_init_dtype)
 
     # Step 13: compile only the execution model, after FSDP and loading.
     if compile_for_execution:
-        model = apply_compile(model, compile_config)
+        model = apply_compile(model, options.compile_config)
 
     return model
 
@@ -558,14 +604,14 @@ def _validate_model_init_dtype(
         target_dtype: torch.dtype,
 ) -> None:
     """Validate floating model parameters and buffers after conversion."""
-    mismatched = [
-        name
-        for name, tensor in (
-            list(model.named_parameters(remove_duplicate=False))
-            + list(model.named_buffers(remove_duplicate=False))
-        )
-        if tensor.is_floating_point() and tensor.dtype != target_dtype
-    ]
+    model_tensors = chain(
+        model.named_parameters(remove_duplicate=False),
+        model.named_buffers(remove_duplicate=False),
+    )
+    mismatched = []
+    for name, tensor in model_tensors:
+        if tensor.is_floating_point() and tensor.dtype != target_dtype:
+            mismatched.append(name)
     if mismatched:
         raise RuntimeError(
             "Model initialization dtype conversion failed for: "

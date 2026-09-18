@@ -14,6 +14,8 @@
 # limitations under the License.
 """Text Trainer assembled from the shared BaseTrainer stages."""
 
+__all__ = ["TextTrainer"]
+
 from collections import defaultdict
 from typing import Any, Dict
 
@@ -322,6 +324,3 @@ class TextTrainer:
 
         synchronize()
         self.base.destroy_distributed()
-
-
-__all__ = ["TextTrainer"]

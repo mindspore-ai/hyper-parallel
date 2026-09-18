@@ -18,6 +18,13 @@ Split out of the former ``auto_models/components/utils/helper.py`` in stage 7
 (05 §10.4); function names and signatures are unchanged.
 """
 
+__all__ = [
+    "create_logger",
+    "disable_warning",
+    "enable_third_party_logging",
+    "setup_logging",
+]
+
 import logging as builtin_logging
 import os
 import sys
@@ -87,18 +94,12 @@ def disable_warning() -> None:
     builtin_logging.basicConfig(level=builtin_logging.ERROR)
     warnings.simplefilter("ignore")
     LoggingMetricsReporter()
-    LoggingMetricsReporter._logger = builtin_logging.getLogger(LoggingMetricsReporter.__name__)
-    LoggingMetricsReporter._logger.setLevel(builtin_logging.WARNING)
-    LoggingMetricsReporter._logger.propagate = False
+    reporter_logger = builtin_logging.getLogger(LoggingMetricsReporter.__name__)
+    # PyIceberg exposes no public logger setter; retain its class-level reporter binding.
+    setattr(LoggingMetricsReporter, "_logger", reporter_logger)
+    reporter_logger.setLevel(builtin_logging.WARNING)
+    reporter_logger.propagate = False
 
 
 if os.getenv("DISABLE_WARNINGS", "0").lower() in ["true", "1"]:
     disable_warning()
-
-
-__all__ = [
-    "create_logger",
-    "disable_warning",
-    "enable_third_party_logging",
-    "setup_logging",
-]

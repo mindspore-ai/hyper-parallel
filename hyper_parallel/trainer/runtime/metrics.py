@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+__all__ = ["mean_global_loss"]
+
 from typing import TYPE_CHECKING, Union
 
 import torch
@@ -24,6 +26,23 @@ from hyper_parallel.trainer.runtime.distributed import all_reduce
 
 if TYPE_CHECKING:
     from hyper_parallel.distributed.mesh import MeshContext
+
+
+def _reduce_weighted_loss(cur_loss, cur_token_len, all_reduced_len, loss_name, device_mesh, dp_cp_group):
+    if all_reduced_len != 0:
+        local_weighted_loss = cur_loss * cur_token_len
+        backward_loss = local_weighted_loss / all_reduced_len * device_mesh.dp_size * device_mesh.cp_size
+        global_weighted_loss = all_reduce(
+            local_weighted_loss.detach().item(),
+            op="sum",
+            group=dp_cp_group,
+        )
+        global_mean = cur_loss.new_tensor(global_weighted_loss / all_reduced_len)
+        return backward_loss + global_mean - backward_loss.detach()
+
+    if not torch.allclose(cur_loss, torch.zeros_like(cur_loss)):
+        raise ValueError(f"The all_reduced_len for {loss_name}_tokens is 0, but the cur_loss is not 0: {cur_loss}")
+    return cur_loss
 
 
 def mean_global_loss(
@@ -77,21 +96,14 @@ def mean_global_loss(
             group=dp_cp_group,
         )
 
-        if all_reduced_len != 0:
-            local_weighted_loss = cur_loss * cur_token_len
-            backward_loss = local_weighted_loss / all_reduced_len * device_mesh.dp_size * device_mesh.cp_size
-            global_weighted_loss = all_reduce(
-                local_weighted_loss.detach().item(),
-                op="sum",
-                group=dp_cp_group,
-            )
-            global_mean = cur_loss.new_tensor(global_weighted_loss / all_reduced_len)
-            cur_loss = backward_loss + global_mean - backward_loss.detach()
-        else:
-            if not torch.allclose(cur_loss, torch.zeros_like(cur_loss)):
-                raise ValueError(
-                    f"The all_reduced_len for {loss_name}_tokens is 0, but the cur_loss is not 0: {cur_loss}"
-                )
+        cur_loss = _reduce_weighted_loss(
+            cur_loss,
+            cur_token_len,
+            all_reduced_len,
+            loss_name,
+            device_mesh,
+            dp_cp_group,
+        )
 
         if sequence_parallel:
             cur_loss = cur_loss / sequence_parallel_size
@@ -99,6 +111,3 @@ def mean_global_loss(
         loss_dict[key] = cur_loss
 
     return loss_dict
-
-
-__all__ = ["mean_global_loss"]

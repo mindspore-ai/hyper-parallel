@@ -622,6 +622,22 @@ class BaseTrainer(Stateful, ABC):
         """Configure FSDP gradient synchronization for an external training loop."""
         self._configure_fsdp_gradient_sync(micro_step, num_micro_steps)
 
+    def _step_optimizers_and_schedulers(self) -> None:
+        """Step optimizers and schedulers after gradient accumulation."""
+        optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
+        for optimizer in optimizers:
+            with SkipDTensorDispatch():
+                optimizer.step()
+            optimizer.zero_grad()
+
+        schedulers = (
+            self.lr_scheduler
+            if isinstance(self.lr_scheduler, list)
+            else ([self.lr_scheduler] if self.lr_scheduler is not None else [])
+        )
+        for scheduler in schedulers:
+            scheduler.step()
+
     def train_step(
             self,
             data_iterator: Any,
@@ -664,19 +680,7 @@ class BaseTrainer(Stateful, ABC):
         )
 
         # Optimizer and scheduler step
-        optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
-        for optimizer in optimizers:
-            with SkipDTensorDispatch():
-                optimizer.step()
-            optimizer.zero_grad()
-
-        schedulers = (
-            self.lr_scheduler
-            if isinstance(self.lr_scheduler, list)
-            else ([self.lr_scheduler] if self.lr_scheduler is not None else [])
-        )
-        for scheduler in schedulers:
-            scheduler.step()
+        self._step_optimizers_and_schedulers()
 
         grad_norm_value = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm_value)

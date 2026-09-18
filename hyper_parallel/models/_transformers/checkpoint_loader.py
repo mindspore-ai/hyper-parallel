@@ -21,7 +21,7 @@ from collections import Counter, OrderedDict, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Optional, Protocol
 
 import torch
 from huggingface_hub import snapshot_download
@@ -217,6 +217,66 @@ def _make_tensor_loader(index: _CheckpointIndex, source_key: str) -> Callable[[]
     return lambda: index.load_tensor(source_key)
 
 
+def _prepare_weight_mapping(
+    weights_mapping: list[WeightRenaming | WeightConverter],
+) -> tuple[
+    list[WeightRenaming],
+    list[WeightConverter],
+    dict[str, list[WeightConverter]],
+]:
+    unsupported = [
+        transform
+        for transform in weights_mapping
+        if not isinstance(transform, (WeightRenaming, WeightConverter))
+    ]
+    if unsupported:
+        names = ", ".join(type(transform).__name__ for transform in unsupported)
+        raise ValueError(f"Unsupported Transformers weight transforms in MVP: {names}")
+
+    renamings = [transform for transform in weights_mapping if isinstance(transform, WeightRenaming)]
+    converters = [transform for transform in weights_mapping if isinstance(transform, WeightConverter)]
+    converters_by_pattern = defaultdict(list)
+    for converter in converters:
+        for pattern in converter.source_patterns:
+            converters_by_pattern[pattern].append(converter)
+    return renamings, converters, converters_by_pattern
+
+
+def _select_load_transform(
+    source_key: str,
+    target_name: str,
+    source_pattern: Optional[str],
+    converters_by_pattern: dict[str, list[WeightConverter]],
+) -> tuple[str, WeightRenaming | WeightConverter]:
+    if source_pattern is None:
+        transform = WeightRenaming(source_patterns=source_key, target_patterns=target_name)
+        return source_key, transform
+
+    candidates = converters_by_pattern.get(source_pattern, [])
+    scoped_candidates = [
+        converter
+        for converter in candidates
+        if converter.scope_prefix is not None
+        and (
+            target_name == converter.scope_prefix
+            or target_name.startswith(f"{converter.scope_prefix}.")
+        )
+    ]
+    if len(scoped_candidates) == 1:
+        converter = scoped_candidates[0]
+    else:
+        unscoped_candidates = [
+            converter for converter in candidates if converter.scope_prefix is None
+        ]
+        converter = unscoped_candidates[0] if len(unscoped_candidates) == 1 else None
+    if converter is None:
+        raise ValueError(
+            "No unique WeightConverter found for matched source pattern "
+            f"{source_pattern!r} and target {target_name!r}"
+        )
+    return source_pattern, deepcopy(converter)
+
+
 def _build_load_groups(
     model: nn.Module,
     checkpoint_index: _CheckpointIndex,
@@ -230,22 +290,7 @@ def _build_load_groups(
 ]:
     """Build checkpoint conversion groups and report unmatched transforms."""
 
-    weight_mapping = weights_mapping
-    unsupported = [
-        transform
-        for transform in weight_mapping
-        if not isinstance(transform, (WeightRenaming, WeightConverter))
-    ]
-    if unsupported:
-        names = ", ".join(type(transform).__name__ for transform in unsupported)
-        raise ValueError(f"Unsupported Transformers weight transforms in MVP: {names}")
-
-    renamings = [transform for transform in weight_mapping if isinstance(transform, WeightRenaming)]
-    converters = [transform for transform in weight_mapping if isinstance(transform, WeightConverter)]
-    converters_by_pattern = defaultdict(list)
-    for converter in converters:
-        for pattern in converter.source_patterns:
-            converters_by_pattern[pattern].append(converter)
+    renamings, converters, converters_by_pattern = _prepare_weight_mapping(weights_mapping)
     groups: OrderedDict[str, _LoadGroup] = OrderedDict()
     unexpected_keys = []
     base_model_prefix = getattr(model, "base_model_prefix", None)
@@ -270,33 +315,12 @@ def _build_load_groups(
             unexpected_keys.append(source_key)
             continue
 
-        if source_pattern is None:
-            source_pattern = source_key
-            transform = WeightRenaming(source_patterns=source_key, target_patterns=target_name)
-        else:
-            candidates = converters_by_pattern.get(source_pattern, [])
-            scoped_candidates = [
-                converter
-                for converter in candidates
-                if converter.scope_prefix is not None
-                and (
-                    target_name == converter.scope_prefix
-                    or target_name.startswith(f"{converter.scope_prefix}.")
-                )
-            ]
-            if len(scoped_candidates) == 1:
-                converter = scoped_candidates[0]
-            else:
-                unscoped_candidates = [
-                    converter for converter in candidates if converter.scope_prefix is None
-                ]
-                converter = unscoped_candidates[0] if len(unscoped_candidates) == 1 else None
-            if converter is None:
-                raise ValueError(
-                    "No unique WeightConverter found for matched source pattern "
-                    f"{source_pattern!r} and target {target_name!r}"
-                )
-            transform = deepcopy(converter)
+        source_pattern, transform = _select_load_transform(
+            source_key,
+            target_name,
+            source_pattern,
+            converters_by_pattern,
+        )
 
         group = groups.setdefault(
             target_name,
@@ -309,7 +333,7 @@ def _build_load_groups(
             _make_tensor_loader(checkpoint_index, source_key),
         )
 
-    return tuple(groups.values()), tuple(unexpected_keys), weight_mapping
+    return tuple(groups.values()), tuple(unexpected_keys), weights_mapping
 
 
 def _build_replacement_routes(
@@ -500,23 +524,11 @@ class CheckpointManager:
             targets,
             weights_mapping=weights_mapping,
         )
-        aliases_by_target = _alias_names_by_target(targets)
-        loaded_keys = set()
-        loaded_target_ids = set()
-
-        for group in groups:
-            converted = self._convert_group(group)
-            for target_name, tensor in converted.items():
-                target = targets.get(target_name)
-                if target is None:
-                    unexpected_keys += (target_name,)
-                    continue
-                tensor = tensor[0] if isinstance(tensor, list) else tensor
-                target_id = id(target)
-                if target_id not in loaded_target_ids:
-                    _copy_into_target(target_name, tensor, target)
-                    loaded_target_ids.add(target_id)
-                loaded_keys.update(aliases_by_target[target_id])
+        loaded_keys, unexpected_keys = self._load_groups_into_targets(
+            groups,
+            targets,
+            unexpected_keys,
+        )
 
         missing_keys = tuple(sorted(set(targets) - loaded_keys, key=dot_natural_key))
         unexpected_keys = tuple(sorted(set(unexpected_keys), key=dot_natural_key))
@@ -534,6 +546,32 @@ class CheckpointManager:
             pretrained_path,
         )
         return report
+
+    def _load_groups_into_targets(
+        self,
+        groups: tuple[_LoadGroup, ...],
+        targets: dict[str, torch.Tensor],
+        unexpected_keys: tuple[str, ...],
+    ) -> tuple[set[str], tuple[str, ...]]:
+        """Convert load groups and copy their tensors into model targets."""
+        aliases_by_target = _alias_names_by_target(targets)
+        loaded_keys = set()
+        loaded_target_ids = set()
+
+        for group in groups:
+            converted = self._convert_group(group)
+            for target_name, tensor in converted.items():
+                target = targets.get(target_name)
+                if target is None:
+                    unexpected_keys += (target_name,)
+                    continue
+                tensor = tensor[0] if isinstance(tensor, list) else tensor
+                target_id = id(target)
+                if target_id not in loaded_target_ids:
+                    _copy_into_target(target_name, tensor, target)
+                    loaded_target_ids.add(target_id)
+                loaded_keys.update(aliases_by_target[target_id])
+        return loaded_keys, unexpected_keys
 
     def _load_with_replacement_conversions(
         self,
