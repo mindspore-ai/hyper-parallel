@@ -26,7 +26,6 @@ import torch.distributed as dist
 
 
 _COMMUNICATION_SPLIT = 128
-_MAX_COMMUNICATION_SPLIT = 1024
 
 
 @dataclass(frozen=True)
@@ -72,14 +71,6 @@ def _align_capacity(capacity: int) -> int:
         // _COMMUNICATION_SPLIT
         * _COMMUNICATION_SPLIT
     )
-
-
-def _balanced_communication_split(local_num_tokens: int) -> int:
-    """Reduce large balanced-route queues without dropping source tails."""
-    if local_num_tokens < 4096:
-        return _COMMUNICATION_SPLIT
-    # Graph task counts use integer division, so every source row must fit an exact tile.
-    return math.gcd(local_num_tokens, _MAX_COMMUNICATION_SPLIT)
 
 
 def _resolve_receive_capacity(

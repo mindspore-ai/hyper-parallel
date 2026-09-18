@@ -61,6 +61,14 @@ class TestMegaMoeRoute(unittest.TestCase):
             num_cube_cores=24,
         )
 
+    def test_communication_splits_are_fixed_at_128_rows(self) -> None:
+        """Use one 128-row communication split for every route and transport."""
+        spec = self._spec()
+
+        self.assertEqual(spec.dispatch_split, 128)
+        self.assertEqual(spec.combine_split, 128)
+        self.assertEqual(spec.swiglu_split, 128)
+
     def test_router_counts_are_reused_or_computed_only_when_omitted(self) -> None:
         """Reuse supplied counts and compute a histogram only when omitted."""
         spec = self._spec()

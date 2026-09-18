@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -30,7 +29,7 @@ from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
-from .spec import _COMMUNICATION_SPLIT, _balanced_communication_split, bind_mega_moe_spec
+from .spec import _COMMUNICATION_SPLIT, bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace, configure_symmetric_heap
 
 __all__ = ["MegaMoeExperts"]
@@ -70,32 +69,6 @@ def _validate_resource_layout(specifications: tuple[Any, ...], tensor: torch.Ten
         raise ValueError("MegaMoe static shapes, heap configuration and allocation order must match on all EP ranks.")
 
 
-def _select_plan(resources: Any, route: Any) -> Any:
-    """Keep coarse GET tasks only while the global receive load stays nearly uniform."""
-    balanced = resources.balanced_plan
-    if balanced is None:
-        return resources.plan
-    maximum_received = route.maximum_received_slots
-    if 64 * maximum_received < 65 * resources.spec.routed_slots:
-        return balanced
-    moderate = resources.moderate_plan
-    if maximum_received <= 2 * resources.spec.routed_slots:
-        return moderate
-    return resources.plan
-
-
-def _alternative_plans(spec: Any, device: Any, plan: Any) -> tuple[Any, Any]:
-    """Keep the pull scheduling policy independent of push resource allocation."""
-    balanced_split = _balanced_communication_split(spec.local_num_tokens)
-    if spec.dispatch_mode != "pull" or balanced_split <= _COMMUNICATION_SPLIT:
-        return None, None
-    balanced = build_mega_moe_plan(replace(spec, dispatch_split=balanced_split, combine_split=balanced_split), device)
-    moderate_split = math.gcd(spec.local_num_tokens, 512)
-    moderate = (build_mega_moe_plan(replace(spec, combine_split=moderate_split), device)
-                if moderate_split > _COMMUNICATION_SPLIT else plan)
-    return balanced, moderate
-
-
 class _MegaMoeExecutionResources:
     """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
 
@@ -114,7 +87,6 @@ class _MegaMoeExecutionResources:
         shmem.acquire(self.spec.ep_group)
         try:
             self.plan = build_mega_moe_plan(self.spec, tensor.device)
-            self.balanced_plan, self.moderate_plan = _alternative_plans(self.spec, tensor.device, self.plan)
             self.workspace = MegaMoeWorkspace(shared=shared)
         except Exception:
             shmem.release()
@@ -403,7 +375,7 @@ class MegaMoeExperts(MulticoreModule):
             self.gate_up_weight,
             self.down_weight,
             route,
-            _select_plan(resources, route),
+            resources.plan,
             resources.workspace,
             topk_weights=topk_weights if self.dispatch_mode == "pull" else None,
         )

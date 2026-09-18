@@ -186,7 +186,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         topk_weights = torch.full((128, 2), 0.5)
         tokens_per_expert = torch.tensor([256, 0, 0, 0], dtype=torch.int32)
         expected = hidden_states.reshape(128, 16) + 1
-        resources = SimpleNamespace(spec=object(), plan=object(), workspace=object(), balanced_plan=None)
+        resources = SimpleNamespace(spec=object(), plan=object(), workspace=object())
         route = SimpleNamespace(
             routed_tokens=object(), metadata=object(), unpermute_mapping=object()
         )
@@ -254,23 +254,6 @@ class TestMegaMoeExperts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dispatch_mode"):
             MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
                            num_experts=4, top_k=2, ep_size=2, dispatch_mode="invalid")
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
-              essential_mark="essential")
-    def test_pull_plan_selection_uses_global_receive_load(self) -> None:
-        """Feature: pull plan selection uses global receive load.
-
-        Description: Probe the global load immediately below and at each scheduling threshold.
-        Expectation: Select consistent schedules at the near-balanced and moderate-load bounds.
-        """
-        resources = SimpleNamespace(spec=SimpleNamespace(routed_slots=32768), plan=object(),
-                                    balanced_plan=object(), moderate_plan=object())
-        for maximum, expected in ((32768, resources.balanced_plan), (33279, resources.balanced_plan),
-                                  (33280, resources.moderate_plan), (40960, resources.moderate_plan),
-                                  (65536, resources.moderate_plan), (65537, resources.plan)):
-            with self.subTest(maximum=maximum):
-                self.assertIs(mega_moe_module._select_plan(
-                    resources, SimpleNamespace(maximum_received_slots=maximum)), expected)
 
     def test_forward_rejects_invalid_weights_before_resource_creation(self) -> None:
         """Reject invalid expert weights before initializing native resources."""
@@ -373,7 +356,9 @@ class TestMegaMoeExperts(unittest.TestCase):
             patch.object(mega_moe_module, "configure_symmetric_heap"),
             patch.object(mega_moe_module.shmem, "acquire") as mock_acquire,
             patch.object(mega_moe_module.shmem, "release") as mock_release,
-            patch.object(mega_moe_module, "build_mega_moe_plan", return_value=object()),
+            patch.object(
+                mega_moe_module, "build_mega_moe_plan", return_value=object()
+            ) as mock_build_plan,
             patch.object(mega_moe_module, "MegaMoeWorkspace", return_value=workspace),
         ):
             resources = mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
@@ -383,6 +368,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                 active_specifications=(),
             )
             mock_acquire.assert_called_once_with(root_group)
+            mock_build_plan.assert_called_once_with(bound_spec, "npu:0")
             mock_release.assert_not_called()
             resources.close()
             resources.close()

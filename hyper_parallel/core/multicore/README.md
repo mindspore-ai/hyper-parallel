@@ -115,9 +115,7 @@ push 的 SHMEM heap 由配置接收容量决定；pull 的 heap 由本地发送�
 两者均包含 `T * K` 行 combine 区及事件区，并按 2 MiB 物理页取整。
 pull 仍需普通 HBM 容纳热点接收数据，不会消除计算激活的负载开销。
 
-pull 对 `T >= 4096` 启用自适应通信任务分块：全局最大接收量小于平均的 `65/64` 时，
-dispatch/combine 使用 `gcd(T, 1024)`；不超过 2 倍时使用 `128 / gcd(T, 512)`；
-其余使用 `128 / 128`。较小 T 和 push 保持 `128 / 128`。
+push 和 pull 的 dispatch/combine 通信任务均固定为 128 行，不根据接收负载动态切换。
 
 显式设置不小于 1 的有限 factor 时，容量改为 `ceil(T * K * factor)` 再对齐。
 超过容量时，所有 EP rank 在进入 native kernel 前报 `capacity overflow`。
