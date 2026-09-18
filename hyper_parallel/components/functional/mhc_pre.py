@@ -26,6 +26,17 @@ except ImportError:
 from hyper_parallel.components.functional.sinkhorn import sinkhorn
 
 
+def _mhc_pre_backward(ctx, dh_in, dh_post, dh_res, dh_x):
+    """Invoke the MHC gradient operator with the saved forward state."""
+    x, phi, alpha, gamma, h_post, inv_rms, h_mix, h_pre = ctx.saved_tensors
+    return torch.ops.custom.npu_manifold_constrained_hyper_connection_pre_grad(
+        x, phi, alpha, dh_in, dh_post, dh_res, inv_rms, h_mix, h_pre, h_post,
+        gamma=gamma,
+        hc_eps=ctx.hc_eps,
+        grad_x_post=dh_x,
+    )
+
+
 class _MhcPre(torch.autograd.Function):
     """Autograd bridge for the NPU MHC pre custom operator."""
 
@@ -72,25 +83,7 @@ class _MhcPre(torch.autograd.Function):
     ) -> tuple:
         """Run the NPU MHC pre backward operator."""
         del dh_pre
-        x, phi, alpha, gamma, h_post, inv_rms, h_mix, h_pre = ctx.saved_tensors
-        hc_eps = ctx.hc_eps
-        dx, dphi, dalpha, dbias, dgamma = (
-            torch.ops.custom.npu_manifold_constrained_hyper_connection_pre_grad(
-                x,
-                phi,
-                alpha,
-                dh_in,
-                dh_post,
-                dh_res,
-                inv_rms,
-                h_mix,
-                h_pre,
-                h_post,
-                gamma=gamma,
-                hc_eps=hc_eps,
-                grad_x_post=dh_x,
-            )
-        )
+        dx, dphi, dalpha, dbias, dgamma = _mhc_pre_backward(ctx, dh_in, dh_post, dh_res, dh_x)
         if not ctx.has_gamma:
             dgamma = None
         grads = [dx, dphi, dalpha, dbias, dgamma, None, None, None]

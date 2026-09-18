@@ -46,8 +46,67 @@ def _rescale_attention_outputs(
     combined_sum = output_sum + sink_sum
     output_scale = (output_sum / combined_sum).unsqueeze(3)
     sink_scale = (sink_sum / combined_sum).unsqueeze(3)
-    rescaled_output = output * output_scale + sink_output * sink_scale
-    return rescaled_output.to(dtype=output.dtype), output_scale, sink_scale
+    return (
+        (output * output_scale + sink_output * sink_scale).to(dtype=output.dtype),
+        output_scale,
+        sink_scale,
+    )
+
+
+def _normal_attention_backward(ctx, grad_rescaled_output):
+    """Compute the normal branch's Q/K/V gradients."""
+    (
+        query, key, value, sink_key, _, attention_mask, softmax_max, softmax_sum,
+        _, _, rescaled_output, output_scale, _,
+    ) = ctx.saved_tensors
+    grad_output = rearrange(output_scale * grad_rescaled_output, "s b n d -> (b s) n d")
+    return torch_npu.npu_fusion_attention_grad(
+        query, key, value, grad_output.to(sink_key.dtype), ctx.num_heads, "TND",
+        pse=None,
+        padding_mask=None,
+        atten_mask=attention_mask,
+        softmax_max=softmax_max,
+        softmax_sum=softmax_sum,
+        attention_in=rearrange(rescaled_output, "s b n d -> (b s) n d"),
+        scale_value=ctx.scale,
+        pre_tockens=ctx.pre_tokens,
+        next_tockens=ctx.next_tokens,
+        inner_precise=0,
+        keep_prob=ctx.keep_prob,
+        actual_seq_qlen=ctx.actual_seq_qlen,
+        actual_seq_kvlen=ctx.actual_seq_kvlen,
+        sparse_mode=ctx.sparse_mode,
+        softmax_layout="TND",
+    )[:3]
+
+
+def _sink_attention_backward(ctx, grad_rescaled_output):
+    """Compute sink gradients and restore the query gradient's TND layout."""
+    (
+        query, _, _, sink_key, sink_value, _, _, _,
+        sink_softmax_max, sink_softmax_sum, rescaled_output, _, sink_scale,
+    ) = ctx.saved_tensors
+    sink_query = rearrange(query, "(b s) n d -> s b (n d)", b=ctx.batch_size, s=ctx.sequence_length)
+    grad_output = rearrange(sink_scale * grad_rescaled_output, "s b n d -> s b (n d)")
+    grad_query, grad_key, grad_value = torch_npu.npu_fusion_attention_grad(
+        sink_query, sink_key, sink_value, grad_output.to(sink_key.dtype), ctx.num_heads, "SBH",
+        pse=None,
+        padding_mask=None,
+        atten_mask=None,
+        softmax_max=sink_softmax_max,
+        softmax_sum=sink_softmax_sum,
+        attention_in=rearrange(rescaled_output, "s b n d -> s b (n d)"),
+        scale_value=ctx.scale,
+        inner_precise=0,
+        keep_prob=ctx.keep_prob,
+        actual_seq_qlen=None,
+        actual_seq_kvlen=None,
+        sparse_mode=0,
+    )[:3]
+    grad_query = rearrange(
+        grad_query, "s b (n d) -> (b s) n d", b=ctx.batch_size, s=ctx.sequence_length, n=ctx.num_heads,
+    )
+    return grad_query, grad_key, grad_value
 
 
 class _AttentionRescale(torch.autograd.Function):
@@ -136,103 +195,23 @@ class _AttentionRescale(torch.autograd.Function):
             output_scale,
             sink_scale,
         )
-        ctx.params = (
-            batch_size,
-            sequence_length,
-            num_heads,
-            scale,
-            pre_tokens,
-            next_tokens,
-            keep_prob,
-            sparse_mode,
-            actual_seq_qlen,
-            actual_seq_kvlen,
-        )
+        ctx.batch_size = batch_size
+        ctx.sequence_length = sequence_length
+        ctx.num_heads = num_heads
+        ctx.scale = scale
+        ctx.pre_tokens = pre_tokens
+        ctx.next_tokens = next_tokens
+        ctx.keep_prob = keep_prob
+        ctx.sparse_mode = sparse_mode
+        ctx.actual_seq_qlen = actual_seq_qlen
+        ctx.actual_seq_kvlen = actual_seq_kvlen
         return rescaled_output, softmax_max
 
     @staticmethod
     def backward(ctx: Any, grad_rescaled_output: torch.Tensor, _grad_softmax_max: torch.Tensor) -> tuple:
         """Run the explicit fusion-attention backward operators."""
-        (
-            query,
-            key,
-            value,
-            sink_key,
-            sink_value,
-            attention_mask,
-            softmax_max,
-            softmax_sum,
-            sink_softmax_max,
-            sink_softmax_sum,
-            rescaled_output,
-            output_scale,
-            sink_scale,
-        ) = ctx.saved_tensors
-        (
-            batch_size,
-            sequence_length,
-            num_heads,
-            scale,
-            pre_tokens,
-            next_tokens,
-            keep_prob,
-            sparse_mode,
-            actual_seq_qlen,
-            actual_seq_kvlen,
-        ) = ctx.params
-        grad_output = rearrange(output_scale * grad_rescaled_output, "s b n d -> (b s) n d")
-        grad_query, grad_key, grad_value, *_ = torch_npu.npu_fusion_attention_grad(
-            query,
-            key,
-            value,
-            grad_output.to(sink_key.dtype),
-            num_heads,
-            "TND",
-            pse=None,
-            padding_mask=None,
-            atten_mask=attention_mask,
-            softmax_max=softmax_max,
-            softmax_sum=softmax_sum,
-            attention_in=rearrange(rescaled_output, "s b n d -> (b s) n d"),
-            scale_value=scale,
-            pre_tockens=pre_tokens,
-            next_tockens=next_tokens,
-            inner_precise=0,
-            keep_prob=keep_prob,
-            actual_seq_qlen=actual_seq_qlen,
-            actual_seq_kvlen=actual_seq_kvlen,
-            sparse_mode=sparse_mode,
-            softmax_layout="TND",
-        )
-        sink_grad_output = rearrange(sink_scale * grad_rescaled_output, "s b n d -> s b (n d)")
-        sink_query = rearrange(query, "(b s) n d -> s b (n d)", b=batch_size, s=sequence_length)
-        sink_grad_query, sink_grad_key, sink_grad_value, *_ = torch_npu.npu_fusion_attention_grad(
-            sink_query,
-            sink_key,
-            sink_value,
-            sink_grad_output.to(sink_key.dtype),
-            num_heads,
-            "SBH",
-            pse=None,
-            padding_mask=None,
-            atten_mask=None,
-            softmax_max=sink_softmax_max,
-            softmax_sum=sink_softmax_sum,
-            attention_in=rearrange(rescaled_output, "s b n d -> s b (n d)"),
-            scale_value=scale,
-            inner_precise=0,
-            keep_prob=keep_prob,
-            actual_seq_qlen=None,
-            actual_seq_kvlen=None,
-            sparse_mode=0,
-        )
-        sink_grad_query = rearrange(
-            sink_grad_query,
-            "s b (n d) -> (b s) n d",
-            b=batch_size,
-            s=sequence_length,
-            n=num_heads,
-        )
+        grad_query, grad_key, grad_value = _normal_attention_backward(ctx, grad_rescaled_output)
+        sink_grad_query, sink_grad_key, sink_grad_value = _sink_attention_backward(ctx, grad_rescaled_output)
         return (
             grad_query + sink_grad_query,
             grad_key,

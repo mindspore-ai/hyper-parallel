@@ -52,13 +52,37 @@ def _projections_can_fuse(projections: tuple[nn.Linear, ...]) -> bool:
     )
 
 
+def _apply_gqa_rope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+    rotary_interleaved: bool,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if position_embeddings is None:
+        return query, key
+    cos, sin = position_embeddings
+    if rotary_interleaved:
+        return apply_rotary_pos_emb_interleave(query, key, cos, sin, unsqueeze_dim=2)
+    if cos.shape[-1] >= head_dim:
+        return apply_rotary_pos_emb(query, key, cos, sin, unsqueeze_dim=2)
+    rotary_dim = cos.shape[-1]
+    query_rot, query_pass = query[..., :rotary_dim], query[..., rotary_dim:]
+    key_rot, key_pass = key[..., :rotary_dim], key[..., rotary_dim:]
+    cos = cos.unsqueeze(2)
+    sin = sin.unsqueeze(2)
+    query = torch.cat((query_rot * cos + rotate_half(query_rot) * sin, query_pass), dim=-1)
+    key = torch.cat((key_rot * cos + rotate_half(key_rot) * sin, key_pass), dim=-1)
+    return query, key
+
+
 @module_replacement
 class GQAAttention(nn.Module):
     """Transformers-compatible GQA using a grouped ``linear_qkv`` layout.
 
     The source module may expose a fused ``qkv_proj`` or separate
     ``q_proj``/``k_proj``/``v_proj`` layers. Its checkpoint layout is converted
-    to the per-KV-head grouping consumed by the original high-performance PR.
+    to the per-KV-head grouping consumed by the high-performance kernel.
     Construction only creates the target structure; ``make_transforms``
     declares the checkpoint conversion.
     """
@@ -258,36 +282,13 @@ class GQAAttention(nn.Module):
         if self.k_norm is not None:
             key_states = self.k_norm(key_states)
 
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-            if self.rotary_interleaved:
-                query_states, key_states = apply_rotary_pos_emb_interleave(
-                    query_states, key_states, cos, sin, unsqueeze_dim=2
-                )
-            elif cos.shape[-1] < self.qk_head_dim:
-                rotary_dim = cos.shape[-1]
-                query_rot, query_pass = (
-                    query_states[..., :rotary_dim],
-                    query_states[..., rotary_dim:],
-                )
-                key_rot, key_pass = (
-                    key_states[..., :rotary_dim],
-                    key_states[..., rotary_dim:],
-                )
-                cos = cos.unsqueeze(2)
-                sin = sin.unsqueeze(2)
-                query_states = torch.cat(
-                    (query_rot * cos + rotate_half(query_rot) * sin, query_pass),
-                    dim=-1,
-                )
-                key_states = torch.cat(
-                    (key_rot * cos + rotate_half(key_rot) * sin, key_pass),
-                    dim=-1,
-                )
-            else:
-                query_states, key_states = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, unsqueeze_dim=2
-                )
+        query_states, key_states = _apply_gqa_rope(
+            query_states,
+            key_states,
+            position_embeddings,
+            self.rotary_interleaved,
+            self.qk_head_dim,
+        )
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
@@ -491,36 +492,13 @@ class GatedGQAAttention(nn.Module):
         if self.k_norm is not None:
             key_states = self.k_norm(key_states)
 
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-            if self.rotary_interleaved:
-                query_states, key_states = apply_rotary_pos_emb_interleave(
-                    query_states, key_states, cos, sin, unsqueeze_dim=2
-                )
-            elif cos.shape[-1] < self.qk_head_dim:
-                rotary_dim = cos.shape[-1]
-                query_rot, query_pass = (
-                    query_states[..., :rotary_dim],
-                    query_states[..., rotary_dim:],
-                )
-                key_rot, key_pass = (
-                    key_states[..., :rotary_dim],
-                    key_states[..., rotary_dim:],
-                )
-                cos = cos.unsqueeze(2)
-                sin = sin.unsqueeze(2)
-                query_states = torch.cat(
-                    (query_rot * cos + rotate_half(query_rot) * sin, query_pass),
-                    dim=-1,
-                )
-                key_states = torch.cat(
-                    (key_rot * cos + rotate_half(key_rot) * sin, key_pass),
-                    dim=-1,
-                )
-            else:
-                query_states, key_states = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, unsqueeze_dim=2
-                )
+        query_states, key_states = _apply_gqa_rope(
+            query_states,
+            key_states,
+            position_embeddings,
+            self.rotary_interleaved,
+            self.qk_head_dim,
+        )
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)

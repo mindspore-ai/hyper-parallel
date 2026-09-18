@@ -19,10 +19,6 @@ unrelated optional Omni custom operators. Accessing an Omni-backed module still
 loads and validates that dependency normally.
 """
 
-import importlib
-from typing import Any
-
-
 _EXPORT_TO_MODULE = {
     "DeepseekV32DSAAttention": "dsa_attention",
     "DSAAttention": "dsa_attention",
@@ -40,6 +36,11 @@ _EXPORT_TO_MODULE = {
     "SwiGLUMLP": "swiglu_mlp",
 }
 
+__all__ = list(_EXPORT_TO_MODULE)
+
+import importlib
+from typing import Any
+
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     """Resolve a public class by importing only its owning submodule."""
@@ -50,5 +51,3 @@ def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     value = getattr(module, name)
     globals()[name] = value
     return value
-
-__all__ = list(_EXPORT_TO_MODULE)

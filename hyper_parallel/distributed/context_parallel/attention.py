@@ -110,7 +110,8 @@ def _mla_cp_alltoall(attention_functions, context):
         if module.attention_type != "mla":
             return original(
                 module, query, key, value, attention_mask, **kwargs)
-        if not module.apply_FA_rescale or module.use_fused_sink_fa:
+        apply_fa_rescale = getattr(module, "apply_fa_rescale", False)
+        if not apply_fa_rescale or module.use_fused_sink_fa:
             raise ValueError(
                 "MLA CP supports only non-fused npu_fa_rescale")
         local_shape = tuple(query.shape)

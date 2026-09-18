@@ -33,6 +33,7 @@ from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.functional import swiglu
 
+
 @module_replacement
 class SwiGLUMLP(nn.Module):
     """Transformers-compatible SwiGLU MLP using one fused Gate/Up matmul."""

@@ -331,6 +331,18 @@ class DeepseekV32DSAAttention(nn.Module):
         )
 
     @staticmethod
+    def _invalid_position_ids(
+        position_ids: torch.Tensor | None,
+        batch_size: int,
+        seq_length: int,
+    ) -> bool:
+        if position_ids is None:
+            return False
+        if position_ids.ndim != 2:
+            return True
+        return position_ids.shape[0] not in (1, batch_size) or position_ids.shape[1] != seq_length
+
+    @staticmethod
     def _validate_forward_inputs(
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
@@ -342,11 +354,7 @@ class DeepseekV32DSAAttention(nn.Module):
         batch_size, seq_length = hidden_states.shape[:-1]
         if past_key_values is not None:
             raise NotImplementedError("DeepseekV32DSAAttention does not support KV cache")
-        if position_ids is not None and (
-            position_ids.ndim != 2
-            or position_ids.shape[0] not in (1, batch_size)
-            or position_ids.shape[1] != seq_length
-        ):
+        if DeepseekV32DSAAttention._invalid_position_ids(position_ids, batch_size, seq_length):
             raise ValueError("position_ids must have shape [1 or batch_size, sequence_length]")
         if attention_mask is not None:
             expected_shape = (batch_size, 1, seq_length, seq_length)
@@ -424,18 +432,82 @@ class DeepseekV32DSAAttention(nn.Module):
         """Attach the DSA KL auxiliary loss when training enables it."""
         if not (self.training and not self.freeze_dsa and self.dsa_loss_coeff):
             return attn_output
-        index_query_tnd, index_key_tnd, merge_weight_tnd = index_states
         query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
             for tensor in attention_states
         )
-        softmax_max, softmax_sum = softmax_stats
         aux_loss = dsa_kl_loss(
-            index_query_tnd, index_key_tnd, merge_weight_tnd, query_tnd, key_tnd,
-            topk_indices, softmax_max, softmax_sum, q_rot_tnd, k_rot_tnd,
+            *index_states, query_tnd, key_tnd,
+            topk_indices, *softmax_stats, q_rot_tnd, k_rot_tnd,
             actual_q_len, actual_kv_len, self.scaling, self.dsa_loss_coeff,
         )
         return aux_loss_auto_scale(attn_output, aux_loss)
+
+    def _prepare_attention_states(self, hidden_states, position_embeddings):
+        """Project attention states and apply their rotary embeddings."""
+        q_resid, absorbed_query_states, kv_nope, q_rot, k_rot, kv_weight = self._project_attention_states(
+            hidden_states
+        )
+        q_rot, k_rot = _apply_attention_rope(
+            q_rot, k_rot, position_embeddings, interleaved=self.rotary_interleaved
+        )
+        return q_resid, (absorbed_query_states, kv_nope, q_rot, k_rot), kv_weight
+
+    def _run_indexer(self, hidden_states, q_resid, position_embeddings, actual_seq_len, kwargs):
+        """Resolve packed boundaries and select sparse attention indices."""
+        index_states = self._project_index_states(hidden_states, q_resid, position_embeddings)
+        packed_kwargs = dict(kwargs)
+        packed_kwargs["actual_seq_len"] = actual_seq_len
+        actual_q_len, actual_kv_len = resolve_packed_sequence_lengths(
+            packed_kwargs,
+            hidden_states.shape[0] * hidden_states.shape[1],
+            hidden_states.shape[0] * hidden_states.shape[1],
+        )
+        actual_q_len = self._get_actual_seq_len(
+            actual_q_len, *hidden_states.shape[:-1], hidden_states.device,
+        )
+        actual_kv_len = self._get_actual_seq_len(
+            actual_kv_len, *hidden_states.shape[:-1], hidden_states.device,
+        )
+        indexed = dsa_indexer(*index_states, actual_q_len, actual_kv_len, self.index_topk)
+        return indexed[0], indexed[1:], actual_q_len, actual_kv_len
+
+    def _compute_sparse_attention(
+        self, hidden_states, q_resid, attention_states, position_embeddings, actual_seq_len, kwargs,
+    ):
+        """Run sparse attention and attach its optional auxiliary loss."""
+        topk_indices, index_states, actual_q_len, actual_kv_len = self._run_indexer(
+            hidden_states, q_resid, position_embeddings, actual_seq_len, kwargs,
+        )
+        attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
+            *attention_states, topk_indices, self.scaling, actual_q_len, actual_kv_len,
+        )
+        return self._apply_auxiliary_loss(
+            attn_output, index_states, attention_states, topk_indices,
+            (softmax_max, softmax_sum), actual_q_len, actual_kv_len,
+        )
+
+    def _compute_attention_output(
+        self, hidden_states, position_embeddings, actual_seq_len, kwargs,
+    ):
+        """Compute sparse attention and restore its value projection."""
+        batch_size, seq_length = hidden_states.shape[:-1]
+        q_resid, attention_states, kv_weight = self._prepare_attention_states(
+            hidden_states, position_embeddings,
+        )
+        attn_output = self._compute_sparse_attention(
+            hidden_states, q_resid, attention_states, position_embeddings, actual_seq_len, kwargs,
+        )
+        value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)
+        return _restore_attention_projection(
+            attn_output,
+            value_up_weight,
+            num_heads=self.num_heads,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            kv_lora_rank=self.kv_lora_rank,
+            value_head_dim=self.v_head_dim,
+        )
 
     def forward(
         self,
@@ -448,72 +520,9 @@ class DeepseekV32DSAAttention(nn.Module):
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
         """Run causal or packed DSA with the NPU sparse-attention kernels."""
-        batch_size, seq_length = hidden_states.shape[:-1]
         self._validate_forward_inputs(hidden_states, attention_mask, past_key_values, position_ids, kwargs)
-        q_resid, absorbed_query_states, kv_nope, q_rot, k_rot, kv_weight = self._project_attention_states(
-            hidden_states
-        )
-        q_rot, k_rot = _apply_attention_rope(
-            q_rot, k_rot, position_embeddings, interleaved=self.rotary_interleaved
-        )
-        index_query, index_key, merge_weight = self._project_index_states(
-            hidden_states, q_resid, position_embeddings
-        )
-        packed_kwargs = dict(kwargs)
-        packed_kwargs["actual_seq_len"] = actual_seq_len
-        actual_q_len, actual_kv_len = resolve_packed_sequence_lengths(
-            packed_kwargs,
-            batch_size * seq_length,
-            batch_size * seq_length,
-        )
-        actual_q_len = self._get_actual_seq_len(
-            actual_q_len,
-            batch_size,
-            seq_length,
-            hidden_states.device,
-        )
-        actual_kv_len = self._get_actual_seq_len(
-            actual_kv_len,
-            batch_size,
-            seq_length,
-            hidden_states.device,
-        )
-        topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(
-            index_query,
-            index_key,
-            merge_weight,
-            actual_q_len,
-            actual_kv_len,
-            self.index_topk,
-        )
-        attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
-            absorbed_query_states,
-            kv_nope,
-            q_rot,
-            k_rot,
-            topk_indices,
-            self.scaling,
-            actual_q_len,
-            actual_kv_len,
-        )
-        attn_output = self._apply_auxiliary_loss(
-            attn_output,
-            (index_query_tnd, index_key_tnd, merge_weight_tnd),
-            (absorbed_query_states, kv_nope, q_rot, k_rot),
-            topk_indices,
-            (softmax_max, softmax_sum),
-            actual_q_len,
-            actual_kv_len,
-        )
-        value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)
-        attn_output = _restore_attention_projection(
-            attn_output,
-            value_up_weight,
-            num_heads=self.num_heads,
-            batch_size=batch_size,
-            seq_length=seq_length,
-            kv_lora_rank=self.kv_lora_rank,
-            value_head_dim=self.v_head_dim,
+        attn_output = self._compute_attention_output(
+            hidden_states, position_embeddings, actual_seq_len, kwargs,
         )
         attn_output = self.o_proj(attn_output)
         return attn_output, None
@@ -584,9 +593,8 @@ class DSAAttention(nn.Module):
         self.use_fused_mome = bool(getattr(module, "use_fused_mome", False))
         self.param_sink_number = int(getattr(module, "param_sink_number", 0))
         self.param_sink_scalar = getattr(module, "param_sink_scalar", None)
-        # Preserve the source model's attribute spelling for compatibility.
-        self.apply_FA_rescale = bool(  # pylint: disable=invalid-name
-            getattr(module, "apply_FA_rescale", False)
+        self.apply_fa_rescale = bool(
+            getattr(module, "apply_fa_rescale", False)
         )
         self.attention_dropout = getattr(module, "attention_dropout", nn.Dropout(0.0))
         if self.param_sink_number > 0:
@@ -594,10 +602,10 @@ class DSAAttention(nn.Module):
                 raise NotImplementedError(
                     "DSAAttention does not support scalar parameter sink"
                 )
-            if not self.apply_FA_rescale:
+            if not self.apply_fa_rescale:
                 raise NotImplementedError(
                     "DSAAttention supports parameter sink through "
-                    "apply_FA_rescale only"
+                    "apply_fa_rescale only"
                 )
 
         self.linear_qkv = module.linear_qkv
@@ -772,18 +780,82 @@ class DSAAttention(nn.Module):
         """Attach the DSA KL auxiliary loss when training enables it."""
         if not (self.training and not self.freeze_dsa and self.dsa_loss_coeff):
             return attn_output
-        index_query_tnd, index_key_tnd, merge_weight_tnd = index_states
         query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
             for tensor in attention_states
         )
-        softmax_max, softmax_sum = softmax_stats
         aux_loss = dsa_kl_loss(
-            index_query_tnd, index_key_tnd, merge_weight_tnd, query_tnd, key_tnd,
-            topk_indices, softmax_max, softmax_sum, q_rot_tnd, k_rot_tnd,
+            *index_states, query_tnd, key_tnd,
+            topk_indices, *softmax_stats, q_rot_tnd, k_rot_tnd,
             actual_q_len, actual_kv_len, self.qk_head_dim**-0.5, self.dsa_loss_coeff,
         )
         return aux_loss_auto_scale(attn_output, aux_loss)
+
+    def _prepare_attention_states(self, hidden_states, position_embeddings, mome_mask):
+        """Project attention states and apply their rotary embeddings."""
+        q_resid, absorbed_query_states, kv_nope, q_rot, k_rot, kv_weight = self._project_attention_states(
+            hidden_states, mome_mask
+        )
+        q_rot, k_rot = _apply_attention_rope(
+            q_rot, k_rot, position_embeddings, interleaved=self.rotary_interleaved
+        )
+        return q_resid, (absorbed_query_states, kv_nope, q_rot, k_rot), kv_weight
+
+    def _run_indexer(self, hidden_states, q_resid, position_embeddings, actual_seq_len, kwargs):
+        """Resolve packed boundaries and select sparse attention indices."""
+        index_states = self._project_index_states(hidden_states, q_resid, position_embeddings)
+        packed_kwargs = dict(kwargs)
+        packed_kwargs["actual_seq_len"] = actual_seq_len
+        actual_q_len, actual_kv_len = resolve_packed_sequence_lengths(
+            packed_kwargs,
+            hidden_states.shape[0] * hidden_states.shape[1],
+            hidden_states.shape[0] * hidden_states.shape[1],
+        )
+        actual_q_len = self._get_actual_seq_len(
+            actual_q_len, *hidden_states.shape[:-1], hidden_states.device,
+        )
+        actual_kv_len = self._get_actual_seq_len(
+            actual_kv_len, *hidden_states.shape[:-1], hidden_states.device,
+        )
+        indexed = dsa_indexer(*index_states, actual_q_len, actual_kv_len, self.index_topk)
+        return indexed[0], indexed[1:], actual_q_len, actual_kv_len
+
+    def _compute_sparse_attention(
+        self, hidden_states, q_resid, attention_states, position_embeddings, actual_seq_len, kwargs,
+    ):
+        """Run sparse attention and attach its optional auxiliary loss."""
+        topk_indices, index_states, actual_q_len, actual_kv_len = self._run_indexer(
+            hidden_states, q_resid, position_embeddings, actual_seq_len, kwargs,
+        )
+        attn_output, softmax_max, softmax_sum = self._run_sparse_attention(
+            attention_states, topk_indices, actual_q_len, actual_kv_len, *hidden_states.shape[:-1],
+        )
+        return self._apply_auxiliary_loss(
+            attn_output, index_states, attention_states, topk_indices,
+            (softmax_max, softmax_sum), actual_q_len, actual_kv_len,
+        )
+
+    def _compute_attention_output(
+        self, hidden_states, position_embeddings, actual_seq_len, kwargs, mome_mask,
+    ):
+        """Compute sparse attention and restore its value projection."""
+        batch_size, seq_length = hidden_states.shape[:-1]
+        q_resid, attention_states, kv_weight = self._prepare_attention_states(
+            hidden_states, position_embeddings, mome_mask,
+        )
+        attn_output = self._compute_sparse_attention(
+            hidden_states, q_resid, attention_states, position_embeddings, actual_seq_len, kwargs,
+        )
+        value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)
+        return _restore_attention_projection(
+            attn_output,
+            value_up_weight,
+            num_heads=self.num_heads,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            kv_lora_rank=self.kv_lora_rank,
+            value_head_dim=self.v_head_dim,
+        )
 
     def forward(
         self,
@@ -803,59 +875,8 @@ class DSAAttention(nn.Module):
         self._validate_forward_inputs(
             attention_mask, kv_reuse_states, past_key_values, cache_position, output_attentions
         )
-        batch_size, seq_length = hidden_states.shape[:-1]
-        q_resid, absorbed_query_states, kv_nope, q_rot, k_rot, kv_weight = self._project_attention_states(
-            hidden_states, mome_mask
-        )
-        q_rot, k_rot = _apply_attention_rope(
-            q_rot, k_rot, position_embeddings, interleaved=self.rotary_interleaved
-        )
-        index_query, index_key, merge_weight = self._project_index_states(
-            hidden_states, q_resid, position_embeddings
-        )
-        packed_kwargs = dict(kwargs)
-        packed_kwargs["actual_seq_len"] = actual_seq_len
-        actual_q_len, actual_kv_len = resolve_packed_sequence_lengths(
-            packed_kwargs,
-            batch_size * seq_length,
-            batch_size * seq_length,
-        )
-        actual_q_len = self._get_actual_seq_len(
-            actual_q_len, batch_size, seq_length, hidden_states.device
-        )
-        actual_kv_len = self._get_actual_seq_len(
-            actual_kv_len, batch_size, seq_length, hidden_states.device
-        )
-        topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(
-            index_query,
-            index_key,
-            merge_weight,
-            actual_q_len,
-            actual_kv_len,
-            self.index_topk,
-        )
-        attention_states = (absorbed_query_states, kv_nope, q_rot, k_rot)
-        attn_output, softmax_max, softmax_sum = self._run_sparse_attention(
-            attention_states, topk_indices, actual_q_len, actual_kv_len, batch_size, seq_length
-        )
-        attn_output = self._apply_auxiliary_loss(
-            attn_output,
-            (index_query_tnd, index_key_tnd, merge_weight_tnd),
-            attention_states,
-            topk_indices,
-            (softmax_max, softmax_sum),
-            actual_q_len,
-            actual_kv_len,
-        )
-        value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)
-        attn_output = _restore_attention_projection(
-            attn_output,
-            value_up_weight,
-            num_heads=self.num_heads,
-            batch_size=batch_size,
-            seq_length=seq_length,
-            kv_lora_rank=self.kv_lora_rank,
-            value_head_dim=self.v_head_dim,
+        attn_output = self._compute_attention_output(
+            hidden_states, position_embeddings, actual_seq_len, kwargs, mome_mask,
         )
         if self.use_mome:
             attn_output = apply_mome(

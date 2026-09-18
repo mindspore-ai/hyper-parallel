@@ -17,10 +17,29 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 import torch_npu
+
+
+@dataclass
+class _FusionAttentionContext:
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    input_layout: str
+    attention_mask: Optional[torch.Tensor]
+    sparse_mode: int
+    query_lengths: Optional[Sequence[int]]
+    key_lengths: Optional[Sequence[int]]
+    batch_size: int
+    query_length: int
+    head_dim: int
+    pre_tokens: int
+    next_tokens: int
+    is_packed: bool
 
 
 def _npu_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -221,6 +240,44 @@ def _prepare_attention_inputs(
     return query, key, value, "BNSD", npu_mask, sparse_mode
 
 
+def _prepare_fusion_attention_context(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    kwargs: dict[str, Any],
+) -> _FusionAttentionContext:
+    query_lengths, key_lengths = resolve_packed_sequence_lengths(
+        kwargs,
+        query.shape[0] * query.shape[2],
+        key.shape[0] * key.shape[2],
+    )
+    options = _attention_options(module, kwargs)
+    prepared = _prepare_attention_inputs(
+        query,
+        key,
+        value,
+        attention_mask,
+        is_packed=query_lengths is not None,
+        is_causal=options[4],
+        sliding_window=options[3],
+        sparse_mode=options[2],
+    )
+    return _FusionAttentionContext(
+        *prepared[:5],
+        prepared[5],
+        query_lengths,
+        key_lengths,
+        query.shape[0],
+        query.shape[2],
+        query.shape[-1],
+        options[0],
+        options[1],
+        query_lengths is not None,
+    )
+
+
 def npu_fusion_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -252,8 +309,8 @@ def npu_fusion_attention_forward(
 
     Note:
         QKV inputs use four-dimensional BNSD layout. Packed inputs are flattened
-        to TND when cumulative sequence lengths are supplied through the PR/VeOmni
-        ``actual_*`` names or Transformers ``cu_seq_lens_*`` names. Float16,
+        to TND when cumulative sequence lengths are supplied through the project
+        ``actual_*`` aliases or Transformers ``cu_seq_lens_*`` names. Float16,
         bfloat16, and float32 inputs have been verified. A boolean mask uses
         ``True`` for positions that participate in attention; an additive mask
         uses zero for those positions.
@@ -263,46 +320,38 @@ def npu_fusion_attention_forward(
             "npu_fusion_attention_forward does not consume sparse attention indices; "
             "select a DSA sparse-attention implementation instead."
         )
-    head_dim = query.shape[-1]
-    batch_size = query.shape[0]
-    query_length = query.shape[2]
-    key_length = key.shape[2]
-    query_lengths, key_lengths = resolve_packed_sequence_lengths(
-        kwargs,
-        batch_size * query_length,
-        key.shape[0] * key_length,
-    )
-    is_packed = query_lengths is not None
-    pre_tokens, next_tokens, sparse_mode, sliding_window, is_causal = _attention_options(module, kwargs)
-    query, key, value, input_layout, npu_attention_mask, sparse_mode = _prepare_attention_inputs(
+    context = _prepare_fusion_attention_context(
+        module,
         query,
         key,
         value,
         attention_mask,
-        is_packed=is_packed,
-        is_causal=is_causal,
-        sliding_window=sliding_window,
-        sparse_mode=sparse_mode,
+        kwargs,
     )
     output = torch_npu.npu_fusion_attention(
-        query,
-        key,
-        value,
-        query.shape[1],
-        input_layout,
+        context.query,
+        context.key,
+        context.value,
+        context.query.shape[1],
+        context.input_layout,
         pse=None,
         padding_mask=None,
-        atten_mask=npu_attention_mask,
-        scale=head_dim**-0.5 if scaling is None else scaling,
-        pre_tockens=pre_tokens,
-        next_tockens=next_tokens,
+        atten_mask=context.attention_mask,
+        scale=context.head_dim**-0.5 if scaling is None else scaling,
+        pre_tockens=context.pre_tokens,
+        next_tockens=context.next_tokens,
         keep_prob=1.0 - dropout,
         inner_precise=0,
-        sparse_mode=sparse_mode,
-        actual_seq_qlen=query_lengths,
-        actual_seq_kvlen=key_lengths,
+        sparse_mode=context.sparse_mode,
+        actual_seq_qlen=context.query_lengths,
+        actual_seq_kvlen=context.key_lengths,
     )[0]
-    if is_packed:
-        output = output.reshape(batch_size, query_length, output.shape[1], output.shape[2])
+    if context.is_packed:
+        output = output.reshape(
+            context.batch_size,
+            context.query_length,
+            output.shape[1],
+            output.shape[2],
+        )
         return output, None
     return output.transpose(1, 2), None
