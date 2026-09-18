@@ -42,6 +42,23 @@
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
       },
+      "ops_nn_clipped_swiglu": {
+        "version": "v9.2.0-beta.2",
+        "repository": "https://gitcode.com/cann/ops-nn.git",
+        "tag_object": "30ef7dd563c8a4b74c3161835c8e47d1d96f87b6",
+        "commit": "30ef7dd563c8a4b74c3161835c8e47d1d96f87b6",
+        "tree": "db38eb693e9c5d191614e3465840a924c3bf67df",
+        "git_archive_tar_sha256": "a38115da10c5210f21b3cfdeecb922b1cc618286aadf60a7e7692c6f66c81287",
+        "resolution": "exact upstream source tag providing official ClippedSwiglu and ClippedSwigluGrad kernels",
+        "patches": [
+          {
+            "path": "hyper_parallel/core/multicore/ops/clipped_swiglu_fusion.patch",
+            "sha256": "76f9d0a1399cc963b4b033a066018e4ba5703748975a2fed35c04de22ff32413",
+            "purpose": "adapt official clipped SwiGLU kernels to one inline HyperMegaMoe vector task without altering its math"
+          }
+        ],
+        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+      },
       "ops_transformer": {
         "version": "v9.1.0.pre",
         "repository": "https://gitcode.com/cann/ops-transformer.git",
@@ -83,6 +100,7 @@
   "current_repository_baseline": {
     "shmem": "d30702bb55d0",
     "ops_nn": "v9.1.0.pre",
+    "ops_nn_clipped_swiglu": "v9.2.0-beta.2",
     "ops_transformer": "v9.1.0.pre",
     "multicore_input": "locked ops-nn and ops-transformer kernel source plus the selected installed CANN >=9.1.0 toolchain"
   }

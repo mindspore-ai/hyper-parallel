@@ -19,6 +19,9 @@ set(CANN_OP_COMMON_INCLUDE
     ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/op_common
 )
 set(CANN_OP_HOST_INCLUDE ${CANN_OP_COMMON_INCLUDE}/op_host)
+set(CANN_BASE_INCLUDE
+    ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc/base
+)
 set(CANN_ACLNN_INCLUDE
     ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/aclnn
 )
@@ -48,6 +51,7 @@ npu_op_code_gen(
     COMPILE_OPTIONS
         -I${CANN_OP_COMMON_INCLUDE}
         -I${CANN_OP_HOST_INCLUDE}
+        -I${CANN_BASE_INCLUDE}
 )
 
 set(ACLNN_SOURCES
@@ -63,6 +67,7 @@ target_include_directories(cust_opapi PRIVATE
     ${BWD_HOST}/op_api
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
+    ${CANN_BASE_INCLUDE}
     ${CANN_ACLNN_INCLUDE}
     ${CANN_ACLNN_OP_INCLUDE}
 )
@@ -84,6 +89,7 @@ target_include_directories(cust_op_proto PRIVATE
     ${BWD_HOST}
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
+    ${CANN_BASE_INCLUDE}
 )
 hp_enable_elf_hardening(cust_op_proto)
 
@@ -100,6 +106,7 @@ target_include_directories(cust_optiling PRIVATE
     ${BWD_HOST}
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
+    ${CANN_BASE_INCLUDE}
 )
 target_link_directories(cust_optiling PRIVATE ${CANN_ARCH_LIBRARY})
 target_link_libraries(cust_optiling PRIVATE ops_base)

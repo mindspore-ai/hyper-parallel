@@ -39,6 +39,10 @@ _OPS_NN_PATHS = (
     "activation/swi_glu/op_kernel",
     "activation/swi_glu_grad/op_kernel",
 )
+_OPS_NN_CLIPPED_SWIGLU_PATHS = (
+    "activation/clipped_swiglu/op_kernel",
+    "activation/clipped_swiglu_grad/op_kernel",
+)
 _OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel",)
 _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad")
 
@@ -47,6 +51,7 @@ def _parse_args() -> argparse.Namespace:
     """Parse the isolated source assembly contract."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ops-nn-source", required=True)
+    parser.add_argument("--ops-nn-clipped-swiglu-source", required=True)
     parser.add_argument("--ops-transformer-source", required=True)
     parser.add_argument("--work-dir", required=True)
     return parser.parse_args()
@@ -57,11 +62,20 @@ def main() -> int:
     args = _parse_args()
     lock = json.loads(_LOCK_PATH.read_text(encoding="utf-8"))["components"]["multicore"]
     ops_nn_source = Path(args.ops_nn_source).resolve()
+    ops_nn_clipped_swiglu_source = Path(args.ops_nn_clipped_swiglu_source).resolve()
     ops_transformer_source = Path(args.ops_transformer_source).resolve()
     work_dir = Path(args.work_dir).resolve()
-    _validate_new_work_dir(work_dir, (ops_nn_source, ops_transformer_source))
+    _validate_new_work_dir(
+        work_dir,
+        (ops_nn_source, ops_nn_clipped_swiglu_source, ops_transformer_source),
+    )
 
     verify_git_dependency(lock["ops_nn"], ops_nn_source, dependency_name="ops_nn")
+    verify_git_dependency(
+        lock["ops_nn_clipped_swiglu"],
+        ops_nn_clipped_swiglu_source,
+        dependency_name="ops_nn_clipped_swiglu",
+    )
     verify_git_dependency(
         lock["ops_transformer"],
         ops_transformer_source,
@@ -69,6 +83,7 @@ def main() -> int:
     )
 
     ops_nn_copy = work_dir / "adapter-inputs" / "ops-nn"
+    ops_nn_clipped_swiglu_copy = work_dir / "adapter-inputs" / "ops-nn-clipped-swiglu"
     transformer_copy = work_dir / "adapter-inputs" / "ops-transformer"
     _export_git_tree(
         ops_nn_source,
@@ -77,16 +92,28 @@ def main() -> int:
         _OPS_NN_PATHS,
     )
     _export_git_tree(
+        ops_nn_clipped_swiglu_source,
+        ops_nn_clipped_swiglu_copy,
+        lock["ops_nn_clipped_swiglu"]["commit"],
+        _OPS_NN_CLIPPED_SWIGLU_PATHS,
+    )
+    _export_git_tree(
         ops_transformer_source,
         transformer_copy,
         lock["ops_transformer"]["commit"],
         _OPS_TRANSFORMER_PATHS,
     )
     _apply_locked_adapters(ops_nn_copy, lock["ops_nn"])
+    _apply_locked_adapters(ops_nn_clipped_swiglu_copy, lock["ops_nn_clipped_swiglu"])
     _apply_locked_adapters(transformer_copy, lock["ops_transformer"])
 
     source_root = work_dir / "source"
-    _compose_hyper_parallel_ops(source_root, ops_nn_copy, transformer_copy)
+    _compose_hyper_parallel_ops(
+        source_root,
+        ops_nn_copy,
+        ops_nn_clipped_swiglu_copy,
+        transformer_copy,
+    )
     _require_assembled_files(source_root)
     print(json.dumps({"source_root": str(source_root)}, sort_keys=True))
     return 0
@@ -178,6 +205,7 @@ def _run_git_apply(
 def _compose_hyper_parallel_ops(
     source_root: Path,
     ops_nn_copy: Path,
+    ops_nn_clipped_swiglu_copy: Path,
     transformer_copy: Path,
 ) -> None:
     """Compose HP operator code with selected adapted upstream kernel sources."""
@@ -198,12 +226,20 @@ def _compose_hyper_parallel_ops(
             operator_root / "op_kernel" / "swi_glu",
         )
         shutil.copytree(
+            ops_nn_clipped_swiglu_copy / "activation" / "clipped_swiglu" / "op_kernel",
+            operator_root / "op_kernel" / "clipped_swiglu",
+        )
+        shutil.copytree(
             transformer_copy / "gmm" / "grouped_matmul" / "op_kernel",
             operator_root / "op_kernel" / "grouped_matmul",
         )
     shutil.copytree(
         ops_nn_copy / "activation" / "swi_glu_grad" / "op_kernel",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad",
+    )
+    shutil.copytree(
+        ops_nn_clipped_swiglu_copy / "activation" / "clipped_swiglu_grad" / "op_kernel",
+        source_root / "hyper_mega_moe_grad" / "op_kernel" / "clipped_swiglu_grad",
     )
 
 
@@ -213,10 +249,12 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_moe" / "op_host" / "hyper_mega_moe_def.cpp",
         source_root / "hyper_mega_moe" / "op_kernel" / "hyper_mega_moe.cpp",
         source_root / "hyper_mega_moe" / "op_kernel" / "swi_glu" / "swi_glu.cpp",
+        source_root / "hyper_mega_moe" / "op_kernel" / "clipped_swiglu" / "clipped_swiglu.hpp",
         source_root / "hyper_mega_moe" / "op_kernel" / "grouped_matmul" / "grouped_matmul.cpp",
         source_root / "hyper_mega_moe_grad" / "op_host" / "hyper_mega_moe_grad_def.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "hyper_mega_moe_grad.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad" / "swi_glu_grad.cpp",
+        source_root / "hyper_mega_moe_grad" / "op_kernel" / "clipped_swiglu_grad" / "clipped_swiglu_grad.h",
         source_root / "shmem" / "data_plane" / "rma.h",
         source_root / "shmem" / "data_plane" / "sync.h",
     )

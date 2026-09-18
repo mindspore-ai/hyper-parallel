@@ -1,0 +1,76 @@
+diff --git a/activation/clipped_swiglu/op_kernel/clipped_swiglu.hpp b/activation/clipped_swiglu/op_kernel/clipped_swiglu.hpp
+index cd689804..ae881dde 100644
+--- a/activation/clipped_swiglu/op_kernel/clipped_swiglu.hpp
++++ b/activation/clipped_swiglu/op_kernel/clipped_swiglu.hpp
+@@ -60,2 +60,2 @@ protected:
+-    uint32_t blockIdx_ = GetBlockIdx();
++    uint32_t blockIdx_ = 0;
+     uint32_t usedCoreNum_ = 0;
+@@ -219,13 +219,12 @@ __aicore__ inline void ClippedSwigluBase<inType>::ProcessSingleLoop(int64_t xOff
+     LocalTensor<float> xFloatLocal = xDTypeLocal.template ReinterpretCast<float>();
+-#if (ORIG_DTYPE_X != DT_FLOAT)
+-    if (tl_->isInterleaved == 0) {
+-        Cast(xFloatLocal, xDTypeLocal[xLocalOffset1_], RoundMode::CAST_NONE, calPairNum_);
+-        PipeBarrier<PIPE_V>();
+-        Cast(xFloatLocal[xQueSpace_ / sizeof(float) / SWI_FACTOR], xDTypeLocal[xLocalOffset1_ + xLocalOffset2_],
+-             RoundMode::CAST_NONE, calPairNum_);
+-    } else {
+-        Cast(xFloatLocal, xDTypeLocal[xLocalOffset1_], RoundMode::CAST_NONE, calPairNum_ * SWI_FACTOR);
++    if constexpr (!std::is_same_v<inType, float>) {
++        if (tl_->isInterleaved == 0) {
++            Cast(xFloatLocal, xDTypeLocal[xLocalOffset1_], RoundMode::CAST_NONE, calPairNum_);
++            PipeBarrier<PIPE_V>();
++            Cast(xFloatLocal[xQueSpace_ / sizeof(float) / SWI_FACTOR],
++                 xDTypeLocal[xLocalOffset1_ + xLocalOffset2_], RoundMode::CAST_NONE, calPairNum_);
++        } else {
++            Cast(xFloatLocal, xDTypeLocal[xLocalOffset1_], RoundMode::CAST_NONE, calPairNum_ * SWI_FACTOR);
++        }
+     }
+-
+-#endif
+     LocalTensor<float> tmpUbF32 = tmpBuf1_.Get<float>(); // 用于装A\B矩阵
+@@ -234,8 +233,7 @@ __aicore__ inline void ClippedSwigluBase<inType>::ProcessSingleLoop(int64_t xOff
+     LocalTensor<inType> yDTypeLocal = yFloatLocal.template ReinterpretCast<inType>();
+-#if (ORIG_DTYPE_X == DT_BF16)
+-    Cast(yDTypeLocal, yFloatLocal, RoundMode::CAST_RINT, calPairNum_);
+-#endif
+-#if (ORIG_DTYPE_X == DT_FLOAT16)
+-    Cast(yDTypeLocal, yFloatLocal, RoundMode::CAST_NONE, calPairNum_);
+-#endif
++    if constexpr (std::is_same_v<inType, bfloat16_t>) {
++        Cast(yDTypeLocal, yFloatLocal, RoundMode::CAST_RINT, calPairNum_);
++    } else if constexpr (std::is_same_v<inType, half>) {
++        Cast(yDTypeLocal, yFloatLocal, RoundMode::CAST_NONE, calPairNum_);
++    }
+     yQueue_.EnQue<inType>(yDTypeLocal);
+@@ -247,10 +245,10 @@ __aicore__ inline void ClippedSwigluBase<inType>::CopyIn(int64_t xOffset)
+ {
+-#if (ORIG_DTYPE_X != DT_FLOAT) // 16位的数据DataCopy的时候放在buffer的后面一半，防止后续Cast出错
+-    xLocalOffset1_ = xQueSpace_ / SWI_FACTOR / static_cast<int64_t>(sizeof(bfloat16_t));
+-    xLocalOffset2_ = xLocalOffset1_ / SWI_FACTOR;
+-#endif
+-#if (ORIG_DTYPE_X == DT_FLOAT)
+-    xLocalOffset1_ = 0;
+-    xLocalOffset2_ = xQueSpace_ / static_cast<int64_t>(sizeof(float)) / SWI_FACTOR;
+-#endif
++    if constexpr (!std::is_same_v<inType, float>) {
++        // 16-bit data is copied into the back half of the buffer before casting.
++        xLocalOffset1_ = xQueSpace_ / SWI_FACTOR / static_cast<int64_t>(sizeof(bfloat16_t));
++        xLocalOffset2_ = xLocalOffset1_ / SWI_FACTOR;
++    } else {
++        xLocalOffset1_ = 0;
++        xLocalOffset2_ = xQueSpace_ / static_cast<int64_t>(sizeof(float)) / SWI_FACTOR;
++    }
+     LocalTensor<inType> xDTypeLocal = xQueue_.AllocTensor<inType>();
+diff --git a/activation/clipped_swiglu_grad/op_kernel/clipped_swiglu_grad.h b/activation/clipped_swiglu_grad/op_kernel/clipped_swiglu_grad.h
+index e0b31f3e..c4b6b986 100644
+--- a/activation/clipped_swiglu_grad/op_kernel/clipped_swiglu_grad.h
++++ b/activation/clipped_swiglu_grad/op_kernel/clipped_swiglu_grad.h
+@@ -104,2 +104,2 @@ protected:
+-    uint32_t blockIdx_ = GetBlockIdx();
++    uint32_t blockIdx_ = 0;
+     uint32_t usedCoreNum_ = 0;
+@@ -174,3 +173,1 @@ __aicore__ inline void ClippedSwigluGradBase<T, isInterleaved, isGroup>::Process
+-    SyncAll();
+-
+     if constexpr (isGroup) {
