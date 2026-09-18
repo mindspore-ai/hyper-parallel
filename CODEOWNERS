@@ -23,7 +23,7 @@
 /hyper_parallel/core/fully_shard/ @Meng107
 /hyper_parallel/core/pipeline_parallel/ @lichen666
 /hyper_parallel/core/shard/ @yangzhenzhang
-/hyper_parallel/core/shard/ops/ @david-he91
+/hyper_parallel/core/shard/ops/ @davidhe91
 
 
 # The maintainers of hyper_parallel/platform.
@@ -58,6 +58,6 @@
 /requirements.txt  @yangzhenzhang
 /setup.py  @yangzhenzhang
 
-/hyper_parallel/core/multicore/ @david-he91 @probiotics_53
-/tests/ut/core/multicore/ @david-he91 @probiotics_53
-/tests/torch/multicore/ @david-he91 @probiotics_53
+/hyper_parallel/core/multicore/ @davidhe91 @Probiotics5333
+/tests/ut/core/multicore/ @davidhe91 @Probiotics5333
+/tests/torch/multicore/ @davidhe91 @Probiotics5333

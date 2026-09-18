@@ -1150,6 +1150,39 @@ def _validate_ulysses_requirements(target_module, cp_size):
         raise ValueError("MLA/DSA CP does not support fused sink FA")
 
 
+def _collect_mla_dsa_text_models(target_module):
+    """Collect text-model modules supported by the MLA/DSA wrapper.
+
+    Args:
+        target_module: Root module whose descendants are inspected.
+
+    Returns:
+        The matching text-model modules in traversal order.
+    """
+    text_models = []
+    for name, module in target_module.named_modules():
+        if name.rsplit(".", maxsplit=1)[-1] in {"text_model", "language_model"}:
+            text_models.append(module)
+    return text_models
+
+
+def _collect_mla_dsa_attention_registries(attention_module):
+    """Collect registries that expose both required MLA/DSA backends.
+
+    Args:
+        attention_module: Python module that owns the attention registries.
+
+    Returns:
+        Dictionaries containing both required attention functions.
+    """
+    attention_registries = []
+    required_attention_functions = {"npu_fa_rescale", "dsa_sparse_attention"}
+    for value in vars(attention_module).values():
+        if isinstance(value, dict) and required_attention_functions <= value.keys():
+            attention_registries.append(value)
+    return attention_registries
+
+
 @inner_wrapper
 def mla_dsa_ulysses_cp_wrapper(  # pylint: disable=inconsistent-return-statements
         target_module: Module, mesh: Any, tp_mesh: Any,
@@ -1164,9 +1197,7 @@ def mla_dsa_ulysses_cp_wrapper(  # pylint: disable=inconsistent-return-statement
     _validate_ulysses_requirements(target_module, cp_mesh.size())
     context = _UlyssesContext(cp_mesh)
 
-    text_models = [module for name, module in target_module.named_modules()
-                   if name.rsplit(".", maxsplit=1)[-1] in {
-                       "text_model", "language_model"}]
+    text_models = _collect_mla_dsa_text_models(target_module)
     if not text_models:
         raise RuntimeError("Cannot find a text or language model")
     requests = []
@@ -1184,10 +1215,7 @@ def mla_dsa_ulysses_cp_wrapper(  # pylint: disable=inconsistent-return-statement
         raise RuntimeError(
             f"Expected one MLA/DSA attention module, found {names}")
     attention_module = next(iter(attention_modules))
-    attention_registries = [
-        value for value in vars(attention_module).values()
-        if isinstance(value, dict)
-        and {"npu_fa_rescale", "dsa_sparse_attention"} <= value.keys()]
+    attention_registries = _collect_mla_dsa_attention_registries(attention_module)
     if len(attention_registries) != 1:
         raise RuntimeError(
             "Expected one attention-function registry containing MLA and DSA backends")
