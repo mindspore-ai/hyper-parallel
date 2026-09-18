@@ -259,8 +259,6 @@ class ExpandAsDistributedOp(DistributedOp):
             self._check_partial_inputs([input_layout])
 
         in_alias_map = input_layout.alias_tensor_map
-        input_ndim = len(in_alias_map)
-
         input_global_shape = cache_values[1]
         target_shape = cache_values[2]
 
@@ -275,16 +273,14 @@ class ExpandAsDistributedOp(DistributedOp):
                 f"but got {type(input_global_shape)}."
             )
 
-        target_ndim = len(target_shape)
-
-        if target_ndim < input_ndim:
+        if len(target_shape) < len(in_alias_map):
             raise ValueError(
-                f"For {self.op_name}, target shape {target_shape} (ndim={target_ndim}) "
-                f"cannot be smaller than input shape {input_global_shape} (ndim={input_ndim})."
+                f"For {self.op_name}, target shape {target_shape} (ndim={len(target_shape)}) "
+                f"cannot be smaller than input shape {input_global_shape} (ndim={len(in_alias_map)})."
             )
 
         # Align dimensions: right-align input to target shape
-        num_leading_implicit = target_ndim - input_ndim
+        num_leading_implicit = len(target_shape) - len(in_alias_map)
         aligned_input_shape = (1,) * num_leading_implicit + input_global_shape
         aligned_tensor_map = ("None",) * num_leading_implicit + in_alias_map
 
@@ -318,4 +314,3 @@ class ExpandAsDistributedOp(DistributedOp):
         )
         output_layout = output_layout(*output_tensor_map)
         return ((output_layout,), None)
-    

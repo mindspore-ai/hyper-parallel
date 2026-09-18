@@ -116,15 +116,11 @@ class StackDistributedOp(DistributedOp):
             )
 
         # 2. Layout Inference Logic
-        in_tensor_map = base_layout.tensor_map
-
         # Insert an unsharded mapping (-1) at the newly created dimension
-        output_tensor_map = list(in_tensor_map)
+        output_tensor_map = list(base_layout.tensor_map)
         output_tensor_map.insert(actual_dim, -1)
 
-        mesh_shape = base_layout.mesh_shape
         alias_name = base_layout.alias_name
-        rank_list = base_layout.rank_list
 
         def idx_to_alias(idx, aliases):
             """Map tensor_map index back to the alias string."""
@@ -137,9 +133,9 @@ class StackDistributedOp(DistributedOp):
 
         # Reconstruct the output layout
         output_layout = Layout(
-            mesh_shape=mesh_shape,
+            mesh_shape=base_layout.mesh_shape,
             alias_name=alias_name,
-            rank_list=rank_list
+            rank_list=base_layout.rank_list
         )
 
         # Apply the placement mappings via the __call__ method

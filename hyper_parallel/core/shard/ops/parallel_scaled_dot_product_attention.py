@@ -535,8 +535,7 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
             scale=None,
             enable_gqa=False,
         ):
-            split_info = self._get_split_info(query_layout, dims)
-            seq_split_num = split_info["seq"]
+            seq_split_num = self._get_split_info(query_layout, dims)["seq"]
 
             lb_split_id, lb_split_num = _get_lb_override()
 
@@ -552,13 +551,11 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
                 else:
                     split_id = self._get_split_id(query_layout, dims)
                 local_q_len = query.shape[dims["seq"]]
-                global_kv_len = key.shape[dims["seq"]]
-
                 adjusted_attn_mask, adjusted_is_causal, key, value = (
                     self._adjust_attn_mask_for_sp(
                         attn_mask, is_causal, key, value,
                         split_id, local_q_len, seq_split_num,
-                        global_kv_len, dims["seq"], query.device,
+                        key.shape[dims["seq"]], dims["seq"], query.device,
                     )
                 )
 
