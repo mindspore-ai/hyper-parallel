@@ -118,12 +118,11 @@ def get_parallel_state():
 '''
 
 
+#: Bare TP operators for the generated forwards.  This snippet is emitted
+#: alongside the rendered attention class, which already declares
+#: ``get_parallel_state()`` (``inline.attention``), so the accessor is not
+#: repeated here.
 TP_OPERATORS_CLASS = '''
-def get_parallel_state():
-    """Return the externally installed codegen parallel state."""
-    return get_inline_parallel_state(__name__)
-
-
 class TPOperators:
     """TP communication operators used directly by generated forwards."""
 

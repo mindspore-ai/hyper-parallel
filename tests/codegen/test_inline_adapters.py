@@ -27,7 +27,7 @@ from unittest.mock import patch
 from hyper_parallel.codegen.emit.modeling import _apply_inline_modeling
 from hyper_parallel.codegen import manager
 from hyper_parallel.codegen.inline.ir import (
-    ForwardExtractPatch, InlinePatchSet, InlineRule,
+    ForwardExtractPatch, InlinePatchSet, InlineRule, ModuleSnippetPatch,
 )
 from hyper_parallel.codegen.inline.framework_spec import GENERATED_ATTENTION_CLASS
 from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
@@ -230,6 +230,30 @@ class TestInlineAdapters(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Conflicting inline strategies"):
                 build_strategy_patches(rules)
 
+    def test_repeated_rules_share_one_snippet_and_forward_patch(self):
+        """One target matched by N rules contributes its snippets once.
+
+        A plan freezes one rule per matched FQN, so without dedup a
+        module-level snippet (the EP parallel-state accessor) is emitted once
+        per layer — 61 identical copies for DeepSeek-V3.
+        """
+        snippet = ModuleSnippetPatch("def helper():\n    return 1")
+        declaration = StrategySpec(
+            "ep", (), "Block", body_template="return 1", snippets=(snippet,)
+        )
+        rules = tuple(
+            InlineRule((f"model.layers.{index}.mlp",), local_compute_target=EP)
+            for index in range(5)
+        )
+        with patch(
+            "hyper_parallel.codegen.inline.strategy_pass.strategy_spec",
+            side_effect=lambda target, model_type, **kwargs: declaration,
+        ):
+            patches = build_strategy_patches(rules)
+        self.assertEqual(len(rules), 5)
+        self.assertEqual(patches.module_snippets, [snippet])
+        self.assertEqual(len(patches.forward_extracts), 1)
+
     def test_qwen_metadata_and_source_remain_compatible(self):
         """QKV expansion is scoped, independent and stable across re-emission."""
         source = """
@@ -256,6 +280,9 @@ class Model:
         self.assertEqual(vars(meta), vars(expected_meta))
         self.assertIn("class GQAAttention", explicit)
         self.assertIn("def _forward_impl", explicit)
+        # The rendered attention class owns the accessor, so the TP-operator
+        # snippet must not declare a second identical copy.
+        self.assertEqual(explicit.count("def get_parallel_state"), 1)
         # S4: the decoder-layer call wraps the source attention module with the
         # generated class's keyword-only ctor (matching the real component /
         # runtime replacement), so the source class is kept as the wrapper input.
