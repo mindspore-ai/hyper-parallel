@@ -181,7 +181,8 @@ def main() -> None:  # pylint: disable=too-many-locals
     # The data iterator yields ``(input, label)`` batches. train drives the whole
     # loop: it compiles on the first batch, moves each batch onto the trainer's
     # device, runs a step + optimizer update, and logs on ``log_interval``.
-    # Batches are produced on CPU; ``train`` moves them onto ``trainer.device``.
+    # Batches are produced on CPU; ``train`` moves them onto the compiler's
+    # device.
     g_input_ids = torch.randint(0, vocab_size, (1, max_seq_len))
     g_labels = torch.randint(0, vocab_size, (1, max_seq_len))
 

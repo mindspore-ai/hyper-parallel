@@ -214,10 +214,10 @@ def main() -> None:  # pylint: disable=too-many-locals
     # every full batch it receives into matching microbatches at runtime.
     # ``compile`` does NOT move its sample tensors, so place them on the
     # trainer's device here (``train_step`` does the same per batch).
-    sample_input, sample_label = trainer._place_on_device(  # pylint: disable=protected-access
+    input_batch, label_batch = trainer._place_on_device(  # pylint: disable=protected-access
         (batch[:microbatch], labels[:microbatch])
     )
-    trainer.compile(sample_input, sample_label)
+    trainer.compile(input_batch, label_batch)
 
     def data_iter() -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
         """Yield the same synthetic batch each step (demo workload)."""

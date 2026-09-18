@@ -17,22 +17,25 @@ Graph Trainer - Graph-mode Trainer
 
 Users provide model code and parallel configuration.
 Framework automatically handles all parallel logic.
+
+The trainer composes ``GraphCompiler``: compilation and graph execution
+(``compile`` / ``forward_backward``) are delegated to the compiler, while the
+trainer owns the training policy -- optimizer lifecycle, grad clip, batch
+device placement, and the ``train`` loop. Model / device / compiled-graph
+state lives on the compiler (``trainer._compiler``).
 """
 
 __all__ = ["GraphTrainer"]
 
 import logging
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Iterable, Iterator, List, Optional
 
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.distributed_c10d import _register_process_group
 
+from .compiler import GraphCompiler
 from .pass_config import PassConfig
-from .passes.pipeline import PassPipeline
 from .pass_plan import PassPlan
-from .tracer.graph_tracer import run_traced_graph, trace_model_graph
 
 _LOG = logging.getLogger(__name__)
 
@@ -43,6 +46,9 @@ class GraphTrainer:
 
     Users provide model code and parallel configuration.
     Framework automatically handles all parallel logic.
+
+    Holds a ``GraphCompiler`` and delegates compilation and graph execution
+    to it; the optimizer and the training loop stay here.
     """
 
     def __init__(
@@ -66,127 +72,38 @@ class GraphTrainer:
             device: Device to place the model and run training on. Defaults to
                 the NPU device when available, otherwise CPU.
             mesh_context: Optional automodel ``MeshContext`` carrying a
-                pre-built TP/FSDP mesh. When provided, the TP group is reused
-                as-is (boundary forwards already hold the group object) and
-                only the FSDP shard sub-mesh is registered under ``"fsdp"``.
-                Use this to feed an automodel TP-sharded model into the
-                graph-mode FSDP pass.
+                pre-built TP/FSDP mesh (forwarded to ``GraphCompiler``). When
+                provided, the TP group is reused as-is (boundary forwards
+                already hold the group object) and only the FSDP shard
+                sub-mesh is registered under ``"fsdp"``. Use this to feed an
+                automodel TP-sharded model into the graph-mode FSDP pass.
         """
-        self.model = model
-        self.train_fn = train_fn
-        self.pass_config = pass_config
-        self.pass_plan = pass_plan
-        self.optimizer_config = optimizer_config or {}
-        self._mesh_context = mesh_context
-        self.device = device or (
-            torch.device("npu")
-            if (hasattr(torch, "npu") and torch.npu.is_available())
-            else torch.device("cpu")
+        # The compiler owns the model, device, config, and the compiled
+        # graph; the trainer keeps only the optimizer / loop policy.
+        self._compiler = GraphCompiler(
+            model=model,
+            train_fn=train_fn,
+            pass_config=pass_config,
+            pass_plan=pass_plan,
+            device=device,
+            mesh_context=mesh_context,
         )
-
-        pass_config.validate()
-
-        self._joint_graph = None
+        self.optimizer_config = optimizer_config or {}
         self.optimizer = None
-        # Optional hook run right before the first compile, for model-specific
-        # pytree / tracer registration (e.g. flex-attention BlockMask).
-        self._pytree_pre_hook: Optional[Callable[[], None]] = None
 
-    def compile(self, sample_input: torch.Tensor, sample_label: torch.Tensor) -> None:
+    def compile(self, input_batch: torch.Tensor, label_batch: torch.Tensor) -> None:
         """
         Compile model into parallel graph
 
-        Users can explicitly call this, or it will be automatically compiled at first train_step
+        Users can explicitly call this, or it will be automatically compiled
+        at first train_step
+
+        Args:
+            input_batch: Input batch used to trace the joint graph
+            label_batch: Label batch used to trace the joint graph
         """
-        if self._pytree_pre_hook is not None:
-            self._pytree_pre_hook()
-
-        if self.pass_config.fsdp_enabled and dist.is_initialized():
-            # Only build the FSDP mesh when distributed is actually up.
-            # ``FSDPPass`` early-returns when ``world_size == 1``, so a
-            # single-process run (no dist, or a single rank) compiles and
-            # trains as plain graph mode without sharding.
-            self._init_device_mesh(self._mesh_context)
-
-        joint_graph = trace_model_graph(
-            self.model, self.train_fn, sample_input, sample_label
-        )
-
-        pipeline = PassPipeline.from_config(self.pass_config, self.pass_plan)
-
-        pass_kwargs = self._build_pass_kwargs()
-
-        # Passes mutate ``graph_module`` in place and return it, so the
-        # transformed graph lives on ``joint_graph`` for ``train_step``.
-        pipeline.run(joint_graph.graph_module, **pass_kwargs)
-
-        self._joint_graph = joint_graph
-
+        self._compiler.compile(input_batch, label_batch)
         self._init_optimizer()
-
-    def _init_device_mesh(self, mesh_context: Optional[Any] = None):
-        """Initialize the FSDP process group.
-
-        Two modes:
-
-        * **External mesh** (``mesh_context`` from automodel): the TP group is
-          already created by automodel (the boundary forward holds the group
-          object directly), so we only resolve the FSDP shard sub-mesh and
-          register it under the name ``"fsdp"`` so ``FSDPPass``'s functional
-          collectives resolve it by name. ``fsdp_degree`` is back-filled on
-          ``pass_config`` from the sub-mesh size — essential for a TP+FSDP
-          hybrid, where the FSDP group is a proper sub-group of the world and
-          must NOT be confused with ``world_size``.
-        * **Fallback** (no mesh): build a 1-D ``("fsdp",)`` mesh over the
-          whole world (the original FSDP-only path).
-        """
-        if mesh_context is not None:
-            fsdp_mesh = (
-                getattr(mesh_context, "fsdp_non_moe_mesh", None)
-                or mesh_context.device_mesh
-            )
-            names = tuple(getattr(fsdp_mesh, "mesh_dim_names", ()) or ())
-            # automodel's fsdp_non_moe_mesh is ("fsdp_replicate","fsdp_shard","tp");
-            # device_mesh (cp=1) is ("dp","cp","tp") and "dp" is the FSDP axis.
-            dim = "fsdp_shard" if "fsdp_shard" in names else "dp"
-            sub = fsdp_mesh[dim]
-            pg = sub.get_group()
-            _register_process_group("fsdp", pg)
-            self.pass_config.fsdp_degree = sub.size()
-            return
-
-        device_type = (
-            "npu" if (hasattr(torch, "npu") and torch.npu.is_available()) else "cpu"
-        )
-        world_size = dist.get_world_size()
-
-        mesh = init_device_mesh(
-            device_type,
-            (world_size,),
-            mesh_dim_names=("fsdp",),
-        )
-
-        pg = mesh["fsdp"].get_group()
-        _register_process_group("fsdp", pg)
-        # Back-fill, mirroring the external-mesh branch: FSDPPass resolves the
-        # group size from ``fsdp_degree`` (falling back to world_size when
-        # ``None``), so setting it here keeps the two paths consistent.
-        self.pass_config.fsdp_degree = world_size
-
-    def _build_pass_kwargs(self) -> dict:
-        """
-        Build kwargs to pass to passes.
-        """
-        kwargs = {}
-
-        # Live model: partitioning passes (FSDPPass) physically shard
-        # parameters in place, keeping the trainer FSDP-agnostic.
-        kwargs["model"] = self.model
-
-        if self.pass_config.fsdp_enabled:
-            kwargs["fsdp_group_name"] = "fsdp"
-
-        return kwargs
 
     def train_step(self, input_batch: torch.Tensor, label_batch: torch.Tensor) -> Any:
         """
@@ -199,14 +116,19 @@ class GraphTrainer:
         Returns:
             loss: Loss value
         """
-        if self._joint_graph is None:
-            self.compile(input_batch, label_batch)
+        return self._compiler.forward_backward(input_batch, label_batch)
 
-        loss, grads = self._run_graph(input_batch, label_batch)
+    def to(self, device: torch.device) -> "GraphTrainer":
+        """Move the model to ``device`` and remember it for batch placement.
 
-        self._accumulate_grads(grads)
+        Args:
+            device: Target device for the model and subsequent batches
 
-        return loss
+        Returns:
+            self, so calls can be chained
+        """
+        self._compiler.to(device)
+        return self
 
     def optimizer_step(self) -> None:
         """Optimizer update"""
@@ -215,36 +137,18 @@ class GraphTrainer:
 
         if self.optimizer_config.get("grad_clip"):
             torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.optimizer_config["grad_clip"]
+                self._compiler.model.parameters(), self.optimizer_config["grad_clip"]
             )
 
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-    def to(self, device: torch.device) -> "GraphTrainer":
-        """Move the model to ``device`` and remember it for batch placement."""
-        self.device = torch.device(device)
-        self.model = self.model.to(self.device)
-        return self
-
-    def set_pytree_pre_hook(self, hook: Callable[[], None]) -> "GraphTrainer":
-        """Register a no-arg hook run just before the graph is compiled.
-
-        Used for model-specific tracer setup that must happen before the first
-        ``compile`` -- e.g. registering flex-attention ``BlockMask`` as a
-        pytree node inside ``torch``'s pytree registry. ``train`` triggers
-        compilation lazily on the first batch, so the hook fires on that batch.
-        """
-        self._pytree_pre_hook = hook
-        return self
-
     def _place_on_device(self, batch):
-        """Move a ``(input, label)`` batch onto ``self.device``."""
-        if self.device is None:
+        """Move a ``(input, label)`` batch onto the compiler's device."""
+        device = self._compiler.device
+        if device is None:
             return batch
-        moved = tuple(
-            b.to(self.device) if isinstance(b, torch.Tensor) else b for b in batch
-        )
+        moved = tuple(b.to(device) if isinstance(b, torch.Tensor) else b for b in batch)
         return moved
 
     def train(
@@ -258,9 +162,9 @@ class GraphTrainer:
 
         The data iterator must yield ``(input, label)`` pairs (the same two
         positional arguments ``train_fn`` and ``train_step`` consume). Each
-        batch is moved onto ``self.device`` (if one is set), then
-        ``train_step`` + ``optimizer_step`` are driven. The graph is compiled
-        lazily on the first batch via ``train_step``.
+        batch is moved onto the compiler's device, then ``train_step`` +
+        ``optimizer_step`` are driven. The graph is compiled lazily on the
+        first batch via ``train_step``.
 
         Args:
             data_iterable: An iterable / iterator of ``(input, label)`` pairs.
@@ -284,10 +188,7 @@ class GraphTrainer:
                 break
 
             input_batch, label_batch = batch
-            if self.device is not None:
-                input_batch, label_batch = self._place_on_device(
-                    (input_batch, label_batch)
-                )
+            input_batch, label_batch = self._place_on_device((input_batch, label_batch))
 
             loss = self.train_step(input_batch, label_batch)
             self.optimizer_step()
@@ -304,9 +205,9 @@ class GraphTrainer:
     def _init_optimizer(self):
         """Initialize optimizer on the model's (FSDP-sharded) parameters.
 
-        FSDPPass shards ``self.model``'s parameters in place during compile,
-        so ``model.parameters()`` already yields the local shards and the
-        optimizer needs no FSDP awareness.
+        FSDPPass shards the compiler's model parameters in place during
+        compile, so ``model.parameters()`` already yields the local shards
+        and the optimizer needs no FSDP awareness.
 
         When ``torch_npu`` is installed but no NPU is available (e.g. a
         CPU-only CI run), Adam's automatic foreach/fused kernel selection
@@ -319,79 +220,4 @@ class GraphTrainer:
         kwargs = {"lr": self.optimizer_config.get("lr", 1e-4)}
         if hasattr(torch, "npu") and not torch.npu.is_available():
             kwargs["foreach"] = False
-        self.optimizer = optimizer_class(self.model.parameters(), **kwargs)
-
-    def _run_graph(self, input_batch, label_batch):
-        """Execute compiled graph"""
-        if self._joint_graph is None:
-            raise RuntimeError(
-                "Graph not compiled. Call trainer.compile() or trainer.train() first."
-            )
-
-        # The joint graph's parameters/buffers are static inputs: feed the
-        # live (FSDP-sharded) model state in FQN order each step.
-        return run_traced_graph(
-            self._joint_graph,
-            self.model,
-            input_batch,
-            label_batch,
-        )
-
-    def _accumulate_grads(self, grads: List[torch.Tensor]) -> None:
-        """Accumulate graph-computed gradients into the live model's parameters.
-
-        The graph emits gradients in ``state_fqns`` order (trainable
-        parameters only, shared parameters included once per FQN), which
-        diverges from ``model.parameters()`` (deduplicated) when the model
-        ties weights. Mapping by FQN keeps every gradient on the right
-        parameter; the count check refuses to assign on mismatch instead of
-        letting ``zip`` silently truncate.
-
-        Accumulation (not overwrite) keeps ``train_step`` composable: several
-        micro-batch steps may run before ``optimizer_step`` (which ends with
-        ``zero_grad``), so per-step grads must sum into ``param.grad``.
-        """
-        # ``state_is_param`` is attached to the traced GraphModule by
-        # ``trace_model_graph``, not to the JointGraph dataclass itself.
-        state_is_param = getattr(self._joint_graph.graph_module, "state_is_param", None)
-        fqn_to_param = dict(self.model.named_parameters(remove_duplicate=False))
-        trainable = self._trainable_params_in_state_order(
-            self._joint_graph.state_fqns, state_is_param, fqn_to_param
-        )
-        if len(trainable) != len(grads):
-            raise ValueError(
-                f"Gradient count ({len(grads)}) does not match trainable "
-                f"parameter count ({len(trainable)}). The traced graph and "
-                f"the live model disagree on which parameters are trainable; "
-                f"refusing to assign gradients to avoid silent misalignment."
-            )
-
-        for param, grad in zip(trainable, grads):
-            if param.grad is None:
-                param.grad = grad
-            else:
-                param.grad += grad
-
-    @staticmethod
-    def _trainable_params_in_state_order(
-        state_fqns: List[str],
-        state_is_param: Optional[List[bool]],
-        fqn_to_param: Dict[str, torch.nn.Parameter],
-    ) -> List[torch.nn.Parameter]:
-        """Return the live trainable parameters in the graph's state order.
-
-        Mirrors the tracer's gradient emission order (``state_fqns`` order,
-        parameters only, trainable only, shared parameters kept per FQN), so
-        gradient ``i`` belongs to the returned parameter ``i``. Buffers share
-        ``state_fqns`` but are absent from the parameter lookup; they are
-        skipped explicitly so a missing ``state_is_param`` flag (old traces)
-        degrades to parameter-only instead of raising KeyError.
-        """
-        trainable: List[torch.nn.Parameter] = []
-        for idx, fqn in enumerate(state_fqns):
-            if state_is_param is not None and not state_is_param[idx]:
-                continue
-            param = fqn_to_param.get(fqn)
-            if param is not None and param.requires_grad:
-                trainable.append(param)
-        return trainable
+        self.optimizer = optimizer_class(self._compiler.model.parameters(), **kwargs)

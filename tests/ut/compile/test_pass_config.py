@@ -21,8 +21,8 @@ Covers the rules the dataclass asserts and that have regressed before:
 2. ``__post_init__`` rejects negative ``tp_size`` and non-positive explicit
    ``fsdp_degree``.
 3. ``validate()`` re-runs the same checks after a caller mutates a field
-   (the trainer back-fills ``fsdp_degree`` from the mesh in
-   ``GraphTrainer._init_device_mesh``).
+   (the compiler back-fills ``fsdp_degree`` from the mesh in
+   ``GraphCompiler._init_device_mesh``).
 4. The dataclass is torch-free at import time (no top-level
    ``torch.distributed`` import) so it can be imported anywhere.
 """
@@ -133,7 +133,7 @@ class TestPassConfigValidation(unittest.TestCase):
     def test_validate_after_mutation(self):
         """Test ``validate()`` re-runs checks after a caller mutates a field.
 
-        ``GraphTrainer._init_device_mesh`` writes ``fsdp_degree`` from the
+        ``GraphCompiler._init_device_mesh`` writes ``fsdp_degree`` from the
         mesh sub-size after construction; ``validate()`` is the public hook
         for re-checking invariants then.
         """
