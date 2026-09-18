@@ -65,6 +65,10 @@ class HiFloat8TensorStorage(QuantizedTensorStorage):
         self.col_scale = col_scale if col_scale is not None else (
             scale if self.col_data is not None else None
         )
+        if (self.row_data is None) != (self.row_scale is None):
+            raise ValueError("HiFloat8 row_data and row_scale must be provided together.")
+        if (self.col_data is None) != (self.col_scale is None):
+            raise ValueError("HiFloat8 col_data and col_scale must be provided together.")
         self.scale = (
             scale
             if scale is not None
@@ -78,7 +82,12 @@ class HiFloat8TensorStorage(QuantizedTensorStorage):
         self.quantizer = quantizer
 
     def update_usage(self, rowwise: bool = True, colwise: bool = True) -> None:
-        """Release row/column references independently, matching Pangu."""
+        """Release row/column references independently, matching Pangu.
+
+        Args:
+            rowwise: Keep the row payload and scale when True, release otherwise.
+            colwise: Keep the column payload and scale when True, release otherwise.
+        """
 
         if not rowwise:
             self.row_data = None
@@ -91,12 +100,12 @@ class HiFloat8TensorStorage(QuantizedTensorStorage):
     def is_rowwise(self) -> bool:
         """Return whether row-wise HiFloat8 data and scale are available."""
 
-        return self.row_data is not None
+        return self.row_data is not None and self.row_scale is not None
 
     def is_colwise(self) -> bool:
         """Return whether column-wise HiFloat8 data and scale are available."""
 
-        return self.col_data is not None
+        return self.col_data is not None and self.col_scale is not None
 
     def get_metadata(self) -> dict[str, Any]:
         """Return the same directional metadata fields as Pangu HiF8Tensor."""
@@ -159,6 +168,7 @@ class HiFloat8Tensor(HiFloat8TensorStorage, QuantizedTensor):
         """Initialize directional storage after wrapper allocation."""
 
         del device, requires_grad
+        QuantizedTensor.__init__(self)
         HiFloat8TensorStorage.__init__(
             self,
             shape,

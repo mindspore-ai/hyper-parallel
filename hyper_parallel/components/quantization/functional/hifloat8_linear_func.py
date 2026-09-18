@@ -17,6 +17,7 @@
 from typing import Optional
 
 import torch  # pylint: disable=forbidden-backend-import
+from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.quantization.functional.npu_hifloat8 import (
     hifloat8_matmul,
@@ -46,7 +47,19 @@ class _HiFloat8LinearFunction(torch.autograd.Function):
         weight_quantizer: HiFloat8Quantizer,
         grad_output_quantizer: HiFloat8Quantizer,
     ) -> torch.Tensor:
-        """Execute bias-free HiFloat8 forward with separate X/W roles."""
+        """Execute bias-free HiFloat8 forward with separate X/W roles.
+
+        Args:
+            ctx: Autograd context owning the saved quantized operands.
+            inputs: High-precision input with the contracting dimension last.
+            weight: High-precision weight in [out_features, in_features] layout.
+            input_quantizer: Current-scaling input recipe.
+            weight_quantizer: Current-scaling weight recipe.
+            grad_output_quantizer: Gradient recipe used by backward.
+
+        Returns:
+            High-precision output preserving the input's leading dimensions.
+        """
 
         input_matrix = _as_matrix(inputs)
         needs_grad_input = inputs.requires_grad
@@ -70,21 +83,34 @@ class _HiFloat8LinearFunction(torch.autograd.Function):
         ctx.input_shape = inputs.shape
         ctx.weight_dtype = weight.dtype
         ctx.grad_output_quantizer = grad_output_quantizer
-        ctx.input_quant = input_quant if needs_grad_weight else None
-        ctx.weight_quant = weight_quant if needs_grad_input else None
         input_quant.update_usage(rowwise=False, colwise=needs_grad_weight)
         weight_quant.update_usage(rowwise=False, colwise=needs_grad_input)
+        # Saved tensors are released by autograd, not by the first backward call.
+        ctx.save_for_backward(
+            input_quant if needs_grad_weight else None,
+            weight_quant if needs_grad_input else None,
+        )
         if inputs.ndim != 2:
             output = output.reshape(*inputs.shape[:-1], output.shape[-1])
         return output
 
     @staticmethod
+    @once_differentiable
     def backward(
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], None, None, None]:
-        """Execute HiFloat8 dgrad and wgrad with the gradient role recipe."""
+        """Execute first-order HiFloat8 dgrad and wgrad; higher derivatives are unsupported.
 
+        Args:
+            ctx: Autograd context containing saved operands and shape metadata.
+            grad_output: High-precision gradient of the projection output.
+
+        Returns:
+            Input and weight gradients, followed by None for each quantizer.
+        """
+
+        input_quant, weight_quant = ctx.saved_tensors
         grad_matrix = _as_matrix(grad_output)
         needs_grad_input = ctx.needs_input_grad[0]
         needs_grad_weight = ctx.needs_input_grad[1]
@@ -98,7 +124,7 @@ class _HiFloat8LinearFunction(torch.autograd.Function):
         if needs_grad_input:
             grad_input = hifloat8_matmul(
                 grad_quant,
-                ctx.weight_quant,
+                weight_quant,
                 layout="NN",
                 output_dtype=grad_output.dtype,
             )
@@ -107,13 +133,11 @@ class _HiFloat8LinearFunction(torch.autograd.Function):
         if needs_grad_weight:
             grad_weight = hifloat8_matmul(
                 grad_quant,
-                ctx.input_quant,
+                input_quant,
                 layout="TN",
                 output_dtype=ctx.weight_dtype,
             )
         grad_quant.update_usage(rowwise=False, colwise=False)
-        ctx.input_quant = None
-        ctx.weight_quant = None
         return grad_input, grad_weight, None, None, None
 
 
@@ -124,7 +148,18 @@ def hifloat8_linear(
     weight_quantizer: HiFloat8Quantizer,
     grad_output_quantizer: HiFloat8Quantizer,
 ) -> torch.Tensor:
-    """Apply the bias-free HiFloat8 Dense autograd function."""
+    """Apply the bias-free HiFloat8 Dense autograd function.
+
+    Args:
+        inputs: High-precision input with the contracting dimension last.
+        weight: High-precision weight in [out_features, in_features] layout.
+        input_quantizer: Current-scaling input recipe.
+        weight_quantizer: Current-scaling weight recipe.
+        grad_output_quantizer: Gradient recipe used by backward.
+
+    Returns:
+        Projection output with the input's logical dtype.
+    """
 
     return _HiFloat8LinearFunction.apply(
         inputs,
