@@ -15,11 +15,13 @@
 """Text Trainer assembled from the shared BaseTrainer stages."""
 
 from collections import defaultdict
-from typing import Any, Dict
+from collections.abc import Mapping
+from typing import Any, Dict, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel import SkipDTensorDispatch
+from hyper_parallel.compile.trainer import GraphTrainer
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.text import build_chat_template
@@ -64,6 +66,38 @@ class TextTrainer:
         self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks()
+
+        self.graph_trainer: Optional[GraphTrainer] = None
+        if config.compile.selects_graph_trainer():
+            self.graph_trainer = GraphTrainer(
+                model=self.base.model,
+                train_fn=self._graph_train_fn,
+                trainer_config=config,
+                device=self.base.device,
+                mesh_context=self.base.mesh,
+                manage_optimizer=False,
+            )
+
+    def _graph_train_fn(
+            self,
+            model: torch.nn.Module,
+            model_inputs: Mapping[str, Any],
+            loss_inputs: Mapping[str, Any],
+    ) -> torch.Tensor:
+        """Compute the scalar text loss captured by the graph executor."""
+        outputs = model(**dict(model_inputs), use_cache=False)
+        labels = loss_inputs.get("labels")
+        loss = self.base.loss_fn(model_output=outputs, labels=labels)
+        if isinstance(loss, dict):
+            return torch.stack(list(loss.values())).sum()
+        return loss
+
+    def set_pytree_pre_hook(self, hook: Any) -> "TextTrainer":
+        """Register a tracer pre-hook when graph-mode training is enabled."""
+        if self.graph_trainer is None:
+            raise RuntimeError("set_pytree_pre_hook requires graph trainer mode")
+        self.graph_trainer.set_pytree_pre_hook(hook)
+        return self
 
     def _build_model_assets(self) -> None:
         """Build tokenizer-backed assets for text training."""
@@ -191,6 +225,25 @@ class TextTrainer:
             grad_norm=grad_norm,
         )
 
+    def _eager_forward_backward_step(
+            self,
+            model_inputs: Mapping[str, Any],
+            loss_inputs: Mapping[str, Any],
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Execute one eager forward-backward micro-step."""
+        return self.base.forward_backward_step(model_inputs, loss_inputs)
+
+    def _graph_forward_backward_step(
+            self,
+            model_inputs: Mapping[str, Any],
+            loss_inputs: Mapping[str, Any],
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Execute one graph-mode forward-backward micro-step."""
+        if self.graph_trainer is None:
+            raise RuntimeError("graph trainer mode is not initialized")
+        loss = self.graph_trainer.train_step(model_inputs, loss_inputs)
+        return loss, _loss_to_metrics(loss)
+
     def forward_backward_step(
             self,
             data_iterator: Any,
@@ -211,9 +264,9 @@ class TextTrainer:
             name: token_count * num_micro_steps
             for name, token_count in self.base.current_token_counts.items()
         }
-        loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
-
-        return loss, loss_dict
+        if self.graph_trainer is not None:
+            return self._graph_forward_backward_step(model_inputs, loss_inputs)
+        return self._eager_forward_backward_step(model_inputs, loss_inputs)
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         """Execute one text training step."""
@@ -322,6 +375,16 @@ class TextTrainer:
 
         synchronize()
         self.base.destroy_distributed()
+
+
+def _loss_to_metrics(loss: Any) -> Dict[str, Any]:
+    """Normalize graph loss output to a callback-friendly metrics mapping."""
+    if isinstance(loss, dict):
+        return {
+            str(name): value.detach() if hasattr(value, "detach") else value
+            for name, value in loss.items()
+        }
+    return {"graph_loss": loss.detach() if hasattr(loss, "detach") else loss}
 
 
 __all__ = ["TextTrainer"]

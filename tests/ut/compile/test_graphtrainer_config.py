@@ -17,7 +17,7 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
@@ -28,6 +28,7 @@ from hyper_parallel.compile.trainer import GraphTrainer
 from hyper_parallel.distributed.compile import _resolve_compile_config
 from hyper_parallel.models._transformers.model_builder import instantiate_infrastructure
 from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.trainer.text_trainer import TextTrainer
 from hyper_parallel.trainer.config import (
     AcceleratorConfig,
     OptimizerConfig,
@@ -157,6 +158,43 @@ class TestGraphModeIntegration(unittest.TestCase):
 
         self.assertTrue(config.compile.selects_graph_trainer())
 
+
+    def test_text_trainer_routes_forward_backward_by_graph_mode(self):
+        """TextTrainer should select graph or eager execution from its executor."""
+        trainer = TextTrainer.__new__(TextTrainer)
+        trainer.base = SimpleNamespace(
+            get_batch=Mock(
+                return_value=(
+                    {"input_ids": torch.ones(1, 2)},
+                    {"labels": torch.ones(1, 2, dtype=torch.long)},
+                )
+            ),
+        )
+        trainer._eager_forward_backward_step = Mock(
+            return_value=(torch.tensor(1.0), {"loss": torch.tensor(1.0)})
+        )
+        trainer._graph_forward_backward_step = Mock(
+            return_value=(torch.tensor(2.0), {"graph_loss": torch.tensor(2.0)})
+        )
+
+        trainer.graph_trainer = None
+        eager_result = trainer.forward_backward_step(iter(()), num_micro_steps=2)
+        trainer._eager_forward_backward_step.assert_called_once()
+        trainer._graph_forward_backward_step.assert_not_called()
+        self.assertEqual(eager_result[0].item(), 1.0)
+
+        trainer.graph_trainer = Mock()
+        graph_result = trainer.forward_backward_step(iter(()), num_micro_steps=2)
+        trainer._graph_forward_backward_step.assert_called_once()
+        self.assertEqual(graph_result[0].item(), 2.0)
+
+    def test_text_trainer_pytree_hook_requires_graph_mode(self):
+        """Tracer hooks should fail explicitly when graph mode is disabled."""
+        trainer = TextTrainer.__new__(TextTrainer)
+        trainer.graph_trainer = None
+
+        with self.assertRaisesRegex(RuntimeError, "requires graph trainer mode"):
+            trainer.set_pytree_pre_hook(Mock())
 
     def test_build_pass_config_projects_parallel_topology(self):
         """Trainer topology and inferred FSDP intent are copied to PassConfig."""

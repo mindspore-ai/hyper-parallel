@@ -57,7 +57,6 @@ from .pass_plan import (
 from .pass_config import PassConfig
 
 from .trainer import GraphTrainer
-from .text_trainer import GraphTextTrainer
 
 __all__ = [
     # Pass plan
@@ -69,5 +68,4 @@ __all__ = [
     "PassConfig",
     # Trainer
     "GraphTrainer",
-    "GraphTextTrainer",
 ]
