@@ -19,6 +19,7 @@
 """
 
 from hyper_parallel.platform.mindspore.custom_ops.custom_op_impl import (
+    NpuFlashAttentionVarLenV4DFunction,
     NpuDenseLightningIndexerGradKlLossDFunction,
     NpuDenseLightningIndexerSoftmaxLseDFunction,
     NpuLightningIndexerDFunction,
@@ -34,6 +35,11 @@ from hyper_parallel.platform.mindspore.custom_ops.custom_op_impl import (
 
 class MindSporeCustomOps:
     """Delegates custom operator calls to DFunction-based implementations."""
+
+    @staticmethod
+    def npu_flash_attention_varlen_v4(*args, **kwargs):
+        """TND varlen FlashAttention via aclnn V4 (differentiable)."""
+        return NpuFlashAttentionVarLenV4DFunction.apply(*args, **kwargs)
 
     @staticmethod
     def npu_dense_lightning_indexer_softmax_lse(*args, **kwargs):

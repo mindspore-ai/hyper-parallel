@@ -154,6 +154,48 @@ def npu_sparse_lightning_indexer_grad_kl_loss(
     )
 
 
+def npu_flash_attention_varlen_v4(
+        query,
+        key,
+        value,
+        *,
+        atten_mask=None,
+        actual_seq_qlen=None,
+        actual_seq_kvlen=None,
+        scale_value: float = 1.0,
+        head_num: int = 1,
+        sparse_mode: int = 3,
+        pre_tokens: int = _MAX_INT64,
+        next_tokens: int = 0,
+        inner_precise: int = 0,
+        tnd_softmax_out: bool = True,
+) -> Tuple:
+    """TND varlen FlashAttention through aclnn V4, with TND-ordered softmax statistics.
+
+    .. warning::
+        This is an experimental API that subject to change or deletion.
+
+    The one thing V4 adds over the stock varlen FA is ``softmaxOutLayout``. With
+    ``tnd_softmax_out=True`` the softmax statistics come out in **TND** order instead of the
+    v1 **NTD** order (per document, head-major), so a consumer that wants ``(N, T)`` only has
+    to transpose them. That removes the consumer's need to know where its chunk sits in the
+    global sequence -- which is what made the statistics silently wrong under any per-block
+    wrapper (CP head-tail fold / load balance).
+
+    Set ``tnd_softmax_out=False`` to keep v1's NTD order, e.g. on hardware where V4's
+    ``softmaxInLayout`` is unavailable (Ascend 950PR/950DT) and the caller must keep its
+    re-packing path.
+
+    Returns:
+        tuple[Tensor, Tensor, Tensor]: ``(softmax_max, softmax_sum, attention_out)``.
+    """
+    return _platform.custom_ops.npu_flash_attention_varlen_v4(
+        query, key, value, atten_mask, actual_seq_qlen, actual_seq_kvlen,
+        scale_value, head_num, sparse_mode, pre_tokens, next_tokens, inner_precise,
+        tnd_softmax_out,
+    )
+
+
 def npu_mhc_post(x, h_res, h_out, h_post) -> Tuple:
     """MHC post-processing with residual connection.
 

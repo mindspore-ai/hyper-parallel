@@ -50,6 +50,14 @@ class TorchCustomOps:
         )
 
     @staticmethod
+    def npu_flash_attention_varlen_v4(*args, **kwargs):
+        """TND varlen FlashAttention via aclnn V4; not supported on PyTorch."""
+        raise NotImplementedError(
+            "npu_flash_attention_varlen_v4 is MindSpore-only: it exists to reach aclnn V4's "
+            "softmaxOutLayout, which torch_npu's FA wrapper does not expose."
+        )
+
+    @staticmethod
     def npu_mhc_post(*args, **kwargs):
         """NPU MHC post-processing operator; not supported on PyTorch."""
         raise NotImplementedError(

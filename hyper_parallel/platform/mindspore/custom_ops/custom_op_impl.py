@@ -41,6 +41,7 @@ _CUSTOM_OP_SOURCES = [
     os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn.cc"),
     os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn_backward.cc"),
     os.path.join(_CC_DIR, "lightning_indexer_v2.cc"),
+    os.path.join(_CC_DIR, "flash_attention_varlen_v4.cc"),
     os.path.join(_CC_DIR, "sparse_flash_mla.cc"),
     os.path.join(_CC_DIR, "sparse_flash_mla_grad.cc"),
     os.path.join(_CC_DIR, "sparse_lightning_indexer_kl_loss_grad.cc"),
@@ -124,6 +125,62 @@ class NpuDenseLightningIndexerSoftmaxLseDFunction(DFunction):  # pylint: disable
     def backward(ctx, *grad_outputs):
         """No-op backward — this operator does not require gradients."""
         return (None,) * 9
+
+
+class NpuFlashAttentionVarLenV4DFunction(DFunction):  # pylint: disable=W0221
+    """TND varlen FlashAttention through aclnn V4, differentiable.
+
+    Unlike the indexer kernels around it this one **does** need a backward: the dense stage's
+    teacher attention sits in the graph. The backward calls
+    ``aclnnFlashAttentionUnpaddingScoreGradV4`` with the *same* softmax layout the forward
+    produced -- ``softmaxInLayout`` and ``softmaxOutLayout`` must agree, and disagreeing is
+    silent (the shapes match either way, only the numbers come out wrong).
+
+    ``tnd_softmax_out=True`` asks the kernel for TND-ordered statistics, which is the whole
+    point: the consumer then only transposes and needs no knowledge of where this chunk sits
+    in the global sequence, so CP fold / head-tail balance wrappers can wrap this freely.
+    """
+
+    _op_name = "npu_flash_attention_varlen_v4"
+
+    @staticmethod
+    def forward(ctx, query, key, value, atten_mask, actual_seq_qlen, actual_seq_kvlen,
+                scale_value, head_num, sparse_mode, pre_tokens, next_tokens, inner_precise,
+                tnd_softmax_out):
+        """Forward: returns ``(softmax_max, softmax_sum, attention_out)``."""
+        q_len = _to_list_int64(actual_seq_qlen)
+        kv_len = _to_list_int64(actual_seq_kvlen)
+        outs = _custom_ops.npu_flash_attention_varlen_v4(
+            query, key, value, atten_mask, q_len, kv_len, scale_value, head_num,
+            sparse_mode, pre_tokens, next_tokens, inner_precise, tnd_softmax_out,
+        )
+        softmax_max, softmax_sum, attention_out = outs
+        ctx.save_for_backward(query, key, value, atten_mask, softmax_max, softmax_sum, attention_out)
+        ctx.fa_args = (q_len, kv_len, scale_value, head_num, sparse_mode, pre_tokens, next_tokens,
+                       inner_precise, tnd_softmax_out)
+        return softmax_max, softmax_sum, attention_out
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """Backward through the attention output only.
+
+        The softmax statistics are consumed by the indexer loss, which produces its own
+        gradients for the indexer parameters and routes nothing back here -- so their
+        incoming gradients are ignored, mirroring what the stock FlashAttentionScore bprop
+        does with them.
+        """
+        query, key, value, atten_mask, softmax_max, softmax_sum, attention_out = ctx.saved_tensors
+        (q_len, kv_len, scale_value, head_num, sparse_mode, pre_tokens, next_tokens,
+         inner_precise, tnd_softmax) = ctx.fa_args
+        dy = grad_outputs[2]
+        if dy is None:
+            return (None,) * 13
+        dq, dk, dv = _custom_ops.npu_flash_attention_varlen_grad_v4(
+            query, key, value, dy, atten_mask, softmax_max, softmax_sum, attention_out,
+            q_len, kv_len, scale_value, head_num, sparse_mode, pre_tokens, next_tokens,
+            inner_precise, tnd_softmax,
+        )
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
 class NpuDenseLightningIndexerGradKlLossDFunction(DFunction):  # pylint: disable=W0221
