@@ -11,6 +11,7 @@
 
 # The maintainers of hyper_parallel/auto_parallel.
 /hyper_parallel/auto_parallel/ @bj-wang @Hrxwhr
+/hyper_parallel/auto_parallel/fast-tuner/ @ChaoRanCaaat
 
 
 # The maintainers of hyper_parallel/collectives.
