@@ -34,42 +34,44 @@ inline void WaitFlag(uint32_t) {}
 using AscendC::GetTPipePtr;
 #include "hyper_parallel/core/multicore/ops/runtime/runtime_config.hpp"
 
-static_assert(sizeof(TensorDesc) == 64);
-static_assert(sizeof(TaskDesc) == 576);
+namespace Runtime = MulticoreRuntime;
+
+static_assert(sizeof(Runtime::TensorDesc) == 64);
+static_assert(sizeof(Runtime::TaskDesc) == 576);
 
 extern "C" bool valid_runtime(uint8_t *image, uint64_t bytes, uint64_t event_bytes) {
-  return isRuntimeStorageValid(image, bytes, event_bytes);
+  return Runtime::isRuntimeStorageValid(image, bytes, event_bytes);
 }
 
 extern "C" bool valid_ready_runtime(uint8_t *image, uint64_t bytes, uint64_t event_bytes, uint32_t ep_size) {
-  return isRuntimeStorageValid(image, bytes, event_bytes, ep_size);
+  return Runtime::isRuntimeStorageValid(image, bytes, event_bytes, ep_size);
 }
 
 extern "C" uint32_t read_ready_event(uint8_t *image) {
-  ReadyHandshakeMeta meta;
-  getReadyHandshakeMeta(image, &meta);
+  Runtime::ReadyHandshakeMeta meta;
+  Runtime::getReadyHandshakeMeta(image, &meta);
   return meta.ready_event;
 }
 
 extern "C" uint32_t group_list_offset(uint8_t *image, uint32_t worker_id) {
-  return getGroupedMatmulGroupListOffsetById(image, worker_id);
+  return Runtime::getGroupedMatmulGroupListOffsetById(image, worker_id);
 }
 
-extern "C" void read_task(uint8_t *image, uint32_t index, TaskDesc *result) {
-  getTaskDesc(image, result, index);
+extern "C" void read_task(uint8_t *image, uint32_t index, Runtime::TaskDesc *result) {
+  Runtime::getTaskDesc(image, result, index);
 }
 
 extern "C" void read_layout(uint8_t *image, uint32_t *result) {
-  result[0] = getAllEventNumTriggersOffset();
-  result[1] = getAllTasksOffset(image);
-  result[2] = getAllEventsOffset(image);
-  result[3] = getTaskIndexNumOffset(image);
-  result[4] = getCubeTaskIndexsOffset(image);
-  result[5] = getVectorTaskIndexsOffset(image);
-  result[6] = getMixTaskIndexsOffset(image);
-  result[7] = getDynamicDataOffset(image);
-  result[8] = getGroupedMatmulGroupListOffsetById(image, 1);
-  result[9] = getAtomicAddValuesOffset(image);
-  result[10] = getRuntimeTaskCapacity(image);
-  result[11] = getRuntimeEventCapacity(image);
+  result[0] = Runtime::getAllEventNumTriggersOffset();
+  result[1] = Runtime::getAllTasksOffset(image);
+  result[2] = Runtime::getAllEventsOffset(image);
+  result[3] = Runtime::getTaskIndexNumOffset(image);
+  result[4] = Runtime::getCubeTaskIndexsOffset(image);
+  result[5] = Runtime::getVectorTaskIndexsOffset(image);
+  result[6] = Runtime::getMixTaskIndexsOffset(image);
+  result[7] = Runtime::getDynamicDataOffset(image);
+  result[8] = Runtime::getGroupedMatmulGroupListOffsetById(image, 1);
+  result[9] = Runtime::getAtomicAddValuesOffset(image);
+  result[10] = Runtime::getRuntimeTaskCapacity(image);
+  result[11] = Runtime::getRuntimeEventCapacity(image);
 }

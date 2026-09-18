@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -27,6 +28,67 @@ from hyper_parallel.core.multicore.torch import ops as multicore_ops
 from .plan import MegaMoePlan
 from .route import PreparedTopKRoute, RouteMetadata
 from .workspace import MegaMoeWorkspace
+
+
+@dataclass(frozen=True)
+class _ForwardIntermediates:
+    """Forward tensors owned by one autograd invocation."""
+
+    up_proj: Any
+    activation: Any
+    down_proj: Any
+
+
+@dataclass(frozen=True)
+class _SavedBackwardState:
+    """Forward tensors and route metadata restored by backward."""
+
+    dispatch: Any
+    up_proj: Any
+    activation: Any
+    weight1: Any
+    weight2: Any
+    group_list: Any
+    dispatch_src_off: Any
+    dispatch_target_off: Any
+    dispatch_size: Any
+    combine_src_off: Any
+    combine_target_off: Any
+    combine_size: Any
+
+
+@dataclass(frozen=True)
+class _BackwardIntermediates:
+    """Backward tensors owned by one autograd invocation."""
+
+    grad_weight1: Any
+    grad_weight2: Any
+    act_grad: Any
+    swiglu_grad: Any
+    gate_dx: Any
+
+
+@dataclass(frozen=True)
+class _ForwardExecution:
+    """Borrowed workspace and profiler state for one forward launch."""
+
+    dispatch: Any
+    combine: Any
+    profile_call: Any
+    gmm_workspace: Any
+    intermediates: _ForwardIntermediates
+
+
+@dataclass(frozen=True)
+class _BackwardExecution:
+    """Borrowed workspace and profiler state for one backward launch."""
+
+    dispatch: Any
+    grad_x: Any
+    profile_call: Any
+    gmm_workspace: Any
+    swiglu_workspace: Any
+    intermediates: _BackwardIntermediates
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -41,7 +103,7 @@ def _allocate_forward_intermediates(
     capacity: int,
     routed_tokens: Any,
     dispatch: Any,
-) -> tuple[Any, Any, Any]:
+) -> _ForwardIntermediates:
     """Allocate outputs whose received rows are overwritten before use."""
     # GMM and SwiGLU cover the received prefix; an empty rank reads no rows.
     up_proj = torch.empty(
@@ -54,7 +116,7 @@ def _allocate_forward_intermediates(
         dtype=routed_tokens.dtype,
         device=routed_tokens.device,
     )
-    return up_proj, activation, torch.empty_like(dispatch[:capacity])
+    return _ForwardIntermediates(up_proj, activation, torch.empty_like(dispatch[:capacity]))
 
 
 def _allocate_backward_intermediates(
@@ -63,7 +125,7 @@ def _allocate_backward_intermediates(
     grad_output: Any,
     weight1: Any,
     weight2: Any,
-) -> tuple[Any, Any, Any, Any, Any]:
+) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
     grad_weight2 = torch.zeros_like(weight2)
     act_grad = torch.empty(
@@ -83,7 +145,87 @@ def _allocate_backward_intermediates(
     )
     # Empty experts must retain exact zero gradients on the baseline kernel.
     grad_weight1 = torch.zeros_like(weight1)
-    return grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx
+    return _BackwardIntermediates(grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx)
+
+
+def _saved_backward_state(saved_tensors: tuple[Any, ...]) -> _SavedBackwardState:
+    """Restore named kernel state from the flat autograd tensor tuple."""
+    return _SavedBackwardState(*saved_tensors[:12])
+
+
+def _prepare_forward_execution(
+    workspace: MegaMoeWorkspace,
+    plan: MegaMoePlan,
+    routed_tokens: Any,
+    capacity: int,
+) -> _ForwardExecution:
+    """Resolve workspace, profiler, and intermediate tensors for forward."""
+    dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
+    combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
+    profile_call = None
+    try:
+        events = workspace.prepare_event_counters(forward=True)
+        profile_call = prepare_mega_kernel_call(
+            plan.fwd_runtime,
+            direction="forward",
+            fallback_event_counters=events,
+        )
+        return _ForwardExecution(
+            dispatch=dispatch,
+            combine=combine,
+            profile_call=profile_call,
+            gmm_workspace=_workspace_tensor(workspace.gmm_workspace, "gmm_workspace"),
+            intermediates=_allocate_forward_intermediates(
+                plan.spec,
+                capacity,
+                routed_tokens,
+                dispatch,
+            ),
+        )
+    except Exception:
+        if profile_call is not None:
+            profile_call.cancel()
+        raise
+
+
+def _prepare_backward_execution(
+    workspace: MegaMoeWorkspace,
+    plan: MegaMoePlan,
+    saved: _SavedBackwardState,
+    grad_output: Any,
+) -> _BackwardExecution:
+    """Resolve workspace, profiler, and intermediate tensors for backward."""
+    dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
+    grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
+    profile_call = None
+    try:
+        events = workspace.prepare_event_counters(forward=False)
+        profile_call = prepare_mega_kernel_call(
+            plan.bwd_runtime,
+            direction="backward",
+            fallback_event_counters=events,
+        )
+        return _BackwardExecution(
+            dispatch=dispatch,
+            grad_x=grad_x,
+            profile_call=profile_call,
+            gmm_workspace=_workspace_tensor(workspace.gmm_workspace, "gmm_workspace"),
+            swiglu_workspace=_workspace_tensor(
+                workspace.swiglu_grad_workspace,
+                "swiglu_grad_workspace",
+            ),
+            intermediates=_allocate_backward_intermediates(
+                plan.spec,
+                saved.dispatch.shape[0],
+                grad_output,
+                saved.weight1,
+                saved.weight2,
+            ),
+        )
+    except Exception:
+        if profile_call is not None:
+            profile_call.cancel()
+        raise
 
 
 def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any, ...]) -> Any:
@@ -139,39 +281,34 @@ def _launch_forward_kernel(
     routed_tokens: Any,
     weight1: Any,
     weight2: Any,
-    dispatch: Any,
-    combine: Any,
-    intermediates: tuple[Any, Any, Any],
-    profile_call: Any,
-    gmm_workspace: Any,
+    execution: _ForwardExecution,
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
-    up_proj, activation, down_proj = intermediates
     multicore_ops.mega_moe_with_profile_buffer(
-        dispatch,
+        execution.dispatch,
         metadata.dispatch_target_off * spec.hidden_size,
         routed_tokens.contiguous(),
         metadata.dispatch_src_off * spec.hidden_size,
         metadata.dispatch_size * spec.hidden_size,
         weight1.contiguous(),
         metadata.group_list,
-        up_proj,
-        activation,
+        execution.intermediates.up_proj,
+        execution.intermediates.activation,
         weight2.contiguous(),
         metadata.group_list,
-        down_proj,
-        combine,
+        execution.intermediates.down_proj,
+        execution.combine,
         metadata.combine_target_off * spec.hidden_size,
         metadata.combine_src_off * spec.hidden_size,
         metadata.combine_size * spec.hidden_size,
-        gmm_workspace,
+        execution.gmm_workspace,
         plan.up_proj_tiling,
         plan.swiglu_tiling,
         plan.down_proj_tiling,
-        profile_call.runtime_config,
-        profile_call.event_counters,
-        profile_call.profile_buffer,
+        execution.profile_call.runtime_config,
+        execution.profile_call.event_counters,
+        execution.profile_call.profile_buffer,
         spec.rank_id,
         spec.ep_size,
         spec.num_experts,
@@ -182,63 +319,44 @@ def _launch_forward_kernel(
 
 def _launch_backward_kernel(
     plan: MegaMoePlan,
-    saved_tensors: tuple[Any, ...],
+    saved: _SavedBackwardState,
     grad_output: Any,
-    dispatch: Any,
-    grad_x: Any,
-    gradients: tuple[Any, Any, Any, Any, Any],
-    profile_call: Any,
-    gmm_workspace: Any,
-    swiglu_workspace: Any,
+    execution: _BackwardExecution,
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
-    (
-        saved_dispatch,
-        up_proj,
-        activation,
-        weight1,
-        weight2,
-        group_list,
-        dispatch_src_off,
-        dispatch_target_off,
-        dispatch_size,
-        combine_src_off,
-        combine_target_off,
-        combine_size,
-    ) = saved_tensors
-    grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx = gradients
+    gradients = execution.intermediates
     multicore_ops.mega_moe_grad_with_profile_buffer(
-        dispatch,
-        dispatch_target_off * spec.hidden_size,
+        execution.dispatch,
+        saved.dispatch_target_off * spec.hidden_size,
         grad_output.contiguous(),
-        dispatch_src_off * spec.hidden_size,
-        dispatch_size * spec.hidden_size,
-        activation,
-        grad_weight2,
-        weight2,
-        act_grad,
-        up_proj,
-        swiglu_grad,
-        weight1,
-        gate_dx,
-        grad_x,
-        combine_target_off * spec.hidden_size,
-        combine_src_off * spec.hidden_size,
-        combine_size * spec.hidden_size,
-        saved_dispatch,
-        grad_weight1,
-        group_list,
+        saved.dispatch_src_off * spec.hidden_size,
+        saved.dispatch_size * spec.hidden_size,
+        saved.activation,
+        gradients.grad_weight2,
+        saved.weight2,
+        gradients.act_grad,
+        saved.up_proj,
+        gradients.swiglu_grad,
+        saved.weight1,
+        gradients.gate_dx,
+        execution.grad_x,
+        saved.combine_target_off * spec.hidden_size,
+        saved.combine_src_off * spec.hidden_size,
+        saved.combine_size * spec.hidden_size,
+        saved.dispatch,
+        gradients.grad_weight1,
+        saved.group_list,
         plan.act_grad_tiling,
         plan.gate_grad_tiling,
         plan.w1_grad_tiling,
         plan.w2_grad_tiling,
         plan.swiglu_grad_tiling,
-        gmm_workspace,
-        swiglu_workspace,
-        profile_call.runtime_config,
-        profile_call.event_counters,
-        profile_call.profile_buffer,
+        execution.gmm_workspace,
+        execution.swiglu_workspace,
+        execution.profile_call.runtime_config,
+        execution.profile_call.event_counters,
+        execution.profile_call.profile_buffer,
         spec.rank_id,
         spec.ep_size,
         spec.num_experts,
@@ -289,26 +407,15 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         ctx.has_permutation = permutation is not None
         workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
         workspace.claim()
-        profile_call = None
+        execution = None
         try:
-            dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
-            combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
-            events = workspace.prepare_event_counters(forward=True)
-            profile_call = prepare_mega_kernel_call(
-                plan.fwd_runtime,
-                direction="forward",
-                fallback_event_counters=events,
-            )
-            gmm_workspace = _workspace_tensor(
-                workspace.gmm_workspace, "gmm_workspace"
-            )
             # Dispatch and combine overwrite disjoint route ranges before consumers run.
             capacity = metadata.expert_capacity
-            up_proj, activation, down_proj = _allocate_forward_intermediates(
-                spec,
-                capacity,
+            execution = _prepare_forward_execution(
+                workspace,
+                plan,
                 routed_tokens,
-                dispatch,
+                capacity,
             )
             _launch_forward_kernel(
                 plan,
@@ -316,24 +423,20 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 routed_tokens,
                 weight1,
                 weight2,
-                dispatch,
-                combine,
-                (up_proj, activation, down_proj),
-                profile_call,
-                gmm_workspace,
+                execution,
             )
-            profile_call.complete()
-            output = combine.clone()
+            execution.profile_call.complete()
+            output = execution.combine.clone()
             # Combine has consumed down_proj on this stream. Retain its owned
             # storage for backward before the next call reuses SHMEM dispatch.
-            down_proj.copy_(dispatch[:capacity])
+            execution.intermediates.down_proj.copy_(execution.dispatch[:capacity])
             _save_forward_state(
                 ctx,
                 plan,
                 workspace,
-                down_proj,
-                up_proj,
-                activation,
+                execution.intermediates.down_proj,
+                execution.intermediates.up_proj,
+                execution.intermediates.activation,
                 weight1,
                 weight2,
                 metadata,
@@ -341,8 +444,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             )
             return output
         finally:
-            if profile_call is not None:
-                profile_call.cancel()
+            if execution is not None:
+                execution.profile_call.cancel()
             workspace.release()
 
     @staticmethod
@@ -359,62 +462,37 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         """
         plan = ctx.plan
         workspace = ctx.workspace
-        spec = plan.spec
-        saved_tensors = ctx.saved_tensors
-        saved_dispatch = saved_tensors[0]
-        weight1 = saved_tensors[3]
-        weight2 = saved_tensors[4]
-        permutation_inputs = saved_tensors[12:]
-        kernel_saved_tensors = saved_tensors[:12]
+        saved = _saved_backward_state(ctx.saved_tensors)
+        permutation_inputs = ctx.saved_tensors[12:]
         workspace.claim()
-        profile_call = None
+        execution = None
         try:
-            dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
-            grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
-            events = workspace.prepare_event_counters(forward=False)
-            profile_call = prepare_mega_kernel_call(
-                plan.bwd_runtime,
-                direction="backward",
-                fallback_event_counters=events,
-            )
-            gmm_workspace = _workspace_tensor(
-                workspace.gmm_workspace, "gmm_workspace"
-            )
-            swiglu_workspace = _workspace_tensor(
-                workspace.swiglu_grad_workspace,
-                "swiglu_grad_workspace",
-            )
-            capacity = saved_dispatch.shape[0]
-            (
-                grad_weight1,
-                grad_weight2,
-                act_grad,
-                swiglu_grad,
-                gate_dx,
-            ) = _allocate_backward_intermediates(
-                spec,
-                capacity,
+            execution = _prepare_backward_execution(
+                workspace,
+                plan,
+                saved,
                 grad_output,
-                weight1,
-                weight2,
             )
             _launch_backward_kernel(
                 plan,
-                kernel_saved_tensors,
+                saved,
                 grad_output,
-                dispatch,
-                grad_x,
-                (grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx),
-                profile_call,
-                gmm_workspace,
-                swiglu_workspace,
+                execution,
             )
-            profile_call.complete()
-            grad_input = _restore_input_gradient(ctx, grad_x, permutation_inputs)
-            return grad_input, grad_weight1, grad_weight2, None, None, None, None
+            execution.profile_call.complete()
+            grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
+            return (
+                grad_input,
+                execution.intermediates.grad_weight1,
+                execution.intermediates.grad_weight2,
+                None,
+                None,
+                None,
+                None,
+            )
         finally:
-            if profile_call is not None:
-                profile_call.cancel()
+            if execution is not None:
+                execution.profile_call.cancel()
             workspace.release()
 
 

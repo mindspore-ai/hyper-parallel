@@ -16,6 +16,18 @@
 
 from __future__ import annotations
 
+__all__ = [
+    "all_gather",
+    "barrier",
+    "empty",
+    "free",
+    "get",
+    "host_barrier",
+    "put",
+    "signal",
+    "wait_signal",
+]
+
 import operator
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
@@ -69,8 +81,8 @@ def empty(
     """Collectively allocate one contiguous Tensor from the Root WORLD symmetric Heap.
 
     Args:
-        size: Torch-style variadic dimensions or one dimension sequence.
-        dtype: Tensor dtype; ``None`` uses Torch's default dtype.
+        size: Variadic dimensions or one dimension sequence.
+        dtype: Tensor dtype; ``None`` uses the framework default dtype.
         alignment: Optional Allocation-base alignment in Byte.
 
     Returns:
@@ -148,10 +160,10 @@ def host_barrier() -> None:
     """Complete a host-synchronous HCCL barrier over the acquired Root group.
 
     Unlike :func:`barrier`, this call blocks the Host until every Root PE has arrived and the device work enqueued
-    earlier on the calling thread's current stream is complete (torch_npu enqueues the HCCL barrier on the current
+    earlier on the calling thread's current stream is complete (the backend enqueues the HCCL barrier on the current
     stream). Work enqueued on other streams is NOT covered: the caller must synchronize those streams
     (``stream.synchronize()``) before calling. It does not use the SHMEM device barrier. A one-PE Root
-    (torch.distributed not initialized or world size 1) is a no-op.
+    (distributed communication not initialized or world size 1) is a no-op.
 
     Raises:
         RuntimeError: If no SHMEM reference is active.
@@ -269,16 +281,3 @@ def all_gather(output: torch.Tensor, input_tensor: torch.Tensor) -> None:
         concurrently with this call.
     """
     _load_native()._all_gather(output, input_tensor)  # pylint: disable=protected-access
-
-
-__all__ = [
-    "all_gather",
-    "barrier",
-    "empty",
-    "free",
-    "get",
-    "host_barrier",
-    "put",
-    "signal",
-    "wait_signal",
-]

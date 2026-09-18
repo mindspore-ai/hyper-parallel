@@ -83,6 +83,30 @@ class MegaMoePlan:
         return self.bwd_runtime.normal_tensor
 
 
+@dataclass(frozen=True)
+class _RuntimeArtifacts:
+    """Host-side forward and backward graphs with serialized schedules."""
+
+    forward_graph: Any
+    forward_config: Any
+    backward_graph: Any
+    backward_config: Any
+
+
+@dataclass(frozen=True)
+class _TilingPayloads:
+    """Serialized tiling payloads before device materialization."""
+
+    up_proj: bytes
+    swiglu: bytes
+    down_proj: bytes
+    act_grad: bytes
+    gate_grad: bytes
+    w1_grad: bytes
+    w2_grad: bytes
+    swiglu_grad: bytes
+
+
 def _tensor_from_bytes(data: bytes, device: Any) -> torch.Tensor:
     """Copy serialized runtime data into a device uint8 tensor."""
     array = np.frombuffer(bytearray(data), dtype=np.uint8).copy()
@@ -116,8 +140,9 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
     )
 
 
-def _build_runtime_configs(spec: MegaMoeSpec, task_values: TaskSplitValue) -> tuple[Any, Any, Any, Any]:
+def _build_runtime_artifacts(spec: MegaMoeSpec) -> _RuntimeArtifacts:
     """Build forward/backward graphs and their serialized RuntimeConfig objects."""
+    task_values = _build_task_values(spec)
     forward_graph = build_forward_graph(
         task_values,
         dispatch_sv=spec.dispatch_split,
@@ -150,7 +175,112 @@ def _build_runtime_configs(spec: MegaMoeSpec, task_values: TaskSplitValue) -> tu
         spec.rank_id,
         spec.num_cube_cores,
     )
-    return forward_graph, forward_data, backward_graph, backward_data
+    return _RuntimeArtifacts(forward_graph, forward_data, backward_graph, backward_data)
+
+
+def _build_tiling_payloads(spec: MegaMoeSpec, artifacts: _RuntimeArtifacts) -> _TilingPayloads:
+    """Build all rank-independent forward and backward tiling payloads."""
+    gmm_options = {
+        "hidden_size": spec.hidden_size,
+        "intermediate_size": spec.intermediate_size,
+        "num_groups": spec.local_experts,
+        "num_cube_cores": spec.num_cube_cores,
+    }
+    forward_graph = artifacts.forward_graph
+    backward_graph = artifacts.backward_graph
+    return _TilingPayloads(
+        up_proj=get_up_proj_tiling_bytes(
+            forward_graph.get_op("up_proj").split_value,
+            **gmm_options,
+        ),
+        swiglu=_resize_swiglu_tiling(
+            get_swiglu_tiling_bytes(
+                forward_graph.get_op("swiglu").split_value,
+                intermediate_size=spec.intermediate_size,
+            ),
+            spec.num_cube_cores,
+        ),
+        down_proj=get_down_proj_tiling_bytes(
+            forward_graph.get_op("down_proj").split_value,
+            **gmm_options,
+        ),
+        act_grad=get_act_grad_tiling_bytes(
+            backward_graph.get_op("act_grad").split_value,
+            **gmm_options,
+        ),
+        gate_grad=get_gate_grad_tiling_bytes(
+            backward_graph.get_op("gate_grad").split_value,
+            **gmm_options,
+        ),
+        w1_grad=get_w1_grad_tiling_bytes(
+            backward_graph.get_op("w1_grad").split_value,
+            **gmm_options,
+        ),
+        w2_grad=get_w2_grad_tiling_bytes(
+            backward_graph.get_op("w2_grad").split_value,
+            **gmm_options,
+        ),
+        swiglu_grad=_resize_swiglu_tiling(
+            get_swiglu_grad_tiling_bytes(
+                backward_graph.get_op("swiglu_grad").split_value,
+                intermediate_size=spec.intermediate_size,
+            ),
+            spec.num_cube_cores,
+        ),
+    )
+
+
+def _prepare_runtimes(
+    spec: MegaMoeSpec,
+    artifacts: _RuntimeArtifacts,
+    device: Any,
+) -> tuple[_PreparedMegaKernelRuntime, _PreparedMegaKernelRuntime]:
+    """Materialize profiler-aware forward and backward runtime images."""
+    device_id = device.index
+    if device_id is None:
+        device_id = torch.npu.current_device()
+
+    def tensor_factory(data: bytes) -> torch.Tensor:
+        """Copy serialized RuntimeConfig bytes to the plan device.
+
+        Args:
+            data: Serialized RuntimeConfig bytes.
+        """
+        return _tensor_from_bytes(data, device)
+
+    options = {
+        "tensor_factory": tensor_factory,
+        "profile_tensor_factory": _enable_runtime_config_tensor,
+        "rank": spec.rank_id,
+        "device_id": device_id,
+    }
+    return (
+        _prepare_mega_kernel_runtime_config(artifacts.forward_config, **options),
+        _prepare_mega_kernel_runtime_config(artifacts.backward_config, **options),
+    )
+
+
+def _materialize_plan(
+    spec: MegaMoeSpec,
+    artifacts: _RuntimeArtifacts,
+    tiling: _TilingPayloads,
+    device: Any,
+) -> MegaMoePlan:
+    """Copy runtime and tiling payloads to their target device."""
+    fwd_runtime, bwd_runtime = _prepare_runtimes(spec, artifacts, device)
+    return MegaMoePlan(
+        spec=spec,
+        fwd_runtime=fwd_runtime,
+        up_proj_tiling=_tensor_from_bytes(tiling.up_proj, device),
+        swiglu_tiling=_tensor_from_bytes(tiling.swiglu, device),
+        down_proj_tiling=_tensor_from_bytes(tiling.down_proj, device),
+        bwd_runtime=bwd_runtime,
+        act_grad_tiling=_tensor_from_bytes(tiling.act_grad, device),
+        gate_grad_tiling=_tensor_from_bytes(tiling.gate_grad, device),
+        w1_grad_tiling=_tensor_from_bytes(tiling.w1_grad, device),
+        w2_grad_tiling=_tensor_from_bytes(tiling.w2_grad, device),
+        swiglu_grad_tiling=_tensor_from_bytes(tiling.swiglu_grad, device),
+    )
 
 
 def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
@@ -163,84 +293,6 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     Returns:
         Rank-local forward and backward runtime resources.
     """
-    task_values = _build_task_values(spec)
-    forward_graph, forward_data, backward_graph, backward_data = _build_runtime_configs(spec, task_values)
-    gmm_options = {
-        "hidden_size": spec.hidden_size,
-        "intermediate_size": spec.intermediate_size,
-        "num_groups": spec.local_experts,
-        "num_cube_cores": spec.num_cube_cores,
-    }
-    up_proj = forward_graph.get_op("up_proj")
-    swiglu = forward_graph.get_op("swiglu")
-    down_proj = forward_graph.get_op("down_proj")
-    act_grad = backward_graph.get_op("act_grad")
-    gate_grad = backward_graph.get_op("gate_grad")
-    w1_grad = backward_graph.get_op("w1_grad")
-    w2_grad = backward_graph.get_op("w2_grad")
-    swiglu_grad = backward_graph.get_op("swiglu_grad")
-    device_id = device.index
-    if device_id is None:
-        device_id = torch.npu.current_device()
-
-    def tensor_factory(data: bytes) -> torch.Tensor:
-        """Copy serialized Host runtime data to the plan's NPU device."""
-        return _tensor_from_bytes(data, device)
-
-    fwd_runtime = _prepare_mega_kernel_runtime_config(
-        forward_data,
-        tensor_factory=tensor_factory,
-        profile_tensor_factory=_enable_runtime_config_tensor,
-        rank=spec.rank_id,
-        device_id=device_id,
-    )
-    bwd_runtime = _prepare_mega_kernel_runtime_config(
-        backward_data,
-        tensor_factory=tensor_factory,
-        profile_tensor_factory=_enable_runtime_config_tensor,
-        rank=spec.rank_id,
-        device_id=device_id,
-    )
-    return MegaMoePlan(
-        spec=spec,
-        fwd_runtime=fwd_runtime,
-        up_proj_tiling=_tensor_from_bytes(
-            get_up_proj_tiling_bytes(up_proj.split_value, **gmm_options), device
-        ),
-        swiglu_tiling=_tensor_from_bytes(
-            _resize_swiglu_tiling(
-                get_swiglu_tiling_bytes(
-                    swiglu.split_value,
-                    intermediate_size=spec.intermediate_size,
-                ),
-                spec.num_cube_cores,
-            ),
-            device,
-        ),
-        down_proj_tiling=_tensor_from_bytes(
-            get_down_proj_tiling_bytes(down_proj.split_value, **gmm_options), device
-        ),
-        bwd_runtime=bwd_runtime,
-        act_grad_tiling=_tensor_from_bytes(
-            get_act_grad_tiling_bytes(act_grad.split_value, **gmm_options), device
-        ),
-        gate_grad_tiling=_tensor_from_bytes(
-            get_gate_grad_tiling_bytes(gate_grad.split_value, **gmm_options), device
-        ),
-        w1_grad_tiling=_tensor_from_bytes(
-            get_w1_grad_tiling_bytes(w1_grad.split_value, **gmm_options), device
-        ),
-        w2_grad_tiling=_tensor_from_bytes(
-            get_w2_grad_tiling_bytes(w2_grad.split_value, **gmm_options), device
-        ),
-        swiglu_grad_tiling=_tensor_from_bytes(
-            _resize_swiglu_tiling(
-                get_swiglu_grad_tiling_bytes(
-                    swiglu_grad.split_value,
-                    intermediate_size=spec.intermediate_size,
-                ),
-                spec.num_cube_cores,
-            ),
-            device,
-        ),
-    )
+    artifacts = _build_runtime_artifacts(spec)
+    tiling = _build_tiling_payloads(spec, artifacts)
+    return _materialize_plan(spec, artifacts, tiling, device)

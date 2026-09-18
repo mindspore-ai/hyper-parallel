@@ -25,6 +25,15 @@ enum class Level : uint8_t {
   Error = 2,
 };
 
+/** @brief Source and Runtime metadata for one structured failure line. */
+struct FailureContext {
+  const char *file;
+  int line;
+  DfxOperation operation;
+  DfxPhase phase;
+  int32_t root_rank;
+};
+
 /** @brief Return the process log level parsed once from HYPER_PARALLEL_SHMEM_LOG_LEVEL.
  *  0=Debug, 1=Info, 2=Error; unset or invalid falls back to Error. */
 Level ActiveLevel() noexcept;
@@ -44,8 +53,7 @@ __attribute__((format(printf, 5, 6)))
 void Line(Level level, int32_t root_rank, const char *file, int line, const char *format, ...) noexcept;
 
 /** @brief Write one Runtime-owned failure without changing the supplied Status. */
-void Failure(const char *file, int line, DfxOperation operation, DfxPhase phase, int32_t root_rank,
-             const Status &error) noexcept;
+void Failure(const FailureContext &context, const Status &error) noexcept;
 
 }  // namespace hyper_parallel::multicore::shmem::runtime::log
 

@@ -16,13 +16,15 @@
 
 from __future__ import annotations
 
+__all__ = ["merge_chrome_traces"]
+
 import copy
 from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, TypeAlias
 
 
 DEFAULT_KERNEL_PATTERN = r"(?i)mega[_]?kernel"
@@ -30,8 +32,8 @@ INTERNAL_EVENT_CATEGORY = "MegaKernelInternal"
 MERGE_SCHEMA_VERSION = 1
 SUPPORTED_CYCLE_TRACE_SCHEMA_VERSION = 1
 
-TraceObject = dict[str, Any]
-TraceInput = str | Path | TraceObject | list[dict[str, Any]]
+TraceObject: TypeAlias = dict[str, Any]
+TraceInput: TypeAlias = str | Path | TraceObject | list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -232,7 +234,11 @@ def _fallback_kernel_candidates(
     invocation_spans = [invocation.span_us for invocation in invocations]
 
     def window_distance(start_index: int) -> tuple[float, float]:
-        """Rank a contiguous Device-kernel window by duration similarity."""
+        """Rank a contiguous Device-kernel window by duration similarity.
+
+        Args:
+            start_index: First Device event in the candidate window.
+        """
         selected = device_events[start_index:start_index + len(invocations)]
         duration_distance = 0.0
         score = 0
@@ -282,8 +288,8 @@ def _invocation_metadata(metadata: dict[str, Any]) -> dict[Any, dict[str, Any]]:
     return resolved
 
 
-def _load_invocations(mega_kernel_trace: Any) -> list[_InvocationTrace]:
-    """Validate and group standalone internal events into invocations."""
+def _load_cycle_trace(mega_kernel_trace: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Validate cycle-trace metadata and return its complete internal events."""
     if not isinstance(mega_kernel_trace, dict):
         raise ValueError("mega_kernel_trace must be a Chrome Trace object")
     metadata = mega_kernel_trace.get("megaKernelCycleTrace")
@@ -303,7 +309,11 @@ def _load_invocations(mega_kernel_trace: Any) -> list[_InvocationTrace]:
     ]
     if not internal_events:
         raise ValueError("mega_kernel_trace contains no complete MegaKernel internal events")
+    return metadata, internal_events
 
+
+def _group_invocation_events(internal_events: list[dict[str, Any]]) -> dict[Any, list[dict[str, Any]]]:
+    """Validate event arguments and group records by invocation identifier."""
     event_args = []
     for event in internal_events:
         args = event.get("args", {})
@@ -322,28 +332,39 @@ def _load_invocations(mega_kernel_trace: Any) -> list[_InvocationTrace]:
             grouped_events.setdefault(invocation_id, []).append(event)
     else:
         grouped_events[None] = internal_events
+    return grouped_events
+
+
+def _build_invocation(
+    invocation_id: Any,
+    events: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    metadata_by_invocation: dict[Any, dict[str, Any]],
+) -> _InvocationTrace:
+    """Resolve display metadata for one grouped invocation."""
+    invocation_item = metadata_by_invocation.get(invocation_id, {})
+    kernel_name = str(invocation_item.get("kernelName") or metadata.get("kernelName") or "MegaKernel")
+    raw_direction = invocation_item.get("direction")
+    return _InvocationTrace(
+        invocation_id=invocation_id,
+        events=events,
+        kernel_name=kernel_name,
+        rank=invocation_item.get("rank", metadata.get("rank")),
+        device_id=invocation_item.get("deviceId", metadata.get("deviceId")),
+        direction=None if raw_direction is None else str(raw_direction),
+    )
+
+
+def _load_invocations(mega_kernel_trace: Any) -> list[_InvocationTrace]:
+    """Validate and group standalone internal events into invocations."""
+    metadata, internal_events = _load_cycle_trace(mega_kernel_trace)
+    grouped_events = _group_invocation_events(internal_events)
 
     metadata_by_invocation = _invocation_metadata(metadata)
-    invocations = []
-    for invocation_id, events in grouped_events.items():
-        invocation_item = metadata_by_invocation.get(invocation_id, {})
-        kernel_name = str(
-            invocation_item.get("kernelName")
-            or metadata.get("kernelName")
-            or "MegaKernel"
-        )
-        raw_direction = invocation_item.get("direction")
-        invocations.append(
-            _InvocationTrace(
-                invocation_id=invocation_id,
-                events=events,
-                kernel_name=kernel_name,
-                rank=invocation_item.get("rank", metadata.get("rank")),
-                device_id=invocation_item.get("deviceId", metadata.get("deviceId")),
-                direction=None if raw_direction is None else str(raw_direction),
-            )
-        )
-    return invocations
+    return [
+        _build_invocation(invocation_id, events, metadata, metadata_by_invocation)
+        for invocation_id, events in grouped_events.items()
+    ]
 
 
 def _core_key(event: dict[str, Any]) -> tuple[str, int]:
@@ -363,14 +384,100 @@ def _core_key(event: dict[str, Any]) -> tuple[str, int]:
 
 
 def _next_thread_id(events: list[dict[str, Any]], pid: Any) -> int:
-    numeric_thread_ids = [
-        event["tid"]
-        for event in events
-        if event.get("pid") == pid
-        and isinstance(event.get("tid"), int)
-        and not isinstance(event.get("tid"), bool)
-    ]
+    numeric_thread_ids = []
+    for event in events:
+        thread_id = event.get("tid")
+        if event.get("pid") == pid and isinstance(thread_id, int) and not isinstance(thread_id, bool):
+            numeric_thread_ids.append(thread_id)
     return max(numeric_thread_ids, default=0) + 1
+
+
+def _thread_metadata_events(
+    invocation: _InvocationTrace,
+    outer_pid: Any,
+    thread_ids: dict[tuple[str, int], int],
+    first_sort_index: int,
+) -> list[dict[str, Any]]:
+    """Build framework-thread metadata for the logical Device cores."""
+    metadata_events = []
+    for index, (core_key, thread_id) in enumerate(thread_ids.items()):
+        metadata_events.extend([
+            {
+                "name": "thread_name",
+                "ph": "M",
+                "pid": outer_pid,
+                "tid": thread_id,
+                "args": {"name": f"{invocation.kernel_name}/{core_key[0]}/{core_key[1]}"},
+            },
+            {
+                "name": "thread_sort_index",
+                "ph": "M",
+                "pid": outer_pid,
+                "tid": thread_id,
+                "args": {"sort_index": first_sort_index + index},
+            },
+        ])
+    return metadata_events
+
+
+def _align_internal_events(
+    invocation: _InvocationTrace,
+    outer_event: dict[str, Any],
+    outer_pid: Any,
+    outer_timestamp: float,
+    outer_duration: float,
+    thread_ids: dict[tuple[str, int], int],
+) -> list[dict[str, Any]]:
+    """Shift internal events to the selected outer-kernel timeline."""
+    aligned_events = []
+    invocation_anchor = invocation.anchor_us
+    for internal_event in invocation.events:
+        internal_args = copy.deepcopy(internal_event.get("args", {}))
+        aligned_event = copy.deepcopy(internal_event)
+        aligned_event["pid"] = outer_pid
+        aligned_event["tid"] = thread_ids[_core_key(internal_event)]
+        aligned_event["ts"] = outer_timestamp + _number(internal_event.get("ts"), "ts") - invocation_anchor
+        internal_args.update({
+            "parent_kernel": outer_event.get("name"),
+            "parent_kernel_ts": outer_timestamp,
+            "parent_kernel_dur": outer_duration,
+            "cycle_trace_rank": invocation.rank,
+            "cycle_trace_device_id": invocation.device_id,
+        })
+        aligned_event["args"] = internal_args
+        aligned_events.append(aligned_event)
+    return aligned_events
+
+
+def _alignment_report(
+    invocation: _InvocationTrace,
+    outer_event: dict[str, Any],
+    outer_timestamp: float,
+    outer_duration: float,
+    aligned_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Describe the selected outer kernel and resulting timeline bounds."""
+    internal_end = max(
+        _number(event.get("ts"), "ts") + _number(event.get("dur"), "dur")
+        for event in aligned_events
+    )
+    return {
+        "invocationId": invocation.invocation_id,
+        "direction": invocation.direction,
+        "kernelName": invocation.kernel_name,
+        "rank": invocation.rank,
+        "deviceId": invocation.device_id,
+        "outerKernelName": outer_event.get("name"),
+        "outerKernelPid": outer_event.get("pid", 0),
+        "outerKernelTid": outer_event.get("tid"),
+        "outerKernelTs": outer_timestamp,
+        "outerKernelDur": outer_duration,
+        "outerKernelScore": _kernel_score(outer_event),
+        "outerKernelIsDevice": _is_device_kernel_event(outer_event),
+        "internalEventCount": len(aligned_events),
+        "internalSpanUs": invocation.span_us,
+        "exceedsOuterKernelUs": max(internal_end - outer_timestamp - outer_duration, 0.0),
+    }
 
 
 def _initial_thread_sort_indexes(
@@ -417,70 +524,22 @@ def _align_invocation(
         core_key: first_thread_id + index
         for index, core_key in enumerate(core_keys)
     }
-
-    metadata_events = []
-    for index, (core_key, thread_id) in enumerate(thread_ids.items()):
-        metadata_events.extend([
-            {
-                "name": "thread_name",
-                "ph": "M",
-                "pid": outer_pid,
-                "tid": thread_id,
-                "args": {"name": f"{invocation.kernel_name}/{core_key[0]}/{core_key[1]}"},
-            },
-            {
-                "name": "thread_sort_index",
-                "ph": "M",
-                "pid": outer_pid,
-                "tid": thread_id,
-                "args": {"sort_index": first_sort_index + index},
-            },
-        ])
-
-    aligned_events = []
-    invocation_anchor = invocation.anchor_us
-    for internal_event in invocation.events:
-        internal_args = copy.deepcopy(internal_event.get("args", {}))
-        aligned_event = copy.deepcopy(internal_event)
-        aligned_event["pid"] = outer_pid
-        aligned_event["tid"] = thread_ids[_core_key(internal_event)]
-        aligned_event["ts"] = (
-            outer_timestamp
-            + _number(internal_event.get("ts"), "ts")
-            - invocation_anchor
-        )
-        internal_args.update({
-            "parent_kernel": outer_event.get("name"),
-            "parent_kernel_ts": outer_timestamp,
-            "parent_kernel_dur": outer_duration,
-            "cycle_trace_rank": invocation.rank,
-            "cycle_trace_device_id": invocation.device_id,
-        })
-        aligned_event["args"] = internal_args
-        aligned_events.append(aligned_event)
-
-    internal_end = max(
-        _number(event.get("ts"), "ts") + _number(event.get("dur"), "dur")
-        for event in aligned_events
+    metadata_events = _thread_metadata_events(invocation, outer_pid, thread_ids, first_sort_index)
+    aligned_events = _align_internal_events(
+        invocation,
+        outer_event,
+        outer_pid,
+        outer_timestamp,
+        outer_duration,
+        thread_ids,
     )
-    outer_end = outer_timestamp + outer_duration
-    alignment = {
-        "invocationId": invocation.invocation_id,
-        "direction": invocation.direction,
-        "kernelName": invocation.kernel_name,
-        "rank": invocation.rank,
-        "deviceId": invocation.device_id,
-        "outerKernelName": outer_event.get("name"),
-        "outerKernelPid": outer_pid,
-        "outerKernelTid": outer_event.get("tid"),
-        "outerKernelTs": outer_timestamp,
-        "outerKernelDur": outer_duration,
-        "outerKernelScore": _kernel_score(outer_event),
-        "outerKernelIsDevice": _is_device_kernel_event(outer_event),
-        "internalEventCount": len(aligned_events),
-        "internalSpanUs": invocation.span_us,
-        "exceedsOuterKernelUs": max(internal_end - outer_end, 0.0),
-    }
+    alignment = _alignment_report(
+        invocation,
+        outer_event,
+        outer_timestamp,
+        outer_duration,
+        aligned_events,
+    )
     return metadata_events, aligned_events, alignment, first_sort_index + len(core_keys)
 
 
@@ -630,7 +689,7 @@ def merge_chrome_traces(
 
     Each standalone invocation is aligned to one outer Device kernel in
     timestamp order. The merge is pure Host post-processing and does not
-    require Torch, MindSpore, or NPU runtime imports.
+    require framework or NPU runtime imports.
 
     Args:
         framework_trace: Framework Chrome Trace path, object, or event list.
@@ -665,6 +724,3 @@ def merge_chrome_traces(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(merged_trace, ensure_ascii=False), encoding="utf-8")
     return merged_trace
-
-
-__all__ = ["merge_chrome_traces"]

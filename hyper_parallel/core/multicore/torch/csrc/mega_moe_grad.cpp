@@ -8,7 +8,9 @@
  * Meta implementation is a no-op (output tensors pre-allocated by caller).
  */
 #include <torch/library.h>
+
 #include <tuple>
+
 #include "op_plugin/include/npu_cpp_extension.h"
 
 namespace {
@@ -74,40 +76,40 @@ BwdReturn mega_moe_grad_npu(
 // ---------------------------------------------------------------------------
 BwdReturn mega_moe_grad_meta(
     at::Tensor& dispatch_target,
-    const at::Tensor& /*dispatch_target_off*/,
-    const at::Tensor& /*dy*/,
-    const at::Tensor& /*dispatch_src_off*/,
-    const at::Tensor& /*dispatch_size*/,
-    const at::Tensor& /*hidden*/,
+    const at::Tensor& /* dispatch_target_off */,
+    const at::Tensor& /* dy */,
+    const at::Tensor& /* dispatch_src_off */,
+    const at::Tensor& /* dispatch_size */,
+    const at::Tensor& /* hidden */,
     at::Tensor& hidden_dw,
-    const at::Tensor& /*w2*/,
+    const at::Tensor& /* w2 */,
     at::Tensor& act_grad_y,
-    const at::Tensor& /*gate*/,
+    const at::Tensor& /* gate */,
     at::Tensor& grad_gate,
-    const at::Tensor& /*w1*/,
+    const at::Tensor& /* w1 */,
     at::Tensor& gate_dx,
     at::Tensor& grad_x,
-    const at::Tensor& /*combine_target_off*/,
-    const at::Tensor& /*combine_src_off*/,
-    const at::Tensor& /*combine_size*/,
+    const at::Tensor& /* combine_target_off */,
+    const at::Tensor& /* combine_src_off */,
+    const at::Tensor& /* combine_size */,
     at::Tensor& permute_out,
     at::Tensor& gate_dw,
-    const at::Tensor& /*group_list*/,
-    const at::Tensor& /*act_grad_tiling*/,
-    const at::Tensor& /*gate_grad_tiling*/,
-    const at::Tensor& /*w1_grad_tiling*/,
-    const at::Tensor& /*w2_grad_tiling*/,
-    const at::Tensor& /*swiglu_grad_tiling*/,
-    const at::Tensor& /*gmm_workspace*/,
-    const at::Tensor& /*swiglu_grad_workspace*/,
-    const at::Tensor& /*runtime_config*/,
-    const at::Tensor& /*all_event_counters*/,
-    const at::Tensor& /*profile_buffer*/,
-    int64_t /*rank_id*/,
-    int64_t /*ep*/,
-    int64_t /*expert_num*/,
-    int64_t /*hidden_size*/,
-    int64_t /*seq_size*/) {
+    const at::Tensor& /* group_list */,
+    const at::Tensor& /* act_grad_tiling */,
+    const at::Tensor& /* gate_grad_tiling */,
+    const at::Tensor& /* w1_grad_tiling */,
+    const at::Tensor& /* w2_grad_tiling */,
+    const at::Tensor& /* swiglu_grad_tiling */,
+    const at::Tensor& /* gmm_workspace */,
+    const at::Tensor& /* swiglu_grad_workspace */,
+    const at::Tensor& /* runtime_config */,
+    const at::Tensor& /* all_event_counters */,
+    const at::Tensor& /* profile_buffer */,
+    int64_t /* rank_id */,
+    int64_t /* ep */,
+    int64_t /* expert_num */,
+    int64_t /* hidden_size */,
+    int64_t /* seq_size */) {
     return BwdReturn(dispatch_target, hidden_dw, act_grad_y, grad_gate,
                      gate_dx, grad_x, permute_out, gate_dw);
 }

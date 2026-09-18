@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+__all__ = ["MegaMoeExperts"]
+
 import math
 from typing import Any
 
@@ -30,9 +32,6 @@ from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import _COMMUNICATION_SPLIT, bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace, configure_symmetric_heap
-
-__all__ = ["MegaMoeExperts"]
-
 
 def _create_mega_moe_parameters(
     local_experts: int,

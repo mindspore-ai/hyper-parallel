@@ -13,6 +13,8 @@
  * @brief MoE-FFN backward — op-specific compute kernels + KernelWorker specialization.
  */
 
+#include <cstddef>
+
 #include "kernel_operator.h"
 #include "swi_glu/swi_glu.cpp"
 #include "swi_glu_grad/swi_glu_grad.cpp"
@@ -21,6 +23,8 @@
 #include "runtime/worker_kernel.h"
 
 using namespace AscendC;
+
+namespace MulticoreRuntime {
 
 class KernelWorker : public KernelWorkerBase<KernelWorker> {
  public:
@@ -32,21 +36,35 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   static constexpr uint32_t PROFILE_IDX             = 32;
   static constexpr uint32_t WORKSPACE_IDX           = 25;
   static constexpr uint32_t SWIGLU_GRAD_WORKSPACE_IDX = 26;
+  static constexpr uint32_t SWIGLU_DYNAMIC_FIELDS_OFFSET =
+    static_cast<uint32_t>(offsetof(SwiGluTilingData, rowLen));
+  static constexpr int64_t SWIGLU_DYNAMIC_FIELDS_BYTES =
+    offsetof(SwiGluTilingData, baseRowLen) + sizeof(uint32_t) - SWIGLU_DYNAMIC_FIELDS_OFFSET;
+  static constexpr uint32_t GMM_BASE_M_OFFSET = static_cast<uint32_t>(
+    offsetof(GMMTilingData, gmmBaseParams) + offsetof(GMMBaseParams, m));
+  static constexpr uint32_t GMM_MATMUL_M_OFFSET = static_cast<uint32_t>(
+    offsetof(GMMTilingData, mmTilingData) + offsetof(TCubeTiling, M));
+  static constexpr int64_t GMM_MATMUL_M_FIELDS_BYTES =
+    offsetof(TCubeTiling, singleCoreM) + sizeof(int32_t) - offsetof(TCubeTiling, M);
+  static constexpr uint32_t GMM_MATMUL_K_OFFSET = static_cast<uint32_t>(
+    offsetof(GMMTilingData, mmTilingData) + offsetof(TCubeTiling, Ka));
+  static constexpr int64_t GMM_MATMUL_K_FIELDS_BYTES =
+    offsetof(TCubeTiling, singleCoreK) + sizeof(int32_t) - offsetof(TCubeTiling, Ka);
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
     switch (task_desc.task_type) {
-      case TASK_BEGIN_TASK_GRAPH:
+      case TaskType::TASK_BEGIN_TASK_GRAPH:
         break;
-      case TASK_MATMUL:
+      case TaskType::TASK_MATMUL:
         ExecuteMatmul(task_desc);
         break;
-      case TASK_GROUPED_MATMUL:
+      case TaskType::TASK_GROUPED_MATMUL:
         ExecuteGroupedMatmul(task_desc);
         break;
-      case TASK_SHMEM_PUT_MEM_SIGNAL:
+      case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
         ExecuteShmemPutMem(task_desc);
         break;
-      case TASK_SWI_GLU_GRAD:
+      case TaskType::TASK_SWI_GLU_GRAD:
         ExecuteSwiGluGrad(task_desc);
         break;
       default:
@@ -128,10 +146,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           if (tilingdata_data->rowLen == 0) {
             return;
           }
-          if (end - (start + current_seq_start) < 19) {
+          if (end - (start + current_seq_start) < SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT) {
             tilingdata_data->baseRowLen = end - (start + current_seq_start);
           }
-          cacheWriteThrough(tiling_data_addr, 10);
+          cacheWriteThrough(tiling_data_addr + SWIGLU_DYNAMIC_FIELDS_OFFSET, SWIGLU_DYNAMIC_FIELDS_BYTES);
           PipeBarrier<PIPE_ALL>();
 
           swi_glu_grad(input_list[task_desc.inputs[0].input_position] + input_0_offset,
@@ -189,12 +207,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           tilingdata_data->mmTilingData.Ka = value;
           tilingdata_data->mmTilingData.Kb = value;
           tilingdata_data->mmTilingData.singleCoreK = value;
+          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
         } else {
           tilingdata_data->gmmBaseParams.m = value;
           tilingdata_data->mmTilingData.M = value;
           tilingdata_data->mmTilingData.singleCoreM = value;
+          cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
+          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
         }
-        cacheWriteThrough(tiling_data_addr, 220);
         PipeBarrier<PIPE_ALL>();
 
         int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
@@ -271,9 +291,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 };
 
+}  // namespace MulticoreRuntime
+
 extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr,
                                                 GM_ADDR *input_list) {
-  KernelWorker worker;
+  MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
   worker.Process();
 }

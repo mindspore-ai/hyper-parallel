@@ -62,7 +62,13 @@ class _MulticoreResourceManager:
         compatibility_key: Any,
         scope_key: Any,
     ) -> tuple[_ExecutionResourceGroup, int]:
-        """Create one unbound resource group and its first membership token."""
+        """Create one unbound resource group and its first membership token.
+
+        Args:
+            specification: Resource specification supplied by the owning module.
+            compatibility_key: Key used to determine whether resources can be shared.
+            scope_key: Execution scope that owns the resource group.
+        """
         group_id = next(self._next_group_id)
         member_token = next(self._next_member_token)
         group = _ExecutionResourceGroup(
@@ -76,7 +82,11 @@ class _MulticoreResourceManager:
         return group, member_token
 
     def add_member(self, group: _ExecutionResourceGroup) -> int:
-        """Add a new membership token to an existing group."""
+        """Add a new membership token to an existing group.
+
+        Args:
+            group: Existing resource group receiving the member.
+        """
         member_token = next(self._next_member_token)
         group.members.add(member_token)
         return member_token
@@ -88,7 +98,13 @@ class _MulticoreResourceManager:
         *,
         close_resources: bool,
     ) -> None:
-        """Retire one member and optionally close the last native owner."""
+        """Retire one member and optionally close the last native owner.
+
+        Args:
+            group_id: Identifier of the resource group.
+            member_token: Membership token to retire.
+            close_resources: Whether to close resources after the last member exits.
+        """
         group = self._groups.get(group_id)
         if group is None:
             return
@@ -107,13 +123,18 @@ class _MulticoreResourceManager:
         resources.close()
 
     def active_specifications(self, scope_key: Any) -> tuple[Any, ...]:
-        """Return one specification per live or native-bound resource group."""
-        return tuple(
-            group.specification
-            for group in self._groups.values()
-            if group.scope_key == scope_key
-            and (group.members or group.resources is not None)
-        )
+        """Return one specification per live or native-bound resource group.
+
+        Args:
+            scope_key: Execution scope whose resource groups are selected.
+        """
+        specifications = []
+        for group in self._groups.values():
+            same_scope = group.scope_key == scope_key
+            is_active = bool(group.members) or group.resources is not None
+            if same_scope and is_active:
+                specifications.append(group.specification)
+        return tuple(specifications)
 
 
 _RESOURCE_MANAGER = _MulticoreResourceManager()

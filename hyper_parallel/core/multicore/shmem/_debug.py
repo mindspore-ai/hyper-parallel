@@ -16,11 +16,13 @@
 
 from __future__ import annotations
 
+__all__ = ["debug_state"]
+
 import os
 import sys
 import traceback
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from ._lifecycle import _reference_count
@@ -81,7 +83,7 @@ def _log_allocation_site(tensor: Any) -> None:
             None,
         )
         callsite = "unknown" if caller is None else f"{caller.filename}:{caller.lineno} in {caller.name}"
-        now = datetime.now()
+        now = datetime.now(timezone.utc).astimezone()
         line = (
             f"[HP-SHMEM][rank {_site_rank()}][DEBUG] {now:%Y-%m-%d-%H:%M:%S}.{now.microsecond // 1000:03d} "
             f"[_api.py] op=Empty allocation_base={hex(tensor.data_ptr())} "
@@ -128,6 +130,3 @@ def debug_state() -> dict[str, object]:
     state["reference_count"] = reference_count
     state.update(native_state)
     return state
-
-
-__all__ = ["debug_state"]

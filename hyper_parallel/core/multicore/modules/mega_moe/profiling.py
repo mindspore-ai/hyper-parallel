@@ -14,6 +14,8 @@
 # ============================================================================
 """MegaMoe owner semantics for the graph-driven generic profiler."""
 
+__all__ = []
+
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,9 +29,6 @@ from hyper_parallel.core.multicore.scheduler.config import (
     TaskSplitValue,
 )
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType
-
-
-__all__ = []
 
 
 MEGA_MOE_PROFILE_OWNER_LABEL = "Expert"

@@ -11,6 +11,8 @@
 #ifndef MULTICORE_SCHEDULER_RUNTIME_CONFIG_HPP
 #define MULTICORE_SCHEDULER_RUNTIME_CONFIG_HPP
 
+namespace MulticoreRuntime {
+
 constexpr uint32_t MAX_TENSOR_DIMS = 4;
 constexpr uint32_t MAX_INPUTS_PER_TASK = 4;
 constexpr uint32_t MAX_OUTPUTS_PER_TASK = 4;
@@ -40,17 +42,20 @@ constexpr uint32_t INT64_T_SIZE = sizeof(int64_t);
 
 constexpr uint32_t EVENT_INVALID_ID = 0xFFFFFFFF;
 constexpr uint32_t PROFILE_DESC_INVALID_ID = 0xFFFFFFFF;
+constexpr uint64_t RUNTIME_ADDRESS_SPACE_BYTES = 1ULL << 32;
+constexpr uint32_t RUNTIME_CAPACITY_ALIGNMENT = 16;
+constexpr uint32_t TASK_AICORE_INDEX_TYPE_COUNT = 3;
 
-typedef uint32_t TaskId;
+using TaskId = uint32_t;
 
-enum TaskAiCoreType : uint32_t {
+enum class TaskAiCoreType : uint32_t {
   TASK_AICORE_INVALID = 0,
   TASK_AICORE_CUBE = 1,
   TASK_AICORE_VECTOR = 2,
   TASK_AICORE_MIX = 3,
 };
 
-enum TaskType : uint32_t {
+enum class TaskType : uint32_t {
   TASK_TERMINATE = 0,
   TASK_BEGIN_TASK_GRAPH = 10,
   // compute task starts from 100
@@ -62,7 +67,7 @@ enum TaskType : uint32_t {
   TASK_SWI_GLU_GRAD = 106,
 };
 
-enum EventType : uint32_t {
+enum class EventType : uint32_t {
   EVENT_EMPTY = 900,
   EVENT_LAUNCH_TASKS = 901,
   EVENT_LAUNCH_MASSIVE_TASKS = 902,
@@ -71,6 +76,10 @@ enum EventType : uint32_t {
   EVENT_TERMINATION = 911,  // TASK_TERMINATE
   EVENT_INVALID = 999,
 };
+
+static_assert(sizeof(TaskAiCoreType) == sizeof(uint32_t), "TaskAiCoreType must remain uint32_t in runtime data.");
+static_assert(sizeof(TaskType) == sizeof(uint32_t), "TaskType must remain uint32_t in runtime data.");
+static_assert(sizeof(EventType) == sizeof(uint32_t), "EventType must remain uint32_t in runtime data.");
 
 struct TensorDesc {
   uint32_t tensor_type;
@@ -212,7 +221,7 @@ __aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData,
     (tilingData->inputs)[i].dynamic_dim = (*(__gm__ uint32_t *)(tiling + start_size));
     start_size = start_size + UINT32_T_SIZE;
   }
-  for (uint32_t i = 0; i < MAX_INPUTS_PER_TASK; i++) {
+  for (uint32_t i = 0; i < MAX_OUTPUTS_PER_TASK; i++) {
     (tilingData->outputs)[i].tensor_type = (*(__gm__ uint32_t *)(tiling + start_size));
     start_size = start_size + UINT32_T_SIZE;
     (tilingData->outputs)[i].num_dims = (*(__gm__ uint32_t *)(tiling + start_size));
@@ -354,38 +363,50 @@ __aicore__ inline int64_t getExtraValueFromTiling(__gm__ uint8_t *tiling, uint32
   return (*(__gm__ int64_t *)(tiling + index * INT64_T_SIZE));
 }
 
-// Check byte and index bounds before reading variable-sized arrays.
-__aicore__ inline bool isRuntimeStorageValid(__gm__ uint8_t *tiling, uint64_t runtime_bytes,
-                                           uint64_t event_bytes, uint32_t ep_size = 1) {
-  if (runtime_bytes < sizeof(RuntimeHeader) || runtime_bytes >= (1ULL << 32)) {
-    return false;
-  }
-  uint64_t capacity = getRuntimeTaskCapacity(tiling);
-  uint64_t events = getRuntimeEventCapacity(tiling);
-  if (capacity % 16 != 0 || events < MIN_EVENT_CAPACITY || events % 16 != 0 ||
-      getTaskNum(tiling) > capacity || event_bytes < events * INT32_T_SIZE) {
-    return false;
-  }
+__aicore__ inline bool isRuntimeCapacityValid(__gm__ uint8_t *tiling, uint64_t event_bytes, uint64_t capacity,
+                                              uint64_t events) {
+  return capacity % RUNTIME_CAPACITY_ALIGNMENT == 0 && events >= MIN_EVENT_CAPACITY &&
+         events % RUNTIME_CAPACITY_ALIGNMENT == 0 && getTaskNum(tiling) <= capacity &&
+         event_bytes >= events * INT32_T_SIZE;
+}
+
+__aicore__ inline bool isReadyHandshakeStorageValid(__gm__ uint8_t *tiling, uint64_t event_bytes, uint64_t events,
+                                                    uint32_t ep_size) {
   ReadyHandshakeMeta meta;
   getReadyHandshakeMeta(tiling, &meta);
-  if (meta.ready_event != 0 &&
-      (ep_size <= 1 || static_cast<uint64_t>(meta.ready_event) + ATOMIC_ADD_VALUE_LEN > events ||
-       event_bytes < events * INT32_T_SIZE + (static_cast<uint64_t>(ep_size) + 1) * DATA_CACHE_LINE_SIZE)) {
-    return false;
-  }
-  uint64_t required = sizeof(RuntimeHeader) + events * (INT32_T_SIZE + sizeof(EventDesc)) +
-                      capacity * (sizeof(TaskDesc) + 3 * INT32_T_SIZE) + 4 * INT32_T_SIZE + sizeof(DynamicData) +
-                      MAX_GROUP_LIST * INT64_T_SIZE + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
-  if (required >= (1ULL << 32) || runtime_bytes < required) {
-    return false;
-  }
+  return meta.ready_event == 0 ||
+         (ep_size > 1 && static_cast<uint64_t>(meta.ready_event) + ATOMIC_ADD_VALUE_LEN <= events &&
+          event_bytes >= events * INT32_T_SIZE + (static_cast<uint64_t>(ep_size) + 1) * DATA_CACHE_LINE_SIZE);
+}
+
+__aicore__ inline bool areTaskIndexCountsValid(__gm__ uint8_t *tiling, uint64_t capacity) {
   __gm__ int32_t *counts = reinterpret_cast<__gm__ int32_t *>(tiling + getTaskIndexNumOffset(tiling));
-  for (uint32_t index = 0; index < 3; ++index) {
+  for (uint32_t index = 0; index < TASK_AICORE_INDEX_TYPE_COUNT; ++index) {
     if (counts[index] < 0 || static_cast<uint64_t>(counts[index]) > capacity) {
       return false;
     }
   }
   return true;
+}
+
+// Check byte and index bounds before reading variable-sized arrays.
+__aicore__ inline bool isRuntimeStorageValid(__gm__ uint8_t *tiling, uint64_t runtime_bytes,
+                                             uint64_t event_bytes, uint32_t ep_size = 1) {
+  if (runtime_bytes < sizeof(RuntimeHeader) || runtime_bytes >= RUNTIME_ADDRESS_SPACE_BYTES) {
+    return false;
+  }
+  uint64_t capacity = getRuntimeTaskCapacity(tiling);
+  uint64_t events = getRuntimeEventCapacity(tiling);
+  if (!isRuntimeCapacityValid(tiling, event_bytes, capacity, events) ||
+      !isReadyHandshakeStorageValid(tiling, event_bytes, events, ep_size)) {
+    return false;
+  }
+  uint64_t required = sizeof(RuntimeHeader) + events * (INT32_T_SIZE + sizeof(EventDesc)) +
+                      capacity * (sizeof(TaskDesc) + TASK_AICORE_INDEX_TYPE_COUNT * INT32_T_SIZE) +
+                      4 * INT32_T_SIZE + sizeof(DynamicData) + MAX_GROUP_LIST * INT64_T_SIZE +
+                      ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
+  return required < RUNTIME_ADDRESS_SPACE_BYTES && runtime_bytes >= required &&
+         areTaskIndexCountsValid(tiling, capacity);
 }
 
 template <AscendC::HardEvent event>
@@ -394,5 +415,7 @@ __aicore__ inline void SyncFunc() {
   AscendC::SetFlag<event>(eventID);
   AscendC::WaitFlag<event>(eventID);
 }
+
+}  // namespace MulticoreRuntime
 
 #endif  // MULTICORE_SCHEDULER_RUNTIME_CONFIG_HPP

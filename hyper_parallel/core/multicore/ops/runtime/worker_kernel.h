@@ -31,6 +31,16 @@
 
 using namespace AscendC;  // NOLINT(build/namespaces)
 
+namespace MulticoreRuntime {
+
+constexpr uint32_t VECTOR_WORKER_STRIDE = 2;
+constexpr int64_t EVENT_REFRESH_TIME_UNIT_CYCLES = 50;
+constexpr int64_t CUBE_EVENT_REFRESH_INTERVAL_UNITS = 50;    // 2,500 system cycles.
+constexpr int64_t VECTOR_EVENT_REFRESH_INTERVAL_UNITS = 150;  // 7,500 system cycles.
+// The selected SwiGLU tiling uses baseRowLen=19; smaller dynamic tails must lower it.
+constexpr int64_t SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT = 19;
+constexpr int64_t READY_SIGNAL_RADIX = 2;
+
 template <typename Derived>
 class KernelWorkerBase {
  public:
@@ -97,17 +107,17 @@ class KernelWorkerBase {
       block_idx = block_idx + this->core_num;
     } while (1);
 #else
-    if (this->worker_id_ % 2 == 0) {
+    if (this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
       return;
     }
-    uint32_t block_idx = this->worker_id_ / 2;
+    uint32_t block_idx = this->worker_id_ / VECTOR_WORKER_STRIDE;
     do {
       if (block_idx >= this->vector_task_num) {
         return;
       }
       TaskId task_index = GetTaskIndex(block_idx);
       ExecuteTaskFast(task_index);
-      uint32_t half_num = this->vector_num / 2;
+      uint32_t half_num = this->vector_num / VECTOR_WORKER_STRIDE;
       block_idx = block_idx + half_num;
     } while (1);
 #endif
@@ -129,17 +139,17 @@ class KernelWorkerBase {
       block_idx = block_idx + this->core_num;
     } while (1);
 #else
-    if (this->worker_id_ % 2 == 0) {
+    if (this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
       return;
     }
-    uint32_t block_idx = this->worker_id_ / 2;
+    uint32_t block_idx = this->worker_id_ / VECTOR_WORKER_STRIDE;
     do {
       if (block_idx >= this->vector_task_num) {
         return;
       }
       TaskId task_index = GetTaskIndex(block_idx);
       ExecuteTaskProfiled(task_index, cycle_trace_recorder);
-      uint32_t half_num = this->vector_num / 2;
+      uint32_t half_num = this->vector_num / VECTOR_WORKER_STRIDE;
       block_idx = block_idx + half_num;
     } while (1);
 #endif
@@ -170,7 +180,7 @@ class KernelWorkerBase {
     PipeBarrier<PIPE_ALL>();
 
     uint32_t round = 0;
-    for (int64_t distance = 1; distance < ep; distance *= 2, ++round) {
+    for (int64_t distance = 1; distance < ep; distance *= READY_SIGNAL_RADIX, ++round) {
       int64_t target = (rank + distance) % ep;
       __gm__ int32_t *round_ready = ready + round * ready_stride;
       aclshmemx_signal_op(round_ready, generation, ACLSHMEM_SIGNAL_SET, static_cast<int>(target));
@@ -184,7 +194,7 @@ class KernelWorkerBase {
 #ifdef __DAV_C220_CUBE__
     WaitForDependency(meta.ready_event);
 #else
-    if (this->worker_id_ % 2 == 0) {
+    if (this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
       return;
     }
     if (this->worker_id_ == 1) {
@@ -249,7 +259,7 @@ class KernelWorkerBase {
       WaitForDependency(task_desc.dependent_event);
     }
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
-    if (task_desc.task_type != TASK_SHMEM_PUT_MEM_SIGNAL) {
+    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
       TriggerEvent(task_desc.trigger_event);
     }
   }
@@ -281,7 +291,7 @@ class KernelWorkerBase {
     uint64_t compute_end_cycle = cycle_trace_recorder.Now();
     cycle_trace_recorder.Record(profile_desc_id, task_id, task_desc.task_index, owner_id, compute_start_cycle,
                                 compute_end_cycle);
-    if (task_desc.task_type != TASK_SHMEM_PUT_MEM_SIGNAL) {
+    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
       uint64_t trigger_start_cycle = cycle_trace_recorder.Now();
       TriggerEvent(task_desc.trigger_event);
       uint64_t trigger_end_cycle = cycle_trace_recorder.Now();
@@ -304,9 +314,9 @@ class KernelWorkerBase {
       }
       int64_t systemCycleAfter = AscendC::GetSystemCycle();
       int64_t GetBlockNumCycle = systemCycleAfter - systemCycleBefore;
-      int64_t CycleToTimeBase = 50;
+      int64_t CycleToTimeBase = EVENT_REFRESH_TIME_UNIT_CYCLES;
       int64_t GetBlockNumTime = GetBlockNumCycle / CycleToTimeBase;
-      if (GetBlockNumTime > 50) {
+      if (GetBlockNumTime > CUBE_EVENT_REFRESH_INTERVAL_UNITS) {
         DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
           all_event_counters[event_index]);
         current = all_event_counters.GetValue(event_index);
@@ -326,9 +336,9 @@ class KernelWorkerBase {
       }
       int64_t systemCycleAfter = AscendC::GetSystemCycle();
       int64_t GetBlockNumCycle = systemCycleAfter - systemCycleBefore;
-      int64_t CycleToTimeBase = 50;
+      int64_t CycleToTimeBase = EVENT_REFRESH_TIME_UNIT_CYCLES;
       int64_t GetBlockNumTime = GetBlockNumCycle / CycleToTimeBase;
-      if (GetBlockNumTime > 150) {
+      if (GetBlockNumTime > VECTOR_EVENT_REFRESH_INTERVAL_UNITS) {
         DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
           all_event_counters[event_index]);
         current = all_event_counters.GetValue(event_index);
@@ -358,5 +368,7 @@ class KernelWorkerBase {
   int64_t core_num = 0;
   int64_t vector_num = 0;
 };
+
+}  // namespace MulticoreRuntime
 
 #endif  // MULTICORE_SCHEDULER_WORKER_KERNEL_H

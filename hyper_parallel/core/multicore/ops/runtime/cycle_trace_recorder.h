@@ -21,6 +21,10 @@
 
 using namespace AscendC;  // NOLINT(build/namespaces)
 
+namespace MulticoreRuntime {
+
+constexpr uint32_t CYCLE_TRACE_RESERVED_WORDS = 9;
+
 struct CycleTraceCoreHeader {
   uint64_t entryCycle;
   uint32_t recordCount;
@@ -28,7 +32,7 @@ struct CycleTraceCoreHeader {
   uint32_t coreType;
   uint32_t blockId;
   uint32_t recordCapacity;
-  uint32_t reserved[9];
+  uint32_t reserved[CYCLE_TRACE_RESERVED_WORDS];
 };
 
 struct CycleTraceRecord {
@@ -75,7 +79,7 @@ class CycleTraceRecorder {
     profile_header_->coreType = core_type;
     profile_header_->blockId = worker_id;
     profile_header_->recordCapacity = record_capacity_;
-    for (uint32_t i = 0; i < 9; ++i) {
+    for (uint32_t i = 0; i < CYCLE_TRACE_RESERVED_WORDS; ++i) {
       profile_header_->reserved[i] = 0;
     }
   }
@@ -111,5 +115,7 @@ class CycleTraceRecorder {
   uint32_t record_count_ = 0;
   uint32_t record_capacity_ = 0;
 };
+
+}  // namespace MulticoreRuntime
 
 #endif  // MULTICORE_SCHEDULER_CYCLE_TRACE_RECORDER_H
