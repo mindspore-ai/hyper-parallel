@@ -16,6 +16,7 @@
 
 import types
 import unittest
+from functools import partial
 from unittest.mock import MagicMock, patch
 
 from hyper_parallel.trainer.base import BaseTrainer
@@ -27,6 +28,20 @@ from tests.common.mark_utils import arg_mark
 
 class _ProbeError(RuntimeError):
     """Stop a lifecycle at the exact probe location."""
+
+
+def _setup_trainer(base: BaseTrainer, *, events: list[str]) -> None:
+    """Provide the rank metadata produced by distributed setup."""
+    events.append("setup")
+    base.global_rank = 4
+    base.mesh = types.SimpleNamespace(tp_rank=2, dp_rank=3)
+
+
+def _reset_profiler(*args: object, events: list[str], **kwargs: object) -> None:
+    """Stop construction when memory profiling is initialized."""
+    del args, kwargs
+    events.append("reset")
+    raise _ProbeError
 
 
 class TestMemoryProfilerLifecycle(unittest.TestCase):
@@ -47,25 +62,14 @@ class TestMemoryProfilerLifecycle(unittest.TestCase):
         )
         for module_name, trainer_class in trainer_cases:
             events = []
-
-            def setup(base: BaseTrainer) -> None:
-                """Provide the rank metadata produced by distributed setup."""
-                events.append("setup")
-                base.global_rank = 4
-                base.mesh = types.SimpleNamespace(tp_rank=2, dp_rank=3)
-
-            def reset(*args: object, **kwargs: object) -> None:
-                """Stop construction when memory profiling is initialized."""
-                del args, kwargs
-                events.append("reset")
-                raise _ProbeError
-
             with self.subTest(trainer=trainer_class.__name__):
                 with (
-                    patch.object(BaseTrainer, "_setup", autospec=True, side_effect=setup),
+                    patch.object(BaseTrainer, "_setup", autospec=True,
+                                 side_effect=partial(_setup_trainer, events=events)),
                     patch.object(BaseTrainer, "_build_model", autospec=True) as build_model_mock,
-                    patch(f"{module_name}.memory_profiler.reset", side_effect=reset),
-                    patch(f"{module_name}.memory_profiler.abort", side_effect=lambda: events.append("abort")),
+                    patch(f"{module_name}.memory_profiler.reset",
+                          side_effect=partial(_reset_profiler, events=events)),
+                    patch(f"{module_name}.memory_profiler.abort", side_effect=partial(events.append, "abort")),
                 ):
                     with self.assertRaises(_ProbeError):
                         trainer_class(types.SimpleNamespace(memory=MemoryConfig()))
@@ -116,10 +120,11 @@ class TestMemoryProfilerLifecycle(unittest.TestCase):
             trainer = self._empty_trainer(trainer_class, events)
             with self.subTest(trainer=trainer_class.__name__):
                 with (
-                    patch.object(trainer, "on_train_begin", side_effect=lambda: events.append("train_begin")),
-                    patch.object(trainer, "on_train_end", side_effect=lambda: events.append("train_end")),
-                    patch(f"{module_name}.memory_profiler.stop", side_effect=lambda: events.append("memory_stop")),
-                    patch(f"{module_name}.synchronize", side_effect=lambda: events.append("synchronize")),
+                    patch.object(trainer, "on_train_begin", side_effect=partial(events.append, "train_begin")),
+                    patch.object(trainer, "on_train_end", side_effect=partial(events.append, "train_end")),
+                    patch(f"{module_name}.memory_profiler.stop",
+                          side_effect=partial(events.append, "memory_stop")),
+                    patch(f"{module_name}.synchronize", side_effect=partial(events.append, "synchronize")),
                     patch(f"{module_name}.HyperIter", return_value=MagicMock(), create=True),
                 ):
                     trainer_class.train(trainer)
@@ -149,7 +154,7 @@ class TestMemoryProfilerLifecycle(unittest.TestCase):
                 with (
                     patch.object(trainer, "on_train_begin", side_effect=_ProbeError),
                     patch.object(trainer, "on_train_end") as train_end_mock,
-                    patch(f"{module_name}.memory_profiler.abort", side_effect=lambda: events.append("abort")),
+                    patch(f"{module_name}.memory_profiler.abort", side_effect=partial(events.append, "abort")),
                     patch(f"{module_name}.memory_profiler.stop") as stop_mock,
                 ):
                     with self.assertRaises(_ProbeError):

@@ -23,6 +23,7 @@ must update the import here, with no signature/field change.
 # pylint: disable=wrong-import-position
 
 import dataclasses
+import importlib
 import inspect
 import os
 import unittest
@@ -252,7 +253,7 @@ class TestOptimizerContracts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_wrapper_signatures(self):
         """AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged."""
-        import hyper_parallel.components.optim as optim
+        optim = importlib.import_module("hyper_parallel.components.optim")
 
         self.assertEqual(
             str(inspect.signature(optim.AdamW.__init__)),
@@ -286,7 +287,7 @@ class TestOptimizerContracts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_module_all(self):
         """optim package and mixed_precision_optimizer ``__all__`` stay unchanged."""
-        import hyper_parallel.components.optim as optim
+        optim = importlib.import_module("hyper_parallel.components.optim")
         from hyper_parallel.components.optim import mixed_precision_optimizer
 
         self.assertEqual(

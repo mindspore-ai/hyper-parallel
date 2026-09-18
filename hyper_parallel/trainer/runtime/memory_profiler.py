@@ -222,6 +222,7 @@ class MemoryProfiler:
             raise ValueError("memory.max_entries must be a positive integer or None")
 
     def _record(self) -> None:
+        """Start allocator memory history recording."""
         self._history_started = True
         try:
             self._memory_api._record_memory_history(
@@ -241,6 +242,7 @@ class MemoryProfiler:
             self._stop_history()
 
     def _dump(self) -> None:
+        """Dump the allocator snapshot for a configured rank."""
         if self.global_rank not in self.dump_ranks:
             return
         os.makedirs(self.save_path, exist_ok=True)
@@ -259,6 +261,7 @@ class MemoryProfiler:
         self._history_started = False
 
     def _log_memory_info(self) -> None:
+        """Log and reset peak allocator statistics for the current step."""
         self._resolve_device_apis(require_history=False)
         logger.info(
             "Memory usage step=%s global_rank=%s tp_rank=%s dp_rank=%s "
@@ -273,6 +276,7 @@ class MemoryProfiler:
         self._device_api.reset_peak_memory_stats()
 
     def _resolve_device_apis(self, *, require_history: bool) -> None:
+        """Resolve and validate the active device memory APIs."""
         if self._device_api is None:
             device_type = get_device_type()
             if device_type not in ("cuda", "npu"):
