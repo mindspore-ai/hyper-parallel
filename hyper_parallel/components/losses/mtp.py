@@ -14,6 +14,8 @@
 # ============================================================================
 """Multi-Token-Prediction auxiliary loss objective."""
 
+__all__ = ["calculate_mtp_loss"]
+
 import torch
 from torch import nn
 
@@ -49,6 +51,3 @@ def calculate_mtp_loss(  # pylint: disable=unused-argument
         )
         total_mtp_loss = total_mtp_loss + depth_loss
     return total_mtp_loss
-
-
-__all__ = ["calculate_mtp_loss"]

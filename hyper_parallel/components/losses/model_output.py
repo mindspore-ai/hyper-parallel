@@ -14,6 +14,8 @@
 # ============================================================================
 """Loss module that reads the loss produced by a model."""
 
+__all__ = ["ModelOutputLoss"]
+
 from typing import Any, Dict, Optional, Union
 
 # AutoModels loss components implement the Transformers/PyTorch Trainer API.
@@ -53,6 +55,3 @@ class ModelOutputLoss(torch.nn.Module):
         local_loss = torch.where(has_valid_labels, local_loss, torch.zeros_like(local_loss))
 
         return local_loss
-
-
-__all__ = ["ModelOutputLoss"]
