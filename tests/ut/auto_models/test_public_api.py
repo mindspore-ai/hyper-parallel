@@ -23,6 +23,7 @@ must update the import here, with no signature/field change.
 # pylint: disable=wrong-import-position
 
 import dataclasses
+import importlib
 import inspect
 import os
 import unittest
@@ -213,7 +214,12 @@ class TestTrainerConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_trainer_config_module_all(self):
-        """trainer.config ``__all__`` stays unchanged."""
+        """Verify the trainer configuration package exports supported sections.
+
+        Feature: Trainer configuration public API.
+        Description: Inspect the ordered names declared by the package.
+        Expectation: MemoryConfig appears alongside the existing configuration classes.
+        """
         from hyper_parallel.trainer import config as trainer_config
 
         self.assertEqual(
@@ -226,6 +232,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 "DatasetConfig",
                 "DebugConfig",
                 "FSDP2Config",
+                "MemoryConfig",
                 "MixedPrecisionConfig",
                 "OptimizerConfig",
                 "ProfilingConfig",
@@ -246,7 +253,7 @@ class TestOptimizerContracts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_wrapper_signatures(self):
         """AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged."""
-        import hyper_parallel.components.optim as optim
+        optim = importlib.import_module("hyper_parallel.components.optim")
 
         self.assertEqual(
             str(inspect.signature(optim.AdamW.__init__)),
@@ -280,7 +287,7 @@ class TestOptimizerContracts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_module_all(self):
         """optim package and mixed_precision_optimizer ``__all__`` stay unchanged."""
-        import hyper_parallel.components.optim as optim
+        optim = importlib.import_module("hyper_parallel.components.optim")
         from hyper_parallel.components.optim import mixed_precision_optimizer
 
         self.assertEqual(
