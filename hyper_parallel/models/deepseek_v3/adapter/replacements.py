@@ -20,6 +20,8 @@ gate/up/down expert containers; the generic grouped-linear modules live in
 TP=CP=EP=PP=1 and validate the NPU runtime before converting.
 """
 
+__all__ = ["replace_hifloat8_grouped_experts", "replace_mxfp8_grouped_experts"]
+
 from collections.abc import Mapping
 from typing import Any
 
@@ -85,6 +87,3 @@ def replace_mxfp8_grouped_experts(
         )
     validate_npu_gmm_runtime()
     return MXFP8GroupedExperts.from_module(module, fqn=module_fqn)
-
-
-__all__ = ["replace_hifloat8_grouped_experts", "replace_mxfp8_grouped_experts"]

@@ -25,6 +25,7 @@ Split out of components/distributed/cp_utils.py in stage 4e.
 
 import contextvars
 import functools
+import inspect
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 import torch
@@ -53,6 +54,17 @@ class _DSATensorContext:
 
 _dsa_tensor_context = contextvars.ContextVar(
     "hyper_dsa_tensor_context", default=None)
+
+_DSA_KL_ARGUMENTS = (
+    "index_query", "index_key", "merge_weight", "query", "key",
+    "topk_indices", "softmax_max", "softmax_sum", "query_rope",
+    "key_rope", "actual_seq_qlen", "actual_seq_klen", "scale",
+    "loss_coeff",
+)
+_DSA_KL_SIGNATURE = inspect.Signature(
+    inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    for name in _DSA_KL_ARGUMENTS
+)
 
 
 def _mome_cp_halo_exchange(attention_module, context):
@@ -223,39 +235,49 @@ def _dsa_cp_alltoall(attention_module, attention_functions, context):
             """Proxy the DSA KL loss with CP-transformed attention inputs."""
 
             @staticmethod
-            def apply(index_query: Any, index_key: Any, merge_weight: Any,
-                      query: Any, key: Any,
-                      topk_indices: Any, softmax_max: Any, softmax_sum: Any,
-                      query_rope: Any,
-                      key_rope: Any, actual_seq_qlen: Any, actual_seq_klen: Any,
-                      scale: Any,
-                      loss_coeff: Any) -> Any:
+            def apply(*args: Any, **kwargs: Any) -> Any:
                 """Apply the original KL loss with saved global sequence tensors."""
+                arguments = _DSA_KL_SIGNATURE.bind(*args, **kwargs).arguments
                 saved = _dsa_tensor_context.get()
-                if saved is None:
-                    return original_kl.apply(
-                        index_query, index_key, merge_weight, query, key,
-                        topk_indices, softmax_max, softmax_sum, query_rope,
-                        key_rope, actual_seq_qlen, actual_seq_klen, scale,
-                        loss_coeff)
-                _dsa_tensor_context.set(None)
-                query_tnd, key_tnd, q_pe_tnd, k_pe_tnd = [
-                    tensor.flatten(0, 1) for tensor in
-                    (saved.query, saved.key, saved.q_pe, saved.k_pe)]
-                length = saved.query.size(1)
+                if saved is not None:
+                    _dsa_tensor_context.set(None)
+                    length = saved.query.size(1)
+                    arguments.update(
+                        query=saved.query.flatten(0, 1),
+                        key=saved.key.flatten(0, 1),
+                        query_rope=saved.q_pe.flatten(0, 1),
+                        key_rope=saved.k_pe.flatten(0, 1),
+                        actual_seq_qlen=_global_seq_len(
+                            arguments["actual_seq_qlen"], length, saved.query.device),
+                        actual_seq_klen=_global_seq_len(
+                            arguments["actual_seq_klen"], length, saved.query.device),
+                    )
                 return original_kl.apply(
-                    index_query, index_key, merge_weight, query_tnd, key_tnd,
-                    topk_indices, softmax_max, softmax_sum, q_pe_tnd,
-                    k_pe_tnd,
-                    _global_seq_len(
-                        actual_seq_qlen, length, saved.query.device),
-                    _global_seq_len(
-                        actual_seq_klen, length, saved.query.device),
-                    scale, loss_coeff)
+                    *(arguments[name] for name in _DSA_KL_ARGUMENTS))
 
         setattr(CPDSAKLLoss, _ULYSSES_WRAPPED_FLAG, True)
         attention_module.SparseLightningIndexerKLLossTrainFunction = (
             CPDSAKLLoss)
+
+
+def _head_tail_peer_rank(cp_mesh: Any) -> int:
+    """Return the mirror rank in the CP mesh."""
+    rank_list = list(cp_mesh.rank_list)
+    return rank_list[cp_mesh.size() - 1 - rank_list.index(dist.get_rank())]
+
+
+def _run_head_tail_half(
+        attention_fn: Callable[[Tensor, Tensor, Tensor, dict[str, Any]], Any],
+        query: Tensor, key: Tensor, value: Tensor,
+        call_kwargs: dict[str, Any]) -> Tensor:
+    """Run attention for one query half and check its output contract."""
+    output = attention_fn(query, key, value, call_kwargs)
+    if not isinstance(output, Tensor):
+        raise TypeError(
+            "Head-Tail load balance requires the attention callable to "
+            f"return a Tensor, got {type(output).__name__}"
+        )
+    return output
 
 
 def head_tail_load_balance_attention(
@@ -279,38 +301,19 @@ def head_tail_load_balance_attention(
             f"multiple of 2 * cp_size ({2 * cp_mesh.size()})"
         )
 
-    rank_list = list(cp_mesh.rank_list)
-    local_rank = rank_list.index(dist.get_rank())
-    peer_index = cp_mesh.size() - 1 - local_rank
-    peer_rank = rank_list[peer_index]
-    half = local_q_len // 2
-    query_keep = query.narrow(2, 0, half)
-    query_tail = query.narrow(2, half, half)
-    query_peer = _collectives.p2p_exchange(query_tail, peer_rank)
+    peer_rank = _head_tail_peer_rank(cp_mesh)
+    query_peer = _collectives.p2p_exchange(
+        query.narrow(2, local_q_len // 2, local_q_len // 2), peer_rank)
     global_key, global_value = flex_cp_allgather(key, value, 2, cp_mesh)
-
-    def run_half(
-            query_half: Tensor,
-            call_kwargs: dict[str, Any],
-    ) -> Tensor:
-        """Run attention for one Head-Tail query half."""
-        output = attention_fn(
-            query_half, global_key, global_value, call_kwargs
-        )
-        if not isinstance(output, Tensor):
-            raise TypeError(
-                "Head-Tail load balance requires the attention callable to "
-                f"return a Tensor, got {type(output).__name__}"
-            )
-        return output
-
-    keep_output = run_half(query_keep, attention_kwargs)
-    peer_output = run_half(
-        query_peer,
+    keep_output = _run_head_tail_half(
+        attention_fn, query.narrow(2, 0, local_q_len // 2),
+        global_key, global_value, attention_kwargs)
+    peer_output = _run_head_tail_half(
+        attention_fn, query_peer, global_key, global_value,
         attention_kwargs if peer_attention_kwargs is None else peer_attention_kwargs,
     )
-    tail_output = _collectives.p2p_exchange(peer_output, peer_rank)
-    return torch.cat([keep_output, tail_output], dim=2)
+    return torch.cat(
+        [keep_output, _collectives.p2p_exchange(peer_output, peer_rank)], dim=2)
 
 
 def _cp_offset_causal_mask(q_len: int, kv_len: int, lo: int,

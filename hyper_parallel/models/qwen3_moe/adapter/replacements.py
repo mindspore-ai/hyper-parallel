@@ -25,6 +25,12 @@ package wraps NPU-only ``functional`` backends, so it is imported lazily
 inside each factory body.
 """
 
+__all__ = [
+    "replace_qwen3_moe_flash_attention",
+    "replace_qwen3_moe_grouped_experts",
+    "replace_qwen3_moe_rms_norm",
+]
+
 from collections.abc import Mapping
 from typing import Any
 
@@ -134,10 +140,3 @@ def replace_qwen3_moe_grouped_experts(
     from hyper_parallel.components.modules import GroupedExperts  # pylint: disable=C0415
 
     return GroupedExperts(module=module, module_fqn=module_fqn, context=context)
-
-
-__all__ = [
-    "replace_qwen3_moe_flash_attention",
-    "replace_qwen3_moe_grouped_experts",
-    "replace_qwen3_moe_rms_norm",
-]
