@@ -330,8 +330,31 @@ def _load_generated_checkpoint(
         from hyper_parallel.platform import get_platform  # pylint: disable=import-outside-toplevel
 
         dtype = torch_dtype if "." in torch_dtype else f"torch.{torch_dtype}"
-        model.to(dtype=get_platform().str_to_dtype(dtype))
+        _cast_parameters_to(model, get_platform().str_to_dtype(dtype))
     return model
+
+
+def _cast_parameters_to(model: Any, dtype: Any) -> None:
+    """Cast the model's parameters to ``dtype`` the way the native path does.
+
+    ``model.to(dtype)`` also down-casts floating-point *buffers*, but the native
+    ``from_pretrained(dtype=...)`` path only casts parameters: buffers such as
+    the RoPE ``inv_freq`` table keep the precision they were computed with.
+    Casting them here rounds the table to bf16, which changes every cos/sin
+    value and makes the generated model diverge numerically from the trained
+    one.  Modules listed in ``_keep_in_fp32_modules`` stay in fp32 on both
+    paths, so they are skipped as well.
+
+    Args:
+        model: Model whose parameters are cast in place.
+        dtype: Target ``torch`` dtype.
+    """
+
+    keep_fp32 = tuple(getattr(model, "_keep_in_fp32_modules", None) or ())
+    for name, parameter in model.named_parameters():
+        if keep_fp32 and any(module_name in name for module_name in keep_fp32):
+            continue
+        parameter.data = parameter.data.to(dtype)
 
 
 def _source_model_shapes(hf_config: Any) -> dict[str, tuple[int, ...]]:
