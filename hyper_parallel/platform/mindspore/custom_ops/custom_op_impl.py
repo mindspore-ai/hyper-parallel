@@ -16,6 +16,7 @@
 import importlib
 import os
 import sys
+from typing import NamedTuple, Optional
 
 import mindspore as ms # pylint: disable=C0415
 
@@ -76,6 +77,44 @@ def _to_list_int64(val):
     if isinstance(val, ms.Tensor):
         return val.asnumpy().astype("int64").tolist()
     return val
+
+
+class _SparseFlashMlaSavedTensors(NamedTuple):
+    """Tensors retained by sparse flash MLA for its backward pass."""
+
+    query: ms.Tensor
+    ori_kv: Optional[ms.Tensor]
+    cmp_kv: Optional[ms.Tensor]
+    sinks: Optional[ms.Tensor]
+    ori_sparse_indices: Optional[ms.Tensor]
+    cmp_sparse_indices: Optional[ms.Tensor]
+    cu_seq_lens_q: Optional[ms.Tensor]
+    cu_seq_lens_ori_kv: Optional[ms.Tensor]
+    cu_seq_lens_cmp_kv: Optional[ms.Tensor]
+    attention_out: ms.Tensor
+    softmax_lse: ms.Tensor
+    cmp_residual_kv: Optional[ms.Tensor]
+
+
+def _restore_sparse_flash_mla_saved_tensors(ctx):
+    """Restore optional tensors from the compact autograd saved-tensor sequence."""
+    saved_tensors = iter(ctx.saved_tensors)
+    presence = (
+        True,
+        ctx.has_ori_kv,
+        ctx.has_cmp_kv,
+        ctx.has_sinks,
+        ctx.has_ori_sparse,
+        ctx.has_cmp_sparse,
+        ctx.has_cu_q,
+        ctx.has_cu_ori_kv,
+        ctx.has_cu_cmp_kv,
+        True,
+        True,
+        ctx.has_cmp_residual,
+    )
+    values = (next(saved_tensors) if is_present else None for is_present in presence)
+    return _SparseFlashMlaSavedTensors(*values)
 
 
 class NpuDenseLightningIndexerSoftmaxLseDFunction(DFunction):  # pylint: disable=W0221
@@ -540,11 +579,12 @@ class NpuSparseFlashMlaDFunction(DFunction):  # pylint: disable=W0221
         # metadata is NOT saved for backward: the grad kernel asserts metadata
         # must be nullptr and re-derives its own tiling internally.  cmp_residual_kv
         # IS saved — the grad kernel requires it for CFA/SCFA with cmp_mask_mode=3.
-        ctx.save_for_backward(*[t for t in [
+        saved_tensors = [
             query, ori_kv, cmp_kv, sinks, ori_sparse_indices, cmp_sparse_indices,
             cu_seq_lens_q, cu_seq_lens_ori_kv, cu_seq_lens_cmp_kv,
             attention_out, softmax_lse, cmp_residual_kv,
-        ] if t is not None])
+        ]
+        ctx.save_for_backward(*[tensor for tensor in saved_tensors if tensor is not None])
         ctx.softmax_scale = softmax_scale
         ctx.cmp_ratio = cmp_ratio
         ctx.ori_mask_mode = ori_mask_mode
@@ -558,36 +598,24 @@ class NpuSparseFlashMlaDFunction(DFunction):  # pylint: disable=W0221
     @staticmethod
     def backward(ctx, grad_attention_out, grad_softmax_lse):  # pylint: disable=unused-argument
         """Backward pass: calls npu_sparse_flash_mla_grad kernel."""
-        it = iter(ctx.saved_tensors)
-        q = next(it)
-        ori_kv = next(it) if ctx.has_ori_kv else None
-        cmp_kv = next(it) if ctx.has_cmp_kv else None
-        sinks = next(it) if ctx.has_sinks else None
-        ori_sparse_indices = next(it) if ctx.has_ori_sparse else None
-        cmp_sparse_indices = next(it) if ctx.has_cmp_sparse else None
-        cu_seq_lens_q = next(it) if ctx.has_cu_q else None
-        cu_seq_lens_ori_kv = next(it) if ctx.has_cu_ori_kv else None
-        cu_seq_lens_cmp_kv = next(it) if ctx.has_cu_cmp_kv else None
-        attention_out = next(it)
-        softmax_lse = next(it)
-        cmp_residual_kv = next(it) if ctx.has_cmp_residual else None
+        state = _restore_sparse_flash_mla_saved_tensors(ctx)
         # metadata MUST be None: the grad kernel asserts it is nullptr and
         # re-derives tiling internally.  cmp_residual_kv is passed through —
         # required for CFA/SCFA (cmp_ratio!=1) with cmp_mask_mode=3.
         grads = _custom_ops.npu_sparse_flash_mla_grad(
-            q, grad_attention_out, attention_out, softmax_lse,
-            ori_kv, cmp_kv, ori_sparse_indices, cmp_sparse_indices,
-            cu_seq_lens_q, cu_seq_lens_ori_kv, cu_seq_lens_cmp_kv,
+            state.query, grad_attention_out, state.attention_out, state.softmax_lse,
+            state.ori_kv, state.cmp_kv, state.ori_sparse_indices, state.cmp_sparse_indices,
+            state.cu_seq_lens_q, state.cu_seq_lens_ori_kv, state.cu_seq_lens_cmp_kv,
             None, None, None,                 # seq_used_q, seq_used_ori_kv, seq_used_cmp_kv
-            cmp_residual_kv, None, None,       # cmp_residual_kv, ori_topk_length, cmp_topk_length
-            sinks, None,                      # sinks, metadata(None → grad kernel self-derives)
+            state.cmp_residual_kv, None, None,  # cmp_residual_kv, ori_topk_length, cmp_topk_length
+            state.sinks, None,                 # sinks, metadata(None → grad kernel self-derives)
             ctx.softmax_scale, ctx.cmp_ratio, ctx.ori_mask_mode, ctx.cmp_mask_mode,
             ctx.ori_win_left, ctx.ori_win_right, ctx.layout_q, ctx.layout_kv,
         )
         d_query = grads[0]
-        d_ori_kv = grads[1] if ori_kv is not None else None
-        d_cmp_kv = grads[2] if cmp_kv is not None else None
-        d_sinks = grads[3] if sinks is not None else None
+        d_ori_kv = grads[1] if state.ori_kv is not None else None
+        d_cmp_kv = grads[2] if state.cmp_kv is not None else None
+        d_sinks = grads[3] if state.sinks is not None else None
         # grads[4], grads[5] = ori/cmp_softmax_l1_norm — discarded here.
         # 21 positional forward args (ctx excluded):
         # query, ori_kv, cmp_kv, cu_seq_lens_q, cu_seq_lens_ori_kv, cu_seq_lens_cmp_kv,

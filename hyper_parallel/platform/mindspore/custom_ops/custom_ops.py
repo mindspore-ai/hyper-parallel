@@ -77,9 +77,7 @@ class MindSporeCustomOps:
 
     @staticmethod
     def npu_sparse_flash_mla_grad(*args, **kwargs):
-        """Raw MLA sparse-attention backward kernel — returns 6 outputs including
-        ``ori/cmp_softmax_l1_norm``.  Stateless passthrough for use inside a
-        network-defined custom backward (no autograd)."""
+        """Run the raw MLA sparse-attention backward kernel and return all six outputs."""
         return _npu_sparse_flash_mla_grad(*args, **kwargs)
 
     @staticmethod
