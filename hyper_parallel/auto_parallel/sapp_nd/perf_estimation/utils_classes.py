@@ -63,7 +63,7 @@ class CustomConfig:
         rtype=RatioType.DYNAMIC,
         #  ttype = PerformanceType.TIME,
         ttype=PerformanceType.FLOP,
-        ptype=P2PCommType.NONE, #MANUAL,
+        ptype=P2PCommType.NONE, # MANUAL,
         retype=RecType.COMPUTE_ONLY,
     ):
         self.rtype = rtype

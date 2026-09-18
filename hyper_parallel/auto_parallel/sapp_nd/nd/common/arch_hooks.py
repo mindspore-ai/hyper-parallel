@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@
 # ============================================================================
 """Custom variables per model (expert knowledge)"""
 import math
+from typing import Any, Callable
+
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
@@ -24,8 +26,14 @@ class CWrap:
 
     def __init__(self, e) -> None:
         self.ccfg = e
-        self.set_ccfg = lambda hook: hook(self.ccfg)
-        self.get_model_name = lambda: self.ccfg.model_name
+
+    def set_ccfg(self, hook: Callable[[Any], Any]) -> Any:
+        """Apply a hook to the wrapped config object."""
+        return hook(self.ccfg)
+
+    def get_model_name(self) -> str:
+        """Return model name from the wrapped config."""
+        return self.ccfg.model_name
 
     def reset(self, e):
         """Replace the wrapped config object."""

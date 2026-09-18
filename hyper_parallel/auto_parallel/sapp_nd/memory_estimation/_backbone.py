@@ -100,15 +100,11 @@ class _Backbone:
                     with open(spec.origin, "r", encoding="utf-8") as mf:
                         source = mf.read()
                         tree = ast.parse(source)
-                        mod_cls = next(
-                            (
-                                node
-                                for node in ast.walk(tree)
-                                if isinstance(node, ast.ClassDef)
-                                and node.name == hook_cls
-                            ),
-                            None,
-                        )
+                        mod_cls = None
+                        for node in ast.walk(tree):
+                            if isinstance(node, ast.ClassDef) and node.name == hook_cls:
+                                mod_cls = node
+                                break
                         if mod_cls:
                             target_mod_path = mod_path
                             break
@@ -402,7 +398,7 @@ class _Backbone:
             tmp_evaluator = type(self._child_cls)(
                 None,
                 ccfg=self._ccfg.mm_ccfgs[m],
-                trace_fun=self.toggle_func_trace
+                trace_fun=getattr(self, "toggle_func_trace", False),
             )
             tmp_evaluator.import_eval_yaml()
             num_layer = tmp_evaluator.get_num_layers()
@@ -595,9 +591,7 @@ class _Backbone:
                     self._ctx.current_chunk_id = chunk_id
                     self._ctx.current_lay_id = lay_id
                     self._ctx.current_node = node
-                    sm["stat"][stage_id][chunk_id][
-                        lay_id
-                    ] = self._inner_static_mem()
+                    sm["stat"][stage_id][chunk_id][lay_id] = self._inner_static_mem()
                     sm["dyn"][stage_id][chunk_id][lay_id] = sum(
                         self._inner_dynamic_mem()
                     )

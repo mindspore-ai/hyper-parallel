@@ -163,15 +163,19 @@ class _BackwardOverhead:
         fwd_first, bwd_last = 0, 0
         for lay_id, lay in enumerate(stages[stage_id][0]):
             self._ctx.current_node = lay
-            self._fetch_node_and_switch_env(
+            result = self._fetch_node_and_switch_env(
                 stages, record_lay_types, stage_id, 0, lay_id
             )
+            if result is None:
+                raise RuntimeError("_fetch_node_and_switch_env returned None.")
             fwd_first += sum(self._inner_dynamic_mem(default_micro_factor=1))
         for lay_id, lay in enumerate(stages[stage_id][1]):
             self._ctx.current_node = LayerType.NOT_REC_LAYER
-            self._fetch_node_and_switch_env(
+            result = self._fetch_node_and_switch_env(
                 stages, record_lay_types, stage_id, 1, lay_id
             )
+            if result is None:
+                raise RuntimeError("_fetch_node_and_switch_env returned None.")
             if lay == LayerType.FULL_REC_LAYER:
                 bwd_last = max(
                     bwd_last,
@@ -179,17 +183,21 @@ class _BackwardOverhead:
                 )
         # fwd last + bwd first
         fwd_last, bwd_first = 0, 0
-        for lay_id, lay in enumerate(stages[stage_id][1]):
+        for lay_id, _ in enumerate(stages[stage_id][1]):
             self._ctx.current_node = LayerType.NOT_REC_LAYER
-            self._fetch_node_and_switch_env(
+            result = self._fetch_node_and_switch_env(
                 stages, record_lay_types, stage_id, 1, lay_id
             )
+            if result is None:
+                raise RuntimeError("_fetch_node_and_switch_env returned None.")
             fwd_last = sum(self._inner_dynamic_mem(default_micro_factor=1))
         for lay_id, lay in enumerate(stages[stage_id][0]):
             self._ctx.current_node = LayerType.NOT_REC_LAYER
-            self._fetch_node_and_switch_env(
+            result = self._fetch_node_and_switch_env(
                 stages, record_lay_types, stage_id, 0, lay_id
             )
+            if result is None:
+                raise RuntimeError("_fetch_node_and_switch_env returned None.")
             if lay == LayerType.FULL_REC_LAYER:
                 bwd_first = max(
                     bwd_first,

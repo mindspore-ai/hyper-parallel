@@ -254,10 +254,12 @@ class ComputationAnalyzer:
             for pre_defined_layer_name in self.layer_list["pre_defined_layer"]:
                 if pre_defined_layer_name in obj["name"]:
                     layer_with_computation_time_list[pre_defined_layer_name] += (float(obj["dur"]) / 1000)
+        layer_patterns = {
+            name: re.compile(rf"\b{re.escape(name)}") for name in self.auto_partition_layer_name_list
+        }
         for obj in self.auto_partition_layer_objects:
-            for auto_partition_layer_name in self.auto_partition_layer_name_list:
-                # if auto_partition_layer_name in obj["name"]:
-                if re.search(r"\b" + re.escape(auto_partition_layer_name), obj["name"]):
+            for auto_partition_layer_name, pattern in layer_patterns.items():
+                if pattern.search(obj["name"]):
                     layer_with_computation_time_list[auto_partition_layer_name] += (
                         float(obj["dur"]) / 1000)
         return layer_with_computation_time_list

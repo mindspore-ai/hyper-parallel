@@ -342,6 +342,26 @@ class TestSappSolver:
         with pytest.raises(ValueError):
             pipe.simulate_manual(broken, show=False)
 
+    def test_manual_memory_ignores_unused_recompute_and_nonpositive_counts(self) -> None:
+        """Sparse assignments preserve per-chunk memory and skip unavailable memory values."""
+        pipe, body = _make_pipeline()
+        body.memory_activation_rec_ = {rec: None for rec in Recompute.TYPE}
+        body.memory_activation_rec_[Recompute.TYPE.NONE] = 2
+        assignment = {
+            body: {
+                Recompute.TYPE.NONE: [[2, -1], [0, 3]],
+                Recompute.TYPE.FULL: None,
+                Recompute.TYPE.SLCT: [[0, 0], [0, 0]],
+            }
+        }
+        assert pipe.get_manual_memory_activation(assignment, interleave_num=2) == [[4, 0], [0, 6]]
+        assert pipe.get_manual_memory_parameter(assignment, interleave_num=2) == [[13, 22], [13, 22]]
+
+        body.memory_parameter_ = None
+        assert pipe.get_manual_memory_parameter(assignment, interleave_num=2) == [[3, 7], [3, 7]]
+        pipe.problem_.has_memory = False
+        assert not pipe.get_manual_memory_activation(assignment, interleave_num=2)
+
     def test_sapp_pipeline_simulation_branches_and_manual_files(self, tmp_path, monkeypatch):
         """Naive/manual simulation branches normalize YAML and dispatch to simulation helpers."""
         pipe, _ = _make_pipeline()

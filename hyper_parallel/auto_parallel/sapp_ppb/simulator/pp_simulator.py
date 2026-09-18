@@ -108,6 +108,10 @@ class PipelineSimulator:
                  backward_ratio: object = 2.,
                  sub_fig: object = None, **kwargs: object) -> None:
         """Delegate initialisation to :meth:`init` (kept as a named method for subclassing)."""
+        self.lines: list[list[BlockSim]] = []
+        self.canvas: PlotMgr | None = None
+        self.peak_memory: list[float] = []
+        self.end_time: float | None = None
         self.init(block_time, micro_num, comm_time, layer_recompute, block_mem,
                   block_mem_par, constant_mem, backward_ratio, sub_fig, *args, **kwargs)
 
@@ -117,6 +121,10 @@ class PipelineSimulator:
              constant_mem: float, backward_ratio: object,
              sub_fig: object, *args: object, **kwargs: object) -> None:
         """Build the block grid, statistics and communication graph for the simulator."""
+        self.lines = []
+        self.canvas = None
+        self.peak_memory = []
+        self.end_time = None
         self.micro_num = micro_num
         self.pp, self.vp = self._base_init(block_time)
         self.block_num = 2 * self.vp * self.micro_num
@@ -202,16 +210,16 @@ class PipelineSimulator:
     def show(self, comm: bool = True, connect: bool = None,
              file_name: str = None) -> "PipelineSimulator":
         """Draw the pipeline and display/save it via the canvas."""
-        self.draw(comm, connect)
-        self.canvas.show(file_name)
-        return self
+        simulator = self.draw(comm, connect)
+        simulator.canvas.show(file_name)
+        return simulator
 
     def save(self, file_name: str, comm: bool = True,
              connect: bool = None) -> "PipelineSimulator":
         """Draw the pipeline and save it to ``file_name``."""
-        self.draw(comm, connect)
-        self.canvas.save(file_name)
-        return self
+        simulator = self.draw(comm, connect)
+        simulator.canvas.save(file_name)
+        return simulator
 
     def print_info(self) -> "PipelineSimulator":
         """Log bubble and peak memory information."""
@@ -446,14 +454,14 @@ class PipelineSimulator:
         i_new = lines[p].index(self.blocks[p][b + distance]) + 1
         lines[p].insert(i_new, send_block)
 
-    def _process_swap(self, block, lines, p, b, i_b, i_bn) -> bool:
-        r"""process swap in condition"""
+    def _process_swap(self, block, lines, p, b, i_b, i_bn) -> None:
+        """Update communication ordering in place, preserving the warmup/cooldown boundary."""
         if i_bn - i_b == 3:
             if p % 2 == 0 and lines[p][i_b + 1].type == 'r' and lines[p][i_b + 2].type == 's':
                 lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
             if p % 2 == 1 and lines[p][i_b + 1].type == 's' and lines[p][i_b + 2].type == 'r':
                 if block.phase == 'warmup' and self.blocks[p][b + 1].phase == 'cooldown':
-                    return False
+                    return
                 lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
             if lines[p][i_b + 1].dual.stage == lines[p][i_b + 2].dual.stage:
                 pd = lines[p][i_b + 1].dual.stage
@@ -467,7 +475,6 @@ class PipelineSimulator:
                 if lines[p][i_b + 1].type == 's' and lines[p][i_b + 2].type == 's' \
                     and lines[p][i_b + 3].type == 'r':
                     lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
-        return True
 
     def swap_send_rec(self, lines: list[list[BlockSim]]) -> list[list[BlockSim]]:
         """Adjust send blocks: swap adjacent send/receive pairs where ordering is ambiguous."""
