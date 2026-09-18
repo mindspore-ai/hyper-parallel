@@ -216,7 +216,7 @@ def main(argv: List[str] | None = None) -> None:
     if int(os.environ.get("RANK", "0")) != 0:
         return
 
-    _download_jsonl(config)
+    _ = _download_jsonl(config)
     prepare_offline_dataset(config.to_offline_args())
 
 

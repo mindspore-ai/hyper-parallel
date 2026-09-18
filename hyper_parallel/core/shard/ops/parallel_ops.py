@@ -100,9 +100,9 @@ class DistributedOp:
             return (cache_values[0],)
         return None
 
+    @staticmethod
     # pylint: disable=W0613
     def get_expand_impl(
-        self,
         func: Optional[callable],
         infer_result: tuple,
         cache_values: list,

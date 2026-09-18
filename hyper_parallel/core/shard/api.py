@@ -284,6 +284,13 @@ def _forward_with_kwargs_hook(cell, inputs, kwargs, outputs):  # pylint: disable
     return _forward_hook(cell, inputs, outputs)
 
 
+def _split_sharding_plan_key(key: str) -> tuple[str, str]:
+    """Split a sharding plan key into its module prefix and layout suffix."""
+    if '.' not in key:
+        return "", key
+    return tuple(key.rsplit('.', 1))
+
+
 def _register_hook(model: nn.Module, sharding_plan: Dict):
     """_register_hook"""
 
@@ -314,20 +321,16 @@ def _register_hook(model: nn.Module, sharding_plan: Dict):
     for key, value in sharding_plan.items():
         if value is None:
             continue
-        has_dot = '.' in key
-        split_key = key.rsplit('.', 1)
-        prefix = split_key[0] if has_dot else ""
-        suffix = split_key[1] if has_dot else key
+        prefix, suffix = _split_sharding_plan_key(key)
         if suffix not in valid_suffix:
             raise ValueError(f"In python shard_module, sharding_plan's forward key must end with input or output, "
                              f"but got type {suffix}")
 
         set_inputs_layout = suffix == "input"
-        set_outputs_layout = not set_inputs_layout
         register_cell = cell_dict[prefix]
 
-        _set_layouts(register_cell, value, set_inputs_layout, set_outputs_layout)
-        _register_cell_hook(register_cell, set_inputs_layout, set_outputs_layout)
+        _set_layouts(register_cell, value, set_inputs_layout, not set_inputs_layout)
+        _register_cell_hook(register_cell, set_inputs_layout, not set_inputs_layout)
 
 
 def _register_local_tensor_hook(cell: nn.Module, return_local_tensor_list: List[str]):
