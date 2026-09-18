@@ -178,13 +178,27 @@ class TextTrainer:
         """Dispatch the step-begin lifecycle hook."""
         self.base.on_step_begin()
 
+    def on_micro_step_begin(self, micro_batch: dict[str, Any]) -> None:
+        """Dispatch the micro-step-begin lifecycle hook.
+
+        Args:
+            micro_batch: Prepared inputs and lightweight metric metadata.
+        """
+        self.base.on_micro_step_begin(micro_batch)
+
     def on_step_end(
             self,
             loss: Any = None,
             loss_dict: Any = None,
             grad_norm: Any = None,
     ) -> None:
-        """Dispatch the step-end lifecycle hook."""
+        """Dispatch the step-end lifecycle hook.
+
+        Args:
+            loss: Aggregated loss for the optimizer step.
+            loss_dict: Named loss values for the optimizer step.
+            grad_norm: Gradient norm measured before the optimizer update.
+        """
         self.base.on_step_end(
             loss=loss,
             loss_dict=loss_dict,
@@ -211,12 +225,26 @@ class TextTrainer:
             name: token_count * num_micro_steps
             for name, token_count in self.base.current_token_counts.items()
         }
+        metric_inputs = {
+            **model_inputs,
+            **loss_inputs,
+            "token_count": self.base.current_token_counts["foundation_tokens"],
+        }
+        self.on_micro_step_begin(metric_inputs)
+        del metric_inputs
         loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
 
         return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        """Execute one text training step."""
+        """Execute one text training step.
+
+        Args:
+            data_iterator: Iterator providing the step's micro-batches.
+
+        Returns:
+            Aggregated loss and gradient norm for the completed step.
+        """
         config = self.base.config
         num_micro_steps = self.base.num_micro_batches
         optimizers = self.base.optimizer if isinstance(self.base.optimizer, list) else [self.base.optimizer]

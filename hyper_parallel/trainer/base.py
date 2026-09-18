@@ -486,13 +486,29 @@ class BaseTrainer(Stateful, ABC):
         for callback in self._callbacks:
             callback.on_step_begin(self.state, **kwargs)
 
+    def on_micro_step_begin(self, micro_batch: Dict[str, Any], **kwargs: Any) -> None:
+        """Run all registered callbacks before one forward-backward micro step.
+
+        Args:
+            micro_batch: Prepared inputs for the current micro step.
+            **kwargs: Additional callback context.
+        """
+        for callback in self._callbacks:
+            callback.on_micro_step_begin(self.state, micro_batch, **kwargs)
+
     def on_step_end(
         self,
         loss: Optional[float] = None,
         loss_dict: Optional[Dict[str, Any]] = None,
         grad_norm: Optional[float] = None,
     ) -> None:
-        """Run all registered callbacks at the end of a training step."""
+        """Run all registered callbacks at the end of a training step.
+
+        Args:
+            loss: Aggregated loss for the optimizer step.
+            loss_dict: Named loss values for the optimizer step.
+            grad_norm: Gradient norm measured before the optimizer update.
+        """
         for callback in self._callbacks:
             callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
@@ -503,6 +519,12 @@ class BaseTrainer(Stateful, ABC):
         (e.g. ``multimodal_metadata`` emitted by ``PackingCollator``) are
         recursed so inner tensor values land on the device too; Python ints
         / lists / etc. pass through unchanged.
+
+        Args:
+            micro_batch: Batch fields to move to the training device.
+
+        Returns:
+            Batch fields with tensors moved to the training device.
         """
 
         def _to_device(v: Any) -> Any:
@@ -522,7 +544,15 @@ class BaseTrainer(Stateful, ABC):
     def postforward(
             self, outputs: ModelOutput, labels: Optional[torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Postprocess model outputs after forward pass."""
+        """Postprocess model outputs after forward pass.
+
+        Args:
+            outputs: Model outputs consumed by the configured loss.
+            labels: Labels associated with the current micro-batch.
+
+        Returns:
+            Backward loss and named globally aggregated loss values.
+        """
         local_loss = self.loss_fn(model_output=outputs, labels=labels)
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             local_loss,
@@ -605,7 +635,12 @@ class BaseTrainer(Stateful, ABC):
             return loss, loss_dict
 
     def model_reshard(self, micro_step: int, num_micro_steps: int) -> None:
-        """Reshard model after backward pass; policy lives in ``runtime/fsdp.py``."""
+        """Reshard model after backward pass; policy lives in ``runtime/fsdp.py``.
+
+        Args:
+            micro_step: Zero-based micro-step index.
+            num_micro_steps: Number of micro-steps in the optimizer step.
+        """
         fsdp_runtime.model_reshard(self.hsdp_model_parts, self.config.fsdp_config, micro_step, num_micro_steps)
 
     def _configure_fsdp_gradient_sync(self, micro_step: int, num_micro_steps: int):
@@ -619,14 +654,26 @@ class BaseTrainer(Stateful, ABC):
         )
 
     def configure_fsdp_gradient_sync(self, micro_step: int, num_micro_steps: int) -> None:
-        """Configure FSDP gradient synchronization for an external training loop."""
+        """Configure FSDP gradient synchronization for an external training loop.
+
+        Args:
+            micro_step: Zero-based micro-step index.
+            num_micro_steps: Number of micro-steps in the optimizer step.
+        """
         self._configure_fsdp_gradient_sync(micro_step, num_micro_steps)
 
     def train_step(
             self,
             data_iterator: Any,
     ) -> Dict[str, float]:
-        """Execute one optimizer update from the next dataloader batch."""
+        """Execute one optimizer update from the next dataloader batch.
+
+        Args:
+            data_iterator: Iterator providing the next optimizer-step batch.
+
+        Returns:
+            Aggregated loss and gradient norm for the completed step.
+        """
         config = self.config
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
