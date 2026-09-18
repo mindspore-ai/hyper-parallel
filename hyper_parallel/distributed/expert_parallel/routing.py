@@ -55,20 +55,9 @@ def _softmax_topk_router(module, hidden_states):
 
 
 def _topk_router_module(module, hidden_states):
-    """Qwen2/Qwen3/Mixtral adapter: gate is a TopKRouter module (after the HF 2025
-    refactor); forward directly returns (logits, scores [T,K], indices [T,K])
-    -- take the latter two."""
-    gate = getattr(module, "gate", None)
-    if gate is None:
-        gate = getattr(module, "router", None)
-    out = gate(hidden_states)
-    if isinstance(out, (tuple, list)) and len(out) == 3:
-        _, scores, indices = out
-        return indices, scores
-    raise TypeError(
-        f"{type(module).__name__}: TopKRouter should return (logits, scores, indices), "
-        f"got {type(out).__name__} -- use the default adapter or register a custom adapter"
-    )
+    """Return the scores and indices from the fixed TopKRouter contract."""
+    _, scores, indices = module.gate(hidden_states)
+    return indices, scores
 
 
 def _sigmoid_group_router(module, hidden_states):
