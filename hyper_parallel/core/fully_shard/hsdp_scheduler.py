@@ -31,12 +31,16 @@ class HSDPSchedulerContext:
     """HSDPSchedulerContext"""
 
     def __init__(self) -> None:
+        """Initialize state shared by schedulers in one FSDP module tree."""
         # Currently only record is_last_backward flag for scheduler context.
         self.is_last_backward: bool = True
         # flag to identify "root_module"
         self.root_module = None
         # all_hsdp_schedulers (for one module tree structure)
         self.all_hsdp_schedulers = []
+        # MindSpore nested backward tasks share the enclosing FSDP tree's finalization owner.
+        self.post_backward_final_callback_queued: bool = False
+        self.post_backward_schedulers: dict = {}
         # Flag to avoid repeatedly initializing parameter FQNs.
         self._param_fqn_initilized = False
 
