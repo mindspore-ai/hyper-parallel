@@ -65,6 +65,7 @@ __all__ = [
     "natural_prefix_grad",
     "fold_dense_lightning_indexer_softmax_lse",
     "fold_dense_indexer_kl_loss",
+    "tnd_block_seq_lens",
 ]
 
 # Folding is a property of how the data was sliced, so it is process-wide rather than
@@ -299,6 +300,60 @@ def _cat_pair(a, b, dim: int):
 
 
 # ---------------------------------------------------------------------------
+# TND: per-block ``actual_seq_len`` recomputation
+# ---------------------------------------------------------------------------
+
+def tnd_block_seq_lens(actual_seq_qlen, actual_seq_klen, full_len: int,
+                       seq_shard_id: int, seq_shards: int, block_id: int):
+    """Per-block ``(actual_seq_qlen, actual_seq_klen)`` for one folded TND block.
+
+    This is the **only new semantics** the TND fold needs. Under BSND the causal prefix is
+    expressed by the key tensor's length alone; under TND the kernel derives each query's
+    causal window from the cumulative document ends instead, so a block that holds tokens
+    ``[s_b, e_b)`` of the global sequence and is handed the natural-order key prefix
+    ``[0, e_b)`` must be given cumulative lengths *restated in that block's coordinates*::
+
+        Q_b[i] = clamp(C_i - s_b, 0, Sf)     # doc i's tokens that fall inside this block
+        K_b[i] = clamp(C_i,       0, e_b)    # doc i's tokens from its start up to the prefix end
+
+    where ``C`` are the global cumulative document ends and ``Sf = e_b - s_b``. The kernels
+    pair q document ``i`` with k document ``i``, so restating both sides keeps every query on
+    its own document and drops nothing: proven in ``scripts/verify_tnd_fold_equivalence.py``
+    (numpy,每对恰好一次) and measured bit-identical on the real kernels in
+    ``scripts/verify_tnd_fold_ops.py``.
+
+    ``K_b``'s last entry comes out as ``e_b`` on its own (the global total is never smaller
+    than a prefix end), which is what the kernel requires -- it checks that the accumulated
+    key length equals the key tensor's ``T``.
+
+    **The caller must pass the un-adjusted, sequence-global cumulative lengths**, not the
+    per-rank ones ``_adjust_tnd_seq_lens`` produces: that helper assumes a *contiguous* CP
+    slice (``offset = local_T * cp_rank``), which the fold deliberately breaks. Feeding its
+    output in here is silent -- the shapes all still fit and only the causal prefix is wrong.
+
+    Args:
+        actual_seq_qlen: Global cumulative query document ends (int32 Tensor).
+        actual_seq_klen: Global cumulative key document ends (int32 Tensor).
+        full_len: Global sequence length ``T`` (the folded key's length).
+        seq_shard_id: This rank's position among the ``seq_shards`` sequence shards.
+        seq_shards: ``N``; the sequence is cut into ``2N`` chunks.
+        block_id: 0 for the head chunk (``2r``), 1 for the tail chunk (``2N-1-2r``).
+
+    Returns:
+        tuple: ``(Q_b, K_b)`` as int32 tensors of the same length as the inputs.
+    """
+    if actual_seq_qlen is None or actual_seq_klen is None:
+        return actual_seq_qlen, actual_seq_klen
+    sf = int(full_len) // (2 * int(seq_shards))
+    # The block's causal prefix spans this many Sf chunks, so its own chunk ends the prefix.
+    end = balanced_prefix_chunks(seq_shard_id, seq_shards, block_id) * sf
+    start = end - sf
+    q_block = platform.tensor_type_cast((actual_seq_qlen - start).clamp(0, sf), 'int32')
+    k_block = platform.tensor_type_cast(actual_seq_klen.clamp(0, end), 'int32')
+    return q_block, k_block
+
+
+# ---------------------------------------------------------------------------
 # Per-kernel twice-call wrappers (BSND). ``func`` is the local kernel callable the
 # distributed op would otherwise have called once on the full local query.
 # ---------------------------------------------------------------------------
@@ -334,41 +389,68 @@ def check_fold_shapes(local_q, key, seq_shards: int, seq_dim: int = 1) -> None:
         )
 
 
-def fold_lightning_indexer(func: Callable, seq_shard_id: int, seq_shards: int, *args, **kwargs):
+def fold_lightning_indexer(func: Callable, seq_shard_id: int, seq_shards: int, *args,
+                           fold_layout: str = "BSND", **kwargs):
     """``lightning_indexer(query, key, weights, ...)``: Top-K indices/scores per block.
 
     The indices of each block address that block's natural-order key prefix, which is
-    exactly the key the sparse attention and the KL loss see for the same block.
+    exactly the key the sparse attention and the KL loss see for the same block -- and
+    because the prefix is a natural-order truncation, an index is the same number in the
+    prefix as in the whole sequence, so nothing has to be remapped afterwards.
+
+    ``fold_layout='TND'``: the token axis is dim 0 and the causal window comes from
+    ``actual_seq_lengths_query/key``, which are restated per block (see
+    :func:`tnd_block_seq_lens`). The caller must hand over the **global** cumulative
+    lengths, not ``_adjust_tnd_seq_lens``'s contiguous-slice output.
     """
-    check_fold_shapes(args[0], args[1], seq_shards)
-    q0, q1 = split_half(args[0], 1)
-    w0, w1 = split_half(args[2], 1)
+    tnd = fold_layout == "TND"
+    seq_dim = 0 if tnd else 1
+    check_fold_shapes(args[0], args[1], seq_shards, seq_dim)
+    q0, q1 = split_half(args[0], seq_dim)
+    w0, w1 = split_half(args[2], seq_dim)
     key = args[1]
     rest = args[3:]
-    k0, k1 = unfold_prefix_pair(key, seq_shard_id, seq_shards)
-    out0 = func(q0, k0, w0, *rest, **kwargs)
-    out1 = func(q1, k1, w1, *rest, **kwargs)
+    k0, k1 = unfold_prefix_pair(key, seq_shard_id, seq_shards, seq_dim)
+
+    def _kwargs(block_id):
+        if not tnd:
+            return kwargs
+        q_len, k_len = tnd_block_seq_lens(
+            kwargs.get("actual_seq_lengths_query"), kwargs.get("actual_seq_lengths_key"),
+            key.shape[0], seq_shard_id, seq_shards, block_id)
+        return {**kwargs, "actual_seq_lengths_query": q_len, "actual_seq_lengths_key": k_len}
+
+    out0 = func(q0, k0, w0, *rest, **_kwargs(0))
+    out1 = func(q1, k1, w1, *rest, **_kwargs(1))
     if not isinstance(out0, (tuple, list)):
-        return _cat_pair(out0, out1, 1)
-    return type(out0)(_cat_pair(a, b, 1) for a, b in zip(out0, out1))
+        return _cat_pair(out0, out1, seq_dim)
+    return type(out0)(_cat_pair(a, b, seq_dim) for a, b in zip(out0, out1))
 
 
-def fold_sparse_flash_attention(func: Callable, seq_shard_id: int, seq_shards: int, *args, **kwargs):
+def fold_sparse_flash_attention(func: Callable, seq_shard_id: int, seq_shards: int, *args,
+                                fold_layout: str = "BSND", **kwargs):
     """``sparse_flash_attention(query, key, value, sparse_indices, scale, **kw)`` per block.
 
-    ``attention_out`` is stitched on seq dim 1; ``softmax_max/sum`` are
+    BSND: ``attention_out`` is stitched on seq dim 1; ``softmax_max/sum`` are
     ``(B, N2, S1, G)`` and stitch on dim 2.
+
+    TND: query-side inputs are on dim 0 and ``attention_out`` is ``(T, N, D)`` so it also
+    stitches on dim 0, while ``softmax_max/sum`` are ``(1, T, N)`` and stitch on dim 1.
+    The per-block ``actual_seq_lengths_query/kv`` come from :func:`tnd_block_seq_lens`.
     """
-    q0, q1 = split_half(args[0], 1)
-    t0, t1 = split_half(args[3], 1)
+    tnd = fold_layout == "TND"
+    seq_dim = 0 if tnd else 1
+    stats_dim = 1 if tnd else 2
+    q0, q1 = split_half(args[0], seq_dim)
+    t0, t1 = split_half(args[3], seq_dim)
     key, value = args[1], args[2]
     rest = args[4:]
-    qr0, qr1 = split_half(kwargs.get("query_rope"), 1)
+    qr0, qr1 = split_half(kwargs.get("query_rope"), seq_dim)
     key_rope = kwargs.get("key_rope")
 
-    keys = unfold_prefix_pair(key, seq_shard_id, seq_shards)
-    values = unfold_prefix_pair(value, seq_shard_id, seq_shards)
-    key_ropes = unfold_prefix_pair(key_rope, seq_shard_id, seq_shards)
+    keys = unfold_prefix_pair(key, seq_shard_id, seq_shards, seq_dim)
+    values = unfold_prefix_pair(value, seq_shard_id, seq_shards, seq_dim)
+    key_ropes = unfold_prefix_pair(key_rope, seq_shard_id, seq_shards, seq_dim)
 
     def _call(block_id, q, topk, q_rope):
         kw = dict(kwargs)
@@ -376,32 +458,59 @@ def fold_sparse_flash_attention(func: Callable, seq_shard_id: int, seq_shards: i
             kw["query_rope"] = q_rope
         if "key_rope" in kw:
             kw["key_rope"] = key_ropes[block_id]
+        if tnd:
+            q_len, k_len = tnd_block_seq_lens(
+                kw.get("actual_seq_lengths_query"), kw.get("actual_seq_lengths_kv"),
+                key.shape[0], seq_shard_id, seq_shards, block_id)
+            kw["actual_seq_lengths_query"] = q_len
+            kw["actual_seq_lengths_kv"] = k_len
         return func(q, keys[block_id], values[block_id], topk, *rest, **kw)
 
     out0 = _call(0, q0, t0, qr0)
     out1 = _call(1, q1, t1, qr1)
     if not isinstance(out0, (tuple, list)):
-        return _cat_pair(out0, out1, 1)
-    stitched = [_cat_pair(out0[0], out1[0], 1)]
-    stitched.extend(_cat_pair(a, b, 2) for a, b in zip(out0[1:], out1[1:]))
+        return _cat_pair(out0, out1, seq_dim)
+    stitched = [_cat_pair(out0[0], out1[0], seq_dim)]
+    stitched.extend(_cat_pair(a, b, stats_dim) for a, b in zip(out0[1:], out1[1:]))
     return type(out0)(stitched)
 
 
-def fold_sparse_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: int, *args):
+# ``args`` positions of the MindSpore positional form of the sparse indexer KL loss:
+#   0 query, 1 key, 2 query_index, 3 key_index, 4 weights, 5 sparse_indices,
+#   6 softmax_max, 7 softmax_sum, 8 scale, 9 query_rope, 10 key_rope,
+#   11 actual_seq_qlen, 12 actual_seq_klen, 13 layout, 14 sparse_mode, 15/16 pre/next tokens.
+_KL_ACTUAL_SEQ_QLEN_IDX = 11
+_KL_ACTUAL_SEQ_KLEN_IDX = 12
+
+
+def fold_sparse_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: int, *args,
+                                fold_layout: str = "BSND"):
     """Sparse indexer KL loss per block, MindSpore positional form (17 args).
 
-    Layout of ``args``: query, key, query_index, key_index, weights, sparse_indices,
-    softmax_max, softmax_sum, scale, query_rope, key_rope, then scalars/options.
-    Query-side inputs split on seq dim 1 except the softmax stats ``(B, N2, S1, G)`` on
-    dim 2. Returns ``(d_query_index, d_key_index, d_weights, loss)`` where
-    ``d_key_index`` is full-length on the folded layout and ``loss`` is the sum of the
-    two blocks (the kernel returns an un-normalised sum over its queries).
+    Query-side inputs split on the sequence axis except the softmax stats, which carry the
+    token axis one dim later. Returns ``(d_query_index, d_key_index, d_weights, loss)``
+    where ``d_key_index`` is full-length on the folded layout and ``loss`` is the sum of
+    the two blocks (the kernel returns an un-normalised sum over its queries).
+
+    Per layout:
+
+    * ``BSND``: query side on dim 1, softmax stats ``(B, N2, S1, G)`` on dim 2.
+    * ``TND``: query side on dim 0, softmax stats ``(1, T, N)`` on dim 1, and the
+      per-block ``actual_seq_qlen/klen`` replace args 11/12 (:func:`tnd_block_seq_lens`).
+
+    ``d_key_index`` must be scattered with :func:`fold_prefix_grad` rather than tail-padded:
+    the kernel returns it ordered like the *prefix*, so padding at the tail would land odd
+    chunks on the wrong tokens.
     """
-    q_side_dims = {0: 1, 2: 1, 4: 1, 5: 1, 6: 2, 7: 2, 9: 1}
+    tnd = fold_layout == "TND"
+    seq_dim = 0 if tnd else 1
+    stats_dim = 1 if tnd else 2
+    q_side_dims = {0: seq_dim, 2: seq_dim, 4: seq_dim, 5: seq_dim,
+                   6: stats_dim, 7: stats_dim, 9: seq_dim}
     key_side = (1, 3, 10)
-    full_len = args[3].shape[1]
+    full_len = args[3].shape[seq_dim]
     halves = {i: split_half(args[i], d) for i, d in q_side_dims.items()}
-    prefixes = {i: unfold_prefix_pair(args[i], seq_shard_id, seq_shards) for i in key_side}
+    prefixes = {i: unfold_prefix_pair(args[i], seq_shard_id, seq_shards, seq_dim) for i in key_side}
 
     def _block(block_id):
         call = list(args)
@@ -409,13 +518,18 @@ def fold_sparse_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: i
             call[i] = halves[i][block_id]
         for i in key_side:
             call[i] = prefixes[i][block_id]
+        if tnd:
+            call[_KL_ACTUAL_SEQ_QLEN_IDX], call[_KL_ACTUAL_SEQ_KLEN_IDX] = tnd_block_seq_lens(
+                args[_KL_ACTUAL_SEQ_QLEN_IDX], args[_KL_ACTUAL_SEQ_KLEN_IDX],
+                full_len, seq_shard_id, seq_shards, block_id)
         return func(*call)
 
     d_qi0, d_ki0, d_w0, loss0 = _block(0)
     d_qi1, d_ki1, d_w1, loss1 = _block(1)
-    d_key_index = (fold_prefix_grad(d_ki0, seq_shard_id, seq_shards, 0, full_len)
-                   + fold_prefix_grad(d_ki1, seq_shard_id, seq_shards, 1, full_len))
-    return _cat_pair(d_qi0, d_qi1, 1), d_key_index, _cat_pair(d_w0, d_w1, 1), loss0 + loss1
+    d_key_index = (fold_prefix_grad(d_ki0, seq_shard_id, seq_shards, 0, full_len, seq_dim)
+                   + fold_prefix_grad(d_ki1, seq_shard_id, seq_shards, 1, full_len, seq_dim))
+    return (_cat_pair(d_qi0, d_qi1, seq_dim), d_key_index,
+            _cat_pair(d_w0, d_w1, seq_dim), loss0 + loss1)
 
 
 
@@ -459,32 +573,75 @@ def natural_prefix_grad(grad, full_len: int, seq_dim: int = 1):
     return platform.cat([grad, zero], dim=seq_dim)
 
 
-def fold_dense_lightning_indexer_softmax_lse(func: Callable, seq_shard_id: int, seq_shards: int, *args, **kwargs):
-    """Dense (stage-1) indexer softmax statistics per block, BSND.
+# ``args`` positions of the MindSpore positional form of the dense indexer forward:
+#   0 query_index, 1 key_index, 2 weights, 3 actual_seq_qlen, 4 actual_seq_klen,
+#   5 layout, 6 sparse_mode, 7/8 pre/next tokens.
+_DENSE_LSE_ACTUAL_SEQ_QLEN_IDX = 3
+_DENSE_LSE_ACTUAL_SEQ_KLEN_IDX = 4
+
+
+def fold_dense_lightning_indexer_softmax_lse(func: Callable, seq_shard_id: int, seq_shards: int, *args,
+                                             fold_layout: str = "BSND", **kwargs):
+    """Dense (stage-1) indexer softmax statistics per block.
 
     ``args``: query_index, key_index, weights, then scalars/options. The query side holds
     this rank's two folded blocks; the key side is **natural order** (see
-    :func:`natural_prefix`). Both outputs are ``(B, Nidx2, S1)`` per-query statistics, so
-    they stitch on dim 2 while the query-side inputs split on dim 1.
+    :func:`natural_prefix`), because stage 1 folds only the query-side tensors.
+
+    BSND: query-side inputs split on dim 1 and both outputs ``(B, Nidx2, S1)`` stitch on dim 2.
+    TND: the token axis is dim 0, the outputs are ``(Nidx2, T1)`` and stitch on dim 1, and the
+    causal window comes from ``actual_seq_qlen/klen`` (positional 3/4), restated per block by
+    :func:`tnd_block_seq_lens` -- which needs the **global** cumulative lengths, not
+    ``_adjust_tnd_seq_lens``'s contiguous-slice output.
     """
-    check_fold_shapes(args[0], args[1], seq_shards)
-    q0, q1 = split_half(args[0], 1)
-    w0, w1 = split_half(args[2], 1)
-    rest = args[3:]
-    out0 = func(q0, natural_prefix(args[1], seq_shard_id, seq_shards, 0), w0, *rest, **kwargs)
-    out1 = func(q1, natural_prefix(args[1], seq_shard_id, seq_shards, 1), w1, *rest, **kwargs)
-    return type(out0)(_cat_pair(a, b, 2) for a, b in zip(out0, out1))
+    tnd = fold_layout == "TND"
+    seq_dim = 0 if tnd else 1
+    stats_dim = 1 if tnd else 2
+    if tnd and len(args) <= _DENSE_LSE_ACTUAL_SEQ_KLEN_IDX:
+        raise NotImplementedError(
+            "DSA CP head-tail fold under TND needs the MindSpore positional signature of the "
+            "dense indexer forward, which carries actual_seq_qlen/klen.")
+    check_fold_shapes(args[0], args[1], seq_shards, seq_dim)
+    q0, q1 = split_half(args[0], seq_dim)
+    w0, w1 = split_half(args[2], seq_dim)
+
+    def _call(block_id, query_index, weights):
+        rest = list(args[3:])
+        if tnd:
+            q_len, k_len = tnd_block_seq_lens(
+                args[_DENSE_LSE_ACTUAL_SEQ_QLEN_IDX], args[_DENSE_LSE_ACTUAL_SEQ_KLEN_IDX],
+                args[1].shape[seq_dim], seq_shard_id, seq_shards, block_id)
+            rest[_DENSE_LSE_ACTUAL_SEQ_QLEN_IDX - 3] = q_len
+            rest[_DENSE_LSE_ACTUAL_SEQ_KLEN_IDX - 3] = k_len
+        key_prefix = natural_prefix(args[1], seq_shard_id, seq_shards, block_id, seq_dim)
+        return func(query_index, key_prefix, weights, *rest, **kwargs)
+
+    out0 = _call(0, q0, w0)
+    out1 = _call(1, q1, w1)
+    return type(out0)(_cat_pair(a, b, stats_dim) for a, b in zip(out0, out1))
 
 
-def fold_dense_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: int, *args):
+# ``args`` positions of the MindSpore positional form of the dense indexer KL loss:
+#   0 query, 1 key, 2 query_index, 3 key_index, 4 weights, 5 softmax_max, 6 softmax_sum,
+#   7 softmax_max_index, 8 softmax_sum_index, 9 scale, 10 query_rope, 11 key_rope,
+#   12 actual_seq_qlen, 13 actual_seq_klen, 14 layout, 15 sparse_mode, 16/17 pre/next tokens.
+# Two more query-side statistics than the sparse loss, hence the shifted seq-len indices.
+_DENSE_KL_ACTUAL_SEQ_QLEN_IDX = 12
+_DENSE_KL_ACTUAL_SEQ_KLEN_IDX = 13
+
+
+def fold_dense_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: int, *args,
+                               fold_layout: str = "BSND"):
     """Dense (stage-1) indexer KL loss per block, MindSpore positional form (18 args).
 
-    Layout of ``args``: query, key, query_index, key_index, weights, softmax_max,
-    softmax_sum, softmax_max_index, softmax_sum_index, scale, query_rope, key_rope,
-    then scalars/options. Unlike the sparse loss this one has no ``sparse_indices`` and
-    carries two extra query-side statistics (the indexer's own softmax max/sum, from
-    :func:`fold_dense_lightning_indexer_softmax_lse`), which are ``(B, Nidx2, S1)`` and
-    therefore split on dim 2 like the attention stats ``(B, N2, S1, G)``.
+    Unlike the sparse loss this one has no ``sparse_indices`` and carries two extra
+    query-side statistics (the indexer's own softmax max/sum, from
+    :func:`fold_dense_lightning_indexer_softmax_lse`).
+
+    BSND: query-side inputs split on dim 1, except the four statistics -- the attention's
+    ``(B, N2, S1, G)`` and the indexer's ``(B, Nidx2, S1)`` -- which split on dim 2.
+    TND: the token axis is dim 0 and every statistic is ``(N, T1, ...)``, so they split on
+    dim 1; the per-block ``actual_seq_qlen/klen`` come from :func:`tnd_block_seq_lens`.
 
     The key side is **natural order**: stage 1 folds only the query-side tensors, so each
     block's causal prefix is a leading narrow and ``d_key_index`` pads back at the tail.
@@ -492,10 +649,14 @@ def fold_dense_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: in
     Returns ``(d_query_index, d_key_index, d_weights, loss)`` with ``d_key_index`` full
     length and ``loss`` the sum over the two blocks.
     """
-    q_side_dims = {0: 1, 2: 1, 4: 1, 5: 2, 6: 2, 7: 2, 8: 2, 10: 1}
+    tnd = fold_layout == "TND"
+    seq_dim = 0 if tnd else 1
+    stats_dim = 1 if tnd else 2
+    q_side_dims = {0: seq_dim, 2: seq_dim, 4: seq_dim, 10: seq_dim,
+                   5: stats_dim, 6: stats_dim, 7: stats_dim, 8: stats_dim}
     key_side = (1, 3, 11)
-    full_len = args[3].shape[1]
-    check_fold_shapes(args[0], args[1], seq_shards)
+    full_len = args[3].shape[seq_dim]
+    check_fold_shapes(args[0], args[1], seq_shards, seq_dim)
     halves = {i: split_half(args[i], d) for i, d in q_side_dims.items()}
 
     def _block(block_id):
@@ -503,10 +664,16 @@ def fold_dense_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: in
         for i in q_side_dims:
             call[i] = halves[i][block_id]
         for i in key_side:
-            call[i] = natural_prefix(args[i], seq_shard_id, seq_shards, block_id)
+            call[i] = natural_prefix(args[i], seq_shard_id, seq_shards, block_id, seq_dim)
+        if tnd:
+            call[_DENSE_KL_ACTUAL_SEQ_QLEN_IDX], call[_DENSE_KL_ACTUAL_SEQ_KLEN_IDX] = tnd_block_seq_lens(
+                args[_DENSE_KL_ACTUAL_SEQ_QLEN_IDX], args[_DENSE_KL_ACTUAL_SEQ_KLEN_IDX],
+                full_len, seq_shard_id, seq_shards, block_id)
         return func(*call)
 
     d_qi0, d_ki0, d_w0, loss0 = _block(0)
     d_qi1, d_ki1, d_w1, loss1 = _block(1)
-    d_key_index = (natural_prefix_grad(d_ki0, full_len) + natural_prefix_grad(d_ki1, full_len))
-    return _cat_pair(d_qi0, d_qi1, 1), d_key_index, _cat_pair(d_w0, d_w1, 1), loss0 + loss1
+    d_key_index = (natural_prefix_grad(d_ki0, full_len, seq_dim)
+                   + natural_prefix_grad(d_ki1, full_len, seq_dim))
+    return (_cat_pair(d_qi0, d_qi1, seq_dim), d_key_index,
+            _cat_pair(d_w0, d_w1, seq_dim), loss0 + loss1)

@@ -439,6 +439,13 @@ class SparseFlashAttentionDistributedOp(DistributedOp):
             klen_tensor = kwargs.get('actual_seq_lengths_kv')
             if qlen_tensor is None or klen_tensor is None:
                 return func(*args, **kwargs)
+            if dsa_cp_fold_enabled():
+                # Head-tail folded query: one call per block on its own causal prefix, with the
+                # cumulative lengths restated in that block's coordinates. The **global** ones
+                # are passed through untouched -- _adjust_tnd_seq_lens assumes a contiguous CP
+                # slice, which the fold breaks.
+                return fold_sparse_flash_attention(
+                    func, seq_shard_id, seq_shards, *args, fold_layout='TND', **kwargs)
             adj_q, adj_k = _adjust_tnd_seq_lens(
                 local_q, local_k, qlen_tensor, klen_tensor,
                 cp_rank=seq_shard_id,

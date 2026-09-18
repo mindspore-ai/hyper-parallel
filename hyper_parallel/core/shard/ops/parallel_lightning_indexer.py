@@ -337,6 +337,11 @@ class LightningIndexerDistributedOp(DistributedOp):
             if qlen_tensor is None or klen_tensor is None:
                 return func(*args, **kwargs)
 
+            if dsa_cp_fold_enabled():
+                # See fold_sparse_flash_attention: global cumulative lengths in, per-block out.
+                return fold_lightning_indexer(
+                    func, seq_shard_id, seq_shards, *args, fold_layout='TND', **kwargs)
+
             adj_q, adj_k = _adjust_tnd_seq_lens(
                 local_q, local_k, qlen_tensor, klen_tensor,
                 cp_rank=seq_shard_id,

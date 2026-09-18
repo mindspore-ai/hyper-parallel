@@ -458,9 +458,9 @@ class NpuDenseLightningIndexerGradKlLossDistributedOp(DistributedOp):
         # requires token-level offset adjustment.
         dp_size = k_layout.get_dim_split_num(0)  # DP splits on k's T2
         split_id = q_layout.get_split_id(0)
-        cp_size = (q_layout.get_dim_split_num(0) // dp_size
-                   if dp_size > 0 else 1)
-        cp_rank = split_id % cp_size if cp_size > 1 else 0
+        seq_shards = (q_layout.get_dim_split_num(0) // dp_size
+                      if dp_size > 0 else 1)
+        seq_shard_id = split_id % seq_shards if seq_shards > 1 else 0
 
         def _tnd_impl(*args, **kwargs):
             local_q, local_k = args[0], args[1]
@@ -474,9 +474,19 @@ class NpuDenseLightningIndexerGradKlLossDistributedOp(DistributedOp):
             if qlen_tensor is None or klen_tensor is None:
                 return func(*args, **kwargs)
 
+            if dsa_cp_fold_enabled():
+                # Global cumulative lengths in, per-block ones out; must precede
+                # ``_adjust_tnd_seq_lens``, whose contiguous-slice assumption the fold breaks.
+                if len(args) <= 13 or kwargs:
+                    raise NotImplementedError(
+                        "DSA CP head-tail fold is implemented for the MindSpore positional "
+                        "signature of the dense indexer KL loss only.")
+                return fold_dense_indexer_kl_loss(
+                    func, seq_shard_id, seq_shards, *args, fold_layout='TND')
+
             adj_q, adj_k = _adjust_tnd_seq_lens(
                 local_q, local_k, qlen_tensor, klen_tensor,
-                cp_rank=cp_rank,
+                cp_rank=seq_shard_id,
             )
 
             if len(args) > 10:  # MindSpore

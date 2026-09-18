@@ -471,6 +471,18 @@ class NpuSparseLightningIndexerGradKlLossDistributedOp(DistributedOp):
             if qlen_tensor is None or klen_tensor is None:
                 return func(*args, **kwargs)
 
+            if dsa_cp_fold_enabled():
+                # Head-tail folded query: one call per block on its own causal prefix.
+                # The fold wrapper rewrites args 11/12 per block, so the **global**
+                # cumulative lengths must reach it untouched.
+                if len(args) <= 9:
+                    raise NotImplementedError(
+                        "DSA CP head-tail fold for the TND indexer KL loss is implemented for "
+                        "the MindSpore positional form only; this call passed the sequence "
+                        "lengths as keyword arguments (torch path).")
+                return fold_sparse_indexer_kl_loss(
+                    func, seq_shard_id, seq_shards, *args, fold_layout='TND')
+
             adj_q, adj_k = _adjust_tnd_seq_lens(
                 local_q, local_k, qlen_tensor, klen_tensor,
                 cp_rank=seq_shard_id,

@@ -274,8 +274,9 @@ def _enable_fold_if_requested(style_name: str, layout: str, load_balance: bool) 
         # sequence) would otherwise inherit the folded kernels.
         set_dsa_cp_fold(False)
         return False
-    if layout != "BSND":
-        raise ValueError(f"{style_name}(load_balance=True) supports only BSND layout, got {layout!r}.")
+    if layout not in ("BSND", "TND"):
+        raise ValueError(
+            f"{style_name}(load_balance=True) supports BSND and TND layouts, got {layout!r}.")
     set_dsa_cp_fold(True)
     return True
 
