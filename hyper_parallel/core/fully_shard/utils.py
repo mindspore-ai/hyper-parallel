@@ -36,12 +36,71 @@ class MixedPrecisionPolicy:
         param_dtype: Data type for parameter computation. If None, uses original dtype.
         reduce_dtype: Data type for gradient reduction. If None, uses param_dtype.
         output_dtype: Data type for module outputs. If None, no casting applied.
+        cast_forward_inputs: Whether to cast floating-point forward inputs to ``param_dtype``.
+        apply_grad_on_fp32_main_grad: Whether to accumulate reduced gradients into an
+            FP32 main_grad buffer.
+        custom_params: Per-parameter overrides, mapping a parameter's fully qualified
+            name to its ``(param_dtype, reduce_dtype)`` pair. An override wins over
+            ``param_dtype`` / ``reduce_dtype`` for that parameter only, which keeps
+            a high-precision parameter inside its existing FSDP unit instead of
+            forcing it into a separate one. Casting of inputs and outputs stays a
+            module-level decision.
+
+            Names follow the same enumeration the FSDP root uses: a key is the
+            dotted path ``named_parameters()`` yields on the module passed to the
+            outermost ``fully_shard`` call, so ``model.layers[0].mlp.gate.weight``
+            is keyed as ``"layers.0.mlp.gate.weight"`` -- the root's own name is
+            not part of the key. Keying by name rather than by parameter object
+            lets one policy be reused by every ``fully_shard`` call in a model
+            without retaining the pre-shard weights, and lets the override be
+            resolved after wrapping, when names exist.
+
+            Pass the mapping to **every** ``fully_shard`` call whose unit owns an
+            overridden parameter: a policy is not inherited by child units, so
+            configuring ``custom_params`` only on the outermost call leaves the
+            nested units at the module-level dtypes. A key that matches no
+            parameter of its unit is ignored.
+
+    Note:
+        An override only changes the dtype of the parameter itself -- the
+        all-gathered weight, its reduction dtype and its communication bucket. It
+        does not change how forward inputs are cast, which stays driven by
+        ``cast_forward_inputs`` / ``param_dtype``, and it does not change the
+        stored dtype of the sharded parameter. Both consequences are easy to
+        miss: an FP32 override inside a unit that still casts inputs to the
+        module dtype feeds mismatched operands to dtype-checked kernels, so such
+        a unit must set ``cast_forward_inputs=False``; and a model loaded in a
+        low-precision dtype keeps low-precision storage, so the override buys a
+        higher-precision compute and communication path, not a higher-precision
+        optimizer update.
     """
     param_dtype: Optional[DType] = None
     reduce_dtype: Optional[DType] = None
     output_dtype: Optional[DType] = None
     cast_forward_inputs: bool = True
     apply_grad_on_fp32_main_grad: bool = False
+    custom_params: Optional[dict[str, tuple[Optional[DType], Optional[DType]]]] = None
+
+    def get_param_dtypes(self, fqn: str) -> tuple[Optional[DType], Optional[DType]]:
+        """Return the ``(param_dtype, reduce_dtype)`` pair that applies to ``fqn``.
+
+        Falls back to the module-level pair when ``fqn`` has no override.
+
+        Args:
+            fqn: Fully qualified parameter name, as assigned by the FSDP root.
+
+        Raises:
+            ValueError: If the stored override is not a two-element tuple.
+        """
+        if self.custom_params is None or fqn not in self.custom_params:
+            return self.param_dtype, self.reduce_dtype
+        custom_dtypes = self.custom_params[fqn]
+        if not isinstance(custom_dtypes, tuple) or len(custom_dtypes) != 2:
+            raise ValueError(
+                "MixedPrecisionPolicy custom_params values must be "
+                "(param_dtype, reduce_dtype) tuples."
+            )
+        return custom_dtypes
 
 
 @dataclass

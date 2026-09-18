@@ -649,8 +649,19 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.reduce_dtype = None
 
     def init_dtype_attrs(self, mp_policy: MixedPrecisionPolicy) -> None:
-        """Initialize param_dtype and reduce_dtype from the mixed precision policy."""
-        param_dtype, reduce_dtype = (mp_policy.param_dtype, mp_policy.reduce_dtype)
+        """Initialize param_dtype and reduce_dtype from the mixed precision policy.
+
+        A per-parameter override from ``mp_policy.custom_params`` wins over the
+        module-level pair. The override is looked up by this parameter's fully
+        qualified name, which the owning tree assigns before the first forward
+        (``_init_params_fqn``). A parameter that has no name yet -- a tree that was
+        never entered through its root -- falls back to the module-level pair; the
+        lookup is repeated once the name exists.
+        """
+        if self._param_fqn is None:
+            param_dtype, reduce_dtype = (mp_policy.param_dtype, mp_policy.reduce_dtype)
+        else:
+            param_dtype, reduce_dtype = mp_policy.get_param_dtypes(self._param_fqn)
         self.orig_dtype = self.sharded_param.dtype
         if reduce_dtype == param_dtype:
             reduce_dtype = None
@@ -777,17 +788,18 @@ class TorchHSDPParamV2(HSDPParamV2):
         """
         Converts a local tensor representing either the sharded parameter or
         sharded gradient to DTensor.
+
+        The parameter-owned sharding specification already contains the
+        logical shape, stride, dtype, and placements. Reusing it avoids the
+        metadata deepcopy performed by ``DTensor.from_local`` when explicit
+        shape and stride are supplied. The returned DTensor intentionally
+        shares this layout with the sharded parameter.
         """
-        sharded_dtensor = DTensor.from_local(
+        return DTensor.from_local_with_layout(
             tensor,
-            self._sharding_spec.mesh,
-            self._sharding_spec.placements,
+            self._sharding_spec,
             shape=self._sharding_spec.tensor_shape,
-            stride=self._sharding_spec.tensor_stride,
         )
-        sharded_dtensor._layout = self._sharding_spec
-        sharded_dtensor._placements = tuple(self._sharding_spec.placements)
-        return sharded_dtensor
 
     def to_accumulated_grad_if_needed(self) -> None:
         if self._unsharded_param.grad is None:

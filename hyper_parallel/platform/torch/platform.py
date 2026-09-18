@@ -562,6 +562,38 @@ class TorchPlatform(Platform):
 
     _custom_ops_cls = None
 
+    @staticmethod
+    def register_optimizer_tensor_type(tensor_type: type) -> None:
+        """Register a tensor subclass for PyTorch optimizer and foreach selection.
+
+        Re-entrant: the type is recorded under its qualified name rather than
+        appended blindly, so calling this again for the same class is a no-op and
+        a class rebuilt by a module reload (or reached through a second import
+        path) replaces its stale entry instead of adding another one. Neither
+        supported-type list can therefore grow as the registering module is
+        re-imported.
+        """
+        from torch.optim.optimizer import _foreach_supported_types as optimizer_tensor_types  # pylint: disable=C0415
+        from torch.utils._foreach_utils import _foreach_supported_types as foreach_tensor_types  # pylint: disable=C0415
+
+        for supported_types in (optimizer_tensor_types, foreach_tensor_types):
+            TorchPlatform._upsert_supported_type(supported_types, tensor_type)
+
+    @staticmethod
+    def _upsert_supported_type(supported_types: list, tensor_type) -> None:
+        """Store ``tensor_type``, replacing any entry naming the same class."""
+        qualified_name = TorchPlatform._tensor_type_name(tensor_type)
+        for index, registered in enumerate(supported_types):
+            if TorchPlatform._tensor_type_name(registered) == qualified_name:
+                supported_types[index] = tensor_type
+                return
+        supported_types.append(tensor_type)
+
+    @staticmethod
+    def _tensor_type_name(tensor_type) -> str:
+        """Return the import-stable identity of a registered tensor type."""
+        return f"{getattr(tensor_type, '__module__', '')}.{getattr(tensor_type, '__qualname__', tensor_type)}"
+
     @property
     def custom_ops(self):
         """Return the Torch platform custom ops instance.

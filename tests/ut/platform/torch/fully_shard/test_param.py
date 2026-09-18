@@ -27,6 +27,7 @@ import torch
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo, ShardedState
 from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, HSDPMeshInfo, MixedPrecisionPolicy, SourceShardMetaInfo
@@ -66,10 +67,12 @@ def _new_param():
         grad=None,
         requires_grad=True,
         _local_tensor=torch.tensor([1.0, 2.0]),
+        dtype=torch.float32,
     )
     hsdp_param._unsharded_param = SimpleNamespace(grad=None)
     hsdp_param.unsharded_accumulated_grad = None
     hsdp_param.mp_policy = MixedPrecisionPolicy()
+    hsdp_param._param_fqn = None
     hsdp_param.orig_dtype = torch.float32
     hsdp_param.reduce_dtype = None
     hsdp_param.gradient_scaling_factor = None
@@ -90,6 +93,80 @@ def _new_param():
 
 class TestTorchHSDPParamHelpers(unittest.TestCase):
     """Cover parameter helper behavior without constructing real device meshes."""
+
+    def test_to_sharded_dtensor_reuses_uneven_sharding_layout(self):
+        """Gradient wrapping should retain uneven metadata without copying its layout."""
+        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+            mesh = DeviceMesh(
+                "cpu",
+                [0, 1],
+                mesh_dim_names=("fsdp",),
+                _init_backend=False,
+            )
+        sharding_spec = Layout.from_device_mesh(mesh)
+        sharding_spec.set_placements((Shard(0, uneven_shard=True),))
+        sharding_spec.placement_to_tensor_map(2)
+        sharding_spec.set_tensor_meta((5, 3), (3, 1), torch.float32)
+        hsdp_param = object.__new__(TorchHSDPParamV2)
+        hsdp_param._sharding_spec = sharding_spec
+        local_gradient = torch.arange(6, dtype=torch.float32).view(2, 3)
+
+        with patch.object(DTensor, "from_local", side_effect=AssertionError("slow constructor called")):
+            sharded_gradient = hsdp_param.to_sharded_dtensor(local_gradient)
+
+        self.assertIs(sharded_gradient.layout, sharding_spec)
+        self.assertIs(sharded_gradient.to_local(), local_gradient)
+        self.assertEqual(sharded_gradient.shape, (5, 3))
+        self.assertEqual(sharded_gradient.placements, (Shard(0, uneven_shard=True),))
+        self.assertEqual(sharded_gradient.layout.tensor_stride, (3, 1))
+
+    def test_init_dtype_attrs_resolves_override_by_fqn(self):
+        """A named parameter resolves its override from custom_params.
+
+        description: Resolve dtypes for a parameter whose FQN carries an override.
+        expectation: The override suppresses both casts for an FP32 parameter stored
+            in FP32, which the module-level pair would not do.
+        feature: TorchHSDPParamV2.init_dtype_attrs per-parameter override.
+        """
+        # Arrange
+        hsdp_param = _new_param()
+        hsdp_param._param_fqn = "layers.0.mlp.gate.weight"
+        policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            custom_params={hsdp_param._param_fqn: (torch.float32, torch.float32)},
+        )
+
+        # Act
+        hsdp_param.init_dtype_attrs(policy)
+
+        # Assert
+        self.assertEqual(hsdp_param.orig_dtype, torch.float32)
+        self.assertIsNone(hsdp_param.param_dtype)
+        self.assertIsNone(hsdp_param.reduce_dtype)
+
+    def test_init_dtype_attrs_unnamed_param_ignores_overrides(self):
+        """A parameter with no name yet falls back to the module-level pair.
+
+        description: Resolve dtypes before the owning tree assigned an FQN.
+        expectation: The module-level pair applies, so an override cannot match.
+        feature: TorchHSDPParamV2.init_dtype_attrs FQN fallback.
+        """
+        # Arrange
+        hsdp_param = _new_param()
+        hsdp_param._param_fqn = None
+        policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            custom_params={"layers.0.mlp.gate.weight": (torch.float32, torch.float32)},
+        )
+
+        # Act
+        hsdp_param.init_dtype_attrs(policy)
+
+        # Assert
+        self.assertEqual(hsdp_param.param_dtype, torch.bfloat16)
+        self.assertEqual(hsdp_param.reduce_dtype, torch.float32)
 
     def test_reduce_comm_dtype_prefers_parameter_policy_and_falls_back_to_grad(self):
         """Effective reduction dtype should be resolved entirely by the parameter."""
