@@ -38,6 +38,7 @@ from hyper_parallel.trainer.config.optimization import (
 from hyper_parallel.trainer.config.parallelism import (
     AcceleratorConfig,
     ActivationCheckpointConfig,
+    ActivationCheckpointSelection,
     PlanOverride,
     _import_module_type,
     entries_to_module_replacements,
@@ -48,6 +49,7 @@ from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.config.trainer import TrainerConfig, save_configs
 from hyper_parallel.trainer.config.training import (
     DebugConfig,
+    ModelIntegrationConfig,
     ProfilingConfig,
     TrainingConfig,
     WandbConfig,
@@ -56,12 +58,14 @@ from hyper_parallel.trainer.config.training import (
 __all__ = [
     "AcceleratorConfig",
     "ActivationCheckpointConfig",
+    "ActivationCheckpointSelection",
     "CompileConfig",
     "DataLoaderConfig",
     "DatasetConfig",
     "DebugConfig",
     "FSDP2Config",
     "MixedPrecisionConfig",
+    "ModelIntegrationConfig",
     "OptimizerConfig",
     "ProfilingConfig",
     "Target",

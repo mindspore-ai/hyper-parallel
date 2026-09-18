@@ -18,7 +18,7 @@ Migrated from ``components/models/qwen3_moe_fusions.py`` in M3 (adjust doc
 §5.3/§8). The wrappers orchestrate only the Qwen attention interface with
 the public CP collectives — the projection pipeline (fused QKV, Q/K norm,
 RoPE, cache, output projection) is owned by the generic
-``modules.GQAAttention`` built by ``adapter/replacements.py``.
+``modules.GQAAttention`` built by ``adapter/conversion/module_replacement.py``.
 
 Forward-install discipline (05 §15.2.3): the wrappers never assign
 ``module.forward`` themselves; each validates its target and returns a
@@ -48,7 +48,7 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     ulysses_seq_to_head,
 )
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
-from hyper_parallel.models.qwen3_moe.adapter.attention import (
+from hyper_parallel.models.qwen3_moe.adapter.runtime.attention import (
     run_qwen3_moe_flash_attention,
 )
 

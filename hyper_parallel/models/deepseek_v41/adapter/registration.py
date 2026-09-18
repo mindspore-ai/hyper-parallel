@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Register the DeepSeek-V4.1 validation model and adapter providers."""
-
-from typing import Any
+"""Register the DeepSeek-V4.1 model and adapter providers."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
-from hyper_parallel.models.deepseek_v41.adapter.checkpoint import (
+from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping import (
     register_deepseek_v41_checkpoint_mapping,
+)
+from hyper_parallel.models.deepseek_v41.adapter.policies.activation_checkpointing import (
+    build_recompute_policy,
+)
+from hyper_parallel.models.deepseek_v41.adapter.policies.sharding import (
+    build_parameter_sharding_rules,
+    get_fsdp_excluded_subtrees,
+    get_fsdp_execution_order,
+    get_fsdp_wrap_modules,
 )
 from hyper_parallel.models.registry import (
     register_custom_model,
@@ -26,122 +33,51 @@ from hyper_parallel.models.registry import (
 )
 
 
-def _load_replacements():
-    """Return the model's replacement factories lazily."""
-    from hyper_parallel.models.deepseek_v41.adapter import replacements  # pylint: disable=C0415
-
-    return replacements
-
-
 def _load_expert_parallel():
-    """Return the model's EP forward factory lazily."""
-    from hyper_parallel.models.deepseek_v41.adapter import expert_parallel  # pylint: disable=C0415
+    """Return the model's MoE and Engram EP factories lazily."""
+    from hyper_parallel.models.deepseek_v41.adapter.distributed import (  # pylint: disable=C0415
+        moe_engram_expert_parallel,
+    )
 
-    return expert_parallel
+    return moe_engram_expert_parallel
 
 
 def _load_context_parallel():
     """Return the model's shared-attention CP wrapper lazily."""
-    from hyper_parallel.models.deepseek_v41.adapter import context_parallel  # pylint: disable=C0415
-
-    return context_parallel
-
-
-def _load_sharding_rules():
-    """Return V4.1 parameter-role overrides."""
-    from hyper_parallel.distributed.tensor_parallel.param_role import (  # pylint: disable=C0415
-        ParamRole,
+    from hyper_parallel.models.deepseek_v41.adapter.distributed import (  # pylint: disable=C0415
+        shared_attention_context_parallel,
     )
 
-    return [
-        (["indexer.q_b_proj", "indexer.weights_proj"], ParamRole.COLWISE),
-        (["q_a_proj", "kv_proj", "compressor", "indexer.wk", "indexer.k_norm"],
-         ParamRole.REPLICATED),
-        (["engram", "attn_hc", "ffn_hc"], ParamRole.REPLICATED),
-        (["q_b_proj", "o_a_proj", "sinks"], ParamRole.COLWISE),
-        ("o_b_proj", ParamRole.ROWWISE),
-    ]
+    return shared_attention_context_parallel
 
 
-def _get_visual_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
-    """Return V4.1 visual execution units with bounded unshard size."""
-    module_by_fqn = dict(model.named_modules())
-    vision_blocks = tuple(
-        module_fqn
-        for module_fqn in module_by_fqn
-        if module_fqn.startswith("model.vision.blocks.")
-        and module_fqn.count(".") == 3
+def _load_validation_spec():
+    """Return model-owned parity and self-consistency declarations lazily."""
+    from hyper_parallel.models.deepseek_v41.adapter.validation.model_validation_spec import (  # pylint: disable=C0415
+        get_validation_spec,
     )
-    aligner = (
-        ("model.aligner",)
-        if module_by_fqn.get("model.aligner") is not None
-        else ()
-    )
-    return vision_blocks + aligner
 
-
-def _get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
-    """Return visual units and homogeneous-mesh Engram child units."""
-    module_by_fqn = dict(model.named_modules())
-    engram_units = tuple(
-        module_fqn
-        for module_fqn in module_by_fqn
-        if module_fqn.endswith(".engram.embed") or module_fqn.endswith(".engram.wkv")
-    )
-    return _get_visual_fsdp_wrap_modules(model) + engram_units
-
-
-def _get_fsdp_excluded_subtrees(model: Any) -> tuple[str, ...]:
-    """Keep the ViT hierarchy out of HF decoder-container discovery."""
-    module_by_fqn = dict(model.named_modules())
-    return ("model.vision",) if module_by_fqn.get("model.vision") is not None else ()
-
-
-def _get_fsdp_execution_order(
-        model: Any,
-        module_fqns: tuple[str, ...],
-) -> tuple[str, ...]:
-    """Return visual and per-decoder child units in V4.1 forward order."""
-    visual_fqns = _get_visual_fsdp_wrap_modules(model)
-    selected_fqns = set(module_fqns)
-    execution_order = [
-        module_fqn for module_fqn in visual_fqns if module_fqn in selected_fqns
-    ]
-    layer_fqns = tuple(
-        module_fqn
-        for module_fqn in module_fqns
-        if module_fqn.startswith("model.layers.")
-        and module_fqn.count(".") == 2
-    )
-    for layer_fqn in layer_fqns:
-        execution_order.append(layer_fqn)
-        for suffix in ("engram.embed", "engram.wkv", "mlp.experts"):
-            child_fqn = f"{layer_fqn}.{suffix}"
-            if child_fqn in selected_fqns:
-                execution_order.append(child_fqn)
-    execution_order.extend(
-        module_fqn for module_fqn in module_fqns if module_fqn not in execution_order
-    )
-    return tuple(execution_order)
+    return get_validation_spec()
 
 
 register_custom_model(
     "DeepseekV41ForCausalLM",
     "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
-    "DeepseekV41CroppedForCausalLM",
+    "DeepseekV41ForCausalLM",
 )
 register_deepseek_v41_checkpoint_mapping()
 
 DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV41ForCausalLM",
     model_type="deepseek_v41",
-    replacements=_load_replacements,
     context_parallel=_load_context_parallel,
     expert_parallel=_load_expert_parallel,
-    sharding_rules=_load_sharding_rules,
-    fsdp_wrap_modules=_get_fsdp_wrap_modules,
-    fsdp_excluded_subtrees=_get_fsdp_excluded_subtrees,
-    fsdp_execution_order=_get_fsdp_execution_order,
+    sharding_rules=build_parameter_sharding_rules,
+    fsdp_wrap_modules=get_fsdp_wrap_modules,
+    fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,
+    fsdp_execution_order=get_fsdp_execution_order,
+    recompute=build_recompute_policy,
+    validation=_load_validation_spec,
 )
 register_model_adapter(DEEPSEEK_V41_ADAPTER_SPEC)
 

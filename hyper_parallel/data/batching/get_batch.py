@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Build one model and loss batch from a DataLoader iterator."""
+# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 
@@ -132,6 +133,12 @@ class OmniParallelBatch:
         runtime_inputs = self.runtime_input_adapter.build(
             batch=batch, parallel_context=self.parallel_context
         )
+        collisions = set(batch).intersection(runtime_inputs)
+        if collisions:
+            raise ValueError(
+                "[HP-DATA-001] runtime inputs cannot replace Omni model inputs: "
+                f"{sorted(collisions)}"
+            )
         return runtime_inputs
 
     @staticmethod
@@ -172,6 +179,7 @@ class TextParallelBatch:
             reset_position_ids: bool = False,
             reset_attention_mask: bool = False,
             eod_mask_loss: bool = False,
+            runtime_input_adapter: RuntimeInputAdapter | None = None,
     ) -> None:
         """Initialize the batch runtime and its parallel execution context.
 
@@ -188,6 +196,7 @@ class TextParallelBatch:
             reset_position_ids: Whether positions restart at sequence boundaries.
             reset_attention_mask: Whether EOD starts an independent attention sequence.
             eod_mask_loss: Whether EOD tokens are excluded from the loss.
+            runtime_input_adapter: Optional model-owned forward-input extension.
         """
         # pylint: disable=too-many-locals
 
@@ -200,6 +209,13 @@ class TextParallelBatch:
         self.tokenizer = tokenizer
         self.data_config = dict(data_config)
         self.source_type = source_type
+        self.causal = causal
+        self.sliding_window = sliding_window
+        if runtime_input_adapter is not None and not isinstance(
+                runtime_input_adapter, RuntimeInputAdapter
+        ):
+            raise TypeError("TextParallelBatch runtime_input_adapter must be a RuntimeInputAdapter")
+        self.runtime_input_adapter = runtime_input_adapter
         self._batch_flow_logged = False
 
         if source_type == "online":
@@ -277,11 +293,31 @@ class TextParallelBatch:
             self,
             parallel_batch: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """Build common attention inputs for the model forward call."""
+        """Build common attention inputs plus a model-owned extension."""
         runtime_inputs = self.attention_runtime.build(
             batch=parallel_batch,
             parallel_context=self.parallel_context,
         )
+        if self.runtime_input_adapter is None:
+            return runtime_inputs
+
+        model_runtime_inputs = self.runtime_input_adapter.build(
+            batch=parallel_batch,
+            parallel_context=self.parallel_context,
+            options={
+                "source_type": self.source_type,
+                "attention_mode": self.attention_runtime.mode,
+                "causal": self.causal,
+                "sliding_window": self.sliding_window,
+            },
+        )
+        collisions = set(runtime_inputs).intersection(model_runtime_inputs)
+        if collisions:
+            raise ValueError(
+                "[HP-DATA-001] model runtime inputs cannot replace common attention inputs: "
+                f"{sorted(collisions)}"
+            )
+        runtime_inputs.update(model_runtime_inputs)
         return runtime_inputs
 
     def _log_batch_flow(
@@ -419,7 +455,7 @@ class TextParallelBatch:
         collisions = set(model_inputs).intersection(runtime_inputs)
         if collisions:
             raise ValueError(
-                "runtime inputs cannot replace framework-owned model inputs: "
+                "[HP-DATA-001] runtime inputs cannot replace framework-owned model inputs: "
                 f"{sorted(collisions)}"
             )
         model_inputs.update(runtime_inputs)

@@ -27,8 +27,24 @@ Provider fields stay ``None`` until the family's adapter modules land
 (Qwen3-MoE: replacements/attention in M2, distributed rules in M3).
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+
+
+@dataclass(frozen=True)
+class RecomputePolicy:
+    """Model-owned activation-checkpoint regions used by normal training.
+
+    Cross-layer state producers must be excluded from whole-module replay.
+    The adapter therefore declares checkpoint-safe submodules independently
+    from optional model-integration validation metadata. Layer coverage is
+    selected independently through the Trainer's activation-checkpoint config.
+    """
+
+    safe_module_patterns: tuple[str, ...]
+    no_replay_module_patterns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -71,6 +87,11 @@ class ModelAdapterSpec:
             selected child-unit FQN, then returning their first-forward
             execution order. This lets conditional multimodal models override
             module-registration order for FSDP communication prefetching.
+        recompute: provider returning normal-training activation-checkpoint
+            policy. This must not depend on validation-only imports.
+        validation: lazy provider returning the family's ``ModelValidationSpec``.
+            Normal training never calls it; authoritative repositories and
+            validation-only dependencies therefore stay outside import paths.
         loss: provider returning model-family output-loss adapters that must
             intercept the model before a full terminal output is materialized.
     """
@@ -87,4 +108,6 @@ class ModelAdapterSpec:
     fsdp_wrap_modules: Optional[Callable[..., Any]] = None
     fsdp_excluded_subtrees: Optional[Callable[..., Any]] = None
     fsdp_execution_order: Optional[Callable[..., Any]] = None
+    recompute: Optional[Callable[..., RecomputePolicy]] = None
+    validation: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None

@@ -184,3 +184,15 @@ class LRSchedulersContainer:
             self._schedulers_by_name[name].load_state_dict(
                 copy.deepcopy(state_dict[name]),
             )
+            scheduler = self._schedulers_by_name[name]
+            last_lrs = scheduler.get_last_lr()
+            if len(last_lrs) != len(scheduler.optimizer.param_groups):
+                raise RuntimeError(
+                    f"Scheduler '{name}' restored {len(last_lrs)} learning rates "
+                    f"for {len(scheduler.optimizer.param_groups)} parameter groups."
+                )
+            for parameter_group, learning_rate in zip(
+                    scheduler.optimizer.param_groups,
+                    last_lrs,
+            ):
+                parameter_group["lr"] = learning_rate

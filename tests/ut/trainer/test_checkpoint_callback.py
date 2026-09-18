@@ -40,6 +40,7 @@ def _checkpoint_config(restore_from: str) -> SimpleNamespace:
         restore_from=restore_from,
         restore_optimizer=False,
         restore_train_state=False,
+        restore_dataloader_state=True,
     )
 
 
@@ -86,6 +87,62 @@ class TestCheckpointerCallback(unittest.TestCase):
             "float32",
         )
         mock_empty_cache.assert_called_once_with()
+
+    @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.set_device_rng_state")
+    def test_partial_epoch_restore_uses_step_derived_position(
+            self,
+            mock_set_device_rng_state: MagicMock,
+    ) -> None:
+        """Resume a mid-epoch checkpoint even if its epoch field was advanced."""
+        callback = CheckpointerCallback.__new__(CheckpointerCallback)
+        callback.trainer = SimpleNamespace(
+            state=TrainerState(),
+            train_dataloader=[object()] * 4,
+            train_steps=4,
+            lr_scheduler=None,
+        )
+
+        callback._apply_extra_state({
+            "global_step": 2,
+            "epoch": 1,
+            "lr_scheduler": None,
+            "train_dataloader": {},
+            "rng_state": {},
+        })
+
+        self.assertEqual(callback.trainer.state.global_step, 2)
+        self.assertEqual(callback.trainer.state.epoch, 0)
+        self.assertEqual(callback.trainer.start_epoch, 0)
+        self.assertEqual(callback.trainer.start_step, 2)
+        mock_set_device_rng_state.assert_called_once_with(None)
+
+    @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.set_device_rng_state")
+    def test_train_state_restore_can_replay_from_configured_data_start(
+            self,
+            mock_set_device_rng_state: MagicMock,
+    ) -> None:
+        """Warm-start restore keeps progress and RNG without loading the cursor."""
+        dataloader = MagicMock()
+        callback = CheckpointerCallback.__new__(CheckpointerCallback)
+        callback._restore_dataloader_state = False
+        callback.trainer = SimpleNamespace(
+            state=TrainerState(),
+            train_dataloader=dataloader,
+            train_steps=4,
+            lr_scheduler=None,
+        )
+
+        callback._apply_extra_state({
+            "global_step": 1,
+            "epoch": 0,
+            "lr_scheduler": None,
+            "train_dataloader": {"cursor": 7},
+            "rng_state": {},
+        })
+
+        self.assertEqual(callback.trainer.state.global_step, 1)
+        dataloader.load_state_dict.assert_not_called()
+        mock_set_device_rng_state.assert_called_once_with(None)
 
 
 if __name__ == "__main__":

@@ -69,7 +69,7 @@ class _InvalidHookModule(nn.Module):
 
     @torch.no_grad()
     def rebuild_materialized_state_(self, context: MaterializationContext) -> None:
-        """Deliberately violate the hook contract for DFX validation."""
+        """Deliberately violate the hook contract for model integration validation."""
         del context
         self.weight.zero_()
 

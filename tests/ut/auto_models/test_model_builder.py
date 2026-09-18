@@ -17,6 +17,7 @@
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
@@ -28,6 +29,7 @@ from hyper_parallel import DTensor, DeviceMesh, Replicate
 from hyper_parallel.models._transformers.model_builder import (
     validate_model_init_dtype,
 )
+from hyper_parallel.models._transformers.auto_model import _BaseHyperAutoModelClass
 from tests.common.mark_utils import arg_mark
 
 
@@ -80,6 +82,58 @@ class TestValidateModelInitDtype(unittest.TestCase):
 
         self.assertIs(model.weight, parameter)
         self.assertEqual(model.weight.dtype, torch.bfloat16)
+
+
+class TestAutoModelBuildForwarding(unittest.TestCase):
+    """Tests for options forwarded through the private build orchestrator."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_activation_checkpoint_selection_reaches_infrastructure(self) -> None:
+        """Forward adapter-safe layer selection to activation checkpointing.
+
+        Feature: Adapter-safe activation-checkpoint selection.
+        Description: Build a model with an explicit layer selector.
+        Expectation: Infrastructure receives the identical selection object.
+        """
+        model = nn.Linear(2, 2)
+        selection = SimpleNamespace(
+            source="model_adapter_safe_regions",
+            layer_count=2,
+            layer_indices=None,
+        )
+        module_path = "hyper_parallel.models._transformers.auto_model"
+        with (
+            patch(f"{module_path}._init_model", return_value=(None, model)),
+            patch(
+                f"{module_path}.apply_model_infrastructure",
+                return_value=model,
+            ) as apply_infrastructure,
+            patch(f"{module_path}.torch.distributed.is_initialized", return_value=False),
+            patch(f"{module_path}._current_device", return_value=torch.device("cpu")),
+        ):
+            result = _BaseHyperAutoModelClass._build_model(  # pylint: disable=protected-access
+                None,
+                is_hf_model=True,
+                hf_config=SimpleNamespace(),
+                mesh=None,
+                sharding_planner=None,
+                fsdp2_manager=None,
+                backend=None,
+                peft_config=None,
+                torch_dtype=torch.float32,
+                attn_implementation="eager",
+                validate_placement=False,
+                load_base_model=False,
+                activation_checkpoint="selective",
+                activation_checkpoint_selection=selection,
+            )
+
+        self.assertIs(result, model)
+        self.assertIs(
+            apply_infrastructure.call_args.kwargs["activation_checkpoint_selection"],
+            selection,
+        )
 
 
 if __name__ == "__main__":

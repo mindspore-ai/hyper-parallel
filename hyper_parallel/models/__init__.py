@@ -47,6 +47,7 @@ if TYPE_CHECKING:
         HyperAutoModelForImageTextToText,
         HyperAutoModelForSequenceClassification,
     )
+    from hyper_parallel.models.adapter_spec import RecomputePolicy
     from hyper_parallel.models.materialization import (
         MaterializationContext,
         MaterializationReason,
@@ -55,6 +56,17 @@ if TYPE_CHECKING:
         rebuild_materialized_state,
         register_materialized_state_hook,
         register_rebuildable_buffer,
+    )
+    from hyper_parallel.models.validation_spec import (
+        CheckpointValidationSpec,
+        DataValidationSpec,
+        ModelValidationSpec,
+        ModuleParityCase,
+        ObservationSpec,
+        ParameterProbeSpec,
+        SharedStateValidationSpec,
+        StateInvariantSpec,
+        TopologyConstraint,
     )
 
 
@@ -74,8 +86,22 @@ _LAZY_MATERIALIZATION_EXPORTS = {
     "register_rebuildable_buffer",
 }
 
+_LAZY_VALIDATION_EXPORTS = {
+    "CheckpointValidationSpec",
+    "DataValidationSpec",
+    "ModelValidationSpec",
+    "ModuleParityCase",
+    "ObservationSpec",
+    "ParameterProbeSpec",
+    "SharedStateValidationSpec",
+    "StateInvariantSpec",
+    "TopologyConstraint",
+}
+
 __all__ = [
     "CompileConfig",
+    "CheckpointValidationSpec",
+    "DataValidationSpec",
     "FSDP2Config",
     "FSDP2MixedPrecisionConfig",
     "HyperAutoModelForCausalLM",
@@ -86,7 +112,15 @@ __all__ = [
     "MaterializedStateHook",
     "ModelAdapterSpec",
     "ModelBuildOptions",
+    "ModelValidationSpec",
+    "ModuleParityCase",
+    "ObservationSpec",
+    "ParameterProbeSpec",
     "RebuildableBufferSpec",
+    "RecomputePolicy",
+    "SharedStateValidationSpec",
+    "StateInvariantSpec",
+    "TopologyConstraint",
     "get_model_adapter",
     "normalize_build_options",
     "rebuild_materialized_state",
@@ -108,8 +142,15 @@ def __getattr__(name):  # pylint: disable=invalid-name
         value = getattr(module, name)
         globals()[name] = value
         return value
+    if name in _LAZY_VALIDATION_EXPORTS:
+        module = importlib.import_module(".validation_spec", __name__)
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
     if name == "ModelAdapterSpec":
         return importlib.import_module(".adapter_spec", __name__).ModelAdapterSpec
+    if name == "RecomputePolicy":
+        return importlib.import_module(".adapter_spec", __name__).RecomputePolicy
     if name in ("get_model_adapter", "register_model_adapter"):
         return getattr(importlib.import_module(".registry", __name__), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -117,4 +158,9 @@ def __getattr__(name):  # pylint: disable=invalid-name
 
 def __dir__():  # pylint: disable=invalid-name
     """Include lazy facade exports in ``dir()``."""
-    return sorted(set(globals()) | set(_LAZY_FACADE_EXPORTS) | _LAZY_MATERIALIZATION_EXPORTS)
+    return sorted(
+        set(globals())
+        | set(_LAZY_FACADE_EXPORTS)
+        | _LAZY_MATERIALIZATION_EXPORTS
+        | _LAZY_VALIDATION_EXPORTS
+    )

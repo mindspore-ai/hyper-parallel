@@ -22,10 +22,10 @@ Post-M5 state (adjust doc §5.1-§5.3, M5): the legacy
 Qwen3-MoE rule lives at exactly one adapter home:
 
 * the ``@module_replacement`` factories in
-  ``models/qwen3_moe/adapter/replacements.py`` (declaring the generic
+  ``models/qwen3_moe/adapter/conversion/module_replacement.py`` (declaring the generic
   ``modules.RMSNorm`` / ``modules.GQAAttention`` entries);
 * the Qwen mask/cache attention contract in
-  ``models/qwen3_moe/adapter/attention.py``;
+  ``models/qwen3_moe/adapter/runtime/attention.py``;
 * the fused ``@inner_wrapper`` CP wrappers in
   ``adapter/distributed/context_parallel.py`` and the async (whole-forward,
   HF-structure) wrappers in ``adapter/distributed/context_parallel_async.py``
@@ -68,13 +68,11 @@ from hyper_parallel.distributed.recipe_spec import (
     INNER_WRAPPER,
     LOCAL_COMPUTE,
 )
-from hyper_parallel.models.qwen3_moe.adapter import (
-    attention as adapter_attention,
+from hyper_parallel.models.qwen3_moe.adapter.conversion import (
+    module_replacement as adapter_replacements,
 )
-from hyper_parallel.models.qwen3_moe.adapter import (
-    replacements as adapter_replacements,
-)
-from hyper_parallel.models.qwen3_moe.adapter.attention import (
+from hyper_parallel.models.qwen3_moe.adapter.runtime import attention as adapter_attention
+from hyper_parallel.models.qwen3_moe.adapter.runtime.attention import (
     run_qwen3_moe_flash_attention,
 )
 from hyper_parallel.models.qwen3_moe.adapter.distributed import (

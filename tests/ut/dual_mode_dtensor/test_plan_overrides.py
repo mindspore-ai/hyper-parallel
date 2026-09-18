@@ -628,7 +628,7 @@ def test_incomplete_glob_for_unplanned_module_fails(tiny_llama, make_mesh):
     )
     for fragment in expected_fragments:
         assert fragment in message, (
-            f"incomplete-glob DFX is missing {fragment!r}: {message}"
+            f"incomplete-glob model integration is missing {fragment!r}: {message}"
         )
 
 

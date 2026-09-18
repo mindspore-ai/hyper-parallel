@@ -12,82 +12,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for model-neutral VLM collation."""
+"""Unit tests for model-neutral Omni collation and forwarding."""
 
 import unittest
 
 import torch
 
-from hyper_parallel.data.batching.build_collate_fn import (
-    DataBatchAdapter,
-    DataBatchContext,
-)
-from hyper_parallel.data.vlm.collator import VLMCollator
-from hyper_parallel.data.vlm.get_batch import VLMBatchProcessor
+from hyper_parallel.data.batching.build_collate_fn import OmniCollator
+from hyper_parallel.data.batching.get_batch import OmniParallelBatch
+from tests.common.mark_utils import arg_mark
 
 
-class TestVLMCollator(unittest.TestCase):
-    """VLM collation delegates field semantics to the batch adapter."""
+class TestOmniCollator(unittest.TestCase):
+    """Omni collation keeps generic model fields without an allowlist."""
 
-    def test_default_adapter_collates_fixed_shape_mappings(self):
-        """The default adapter retains PyTorch collation for generic fields."""
-        collator = VLMCollator()
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_collator_stacks_tokens_and_concatenates_modality_values(self):
+        """Collate fixed token fields and variable image rows.
+
+        Feature: Generic Omni collation.
+        Description: Collate two samples with different image-row counts.
+        Expectation: Tokens stack by sample and image rows concatenate in order.
+        """
+        collator = OmniCollator()
 
         batch = collator([
             {
                 "input_ids": torch.tensor([1, 2]),
                 "labels": torch.tensor([-100, 2]),
-                "model_feature": torch.tensor([3]),
+                "pixel_values": torch.tensor([[1.0, 2.0]]),
             },
             {
                 "input_ids": torch.tensor([4, 5]),
                 "labels": torch.tensor([-100, 5]),
-                "model_feature": torch.tensor([6]),
+                "pixel_values": torch.tensor([[3.0, 4.0], [5.0, 6.0]]),
             },
         ])
 
         torch.testing.assert_close(batch["input_ids"], torch.tensor([[1, 2], [4, 5]]))
-        torch.testing.assert_close(batch["model_feature"], torch.tensor([[3], [6]]))
-
-    def test_collator_runs_adapter_lifecycle_in_order(self):
-        """Preparation, custom collation, and finalization share one context."""
-        events = []
-
-        class _LifecycleAdapter(DataBatchAdapter):
-            def prepare_items(self, items, context):
-                events.append(("prepare", context.source_type))
-                return items
-
-            def collate_items(self, items, context):
-                events.append(("collate", context.source_type))
-                return {
-                    "input_ids": torch.stack([item["input_ids"] for item in items]),
-                    "labels": torch.stack([item["labels"] for item in items]),
-                }
-
-            def finalize_batch(self, batch, context):
-                events.append(("finalize", context.source_type))
-                return {**batch, "adapter_marker": context.source_type}
-
-        context = DataBatchContext(source_type="multimodal")
-        collator = VLMCollator(
-            context=context,
-            batch_adapter=_LifecycleAdapter(),
+        torch.testing.assert_close(
+            batch["pixel_values"],
+            torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
         )
 
-        batch = collator([
-            {"input_ids": torch.tensor([1]), "labels": torch.tensor([1])},
-        ])
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_batch_runtime_forwards_unknown_model_fields(self):
+        """Forward model-specific fields without a framework allowlist.
 
-        self.assertEqual(
-            events,
-            [("prepare", "multimodal"), ("collate", "multimodal"), ("finalize", "multimodal")],
-        )
-        self.assertEqual(batch["adapter_marker"], "multimodal")
-
-    def test_batch_processor_forwards_adapter_defined_model_fields(self):
-        """Unknown modality fields reach the model without a framework allowlist."""
-        model_inputs, loss_inputs = VLMBatchProcessor.prepare_batch({
+        Feature: Omni model-input forwarding.
+        Description: Split one batch containing an unknown modality route.
+        Expectation: The route reaches model inputs while loss metadata stays separate.
+        """
+        model_inputs, loss_inputs = OmniParallelBatch._split_model_and_loss_inputs({
             "input_ids": torch.tensor([[1, 2]]),
             "labels": torch.tensor([[-100, 2]]),
             "loss_mask": torch.tensor([[False, True]]),

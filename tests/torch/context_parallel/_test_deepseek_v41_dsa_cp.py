@@ -26,17 +26,16 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedPackedSequence,
     SharedCompressedAttentionState,
-    SharedCompressedDSAAttention,
     compressed_candidate_topk,
     compressed_causal_topk_and_candidates,
     shared_compressed_indexer_kl_loss,
 )
-from hyper_parallel.models.deepseek_v41.adapter.context_parallel import (
+from hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel import (
     _build_shared_attention_cp_context,
     _build_shared_attention_tp_context,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
-    DeepseekV41AttentionPlaceholder,
+    DeepseekV41Attention,
 )
 
 
@@ -112,9 +111,7 @@ def test_deepseek_v41_dsa_cp_gloo():
         rank = dist.get_rank()
         assert dist.get_world_size() == 2
         torch.manual_seed(29)
-        reference = SharedCompressedDSAAttention(
-            DeepseekV41AttentionPlaceholder(_config(), layer_idx=2)
-        )
+        reference = DeepseekV41Attention(_config(), layer_idx=2)
         with torch.no_grad():
             for name, parameter in reference.named_parameters():
                 if name == "sinks":

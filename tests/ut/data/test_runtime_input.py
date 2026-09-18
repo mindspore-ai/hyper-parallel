@@ -21,13 +21,7 @@ from typing import Any
 
 import torch
 
-from hyper_parallel.data.batching.get_batch import ParallelBatch
-from hyper_parallel.data.batching.build_collate_fn import (
-    BatchConstraints,
-    DataBatchAdapter,
-    DataBatchContext,
-)
-from hyper_parallel.data.batching.build_dataloader import TextTokenBatcher
+from hyper_parallel.data.batching.get_batch import OmniParallelBatch
 from hyper_parallel.data.batching.runtime_input import (
     RuntimeInputAdapter,
     RuntimeInputContext,
@@ -38,6 +32,10 @@ from tests.common.mark_utils import arg_mark
 class _ModalityRuntimeAdapter(RuntimeInputAdapter):
     """Test adapter proving that runtime inputs are not attention-specific."""
 
+    def runtime_input_fields(self) -> tuple[str, ...]:
+        """Declare the fields produced for every batch."""
+        return ("runtime_modality_route", "runtime_cp_rank")
+
     def build_runtime_inputs(
             self,
             *,
@@ -46,57 +44,59 @@ class _ModalityRuntimeAdapter(RuntimeInputAdapter):
     ) -> Mapping[str, Any]:
         """Forward a modality route and record generic execution context."""
         return {
-            "modality_route": batch["modality_route"],
+            "runtime_modality_route": batch["modality_route"],
             "runtime_cp_rank": context.parallel_ranks["cp"],
         }
 
 
-class _AlignedDataBatchAdapter(DataBatchAdapter):
-    """Charge physical length rounded to a four-token model constraint."""
+class _CollidingRuntimeAdapter(RuntimeInputAdapter):
+    """Produce one invalid field already owned by the Omni batch."""
 
-    def item_cost(
+    def build_runtime_inputs(
             self,
-            item: Mapping[str, Any],
-            context: DataBatchContext,
-    ) -> int:
-        """Return the aligned physical token count."""
+            *,
+            batch: Mapping[str, Any],
+            context: RuntimeInputContext,
+    ) -> Mapping[str, Any]:
+        """Attempt to replace canonical token IDs."""
         del context
-        item_length = int(item["input_ids"].shape[-1])
-        return item_length + (-item_length) % 4
-
-    def constraints(self, context: DataBatchContext) -> BatchConstraints:
-        """Declare the same final sequence alignment."""
-        del context
-        return BatchConstraints(sequence_multiple=4)
+        return {"input_ids": batch["input_ids"]}
 
 
 class TestRuntimeInputAdapter(unittest.TestCase):
     """Generic adapters may add arbitrary non-colliding forward inputs."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_parallel_batch_merges_non_attention_runtime_inputs(self):
-        """A model adapter can extend a dense batch with modality metadata."""
-        batch_runtime = ParallelBatch.__new__(ParallelBatch)
-        batch_runtime.runtime_input_adapter = _ModalityRuntimeAdapter()
-        batch_runtime.source_type = "online"
-        batch_runtime.attention_mode = "dense"
-        batch_runtime.cp_algorithm = "ulysses"
-        batch_runtime.causal = True
-        batch_runtime.sliding_window = None
-        batch_runtime.labels_are_shifted = False
-        batch_runtime.parallel_context = SimpleNamespace(
+    @staticmethod
+    def _parallel_context() -> SimpleNamespace:
+        """Build the topology fields consumed by RuntimeInputContext."""
+        return SimpleNamespace(
             tp_rank=0,
             tp_world_size=2,
             cp_rank=1,
             cp_world_size=2,
         )
+
+    @staticmethod
+    def _omni_batch_runtime(adapter: RuntimeInputAdapter) -> OmniParallelBatch:
+        """Build an uninitialized runtime for pure input-contract tests."""
+        batch_runtime = OmniParallelBatch.__new__(OmniParallelBatch)
+        batch_runtime.runtime_input_adapter = adapter
+        batch_runtime.parallel_context = TestRuntimeInputAdapter._parallel_context()
+        return batch_runtime
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_omni_batch_merges_non_attention_runtime_inputs(self):
+        """Exercise a model-owned extension of an Omni batch.
+
+        Feature: Generic runtime-input adapter support.
+        Description: Build modality metadata from topology and batch fields.
+        Expectation: Non-colliding fields are forwarded without an allowlist.
+        """
+        batch_runtime = self._omni_batch_runtime(_ModalityRuntimeAdapter())
         parallel_batch = {
             "input_ids": torch.ones(1, 4, dtype=torch.long),
             "labels": torch.ones(1, 4, dtype=torch.long),
-            "position_ids": torch.arange(4).unsqueeze(0),
-            "attention_mask": None,
-            "swa_mask": None,
             "loss_mask": torch.ones(1, 4, dtype=torch.long),
             "modality_route": torch.tensor([[0, 1, 1, 0]]),
         }
@@ -105,22 +105,46 @@ class TestRuntimeInputAdapter(unittest.TestCase):
             parallel_batch
         )
         model_inputs, _ = batch_runtime._split_model_and_loss_inputs(  # pylint: disable=protected-access
-            parallel_batch,
-            runtime_inputs,
+            parallel_batch
         )
+        model_inputs.update(runtime_inputs)
 
         torch.testing.assert_close(
-            model_inputs["modality_route"],
+            model_inputs["runtime_modality_route"],
             parallel_batch["modality_route"],
         )
         self.assertEqual(model_inputs["runtime_cp_rank"], 1)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_omni_batch_rejects_runtime_field_collision(self):
+        """Reject a runtime adapter that replaces encoded Omni fields.
+
+        Feature: Runtime-input field ownership.
+        Description: Return ``input_ids`` from a model runtime adapter.
+        Expectation: The merge fails with ``HP-DATA-001`` before forward.
+        """
+        batch_runtime = self._omni_batch_runtime(_CollidingRuntimeAdapter())
+        parallel_batch = {
+            "input_ids": torch.ones(1, 4, dtype=torch.long),
+            "labels": torch.ones(1, 4, dtype=torch.long),
+        }
+
+        with self.assertRaisesRegex(ValueError, "HP-DATA-001"):
+            batch_runtime._build_runtime_inputs(  # pylint: disable=protected-access
+                parallel_batch
+            )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_runtime_context_is_feature_neutral(self):
-        """The public context stores generic topology and opaque options."""
+        """Keep model-specific options opaque to the generic context.
+
+        Feature: Feature-neutral runtime context.
+        Description: Construct context with generic topology and one opaque option.
+        Expectation: The option survives without adding attention-specific state.
+        """
         context = RuntimeInputContext(
-            source_type="online",
             local_input_shape=(1, 8),
             parallel_ranks={"tp": 1, "cp": 0},
             parallel_sizes={"tp": 2, "cp": 1},
@@ -129,31 +153,6 @@ class TestRuntimeInputAdapter(unittest.TestCase):
 
         self.assertEqual(context.options["model_feature"], "value")
         self.assertFalse(hasattr(context, "attention_mask"))
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_dynamic_batching_uses_adapter_physical_item_cost(self):
-        """Selection budgets transformed physical tokens, not raw lengths."""
-        context = DataBatchContext(
-            source_type="online",
-            token_budget=6,
-        )
-        batcher = TextTokenBatcher(
-            token_budget=6,
-            min_buffered_samples=2,
-            batch_adapter=_AlignedDataBatchAdapter(),
-            batch_context=context,
-        )
-        first = {"input_ids": torch.tensor([1, 2, 3])}
-        second = {"input_ids": torch.tensor([4, 5])}
-        batcher.put_item(first)
-        batcher.put_item(second)
-
-        selected = batcher.get_micro_batch()
-
-        self.assertEqual(len(selected), 1)
-        self.assertIs(selected[0], first)
-        self.assertEqual(batcher.buffer_token_count, 4)
 
 
 if __name__ == "__main__":

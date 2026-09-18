@@ -139,6 +139,14 @@ class RuntimeInputAdapter(ABC):
             )
         return dict(runtime_inputs)
 
+    def runtime_input_fields(self) -> tuple[str, ...]:
+        """Return the forward fields exclusively owned by this adapter.
+
+        Dynamic values may vary by batch, but field ownership must be stable so
+        diagnostics can reject collisions before interpreting precision runs.
+        """
+        return ()
+
     @abstractmethod
     def build_runtime_inputs(
             self,

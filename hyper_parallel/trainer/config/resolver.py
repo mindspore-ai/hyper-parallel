@@ -34,6 +34,10 @@ from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 
 
+_NONE_TYPE = types.NoneType  # pylint: disable=no-member
+_UNION_TYPE = types.UnionType  # pylint: disable=no-member
+
+
 class ConfigResolutionError(ValueError):
     """A target or typed configuration value is invalid."""
 
@@ -82,7 +86,7 @@ def import_target(target_path: str, *, path: str) -> object:
 
 
 def _is_union(annotation: object) -> bool:
-    return get_origin(annotation) in (Union, types.UnionType)
+    return get_origin(annotation) in (Union, _UNION_TYPE)
 
 
 def _type_name(annotation: object) -> str:
@@ -128,8 +132,8 @@ def _normalize_tuple(value: object, item_types: tuple, *, path: str) -> tuple:
 def _coerce_none(annotation: object, *, path: str) -> None:
     """Accept ``None`` only when the annotation permits it."""
 
-    if annotation is types.NoneType or (
-        _is_union(annotation) and types.NoneType in get_args(annotation)
+    if annotation is _NONE_TYPE or (
+        _is_union(annotation) and _NONE_TYPE in get_args(annotation)
     ):
         return None
     raise _fail(path, f"expected {_type_name(annotation)}, got None")
@@ -139,7 +143,7 @@ def _coerce_union(value: object, annotation: object, *, path: str) -> object:
     """Normalize a value against an ``Optional`` or general union."""
 
     members = get_args(annotation)
-    non_none_members = tuple(member for member in members if member is not types.NoneType)
+    non_none_members = tuple(member for member in members if member is not _NONE_TYPE)
     if len(non_none_members) == 1 and len(non_none_members) != len(members):
         return coerce_value(value, non_none_members[0], path=path)
 
@@ -239,7 +243,7 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
 def _resolve_union(node: object, annotation: object, *, path: str) -> object:
     """Resolve one value against an Optional or general union."""
     non_none_members = [
-        member for member in get_args(annotation) if member is not types.NoneType
+        member for member in get_args(annotation) if member is not _NONE_TYPE
     ]
     if len(non_none_members) == 1:
         # Single-member union (e.g. Optional[Target]): resolve directly so the
@@ -411,14 +415,20 @@ def _resolve_target(node: object, *, path: str) -> Target[Any]:
 
 
 def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
-    """Resolve a DataLoader target with nested collator and batch adapter."""
+    """Resolve a DataLoader target with nested collator and batch runtime."""
     if not isinstance(node, Mapping):
         raise _fail(path, "DataLoader configuration must be a YAML mapping")
 
     target_node = dict(node)
     if "dataloader_type" in target_node:
         raise _fail(f"{path}.dataloader_type", "renamed to sampler_type")
-    batch_adapter_node = target_node.pop("batch_adapter", None)
+    if "batch_adapter" in target_node:
+        raise _fail(
+            f"{path}.batch_adapter",
+            "removed by the Omni data lifecycle; use dataset.data_transform for "
+            "sample/batch encoding and dataloader.get_batch.runtime_input_adapter "
+            "for model-owned forward metadata",
+        )
     collate_node = target_node.pop("collate_fn", None)
     get_batch_node = target_node.pop("get_batch", None)
     sampler_type = coerce_value(
@@ -438,11 +448,6 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         path=f"{path}.use_background_prefetcher",
     )
     target = _resolve_target(target_node, path=path)
-    batch_adapter = (
-        None
-        if batch_adapter_node is None
-        else _resolve_target(batch_adapter_node, path=f"{path}.batch_adapter")
-    )
     collate_fn = (
         None
         if collate_node is None
@@ -455,7 +460,6 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
     )
     return DataLoaderConfig(
         target=target,
-        batch_adapter=batch_adapter,
         collate_fn=collate_fn,
         get_batch=get_batch,
         sampler_type=sampler_type,

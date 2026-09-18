@@ -12,4 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DeepSeek-V4.1 adapter providers."""
+"""DeepSeek-V4.1 model integration providers.
+
+Providers are grouped by conversion, data, distributed execution, policies, and
+validation. ``registration`` is the only discovery entry point.
+"""

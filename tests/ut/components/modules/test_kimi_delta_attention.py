@@ -142,7 +142,7 @@ def test_kda_eager_dispatch_matches_torch_reference():
     torch.testing.assert_close(actual_state, expected_state)
 
 
-def test_kimi_k3_gate_is_lower_bounded_and_differentiable():
+def test_kimi_gate_is_lower_bounded_and_differentiable():
     """The K3 decay mapping stays in ``(lower_bound, 0)`` and has gradients."""
     gate_logits = torch.linspace(-20, 20, 48).reshape(1, 3, 4, 4).requires_grad_()
     a_log = torch.zeros(4, requires_grad=True)
