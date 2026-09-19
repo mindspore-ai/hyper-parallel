@@ -21,6 +21,7 @@ from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
 from .parallel_ops import DistributedOp
+from .dsa_cp_fold import SPARSE_KL_MIN_ARGS, dsa_cp_fold_enabled, fold_sparse_indexer_kl_loss
 from .parallel_npu_dense_lightning_indexer_softmax_lse import (
     _adjust_bsnd_key,
     _adjust_tnd_seq_lens,
@@ -398,8 +399,17 @@ class NpuSparseLightningIndexerGradKlLossDistributedOp(DistributedOp):
             if q_layout.tensor_map[1] == -1:
                 return None
             split_id = q_layout.get_split_id(1)
+            seq_shards = q_layout.get_dim_split_num(1)
 
             def _bsnd_cp_impl(*args, **kwargs):
+                if dsa_cp_fold_enabled():
+                    if len(args) < SPARSE_KL_MIN_ARGS["BSND"] or kwargs:
+                        raise NotImplementedError(
+                            "DSA CP head-tail fold is implemented for the MindSpore positional "
+                            "signature of the sparse indexer KL loss only.")
+                    # d_key_index comes back full-length on the folded layout, so the Partial
+                    # reduction and the local narrow in DSAIndexerLossContextParallel still apply.
+                    return fold_sparse_indexer_kl_loss(func, split_id, seq_shards, *args)
                 local_q = args[0]
                 s1_local = local_q.shape[1]
                 # args[3] is the full (unsliced) local key_index; S2 is replicated
@@ -445,9 +455,9 @@ class NpuSparseLightningIndexerGradKlLossDistributedOp(DistributedOp):
         # requires token-level offset adjustment.
         dp_size = k_layout.get_dim_split_num(0)  # DP splits on k's T2
         split_id = q_layout.get_split_id(0)
-        cp_size = (q_layout.get_dim_split_num(0) // dp_size
+        seq_shards = (q_layout.get_dim_split_num(0) // dp_size
                    if dp_size > 0 else 1)
-        cp_rank = split_id % cp_size if cp_size > 1 else 0
+        seq_shard_id = split_id % seq_shards if seq_shards > 1 else 0
 
         def _tnd_impl(*args, **kwargs):
             local_q, local_k = args[0], args[1]
@@ -461,9 +471,24 @@ class NpuSparseLightningIndexerGradKlLossDistributedOp(DistributedOp):
             if qlen_tensor is None or klen_tensor is None:
                 return func(*args, **kwargs)
 
+            if dsa_cp_fold_enabled():
+                # Head-tail folded query: one call per block on its own causal prefix.
+                # The fold wrapper rewrites args 11/12 per block, so the **global**
+                # cumulative lengths must reach it untouched.
+                # `or kwargs`: fold_sparse_indexer_kl_loss takes no **kwargs, so any keyword
+                # argument reaching it would be dropped silently. The BSND branch above already
+                # guards this way; keep the two in step.
+                if len(args) < SPARSE_KL_MIN_ARGS["TND"] or kwargs:
+                    raise NotImplementedError(
+                        "DSA CP head-tail fold for the TND indexer KL loss is implemented for "
+                        "the MindSpore positional form only; this call passed the sequence "
+                        "lengths as keyword arguments (torch path).")
+                return fold_sparse_indexer_kl_loss(
+                    func, seq_shard_id, seq_shards, *args, fold_layout='TND')
+
             adj_q, adj_k = _adjust_tnd_seq_lens(
                 local_q, local_k, qlen_tensor, klen_tensor,
-                cp_rank=cp_rank,
+                cp_rank=seq_shard_id,
             )
 
             if len(args) > 9:  # MindSpore

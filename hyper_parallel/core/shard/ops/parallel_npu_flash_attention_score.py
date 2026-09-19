@@ -71,6 +71,19 @@ def _get_lb_override() -> Tuple[Optional[int], Optional[int]]:
     return getattr(_LB_OVERRIDE, 'split_id', None), getattr(_LB_OVERRIDE, 'split_num', None)
 
 
+def current_lb_split() -> Tuple[Optional[int], Optional[int]]:
+    """This sub-call's ``(split_id, split_num)`` under head-tail load balance, else ``(None, None)``.
+
+    The public view of the override above, for code *outside* this operator that rebuilds
+    something from the sub-call's **global** position. The balanced forward issues two
+    sub-calls holding chunks ``2r`` and ``2N - 2r - 1`` of a ``2N`` grid -- neither of which
+    is this rank's contiguous CP slice -- so anything keyed on ``cp_rank`` (MindFormers' TND
+    softmax-statistics converter repacks per document from ``offset = t * cp_rank``) is wrong
+    while this is active and must key on ``split_id`` instead. ``split_num`` is ``2N``.
+    """
+    return _get_lb_override()
+
+
 def _normalize_npu_fusion_attention_args(
     query, key, value, head_num, input_layout,
     pse=None, padding_mask=None, atten_mask=None,

@@ -28,6 +28,7 @@ from hyper_parallel.core.context_parallel.dsa_context_parallel import (
     DSAIndexerLossContextParallel,
     DSASparseAttentionContextParallel,
     _apply_sparse_attention_boundary,
+    _enable_fold_if_requested,
     _is_tensor_or_dtensor,
     _to_sequence_replicate,
 )
@@ -169,6 +170,7 @@ class AsyncDSAIndexerContextParallel(DSAIndexerContextParallel):
 
     def apply(self, module: Module, device_mesh: DeviceMesh, *, key_handoff: Optional[Module] = None) -> Module:
         """Register async DSA indexer CP hooks on ``module`` and optional producer."""
+        _enable_fold_if_requested(self.__class__.__name__, self.layout, self.load_balance)
         cp_mesh = _ensure_1d(device_mesh)
         async_state = _AsyncSequenceReplicateSlot(cp_mesh, self.seq_dim)
         async_state.register_launch_hook(key_handoff, "key")
@@ -192,6 +194,7 @@ class AsyncDSASparseAttentionContextParallel(DSASparseAttentionContextParallel):
             key_rope_handoff: Optional[Module] = None,
     ) -> Module:
         """Register async DSA sparse-attention CP hooks on ``module`` and producers."""
+        _enable_fold_if_requested(self.__class__.__name__, self.layout, self.load_balance)
         cp_mesh = _ensure_1d(device_mesh)
         async_state = _AsyncSequenceReplicateSlot(cp_mesh, self.seq_dim)
         async_state.register_launch_hook(key_handoff, "key")
@@ -213,6 +216,7 @@ class AsyncDSAIndexerLossContextParallel(DSAIndexerLossContextParallel):
             key_rope_handoff: Optional[Module] = None,
     ) -> Module:
         """Register async DSA indexer-loss CP hooks on ``module`` and producers."""
+        _enable_fold_if_requested(self.__class__.__name__, self.layout, self.load_balance)
         cp_mesh = _ensure_1d(device_mesh)
         async_state = _AsyncSequenceReplicateSlot(cp_mesh, self.seq_dim)
         async_state.register_launch_hook(key_handoff, "key")

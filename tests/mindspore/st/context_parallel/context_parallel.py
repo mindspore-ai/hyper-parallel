@@ -24,7 +24,7 @@ from mindspore import mint, nn
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "mindspore")
 
-from hyper_parallel import init_device_mesh, ContextParallel, AsyncContextParallel
+from hyper_parallel import init_device_mesh, ContextParallel, AsyncContextParallel, get_platform
 
 
 def _init_dist(expected_world_size: int):
@@ -418,3 +418,27 @@ def test_async_context_parallel_hybrid_forward():
     model_ref = _TinyCpModel(hidden_size, num_heads=4, head_dim=4)
     ref_out = _build_local_reference(rank, local_s, model_ref(full_x))
     _assert_close(cp_out, ref_out, rank, "async_context_parallel_hybrid_forward", atol=5e-4, rtol=5e-4)
+
+
+def test_p2p_exchange_forward_backward():
+    """
+    Feature: MindSpore platform p2p_exchange (used by head-tail load-balanced Colossal CP).
+    Description: Two ranks swap a tensor; the gradient must take the same exchange back.
+    Expectation: Each rank receives the peer's value, and its gradient is the peer's weight.
+    """
+    rank, world_size = _init_dist(2)
+    peer = 1 - rank
+    platform = get_platform()
+    x = ms.Tensor(np.full((4, 8), float(rank), np.float32))
+    w = ms.Tensor(np.full((4, 8), float(rank + 1), np.float32))
+    assert world_size == 2
+
+    def fwd(value):
+        return (platform.p2p_exchange(value, peer) * w).sum()
+
+    _, grad = ms.value_and_grad(fwd)(x)
+    got = platform.p2p_exchange(x, peer)
+    # forward: the peer's value; backward: the peer's weight, because the gradient is
+    # exchanged once more on the way back.
+    _assert_close(got, ms.Tensor(np.full((4, 8), float(peer), np.float32)), rank, "p2p forward")
+    _assert_close(grad, ms.Tensor(np.full((4, 8), float(peer + 1), np.float32)), rank, "p2p backward")

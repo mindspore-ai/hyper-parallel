@@ -39,6 +39,7 @@ def test_context_parallel_group1_msrun():
         2. async Ulysses forward parity
         3. async Ulysses backward parity
         4. async Ulysses repeated forward stability
+        5. p2p_exchange forward/backward (the head-tail load-balance primitive)
     Expectation: Run success.
     """
     _run_group(
@@ -46,6 +47,7 @@ def test_context_parallel_group1_msrun():
         ("test_async_context_parallel_ulysses_forward", 13340, 2, 2),
         ("test_async_context_parallel_ulysses_backward", 13360, 2, 2),
         ("test_async_context_parallel_ulysses_forward_repeat", 13380, 2, 2),
+        ("test_p2p_exchange_forward_backward", 13390, 2, 2),
     )
 
 

@@ -20,6 +20,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
+from .dsa_cp_fold import dsa_cp_fold_enabled, fold_dense_lightning_indexer_softmax_lse
 from .parallel_ops import DistributedOp
 
 platform = get_platform()
@@ -356,7 +357,9 @@ class NpuDenseLightningIndexerSoftmaxLseDistributedOp(DistributedOp):
     ) -> Optional[Callable]:
         """Return a custom callable if context-parallel adjustments are needed.
 
-        BSND+CP: wraps ``func`` to slice key's S2 to the causal window.
+        BSND+CP: wraps ``func`` to slice key's S2 to the causal window, or, with the
+                 head-tail fold on, to run once per folded block against that block's
+                 own causal prefix.
         TND+CP:  wraps ``func`` to adjust actual_seq_qlen/klen per rank.
         No CP:   returns None (dispatcher calls ``func`` directly).
 
@@ -378,8 +381,14 @@ class NpuDenseLightningIndexerSoftmaxLseDistributedOp(DistributedOp):
             if q_layout.tensor_map[1] == -1:
                 return None
             split_id = q_layout.get_split_id(1)
+            seq_shards = q_layout.get_dim_split_num(1)
 
             def _bsnd_cp_impl(*args, **kwargs):
+                if dsa_cp_fold_enabled():
+                    # Folded layout: the local query holds this rank's two head-tail blocks,
+                    # each of which gets its own causal key prefix out of the full-length key.
+                    return fold_dense_lightning_indexer_softmax_lse(
+                        func, split_id, seq_shards, *args, **kwargs)
                 local_q, local_k = args[0], args[1]
                 sliced_k = _adjust_bsnd_key(local_k, local_q.shape[1], split_id)
                 return func(local_q, sliced_k, *args[2:], **kwargs)
@@ -390,9 +399,9 @@ class NpuDenseLightningIndexerSoftmaxLseDistributedOp(DistributedOp):
         # requires token-level offset adjustment.
         dp_size = k_layout.get_dim_split_num(0)  # DP splits on k's T2
         split_id = q_layout.get_split_id(0)
-        cp_size = (q_layout.get_dim_split_num(0) // dp_size
-                   if dp_size > 0 else 1)
-        cp_rank = split_id % cp_size if cp_size > 1 else 0
+        seq_shards = (q_layout.get_dim_split_num(0) // dp_size
+                      if dp_size > 0 else 1)
+        seq_shard_id = split_id % seq_shards if seq_shards > 1 else 0
 
         def _tnd_impl(*args, **kwargs):
             local_q, local_k = args[0], args[1]
@@ -406,9 +415,21 @@ class NpuDenseLightningIndexerSoftmaxLseDistributedOp(DistributedOp):
             if qlen_tensor is None or klen_tensor is None:
                 return func(*args, **kwargs)
 
+            if dsa_cp_fold_enabled():
+                # Folded layout: one call per block against its own causal prefix. The
+                # cumulative lengths handed down must be the GLOBAL ones -- restating them
+                # per block is the fold's job, and ``_adjust_tnd_seq_lens`` below assumes the
+                # contiguous CP slice the fold deliberately breaks -- so this comes first.
+                if len(args) <= 4:
+                    raise NotImplementedError(
+                        "DSA CP head-tail fold is implemented for the MindSpore positional "
+                        "signature of the dense indexer forward only.")
+                return fold_dense_lightning_indexer_softmax_lse(
+                    func, seq_shard_id, seq_shards, *args, fold_layout='TND', **kwargs)
+
             adj_q, adj_k = _adjust_tnd_seq_lens(
                 local_q, local_k, qlen_tensor, klen_tensor,
-                cp_rank=cp_rank,
+                cp_rank=seq_shard_id,
             )
 
             if len(args) > 3:  # MindSpore
