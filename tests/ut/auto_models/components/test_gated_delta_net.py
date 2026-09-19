@@ -22,8 +22,7 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.functional import gated_delta_rule
-from hyper_parallel.components.modules.gdn_ascendc import replace_gdn_chunk_rule
-from hyper_parallel.components.modules.gdn_triton import replace_gdn_triton_chunk_rule
+from hyper_parallel.components.modules import AscendCGDN, TritonGDN
 from hyper_parallel.distributed.context_parallel import wrappers as cp_wrappers
 
 
@@ -66,7 +65,7 @@ class TestGatedDeltaNet(unittest.TestCase):
         original = FakeGatedDeltaNet()
         fused = Mock(side_effect=_original_rule)
         with patch("hyper_parallel.components.modules.gdn_ascendc.chunk_gated_delta_rule", fused):
-            replacement = replace_gdn_chunk_rule(module=original)
+            replacement = AscendCGDN(module=original)
         self.assertIs(type(replacement), type(original))
         self.assertIs(replacement.weight, original.weight)
         self.assertEqual(list(replacement.state_dict()), list(original.state_dict()))
@@ -80,13 +79,13 @@ class TestGatedDeltaNet(unittest.TestCase):
     def test_rejects_missing_primitive(self):
         """Unsupported modules cannot be silently relabeled as fused GDN."""
         with self.assertRaisesRegex(TypeError, "requires callable"):
-            replace_gdn_chunk_rule(module=nn.Linear(2, 2))
+            AscendCGDN(module=nn.Linear(2, 2))
 
     def test_cp_wraps_replaced_primitive(self):
         """CP retains the fused callable and restores it after forward."""
         fused = Mock(side_effect=_original_rule)
         with patch("hyper_parallel.components.modules.gdn_ascendc.chunk_gated_delta_rule", fused):
-            replacement = replace_gdn_chunk_rule(module=FakeGatedDeltaNet())
+            replacement = AscendCGDN(module=FakeGatedDeltaNet())
         mesh = SimpleNamespace(size=lambda: 2)
         cp_wrappers.gdn_ulysses_cp_wrapper(replacement, None, None, mesh, None)
         inputs = torch.ones(1, 4, 2, 3, requires_grad=True)
@@ -104,7 +103,7 @@ class TestGatedDeltaNet(unittest.TestCase):
         triton_rule = Mock(side_effect=_original_rule)
         backend = SimpleNamespace(chunk_gated_delta_rule=triton_rule)
         with patch("hyper_parallel.components.modules.gdn_triton.import_module", return_value=backend) as loader:
-            replacement = replace_gdn_triton_chunk_rule(module=original)
+            replacement = TritonGDN(module=original)
         loader.assert_called_once_with("hyper_parallel.components.functional.gated_delta_net")
         self.assertIs(replacement.chunk_gated_delta_rule, triton_rule)
         self.assertIs(original.chunk_gated_delta_rule, _original_rule)
@@ -119,7 +118,7 @@ class TestGatedDeltaNet(unittest.TestCase):
         """Reject an incompatible source before loading optional Triton modules."""
         with patch("hyper_parallel.components.modules.gdn_triton.import_module") as loader:
             with self.assertRaisesRegex(TypeError, "requires callable"):
-                replace_gdn_triton_chunk_rule(module=nn.Linear(2, 2))
+                TritonGDN(module=nn.Linear(2, 2))
         loader.assert_not_called()
 
     def test_cp_wraps_direct_triton_primitive(self):
@@ -127,7 +126,7 @@ class TestGatedDeltaNet(unittest.TestCase):
         triton_rule = Mock(side_effect=_original_rule)
         backend = SimpleNamespace(chunk_gated_delta_rule=triton_rule)
         with patch("hyper_parallel.components.modules.gdn_triton.import_module", return_value=backend):
-            replacement = replace_gdn_triton_chunk_rule(module=FakeGatedDeltaNet())
+            replacement = TritonGDN(module=FakeGatedDeltaNet())
         mesh = SimpleNamespace(size=lambda: 2)
         cp_wrappers.gdn_ulysses_cp_wrapper(replacement, None, None, mesh, None)
         inputs = torch.ones(1, 4, 2, 3, requires_grad=True)

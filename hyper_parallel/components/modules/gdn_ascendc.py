@@ -29,38 +29,45 @@ from hyper_parallel.components.functional.gated_delta_rule import chunk_gated_de
 
 
 @module_replacement
-def replace_gdn_chunk_rule(
-    *,
-    module: nn.Module,
-    module_fqn: str = "",
-    context: Mapping[str, Any] | None = None,
-) -> nn.Module:
-    """Replace only the GDN chunk primitive, preserving the model's forward and weights.
+class AscendCGDN:
+    """Factory selecting the AscendC GDN primitive for an existing module.
 
-    Args:
-        module: GDN module exposing an instance-level chunk_gated_delta_rule callable.
-        module_fqn: Source module's fully qualified name.
-        context: Model replacement context.
-
-    Returns:
-        A shallow module copy sharing the original parameters and submodules.
-
-    Raises:
-        TypeError: The source does not expose the supported GDN primitive.
-
-    Note:
-        Select this factory through ``plan_overrides[].replace_module._target_``
-        as ``hyper_parallel.components.modules.replace_gdn_chunk_rule``.
-        Install a matching fla_npu Python runtime and AscendC OPP, plus
-        triton-ascend for the auxiliary kernels. No global monkey patch is used.
-        Only stateless, fixed-length chunk training is supported.
-        AscendC intermediates use reduced precision and are not bitwise
-        equivalent to the Transformers FP32 fallback.
+    The returned module retains its source type so the model's forward, CP
+    wrapper, and checkpoint layout remain unchanged.
     """
-    del context
-    if not callable(getattr(module, "chunk_gated_delta_rule", None)):
-        raise TypeError(f"{module_fqn}: GDN replacement requires callable chunk_gated_delta_rule")
-    replacement = copy.copy(module)
-    # CP wraps this callable after replacement; no global monkey patch or forward rewrite.
-    replacement.chunk_gated_delta_rule = chunk_gated_delta_rule
-    return replacement
+
+    def __new__(
+        cls,
+        *,
+        module: nn.Module,
+        module_fqn: str = "",
+        context: Mapping[str, Any] | None = None,
+    ) -> nn.Module:
+        """Replace only the GDN chunk primitive, preserving forward and weights.
+
+        Args:
+            module: GDN module exposing an instance-level chunk primitive.
+            module_fqn: Source module's fully qualified name.
+            context: Model replacement context.
+
+        Returns:
+            A shallow module copy sharing the original parameters and submodules.
+
+        Raises:
+            TypeError: The source does not expose the supported GDN primitive.
+
+        Note:
+            Select this factory through ``plan_overrides[].replace_module._target_``
+            as ``hyper_parallel.components.modules.AscendCGDN``. Install a
+            matching fla_npu Python runtime and AscendC OPP, plus triton-ascend
+            for the auxiliary kernels. Only stateless, fixed-length chunk
+            training is supported; reduced-precision AscendC intermediates are
+            not bitwise equivalent to the Transformers FP32 fallback.
+        """
+        del cls, context
+        if not callable(getattr(module, "chunk_gated_delta_rule", None)):
+            raise TypeError(f"{module_fqn}: GDN replacement requires callable chunk_gated_delta_rule")
+        replacement = copy.copy(module)
+        # CP wraps this callable after replacement; no global monkey patch or forward rewrite.
+        replacement.chunk_gated_delta_rule = chunk_gated_delta_rule
+        return replacement

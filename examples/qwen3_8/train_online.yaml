@@ -44,7 +44,7 @@ plan_overrides:
     module_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet
     exact_type: true
     replace_module:
-      _target_: hyper_parallel.components.modules.replace_gdn_triton_chunk_rule
+      _target_: hyper_parallel.components.modules.TritonGDN
   - match: "*.self_attn"
     when: cp
     inner_target: self
