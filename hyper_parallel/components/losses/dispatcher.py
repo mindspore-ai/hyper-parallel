@@ -14,6 +14,8 @@
 # ============================================================================
 """Loss calculation dispatcher — calculate_loss following design doc §10."""
 
+__all__ = ["calculate_loss"]
+
 from typing import Any, Optional
 
 import torch
@@ -58,7 +60,6 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
     Returns:
         Raw loss tensor (reduction="sum", not divided by num_label_tokens).
     """
-    num_label_tokens = kwargs.pop("num_label_tokens", None)
     loss_aggregation = kwargs.pop("loss_aggregation", "token_weighted")
 
     if FusedLinearCrossEntropy is not None and isinstance(loss_fn, FusedLinearCrossEntropy):
@@ -104,6 +105,3 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         logits.view(-1, logits.size(-1)),
         labels.view(-1),
     )
-
-
-__all__ = ["calculate_loss"]

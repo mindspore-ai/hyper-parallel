@@ -48,34 +48,41 @@ class _MicroBatch(nn.Module):
         self.args_batch_dim = args_batch_dim
         self.kwargs_batch_dim = kwargs_batch_dim
 
+    def _split_args_for_micro_batch(self, args: tuple, micro_idx: int) -> list:
+        """Split positional arguments for one micro-batch."""
+        micro_args = []
+        for arg_idx, cur_arg in enumerate(args):
+            cur_arg_batch_dim = 0
+            if self.args_batch_dim and self.args_batch_dim[arg_idx] is not None:
+                cur_arg_batch_dim = self.args_batch_dim[arg_idx].batch_dim
+            if isinstance(cur_arg, hyper_parallel.DTensor):
+                micro_arg = self.split_inputs_with_custom_shard(cur_arg, cur_arg_batch_dim, micro_idx)
+            else:
+                micro_arg = self.split_inputs(cur_arg, cur_arg_batch_dim, micro_idx)
+            micro_args.append(micro_arg)
+        return micro_args
+
+    def _split_kwargs_for_micro_batch(self, kwargs: dict, micro_idx: int) -> dict:
+        """Split keyword arguments for one micro-batch."""
+        micro_kwargs = {}
+        for key, cur_kwarg in kwargs.items():
+            cur_kwarg_batch_dim = 0
+            if self.kwargs_batch_dim is not None:
+                cur_kwarg_batch_dim = self.kwargs_batch_dim[key].batch_dim
+            if isinstance(cur_kwarg, hyper_parallel.DTensor):
+                micro_kwarg = self.split_inputs_with_custom_shard(cur_kwarg, cur_kwarg_batch_dim, micro_idx)
+            else:
+                micro_kwarg = self.split_inputs(cur_kwarg, cur_kwarg_batch_dim, micro_idx)
+            micro_kwargs[key] = micro_kwarg
+        return micro_kwargs
+
     def forward(self, args: tuple, kwargs: dict) -> tuple[list, list]:
         """forward of _MicroBatch"""
         args_after_split = []
         kwargs_after_split = []
         for micro_idx in range(self.micro_batch_num):
-            micro_args = []
-            micro_kwargs = {}
-            for arg_idx, cur_arg in enumerate(args):
-                cur_arg_batch_dim = 0
-                if self.args_batch_dim and self.args_batch_dim[arg_idx] is not None:
-                    cur_arg_batch_dim = self.args_batch_dim[arg_idx].batch_dim
-                if isinstance(cur_arg, hyper_parallel.DTensor):
-                    micro_arg = self.split_inputs_with_custom_shard(cur_arg, cur_arg_batch_dim, micro_idx)
-                else:
-                    micro_arg = self.split_inputs(cur_arg, cur_arg_batch_dim, micro_idx)
-                micro_args.append(micro_arg)
-            args_after_split.append(micro_args)
-
-            for key, cur_kwarg in kwargs.items():
-                cur_kwarg_batch_dim = 0
-                if self.kwargs_batch_dim is not None:
-                    cur_kwarg_batch_dim = self.kwargs_batch_dim[key].batch_dim
-                if isinstance(cur_kwarg, hyper_parallel.DTensor):
-                    micro_kwarg = self.split_inputs_with_custom_shard(cur_kwarg, cur_kwarg_batch_dim, micro_idx)
-                else:
-                    micro_kwarg = self.split_inputs(cur_kwarg, cur_kwarg_batch_dim, micro_idx)
-                micro_kwargs[key] = micro_kwarg
-            kwargs_after_split.append(micro_kwargs)
+            args_after_split.append(self._split_args_for_micro_batch(args, micro_idx))
+            kwargs_after_split.append(self._split_kwargs_for_micro_batch(kwargs, micro_idx))
         return args_after_split, kwargs_after_split
 
     def split_inputs_with_custom_shard(
