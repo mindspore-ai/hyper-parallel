@@ -49,8 +49,16 @@ class _LocalBatch:
     stats: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class _PreparedSourceStep:
+    """CPU-only source data prepared before the foreground collective phase."""
+
+    metadata: tuple[Any, ...]
+    local_payloads: dict[SampleKey, Any]
+
+
 class _LocalBalancingIterator(Iterator[Any]):
-    """Keep one fully balanced Host batch ahead of the training consumer."""
+    """Keep one source step ahead of the training consumer when it is safe."""
 
     def __init__(self, loader: LocalBalancingDataLoader) -> None:
         """Initialize a source iterator and one empty prefetch slot."""
@@ -61,6 +69,7 @@ class _LocalBalancingIterator(Iterator[Any]):
         self.finished = False
         self._thread: Thread | None = None
         self._result: _LocalBatch | None = None
+        self._prepared_source_step: _PreparedSourceStep | None = None
         self._error: BaseException | None = None
 
     def __next__(self) -> Any:
@@ -70,22 +79,20 @@ class _LocalBalancingIterator(Iterator[Any]):
             raise StopIteration
         try:
             if self._thread is None:
-                if self._loader._uses_synchronous_collectives:
-                    # HCCL/NCCL collectives from a producer thread can be
-                    # interleaved with model collectives in a different order
-                    # on different ranks.  Keep accelerator data collectives
-                    # on the training thread so every rank observes one
-                    # deterministic collective sequence.  Gloo keeps the
-                    # speculative one-step host/device buffer below.
-                    self._result = self._collect_batch()
-                else:
-                    self._start_prefetch()
+                self._start_prefetch()
             self.wait_for_prefetch()
             self._thread = None
             if self._error is not None:
                 raise self._error
-            result = self._result
-            self._result = None
+            if self._loader._uses_synchronous_collectives:
+                prepared = self._prepared_source_step
+                self._prepared_source_step = None
+                if prepared is None:
+                    raise RuntimeError("Synchronous data preparation completed without a source step.")
+                result = self._collect_batch(prepared)
+            else:
+                result = self._result
+                self._result = None
             if result is None:
                 raise RuntimeError("Local balancing prefetch completed without a batch.")
         except BaseException:
@@ -93,18 +100,21 @@ class _LocalBalancingIterator(Iterator[Any]):
             raise
         self._step += 1
         self._loader.last_balance_stats = result.stats
-        if not self._limit_reached() and not self._loader._uses_synchronous_collectives:
+        if not self._limit_reached():
             self._start_prefetch()
         return self._loader._deliver_batch(result, self._step)
 
     def _limit_reached(self) -> bool:
         return self._loader.max_steps is not None and self._step >= self._loader.max_steps
 
-    def _collect_batch(self) -> _LocalBatch:
-        return self._loader._construct_batch(next(self._source), self._step)
+    def _collect_batch(self, prepared: _PreparedSourceStep | None = None) -> _LocalBatch:
+        if prepared is None:
+            return self._loader._construct_batch(next(self._source), self._step)
+        return self._loader._construct_batch((), self._step, prepared=prepared)
 
     def _start_prefetch(self) -> None:
         self._result = None
+        self._prepared_source_step = None
         self._error = None
         self._thread = Thread(
             target=self._run_prefetch,
@@ -115,6 +125,15 @@ class _LocalBalancingIterator(Iterator[Any]):
 
     def _run_prefetch(self) -> None:
         try:
+            if self._loader._uses_synchronous_collectives:
+                # HCCL/NCCL collectives from a producer thread can be
+                # interleaved with model collectives in a different order on
+                # different ranks. Only source reads and metadata extraction
+                # run ahead; the foreground owns every accelerator collective.
+                raw_bins = next(self._source)
+                metadata, local_payloads = self._loader._read_step(raw_bins, self._step)
+                self._prepared_source_step = _PreparedSourceStep(metadata, local_payloads)
+                return
             # ``torch.npu``/``torch.cuda`` keeps the current device per host
             # thread.  The balancing producer performs HCCL/NCCL collectives
             # from this background thread, so establish the same rank-local
@@ -141,6 +160,7 @@ class _LocalBalancingIterator(Iterator[Any]):
         self.finished = True
         self._thread = None
         self._result = None
+        self._prepared_source_step = None
         self._error = None
 
 
@@ -291,8 +311,17 @@ class LocalBalancingDataLoader:
         batch = self._collate_fn(packed_bins)
         return self._device_prefetch(batch) if self._device_prefetch is not None else batch
 
-    def _construct_batch(self, raw_bins: Sequence[Sequence[Any]], step: int) -> _LocalBatch:
-        metadata, local_payloads = self._read_step(raw_bins, step)
+    def _construct_batch(
+            self,
+            raw_bins: Sequence[Sequence[Any]],
+            step: int,
+            *,
+            prepared: _PreparedSourceStep | None = None,
+    ) -> _LocalBatch:
+        if prepared is None:
+            metadata, local_payloads = self._read_step(raw_bins, step)
+        else:
+            metadata, local_payloads = prepared.metadata, prepared.local_payloads
         gathered = self._transport.all_gather_object(metadata)
         plan, stats = self._plan_step(gathered, step)
         if stats["moved_samples"]:
