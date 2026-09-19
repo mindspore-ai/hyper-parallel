@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 class ParamRole(Enum):
-    """Semantic roles of parameters used by sharding-plan derivation."""
+    """Semantic roles of parameters (14 enum values, 05 §3.6)."""
     COLWISE = auto()        # column-sharded linear layers: q/k/v/gate/up proj → Shard(0)
     ROWWISE = auto()        # row-sharded linear layers: o/down proj → Shard(1)
     NORM = auto()           # RMSNorm/LayerNorm weight → Replicate
@@ -118,11 +118,6 @@ def _build_default_rules() -> List[Tuple[List[str], ParamRole, str]]:
         (["shared_expert", "shared_experts"], ParamRole.SHARED_EXPERT, SEGMENT_EXACT),
         (["experts"], ParamRole.MOE_EXPERT, SEGMENT_SUBSTRING),
         ([".mlp.gate.", ".router.", "moe_gate", "mlp.router"], ParamRole.MOE_GATE, SEGMENT_SUBSTRING),
-        (["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "linear_attn.out_proj"],
-         ParamRole.COLWISE, SEGMENT_SUBSTRING),
-        (["linear_attn.conv1d", "linear_attn.a_log", "linear_attn.dt_bias",
-          "linear_attention.conv1d", "linear_attention.a_log", "linear_attention.dt_bias"],
-         ParamRole.REPLICATED, SEGMENT_SUBSTRING),
         (["fused_qkv", "linear_qkv", "qkv_proj", "query_key_value"],
          ParamRole.FUSED_QKV, SEGMENT_SUBSTRING),
         (["gate_up_proj", "fused_gate_up", ".w13."], ParamRole.FUSED_GATE_UP, SEGMENT_SUBSTRING),

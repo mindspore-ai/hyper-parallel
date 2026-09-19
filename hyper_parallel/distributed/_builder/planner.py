@@ -239,32 +239,7 @@ class ShardingPlanner:
                     spec.inner_target = "self"
                     spec.inner_wrapper = "gdn_ulysses"
                     spec.region_dispatch = False
-            if boundary_type == "linear_attention" and "tp" in mesh_dim_names:
-                self._keep_gdn_replicated_on_tp(
-                    spec,
-                    model.get_submodule(boundary_fqn),
-                )
             plan.modules[boundary_fqn] = spec
-
-    @staticmethod
-    def _keep_gdn_replicated_on_tp(
-        spec: ModuleShardingSpec,
-        module: nn.Module,
-    ) -> None:
-        """Keep an unmodified Gated DeltaNet replicated across the TP mesh."""
-        if "GatedDeltaNet" not in type(module).__name__:
-            return
-
-        # The stock GDN convolution and recurrent rule consume full head/channel
-        # dimensions. Until those kernels have a TP-local contract, sharding only
-        # their surrounding Linear modules would not form a complete TP region.
-        for placement in spec.params.values():
-            placement[TP] = Replicate()
-        for placement in spec.in_dst.values():
-            placement[TP] = Replicate()
-        for placement in spec.out_src.values():
-            placement[TP] = Replicate()
-        spec.tp_divide_attrs = []
 
     def _finalize_boundary_specs(
         self,
