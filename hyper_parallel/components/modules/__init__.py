@@ -24,8 +24,8 @@ from typing import Any
 
 
 _EXPORT_TO_MODULE = {
-    "replace_gdn_chunk_rule": "gdn_ascendc",
-    "replace_gdn_triton_chunk_rule": "gdn_triton",
+    "AscendCGDN": "gdn_ascendc",
+    "TritonGDN": "gdn_triton",
     "DeepseekV32DSAAttention": "dsa_attention",
     "DSAAttention": "dsa_attention",
     "GQAAttention": "gqa_attention",

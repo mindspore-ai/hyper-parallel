@@ -28,32 +28,40 @@ from hyper_parallel.models.replacement import module_replacement
 
 
 @module_replacement
-def replace_gdn_triton_chunk_rule(
-    *,
-    module: nn.Module,
-    module_fqn: str = "",
-    context: Mapping[str, Any] | None = None,
-) -> nn.Module:
-    """Bind the full Triton-Ascend GDN forward/backward without changing weights.
+class TritonGDN:
+    """Factory selecting the Triton-Ascend GDN primitive for an existing module.
 
-    Args:
-        module: GDN module exposing an instance-level chunk primitive.
-        module_fqn: Source module's fully qualified name.
-        context: Model replacement context.
-
-    Returns:
-        A shallow copy with its chunk primitive bound to the Triton implementation.
-
-    Raises:
-        TypeError: The source does not expose the expected primitive.
+    The returned module retains its source type so the model's forward, CP
+    wrapper, and checkpoint layout remain unchanged.
     """
-    del context
-    if not callable(getattr(module, "chunk_gated_delta_rule", None)):
-        raise TypeError(f"{module_fqn}: GDN replacement requires callable chunk_gated_delta_rule")
-    # Triton-Ascend is optional and should load only when this replacement is selected.
-    triton_rule = import_module(
-        "hyper_parallel.components.functional.gated_delta_net"
-    ).chunk_gated_delta_rule
-    replacement = copy.copy(module)
-    replacement.chunk_gated_delta_rule = triton_rule
-    return replacement
+
+    def __new__(
+        cls,
+        *,
+        module: nn.Module,
+        module_fqn: str = "",
+        context: Mapping[str, Any] | None = None,
+    ) -> nn.Module:
+        """Bind the full Triton-Ascend GDN forward/backward without changing weights.
+
+        Args:
+            module: GDN module exposing an instance-level chunk primitive.
+            module_fqn: Source module's fully qualified name.
+            context: Model replacement context.
+
+        Returns:
+            A shallow copy with its chunk primitive bound to the Triton implementation.
+
+        Raises:
+            TypeError: The source does not expose the expected primitive.
+        """
+        del cls, context
+        if not callable(getattr(module, "chunk_gated_delta_rule", None)):
+            raise TypeError(f"{module_fqn}: GDN replacement requires callable chunk_gated_delta_rule")
+        # Triton-Ascend is optional and should load only when this replacement is selected.
+        triton_rule = import_module(
+            "hyper_parallel.components.functional.gated_delta_net"
+        ).chunk_gated_delta_rule
+        replacement = copy.copy(module)
+        replacement.chunk_gated_delta_rule = triton_rule
+        return replacement
