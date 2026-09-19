@@ -39,6 +39,9 @@ class SwapOptimizerConfig:
         packed_swap: Whether to use two packed A/B staging buffers. Defaults to
             ``True``; when ``False``, optimizer states are swapped tensor by
             tensor.
+        pipelined: Whether to partition the state into a prefetch pipeline.
+            Defaults to ``True``. Muon-driven wrappers force this off, because
+            its state is handed over in one piece; see ``SwapMuonConfig``.
     """
 
     swap_times: int = 16
@@ -46,6 +49,7 @@ class SwapOptimizerConfig:
     min_numel: int = 1024
     include_master_params: bool = False
     packed_swap: bool = True
+    pipelined: bool = True
 
     def __post_init__(self) -> None:
         if self.swap_times <= 0:
@@ -63,7 +67,7 @@ class SwapOptimizer:
 
 
 def swap_optimizer(optimizer: Any, config: Optional[SwapOptimizerConfig] = None) -> Any:
-    """Wrap a supported Adam/AdamW optimizer with optimizer-state swap.
+    """Wrap a supported Adam/AdamW or Muon optimizer with optimizer-state swap.
 
     Args:
         optimizer: Base optimizer instance.
@@ -75,7 +79,18 @@ def swap_optimizer(optimizer: Any, config: Optional[SwapOptimizerConfig] = None)
     Raises:
         ValueError: If the optimizer type is unsupported.
     """
-    return _SwapOptimizer(optimizer, config or SwapOptimizerConfig())
+    resolved = config or SwapOptimizerConfig()
+
+    # Muon is Torch-only and imports this module for ``SwapOptimizerConfig``.
+    # Resolve it lazily here so the public factory can dispatch without closing
+    # that module-level import cycle or depending on the retiring platform tree.
+    from hyper_parallel.core.optimizer.muon import Muon  # pylint: disable=import-outside-toplevel
+
+    if isinstance(optimizer, Muon):
+        from hyper_parallel.core.optimizer.swap_muon import swap_muon  # pylint: disable=import-outside-toplevel
+
+        return swap_muon(optimizer, resolved)
+    return _SwapOptimizer(optimizer, resolved)
 
 
 def is_swap_optimizer(optimizer: Any) -> bool:
