@@ -294,6 +294,7 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.parser = self
         cc.model_name = name
         cc.rec_op = Config(dict(self.ccfg.rec_op.__dict__))
+        cc.overwrite_eval_functions = dict(self.ccfg.overwrite_eval_functions)
         cc.layer_custom_config = [(cc.n_lay + cc.n_mtp, None)]
         cc.offset = self._even_offset()
         return cc
