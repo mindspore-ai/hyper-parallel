@@ -408,3 +408,52 @@ if __name__ == "__main__":
     test_microbatch_default_batch_dim()
     test_microbatch_partial_batch_dim_spec()
     test_microbatch_edge_cases()
+
+
+# --------------------------------------------------------------------------- #
+# Host-side metadata splitting.
+# ``actual_seq_len`` (the TND cu_seqlens FlashAttention reads on the host) is
+# carried as a numpy array so its values survive MS_SIMULATION_LEVEL, where no
+# kernel runs and a device slice would return an unfilled buffer. Pure host
+# code, no collectives, so plain UT.
+# --------------------------------------------------------------------------- #
+
+
+def test_split_inputs_slices_numpy_on_host():
+    """
+    Feature: _microbatch
+    Description: A numpy input is sliced on the host, keeping its values.
+    Expectation: Each micro-batch holds its own rows, still as a numpy array.
+    """
+    micro_batch_num = 4
+    cu_seqlens = np.arange(micro_batch_num * 3, dtype=np.int32).reshape(micro_batch_num, 3)
+    microbatch = _MicroBatch(micro_batch_num=micro_batch_num)
+
+    for micro_idx in range(micro_batch_num):
+        micro_input = microbatch.split_inputs(cu_seqlens, 0, micro_idx)
+        assert isinstance(micro_input, np.ndarray)
+        np.testing.assert_array_equal(micro_input, cu_seqlens[micro_idx:micro_idx + 1])
+
+
+def test_split_inputs_numpy_respects_batch_dim():
+    """
+    Feature: _microbatch
+    Description: Host slicing honours a non-zero batch dim and the -1 passthrough.
+    Expectation: Dim 1 is sliced; -1 returns the input untouched.
+    """
+    values = np.arange(24, dtype=np.int32).reshape(2, 4, 3)
+    microbatch = _MicroBatch(micro_batch_num=2)
+
+    np.testing.assert_array_equal(microbatch.split_inputs(values, 1, 1), values[:, 2:4, :])
+    assert microbatch.split_inputs(values, -1, 0) is values
+
+
+def test_split_inputs_numpy_rejects_indivisible_batch():
+    """
+    Feature: _microbatch
+    Description: The divisibility check applies to numpy inputs too.
+    Expectation: ValueError is raised.
+    """
+    microbatch = _MicroBatch(micro_batch_num=3)
+    with pytest.raises(ValueError):
+        microbatch.split_inputs(np.zeros((4, 2), dtype=np.int32), 0, 0)

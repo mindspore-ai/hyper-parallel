@@ -15,6 +15,7 @@
 """pipeline parallel utils"""
 import io
 import pickle
+import numpy as np
 
 from mindspore import nn, Tensor, mint, ops
 from mindspore.common import dtype as mstype
@@ -104,6 +105,14 @@ class _MicroBatch(nn.Cell):
                 micro_batch_num {self.micro_batch_num}")
         micro_batch_begin = (batch_dim_shape // self.micro_batch_num) * micro_idx
         micro_batch_end = (batch_dim_shape // self.micro_batch_num) * (micro_idx + 1)
+        if isinstance(input_tensor, np.ndarray):
+            # Host-side metadata (e.g. the TND ``actual_seq_len`` cu_seqlens, whose
+            # values FlashAttention reads on the host) is carried as a numpy array on
+            # purpose: slicing it with a device op would zero it out under
+            # MS_SIMULATION_LEVEL, where no kernel is ever launched. Slice on host.
+            host_slice = [slice(None)] * input_tensor.ndim
+            host_slice[cur_arg_batch_dim] = slice(micro_batch_begin, micro_batch_end)
+            return input_tensor[tuple(host_slice)]
         strided_slice_begin = [0] * input_tensor.ndim
         strided_slice_strides = [1] * input_tensor.ndim
         strided_slice_end = list(input_tensor.shape)
