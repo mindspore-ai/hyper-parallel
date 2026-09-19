@@ -475,7 +475,10 @@ class NpuSparseLightningIndexerGradKlLossDistributedOp(DistributedOp):
                 # Head-tail folded query: one call per block on its own causal prefix.
                 # The fold wrapper rewrites args 11/12 per block, so the **global**
                 # cumulative lengths must reach it untouched.
-                if len(args) <= 9:
+                # `or kwargs`: fold_sparse_indexer_kl_loss takes no **kwargs, so any keyword
+                # argument reaching it would be dropped silently. The BSND branch above already
+                # guards this way; keep the two in step.
+                if len(args) <= 9 or kwargs:
                     raise NotImplementedError(
                         "DSA CP head-tail fold for the TND indexer KL loss is implemented for "
                         "the MindSpore positional form only; this call passed the sequence "

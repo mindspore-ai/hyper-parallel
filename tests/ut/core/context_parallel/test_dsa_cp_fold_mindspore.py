@@ -381,7 +381,7 @@ def test_folded_dense_lse_matches_full_sequence(cp_size):
     opts = (None, None, "BSND", 3, 1, 1)
 
     ref = toy_dense_lse(Tensor(qi), Tensor(ki), Tensor(w), *opts)
-    natural_ki = Tensor(ki)  # 一阶段只折 q 侧，key 是自然序
+    natural_ki = Tensor(ki)  # stage 1 folds the query side only; the key stays in natural order
     for r in range(cp_size):
         local = lambda x, axis=1: Tensor(_fold_rows(x, r, cp_size, axis))
         out = fold.fold_dense_lightning_indexer_softmax_lse(
@@ -410,7 +410,7 @@ def test_folded_dense_kl_loss_matches_full_sequence(cp_size):
     ref = toy_dense_kl_loss(Tensor(q), Tensor(k), Tensor(qi), Tensor(ki), Tensor(w),
                             Tensor(stats), Tensor(stats), Tensor(idx_stats), Tensor(idx_stats),
                             0.5, Tensor(qr), Tensor(kr), *opts)
-    natural_k = [Tensor(x) for x in (k, ki, kr)]  # 一阶段只折 q 侧，key 是自然序
+    natural_k = [Tensor(x) for x in (k, ki, kr)]  # stage 1 folds the query side only; the key stays in natural order
     d_k_sum, loss_sum = 0, 0
     for r in range(cp_size):
         local = lambda x, axis=1: Tensor(_fold_rows(x, r, cp_size, axis))

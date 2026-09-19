@@ -43,7 +43,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
 from hyper_parallel.platform import get_platform
-from hyper_parallel.core.shard.ops.dsa_cp_fold import set_dsa_cp_fold
+from hyper_parallel.core.shard.ops.dsa_cp_fold import dsa_cp_fold_requester, set_dsa_cp_fold
 
 platform = get_platform()
 Module = platform.Module
@@ -269,15 +269,32 @@ def _enable_fold_if_requested(style_name: str, layout: str, load_balance: bool) 
     ``2r`` and ``2N - 2r - 1``); see ``hyper_parallel.core.shard.ops.dsa_cp_fold``.
     """
     if not load_balance:
-        # Clear rather than leave alone: the flag is process-wide, so a style built without
-        # folding after one built with it (a second model in the same process, or a test
-        # sequence) would otherwise inherit the folded kernels.
+        # The flag is process-wide while folding is a per-style decision, and the kernels read
+        # it at *call* time while styles write it at *apply* time -- so whichever style applies
+        # last decides for all of them. Clearing it silently here is a foot-gun: miss the
+        # load_balance kwarg on one style (it defaults to False) and that style, applying last,
+        # turns folding off for the ones that were configured with it. The input is still laid
+        # out folded, the kernels then read the wrong causal prefix, and the loss is merely a
+        # little off -- no crash, no NaN, and check_fold_shapes cannot see it because the
+        # shapes do not change.
+        #
+        # So refuse instead of clearing. The case the old clear was written for -- a second
+        # model or test in the same process inheriting a stale True -- still works, because
+        # then nobody has asked for folding and this is a no-op.
+        previous = dsa_cp_fold_requester()
+        if previous:
+            raise ValueError(
+                f"{style_name}(load_balance=False) would turn off DSA CP head-tail folding that "
+                f"{previous} already turned on for this process. The DSA styles must agree: pass "
+                f"load_balance to every one of them (it defaults to False), or to none. If you "
+                f"really want to reset the flag between models, call set_dsa_cp_fold(False) "
+                f"explicitly at model teardown.")
         set_dsa_cp_fold(False)
         return False
     if layout not in ("BSND", "TND"):
         raise ValueError(
             f"{style_name}(load_balance=True) supports BSND and TND layouts, got {layout!r}.")
-    set_dsa_cp_fold(True)
+    set_dsa_cp_fold(True, requester=style_name)
     return True
 
 

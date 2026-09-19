@@ -47,6 +47,7 @@ from hyper_parallel.platform import get_platform
 platform = get_platform()
 
 __all__ = [
+    'dsa_cp_fold_requester',
     'check_fold_shapes',
     "set_dsa_cp_fold",
     "dsa_cp_fold_enabled",
@@ -72,12 +73,22 @@ __all__ = [
 # per call: every DSA kernel on a CP-sharded query sees folded blocks once the input
 # is folded. A module flag (instead of a thread-local) also covers activation
 # recompute and the backward / overlap threads without re-arming anything.
-_FOLD_STATE = {"enabled": False}
+_FOLD_STATE = {"enabled": False, "requester": ""}
 
 
-def set_dsa_cp_fold(enabled: bool) -> None:
-    """Turn head-tail folding of DSA CP kernels on or off for this process."""
+def set_dsa_cp_fold(enabled: bool, requester: str = "") -> None:
+    """Turn head-tail folding of DSA CP kernels on or off for this process.
+
+    ``requester`` names the style that asked, so a later style asking for the opposite can
+    say who it is fighting with. See :func:`dsa_cp_fold_requester`.
+    """
     _FOLD_STATE["enabled"] = bool(enabled)
+    _FOLD_STATE["requester"] = requester if enabled else ""
+
+
+def dsa_cp_fold_requester() -> str:
+    """Name of the style that last turned folding on, or "" when it is off."""
+    return _FOLD_STATE.get("requester", "")
 
 
 def dsa_cp_fold_enabled() -> bool:
@@ -303,6 +314,37 @@ def _cat_pair(a, b, dim: int):
 # TND: per-block ``actual_seq_len`` recomputation
 # ---------------------------------------------------------------------------
 
+# The klen-vs-T check below costs one device->host sync, so do it once per process: the
+# property it guards (whether the data pipeline pads the tail) is a property of the run, not
+# of the call.
+_KLEN_CHECKED = [False]
+
+
+def _check_klen_covers_full_len(actual_seq_klen, full_len) -> None:
+    """Refuse a padded key tail, which the fold's per-block cumulative lengths cannot express.
+
+    ``tnd_block_seq_lens`` leaves ``K_b``'s last entry at ``min(C_last, e_b)``. The kernel
+    requires the accumulated key length to equal the key tensor's ``T``, which holds only when
+    ``C_last == T``. A padded tail (``eod_pad_length`` rounds the packed sample up) makes
+    ``C_last < T``, and the last block then fails inside the kernel with a message about
+    sequence lengths that says nothing about folding or padding. Fail here instead, once.
+    """
+    if _KLEN_CHECKED[0]:
+        return
+    _KLEN_CHECKED[0] = True
+    try:
+        last = int(actual_seq_klen[-1])
+    except Exception:  # pylint: disable=broad-except
+        return          # cannot read it (traced/placeholder tensor) -- leave it to the kernel
+    if last != int(full_len):
+        raise ValueError(
+            f"DSA CP head-tail fold needs the key cumulative lengths to cover the whole key "
+            f"tensor, but actual_seq_klen[-1]={last} while the key length is {int(full_len)}. "
+            f"A padded tail (eod_pad_length) is not supported by the folded per-block "
+            f"cumulative lengths: the kernel checks that the accumulated key length equals T. "
+            f"Pack without tail padding, or turn dsa_enable_load_balance off.")
+
+
 def tnd_block_seq_lens(actual_seq_qlen, actual_seq_klen, full_len: int,
                        seq_shard_id: int, seq_shards: int, block_id: int):
     """Per-block ``(actual_seq_qlen, actual_seq_klen)`` for one folded TND block.
@@ -318,9 +360,9 @@ def tnd_block_seq_lens(actual_seq_qlen, actual_seq_klen, full_len: int,
 
     where ``C`` are the global cumulative document ends and ``Sf = e_b - s_b``. The kernels
     pair q document ``i`` with k document ``i``, so restating both sides keeps every query on
-    its own document and drops nothing: proven in ``scripts/verify_tnd_fold_equivalence.py``
-    (numpy,每对恰好一次) and measured bit-identical on the real kernels in
-    ``scripts/verify_tnd_fold_ops.py``.
+    its own document and drops nothing: every (query, key) pair the unfolded call would form is
+    formed exactly once across the two blocks, verified against a numpy reference and measured
+    bit-identical on the real kernels.
 
     ``K_b``'s last entry comes out as ``e_b`` on its own (the global total is never smaller
     than a prefix end), which is what the kernel requires -- it checks that the accumulated
@@ -344,6 +386,7 @@ def tnd_block_seq_lens(actual_seq_qlen, actual_seq_klen, full_len: int,
     """
     if actual_seq_qlen is None or actual_seq_klen is None:
         return actual_seq_qlen, actual_seq_klen
+    _check_klen_covers_full_len(actual_seq_klen, full_len)
     sf = int(full_len) // (2 * int(seq_shards))
     # The block's causal prefix spans this many Sf chunks, so its own chunk ends the prefix.
     end = balanced_prefix_chunks(seq_shard_id, seq_shards, block_id) * sf
@@ -441,6 +484,7 @@ def fold_sparse_flash_attention(func: Callable, seq_shard_id: int, seq_shards: i
     tnd = fold_layout == "TND"
     seq_dim = 0 if tnd else 1
     stats_dim = 1 if tnd else 2
+    check_fold_shapes(args[0], args[1], seq_shards, seq_dim)
     q0, q1 = split_half(args[0], seq_dim)
     t0, t1 = split_half(args[3], seq_dim)
     key, value = args[1], args[2]
@@ -505,6 +549,7 @@ def fold_sparse_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: i
     tnd = fold_layout == "TND"
     seq_dim = 0 if tnd else 1
     stats_dim = 1 if tnd else 2
+    check_fold_shapes(args[0], args[1], seq_shards, seq_dim)
     q_side_dims = {0: seq_dim, 2: seq_dim, 4: seq_dim, 5: seq_dim,
                    6: stats_dim, 7: stats_dim, 9: seq_dim}
     key_side = (1, 3, 10)
