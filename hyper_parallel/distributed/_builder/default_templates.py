@@ -131,6 +131,20 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         needs_cp_attn=True,
     ),
 
+    "linear_attention": ShardingTemplate(
+        colwise_placement=Shard(0),
+        rowwise_placement=Shard(1),
+        sp_in_src=_hid(Shard(1), Shard(1)),
+        sp_in_dst=_hid(Replicate(), Shard(1)),
+        sp_out_src=_out(Partial(), Shard(1)),
+        sp_out_dst=_out(Shard(1), Shard(1)),
+        nosp_in_src=_hid(Replicate(), Shard(1)),
+        nosp_in_dst=_hid(Replicate(), Shard(1)),
+        nosp_out_src=_out(Partial(), Shard(1)),
+        nosp_out_dst=_out(Replicate(), Shard(1)),
+        needs_cp_attn=True,
+    ),
+
     # ── MLP (gate/up Colwise + down Rowwise) ──
     # The CP dim stays Shard(1) throughout (revision D-06): MLP is pointwise and
     # CP needs no communication; if in_dst had CP=Replicate, the full-sequence

@@ -33,6 +33,7 @@ from hyper_parallel.distributed.context_parallel.collectives import (
 from hyper_parallel.distributed.context_parallel.wrappers import (
     INNER_WRAPPER_REGISTRY,
     INNER_WRAPPER_REQUIREMENTS,
+    gdn_ulysses_cp_wrapper,
     flex_hf_cp_wrapper,
     flex_hf_hybrid_cp_wrapper,
     flex_hf_ulysses_cp_wrapper,
@@ -54,6 +55,7 @@ __all__ = [
     "AsyncCPCollective",
     "INNER_WRAPPER_REGISTRY",
     "INNER_WRAPPER_REQUIREMENTS",
+    "gdn_ulysses_cp_wrapper",
     "async_cp_allgather_launch",
     "async_ulysses_seq_to_head_launch",
     "flex_cp_allgather",

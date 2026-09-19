@@ -39,20 +39,20 @@ from tests.ut.dual_mode_dtensor.conftest import _meta_mesh
 
 # ==========================================================================
 # Feature family 1: ShardingTemplate + TEMPLATES -- field completeness of the
-# 7 templates / I/O contracts (source: test_s1_templates.py, 8 atomic cases merged)
+# 8 templates / I/O contracts (source: test_s1_templates.py, 8 atomic cases merged)
 # ==========================================================================
 
 EXPECTED_TEMPLATES = {
-    "attention", "mlp", "norm", "embed", "lm_head", "moe_gate", "moe_mlp",
+    "attention", "linear_attention", "mlp", "norm", "embed", "lm_head", "moe_gate", "moe_mlp",
 }
 
 
 def test_templates_contract():
-    """7-template enumeration + SP/non-SP field completeness + CP I/O contract + per-template fields."""
+    """8-template enumeration + SP/non-SP field completeness + CP I/O contract + per-template fields."""
 
-    # ---- case: test_seven_templates_enumerated ----
+    # ---- case: test_eight_templates_enumerated ----
     assert set(TEMPLATES) == EXPECTED_TEMPLATES, \
-        "case: seven_templates_enumerated"
+        "case: eight_templates_enumerated"
 
     # ---- case: test_field_completeness_sp_and_nosp ----
     # Every template's SP/non-SP I/O fields are fully populated.
