@@ -21,7 +21,7 @@ from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
 from .parallel_ops import DistributedOp
-from .dsa_cp_fold import dsa_cp_fold_enabled, fold_sparse_indexer_kl_loss
+from .dsa_cp_fold import SPARSE_KL_MIN_ARGS, dsa_cp_fold_enabled, fold_sparse_indexer_kl_loss
 from .parallel_npu_dense_lightning_indexer_softmax_lse import (
     _adjust_bsnd_key,
     _adjust_tnd_seq_lens,
@@ -403,7 +403,7 @@ class NpuSparseLightningIndexerGradKlLossDistributedOp(DistributedOp):
 
             def _bsnd_cp_impl(*args, **kwargs):
                 if dsa_cp_fold_enabled():
-                    if len(args) <= 9 or kwargs:
+                    if len(args) < SPARSE_KL_MIN_ARGS["BSND"] or kwargs:
                         raise NotImplementedError(
                             "DSA CP head-tail fold is implemented for the MindSpore positional "
                             "signature of the sparse indexer KL loss only.")
@@ -478,7 +478,7 @@ class NpuSparseLightningIndexerGradKlLossDistributedOp(DistributedOp):
                 # `or kwargs`: fold_sparse_indexer_kl_loss takes no **kwargs, so any keyword
                 # argument reaching it would be dropped silently. The BSND branch above already
                 # guards this way; keep the two in step.
-                if len(args) <= 9 or kwargs:
+                if len(args) < SPARSE_KL_MIN_ARGS["TND"] or kwargs:
                     raise NotImplementedError(
                         "DSA CP head-tail fold for the TND indexer KL loss is implemented for "
                         "the MindSpore positional form only; this call passed the sequence "

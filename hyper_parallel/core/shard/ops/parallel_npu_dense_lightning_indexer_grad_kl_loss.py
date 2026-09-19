@@ -20,7 +20,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
-from .dsa_cp_fold import dsa_cp_fold_enabled, fold_dense_indexer_kl_loss
+from .dsa_cp_fold import DENSE_KL_MIN_ARGS, dsa_cp_fold_enabled, fold_dense_indexer_kl_loss
 from .parallel_ops import DistributedOp
 from .parallel_npu_dense_lightning_indexer_softmax_lse import (
     _adjust_bsnd_key,
@@ -408,7 +408,7 @@ class NpuDenseLightningIndexerGradKlLossDistributedOp(DistributedOp):
 
             def _bsnd_cp_impl(*args, **kwargs):
                 if dsa_cp_fold_enabled():
-                    if len(args) <= 10 or kwargs:
+                    if len(args) < DENSE_KL_MIN_ARGS["BSND"] or kwargs:
                         raise NotImplementedError(
                             "DSA CP head-tail fold is implemented for the MindSpore positional "
                             "signature of the dense indexer KL loss only.")
@@ -477,7 +477,7 @@ class NpuDenseLightningIndexerGradKlLossDistributedOp(DistributedOp):
             if dsa_cp_fold_enabled():
                 # Global cumulative lengths in, per-block ones out; must precede
                 # ``_adjust_tnd_seq_lens``, whose contiguous-slice assumption the fold breaks.
-                if len(args) <= 13 or kwargs:
+                if len(args) < DENSE_KL_MIN_ARGS["TND"] or kwargs:
                     raise NotImplementedError(
                         "DSA CP head-tail fold is implemented for the MindSpore positional "
                         "signature of the dense indexer KL loss only.")

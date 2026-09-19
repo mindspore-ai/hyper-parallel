@@ -401,6 +401,20 @@ def tnd_block_seq_lens(actual_seq_qlen, actual_seq_klen, full_len: int,
 # distributed op would otherwise have called once on the full local query.
 # ---------------------------------------------------------------------------
 
+def _same_sequence_type(original, items):
+    """Rebuild ``items`` as the same kind of sequence ``original`` is.
+
+    ``type(original)(generator)`` is the obvious spelling and is wrong for a namedtuple,
+    whose constructor takes the fields positionally and raises ``TypeError`` on an iterable.
+    Kernels are free to return one. (Same helper as in ``core/context_parallel``; kept here
+    so this module keeps depending on the platform layer alone.)
+    """
+    items = list(items)
+    if isinstance(original, tuple) and hasattr(original, "_fields"):
+        return type(original)(*items)
+    return type(original)(items)
+
+
 def check_fold_shapes(local_q, key, seq_shards: int, seq_dim: int = 1) -> None:
     """Catch an N mismatch between who sliced the data and who folds it.
 
@@ -467,7 +481,7 @@ def fold_lightning_indexer(func: Callable, seq_shard_id: int, seq_shards: int, *
     out1 = func(q1, k1, w1, *rest, **_kwargs(1))
     if not isinstance(out0, (tuple, list)):
         return _cat_pair(out0, out1, seq_dim)
-    return type(out0)(_cat_pair(a, b, seq_dim) for a, b in zip(out0, out1))
+    return _same_sequence_type(out0, (_cat_pair(a, b, seq_dim) for a, b in zip(out0, out1)))
 
 
 def fold_sparse_flash_attention(func: Callable, seq_shard_id: int, seq_shards: int, *args,
@@ -516,7 +530,7 @@ def fold_sparse_flash_attention(func: Callable, seq_shard_id: int, seq_shards: i
         return _cat_pair(out0, out1, seq_dim)
     stitched = [_cat_pair(out0[0], out1[0], seq_dim)]
     stitched.extend(_cat_pair(a, b, stats_dim) for a, b in zip(out0[1:], out1[1:]))
-    return type(out0)(stitched)
+    return _same_sequence_type(out0, stitched)
 
 
 # ``args`` positions of the MindSpore positional form of the sparse indexer KL loss:
@@ -525,6 +539,14 @@ def fold_sparse_flash_attention(func: Callable, seq_shard_id: int, seq_shards: i
 #   11 actual_seq_qlen, 12 actual_seq_klen, 13 layout, 14 sparse_mode, 15/16 pre/next tokens.
 _KL_ACTUAL_SEQ_QLEN_IDX = 11
 _KL_ACTUAL_SEQ_KLEN_IDX = 12
+
+
+# Smallest positional-arg count each KL-loss fold wrapper can be called with: one past the
+# highest index it reads. The call sites guard on these rather than on a hand-written number,
+# which is how the guards came to stop one or two short of the indices they protect (harmless
+# only because MindSpore passes either the full positional form or none of it).
+SPARSE_KL_MIN_ARGS = {"BSND": 11, "TND": 13}
+DENSE_KL_MIN_ARGS = {"BSND": 12, "TND": 14}
 
 
 def fold_sparse_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: int, *args,
@@ -663,7 +685,11 @@ def fold_dense_lightning_indexer_softmax_lse(func: Callable, seq_shard_id: int, 
 
     out0 = _call(0, q0, w0)
     out1 = _call(1, q1, w1)
-    return type(out0)(_cat_pair(a, b, stats_dim) for a, b in zip(out0, out1))
+    if not isinstance(out0, (tuple, list)):
+        # Mirrors the guard the sibling wrappers already have: a single-tensor return is
+        # stitched directly rather than zipped element-wise.
+        return _cat_pair(out0, out1, stats_dim)
+    return _same_sequence_type(out0, (_cat_pair(a, b, stats_dim) for a, b in zip(out0, out1)))
 
 
 # ``args`` positions of the MindSpore positional form of the dense indexer KL loss:

@@ -37,6 +37,19 @@ _OUTPUT_NON_CP = "non_cp"
 # DTensor boundary helpers
 # ---------------------------------------------------------------------------
 
+def _same_sequence_type(original, items):
+    """Rebuild ``items`` as the same kind of sequence ``original`` is.
+
+    ``type(original)(generator)`` is the obvious spelling and is wrong for a namedtuple,
+    whose constructor takes the fields positionally and raises ``TypeError`` on an iterable.
+    Boundaries are free to return one, so unpack for that case.
+    """
+    items = list(items)
+    if isinstance(original, tuple) and hasattr(original, "_fields"):
+        return type(original)(*items)
+    return type(original)(items)
+
+
 def _same_mesh_rank_list(lhs: DeviceMesh, rhs: DeviceMesh) -> bool:
     """Return whether two meshes describe the same participant ranks."""
     return tuple(lhs.rank_list) == tuple(rhs.rank_list)
@@ -770,7 +783,7 @@ class ContextParallel(ParallelStyle):
             return out
 
         if isinstance(outputs, (tuple, list)):
-            return type(outputs)(_process(item) for item in outputs)
+            return _same_sequence_type(outputs, (_process(item) for item in outputs))
         return _process(outputs)
 
     def _post_hook_hybrid(self, module, inputs, outputs, hybrid_cp_mesh, ds_submesh):  # pylint: disable=unused-argument
@@ -804,7 +817,7 @@ class ContextParallel(ParallelStyle):
             return seq_local
 
         if isinstance(outputs, (tuple, list)):
-            return type(outputs)(_process(item) for item in outputs)
+            return _same_sequence_type(outputs, (_process(item) for item in outputs))
         return _process(outputs)
 
     def _post_hook_colossal(self, module, inputs, outputs, co_submesh):  # pylint: disable=unused-argument
@@ -817,7 +830,7 @@ class ContextParallel(ParallelStyle):
             )
 
         if isinstance(outputs, (tuple, list)):
-            return type(outputs)(_process(item) for item in outputs)
+            return _same_sequence_type(outputs, (_process(item) for item in outputs))
         return _process(outputs)
 
     # ------------------------------------------------------------------
@@ -834,8 +847,30 @@ class ContextParallel(ParallelStyle):
         """
         return "construct" if platform.platform_type == PlatformType.MINDSPORE else "forward"
 
+    @staticmethod
+    def _reject_graph_mode() -> None:
+        """Refuse to install the load-balanced wrapper where it would not run.
+
+        The wrapper is an *instance* attribute shadowing the class method. PyNative looks the
+        body up on the instance, so it takes effect; graph mode compiles the **class**'s
+        ``construct`` source and never sees it -- the balance would simply not happen, with
+        every rank keeping its own causal cost and the losses still correct, i.e. nothing to
+        notice. (A cell that is individually jitted under an otherwise PyNative run has the
+        same problem and cannot be detected here.)
+        """
+        if platform.platform_type != PlatformType.MINDSPORE:
+            return
+        import mindspore  # pylint: disable=import-outside-toplevel
+        if mindspore.get_context("mode") == mindspore.GRAPH_MODE:
+            raise NotImplementedError(
+                "Head-tail load balance for Colossal CP is implemented for PyNative only: it "
+                "replaces the module's construct on the instance, which graph mode ignores. "
+                "Run in PyNative or leave load_balance off."
+            )
+
     def _apply_lb_colossal(self, module: Module, co_submesh: DeviceMesh) -> None:
         """Replace the module's forward body with the load-balanced two-sub-FA wrapper."""
+        self._reject_graph_mode()
         ws = co_submesh.mesh.numel()
         rank_list = list(co_submesh.rank_list)
         local_idx = rank_list.index(platform.get_rank())
@@ -905,11 +940,17 @@ class ContextParallel(ParallelStyle):
             new_args[q_idx] = DTensor.from_local(q_half, co_submesh, (Shard(seq_dim),))
             new_args[k_idx] = k_full_dt
             new_args[v_idx] = v_full_dt
+            # try/finally: the override is process-global and read by the FA op *and* by
+            # MindFormers' TND softmax converter (``current_lb_split``). Leaking it past an
+            # exception in the boundary would leave every later call reading this sub-call's
+            # chunk id -- which shows up as a wrong loss, not as an error.
             _set_lb_override(split_id=split_id, split_num=2 * ws)
-            out = original_forward(*new_args, **kwargs)
-            _clear_lb_override()
+            try:
+                out = original_forward(*new_args, **kwargs)
+            finally:
+                _clear_lb_override()
             if isinstance(out, (tuple, list)):
-                return type(out)(_localize(item) for item in out)
+                return _same_sequence_type(out, (_localize(item) for item in out))
             return _localize(out)
 
         fa1_out = _fa(q_keep, split_id=2 * local_idx)
@@ -919,11 +960,22 @@ class ContextParallel(ParallelStyle):
         # query half and is stitched on the same sequence axis -- MindFormers canonicalises
         # the statistics to the output's axes before they cross this boundary.
         if isinstance(fa1_out, (tuple, list)):
+            for index, item in enumerate(fa1_out):
+                # Every element must be per-query, or stitching it on the sequence axis is
+                # wrong -- silently so: a None would crash deep inside p2p_exchange and a
+                # reduced scalar (a loss, say) would be concatenated into nonsense.
+                if item is None or not hasattr(item, "shape") or len(item.shape) <= seq_dim:
+                    raise NotImplementedError(
+                        f"Head-tail load balance needs every output of the attention boundary "
+                        f"to be a per-query tensor stitched on dim {seq_dim}, but output "
+                        f"{index} is {type(item).__name__}. An output that is not per-query "
+                        f"would have to be combined, not concatenated."
+                    )
             fa2_our = [platform.p2p_exchange(item, peer_rank) for item in fa2_out]
-            out = type(fa1_out)(
+            out = _same_sequence_type(fa1_out, (
                 platform.cat([first, second], dim=seq_dim)
                 for first, second in zip(fa1_out, fa2_our)
-            )
+            ))
         else:
             fa2_our = platform.p2p_exchange(fa2_out, peer_rank)
             out = platform.cat([fa1_out, fa2_our], dim=seq_dim)

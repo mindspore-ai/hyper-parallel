@@ -21,6 +21,7 @@ must reproduce a single full-sequence call -- outputs row by row, the key gradie
 after summing the ranks, and the loss after summing the ranks.
 """
 import os
+from collections import namedtuple
 
 import numpy as np
 import pytest
@@ -444,3 +445,75 @@ def test_dense_fold_rejects_n_mismatch(wrapper, n_args):
         args = [q, key, Tensor(np.zeros((B, local_len, N_HEADS), np.float32))]
     with pytest.raises(ValueError, match="fold shape mismatch"):
         wrapper(lambda *a, **k: None, 0, cp_size // 2, *args)
+
+
+class _ReachedKernel(Exception):
+    """Raised by the stand-in kernel once every index the wrapper reads has been read."""
+
+
+def _min_args_call(spec, n_args, layout, shards=4, seq=24):
+    """Positional args of exactly ``n_args`` length, shaped for ``layout``."""
+    q_len = seq // shards
+    if layout == "TND":
+        q = Tensor(np.zeros((q_len, N_HEADS, D), np.float32))
+        key = Tensor(np.zeros((seq, 1, D), np.float32))
+        cumulative = Tensor(np.array([seq], np.int32))
+    else:
+        q = Tensor(np.zeros((B, q_len, N_HEADS, D), np.float32))
+        key = Tensor(np.zeros((B, seq, 1, D), np.float32))
+        cumulative = None
+    args = [1.0] * n_args
+    for index in spec["q_side"]:
+        args[index] = q
+    for index in spec["key_side"]:
+        args[index] = key
+    if layout == "TND":
+        args[spec["qlen"]] = cumulative
+        args[spec["klen"]] = cumulative
+    return args
+
+
+# Every positional index each KL-loss wrapper reads, next to the minimum arg count its call
+# sites guard on. The guards used to stop one or two short of these, which would have
+# surfaced as an IndexError from inside the fold rather than as the NotImplementedError the
+# guard promises.
+_KL_ARG_SPECS = {
+    ("sparse", "BSND"): {"n": 11, "q_side": (0, 2, 4, 5, 6, 7, 9), "key_side": (1, 3, 10)},
+    ("sparse", "TND"): {"n": 13, "q_side": (0, 2, 4, 5, 6, 7, 9), "key_side": (1, 3, 10),
+                        "qlen": 11, "klen": 12},
+    ("dense", "BSND"): {"n": 12, "q_side": (0, 2, 4, 5, 6, 7, 8, 10), "key_side": (1, 3, 11)},
+    ("dense", "TND"): {"n": 14, "q_side": (0, 2, 4, 5, 6, 7, 8, 10), "key_side": (1, 3, 11),
+                       "qlen": 12, "klen": 13},
+}
+
+
+@pytest.mark.parametrize("kind,layout", list(_KL_ARG_SPECS))
+def test_kl_fold_reads_within_min_args(kind, layout):
+    """MIN_ARGS must really cover every index the wrapper reads.
+
+    The stand-in kernel raises as soon as it is reached, so the call gets that far only if
+    every index the wrapper touches before it was within the declared minimum.
+    """
+    spec = _KL_ARG_SPECS[(kind, layout)]
+    wrapper = (fold.fold_sparse_indexer_kl_loss if kind == "sparse"
+               else fold.fold_dense_indexer_kl_loss)
+    declared = (fold.SPARSE_KL_MIN_ARGS if kind == "sparse" else fold.DENSE_KL_MIN_ARGS)[layout]
+    # Stated twice on purpose: the constant is what the call sites guard on, the spec is
+    # what this test read off the wrapper. The call below uses the constant, so shrinking it
+    # fails with an IndexError from inside the fold rather than only tripping this line.
+    assert declared == spec["n"]
+
+    def _kernel(*_args, **_kwargs):
+        raise _ReachedKernel
+
+    with pytest.raises(_ReachedKernel):
+        wrapper(_kernel, 0, 4, *_min_args_call(spec, declared, layout), fold_layout=layout)
+
+
+def test_same_sequence_type_rebuilds_a_namedtuple():
+    """``type(out)(genexpr)`` would raise TypeError on a namedtuple; kernels may return one."""
+    pair = namedtuple("pair", "first second")
+    out = fold._same_sequence_type(pair(1, 2), (value * 10 for value in pair(1, 2)))
+    assert out == pair(10, 20)
+    assert fold._same_sequence_type([1, 2], (value * 10 for value in [1, 2])) == [10, 20]
+    assert fold._same_sequence_type((1, 2), (value * 10 for value in (1, 2))) == (10, 20)
