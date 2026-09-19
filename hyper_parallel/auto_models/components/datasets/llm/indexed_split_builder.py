@@ -42,6 +42,19 @@ SplitRange: TypeAlias = tuple[float, float]
 SplitMatrix: TypeAlias = Sequence[SplitRange | None]
 
 
+def _get_blend_size(
+        datasets: Sequence[Any], weights: Sequence[float], requested_size: int, config: GPTDatasetConfig,
+) -> int:
+    """Size one weighted epoch to cover the longest source; shorter sources repeat."""
+    if config.packing_stage != "distributed_dataloader":
+        return int(requested_size)
+    if not datasets or len(datasets) != len(weights):
+        raise ValueError("Source blend datasets and weights must be non-empty and aligned")
+    if any(len(dataset) < 1 for dataset in datasets):
+        raise ValueError("Every enabled source split must contribute at least one distributed-packing sample")
+    return max(math.ceil(len(dataset) / weight) for dataset, weight in zip(datasets, weights))
+
+
 class _Split(Enum):
     """Stable train, validation, and test identifiers used by Dataset caches."""
 
@@ -331,6 +344,7 @@ class IndexedDatasetSplitBuilder:
 
             component_datasets = [dataset for dataset in component_datasets if dataset is not None]
             if blend_mode == "no":
+                size = _get_blend_size(component_datasets, weights, size, config)
                 dataset_factory = partial(BlendedDataset, component_datasets, weights, int(size), config)
             else:
                 dataset_factory = partial(SimpleBlendedDataset, component_datasets, int(size), blend_mode)
@@ -354,7 +368,11 @@ class IndexedDatasetSplitBuilder:
         if (
             config.data_lazy_load
             and self.dataloader_context.distributed_enabled
-            and not (self.dataloader_context.data_index_cache or self.dataloader_context.build_on_rank())
+            and not (
+                self.dataloader_context.collective_source
+                or self.dataloader_context.data_index_cache
+                or self.dataloader_context.build_on_rank()
+            )
         ):
             return cast(DatasetSplits, (None, None, None))
 

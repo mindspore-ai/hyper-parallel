@@ -383,13 +383,14 @@ def _resolve_target(node: object, *, path: str) -> Target[Any]:
 
 
 def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
-    """Resolve a DataLoader target with nested collator and batch adapter."""
+    """Resolve a DataLoader target with nested assembly and balancing policies."""
     if not isinstance(node, Mapping):
         raise _fail(path, "DataLoader configuration must be a YAML mapping")
 
     target_node = dict(node)
     collate_node = target_node.pop("collate_fn", None)
     get_batch_node = target_node.pop("get_batch", None)
+    policy_nodes = {name: target_node.pop(name, None) for name in ("cost_model", "balancing_algorithm")}
     dataloader_type = coerce_value(
         target_node.pop("dataloader_type", "single"),
         Literal["single", "cyclic"],
@@ -416,6 +417,10 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         target=target,
         collate_fn=collate_fn,
         get_batch=get_batch,
+        **{
+            name: None if value is None else _resolve_target(value, path=f"{path}.{name}")
+            for name, value in policy_nodes.items()
+        },
         dataloader_type=dataloader_type,
         data_rearrange_map=data_rearrange_map,
         data_sharding=data_sharding,
