@@ -35,6 +35,7 @@ re-distribution.
 __all__ = [
     "npu_dense_lightning_indexer_grad_kl_loss",
     "npu_dense_lightning_indexer_softmax_lse",
+    "npu_flash_attention_varlen_v4",
     "npu_lightning_indexer",
     "npu_mhc_post",
     "npu_mhc_pre_clamp_sinkhorn",
@@ -48,6 +49,7 @@ __all__ = [
 from hyper_parallel.custom_ops.experimental.experimental_ops import (
     npu_dense_lightning_indexer_grad_kl_loss,
     npu_dense_lightning_indexer_softmax_lse,
+    npu_flash_attention_varlen_v4,
     npu_lightning_indexer,
     npu_mhc_post,
     npu_mhc_pre_clamp_sinkhorn,

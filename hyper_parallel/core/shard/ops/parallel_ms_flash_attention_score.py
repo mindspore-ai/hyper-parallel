@@ -59,6 +59,53 @@ INPUT_LAYOUT_INT_TO_STR = {
 }
 
 
+# ---------------------------------------------------------------------------
+# TND: let FlashAttention emit TND-ordered softmax statistics directly, via the
+# ``softmaxOutLayout`` argument of aclnn V4.
+#
+# Why the swap happens here and not in the caller: CP folding, head-tail load
+# balancing and the ``actual_seq_len`` adjustment all live in ``_expanded_impl``.
+# Replacing the dispatched operator at that level would mean rewriting a thousand
+# lines of parallel logic. Here only the innermost *local kernel* is replaced,
+# arguments are forwarded unchanged, and none of the parallel logic above moves.
+#
+# Off by default: Ascend 950PR/950DT do not support the V4 ``softmaxInLayout``,
+# so callers must keep their own statistics-reordering path.
+_TND_SOFTMAX_OUT = {"enabled": False}
+
+
+def set_tnd_softmax_out(enabled: bool) -> None:
+    """Whether TND FlashAttention should emit TND-ordered softmax statistics."""
+    _TND_SOFTMAX_OUT["enabled"] = bool(enabled)
+
+
+def tnd_softmax_out_enabled() -> bool:
+    """Whether the TND-ordered softmax statistics path is on."""
+    return _TND_SOFTMAX_OUT["enabled"]
+
+
+def _reject_unsupported_v4_inputs(real_shift, drop_mask, padding_mask, prefix, keep_prob) -> None:
+    """Raise when an input the aclnn V4 varlen kernel cannot honour is in use."""
+    unsupported = [
+        name
+        for name, value in (
+            ("real_shift", real_shift),
+            ("drop_mask", drop_mask),
+            ("padding_mask", padding_mask),
+            ("prefix", prefix),
+        )
+        if value is not None
+    ]
+    if keep_prob is not None and float(keep_prob) != 1.0:
+        unsupported.append(f"keep_prob={keep_prob}")
+    if unsupported:
+        raise NotImplementedError(
+            "TND-ordered softmax statistics use the aclnn V4 varlen kernel, which does not "
+            f"accept {', '.join(unsupported)}. Turn the path off with "
+            "set_tnd_softmax_out(False) for this model."
+        )
+
+
 def _resolve_input_layout(input_layout) -> str:
     """Resolve input_layout from either string or integer enum to string."""
     if isinstance(input_layout, str):
@@ -975,15 +1022,46 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
 
             lb_split_id, lb_split_num = _get_lb_override()
 
-            if head_split_num == 1 and seq_split_num == 1 and lb_split_id is None:
-                result = func(
-                    query, key, value,
-                    real_shift, drop_mask, padding_mask, attn_mask, prefix,
-                    actual_seq_qlen, actual_seq_kvlen,
-                    head_num, keep_prob, scale_value,
-                    pre_tokens, next_tokens, inner_precise,
-                    p_input_layout, sparse_mode,
+            def _local_kernel(q, k, v, a_qlen, a_kvlen, h_num, s_mode, pre_t, next_t):
+                """Run the local FA kernel: stock primitive, or aclnn V4 for TND statistics."""
+                if input_layout == "TND" and tnd_softmax_out_enabled():
+                    # The V4 operator takes no pse / dropout / padding / prefix inputs and
+                    # always runs at keep_prob == 1.0. Refuse rather than forward a subset:
+                    # dropping any of them would change the attention numerically while the
+                    # output still looks plausible, so it would only ever surface as an
+                    # accuracy drift, never as an error.
+                    _reject_unsupported_v4_inputs(
+                        real_shift, drop_mask, padding_mask, prefix, keep_prob
+                    )
+                    # Imported locally so that processes which are not on TND, or have
+                    # this path disabled, never load the custom-operator extension.
+                    from hyper_parallel.custom_ops.experimental import (  # pylint: disable=C0415
+                        npu_flash_attention_varlen_v4,
+                    )
+                    s_max, s_sum, attn = npu_flash_attention_varlen_v4(
+                        q, k, v, atten_mask=attn_mask,
+                        actual_seq_qlen=a_qlen, actual_seq_kvlen=a_kvlen,
+                        scale_value=scale_value, head_num=int(h_num), sparse_mode=int(s_mode),
+                        pre_tokens=int(pre_t), next_tokens=int(next_t), inner_precise=inner_precise,
+                        tnd_softmax_out=True,
+                    )
+                    # Match the four outputs of FlashAttentionScore:
+                    # (max, sum, softmax_out, attention_out). The third one is a
+                    # placeholder: on TND the stock primitive was measured to return a
+                    # shape-(1,) tensor of the same dtype, and that must be reproduced
+                    # here. Passing None makes the DTensor dispatch raise
+                    # "local_tensor must be a Tensor" when it wraps all four outputs.
+                    softmax_out = platform.zeros((1,), dtype=attn.dtype, device=attn.device)
+                    return (s_max, s_sum, softmax_out, attn)
+                return func(
+                    q, k, v, real_shift, drop_mask, padding_mask, attn_mask, prefix,
+                    a_qlen, a_kvlen, h_num, keep_prob, scale_value,
+                    pre_t, next_t, inner_precise, p_input_layout, s_mode,
                 )
+
+            if head_split_num == 1 and seq_split_num == 1 and lb_split_id is None:
+                result = _local_kernel(query, key, value, actual_seq_qlen, actual_seq_kvlen,
+                                       head_num, sparse_mode, pre_tokens, next_tokens)
                 return FlashAttentionScoreDistributedOp._truncate_result(result)
 
             adjusted_head_num = self._adjust_head_num(head_num, head_split_num)
@@ -996,13 +1074,10 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
                 seq_split_num, lb_split_id, lb_split_num,
             )
 
-            result = func(
-                query, key, value,
-                real_shift, drop_mask, padding_mask, attn_mask, prefix,
-                adjusted_actual_seq_qlen, adjusted_actual_seq_kvlen,
-                int(adjusted_head_num), keep_prob, scale_value,
-                int(adjusted_pre_tokens), int(adjusted_next_tokens), inner_precise,
-                p_input_layout, int(adjusted_sparse_mode),
+            result = _local_kernel(
+                query, key, value, adjusted_actual_seq_qlen, adjusted_actual_seq_kvlen,
+                int(adjusted_head_num), int(adjusted_sparse_mode),
+                int(adjusted_pre_tokens), int(adjusted_next_tokens),
             )
 
             return FlashAttentionScoreDistributedOp._truncate_result(result)
