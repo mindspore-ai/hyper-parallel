@@ -983,6 +983,28 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(vision.s, 2304 // 4)
 
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_vl_submodules_keep_private_eval_function_caches(self, mock_hf):
+        """
+        Feature: multimodal evaluator cache isolation.
+        Description: Each submodule cost config owns its evaluator override
+            cache so a custom hook cannot affect a sibling submodule.
+        Expectation: Mutating one cache leaves the parent and other submodule
+            caches unchanged.
+        """
+        mock_hf.return_value = self._vl_config()
+        ccfg = _make_ccfg(_auto_models_config())
+        text = ccfg.mm_ccfgs["text"]
+        vision = ccfg.mm_ccfgs["vision"]
+
+        self.assertIsNot(text.overwrite_eval_functions, vision.overwrite_eval_functions)
+        self.assertIsNot(text.overwrite_eval_functions, ccfg.overwrite_eval_functions)
+        self.assertIsNot(vision.overwrite_eval_functions, ccfg.overwrite_eval_functions)
+
+        text.overwrite_eval_functions["num_params_norm"] = object()
+        self.assertNotIn("num_params_norm", vision.overwrite_eval_functions)
+        self.assertNotIn("num_params_norm", ccfg.overwrite_eval_functions)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_vl_visual_seq_len_override(self, mock_hf):
         """
         Feature: visual sequence length.
