@@ -28,8 +28,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import torch
 
 STATE_KEYS = ("exp_avg", "exp_avg_sq", "max_exp_avg_sq")
+MUON_STATE_KEYS = ("momentum_buffer",)
 MASTER_PARAM_KEY = "master_param"
-SUPPORTED_STATE_KEYS = STATE_KEYS + (MASTER_PARAM_KEY,)
+SUPPORTED_STATE_KEYS = STATE_KEYS + MUON_STATE_KEYS + (MASTER_PARAM_KEY,)
 _PACKED_ALIGNMENT_BYTES = 512
 _DEVICE_TYPE = "npu"
 
@@ -52,6 +53,7 @@ class SwapSlot:
     host_offset: int = 0
     packed: bool = False
     logical_tensor: Optional[Any] = None
+    owner_param: Optional[Any] = None
 
     def bind_tensor(self, tensor: Any) -> None:
         """Bind the slot to a host or staging tensor view."""
@@ -100,11 +102,29 @@ class PipelineSwapRuntime:
         self._packed_offload_events: Dict[int, Any] = {}
         self._packed_tail_event: Optional[Any] = None
         self._packed_device_views: Dict[Any, Any] = {}
+        # Whole-batch (non-pipelined) bookkeeping: the batch to update and the
+        # slots whose D2H copies are still in flight across the step boundary.
+        self._whole_batch_units: List[UpdateUnit] = []
+        self._pending_offload_slots: Dict[int, SwapSlot] = {}
+        self.adapter: Optional[Any] = None
 
     @property
     def packed_enabled(self) -> bool:
         """Return whether this runtime may build packed state candidates."""
         return self._packed_enabled
+
+    @property
+    def pipelined_enabled(self) -> bool:
+        """Return whether this runtime partitions and overlaps state transfers.
+
+        Adapters that must hand the whole optimizer state over at once (Muon)
+        set ``supports_pipelined = False``, which the wrapper mirrors onto the
+        config and resolves here to a single whole-batch transfer pair instead
+        of a prefetch pipeline.
+        """
+        return bool(getattr(self.config, "pipelined", True)) and bool(
+            getattr(self.config, "supports_pipelined", True)
+        )
 
     def partition(self, units: Sequence[UpdateUnit]) -> List[List[UpdateUnit]]:
         """Partition update units into balanced batches by swappable state bytes."""
@@ -151,7 +171,15 @@ class PipelineSwapRuntime:
         results = []
         batch_lists = [list(batch) for batch in batches]
         if not batch_lists:
+            # An adapter may hand over no units yet still need its update to run:
+            # an optimizer that allocates state lazily owns nothing on its first
+            # step, and skipping the step there would drop the update entirely.
+            if not self.pipelined_enabled:
+                return self._run_whole_batch(step_context, step_batch)
             return results
+
+        if not self.pipelined_enabled:
+            return self._run_whole_batch(step_context, step_batch)
 
         if self.supports_packed_pipeline(batch_lists):
             return self._run_packed_pipeline(batch_lists, step_context, step_batch)
@@ -190,6 +218,56 @@ class PipelineSwapRuntime:
         for batch_list in batch_lists:
             self.wait_prefetch(batch_list)
             self.wait_offload(batch_list)
+
+    def _run_whole_batch(
+            self,
+            step_context: Any,
+            step_batch: Callable[[List[UpdateUnit], Any], Any],
+    ) -> List[Any]:
+        """Hand the whole optimizer state to the device, update, and defer offload.
+
+        Unlike :meth:`_run_packed_pipeline` this never partitions the state and
+        never waits on the D2H it issues: ``step()`` returns as soon as the
+        copies are enqueued, so they overlap the next step's forward/backward
+        pass.  Readers converge on :meth:`wait_pending_offload` instead.
+
+        State travels tensor by tensor.  Packing a whole batch's state into one
+        shared staging buffer only pays off when the optimizer owns several
+        tensors per parameter; for an optimizer with a single state tensor per
+        parameter the arena costs as much as the state it replaces, so this path
+        does not offer it.
+        """
+        units = self._whole_batch_units
+
+        # The previous step's D2H must land before this step's H2D reuses the
+        # same copy stream.  This runs even when the optimizer has no state yet:
+        # the deferred offload is a hand-off from the previous step, not part of
+        # this one's batch.
+        self.wait_pending_offload()
+
+        # An optimizer that allocates its state lazily contributes no state on
+        # its first step, so the update always runs even with an empty batch.
+        if not units:
+            self.bind_slots_for_device(units)
+            results = [step_batch(units, step_context)]
+            self.refresh_swappable_slots(units)
+            return results
+
+        self.prefetch(units)
+        self.wait_prefetch(units)
+        self.bind_slots_for_device(units)
+        results = [step_batch(units, step_context)]
+        self.refresh_swappable_slots(units)
+        self.offload(units)
+        self._track_pending_offload(units)
+        return results
+
+    def bind_slots_for_device(self, units: Sequence[UpdateUnit]) -> None:
+        """Hook for adapters that must repoint optimizer state after a transfer."""
+        adapter = getattr(self, "adapter", None)
+        bind_fn = getattr(adapter, "bind_slots_for_device", None)
+        if callable(bind_fn):  # pylint: disable=not-callable
+            bind_fn(units)  # pylint: disable=not-callable
 
     def _run_packed_pipeline(
             self,
@@ -241,8 +319,15 @@ class PipelineSwapRuntime:
         del results
 
     def refresh_swappable_slots(self, batch: Sequence[UpdateUnit]) -> None:
-        """Refresh slots that become swappable after the optimizer update."""
-        del batch
+        """Refresh slots that become swappable after the optimizer update.
+
+        Dispatches to the adapter, which owns slot registration: an optimizer
+        that allocates state inside its own ``step`` only reveals that state once
+        the update has run.
+        """
+        refresh_fn = getattr(self.adapter, "refresh_swappable_slots", None)
+        if callable(refresh_fn):  # pylint: disable=not-callable
+            refresh_fn(batch)  # pylint: disable=not-callable
 
     def synchronize_cpu_mirrors(self, slots: Iterable[SwapSlot]) -> None:
         """Ensure CPU mirrors contain latest data for checkpointing."""
@@ -362,6 +447,55 @@ class PipelineSwapRuntime:
             for slot in slots:
                 self.wait_offload_slot(slot)
                 slot.event = None
+
+    def _track_pending_offload(self, batch: Sequence[UpdateUnit]) -> None:
+        """Remember the slots whose deferred D2H copies must still be waited on.
+
+        Per-tensor swaps carry their own copy-stream events, which are recorded
+        here as the hand-off state for the next step.  Packed swaps serialize
+        their D2H chain on the copy stream instead and are waited on through the
+        tail event recorded by the runtime's packed hooks.
+        """
+        slots = [slot for slot in _iter_unique_slots(batch) if slot.swappable]
+        for slot in slots:
+            self._pending_offload_slots[id(slot)] = slot
+
+    def wait_pending_offload(self) -> None:
+        """Coalesce deferred D2H copies, so their host mirrors hold final values.
+
+        Steps hand their offload back to the caller instead of blocking on it,
+        which lets the copy overlap the next step's forward/backward pass.  Any
+        later reader -- the next step's prefetch, a checkpoint, or a trainer
+        shutdown -- funnels through here.  Waiting with no stream synchronizes
+        the host thread, which is what a host-side reader requires.
+        """
+        slots = list(self._pending_offload_slots.values())
+        self._pending_offload_slots.clear()
+        tail_event = self._packed_tail_event
+        if tail_event is not None:
+            # The packed chain runs on the copy stream.  Waiting on its tail
+            # event orders the host thread after the chain; the copy stream is
+            # drained as well, because the event only proves the queue reached
+            # this point, not that every earlier copy retired.
+            self.wait_event(tail_event, None)
+            copy_stream = self._copy_stream
+            drain = getattr(copy_stream, "synchronize", None)
+            if callable(drain):  # pylint: disable=not-callable
+                drain()  # pylint: disable=not-callable
+            self._packed_tail_event = None
+        if not slots:
+            return
+        compute_stream = self.current_stream()
+        with self.stream_context(compute_stream):
+            for event in _iter_unique_events(slots):
+                self.wait_event(event, compute_stream)
+            for slot in slots:
+                self.wait_offload_slot(slot)
+                slot.event = None
+
+    def synchronize(self) -> None:
+        """Settle every deferred transfer, leaving host mirrors authoritative."""
+        self.wait_pending_offload()
 
     @staticmethod
     def _unit_cost(unit: UpdateUnit) -> int:
@@ -612,6 +746,29 @@ class PipelineSwapRuntime:
         if storage.size() != 0:
             storage.resize_(0)
 
+    def ensure_device_storage(self, slot: SwapSlot) -> Any:
+        """Return the slot's device tensor, rebuilding its released storage if needed.
+
+        A host-packed slot is bound to its pinned host view once it is offloaded,
+        so there is no device tensor left to copy into.  This re-derives one from
+        the parameter device and gives it the slot's exact capacity again.  The
+        restored bytes are uninitialized by design: the following prefetch fills
+        them from the host mirror.
+        """
+        storage_tensor = self._storage_tensor(slot.tensor)
+        if storage_tensor.device.type != "cpu":
+            if storage_tensor.untyped_storage().size() != slot.storage_nbytes:
+                storage_tensor.untyped_storage().resize_(slot.storage_nbytes)
+            return storage_tensor
+        # A slot parked on its host mirror, or one whose device tensor was
+        # replaced by a staging view, has no device tensor to copy into.  One is
+        # allocated from the recorded metadata instead.  The bytes are left
+        # uninitialized by design; the prefetch that follows fills them from the
+        # host mirror.
+        device_tensor = torch.empty(slot.shape, dtype=slot.dtype, device=slot.device)
+        slot.storage_nbytes = int(device_tensor.untyped_storage().size())
+        return device_tensor
+
     @staticmethod
     def device_handle() -> Any:
         """Return the Torch device module (``torch.npu``) that owns streams and events."""
@@ -687,6 +844,23 @@ class PipelineSwapRuntime:
         """Return the local tensor whose storage is managed by this runtime."""
         to_local = getattr(tensor, "to_local", None)
         return to_local() if callable(to_local) else tensor
+
+    def storage_tensor(self, tensor: Any) -> Any:
+        """Return the local tensor whose storage the runtime copies in and out."""
+        return self._storage_tensor(tensor)
+
+    def is_swappable_slot(self, slot: SwapSlot, min_numel: int) -> bool:
+        """Return whether ``slot`` holds optimizer state worth swapping.
+
+        The check reads the slot's recorded metadata rather than its current
+        tensor: an offloaded slot is bound to a host view, which would otherwise
+        look non-swappable and stop the state coming back to the device.
+        """
+        return bool(slot.swappable) and int(slot.numel) >= int(min_numel)
+
+    def set_whole_batch_units(self, units: Sequence[UpdateUnit]) -> None:
+        """Record the batch a non-pipelined adapter hands over in one piece."""
+        self._whole_batch_units = list(units)
 
     @staticmethod
     def _first_swappable_slot(batches: Sequence[Sequence[UpdateUnit]]) -> SwapSlot:
@@ -1201,8 +1375,15 @@ class OptimizerSwapAdapter:
         return tuple(self._ordered_slots())
 
     def checkpoint_state_dict(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Return optimizer checkpoint state using CPU mirrors for swapped slots."""
+        """Return optimizer checkpoint state using CPU mirrors for swapped slots.
+
+        Deferred offloads are settled first: the mirrors only hold the step's
+        final momentum once its D2H has landed, and the export reads them.
+        """
         del args, kwargs
+        # A deferred offload may still be in flight.  Settling it first makes the
+        # mirrors authoritative, which is what the export reads.
+        self.runtime.synchronize()
         self.runtime.synchronize_cpu_mirrors(self.all_slots())
         return self.export_swappable_state(self.optimizer.state_dict())
 
@@ -1669,7 +1850,7 @@ def validate_state_keys(state_keys: Optional[Sequence[str]]) -> Optional[tuple[s
     invalid = sorted(set(normalized) - set(SUPPORTED_STATE_KEYS))
     if invalid:
         raise ValueError(
-            "SwapOptimizerConfig.state_keys only supports Adam/AdamW logical slots "
+            "SwapOptimizerConfig.state_keys only supports optimizer state slots "
             f"{SUPPORTED_STATE_KEYS}, but got {invalid}."
         )
     return normalized
@@ -1706,6 +1887,8 @@ class SwapOptimizer(torch.optim.Optimizer):
         self.config = config
         self.runtime = PipelineSwapRuntime(config)
         self.adapter = self._build_adapter()
+        # The runtime drives host packing and needs the adapter's slot registry.
+        self.runtime.adapter = self.adapter
         self.adapter.validate()
         # Torch Adam states are normally lazy, but callers may materialize them
         # before wrapping to avoid first-step initialization in the measured loop.
