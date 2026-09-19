@@ -57,6 +57,7 @@ class CacheLengthLM(nn.Module):
             "use_cache": use_cache,
         })
         past = None
+        print("this is a test for ci")
         if use_cache:
             key = torch.zeros(batch_size, 1, total_len, 4)
             value = torch.zeros(batch_size, 1, total_len, 4)
