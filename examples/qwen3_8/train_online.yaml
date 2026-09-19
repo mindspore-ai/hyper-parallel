@@ -1,4 +1,4 @@
-# Eight-rank Qwen3.8-27B online conversation training with FSDP + CP + Triton-Ascend GDN.
+# Eight-rank Qwen3.8-27B online conversation training with FSDP + CP + high-performance fused GDN.
 
 model:
   _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
@@ -39,7 +39,7 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
-  # Use the full Triton-Ascend GDN forward/backward path.
+  # Use the high-performance fused GDN forward/backward path.
   - match: "*.linear_attn"
     module_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet
     exact_type: true

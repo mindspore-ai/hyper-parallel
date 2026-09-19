@@ -31,8 +31,8 @@ from typing import Any
 # auto_models/ops contains PyTorch-specific high-performance kernels.
 import torch  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.components.functional._veomni_gdn_kkt import chunk_scaled_dot_kkt_fwd
-from hyper_parallel.components.functional._veomni_gdn_tril import solve_tril
+from hyper_parallel.components.functional._gdn_kkt import chunk_scaled_dot_kkt_fwd
+from hyper_parallel.components.functional._gdn_tril import solve_tril
 from hyper_parallel.components.functional._gdn_triton.cumsum import chunk_local_cumsum
 from hyper_parallel.components.functional._gdn_triton.utils import input_guard, is_arch35
 

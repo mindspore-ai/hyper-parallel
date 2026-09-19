@@ -14,6 +14,8 @@
 # limitations under the License.
 # ============================================================================
 
+# Launch train_online.yaml after sourcing CANN.
+
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -35,5 +37,5 @@ torchrun \
     --rdzv_backend=c10d \
     --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
     --module examples.qwen3_8.train_text \
-    "${SCRIPT_DIR}/train.yaml" \
+    "${SCRIPT_DIR}/train_online.yaml" \
     "$@"
