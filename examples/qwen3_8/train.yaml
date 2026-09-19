@@ -1,4 +1,4 @@
-# Eight-rank Qwen3.8-27B FSDP + CP training with AscendC GDN.
+# Eight-rank Qwen3.8-27B FSDP + CP training with Triton-Ascend GDN.
 #
 # The defaults load public Hugging Face assets. Command-line overrides can
 # select local or offline model, tokenizer, and dataset assets.
@@ -42,12 +42,12 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
-  # Requires a matching fla_npu AscendC runtime/OPP and triton-ascend helpers.
+  # Use the full Triton-Ascend GDN forward/backward path.
   - match: "*.linear_attn"
     module_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet
     exact_type: true
     replace_module:
-      _target_: hyper_parallel.components.modules.replace_gdn_chunk_rule
+      _target_: hyper_parallel.components.modules.replace_gdn_triton_chunk_rule
   - match: "*.self_attn"
     when: cp
     inner_target: self
