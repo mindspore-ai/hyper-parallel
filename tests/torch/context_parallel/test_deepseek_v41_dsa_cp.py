@@ -14,7 +14,7 @@
 # ============================================================================
 """Launcher for DeepSeek-V4.1 shared compressed DSA CP precision."""
 
-import importlib.util
+import importlib
 from pathlib import Path
 
 import pytest
@@ -25,16 +25,16 @@ from tests.common.mark_utils import arg_mark
 
 _WORKER = str(Path(__file__).resolve().parent / "_test_deepseek_v41_dsa_cp.py")
 try:
-    _DEEPSEEK_V4_AVAILABLE = importlib.util.find_spec(
-        "transformers.models.deepseek_v4.configuration_deepseek_v4"
-    ) is not None
-except ModuleNotFoundError:
-    _DEEPSEEK_V4_AVAILABLE = False
+    importlib.import_module("tests.torch.context_parallel._test_deepseek_v41_dsa_cp")
+except ImportError:
+    _WORKER_DEPENDENCIES_AVAILABLE = False
+else:
+    _WORKER_DEPENDENCIES_AVAILABLE = True
 
 
 @pytest.mark.skipif(
-    not _DEEPSEEK_V4_AVAILABLE,
-    reason="The installed Transformers version does not provide DeepSeek V4",
+    not _WORKER_DEPENDENCIES_AVAILABLE,
+    reason="The DeepSeek V4 worker dependencies are unavailable",
 )
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
