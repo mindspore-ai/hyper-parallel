@@ -200,23 +200,25 @@ class TestMaterializedState(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
-    @patch("hyper_parallel.models._transformers.model_builder.CheckpointManager")
-    def test_builder_rebuilds_buffers_after_checkpoint_load(self, mock_manager_cls) -> None:
+    @patch("hyper_parallel.models._transformers.model_builder.HuggingFaceCheckpointer")
+    def test_builder_rebuilds_buffers_after_checkpoint_load(self, mock_checkpointer_cls) -> None:
         """The pretrained path rebuilds runtime state after load finalization."""
         model = _DerivedBufferModule().to(device="meta")
         model.factory_contexts.clear()
 
-        def _load_checkpoint(*args, **kwargs):
-            del args, kwargs
+        def _load(path, state, **kwargs):
+            """Stand in for the checkpointer: fill the weight and report it loaded."""
+            del path, kwargs
             with torch.no_grad():
                 model.weight.fill_(3.0)
-            return LoadReport(
+            state["load_report"] = LoadReport(
                 loaded_keys=("weight",),
                 missing_keys=(),
                 unexpected_keys=(),
             )
+            return state
 
-        mock_manager_cls.return_value.load_checkpoint.side_effect = _load_checkpoint
+        mock_checkpointer_cls.return_value.load.side_effect = _load
 
         _materialize_and_load_model(
             model,
