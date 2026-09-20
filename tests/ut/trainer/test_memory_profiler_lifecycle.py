@@ -13,11 +13,16 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for memory profiler integration with Trainer lifecycles."""
+# pylint: disable=wrong-import-position
 
 import types
 import unittest
 from functools import partial
 from unittest.mock import MagicMock, patch
+
+import pytest
+
+pytest.importorskip("torchdata.stateful_dataloader")
 
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config.training import MemoryConfig

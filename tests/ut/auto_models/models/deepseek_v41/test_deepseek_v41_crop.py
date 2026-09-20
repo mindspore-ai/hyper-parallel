@@ -27,10 +27,14 @@ from types import SimpleNamespace
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_utils import ContextManagers
+
+pytest.importorskip("transformers.models.deepseek_v4.configuration_deepseek_v4")
+
 try:
     from transformers.modeling_utils import no_init_weights
 except ImportError:

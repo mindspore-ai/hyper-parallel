@@ -13,10 +13,14 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for model-neutral VLM collation."""
+# pylint: disable=wrong-import-position
 
 import unittest
 
+import pytest
 import torch
+
+pytest.importorskip("torchdata.stateful_dataloader")
 
 from hyper_parallel.data.batching.build_collate_fn import (
     DataBatchAdapter,
