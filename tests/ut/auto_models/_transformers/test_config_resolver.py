@@ -55,8 +55,26 @@ class TestEmptyMappingFallback(unittest.TestCase):
                 "DeepseekV41CroppedForCausalLM",
             ),
         )
-        model_cls = registry._resolve_custom_model_cls("DeepseekV41ForCausalLM")
-        self.assertEqual(model_cls.__name__, "DeepseekV41CroppedForCausalLM")
+        fake_model_cls = type("DeepseekV41CroppedForCausalLM", (), {})
+        registry._resolve_custom_model_cls.cache_clear()
+        try:
+            with patch.object(
+                    registry.importlib,
+                    "import_module",
+                    return_value=SimpleNamespace(
+                        DeepseekV41CroppedForCausalLM=fake_model_cls,
+                    ),
+            ) as import_module:
+                model_cls = registry._resolve_custom_model_cls(
+                    "DeepseekV41ForCausalLM"
+                )
+        finally:
+            registry._resolve_custom_model_cls.cache_clear()
+
+        self.assertIs(model_cls, fake_model_cls)
+        import_module.assert_called_once_with(
+            "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41"
+        )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
