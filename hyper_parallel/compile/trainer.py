@@ -116,6 +116,8 @@ class GraphTrainer:
         Returns:
             loss: Loss value
         """
+        if self.optimizer is None:
+            self.compile(input_batch, label_batch)
         return self._compiler.forward_backward(input_batch, label_batch)
 
     def to(self, device: torch.device) -> "GraphTrainer":
