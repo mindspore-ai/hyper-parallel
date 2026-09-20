@@ -57,6 +57,7 @@ import traceback
 import numpy
 import torch
 
+from hyper_parallel.data.constants import INDEX_HEADER, INDEX_VERSION, MSC_PREFIX, S3_PREFIX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 
 logger = get_dataset_logger(__name__)
@@ -103,10 +104,6 @@ def safe_import(
 HAS_BOTO3, boto3 = safe_import("boto3")
 HAS_MSC, multi_storage_client = safe_import("multi_storage_client")
 
-_S3_PREFIX = "s3://"
-_MSC_PREFIX = "msc://"
-
-
 @dataclass
 class ObjectStorageConfig:
     """Configuration for reading ``.bin``/``.idx`` files from object storage.
@@ -125,14 +122,14 @@ class ObjectStorageConfig:
 
 def _is_object_storage_path(path: str) -> bool:
     """Return ``True`` if ``path`` is an ``s3://`` or ``msc://`` URI."""
-    return path.startswith(_S3_PREFIX) or path.startswith(_MSC_PREFIX)
+    return path.startswith(S3_PREFIX) or path.startswith(MSC_PREFIX)
 
 
 def _parse_s3_path(path: str) -> Tuple[str, str]:
     """Split an ``s3://bucket/key`` URI into ``(bucket, key)``."""
-    if not path.startswith(_S3_PREFIX):
+    if not path.startswith(S3_PREFIX):
         raise ValueError(f"Not an S3 path: {path}")
-    parts = path[len(_S3_PREFIX) :].split("/")
+    parts = path[len(S3_PREFIX) :].split("/")
     bucket = parts[0]
     key = "/".join(parts[1:]) if len(parts) > 1 else ""
     return bucket, key
@@ -140,10 +137,10 @@ def _parse_s3_path(path: str) -> Tuple[str, str]:
 
 def _get_index_cache_path(idx_path: str, object_storage_config: ObjectStorageConfig) -> str:
     """Return the local cache path for ``idx_path`` under ``path_to_idx_cache``."""
-    if idx_path.startswith(_S3_PREFIX):
-        stripped = idx_path[len(_S3_PREFIX) :]
-    elif idx_path.startswith(_MSC_PREFIX):
-        stripped = idx_path[len(_MSC_PREFIX) :]
+    if idx_path.startswith(S3_PREFIX):
+        stripped = idx_path[len(S3_PREFIX) :]
+    elif idx_path.startswith(MSC_PREFIX):
+        stripped = idx_path[len(MSC_PREFIX) :]
     else:
         raise ValueError(f"Not an object storage path: {idx_path}")
     return os.path.join(object_storage_config.path_to_idx_cache, stripped)
@@ -164,7 +161,7 @@ def _cache_index_file(remote_path: str, local_path: str) -> None:
     torch_dist_enabled = torch.distributed.is_initialized()
     rank = torch.distributed.get_rank() if torch_dist_enabled else 0
 
-    if remote_path.startswith(_S3_PREFIX):
+    if remote_path.startswith(S3_PREFIX):
         if not HAS_BOTO3:
             raise ImportError("boto3 is required to read s3:// datasets. Install via `pip install boto3`.")
         if not os.path.exists(local_path):
@@ -175,7 +172,7 @@ def _cache_index_file(remote_path: str, local_path: str) -> None:
                 logger.info("Downloading %s -> %s", remote_path, local_path)
                 client.download_file(bucket, key, local_path)
                 client.close()
-    elif remote_path.startswith(_MSC_PREFIX):
+    elif remote_path.startswith(MSC_PREFIX):
         if not HAS_MSC:
             raise ImportError(
                 "multi_storage_client is required to read msc:// datasets. "
@@ -192,9 +189,6 @@ def _cache_index_file(remote_path: str, local_path: str) -> None:
         torch.distributed.barrier()
     if not os.path.exists(local_path):
         raise RuntimeError(f"Index cache file not found after download: {local_path}")
-
-
-_INDEX_HEADER = b"MMIDIDX\x00\x00"
 
 
 class DType(Enum):
@@ -296,9 +290,9 @@ class _IndexWriter:
         """
         self.idx_writer = open(self.idx_path, "wb")
         # fixed, vestigial practice
-        self.idx_writer.write(_INDEX_HEADER)
+        self.idx_writer.write(INDEX_HEADER)
         # fixed, vestigial practice
-        self.idx_writer.write(struct.pack("<Q", 1))
+        self.idx_writer.write(struct.pack("<Q", INDEX_VERSION))
         # the numeric code for the dtype
         self.idx_writer.write(struct.pack("<B", DType.code_from_dtype(self.dtype)))
         return self
@@ -399,13 +393,11 @@ class _IndexReader:
         logger.info("Loading index file %s", idx_path)
 
         with open(idx_path, "rb") as f:
-            header = f.read(9)
-            if header != _INDEX_HEADER:
-                raise ValueError(f"Bad header in {idx_path}")
+            header = f.read(len(INDEX_HEADER))
+            assert header == INDEX_HEADER, f"Bad header in {idx_path}"
 
             version = struct.unpack("<Q", f.read(8))[0]
-            if version != 1:
-                raise ValueError(f"Unsupported index version {version} in {idx_path}")
+            assert version == INDEX_VERSION, f"Unsupported index version {version} in {idx_path}"
 
             code = struct.unpack("<B", f.read(1))[0]
             self.dtype = DType.dtype_from_code(code)
@@ -773,7 +765,7 @@ class IndexedDataset(torch.utils.data.Dataset):
             local_idx_path = _get_index_cache_path(idx_path, object_storage_config)
             if not os.path.exists(local_idx_path):
                 raise RuntimeError(f"Cached .idx not found: {local_idx_path}")
-            access = "s3" if path_prefix.startswith(_S3_PREFIX) else "msc"
+            access = "s3" if path_prefix.startswith(S3_PREFIX) else "msc"
             bin_reader: _BinReader = OBJECT_STORAGE_BIN_READERS[access](bin_path, object_storage_config)
             index_reader = _IndexReader(local_idx_path, multimodal)
         else:

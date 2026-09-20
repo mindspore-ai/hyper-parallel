@@ -28,8 +28,11 @@ Split out of components/distributed/cp_utils.py in stage 4e; merged with
 components/datasets/parallel/batch_parallel.py in stage 6 (05 §11.2).
 """
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from typing import Any
+
 import torch
 import torch.distributed as dist
 
@@ -172,18 +175,22 @@ def _shard_seq_lens_for_cp(seq_lens, seq_lens_padded, *, cp_rank: int, chunk: in
 
 
 class CPBatchSharder:
-    """Select the contiguous token fields owned by the current CP rank."""
+    """Select contiguous CP token intervals with optional multimodal field rules."""
 
     def __init__(
             self,
             parallel_context: DataLoaderParallelContext,
+            token_pad_values: Mapping[str, int] | None = None,
     ) -> None:
         """Initialize context-parallel batch sharding.
 
         Args:
             parallel_context: DataLoader and TP/CP topology information.
+            token_pad_values: Optional sequence fields and their padding values.
+                When supplied, fields not listed here remain complete on each CP rank.
         """
         self.parallel_context = parallel_context
+        self.token_pad_values = token_pad_values
 
     def shard(
             self,
@@ -200,6 +207,9 @@ class CPBatchSharder:
         if canonical_batch is None:
             cp_batch = None
             return cp_batch
+
+        if self.token_pad_values is not None:
+            return self._shard_configured_fields(canonical_batch)
 
         input_ids = canonical_batch["input_ids"]
         cp_batch = {
@@ -219,6 +229,43 @@ class CPBatchSharder:
         for field, value in cp_batch.items():
             local_value = torch.chunk(value, cp_size, dim=1)[cp_rank]
             cp_batch[field] = local_value.contiguous()
+
+        return cp_batch
+
+    def _shard_configured_fields(self, canonical_batch: Mapping[str, Any]) -> dict[str, Any]:
+        """Shard configured token fields and preserve all modality metadata."""
+        cp_batch = dict(canonical_batch)
+        cp_size = self.parallel_context.cp_world_size
+        if cp_size == 1:
+            return cp_batch
+        input_ids = cp_batch["input_ids"]
+        if not torch.is_tensor(input_ids) or input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError("Configured CP sharding requires input_ids with shape [1, sequence]")
+
+        sequence_length = input_ids.shape[1]
+        pad_length = (-sequence_length) % (2 * cp_size)
+        if "cu_seq_lens" in cp_batch:
+            boundaries = cp_batch["cu_seq_lens"].reshape(-1)
+            if int(boundaries[0]) != 0 or int(boundaries[-1]) != sequence_length:
+                raise ValueError("cu_seq_lens must cover the complete CP input sequence")
+
+            if pad_length:
+                boundaries = torch.cat((boundaries, boundaries[-1:] + pad_length))
+            cp_batch["cu_seq_lens"] = boundaries
+
+        chunk_length = (sequence_length + pad_length) // cp_size
+        local_start = self.parallel_context.cp_rank * chunk_length
+        local_end = local_start + chunk_length
+        for field, pad_value in self.token_pad_values.items():
+            if field not in cp_batch:
+                continue
+
+            value = cp_batch[field]
+            if not torch.is_tensor(value) or value.ndim != 2 or value.shape != input_ids.shape:
+                raise ValueError(f"CP token field {field!r} must match input_ids shape")
+
+            padded = torch.nn.functional.pad(value, (0, pad_length), value=pad_value)
+            cp_batch[field] = padded[:, local_start:local_end].contiguous()
 
         return cp_batch
 
@@ -243,17 +290,22 @@ class TPBatchBroadcaster:
     def broadcast(
             self,
             cp_local_batch: Mapping[str, Any] | None,
-            cu_seq_lens: Any,
+            cu_seq_lens: Any = None,
+            *,
+            broadcast_all_fields: bool = False,
     ) -> dict[str, Any]:
         """Broadcast CP-local fields and global boundaries across TP ranks.
 
         Args:
             cp_local_batch: CP-local fields on TP rank zero, or ``None`` elsewhere.
             cu_seq_lens: Global sequence boundaries, unsharded across CP ranks.
+            broadcast_all_fields: Preserve heterogeneous Omni fields and dtypes.
 
         Returns:
             Local batch populated on every TP rank.
         """
+        if broadcast_all_fields:
+            return self._broadcast_mapping(cp_local_batch)
         tp_rank = self.parallel_context.tp_rank
         # TP rank zero owns the CP-local DataLoader fields and moves them to
         # the target device before communication.
@@ -315,3 +367,39 @@ class TPBatchBroadcaster:
         parallel_batch["cu_seq_lens"] = local_cu_seq_lens
 
         return parallel_batch
+
+    def _broadcast_mapping(self, cp_local_batch: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Broadcast variable-shaped Omni tensors and scalar metadata."""
+        if self.parallel_context.tp_world_size == 1:
+            return self._move_mapping_to_device(cp_local_batch)
+        is_source = self.parallel_context.tp_rank == 0
+        if is_source:
+            parallel_batch = self._move_mapping_to_device(cp_local_batch)
+            metadata = []
+            for name, value in parallel_batch.items():
+                if torch.is_tensor(value):
+                    metadata.append((name, tuple(value.shape), value.dtype, None))
+                else:
+                    metadata.append((name, None, None, value))
+        else:
+            parallel_batch = {}
+            metadata = None
+        object_list = [metadata]
+        dist.broadcast_object_list(
+            object_list, group=self.parallel_context.tp_group, group_src=0, device=self.device
+        )
+        for name, shape, dtype, value in object_list[0]:
+            if shape is None:
+                parallel_batch[name] = value
+                continue
+            if not is_source:
+                parallel_batch[name] = torch.empty(shape, dtype=dtype, device=self.device)
+            dist.broadcast(parallel_batch[name], group=self.parallel_context.tp_group, group_src=0)
+        return parallel_batch
+
+    def _move_mapping_to_device(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+        """Transfer Omni tensors without changing their native dtypes."""
+        return {
+            field: value.to(self.device, non_blocking=True) if torch.is_tensor(value) else value
+            for field, value in batch.items()
+        }

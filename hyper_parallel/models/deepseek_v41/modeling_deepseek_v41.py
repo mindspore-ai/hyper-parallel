@@ -51,6 +51,12 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedDSAAttention as DeepseekV41SharedCompressedAttention,
     build_sliding_window_indices as _window_indices,
 )
+from hyper_parallel.models.deepseek_v41.adapter.image_processor import (
+    IMAGE,
+    IMAGE_END,
+    IMAGE_NEW_LINE,
+    IMAGE_START,
+)
 from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
@@ -444,18 +450,16 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
             nn.init.normal_(module.image_end, mean=0.0, std=self.config.initializer_range)
             nn.init.normal_(module.image_newline, mean=0.0, std=self.config.initializer_range)
 
-    def _merge_image_embeddings(
+    def _encode_image_features(
             self,
-            input_embeddings: torch.Tensor,
-            token_types: torch.Tensor,
             pixel_values: torch.Tensor,
             image_patch_offsets: torch.Tensor,
             image_vit_grid_hw: torch.Tensor,
             image_llm_grid_hw: torch.Tensor,
             image_batch_indices: torch.Tensor,
             image_token_starts: torch.Tensor,
-    ) -> torch.Tensor:
-        """Replace V4.1 image token spans with vision/aligner features.
+    ) -> list[tuple[int, int, int, int, torch.Tensor]]:
+        """Run complete ViT and aligner computation before LLM embedding.
 
         The dataset supplies image metadata in global image order. Vision
         executes per image because V4.1 applies bidirectional attention only
@@ -475,7 +479,7 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
             raise ValueError(f"inconsistent V4.1 image metadata: {', '.join(invalid)}")
         if pixel_values.ndim != 4:
             raise ValueError("pixel_values must have shape [total_patches, 3, patch, patch]")
-        merged = input_embeddings.clone()
+        image_records = []
         for image_index in range(image_count):
             patch_start = int(image_patch_offsets[image_index])
             patch_end = int(image_patch_offsets[image_index + 1])
@@ -483,33 +487,65 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
             llm_height, llm_width = (int(value) for value in image_llm_grid_hw[image_index])
             batch_index = int(image_batch_indices[image_index])
             token_start = int(image_token_starts[image_index])
-            if not 0 <= batch_index < merged.shape[0]:
-                raise ValueError(f"image_batch_indices[{image_index}] is outside the batch")
-            span_length = llm_height * (llm_width + 1) + 2
-            token_end = token_start + span_length
-            if token_start < 0 or token_end > merged.shape[1]:
-                raise ValueError(f"image token span {image_index} is outside input_ids")
-            span_types = token_types[batch_index, token_start:token_end]
-            image_slots = span_types == 1
-            expected_types = torch.tensor(
-                [0] + ([1] * llm_width + [2]) * llm_height + [3],
-                device=span_types.device,
-                dtype=span_types.dtype,
-            )
-            if not torch.equal(span_types, expected_types):
-                raise ValueError(f"image token_types do not match V4.1 grid layout for image {image_index}")
             vision_features = self.vision(pixel_values[patch_start:patch_end], vit_height, vit_width)
             image_features = self.aligner(vision_features, vit_height, vit_width)
-            if image_features.shape[0] != int(image_slots.sum()):
+            if image_features.shape[0] != llm_height * llm_width:
                 raise ValueError(
                     f"aligner/image-token count mismatch for image {image_index}: "
-                    f"{image_features.shape[0]} versus {int(image_slots.sum())}"
+                    f"{image_features.shape[0]} versus {llm_height * llm_width}"
                 )
-            span_embeddings = merged[batch_index, token_start:token_end]
-            span_embeddings[span_types == 0] = self.image_start.to(span_embeddings.dtype)
-            span_embeddings[span_types == 2] = self.image_newline.to(span_embeddings.dtype)
-            span_embeddings[span_types == 3] = self.image_end.to(span_embeddings.dtype)
-            span_embeddings[image_slots] = image_features.to(span_embeddings.dtype)
+            image_records.append((batch_index, token_start, llm_height, llm_width, image_features))
+        return image_records
+
+    def _merge_image_embeddings(
+            self,
+            input_embeddings: torch.Tensor,
+            token_types: torch.Tensor,
+            image_records: list[tuple[int, int, int, int, torch.Tensor]],
+            image_sequence_start: int,
+    ) -> torch.Tensor:
+        """Apply the official type-based image insertion to local CP token spans."""
+        merged = input_embeddings.clone()
+        local_end = image_sequence_start + merged.shape[1]
+        for image_index, (batch_index, token_start, llm_height, llm_width, image_features) in enumerate(image_records):
+            if not 0 <= batch_index < merged.shape[0]:
+                raise ValueError(f"image_batch_indices[{image_index}] is outside the batch")
+
+            span_length = llm_height * (llm_width + 1) + 2
+            token_end = token_start + span_length
+            if token_start < 0:
+                raise ValueError(f"image token span {image_index} has a negative start")
+
+            intersection_start = max(token_start, image_sequence_start)
+            intersection_end = min(token_end, local_end)
+            if intersection_start < intersection_end:
+                local_start = intersection_start - image_sequence_start
+                local_stop = intersection_end - image_sequence_start
+                feature_start = intersection_start - token_start
+                feature_stop = intersection_end - token_start
+                expected_types = torch.tensor(
+                    [IMAGE_START] + ([IMAGE] * llm_width + [IMAGE_NEW_LINE]) * llm_height + [IMAGE_END],
+                    device=token_types.device,
+                    dtype=token_types.dtype,
+                )
+                local_types = token_types[batch_index, local_start:local_stop]
+                if not torch.equal(local_types, expected_types[feature_start:feature_stop]):
+                    raise ValueError(f"image token_types do not match V4.1 grid layout for image {image_index}")
+
+                local_span = merged[batch_index, local_start:local_stop]
+                local_span[local_types == IMAGE_START] = self.image_start.to(merged.dtype)
+                local_span[local_types == IMAGE_END] = self.image_end.to(merged.dtype)
+                local_span[local_types == IMAGE_NEW_LINE] = self.image_newline.to(merged.dtype)
+                image_offsets = torch.arange(feature_start, feature_stop, device=token_types.device)
+                image_offsets = image_offsets[local_types == IMAGE]
+                feature_indices = image_offsets - 1 - (image_offsets - 1) // (llm_width + 1)
+                local_span[local_types == IMAGE] = image_features[feature_indices].to(merged.dtype)
+            # Keep every vision parameter in the graph even when this CP rank
+            # owns none of an image's token types.
+            image_grad_anchor = (
+                image_features.sum() + self.image_start.sum() + self.image_end.sum() + self.image_newline.sum()
+            )
+            merged = merged + image_grad_anchor.to(merged.dtype) * 0.0
         return merged
 
     def forward(
@@ -527,6 +563,7 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
             image_llm_grid_hw: torch.LongTensor | None = None,
             image_batch_indices: torch.LongTensor | None = None,
             image_token_starts: torch.LongTensor | None = None,
+            image_sequence_start: int = 0,
             **kwargs: Any,
     ) -> MoeModelOutputWithPast:
         """Execute image injection, Engram, shared attention, and pipelined mHC."""
@@ -536,8 +573,6 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
             raise ValueError("specify exactly one of input_ids or inputs_embeds")
         if input_ids is None:
             raise ValueError("input_ids are required while Engram is enabled")
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
         image_inputs = (
             pixel_values,
             image_patch_offsets,
@@ -551,15 +586,17 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
                 raise ValueError("token_types are required with V4.1 image inputs")
             if any(value is None for value in image_inputs):
                 raise ValueError("all V4.1 image metadata fields are required with pixel_values")
+            image_records = self._encode_image_features(
+                pixel_values, image_patch_offsets, image_vit_grid_hw, image_llm_grid_hw,
+                image_batch_indices, image_token_starts,
+            )
+        else:
+            image_records = []
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        if image_records:
             inputs_embeds = self._merge_image_embeddings(
-                inputs_embeds,
-                token_types,
-                pixel_values,
-                image_patch_offsets,
-                image_vit_grid_hw,
-                image_llm_grid_hw,
-                image_batch_indices,
-                image_token_starts,
+                inputs_embeds, token_types, image_records, image_sequence_start,
             )
         if token_types is not None and token_types.shape != input_ids.shape:
             raise ValueError("token_types must have the same shape as input_ids")

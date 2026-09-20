@@ -23,14 +23,10 @@ from typing import Any, Literal
 
 import torch.distributed as dist
 
+from hyper_parallel.data.constants import DATASET_DATE_FORMAT, DATASET_LOG_FORMAT, DATASET_LOGGER_NAME
+
 RankCondition = bool | Callable[[], bool]
 DatasetLogLevel = Literal["debug", "info", "warn"]
-_DATASET_LOGGER_NAME = "hyper_parallel.data"
-_DATASET_LOG_FORMAT = (
-    "[%(asctime)s] [%(levelname)s] [%(filename)s:%(lineno)d] "
-    "[rank:%(rank_id)d] \t> %(message)s"
-)
-_DATASET_DATE_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
 
 
 def _get_rank() -> int:
@@ -53,7 +49,7 @@ class _DatasetDebugRankFilter(logging.Filter):
         """Keep regular logs and Dataset DEBUG logs from selected ranks."""
         rank = _get_rank()
         record.rank_id = rank
-        if record.levelno != logging.DEBUG or not record.name.startswith(_DATASET_LOGGER_NAME):
+        if record.levelno != logging.DEBUG or not record.name.startswith(DATASET_LOGGER_NAME):
             return True
         rank_enabled = getattr(record, "dataset_rank_enabled", None)
         if rank_enabled is not None:
@@ -120,13 +116,13 @@ def enable_dataset_logging(level: DatasetLogLevel, ranks: Iterable[int] | None =
             raise ValueError("ranks must contain non-negative integers, or be None for all ranks")
 
     _DEBUG_RANK_FILTER.ranks = selected_ranks
-    dataset_logger = logging.getLogger(_DATASET_LOGGER_NAME)
+    dataset_logger = logging.getLogger(DATASET_LOGGER_NAME)
     dataset_logger.setLevel(log_levels[level])
     dataset_logger.propagate = False
     dataset_handlers = [handler for handler in dataset_logger.handlers if _DEBUG_RANK_FILTER in handler.filters]
     if not dataset_handlers:
         dataset_handler = logging.StreamHandler()
-        dataset_handler.setFormatter(_DatasetLogFormatter(_DATASET_LOG_FORMAT, datefmt=_DATASET_DATE_FORMAT))
+        dataset_handler.setFormatter(_DatasetLogFormatter(DATASET_LOG_FORMAT, datefmt=DATASET_DATE_FORMAT))
         dataset_handler.addFilter(_DEBUG_RANK_FILTER)
         dataset_logger.addHandler(dataset_handler)
         dataset_handlers.append(dataset_handler)

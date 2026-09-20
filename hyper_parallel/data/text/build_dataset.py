@@ -20,15 +20,16 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-from hyper_parallel.data.text.build_data_transform import PlaintextTransform
 from hyper_parallel.data.indexed.indexed_dataset import (
     build_indexed_dataset as _build_indexed_dataset,
 )
-from hyper_parallel.data.text.online.online_dataset import (
-    build_online_dataset as _build_online_dataset,
+from hyper_parallel.data.online import (
+    IterableTransformDataset,
+    MappingTransformDataset,
+    OnlineDataPath,
+    build_online_iterable_source,
+    build_online_mapping_source,
 )
-from hyper_parallel.data.text.online.online_utils import ONLINE_PLAINTEXT_TEXT_KEYS_KEY
-from hyper_parallel.data.text.transform_dataset import apply_llm_data_transform
 from hyper_parallel.data.parallel import (
     DataLoaderParallelContext,
     create_dataloader_parallel_context,
@@ -53,10 +54,10 @@ def _build_dataloader_context(
     return dataloader_context
 
 
-def _get_indexed_split_sizes(training_config: Any) -> tuple[int, int, int]:
-    """Calculate Indexed Dataset target sizes from the training plan."""
+def _get_train_valid_test_num_samples(training_config: Any) -> tuple[int, int, int]:
+    """Calculate train, validation, and test sizes from the training plan."""
     if training_config is None:
-        raise ValueError("Indexed Dataset requires a training configuration")
+        raise ValueError("Dataset sample planning requires a training configuration")
 
     global_batch_size = training_config.global_batch_size
     if training_config.train_iters is not None:
@@ -70,28 +71,26 @@ def _get_indexed_split_sizes(training_config: Any) -> tuple[int, int, int]:
     eval_iters = training_config.eval_iters
     valid_iters = (train_iters // eval_iters + 1) * eval_iters if eval_iters else 0
     split_sizes = (train_samples, valid_iters * global_batch_size, eval_iters * global_batch_size)
-    logger.debug("Indexed Dataset target sizes: train=%d, validation=%d, test=%d", *split_sizes)
+    logger.debug("Dataset target sizes: train=%d, validation=%d, test=%d", *split_sizes)
     return split_sizes
 
 
-def build_online_text_dataset(
-        *,
-        data_config: Mapping[str, Any],
-        data_path: str | Sequence[str] | None = None,
-        transform: Callable[[Any], Any] | None = None,
-        dataloader_context: DataLoaderParallelContext | None = None,
-        mesh_context: Any = None,
-        training_config: Any = None,
+def build_online_text_mapping_dataset(
+    *,
+    data_config: Mapping[str, Any],
+    data_path: OnlineDataPath | None = None,
+    transform: Callable[[Any], Any] | None = None,
+    training_config: Any = None,
 ) -> Any:
-    """Build an Online source and apply its text transform.
+    """Build an Online Mapping Dataset and apply its text transform.
 
     Args:
-        data_config: Online mapping or iterable source options.
-        data_path: Optional local source path or ordered paths.
+        data_config: Online Mapping source options.
+        data_path: Optional local source path, ordered paths, or pre-split
+            train/valid/test path mapping. Use ``data_config.sources`` for
+            multiple sources.
         transform: Plaintext or conversation sample transform.
-        dataloader_context: Optional explicit DataLoader ownership context.
-        mesh_context: Runtime mesh used to derive DataLoader ownership.
-        training_config: Training plan providing the random seed.
+        training_config: Training plan providing the random seed and split sizes.
 
     Returns:
         A transformed Online Dataset on each DataLoader-owning rank.
@@ -105,22 +104,64 @@ def build_online_text_dataset(
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
-    if isinstance(transform, PlaintextTransform):
-        dataset_config[ONLINE_PLAINTEXT_TEXT_KEYS_KEY] = transform.text_keys
+    train_valid_test_num_samples = None
+    if training_config is not None:
+        train_valid_test_num_samples = _get_train_valid_test_num_samples(training_config)
+    sample_filter = transform.is_valid_sample
+    source_dataset = build_online_mapping_source(
+        data_path=data_path,
+        data_config=dataset_config,
+        sample_filter=sample_filter,
+        train_valid_test_num_samples=train_valid_test_num_samples,
+    )
+    text_dataset = MappingTransformDataset.apply(source_dataset, transform)
+    return text_dataset
+
+
+def build_online_iterable_dataset(
+    *,
+    data_config: Mapping[str, Any],
+    data_path: OnlineDataPath | None = None,
+    transform: Callable[[Any], Any] | None = None,
+    dataloader_context: DataLoaderParallelContext | None = None,
+    mesh_context: Any = None,
+    training_config: Any = None,
+) -> Any:
+    """Build an Online Iterable Dataset and apply its text transform.
+
+    Args:
+        data_config: Online Iterable source options.
+        data_path: Optional local source path, ordered paths, or Hub Dataset
+            ID. Use ``data_config.sources`` for multiple sources.
+        transform: Plaintext or conversation sample transform.
+        dataloader_context: Optional explicit DataLoader ownership context.
+        mesh_context: Runtime mesh used to derive Iterable source ownership.
+        training_config: Training plan providing the shuffle seed.
+
+    Returns:
+        A transformed Online Iterable Dataset on each DataLoader-owning rank.
+
+    Raises:
+        ValueError: If no Online text transform is configured.
+    """
+    if transform is None:
+        raise ValueError("Online Dataset requires a plaintext or conversation data_transform")
+
+    dataset_config = dict(data_config)
+    training_seed = getattr(training_config, "seed", None)
+    dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
+    sample_filter = transform.is_valid_sample
     if dataloader_context is None:
         dataloader_context = _build_dataloader_context(mesh_context, dataset_config)
 
-    online_dataset = _build_online_dataset(
+    source_dataset = build_online_iterable_source(
         data_path=data_path,
         data_config=dataset_config,
         dataloader_context=dataloader_context,
+        sample_filter=sample_filter,
     )
-    transformed_dataset = apply_llm_data_transform(
-        online_dataset,
-        transform,
-        skip_invalid_samples=True,
-    )
-    return transformed_dataset
+    text_dataset = IterableTransformDataset.apply(source_dataset, transform)
+    return text_dataset
 
 
 def build_indexed_text_dataset(
@@ -160,7 +201,7 @@ def build_indexed_text_dataset(
         raise ValueError("Indexed Dataset requires data_path")
 
     if train_valid_test_num_samples is None:
-        train_valid_test_num_samples = _get_indexed_split_sizes(training_config)
+        train_valid_test_num_samples = _get_train_valid_test_num_samples(training_config)
 
     if dataloader_context is None:
         dataloader_context = _build_dataloader_context(mesh_context, dataset_config)

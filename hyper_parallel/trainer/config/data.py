@@ -37,12 +37,13 @@ class DatasetConfig:
     """Dataset target with its model assets and sample transform."""
 
     target: Target[Any]
-    model_assets: ModelAssetsConfig = field(default_factory=ModelAssetsConfig)
+    model_assets: Union[ModelAssetsConfig, Target[Any]] = field(default_factory=ModelAssetsConfig)
     data_transform: Optional[Target[Any]] = None
 
     def build(self, **runtime_kwargs: Any) -> Any:
         """Build the Dataset target with runtime Trainer arguments."""
-        return self.target.build(**runtime_kwargs)
+        dataset = self.target.build(**runtime_kwargs)
+        return dataset
 
     def __getattr__(self, name: str) -> Any:
         """Expose configured Dataset options through the wrapped target."""
@@ -64,9 +65,10 @@ class DataLoaderConfig:
     batch_adapter: Optional[Target[Any]] = None
     collate_fn: Optional[Target[Any]] = None
     get_batch: Optional[Target[Any]] = None
-    dataloader_type: Literal["single", "cyclic"] = "single"
+    sampler_type: Literal["single", "cyclic"] = "single"
     data_rearrange_map: Any = None
     data_sharding: bool = False
+    use_background_prefetcher: bool = False
 
     def build(self, **runtime_kwargs: Any) -> Any:
         """Build the DataLoader target with runtime Dataset arguments."""
@@ -82,7 +84,8 @@ class DataLoaderConfig:
         config["batch_adapter"] = _serialize_config_value(self.batch_adapter)
         config["collate_fn"] = _serialize_config_value(self.collate_fn)
         config["get_batch"] = _serialize_config_value(self.get_batch)
-        config["dataloader_type"] = self.dataloader_type
+        config["sampler_type"] = self.sampler_type
         config["data_rearrange_map"] = _serialize_config_value(self.data_rearrange_map)
         config["data_sharding"] = self.data_sharding
+        config["use_background_prefetcher"] = self.use_background_prefetcher
         return config

@@ -628,18 +628,26 @@ def _resolve_target(node: object, *, path: str) -> Target[Any]:
 
 
 def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
-    """Resolve a ``DataLoaderConfig`` with its collator and batch adapter."""
+    """Resolve a DataLoader target with nested collator and batch runtime."""
     if not isinstance(node, Mapping):
         raise ConfigResolutionError(path, "DataLoader configuration must be a YAML mapping")
 
     target_node = dict(node)
-    batch_adapter_node = target_node.pop("batch_adapter", None)
+    if "dataloader_type" in target_node:
+        raise ConfigResolutionError(f"{path}.dataloader_type", "renamed to sampler_type")
+    if "batch_adapter" in target_node:
+        raise ConfigResolutionError(
+            f"{path}.batch_adapter",
+            "removed by the Omni data lifecycle; use dataset.data_transform for "
+            "sample/batch encoding and dataloader.get_batch.runtime_input_adapter "
+            "for model-owned forward metadata",
+        )
     collate_node = target_node.pop("collate_fn", None)
     get_batch_node = target_node.pop("get_batch", None)
-    dataloader_type = normalize_value(
-        target_node.pop("dataloader_type", "single"),
+    sampler_type = normalize_value(
+        target_node.pop("sampler_type", "single"),
         Literal["single", "cyclic"],
-        path=f"{path}.dataloader_type",
+        path=f"{path}.sampler_type",
     )
     data_rearrange_map = target_node.pop("data_rearrange_map", None)
     data_sharding = normalize_value(
@@ -647,12 +655,12 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         bool,
         path=f"{path}.data_sharding",
     )
-    target = _resolve_target(target_node, path=path)
-    batch_adapter = (
-        None
-        if batch_adapter_node is None
-        else _resolve_target(batch_adapter_node, path=f"{path}.batch_adapter")
+    use_background_prefetcher = normalize_value(
+        target_node.pop("use_background_prefetcher", False),
+        bool,
+        path=f"{path}.use_background_prefetcher",
     )
+    target = _resolve_target(target_node, path=path)
     collate_fn = (
         None
         if collate_node is None
@@ -665,12 +673,12 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
     )
     return DataLoaderConfig(
         target=target,
-        batch_adapter=batch_adapter,
         collate_fn=collate_fn,
         get_batch=get_batch,
-        dataloader_type=dataloader_type,
+        sampler_type=sampler_type,
         data_rearrange_map=data_rearrange_map,
         data_sharding=data_sharding,
+        use_background_prefetcher=use_background_prefetcher,
     )
 
 
@@ -683,11 +691,17 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
     model_assets_node = target_node.pop("model_assets", {})
     data_transform_node = target_node.pop("data_transform", None)
     target = _resolve_target(target_node, path=path)
-    model_assets = resolve_component(
-        model_assets_node,
-        annotation=ModelAssetsConfig,
-        path=f"{path}.model_assets",
-    )
+    if isinstance(model_assets_node, Mapping) and "_target_" in model_assets_node:
+        model_assets = _resolve_target(
+            model_assets_node,
+            path=f"{path}.model_assets",
+        )
+    else:
+        model_assets = resolve_component(
+            model_assets_node,
+            annotation=ModelAssetsConfig,
+            path=f"{path}.model_assets",
+        )
     data_transform = (
         None
         if data_transform_node is None
@@ -696,11 +710,12 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
             path=f"{path}.data_transform",
         )
     )
-    return DatasetConfig(
+    dataset_config = DatasetConfig(
         target=target,
         model_assets=model_assets,
         data_transform=data_transform,
     )
+    return dataset_config
 
 
 def _resolve_optimizer_config(node: object, *, path: str) -> OptimizerConfig:

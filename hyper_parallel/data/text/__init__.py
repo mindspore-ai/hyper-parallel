@@ -23,25 +23,14 @@ importing this package must stay cheap.
 import importlib
 from typing import Any
 
-_LAZY_EXPORTS = {
-    "AutoTokenizer": "hyper_parallel.data.text.build_tokenizer",
-    "ChatTemplate": "hyper_parallel.data.text.chat_template",
-    "IdentityDataTransform": "hyper_parallel.data.text.build_data_transform",
-    "PlaintextTransform": "hyper_parallel.data.text.build_data_transform",
-    "TextConversationTransform": "hyper_parallel.data.text.build_data_transform",
-    "build_chat_template": "hyper_parallel.data.text.chat_template",
-    "build_indexed_text_dataset": "hyper_parallel.data.text.build_dataset",
-    "build_llm_data_transform": "hyper_parallel.data.text.build_data_transform",
-    "build_online_text_dataset": "hyper_parallel.data.text.build_dataset",
-    "build_tokenizer": "hyper_parallel.data.text.build_tokenizer",
-}
+from hyper_parallel.data.constants import TEXT_LAZY_EXPORTS
 
-__all__ = sorted(_LAZY_EXPORTS)
+__all__ = sorted(TEXT_LAZY_EXPORTS)
 
 
 def __getattr__(name: str) -> Any:
     """Resolve a public name through its owning submodule on first use."""
-    module_path = _LAZY_EXPORTS.get(name)
+    module_path = TEXT_LAZY_EXPORTS.get(name)
     if module_path is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     value = getattr(importlib.import_module(module_path), name)

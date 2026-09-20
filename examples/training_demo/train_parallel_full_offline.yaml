@@ -118,10 +118,10 @@ dataloader:
   collate_fn:
     _target_: hyper_parallel.data.batching.build_indexed_collate_fn
   get_batch:
-    _target_: hyper_parallel.data.batching.ParallelBatch
+    _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: indexed
     attention_mode: dense
-  dataloader_type: single
+  sampler_type: single
   data_rearrange_map: null
   data_sharding: false
   drop_last: true

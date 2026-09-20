@@ -12,10 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Online (Hugging Face-backed) LLM dataset sources.
+"""Unified image, video, and audio data facade."""
 
-Moved from ``components/datasets/llm/online_*`` in stage 6 (05 §11.3).
-Import the concrete builder modules directly
-(``online_dataset`` / ``online_mapping_dataset`` /
-``online_iterable_dataset`` / ``online_utils``).
-"""
+from hyper_parallel.data.omni.omni_transform import (
+    AutoProcessorTransform,
+    OmniDataTransform,
+    build_auto_processor,
+)
+from hyper_parallel.data.omni.build_dataset import build_online_omni_mapping_dataset
+
+__all__ = [
+    "AutoProcessorTransform",
+    "OmniDataTransform",
+    "build_auto_processor",
+    "build_online_omni_mapping_dataset",
+]

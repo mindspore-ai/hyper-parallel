@@ -165,35 +165,29 @@ dataset:
       use_fast: true
       trust_remote_code: false
   data_transform:
-    _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
     data_type: plaintext
     text_keys: text
     max_seq_len: 4096
-  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
   data_path: ./output/training_demo/deepseek_v41/online_4k.jsonl
   data_config:
-    dataset_type: mapping
-    hf_dataset_name: null
     # Emit compact sample boundaries through the V4.1 runtime adapter. A dense
     # [S,S] mask would be infeasible at the report's 64K/1M training lengths.
     create_attention_mask_in_dataloader: true
     labels_are_shifted: true
 
 dataloader:
-  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
-  min_buffered_samples: 16
-  # One model adapter owns physical token cost, per-item compression padding,
-  # resumable state identity, and compact forward metadata.
-  batch_adapter:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.packed_sequence.DeepseekV41BatchAdapter
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
+  min_buffered_samples: 1
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
   get_batch:
-    _target_: hyper_parallel.data.batching.ParallelBatch
+    _target_: hyper_parallel.models.deepseek_v41.adapter.runtime.DeepseekV41TextBatch
     source_type: online
     attention_mode: compressed
-    cp_algorithm: colossal
-  dataloader_type: cyclic
+  # Online Mapping owns its deterministic sample and blend indices.
+  sampler_type: single
   data_rearrange_map: null
   data_sharding: false
   drop_last: true

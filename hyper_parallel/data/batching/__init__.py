@@ -12,63 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""data.batching: collation and DataLoader construction.
-
-Rebuilt from ``components/datasets/batching`` plus
-``components/data/data_collator.py`` and ``components/data/dataloader.py``
-in stage 6 (05 §11.2).
-"""
+"""Batch collation, dynamic packing, and DataLoader construction."""
 
 from hyper_parallel.data.batching.build_collate_fn import (
-    BatchConstraints,
-    DataBatchAdapter,
-    DataBatchContext,
-    DataCollator,
-    MainCollator,
-    TextPackingCollator,
+    build_default_collate_fn,
     build_indexed_collate_fn,
+    build_omni_collate_fn,
     build_online_text_collate_fn,
-    get_sequence_parallel_size,
 )
 from hyper_parallel.data.batching.build_dataloader import (
-    DynamicBatchDataLoader,
     FixedBatchDataLoader,
-    TextTokenBatcher,
+    OmniPackingLoader,
+    TokenBatchLoader,
     build_dataloader,
     calculate_num_micro_batches,
 )
-from hyper_parallel.data.batching.data_collator import MakeMicroBatchCollator
-from hyper_parallel.data.batching.dataloader import DataLoader
-from hyper_parallel.data.batching.get_batch import ParallelBatch
+from hyper_parallel.data.batching.get_batch import OmniParallelBatch, TextParallelBatch
+from hyper_parallel.data.batching.packing import (
+    FirstFitPackingSelector,
+    PackingSelector,
+    SamplePacker,
+)
 from hyper_parallel.data.batching.runtime_input import (
     RuntimeInputAdapter,
     RuntimeInputContext,
 )
-from hyper_parallel.data.batching.sequence_boundaries import (
-    IndexedBoundaryResolver,
-    OnlineBoundaryResolver,
-)
 
 __all__ = [
-    "BatchConstraints",
-    "DataBatchAdapter",
-    "DataBatchContext",
-    "DataCollator",
-    "DataLoader",
-    "DynamicBatchDataLoader",
+    "FirstFitPackingSelector",
     "FixedBatchDataLoader",
-    "IndexedBoundaryResolver",
-    "MainCollator",
-    "MakeMicroBatchCollator",
-    "OnlineBoundaryResolver",
-    "ParallelBatch",
+    "OmniParallelBatch",
+    "OmniPackingLoader",
+    "PackingSelector",
+    "TextParallelBatch",
     "RuntimeInputAdapter",
     "RuntimeInputContext",
-    "TextPackingCollator",
-    "TextTokenBatcher",
+    "SamplePacker",
+    "TokenBatchLoader",
+    "build_default_collate_fn",
     "build_dataloader",
     "build_indexed_collate_fn",
+    "build_omni_collate_fn",
     "build_online_text_collate_fn",
     "calculate_num_micro_batches",
-    "get_sequence_parallel_size",
 ]

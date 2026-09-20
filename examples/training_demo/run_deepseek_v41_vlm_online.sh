@@ -85,8 +85,9 @@ fi
     "${SCRIPT_DIR}/train_deepseek_v41_vlm_online.yaml" \
     --model.config_path="${MODEL_PATH}" \
     --model.engram_assets_path="${ASSETS_PATH}" \
-    --dataset.data_transform.config_path="${MODEL_PATH}" \
+    --dataset.model_assets.config_path="${MODEL_PATH}" \
     --dataset.data_path="${DATA_PATH}" \
+    --accelerator.cp_size=1 \
     "$@" \
     2>&1 | tee "${OUTPUT_DIR}/run_${RUN_NAME}.log"
 

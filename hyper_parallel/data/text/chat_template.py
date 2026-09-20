@@ -24,15 +24,13 @@ Canonical merge (05 §11.3) of the former
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, MutableMapping, Optional, Sequence, Type, Union
 
-from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.data.dataset_logging import get_dataset_logger
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
 logger = get_dataset_logger(__name__)
-
-ROLE_SUPPORTED = ["system", "user", "assistant", "tool"]
 
 
 class Registry(MutableMapping):

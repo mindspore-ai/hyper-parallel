@@ -57,7 +57,6 @@ torchrun \
     --dataset.model_assets.tokenizer.pretrained_model_name_or_path="${MODEL_PATH}" \
     --dataset.model_assets.tokenizer.local_files_only=true \
     --dataset.data_path="${DATA_ROOT}/parallel_online.jsonl" \
-    --dataset.data_config.hf_dataset_name=null \
     --dataset.data_transform.max_seq_len=128 \
     --dataloader.min_buffered_samples=8 \
     "$@" \

@@ -12,14 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Build LLM plaintext and conversation data transforms.
-
-Merged from ``components/datasets/llm/build_data_transform.py`` and
-``components/data/identity_transform.py`` (05 §11.3): the two identity
-transforms collapsed into the single ``IdentityDataTransform`` below, whose
-``tokenizer``/``chat_template`` keyword superset covers both legacy call
-styles.
-"""
+"""Transform plaintext and conversation records into model samples."""
 
 from __future__ import annotations
 
@@ -29,9 +22,10 @@ from typing import Any, Literal
 
 import torch
 
+from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 
-LLMDataType = Literal["plaintext", "conversation"]
+TextDataType = Literal["plaintext", "conversation"]
 logger = get_dataset_logger(__name__)
 
 
@@ -99,6 +93,14 @@ class PlaintextTransform:
             transformed.append(model_sample)
         return transformed
 
+    def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
+        """Return whether one source record contains non-empty plaintext."""
+        text = _get_record_value(sample, self.text_keys)
+        if not isinstance(text, str):
+            raise ValueError("Plaintext sample text must be a string")
+        is_valid = text.strip() != ""
+        return is_valid
+
 
 @dataclass
 class TextConversationTransform:
@@ -121,16 +123,32 @@ class TextConversationTransform:
         encoded = self.chat_template.encode_messages(messages, max_seq_len=self.max_seq_len)
         input_ids = torch.as_tensor(encoded["input_ids"], dtype=torch.long)
         labels = torch.as_tensor(encoded["labels"], dtype=torch.long)
+        shifted_labels = labels[1:]
+        if not bool(shifted_labels.ne(IGNORE_INDEX).any()):
+            return []
+
         model_sample = {
             "input_ids": input_ids[:-1],
-            "labels": labels[1:],
+            "labels": shifted_labels,
         }
         return [model_sample]
 
+    def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
+        """Return whether one source record contains conversation messages."""
+        messages = _get_record_value(sample, self.text_keys)
+        is_valid = bool(messages)
+        return is_valid
 
-def build_llm_data_transform(data_type: LLMDataType, *, tokenizer: Any = None, chat_template: Any = None,
-                             max_seq_len: int, text_keys: str | Sequence[str] = "text") -> Callable[[Any], Any]:
-    """Build the transform selected by the LLM data type.
+
+def build_text_transform(
+    data_type: TextDataType,
+    *,
+    tokenizer: Any = None,
+    chat_template: Any = None,
+    max_seq_len: int,
+    text_keys: str | Sequence[str] = "text",
+) -> Callable[[Any], Any]:
+    """Build the transform selected by the text data type.
 
     Args:
         data_type: Plaintext or conversation input format.
@@ -140,7 +158,7 @@ def build_llm_data_transform(data_type: LLMDataType, *, tokenizer: Any = None, c
         text_keys: Field or candidate fields containing the source text.
 
     Returns:
-        The configured LLM sample transform.
+        The configured text sample transform.
 
     Raises:
         ValueError: If ``data_type`` is unsupported.
@@ -150,6 +168,7 @@ def build_llm_data_transform(data_type: LLMDataType, *, tokenizer: Any = None, c
     elif data_type == "conversation":
         data_transform = TextConversationTransform(chat_template, max_seq_len, text_keys)
     else:
-        raise ValueError(f"Unsupported LLM data type: {data_type!r}")
-    logger.debug("Built LLM data transform: data_type=%s, transform=%s", data_type, type(data_transform).__name__)
+        raise ValueError(f"Unsupported text data type: {data_type!r}")
+
+    logger.debug("Built text transform: data_type=%s, transform=%s", data_type, type(data_transform).__name__)
     return data_transform

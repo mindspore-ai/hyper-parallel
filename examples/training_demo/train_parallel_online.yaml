@@ -88,32 +88,30 @@ dataset:
       trust_remote_code: false
 
   data_transform:
-    _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
     data_type: plaintext
     text_keys: text
     max_seq_len: 128
 
-  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
   data_path: ./output/training_demo/data/parallel_online.jsonl
   data_config:
-    dataset_type: mapping
-    hf_dataset_name: null
     # Packed documents require the external global block mask accepted by the CP mask wrapper.
     create_attention_mask_in_dataloader: true
     # The online text transform already pairs input_ids[:-1] with labels[1:].
     labels_are_shifted: true
 
 dataloader:
-  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
   min_buffered_samples: 8
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
   get_batch:
-    _target_: hyper_parallel.data.batching.ParallelBatch
+    _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
     attention_mode: dense
-    cp_algorithm: ulysses
-  dataloader_type: cyclic
+  # Online Mapping owns its deterministic sample and blend indices.
+  sampler_type: single
   data_rearrange_map: null
   data_sharding: false
   drop_last: true
@@ -153,4 +151,4 @@ checkpoint:
 
 debug:
   check_nan_inf: false
-  check_dataset: null
+  check_dataset: debug
