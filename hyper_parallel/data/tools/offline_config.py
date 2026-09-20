@@ -45,6 +45,11 @@ class OfflinePreparationConfig:
     data_files: Optional[_DatasetDataFiles] = None
     num_proc: Optional[int] = None
     json_keys: Union[str, List[str]] = field(default_factory=lambda: ["text"])
+    text_template: Optional[str] = None
+    conversation_key: Optional[str] = None
+    role_key: str = "role"
+    content_key: str = "content"
+    role_map: Optional[Dict[str, str]] = None
     tokenizer_use_fast: bool = True
     trust_remote_code: bool = False
     chat_template: Optional[str] = None
@@ -104,6 +109,10 @@ class OfflinePreparationConfig:
             raise ValueError("json_keys must contain one or more column names")
         return keys
 
+    def uses_record_transform(self) -> bool:
+        """Return whether preprocessing needs columns beyond ``json_keys``."""
+        return self.text_template is not None or self.conversation_key is not None
+
     def download_root(self) -> Path:
         """Resolve the root directory for downloaded raw JSONL datasets.
 
@@ -158,6 +167,11 @@ class OfflinePreparationConfig:
             dataset_name_or_path=str(self.resolved_json_path()),
             output_prefix=str(self.resolved_output_prefix()),
             json_keys=self.json_keys_list(),
+            text_template=self.text_template,
+            conversation_key=self.conversation_key,
+            role_key=self.role_key,
+            content_key=self.content_key,
+            role_map=self.role_map,
             tokenizer_name_or_path=self.tokenizer_name_or_path,
             tokenizer_use_fast=self.tokenizer_use_fast,
             trust_remote_code=self.trust_remote_code,

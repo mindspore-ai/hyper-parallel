@@ -43,6 +43,10 @@ else:
 
 # Store generated samples in the indexed ``.bin/.idx`` format.
 from hyper_parallel.data.tools import io as indexed_dataset
+from hyper_parallel.data.tools.offline_record_transform import (
+    OfflineRecordTransform,
+    parse_role_map,
+)
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 
 logger = get_dataset_logger(__name__)
@@ -116,6 +120,61 @@ def append_eod(args: argparse.Namespace, tokenizer: Any) -> int | None:
     return int(eod_id)
 
 
+def build_record_transform(args: argparse.Namespace) -> OfflineRecordTransform:
+    """Build the optional source-schema conversion for offline records."""
+    transform = OfflineRecordTransform(
+        output_key=args.json_keys[0],
+        text_template=getattr(args, "text_template", None),
+        conversation_key=getattr(args, "conversation_key", None),
+        role_key=getattr(args, "role_key", "role"),
+        content_key=getattr(args, "content_key", "content"),
+        role_map=getattr(args, "role_map", None),
+    )
+    if transform.enabled and len(args.json_keys) != 1:
+        raise ValueError(
+            "text_template and conversation_key require exactly one --json-keys output field"
+        )
+    return transform
+
+
+def _normalized_json_path(args: argparse.Namespace) -> Path:
+    """Return the inspectable JSONL artifact used after schema conversion."""
+    output_path = Path(args.output_prefix).expanduser().resolve()
+    return output_path.with_name(f"{output_path.name}_normalized.jsonl")
+
+
+def _materialize_normalized_jsonl(
+    args: argparse.Namespace,
+    input_files: list[str],
+    transform: OfflineRecordTransform,
+) -> str:
+    """Convert source schemas once, before partitioning and tokenization."""
+    normalized_path = _normalized_json_path(args)
+    tokenizer = build_tokenizer(args)
+    record_count = 0
+    with normalized_path.open("w", encoding="utf-8") as output_file:
+        for input_file_name in input_files:
+            open_file = gzip.open if input_file_name.endswith(".gz") else open
+            with open_file(input_file_name, "rt", encoding="utf-8") as input_file:
+                for line_number, line in enumerate(input_file, start=1):
+                    try:
+                        record = json.loads(line)
+                        normalized = transform(record, tokenizer)
+                    except (json.JSONDecodeError, ValueError) as error:
+                        raise ValueError(
+                            f"Failed to convert {input_file_name}:{line_number}: {error}"
+                        ) from error
+                    json.dump(
+                        {transform.output_key: normalized[transform.output_key]},
+                        output_file,
+                        ensure_ascii=False,
+                    )
+                    output_file.write("\n")
+                    record_count += 1
+    logger.info("Offline record conversion wrote %d records to %s", record_count, normalized_path)
+    return str(normalized_path)
+
+
 class Encoder:
     """Encode JSON text fields into token ids and sentence lengths."""
 
@@ -131,6 +190,7 @@ class Encoder:
         """Build the tokenizer and sentence splitter in each worker process."""
         # Use Encoder class as a container for global data
         Encoder.tokenizer = build_tokenizer(self.args)
+        Encoder.record_transform = build_record_transform(self.args)
         if self.args.split_sentences:
             if not NLTK_AVAILABLE:
                 raise ImportError("NLTK is required when --split-sentences is enabled")
@@ -154,7 +214,7 @@ class Encoder:
 
     def split(self, json_line: str) -> tuple[str, int]:
         """Split configured JSON text fields into sentence lists."""
-        data = json.loads(json_line)
+        data = Encoder.record_transform(json.loads(json_line), Encoder.tokenizer)
         output = {}
         max_chunk_length = 1_000_000
         for key in self.args.json_keys:
@@ -179,6 +239,8 @@ class Encoder:
             Per-key token ids, per-key sentence lengths, and the input byte length.
         """
         data = json.loads(json_line)
+        if not self.args.split_sentences:
+            data = Encoder.record_transform(data, Encoder.tokenizer)
         ids = {}
         lens = {}
         keys = self.args.json_keys
@@ -387,6 +449,11 @@ def _add_offline_source_arguments(group: Any) -> None:
         (("--dataset-name-or-path",), {"required": True, "help": "Input JSON/JSONL file, directory, or glob."}),
         (("--output-prefix",), {"required": True, "help": "Path prefix for generated .bin/.idx files."}),
         (("--json-keys",), {"nargs": "+", "default": ["text"], "help": "JSON fields to tokenize."}),
+        (("--text-template",), {"default": None, "help": "Python format template for one source record."}),
+        (("--conversation-key",), {"default": None, "help": "Conversation list field to render."}),
+        (("--role-key",), {"default": "role", "help": "Conversation role field."}),
+        (("--content-key",), {"default": "content", "help": "Conversation content field."}),
+        (("--role-map",), {"type": parse_role_map, "default": None, "help": "JSON role alias map."}),
         (("--tokenizer-name-or-path",), {"required": True, "help": "Tokenizer name or local path."}),
         (("--chat-template",), {"default": None, "help": "Optional tokenizer chat template."}),
         (("--add-special-tokens",), {"nargs": "+", "default": None, "help": "Additional special tokens."}),
@@ -776,9 +843,23 @@ def prepare_offline_dataset(args: argparse.Namespace) -> None:
         args: Offline dataset preprocessing configuration.
     """
     worker_candidates = _validate_preparation_args(args)
+    record_transform = build_record_transform(args)
+    if record_transform.enabled:
+        input_files = _resolve_input_files(args.dataset_name_or_path)
+        input_files = [_materialize_normalized_jsonl(args, input_files, record_transform)]
+        args = argparse.Namespace(**vars(args))
+        args.dataset_name_or_path = input_files[0]
+        args.text_template = None
+        args.conversation_key = None
+        logger.info(
+            "Offline record conversion enabled: output=%s, source=%s",
+            record_transform.output_key,
+            record_transform.conversation_key or "text_template",
+        )
+    else:
+        input_files = _resolve_input_files(args.dataset_name_or_path)
 
     performance = {}
-    input_files = _resolve_input_files(args.dataset_name_or_path)
     for workers in worker_candidates:
         logger.info("Processing data with %d workers.", workers)
         workers_per_partition = workers // args.partitions

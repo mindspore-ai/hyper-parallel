@@ -33,6 +33,7 @@ from typing import Any, List
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.tools.offline_config import OfflinePreparationConfig
+from hyper_parallel.data.tools.offline_record_transform import parse_role_map
 from hyper_parallel.data.tools.offline_preparation import (
     prepare_offline_dataset,
 )
@@ -78,15 +79,16 @@ def _download_jsonl(config: OfflinePreparationConfig) -> Path:
     }
     load_dataset_kwargs.update({key: value for key, value in optional_load_dataset_kwargs.items() if value is not None})
     dataset = load_dataset(**load_dataset_kwargs)
-    keys = config.json_keys_list()
-    missing_keys = [key for key in keys if key not in dataset.column_names]
-    if missing_keys:
-        raise ValueError(
-            f"Dataset {config.dataset_name_or_path} does not contain configured "
-            f"keys {missing_keys}; "
-            f"available columns: {dataset.column_names}"
-        )
-    dataset = dataset.select_columns(keys)
+    if not config.uses_record_transform():
+        keys = config.json_keys_list()
+        missing_keys = [key for key in keys if key not in dataset.column_names]
+        if missing_keys:
+            raise ValueError(
+                f"Dataset {config.dataset_name_or_path} does not contain configured "
+                f"keys {missing_keys}; "
+                f"available columns: {dataset.column_names}"
+            )
+        dataset = dataset.select_columns(keys)
 
     json_path.parent.mkdir(parents=True, exist_ok=True)
     dataset.to_json(
@@ -122,6 +124,11 @@ def _add_huggingface_arguments(parser: argparse.ArgumentParser) -> None:
         (("--data-files",), {"nargs": "+", "default": None, "help": "Optional source data files."}),
         (("--num-proc",), {"type": int, "default": None, "help": "Dataset preparation process count."}),
         (("--json-keys",), {"nargs": "+", "default": ["text"], "help": "JSON fields to tokenize."}),
+        (("--text-template",), {"default": None, "help": "Python format template for one source record."}),
+        (("--conversation-key",), {"default": None, "help": "Conversation list field to render."}),
+        (("--role-key",), {"default": "role", "help": "Conversation role field."}),
+        (("--content-key",), {"default": "content", "help": "Conversation content field."}),
+        (("--role-map",), {"type": parse_role_map, "default": None, "help": "JSON role alias map."}),
     )
     for flags, options in dataset_arguments:
         dataset_group.add_argument(*flags, **options)
@@ -191,6 +198,11 @@ def main(argv: List[str] | None = None) -> None:
         data_files=args.data_files,
         num_proc=args.num_proc,
         json_keys=args.json_keys,
+        text_template=args.text_template,
+        conversation_key=args.conversation_key,
+        role_key=args.role_key,
+        content_key=args.content_key,
+        role_map=args.role_map,
         output_prefix=args.output_prefix,
         download_dir=args.download_dir,
         tokenizer_name_or_path=args.tokenizer,

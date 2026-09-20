@@ -7,7 +7,17 @@
 - `offline_preparation`：处理本地 JSON/JSONL 文件、目录或 glob 表达式。
 - `huggingface_offline`：下载 Hugging Face 数据集后进行处理，也可以直接处理本地数据。
 
-处理完成后，每个 `json_key` 会生成一组 `.bin` 和 `.idx` 文件。
+处理完成后，每个 `json_key` 会生成一组 `.bin` 和 `.idx` 文件。对于 Instruction/Alpaca、ShareGPT 等常见
+SFT 记录，工具会先生成可检查的 `<output-prefix>_normalized.jsonl`，再复用同一条 tokenizer 和 indexed writer
+链路。
+
+```text
+原始 JSON/JSONL 或 Hugging Face Dataset
+  -> Instruction 模板渲染 / ShareGPT 消息规范化
+  -> <output-prefix>_normalized.jsonl
+  -> Hugging Face tokenizer
+  -> Megatron .bin + .idx
+```
 
 ## 1. 使用前准备
 
@@ -102,7 +112,45 @@ Hugging Face Hub。
 
 每个字段会单独生成一组 `.bin` 和 `.idx` 文件。
 
-### 3.2 配置 EOD
+### 3.2 转换 Instruction/Alpaca 记录
+
+对于包含 `instruction`、`input`、`output` 的记录，使用 `--text-template` 指定 Python format 模板。模板
+渲染结果写入唯一的 `--json-keys` 输出字段，并保存为 `<output-prefix>_normalized.jsonl`，然后按普通
+plaintext 进行分词：
+
+```bash
+python -m hyper_parallel.data.tools.offline_preparation \
+    --dataset-name-or-path ./data/alpaca.jsonl \
+    --output-prefix ./offline_datasets/alpaca/train \
+    --json-keys text \
+    --text-template "Instruction: {instruction}\nInput: {input}\nOutput: {output}" \
+    --tokenizer-name-or-path /path/to/tokenizer
+```
+
+模板引用的每个字段都必须存在。对于没有 `input` 字段的数据，应使用不含 `{input}` 的模板。
+
+### 3.3 转换 ShareGPT 记录
+
+ShareGPT 常用结构为 `conversations: [{from, value}]`。配置会将其规范化为
+`messages: [{role, content}]`，再使用 tokenizer 的 chat template 渲染为 plaintext，并保存为
+`<output-prefix>_normalized.jsonl`：
+
+```bash
+python -m hyper_parallel.data.tools.offline_preparation \
+    --dataset-name-or-path ./data/sharegpt.jsonl \
+    --output-prefix ./offline_datasets/sharegpt/train \
+    --json-keys text \
+    --conversation-key conversations \
+    --role-key from \
+    --content-key value \
+    --tokenizer-name-or-path /path/to/tokenizer
+```
+
+默认角色归一化包括 `human -> user`、`gpt -> assistant`、`bot/model -> assistant`，并保留 `system`。可通过
+`--role-map '{"customer": "user"}'` 补充或覆盖别名。ShareGPT 转换要求 tokenizer 自带 chat template，或显式传入
+`--chat-template`。
+
+### 3.4 配置 EOD
 
 工具默认在每个非空文档末尾追加 tokenizer 的 EOS token；tokenizer 没有 EOS 时尝试使用 SEP token。
 
@@ -121,7 +169,7 @@ Hugging Face Hub。
 如果启用了 `--pack-to-seq-len`，同时将 `--append-eod` 设置为 `false`，工具会输出 warning。此时仍会生成
 定长样本，但原始文档边界不会包含 EOD token。
 
-### 3.3 配置 tokenizer
+### 3.5 配置 tokenizer
 
 使用 Hugging Face 模型名称：
 
@@ -159,7 +207,7 @@ Hugging Face Hub。
 --chat-template "{{ messages }}"
 ```
 
-### 3.4 配置并行处理
+### 3.6 配置并行处理
 
 ```bash
 --workers 8 --partitions 2
@@ -178,7 +226,7 @@ Hugging Face Hub。
 
 未设置时，数据按 round-robin 方式分配到各 partition。
 
-### 3.5 生成定长样本
+### 3.7 生成定长样本
 
 下面的配置适用于训练序列长度为 4096 的场景：
 
@@ -189,7 +237,7 @@ Hugging Face Hub。
 启用后，每个输出 document 包含 `4097` 个 token，用于构造长度为 `4096` 的 input 和 label。每个 partition
 最后不足 `4097` 个 token 的残余部分会被直接丢弃，不进行 padding。
 
-### 3.6 分句处理
+### 3.8 分句处理
 
 启用 NLTK Punkt 分句：
 
@@ -209,7 +257,7 @@ Hugging Face Hub。
 --split-sentences --keep-newlines
 ```
 
-### 3.7 自动选择 worker 数量
+### 3.9 自动选择 worker 数量
 
 ```bash
 --find-optimal-num-workers \
@@ -232,6 +280,11 @@ python -m hyper_parallel.data.tools.offline_preparation [参数]
 | `--dataset-name-or-path` | 是 | 无 | 本地文件、目录或 glob 表达式 |
 | `--output-prefix` | 是 | 无 | 输出路径前缀，不要添加 `.bin` 或 `.idx` 后缀 |
 | `--json-keys` | 否 | `text` | 要处理的字段，可配置一个或多个字段 |
+| `--text-template` | 否 | `None` | 用 Python format 模板将一条记录渲染到唯一的 `json-keys` 输出字段 |
+| `--conversation-key` | 否 | `None` | 使用 chat template 渲染的会话列表字段 |
+| `--role-key` | 否 | `role` | 会话消息中的角色字段 |
+| `--content-key` | 否 | `content` | 会话消息中的内容字段 |
+| `--role-map` | 否 | `None` | JSON 角色别名映射，例如 `'{"customer": "user"}'` |
 | `--tokenizer-name-or-path` | 是 | 无 | Hugging Face tokenizer 名称或本地目录 |
 | `--chat-template` | 否 | `None` | 覆盖 tokenizer 的 chat template |
 | `--add-special-tokens` | 否 | `None` | 添加一个或多个 special token |
@@ -284,6 +337,11 @@ python -m hyper_parallel.data.tools.huggingface_offline [参数]
 | 参数 | 是否必填 | 默认值 | 配置说明 |
 |---|---:|---:|---|
 | `--json-keys` | 否 | `text` | 要处理的字段，可配置一个或多个字段 |
+| `--text-template` | 否 | `None` | 用 Python format 模板将一条记录渲染到唯一的 `json-keys` 输出字段 |
+| `--conversation-key` | 否 | `None` | 使用 chat template 渲染的会话列表字段 |
+| `--role-key` | 否 | `role` | 会话消息中的角色字段 |
+| `--content-key` | 否 | `content` | 会话消息中的内容字段 |
+| `--role-map` | 否 | `None` | JSON 角色别名映射，例如 `'{"customer": "user"}'` |
 | `--tokenizer` | 是 | 无 | Hugging Face tokenizer 名称或本地目录 |
 | `--tokenizer-use-fast` | 否 | `true` | 是否使用 fast tokenizer，使用 `true` 或 `false` |
 | `--trust-remote-code` | 否 | 关闭 | 允许数据集或 tokenizer 仓库执行自定义代码 |
