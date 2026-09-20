@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from threading import Condition, Thread
@@ -27,6 +27,7 @@ import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed_data.data_constructor import PackingDataConstructor
 from hyper_parallel.distributed_data.batch_sampler import BatchSamplerReader
+from hyper_parallel.distributed_data.device_prefetch import DevicePrefetchedStep, DeviceStepPrefetcher
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
@@ -63,7 +64,6 @@ def _validate_loader_components(
         metadata_reader: BatchSamplerReader | None,
         direct_sample_loader: PlannedSampleLoader | None,
         metadata_mode: bool,
-        double_buffer: bool,
 ) -> None:
     if not isinstance(metadata_mode, bool):
         raise ValueError("metadata_mode must be boolean.")
@@ -84,8 +84,6 @@ def _validate_loader_components(
         metadata_mode=metadata_mode,
         direct_sample_loader=direct_sample_loader,
     )
-    if not isinstance(double_buffer, bool):
-        raise ValueError("double_buffer must be boolean.")
 
 
 def _validate_metadata_loader_owner(
@@ -106,8 +104,9 @@ class DistributedDataLoader(Iterator[Any]):
     One distributed transaction fills Dataset Reader buffers, freezes the
     current Step Sample Selection, balances that exact set, moves payloads,
     constructs local batches, and broadcasts them to model-parallel peers.
-    Optional double buffering runs the next transaction in a background thread
-    after the current batch has been returned to the trainer.
+    One-step buffering overlaps CPU preparation and final H2D with training.
+    Accelerator collectives are launched by the caller through prefetch hooks;
+    ordinary iteration completes any omitted hooks before returning a batch.
     """
 
     # HP Trainer and batch adapters must advance this loader on every model peer.
@@ -126,8 +125,8 @@ class DistributedDataLoader(Iterator[Any]):
             data_constructor: PackingDataConstructor,
             data_plane: DataPlaneTransport,
             model_transport: ModelParallelTransport,
-            double_buffer: bool,
             config_fingerprint: str,
+            device_prefetch: DeviceStepPrefetcher | None = None,
             batch_sampler_mode: bool = False,
             external_step_mode: bool = False,
             initial_epoch: int = 0,
@@ -144,7 +143,6 @@ class DistributedDataLoader(Iterator[Any]):
             metadata_reader=metadata_reader,
             direct_sample_loader=direct_sample_loader,
             metadata_mode=metadata_mode,
-            double_buffer=double_buffer,
         )
         self._topology = topology
         self._dataset_reader_ranks = frozenset(dataset_reader_ranks)
@@ -156,7 +154,7 @@ class DistributedDataLoader(Iterator[Any]):
         self._data_constructor = data_constructor
         self._data_plane = data_plane
         self._model_transport = model_transport
-        self._double_buffer = double_buffer
+        self._device_prefetch = device_prefetch
         self._config_fingerprint = config_fingerprint
         self._batch_sampler_mode = batch_sampler_mode
         self._external_step_mode = external_step_mode
@@ -176,6 +174,8 @@ class DistributedDataLoader(Iterator[Any]):
         self._prefetch_requested = False
         self._prefetch_in_flight = False
         self._prefetch_stream: Any = None
+        self._prefetch_task: Callable[[], Any] | None = self._prepare_next_batch
+        self._prefetch_phase = "source"
 
     def __iter__(self) -> "DistributedDataLoader":
         """Return this stateful distributed iterator."""
@@ -183,26 +183,64 @@ class DistributedDataLoader(Iterator[Any]):
 
     def __next__(self) -> Any:
         """Collectively construct and return the next rank-local batch."""
-        if self._double_buffer:
-            received = self._broadcast_batch(self._take_prefetched())
-        else:
-            received = self._prepare_and_broadcast_batch()
+        if self._stopped:
+            raise StopIteration
+        self.prefetch()
+        batch = self._take_prefetched()
+        if isinstance(batch, DevicePrefetchedStep):
+            batch = batch.take_microbatch(0)
+        received = self._broadcast_batch(batch)
         data = self._consume_batch(received)
-        if self._double_buffer:
-            self._start_prefetch()
+        self._prefetch_phase = "source"
+        self._start_prefetch()
         return data
 
-    def _prepare_and_broadcast_batch(self) -> Any:
-        """Prepare the next batch and broadcast it to model-parallel peers."""
-        constructed_batch = None
-        if self._data_plane.is_member:
-            constructed_batch = self._produce_on_data_plane()
-        return self._model_transport.broadcast(constructed_batch)
+    @property
+    def _caller_collectives(self) -> bool:
+        return self._data_plane.communication_backend in ("hccl", "nccl")
+
+    def prefetch_plan(self) -> None:
+        """Gather metadata on the caller after current-step compute submission."""
+        if not self._caller_collectives or self._stopped or self._prefetch_phase != "source":
+            return
+        snapshot = self._take_prefetched()
+        with self._prefetch_stream_context():
+            snapshots = self._data_plane.gather_object_to_planner(snapshot) if self._data_plane.is_member else None
+        self._prefetch_phase = "plan"
+        self._start_prefetch(lambda: self._build_plan_control(snapshots) if snapshots is not None else None)
+
+    def prefetch(self) -> None:
+        """Launch next-step routing on the caller, then construct and copy off-thread."""
+        self.prefetch_plan()
+        if not self._caller_collectives or self._stopped or self._prefetch_phase != "plan":
+            return
+        plan = self._take_prefetched()
+        with self._prefetch_stream_context():
+            if self._data_plane.is_member:
+                plan = self._data_plane.broadcast_from_planner(plan)
+            self._set_pending_plan(plan)
+            work = None
+            if plan is not None and not self._metadata_mode:
+                work = self._data_plane.begin_exchange_prepared(self._prepare_outgoing(plan, self._pending_local_keys))
+        self._prefetch_phase = "batch"
+        self._start_prefetch(lambda: self._finish_planned_batch(plan, work))
+
+    def _finish_planned_batch(self, plan: DistributedPackingPlan | None, work: Any) -> Any:
+        if plan is None:
+            return None
+        if self._metadata_mode:
+            batch = self._produce_metadata_batch(plan)
+        else:
+            batch = self._construct_received_payloads(plan, work.wait())
+        return self._stage_batch(batch)
+
+    def _stage_batch(self, batch: Any) -> Any:
+        return self._device_prefetch([batch]) if batch is not None and self._device_prefetch is not None else batch
 
     def _prepare_next_batch(self) -> Any:
         """Select, balance, route, and construct samples without model-group broadcast."""
         if self._data_plane.is_member:
-            return self._produce_on_data_plane()
+            return self._stage_batch(self._produce_on_data_plane())
         return None
 
     def _broadcast_batch(self, constructed_batch: Any) -> Any:
@@ -215,6 +253,7 @@ class DistributedDataLoader(Iterator[Any]):
             self._stopped = True
             self._pending_local_keys.clear()
             self._pending_plan = None
+            self.close()
             raise StopIteration
         # Dataset Reader buffers are committed only after construction and broadcast
         # have both succeeded, leaving checkpoint boundaries unambiguous.
@@ -230,7 +269,7 @@ class DistributedDataLoader(Iterator[Any]):
         self._step += 1
         return received
 
-    def _start_prefetch(self) -> None:
+    def _start_prefetch(self, task: Callable[[], Any] | None = None) -> None:
         """Submit one background transaction to the persistent prefetch thread."""
         with self._prefetch_condition:
             if self._prefetch_in_flight:
@@ -243,6 +282,9 @@ class DistributedDataLoader(Iterator[Any]):
                 )
                 self._prefetch_thread.start()
             self._prefetch_result = _PREFETCH_PENDING
+            self._prefetch_task = task or (
+                self._fill_local_reader if self._caller_collectives else self._prepare_next_batch
+            )
             self._prefetch_error = None
             self._prefetch_requested = True
             self._prefetch_in_flight = True
@@ -258,12 +300,14 @@ class DistributedDataLoader(Iterator[Any]):
                 while not self._prefetch_requested:
                     self._prefetch_condition.wait()
                 self._prefetch_requested = False
+            if self._prefetch_task is None:
+                return
             try:
                 if not device_bound:
                     self._bind_prefetch_device()
                     device_bound = True
                 with self._prefetch_stream_context():
-                    batch = self._prepare_next_batch()
+                    batch = self._prefetch_task()
             except BaseException as exc:  # The foreground re-raises failures at the next iterator boundary.
                 with self._prefetch_condition:
                     self._prefetch_error = exc
@@ -285,7 +329,7 @@ class DistributedDataLoader(Iterator[Any]):
     def _prefetch_stream_context(self) -> Any:
         """Keep payload HCCL dependencies off the model's caller stream."""
         device = getattr(self._data_plane, "communication_device", None)
-        if device is None or device.type != "npu":
+        if device is None or device.type not in ("npu", "cuda"):
             return nullcontext()
         device_module = getattr(torch, device.type)
         if self._prefetch_stream is None:
@@ -331,22 +375,46 @@ class DistributedDataLoader(Iterator[Any]):
                     and self._prefetch_error is None
             ):
                 self._prefetch_condition.wait()
+        if self._device_prefetch is not None:
+            self._device_prefetch.close()
+        if self._prefetch_error is not None:
+            raise self._prefetch_error
 
     @property
     def last_plan(self) -> DistributedPackingPlan | None:
         """Return the last plan on data-plane ranks, otherwise ``None``."""
         return self._last_plan
 
+    def close(self) -> None:
+        """Drain the pending phase and release the persistent worker and copy buffers."""
+        try:
+            self.wait_for_prefetch()
+        finally:
+            with self._prefetch_condition:
+                self._prefetch_task = None
+                self._prefetch_requested = True
+                self._prefetch_condition.notify()
+            if self._prefetch_thread is not None:
+                self._prefetch_thread.join()
+                self._prefetch_thread = None
+            self._prefetch_result = _PREFETCH_PENDING
+            self._prefetch_in_flight = False
+            self._stopped = True
+
+    def __enter__(self) -> "DistributedDataLoader":
+        """Support deterministic cleanup on early loop exit."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        """Release prefetch resources before process-group teardown."""
+        self.close()
+
     def state_dict(self) -> dict[str, Any]:
         """Return rank-local state at a completed distributed-batch boundary."""
-        restart_prefetch = self._prefetch_in_flight
-        if restart_prefetch:
-            self._take_prefetched()
-            # Prefetch is speculative until the trainer requests the batch.
-            # Keep Reader buffers uncommitted so the checkpoint can replan it.
-            self._pending_local_keys.clear()
-            self._pending_plan = None
-        if self._pending_local_keys:
+        self.wait_for_prefetch()
+        # Readers snapshot their committed cursor, excluding speculative work.
+        # Keep the ready slot intact so saving does not repeat reads or collation.
+        if self._pending_local_keys and not self._prefetch_in_flight:
             raise ValueError("Cannot checkpoint while a distributed batch is in flight.")
         state = {
             "topology_fingerprint": self._topology.fingerprint,
@@ -366,8 +434,6 @@ class DistributedDataLoader(Iterator[Any]):
             copied_state = copy.deepcopy(state)
         except Exception as exc:
             raise ValueError(f"Distributed DataLoader state is not checkpointable: {exc}") from exc
-        if restart_prefetch:
-            self._start_prefetch()
         return copied_state
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
@@ -497,17 +563,15 @@ class DistributedDataLoader(Iterator[Any]):
         self._last_plan_id = None
         self._last_plan = None
         self._pending_plan = None
+        self._prefetch_phase = "source"
 
     def _produce_on_data_plane(self) -> Any:
         plan = self._next_plan_control()
         if plan is None:
             return None
 
-        self._pending_plan = plan
-        local_selected_keys = {
-            key for key in plan.selected_keys if key.reader_rank == self._topology.global_rank
-        }
-        self._pending_local_keys = local_selected_keys
+        self._set_pending_plan(plan)
+        local_selected_keys = self._pending_local_keys
         if self._metadata_mode:
             return self._produce_metadata_batch(plan)
 
@@ -531,6 +595,12 @@ class DistributedDataLoader(Iterator[Any]):
         outgoing = self._prepare_outgoing(plan, local_selected_keys)
         received_payloads = self._data_plane.exchange_prepared(outgoing)
         return self._construct_received_payloads(plan, received_payloads)
+
+    def _set_pending_plan(self, plan: DistributedPackingPlan | None) -> None:
+        self._pending_plan = plan
+        self._pending_local_keys = set() if plan is None else {
+            key for key in plan.selected_keys if key.reader_rank == self._topology.global_rank
+        }
 
     def _produce_metadata_batch(self, plan: DistributedPackingPlan) -> Any:
         """Directly read constructor-assigned shared indices without payload A2A."""

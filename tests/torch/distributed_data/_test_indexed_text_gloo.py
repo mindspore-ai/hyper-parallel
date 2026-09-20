@@ -145,8 +145,9 @@ def _run_epoch(prefix: str, mesh_context: object) -> None:
         )
         loader = build_distributed_dataloader(
             datasets[0], mesh_context.device_mesh,
-            DistributedDatasetConfig(seq_len=8, local_batch_size=4),
+            DistributedDatasetConfig(seq_len=8, local_batch_size=4, communication_backend="gloo"),
             batch_sampler=sampler, collate_fn=_collate_sources,
+            cost_model=lambda metadata: metadata.cost,
         )
         runtime = ParallelBatch(
             mesh_context=mesh_context, device="cpu", tokenizer=_Tokenizer(),
@@ -202,6 +203,7 @@ def _run_native_sampler(prefix: str, mesh_context: object) -> None:
         SimpleNamespace(dataloader_type="cyclic"), datasets=datasets, collate_fn=collate_fn,
         mesh_context=mesh_context,
         training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=8, seed=7), data_config=config,
+        cost_model=lambda metadata: metadata.cost,
     )
     loader = loaders[0]
     sampler = build_dataset_batch_sampler(

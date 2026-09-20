@@ -16,14 +16,20 @@
 
 import copy
 import unittest
+from contextlib import nullcontext
+from collections.abc import Callable
+from threading import current_thread
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, PropertyMock, patch
+
+import torch
 
 from hyper_parallel.auto_models.components.datasets.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
 from hyper_parallel.distributed_data.distributed_dataloader import _ReaderSnapshot
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import BufferedSampleMetadata, DistributedPackingPlan, SampleKey
+from hyper_parallel.distributed_data.transport import DataPlaneTransport
 from tests.common.mark_utils import arg_mark
 
 
@@ -113,14 +119,12 @@ def _steps():
     ]
 
 
-def _external_loader(reader=None, *, double_buffer=False, **options):
+def _external_loader(reader=None, **options):
     reader = _StepReader(_steps()) if reader is None else reader
     loader = build_distributed_dataloader(
         None, _StandaloneMesh(), DistributedDatasetConfig(seq_len=10, local_batch_size=1, **options),
-        external_step_reader=reader,
+        external_step_reader=reader, device="cpu", cost_model=lambda metadata: metadata.cost,
     )
-    # Exercise the retained runtime prefetch independently of public configuration.
-    loader._double_buffer = double_buffer
     return loader
 
 
@@ -134,6 +138,101 @@ def _sampler(size=6, local_batch_size=2):
 class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
     """Verify that each plan consumes one externally determined step."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_accelerator_collectives_stay_on_caller(self) -> None:
+        """Feature: Ordered accelerator collective launches.
+        Description: Consume steps with implicit or repeated explicit prefetch hooks.
+        Expectation: Collectives stay on the caller; CPU work reuses one background thread.
+        """
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit):
+                loader = _external_loader()
+                events = []
+
+                def record(name: str, callback: Callable[..., Any]) -> Callable[..., Any]:
+                    """Record thread ownership without changing callback semantics."""
+                    def run(*args: Any, **kwargs: Any) -> Any:
+                        """Execute one instrumented pipeline stage."""
+                        events.append((name, current_thread().name))
+                        return callback(*args, **kwargs)
+                    return run
+
+                with patch.object(DataPlaneTransport, "communication_backend", new_callable=PropertyMock,
+                                  return_value="hccl"), patch.object(
+                        loader, "_fill_local_reader", side_effect=record("read", loader._fill_local_reader),
+                ), patch.object(
+                        loader, "_build_plan_control", side_effect=record("plan", loader._build_plan_control),
+                ), patch.object(
+                        loader._data_plane, "gather_object_to_planner",
+                        side_effect=record("gather", loader._data_plane.gather_object_to_planner),
+                ), patch.object(
+                        loader._data_plane, "broadcast_from_planner",
+                        side_effect=record("broadcast", loader._data_plane.broadcast_from_planner),
+                ), patch.object(
+                        loader._data_plane, "begin_exchange_prepared",
+                        side_effect=record("exchange", loader._data_plane.begin_exchange_prepared),
+                ):
+                    self.assertEqual(next(loader)[0][0]["id"], 0)
+                    worker = loader._prefetch_thread
+                    if explicit:
+                        loader.prefetch_plan()
+                        loader.prefetch_plan()
+                        loader.prefetch()
+                        loader.prefetch()
+                    state = loader.state_dict()
+                    self.assertEqual(state["step"], 1)
+                    self.assertEqual(next(loader)[0][0]["id"], 2)
+                    self.assertIs(worker, loader._prefetch_thread)
+                    self.assertEqual(len(list(loader)), 1)
+                for name, thread in events:
+                    expected = "MainThread" if name in ("gather", "broadcast", "exchange") else worker.name
+                    self.assertEqual(thread, expected)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_sampler_paths_stage_h2d_before_model_broadcast(self) -> None:
+        """Feature: Shared sampler H2D staging.
+        Description: Consume and checkpoint online and metadata sampler batches.
+        Expectation: Broadcast waits for device copies without committing speculative reads.
+        """
+        for metadata_mode in (False, True):
+            with self.subTest(metadata_mode=metadata_mode):
+                accelerator = Mock()
+                accelerator.stream.side_effect = lambda _: nullcontext()
+                accelerator.Event.return_value.query.return_value = False
+                copies = []
+
+                def move(batch: Any, device: torch.device) -> dict[str, Any]:
+                    """Record an asynchronous copy without requiring accelerator hardware."""
+                    copies.append((batch, device, current_thread().name))
+                    return {"data": batch, "storage": Mock()}
+
+                options = {"metadata": [SampleMetadata(1)] * 6} if metadata_mode else {
+                    "metadata_fn": lambda _: SampleMetadata(1),
+                }
+                with patch.object(torch, "cuda", accelerator), patch(
+                        "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+                ):
+                    with build_distributed_dataloader(
+                            list(range(6)), _StandaloneMesh(),
+                            DistributedDatasetConfig(seq_len=10, local_batch_size=2, communication_backend="gloo"),
+                            batch_sampler=_sampler(), device="cuda:0", move_fn=move,
+                            cost_model=lambda metadata: metadata.cost, **options,
+                    ) as loader:
+                        broadcast = Mock(side_effect=lambda value: value)
+                        loader._model_transport = Mock(broadcast=broadcast)
+                        first = next(loader)
+                        self.assertEqual(first["data"], (0, 1))
+                        self.assertIs(broadcast.call_args.args[0], first)
+                        accelerator.current_stream.return_value.wait_event.assert_called_once()
+                        first["storage"].record_stream.assert_called_once()
+                        loader.wait_for_prefetch()
+                        self.assertEqual(len(copies), 2)
+                        self.assertTrue(all(thread != "MainThread" for _, _, thread in copies))
+                        state = loader.state_dict()
+                        self.assertEqual(state["step"], 1)
+                        self.assertEqual(len(copies), 2)
+                        self.assertEqual(next(loader)["data"], (2, 3))
+
     def test_plan_uses_reader_snapshots_in_collective_order(self) -> None:
         """Non-readers are filtered without changing source-selected membership."""
         loader = _external_loader()
@@ -144,7 +243,9 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             _ReaderSnapshot(1, True, ()),
             _ReaderSnapshot(2, False, (second,), ((second,),)),
         )
-        planner = DynamicPackingPlanner(data_parallel_size=2, seq_len=10, local_batch_size=1)
+        planner = DynamicPackingPlanner(
+            data_parallel_size=2, seq_len=10, local_batch_size=1, cost_model=lambda metadata: metadata.cost,
+        )
         with (
                 patch.object(loader, "_dataset_reader_ranks", frozenset((0, 2))),
                 patch.object(loader, "_planner", planner),
@@ -262,6 +363,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         loader = build_distributed_dataloader(
             Dataset(), _StandaloneMesh(), DistributedDatasetConfig(seq_len=10, local_batch_size=2),
             batch_sampler=_sampler(), metadata=[SampleMetadata(1)] * 6,
+            device="cpu", cost_model=lambda metadata: metadata.cost,
         )
         original_plan = loader._planner.plan
 
@@ -279,10 +381,11 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 loader._data_plane, "broadcast_from_planner", wraps=loader._data_plane.broadcast_from_planner,
         ) as broadcast:
             self.assertEqual(sorted(sample["id"] for sample in next(loader)), [0, 1])
+            loader.wait_for_prefetch()
         self.assertEqual(events[0][0], "plan")
-        self.assertEqual(sorted(index for kind, index in events if kind == "read"), [0, 1])
-        gather.assert_called_once()
-        broadcast.assert_called_once()
+        self.assertEqual(sorted(index for kind, index in events if kind == "read"), [0, 1, 2, 3])
+        self.assertEqual(gather.call_count, 2)
+        self.assertEqual(broadcast.call_count, 2)
         self.assertEqual(len(broadcast.call_args.args[0].selected_keys), 2)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
@@ -297,7 +400,9 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             batch = next(loader)
             self.assertEqual(sorted(sample["id"] for row in batch for sample in row),
                              [position * 2, position * 2 + 1])
-            self.assertEqual(reader.prepare_calls, position + 1)
+            loader.wait_for_prefetch()
+            self.assertEqual(reader.position, position + 1)
+            self.assertEqual(reader.prepare_calls, position + 2)
         self.assertFalse(hasattr(loader, "_step_sample_selector"))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
@@ -320,14 +425,12 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         Description: None denotes EOF; a fresh epoch replays the same explicitly selected steps.
         Expectation: Exhaustion remains stable and set_epoch replays source-defined steps.
         """
-        for double_buffer in (False, True):
-            with self.subTest(double_buffer=double_buffer):
-                loader = _external_loader(double_buffer=double_buffer)
-                expected = list(loader)
-                with self.assertRaises(StopIteration):
-                    next(loader)
-                loader.set_epoch(1)
-                self.assertEqual(list(loader), expected)
+        loader = _external_loader()
+        expected = list(loader)
+        with self.assertRaises(StopIteration):
+            next(loader)
+        loader.set_epoch(1)
+        self.assertEqual(list(loader), expected)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_double_buffer_reuses_worker_and_preserves_pending_result(self) -> None:
@@ -336,7 +439,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         Expectation: The same worker prepares the next uncommitted step.
         """
         reader = _StepReader(_steps())
-        loader = _external_loader(reader, double_buffer=True)
+        loader = _external_loader(reader)
         next(loader)
         thread = loader._prefetch_thread
         loader.wait_for_prefetch()
@@ -352,7 +455,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         Description: A producer exception wakes the consuming thread instead of hanging it.
         Expectation: The consumer receives the original background exception.
         """
-        loader = _external_loader(double_buffer=True)
+        loader = _external_loader()
         with patch.object(loader, "_prepare_next_batch", side_effect=RuntimeError("reader failed")):
             with self.assertRaisesRegex(RuntimeError, "reader failed"):
                 next(loader)
@@ -371,11 +474,11 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 samples, _StandaloneMesh(),
                 DistributedDatasetConfig(seq_len=10, local_batch_size=2),
                 metadata=[SampleMetadata(sample["tokens"]) for sample in samples], batch_sampler=_sampler(),
+                device="cpu", cost_model=lambda metadata: metadata.cost,
             )
-            loader._double_buffer = True
             return loader
 
-        for build in (metadata_loader, lambda: _external_loader(double_buffer=True)):
+        for build in (metadata_loader, _external_loader):
             with self.subTest(build=build):
                 loader = build()
                 next(loader)

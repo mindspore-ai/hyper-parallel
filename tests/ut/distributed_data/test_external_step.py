@@ -14,7 +14,6 @@
 # ============================================================================
 """Tests for the source-only external step adapter."""
 
-import copy
 import unittest
 from collections.abc import Iterator
 
@@ -74,6 +73,7 @@ def _build(source: _Source):
         pack_fn=lambda samples, seq_len: tuple(samples) if sum(item["tokens"] for item in samples) <= seq_len else None,
         collate_fn=list,
         external_step_source=source,
+        device="cpu", cost_model=lambda metadata: metadata.cost,
     )
 
 
@@ -81,37 +81,33 @@ class TestExternalStepAdapter(unittest.TestCase):
     """Verify that HP owns source metadata and checkpoint lifecycle."""
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_source_only_steps_and_resume(self) -> None:
+    def test_source_only_steps_and_checkpoint_contract(self) -> None:
         """Feature: External complete-step sources.
-        Description: Save an HP loader after one step and restore it around a fresh source.
-        Expectation: The restored loader returns the same next step as the uninterrupted loader.
+        Description: Consume two selected steps with the automatic balancing pipeline.
+        Expectation: Membership is preserved; unsupported resume fails explicitly.
         """
         source = _Source()
         loader = _build(source)
         self.assertEqual(next(loader), [({"id": 0, "tokens": 4},)])
-        state = copy.deepcopy(loader.state_dict())
+        with self.assertRaisesRegex(NotImplementedError, "checkpoint"):
+            loader.state_dict()
         self.assertEqual(next(loader), [({"id": 1, "tokens": 5},)])
 
-        resumed = _build(_Source())
-        resumed.load_state_dict(state)
-        self.assertEqual(next(resumed), [({"id": 1, "tokens": 5},)])
-
-        legacy_state = copy.deepcopy(state)
-        legacy_state["dataset_reader"].pop("payloads")
-        legacy_resumed = _build(_Source())
-        legacy_resumed.load_state_dict(legacy_state)
-        self.assertEqual(next(legacy_resumed), [({"id": 1, "tokens": 5},)])
+        with self.assertRaisesRegex(NotImplementedError, "checkpoint"):
+            loader.load_state_dict({})
+        loader.close()
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_source_requires_checkpoint_hooks(self) -> None:
+    def test_source_does_not_require_checkpoint_hooks(self) -> None:
         """Feature: External source lifecycle validation.
         Description: Build an HP loader around an iterable without checkpoint hooks.
-        Expectation: Build fails with a descriptive missing-state_dict error.
+        Expectation: A plain iterable is accepted and exhausts normally.
         """
         class Incomplete:
             def __iter__(self) -> Iterator[None]:
                 """Return an empty stream without implementing checkpoint hooks."""
                 return iter(())
 
-        with self.assertRaisesRegex(ValueError, "missing state_dict"):
-            _build(Incomplete())
+        loader = _build(Incomplete())
+        self.assertEqual(list(loader), [])
+        loader.close()

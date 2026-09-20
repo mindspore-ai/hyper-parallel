@@ -114,24 +114,24 @@ def _gather(value):
     return gathered
 
 
-def _loader(mesh, reader_ranks, double_buffer):
+def _loader(mesh, reader_ranks):
     rank = dist.get_rank()
     reader = _StepReader(rank, reader_ranks.index(rank)) if rank in reader_ranks else None
     loader = build_distributed_dataloader(
         None, mesh,
         DistributedDatasetConfig(
             seq_len=10, local_batch_size=1, dataset_reader_ranks=reader_ranks,
+            communication_backend="gloo",
         ),
         external_step_reader=reader,
+        device="cpu", cost_model=lambda metadata: metadata.cost,
     )
-    # Keep low-level runtime coverage after removal of the public prefetch switch.
-    loader._double_buffer = double_buffer
     return loader
 
 
-def _run_steps(mesh, reader_ranks, double_buffer):
+def _run_steps(mesh, reader_ranks):
     """Check step membership, routing, model peers, and checkpoint replay."""
-    loader = _loader(mesh, reader_ranks, double_buffer)
+    loader = _loader(mesh, reader_ranks)
     checkpoint = None
     second = None
     for step in range(2):
@@ -154,7 +154,7 @@ def _run_steps(mesh, reader_ranks, double_buffer):
             second = batch
     assert not list(loader), f"Expected exactly two producer steps, plan={loader.last_plan}"
 
-    resumed = _loader(mesh, reader_ranks, double_buffer)
+    resumed = _loader(mesh, reader_ranks)
     resumed.load_state_dict(checkpoint)
     replay = list(resumed)
     assert replay == [second], f"Replay changed membership: actual={replay}, expected={[second]}"
@@ -171,7 +171,7 @@ def _run_local_steps(dataset_api: bool) -> None:
            "cost": 9 if step == 0 and rank == 0 else 1} for ordinal in range(2)]]
         for step in range(2)
     ]
-    config = DistributedDatasetConfig(seq_len=10, local_batch_size=1, enable_dp_balance=True)
+    config = DistributedDatasetConfig(seq_len=10, local_batch_size=1, communication_backend="gloo")
 
     def metadata_fn(sample: dict) -> SampleMetadata:
         """Return a fixed footprint with deliberately skewed per-sample costs.
@@ -212,7 +212,8 @@ def test_dynamic_packing_dp2_mp2_gloo() -> None:
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "mp"))
         try:
             build_distributed_dataloader(
-                [0], mesh, DistributedDatasetConfig(seq_len=10, local_batch_size=1),
+                [0], mesh, DistributedDatasetConfig(seq_len=10, local_batch_size=1, communication_backend="gloo"),
+                device="cpu",
                 metadata=[SampleMetadata(1)],
             )
         except ValueError as error:
@@ -220,8 +221,7 @@ def test_dynamic_packing_dp2_mp2_gloo() -> None:
         else:
             raise AssertionError("Metadata streaming without a sampler must be rejected.")
         for reader_ranks in ((0, 2), (1, 3)):
-            for double_buffer in (False, True):
-                _run_steps(mesh, reader_ranks, double_buffer)
+            _run_steps(mesh, reader_ranks)
         for dataset_api in (False, True):
             _run_local_steps(dataset_api)
     finally:

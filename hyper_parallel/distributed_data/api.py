@@ -39,7 +39,7 @@ from hyper_parallel.distributed_data.data_constructor import (
 )
 from hyper_parallel.distributed_data.dataset import DistributedDataset
 from hyper_parallel.distributed_data.dataset_dataloader import DatasetDataLoader
-from hyper_parallel.distributed_data.device_prefetch import _resolve_device
+from hyper_parallel.distributed_data.device_prefetch import _create_device_prefetcher, _resolve_device
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorithm
 from hyper_parallel.distributed_data.cost_model import CostModel
@@ -907,7 +907,8 @@ def build_distributed_dataloader(
         device: Rank-local training device. Node-local balancing uses
             it for final H2D and for control/payload tensors when
             ``communication_backend="hccl"``. Gloo keeps metadata and raw
-            sample communication on the host.
+            sample communication on the host and defaults to CPU batches;
+            pass an explicit NPU/CUDA device to enable H2D with Gloo.
         batch_sampler: Optional native HP BatchSampler. Supply the rank-local
             sampler on every rank; only each DP Constructor advances it. Its
             next yield fixes local sample membership, with no second stride,
@@ -936,7 +937,8 @@ def build_distributed_dataloader(
         cost_model: Optional user workload callback replacing the default.
         balancing_algorithm: Optional assignment and objective policy. Receives
             already-scored samples; Hyper enforces capacities and the gain gate.
-        move_fn: Local-step H2D field mapping; retain CPU-only metadata here.
+        move_fn: H2D field mapping; retain CPU-only metadata here. Called per
+            microbatch for local-step sources, or per collated batch for samplers/readers.
         bin_stats_fn: Optional per-bin counters in the local-step rank-zero log.
         max_steps: Local-step step limit, including speculative prefetch.
 
@@ -964,7 +966,7 @@ def build_distributed_dataloader(
                 batch_sampler, external_step_source, external_step_reader,
         )) or dataloader_kwargs:
             raise ValueError("Configure source, metadata, collation and field placement on DistributedDataset.")
-        device = _resolve_device(device)
+        device = _resolve_device(device, communication_backend=config.communication_backend)
         loader = build_local_balancing_dataloader(
             dataset, mesh, config,
             metadata_fn=dataset.sample_metadata,
@@ -1015,6 +1017,7 @@ def build_distributed_dataloader(
         model_config=model_config,
         cost_model=cost_model,
         balancing_algorithm=balancing_algorithm,
+        move_fn=move_fn,
     )
 
 
@@ -1035,9 +1038,12 @@ def _build_distributed_dataloader_impl(
         model_config: Any = None,
         cost_model: CostModel | None = None,
         balancing_algorithm: BalancingAlgorithm | None = None,
+        move_fn: Callable[[Any, Any], Any] | None = None,
 ) -> DistributedDataLoader:
     if external_step_reader is not None and external_step_source is not None:
         raise ValueError("external_step_reader and external_step_source are mutually exclusive.")
+    if communication_device is None:
+        communication_device = _resolve_device(communication_backend=getattr(config, "communication_backend", "hccl"))
     metadata_mode = _resolve_metadata_mode(
         metadata_fn,
         metadata,
@@ -1050,6 +1056,7 @@ def _build_distributed_dataloader_impl(
         metadata_mode=metadata_mode, model_config=model_config,
         cost_model=cost_model, balancing_algorithm=balancing_algorithm,
     )
+    device_prefetch = None
     try:
         _populate_build_state(
             state,
@@ -1066,6 +1073,9 @@ def _build_distributed_dataloader_impl(
             external_step_reader,
             external_step_source,
         )
+        device = _resolve_device(communication_device)
+        device_prefetch = _create_device_prefetcher(device, move_fn)
+        state.communication_device = device
     except Exception as exc:  # Every WORLD rank must fail before subgroup creation.
         state.local_error = f"{type(exc).__name__}: {exc}"
 
@@ -1081,6 +1091,7 @@ def _build_distributed_dataloader_impl(
             state.communication_device if config.communication_backend == "hccl" else None
         ),
         enable_payload_exchange=not state.metadata_mode,
+        model_device=state.communication_device,
     )
 
     return DistributedDataLoader(
@@ -1109,7 +1120,7 @@ def _build_distributed_dataloader_impl(
                 state.communication_device if config.communication_backend == "hccl" else None
             ),
         ),
-        double_buffer=False,
+        device_prefetch=device_prefetch if state.topology.is_constructor else None,
         config_fingerprint=state.config_fingerprint,
     )
 

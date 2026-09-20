@@ -15,7 +15,7 @@
 """Collective VLM Trainer epochs, checkpoint callbacks and accumulation tails."""
 
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -28,6 +28,7 @@ from hyper_parallel.auto_models.components.data.vlm.metadata import vlm_sample_m
 from hyper_parallel.auto_models.trainer.base import BaseTrainer
 from hyper_parallel.auto_models.trainer.vlm_trainer import VLMTrainer
 from tests.common.vlm_fixtures import build_image_corpus, vlm_loader_target
+from tests.common.mark_utils import arg_mark
 
 
 def _loader(dataset: object) -> object:
@@ -38,12 +39,38 @@ def _loader(dataset: object) -> object:
         training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=4, seed=17),
         data_config={"load_balance": "native_batch_sampler"},
         max_seq_len=64, metadata_fn=vlm_sample_metadata,
+        cost_model=lambda metadata: metadata.cost,
     )
     return loaders[0]
 
 
 class TestVLMTrainer(unittest.TestCase):
     """Keep the native model path while adapting collective DataLoader lifecycle."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_trainer_schedules_prefetch_before_loss_sync(self) -> None:
+        """Feature: Trainer-owned prefetch scheduling.
+        Description: Record forward/backward and data-hook ordering.
+        Expectation: Planning follows forward and routing follows backward before loss synchronization.
+        """
+        trainer = object.__new__(BaseTrainer)
+        events = []
+        loss = Mock()
+        loss.backward.side_effect = lambda: events.append("backward")
+        trainer.preforward = lambda batch: batch
+        trainer.model = Mock(side_effect=lambda **_: events.append("forward"))
+        trainer.postforward = Mock(return_value=(loss, {}))
+        trainer.model_fwd_context = nullcontext()
+        trainer.model_bwd_context = nullcontext()
+        trainer.config = SimpleNamespace(training=SimpleNamespace(empty_cache_before_backward=False))
+        trainer.train_dataloader = Mock()
+        trainer.train_dataloader.prefetch_plan.side_effect = lambda: events.append("plan")
+        trainer.train_dataloader.prefetch.side_effect = lambda: events.append("prefetch")
+
+        actual, _ = trainer.forward_backward_step({})
+
+        self.assertIs(actual, loss)
+        self.assertEqual(events, ["forward", "plan", "backward", "prefetch"])
 
     def test_constructor_supplies_vlm_callback(self) -> None:
         """VLM Trainer initialization explicitly selects VLM rather than GPT metadata."""
@@ -86,7 +113,8 @@ class TestVLMTrainer(unittest.TestCase):
                     patch("hyper_parallel.auto_models.trainer.vlm_trainer.helper.print_device_mem_info"), \
                     patch.object(loader, "wait_for_prefetch", wraps=loader.wait_for_prefetch) as drain:
                 trainer.train()
-                drain.assert_called_once()
+            # Exhausted epochs release their workers; training also drains before teardown.
+            self.assertEqual(drain.call_count, 3)
             self.assertEqual(delivered, [[2, 3], [0, 1], [2, 3], [0, 1]])
             self.assertEqual(base.state.global_step, 5)
             self.assertEqual(base.state.epoch, 2)

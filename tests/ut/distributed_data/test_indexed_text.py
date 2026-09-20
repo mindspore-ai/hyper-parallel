@@ -102,6 +102,7 @@ class TestIndexedTextConstruction(unittest.TestCase):
             dataset,
             _StandaloneMesh(),
             DistributedDatasetConfig(seq_len=6, local_batch_size=2),
+            device="cpu", cost_model=lambda metadata: metadata.cost,
             batch_sampler=build_dataset_batch_sampler(
                 total_samples=2, micro_batch_size=2, global_batch_size=2, dp_world_size=1, dp_rank=0,
             ),

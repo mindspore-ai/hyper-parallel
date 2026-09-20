@@ -45,6 +45,7 @@ def build_test_loader(dataset: object, **kwargs: object) -> object:
         training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=4, seed=17),
         data_config={"load_balance": "native_batch_sampler", **kwargs},
         max_seq_len=64, metadata_fn=vlm_sample_metadata,
+        cost_model=lambda metadata: metadata.cost,
     )
     if samplers != (None, None, None):
         raise AssertionError(f"Collective loader must own sampler state, got {samplers}")

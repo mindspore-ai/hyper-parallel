@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Trainer- and producer-owned Host-to-device batch prefetch."""
+"""Producer-owned Host-to-device prefetch shared by all data loaders."""
 # This distributed-data package is intentionally PyTorch-only.
 
 from __future__ import annotations
@@ -85,103 +85,6 @@ def _record_stream(value: Any, stream: Any, visited: set[int] | None = None) -> 
             _record_stream(item, stream, visited)
 
 
-class DeviceBatchPrefetcher:
-    """Maintain one Trainer-owned batch on an accelerator copy stream.
-
-    The distributed DataLoader prepares a complete Host batch. The Trainer
-    calls :meth:`prefetch` after launching the current backward pass, then
-    calls :meth:`wait` before the next model or broadcast operation consumes
-    that batch. An optional ``prepare_fn`` performs CPU-only model-specific
-    work, such as extracting a CP UND attention-mask block, before H2D.
-    """
-
-    def __init__(
-            self,
-            device: Any,
-            *,
-            prepare_fn: Callable[[Any], Any] | None = None,
-            move_fn: Callable[[Any, torch.device], Any] | None = None,
-    ) -> None:
-        """Initialize an empty one-batch device slot.
-
-        Args:
-            device: Target CUDA or NPU device.
-            prepare_fn: Optional CPU transformation run before H2D.
-            move_fn: Optional H2D callback. It must enqueue non-blocking copies
-                on the current copy stream. The default supports tensors,
-                objects with ``to(device, non_blocking=True)``, and standard
-                nested containers.
-
-        Raises:
-            ValueError: If the device or callbacks are invalid.
-        """
-        try:
-            normalized_device = torch.device(device)
-        except Exception as exc:
-            raise ValueError(f"device is invalid: {device!r}.") from exc
-        if normalized_device.type == "cpu":
-            raise ValueError("DeviceBatchPrefetcher requires an accelerator device, not CPU.")
-        if prepare_fn is not None and not callable(prepare_fn):
-            raise ValueError("prepare_fn must be callable or None.")
-        if move_fn is not None and not callable(move_fn):
-            raise ValueError("move_fn must be callable or None.")
-        self._device = normalized_device
-        self._prepare_fn = prepare_fn
-        self._move_fn = _move_to_device if move_fn is None else move_fn
-        self._accelerator = _accelerator_module(self._device)
-        self._copy_stream = None
-        self._pending_batch = None
-        self._ready_event = None
-        self._has_pending = False
-
-    @property
-    def has_pending(self) -> bool:
-        """Return whether one prefetched device batch awaits consumption."""
-        return self._has_pending
-
-    def prefetch(self, host_batch: Any) -> None:
-        """Prepare and asynchronously move one Host batch to the device.
-
-        Args:
-            host_batch: Complete Host batch returned by the distributed loader.
-
-        Raises:
-            ValueError: If the one-batch slot is already occupied.
-        """
-        if self._has_pending:
-            raise ValueError("Cannot prefetch a second device batch before consuming the pending batch.")
-        prepared_batch = self._prepare_fn(host_batch) if self._prepare_fn is not None else host_batch
-        if self._copy_stream is None:
-            self._copy_stream = self._accelerator.Stream(device=self._device)
-        with self._accelerator.stream(self._copy_stream):
-            device_batch = self._move_fn(prepared_batch, self._device)
-            ready_event = self._accelerator.Event()
-            ready_event.record(self._copy_stream)
-        self._pending_batch = device_batch
-        self._ready_event = ready_event
-        self._has_pending = True
-
-    def wait(self) -> Any:
-        """Order the consumer stream after H2D and return the ready batch.
-
-        Returns:
-            The prefetched device batch.
-
-        Raises:
-            ValueError: If no device batch is pending.
-        """
-        if not self._has_pending or self._ready_event is None:
-            raise ValueError("No prefetched device batch is pending.")
-        current_stream = self._accelerator.current_stream(self._device)
-        self._ready_event.wait(current_stream)
-        batch = self._pending_batch
-        _record_stream(batch, current_stream)
-        self._pending_batch = None
-        self._ready_event = None
-        self._has_pending = False
-        return batch
-
-
 def _pin_memory(value: Any) -> Any:
     """Pin final collated CPU tensors without changing metadata or dtype."""
     if isinstance(value, torch.Tensor):
@@ -242,7 +145,6 @@ class DeviceStepPrefetcher:
     exchange finish before this stage runs. The consumer stream waits for the
     H2D event before using inputs, while training uses the original
     Host view for metrics and takes device microbatches immediately before use.
-    The trainer-owned :class:`DeviceBatchPrefetcher` API remains independent.
     """
 
     def __init__(
@@ -261,6 +163,8 @@ class DeviceStepPrefetcher:
         self.device = torch.device(device)
         if self.device.type not in ("cuda", "npu"):
             raise ValueError("DeviceStepPrefetcher requires a CUDA or NPU device.")
+        if move_fn is not None and not callable(move_fn):
+            raise ValueError("move_fn must be callable or None.")
         self._accelerator = _accelerator_module(self.device)
         self._move_fn = _move_to_device if move_fn is None else move_fn
         self._copy_stream = None
@@ -313,8 +217,10 @@ class DeviceStepPrefetcher:
         )
 
 
-def _resolve_device(device: Any = None) -> torch.device:
-    """Select the current accelerator unless an explicit CPU flow is requested."""
+def _resolve_device(device: Any = None, *, communication_backend: str = "hccl") -> torch.device:
+    """Keep Gloo on CPU by default; otherwise select the current accelerator."""
+    if device is None and communication_backend == "gloo":
+        return torch.device("cpu")
     if device is None:
         for device_type in ("npu", "cuda"):
             accelerator = getattr(torch, device_type, None)
@@ -337,4 +243,4 @@ def _create_device_prefetcher(
     return DeviceStepPrefetcher(device, move_fn=move_fn)
 
 
-__all__ = ["DeviceBatchPrefetcher"]
+__all__ = ["DeviceStepPrefetcher"]

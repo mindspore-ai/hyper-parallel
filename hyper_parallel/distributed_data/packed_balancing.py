@@ -28,7 +28,11 @@ import torch  # pylint: disable=forbidden-backend-import
 from hyper_parallel.distributed_data.balance_logging import log_balance_stats
 from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorithm, resolve_balancing_algorithm
 from hyper_parallel.distributed_data.cost_model import CostModel, resolve_cost_model
-from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher, _create_device_prefetcher
+from hyper_parallel.distributed_data.device_prefetch import (
+    DeviceStepPrefetcher,
+    _create_device_prefetcher,
+    _resolve_device,
+)
 from hyper_parallel.distributed_data.locality import _create_locality_groups
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import (
@@ -252,6 +256,7 @@ class LocalBalancingDataLoader:
         self.max_steps = max_steps
         self.prefetches_to_device = device_prefetch is not None
         self.last_balance_stats: dict[str, Any] | None = None
+        self.last_host_batch: Any = None
         self._metadata_fn = metadata_fn
         self._bin_stats_fn = bin_stats_fn
         self._pack_fn = pack_fn
@@ -262,7 +267,6 @@ class LocalBalancingDataLoader:
         self._data_rank = self.group_ranks.index(global_rank)
         self._iterator: _LocalBalancingIterator | None = None
         self._device_prefetch = device_prefetch
-        self._device_batch = None
         self._data_stream = None
         self._balance_stats_callback = balance_stats_callback
 
@@ -323,7 +327,7 @@ class LocalBalancingDataLoader:
             self._iterator = None
         if self._device_prefetch is not None:
             self._device_prefetch.close()
-        self._device_batch = None
+        self.last_host_batch = None
         setter = getattr(self.local_dataloader, "set_epoch", None)
         if callable(setter):
             setter(epoch)
@@ -358,19 +362,8 @@ class LocalBalancingDataLoader:
         """
         if self._iterator is not None:
             self._iterator.wait_for_prefetch()
-
-    def take_device_microbatch(self, index: int) -> Any:
-        """Take one staged microbatch just before training consumes it.
-
-        Args:
-            index: Microbatch index in the last delivered Host step.
-
-        Returns:
-            Device inputs with allocator lifetime recorded on the consumer stream.
-        """
-        if self._device_batch is None:
-            raise RuntimeError("No device-prefetched step has been delivered.")
-        return self._device_batch.take_microbatch(index)
+        if self._device_prefetch is not None:
+            self._device_prefetch.close()
 
     def close(self) -> None:
         """Drain the producer and release unconsumed Host/device views."""
@@ -378,14 +371,16 @@ class LocalBalancingDataLoader:
             self._iterator.close()
         if self._device_prefetch is not None:
             self._device_prefetch.close()
-        self._device_batch = None
+        self.last_host_batch = None
 
     def _deliver_batch(self, result: _LocalBatch, step: int) -> Any:
         batch = result.data
         if self.prefetches_to_device:
-            self._device_batch = batch
-            # Logging and metering use the original Host view, without D2H.
-            batch = batch.cpu_micro_batches
+            self.last_host_batch = batch.cpu_micro_batches
+            ready = [batch.take_microbatch(index) for index in range(len(batch.cpu_micro_batches))]
+            batch = tuple(ready) if isinstance(batch.cpu_micro_batches, tuple) else ready
+        else:
+            self.last_host_batch = batch
         if result.stats is not None and self._balance_stats_callback is not None and self._global_rank == 0:
             self._balance_stats_callback(result.stats, step, self.max_steps)
         return batch
@@ -589,8 +584,8 @@ def build_local_balancing_dataloader(
         cost_model: Optional user estimate replacing the default cost model.
         balancing_algorithm: Optional sample assignment and objective policy.
             Costs and the improvement gate remain framework-owned.
-        device: Training device; defaults to the current NPU or CUDA device.
-            CPU-only execution keeps batches on the host.
+        device: Training device; defaults to CPU with Gloo, otherwise the current
+            accelerator. Pass an explicit NPU/CUDA device for H2D with Gloo.
         move_fn: Optional per-microbatch tensor mapping to the training device;
             use it to retain fields that must stay on CPU.
         bin_stats_fn: Optional CPU-only per-bin counters for the rank-zero log.
@@ -605,8 +600,8 @@ def build_local_balancing_dataloader(
     Note:
         All ranks must consume the same number of steps. Checkpoint/resume and
         nontrivial model parallelism are not supported by this local-step path.
-        The iterator yields CPU views for metering; take_device_microbatch()
-        hands the staged device view to training without another transfer.
+        Iteration returns device-ready batches. last_host_batch retains the CPU
+        view for metering without a device-to-host copy.
     """
     error = None
     identity = None
@@ -614,6 +609,7 @@ def build_local_balancing_dataloader(
     try:
         cost_model = resolve_cost_model(cost_model, model_config)
         balancing_algorithm = resolve_balancing_algorithm(balancing_algorithm)
+        device = _resolve_device(device, communication_backend=config.communication_backend)
         device_prefetch = _create_device_prefetcher(device, move_fn)
         if not all(callable(callback) for callback in (metadata_fn, pack_fn, collate_fn)):
             raise ValueError("metadata_fn, pack_fn and collate_fn must be callable.")
@@ -641,7 +637,9 @@ def build_local_balancing_dataloader(
         }, sort_keys=True)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-    communication_device = device if config.communication_backend == "hccl" else None
+    communication_device = None
+    if config.communication_backend == "hccl":
+        communication_device = device_prefetch.device if device_prefetch is not None else device
     topology, groups = _create_locality_groups(
         mesh,
         dp_dim_names=config.dp_dim_names,

@@ -46,12 +46,9 @@ class DatasetDataLoader(Iterator[list[Any]]):
 
     def __next__(self) -> list[Any]:
         """Return ready microbatches with the dataset's CPU field policy applied."""
-        host_batch = next(self._loader)
-        self.last_host_batch = host_batch
-        if self._loader.prefetches_to_device:
-            return [self._loader.take_device_microbatch(index) for index in range(len(host_batch))]
-        # CPU-only execution has no device-prefetch slot.
-        return [self.dataset.move_to_device(batch, self.device) for batch in host_batch]
+        batch = next(self._loader)
+        self.last_host_batch = self._loader.last_host_batch
+        return batch
 
     def prefetch_plan(self) -> None:
         """Start next-step planning after compute submission on every rank."""
@@ -60,6 +57,10 @@ class DatasetDataLoader(Iterator[list[Any]]):
     def prefetch(self) -> None:
         """Launch next-step exchange before the trainer synchronizes compute."""
         self._loader.prefetch()
+
+    def wait_for_prefetch(self) -> None:
+        """Drain pending communication and copies without consuming the next step."""
+        self._loader.wait_for_prefetch()
 
     def __len__(self) -> int:
         """Return the source length or explicit step limit."""

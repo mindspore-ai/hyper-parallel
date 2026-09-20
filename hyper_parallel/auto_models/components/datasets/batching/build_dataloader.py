@@ -19,7 +19,7 @@ from __future__ import annotations
 import copy
 import operator
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 # DataLoader implementations use the PyTorch runtime directly.
@@ -228,7 +228,9 @@ def _build_native_sampler_loader(
         if getattr(dataloader_target, name, None) is not None
     }
     device_type = getattr(mesh_context.device_mesh, "device_type", "cpu")
-    communication_device = None
+    if device_type != "npu" and "communication_backend" not in data_config.get("distributed_dataloader", {}):
+        config = replace(config, communication_backend="gloo")
+    communication_device = torch.device("cpu")
     if device_type != "cpu":
         communication_device = torch.device(device_type, getattr(torch, device_type).current_device())
     return build_distributed_dataloader(

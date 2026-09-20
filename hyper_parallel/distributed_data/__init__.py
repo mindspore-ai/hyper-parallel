@@ -21,7 +21,6 @@ from hyper_parallel.distributed_data.cost_model import BackboneFlopsConfig, Cost
 from hyper_parallel.distributed_data.data_constructor import default_collate_fn, default_pack_fn
 from hyper_parallel.distributed_data.dataset import DistributedDataset, build_distributed_dataset
 from hyper_parallel.distributed_data.dataset_dataloader import DatasetDataLoader
-from hyper_parallel.distributed_data.device_prefetch import DeviceBatchPrefetcher
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.external_step import ExternalStepAdapter, ExternalStepSource
 from hyper_parallel.distributed_data.indexed_text import collate_indexed_text_sequences, pack_indexed_text_samples
@@ -44,7 +43,6 @@ __all__ = [
     "CostModel",
     "DefaultCostModel",
     "DatasetDataLoader",
-    "DeviceBatchPrefetcher",
     "DistributedDataLoader",
     "DistributedDataset",
     "DistributedDatasetConfig",

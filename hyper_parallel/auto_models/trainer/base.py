@@ -646,7 +646,14 @@ class BaseTrainer(Stateful, ABC):
     def forward_backward_step(
             self, micro_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Run forward and backward computation for one micro batch."""
+        """Run forward/backward and schedule next-batch preparation before loss sync.
+
+        Args:
+            micro_batch: Current microbatch's model and loss inputs.
+
+        Returns:
+            Differentiable loss and named loss components.
+        """
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
@@ -669,6 +676,9 @@ class BaseTrainer(Stateful, ABC):
 
             # with use_parallel_state("base"):
             loss, loss_dict = self.postforward(outputs, labels)
+            prefetch_plan = getattr(self.train_dataloader, "prefetch_plan", None)
+            if callable(prefetch_plan):
+                prefetch_plan()
             # The loss graph owns everything required for backward. Releasing
             # the model output here avoids retaining large vocabulary logits
             # until the whole backward pass finishes.
@@ -679,6 +689,9 @@ class BaseTrainer(Stateful, ABC):
             # Backward pass
             with self.model_bwd_context:
                 loss.backward()
+            prefetch = getattr(self.train_dataloader, "prefetch", None)
+            if callable(prefetch):
+                prefetch()
 
             del micro_batch
             return loss, loss_dict

@@ -98,35 +98,6 @@ class TestDistributedDataset(unittest.TestCase):
         self.assertEqual(batch["inputs"][0].device.type, "cpu")
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_disabled_balance_preserves_bins_without_metadata_or_prefetch(self) -> None:
-        """Feature: Disabled balancing.
-        Description: Iterate one source-selected step with balancing disabled.
-        Expectation: No metadata, collective, or speculative source read is performed.
-        """
-        samples = _samples()
-        source = Mock()
-        source.__iter__ = Mock(return_value=iter([[samples[:2]], [samples[2:]]]))
-        metadata = Mock(side_effect=AssertionError("metadata should not run"))
-        dataset = build_distributed_dataset(source, metadata=metadata, collate_fn=_collate)
-        with patch("hyper_parallel.distributed_data.packed_balancing._create_locality_groups") as groups:
-            with build_distributed_dataloader(
-                    dataset, _mesh(), DistributedDatasetConfig(seq_len=8, local_batch_size=1),
-                    device="cpu", max_steps=1,
-            ) as loader:
-                self.assertEqual(len(loader), 1)
-                self.assertEqual(next(loader)[0]["input_ids"].tolist(), [0, 1, 1, 2])
-                self.assertEqual(loader.step, 1)
-                self.assertIsNone(loader.last_balance_stats)
-                with self.assertRaises(StopIteration):
-                    next(loader)
-                remaining = next(source.__iter__.return_value)
-                self.assertEqual(len(remaining[0]), 2)
-                self.assertIs(remaining[0][0], samples[2])
-            groups.assert_not_called()
-        metadata.assert_not_called()
-        self.assertIsNone(loader.last_host_batch)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_enabled_balance_stops_prefetch_at_limit_and_reports_custom_cost(self) -> None:
         """Feature: Buffered local balancing.
         Description: Apply a custom cost model and an explicit one-step limit.
@@ -142,7 +113,7 @@ class TestDistributedDataset(unittest.TestCase):
                 yield [samples[step * 2:step * 2 + 2]]
 
         dataset = build_distributed_dataset(source(), metadata="metadata", collate_fn=_collate, log_fields=("images",))
-        config = DistributedDatasetConfig(seq_len=8, local_batch_size=1, enable_dp_balance=True)
+        config = DistributedDatasetConfig(seq_len=8, local_batch_size=1)
         with build_distributed_dataloader(
                 dataset, _mesh(), config, device="cpu", max_steps=1,
                 cost_model=lambda metadata: WorkloadCost(llm=metadata.cost.llm * 10),
@@ -166,7 +137,7 @@ class TestDistributedDataset(unittest.TestCase):
         dataset = build_distributed_dataset([], metadata="metadata", collate_fn=_collate)
         with self.assertRaisesRegex(ValueError, "model_config"):
             build_distributed_dataloader(
-                dataset, _mesh(), DistributedDatasetConfig(seq_len=8, local_batch_size=1, enable_dp_balance=True),
+                dataset, _mesh(), DistributedDatasetConfig(seq_len=8, local_batch_size=1),
                 device="cpu",
             )
 
@@ -180,7 +151,8 @@ class TestDistributedDataset(unittest.TestCase):
         source.__iter__ = Mock(side_effect=lambda: iter([[_samples()]]))
         dataset = build_distributed_dataset(source, metadata="metadata", collate_fn=_collate)
         with build_distributed_dataloader(
-                dataset, _mesh(), DistributedDatasetConfig(seq_len=8, local_batch_size=1), device="cpu",
+                dataset, _mesh(), DistributedDatasetConfig(seq_len=8, local_batch_size=1),
+                device="cpu", cost_model=lambda metadata: metadata.cost,
         ) as loader:
             first = next(loader)[0]["input_ids"]
             loader.set_epoch(3)
@@ -204,7 +176,7 @@ class TestDistributedDataset(unittest.TestCase):
             [[_samples()]], metadata="metadata", collate_fn=Mock(side_effect=failure),
         )
         with build_distributed_dataloader(
-                dataset, _mesh(), DistributedDatasetConfig(seq_len=8, local_batch_size=1, enable_dp_balance=True),
+                dataset, _mesh(), DistributedDatasetConfig(seq_len=8, local_batch_size=1),
                 device="cpu", cost_model=lambda metadata: metadata.cost,
         ) as loader:
             with self.assertRaises(RuntimeError) as caught:
@@ -233,12 +205,10 @@ class TestDistributedDataset(unittest.TestCase):
         dataset = build_distributed_dataset([], metadata="metadata", collate_fn=_collate)
         host_batch = [{"host": 1}, {"host": 2}]
         device_batch = [{"device": 1}, {"device": 2}]
-        local_loader = Mock(prefetches_to_device=True)
-        local_loader.__next__ = Mock(return_value=host_batch)
-        local_loader.take_device_microbatch.side_effect = device_batch
+        local_loader = Mock(last_host_batch=host_batch)
+        local_loader.__next__ = Mock(return_value=device_batch)
         loader = DatasetDataLoader(dataset, local_loader, torch.device("cpu"))
         with patch.object(dataset, "move_to_device") as move:
             self.assertEqual(next(loader), device_batch)
             self.assertIs(loader.last_host_batch, host_batch)
-            self.assertEqual([call.args[0] for call in local_loader.take_device_microbatch.call_args_list], [0, 1])
             move.assert_not_called()

@@ -114,6 +114,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 _StandaloneMesh(),
                 self._config(),
                 metadata_fn=_metadata_fn,
+                device="cpu", cost_model=lambda metadata: metadata.cost,
                 dataloader_kwargs=supplied,
                 batch_sampler=build_dataset_batch_sampler(
                     total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,
@@ -139,6 +140,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 _StandaloneMesh(),
                 self._config(),
                 metadata=metadata,
+                device="cpu", cost_model=lambda metadata: metadata.cost,
                 dataloader_kwargs=supplied,
                 batch_sampler=build_dataset_batch_sampler(
                     total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,

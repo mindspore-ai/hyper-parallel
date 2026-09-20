@@ -67,7 +67,7 @@ def _sampler(**overrides: object) -> object:
 
 def _loader(
         dataset: object, *, sampler: object = None, metadata_mode: bool = False,
-        double_buffer: bool = False, **options: object,
+        **options: object,
 ) -> object:
     kwargs = {"metadata": [SampleMetadata(pack_tokens=1, sample_id=index) for index in range(len(dataset))]}
     if not metadata_mode:
@@ -75,9 +75,8 @@ def _loader(
     loader = build_distributed_dataloader(
         dataset, _StandaloneMesh(), DistributedDatasetConfig(seq_len=16, local_batch_size=2, **options),
         batch_sampler=sampler if sampler is not None else _sampler(), **kwargs,
+        device="cpu", cost_model=lambda metadata: metadata.cost,
     )
-    # Public native loading is synchronous; this switch exercises the retained runtime.
-    loader._double_buffer = double_buffer
     return loader
 
 
@@ -95,9 +94,11 @@ class TestNativeBatchSampler(unittest.TestCase):
                 dataset = _TrackedDataset()
                 loader = _loader(dataset, metadata_mode=metadata_mode, buffer_size_multiplier=100)
                 self.assertEqual(_batch_ids(next(loader)), [0, 1])
-                self.assertEqual(sorted(dataset.reads), [0, 1])
-                self.assertEqual(_batch_ids(next(loader)), [2, 3])
+                loader.wait_for_prefetch()
                 self.assertEqual(sorted(dataset.reads), [0, 1, 2, 3])
+                self.assertEqual(_batch_ids(next(loader)), [2, 3])
+                loader.wait_for_prefetch()
+                self.assertEqual(sorted(dataset.reads), [0, 1, 2, 3, 4, 5])
 
     def test_native_mode_does_not_construct_dynamic_selector(self) -> None:
         """Native sampling should not allocate an unused stream selector."""
@@ -128,7 +129,8 @@ class TestNativeBatchSampler(unittest.TestCase):
                 dataset = _TrackedDataset()
                 loader = _loader(dataset, sampler=_sampler(index_mapping=[3] * 10), metadata_mode=metadata_mode)
                 self.assertEqual(_batch_ids(next(loader)), [3, 3])
-                self.assertEqual(dataset.reads, [3, 3])
+                loader.wait_for_prefetch()
+                self.assertEqual(dataset.reads, [3, 3, 3, 3])
                 self.assertEqual(len(set(loader.last_plan.selected_keys)), 2)
 
     def test_checkpoint_at_accumulation_round_excludes_prefetch(self) -> None:
@@ -136,7 +138,7 @@ class TestNativeBatchSampler(unittest.TestCase):
         for metadata_mode in (False, True):
             with self.subTest(metadata_mode=metadata_mode):
                 sampler = _sampler()
-                loader = _loader(_TrackedDataset(), sampler=sampler, metadata_mode=metadata_mode, double_buffer=True)
+                loader = _loader(_TrackedDataset(), sampler=sampler, metadata_mode=metadata_mode)
                 self.assertEqual(_batch_ids(next(loader)), [0, 1])
                 loader.wait_for_prefetch()
                 self.assertEqual(sampler.consumed_samples, 4)
@@ -148,7 +150,7 @@ class TestNativeBatchSampler(unittest.TestCase):
                     with self.subTest(reader_key=reader_key):
                         restored_state = dict(state)
                         restored_state[reader_key] = restored_state.pop("metadata_reader")
-                        resumed = _loader(_TrackedDataset(), metadata_mode=metadata_mode, double_buffer=True)
+                        resumed = _loader(_TrackedDataset(), metadata_mode=metadata_mode)
                         resumed.load_state_dict(restored_state)
                         self.assertEqual([_batch_ids(batch) for batch in resumed], original)
                 self.assertEqual(original[0], [2, 3])
@@ -187,6 +189,7 @@ class TestNativeBatchSampler(unittest.TestCase):
         loader = build_distributed_dataloader(
             _TrackedDataset(), _StandaloneMesh(), DistributedDatasetConfig(seq_len=16, local_batch_size=2),
             batch_sampler=_sampler(), metadata_fn=broken_metadata,
+            device="cpu", cost_model=lambda metadata: metadata.cost,
         )
         with self.assertRaisesRegex(RuntimeError, "invalid metadata callback"):
             next(loader)
@@ -194,19 +197,17 @@ class TestNativeBatchSampler(unittest.TestCase):
     def test_callback_errors_propagate_without_wrapping(self) -> None:
         """Only StopIteration needs translation; normal callback errors retain identity."""
         failure = ValueError("metadata unavailable")
-        for double_buffer in (False, True):
-            with self.subTest(double_buffer=double_buffer):
-                loader = build_distributed_dataloader(
-                    _TrackedDataset(), _StandaloneMesh(),
-                    DistributedDatasetConfig(seq_len=16, local_batch_size=2),
-                    batch_sampler=_sampler(), metadata_fn=_metadata,
-                )
-                loader._double_buffer = double_buffer
-                with patch.object(loader._dataset_reader, "_metadata_fn", side_effect=failure):
-                    with self.assertRaises(ValueError) as caught:
-                        next(loader)
-                self.assertIs(caught.exception, failure)
-                self.assertEqual(loader._dataset_reader.state_dict()["sampler"]["consumed_samples"], 0)
+        loader = build_distributed_dataloader(
+            _TrackedDataset(), _StandaloneMesh(),
+            DistributedDatasetConfig(seq_len=16, local_batch_size=2),
+            batch_sampler=_sampler(), metadata_fn=_metadata,
+            device="cpu", cost_model=lambda metadata: metadata.cost,
+        )
+        with patch.object(loader._dataset_reader, "_metadata_fn", side_effect=failure):
+            with self.assertRaises(ValueError) as caught:
+                next(loader)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(loader._dataset_reader.state_dict()["sampler"]["consumed_samples"], 0)
 
     def test_invalid_native_sampler_options_fail_at_build(self) -> None:
         """Reject incompatible slicing, shuffle, sizing, and custom packing early."""
@@ -295,3 +296,4 @@ class TestNativeBatchSampler(unittest.TestCase):
                 data_config={"seq_length": 16, "load_balance": "native_batch_sampler"},
             )
         self.assertEqual(str(build.call_args.kwargs["device"]), "cuda:3")
+        self.assertEqual(build.call_args.args[2].communication_backend, "gloo")

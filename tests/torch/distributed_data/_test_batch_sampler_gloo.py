@@ -71,7 +71,7 @@ def _run_case(
     dataset = _Dataset()
     reference = list(_sampler(sampler_type, data_sharding))
     source_sampler = _sampler(sampler_type, data_sharding)
-    config = DistributedDatasetConfig(seq_len=8, local_batch_size=2)
+    config = DistributedDatasetConfig(seq_len=8, local_batch_size=2, communication_backend="gloo")
     metadata_options = (
         {"metadata": [_metadata({"id": index}) for index in range(len(dataset))]}
         if metadata_mode else {"metadata_fn": _metadata}
@@ -80,6 +80,7 @@ def _run_case(
     with no_a2a if metadata_mode else nullcontext():
         loader = build_distributed_dataloader(
             dataset if rank % 2 == 0 else None, mesh, config, batch_sampler=source_sampler, **metadata_options,
+            cost_model=lambda metadata: metadata.cost,
         )
         saved_state = None
         delivered = []
@@ -120,6 +121,7 @@ def _run_case(
         resumed = build_distributed_dataloader(
             dataset if rank % 2 == 0 else None, mesh, config,
             batch_sampler=_sampler(sampler_type, data_sharding), **metadata_options,
+            cost_model=lambda metadata: metadata.cost,
         )
         resumed.load_state_dict(saved_state)
         remaining = list(resumed)
@@ -133,8 +135,9 @@ def _run_cost_balance(mesh: object) -> None:
         dp_rank=dist.get_rank() // 2, dp_world_size=2,
     )
     loader = build_distributed_dataloader(
-        _Dataset(), mesh, DistributedDatasetConfig(seq_len=8, local_batch_size=2),
+        _Dataset(), mesh, DistributedDatasetConfig(seq_len=8, local_batch_size=2, communication_backend="gloo"),
         batch_sampler=sampler, metadata_fn=_metadata,
+        cost_model=lambda metadata: metadata.cost,
     )
     next(loader)
     plan = _gather(loader.last_plan)[0]
@@ -142,6 +145,7 @@ def _run_cost_balance(mesh: object) -> None:
     assert actual_costs == [10, 10], f"Expected costs=[10, 10] instead of native [18, 2], got costs={actual_costs}"
     actual_indices = sorted(key.dataset_index for key in plan.selected_keys)
     assert actual_indices == [0, 1, 2, 3], f"Cost balancing changed the native round: indices={actual_indices}"
+    loader.close()
 
 
 def test_native_batch_sampler_dp2_tp2_gloo() -> None:

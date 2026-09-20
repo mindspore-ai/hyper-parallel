@@ -69,7 +69,10 @@ class TestDynamicPackingPlanner(unittest.TestCase):
             BufferedSampleMetadata(SampleKey(0, 7, position), SampleMetadata(2), position)
             for position in range(2)
         )
-        planner = DynamicPackingPlanner(data_parallel_size=2, seq_len=8, local_batch_size=1)
+        planner = DynamicPackingPlanner(
+            cost_model=lambda metadata: metadata.cost,
+            data_parallel_size=2, seq_len=8, local_batch_size=1,
+        )
         plan = planner.plan(samples, reference_bins=_reference_bins(samples, (1, 1)), step=0)
         self.assertEqual(set(plan.selected_keys), {sample.key for sample in samples})
         self.assertEqual(len(plan.selected_keys), 2)
@@ -85,11 +88,11 @@ class TestDynamicPackingPlanner(unittest.TestCase):
             for index, tokens in enumerate((6, 2, 2, 5, 3, 2))
         )
         reference_bins = _reference_bins(samples, (3, 3))
-        for enabled in (False, True):
-            with self.subTest(enable_balancing=enabled):
+        for validate in (False, True):
+            with self.subTest(validate=validate):
                 planner = DynamicPackingPlanner(
                     data_parallel_size=1, seq_len=10, local_batch_size=2,
-                    enable_balancing=enabled, cost_model=lambda _metadata: WorkloadCost(llm=1),
+                    cost_model=lambda _metadata: WorkloadCost(llm=1), validate=validate,
                 )
                 plan = planner.plan(samples, reference_bins=reference_bins, step=0)
                 self.assertEqual(
@@ -114,6 +117,7 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         )
         reference_bins = _reference_bins(samples, (2, 2))
         planner = DynamicPackingPlanner(
+            cost_model=lambda metadata: metadata.cost,
             data_parallel_size=2, seq_len=10, local_batch_size=1, min_balance_gain=0.6,
         )
         plan = planner.plan(samples, reference_bins=reference_bins, step=0)
@@ -130,9 +134,10 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         for validate in (False, True):
             with self.subTest(validate=validate):
                 planner = DynamicPackingPlanner(
+                    cost_model=lambda metadata: metadata.cost,
                     data_parallel_size=1, seq_len=5, local_batch_size=1, validate=validate,
                 )
-                with self.assertRaisesRegex(ValueError, "cannot fit within this bin"):
+                with self.assertRaisesRegex(ValueError, "cannot admit sample"):
                     planner.plan(samples, reference_bins=_reference_bins(samples, (2,)), step=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
@@ -143,7 +148,7 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         """
         planner = DynamicPackingPlanner(
             data_parallel_size=2, seq_len=10, local_batch_size=1,
-            enable_balancing=True, cost_model=lambda metadata: metadata.cost,
+            cost_model=lambda metadata: metadata.cost,
         )
         for costs, expected_costs in (((9, 9, 1, 1), [10, 10]), ((1, 1, 1, 1), [2, 2])):
             with self.subTest(costs=costs):
@@ -167,7 +172,10 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         Description: Place complementary selected samples across data-parallel bins.
         Expectation: Every selected sample is conserved and every bin is full.
         """
-        planner = DynamicPackingPlanner(data_parallel_size=2, seq_len=10, local_batch_size=1)
+        planner = DynamicPackingPlanner(
+            cost_model=lambda metadata: metadata.cost,
+            data_parallel_size=2, seq_len=10, local_batch_size=1,
+        )
         candidates = tuple(_candidate(index, tokens) for index, tokens in enumerate((7, 3, 7, 3)))
         reference_bins = _reference_bins(candidates, (2, 2))
 
@@ -185,13 +193,16 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         Description: Change sample costs while preserving packing footprints.
         Expectation: Cost changes placement without changing step membership.
         """
-        planner = DynamicPackingPlanner(data_parallel_size=2, seq_len=10, local_batch_size=1)
+        planner = DynamicPackingPlanner(
+            cost_model=lambda metadata: metadata.cost,
+            data_parallel_size=2, seq_len=10, local_batch_size=1,
+        )
         first_costs = tuple(
-            _candidate(index, 5, cost=WorkloadCost(encoder=100 if index == 0 else 1))
+            _candidate(index, 5, cost=WorkloadCost(llm=9 if index < 2 else 1))
             for index in range(4)
         )
         second_costs = tuple(
-            _candidate(index, 5, cost=WorkloadCost(encoder=100 if index == 1 else 1))
+            _candidate(index, 5, cost=WorkloadCost(llm=9 if index % 2 == 0 else 1))
             for index in range(4)
         )
 
@@ -208,7 +219,10 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         Description: Drive workload-aware greedy placement into a dead end.
         Expectation: The known-feasible canonical grouping preserves all samples.
         """
-        planner = DynamicPackingPlanner(data_parallel_size=1, seq_len=10, local_batch_size=2)
+        planner = DynamicPackingPlanner(
+            cost_model=lambda metadata: metadata.cost,
+            data_parallel_size=1, seq_len=10, local_batch_size=2,
+        )
         candidates = tuple(_candidate(index, tokens) for index, tokens in enumerate((6, 2, 2, 5, 3, 2)))
         reference_bins = _reference_bins(candidates, (3, 3))
 
@@ -228,13 +242,16 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         Description: Inject a balanced plan that omits selected keys.
         Expectation: The final invariant rejects the incomplete plan.
         """
-        planner = DynamicPackingPlanner(data_parallel_size=1, seq_len=10, local_batch_size=1)
+        planner = DynamicPackingPlanner(
+            cost_model=lambda metadata: metadata.cost,
+            data_parallel_size=1, seq_len=10, local_batch_size=1,
+        )
         candidates = (_candidate(0, 5), _candidate(1, 5))
         reference_bins = _reference_bins(candidates, (2,))
 
         with (
-                patch.object(planner, "_freeze_bins", return_value=()),
-                self.assertRaisesRegex(ValueError, "conserve the frozen step sample set exactly"),
+                patch.object(planner.balancing_algorithm, "assign", return_value=((candidates[0].key,),)),
+                self.assertRaisesRegex(ValueError, "conserve every selected sample key exactly once"),
         ):
             planner.plan(candidates, reference_bins=reference_bins, step=0)
 
@@ -244,7 +261,10 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         Description: Plan candidates in forward and reverse gathered order.
         Expectation: Canonical stream positions produce the same plan and ID.
         """
-        planner = DynamicPackingPlanner(data_parallel_size=2, seq_len=12, local_batch_size=2)
+        planner = DynamicPackingPlanner(
+            cost_model=lambda metadata: metadata.cost,
+            data_parallel_size=2, seq_len=12, local_batch_size=2,
+        )
         candidates = tuple(
             _candidate(
                 index,
@@ -270,7 +290,10 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         Description: Select a sample larger than the configured sequence length.
         Expectation: The default policy rejects overflow during planning.
         """
-        planner = DynamicPackingPlanner(data_parallel_size=1, seq_len=10, local_batch_size=1)
+        planner = DynamicPackingPlanner(
+            cost_model=lambda metadata: metadata.cost,
+            data_parallel_size=1, seq_len=10, local_batch_size=1,
+        )
         samples = (_candidate(0, 12),)
         with self.assertRaisesRegex(ValueError, "requires 12 tokens, exceeding seq_len=10"):
             planner.plan(samples, reference_bins=_reference_bins(samples, (1,)), step=0)
@@ -282,6 +305,7 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         Expectation: No other sample is packed with the oversized sample.
         """
         planner = DynamicPackingPlanner(
+            cost_model=lambda metadata: metadata.cost,
             data_parallel_size=1,
             seq_len=10,
             local_batch_size=1,

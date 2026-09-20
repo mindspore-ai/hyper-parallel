@@ -390,6 +390,7 @@ def create_data_groups(
         payload_backend: str | None,
         communication_device: Any,
         enable_payload_exchange: bool,
+        model_device: Any = None,
 ) -> DataGroups:
     """Create control, optional payload, and model groups deterministically.
 
@@ -402,6 +403,8 @@ def create_data_groups(
             with an accelerator communication device, the WORLD backend is used.
         communication_device: Optional rank-local device for payload tensors.
         enable_payload_exchange: Whether the online path needs a payload group.
+        model_device: Training device for direct model-peer tensor broadcast,
+            independent of the raw payload backend.
 
     Returns:
         Groups relevant to the current rank.
@@ -429,8 +432,11 @@ def create_data_groups(
         reuse_control_group=reuse_control_group,
         enable_payload_exchange=enable_payload_exchange,
     )
+    tensor_backend = _resolve_model_tensor_backend(communication_device, payload_backend)
+    if model_device is not None and torch.device(model_device).type in ("cuda", "npu"):
+        tensor_backend = "nccl" if torch.device(model_device).type == "cuda" else "hccl"
     model_parallel_group, model_parallel_tensor_group = _create_model_parallel_process_groups(
-        topology, cpu_backend, _resolve_model_tensor_backend(communication_device, payload_backend),
+        topology, cpu_backend, tensor_backend,
     )
     return DataGroups(
         data_plane_ranks, control_group, payload_group, model_parallel_group, planner_rank, True,
@@ -1155,13 +1161,17 @@ class ModelParallelTransport:
         received_tensors = []
         for index, spec in enumerate(tensor_specs):
             tensor_group = self._group_for_tensor(spec[2])
-            device = _tensor_device(spec[2], tensor_group)
+            # A move_fn may retain CPU-only fields even with HCCL control.
+            # Stage those leaves for transport, then restore their CPU placement.
+            host_over_device = spec[2] == "cpu" and _is_accelerator_backend(_control_backend(tensor_group))
+            device = self._communication_device if host_over_device else _tensor_device(spec[2], tensor_group)
             if is_constructor:
-                tensor = source_tensors[index]
+                tensor = source_tensors[index].to(device).contiguous()
             else:
                 tensor = torch.empty(spec[0], dtype=spec[1], device=device)
             dist.broadcast(tensor, src=self._constructor_rank, group=tensor_group)
-            received_tensors.append(tensor)
+            if not is_constructor:
+                received_tensors.append(tensor.cpu() if host_over_device else tensor)
         return batch if is_constructor else _decode_model_batch(received_schema, received_tensors)
 
     def _group_for_tensor(self, device_type: str) -> Any:

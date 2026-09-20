@@ -186,8 +186,10 @@ These factories are constructed only for `load_balance: native_batch_sampler`;
 they may accept the runtime `model_config`. Explicit Python policy arguments
 take precedence over configured factories. Omitting both selects default costs
 and LPT, not a separate disabled planner.
-For CUDA/NPU meshes the Trainer passes the foreground rank-local device to the
-existing device payload transport; CPU meshes use Gloo.
+The Trainer passes the foreground rank-local device for final H2D. NPU meshes
+default to HCCL data transport; CPU/CUDA meshes default to Gloo data transport.
+Explicit `communication_backend` settings take precedence. Accelerator model
+peers use a separate HCCL/NCCL tensor-broadcast group when needed.
 
 Current boundaries of the native-sampler path:
 
@@ -330,52 +332,52 @@ and applies packing/collation. The legacy
 `external_step_reader` remains supported as a compatibility interface. HP no
 longer infers step boundaries by scanning source metadata.
 
-Reader/sampler loading retains synchronous planning and its checkpoint
-contract. Dataset-owned and external raw-step loading automatically uses
-node-local exchange, one-step buffering and H2D. The communication backend
-defaults to HCCL for NPU training and can be set to Gloo. Every path accepts independent cost and
-assignment policies; plans below the required relative improvement keep the
-original distribution. See [node-local balancing](NODE_LOCAL_BALANCING.md).
+All paths use the same cost-model and assignment pipeline (default: LPT),
+one-step double buffering, and automatic H2D on the selected accelerator.
+There is no balance-enable or synchronous-loader switch. CPU execution keeps
+batches on the host. The original step membership and gain gate are unchanged.
+Gloo defaults to CPU batches; pass an explicit NPU/CUDA `device` to enable H2D
+while retaining Gloo for data-plane communication.
+Reader/sampler loading retains checkpoint/resume and metadata direct reads;
+metadata mode still skips payload A2A.
 
-For the reader/sampler path, Trainer-side H2D is a separate slot because CP-specific mask preparation and
-the accelerator copy stream are model-runtime concerns. `DeviceBatchPrefetcher`
-implements the reusable stream/Event part:
+`next(loader)` returns device-ready inputs. One shared producer-owned copy
+stage pins host tensors, enqueues non-blocking H2D on a separate stream, and
+records a ready event. The consumer stream waits on that event and records
+storage ownership before model broadcast or training uses the inputs. A
+`move_fn(batch, device)` can retain CPU-only fields or perform model-specific
+preparation; HP does not hard-code CP/UND masks. For source-only local steps,
+`move_fn` runs per microbatch; for samplers/readers it runs on the collated batch.
+The old standalone trainer-owned device-prefetch slot has been removed.
+
+HCCL/NCCL collectives must be launched on the training thread in a consistent
+order. Both loader adapters expose the same idempotent scheduling hooks:
 
 ```python
-from hyper_parallel.distributed_data import DeviceBatchPrefetcher
-
-device_prefetcher = DeviceBatchPrefetcher(
-    accelerator.device,
-    prepare_fn=prepare_cp_und_mask,  # optional CPU-only transformation
-)
-
-# The first batch has no previous compute to hide its copy behind.
-device_prefetcher.prefetch(next(loader))
-for step in range(train_steps):
-    batch = device_prefetcher.wait()  # Event wait before model/broadcast reads
-    loss = forward(batch)
-    backward(loss)
-    if step + 1 < train_steps:
-        device_prefetcher.prefetch(next(loader))
+batch = next(loader)
+loss = forward(batch)
+loader.prefetch_plan()  # gather metadata, then plan in the CPU worker
+backward(loss)
+loader.prefetch()       # launch routing; construct and H2D in the worker
 ```
 
-The prefetcher lazily creates one accelerator copy stream, calls
-`batch.to(device, non_blocking=True)` by default, records a per-batch ready
-Event, and associates device tensors with the consuming stream after the wait.
-Actual asynchronous H2D requires pinned Host tensors. A custom `move_fn` may be
-used for a batch type without a compatible `to` method.
+HP's Trainer invokes these hooks automatically before synchronizing loss.
+External training loops should invoke them at the same boundaries to overlap
+accelerator routing and final H2D. Without hooks, iteration remains correct,
+but completes these stages at the next `next(loader)` call. Gloo preparation
+can run entirely in the producer thread. Overlap is not a guarantee that all
+loading time is hidden; that depends on compute time and data volume.
 
-Every rank must continue to call `next(loader)` in the same order because the
-distributed loader performs collective planning and model-parallel Host
-broadcast. In that normal path, each rank moves its received local batch and a
-separate CP rank-0 device broadcast is unnecessary. A legacy rank-0-only
-DataLoader may instead use `DeviceBatchPrefetcher` only on the source rank and
-call `wait()` before its existing device broadcast.
+All model peers call `next(loader)` in the same order. Constructor ranks stage
+H2D before direct tensor broadcast to model peers; Gloo data transport can use
+a separate HCCL/NCCL model tensor group. CPU-only fields retain their placement.
 
-Calling `next(loader)` for H2D prefetch advances the loader's completed-step
-boundary. Do not checkpoint between that call and training the returned device
-batch. On a checkpoint step, save the completed loader state before pulling the
-next Host batch; delaying H2D for those infrequent steps preserves exact replay.
+Checkpoint through the reader/sampler loader after training the returned batch.
+Its snapshot excludes speculative progress and leaves the pending batch intact,
+without repeating reads or advancing the delivered-step cursor. Call
+`wait_for_prefetch()` before process-group teardown, or use the loader as a
+context manager to also release its persistent worker. Local-step loaders retain
+CPU metering inputs in `last_host_batch` and do not support checkpoint/resume.
 
 PyTorch DataLoader execution options can be passed through
 `dataloader_kwargs`:

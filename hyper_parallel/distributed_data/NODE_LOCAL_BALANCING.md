@@ -6,6 +6,8 @@ one-step buffering, and final H2D on a copy stream. Set
 `communication_backend="hccl"` (the default) with an NPU `device` to encode
 control objects as device tensors and route all data-plane collectives through
 HCCL. Set `communication_backend="gloo"` for CPU object/payload exchange.
+Gloo defaults to CPU batches; an explicit NPU/CUDA `device` enables final H2D
+without changing the data-plane backend.
 There is no enable switch: every step evaluates a candidate, but raw samples move only when
 the candidate's relative objective improvement is strictly greater than
 `min_balance_gain` (default `0.0`). Equal, worse or insufficient-gain candidates
@@ -102,8 +104,8 @@ with build_distributed_dataloader(
   Generic sample/sequence/cost and send/receive logs need no extra callback.
   Configure the application's Python logging to include INFO messages.
 - Iteration returns ready device microbatches. The loader waits on the copy
-  event and records storage on the consumer stream internally. Do not call
-  `take_device_microbatch()` or repeat application-side H2D on this facade.
+  event and records storage on the consumer stream internally. No explicit
+  device-consumption hook or application-side H2D is needed.
   `loader.last_host_batch` retains the corresponding CPU microbatches for
   optional host-only metering without D2H. Moving previously CPU-only metering
   to the device outputs may introduce synchronization; use that host view if
@@ -187,8 +189,8 @@ Those identities participate in cross-rank build and checkpoint fingerprints.
 ## Existing integrations
 
 The original `external_step_source`, `metadata_fn`, `pack_fn`, `move_fn` and
-`bin_stats_fn` arguments remain supported for existing users. That entry still
-yields CPU views and uses `take_device_microbatch()` for staged device inputs.
+`bin_stats_fn` arguments remain supported for existing users. That entry also
+returns device-ready batches and retains CPU views in `last_host_batch`.
 Do not mix those arguments with a `DistributedDataset`: the dataset owns all
 data callbacks. Plain Dataset + native BatchSampler retains its selection and
 checkpoint mechanism, but now receives the same cost and algorithm parameters.

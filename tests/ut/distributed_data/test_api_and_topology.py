@@ -41,14 +41,14 @@ class TestDistributedDataPublicApi(unittest.TestCase):
 
         self.assertIn("seq_len", field_names)
         self.assertIn("local_batch_size", field_names)
-        self.assertIn("enable_dp_balance", field_names)
+        self.assertNotIn("enable_dp_balance", field_names)
         self.assertNotIn("double_buffer", field_names)
         self.assertIn("dataset_already_sharded", field_names)
         self.assertNotIn("raw_sample_size", field_names)
         self.assertNotIn("micro_batch_num", field_names)
 
         config = DistributedDatasetConfig(seq_len=32_768, local_batch_size=4)
-        self.assertFalse(config.enable_dp_balance)
+        self.assertFalse(hasattr(config, "enable_dp_balance"))
         self.assertFalse(config.dataset_already_sharded)
         self.assertFalse(hasattr(config, "raw_sample_size"))
         self.assertFalse(hasattr(config, "micro_batch_num"))
@@ -133,15 +133,6 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         self.assertNotIn("payload_backend", field_names)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_enable_dp_balance_must_be_boolean(self) -> None:
-        """Feature: Node-local balancing.
-        Description: Configure the overlap switch with a truthy non-boolean value.
-        Expectation: Configuration validation rejects the invalid value.
-        """
-        with self.assertRaisesRegex(ValueError, "enable_dp_balance must be boolean"):
-            DistributedDatasetConfig(seq_len=32, local_batch_size=1, enable_dp_balance=1)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_dataset_already_sharded_must_be_boolean(self) -> None:
         """Feature: Dataset Reader sharding.
         Description: Configure the reader-stride switch with a truthy non-boolean value.
@@ -175,6 +166,7 @@ class TestDistributedDataBuildState(unittest.TestCase):
                 )
                 loader = build_distributed_dataloader(
                     samples, self._mesh(), config, batch_sampler=sampler, **callbacks,
+                    device="cpu", cost_model=lambda metadata: metadata.cost,
                 )
                 self.assertEqual(next(loader), (0,))
                 preflight.assert_called_once()

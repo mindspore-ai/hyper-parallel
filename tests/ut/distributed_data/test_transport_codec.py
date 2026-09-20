@@ -433,23 +433,29 @@ class TestModelParallelTransport(unittest.TestCase):
         self.assertEqual(received["inputs"][1][1], "text")
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_device_backend_mismatch_still_fails_before_tensor_broadcast(self) -> None:
-        """Feature: Model broadcast validation.
-        Description: Send a CPU tensor through an HCCL tensor group.
-        Expectation: The device mismatch fails before tensor broadcast.
+    def test_accelerator_broadcast_preserves_cpu_only_fields(self) -> None:
+        """Feature: Model broadcast field placement.
+        Description: Stage CPU-only fields for an accelerator collective.
+        Expectation: The source batch retains CPU placement after transport.
         """
         groups = DataGroups((0,), None, None, "model", 0, True)
-        transport = ModelParallelTransport(self._topology(), groups, communication_device="npu:0")
+        transport = ModelParallelTransport(self._topology(), groups, communication_device="cuda:0")
         schema, _ = _encode_model_batch({"input_ids": torch.tensor([1, 2])})
+        staged = Mock()
+        staged.contiguous.return_value = staged
         with (
                 patch("hyper_parallel.distributed_data.transport.broadcast_control_object", return_value=schema),
                 patch("hyper_parallel.distributed_data.transport.dist.broadcast") as broadcast,
-                patch("hyper_parallel.distributed_data.transport.dist.get_backend", return_value="hccl"),
-                self.assertRaisesRegex(ValueError, "incompatible"),
+                patch("hyper_parallel.distributed_data.transport.dist.get_backend", return_value="nccl"),
+                patch.object(torch.Tensor, "to", return_value=staged) as move,
         ):
-            transport.broadcast({"input_ids": torch.tensor([1, 2])})
+            batch = {"input_ids": torch.tensor([1, 2])}
+            self.assertIs(transport.broadcast(batch), batch)
 
-        broadcast.assert_not_called()
+        move.assert_called_once_with(torch.device("cuda:0"))
+        broadcast.assert_called_once_with(staged, src=0, group="model")
+        staged.cpu.assert_not_called()
+        self.assertEqual(batch["input_ids"].device.type, "cpu")
 
 
 if __name__ == "__main__":

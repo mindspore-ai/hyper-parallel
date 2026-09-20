@@ -36,7 +36,7 @@ from hyper_parallel.auto_models.components.datasets.llm.build_dataset import bui
 from hyper_parallel.auto_models.components.datasets.parallel import build_dataset_batch_sampler
 from hyper_parallel.auto_models.trainer.text_trainer import TextTrainer
 from hyper_parallel.distributed_data import (
-    DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader,
+    DistributedDatasetConfig, SampleMetadata, WorkloadCost, build_distributed_dataloader,
     collate_indexed_text_sequences, pack_indexed_text_samples,
 )
 from tests.common.mark_utils import arg_mark
@@ -124,6 +124,7 @@ def _build_source_loader(datasets: tuple, data_config: dict, *, local_batch_size
         batch_sampler=sampler,
         collate_fn=partial(_collate_source_samples, seq_len=data_config["seq_length"]),
         dataloader_kwargs=worker_options,
+        device="cpu", cost_model=lambda metadata: WorkloadCost(llm=metadata.pack_tokens ** 2),
     )
 
 
@@ -189,25 +190,26 @@ class TestIndexedSourceDataset(unittest.TestCase):
                 self.assertEqual(datasets[0].get_sample_metadata(1).pack_tokens, 3)
 
             batch = next(loader)
-            self.assertEqual(batch["input_ids"].tolist(), [[3, 4, 5, 0, 0, 0, 0, 0], [1, 2, 0, 0, 0, 0, 0, 0]])
+            # One DP rank has no balancing gain, so the native sampler order remains unchanged.
+            self.assertEqual(batch["input_ids"].tolist(), [[1, 2, 0, 0, 0, 0, 0, 0], [3, 4, 5, 0, 0, 0, 0, 0]])
             self.assertEqual(
                 batch["labels"].tolist(),
-                [[4, 5, 9, -100, -100, -100, -100, -100], [2, 9, -100, -100, -100, -100, -100, -100]],
+                [[2, 9, -100, -100, -100, -100, -100, -100], [4, 5, 9, -100, -100, -100, -100, -100]],
             )
-            self.assertEqual(batch["cu_seq_lens"].tolist(), [0, 3, 8, 10, 16])
+            self.assertEqual(batch["cu_seq_lens"].tolist(), [0, 2, 8, 11, 16])
             runtime = ParallelBatch(
                 mesh_context=None, device="cpu", tokenizer=_Tokenizer(),
                 data_config=config, source_type="indexed_source", pp_shared_data=False,
             )
             model_inputs, loss_inputs = runtime(iter([batch]))
             self.assertEqual(
-                model_inputs["position_ids"].tolist(), [[0, 1, 2, 0, 1, 2, 3, 4], [0, 1, 0, 1, 2, 3, 4, 5]],
+                model_inputs["position_ids"].tolist(), [[0, 1, 0, 1, 2, 3, 4, 5], [0, 1, 2, 0, 1, 2, 3, 4]],
             )
-            self.assertEqual(loss_inputs["loss_mask"].tolist(), [[1, 1, 1, 0, 0, 0, 0, 0], [1, 1, 0, 0, 0, 0, 0, 0]])
+            self.assertEqual(loss_inputs["loss_mask"].tolist(), [[1, 1, 0, 0, 0, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]])
             self.assertTrue(torch.equal(model_inputs["shift_labels"], batch["labels"]))
             mask = model_inputs["attention_mask"][0, 0]
-            self.assertFalse(bool(mask[3, 2]))
-            self.assertTrue(bool(mask[4, 3]))
+            self.assertFalse(bool(mask[2, 1]))
+            self.assertTrue(bool(mask[3, 2]))
             with self.assertRaises(StopIteration):
                 next(loader)
 
@@ -256,6 +258,7 @@ class TestIndexedSourceDataset(unittest.TestCase):
                         mesh_context=SimpleNamespace(device_mesh=_StandaloneMesh(), dp_rank=0, dp_size=1),
                         training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=4, seed=7),
                         data_config=config,
+                        cost_model=lambda metadata: metadata.cost,
                     )
                     self.assertEqual(samplers, (None, None, None))
                     reference_sampler = build_dataset_batch_sampler(

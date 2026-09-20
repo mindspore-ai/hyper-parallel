@@ -12,50 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for Trainer-side asynchronous H2D batch prefetch."""
+"""Tests for shared producer-owned asynchronous H2D batch prefetch."""
 
 import unittest
 from contextlib import nullcontext
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
-from hyper_parallel.auto_models.components.datasets.parallel import build_dataset_batch_sampler
-from hyper_parallel.distributed_data import (
-    DeviceBatchPrefetcher,
-    DistributedDatasetConfig,
-    SampleMetadata,
-    WorkloadCost,
-    build_distributed_dataloader,
-)
-from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher
+from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher, _resolve_device
 from tests.common.mark_utils import arg_mark
-
-
-class _StandaloneMesh:
-    """Represent one DP rank without initializing torch.distributed."""
-
-    mesh_shape = (1,)
-    mesh_dim_names = ("dp",)
-    rank_list = (0,)
-
-
-class _StreamContext:
-    """Record copy-stream context entry and exit."""
-
-    def __init__(self, events: list[tuple[str, object]], stream: object) -> None:
-        """Store the event sink and selected stream."""
-        self._events = events
-        self._stream = stream
-
-    def __enter__(self) -> None:
-        """Record context entry."""
-        self._events.append(("enter", self._stream))
-
-    def __exit__(self, exception_type: object, exception: object, traceback: object) -> None:
-        """Record context exit."""
-        self._events.append(("exit", self._stream))
 
 
 class _DeviceBatch:
@@ -70,42 +36,39 @@ class _DeviceBatch:
         self._events.append(("record_stream", stream))
 
 
-def _fake_accelerator(events: list[tuple[str, object]]) -> SimpleNamespace:
-    """Build deterministic fake Stream/Event APIs without accelerator hardware."""
-    copy_stream = object()
-    current_stream = object()
-
-    def create_stream(*, device: torch.device) -> object:
-        """Return the fixed fake copy stream."""
-        events.append(("create_stream", device))
-        return copy_stream
-
-    def stream_context(stream: object) -> _StreamContext:
-        """Return a recording fake stream context."""
-        return _StreamContext(events, stream)
-
-    def create_event() -> Mock:
-        """Return one fake ready Event."""
-        event = Mock()
-        event.record.side_effect = lambda stream: events.append(("event_record", stream))
-        event.wait.side_effect = lambda stream: events.append(("event_wait", stream))
-        return event
-
-    def get_current_stream(device: torch.device) -> object:
-        """Return the fixed fake consumer stream."""
-        events.append(("current_stream", device))
-        return current_stream
-
-    return SimpleNamespace(
-        Event=create_event,
-        Stream=create_stream,
-        current_stream=get_current_stream,
-        stream=stream_context,
-    )
-
-
-class TestDeviceBatchPrefetcher(unittest.TestCase):
+class TestDeviceStepPrefetcher(unittest.TestCase):
     """Verify copy-stream launch, event ordering, and slot lifecycle."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_gloo_device_selection_does_not_probe_accelerators(self) -> None:
+        """Feature: Gloo device selection.
+        Description: Resolve implicit CPU and explicit accelerator training devices.
+        Expectation: Neither operation probes available accelerators.
+        """
+        with patch.object(torch, "npu", create=True) as npu, patch.object(torch, "cuda") as cuda:
+            self.assertEqual(_resolve_device(communication_backend="gloo"), torch.device("cpu"))
+            self.assertEqual(_resolve_device("cuda:1", communication_backend="gloo"), torch.device("cuda:1"))
+            npu.is_available.assert_not_called()
+            cuda.is_available.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_failed_copy_drains_only_copy_stream(self) -> None:
+        """Feature: Failed H2D staging lifecycle.
+        Description: Fail a mapping after launching the first copy.
+        Expectation: Drain only the copy stream before releasing staging storage.
+        """
+        accelerator = Mock()
+        accelerator.stream.side_effect = lambda _stream: nullcontext()
+        move = Mock(side_effect=[object(), RuntimeError("copy failed")])
+        with patch.object(torch, "cuda", accelerator), patch(
+                "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+        ):
+            prefetcher = DeviceStepPrefetcher("cuda:0", move_fn=move)
+            with self.assertRaisesRegex(RuntimeError, "copy failed"):
+                prefetcher([{"host": 1}, {"host": 2}])
+            accelerator.Stream.return_value.synchronize.assert_called_once()
+            accelerator.synchronize.assert_not_called()
+            self.assertEqual(prefetcher._pending_staging, [])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_discarded_step_retains_staging_until_close(self) -> None:
@@ -154,180 +117,3 @@ class TestDeviceBatchPrefetcher(unittest.TestCase):
             self.assertEqual(events, [("record_stream", accelerator.current_stream.return_value)])
             self.assertEqual(first.device_micro_batches, [None])
             self.assertEqual(first.cpu_micro_batches, [{"host": 1}])
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_prepares_copies_and_waits_before_returning_batch(self) -> None:
-        """Feature: Asynchronous device batch prefetch.
-        Description: Prepare and copy a Host batch on the copy stream.
-        Expectation: Preparation and H2D precede the consumer-stream dependency.
-        """
-        events: list[tuple[str, object]] = []
-        accelerator = _fake_accelerator(events)
-        device_batch = _DeviceBatch(events)
-
-        def prepare(host_batch: str) -> str:
-            """Record CPU preparation and return its transformed value."""
-            events.append(("prepare", host_batch))
-            return f"prepared-{host_batch}"
-
-        def move(prepared_batch: str, device: torch.device) -> _DeviceBatch:
-            """Record H2D launch and return the fake device batch."""
-            events.append(("move", (prepared_batch, device)))
-            return device_batch
-
-        with patch(
-                "hyper_parallel.distributed_data.device_prefetch._accelerator_module",
-                return_value=accelerator,
-        ):
-            prefetcher = DeviceBatchPrefetcher("cuda:3", prepare_fn=prepare, move_fn=move)
-            prefetcher.prefetch("host")
-            self.assertTrue(prefetcher.has_pending)
-            result = prefetcher.wait()
-
-        self.assertIs(result, device_batch)
-        self.assertFalse(prefetcher.has_pending)
-        self.assertEqual(
-            [name for name, _ in events],
-            [
-                "prepare",
-                "create_stream",
-                "enter",
-                "move",
-                "event_record",
-                "exit",
-                "current_stream",
-                "event_wait",
-                "record_stream",
-            ],
-        )
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_reuses_one_copy_stream_across_batches(self) -> None:
-        """Feature: Device copy-stream lifecycle.
-        Description: Prefetch and consume two consecutive batches.
-        Expectation: One lazy copy stream is reused while Events remain per-batch.
-        """
-        events: list[tuple[str, object]] = []
-        accelerator = _fake_accelerator(events)
-        with patch(
-                "hyper_parallel.distributed_data.device_prefetch._accelerator_module",
-                return_value=accelerator,
-        ):
-            prefetcher = DeviceBatchPrefetcher(
-                "cuda:0",
-                move_fn=lambda batch, _device: _DeviceBatch(events),
-            )
-            prefetcher.prefetch("first")
-            prefetcher.wait()
-            prefetcher.prefetch("second")
-            prefetcher.wait()
-
-        self.assertEqual([name for name, _ in events].count("create_stream"), 1)
-        self.assertEqual([name for name, _ in events].count("event_record"), 2)
-        self.assertEqual([name for name, _ in events].count("event_wait"), 2)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_default_move_uses_non_blocking_batch_to(self) -> None:
-        """Feature: Default device movement.
-        Description: Prefetch a model-specific batch object with a ``to`` method.
-        Expectation: The move targets the configured device and is non-blocking.
-        """
-        events: list[tuple[str, object]] = []
-        accelerator = _fake_accelerator(events)
-        host_batch = Mock()
-        device_batch = _DeviceBatch(events)
-        host_batch.to.return_value = device_batch
-
-        with patch(
-                "hyper_parallel.distributed_data.device_prefetch._accelerator_module",
-                return_value=accelerator,
-        ):
-            prefetcher = DeviceBatchPrefetcher("cuda:1")
-            prefetcher.prefetch(host_batch)
-            prefetcher.wait()
-
-        host_batch.to.assert_called_once_with(torch.device("cuda:1"), non_blocking=True)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_rejects_slot_overwrite_and_empty_wait(self) -> None:
-        """Feature: Device prefetch slot validation.
-        Description: Wait on an empty slot and prefetch over an occupied slot.
-        Expectation: Both invalid lifecycle operations are rejected.
-        """
-        events: list[tuple[str, object]] = []
-        with patch(
-                "hyper_parallel.distributed_data.device_prefetch._accelerator_module",
-                return_value=_fake_accelerator(events),
-        ):
-            prefetcher = DeviceBatchPrefetcher(
-                "cuda:0",
-                move_fn=lambda batch, _device: _DeviceBatch(events),
-            )
-            with self.assertRaisesRegex(ValueError, "No prefetched device batch"):
-                prefetcher.wait()
-            prefetcher.prefetch("first")
-            with self.assertRaisesRegex(ValueError, "Cannot prefetch a second device batch"):
-                prefetcher.prefetch("second")
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_composes_with_distributed_host_double_buffer(self) -> None:
-        """Feature: Host and device double buffering.
-        Description: Feed Host-prefetched distributed batches into device prefetch.
-        Expectation: Device prefetch preserves both selected batch payloads.
-        """
-        samples = [{"id": 0, "tokens": 8}, {"id": 1, "tokens": 8}]
-
-        def metadata_fn(sample: dict[str, int]) -> SampleMetadata:
-            """Expose one full packing bin per sample."""
-            return SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
-
-        loader = build_distributed_dataloader(
-            samples,
-            _StandaloneMesh(),
-            DistributedDatasetConfig(
-                seq_len=8,
-                local_batch_size=1,
-                buffer_size_multiplier=1.0,
-            ),
-            metadata_fn=metadata_fn,
-            cost_model=lambda metadata: WorkloadCost(llm=metadata.pack_tokens),
-            batch_sampler=build_dataset_batch_sampler(
-                total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,
-            ),
-        )
-        loader._double_buffer = True
-        events: list[tuple[str, object]] = []
-        with patch(
-                "hyper_parallel.distributed_data.device_prefetch._accelerator_module",
-                return_value=_fake_accelerator(events),
-        ):
-            prefetcher = DeviceBatchPrefetcher(
-                "cuda:0",
-                move_fn=lambda batch, _device: {"host_batch": batch, "storage": _DeviceBatch(events)},
-            )
-            prefetcher.prefetch(next(loader))
-            first = prefetcher.wait()
-            prefetcher.prefetch(next(loader))
-            second = prefetcher.wait()
-
-        self.assertEqual(first["host_batch"], (samples[0],))
-        self.assertEqual(second["host_batch"], (samples[1],))
-        with self.assertRaises(StopIteration):
-            next(loader)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_rejects_cpu_and_invalid_callbacks(self) -> None:
-        """Feature: Device prefetch input validation.
-        Description: Configure a CPU device and non-callable hooks.
-        Expectation: Validation fails before accelerator resources are allocated.
-        """
-        with self.assertRaisesRegex(ValueError, "requires an accelerator device"):
-            DeviceBatchPrefetcher("cpu")
-        with self.assertRaisesRegex(ValueError, "prepare_fn must be callable"):
-            DeviceBatchPrefetcher("cuda:0", prepare_fn=object())
-        with self.assertRaisesRegex(ValueError, "move_fn must be callable"):
-            DeviceBatchPrefetcher("cuda:0", move_fn=object())
-
-
-if __name__ == "__main__":
-    unittest.main()

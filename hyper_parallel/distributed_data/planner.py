@@ -200,8 +200,7 @@ class DynamicPackingPlanner:
         rank_costs = [WorkloadCost() for _ in range(self.data_parallel_size)]
         for index, keys in enumerate(key_bins):
             items = tuple(samples_by_key[key] for key in keys)
-            if audit:
-                self._constraints.validate_bin(items)
+            self._constraints.validate_bin(items)
             tokens = sum(item.metadata.pack_tokens for item in items)
             rank = index // self.local_batch_size
             rank_costs[rank] += sum((item.metadata.cost for item in items), WorkloadCost())

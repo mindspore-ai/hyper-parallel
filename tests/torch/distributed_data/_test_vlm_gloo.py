@@ -29,6 +29,7 @@ from hyper_parallel.auto_models.components.data.vlm.collator import VLMCollator
 from hyper_parallel.auto_models.components.data.vlm.get_batch import VLMGetBatch
 from hyper_parallel.auto_models.components.data.vlm.metadata import vlm_sample_metadata
 from hyper_parallel.auto_models.components.loss.loss_utils import count_loss_token, mean_global_loss
+from hyper_parallel.distributed_data import WorkloadCost
 from tests.common.vlm_fixtures import build_image_corpus, vlm_loader_target
 
 
@@ -41,6 +42,8 @@ def _build_loader(dataset: object, mesh: object, workers: int) -> object:
         training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=8, seed=17),
         data_config={"source_type": "online", "load_balance": "native_batch_sampler"},
         max_seq_len=64, metadata_fn=vlm_sample_metadata,
+        # The toy workload includes image work in LPT's scalar scheduling cost.
+        cost_model=lambda metadata: WorkloadCost(llm=metadata.cost.total, encoder=metadata.cost.encoder),
     )
     return loaders[0]
 
