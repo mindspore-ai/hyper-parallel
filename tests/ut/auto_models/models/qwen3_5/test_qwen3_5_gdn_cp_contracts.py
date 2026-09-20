@@ -18,6 +18,7 @@
 import os
 import tempfile
 import unittest
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,6 +27,7 @@ from unittest.mock import patch
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 import torch
+from packaging.version import Version
 from torch import nn
 
 from hyper_parallel.components.modules.gated_delta_net import (
@@ -48,6 +50,12 @@ from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.config import entries_to_plan_overrides
 from hyper_parallel.trainer.config.manager import parse_training_args
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
+
+
+try:
+    _QWEN35_ADAPTER_SUPPORTED = Version(version("transformers")) >= Version("5.2.0")
+except PackageNotFoundError:
+    _QWEN35_ADAPTER_SUPPORTED = False
 
 
 class _FakeMesh:
@@ -130,6 +138,10 @@ class _TinyQwen35Model(nn.Module):
 class TestQwen35GdnCpContracts(unittest.TestCase):
     """Pin the public Qwen3.5 GDN adapter and eager numerical oracle."""
 
+    @unittest.skipUnless(
+        _QWEN35_ADAPTER_SUPPORTED,
+        "Qwen3.5 adapters require Transformers >= 5.2.0",
+    )
     def test_registration_and_wrapper_metadata(self):
         """Both HF identities discover the same pair of GDN CP wrappers."""
         # Resolve the nested text identity first to exercise cold discovery
@@ -178,6 +190,10 @@ plan_overrides:
         self.assertIs(active["*.linear_attn"].inner_wrapper, entry.inner_wrapper)
         self.assertEqual(entry.inner_wrapper.backend, "triton")
 
+    @unittest.skipUnless(
+        _QWEN35_ADAPTER_SUPPORTED,
+        "Qwen3.5 adapters require Transformers >= 5.2.0",
+    )
     def test_cp4_plan_derives_gdn_execution_boundary(self):
         """Planner derives the GDN boundary and preserves its CP injection."""
         model = _TinyQwen35Model()
