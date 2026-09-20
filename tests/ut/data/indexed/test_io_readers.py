@@ -72,19 +72,29 @@ def test_index_reader_close_releases_mmap_views(tmp_path):
 
 
 def test_index_reader_exposed_arrays_survive_reader_close(tmp_path):
-    """Index arrays exposed through properties should not depend on the mmap lifetime."""
+    """Exposed index views should keep the mmap alive until the views are released."""
     idx_path = tmp_path / "sample.idx"
     with _IndexWriter(str(idx_path), numpy.int32) as writer:
         writer.write([2, 3], None, [0, 2])
 
     reader = _IndexReader(str(idx_path), multimodal=False)
+    mmap_ref = weakref.ref(reader._mmap)  # pylint: disable=protected-access
     sequence_lengths = reader.sequence_lengths
     document_indices = reader.document_indices
+    assert not sequence_lengths.flags.owndata
+    assert not document_indices.flags.owndata
 
     reader.close()
 
+    assert mmap_ref() is not None
     assert sequence_lengths.tolist() == [2, 3]
     assert document_indices.tolist() == [0, 2]
+
+    del sequence_lengths
+    del document_indices
+    gc.collect()
+
+    assert mmap_ref() is None
 
 
 def test_index_reader_getitem_does_not_keep_reader_alive(tmp_path):

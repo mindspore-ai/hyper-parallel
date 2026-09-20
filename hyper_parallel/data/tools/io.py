@@ -423,21 +423,21 @@ class _IndexReader:
         logger.info("Extracting sequence lengths")
         self.sequence_lengths = numpy.frombuffer(
             self._buffer, dtype=numpy.int32, count=self.sequence_count, offset=payload_offset
-        ).copy()
+        )
         logger.info("Extracting sequence pointers")
         self.sequence_pointers = numpy.frombuffer(
             self._buffer,
             dtype=numpy.int64,
             count=self.sequence_count,
             offset=payload_offset + self.sequence_lengths.nbytes,
-        ).copy()
+        )
         logger.info("Extracting document indices")
         self.document_indices = numpy.frombuffer(
             self._buffer,
             dtype=numpy.int64,
             count=self.document_count,
             offset=payload_offset + self.sequence_lengths.nbytes + self.sequence_pointers.nbytes,
-        ).copy()
+        )
 
         self.sequence_modes: Optional[numpy.ndarray] = None
         if multimodal:
@@ -450,7 +450,7 @@ class _IndexReader:
                 + self.sequence_lengths.nbytes
                 + self.sequence_pointers.nbytes
                 + self.document_indices.nbytes,
-            ).copy()
+            )
 
         sequence_length_count = self.sequence_lengths.shape[0]
         if sequence_length_count != len(self):
