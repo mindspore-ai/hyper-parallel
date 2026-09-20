@@ -1,0 +1,28 @@
+# Dense MLA CP recipe fragment. Merge into a DeepSeek-V3 training configuration.
+# The model factory/checkpoint, data pipeline and optimizer remain caller choices.
+accelerator:
+  tp_size: 2
+  cp_size: 4
+  sequence_parallel: false  # Optional TP sequence parallelism; both MLA strategies support enabling it.
+  loss_parallel: false
+
+plan_overrides:
+  - match: "model.layers.*.self_attn"
+    module_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3Attention
+    replace_module:
+      _target_: hyper_parallel.components.modules.mla_attention.MLAAttention
+  - match: "model.layers.*.self_attn"
+    region_dispatch: false
+    inner_target: self
+    inner_wrapper:
+      _target_: hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel.mla_cp_wrapper
+      strategy: expanded_ulysses
+      backend: npu
+
+fsdp_config:
+  dp_shard_size: 4
+  reshard_after_forward: true
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
