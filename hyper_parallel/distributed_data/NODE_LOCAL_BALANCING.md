@@ -12,10 +12,42 @@ the candidate's relative objective improvement is strictly greater than
 retain the original distribution. Metadata gathering and planning still occur
 when sample exchange is skipped.
 
-When HCCL or NCCL is selected, data-plane collectives stay on the training
-thread so their order cannot race model collectives issued by another thread.
-Gloo keeps the speculative one-step Host/H2D producer; accelerator backends
-still use the configured copy stream for H2D after their data collective.
+With HCCL, source loading starts one step ahead. Metadata and payload
+collectives are issued by the training thread on an independent data stream;
+control and payload groups are separate from model groups. CPU planning,
+decoding and collation run in the producer. H2D uses a copy stream, and the
+consumer waits on its ready event without a host event synchronization.
+Pinned copy sources are retained until completion, including early close.
+Gloo keeps its complete background producer.
+
+To overlap the full pipeline with model computation, call the two optional
+hooks on **every rank at the same training boundaries**:
+
+```python
+for microbatches in loader:
+    for index, batch in enumerate(microbatches):
+        loss = forward(batch)
+        if index == 0:
+            loader.prefetch_plan()  # HCCL metadata, then background CPU planner
+        loss.backward()
+        if index == 0:
+            loader.prefetch()       # HCCL plan/payload, then decode/collate/H2D
+        log_loss(loss.item())       # Host synchronization belongs after launch
+```
+
+`prefetch()` completes `prefetch_plan()` if needed; repeated calls before
+consumption do not advance the source twice. Ordinary `next(loader)` also
+completes omitted hooks, preserving the iteration contract. Without early
+hooks, accelerator data exchange starts only when the batch is requested.
+The first step has no prior compute to overlap. End-of-source and `max_steps`
+stop speculative work. All ranks must still consume equal step counts.
+
+Launch these hooks while previously submitted device computation is still
+pending. A separate group alone does not create overlap: using the model's
+current stream, calling device-wide synchronization, or launching after a
+blocking loss read can remove that window. Metadata sizes and the plan still
+need to reach the host, and payload encoding/split exchange run on the caller;
+the amount hidden depends on the remaining compute and shared bandwidth.
 
 ## Dataset-based integration
 

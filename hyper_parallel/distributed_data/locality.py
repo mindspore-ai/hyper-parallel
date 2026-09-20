@@ -141,8 +141,12 @@ def _create_locality_groups(
     own_groups = None
     for ranks in rank_groups:
         control_group = None
+        payload_group = None
         if distributed and len(ranks) > 1:
             control_group = dist.new_group(ranks=list(ranks), backend=communication_backend)
+            payload_group = control_group
+            if communication_backend == "hccl":
+                payload_group = dist.new_group(ranks=list(ranks), backend=communication_backend)
         if rank in ranks:
-            own_groups = DataGroups(ranks, control_group, control_group, None, min(ranks), distributed)
+            own_groups = DataGroups(ranks, control_group, payload_group, None, min(ranks), distributed)
     return topology, own_groups

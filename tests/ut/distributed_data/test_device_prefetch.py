@@ -26,6 +26,7 @@ from hyper_parallel.distributed_data import (
     DeviceBatchPrefetcher,
     DistributedDatasetConfig,
     SampleMetadata,
+    WorkloadCost,
     build_distributed_dataloader,
 )
 from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher
@@ -107,6 +108,27 @@ class TestDeviceBatchPrefetcher(unittest.TestCase):
     """Verify copy-stream launch, event ordering, and slot lifecycle."""
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_discarded_step_retains_staging_until_close(self) -> None:
+        """Feature: Pending H2D staging lifecycle.
+        Description: Close immediately after enqueueing an unconsumed device step.
+        Expectation: Copies drain before pinned staging storage is released.
+        """
+        accelerator = Mock()
+        accelerator.stream.side_effect = lambda _stream: nullcontext()
+        accelerator.Event.return_value.query.return_value = False
+        pinned = {"pinned": object()}
+        with patch.object(torch, "cuda", accelerator), patch(
+                "hyper_parallel.distributed_data.device_prefetch._pin_memory", return_value=pinned,
+        ):
+            prefetcher = DeviceStepPrefetcher("cuda:0", move_fn=lambda batch, device: {})
+            prefetcher([{"host": 1}])
+            self.assertIs(prefetcher._pending_staging[0][1][0], pinned)
+            accelerator.Event.return_value.synchronize.assert_not_called()
+            prefetcher.close()
+            accelerator.Event.return_value.synchronize.assert_called_once()
+            self.assertEqual(prefetcher._pending_staging, [])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_producer_prefetch_binds_device_and_hands_off_storage(self) -> None:
         """Feature: Producer-owned H2D.
         Description: Stage two steps on one copy stream and consume the first.
@@ -124,7 +146,9 @@ class TestDeviceBatchPrefetcher(unittest.TestCase):
             prefetcher([{"host": 2}])
             self.assertEqual(accelerator.set_device.call_count, 2)
             accelerator.Stream.assert_called_once_with(device=torch.device("cuda:0"))
-            self.assertEqual(accelerator.Event.return_value.synchronize.call_count, 2)
+            # H2D is intentionally not host-synchronized here.  The consumer
+            # stream waits on each step's ready event in ``take_microbatch``.
+            self.assertEqual(accelerator.Event.return_value.synchronize.call_count, 0)
             self.assertIs(first.take_microbatch(0), device_batch)
             accelerator.current_stream.return_value.wait_event.assert_called_once_with(first.ready_event)
             self.assertEqual(events, [("record_stream", accelerator.current_stream.return_value)])
@@ -266,6 +290,7 @@ class TestDeviceBatchPrefetcher(unittest.TestCase):
                 buffer_size_multiplier=1.0,
             ),
             metadata_fn=metadata_fn,
+            cost_model=lambda metadata: WorkloadCost(llm=metadata.pack_tokens),
             batch_sampler=build_dataset_batch_sampler(
                 total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,
             ),

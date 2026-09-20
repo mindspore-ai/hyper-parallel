@@ -208,12 +208,14 @@ class DevicePrefetchedStep:
             device_micro_batches: list[Any],
             ready_event: Any,
             device: torch.device,
+            staging_micro_batches: list[Any] | None = None,
     ) -> None:
-        """Store both views and the producer's completed copy event."""
+        """Retain batch views and pinned sources while device copies are pending."""
         self.cpu_micro_batches = cpu_micro_batches
         self.device_micro_batches = device_micro_batches
         self.ready_event = ready_event
         self.device = device
+        self._staging_micro_batches = staging_micro_batches
 
     def take_microbatch(self, index: int) -> Any:
         """Transfer one microbatch's lifetime to the current consumer stream.
@@ -237,8 +239,8 @@ class DeviceStepPrefetcher:
     """Stage a complete step inside the DataLoader's existing producer thread.
 
     This is not an additional iterator, queue, or thread. Packing and payload
-    exchange finish before this stage runs. The producer waits only for its
-    own H2D event before publishing a step, while training uses the original
+    exchange finish before this stage runs. The consumer stream waits for the
+    H2D event before using inputs, while training uses the original
     Host view for metrics and takes device microbatches immediately before use.
     The trainer-owned :class:`DeviceBatchPrefetcher` API remains independent.
     """
@@ -262,15 +264,24 @@ class DeviceStepPrefetcher:
         self._accelerator = _accelerator_module(self.device)
         self._move_fn = _move_to_device if move_fn is None else move_fn
         self._copy_stream = None
+        self._pending_staging: list[tuple[Any, list[Any]]] = []
+
+    def close(self) -> None:
+        """Drain pending copies before dropping their pinned source storage."""
+        for event, _ in self._pending_staging:
+            event.synchronize()
+        self._pending_staging.clear()
 
     def __call__(self, cpu_micro_batches: list[Any]) -> DevicePrefetchedStep:
-        """Stage final microbatches and publish only after their H2D completes.
+        """Enqueue final microbatches and publish their copy-completion event.
 
         Args:
             cpu_micro_batches: Final collated step, retained for Host metering.
 
         Returns:
-            Host/device views of the step with a completed copy event.
+            Host/device views of the step with a copy-completion event.  The
+            producer thread does not wait for that event; the consumer stream
+            orders itself with ``wait_event`` in ``take_microbatch``.
         """
         accelerator = self._accelerator
         # The local loader may create a fresh producer thread each step; device
@@ -278,6 +289,7 @@ class DeviceStepPrefetcher:
         accelerator.set_device(self.device)
         if self._copy_stream is None:
             self._copy_stream = accelerator.Stream(device=self.device)
+        self._pending_staging = [(event, batch) for event, batch in self._pending_staging if not event.query()]
         staging = [_pin_memory(micro_batch) for micro_batch in cpu_micro_batches]
         device_micro_batches = []
         try:
@@ -286,13 +298,19 @@ class DeviceStepPrefetcher:
                     device_micro_batches.append(self._move_fn(micro_batch, self.device))
                 ready_event = accelerator.Event()
                 ready_event.record(self._copy_stream)
-            ready_event.synchronize()
         except BaseException:
             # Earlier copies may still read pinned staging when a later
             # launch fails. Drain only this stream before releasing sources.
             self._copy_stream.synchronize()
             raise
-        return DevicePrefetchedStep(cpu_micro_batches, device_micro_batches, ready_event, self.device)
+        self._pending_staging.append((ready_event, staging))
+        return DevicePrefetchedStep(
+            cpu_micro_batches,
+            device_micro_batches,
+            ready_event,
+            self.device,
+            staging_micro_batches=staging,
+        )
 
 
 def _resolve_device(device: Any = None) -> torch.device:

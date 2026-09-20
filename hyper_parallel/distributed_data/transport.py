@@ -51,6 +51,37 @@ class PreparedPayloadExchange:
     local_segment: bytes
 
 
+@dataclass
+class PayloadExchangeWork:
+    """Main-thread-launched asynchronous payload exchange.
+
+    The HCCL/NCCL work is launched by the caller that owns the training
+    thread.  A producer may wait on this handle and perform CPU collation, but
+    it must not enter the collective itself.  Keeping the prepared send
+    tensor alive on the handle also keeps its backing storage valid until the
+    accelerator has consumed it.
+    """
+
+    prepared: PreparedPayloadExchange
+    output_splits: tuple[int, ...]
+    received_tensor: torch.Tensor | None
+    data_work: Any = None
+    completed_payloads: dict[SampleKey, Any] | None = None
+
+    def wait(self) -> dict[SampleKey, Any]:
+        """Wait and decode on the launch stream with its rank-local device bound."""
+        if self.completed_payloads is not None:
+            return self.completed_payloads
+        if self.data_work is not None:
+            self.data_work.wait()
+        if self.received_tensor is None:
+            received_bytes = b""
+        else:
+            received_bytes = self.received_tensor.cpu().numpy().tobytes()
+        self.completed_payloads = _decode_received_payloads(received_bytes, self.output_splits)
+        return self.completed_payloads
+
+
 def _is_accelerator_backend(backend: str) -> bool:
     return "hccl" in backend.lower() or "nccl" in backend.lower()
 
@@ -1014,8 +1045,37 @@ class DataPlaneTransport:
         Returns:
             Received payloads keyed by their source identities.
         """
+        return self.begin_exchange_prepared(prepared).wait()
+
+    def begin_exchange_prepared(
+            self,
+            prepared: PreparedPayloadExchange,
+    ) -> PayloadExchangeWork:
+        """Launch payload A2A from the caller's accelerator stream.
+
+        Args:
+            prepared: Serialized payload buffers and input split sizes.
+
+        Returns:
+            A handle that waits for and decodes the bulk payload exchange.
+
+        The split-size exchange is completed before the data A2A is launched,
+        because its result determines the receive allocation.  The bulk byte
+        exchange itself remains in flight when this method returns.  This
+        method is intentionally separate from :meth:`exchange_prepared` so a
+        training thread can launch the next step's HCCL transfer and then
+        continue model computation while a CPU producer waits and decodes it.
+        """
         if len(self._ranks) == 1:
-            return _decode_received_payloads(prepared.local_segment, prepared.input_splits)
+            return PayloadExchangeWork(
+                prepared=prepared,
+                output_splits=tuple(prepared.input_splits),
+                received_tensor=None,
+                completed_payloads=_decode_received_payloads(
+                    prepared.local_segment,
+                    prepared.input_splits,
+                ),
+            )
         if self._payload_group is None:
             raise ValueError("Sample payload exchange requires a payload process group.")
 
@@ -1038,10 +1098,12 @@ class DataPlaneTransport:
             group=self._payload_group,
             async_op=True,
         )
-        if data_work is not None:
-            data_work.wait()
-        received_bytes = received_tensor.cpu().numpy().tobytes()
-        return _decode_received_payloads(received_bytes, output_splits)
+        return PayloadExchangeWork(
+            prepared=prepared,
+            output_splits=tuple(output_splits),
+            received_tensor=received_tensor,
+            data_work=data_work,
+        )
 
 
 class ModelParallelTransport:

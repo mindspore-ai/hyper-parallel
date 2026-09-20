@@ -17,15 +17,13 @@
 import pickle
 import unittest
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+from hyper_parallel.distributed_data.api import DistributedDatasetConfig
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.distributed_data.topology import DataTopology
-from hyper_parallel.distributed_data.api import DistributedDatasetConfig
-from tests.common.mark_utils import arg_mark
-
 from hyper_parallel.distributed_data.transport import (
     DataGroups,
     DataPlaneTransport,
@@ -37,6 +35,7 @@ from hyper_parallel.distributed_data.transport import (
     _decode_received_payloads,
     _encode_payload_segment,
 )
+from tests.common.mark_utils import arg_mark
 
 
 class TestPayloadCodec(unittest.TestCase):
@@ -253,6 +252,33 @@ class TestDataPlaneTransport(unittest.TestCase):
 
         self.assertEqual(received, expected)
         self.assertEqual(collective_groups, ["control", "payload"])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_async_exchange_defers_wait_and_preserves_send_storage(self) -> None:
+        """Feature: Asynchronous payload exchange.
+        Description: Launch a bulk exchange with a deferred fake Work handle.
+        Expectation: Decoding waits once and the prepared send state stays live.
+        """
+        transport = DataPlaneTransport(DataGroups((0, 1), "control", "payload", None, 0, True), 0)
+        key = SampleKey(0, 7)
+        prepared = transport.prepare_exchange({1: [(key, {"value": 19})]})
+        work = Mock()
+
+        def exchange(output: torch.Tensor, source: torch.Tensor, **kwargs: Any) -> Any:
+            """Copy fake control data and complete fake payload data on wait."""
+            if kwargs["group"] == "control":
+                output.copy_(source)
+                return None
+            work.wait.side_effect = lambda: output.copy_(source)
+            return work
+
+        with patch("hyper_parallel.distributed_data.transport.dist.all_to_all_single", side_effect=exchange):
+            pending = transport.begin_exchange_prepared(prepared)
+            work.wait.assert_not_called()
+            self.assertIs(pending.prepared, prepared)
+            self.assertEqual(pending.wait(), {key: {"value": 19}})
+            self.assertEqual(pending.wait(), {key: {"value": 19}})
+            work.wait.assert_called_once()
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_singleton_exchange_still_rejects_duplicate_occurrences(self) -> None:

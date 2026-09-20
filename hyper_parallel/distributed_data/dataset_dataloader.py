@@ -53,6 +53,14 @@ class DatasetDataLoader(Iterator[list[Any]]):
         # CPU-only execution has no device-prefetch slot.
         return [self.dataset.move_to_device(batch, self.device) for batch in host_batch]
 
+    def prefetch_plan(self) -> None:
+        """Start next-step planning after compute submission on every rank."""
+        self._loader.prefetch_plan()
+
+    def prefetch(self) -> None:
+        """Launch next-step exchange before the trainer synchronizes compute."""
+        self._loader.prefetch()
+
     def __len__(self) -> int:
         """Return the source length or explicit step limit."""
         return len(self._loader)

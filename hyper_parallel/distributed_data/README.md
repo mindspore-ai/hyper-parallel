@@ -545,5 +545,9 @@ estimation, node-local LPT balancing and rank-zero DP logs, see
 to use the default cost, or provide `cost_model`. A custom
 `balancing_algorithm` owns assignment and its scalar objective; Hyper applies
 the shared `min_balance_gain` acceptance threshold before sample exchange.
-Gloo uses a speculative producer thread; HCCL/NCCL keeps data collectives on
-the training thread to preserve ordering with model collectives.
+Gloo uses a speculative producer thread. HCCL keeps collective launches on
+the training thread, with independent data groups and a data stream. Calling
+`prefetch_plan()` after forward submission and `prefetch()` after backward
+submission overlaps CPU planning, payload exchange, collation and H2D with
+pending computation. Call these hooks consistently on all ranks before host
+synchronization; ordinary iteration remains supported without the hooks.
