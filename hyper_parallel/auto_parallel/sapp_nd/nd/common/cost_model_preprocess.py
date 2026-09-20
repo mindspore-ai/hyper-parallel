@@ -313,9 +313,9 @@ class CostModelConfig(PartitionGenerator):
             target_ccfg.vp,
         )
         if hasattr(target_ccfg.parser, "config_shard_emb"):
-            target_ccfg.parser.config_shard_emb()
+            target_ccfg.parser.config_shard_emb(target_ccfg)
         if hasattr(target_ccfg.parser, "config_shard_recompute"):
-            target_ccfg.parser.config_shard_recompute()
+            target_ccfg.parser.config_shard_recompute(target_ccfg)
         target_ccfg.parser.config_dp_tp_exp(target_ccfg)
         target_ccfg.parser.config_optimizer_shard(target_ccfg)
         target_ccfg.parser.config_comm_flag(target_ccfg)
