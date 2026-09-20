@@ -150,12 +150,21 @@ class TestMultimodalCostModel(unittest.TestCase):
             target must reach both.
         Expectation: Vision and text both adopt the new degrees.
         """
-        ccfg = self._build().instance.mem_eval.ccfg
-        ccfg.set_strategy(dp=2, mp=2)
-        self.assertEqual(ccfg.mm_ccfgs["vision"].d, 2)
-        self.assertEqual(ccfg.mm_ccfgs["text"].d, 2)
+        ccfg = self._build({
+            "activation_checkpoint": {
+                "mode": "full",
+                "recompute_slice_activation": True,
+            },
+        }).instance.mem_eval.ccfg
+        ccfg.set_strategy(dp=1, mp=2)
+        self.assertEqual(ccfg.mm_ccfgs["vision"].d, 1)
+        self.assertEqual(ccfg.mm_ccfgs["text"].d, 1)
         self.assertEqual(ccfg.mm_ccfgs["vision"].t, 2)
         self.assertEqual(ccfg.mm_ccfgs["text"].t, 2)
+        self.assertEqual(ccfg.mm_ccfgs["vision"].shard_embed, 2)
+        self.assertEqual(ccfg.mm_ccfgs["text"].shard_embed, 2)
+        self.assertEqual(ccfg.mm_ccfgs["vision"].shard_recompute_input, 2)
+        self.assertEqual(ccfg.mm_ccfgs["text"].shard_recompute_input, 2)
 
 
 if __name__ == "__main__":
