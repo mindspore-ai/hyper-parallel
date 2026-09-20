@@ -105,7 +105,7 @@ def build_online_text_dataset(
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
-    if isinstance(transform, PlaintextTransform):
+    if isinstance(transform, PlaintextTransform) and transform.text_template is None:
         dataset_config[ONLINE_PLAINTEXT_TEXT_KEYS_KEY] = transform.text_keys
     if dataloader_context is None:
         dataloader_context = _build_dataloader_context(mesh_context, dataset_config)

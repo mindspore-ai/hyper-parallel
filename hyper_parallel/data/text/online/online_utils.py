@@ -34,7 +34,25 @@ _ONLINE_FILE_FORMATS = {
     ".json": "json",
     ".jsonl": "json",
     ".parquet": "parquet",
+    ".txt": "text",
 }
+
+_ONLINE_COMPRESSED_FORMATS = {
+    ".json.gz": "json",
+    ".jsonl.gz": "json",
+    ".csv.gz": "csv",
+    ".txt.gz": "text",
+}
+
+
+def _online_loader_format(path: str) -> str | None:
+    """Return a Hugging Face loader format based on a full file suffix."""
+    lowered_path = path.lower()
+    for suffix, loader_format in _ONLINE_COMPRESSED_FORMATS.items():
+        if lowered_path.endswith(suffix):
+            return loader_format
+    extension = os.path.splitext(lowered_path)[1]
+    return _ONLINE_FILE_FORMATS.get(extension)
 
 
 def _is_nonempty_plaintext_sample(sample: Mapping[str, Any], *, text_keys: str | Sequence[str]) -> bool:
@@ -104,22 +122,26 @@ def resolve_online_data_files(data_path: str | Sequence[str]) -> tuple[list[str]
         if not os.path.isdir(configured_path):
             raise FileNotFoundError(f"Online Dataset path does not exist: {configured_path}")
 
-        for filename in sorted(os.listdir(configured_path)):
-            file_extension = os.path.splitext(filename)[1].lower()
-            if file_extension in _ONLINE_FILE_FORMATS:
-                data_files.append(os.path.join(configured_path, filename))
+        for directory, directory_names, filenames in os.walk(configured_path):
+            directory_names.sort()
+            for filename in sorted(filenames):
+                file_path = os.path.join(directory, filename)
+                if _online_loader_format(file_path) is not None:
+                    data_files.append(file_path)
 
     if not data_files:
         raise ValueError("Online data_path must contain at least one supported data file")
 
     loader_formats = set()
     for data_file in data_files:
-        file_extension = os.path.splitext(data_file)[1].lower()
-        file_format = _ONLINE_FILE_FORMATS.get(file_extension)
+        file_format = _online_loader_format(data_file)
         loader_formats.add(file_format)
 
     if None in loader_formats or len(loader_formats) != 1:
-        raise ValueError("Online Dataset files must use one supported format: JSON/JSONL/Parquet/CSV/Arrow")
+        raise ValueError(
+            "Online Dataset files must use one supported format: "
+            "JSON/JSONL (optionally gzip-compressed), CSV, TXT, Parquet, or Arrow"
+        )
 
     loader_format = loader_formats.pop()
     return data_files, loader_format

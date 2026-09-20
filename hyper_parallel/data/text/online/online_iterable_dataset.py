@@ -42,7 +42,8 @@ def build_online_iterable_dataset(
     """Build a shuffled, DP-sharded, stateful Online raw-record stream.
 
     Args:
-        data_path: Optional local JSON/JSONL/Parquet/CSV/Arrow paths.
+        data_path: Optional local JSON/JSONL/CSV/TXT/Parquet/Arrow paths; JSON, CSV,
+            and TXT files may be gzip-compressed.
         data_config: Streaming options including ``shuffle``,
             ``shuffle_buffer_size``, and ``split_by_data_parallel``.
         dataloader_context: DataLoader ownership and DP topology.
