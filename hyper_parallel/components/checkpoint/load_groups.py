@@ -14,7 +14,7 @@
 # ============================================================================
 """Hugging Face checkpoint names and layouts, mapped onto the tensors of a finalized model.
 
-Both pretrained loaders are built on what is here. :class:`CheckpointManager` reads whole checkpoint
+Both pretrained loaders are built on what is here. :class:`HuggingFaceCheckpointer` reads whole checkpoint
 tensors and converts them in memory, while :class:`HFLoadPlanner` plans the same conversions as
 distributed checkpoint reads. Keys are renamed, converters are chosen and replacement conversions are
 routed the same way in both, so the two load the same values under the same names.

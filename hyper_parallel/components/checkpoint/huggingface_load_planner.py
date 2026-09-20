@@ -14,7 +14,7 @@
 # ============================================================================
 """Hugging Face checkpoints loaded into a finalized model through distributed checkpoint reads.
 
-:class:`HFLoadPlanner` loads what :meth:`CheckpointManager.load_checkpoint` loads, with the same
+:class:`HFLoadPlanner` loads what :meth:`HuggingFaceCheckpointer.load` loads, with the same
 renaming rules, converters and replacement conversions. The difference is in how the values get
 there. Every conversion is run once on :class:`RegionTensor` inputs while the load is planned, which
 turns it into the regions of checkpoint tensors each model tensor is copied from. Each rank then reads
@@ -51,7 +51,7 @@ from hyper_parallel.core.distributed_checkpoint.hf_storage import HuggingFaceSto
 from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, TensorStorageMetadata
 from hyper_parallel.core.distributed_checkpoint.remap_planner import DeferredRead, RemapBlock, RemapLoadPlanner
 from hyper_parallel.core.distributed_checkpoint.utils import all_gather_object, str_to_dtype
-from hyper_parallel.models._transformers.checkpoint_conversion import (
+from hyper_parallel.components.checkpoint.load_groups import (
     LoadGroup,
     LoadReport,
     SourceModelView,

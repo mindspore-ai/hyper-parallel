@@ -29,8 +29,13 @@ from hyper_parallel.components.checkpoint.conversion_ops import AddScalar, Inter
 from hyper_parallel.components.checkpoint.weight_conversion import ConversionOps, WeightConverter
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
-from hyper_parallel.models._transformers.hf_load_planner import HFLoadPlanner, load_hf_checkpoint
+from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
+    HuggingFaceCheckpointer,
+)
+from hyper_parallel.components.checkpoint.huggingface_load_planner import (
+    HFLoadPlanner,
+    load_hf_checkpoint,
+)
 from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
 # Model tensor -> (placements over the (dp, tp) = (2, 2) mesh, local shape on every rank).
@@ -165,9 +170,11 @@ def test_dcp_hf_planner_matches_legacy_loader() -> None:
         dist.barrier()
         mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
         legacy = _build_model(mesh)
-        legacy_report = CheckpointManager(legacy).load_checkpoint(
-            str(checkpoint_dir), weights_mapping=_mapping(), loader="legacy"
+        legacy_state = {"model": legacy}
+        HuggingFaceCheckpointer(loader="legacy", weights_mapping=_mapping()).load(
+            str(checkpoint_dir), legacy_state
         )
+        legacy_report = legacy_state["load_report"]
         expected = _full_tensors(legacy)
 
         for load_kwargs in ({}, {"use_collectives": False}):

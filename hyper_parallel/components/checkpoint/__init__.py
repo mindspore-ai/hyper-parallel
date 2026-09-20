@@ -30,6 +30,16 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
     DistributedCheckpointer,
     initialize_optimizer_state,
 )
+from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
+    HuggingFaceCheckpointer,
+    load_pretrained_weights,
+    resolve_hf_loader,
+)
+from hyper_parallel.components.checkpoint.huggingface_load_planner import (
+    HFLoadPlanner,
+    load_hf_checkpoint,
+)
+from hyper_parallel.components.checkpoint.load_groups import LoadReport
 from hyper_parallel.components.checkpoint.registry import (
     CHECKPOINTER_REGISTRY,
     build_checkpointer,
@@ -44,10 +54,16 @@ __all__ = [
     "DeinterleaveGateQKV",
     "DeinterleaveQKV",
     "DistributedCheckpointer",
+    "HFLoadPlanner",
+    "HuggingFaceCheckpointer",
     "InterleaveGateQKV",
     "InterleaveQKV",
+    "LoadReport",
     "STEP_PREFIX",
     "Split",
     "build_checkpointer",
     "initialize_optimizer_state",
+    "load_hf_checkpoint",
+    "load_pretrained_weights",
+    "resolve_hf_loader",
 ]

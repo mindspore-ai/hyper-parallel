@@ -22,29 +22,15 @@ if TYPE_CHECKING:
         HyperAutoModelForImageTextToText,
         HyperAutoModelForSequenceClassification,
     )
-    from hyper_parallel.models._transformers.checkpoint_loader import (
-        CheckpointManager,
-        DCPBackend,
-        LoadReport,
-    )
-    from hyper_parallel.models._transformers.hf_load_planner import (
-        HFLoadPlanner,
-        load_hf_checkpoint,
-    )
 
 
-# AutoModel and checkpoint modules load the full torch/Transformers runtime.
+# AutoModel loads the full torch/Transformers runtime.
 # Keep package initialization lightweight for direct imports such as
 # ``config_resolver``.
 _LAZY_EXPORTS = {
     "HyperAutoModelForCausalLM": ".auto_model",
     "HyperAutoModelForImageTextToText": ".auto_model",
     "HyperAutoModelForSequenceClassification": ".auto_model",
-    "CheckpointManager": ".checkpoint_loader",
-    "DCPBackend": ".checkpoint_loader",
-    "LoadReport": ".checkpoint_loader",
-    "HFLoadPlanner": ".hf_load_planner",
-    "load_hf_checkpoint": ".hf_load_planner",
 }
 
 
@@ -68,9 +54,4 @@ __all__ = [
     "HyperAutoModelForCausalLM",
     "HyperAutoModelForImageTextToText",
     "HyperAutoModelForSequenceClassification",
-    "CheckpointManager",
-    "DCPBackend",
-    "LoadReport",
-    "HFLoadPlanner",
-    "load_hf_checkpoint",
 ]

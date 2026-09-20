@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""UT for :mod:`hyper_parallel.models._transformers.hf_load_planner`, against the legacy loader."""
+"""UT for :mod:`hyper_parallel.components.checkpoint.huggingface_load_planner`, against the legacy loader."""
 import os
 import shutil
 import tempfile
@@ -31,8 +31,14 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
     WeightRenaming,
 )
-from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager, resolve_hf_loader
-from hyper_parallel.models._transformers.hf_load_planner import HFLoadPlanner, load_hf_checkpoint
+from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
+    HuggingFaceCheckpointer,
+    resolve_hf_loader,
+)
+from hyper_parallel.components.checkpoint.huggingface_load_planner import (
+    HFLoadPlanner,
+    load_hf_checkpoint,
+)
 
 _QKV_SOURCES = ["q_proj.weight", "k_proj.weight", "v_proj.weight"]
 
@@ -122,7 +128,7 @@ class TestHFLoadPlanner(unittest.TestCase):
 
     def _checkpoint_dir(self, tensors: dict[str, torch.Tensor], file_name: str = "model.safetensors") -> Path:
         """A checkpoint directory holding ``tensors`` in one file, removed once the test is done."""
-        path = Path(tempfile.mkdtemp(prefix="test_hf_load_planner_"))
+        path = Path(tempfile.mkdtemp(prefix="test_huggingface_load_planner_"))
         self.addCleanup(shutil.rmtree, path, ignore_errors=True)
         save_file(tensors, str(path / file_name))
         return path
@@ -141,13 +147,15 @@ class TestHFLoadPlanner(unittest.TestCase):
         for loader in ("legacy", "dcp"):
             model = make_model()
             mapping = make_mapping(model) if make_mapping is not None else None
-            reports.append(CheckpointManager(model).load_checkpoint(path, weights_mapping=mapping, loader=loader))
+            state = {"model": model}
+            HuggingFaceCheckpointer(loader=loader, weights_mapping=mapping).load(path, state)
+            reports.append(state["load_report"])
             models.append(model)
         return models[0], models[1], reports[0], reports[1]
 
     def test_dcp_loader_matches_the_legacy_loader(self):
         """
-        Feature: CheckpointManager.load_checkpoint with loader="dcp".
+        Feature: HuggingFaceCheckpointer.load with loader="dcp".
         Description: Load a checkpoint whose Q, K and V are grouped into one projection, whose norm is
             shifted by one and whose embedding is bfloat16 and tied to the head, once per loader.
         Expectation: Both models hold the same tensors, the reports agree, the tied head counts as
@@ -210,7 +218,7 @@ class TestHFLoadPlanner(unittest.TestCase):
             return [_mapping()[0], product]
 
         legacy = _TinyModel()
-        CheckpointManager(legacy).load_checkpoint(path, weights_mapping=rules(), loader="legacy")
+        HuggingFaceCheckpointer(loader="legacy", weights_mapping=rules()).load(path, {"model": legacy})
         dcp = _TinyModel()
         planner = HFLoadPlanner(dcp, weights_mapping=rules())
         load_hf_checkpoint(dcp, path, planner=planner)
