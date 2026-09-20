@@ -2374,6 +2374,44 @@ class TestSwapAdapterStepPreparation(_AdapterTestCase):
         # The original checkpoint is left untouched for the second load phase.
         self.assertEqual(set(state_dict["state"][id(param)]), {"step", *ADAM_STATE_KEYS})
 
+    def test_strip_swappable_state_reuses_checkpoint_tensors(self):
+        """Stripping must not duplicate the large checkpoint buffers in host memory."""
+        param = torch.nn.Parameter(torch.ones(8))
+        adapter, _ = self._adapter(torch.optim.Adam([param], lr=0.01))
+        step = torch.zeros(())
+        exp_avg = torch.ones(8)
+        exp_avg_sq = torch.full((8,), 2.0)
+        saved_state = {"step": step, "exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq}
+        state_dict = {
+            "state": {id(param): saved_state},
+            "param_groups": [{"params": [id(param)]}],
+        }
+
+        stripped, removed = adapter.strip_swappable_state(state_dict)
+
+        # Swappable buffers are handed over by reference, not copied.
+        self.assertIs(removed[id(param)]["exp_avg"], exp_avg)
+        self.assertIs(removed[id(param)]["exp_avg_sq"], exp_avg_sq)
+        # The caller's checkpoint mapping and state dict are not mutated.
+        self.assertIs(state_dict["state"][id(param)], saved_state)
+        self.assertEqual(set(saved_state), {"step", *ADAM_STATE_KEYS})
+        self.assertIsNot(stripped, state_dict)
+        self.assertIsNot(stripped["state"], state_dict["state"])
+        # Only the container is copied for non-swappable entries.
+        self.assertIs(stripped["state"][id(param)]["step"], step)
+        self.assertIs(stripped["param_groups"], state_dict["param_groups"])
+
+    def test_strip_swappable_state_keeps_non_mapping_state(self):
+        """Malformed checkpoint state entries pass through unchanged."""
+        param = torch.nn.Parameter(torch.ones(8))
+        adapter, _ = self._adapter(torch.optim.Adam([param], lr=0.01))
+        state_dict = {"state": {id(param): None}, "param_groups": []}
+
+        stripped, removed = adapter.strip_swappable_state(state_dict)
+
+        self.assertIsNone(stripped["state"][id(param)])
+        self.assertEqual(removed, {})
+
     def test_initial_slots_discovers_pre_existing_state(self):
         """State materialized before wrapping is discovered for the first offload."""
         param = torch.nn.Parameter(torch.ones(8))

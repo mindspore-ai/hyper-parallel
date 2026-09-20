@@ -211,6 +211,15 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
             group_name = swap_manager.get_current_group_name()
             if not group_name:
                 return tensor.detach()
+            if swap_manager.is_last_group(group_name):
+                # The terminal group has no next layer, so its forward hook never
+                # launches an offload and its backward pre-hook never calls
+                # wait_load().  Registering its tensors would therefore grow the
+                # group's persistent _seen_dedup_keys set forever (wait_load is
+                # its only reset point) and misflag later tensors that reuse a
+                # recycled data_ptr as duplicates.  Leave them on device, as
+                # swap_tensor_wrapper() already does for the last group.
+                return tensor.detach()
             if not self.add_to_storage:
                 swap_manager.add_storage(group_name, self.storage)
                 self.add_to_storage = True

@@ -1299,25 +1299,40 @@ class OptimizerSwapAdapter:
         PyTorch's ``load_state_dict`` eagerly restores tensors into the
         optimizer state.  For swap-managed Adam buffers, that would bypass the
         adapter/runtime bookkeeping and can place large tensors directly on the
-        device.  This method therefore deep-copies the checkpoint state dict,
-        removes the Adam buffers that may be swap-managed, and returns them in a
-        side table keyed by the checkpoint parameter id.
+        device.  This method therefore removes the Adam buffers that may be
+        swap-managed from a copy of the checkpoint state dict and returns them
+        in a side table keyed by the checkpoint parameter id.
 
         The stripped state dict is safe to pass to the wrapped optimizer's
         ``load_state_dict`` for ordinary fields such as parameter groups and
         step counters.  The removed tensors must be handed to
         ``load_swappable_state`` afterwards so they can be restored with the
         correct CPU mirror/device placeholder layout.
+
+        Only the container structure is copied: the large state tensors stay
+        owned by the caller's checkpoint and are referenced by ``removed``, so
+        the original checkpoint is left untouched (its state mappings are not
+        popped) without duplicating every ``exp_avg``/``exp_avg_sq`` buffer on
+        host for the duration of the load.  Consumers only read from
+        ``removed`` and build their own CPU copies, so the aliasing is safe.
         """
-        stripped = copy.deepcopy(state_dict)
+        stripped = dict(state_dict)
         removed: Dict[int, Dict[str, Any]] = {}
         swappable_keys = self._configured_state_keys()
-        for param_id, saved_state in list(stripped.get("state", {}).items()):
+        stripped_state: Dict[Any, Any] = {}
+        for param_id, saved_state in state_dict.get("state", {}).items():
             if not isinstance(saved_state, dict):
+                stripped_state[param_id] = saved_state
                 continue
+            # Copy the per-parameter mapping so popping the swappable keys does
+            # not mutate the caller's checkpoint; the remaining values are
+            # shared by reference.
+            remaining = dict(saved_state)
             for key in swappable_keys:
-                if key in saved_state:
-                    removed.setdefault(param_id, {})[key] = saved_state.pop(key)
+                if key in remaining:
+                    removed.setdefault(param_id, {})[key] = remaining.pop(key)
+            stripped_state[param_id] = remaining
+        stripped["state"] = stripped_state
         return stripped, removed
 
     def load_swappable_state(self, original_state_dict: Dict[str, Any], removed: Dict[int, Dict[str, Any]]) -> None:

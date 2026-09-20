@@ -57,6 +57,49 @@ _checkpoint_exclude = importlib.import_module("hyper_parallel.core.activation_me
 _swap_module = importlib.import_module("hyper_parallel.core.activation_memory.swap")
 
 
+class _MetaSwapBackend:
+    """Backend shim that makes meta tensors look like accelerator tensors.
+
+    ``SwapTensor`` only takes its swappable (device) branch for tensors that
+    pass ``isinstance(val, _backend.Tensor)`` and are not CPU tensors, so the
+    swap bookkeeping under test is never exercised on a CPU-only host without
+    this shim.  Meta tensors report every ``data_ptr()`` as 0, which would
+    collapse all dedup keys into one, so :meth:`dedup_key` is overridden to key
+    on object identity instead.
+    """
+    Tensor = torch.Tensor
+
+    @staticmethod
+    def tree_map(fn, tree):
+        """Apply ``fn`` over a nested list/tuple/dict structure."""
+        if isinstance(tree, (list, tuple)):
+            return type(tree)(_MetaSwapBackend.tree_map(fn, x) for x in tree)
+        if isinstance(tree, dict):
+            return type(tree)((k, _MetaSwapBackend.tree_map(fn, v)) for k, v in tree.items())
+        return fn(tree)
+
+
+class _LastGroupModule(torch.nn.Module):
+    """Minimal layer used to grow a two-layer swap prefetch chain."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(4, 4)
+
+
+def _non_last_group_manager(group_name: str) -> MagicMock:
+    """Build a SwapManager stub that reports ``group_name`` as non-terminal.
+
+    ``is_last_group`` must be stubbed explicitly: a bare MagicMock returns a
+    truthy mock, which would silently route the pack hook down the terminal-group
+    fast path and hide the registration behavior these tests assert.
+    """
+    fake_manager = MagicMock()
+    fake_manager.get_current_group_name.return_value = group_name
+    fake_manager.is_last_group.return_value = False
+    return fake_manager
+
+
 class _TinyModule(torch.nn.Module):
     """Small module used by wrapper tests."""
 
@@ -329,8 +372,7 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
         expected = torch.tensor([1.0, 2.0])
         original = expected.clone()
         original_ref = weakref.ref(original)
-        fake_manager = MagicMock()
-        fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager = _non_last_group_manager("group0")
 
         with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
             saved_tensors = AsyncSaveOnCpu(group_swap=True)
@@ -359,14 +401,61 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
     def test_adds_storage_once_for_registered_group(self):
         """MUST_SWAP policies should register swap storage once per group."""
         x = torch.randn(2, requires_grad=True)
-        fake_manager = MagicMock()
-        fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager = _non_last_group_manager("group0")
 
         with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
             with AsyncSaveOnCpu(policy_fn=lambda tensor: CheckpointPolicy.MUST_SWAP, group_swap=True):
                 (x * x).sum()
 
         fake_manager.add_storage.assert_called_once()
+
+    def test_skips_registration_for_last_group(self):
+        """Last-group tensors must not be registered, matching swap_tensor_wrapper."""
+        x = torch.randn(2, requires_grad=True)
+        fake_manager = _non_last_group_manager("group_last")
+        fake_manager.is_last_group.return_value = True
+
+        with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
+            context = AsyncSaveOnCpu(policy_fn=lambda tensor: CheckpointPolicy.MUST_SWAP, group_swap=True)
+            with context:
+                (x * x).sum()
+
+        fake_manager.add_storage.assert_not_called()
+        self.assertFalse(context.add_to_storage)
+        self.assertEqual(context.count_idx, 0)
+
+    def test_last_group_registration_set_does_not_grow_across_iterations(self):
+        """Repeated forwards on the terminal layer must not leak dedup keys.
+
+        The terminal group never offloads and never calls ``wait_load()``, which
+        is the only place ``_seen_dedup_keys`` is reset.  Registering its saved
+        tensors would therefore grow that set once per iteration, and stale
+        ``data_ptr`` keys would later misflag tensors at recycled addresses as
+        duplicates.
+        """
+        manager = _swap_module.SwapManager()
+        first, second = _LastGroupModule(), _LastGroupModule()
+        manager.set_forward_prefetch_layer(first, second)
+        self.addCleanup(manager.unregister_forward_prefetch_layer, first)
+        self.addCleanup(manager.unregister_forward_prefetch_layer, second)
+        self.addCleanup(manager._groups.clear)
+
+        last_group_name = second._swap_group_name
+        self.assertTrue(manager.is_last_group(last_group_name))
+        last_group = manager._groups[last_group_name]
+
+        with patch.object(_swap_module, "_backend", _MetaSwapBackend()), \
+                patch.object(_swap_module.SwapTensor, "dedup_key", lambda self: id(self.val)):
+            with manager.group_context(last_group_name):
+                for _ in range(4):
+                    context = AsyncSaveOnCpu(group_swap=True)
+                    for _ in range(3):
+                        context.pack_hook(torch.empty(8, device="meta"))
+                    # Backward side of the terminal group's own hook.
+                    manager.release_group_storage(last_group_name)
+
+        self.assertEqual(last_group._seen_dedup_keys, set())
+        self.assertEqual(last_group._storages, [])
 
 
 class TestSwapTensorWrapper(unittest.TestCase):
