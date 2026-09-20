@@ -27,9 +27,8 @@ from torch import nn
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
+from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.functional import apply_rotary_pos_emb, apply_rotary_pos_emb_interleave
-from hyper_parallel.components.functional import npu_fusion_attention_forward
 
 
 @dataclass
@@ -83,6 +82,8 @@ class MLAAttention(nn.Module):
         self.config = config
         self.layer_idx = getattr(module, "layer_idx", getattr(module, "layer_number", None))
         self.num_heads = getattr(module, "num_heads", config.num_attention_heads)
+        self.global_num_heads = self.num_heads
+        self.mla_cp_runtime = None
         self.num_key_value_heads = getattr(
             module,
             "num_key_value_heads",
@@ -197,16 +198,23 @@ class MLAAttention(nn.Module):
             )
         return transforms
 
-    def _project_latents(self, hidden_states: torch.Tensor) -> _MLALatents:
-        """Project hidden states into query and compressed KV latent states."""
-        batch_size, sequence_length = hidden_states.shape[:-1]
+    def _normalized_latents(
+        self, hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Expose normalized latents before up projection for MLA CP routing."""
         latent_states = self.linear_qkv(hidden_states)
         query_latent, kv_nope, key_rope = torch.split(
             latent_states,
             (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim),
             dim=-1,
         )
-        query_states = self.q_b_proj(self.q_a_layernorm(query_latent)).view(
+        return self.q_a_layernorm(query_latent), self.kv_a_layernorm(kv_nope), key_rope
+
+    def _project_latents(self, hidden_states: torch.Tensor) -> _MLALatents:
+        """Project hidden states into query and compressed KV latent states."""
+        batch_size, sequence_length = hidden_states.shape[:-1]
+        query_latent, kv_nope, key_rope = self._normalized_latents(hidden_states)
+        query_states = self.q_b_proj(query_latent).view(
             batch_size,
             sequence_length,
             self.num_heads,
@@ -222,7 +230,7 @@ class MLAAttention(nn.Module):
             sequence_length,
             query_pass,
             query_rope.transpose(1, 2),
-            self.kv_a_layernorm(kv_nope).view(
+            kv_nope.view(
                 batch_size, 1, sequence_length, self.kv_lora_rank
             ),
             key_rope.view(batch_size, 1, sequence_length, self.qk_rope_head_dim),
@@ -238,6 +246,11 @@ class MLAAttention(nn.Module):
         latents = self._project_latents(hidden_states)
         query_rope, key_rope = latents.query_rope, latents.key_rope
         if position_embeddings is not None:
+            # The original NPU RoPE implementation is optional on CPU CP users.
+            from hyper_parallel.components.functional import (  # pylint: disable=C0415
+                apply_rotary_pos_emb, apply_rotary_pos_emb_interleave,
+            )
+
             cos, sin = position_embeddings
             rope_fn = apply_rotary_pos_emb_interleave if self.rotary_interleaved else apply_rotary_pos_emb
             query_rope, key_rope = rope_fn(query_rope, key_rope, cos, sin)
@@ -272,6 +285,15 @@ class MLAAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run MLA with the same external contract as Transformers attention."""
         batch_size, seq_length = hidden_states.shape[:-1]
+        if self.mla_cp_runtime is not None:
+            if past_key_values is not None:
+                raise ValueError("MLA CP training does not support a KV cache")
+            attn_output, attn_weights = self.mla_cp_runtime(
+                self, *self._normalized_latents(hidden_states),
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask, actual_seq_len=actual_seq_len, **kwargs,
+            )
+            return self.o_proj(attn_output.reshape(batch_size, seq_length, -1).contiguous()), attn_weights
         query_states, key_states, value_states = self._project_attention_inputs(
             hidden_states,
             position_embeddings,

@@ -91,10 +91,11 @@ def _apply_interleaved_rope(
             rotary_mode="interleave",
         )
     rotated = rotated.permute(1, 2, 0, 3)
-    rotated = torch.cat((rotated[..., 0::2], rotated[..., 1::2]), dim=-1)
+    # Transpose pairs instead of strided slices to avoid scattered writes in backward.
+    rotated = rotated.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2)
     if unsqueeze_dim == 2:
         rotated = rotated.transpose(1, 2)
-    return torch.cat((rotated, pass_through), dim=-1)
+    return torch.cat((rotated, pass_through), dim=-1) if pass_through.shape[-1] else rotated
 
 
 def apply_rotary_pos_emb_interleave(
