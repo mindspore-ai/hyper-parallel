@@ -147,3 +147,86 @@ def apply_rotary_pos_emb_interleave(
         rotated_tensors.append(torch.cat((rotated, pass_through), dim=-1))
 
     return rotated_tensors[0], rotated_tensors[1]
+
+
+def _rotate_half(
+        x: torch.Tensor,
+        rotary_interleaved: bool = False,
+) -> torch.Tensor:
+    if not rotary_interleaved:
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+
+    dim = x.shape[-1]
+    index1 = np.ones(dim)
+    index1[::2] = 0
+    index2 = np.zeros(dim)
+    index2[::2] = -1
+    rotation_matrix = np.eye(dim, k=1) * index1 + np.eye(dim, k=-1) * index2
+    rotation_matrix = torch.from_numpy(rotation_matrix[None, None, :, :]).to(x.dtype).to(x.device)
+    return torch.matmul(x, rotation_matrix)
+
+
+def apply_rotary_pos_emb_single(
+        t: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        rotary_interleaved: bool = False, 
+        use_fused_rotary_pos_emb: bool = False,
+) -> torch.Tensor:
+    """Apply rotary embeddings using precomputed cosine and sine tensors."""
+    rot_dim = cos.shape[-1]
+    t_dim = t.shape[-1]
+    t_pass = None
+    if rot_dim != t_dim:
+        t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+
+    cos = cos.to(t.dtype)
+    sin = sin.to(t.dtype)
+
+    while cos.ndim < t.ndim:
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+
+    if use_fused_rotary_pos_emb and HAS_NPU and t.device.type != "cpu":
+        rotary_mode = "interleave" if rotary_interleaved else "half"
+        sequence_length, batch_size, num_heads, head_dim = t.shape
+        if rotary_interleaved and batch_size > 1 and sequence_length > 1:
+            t = torch_npu.npu_rotary_mul(
+                t.reshape(batch_size * sequence_length, 1, num_heads, head_dim),
+                cos.reshape(batch_size * sequence_length, 1, cos.shape[-2], cos.shape[-1]),
+                sin.reshape(batch_size * sequence_length, 1, sin.shape[-2], sin.shape[-1]),
+                rotary_mode=rotary_mode,
+            ).reshape(sequence_length, batch_size, num_heads, head_dim)
+        else:
+            t = torch_npu.npu_rotary_mul(t.clone(), cos, sin, rotary_mode=rotary_mode)
+    else:
+        t = (t * cos) + (_rotate_half(t, rotary_interleaved) * sin)
+
+    if rot_dim != t_dim:
+        return torch.cat((t, t_pass), dim=-1)
+    return t
+
+
+def apply_rotary_pos_emb_single_freqs(
+        t: torch.Tensor,
+        freqs: torch.Tensor,
+        rotary_interleaved: bool = False, 
+) -> torch.Tensor:
+    rot_dim = freqs.shape[-1]
+    t_dim = t.shape[-1]
+    t_pass = None
+    if rot_dim != t_dim:
+        t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+
+    cos_ = torch.cos(freqs).to(t.dtype)
+    sin_ = torch.sin(freqs).to(t.dtype)
+
+    rotary_mode = "interleave" if rotary_interleaved else "half"
+    t_copy = t.clone()
+    t = torch_npu.npu_rotary_mul(t_copy, cos_, sin_, rotary_mode=rotary_mode)
+    t_copy.untyped_storage().resize_(0)
+
+    if t_pass is not None:
+        return torch.cat((t, t_pass), dim=-1)
+    return t
