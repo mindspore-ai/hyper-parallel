@@ -369,7 +369,7 @@ def _build_replacement_context(
 
 
 def _apply_pre_sharding_features(
-    model: nn.Module,
+    _model: nn.Module,
     peft_config: Optional[Any],
     qat_config: Optional[Any],
     fp8_config: Optional[Any],

@@ -34,7 +34,7 @@ class _FakeGatedDeltaNet(nn.Module):
         super().__init__()
         self.num_v_heads = 8
         self.dt_bias = nn.Parameter(torch.empty(4))
-        self.A_log = nn.Parameter(torch.empty(4))
+        self.register_parameter("A_log", nn.Parameter(torch.empty(4)))
 
 
 class _FakeModel(nn.Module):
