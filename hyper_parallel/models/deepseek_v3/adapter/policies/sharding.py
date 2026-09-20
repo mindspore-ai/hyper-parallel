@@ -24,7 +24,7 @@ def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
     )
 
     return [
-        (["q_a_proj", "kv_a_proj_with_mqa"], ParamRole.REPLICATED),
+        (["q_a_proj", "kv_a_proj_with_mqa", "linear_qkv"], ParamRole.REPLICATED),
         (["q_b_proj", "kv_b_proj"], ParamRole.COLWISE),
     ]
 
