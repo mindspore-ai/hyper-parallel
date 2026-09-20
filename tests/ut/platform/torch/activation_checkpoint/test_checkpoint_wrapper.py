@@ -194,7 +194,7 @@ class TestCkptWrapper(unittest.TestCase):
         """DCP optimizer restore should not expose the wrapper prefix."""
         source = torch.nn.Module()
         source.block = ckpt_wrapper(_BaseWrapperModule())
-        source_optimizer = torch.optim.AdamW(source.parameters())
+        source_optimizer = torch.optim.AdamW(source.parameters(), foreach=False)
         source_optimizer.zero_grad()
         for parameter in source.parameters():
             parameter.grad = torch.zeros_like(parameter)
@@ -213,7 +213,7 @@ class TestCkptWrapper(unittest.TestCase):
 
         target = torch.nn.Module()
         target.block = ckpt_wrapper(_BaseWrapperModule())
-        target_optimizer = torch.optim.AdamW(target.parameters())
+        target_optimizer = torch.optim.AdamW(target.parameters(), foreach=False)
         set_optimizer_state_dict(
             target,
             target_optimizer,
