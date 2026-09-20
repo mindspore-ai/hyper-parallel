@@ -706,14 +706,10 @@ class StandardLoadPlanner(LoadPlanner):
                     if not item.broadcastable:
                         unsendable.add(item.dest_index)
 
-        item_size = {
-            fqn: dtype_element_size(getattr(getattr(md, "properties", None), "dtype", None))
-            for fqn, md in self.metadata.state_dict_metadata.items()
-        }
         # Every member of a group counted its own read into group_elements, and they all read
         # the same, so dividing by the group size gives back what the one reader will move.
         shards = [
-            (item_size[index.fqn] * group_elements[index] // len(ranks), index, tuple(sorted(ranks)))
+            (self._shard_element_size(index) * group_elements[index] // len(ranks), index, tuple(sorted(ranks)))
             for index, ranks in replicas.items() if len(ranks) > 1 and index not in unsendable
         ]
         if not shards:
@@ -747,6 +743,19 @@ class StandardLoadPlanner(LoadPlanner):
             if item.dest_index in sources else item
             for item in own_plan.items
         ])
+
+    def _shard_element_size(self, index: MetadataIndex) -> int:
+        """
+        Bytes one element of the shard ``index`` names takes, which weighs it when readers are picked.
+
+        Args:
+            index (MetadataIndex): Names the shard, as a read item destination does.
+
+        Returns:
+            int: Element size of the checkpoint tensor the shard is read from.
+        """
+        md = self.metadata.state_dict_metadata.get(index.fqn)
+        return dtype_element_size(getattr(getattr(md, "properties", None), "dtype", None))
 
     def finalize_plan(self, plan: LoadPlan) -> LoadPlan:
         """

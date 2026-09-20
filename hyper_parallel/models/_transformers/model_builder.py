@@ -30,12 +30,14 @@ from torch import nn
 from transformers import PreTrainedModel
 from hyper_parallel import DTensor
 from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
+from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
+    HuggingFaceCheckpointer,
+)
 from hyper_parallel.components.checkpoint.weight_conversion import (
     get_model_conversion_mapping,
 )
 
 from hyper_parallel.models._transformers.checkpoint_loader import (
-    CheckpointManager,
     _finalize_model_loading,
 )
 from hyper_parallel.models.build_options import CompileConfig
@@ -414,10 +416,11 @@ def _materialize_and_load_model(
     if not is_meta_device:
         return model
     if load_base_model:
-        load_report = CheckpointManager(model).load_checkpoint(
-            pretrained_path, strict=False, weights_mapping=weights_mapping
+        state = {"model": model}
+        HuggingFaceCheckpointer(weights_mapping=weights_mapping).load(
+            pretrained_path, state, strict_model=False
         )
-        _finalize_model_loading(model, load_report, strict=True)
+        _finalize_model_loading(model, state["load_report"], strict=True)
         reason = "checkpoint_load"
     else:
         _initialize_model_weights(model)

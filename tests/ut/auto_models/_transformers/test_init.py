@@ -23,6 +23,7 @@ import unittest
 _EXPORT_MODULES = (
     "hyper_parallel.models._transformers.auto_model",
     "hyper_parallel.models._transformers.checkpoint_loader",
+    "hyper_parallel.models._transformers.model_builder",
 )
 
 
@@ -72,7 +73,7 @@ class TestLazyTransformersExports(unittest.TestCase):
     def test_lazy_export_is_resolved_and_cached(self):
         """
         Feature: lazy export resolution
-        Description: resolve CheckpointManager using a mocked module import
+        Description: resolve HyperAutoModelForCausalLM using a mocked module import
         Expectation: the owner module is imported once and the symbol is cached
         """
         script = textwrap.dedent(
@@ -82,11 +83,11 @@ class TestLazyTransformersExports(unittest.TestCase):
             import hyper_parallel.models._transformers as integration
 
             sentinel = object()
-            owner_module = SimpleNamespace(CheckpointManager=sentinel)
+            owner_module = SimpleNamespace(HyperAutoModelForCausalLM=sentinel)
             with patch.object(integration, "_import_module", return_value=owner_module) as importer:
-                assert integration.CheckpointManager is sentinel
-                assert integration.CheckpointManager is sentinel
-                importer.assert_called_once_with(".checkpoint_loader", integration.__name__)
+                assert integration.HyperAutoModelForCausalLM is sentinel
+                assert integration.HyperAutoModelForCausalLM is sentinel
+                importer.assert_called_once_with(".auto_model", integration.__name__)
             """
         )
 

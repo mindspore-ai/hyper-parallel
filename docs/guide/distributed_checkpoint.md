@@ -1,6 +1,6 @@
 # DCP 分布式检查点使用指南
 
-HyperParallel 提供 DCP（Distributed Checkpoint）能力：每个 rank 只保存自己持有的分片，配合一份描述"谁存了哪一块"的全局元数据；加载时按目标切分策略重新计算需要读哪些片段，因此**并行策略变化后无需离线转换**。此外支持异步落盘、副本张量读一次 + 广播、Plan 缓存，以及与 Hugging Face safetensors 格式的离线互转。
+HyperParallel 提供 DCP（Distributed Checkpoint）能力：每个 rank 只保存自己持有的分片，配合一份描述"谁存了哪一块"的全局元数据；加载时按目标切分策略重新计算需要读哪些片段，因此**并行策略变化后无需离线转换**。此外支持异步落盘、副本张量读一次 + 广播、Plan 缓存、直接加载 Hugging Face 权重和 torch 分片写出的 safetensors 目录，以及与 Hugging Face safetensors 格式的离线互转。
 
 ## 核心概念
 
@@ -23,6 +23,7 @@ DCP 模块位于 `hyper_parallel/core/distributed_checkpoint/`：
 | `standard_planner.py` | 默认实现 `StandardSavePlanner` / `StandardLoadPlanner` |
 | `storage.py` | 存储后端抽象接口 `StorageWriter` / `StorageReader` |
 | `filesystem_storage.py` | 文件系统实现 `FileSystemWriter` / `FileSystemReader`（safetensors） |
+| `hf_storage.py` | 不经 DCP 写出的 safetensors 目录的读取器：`HuggingFaceStorageReader`（HF 权重）、`TorchShardedSafetensorsReader`（torch 分片写出的目录），由各文件头构造元数据，直接走 `load` 加载 |
 | `metadata.py` | `Metadata` / `ChunkStorageMetadata` / `ChunkInfo` / `BroadcastInfo` 等元数据结构 |
 | `async_persist.py` | 异步保存：staging（`DataCopier`）与子进程持久化 |
 | `ragged.py` | `RaggedShard`（非均匀切分）的几何适配 |
@@ -288,6 +289,56 @@ model = fully_shard(model, mesh=mesh)
 
 save(model.state_dict(), checkpoint_id="/ckpt/step_1000")
 ```
+
+---
+
+## 直接加载 safetensors 权重
+
+两种不是 DCP 写出的 safetensors 目录可以直接交给 `load`，不必先离线转成 DCP。两种目录的规则互相冲突，所以各用一个 reader：
+
+| | `HuggingFaceStorageReader` | `TorchShardedSafetensorsReader` |
+|------|------|------|
+| 读什么 | Hugging Face 权重，即 `save_pretrained` 的产物：张量完整，每个只在一个文件里 | torch `HuggingFaceStorageWriter(save_distributed=True)` 写出、尚未合并的分片：每个 rank 一个文件，同一个张量分散在多个文件里，没有 index |
+| 读哪些文件 | `model.safetensors.index.json` 列出的文件；没有 index 时只读 `model.safetensors`，目录里其他 safetensors 都不读 | 目录下（不递归）的全部 `*.safetensors` |
+| 张量位置 | 文件头若带 `DCP_SHARDING_INFO`，offsets 必须全为 0 | 每个文件都必须带 `DCP_SHARDING_INFO`；同名张量的各片按 offsets 拼成一个张量，必须拼满且不重叠 |
+| 指错目录时 | 某个张量的 offsets 不为 0 → `ValueError`；既没有 index 也没有 `model.safetensors` → `FileNotFoundError`。两者都提示改用 `TorchShardedSafetensorsReader` | 目录里有 index，或文件没带 `DCP_SHARDING_INFO` → `ValueError`，提示改用 `HuggingFaceStorageReader` |
+
+```python
+from hyper_parallel.core.distributed_checkpoint import (
+    HuggingFaceStorageReader,
+    StandardLoadPlanner,
+    TorchShardedSafetensorsReader,
+    load,
+)
+
+load(model.state_dict(), storage_reader=HuggingFaceStorageReader("/models/Qwen3-8B"))
+
+# tie_word_embeddings 的模型：绑定权重在 HF 文件里只存一份，缺的 key 需要放行
+load(model.state_dict(), storage_reader=HuggingFaceStorageReader("/models/Qwen3-8B"),
+     planner=StandardLoadPlanner(allow_partial_load=True))
+
+# torch 分片写出、尚未合并的目录
+load(model.state_dict(), storage_reader=TorchShardedSafetensorsReader("/ckpt/step_1000/sharded"))
+```
+
+torchtitan 保存为 HF 格式时，先把分片写到 checkpoint 下的 `sharded/` 目录，再合并出带 index 的完整权重，这两个目录分别对应上面两个 reader。
+
+两个 reader 替换的只是「元数据从哪来」这一步：`FileSystemReader` 反序列化 `.metadata`，它们则读每个 safetensors 文件开头的 JSON 头，拿到每个张量的 dtype 和 shape，拼成同样的 `Metadata`，每个张量记在它在文件里的名字下。构造元数据只读文件头，不读张量数据。之后的规划、重切分、副本读一次 + 广播、按文件读取全部沿用，所以：
+
+- 目标可以是任意切分的 DTensor，每个 rank 只读自己那一片；
+- 目标 dtype 可以和文件不同（例如文件是 bf16、参数是 fp32），`copy_` 时转换。
+
+**这一层只管读，不做转换：**
+
+| 限制 | 说明 |
+|------|------|
+| 名字和形状要对上 | state_dict 的 key 必须就是文件里的张量名，全局 shape 一致。改名、q/k/v 合并成 `linear_qkv`、专家权重堆叠这类转换不在这一层 |
+| 缺失的 key | 默认报 `Missing key in checkpoint state_dict`；需要放行时传 `StandardLoadPlanner(allow_partial_load=True)` |
+| 量化权重 | 按存储原样读：FP8 权重读出来仍是 FP8 值，scale 是单独的张量，不做反量化 |
+| 只读 | 暂不支持保存为 HF 格式 |
+| 需要进程组 | 与其他 `load` 相同，要求已经 `init_process_group`，单进程也不例外 |
+
+以下情况 `load_metadata` 直接报错，而不是读出错误的数据：同一张量的同一片出现在两个文件里；各片 dtype 不一致；各片拼不满整个张量（缺文件）或互相重叠；记录了 `DCP_SHARDING_INFO` 的文件漏记了某个张量的偏移；dtype 没有对应的 torch 类型。
 
 ---
 

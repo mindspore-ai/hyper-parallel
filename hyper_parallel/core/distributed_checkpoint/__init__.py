@@ -45,6 +45,10 @@ __all__ = [
     # Standard planners
     "StandardSavePlanner",
     "StandardLoadPlanner",
+    # Loads of checkpoints laid out differently from the state dict
+    "DeferredRead",
+    "RemapBlock",
+    "RemapLoadPlanner",
     # Storage interfaces
     "StorageWriter",
     "StorageReader",
@@ -53,6 +57,9 @@ __all__ = [
     # File system storage
     "FileSystemWriter",
     "FileSystemReader",
+    # Safetensors checkpoints written outside DCP
+    "HuggingFaceStorageReader",
+    "TorchShardedSafetensorsReader",
     # Optimizer state dict
     "get_optim_state_dict",
     "set_optim_state_dict",
@@ -96,6 +103,13 @@ from hyper_parallel.core.distributed_checkpoint.standard_planner import (
     StandardSavePlanner,
 )
 
+# Loads of checkpoints laid out differently from the state dict
+from hyper_parallel.core.distributed_checkpoint.remap_planner import (
+    DeferredRead,
+    RemapBlock,
+    RemapLoadPlanner,
+)
+
 # Storage interfaces and data structures
 from hyper_parallel.core.distributed_checkpoint.storage import (
     StorageInfo,
@@ -108,6 +122,12 @@ from hyper_parallel.core.distributed_checkpoint.storage import (
 from hyper_parallel.core.distributed_checkpoint.filesystem_storage import (
     FileSystemReader,
     FileSystemWriter,
+)
+
+# Safetensors checkpoints written outside DCP
+from hyper_parallel.core.distributed_checkpoint.hf_storage import (
+    HuggingFaceStorageReader,
+    TorchShardedSafetensorsReader,
 )
 
 # Optimizer state dict
