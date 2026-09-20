@@ -1,0 +1,2 @@
+{"instruction":"Summarize the purpose of indexed datasets.","input":"","output":"They store tokenized documents in binary data and index files for efficient training."}
+{"instruction":"Translate the greeting.","input":"Hello, HyperParallel!","output":"你好，HyperParallel！"}
