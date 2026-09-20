@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "experiment_id": "REPLACE_ME",
+  "mode": "veomni-baseline",
+  "reference": {
+    "framework": "veomni",
+    "revision": "REPLACE_ME"
+  },
+  "candidate": {
+    "framework": "hyper_parallel",
+    "revision": "REPLACE_ME"
+  },
+  "model": {
+    "id": "REPLACE_ME",
+    "checkpoint": "REPLACE_ME_IMMUTABLE_CHECKPOINT"
+  },
+  "data": {
+    "revision": "REPLACE_ME",
+    "sample_ids_file": "REPLACE_ME"
+  },
+  "training": {
+    "seed": 1234,
+    "dtype": "bf16",
+    "global_batch": 8,
+    "micro_batch": 1,
+    "gradient_accumulation": 4,
+    "optimizer_steps": 20,
+    "loss_formula": "global_loss_sum/global_valid_token_count"
+  },
+  "parallel": {
+    "dp": 1,
+    "fsdp": 1,
+    "tp": 1,
+    "cp": 1,
+    "ep": 1,
+    "pp": 1
+  },
+  "environment": {
+    "device": "REPLACE_ME",
+    "world_size": 1,
+    "packages_lock": "REPLACE_ME"
+  },
+  "tolerance_tier": "standard",
+  "commands": {
+    "baseline": [
+      "REPLACE_ME_VEOMNI_PYTHON_OR_LAUNCHER",
+      "REPLACE_ME_VEOMNI_ENTRYPOINT_AND_ARGUMENTS",
+      "{baseline_loss}"
+    ],
+    "candidate": [
+      "REPLACE_ME_HYPER_PYTHON_OR_LAUNCHER",
+      "REPLACE_ME_HYPER_ENTRYPOINT_AND_ARGUMENTS",
+      "{candidate_loss}"
+    ]
+  }
+}
