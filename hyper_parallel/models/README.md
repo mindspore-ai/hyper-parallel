@@ -23,7 +23,7 @@ AutoModels 提供由 YAML 配置驱动的文本与多模态 Trainer。`parse_tra
 | `dataset` / `dataloader` | 配置模型资产、样本转换、数据集读取、batch 组装和模型输入 | [Dataset / DataLoader](../data/README.md) |
 | `loss_fn` / `optimizer` / `lr_scheduler` | 配置损失计算、参数分组、优化器和学习率策略 | — |
 | `checkpoint` | 配置模型、优化器和训练进度的保存与恢复 | [Distributed Checkpoint](../../docs/guide/distributed_checkpoint.md) |
-| `debug` / `profiling` / `wandb` | 配置数据与数值检查、性能采集和训练指标上报 | — |
+| `debug` / `profiler` / `wandb` | 配置数据与数值检查、性能采集和训练指标上报 | — |
 
 字段解析、`Target` 和 CLI dotted override 规则见 [YAML Trainer 配置结构](../../docs/guide/trainer/yaml_config.md)；外部组件的接入方式见 [AutoModels 二次开发指南](../../docs/guide/trainer/custom_component.md)。
 

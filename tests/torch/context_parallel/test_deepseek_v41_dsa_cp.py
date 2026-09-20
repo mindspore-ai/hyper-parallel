@@ -14,15 +14,28 @@
 # ============================================================================
 """Launcher for DeepSeek-V4.1 shared compressed DSA CP precision."""
 
+import importlib
 from pathlib import Path
+
+import pytest
 
 from tests.common.distributed_launcher import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
 _WORKER = str(Path(__file__).resolve().parent / "_test_deepseek_v41_dsa_cp.py")
+try:
+    importlib.import_module("tests.torch.context_parallel._test_deepseek_v41_dsa_cp")
+except ImportError:
+    _WORKER_DEPENDENCIES_AVAILABLE = False
+else:
+    _WORKER_DEPENDENCIES_AVAILABLE = True
 
 
+@pytest.mark.skipif(
+    not _WORKER_DEPENDENCIES_AVAILABLE,
+    reason="The DeepSeek V4 worker dependencies are unavailable",
+)
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_deepseek_v41_dsa_cp_gloo():

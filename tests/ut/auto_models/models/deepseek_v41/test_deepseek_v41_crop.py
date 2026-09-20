@@ -27,10 +27,14 @@ from types import SimpleNamespace
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_utils import ContextManagers
+
+pytest.importorskip("transformers.models.deepseek_v4.configuration_deepseek_v4")
+
 try:
     from transformers.modeling_utils import no_init_weights
 except ImportError:
@@ -1296,6 +1300,8 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
                 return gate_up
 
         class _TextMoe(nn.Module):
+            """Minimal text MoE fixture used to inspect factory signatures."""
+
             def __init__(self) -> None:
                 super().__init__()
                 self.gate = nn.Identity()
@@ -1329,8 +1335,8 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
         class _EpMesh:
             @staticmethod
             def get_group(name: str) -> None:
+                """Accept the requested axis without constructing a process group."""
                 del name
-                return None
 
             def __getitem__(self, name: str) -> _EpAxis:
                 del self

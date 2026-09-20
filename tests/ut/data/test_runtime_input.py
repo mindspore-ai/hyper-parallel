@@ -13,13 +13,17 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for model-owned runtime input extensions."""
+# pylint: disable=wrong-import-position
 
 import unittest
 from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
+
+pytest.importorskip("torchdata.stateful_dataloader")
 
 from hyper_parallel.data.batching.get_batch import ParallelBatch
 from hyper_parallel.data.batching.build_collate_fn import (

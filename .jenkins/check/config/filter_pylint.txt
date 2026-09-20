@@ -149,3 +149,8 @@
 #     public API and no get_platform() equivalent (mindspore has no FX-tracing
 #     surface); moving the package under platform/torch/ is tracked separately.
 "hyper-parallel/hyper_parallel/compile/"                                   "forbidden-backend-import"
+
+# 20. Trainer profiler
+"hyper-parallel/hyper_parallel/trainer/callbacks/profiler_callback.py"       "forbidden-backend-import"
+# Allocator history and snapshotting are exposed only through private Torch/NPU APIs.
+"hyper-parallel/hyper_parallel/trainer/runtime/memory_profiler.py"           "protected-access"
