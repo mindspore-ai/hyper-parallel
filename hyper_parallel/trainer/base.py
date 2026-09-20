@@ -34,7 +34,7 @@ import json
 import logging
 from abc import ABC
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -145,8 +145,10 @@ class BaseTrainer(Stateful, ABC):
 
     # Data
     train_dataset: Dataset
+    data_transform: Any
     collate_fn: Any
     train_dataloader: Any
+    num_micro_batches: int
 
     # Model
     model: PreTrainedModel = None
@@ -690,61 +692,63 @@ class BaseTrainer(Stateful, ABC):
         if not dist.is_available() or not dist.is_initialized():
             return
 
-        empty_cache()
-        dist.barrier()
-
-        synchronize()
-        destroy_process_group()
+        try:
+            empty_cache()
+            dist.barrier()
+            synchronize()
+        finally:
+            destroy_process_group()
 
     def train(self) -> None:
         """Run the configured training loop."""
         config: TrainerConfig = self.config
-        self.on_train_begin()
-        self.data_iterator = HyperIter(
-            self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
-        )
-        logger.info(
-            "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
-            self.local_rank, self.state.global_step, self.train_iters, self.state.epoch, self.train_epochs,
-        )
+        self.data_iterator = None
+        try:
+            self.on_train_begin()
+            self.data_iterator = HyperIter(
+                self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
+            )
+            logger.info(
+                "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
+                self.local_rank, self.state.global_step, self.train_iters, self.state.epoch, self.train_epochs,
+            )
 
-        start_epoch = self.state.epoch
-        for epoch in range(start_epoch, self.train_epochs):
-            if epoch != start_epoch:
-                self.train_dataloader.set_epoch(epoch)
-                self.data_iterator = HyperIter(
-                    self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
-                )
-            self.state.epoch = epoch
-
-            self.on_epoch_begin()
-
-            start_step = self.state.global_step - epoch * self.train_steps
-            train_steps = min(self.train_steps, self.train_iters - epoch * self.train_steps)
-            for _ in range(start_step, train_steps):
-                try:
-                    self.train_step(self.data_iterator)
-                except StopIteration:
-                    logger.info(
-                        "epoch:%s Dataloader finished with drop_last %s",
-                        epoch,
-                        config.dataloader.drop_last,
+            start_epoch = self.state.epoch
+            for epoch in range(start_epoch, self.train_epochs):
+                if epoch != start_epoch:
+                    self.train_dataloader.set_epoch(epoch)
+                    self.data_iterator = HyperIter(
+                        self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
                     )
-                    break
+                self.state.epoch = epoch
 
-            self.on_epoch_end()
-            self.state.epoch = epoch + 1
+                self.on_epoch_begin()
 
-            print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+                start_step = self.state.global_step - epoch * self.train_steps
+                train_steps = min(self.train_steps, self.train_iters - epoch * self.train_steps)
+                for _ in range(start_step, train_steps):
+                    try:
+                        self.train_step(self.data_iterator)
+                    except StopIteration:
+                        logger.info(
+                            "epoch:%s Dataloader finished with drop_last %s",
+                            epoch,
+                            config.dataloader.drop_last,
+                        )
+                        break
 
-            if config.dataloader.use_background_prefetcher:
+                self.on_epoch_end()
+                self.state.epoch = epoch + 1
+
+                print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+
                 self.data_iterator.stop()
-
-        self.on_train_end()
-
-        if config.dataloader.use_background_prefetcher:
-            self.data_iterator.stop()
-
-        synchronize()
-
-        self.destroy_distributed()
+                self.data_iterator = None
+        finally:
+            # ExitStack runs every callback even when an earlier cleanup raises.
+            with ExitStack() as cleanup:
+                cleanup.callback(self.destroy_distributed)
+                cleanup.callback(synchronize)
+                cleanup.callback(self.on_train_end)
+                if self.data_iterator is not None:
+                    cleanup.callback(self.data_iterator.stop)
