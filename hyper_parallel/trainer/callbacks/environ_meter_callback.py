@@ -195,22 +195,21 @@ class EnvironMeterCallback(Callback):
         schedulers = self.trainer.lr_scheduler
         if schedulers is not None:
             scheduler_list = schedulers if isinstance(schedulers, list) else [schedulers]
-            learning_rates = [
-                float(learning_rate)
-                for scheduler in scheduler_list
-                for learning_rate in scheduler.get_last_lr()
-            ]
+            learning_rates = []
+            for scheduler in scheduler_list:
+                for learning_rate in scheduler.get_last_lr():
+                    learning_rates.append(float(learning_rate))
             if learning_rates:
                 return max(learning_rates)
 
         optimizers = self.trainer.optimizer
         optimizer_list = optimizers if isinstance(optimizers, list) else [optimizers]
-        learning_rates = [
-            float(param_group["lr"])
-            for optimizer in optimizer_list
-            if optimizer is not None
-            for param_group in optimizer.param_groups
-        ]
+        learning_rates = []
+        for optimizer in optimizer_list:
+            if optimizer is None:
+                continue
+            for param_group in optimizer.param_groups:
+                learning_rates.append(float(param_group["lr"]))
         return max(learning_rates, default=0.0)
 
     def _memory_metrics(self) -> dict[str, float]:

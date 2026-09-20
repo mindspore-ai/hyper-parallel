@@ -65,15 +65,23 @@ class LoggingCallback(Callback):
             return
         logger.info("%s", message)
 
-    def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:
+    def on_step_end(
+        self,
+        state: TrainerState,
+        loss: float,
+        loss_dict: dict[str, float],
+        grad_norm: float,
+        **kwargs: Any,
+    ) -> None:
         """Log all shared environment metrics at the configured cadence."""
-        del kwargs
-        if (
-            self.logging_steps <= 0
-            or getattr(self.trainer, "global_rank", 0) != 0
-            or state.global_step % self.logging_steps != 0
-            or self._last_logged_step == state.global_step
-        ):
+        del loss, loss_dict, grad_norm, kwargs
+        if self.logging_steps <= 0:
+            return
+        if getattr(self.trainer, "global_rank", 0) != 0:
+            return
+        if state.global_step % self.logging_steps != 0:
+            return
+        if self._last_logged_step == state.global_step:
             return
 
         metrics = getattr(self.trainer, "step_env_metrics", {})

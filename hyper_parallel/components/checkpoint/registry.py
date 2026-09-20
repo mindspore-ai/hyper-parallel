@@ -15,6 +15,11 @@
 # ============================================================================
 """Checkpointer backend discovery and construction."""
 
+__all__ = [
+    "CHECKPOINTER_REGISTRY",
+    "build_checkpointer",
+]
+
 from typing import Any, Callable, Iterator, List, MutableMapping, Optional, Type, Union
 
 from hyper_parallel.components.checkpoint.base import CheckpointerBase
@@ -158,9 +163,3 @@ def _dcp_checkpointer(**kwargs: Any) -> CheckpointerBase:
     )
 
     return DistributedCheckpointer(**kwargs)
-
-
-__all__ = [
-    "CHECKPOINTER_REGISTRY",
-    "build_checkpointer",
-]

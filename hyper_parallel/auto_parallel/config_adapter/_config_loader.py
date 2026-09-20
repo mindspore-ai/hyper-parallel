@@ -326,17 +326,14 @@ _AUTO_MODELS_ACCEL_TO_SEARCH = {
 }
 
 
-def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
-    """Construct a normalized config from the current AutoModels schema."""
+def _load_auto_models_model_spec_from_yaml(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Load model dimensions and training attributes from AutoModels YAML."""
     model_raw = _get_dict(raw, "model")
     training_raw = _get_dict(raw, "training")
-    accelerator_raw = _get_dict(raw, "accelerator")
-    fsdp_raw = _get_dict(raw, "fsdp_config")
-    activation_raw = _get_dict(raw, "activation_checkpoint")
     dataset_raw = _get_dict(raw, "dataset")
     data_transform_raw = _get_dict(dataset_raw, "data_transform")
-
     context_raw = _get_dict(raw, "context")
+
     model_spec = _load_auto_models_model_spec(
         model_raw, context_raw.get("visual_seq_len"),
     )
@@ -347,8 +344,17 @@ def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig
         model_spec["device_num"] = int(context_raw["device_num"])
     model_spec["local_batch_size"] = training_raw.get("micro_batch_size", 1)
     model_spec["compute_dtype"] = model_raw.get("torch_dtype", "bfloat16")
+    return model_spec
 
+
+def _load_auto_models_parallelism(
+    raw: Dict[str, Any],
+) -> Tuple[Dict[str, List[int]], int, int]:
+    """Load fixed parallelism degrees from AutoModels YAML."""
+    accelerator_raw = _get_dict(raw, "accelerator")
+    fsdp_raw = _get_dict(raw, "fsdp_config")
     search_space: Dict[str, List[int]] = {}
+
     dp_shard_size = fsdp_raw.get("dp_shard_size")
     if dp_shard_size is not None:
         search_space["data_parallel_shard_degree"] = [int(dp_shard_size)]
@@ -357,16 +363,26 @@ def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig
         if value is not None:
             search_space[search_name] = [int(value)]
 
+    data_parallel_size = int(dp_shard_size or 1)
+    pp_degree = max(1, int(accelerator_raw.get("pp_size", 1) or 1))
+    return search_space, data_parallel_size, pp_degree
+
+
+def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
+    """Construct a normalized config from the current AutoModels schema."""
+    model_spec = _load_auto_models_model_spec_from_yaml(raw)
+    search_space, data_parallel_size, pp_degree = _load_auto_models_parallelism(raw)
+    training_raw = _get_dict(raw, "training")
+    activation_raw = _get_dict(raw, "activation_checkpoint")
+
     global_batch_size = int(training_raw.get("global_batch_size", 0) or 0)
     local_batch_size = int(model_spec["local_batch_size"] or 1)
-    data_parallel_size = int(dp_shard_size or 1)
     micro_batch_num = (
         global_batch_size // (local_batch_size * data_parallel_size)
         if global_batch_size
         and global_batch_size % (local_batch_size * data_parallel_size) == 0
         else 1
     )
-    pp_degree = max(1, int(accelerator_raw.get("pp_size", 1) or 1))
 
     mode = str(activation_raw.get("mode", "off"))
     recompute_map = {

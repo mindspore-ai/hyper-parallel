@@ -121,15 +121,17 @@ def _discover_family_providers() -> Dict[str, str]:
         providers = {}
         models_dir = Path(__file__).resolve().parent
         for child in sorted(models_dir.iterdir()):
-            if (
-                    child.is_dir()
-                    and child.name.isidentifier()
-                    and not child.name.startswith("_")
-                    and (child / "adapter" / "registration.py").is_file()
-            ):
-                providers[_normalize_family_key(child.name)] = (
-                    f"{__package__}.{child.name}.adapter.registration"
-                )
+            if not child.is_dir():
+                continue
+            if not child.name.isidentifier():
+                continue
+            if child.name.startswith("_"):
+                continue
+            if not (child / "adapter" / "registration.py").is_file():
+                continue
+            providers[_normalize_family_key(child.name)] = (
+                f"{__package__}.{child.name}.adapter.registration"
+            )
         _DISCOVERED_PROVIDERS = providers
     return _DISCOVERED_PROVIDERS
 

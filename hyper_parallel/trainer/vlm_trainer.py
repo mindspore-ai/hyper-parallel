@@ -14,10 +14,11 @@
 # limitations under the License.
 """VLM Trainer assembled from the shared BaseTrainer stages."""
 
+__all__ = ["VLMTrainer"]
+
 from collections import defaultdict
 from typing import Any, Dict
 
-from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.vlm import build_processor, build_vlm_get_batch
@@ -171,20 +172,12 @@ class VLMTrainer:
             grad_norm=grad_norm,
         )
 
-    def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        """Execute one VLM training step."""
-        config = self.base.config
-        first_training_batch = self.base.get_batch(data_iterator)
-        num_micro_steps = self.base.num_micro_batches
-        training_batches = [first_training_batch]
-        for _ in range(1, num_micro_steps):
-            training_batches.append(self.base.get_batch(data_iterator))
-
-        self.on_step_begin(
-            micro_batches=[model_inputs for model_inputs, _ in training_batches]
-        )
-        synchronize()
-
+    def _forward_backward_micro_batches(
+            self,
+            training_batches: list[Any],
+            num_micro_steps: int,
+    ) -> tuple[float, Dict[str, float]]:
+        """Run and aggregate the VLM forward-backward micro-steps."""
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
@@ -210,32 +203,33 @@ class VLMTrainer:
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
 
+        return total_loss, total_loss_dict
+
+    def train_step(self, data_iterator: Any) -> Dict[str, float]:
+        """Execute one VLM training step."""
+        config = self.base.config
+        first_training_batch = self.base.get_batch(data_iterator)
+        num_micro_steps = self.base.num_micro_batches
+        training_batches = [first_training_batch]
+        for _ in range(1, num_micro_steps):
+            training_batches.append(self.base.get_batch(data_iterator))
+
+        self.on_step_begin(
+            micro_batches=[model_inputs for model_inputs, _ in training_batches]
+        )
+        synchronize()
+
+        total_loss, total_loss_dict = self._forward_backward_micro_batches(
+            training_batches,
+            num_micro_steps,
+        )
+
         grad_norm = clip_grad_norm_(
             self.base.model,
             config.training.max_grad_norm,
         )
 
-        optimizers = (
-            self.base.optimizer
-            if isinstance(self.base.optimizer, list)
-            else [self.base.optimizer]
-        )
-        for optimizer in optimizers:
-            with SkipDTensorDispatch():
-                optimizer.step()
-            optimizer.zero_grad()
-
-        schedulers = (
-            self.base.lr_scheduler
-            if isinstance(self.base.lr_scheduler, list)
-            else (
-                [self.base.lr_scheduler]
-                if self.base.lr_scheduler is not None
-                else []
-            )
-        )
-        for scheduler in schedulers:
-            scheduler.step()
+        self.base.step_optimizers_and_schedulers()
 
         grad_norm_value = float(grad_norm)
         self.on_step_end(
@@ -294,6 +288,3 @@ class VLMTrainer:
 
         synchronize()
         self.base.destroy_distributed()
-
-
-__all__ = ["VLMTrainer"]

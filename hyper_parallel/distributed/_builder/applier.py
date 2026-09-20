@@ -43,7 +43,7 @@ from hyper_parallel.distributed._builder.parameter_sharding import (
     _resolve_module,
 )
 from hyper_parallel.distributed._builder.planner import (
-    ShardingPlanner,
+    _get_architecture,
 )
 from hyper_parallel.distributed._builder.precompiled_boundary import (
     PrecompiledBoundary,
@@ -70,13 +70,12 @@ logger = logging.getLogger(__name__)
 # ────────────────────────────────────────────────────────────────────────────
 
 def _validate_inner_wrapper_injections(plan, cp_mesh, transformers_version):
+    """Validate the structural contract of every inner wrapper."""
     # Lazy import: wrappers imports forward_rewriter at module level;
     # keeping it lazy decouples the applier's import graph.
     from hyper_parallel.distributed.context_parallel.wrappers import (  # pylint: disable=C0415
-        INNER_WRAPPER_REGISTRY,
         INNER_WRAPPER_REQUIREMENTS,
     )
-    """Validate the structural contract of every inner wrapper."""
     for fqn, spec in plan.modules.items():
         wrapper = getattr(spec, "inner_wrapper", None)
         target = getattr(spec, "inner_target", None)
@@ -173,12 +172,14 @@ def _validate_ep_compute_injections(plan, model):
         EP_ARCHETYPE_SUGGESTIONS,
     )
     for fqn, spec in plan.modules.items():
-        if (spec.is_boundary and getattr(spec, "_ep_size", 0)  # pylint: disable=protected-access
+        if not spec.is_boundary:
+            continue
+        if (getattr(spec, "_ep_size", 0)  # pylint: disable=protected-access
                 and getattr(spec, "local_compute_fn", None) is None
                 and getattr(spec, "region_dispatch", None) is not False):
             suggestion = ""
             if model is not None:
-                arch = ShardingPlanner._get_architecture(model)
+                arch = _get_architecture(model)
                 archetype = EP_ARCHETYPE_SUGGESTIONS.get(arch)
                 if archetype is not None:
                     suggestion = (
@@ -238,10 +239,12 @@ def _log_injection_choice(module_fqn, spec):
     has_wrap = getattr(spec, "inner_wrapper", None) is not None
     if not (has_fn or has_wrap or rd is not None):
         return   # ordinary boundary: no injection, axiomatic default dispatch-through — do not spam the log
-    what = "+".join(
-        [x for x, ok in (("local_compute_fn", has_fn),
-                         ("inner_wrapper", has_wrap)) if ok]
-    ) or "the module's own forward (no fn injected, region_dispatch=False declared)"
+    candidates = (("local_compute_fn", has_fn), ("inner_wrapper", has_wrap))
+    enabled = []
+    for name, is_enabled in candidates:
+        if is_enabled:
+            enabled.append(name)
+    what = "+".join(enabled) or "the module's own forward (no fn injected, region_dispatch=False declared)"
     if rd is True:
         effect = ("validate dispatch-through true validation enabled "
                   "(in-region strategy propagation + true out_src "
@@ -399,7 +402,6 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
             mesh_dim_names,
             op_lowerer=boundary_op_lowerer,
         )
-        keep_output_dtensor = _keep_loss_parallel_output(plan, spec)
         _bind_input_indices(boundary, module)
         # Injection discipline: a declared injection requires an explicit
         # region_dispatch; declaring True without any injection is redundant
@@ -478,7 +480,7 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
                 boundary,
                 spec,
                 mesh_dim_names,
-                keep_output_dtensor=keep_output_dtensor,
+                keep_output_dtensor=_keep_loss_parallel_output(plan, spec),
             )
         else:
             # D-02: production vocab-parallel embedding masked wrapper
@@ -488,5 +490,5 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
                 module,
                 boundary,
                 spec,
-                keep_output_dtensor=keep_output_dtensor,
+                keep_output_dtensor=_keep_loss_parallel_output(plan, spec),
             )

@@ -14,6 +14,8 @@
 # ============================================================================
 """Build the VLM multimodal sample transform."""
 
+__all__ = ["VLMChatTransform", "build_vlm_data_transform"]
+
 import re
 from typing import Any, Optional
 
@@ -42,7 +44,8 @@ class VLMChatTransform:
         self.processor = processor
         self.max_seq_len = max_seq_len
 
-    def _normalize_messages(self, messages: Any, images: Any = None) -> Any:
+    @staticmethod
+    def _normalize_messages(messages: Any, images: Any = None) -> Any:
         """Split ``<image>``/``<video>`` string placeholders into content-list parts."""
         if images is None:
             images = []
@@ -198,6 +201,3 @@ def build_vlm_data_transform(
     if processor is None:
         raise ValueError("processor is required for the VLM data transform")
     return VLMChatTransform(processor, max_seq_len=max_seq_len)
-
-
-__all__ = ["VLMChatTransform", "build_vlm_data_transform"]

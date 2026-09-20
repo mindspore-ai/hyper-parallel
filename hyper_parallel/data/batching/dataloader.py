@@ -14,6 +14,8 @@
 # ============================================================================
 """Dataloader components used by Trainer targets."""
 
+__all__ = ["DataLoader"]
+
 from collections.abc import Callable
 from typing import Any, Optional
 
@@ -96,6 +98,3 @@ class DataLoader(TorchDataLoader):
         """Set the epoch used to deterministically shuffle distributed data."""
         if isinstance(self.sampler, DistributedSampler):
             self.sampler.set_epoch(epoch)
-
-
-__all__ = ["DataLoader"]

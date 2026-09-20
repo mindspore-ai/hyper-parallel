@@ -23,6 +23,7 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 """
 
 import logging
+from itertools import chain
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
@@ -334,7 +335,7 @@ def _build_replacement_context(
     }
 
 
-def _apply_pre_sharding_features(
+def _apply_pre_sharding_features(  # pylint: disable=unused-argument
     model: nn.Module,
     peft_config: Optional[Any],
     qat_config: Optional[Any],
@@ -558,14 +559,14 @@ def _validate_model_init_dtype(
         target_dtype: torch.dtype,
 ) -> None:
     """Validate floating model parameters and buffers after conversion."""
-    mismatched = [
-        name
-        for name, tensor in (
-            list(model.named_parameters(remove_duplicate=False))
-            + list(model.named_buffers(remove_duplicate=False))
-        )
-        if tensor.is_floating_point() and tensor.dtype != target_dtype
-    ]
+    model_tensors = chain(
+        model.named_parameters(remove_duplicate=False),
+        model.named_buffers(remove_duplicate=False),
+    )
+    mismatched = []
+    for name, tensor in model_tensors:
+        if tensor.is_floating_point() and tensor.dtype != target_dtype:
+            mismatched.append(name)
     if mismatched:
         raise RuntimeError(
             "Model initialization dtype conversion failed for: "

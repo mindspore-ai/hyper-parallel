@@ -118,3 +118,21 @@
 #     torch.nn.utils.stateless, torch.distributed.device_mesh). These have no
 #     public API, so the raw imports stay.
 "hyper-parallel/hyper_parallel/compile/"                                   "forbidden-backend-import"
+
+# 20. Trainer runtime — torch_npu is imported for torch.npu and HCCL registration side effects
+"hyper-parallel/hyper_parallel/trainer/runtime/random.py"                  "unused-import"
+
+# 21. VLM collator — __call__ must keep the callable-object instance protocol
+"hyper-parallel/hyper_parallel/data/vlm/collator.py"                      "H3607"
+
+# 22. Trainer callbacks — callback hooks share an instance-method signature so
+#     subclasses can override them uniformly even when a base hook does not use self.
+"hyper-parallel/hyper_parallel/trainer/callbacks/base.py"                  "H3607"
+
+# 23. Recipe injection DSL — its decorator owns the InjectionMeta protocol
+#     attribute attached to injected functions and consumed by the recipe parser.
+"hyper-parallel/hyper_parallel/distributed/recipe_spec.py"                "protected-access"
+
+# 24. DSA functional exports are resolved lazily by components.functional;
+#     pylint cannot infer that the exported operator proxies are callable.
+"hyper-parallel/hyper_parallel/components/modules/dsa_attention.py"        "not-callable"

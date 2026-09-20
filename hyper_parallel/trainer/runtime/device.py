@@ -25,6 +25,27 @@ that model construction uses when no explicit device option is given — and
 re-exported here so Trainer consumers have one import site.
 """
 
+__all__ = [
+    "IS_CUDA_AVAILABLE",
+    "IS_NPU_AVAILABLE",
+    "get_device_type",
+    "get_device_name",
+    "get_torch_device",
+    "get_device_id",
+    "get_dist_comm_backend",
+    "synchronize",
+    "stream_synchronize",
+    "empty_cache",
+    "set_device",
+    "get_device_rng_state",
+    "set_device_rng_state",
+    "is_nccl_backend",
+    "is_hccl_backend",
+    "get_gpu_compute_capability",
+    "is_sm90_or_above",
+    "get_compute_units",
+]
+
 import logging
 from typing import Any
 
@@ -149,25 +170,3 @@ def get_compute_units() -> int:
         num_compute_units = torch.get_num_threads()
 
     return num_compute_units
-
-
-__all__ = [
-    "IS_CUDA_AVAILABLE",
-    "IS_NPU_AVAILABLE",
-    "get_device_type",
-    "get_device_name",
-    "get_torch_device",
-    "get_device_id",
-    "get_dist_comm_backend",
-    "synchronize",
-    "stream_synchronize",
-    "empty_cache",
-    "set_device",
-    "get_device_rng_state",
-    "set_device_rng_state",
-    "is_nccl_backend",
-    "is_hccl_backend",
-    "get_gpu_compute_capability",
-    "is_sm90_or_above",
-    "get_compute_units",
-]

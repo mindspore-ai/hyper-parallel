@@ -20,6 +20,15 @@ Transformers integration; this module never imports
 ``hyper_parallel.trainer`` or ``hyper_parallel.models.trainer``.
 """
 
+__all__ = [
+    "CompileConfig",
+    "FSDP2Config",
+    "FSDP2MixedPrecisionConfig",
+    "ModelBuildOptions",
+    "from_pretrained",
+    "normalize_options",
+]
+
 from typing import Any, Optional
 
 from hyper_parallel.models.build_options import (
@@ -38,7 +47,8 @@ def from_pretrained(pretrained_model_name_or_path: str, **kwargs: Any):
     ``_transformers.HyperAutoModelForCausalLM.from_pretrained`` until the
     model builder is split out of the private integration package.
     """
-    from hyper_parallel.models._transformers import (  # noqa: E402  # lazy: keep api import light
+    # Optional Transformers integration stays lazy so importing the public API remains lightweight.
+    from hyper_parallel.models._transformers import (  # pylint: disable=C0415
         HyperAutoModelForCausalLM,
     )
 
@@ -54,13 +64,3 @@ def normalize_options(value: Optional[Any]) -> ModelBuildOptions:
     never constructs or accepts a Trainer DTO.
     """
     return normalize_build_options(value)
-
-
-__all__ = [
-    "CompileConfig",
-    "FSDP2Config",
-    "FSDP2MixedPrecisionConfig",
-    "ModelBuildOptions",
-    "from_pretrained",
-    "normalize_options",
-]

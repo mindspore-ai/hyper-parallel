@@ -151,6 +151,19 @@ class _StackedExperts(nn.Module):
     EP Shard(0) + TP (the D-08 ndim=3 rule)."""
 
 
+def _install_stacked_expert_holders(module: nn.Module, holders: Dict[str, Dict[str, nn.Parameter]]) -> None:
+    """Replace per-expert containers with their stacked parameter holders."""
+    for parent_path, params in holders.items():
+        holder = _StackedExperts()
+        for name, p in params.items():
+            holder.register_parameter(name, p)
+        *path, leaf = parent_path.split(".")
+        obj = module
+        for seg in path:
+            obj = obj[int(seg)] if seg.isdigit() else getattr(obj, seg)
+        setattr(obj, leaf, holder)   # replace the original ModuleList (original expert params freed)
+
+
 def _stack_moe_experts(module: nn.Module, ep_stack: Dict[str, List[str]]) -> None:
     """Per-expert parameters → stacked 3D parameters (stack is concat, values
     exactly equal).
@@ -185,15 +198,7 @@ def _stack_moe_experts(module: nn.Module, ep_stack: Dict[str, List[str]]) -> Non
         holders.setdefault(parent_path, {})[param_name] = nn.Parameter(
             stacked, requires_grad=requires_grad)
 
-    for parent_path, params in holders.items():
-        holder = _StackedExperts()
-        for name, p in params.items():
-            holder.register_parameter(name, p)
-        *path, leaf = parent_path.split(".")
-        obj = module
-        for seg in path:
-            obj = obj[int(seg)] if seg.isdigit() else getattr(obj, seg)
-        setattr(obj, leaf, holder)   # replace the original ModuleList (original expert params freed)
+    _install_stacked_expert_holders(module, holders)
 
 
 # ────────────────────────────────────────────────────────────────────────────

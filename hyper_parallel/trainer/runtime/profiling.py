@@ -18,10 +18,17 @@ Split out of the former ``auto_models/components/utils/helper.py`` in stage 7
 (05 §10.4); names, signatures and the trace-export behaviour are unchanged.
 """
 
+__all__ = [
+    "CACHE_DIR",
+    "ProfilerWithMem",
+    "create_profiler",
+    "get_cache_dir",
+]
+
 import datetime
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 
@@ -96,6 +103,52 @@ class ProfilerWithMem:
         return self._p.step(*a, **kw)
 
 
+class _ProfilerBackend(NamedTuple):
+    """Backend-specific profiler objects."""
+
+    module: Any
+    activities: Any
+    trace_handler: Any
+    experimental_config: Any
+
+
+def _create_profiler_backend(trace_dir: str) -> _ProfilerBackend:
+    """Create backend-specific profiler objects."""
+    if IS_NPU_AVAILABLE:
+        profiler_module = torch_npu.profiler
+        activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.NPU]
+        trace_handler = torch_npu.profiler.tensorboard_trace_handler(
+            CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir
+        )
+        experimental_config = torch_npu.profiler._ExperimentalConfig(  # pylint: disable=protected-access
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            data_simplification=False,
+        )
+    else:
+        profiler_module = torch.profiler
+        activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
+        trace_handler = None
+        experimental_config = None
+
+    return _ProfilerBackend(profiler_module, activities, trace_handler, experimental_config)
+
+
+def _create_profiler_schedule(profiler_module: Any, start_step: int, end_step: int) -> Any:
+    """Create and log the profiler schedule."""
+    warmup = 0 if start_step == 1 else 1
+    wait = start_step - warmup - 1
+    active = end_step - start_step
+    logger.info(f"build profiler schedule - wait: {wait}, warmup: {warmup}, active: {active}.")  # pylint: disable=logging-fstring-interpolation
+
+    return profiler_module.schedule(
+        wait=wait,
+        warmup=warmup,
+        active=active,
+        repeat=1,
+    )
+
+
 def create_profiler(
     start_step: int,
     end_step: int,
@@ -132,7 +185,7 @@ def create_profiler(
         Args:
             p: The profiler instance that produced the trace.
         """
-        time = int(datetime.datetime.now().timestamp())
+        time = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
 
         trace_file_extention = "pt.trace.json.gz"
         gpu_memory_file_extension = "pkl"
@@ -148,8 +201,7 @@ def create_profiler(
             gpu_memory_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{gpu_memory_file_extension}")
 
         if IS_NPU_AVAILABLE:
-            nonlocal npu_trace_handler
-            npu_trace_handler(p)
+            profiler_backend.trace_handler(p)
             trace_file = p.prof_if.prof_path
         elif IS_CUDA_AVAILABLE:
             p.export_chrome_trace(trace_file)
@@ -165,51 +217,18 @@ def create_profiler(
             copy(trace_file, trace_dir)
             logger.info(f"Profiling result uploaded to {trace_dir}.")  # pylint: disable=logging-fstring-interpolation
 
-    if IS_NPU_AVAILABLE:
-        profiler_module = torch_npu.profiler
-        activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.NPU]
-        npu_trace_handler = torch_npu.profiler.tensorboard_trace_handler(
-            CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir
-        )
-        experimental_config = torch_npu.profiler._ExperimentalConfig(  # pylint: disable=protected-access
-            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-            data_simplification=False,
-        )
-    else:
-        profiler_module = torch.profiler
-        activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
-        experimental_config = None
-
-    warmup = 0 if start_step == 1 else 1
-    wait = start_step - warmup - 1
-    active = end_step - start_step
-    logger.info(f"build profiler schedule - wait: {wait}, warmup: {warmup}, active: {active}.")  # pylint: disable=logging-fstring-interpolation
-
-    schedule = profiler_module.schedule(
-        wait=wait,
-        warmup=warmup,
-        active=active,
-        repeat=1,
-    )
-    base_profiler = profiler_module.profile(
-        activities=activities,
+    profiler_backend = _create_profiler_backend(trace_dir)
+    schedule = _create_profiler_schedule(profiler_backend.module, start_step, end_step)
+    base_profiler = profiler_backend.module.profile(
+        activities=profiler_backend.activities,
         schedule=schedule,
         on_trace_ready=handler_fn,
         record_shapes=record_shapes,
         profile_memory=profile_memory,
         with_modules=with_modules,
         with_stack=with_stack,
-        experimental_config=experimental_config,
+        experimental_config=profiler_backend.experimental_config,
     )
     if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and profile_memory:
         return ProfilerWithMem(base_profiler)
     return base_profiler
-
-
-__all__ = [
-    "CACHE_DIR",
-    "ProfilerWithMem",
-    "create_profiler",
-    "get_cache_dir",
-]

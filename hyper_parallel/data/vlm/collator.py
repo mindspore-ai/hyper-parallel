@@ -14,6 +14,8 @@
 # ============================================================================
 """Build the VLM micro-batch collator."""
 
+__all__ = ["VLMCollator", "build_vlm_collator"]
+
 from typing import Any, Optional
 
 import torch
@@ -88,6 +90,3 @@ def build_vlm_collator(
     if pad_token_id != 0 or ignore_index != IGNORE_INDEX or pad_to_length is not None:
         raise NotImplementedError("The temporary VLM collator does not support custom text padding")
     return VLMCollator()
-
-
-__all__ = ["VLMCollator", "build_vlm_collator"]

@@ -21,6 +21,11 @@ model-construction inputs, while process-group lifecycle helpers moved to
 ``hyper_parallel.trainer.runtime.logging``.
 """
 
+__all__ = [
+    "DistributedSetup",
+    "MeshContext",
+]
+
 import inspect
 import logging
 import math
@@ -318,9 +323,3 @@ def _build_device_mesh_from_accelerator(
         expert_shape,
     )
     return mesh_context, mesh_context.device_mesh.mesh_dim_names
-
-
-__all__ = [
-    "DistributedSetup",
-    "MeshContext",
-]

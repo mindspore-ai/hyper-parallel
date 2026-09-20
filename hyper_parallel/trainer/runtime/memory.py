@@ -18,6 +18,12 @@ Split out of the former ``auto_models/components/utils/helper.py`` in stage 7
 (05 §10.4); function names and signatures are unchanged.
 """
 
+__all__ = [
+    "empty_cache",
+    "print_cpu_memory_info",
+    "print_device_mem_info",
+]
+
 import gc
 
 import psutil
@@ -63,10 +69,3 @@ def empty_cache() -> None:
 
     if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
         get_torch_device().empty_cache()
-
-
-__all__ = [
-    "empty_cache",
-    "print_cpu_memory_info",
-    "print_device_mem_info",
-]

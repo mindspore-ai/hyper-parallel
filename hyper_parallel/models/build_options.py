@@ -27,6 +27,19 @@ device API (synchronize, cache/RNG management, ...) lives in
 ``hyper_parallel.trainer.runtime.device`` and re-uses these primitives.
 """
 
+__all__ = [
+    "CompileConfig",
+    "FSDP2Config",
+    "FSDP2MixedPrecisionConfig",
+    "ModelBuildOptions",
+    "normalize_build_options",
+    "IS_CUDA_AVAILABLE",
+    "IS_NPU_AVAILABLE",
+    "get_device_type",
+    "get_torch_device",
+    "get_device_id",
+]
+
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -85,7 +98,7 @@ def get_device_id() -> int:
 # whose module chain (via ``checkpoint``) reaches modules that import the
 # device primitives from here; keeping the primitives defined first makes
 # that circular edge resolve against already-defined names.
-from hyper_parallel.components.quantization.config import (  # noqa: E402
+from hyper_parallel.components.quantization.config import (  # pylint: disable=C0413
     LowPrecisionConfig,
 )
 
@@ -279,17 +292,3 @@ def normalize_build_options(
         "build options must be a ModelBuildOptions, a mapping, or None; "
         f"got {type(value).__name__}"
     )
-
-
-__all__ = [
-    "CompileConfig",
-    "FSDP2Config",
-    "FSDP2MixedPrecisionConfig",
-    "ModelBuildOptions",
-    "normalize_build_options",
-    "IS_CUDA_AVAILABLE",
-    "IS_NPU_AVAILABLE",
-    "get_device_type",
-    "get_torch_device",
-    "get_device_id",
-]
