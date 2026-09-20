@@ -1300,6 +1300,8 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
                 return gate_up
 
         class _TextMoe(nn.Module):
+            """Minimal text MoE fixture used to inspect factory signatures."""
+
             def __init__(self) -> None:
                 super().__init__()
                 self.gate = nn.Identity()
@@ -1333,8 +1335,8 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
         class _EpMesh:
             @staticmethod
             def get_group(name: str) -> None:
+                """Accept the requested axis without constructing a process group."""
                 del name
-                return None
 
             def __getitem__(self, name: str) -> _EpAxis:
                 del self

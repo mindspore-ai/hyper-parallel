@@ -58,6 +58,8 @@ class TestVLMCollator(unittest.TestCase):
         events = []
 
         class _LifecycleAdapter(DataBatchAdapter):
+            """Record each adapter lifecycle hook invoked by the collator."""
+
             def prepare_items(self, items, context):
                 events.append(("prepare", context.source_type))
                 return items
