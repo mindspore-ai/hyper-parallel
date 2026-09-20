@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """parser child class"""
+from typing import Any
+
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
@@ -22,7 +24,8 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 class CostModelParserMindformers(_CostModelParser):
     """parser class for MindFormers format"""
 
-    def parse(self):
+    def parse(self) -> None:
+        """Parse the configured MindFormers YAML fields."""
         self.__config_parse_yaml()
 
     def __config_parse_yaml_parallelism(self):
@@ -198,12 +201,17 @@ class CostModelParserMindformers(_CostModelParser):
             not (self.config.recompute_config.select_recompute and self.ccfg.sp > 1)
         )
 
-    def config_shard_emb(self):
-        """Configure embedding and output activation sharding."""
-        self.ccfg.shard_embed = (
-            self.ccfg.d
-            if (self.ccfg.vocab_emb_dp and self.ccfg.p == 1)
-            else (self.ccfg.t * self.ccfg.d)
+    def config_shard_emb(self, ccfg: Any = None) -> None:
+        """Configure embedding and output activation sharding.
+
+        Args:
+            ccfg: Cost-model config to update. Defaults to the parser's config.
+        """
+        target_ccfg = self.ccfg if ccfg is None else ccfg
+        target_ccfg.shard_embed = (
+            target_ccfg.d
+            if (target_ccfg.vocab_emb_dp and target_ccfg.p == 1)
+            else (target_ccfg.t * target_ccfg.d)
         )
 
     def __config_parse_yaml_fp_bytes(self):
