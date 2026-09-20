@@ -18,7 +18,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from hyper_parallel.trainer.base import BaseTrainer
+import pytest
+
+pytest.importorskip("torchdata")
+
+from hyper_parallel.trainer.base import BaseTrainer  # pylint: disable=wrong-import-position
 
 
 class TestBaseTrainerLifecycle(unittest.TestCase):
