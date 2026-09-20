@@ -129,7 +129,7 @@ def _run_exclude() -> Dict[str, Any]:
 def _disable_input_rematerialization(args: Any, kwargs: Any) -> tuple:
     """Reproduce legacy exclusion, which retains saved input storage."""
     del args, kwargs
-    return [], []
+    return ()
 
 
 def _run_mode(mode: str) -> Dict[str, Any]:
@@ -142,12 +142,12 @@ def _run_mode(mode: str) -> Dict[str, Any]:
     exclude_module = importlib.import_module(
         "hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_exclude_wrapper"
     )
-    original_mark = exclude_module._mark_recompute_inputs  # pylint: disable=protected-access
-    exclude_module._mark_recompute_inputs = _disable_input_rematerialization  # pylint: disable=protected-access
+    original_capture = exclude_module._capture_recompute_inputs  # pylint: disable=protected-access
+    exclude_module._capture_recompute_inputs = _disable_input_rematerialization  # pylint: disable=protected-access
     try:
         return _run_exclude()
     finally:
-        exclude_module._mark_recompute_inputs = original_mark  # pylint: disable=protected-access
+        exclude_module._capture_recompute_inputs = original_capture  # pylint: disable=protected-access
 
 
 def _run_mode_in_subprocess(mode: str) -> Dict[str, Any]:
