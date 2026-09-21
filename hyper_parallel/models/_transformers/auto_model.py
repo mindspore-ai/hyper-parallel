@@ -112,6 +112,7 @@ class _BaseHyperAutoModelClass:
         sharding_planner, fsdp2_manager = instantiate_infrastructure(
             distributed_setup=distributed_setup,
             device=_current_device(),
+            compile_config=compile_config,
         )
 
         # ③ Get HF config
@@ -182,6 +183,7 @@ class _BaseHyperAutoModelClass:
         sharding_planner, fsdp2_manager = instantiate_infrastructure(
             distributed_setup=distributed_setup,
             device=_current_device(),
+            compile_config=compile_config,
         )
 
         is_hf_model = get_is_hf_model(config, force_hf=False)

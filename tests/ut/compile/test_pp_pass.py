@@ -378,7 +378,7 @@ def _reference_grads_by_fqn(
     joint_graph: fx.GraphModule, model: nn.Module, train_inputs: Dict[str, Any]
 ) -> Dict[str, torch.Tensor]:
     """Full-batch non-PP reference: run the plain joint graph, return grads by FQN."""
-    _, grads = run_traced_graph(joint_graph, model, train_inputs)
+    _, grads, _ = run_traced_graph(joint_graph, model, train_inputs)
     return {name: g.clone() for name, g in _stage_grads_by_fqn(model, grads).items()}
 
 

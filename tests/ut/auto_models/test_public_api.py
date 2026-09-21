@@ -183,6 +183,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
             _field_snapshot(CompileConfig),
             [
                 ("enabled", "False"),
+                ("use_joint_graph", "False"),
                 ("mode", "'default'"),
                 ("fullgraph", "False"),
                 ("dynamic", "False"),
