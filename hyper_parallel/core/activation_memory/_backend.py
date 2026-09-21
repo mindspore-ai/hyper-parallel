@@ -13,16 +13,30 @@
 # limitations under the License.
 # ============================================================================
 """PyTorch device primitives used by the activation-swap implementation."""
+
+__all__ = [
+    "Tensor",
+    "get_device_handle",
+    "new_stream",
+    "get_stream_context",
+    "get_current_stream",
+    "new_event",
+    "no_grad",
+    "preserve_version_counter",
+    "cat",
+    "empty_like",
+    "tree_map",
+    "get_element_size",
+    "alloc_tensor_buffer",
+    "register_forward_pre_hook",
+    "register_full_backward_hook",
+    "register_full_backward_pre_hook",
+]
+
 import torch
 from torch import Tensor
 
-
-def get_device_handle(device_type: str = "npu"):
-    """Return the torch device module (e.g. ``torch.npu`` or ``torch.cuda``)."""
-    try:
-        return getattr(torch, device_type)
-    except AttributeError as e:
-        raise RuntimeError(f"expect got device handle: 'torch.{device_type}' failed.") from e
+from hyper_parallel.core.utils.communication import get_device_handle
 
 
 def new_stream():
@@ -98,23 +112,3 @@ def register_full_backward_pre_hook(module, hook, prepend=False):
     """Register a full backward pre-hook on *module*, ignoring *prepend*."""
     del prepend
     return module.register_full_backward_pre_hook(hook)
-
-
-__all__ = [
-    "Tensor",
-    "get_device_handle",
-    "new_stream",
-    "get_stream_context",
-    "get_current_stream",
-    "new_event",
-    "no_grad",
-    "preserve_version_counter",
-    "cat",
-    "empty_like",
-    "tree_map",
-    "get_element_size",
-    "alloc_tensor_buffer",
-    "register_forward_pre_hook",
-    "register_full_backward_hook",
-    "register_full_backward_pre_hook",
-]

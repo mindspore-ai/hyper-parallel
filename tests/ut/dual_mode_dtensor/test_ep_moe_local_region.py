@@ -1083,7 +1083,7 @@ def test_router_and_expert_utils(tiny_hf_native_moe, tiny_hf_batched_moe):
             self.local_expert_count = 1
             self.gate_up_proj = nn.Parameter(torch.randn(1, 8, 4))
             self.down_proj = nn.Parameter(torch.randn(1, 4, 4))
-            self._ep_act_fn = torch.tanh
+            self.ep_act_fn = torch.tanh
 
     experts = Experts()
     hidden_states = torch.randn(3, 4)
@@ -1149,6 +1149,22 @@ def test_router_and_expert_utils(tiny_hf_native_moe, tiny_hf_batched_moe):
     assert torch.equal(idx, ref_idx), "case: sigmoid_group_router_adapter"
     torch.testing.assert_close(w, ref_w.to(w.dtype),
                                msg="case: sigmoid_group_router_adapter")
+
+    moe.n_group = 2
+    moe.topk_group = 1
+    idx, w = _sigmoid_group_router(moe, hidden)
+    group_scores = choice.view(-1, 2, 2).topk(2, dim=-1)[0].sum(dim=-1)
+    group_idx = group_scores.topk(1, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+    score_mask = group_mask.unsqueeze(-1).expand(-1, 2, 2).reshape(-1, 4)
+    grouped_choice = choice.masked_fill(~score_mask.bool(), float("-inf"))
+    ref_idx = grouped_choice.topk(2, dim=-1, sorted=False)[1]
+    ref_w = scores.gather(1, ref_idx)
+    ref_w = ref_w / (ref_w.sum(-1, keepdim=True) + 1e-20) * 2.5
+    assert torch.equal(idx, ref_idx), "case: sigmoid_group_router_group_filter"
+    torch.testing.assert_close(
+        w, ref_w.to(w.dtype), msg="case: sigmoid_group_router_group_filter"
+    )
 
 
 # ==========================================================================

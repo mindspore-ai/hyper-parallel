@@ -23,7 +23,6 @@ import os
 import unittest
 from unittest.mock import MagicMock
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.dtensor.random import _calc_shard_info, _calc_shard_linear_idx

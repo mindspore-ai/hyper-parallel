@@ -19,7 +19,6 @@ from unittest.mock import patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor._ragged_utils import (
     _compute_ragged_all_to_all_splits,

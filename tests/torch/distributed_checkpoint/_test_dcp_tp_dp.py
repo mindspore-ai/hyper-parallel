@@ -23,7 +23,6 @@ from typing import Any, Tuple
 
 import numpy as np
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 import torch.distributed as dist

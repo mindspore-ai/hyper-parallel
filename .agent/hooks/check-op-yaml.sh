@@ -23,14 +23,6 @@ case "$FILE_PATH" in
         echo "REMINDER: You modified an op YAML registration."
         echo "Check if the Python implementation in core/shard/ops/parallel_*.py is consistent."
         ;;
-    */platform/torch/*.py)
-        echo "REMINDER: You modified PyTorch platform code."
-        echo "Check if platform/mindspore/ needs a corresponding change."
-        ;;
-    */platform/mindspore/*.py)
-        echo "REMINDER: You modified MindSpore platform code."
-        echo "Check if platform/torch/ needs a corresponding change."
-        ;;
     */fully_shard/*.py)
         echo "REMINDER: You modified FSDP code."
         echo "Check memory lifecycle: storage resize_(0), buffer cleanup, grad nulling."
@@ -39,7 +31,7 @@ case "$FILE_PATH" in
         echo "REMINDER: You modified pipeline parallelism code."
         echo "Check buffer cleanup: _clear_recv_buffer(), clear_cache() after each micro-batch."
         ;;
-    */activation_checkpoint/*.py)
+    */activation_memory/*.py)
         echo "REMINDER: You modified activation checkpoint/swap code."
         echo "Check swap lifecycle: wait_offload() frees device, wait_load() frees CPU."
         ;;

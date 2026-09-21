@@ -120,6 +120,7 @@ class Debug:
                 "output",
                 output_file,
             )
+
     def is_enabled(self):
         """Check whether debugging is enabled"""
         return self.enable

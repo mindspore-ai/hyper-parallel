@@ -85,8 +85,7 @@ RUN . /usr/local/Ascend/cann/set_env.sh \
 
 RUN . /usr/local/Ascend/cann/set_env.sh \
     && python3 -c \
-        "import importlib.metadata as metadata; import hyper_parallel as hp; \
-print('hyper_parallel platform:', hp.get_platform()); \
+        "import importlib.metadata as metadata; import hyper_parallel; \
 print('torch:', metadata.version('torch')); \
 print('torch-npu:', metadata.version('torch-npu')); \
 print('hyper_parallel:', metadata.version('hyper_parallel'))"

@@ -15,7 +15,6 @@
 """Test the fully_shard module API."""
 # pylint: disable=W0611,C0413,C0412,W0613,W0612,W0212
 import os
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 import torch.distributed as dist
 import torch_npu

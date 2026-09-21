@@ -20,7 +20,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 
 class TestCEOpWithoutLossParallelContext:

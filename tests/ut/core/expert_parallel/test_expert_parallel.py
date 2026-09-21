@@ -29,7 +29,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.expert_parallel.expert_parallel import (
     AllToAllTokenDispatcher,
@@ -143,7 +142,7 @@ class TestTorchCollectives(unittest.TestCase):
                 self.assertEqual(backward_call.args[1:], (input_splits, output_splits, group))
                 mock_wait.assert_not_called()
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func.all_gather")
+    @patch("hyper_parallel.core.utils.communication.dist_func.all_gather")
     def test_all_gather_materialises_input_and_gradients(self, mock_gather):
         """Concatenation sends contiguous gradients back to every gathered shard."""
         tokens = torch.randn(2, 3).t()
@@ -457,7 +456,7 @@ class TestExpertParallelDispatcherSelection(unittest.TestCase):
     def test_async_token_combine_delegates_to_configured_dispatcher(self):
         """async _token_combine calls the configured dispatcher's combine_start."""
         ep = ExpertParallel(token_dispatcher="deredundency", async_combine=True)
-        module = MagicMock()
+        module = _make_mock_module()
         ctx = DeredundencyDispatchContext(
             input_splits=[], output_splits=[], input_shape=(), permuted_indices=MagicMock()
         )
@@ -474,7 +473,7 @@ class TestExpertParallelDispatcherSelection(unittest.TestCase):
             )
 
         mock_start.assert_called_once()
-        self.assertIs(module._ep_combine_handle, handle)
+        self.assertFalse(hasattr(module, "_ep_combine_handle"))
         self.assertIs(result, expected)
 
 
@@ -517,8 +516,8 @@ class TestExpertParallelDispatch(unittest.TestCase):
             device_mesh=self.mock_mesh,
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatch_returns_permuted_and_counts(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_dispatch return values
@@ -535,8 +534,8 @@ class TestExpertParallelDispatch(unittest.TestCase):
             f"local_counts.shape={local_counts.shape}, expected ({self.num_local_experts},)"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatch_computes_correct_splits(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_dispatch split computation
@@ -557,8 +556,8 @@ class TestExpertParallelDispatch(unittest.TestCase):
             f"output_splits={ctx.output_splits}, expected [5, 5]"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatch_produces_expert_major_order(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_dispatch expert-major permutation
@@ -573,8 +572,8 @@ class TestExpertParallelDispatch(unittest.TestCase):
         self.assertEqual(int(local_counts[0]), 4, f"local_counts[0]={local_counts[0]}, expected 4")
         self.assertEqual(int(local_counts[1]), 6, f"local_counts[1]={local_counts[1]}, expected 6")
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatch_saves_state_for_combine(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_dispatch state preservation
@@ -593,8 +592,8 @@ class TestExpertParallelDispatch(unittest.TestCase):
         self.assertIsNotNone(ctx.input_shape, f"input_shape should be set, got {ctx.input_shape}")
         self.assertIsNotNone(ctx.permuted_indices, f"permuted_indices should be set, got {ctx.permuted_indices}")
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_two_consecutive_forwards_isolate_state(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel state isolation across forwards
@@ -715,8 +714,8 @@ class TestExpertParallelCombine(unittest.TestCase):
         )
         return combined
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_combine_output_shape_matches_original(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_combine output shape
@@ -730,8 +729,8 @@ class TestExpertParallelCombine(unittest.TestCase):
             f"combined.shape={combined.shape}, expected ({self.total_tokens}, {self.dim})"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_combine_is_inverse_of_dispatch_permutation(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_combine round-trip
@@ -752,8 +751,8 @@ class TestExpertParallelCombine(unittest.TestCase):
              f"max diff={(combined - self.routed_input).abs().max():.2e}")
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_combine_calls_differentiable_a2a(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_combine uses differentiable all-to-all
@@ -770,8 +769,8 @@ class TestExpertParallelCombine(unittest.TestCase):
             f"differentiable_all_to_all_single called {call_count} times, expected >= 2"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_combine_swaps_input_output_splits(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_combine swaps splits for reverse all-to-all
@@ -845,8 +844,8 @@ class TestAllToAllTokenDispatcher(unittest.TestCase):
             lambda _out, inp, *_args, **_kw: inp
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatch_standalone(self, mock_dist, mock_dist_func):
         """dispatch can be called directly without an ExpertParallel instance."""
         self._configure_collectives(mock_dist, mock_dist_func)
@@ -865,8 +864,8 @@ class TestAllToAllTokenDispatcher(unittest.TestCase):
             f"local_counts shape {local_counts.shape}, expected ({self.num_local_experts},)"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatch_context_fields(self, mock_dist, mock_dist_func):
         """dispatch returns a DispatchContext with correct field values."""
         self._configure_collectives(mock_dist, mock_dist_func)
@@ -892,8 +891,8 @@ class TestAllToAllTokenDispatcher(unittest.TestCase):
             f"expected {self.total_tokens}"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_combine_with_manual_context(self, mock_dist, mock_dist_func):
         """combine can be called with a manually constructed DispatchContext."""
         self._configure_collectives(mock_dist, mock_dist_func)
@@ -914,8 +913,8 @@ class TestAllToAllTokenDispatcher(unittest.TestCase):
             f"combined shape {combined.shape}, expected ({self.total_tokens}, {self.dim})"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatch_combine_round_trip(self, mock_dist, mock_dist_func):
         """dispatch then combine with identity expert restores original input."""
         self._configure_collectives(mock_dist, mock_dist_func)
@@ -960,8 +959,8 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
 
     @patch("torch.distributed._functional_collectives.wait_tensor")
     @patch("torch.distributed._functional_collectives.all_to_all_single")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_2d_dispatch_and_sync_async_combine(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
         """OEP gathers counts before tokens and both combine paths sum weighted outputs."""
         counts = torch.tensor([1, 1])
@@ -1043,8 +1042,18 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         self.assertTrue(torch.equal(dispatch_indices, expected_indices))
         self.assertTrue(torch.equal(node_counts_per_expert, expected_counts))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+        empty_indices, empty_counts = _generate_deredundency_dispatch_indices(
+            torch.zeros_like(gathered_counts),
+            expert_start=0,
+            iep_size=2,
+            num_local_experts=2,
+        )
+        self.assertEqual(empty_indices.dtype, torch.long)
+        self.assertEqual(empty_indices.numel(), 0)
+        self.assertTrue(torch.equal(empty_counts, torch.zeros(4, dtype=torch.long)))
+
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatch_1d_degenerates_to_standard_contract(self, mock_dist, mock_dist_func):
         """A 1-D mesh preserves the standard dispatcher input/output contract."""
         self._configure_collectives(mock_dist, mock_dist_func)
@@ -1059,8 +1068,8 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         self.assertEqual(ctx.oep_size, 1)
         self.assertTrue(torch.equal(ctx.dispatch_indices, torch.arange(self.total_tokens)))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatch_context_uses_inner_ep_splits(self, mock_dist, mock_dist_func):
         """Deredundency context stores IEP splits for the reverse combine path."""
         self._configure_collectives(mock_dist, mock_dist_func)
@@ -1073,8 +1082,8 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         self.assertEqual(ctx.output_splits, [5, 5])
         self.assertEqual(ctx.gathered_shape, (self.total_tokens, self.dim))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatch_saves_router_coeff_when_provided(self, mock_dist, mock_dist_func):
         """Deredundency dispatch saves router coefficients for combine weighting."""
         self._configure_collectives(mock_dist, mock_dist_func)
@@ -1086,8 +1095,8 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         )
         self.assertTrue(torch.equal(ctx.router_coeff, router_coeff))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatch_combine_round_trip_1d(self, mock_dist, mock_dist_func):
         """dispatch then combine with identity expert restores the routed input."""
         self._configure_collectives(mock_dist, mock_dist_func)
@@ -1106,8 +1115,8 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
 
     @patch("torch.distributed._functional_collectives.wait_tensor")
     @patch("torch.distributed._functional_collectives.all_to_all_single")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_combine_start_wait_round_trip_1d(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
         """async combine path matches sync combine for the 1-D deredundency case."""
         self._configure_collectives(mock_dist, mock_dist_func)
@@ -1132,8 +1141,8 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         self.assertTrue(torch.allclose(combined, self.routed_input, atol=1e-6))
 
     @patch("torch.distributed._functional_collectives.all_to_all_single")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_combine_start_uses_async_iep_all_to_all(self, mock_dist, mock_dist_func, mock_async_a2a):
         """combine_start launches the async IEP reverse all-to-all."""
         self._configure_collectives(mock_dist, mock_dist_func)
@@ -1156,7 +1165,7 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         mock_dist_func.all_to_all_single.assert_not_called()
         mock_async_a2a.assert_called_once()
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
     def test_combine_weights_and_accumulates_duplicate_dispatch_indices(self, mock_dist_func):
         """combine applies router_coeff and scatter-adds duplicate token positions."""
         mock_dist_func.all_to_all_single.side_effect = (
@@ -1218,8 +1227,8 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         expected = torch.tensor([[1.0, 1.0], [7.0, 7.0]])
         self.assertTrue(torch.allclose(combined, expected, atol=1e-6))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatch_rejects_non_divisible_expert_count(self, mock_dist, mock_dist_func):
         """Expert count must be divisible by the resolved full EP size."""
         self._configure_collectives(mock_dist, mock_dist_func)
@@ -1231,8 +1240,8 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
                 device_mesh=self.mock_mesh,
             )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_expert_parallel_deredundency_round_trip_via_hooks(self, mock_dist, mock_dist_func):
         """ExpertParallel+deredundency dispatch→combine runs end-to-end with a
         matching context (regression guard for the hardcoded-AllToAll bug).
@@ -1269,8 +1278,8 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
         self.assertEqual(combined.shape, (self.total_tokens, self.dim))
         self.assertTrue(torch.allclose(combined, self.routed_input, atol=1e-6))
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_deredundency_inputs2_is_router_coeff_not_permuted_probs(self, mock_dist, mock_dist_func):
         """The third input is router_coeff (combine weighting), not permuted_probs.
 
@@ -1463,8 +1472,8 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
             f"w3 should use [Shard(0), Shard(1)], got {shard_by_key.get('w3')}"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_etp_dispatch_delegates_to_ep_submesh(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertTensorParallel._token_dispatch delegates to EP sub-mesh
@@ -1502,8 +1511,8 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
         # reads it once for the score guard and once for dispatch.
         full_mesh.__getitem__.assert_any_call("ep")
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_etp_combine_delegates_to_ep_submesh(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertTensorParallel._token_combine delegates to EP sub-mesh
@@ -1545,6 +1554,28 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
 
         # Verify ["ep"] was accessed on the 2-D mesh for combine too
         full_mesh.__getitem__.assert_called_once_with("ep")
+
+    def test_etp_async_combine_does_not_store_handle_on_module(self):
+        """ETP async combine waits on a local handle without retaining it."""
+        etp = ExpertTensorParallel(async_combine=True)
+        module = _make_mock_module()
+        ctx = MagicMock()
+        module._ep_dispatch_ctx = ctx
+        routed_output = MagicMock()
+        expected = MagicMock()
+        handle = MagicMock()
+        handle.wait.return_value = expected
+        ep_submesh = _make_mock_device_mesh(ep_size=2)
+        full_mesh = MagicMock()
+        full_mesh.__getitem__ = MagicMock(return_value=ep_submesh)
+
+        with patch.object(AllToAllTokenDispatcher, "combine_start", return_value=handle) as mock_start:
+            result = etp._token_combine(module, routed_output, full_mesh)
+
+        mock_start.assert_called_once_with(routed_output, ep_submesh, ctx)
+        handle.wait.assert_called_once_with()
+        self.assertIs(result, expected)
+        self.assertFalse(hasattr(module, "_ep_combine_handle"))
 
     def test_etp_deredundency_dispatcher_not_supported_yet(self):
         """ETP fails fast for deredundency until [oep, iep, tp] mesh support exists."""
@@ -1622,8 +1653,8 @@ class TestCombineStartWait(unittest.TestCase):
         )
 
     @patch("torch.distributed._functional_collectives.all_to_all_single")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_combine_start_returns_handle(self, mock_dist, mock_dist_func, mock_async_a2a):
         """
         Feature: combine_start return types
@@ -1649,8 +1680,8 @@ class TestCombineStartWait(unittest.TestCase):
 
     @patch("torch.distributed._functional_collectives.wait_tensor")
     @patch("torch.distributed._functional_collectives.all_to_all_single")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_combine_start_wait_round_trip(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
         """
         Feature: combine_start + combine_wait round-trip (OV-01)
@@ -1691,8 +1722,8 @@ class TestCombineStartWait(unittest.TestCase):
         )
 
     @patch("torch.distributed._functional_collectives.all_to_all_single")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_combine_start_calls_async_a2a(self, mock_dist, mock_dist_func, mock_async_a2a):
         """
         Feature: combine_start uses differentiable_all_to_all_single_async
@@ -1742,8 +1773,8 @@ class TestExpertParallelAsyncCombine(unittest.TestCase):
 
     @patch("torch.distributed._functional_collectives.wait_tensor")
     @patch("torch.distributed._functional_collectives.all_to_all_single")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_async_combine_no_shared_expert_degradation(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
         """
         Feature: async_combine=True without shared_expert (OV-02)
@@ -1781,14 +1812,16 @@ class TestExpertParallelAsyncCombine(unittest.TestCase):
 
     @patch("torch.distributed._functional_collectives.wait_tensor")
     @patch("torch.distributed._functional_collectives.all_to_all_single")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
-    def test_async_combine_stores_handle_on_module(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
+    def test_async_combine_does_not_store_handle_on_module(
+        self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait
+    ):
         """
-        Feature: async_combine=True stores handle on module
-        Description: After _token_combine with async_combine, the module has
-            _ep_combine_handle attribute.
-        Expectation: attribute exists and has correct type.
+        Feature: async_combine=True keeps its handle local
+        Description: After _token_combine with async_combine, the module does
+            not retain the completed handle.
+        Expectation: _ep_combine_handle is absent.
         """
         self._configure_collectives(mock_dist, mock_dist_func, mock_async_a2a, mock_wait)
         ep_async = ExpertParallel(async_combine=True)
@@ -1803,13 +1836,12 @@ class TestExpertParallelAsyncCombine(unittest.TestCase):
             expert_output = torch.randn(self.total_tokens, self.dim)
             ep_async._token_combine(self.module, expert_output, self.mock_mesh)
 
-        self.assertTrue(hasattr(self.module, "_ep_combine_handle"))
-        self.assertIsInstance(self.module._ep_combine_handle, AsyncHandle)
+        self.assertFalse(hasattr(self.module, "_ep_combine_handle"))
 
     @patch("torch.distributed._functional_collectives.wait_tensor")
     @patch("torch.distributed._functional_collectives.all_to_all_single")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_sync_combine_does_not_store_handle(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
         """
         Feature: async_combine=False does not store handle
@@ -1861,8 +1893,8 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             lambda _out, inp, *_args, **_kw: inp
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_ep_dispatch_returns_probs_when_provided(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_dispatch returns permuted_probs
@@ -1901,8 +1933,8 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             f"expected {self.total_tokens}"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_ep_dispatch_omits_probs_when_absent(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertParallel._token_dispatch without permuted_probs
@@ -1930,8 +1962,8 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             f"expected ({self.num_local_experts},)"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_ep_dispatch_none_probs_falls_back_to_two_tuple(self, mock_dist, mock_dist_func):
         """
         Feature: None permuted_probs is treated as absent
@@ -1954,8 +1986,8 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             "probs all-to-all must not fire when permuted_probs is None"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_ep_probs_exchanged_via_second_differentiable_a2a(self, mock_dist, mock_dist_func):
         """
         Feature: permuted_probs uses a differentiable all-to-all
@@ -1992,8 +2024,8 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             f"probs output_splits={probs_call.kwargs['output_split_sizes']}, expected [5, 5]"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_ep_probs_reordered_to_expert_major(self, mock_dist, mock_dist_func):
         """
         Feature: permuted_probs reordered rank-major → expert-major
@@ -2022,8 +2054,8 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             "permuted_probs must track the same expert-major permutation as tokens"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_ep_ctx_stores_probs_input_shape_when_provided(self, mock_dist, mock_dist_func):
         """
         Feature: DispatchContext.probs_input_shape set on the probs path
@@ -2061,8 +2093,8 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             "probs_input_shape should be None when permuted_probs is absent"
         )
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_etp_dispatch_returns_probs_via_ep_submesh(self, mock_dist, mock_dist_func):
         """
         Feature: ExpertTensorParallel._token_dispatch propagates permuted_probs
@@ -2103,8 +2135,8 @@ class TestPermutedProbsDispatch(unittest.TestCase):
         )
         full_mesh.__getitem__.assert_called_once_with("ep")
 
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
-    @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
+    @patch("hyper_parallel.core.utils.communication.dist_func")
+    @patch("hyper_parallel.core.utils.communication.dist")
     def test_dispatcher_standalone_returns_four_tuple_with_probs(self, mock_dist, mock_dist_func):
         """
         Feature: AllToAllTokenDispatcher.dispatch direct return with probs

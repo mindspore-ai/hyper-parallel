@@ -25,14 +25,11 @@ Tests for :class:`ParallelStyle` abstract base class and its contract:
 ``test/distributed/tensor/parallel/test_parallelize_api.py`` (``TensorParallelAPITests``)
 where applicable; mesh size is 1 with ``init_backend=False`` for CPU-only UT.
 """
-import os
 import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
 from torch import nn
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -46,7 +43,6 @@ from hyper_parallel.core.tensor_parallel.style import (
     PrepareModuleOutput,
 )
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
-from hyper_parallel.platform.platform import PlatformType
 
 
 class TestTorchTensorHelpers(unittest.TestCase):
@@ -68,9 +64,8 @@ class TestTorchTensorHelpers(unittest.TestCase):
 def _patch_platform_rank_for_dtensor_redistribute(world_size: int = 1):
     """Patch ``torch.distributed`` rank helpers so ``tensor_redistribution`` runs without ``init_process_group``.
 
-    Instance-level patches to ``platform.get_rank`` do not reliably override
-    ``TorchPlatform``'s ``@staticmethod`` implementations; patching ``torch.distributed``
-    APIs directly keeps behavior correct when running the full ``tests/ut`` suite.
+    Patching ``torch.distributed`` APIs directly keeps behavior correct when
+    running the full ``tests/ut`` suite, where no process group is initialized.
     """
     return patch.multiple(
         "torch.distributed",
@@ -132,7 +127,6 @@ class TestParallelStyle(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
 
     def _setup_mock_platform(self, mock_platform, world_size: int = 4):
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (
@@ -297,7 +291,6 @@ class TestParallelStyleWithMockMesh(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
 
     def _setup_mock_platform(self, mock_platform, world_size: int = 4):
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (
@@ -362,7 +355,6 @@ class TestPrepareModuleInput(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
 
     def _setup_mock_platform(self, mock_platform, world_size: int = 1):
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (
@@ -631,7 +623,6 @@ class TestPrepareModuleOutput(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
 
     def _setup_mock_platform(self, mock_platform, world_size: int = 1):
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (
@@ -747,7 +738,6 @@ class TestPrepareModuleInputOutput(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
 
     def _setup_mock_platform(self, mock_platform, world_size: int = 1):
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (

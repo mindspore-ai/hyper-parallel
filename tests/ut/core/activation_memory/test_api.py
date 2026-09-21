@@ -24,7 +24,6 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.activation_memory.api import (
     CheckpointPolicy,

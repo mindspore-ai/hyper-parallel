@@ -42,7 +42,7 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.distributed import _collectives
+from hyper_parallel.core.utils import communication
 
 
 _ULYSSES_WRAPPED_FLAG = "_hyper_ulysses_wrapped"
@@ -467,7 +467,7 @@ def _ulysses_all_to_all(
         + list(range(scatter_dim + 1, split_ndim))
     )
     send = tensor.contiguous().reshape(split_shape).permute(permutation).contiguous()
-    received = _collectives.differentiable_all_to_all(
+    received = communication.differentiable_all_to_all(
         send, list(send.shape), cp_mesh.get_group())
     return _reconstruct_all_to_all(received, gather_dim)
 

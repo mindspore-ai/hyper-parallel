@@ -82,6 +82,7 @@ python your_program.py
 
 ```python
 import hyper_parallel as hp
+import importlib.metadata as metadata
 
-print(hp.get_platform())
+print(metadata.version("hyper_parallel"))
 ```

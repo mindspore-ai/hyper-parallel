@@ -13,16 +13,16 @@
 # limitations under the License.
 # ============================================================================
 """Distributed driver for shape utils on a real ``DeviceMesh``."""
+import torch.distributed as dist
+
 from hyper_parallel import (
     destroy_process_group,
-    get_platform,
     init_device_mesh,
     init_process_group,
 )
+from hyper_parallel.core.dtensor._utils import device_type
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.utils.shape_utils import compute_local_shape_and_global_offset
-
-platform = get_platform()
 
 
 def test_shape_utils_alias_shard_uneven_split_matches_chunk():
@@ -36,12 +36,12 @@ def test_shape_utils_alias_shard_uneven_split_matches_chunk():
     """
     init_process_group()
     try:
-        mesh = init_device_mesh(device_type=platform.device_type(),
+        mesh = init_device_mesh(device_type=device_type(),
                                 mesh_shape=(4,), mesh_dim_names=("dp",))
         local_shape = compute_local_shape_and_global_offset(
             global_shape=(10,), device_mesh=mesh, placement=("dp",),
         )
-        rank = platform.get_rank()
+        rank = dist.get_rank()
         expected = 3 if rank < 2 else 2
         assert local_shape == [expected], (
             f"alias shard uneven split mismatch on rank={rank}: "
@@ -64,7 +64,7 @@ def test_shape_utils_placement_objects_uneven_match_alias_string():
     """
     init_process_group()
     try:
-        mesh = init_device_mesh(device_type=platform.device_type(),
+        mesh = init_device_mesh(device_type=device_type(),
                                 mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
         global_shape = (7, 16)
 
@@ -76,7 +76,7 @@ def test_shape_utils_placement_objects_uneven_match_alias_string():
             global_shape=global_shape, device_mesh=mesh,
             placement=("dp", "None"),
         )
-        rank = platform.get_rank()
+        rank = dist.get_rank()
         assert local_via_placement == local_via_alias, (
             f"Placement vs alias mismatch on rank={rank}: "
             f"placement={local_via_placement}, alias={local_via_alias}"

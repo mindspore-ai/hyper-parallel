@@ -305,6 +305,7 @@ class IndexedDatasetSplitBuilder:
 
             final result = (blended_train[100], blended_valid[15], None)
         """
+        # pylint: disable=too-many-locals
         datasets_per_source = []
         logger.debug("Building %d indexed Dataset sources", len(prefixes))
         # TODO: Add a separate cache-prebuild phase that assigns source_index % world_size to each rank,
@@ -351,6 +352,7 @@ class IndexedDatasetSplitBuilder:
         config: GPTDatasetConfig,
     ) -> DatasetSplits:
         """Build each mid-level split from one low-level indexed Dataset."""
+        # pylint: disable=too-many-locals
         if (
             config.data_lazy_load
             and self.dataloader_context.distributed_enabled

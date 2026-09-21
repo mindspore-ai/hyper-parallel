@@ -33,7 +33,7 @@ import torch.distributed as dist
 
 from hyper_parallel.core.utils.moe_utils import sync_and_update_expert_bias
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
-from hyper_parallel.platform.torch.common.moe import MoE
+from hyper_parallel.components.modules.moe import MoE
 from tests.torch.utils import init_dist_gloo
 
 

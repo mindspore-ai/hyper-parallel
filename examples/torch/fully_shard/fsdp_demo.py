@@ -17,15 +17,9 @@
 This script shows how to use fully_shard for distributed training.
 Run with: torchrun --nproc_per_node=8 fsdp_demo.py
 """
-import os
-
 import torch
 from torch import nn
 import torch.distributed as dist
-
-# hyper_parallel selects its backend from HYPER_PARALLEL_PLATFORM at import time,
-# so the environment must be configured before importing it.
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel import init_device_mesh, SkipDTensorDispatch  # pylint: disable=C0413
 from hyper_parallel.core.fully_shard.api import fully_shard  # pylint: disable=C0413

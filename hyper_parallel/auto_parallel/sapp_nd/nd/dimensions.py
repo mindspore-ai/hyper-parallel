@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, Union
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
@@ -289,27 +289,6 @@ def get_dims(dims):
     return [get_dim(acronym) for acronym in dims]
 
 
-def _cp_params_from_args(
-    seq_len, cp_degree, tp_degree, pp_degree, device_per_node,
-    attention_type_str, bw_intra, bw_inter, total_devices,
-    cp_memory_per_layer, device_capacity, num_layers,
-    cp_algo, attention_heads, sp_enabled, num_kv_heads=0,
-):
-    """Resolve CPConstraintParams from flexible args."""
-    if isinstance(seq_len, CPConstraintParams):
-        return seq_len
-    return CPConstraintParams(
-        seq_len=seq_len, cp_degree=cp_degree, tp_degree=tp_degree,
-        pp_degree=pp_degree, device_per_node=device_per_node,
-        attention_type_str=attention_type_str, bw_intra=bw_intra,
-        bw_inter=bw_inter, total_devices=total_devices,
-        cp_memory_per_layer=cp_memory_per_layer,
-        device_capacity=device_capacity, num_layers=num_layers,
-        cp_algo=cp_algo, attention_heads=attention_heads,
-        num_kv_heads=num_kv_heads, sp_enabled=sp_enabled,
-    )
-
-
 def _cp_ok_result(**overrides):
     """Build a passing CPValidationResult with sensible defaults."""
     defaults = {
@@ -419,57 +398,68 @@ def _cp_check_memory(p, warnings, topology_feasible, topology_penalty, recommend
     )
 
 
+_CP_POSITIONAL_FIELDS = (
+    "cp_degree", "tp_degree", "pp_degree", "device_per_node", "attention_type_str",
+    "bw_intra", "bw_inter", "total_devices", "cp_memory_per_layer", "device_capacity",
+    "num_layers", "cp_algo", "attention_heads", "sp_enabled", "num_kv_heads",
+)
+
+
+def _cp_params_from_args(seq_len, args, kwargs):
+    """Preserve the legacy positional field order when building CP parameters."""
+    if len(args) > len(_CP_POSITIONAL_FIELDS):
+        raise TypeError("validate_cp_constraints accepts at most 16 positional arguments")
+    options = dict(zip(_CP_POSITIONAL_FIELDS, args))
+    duplicates = options.keys() & kwargs.keys()
+    if duplicates:
+        raise TypeError(f"Multiple values for CP arguments: {sorted(duplicates)}")
+    unknown = kwargs.keys() - set(_CP_POSITIONAL_FIELDS)
+    if unknown:
+        raise TypeError(f"Unexpected CP arguments: {sorted(unknown)}")
+    if isinstance(seq_len, CPConstraintParams):
+        return seq_len
+    return CPConstraintParams(seq_len=seq_len, **{"cp_degree": 1, **options, **kwargs})
+
+
 def validate_cp_constraints(
     seq_len: Union[CPConstraintParams, int],
-    cp_degree: int = 1,
-    tp_degree: int = 1,
-    pp_degree: int = 1,
-    device_per_node: int = 8,
-    attention_type_str: str = "mha",
-    bw_intra: float = 300.0,
-    bw_inter: float = 25.0,
-    total_devices: int = 0,
-    cp_memory_per_layer: float = 0.0,
-    device_capacity: float = 0.0,
-    num_layers: int = 0,
-    cp_algo: str = "colossalai_cp",
-    attention_heads: int = 0,
-    sp_enabled: bool = False,
-    num_kv_heads: int = 0,
+    *args: Any,
+    **kwargs: Any,
 ) -> CPValidationResult:
     """Validate CP constraints for a given parallel configuration.
 
-    Accepts either a CPConstraintParams dataclass or individual keyword
-    arguments for backward compatibility.
+    Accepts either a CPConstraintParams dataclass or its fields as positional
+    and keyword arguments for backward compatibility.
 
     Args:
         seq_len: Sequence length, or a CPConstraintParams dataclass.
-        cp_degree: CP degree.
-        tp_degree: TP degree.
-        pp_degree: PP degree.
-        device_per_node: Number of devices per node.
-        attention_type_str: Attention type string ("mha", "gqa", "mla").
-        bw_intra: Intra-node bandwidth in GB/s (default: 300.0 for Ascend A2).
-        bw_inter: Inter-node bandwidth in GB/s (default: 25.0).
-        total_devices: Total number of available devices (0 = skip check).
-        cp_memory_per_layer: CP memory per layer in bytes (0 = skip check).
-        device_capacity: Device memory capacity in bytes (0 = skip check).
-        num_layers: Number of transformer layers (0 = skip check).
-        cp_algo: CP algorithm ("colossalai_cp", "hybrid_cp", "ulysses_cp").
-        attention_heads: Number of attention heads (0 = skip Ulysses head check).
-        sp_enabled: Whether sequence parallelism is enabled (SP and CP are incompatible).
-        num_kv_heads: Number of KV heads for Ulysses divisibility check
-            (0 = fall back to attention_heads, matching compute_kv_dim).
+        *args: Legacy positional fields, from cp_degree through num_kv_heads.
+            The final two fields retain the order sp_enabled, num_kv_heads.
+        **kwargs: The other CPConstraintParams fields, read only when seq_len
+            is an int. An omitted field takes the dataclass default, except
+            cp_degree, which defaults to 1.
+
+            cp_degree: CP degree.
+            tp_degree: TP degree.
+            pp_degree: PP degree.
+            device_per_node: Number of devices per node.
+            attention_type_str: Attention type string ("mha", "gqa", "mla").
+            bw_intra: Intra-node bandwidth in GB/s (default: 300.0 for Ascend A2).
+            bw_inter: Inter-node bandwidth in GB/s (default: 25.0).
+            total_devices: Total number of available devices (0 = skip check).
+            cp_memory_per_layer: CP memory per layer in bytes (0 = skip check).
+            device_capacity: Device memory capacity in bytes (0 = skip check).
+            num_layers: Number of transformer layers (0 = skip check).
+            cp_algo: CP algorithm ("colossalai_cp", "hybrid_cp", "ulysses_cp").
+            attention_heads: Number of attention heads (0 = skip Ulysses head check).
+            sp_enabled: Whether sequence parallelism is enabled (SP and CP are incompatible).
+            num_kv_heads: Number of KV heads for Ulysses divisibility check
+                (0 = fall back to attention_heads, matching compute_kv_dim).
 
     Returns:
         CPValidationResult with validation outcome.
     """
-    p = _cp_params_from_args(
-        seq_len, cp_degree, tp_degree, pp_degree, device_per_node,
-        attention_type_str, bw_intra, bw_inter, total_devices,
-        cp_memory_per_layer, device_capacity, num_layers,
-        cp_algo, attention_heads, sp_enabled, num_kv_heads,
-    )
+    p = _cp_params_from_args(seq_len, args, kwargs)
 
     if p.cp_degree <= 1:
         return _cp_ok_result()

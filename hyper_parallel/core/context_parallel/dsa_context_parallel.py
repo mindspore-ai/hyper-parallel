@@ -27,6 +27,8 @@ stay replicated.
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+import torch.distributed as dist
+
 from hyper_parallel.core.context_parallel.context_parallel import (
     _OUTPUT_NON_CP,
     _drop_cp_from_output,
@@ -305,6 +307,7 @@ def _dtensor_to_local_reducing_partial(value: Any) -> Any:
 def _register_boundary_hooks(module: Module, pre_hook, use_local_output: bool, seq_dim: int) -> None:
     """Register a DSA boundary pre-hook and its public output conversion hook."""
     utils.register_forward_pre_hook(module, pre_hook, with_kwargs=True)
+
     def _finalize_output_hook(hook_module, hook_args, outputs):
         del hook_args
         return _finalize_output(
@@ -390,12 +393,22 @@ def _apply_sparse_attention_boundary(
 
     def _replicate(slot_name: str):
         if async_state is not None:
-            return lambda value: async_state.wait(slot_name, value)
+            def _wait_for_replicate(value):
+                return async_state.wait(slot_name, value)
+
+            return _wait_for_replicate
         if style.shared_replicate_cache is not None:
-            return lambda value: style.shared_replicate_cache.replicate(
-                slot_name, value, cp_mesh, style.seq_dim
-            )
-        return lambda value: _to_sequence_replicate(value, cp_mesh, style.seq_dim)
+            def _replicate_from_cache(value):
+                return style.shared_replicate_cache.replicate(
+                    slot_name, value, cp_mesh, style.seq_dim
+                )
+
+            return _replicate_from_cache
+
+        def _replicate_sequence(value):
+            return _to_sequence_replicate(value, cp_mesh, style.seq_dim)
+
+        return _replicate_sequence
 
     key_slot = "main_kv" if style.share_key_value else "key"
     value_slot = "main_kv" if style.share_key_value else "value"
@@ -768,7 +781,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
     def _get_local_idx(cp_mesh: DeviceMesh) -> int:
         """Return current rank's index in the CP mesh rank list."""
         rank_list = list(cp_mesh.rank_list)
-        rank = utils.get_rank()
+        rank = dist.get_rank()
         return rank_list.index(rank) if rank in rank_list else 0
 
     def _apply_with_loss_specs(

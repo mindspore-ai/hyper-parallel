@@ -17,7 +17,6 @@ import os
 import unittest
 from unittest.mock import patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.layout import Layout

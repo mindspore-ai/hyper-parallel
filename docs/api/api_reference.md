@@ -907,39 +907,27 @@ class SwapManager:
 
 ---
 
-## 平台抽象
-
-### `get_platform`
-
-获取当前平台对象。
-
-```python
-get_platform() -> Platform
-```
-
-返回 PyTorch 或 MindSpore 平台实现，用于访问平台特定功能。
-
----
-
 ## 其他导出接口
 
 ### 主接口导出（`hyper_parallel/__init__.py`）
 
 ```python
-__all__ = [
-    "get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDPModule",
-    "DTensor", "Layout", "DeviceMesh", "init_device_mesh", "get_current_mesh",
-    "distribute_module", "init_parameters", "init_empty_weights", "init_on_device",
-    "custom_shard", "SkipDTensorDispatch",
-    "MetaStep", "MetaStepType", "BatchDimSpec", "PipelineStage", "ScheduleInterleaved1F1B",
-    "init_process_group", "destroy_process_group", "get_process_group_ranks", "get_backend",
-    "split_group", "get_group_local_rank", "mark_created_groups",
-    "ContextParallel", "AsyncContextParallel",
-    "AsyncDSAIndexerContextParallel", "AsyncDSAIndexerLossContextParallel",
-    "AsyncDSASparseAttentionContextParallel",
-    "DSAIndexerContextParallel", "DSAIndexerLossContextParallel", "DSASparseAttentionContextParallel",
-    "ColwiseParallel", "RowwiseParallel", "SequenceParallel",
-    "PrepareModuleInput", "PrepareModuleInputOutput", "PrepareModuleOutput",
-    "ParallelStyle", "parallelize_module", "manual_seed",
-]
+__all__ = ["DFunction", "fully_shard", "hsdp_sync_stream", "HSDPModule", "DTensor",
+           "Layout", "DeviceMesh", "init_device_mesh", "get_current_mesh", "distribute_module",
+           "distribute_tensor", "ones", "zeros", "empty", "full", "rand", "randn",
+           "Shard", "RaggedShard", "Replicate", "Partial", "Placement",
+           "init_parameters", "init_empty_weights", "init_on_device",
+           "shard_module", "custom_shard", "SkipDTensorDispatch",
+           "MetaStep", "MetaStepType", "BatchDimSpec", "PipelineStage", "ScheduleInterleaved1F1B",
+           "ScheduleMPipeTranspose",
+           "init_process_group", "destroy_process_group", "get_process_group_ranks", "get_backend", "split_group",
+           "get_group_local_rank", "mark_created_groups",
+           "ContextParallel", "AsyncContextParallel",
+           "AsyncDSAIndexerContextParallel", "AsyncDSAIndexerLossContextParallel",
+           "AsyncDSASparseAttentionContextParallel",
+           "DSAIndexerContextParallel", "DSAIndexerLossContextParallel", "DSASparseAttentionContextParallel",
+           "ColwiseParallel", "MC2ColwiseParallel", "MC2RowwiseParallel", "MC2Linear",
+           "NoParallel", "RowwiseParallel", "SequenceParallel",
+           "PrepareModuleInput", "PrepareModuleInputOutput", "PrepareModuleOutput",
+           "ParallelStyle", "parallelize_module", "manual_seed"]
 ```

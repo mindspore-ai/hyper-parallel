@@ -103,7 +103,7 @@ def _build_mpipe(real_stage_num, n_local_stages, micro_batch_num,
     like the real constructor's default and the text-style cases here).
     ``has_trainable`` overrides the T>0 derivation so frozen-with-T>0 (the
     real frozen visual tower) is constructible; ``kwargs_batch_dim`` sets the
-    kwarg spec ``_DATA_KEYS`` is built from (default empty).
+    kwarg spec ``_data_keys`` is built from (default empty).
     ``overflow_mode`` gates the ``M > NT`` distribution: ``"min"`` (default
     here to match the legacy ordering expectations) keeps a single owner per
     rank and inline-loads the overflow on rank 0; ``"full"`` round-robins
@@ -120,7 +120,7 @@ def _build_mpipe(real_stage_num, n_local_stages, micro_batch_num,
         num_transpose_layers > 0 if has_trainable is None else has_trainable)
     schedule._overflow_mode = overflow_mode
     # ``__init__`` is bypassed via ``object.__new__``, so set the ``_kwargs_batch_dim``
-    # that ``construct_exec_order`` reads to build ``_DATA_KEYS``.
+    # that ``construct_exec_order`` reads to build ``_data_keys``.
     schedule._kwargs_batch_dim = kwargs_batch_dim if kwargs_batch_dim is not None else {}
     # ``construct_exec_order`` reads ``stages[0].dst_stage`` / ``src_stage`` for the
     # DATA_SEND/RECV routing, which these ordering tests never assert on.
@@ -933,7 +933,7 @@ class TestMPipeTransposeOwnerBackwardOrder(unittest.TestCase):
 
 
 class TestMPipeTransposeDataKeys(unittest.TestCase):
-    """``_DATA_KEYS`` pixels policy: ``pixel_values`` leaves the wire only for a
+    """``_data_keys`` pixels policy: ``pixel_values`` leaves the wire only for a
     frozen, fully-transposed visual tower."""
 
     _VL_SPEC = {"attention_mask": 0, "pixel_values": 0, "targets": 0}
@@ -943,7 +943,7 @@ class TestMPipeTransposeDataKeys(unittest.TestCase):
                              num_visual_layers=num_visual_layers,
                              has_trainable=has_trainable,
                              kwargs_batch_dim=self._VL_SPEC)
-        return sched._DATA_KEYS  # pylint: disable=protected-access
+        return sched._data_keys  # pylint: disable=protected-access
 
     def test_frozen_fully_transposed_drops_pixels(self):
         """
@@ -951,7 +951,7 @@ class TestMPipeTransposeDataKeys(unittest.TestCase):
         Description: Frozen tower with T == num_visual_layers (the shipped
             ``pp_mpipe_transpose_layers: visual`` + freeze default) -- pixels are
             consumed on the owning rank, stage 0 only receives features.
-        Expectation: ``pixel_values`` leaves ``_DATA_KEYS``; the other keys stay.
+        Expectation: ``pixel_values`` leaves ``_data_keys``; the other keys stay.
         """
         keys = self._keys(4, 4, has_trainable=False)
         assert "pixel_values" not in keys
@@ -963,7 +963,7 @@ class TestMPipeTransposeDataKeys(unittest.TestCase):
         Description: TRAINABLE tower with T == num_visual_layers -- the stage-0
             backward recomputes the tower forward from the ctx kwargs, which
             DATA_RECV fills under ``data.load: single``.
-        Expectation: ``pixel_values`` stays in ``_DATA_KEYS`` (this PR's fix).
+        Expectation: ``pixel_values`` stays in ``_data_keys`` (this PR's fix).
         """
         assert "pixel_values" in self._keys(4, 4, has_trainable=True)
 
@@ -972,7 +972,7 @@ class TestMPipeTransposeDataKeys(unittest.TestCase):
         Feature: MPipe DATA wire schema.
         Description: Dataload-only mode (T == 0) -- stage 0 runs the visual
             tower itself on the received micros.
-        Expectation: ``pixel_values`` stays in ``_DATA_KEYS``.
+        Expectation: ``pixel_values`` stays in ``_data_keys``.
         """
         assert "pixel_values" in self._keys(0, 4, has_trainable=False)
 
@@ -981,7 +981,7 @@ class TestMPipeTransposeDataKeys(unittest.TestCase):
         Feature: MPipe DATA wire schema.
         Description: ``num_visual_layers`` is ``None`` (schedule built without
             the param, e.g. a non-VL model).
-        Expectation: conservative -- ``pixel_values`` stays in ``_DATA_KEYS``.
+        Expectation: conservative -- ``pixel_values`` stays in ``_data_keys``.
         """
         assert "pixel_values" in self._keys(2, None, has_trainable=False)
 

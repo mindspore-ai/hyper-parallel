@@ -14,6 +14,7 @@
 # ============================================================================
 """Experimental : Comm time"""
 from copy import deepcopy
+from typing import NamedTuple
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
@@ -80,28 +81,82 @@ def _cp_comm_zero(ccfg):
     )
 
 
-def _cp_comm_cost_common(volume_per_step, total_kv_volume, comm_volume,
-                          ring_steps, ring_directions, cp, s, b,
-                          attention_type, kv_dim, cp_algo, topology,
-                          effective_bandwidth):
+class _CPVolumes(NamedTuple):
+    """Algorithm-specific CP communication volumes of one layer."""
+
+    kv_volume_per_step: float
+    total_kv_volume: float
+    comm_volume: float
+    ring_steps: int
+    ring_directions: int
+
+
+def _cp_comm_cost_common(ccfg, volumes, attention_type, kv_dim, cp_algo,
+                          topology, effective_bandwidth):
     """Build CPCommunicationCost with standard time calculation."""
     overlap_ratio = 0.5
-    total_comm_time = (total_kv_volume / (effective_bandwidth * 1e9)) * 1e3
+    total_comm_time = (volumes.total_kv_volume / (effective_bandwidth * 1e9)) * 1e3
     exposed_comm_time = total_comm_time * (1 - overlap_ratio)
     return CPCommunicationCost(
-        kv_volume_per_step=volume_per_step,
-        total_kv_volume=total_kv_volume,
-        comm_volume=comm_volume,
-        ring_steps=ring_steps, ring_directions=ring_directions,
+        kv_volume_per_step=volumes.kv_volume_per_step,
+        total_kv_volume=volumes.total_kv_volume,
+        comm_volume=volumes.comm_volume,
+        ring_steps=volumes.ring_steps, ring_directions=volumes.ring_directions,
         total_comm_time=total_comm_time,
         exposed_comm_time=exposed_comm_time,
         overlap_ratio=overlap_ratio,
         effective_bandwidth=effective_bandwidth,
-        topology=topology, cp_degree=int(cp),
-        seq_len=int(s), batch_size=int(b),
+        topology=topology, cp_degree=int(ccfg.cp),
+        seq_len=int(ccfg.s), batch_size=int(ccfg.b),
         attention_type=attention_type, kv_dim=int(kv_dim),
         cp_algo=cp_algo,
     )
+
+
+def _cp_rec_factor(ccfg, ctx):
+    """Recompute coefficient, matching the old cp_comm_non_exp."""
+    rec_layer = (ctx.current_node == LayerType.SEL_REC_LAYER) if ctx else False
+    rec_op_gather = getattr(getattr(ccfg, 'rec_op', None), 'gather', 0)
+    return (int(not rec_layer) | rec_op_gather) * int(ccfg.p == 1)
+
+
+def _ulysses_cp_volumes(ccfg, rec_factor):
+    """Ulysses CP volumes: two All2All over (cp-1)/cp of the local shard."""
+    s, b = ccfg.s, ccfg.b
+    cp = ccfg.cp
+    t = max(1, ccfg.t)
+    local_qkv = s * b * (ccfg.a / t) * ccfg.dh * 2
+    a2a_vol = local_qkv * (cp - 1) / cp
+    # comm_volume: same weighted-unit as dp/tp/ep
+    # Ulysses attention coeff = 0.5*rec_factor + 0.5
+    ulysses_attn_coeff = 0.5 * rec_factor + 0.5
+    comm_vol = (
+        ccfg.comm_cp * 2 * s * b
+        * (ulysses_attn_coeff * ccfg.n_attMM * ccfg.h
+           + ccfg.n_ffMM * ccfg.hff)
+        / t
+    )
+    return _CPVolumes(a2a_vol, a2a_vol * 2, comm_vol, 0, 2)
+
+
+def _ring_cp_volumes(ccfg, rec_factor, kv_dim):
+    """Ring CP volumes: cp-1 P2P steps of s/cp tokens of KV, both directions."""
+    s, b = ccfg.s, ccfg.b
+    cp = ccfg.cp
+    t = max(1, ccfg.t)
+    kv_bytes = 4
+    kv_vol_step = (s / cp) * b * kv_dim * kv_bytes
+    total_kv = kv_vol_step * (cp - 1) * 2
+    # comm_volume: same weighted-unit as dp/tp/ep
+    # Ring attention coeff = 2*0.5*rec_factor + 0.5 (extra /cp from (s/cp)^2)
+    ring_attn_coeff = 2 * 0.5 * rec_factor + 0.5
+    comm_vol = (
+        ccfg.comm_cp * 2 * s * b
+        * (ring_attn_coeff * ccfg.n_attMM * ccfg.h
+           + ccfg.n_ffMM * ccfg.hff)
+        / t
+    )
+    return _CPVolumes(kv_vol_step, total_kv, comm_vol, int(cp - 1), 2)
 
 
 def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPCommunicationCost:
@@ -122,10 +177,6 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
     if ccfg.cp <= 1:
         return _cp_comm_zero(ccfg)
 
-    s, b = ccfg.s, ccfg.b
-    cp = ccfg.cp
-    t = max(1, ccfg.t)
-
     if ccfg.a <= 0:
         raise ValueError(f"Number of attention heads must be positive, got {ccfg.a}")
 
@@ -133,44 +184,15 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
     attention_type = detect_attention_type(ccfg)
     cp_algo = _resolve_cp_algo(ccfg)
     topology, effective_bandwidth = _cp_resolve_topology(
-        cp, ccfg.device_per_node, ccfg.bw_intra, ccfg.bw_inter)
-
-    # rec_factor: recompute coefficient matching old cp_comm_non_exp
-    rec_layer = (ctx.current_node == LayerType.SEL_REC_LAYER) if ctx else False
-    rec_op_gather = getattr(getattr(ccfg, 'rec_op', None), 'gather', 0)
-    rec_factor = (int(not rec_layer) | rec_op_gather) * int(ccfg.p == 1)
+        ccfg.cp, ccfg.device_per_node, ccfg.bw_intra, ccfg.bw_inter)
+    rec_factor = _cp_rec_factor(ccfg, ctx)
 
     if cp_algo == CPAlgo.ULYSSES_CP:
-        local_qkv = s * b * (ccfg.a / t) * ccfg.dh * 2
-        a2a_vol = local_qkv * (cp - 1) / cp
-        # comm_volume: same weighted-unit as dp/tp/ep
-        # Ulysses attention coeff = 0.5*rec_factor + 0.5
-        ulysses_attn_coeff = 0.5 * rec_factor + 0.5
-        comm_vol = (
-            ccfg.comm_cp * 2 * s * b
-            * (ulysses_attn_coeff * ccfg.n_attMM * ccfg.h
-               + ccfg.n_ffMM * ccfg.hff)
-            / t
-        )
-        return _cp_comm_cost_common(
-            a2a_vol, a2a_vol * 2, comm_vol, 0, 2, cp, s, b,
-            attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
-
-    kv_bytes = 4
-    kv_vol_step = (s / cp) * b * kv_dim * kv_bytes
-    total_kv = kv_vol_step * (cp - 1) * 2
-    # comm_volume: same weighted-unit as dp/tp/ep
-    # Ring attention coeff = 2*0.5*rec_factor + 0.5 (extra /cp from (s/cp)^2)
-    ring_attn_coeff = 2 * 0.5 * rec_factor + 0.5
-    comm_vol = (
-        ccfg.comm_cp * 2 * s * b
-        * (ring_attn_coeff * ccfg.n_attMM * ccfg.h
-           + ccfg.n_ffMM * ccfg.hff)
-        / t
-    )
+        volumes = _ulysses_cp_volumes(ccfg, rec_factor)
+    else:
+        volumes = _ring_cp_volumes(ccfg, rec_factor, kv_dim)
     return _cp_comm_cost_common(
-        kv_vol_step, total_kv, comm_vol, int(cp - 1), 2, cp, s, b,
-        attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
+        ccfg, volumes, attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
 
 
 def fill_dp_table(cfg, tables):
@@ -447,6 +469,40 @@ def prepare_context():
     return ctx
 
 
+def _accumulate_stage_comm(param, stage):
+    """Sum the per-layer DP, TP, EP and CP communication volumes of one stage."""
+    comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0}
+    for chunk in stage:
+        for layer in chunk:
+            param["ctx"].current_node = layer
+            if (
+                layer
+                not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
+                and param["flatten"]
+            ):
+                custom_fun = param["flatten"].pop(0)
+                if custom_fun:
+                    custom_fun(param["cfg"])
+                logger.info("is layer moe ? %s", param["cfg"].n_exp > 1)
+                param["ctx"].current_node = LayerType.NOT_REC_LAYER
+                logger.info("param ctx %s", param["ctx"])
+                comm[Dim.DP] += EvalLayerComm.dp_comm_layer(param["cfg"], param["ctx"])
+
+            comm[Dim.TP] += EvalLayerComm.tp_comm_layer(
+                param["cfg"], param["ctx"], 1
+            )  # / 4 #* (param["cfg"].t - 1)
+            comm[Dim.EP] += EvalLayerComm.ep_comm_layer(
+                param["cfg"], param["ctx"], 1
+            )  # * param["cfg"].ep
+            comm[Dim.CP] += cp_comm_layer_detailed(
+                param["cfg"], param["ctx"]
+            ).comm_volume
+            # min(device_type.level_bound_number[0], param["cfg"].ep)
+            # comm_cp += EvalLayerComm.cp_comm_layer
+            # (param["cfg"], param["ctx"])
+    return comm
+
+
 def estimate_from_mem_comm(*args, **kwargs):
     """For memory estimation"""
 
@@ -467,37 +523,7 @@ def estimate_from_mem_comm(*args, **kwargs):
     )
     comms = {Dim.DP: [], Dim.TP: [], Dim.EP: [], Dim.CP: []}
     for stage in param["stages"]:
-        comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0}
-        for chunk in stage:
-            for layer in chunk:
-                param["ctx"].current_node = layer
-                if (
-                    layer
-                    not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
-                    and param["flatten"]
-                ):
-                    custom_fun = param["flatten"].pop(0)
-                    if custom_fun:
-                        custom_fun(param["cfg"])
-                    logger.info("is layer moe ? %s", param["cfg"].n_exp > 1)
-                    param["ctx"].current_node = LayerType.NOT_REC_LAYER
-                    logger.info("param ctx %s", param["ctx"])
-                    comm[Dim.DP] += EvalLayerComm.dp_comm_layer(param["cfg"], param["ctx"])
-
-                comm[Dim.TP] += EvalLayerComm.tp_comm_layer(
-                    param["cfg"], param["ctx"], 1
-                )  # / 4 #* (param["cfg"].t - 1)
-                comm[Dim.EP] += EvalLayerComm.ep_comm_layer(
-                    param["cfg"], param["ctx"], 1
-                )  # * param["cfg"].ep
-                comm[Dim.CP] += cp_comm_layer_detailed(
-                    param["cfg"], param["ctx"]
-                ).comm_volume
-                # min(device_type.level_bound_number[0], param["cfg"].ep)
-                # comm_cp += EvalLayerComm.cp_comm_layer
-                # (param["cfg"], param["ctx"])
-
-
+        comm = _accumulate_stage_comm(param, stage)
 
         if param["ccfg"].ttype == PerformanceType.TIME:
             for dim, ov in zip([Dim.DP, Dim.TP, Dim.CP], [0.0, 0.0, 0.0]):

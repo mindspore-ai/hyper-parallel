@@ -36,7 +36,6 @@ import os
 import unittest
 from unittest.mock import patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 from torch import fx

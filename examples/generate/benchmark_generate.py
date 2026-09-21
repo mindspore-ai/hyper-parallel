@@ -14,8 +14,8 @@
 # ============================================================================
 """Generate micro-benchmark."""
 import argparse
-import importlib
 import json
+import logging
 import sys
 import time
 import warnings
@@ -25,15 +25,9 @@ from statistics import mean
 import torch
 from torch import nn
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+from hyper_parallel.infer import GenerationConfig, build_causal_mask, build_position_ids, generate
 
-_infer = importlib.import_module("hyper_parallel.infer")
-GenerationConfig = _infer.GenerationConfig
-build_causal_mask = _infer.build_causal_mask
-build_position_ids = _infer.build_position_ids
-generate = _infer.generate
+logger = logging.getLogger(__name__)
 
 
 class CacheLengthLM(nn.Module):
@@ -238,10 +232,11 @@ def main():
         "no_cache": _run_case(args, device, use_cache=False),
     }
     text = json.dumps(result, indent=2, sort_keys=True)
-    print(text)
+    logger.info("%s", text)
     if args.output:
         Path(args.output).write_text(text + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     main()

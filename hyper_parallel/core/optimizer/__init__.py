@@ -101,6 +101,7 @@ def _filter_optimizer_config(
         inspect.signature(optimizer_class.__init__).parameters.keys()
         - {"self", "params"}
     )
+    allowed_keys = set(allowed_keys) | set(getattr(optimizer_class, "ADDITIONAL_CONFIG_KEYS", ()))
     filtered_config = {
         key: value
         for key, value in normalized_config.items()

@@ -21,7 +21,7 @@ import torch.distributed as dist
 
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
-from hyper_parallel.platform.torch.common import MoE
+from hyper_parallel.components.modules.moe import MoE
 from tests.torch.utils import _DEVICE_TYPE, init_backend
 
 

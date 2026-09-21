@@ -398,17 +398,16 @@ def _input_meta(x: Any) -> Any:
 def trace_model_graph(  # pylint: disable=too-many-locals
     model: torch.nn.Module,
     train_fn: Callable,
-    sample_input: torch.Tensor,
-    sample_label: torch.Tensor,
+    inputs: Dict[str, Any],
 ) -> JointGraph:
     """
     Trace model to generate complete forward + backward graph
 
     Args:
         model: Model (no parallel wrapping)
-        train_fn: Training function signature: train_fn(model, input, label) -> loss
-        sample_input: Sample input (for tracing)
-        sample_label: Sample label (for tracing)
+        train_fn: Training function signature:
+            ``train_fn(model, **inputs) -> loss``
+        inputs: Model inputs, forwarded to ``train_fn`` as keyword arguments
 
     Returns:
         JointGraph: Joint forward-backward computation graph
@@ -434,9 +433,9 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     state_is_param = [fqn in param_fqns for fqn in state_fqns]
     state_flat, _ = torch.utils._pytree.tree_flatten({"model": model_state})
 
-    # user_inputs is a plain tuple (sample_input, sample_label) so the traced
-    # closure unpacks it back into the two positional args of train_fn.
-    user_inputs = (sample_input, sample_label)
+    # user_inputs is a plain dict so the traced closure unpacks it back into
+    # train_fn's keyword arguments.
+    user_inputs = inputs
     user_inputs_flat, user_inputs_spec = torch.utils._pytree.tree_flatten(user_inputs)
 
     for leaf in [*state_flat, *user_inputs_flat]:
@@ -477,7 +476,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
             _reparametrize_train_state(model, state_t["model"]),
             _patch_engine_backward(),
         ):
-            loss = train_fn(model, *user_args)
+            loss = train_fn(model, **user_args)
 
             # Read params from state_t["model"] so the exact trace-time
             # tensors (not the live module's) drive autograd.grad.
@@ -544,6 +543,9 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     traced_graph.state_fqns = state_fqns
     traced_graph.state_is_param = state_is_param
     traced_graph.num_state_inputs = num_state_inputs
+    # Kept for ``run_traced_graph`` to validate the runtime inputs' pytree
+    # structure against the traced one.
+    traced_graph.user_inputs_spec = user_inputs_spec
 
     param_names = [name for name, _ in model.named_parameters() if _.requires_grad]
     param_shapes = {
@@ -556,7 +558,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
 
     return JointGraph(
         graph_module=traced_graph,
-        inputs=[_input_meta(sample_input), _input_meta(sample_label)],
+        inputs=[_input_meta(v) for v in inputs.values()],
         outputs=[],
         param_names=param_names,
         param_shapes=param_shapes,
@@ -569,15 +571,16 @@ def trace_model_graph(  # pylint: disable=too-many-locals
 def run_traced_graph(
     joint_graph: JointGraph,
     model: torch.nn.Module,
-    input_batch: Any,
-    label_batch: Any,
+    inputs: Dict[str, Any],
 ) -> tuple:
     """
     Execute a traced joint graph against the live model state.
 
     Parameters/buffers are sampled from ``model`` at call time and fed to the
-    graph as static inputs (in ``joint_graph.state_fqns`` order). Runs
-    under ``torch.no_grad()`` because the graph already contains the explicit
+    graph as static inputs (in ``joint_graph.state_fqns`` order). ``inputs``
+    is flattened with the same pytree structure used at trace time (checked
+    against the stored spec) and appended after the state. Runs under
+    ``torch.no_grad()`` because the graph already contains the explicit
     backward ops traced by ``torch.autograd.grad``.
 
     FSDP is invisible here: FSDPPass shards ``model``'s parameters in place,
@@ -596,9 +599,19 @@ def run_traced_graph(
             f"  Got:    {list(model_state.keys())}"
         )
 
+    user_flat, user_spec = torch.utils._pytree.tree_flatten(inputs)
+    traced_spec = getattr(joint_graph.graph_module, "user_inputs_spec", None)
+    if traced_spec is not None and user_spec != traced_spec:
+        raise ValueError(
+            "model inputs have a different pytree structure than during "
+            "tracing (keys, nesting, or leaf types changed).\n"
+            f"  Traced spec: {traced_spec}\n"
+            f"  Got spec:    {user_spec}"
+        )
+
     state_flat, _ = torch.utils._pytree.tree_flatten({"model": model_state})
 
-    flat_inputs = list(state_flat) + [input_batch, label_batch]
+    flat_inputs = list(state_flat) + list(user_flat)
 
     with torch.no_grad():
         outputs = joint_graph.graph_module(*flat_inputs)

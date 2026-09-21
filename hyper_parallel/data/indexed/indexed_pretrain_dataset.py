@@ -332,6 +332,7 @@ class GPTDataset(_IndexedPretrainDataset):
         Returns:
             The document, sample, and shuffle index arrays.
         """
+        # pylint: disable=too-many-locals
         cache_directory = self.config.path_to_cache
         if cache_directory is None:
             cache_directory = os.path.join(self.dataset.path_prefix, "cache", f"{type(self).__name__}_indices")

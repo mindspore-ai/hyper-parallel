@@ -27,7 +27,6 @@ import unittest
 import warnings
 from unittest.mock import MagicMock, Mock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _mesh_resources
 from hyper_parallel.core.dtensor import dtensor as _hp_dtensor_mod

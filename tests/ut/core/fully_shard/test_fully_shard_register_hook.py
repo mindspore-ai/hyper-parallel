@@ -23,7 +23,6 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import torch
@@ -50,7 +49,6 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.scheduler = _make_scheduler_stub()
 
     def test_mixed_requires_grad_preserves_grad_flag(self):

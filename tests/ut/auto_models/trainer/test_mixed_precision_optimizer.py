@@ -23,7 +23,6 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # Snapshot logging.Logger attributes before importing optimizer modules, whose
 # imports patch rank-aware helpers onto logging.Logger.

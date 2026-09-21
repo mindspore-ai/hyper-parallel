@@ -16,12 +16,10 @@
 # pylint: disable=C0413,C0412
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 # pylint: disable=W0611
 import torch_npu
 from hyper_parallel import DeviceMesh, init_device_mesh, SkipDTensorDispatch
-from hyper_parallel.platform.platform import get_torch_platform
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.common_net import FullyShardTestNet, DenseNet, BufferTestNet, MetaInitNet

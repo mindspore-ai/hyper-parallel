@@ -18,10 +18,10 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 # pylint: disable=W0611
 from hyper_parallel import DTensor
-from hyper_parallel.platform import get_platform
 from hyper_parallel.core.distributed_checkpoint import async_save, load, save
 from hyper_parallel.core.distributed_checkpoint.metadata import Metadata
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
@@ -522,8 +522,7 @@ def _run_dcp_save_load_with_different_mesh_test(
 
     # ========== LOAD PHASE: Use load_mesh_shape ==========
     # Get current rank and world_size
-    platform = get_platform()
-    current_rank = platform.get_rank()
+    current_rank = dist.get_rank()
 
 
     # Calculate load mesh size

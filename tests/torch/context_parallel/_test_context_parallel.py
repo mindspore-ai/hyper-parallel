@@ -30,13 +30,13 @@ Test groups:
   Group 6  (I*)  API & Integration, cp=2/4
 
 Run 2-card tests:
-    HYPER_PARALLEL_PLATFORM=torch torchrun --nproc-per-node=2 \\
+    torchrun --nproc-per-node=2 \\
         --master_addr=127.0.0.1 --master_port=13000 \\
         -m pytest -s tests/torch/context_parallel/_test_context_parallel.py \\
         -k "not hybrid and not tp and not a3"
 
 Run 4-card tests:
-    HYPER_PARALLEL_PLATFORM=torch torchrun --nproc-per-node=4 \\
+    torchrun --nproc-per-node=4 \\
         --master_addr=127.0.0.1 --master_port=13100 \\
         -m pytest -s tests/torch/context_parallel/_test_context_parallel.py \\
         -k "hybrid or tp or a3"
@@ -1774,11 +1774,14 @@ def _test_torch_async_ag_rs_handles_npu():
     if world_size < 2:
         pytest.skip("Requires at least 2 processes")
 
-    from hyper_parallel.platform.torch.platform import TorchPlatform  # pylint: disable=import-outside-toplevel
+    from hyper_parallel.core.context_parallel.utils import (  # pylint: disable=import-outside-toplevel
+        all_gather_single,
+        reduce_scatter_single,
+    )
 
     rows, cols = 2, 3
     local = torch.full((rows, cols), float(rank + 1), dtype=torch.float16, device="npu")
-    gathered, ag_work = TorchPlatform.all_gather_single(
+    gathered, ag_work = all_gather_single(
         local,
         [rows * world_size, cols],
         dist.group.WORLD,
@@ -1799,7 +1802,7 @@ def _test_torch_async_ag_rs_handles_npu():
         dtype=torch.float16,
         device="npu",
     )
-    reduced, rs_work = TorchPlatform.reduce_scatter_single(
+    reduced, rs_work = reduce_scatter_single(
         rs_input,
         [rows, cols],
         dist.group.WORLD,

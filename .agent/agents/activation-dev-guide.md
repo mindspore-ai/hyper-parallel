@@ -19,11 +19,11 @@ This feature adds two activation optimization modes to the LlamaFactory integrat
 - `hyper_parallel/integration/llamafactory/__init__.py` — public re-exports for LlamaFactory side
 
 ### HyperParallel activation subsystem (read-only reference)
-- `hyper_parallel/core/activation_checkpoint/__init__.py` — public API: `CheckpointPolicy`, `checkpoint_wrapper`, `SwapManager`
-- `hyper_parallel/core/activation_checkpoint/activation_checkpoint.py` — `CheckpointPolicy` enum, `checkpoint` fn, `checkpoint_wrapper`
-- `hyper_parallel/core/activation_checkpoint/swap.py` — `SwapManager`, `SwapTensor`, `Storage`
-- `hyper_parallel/platform/torch/activation_checkpoint/sac.py` — SAC dispatch mode (TorchDispatchMode)
-- `hyper_parallel/platform/torch/activation_checkpoint/activation_swap.py` — `swap_wrapper`, `ActivationPolicy`
+- `hyper_parallel/core/activation_memory/__init__.py` — public API: `CheckpointPolicy`, `checkpoint_wrapper`, `SwapManager`, `swap_wrapper`
+- `hyper_parallel/core/activation_memory/checkpoint.py` — `CheckpointPolicy` enum, `checkpoint` fn, `checkpoint_wrapper`
+- `hyper_parallel/core/activation_memory/swap.py` — `SwapManager`, `SwapTensor`, `Storage`
+- `hyper_parallel/core/activation_memory/sac.py` — SAC dispatch mode (TorchDispatchMode)
+- `hyper_parallel/core/activation_memory/api.py` — `swap_wrapper`, swap policy plumbing
 
 ### Tests
 - `tests/torch/integration/llamafactory/ut/test_activation.py` — 25 unit tests (no distributed setup)

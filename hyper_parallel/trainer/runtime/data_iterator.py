@@ -19,6 +19,11 @@
 signatures and checkpointing semantics are unchanged.
 """
 
+__all__ = [
+    "BackgroundPrefetcher",
+    "HyperIter",
+]
+
 import logging
 import queue
 import threading
@@ -142,9 +147,3 @@ class HyperIter:
         if hasattr(self.dataloader, "state_dict"):
             return self.dataloader.state_dict()
         return {}
-
-
-__all__ = [
-    "BackgroundPrefetcher",
-    "HyperIter",
-]

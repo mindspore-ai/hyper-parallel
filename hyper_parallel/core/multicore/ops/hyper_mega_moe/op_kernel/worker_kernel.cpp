@@ -13,6 +13,8 @@
  * @brief MoE-FFN forward — op-specific compute kernels + KernelWorker specialization.
  */
 
+#include <cstddef>
+
 #include "kernel_operator.h"
 #include "swi_glu/swi_glu.cpp"
 #include "grouped_matmul/grouped_matmul.cpp"
@@ -20,6 +22,8 @@
 #include "runtime/worker_kernel.h"
 
 using namespace AscendC;
+
+namespace MulticoreRuntime {
 
 class KernelWorker : public KernelWorkerBase<KernelWorker> {
  public:
@@ -29,24 +33,34 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   static constexpr uint32_t EVENT_IDX = 24;
   static constexpr uint32_t PROFILE_IDX = 25;
   static constexpr uint32_t WORKSPACE_IDX = 16;
+  static constexpr uint32_t SWIGLU_DYNAMIC_FIELDS_OFFSET =
+    static_cast<uint32_t>(offsetof(SwiGluTilingData, rowLen));
+  static constexpr int64_t SWIGLU_DYNAMIC_FIELDS_BYTES =
+    offsetof(SwiGluTilingData, baseRowLen) + sizeof(uint32_t) - SWIGLU_DYNAMIC_FIELDS_OFFSET;
+  static constexpr uint32_t GMM_BASE_M_OFFSET = static_cast<uint32_t>(
+    offsetof(GMMTilingData, gmmBaseParams) + offsetof(GMMBaseParams, m));
+  static constexpr uint32_t GMM_MATMUL_M_OFFSET = static_cast<uint32_t>(
+    offsetof(GMMTilingData, mmTilingData) + offsetof(TCubeTiling, M));
+  static constexpr int64_t GMM_MATMUL_M_FIELDS_BYTES =
+    offsetof(TCubeTiling, singleCoreM) + sizeof(int32_t) - offsetof(TCubeTiling, M);
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
     switch (task_desc.task_type) {
-      case TASK_BEGIN_TASK_GRAPH:
+      case TaskType::TASK_BEGIN_TASK_GRAPH:
         break;
-      case TASK_MATMUL:
+      case TaskType::TASK_MATMUL:
         ExecuteMatmul(task_desc);
         break;
-      case TASK_GROUPED_MATMUL:
+      case TaskType::TASK_GROUPED_MATMUL:
         ExecuteGroupedMatmul(task_desc);
         break;
-      case TASK_SWI_GLU:
+      case TaskType::TASK_SWI_GLU:
         ExecuteSwiglu(task_desc);
         break;
-      case TASK_SHMEM_PUT_MEM_SIGNAL:
+      case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
         ExecuteShmemPutMem(task_desc);
         break;
-      case TASK_SHMEM_GET_MEM:
+      case TaskType::TASK_SHMEM_GET_MEM:
         ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc);
         break;
       default:
@@ -55,6 +69,15 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
  private:
+  __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
+    union {
+      uint32_t bits;
+      float value;
+    } encoded = {};
+    encoded.bits = task_desc.extra_value_0;
+    return encoded.value;
+  }
+
   __aicore__ inline void ExecuteMatmul(const TaskDesc &task_desc) {}
 
   __aicore__ inline void cacheWriteThrough(__gm__ uint8_t *sourceAddr, int64_t length) {
@@ -108,7 +131,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         if (start + current_seq_end <= end) {
           swi_glu(input_list[task_desc.inputs[0].input_position] + input_0_offset,
                   input_list[task_desc.outputs[0].input_position] + output_0_offset, nullptr,
-                  input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
+                  input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
+                  GetSwiGluClampLimit(task_desc));
         } else {
           GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 80 * (AscendC::GetBlockIdx() + 1);
           __gm__ SwiGluTilingData *tilingdata_data = reinterpret_cast<__gm__ SwiGluTilingData *>(tiling_data_addr);
@@ -116,13 +140,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           if (tilingdata_data->rowLen == 0) {
             return;
           }
-          if (end - (start + current_seq_start) < 19) {
+          if (end - (start + current_seq_start) < SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT) {
             tilingdata_data->baseRowLen = end - (start + current_seq_start);
           }
-          cacheWriteThrough(tiling_data_addr, 10);
+          cacheWriteThrough(tiling_data_addr + SWIGLU_DYNAMIC_FIELDS_OFFSET, SWIGLU_DYNAMIC_FIELDS_BYTES);
           PipeBarrier<PIPE_ALL>();
           swi_glu(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                  input_list[task_desc.outputs[0].input_position] + output_0_offset, nullptr, tiling_data_addr);
+                  input_list[task_desc.outputs[0].input_position] + output_0_offset, nullptr, tiling_data_addr,
+                  GetSwiGluClampLimit(task_desc));
         }
       }
       return;
@@ -131,7 +156,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
               task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type,
             input_list[task_desc.outputs[0].input_position] +
               task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type,
-            nullptr, input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
+            nullptr, input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
+            GetSwiGluClampLimit(task_desc));
   }
 
   __aicore__ inline void ExecuteGroupedMatmul(TaskDesc task_desc) {
@@ -176,7 +202,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         tilingdata_data->gmmBaseParams.m = value;
         tilingdata_data->mmTilingData.M = value;
         tilingdata_data->mmTilingData.singleCoreM = value;
-        cacheWriteThrough(tiling_data_addr, 250);
+        cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
+        cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
         PipeBarrier<PIPE_ALL>();
 
         int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
@@ -240,9 +267,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 };
 
+}  // namespace MulticoreRuntime
+
 extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr,
                                                 GM_ADDR *input_list) {
-  KernelWorker worker;
+  MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
   worker.Process();
 }

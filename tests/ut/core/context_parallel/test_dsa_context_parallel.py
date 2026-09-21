@@ -20,7 +20,6 @@ from unittest.mock import MagicMock, patch
 import torch
 from torch import nn
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.context_parallel import (
     AsyncDSAIndexerContextParallel,
@@ -46,7 +45,6 @@ from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_ME
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
-from hyper_parallel.platform.platform import PlatformType
 
 
 def _patch_torch_dist_rank(world_size=1):
@@ -86,7 +84,6 @@ class TestDsaContextParallel(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
 
     def _setup_mock_platform(self, mock_platform, world_size=1):
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (

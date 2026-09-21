@@ -62,9 +62,9 @@ def _run_hyper_v2_search(cli_parser, cli_args):
     if cli_args.global_batch_size is not None:
         search_cfg.constraint["global_batch_size"] = cli_args.global_batch_size
     if cli_args.devices is not None:
-        cards_per_node = max(1, search_cfg.cluster_spec.get("cards_per_node", 8))
-        search_cfg.cluster_spec["num_nodes"] \
-            = max(1, cli_args.devices // cards_per_node)
+        search_cfg.cluster_spec["num_nodes"] = max(
+            1, cli_args.devices // max(1, search_cfg.cluster_spec.get("cards_per_node", 8))
+        )
 
     errors = validate(search_cfg)
     hard_errors = [e for e in errors if e.severity == "error"]

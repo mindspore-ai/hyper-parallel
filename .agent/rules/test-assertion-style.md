@@ -113,32 +113,32 @@ assert callable(impl), (
 If the operator uses the default implementation (returns `None`), verify it in **only one test case** with a comment explaining why other tests don't need this verification:
 
 ```python
-@patch("hyper_parallel.core.dtensor.device_mesh.platform")
-def test_softmax_data_parallel_success(self, mock_platform):
+@patch("hyper_parallel.core.dtensor.device_mesh.dist")
+def test_softmax_data_parallel_success(self, mock_dist):
     """Test softmax with data parallel."""
-    mesh = self._make_2x2x2_mesh(mock_platform)
+    mesh = self._make_2x2x2_mesh(mock_dist)
     placements = (Shard(0), Replicate(), Replicate())
     x_layout = _build_layout(mesh, placements, 3)
-    
+
     output_layout = self.op.infer_layout((x_layout,), (-1,))
-    
+
     assert output_layout.tensor_map == (2, -1, -1), (
         f"Expected (2, -1, -1), got {output_layout.tensor_map}"
     )
-    
+
     # Since `get_expand_impl` is not overridden, it returns None by default.
     # The same applies to other test classes, so it is unnecessary to test its return value.
     assert self.op.get_expand_impl(None, output_layout, (x_layout,), (-1,)) is None
 
-@patch("hyper_parallel.core.dtensor.device_mesh.platform")
-def test_softmax_model_parallel_success(self, mock_platform):
+@patch("hyper_parallel.core.dtensor.device_mesh.dist")
+def test_softmax_model_parallel_success(self, mock_dist):
     """Test softmax with model parallel."""
-    mesh = self._make_2x2x2_mesh(mock_platform)
+    mesh = self._make_2x2x2_mesh(mock_dist)
     placements = (Replicate(), Replicate(), Shard(2))
     x_layout = _build_layout(mesh, placements, 3)
-    
+
     output_layout = self.op.infer_layout((x_layout,), (-1,))
-    
+
     assert output_layout.tensor_map == (-1, -1, 0), (
         f"Expected (-1, -1, 0), got {output_layout.tensor_map}"
     )
@@ -150,16 +150,16 @@ def test_softmax_model_parallel_success(self, mock_platform):
 If the operator has a custom `get_expand_impl` that returns a callable, verify it in **every test case**:
 
 ```python
-@patch("hyper_parallel.core.dtensor.device_mesh.platform")
-def test_matmul_data_parallel_success(self, mock_platform):
+@patch("hyper_parallel.core.dtensor.device_mesh.dist")
+def test_matmul_data_parallel_success(self, mock_dist):
     """Test matmul with data parallel."""
-    mesh = self._make_2x2x2_mesh(mock_platform)
+    mesh = self._make_2x2x2_mesh(mock_dist)
     # ... setup code ...
-    
+
     output_layout = self.op.infer_layout((x_layout, w_layout), extra_args)
-    
+
     assert output_layout.tensor_map == expected_map, f"..."
-    
+
     # Must verify in every test since get_expand_impl is overridden
     impl = self.op.get_expand_impl(None, output_layout, (x_layout, w_layout), extra_args)
     assert callable(impl), f"Expected callable, got {type(impl)}"

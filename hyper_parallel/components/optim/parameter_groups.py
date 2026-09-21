@@ -14,6 +14,12 @@
 # ============================================================================
 """Parameter-name classification and optimizer parameter-group construction."""
 
+__all__ = [
+    "get_adamw_param_groups",
+    "get_parameter_names",
+    "split_muon_adamw_params",
+]
+
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -121,13 +127,10 @@ def split_muon_adamw_params(
     Returns:
         Muon parameters, AdamW parameters, and their respective names.
     """
-    adamw_keywords = tuple(
-        keyword.lower()
-        for keyword in (
-            *_DEFAULT_ADAMW_NAME_KEYWORDS,
-            *extra_adamw_name_keywords,
-        )
-    )
+    adamw_keywords = []
+    for keyword in (*_DEFAULT_ADAMW_NAME_KEYWORDS, *extra_adamw_name_keywords):
+        adamw_keywords.append(keyword.lower())
+    adamw_keywords = tuple(adamw_keywords)
     muon_params, adamw_params = [], []
     muon_names, adamw_names = [], []
 
@@ -146,10 +149,3 @@ def split_muon_adamw_params(
             adamw_names.append(name)
 
     return muon_params, adamw_params, muon_names, adamw_names
-
-
-__all__ = [
-    "get_adamw_param_groups",
-    "get_parameter_names",
-    "split_muon_adamw_params",
-]

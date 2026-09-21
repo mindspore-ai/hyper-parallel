@@ -78,6 +78,11 @@ class Target(Generic[_T]):
         except KeyError as exc:
             raise AttributeError(name) from exc
 
+    @property
+    def callable(self) -> Callable[..., _T]:
+        """Return the wrapped callable, read-only, for callers outside this class."""
+        return self._target_
+
     def build(self, **runtime_kwargs: Any) -> _T:
         """Invoke the target with configured and applicable runtime arguments."""
         signature = inspect.signature(self._target_)

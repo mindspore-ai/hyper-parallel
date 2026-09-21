@@ -13,8 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Pipeline edge groups and batched P2P communicator initialization."""
-import time
-
 import torch.distributed as dist
 
 _P2P_MULTI_STREAM_GROUPS = {}
@@ -93,43 +91,10 @@ def prepare_batch_p2p_group(group: dist.ProcessGroup = None) -> None:
     PyTorch requires every rank in a process group to participate when
     ``batch_isend_irecv`` is the first collective on that group. A barrier
     at the common pipeline run boundary initializes the communicator
-    before ranks reach peer operations at different times. Group members
-    first rendezvous through the CPU store, then group roots serialize the
-    one-time HCCL initialization through a job-local store lock. This
-    avoids host-port collisions when independent pipeline domains prepare
-    different communicators concurrently.
+    before ranks reach peer operations at different times.
 
     Args:
         group: The process group used by the batched P2P operations.
             ``None`` uses the default group.
     """
-    group = group or dist.group.WORLD
-    group_store = group.get_group_store()
-    group_size = dist.get_world_size(group=group)
-    group_name = group.group_name
-    ready_key = f"hyper_parallel_p2p_group_init_ready:{group_name}"
-    ready_count = group_store.add(ready_key, 1)
-    ready_done_key = f"{ready_key}_done"
-    if ready_count == group_size:
-        group_store.set(ready_done_key, "1")
-    group_store.wait([ready_done_key])
-
-    root_ready_key = f"hyper_parallel_p2p_group_init_root_ready:{group_name}"
-    if dist.get_rank(group=group) != 0:
-        group_store.wait([root_ready_key])
-        dist.barrier(group=group)
-        return
-
-    default_store = dist.group.WORLD.get_group_store()
-    lock_key = "hyper_parallel_p2p_group_init_lock"
-    lock_token = group_name
-    deadline = time.monotonic() + 300
-    while default_store.compare_set(lock_key, "", lock_token).decode() != lock_token:
-        if time.monotonic() >= deadline:
-            raise RuntimeError("Timed out waiting to initialize a batched P2P process group.")
-        time.sleep(0.01)
-    try:
-        group_store.set(root_ready_key, "1")
-        dist.barrier(group=group)
-    finally:
-        default_store.compare_set(lock_key, lock_token, "")
+    dist.barrier(group=group)

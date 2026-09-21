@@ -56,7 +56,6 @@ class TestParallelArgsort(unittest.TestCase):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 4),
                                 mesh_dim_names=("dp", "mp"), init_backend=False)
 
@@ -64,7 +63,6 @@ class TestParallelArgsort(unittest.TestCase):
         """Set up mock and return a standard 2x2x2 (dp, tp, mp) mesh via init_device_mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 2, 2),
                                 mesh_dim_names=("dp", "tp", "mp"), init_backend=False)
 

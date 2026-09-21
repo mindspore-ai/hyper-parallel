@@ -20,7 +20,7 @@ import torch.distributed as dist
 from torch import nn
 
 if TYPE_CHECKING:
-    from hyper_parallel.platform.torch.common.moe import MoE
+    from hyper_parallel.components.modules.moe import MoE
 
 
 def sync_and_update_expert_bias(
@@ -207,7 +207,8 @@ class MoEMonitorCallback:
 
         On PyTorch 2.0+, uses ``optimizer.register_step_post_hook``.
         The hook fires after each ``optimizer.step()`` call, so that
-        expert bias is updated once parameters have been updated.
+        expert bias is updated once parameters have been updated. Repeated
+        calls replace the existing hook registration.
 
         Args:
             optimizer: The optimizer instance to register the hook on.
@@ -220,6 +221,7 @@ class MoEMonitorCallback:
                 "Optimizer does not support register_step_post_hook. "
                 "Requires PyTorch 2.0+. Call on_step_end() manually instead."
             )
+        self.remove()
         self._hook_handle = optimizer.register_step_post_hook(
             lambda *_: self.on_step_end(),
         )

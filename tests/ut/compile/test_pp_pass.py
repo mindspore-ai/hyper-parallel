@@ -51,6 +51,9 @@ Review follow-ups:
     containers of declared elements do not.
 12. ``_propagate_anchor_stages`` pulls transitive bwd chains in one
     reverse-topological pass.
+13. User inputs are routed by dataflow to the single stage consuming
+    them (kwargs-general); multi-stage consumption is rejected and
+    unconsumed inputs ride the last stage with a warning.
 """
 
 import logging
@@ -61,7 +64,6 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 from torch import fx, nn
@@ -209,6 +211,44 @@ class MiniLLM(nn.Module):
         self.lin0 = nn.Linear(4, 4)
         self.lin1 = nn.Linear(4, 4)
         self.head = nn.Linear(4, 4)
+
+
+class TinyLM(nn.Module):
+    """Live model matching ``_tiny_lm_joint_graph``'s module layout."""
+
+    def __init__(self) -> None:
+        """Initialize embed/lin0/lin1/head."""
+        super().__init__()
+        self.embed = nn.Embedding(16, 8)
+        self.lin0 = nn.Linear(8, 8)
+        self.lin1 = nn.Linear(8, 8)
+        self.head = nn.Linear(8, 16)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return vocab logits for ``x``."""
+        h = self.embed(x)
+        h = torch.relu(self.lin0(h))
+        return self.head(self.lin1(h))
+
+
+class TinyGatedLM(nn.Module):
+    """Live model for the 3-input routing tests (embed/gate/lin0|lin1/head)."""
+
+    def __init__(self) -> None:
+        """Initialize embed, gate, lin0 (stage 0) and lin1, head (stage 1)."""
+        super().__init__()
+        self.embed = nn.Embedding(16, 8)
+        self.gate = nn.Linear(8, 8)
+        self.lin0 = nn.Linear(8, 8)
+        self.lin1 = nn.Linear(8, 8)
+        self.head = nn.Linear(8, 16)
+
+    def forward(self, x: torch.Tensor, aux: torch.Tensor) -> torch.Tensor:
+        """Gate the embeddings with ``aux`` and return vocab logits."""
+        h = self.embed(x)
+        h = h * torch.sigmoid(self.gate(aux))
+        h = torch.relu(self.lin0(h))
+        return self.head(self.lin1(h))
 
 
 class ContainerModel(nn.Module):
@@ -769,7 +809,7 @@ def _tiny_lm_joint_graph(batch: int = 4):
             h = torch.relu(self.lin0(h))
             return self.head(self.lin1(h))
 
-    def train_fn(model: nn.Module, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def train_fn(model: nn.Module, *, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Cross-entropy over the flattened batch (mean-reduced loss)."""
         logits = model(x)
         return torch.nn.functional.cross_entropy(
@@ -784,8 +824,37 @@ def _tiny_lm_joint_graph(batch: int = 4):
         # Stock torch warns that the autograd-engine hook is absent; the
         # joint graph still captures (the tracer reconstructs the tag).
         warnings.simplefilter("ignore", RuntimeWarning)
-        jg = trace_model_graph(model, train_fn, x, y)
+        jg = trace_model_graph(model, train_fn, {"x": x, "y": y})
     return jg, model, x, y
+
+
+def _tiny_gated_joint_graph(batch: int = 4):
+    """Joint graph for a tiny LM with THREE model inputs (routing test).
+
+    ``x`` (token ids) and ``aux`` (gate features) are consumed by stage-0
+    modules (embed/gate/lin0); ``y`` (labels) feeds the loss glue on the
+    last stage. Returns ``(joint_graph, model, x, aux, y)``. Seed the RNG
+    before calling for reproducible weights.
+    """
+
+    def train_fn(
+        model: nn.Module, *, x: torch.Tensor, aux: torch.Tensor, y: torch.Tensor
+    ) -> torch.Tensor:
+        """Cross-entropy over the flattened batch (mean-reduced loss)."""
+        logits = model(x, aux)
+        return torch.nn.functional.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), y.reshape(-1)
+        )
+
+    torch.manual_seed(0)
+    model = TinyGatedLM().to(torch.float64)  # keep the allclose tolerance tight
+    x = torch.randint(0, 16, (batch, 5))
+    aux = torch.randn(batch, 5, 8, dtype=torch.float64)
+    y = torch.randint(0, 16, (batch, 5))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        jg = trace_model_graph(model, train_fn, {"x": x, "aux": aux, "y": y})
+    return jg, model, x, aux, y
 
 
 class TestScheduleGradEquivalence(unittest.TestCase):
@@ -829,7 +898,7 @@ class TestScheduleGradEquivalence(unittest.TestCase):
         # Reference: single-card full-batch gradient on the plain joint graph
         # (traced at the FULL batch, since there is no micro-batching).
         ref_jg, ref_model, x, y = _tiny_lm_joint_graph(batch=4)
-        _, ref_grads = run_traced_graph(ref_jg, ref_model, x, y)
+        _, ref_grads = run_traced_graph(ref_jg, ref_model, {"x": x, "y": y})
         ref_fqns = [name for name, p in ref_model.named_parameters() if p.requires_grad]
         ref_by_fqn = {n: g.clone() for n, g in zip(ref_fqns, ref_grads)}
 
@@ -857,9 +926,9 @@ class TestScheduleGradEquivalence(unittest.TestCase):
             state1 = [p.detach() for p in models[1].parameters()]
             s0, s1 = scheds[0], scheds[1]
             n_mb = x.shape[0] // s0.microbatch_size
-
-            fwd0 = s0._forward_sweep(state0, x, y, n_mb)  # pylint: disable=protected-access
-            fwd1 = s1._forward_sweep(state1, x, y, n_mb)  # pylint: disable=protected-access
+            # Inputs are routed by dataflow: x feeds stage 0, y stage 1.
+            fwd0 = s0._forward_sweep(state0, [x], n_mb)  # pylint: disable=protected-access
+            fwd1 = s1._forward_sweep(state1, [y], n_mb)  # pylint: disable=protected-access
             grads1 = s1._backward_sweep(state1, fwd1, n_mb)  # pylint: disable=protected-access
             grads0 = s0._backward_sweep(state0, fwd0, n_mb)  # pylint: disable=protected-access
             store.clear()
@@ -880,6 +949,200 @@ class TestScheduleGradEquivalence(unittest.TestCase):
                 torch.allclose(pp_by_fqn[name], ref_g, atol=1e-6, rtol=1e-5),
                 f"PP grad for {name}={pp_by_fqn[name]} != reference {ref_g}",
             )
+
+    def _gated_stage_model(self):
+        """A fresh model matching ``_tiny_gated_joint_graph``'s layout."""
+        torch.manual_seed(0)
+        return TinyGatedLM().to(torch.float64)
+
+    def test_pp_grads_match_full_batch_mean_multi_input(self):
+        """Test 3-input routing (two -> stage 0, one -> last) keeps grads.
+
+        Feature: PP kwargs-general user-input routing
+        Description: Dataflow-routed user inputs (x/aux -> stage 0,
+            y -> last stage) with microbatch slicing per owned input.
+        Expectation: PP parameter gradients match the non-PP full-batch
+            mean-loss gradients within tolerance.
+        """
+        plan = PassPlan()
+        plan.pp_stage(0, ["embed", "gate", "lin0"])
+        plan.pp_stage(1, ["lin1", "head"])
+        cfg = PassConfig(
+            fsdp_enabled=False, pp_enabled=True, pp_degree=2, pp_microbatch_size=2
+        )
+
+        ref_jg, ref_model, x, aux, y = _tiny_gated_joint_graph(batch=4)
+        _, ref_grads = run_traced_graph(ref_jg, ref_model, {"x": x, "aux": aux, "y": y})
+        ref_fqns = [name for name, p in ref_model.named_parameters() if p.requires_grad]
+        ref_by_fqn = {n: g.clone() for n, g in zip(ref_fqns, ref_grads)}
+
+        models, scheds = {}, {}
+        for rank in (0, 1):
+            jg, _, _, _, _ = _tiny_gated_joint_graph(batch=2)
+            model = self._gated_stage_model()
+            with _patch_dist(world_size=2, rank=rank):
+                PpPass(pass_plan=plan).run(jg.graph_module, cfg, model=model)
+            models[rank] = model
+            scheds[rank] = jg.graph_module.pp_schedule
+
+        with _patch_sched_p2p() as store:
+            state0 = [p.detach() for p in models[0].parameters()]
+            state1 = [p.detach() for p in models[1].parameters()]
+            s0, s1 = scheds[0], scheds[1]
+            n_mb = x.shape[0] // s0.microbatch_size
+            fwd0 = s0._forward_sweep(state0, [x, aux], n_mb)  # pylint: disable=protected-access
+            fwd1 = s1._forward_sweep(state1, [y], n_mb)  # pylint: disable=protected-access
+            grads1 = s1._backward_sweep(state1, fwd1, n_mb)  # pylint: disable=protected-access
+            grads0 = s0._backward_sweep(state0, fwd0, n_mb)  # pylint: disable=protected-access
+            store.clear()
+
+        def _fqn_grads(rank, grads):
+            """Map a stage's gradient list to FQNs via its model order."""
+            fqns = [
+                name for name, p in models[rank].named_parameters() if p.requires_grad
+            ]
+            return dict(zip(fqns, grads))
+
+        pp_by_fqn = {**_fqn_grads(0, grads0), **_fqn_grads(1, grads1)}
+        self.assertEqual(
+            set(pp_by_fqn), set(ref_by_fqn), "PP must cover every trainable param"
+        )
+        for name, ref_g in ref_by_fqn.items():
+            self.assertTrue(
+                torch.allclose(pp_by_fqn[name], ref_g, atol=1e-6, rtol=1e-5),
+                f"PP grad for {name}={pp_by_fqn[name]} != reference {ref_g}",
+            )
+
+
+class TestUserInputRouting(unittest.TestCase):
+    """Dataflow routing of user inputs to their consuming stage."""
+
+    _GATED_PLAN = PassPlan()
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Build the 2-stage plan matching ``TinyGatedLM`` once."""
+        cls._GATED_PLAN.pp_stage(0, ["embed", "gate", "lin0"])
+        cls._GATED_PLAN.pp_stage(1, ["lin1", "head"])
+
+    def test_inputs_routed_by_consumer_stage(self):
+        """Test x/aux land on stage 0 and y on the last stage.
+
+        Feature: PP kwargs-general user-input routing
+        Description: Run PpPass on a 3-input joint graph per rank and
+            inspect each stage's schedule routing and fwd placeholders.
+        Expectation: user_input_stages == [0, 0, 1]; stage 0's fwd
+            subgraph owns pp_input_0/1, stage 1's owns pp_input_2 only.
+        """
+        cfg = PassConfig(
+            fsdp_enabled=False, pp_enabled=True, pp_degree=2, pp_microbatch_size=1
+        )
+        jg, _, _, _, _ = _tiny_gated_joint_graph(batch=2)
+        _, gm, _, _ = _run_pp(
+            jg.graph_module,
+            TinyGatedLM().to(torch.float64),
+            rank=0,
+            cfg=cfg,
+            plan=self._GATED_PLAN,
+        )
+        sched = gm.pp_schedule
+        self.assertEqual(
+            sched.user_input_stages, [0, 0, 1], "x/aux -> stage 0, y -> stage 1"
+        )
+        # Stage 0's fwd subgraph takes its two owned inputs directly.
+        phs0 = [n.name for n in sched.fwd_gm.graph.nodes if n.op == "placeholder"]
+        self.assertEqual(phs0.count("pp_input_0"), 1)
+        self.assertEqual(phs0.count("pp_input_1"), 1)
+        self.assertEqual(phs0.count("pp_input_2"), 0)
+        # Stage 1's fwd subgraph takes act_in first, then its owned label.
+        jg1, _, _, _, _ = _tiny_gated_joint_graph(batch=2)
+        _, gm1, _, _ = _run_pp(
+            jg1.graph_module,
+            TinyGatedLM().to(torch.float64),
+            rank=1,
+            cfg=cfg,
+            plan=self._GATED_PLAN,
+        )
+        self.assertEqual(gm1.pp_schedule.user_input_stages, [0, 0, 1])
+        phs1 = [
+            n.name for n in gm1.pp_schedule.fwd_gm.graph.nodes if n.op == "placeholder"
+        ]
+        self.assertEqual(phs1.count("pp_input_2"), 1)
+        self.assertEqual(phs1.count("pp_input_0"), 0)
+
+    def test_input_consumed_on_two_stages_rejected(self):
+        """Test an input feeding two stages fails with an actionable error.
+
+        Feature: PP kwargs-general user-input routing
+        Description: Trace a graph whose ``x`` feeds the stage-0
+            embedding AND the last-stage loss, then run PpPass.
+        Expectation: ValueError mentioning the consuming stages.
+        """
+        cfg = PassConfig(
+            fsdp_enabled=False, pp_enabled=True, pp_degree=2, pp_microbatch_size=1
+        )
+        jg, model, x, y = _tiny_lm_joint_graph(batch=2)
+
+        def train_fn(m: nn.Module, *, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """Consume ``x`` on both stages: embedding AND the loss."""
+            logits = m(x)
+            ce = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), y.reshape(-1)
+            )
+            return ce + x.float().sum() * 0.0
+
+        torch.manual_seed(0)
+        m = TinyLM().to(torch.float64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            jg2 = trace_model_graph(m, train_fn, {"x": x, "y": y})
+        with _patch_dist(world_size=2, rank=0):
+            with self.assertRaises(ValueError) as ctx:
+                PpPass(pass_plan=_manual_plan()).run(jg2.graph_module, cfg, model=model)
+        self.assertIn("consumed on stages", str(ctx.exception))
+
+    def test_unconsumed_input_warns_and_rides_last_stage(self):
+        """Test an ignored kwarg warns and routes to the last stage.
+
+        Feature: PP kwargs-general user-input routing
+        Description: Trace with an ``epoch`` kwarg train_fn never reads,
+            run PpPass capturing the pp_pass logger.
+        Expectation: A not-consumed warning is logged and the input is
+            routed to the last stage (user_input_stages == [0, 1, 1]).
+        """
+        cfg = PassConfig(
+            fsdp_enabled=False, pp_enabled=True, pp_degree=2, pp_microbatch_size=1
+        )
+        jg, _, x, y = _tiny_lm_joint_graph(batch=2)
+        # The traced graph already carries the (x, y) leaves; piggyback an
+        # unconsumed scalar by re-tracing with an extra ignored kwarg.
+        torch.manual_seed(0)
+        model = TinyLM().to(torch.float64)
+
+        def train_fn(
+            m: nn.Module, *, x: torch.Tensor, y: torch.Tensor, epoch: int
+        ) -> torch.Tensor:
+            """Ignore ``epoch`` entirely (it stays an unconsumed leaf)."""
+            del epoch
+            logits = m(x)
+            return torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), y.reshape(-1)
+            )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            jg2 = trace_model_graph(model, train_fn, {"x": x, "y": y, "epoch": 7})
+        with self.assertLogs(
+            "hyper_parallel.compile.passes.parallel.pp_pass", level="WARNING"
+        ) as logs:
+            _, gm, _, _ = _run_pp(
+                jg2.graph_module, TinyLM().to(torch.float64), rank=0, cfg=cfg
+            )
+        self.assertTrue(
+            any("not consumed" in line for line in logs.output),
+            f"expected an unconsumed-input warning, got {logs.output}",
+        )
+        self.assertEqual(gm.pp_schedule.user_input_stages, [0, 1, 1])
 
 
 class TestYamlPpSection(unittest.TestCase):
@@ -940,6 +1203,8 @@ class TestScheduleGPipe(unittest.TestCase):
                 if stage_idx < pp_degree - 1
                 else []
             ),
+            # Input routed to stage 0, label to the last stage.
+            user_input_stages=(0, pp_degree - 1),
         )
         return sched
 
@@ -999,6 +1264,7 @@ class TestScheduleGPipe(unittest.TestCase):
                 ("scalar",),
             ],
             grad_recv_spec=[],
+            user_input_stages=(0, 1),
         )
         sched.is_last = True
 
@@ -1031,8 +1297,13 @@ class TestScheduleGPipe(unittest.TestCase):
         sched = self._make_sched(
             (torch.ones(4, 4),), (torch.ones(4),), stage_idx=0, pp_degree=3
         )
-        with self.assertRaises(ValueError):
-            sched(torch.zeros(4, 4), torch.zeros(4, 7), torch.zeros(4, 7))
+        with patch(_SCHED_DIST_PATH) as mock_dist:
+            mock_dist.isend.return_value = MagicMock()
+            mock_dist.irecv.return_value = MagicMock()
+            mock_dist.get_global_rank.side_effect = lambda _g, r: r
+            with self.assertRaises(ValueError) as ctx:
+                sched(torch.zeros(4, 4), torch.zeros(3, 7), torch.zeros(3, 7))
+        self.assertIn("microbatch", str(ctx.exception))
 
 
 if __name__ == "__main__":

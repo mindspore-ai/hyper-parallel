@@ -147,7 +147,6 @@ hyper_offload/
 
 ## 7. Limitations & Future Work
 
-- **PyTorch-only (v1)**: MindSpore backend requires a separate dispatch adapter.
 - **Static graph assumption**: Warmup trace must match replay execution. Use `@skip_offload` for dynamic branches.
 - **Single-device focus**: Cross-rank coordination with FSDP/TP/PP is future work.
 - **Planner extensibility**: Additional planners (ILP, DP, ML-based) can be plugged in via `ResidencyPlanner`.
@@ -156,4 +155,4 @@ hyper_offload/
 ## 8. References
 
 - PyTorch `TorchDispatchMode`: https://pytorch.org/docs/stable/notes/extending.html
-- HyperParallel activation checkpoint swap: `hyper_parallel.platform.torch.activation_checkpoint`
+- HyperParallel activation checkpoint swap: `hyper_parallel.core.activation_memory`

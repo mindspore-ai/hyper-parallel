@@ -23,7 +23,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 # Force torch platform before any hyper_parallel imports
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import torch
@@ -186,7 +185,6 @@ class TestToDtypeIfNeeded(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
     def test_to_dtype_if_needed_parameterized(self):

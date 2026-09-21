@@ -17,50 +17,41 @@
 The DTensor core used to reach these routines through the platform abstraction
 layer.  Only the torch backend is supported now, so the nontrivial torch
 implementations live here and every caller calls them directly.
+
+Collectives and the small rank/device/module helpers that other ``core``
+modules also needed were lifted into :mod:`hyper_parallel.core.utils`.  The
+collectives stay re-exported here because the debug tracer patches these
+attributes on this module, so ``_utils.<name>`` keeps working for that path;
+callers elsewhere should import from :mod:`hyper_parallel.core.utils`.
 """
 # pylint: disable=C9006,C9007
 from contextlib import contextmanager
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Optional, Union
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 from torch._C._distributed_c10d import ProcessGroup
-from torch._ops import OpOverload, OpOverloadPacket
 from torch.distributed.distributed_c10d import _get_default_group
 
 import torch.distributed as dist
-import torch.distributed.nn.functional as dist_func
-from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
+
+from hyper_parallel.core.utils.communication import (
+    EXISTING_COMM_GROUPS,
+    differentiable_all_gather_concat,
+    differentiable_all_to_all,
+    differentiable_all_to_all_single,
+    differentiable_all_to_all_single_async,
+    differentiable_all_reduce,
+    differentiable_reduce_scatter,
+    differentiable_variable_all_gather,
+)
+from hyper_parallel.core.utils.communication import get_device_handle
+from hyper_parallel.core.shard.utils import get_op_name
 
 
 # ---------------------------------------------------------------------------
 # Small shared helpers
 # ---------------------------------------------------------------------------
-
-def _ensure_contiguous(x):
-    """Return a contiguous copy of *x* if not already contiguous."""
-    if torch.compiler.is_compiling():
-        return x.contiguous()
-    return x if x.is_contiguous() else x.contiguous()
-
-
-def get_op_name(func):
-    """Extract the canonical operation name from a callable or torch op overload."""
-    if hasattr(func, "__name__"):
-        return func.__name__
-    if isinstance(func, OpOverload):
-        full_name = func.name
-        core_name = full_name.split("::")[-1].split(".")[0]
-        return core_name
-    if isinstance(func, OpOverloadPacket):
-        return func.name.split("::")[-1]
-    func_str = str(func)
-    if "built-in function" in func_str:
-        return func_str.split()[-1].strip(">")
-    if "function" in func_str:
-        return func_str.split()[1]
-    return "unknown_op"
-
 
 def tensor_type_cast(input_data, cast_type):
     """Cast tensor to specified data type."""
@@ -75,39 +66,9 @@ def tensor_type_cast(input_data, cast_type):
     return input_data.to(type_mapping[cast_type])
 
 
-# Mapping from string op names to torch.distributed.ReduceOp
-_OP_MAP = {
-    'sum': dist.ReduceOp.SUM,
-    'prod': dist.ReduceOp.PRODUCT,
-    'max': dist.ReduceOp.MAX,
-    'min': dist.ReduceOp.MIN,
-    # convert tensor elements to int32 and use MIN
-    'all': dist.ReduceOp.MIN,
-    # 'avg' is typically handled by SUM followed by division in current implementation logic
-    'avg': dist.ReduceOp.SUM,
-}
-
-# Try to add AVG for 'mean' if supported by current torch version
-if hasattr(dist.ReduceOp, "AVG"):
-    _OP_MAP['mean'] = dist.ReduceOp.AVG
-else:
-    # Fallback for older torch versions if necessary, though this might require manual division upstream
-    # Assuming standard behavior where 'mean' implies native AVG support or upstream handling
-    _OP_MAP['mean'] = dist.ReduceOp.SUM
-
-
 # ---------------------------------------------------------------------------
 # Device / process group helpers
 # ---------------------------------------------------------------------------
-
-def get_device_handle(device_type: str = "npu"):  # pylint: disable=W0621
-    """Return the torch device module (e.g. ``torch.npu`` or ``torch.cuda``) for the given device type."""
-    try:
-        handle = getattr(torch, device_type)
-    except AttributeError as e:
-        raise RuntimeError(f"expect got device handle: 'torch.{device_type}' failed.") from e
-    return handle
-
 
 def device_count(device_handle):
     """Return the number of available devices for *device_handle*."""
@@ -128,11 +89,6 @@ def device(device_idx=None):
     if device_idx is None:
         return torch.device(current_device_type)
     return torch.device(f"{current_device_type}:{device_idx:d}")
-
-
-def manual_seed(seed):
-    """Set the random seed for reproducibility."""
-    return torch.manual_seed(seed)
 
 
 def get_rng_state(device=None, device_handle=None):  # pylint: disable=W0621
@@ -473,275 +429,6 @@ def create_sub_groups(
 
 
 # ---------------------------------------------------------------------------
-# Differentiable collectives
-# ---------------------------------------------------------------------------
-
-class _TorchContiguousGrad(torch.autograd.Function):  # pylint: disable=abstract-method
-    """Autograd identity that materializes gradients before upstream collectives."""
-
-    @staticmethod
-    def forward(ctx: Any, tensor: Tensor) -> Tensor:  # pylint: disable=arguments-differ
-        """Return the input unchanged in the forward pass."""
-        del ctx
-        return tensor
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> Tensor:  # pylint: disable=arguments-differ
-        """Return a contiguous gradient to the preceding autograd node."""
-        del ctx
-        return grad_output.contiguous()
-
-
-class _AsyncA2ALazyBwd(torch.autograd.Function):
-    """All-to-all whose forward AND backward return ``AsyncCollectiveTensor``.
-
-    PyTorch's stock ``all_to_all_single_autograd`` calls ``wait_tensor`` in
-    its backward eagerly, and the autograd engine binds backward stream
-    context to the forward stream — so even if the BWD thread is wrapped
-    in a side-stream context, that wait still lands on the FWD main
-    stream and blocks Attention launches.
-
-    This Function bypasses the engine's binding by calling the
-    non-autograd functional op in both directions and returning ACT.
-    The wait is deferred to the next consumer's first non-view access
-    (e.g. the indexing backward of ``_unpermute``), giving the FWD
-    thread a small Python window to enqueue its Attention kernels onto
-    the main stream **before** the wait lands there.
-    """
-
-    @staticmethod
-    def forward(ctx, input_tensor, output_splits, input_splits, group):  # pylint: disable=arguments-differ
-        """Perform the forward all-to-all single collective, saving splits and group for backward."""
-        ctx.input_splits = input_splits
-        ctx.output_splits = output_splits
-        ctx.group = group
-        # pylint: disable=C0415
-        from torch.distributed._functional_collectives import all_to_all_single
-        return all_to_all_single(
-            input_tensor, output_splits, input_splits, group,
-        )
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Compute the backward pass by performing the inverse all-to-all with swapped splits."""
-        # pylint: disable=C0415
-        from torch.distributed._functional_collectives import all_to_all_single
-        grad_input = all_to_all_single(
-            grad_output, ctx.input_splits, ctx.output_splits, ctx.group,
-        )
-        return grad_input, None, None, None
-
-
-class _TorchP2PExchangeFunction(torch.autograd.Function):
-    """Symmetric bidirectional P2P: send local tensor to peer, receive peer's tensor."""
-
-    @staticmethod
-    def forward(ctx, tensor: torch.Tensor, peer_rank: int, group) -> torch.Tensor:  # pylint: disable=arguments-differ
-        """Perform symmetric bidirectional P2P exchange with peer_rank."""
-        ctx.peer_rank = peer_rank
-        ctx.group = group
-        send_buf = tensor.contiguous()
-        recv_buf = torch.empty_like(send_buf)
-        reqs = dist.batch_isend_irecv([
-            dist.P2POp(dist.isend, send_buf, peer_rank, group),
-            dist.P2POp(dist.irecv, recv_buf, peer_rank, group),
-        ])
-        for req in reqs:
-            req.wait()
-        return recv_buf
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        """Perform symmetric P2P exchange for the backward gradient pass."""
-        send_buf = grad_output.contiguous()
-        recv_buf = torch.empty_like(send_buf)
-        reqs = dist.batch_isend_irecv([
-            dist.P2POp(dist.isend, send_buf, ctx.peer_rank, ctx.group),
-            dist.P2POp(dist.irecv, recv_buf, ctx.peer_rank, ctx.group),
-        ])
-        for req in reqs:
-            req.wait()
-        return recv_buf, None, None
-
-
-class _TorchDifferentiableVariableAllGather(torch.autograd.Function):
-    """Variable dim-zero all-gather with an uneven reduce-scatter backward."""
-
-    @staticmethod
-    def forward(ctx, input_tensor, output_splits, group):  # pylint: disable=arguments-differ
-        """Gather each rank's true row count without replicating inputs for A2A."""
-        if input_tensor.ndim == 0:
-            raise ValueError("variable all-gather input must have at least one dimension")
-        splits = tuple(output_splits)
-        if not splits:
-            raise ValueError("output_splits must contain at least one group rank")
-        if any(not isinstance(rows, int) or isinstance(rows, bool) or rows < 0 for rows in splits):
-            raise ValueError(f"output_splits must contain non-negative integers, got {splits!r}")
-
-        group_rank = dist.get_rank(group=group)
-        if group_rank < 0 or group_rank >= len(splits):
-            raise ValueError(f"group rank must be in [0, {len(splits)}), got {group_rank}")
-        if input_tensor.shape[0] != splits[group_rank]:
-            raise ValueError(
-                "variable all-gather local rows must match output_splits at the group rank, "
-                f"got local_rows={input_tensor.shape[0]}, group_rank={group_rank}, "
-                f"output_splits={splits!r}"
-            )
-
-        input_tensor = input_tensor.contiguous()
-        feature_shape = tuple(input_tensor.shape[1:])
-        if input_tensor.device.type == "npu":
-            gathered = [input_tensor.new_empty((rows, *feature_shape)) for rows in splits]
-            dist.all_gather(gathered, input_tensor, group=group)
-        else:
-            max_rows = max(splits)
-            if max_rows == 0:
-                gathered = [input_tensor.new_empty((0, *feature_shape)) for _ in splits]
-            else:
-                padded = input_tensor.new_zeros((max_rows, *feature_shape))
-                if input_tensor.shape[0] > 0:
-                    padded[:input_tensor.shape[0]].copy_(input_tensor)
-                padded_outputs = [torch.empty_like(padded) for _ in splits]
-                dist.all_gather(padded_outputs, padded, group=group)
-                gathered = [
-                    output[:rows].contiguous()
-                    for output, rows in zip(padded_outputs, splits)
-                ]
-
-        ctx.output_splits = splits
-        ctx.group = group
-        ctx.group_rank = group_rank
-        return torch.cat(gathered, dim=0)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Sum replicated output gradients and return this rank's uneven shard."""
-        output_rows = ctx.output_splits[ctx.group_rank]
-        output = grad_output.new_empty((output_rows, *grad_output.shape[1:]))
-        if sum(ctx.output_splits) == 0:
-            return output, None, None
-
-        grad_output = grad_output.contiguous()
-        if grad_output.device.type == "npu":
-            from torch_npu.distributed import reduce_scatter_tensor_uneven  # pylint: disable=C0415
-            reduce_scatter_tensor_uneven(
-                output,
-                grad_output,
-                input_split_sizes=list(ctx.output_splits),
-                op=dist.ReduceOp.SUM,
-                group=ctx.group,
-            )
-        else:
-            reduced = grad_output.clone()
-            dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=ctx.group)
-            start = sum(ctx.output_splits[:ctx.group_rank])
-            output.copy_(reduced.narrow(0, start, output_rows))
-        return output, None, None
-
-
-def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):  # pylint: disable=W0613
-    """Autograd-aware all-gather whose results are concatenated along ``concat_dim``."""
-    data = _ensure_contiguous(data)
-    output = [
-        _TorchContiguousGrad.apply(tensor)
-        for tensor in dist_func.all_gather(data, group=group)
-    ]
-    if rank_list is not None:
-        group_ranks = dist.get_process_group_ranks(group)
-        if tuple(rank_list) != tuple(group_ranks):
-            rank_to_idx = {int(rank): idx for idx, rank in enumerate(group_ranks)}
-            output = [output[rank_to_idx[int(rank)]] for rank in rank_list]
-    return torch.cat(output, dim=concat_dim)
-
-
-def chunk(data, split_dim, split_size, index):
-    """Return chunk *index* of ``data`` split into ``split_size`` pieces."""
-    return torch.chunk(data, split_size, dim=split_dim)[index]
-
-
-def differentiable_all_to_all(input_data, output_shape, group):
-    """Autograd-aware all-to-all producing a tensor of ``output_shape``."""
-    input_data = _ensure_contiguous(input_data)
-    output_tensor = torch.empty(output_shape, device=input_data.device, dtype=input_data.dtype)
-    return dist_func.all_to_all_single(output_tensor, input_data, group=group)
-
-
-def differentiable_all_reduce(data, op, group):
-    """Autograd-aware all-reduce with string or ``ReduceOp`` *op*."""
-    data = _ensure_contiguous(data)
-    # Resolve the op from string to ReduceOp enum if necessary
-    reduce_op = _OP_MAP.get(op, dist.ReduceOp.SUM) if isinstance(op, str) else op
-    return dist_func.all_reduce(data, op=reduce_op, group=group)
-
-
-def differentiable_reduce_scatter(data, dev_num, axis, op, group):
-    """Autograd-aware reduce-scatter splitting ``axis`` into ``dev_num`` parts."""
-    data = _ensure_contiguous(data)
-    input_tuple = torch.chunk(data, dev_num, dim=axis)
-    output_tensor = torch.empty(input_tuple[0].shape, device=data.device, dtype=data.dtype)
-
-    # Resolve the op from string to ReduceOp enum
-    reduce_op = _OP_MAP.get(op, dist.ReduceOp.SUM) if isinstance(op, str) else op
-
-    output_tensor = dist_func.reduce_scatter(output_tensor, input_tuple, op=reduce_op, group=group)
-
-    # Keep manual handling for 'avg' string as it maps to SUM in _OP_MAP
-    if op == 'avg':
-        output_tensor = output_tensor / dev_num
-    return output_tensor
-
-
-def differentiable_all_to_all_single(input_tensor, input_splits, output_splits, group):
-    """Variable-split all-to-all with autograd support for EP token dispatch/combine."""
-    out_total = sum(output_splits)
-    output = torch.empty(
-        out_total, *input_tensor.shape[1:],
-        dtype=input_tensor.dtype, device=input_tensor.device,
-    )
-    return dist_func.all_to_all_single(
-        output, input_tensor,
-        output_split_sizes=output_splits,
-        input_split_sizes=input_splits,
-        group=group,
-    )
-
-
-def differentiable_all_to_all_single_async(input_tensor, input_splits, output_splits, group):
-    """Truly-async variant of :func:`differentiable_all_to_all_single`.
-
-    Both forward AND backward return ``AsyncCollectiveTensor``, so the
-    ``wait_tensor`` op is queued lazily — only when a downstream kernel
-    actually reads the result.  See :class:`_AsyncA2ALazyBwd`.
-    """
-    return _AsyncA2ALazyBwd.apply(input_tensor, output_splits, input_splits, group)
-
-
-def differentiable_variable_all_gather(
-        input_tensor: Tensor, output_splits: Sequence[int], group: Any) -> Tensor:
-    """Gather variable dim-zero shards on HCCL or Gloo with autograd support."""
-    return _TorchDifferentiableVariableAllGather.apply(
-        input_tensor, tuple(output_splits), group
-    )
-
-
-def wait_async_tensor(tensor):
-    """Wait for an async collective tensor to become materialised.
-
-    Idempotent — calling on an already-waited tensor is a no-op.
-    """
-    from torch.distributed._functional_collectives import wait_tensor  # pylint: disable=C0415
-    wait_tensor(tensor)
-    return tensor
-
-
-def p2p_exchange(tensor, peer_rank: int, group=None):
-    """Symmetric bidirectional P2P exchange with *peer_rank*."""
-    if peer_rank == dist.get_rank(group):
-        return tensor
-    return _TorchP2PExchangeFunction.apply(tensor, peer_rank, group)
-
-
-# ---------------------------------------------------------------------------
 # Unsupported legacy redistribution hooks
 # ---------------------------------------------------------------------------
 
@@ -798,3 +485,37 @@ def init_on_device(device, include_buffers=False):  # pylint: disable=W0621
         nn.Module.register_parameter = orig_register_parameter
         if include_buffers:
             nn.Module.register_buffer = orig_register_buffer
+
+
+__all__ = [
+    # Tensor/device/rng helpers.
+    "tensor_type_cast",
+    "device_count",
+    "device_type",
+    "device",
+    "get_rng_state",
+    "set_rng_state",
+    "get_tensor_transform",
+    "construct_strided_slice",
+    "init_on_device",
+    # Process-group construction.
+    "get_created_group",
+    "create_group",
+    "split_group",
+    "init_process_group",
+    "generate_groups_from_template",
+    "create_sub_groups",
+    # Re-exports kept for the debug tracer, which patches these attributes on
+    # this module; the canonical home is
+    # :mod:`hyper_parallel.core.utils.communication`.
+    "differentiable_all_gather_concat",
+    "differentiable_all_to_all",
+    "differentiable_all_to_all_single",
+    "differentiable_all_to_all_single_async",
+    "differentiable_all_reduce",
+    "differentiable_reduce_scatter",
+    "differentiable_variable_all_gather",
+    # Small shared helpers re-exported for callers that reach them here.
+    "get_device_handle",
+    "get_op_name",
+]

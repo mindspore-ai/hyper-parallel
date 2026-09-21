@@ -26,7 +26,6 @@ module surface (single registry, shared IGNORE_INDEX, DatasetLogger).
 import os
 import unittest
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 from hyper_parallel.data.dataset_logging import DatasetLogger
 from hyper_parallel.data.text import chat_template

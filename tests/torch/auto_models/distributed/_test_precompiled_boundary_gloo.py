@@ -24,9 +24,6 @@ The cases were moved verbatim from
 original world_size=1 semantics (at world_size=1 Replicate and any Shard are
 equivalent, which suffices for wrap/unwrap/identity logic).
 """
-import os
-
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 # pylint: disable=wrong-import-position,redefined-outer-name
 import logging
@@ -174,8 +171,8 @@ def test_redistribute_io(mesh, monkeypatch, caplog):
     tensor = torch.randn(2, 3)
     gathered = torch.randn(2, 6)
     monkeypatch.setattr(
-        "hyper_parallel.distributed._collectives."
-        "differentiable_all_gather_concat",
+        "hyper_parallel.distributed._builder.tp_collective_lowering."
+        "communication.differentiable_all_gather_concat",
         lambda *_args, **_kwargs: gathered,
     )
     monkeypatch.setattr(

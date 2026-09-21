@@ -23,7 +23,7 @@ from typing import Any
 
 from torch.optim import Optimizer  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.trainer.config.target import Target, _serialize_config_value
+from hyper_parallel.trainer.config.target import Target
 
 
 @dataclass

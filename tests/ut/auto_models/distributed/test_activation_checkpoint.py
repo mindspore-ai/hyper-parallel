@@ -13,20 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for model-agnostic activation-checkpoint block discovery."""
-# pylint: disable=wrong-import-position
 
-import os
 import unittest
 from unittest.mock import MagicMock, call, patch
 
 from torch import Tensor, nn
 
-from tests.ut.platform.mindspore._ensure_mindspore_platform import (
-    restore_torch_platform_for_ut,
-)
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-restore_torch_platform_for_ut()
 
 from hyper_parallel.core.activation_memory.wrapper import ckpt_wrapper as _checkpoint_wrapper
 from hyper_parallel.distributed.activation_checkpoint import (

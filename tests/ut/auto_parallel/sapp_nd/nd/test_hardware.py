@@ -24,7 +24,6 @@ Test IDs:
 import os
 import unittest
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware import Type, Device_A2

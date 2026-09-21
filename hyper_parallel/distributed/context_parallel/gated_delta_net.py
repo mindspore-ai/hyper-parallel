@@ -38,7 +38,7 @@ from hyper_parallel.components.modules.gated_delta_net import (
     is_triton_gdn_available,
     torch_chunk_gated_delta_rule,
 )
-from hyper_parallel.distributed import _collectives
+from hyper_parallel.core.utils import communication
 
 
 _GDN_BACKENDS = frozenset({"eager", "triton"})
@@ -161,7 +161,7 @@ def _all_to_all_previous_rank_halo(
     if cp_rank > 0:
         output_splits[rank_to_group_index[rank_list[cp_rank - 1]]] = halo_width
 
-    exchange_output = _collectives.differentiable_all_to_all_single(
+    exchange_output = communication.differentiable_all_to_all_single(
         exchange_input,
         input_splits,
         output_splits,
@@ -907,7 +907,7 @@ def _differentiable_all_to_all_shard(
     split_len = a2a_input.shape[0] // split_count
     input_splits = [split_len] * split_count
     output_splits = [split_len] * split_count
-    output = _collectives.differentiable_all_to_all_single(
+    output = communication.differentiable_all_to_all_single(
         a2a_input,
         input_splits,
         output_splits,

@@ -13,16 +13,15 @@
 # limitations under the License.
 # ============================================================================
 """Shared helpers for MoE EP demo scripts."""
-# pylint: disable=C0413
 from __future__ import annotations
 
 import os
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
-
 import torch
 import torch.distributed as dist
 import torch_npu  # pylint: disable=W0611
+
+os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 TRAIN_STEPS = 10
 

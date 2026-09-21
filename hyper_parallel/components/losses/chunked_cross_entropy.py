@@ -21,6 +21,12 @@ gradients are evaluated one local sequence chunk at a time.
 
 from __future__ import annotations
 
+__all__ = [
+    "ChunkedCausalLMLoss",
+    "ChunkedCausalLMOutput",
+    "chunked_cross_entropy",
+]
+
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -386,10 +392,3 @@ class ChunkedCausalLMLoss(nn.Module):
             local_loss,
             torch.zeros_like(local_loss),
         )
-
-
-__all__ = [
-    "ChunkedCausalLMLoss",
-    "ChunkedCausalLMOutput",
-    "chunked_cross_entropy",
-]

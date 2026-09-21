@@ -59,8 +59,6 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.append(str(_ROOT))
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-
 import torch
 import torch.distributed as dist
 

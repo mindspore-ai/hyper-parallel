@@ -32,7 +32,7 @@ Test IDs:
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.platform.torch.common.moe import _compute_load_balance_loss
+from hyper_parallel.components.modules.moe import _compute_load_balance_loss
 from tests.torch.utils import init_dist_gloo
 
 

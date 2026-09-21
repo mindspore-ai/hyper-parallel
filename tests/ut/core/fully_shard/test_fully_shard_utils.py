@@ -21,7 +21,6 @@ import os
 import unittest
 
 # Force torch platform before any hyper_parallel imports
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import torch
@@ -38,7 +37,6 @@ class TestMixedPrecisionPolicy(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
     def test_default_values(self):
@@ -130,7 +128,6 @@ class TestOffloadPolicy(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
     def test_offload_policy_instantiation(self):
@@ -151,7 +148,6 @@ class TestCPUOffloadPolicy(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
     def test_default_pin_memory_true(self):

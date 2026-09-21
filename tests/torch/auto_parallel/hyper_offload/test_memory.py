@@ -22,7 +22,6 @@ import logging
 import os
 from typing import Any
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import pytest

@@ -43,14 +43,14 @@ Launch::
     torchrun --nproc_per_node=4 pp_overlap_moe_example.py
 """
 # pylint: disable=C0413
-import os
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
-
 import torch
 from torch import nn
 import torch.distributed as dist
 
 from hyper_parallel import PipelineStage, init_device_mesh
+from hyper_parallel.components.modules.moe import MoE
+from hyper_parallel.core.context_parallel.utils import all_to_all_single
+from hyper_parallel.core.utils.communication import differentiable_all_to_all_single_async
 from hyper_parallel.core.expert_parallel.expert_parallel import (  # pylint: disable=C0412
     ExpertParallel,
     _permute,
@@ -61,10 +61,12 @@ from hyper_parallel.core.pipeline_parallel import (
     MetaStepType,
     ScheduleInterleaved1F1B,
 )
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.torch.common import MoE
+from hyper_parallel.core.pipeline_parallel._sync_hook import _SyncHookFunction
 
-platform = get_platform()
+
+def differentiable_sync_hook(tensor, hook_name, coordinator):
+    """Fire a HookCoordinator rendezvous while keeping the autograd graph intact."""
+    return _SyncHookFunction.apply(tensor, hook_name, coordinator)
 
 
 # =========================================================================
@@ -127,7 +129,7 @@ class OverlapExpertParallel(ExpertParallel):
         # producing garbage ``counts_out`` values and 1EB-sized
         # ``torch.empty`` allocations.  Keep counts a2a inside A→B so the
         # coordinator serialises cross-thread HCCL traffic.
-        routed_input = platform.differentiable_sync_hook(routed_input, "A", coord)
+        routed_input = differentiable_sync_hook(routed_input, "A", coord)
 
         # ---- Inside A→B: counts a2a + splits + token a2a. ----
         # Wrap counts a2a in ``no_grad`` to guarantee the autograd graph
@@ -135,7 +137,7 @@ class OverlapExpertParallel(ExpertParallel):
         # ``num_tokens_per_expert`` would make backward replay a phantom
         # counts collective and inflate the per-OVERLAP_B_F a2a count.
         with torch.no_grad():
-            counts_out, handle = platform.all_to_all_single(
+            counts_out, handle = all_to_all_single(
                 num_tokens_per_expert,
                 output_shape=[num_tokens_per_expert.shape[0]],
                 group=ep_group,
@@ -152,10 +154,10 @@ class OverlapExpertParallel(ExpertParallel):
         # kernel, so ``notify_dispatched(B)`` fires while the collective is
         # still in flight and the paired COMPUTE side can start its kernel
         # concurrently — this is what actually produces the overlap.
-        dispatched = platform.differentiable_all_to_all_single_async(
+        dispatched = differentiable_all_to_all_single_async(
             routed_input, input_splits, output_splits, group=ep_group,
         )
-        dispatched = platform.differentiable_sync_hook(dispatched, "B", coord)
+        dispatched = differentiable_sync_hook(dispatched, "B", coord)
 
         # ---- AFTER hook B (COMPUTE region): rank-major -> expert-major. ----
         self._input_shape, permuted, self._permuted_indices, local_counts = _permute(
@@ -181,14 +183,14 @@ class OverlapExpertParallel(ExpertParallel):
         # ---- C → combine a2a launch → D. ----
         # Same async rationale as dispatch: host returns right after the
         # HCCL kernel is queued so the peer thread can race ahead.
-        unpermuted = platform.differentiable_sync_hook(unpermuted, "C", coord)
-        combined = platform.differentiable_all_to_all_single_async(
+        unpermuted = differentiable_sync_hook(unpermuted, "C", coord)
+        combined = differentiable_all_to_all_single_async(
             unpermuted,
             self._output_splits,
             self._input_splits,
             group=ep_group,
         )
-        combined = platform.differentiable_sync_hook(combined, self._d_hook, coord)
+        combined = differentiable_sync_hook(combined, self._d_hook, coord)
         return combined
 
 

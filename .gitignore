@@ -31,6 +31,7 @@ venv/
 *.dot
 *.dat
 *.svg
+!hyper_parallel/rl/docs/images/agentic_rl_architecture.svg
 *.perf
 *.info
 *.ckpt

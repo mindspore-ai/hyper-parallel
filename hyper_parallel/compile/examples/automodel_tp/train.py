@@ -153,7 +153,7 @@ def build_mesh_context(parallel_cfg: dict, device_type: str) -> MeshContext:
     return ctx
 
 
-def train_fn(model, input_ids, labels):
+def train_fn(model, *, input_ids, labels):
     """Standard CE loss on the boundary-wrapped model forward.
 
     In SP mode the lm_head boundary all-gathers hidden_states to full
@@ -189,7 +189,7 @@ def inspect_graph(trainer: GraphTrainer) -> None:
     ``call_function`` nodes whose op name mentions all_gather/all_reduce/
     reduce_scatter.
     """
-    gm = trainer._joint_graph.graph_module  # pylint: disable=W0212
+    gm = trainer._compiler._joint_graph.graph_module  # pylint: disable=W0212
     fsdp, tp_nodes = [], []
     for node in gm.graph.nodes:
         if node.op != "call_function":
@@ -315,14 +315,14 @@ def main():  # pylint: disable=too-many-locals
     )
 
     # Sample one batch for compilation (shape must match runtime batches)
-    sample_input, sample_label = sampler.sample()
+    input_batch, label_batch = sampler.sample()
     if sequence_parallel and rank == 0:
         _LOG.info(
             "[SP] sample input full seq_len=%s (SP sharding via embedding "
             "reduce-scatter)",
-            sample_input.shape[1],
+            input_batch.shape[1],
         )
-    trainer.compile(sample_input, sample_label)
+    trainer.compile(input_ids=input_batch, labels=label_batch)
     inspect_graph(trainer)
 
     # 7. Training data iterator (DataSampler yields full-sequence batches)

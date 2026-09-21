@@ -35,7 +35,7 @@ from hyper_parallel.models.replacement import (
     compile_module_replacements,
     module_replacement,
 )
-from hyper_parallel.trainer.config.resolver import resolve_root
+from hyper_parallel.trainer.config.resolver import resolve_config
 from hyper_parallel.trainer.config import (
     PlanOverride,
     Target,
@@ -130,7 +130,6 @@ class TestModuleReplacementPlan(unittest.TestCase):
 
     def test_success_matching_and_identity_paths(self):
         """Success family: exact/alias matching, parameter identity, context."""
-
         # case: replaces_exact_linear_and_preserves_parameter_identity
         linear = nn.Linear(4, 8, bias=False)
         model = nn.Sequential(linear)
@@ -310,7 +309,6 @@ class TestModuleReplacementPlan(unittest.TestCase):
 
     def test_engine_error_paths(self):
         """Error family: every rejection keeps its identifying match pattern."""
-
         # case: each_pattern_must_match
         with self.assertRaisesRegex(
             ValueError, "typo", msg="case: each_pattern_must_match"
@@ -429,7 +427,7 @@ class TestModuleReplacementYaml(unittest.TestCase):
 
     def test_yaml_desugars_to_generic_rule(self):
         """YAML desugar family: replace_module entry becomes a generic rule."""
-        config = resolve_root(_root([
+        config = resolve_config(_root([
             {
                 "match": ["encoder.*", "decoder.*"],
                 "module_type": "torch.nn.Linear",
@@ -458,7 +456,6 @@ class TestModuleReplacementYaml(unittest.TestCase):
 
     def test_when_gating_rejected(self):
         """When-gating family: replacements reject any 'when' clause."""
-
         # case: replacement_rejects_valid_when
         entry = PlanOverride(
             match="encoder.*",
@@ -497,9 +494,8 @@ class TestModuleReplacementYaml(unittest.TestCase):
 
     def test_yaml_error_paths(self):
         """YAML error family: undeclared factory, bare list match, import error."""
-
         # case: yaml_replacement_rejects_undeclared_factory_contract
-        config = resolve_root(_root([
+        config = resolve_config(_root([
             {
                 "match": "encoder.*",
                 "module_type": "torch.nn.Linear",

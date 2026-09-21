@@ -33,7 +33,6 @@ from hyper_parallel.core.fully_shard.utils import (
     SourceShardMetaInfo,
     apply_to_tensors,
     cast_fp_tensor,
-    get_cells_and_names,
     parameters_dict,
     profiler_record,
 )
@@ -258,7 +257,7 @@ class HSDPSchedulerV2:
             tree_ctx = self.scheduler_ctx
             tree_ctx.root_module = self.cell
             registered_schedulers = set()
-            for module_name, module in get_cells_and_names(tree_ctx.root_module):
+            for module_name, module in tree_ctx.root_module.named_modules():
                 from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
                 if isinstance(module, HSDPModule):
                     submod_scheduler = module.hsdp_scheduler

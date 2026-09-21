@@ -36,7 +36,6 @@ import pytest
 import torch.distributed as dist
 import torch_npu  # noqa: F401  # ensure NPU backend is registered before HCCL init.
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 # ``examples/torch/llama3`` is not a package, mirror the ``sys.path`` hack the
 # example scripts perform so ``import tensor_parallel_example`` resolves their

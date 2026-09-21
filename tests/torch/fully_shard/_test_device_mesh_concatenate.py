@@ -16,7 +16,6 @@
 
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import pytest
 import torch

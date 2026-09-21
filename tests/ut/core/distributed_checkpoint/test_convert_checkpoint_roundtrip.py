@@ -12,26 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""UT: DCP layout round-trip for in-memory full weights (platform-agnostic APIs only).
+"""UT: DCP layout round-trip for in-memory full weights.
 
 Validates :func:`full_state_dict_to_dcp_format` and :func:`dcp_to_full_state_dict` only.
 Hugging Face I/O, ``convert_full_checkpoint_to_dcp``, and file-based checkpoints are
 covered in ST (see ``tests/torch/distributed_checkpoint/test_offline_convert_st_torch.py``).
 
-Uses PyTorch tensors + ``HYPER_PARALLEL_PLATFORM=torch`` as the minimal tensor backend for
-this gate (``pytest tests/ut``).
+Uses plain PyTorch tensors on CPU for this gate (``pytest tests/ut``).
 """
 # pylint: disable=wrong-import-position
 import os
 import shutil
-from typing import Iterator
 
 import pytest
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-import hyper_parallel.platform.platform as _platform_mod
 from hyper_parallel.core.distributed_checkpoint.offline_transform import (
     dcp_to_full_state_dict,
     full_state_dict_to_dcp_format,
@@ -58,15 +54,6 @@ def _assert_flat_state_dicts_close_torch(original: dict, loaded: dict) -> None:
         assert torch.is_tensor(a) and torch.is_tensor(b), (key, type(a), type(b))
         assert a.shape == b.shape
         assert torch.allclose(a.cpu().float(), b.cpu().float())
-
-
-@pytest.fixture(autouse=True)
-def _reset_cached_platform_singleton() -> Iterator[None]:
-    # Other test modules may set HYPER_PARALLEL_PLATFORM during collection; force torch for this UT.
-    os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-    _platform_mod.platform = None
-    yield
-    _platform_mod.platform = None
 
 
 def test_dcp_full_state_dict_roundtrip() -> None:

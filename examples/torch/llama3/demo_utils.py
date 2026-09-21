@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
-
 import torch
 import torch.distributed as dist
 

@@ -1,6 +1,6 @@
 # PR Review Checklist
 
-This checklist covers areas that CI cannot check. Focus on distributed system correctness, cross-platform consistency, and code quality.
+This checklist covers areas that CI cannot check. Focus on distributed system correctness, collective/stream semantics, and code quality.
 
 ## Distributed System Correctness
 
@@ -38,31 +38,23 @@ This checklist covers areas that CI cannot check. Focus on distributed system co
 
 ## Cross-Platform Consistency
 
-### Platform Abstraction
+### Collective APIs
 
-- [ ] **Uses `get_platform()`** — Platform-agnostic code never imports torch/mindspore directly
-- [ ] **Both backends updated** — Changes in `platform/torch/` have corresponding `platform/mindspore/` changes (or explicit justification)
-- [ ] **Base class updated first** — New platform APIs added to `platform/platform.py` abstract class before implementations
-- [ ] **Collective ops via platform** — `all_reduce`, `all_gather`, `reduce_scatter` go through `platform.*`, not raw framework calls
-- [ ] **No `self.platform`** — Platform is always referenced via module-level `platform = get_platform()`, never stored as an instance attribute
-- [ ] **`differentiable_*` in autograd paths** — Code in forward/backward computation (e.g., `TensorRedistribution`, op dispatch) must use `platform.differentiable_all_reduce` / `platform.differentiable_reduce_scatter`, not the non-differentiable variants
-- [ ] **`group` vs `group_info` type correct** — `platform.all_reduce/all_gather_into_tensor/reduce_scatter_tensor` expect `group_info` (object with `.group` attr); `platform.differentiable_*` expect raw `group`; `platform.create_group()` returns raw `group` — verify callers wrap/unwrap correctly
+- [ ] **No `platform/` references** — The platform abstraction is gone; collectives use `torch.distributed` or the shared wrappers in `core/context_parallel/utils.py` / `core/dtensor/_utils.py`
+- [ ] **`differentiable_*` in autograd paths** — Code in forward/backward computation (e.g., `TensorRedistribution`, op dispatch) must use the `differentiable_*` variants, not the eager ones
+- [ ] **`group` vs `group_info` type correct** — Eager collectives expect `group_info` (object with `.group` attr); `differentiable_*` expect a raw group; `create_group()` returns a raw group — verify callers wrap/unwrap correctly
 
-### Common Cross-Platform Pitfalls
+### Common Collective Pitfalls
 
-- torch-specific tensor APIs used in platform-agnostic code
 - Device string handling differences between backends
-- Gradient computation API differences
-- Process group creation/management differences
-- Using `self.platform` instead of module-level `platform` (hides bugs, may reference stale or nonexistent attribute)
 - Mixing `differentiable_*` and non-differentiable collective APIs in autograd paths (breaks gradient flow)
 - Passing raw `ProcessGroup` to APIs that expect `group_info` wrapper, or vice versa (causes `AttributeError` at runtime)
 
-### Multi-Platform & List/Collection APIs
+### List/Collection APIs
 
-When an API supports multiple backends (e.g. Torch + MindSpore) or list/collection inputs (e.g. `fully_shard([m1, m2])`), verify:
+When an API accepts list/collection inputs (e.g. `fully_shard([m1, m2])`), verify:
 
-- [ ] **Same semantics on all backends** — Torch and MindSpore paths receive the same logical inputs (e.g. single module vs tuple of modules); compare state/scheduler construction and who gets the handle
+- [ ] **Same semantics on every element** — Every element receives the same logical treatment (e.g. single module vs tuple of modules); compare state/scheduler construction and who gets the handle
 - [ ] **List/collection contract clear** — If API accepts a list, document and implement whether every element gets a handle, can be used in follow-up APIs (e.g. prefetch), and participates in state
 - [ ] **State/handle covers all managed objects** — When one logical unit spans multiple user-visible objects (e.g. multiple roots), either every object gets the same handle or docs/tests make “only first is handle” explicit
 - [ ] **Tests use real user scenarios** — At least one test exercises “non-first” element (e.g. second root `.unshard()`, or second root in prefetch list); avoid mocking away the code path under test
@@ -106,8 +98,8 @@ When a change introduces new API patterns, evaluate broader implications:
 - [ ] **Naming** — Classes `PascalCase`, functions/vars `snake_case`, private `_leading_underscore`
 - [ ] **Docstrings** — Google-style with `Args:`, `Returns:`, `Raises:`, `Example:` sections on public APIs
 - [ ] **Type hints** — Present on all public function signatures
-- [ ] **Imports** — **Non-platform code:** module-level imports only; flag imports inside methods unless documented exceptions (`TYPE_CHECKING`, optional dependency, circular import). **`platform/torch/` and `platform/mindspore/`:** lazy framework imports inside methods with `# pylint: disable=C0415` are expected
-- [ ] **Pylint compliance** — Run `pylint` on changed `.py` files; add violations to `.jenkins/check/config/filter_pylint.txt` for unified suppression (do not use inline `# pylint: disable=` except `C0415` on lazy backend imports in `platform/torch/` and `platform/mindspore/` per `code-style.md`)
+- [ ] **Imports** — Module-level imports only; flag imports inside methods unless documented exceptions (`TYPE_CHECKING`, optional dependency, circular import). Lazy optional-dependency imports inside methods carry `# pylint: disable=C0415`
+- [ ] **Pylint compliance** — Run `pylint` on changed `.py` files; add violations to `.jenkins/check/config/filter_pylint.txt` for unified suppression (do not use inline `# pylint: disable=` except `C0415` on lazy optional-dependency imports per `code-style.md`)
 
 ### Common Issues to Flag
 
@@ -154,7 +146,7 @@ When a change introduces new API patterns, evaluate broader implications:
 
 - [ ] **Device consistency** — Operations don't unexpectedly move tensors between devices
 - [ ] **Async where possible** — Use `non_blocking=True` for device transfers, `async_op=True` for collectives, with proper sync points
-- [ ] **NPU/GPU compatibility** — Device-specific optimizations are gated by platform checks, not hardcoded
+- [ ] **NPU/GPU compatibility** — Device-specific optimizations read the device from the tensors/mesh in hand, not a hardcoded string
 
 ### Memory Patterns
 
@@ -176,8 +168,7 @@ When a change introduces new API patterns, evaluate broader implications:
 ### Test Existence
 
 - [ ] **Tests exist** — New functionality has corresponding tests
-- [ ] **Right test location** — UT under `tests/ut/` (PyTorch-focused code in `tests/ut/core/` or `tests/ut/platform/torch/`); distributed ST under `tests/torch/`
-- [ ] **MindSpore-specific UT named** — MindSpore-only cases live in `tests/ut/platform/mindspore/` or a `*_mindspore.py` module
+- [ ] **Right test location** — UT under `tests/ut/<module>/`; distributed ST under `tests/torch/<module>/`
 
 ### Style / Comments (from `code-style.md`)
 

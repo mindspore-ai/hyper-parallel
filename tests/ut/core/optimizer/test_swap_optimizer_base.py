@@ -22,7 +22,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 
@@ -2374,6 +2373,29 @@ class TestSwapAdapterStepPreparation(_AdapterTestCase):
         self.assertEqual(set(removed[id(param)]), set(ADAM_STATE_KEYS))
         # The original checkpoint is left untouched for the second load phase.
         self.assertEqual(set(state_dict["state"][id(param)]), {"step", *ADAM_STATE_KEYS})
+
+    def test_strip_swappable_state_shares_checkpoint_tensor_storage(self):
+        """Stripping must not duplicate optimizer tensors on host memory."""
+        param = torch.nn.Parameter(torch.ones(8))
+        adapter, _ = self._adapter(torch.optim.Adam([param], lr=0.01))
+        exp_avg = torch.ones(8)
+        state_dict = {
+            "state": {id(param): {"step": torch.zeros(()), "exp_avg": exp_avg}},
+            "param_groups": [{"params": [id(param)], "lr": 0.01}],
+        }
+
+        stripped, removed = adapter.strip_swappable_state(state_dict)
+
+        # The removed buffer is the checkpoint's own storage, not a copy.
+        self.assertIs(removed[id(param)]["exp_avg"], exp_avg)
+        # Non-swappable entries stay aliased too: no tensor is cloned at all.
+        self.assertIs(stripped["state"][id(param)]["step"], state_dict["state"][id(param)]["step"])
+        # Container skeleton is fresh, so popping cannot touch the caller's dict.
+        self.assertIsNot(stripped, state_dict)
+        self.assertIsNot(stripped["state"], state_dict["state"])
+        self.assertIsNot(stripped["param_groups"], state_dict["param_groups"])
+        self.assertIsNot(stripped["param_groups"][0], state_dict["param_groups"][0])
+        self.assertEqual(set(state_dict["state"][id(param)]), {"step", "exp_avg"})
 
     def test_initial_slots_discovers_pre_existing_state(self):
         """State materialized before wrapping is discovered for the first offload."""

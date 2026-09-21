@@ -14,10 +14,6 @@
 # ============================================================================
 """Torch test package setup.
 
-Only sets ``HYPER_PARALLEL_PLATFORM``. Do **not** import ``hyper_parallel``
-here — that would pull ``torch`` into every pytest launcher under
-``tests.torch.*``.
+Do **not** import ``hyper_parallel`` here — that would pull ``torch`` into
+every pytest launcher under ``tests.torch.*``.
 """
-import os
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"

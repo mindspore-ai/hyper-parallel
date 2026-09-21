@@ -10,7 +10,7 @@
 
 #include "runtime/log.h"
 
-#include <cinttypes>
+#include <charconv>
 #include <climits>
 #include <cstdarg>
 #include <cstdio>
@@ -29,6 +29,53 @@ constexpr std::size_t kLogLineCapacity = 2048U;
 constexpr std::size_t kTimestampCapacity = 32U;
 constexpr int64_t kMillisecondsPerSecond = 1000;
 constexpr std::string_view kTruncationMarker = "...";
+constexpr std::string_view kFallbackTimestamp = "0000-00-00-00:00:00.000";
+
+class FixedBufferWriter {
+ public:
+  FixedBufferWriter(char *buffer, std::size_t capacity) noexcept : buffer_(buffer), capacity_(capacity) {}
+
+  void Append(std::string_view value) noexcept {
+    if (capacity_ == 0U) {
+      truncated_ = truncated_ || !value.empty();
+      return;
+    }
+    const std::size_t available = capacity_ - 1U - length_;
+    const std::size_t copied = std::min(value.size(), available);
+    std::copy_n(value.data(), copied, buffer_ + length_);
+    length_ += copied;
+    buffer_[length_] = '\0';
+    truncated_ = truncated_ || copied != value.size();
+  }
+
+  template <typename Integer>
+  void AppendInteger(Integer value) noexcept {
+    char text[32]{};
+    const auto result = std::to_chars(text, text + sizeof(text), value);
+    if (result.ec != std::errc{}) {
+      truncated_ = true;
+      return;
+    }
+    Append(std::string_view(text, static_cast<std::size_t>(result.ptr - text)));
+  }
+
+  std::size_t length() const noexcept { return length_; }
+
+  bool truncated() const noexcept { return truncated_; }
+
+ private:
+  char *buffer_;
+  std::size_t capacity_;
+  std::size_t length_ = 0U;
+  bool truncated_ = false;
+};
+
+struct LineContext {
+  Level level;
+  int32_t root_rank;
+  const char *file;
+  int line_number;
+};
 
 const char *Basename(const char *file) noexcept {
   if (file == nullptr) {
@@ -113,20 +160,25 @@ void FormatTimestamp(char (&timestamp)[kTimestampCapacity]) noexcept {
   const bool converted = localtime_r(&current_time, &local_time) != nullptr;
 #endif
   if (!converted || std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d-%H:%M:%S", &local_time) == 0) {
-    std::snprintf(timestamp, sizeof(timestamp), "0000-00-00-00:00:00.000");
+    std::copy_n(kFallbackTimestamp.data(), kFallbackTimestamp.size(), timestamp);
+    timestamp[kFallbackTimestamp.size()] = '\0';
     return;
   }
 
   const auto milliseconds =
     std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % kMillisecondsPerSecond;
   const std::size_t length = std::strlen(timestamp);
-  std::snprintf(timestamp + length, sizeof(timestamp) - length, ".%03" PRId64, milliseconds);
+  timestamp[length] = '.';
+  timestamp[length + 1U] = static_cast<char>('0' + milliseconds / 100);
+  timestamp[length + 2U] = static_cast<char>('0' + milliseconds / 10 % 10);
+  timestamp[length + 3U] = static_cast<char>('0' + milliseconds % 10);
+  timestamp[length + 4U] = '\0';
 }
 
 void FinishLine(char (&line)[kLogLineCapacity], std::size_t length, bool truncated) noexcept {
-  if (truncated && kLogLineCapacity > kTruncationMarker.size() + 2U) {
+  if (truncated && kTruncationMarker.size() + 2U < kLogLineCapacity) {
     length = kLogLineCapacity - kTruncationMarker.size() - 2U;
-    std::memcpy(line + length, kTruncationMarker.data(), kTruncationMarker.size());
+    std::copy_n(kTruncationMarker.data(), kTruncationMarker.size(), line + length);
     length += kTruncationMarker.size();
   }
   length = std::min(length, kLogLineCapacity - 2U);
@@ -141,27 +193,32 @@ void FinishLine(char (&line)[kLogLineCapacity], std::size_t length, bool truncat
   static_cast<void>(std::fflush(stderr));
 }
 
-void WriteLine(Level level, int32_t root_rank, const char *file, int line_number, const char *format,
-               std::va_list arguments) noexcept {
+void WriteLine(const LineContext &context, const char *format, std::va_list arguments) noexcept {
   char timestamp[kTimestampCapacity]{};
   FormatTimestamp(timestamp);
 
   char output[kLogLineCapacity]{};
-  const int prefix_size = std::snprintf(output, sizeof(output), "[HP-SHMEM][rank %d][%s] %s [%s:%d] ", root_rank,
-                                        LevelName(level), timestamp, file == nullptr ? "unknown" : file, line_number);
-  if (prefix_size < 0) {
-    return;
-  }
+  FixedBufferWriter writer(output, sizeof(output));
+  writer.Append("[HP-SHMEM][rank ");
+  writer.AppendInteger(context.root_rank);
+  writer.Append("][");
+  writer.Append(LevelName(context.level));
+  writer.Append("] ");
+  writer.Append(timestamp);
+  writer.Append(" [");
+  writer.Append(context.file == nullptr ? "unknown" : context.file);
+  writer.Append(":");
+  writer.AppendInteger(context.line_number);
+  writer.Append("] ");
 
-  const std::size_t prefix_length = std::min(static_cast<std::size_t>(prefix_size), sizeof(output) - 1U);
+  const std::size_t prefix_length = writer.length();
   const std::size_t remaining = sizeof(output) - prefix_length;
   const int message_size = std::vsnprintf(output + prefix_length, remaining, format, arguments);
   if (message_size < 0) {
     return;
   }
 
-  const bool truncated =
-    static_cast<std::size_t>(prefix_size) >= sizeof(output) || static_cast<std::size_t>(message_size) >= remaining;
+  const bool truncated = writer.truncated() || static_cast<std::size_t>(message_size) >= remaining;
   const std::size_t message_length = std::min(static_cast<std::size_t>(message_size), remaining - 1U);
   FinishLine(output, std::min(prefix_length + message_length, sizeof(output) - 1U), truncated);
 }
@@ -184,13 +241,19 @@ Level ParseActiveLevel() noexcept {
   char timestamp[kTimestampCapacity]{};
   FormatTimestamp(timestamp);
   char output[kLogLineCapacity]{};
-  const int length =
-    std::snprintf(output, sizeof(output), "[HP-SHMEM][rank -1][ERROR] %s [%s:%d] invalid %s=\"%s\", using ERROR",
-                  timestamp, Basename(__FILE__), __LINE__, kLogLevelEnv, value);
-  if (length >= 0) {
-    FinishLine(output, std::min(static_cast<std::size_t>(length), sizeof(output) - 1U),
-               static_cast<std::size_t>(length) >= sizeof(output));
-  }
+  FixedBufferWriter writer(output, sizeof(output));
+  writer.Append("[HP-SHMEM][rank -1][ERROR] ");
+  writer.Append(timestamp);
+  writer.Append(" [");
+  writer.Append(Basename(__FILE__));
+  writer.Append(":");
+  writer.AppendInteger(__LINE__);
+  writer.Append("] invalid ");
+  writer.Append(kLogLevelEnv);
+  writer.Append("=\"");
+  writer.Append(value);
+  writer.Append("\", using ERROR");
+  FinishLine(output, writer.length(), writer.truncated());
   return Level::Error;
 }
 
@@ -209,20 +272,22 @@ void Line(Level level, int32_t root_rank, const char *file, int line, const char
   }
   std::va_list arguments;
   va_start(arguments, format);
-  WriteLine(level, root_rank, Basename(file), line, format, arguments);
+  WriteLine(LineContext{level, root_rank, Basename(file), line}, format, arguments);
   va_end(arguments);
 }
 
-void Failure(const char *file, int line, DfxOperation operation, DfxPhase phase, int32_t root_rank,
-             const Status &error) noexcept {
+void Failure(const char *file, int line, const DfxFailure &failure) noexcept {
+  const Status &error = failure.status;
   const int message_length = static_cast<int>(std::min<std::size_t>(error.message.size(), INT_MAX));
   if (error.cann_error_code.has_value()) {
-    Line(Level::Error, root_rank, file, line, "op=%s phase=%s err=%s cann=%d msg=\"%.*s\"", OperationName(operation),
-         PhaseName(phase), ErrorName(error.error_code), *error.cann_error_code, message_length, error.message.data());
+    Line(Level::Error, failure.root_rank, file, line, "op=%s phase=%s err=%s cann=%d msg=\"%.*s\"",
+         OperationName(failure.operation), PhaseName(failure.phase), ErrorName(error.error_code),
+         *error.cann_error_code, message_length, error.message.data());
     return;
   }
-  Line(Level::Error, root_rank, file, line, "op=%s phase=%s err=%s cann=None msg=\"%.*s\"", OperationName(operation),
-       PhaseName(phase), ErrorName(error.error_code), message_length, error.message.data());
+  Line(Level::Error, failure.root_rank, file, line, "op=%s phase=%s err=%s cann=None msg=\"%.*s\"",
+       OperationName(failure.operation), PhaseName(failure.phase),
+       ErrorName(error.error_code), message_length, error.message.data());
 }
 
 }  // namespace hyper_parallel::multicore::shmem::runtime::log

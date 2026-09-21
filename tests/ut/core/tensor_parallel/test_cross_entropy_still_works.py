@@ -53,7 +53,6 @@ class TestCrossEntropyStillWorks:
     def test_cross_entropy_dispatch_path_unchanged(self):
         """cross_entropy should still dispatch through loss_parallel path."""
         import os
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
         from hyper_parallel.core.tensor_parallel import loss_parallel

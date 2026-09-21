@@ -15,7 +15,6 @@
 """Test: deferred (meta-device) initialization coupled with fully_shard and prefetch."""
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 from typing import List, Tuple
@@ -362,11 +361,9 @@ def test_fully_shard_init_empty_weights_with_prefetch(comm_fusion):
     # After the first forward pass, _init_params_fqn has run; verify every
     # managed parameter in hsdp_params got a correct FQN.
     from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state  # pylint: disable=C0415
-    from hyper_parallel.platform import get_platform as _get_platform  # pylint: disable=C0415
-    platform_impl = _get_platform()
 
     assigned_fqns = set()
-    for _, module in platform_impl.get_cells_and_names(model):
+    for _, module in model.named_modules():
         hsdp_state = get_hsdp_state(module)
         if hsdp_state is None:
             continue

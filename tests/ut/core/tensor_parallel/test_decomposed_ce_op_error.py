@@ -123,7 +123,6 @@ class TestDecomposedCEOpDispatchError:
     def test_check_raises_with_sharded_dtensor_in_context(self):
         """Check should raise ValueError with Shard(-1) DTensor in context."""
         import os
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
         from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -163,7 +162,6 @@ class TestDecomposedCEOpDispatchError:
     def test_check_does_not_raise_with_replicated_dtensor(self):
         """Check should not raise with Replicate DTensor in context."""
         import os
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
         from hyper_parallel.core.dtensor.dtensor import DTensor

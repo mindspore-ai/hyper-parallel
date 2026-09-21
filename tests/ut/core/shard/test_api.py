@@ -17,7 +17,6 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import numpy as np
 import torch
@@ -414,7 +413,7 @@ class TestShardModule(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=1)
+    @patch("hyper_parallel.core.shard.api.dist.get_world_size", return_value=1)
     def test_world_size_one_returns_none(self, mock_get_world_size):
         """When world_size==1, shard_module returns None immediately."""
         model = MagicMock()
@@ -423,7 +422,7 @@ class TestShardModule(unittest.TestCase):
         result = shard_api.shard_module(model, mesh, plan)
         self.assertIsNone(result)
 
-    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    @patch("hyper_parallel.core.shard.api.dist.get_world_size", return_value=2)
     def test_invalid_sharding_plan_type_raises(self, mock_get_world_size):
         """Passing a dict instead of ShardingPlan raises TypeError."""
         model = MagicMock()
@@ -433,7 +432,7 @@ class TestShardModule(unittest.TestCase):
             shard_api.shard_module(model, mesh, {"w": (Shard(0),)})
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    @patch("hyper_parallel.core.shard.api.dist.get_world_size", return_value=2)
     def test_callable_is_wrapped_when_not_module(self, mock_get_world_size, mock_mesh_platform):
         """When model is not a Module, _shard_callable wraps it."""
         _make_mesh(mock_mesh_platform, (2,), ("dp",))
@@ -447,7 +446,7 @@ class TestShardModule(unittest.TestCase):
         self.assertIs(result, my_func)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    @patch("hyper_parallel.core.shard.api.dist.get_world_size", return_value=2)
     def test_input_plan_must_be_dict(self, mock_get_world_size, mock_mesh_platform):
         """Non-dict input_plan raises TypeError."""
         _make_mesh(mock_mesh_platform, (2,), ("dp",))
@@ -460,7 +459,7 @@ class TestShardModule(unittest.TestCase):
             shard_api.shard_module(model, mesh, plan)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    @patch("hyper_parallel.core.shard.api.dist.get_world_size", return_value=2)
     def test_output_plan_must_be_dict(self, mock_get_world_size, mock_mesh_platform):
         """Non-dict output_plan raises TypeError."""
         _make_mesh(mock_mesh_platform, (2,), ("dp",))
@@ -914,7 +913,7 @@ class TestShardModuleWithPlan(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    @patch("hyper_parallel.core.shard.api.dist.get_world_size", return_value=2)
     def test_callable_with_full_plan(self, mock_get_world_size, mock_mesh):
         """shard_module with plan + input_plan + output_plan + return_local_tensor (callable)."""
         _make_mesh(mock_mesh, (2,), ("dp",))
@@ -933,7 +932,7 @@ class TestShardModuleWithPlan(unittest.TestCase):
         self.assertTrue(callable(result))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    @patch("hyper_parallel.core.shard.api.dist.get_world_size", return_value=2)
     def test_param_not_found_raises_value_error(self, mock_get_world_size, mock_mesh):
         """shard_module raises ValueError when param not found in model."""
         _make_mesh(mock_mesh, (2,), ("dp",))
@@ -945,7 +944,7 @@ class TestShardModuleWithPlan(unittest.TestCase):
             shard_api.shard_module(model, mesh, plan)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    @patch("hyper_parallel.core.shard.api.dist.get_world_size", return_value=2)
     def test_param_layout_not_layout_raises_value_error(self, mock_get_world_size, mock_mesh):
         """shard_module raises ValueError when layout is not a Layout instance."""
         _make_mesh(mock_mesh, (2,), ("dp",))
@@ -957,7 +956,7 @@ class TestShardModuleWithPlan(unittest.TestCase):
             shard_api.shard_module(model, mesh, plan)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.api.get_world_size", return_value=2)
+    @patch("hyper_parallel.core.shard.api.dist.get_world_size", return_value=2)
     def test_param_found_and_applied(self, mock_get_world_size, mock_mesh):
         """shard_module applies layout to found parameter and returns model."""
         _make_mesh(mock_mesh, (2,), ("dp",))

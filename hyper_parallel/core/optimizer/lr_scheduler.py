@@ -109,7 +109,8 @@ def get_cosine_schedule_with_warmup(
             return min_lr_ratio
 
         progress = float(current_step - num_warmup_steps) / float(max(1, lr_decay_steps - num_warmup_steps))
-        assert 0 <= progress <= 1
+        if not 0 <= progress <= 1:
+            raise ValueError(f"cosine schedule progress must be in [0, 1], but got {progress}")
         factor = 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))
         factor = factor * (1 - min_lr_ratio) + min_lr_ratio
         return max(0, factor)

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import yaml
 
@@ -307,7 +307,20 @@ def _extract_required_fields(
     return pp_degree, num_layer, micro_batch_num
 
 
-def _extract_optional_fields(pipeline_cfg: dict) -> tuple[int, bool, int, int, int, bool, float, bool]:
+class _OptionalPipelineFields(NamedTuple):
+    """Typed optional settings, preserving tuple unpacking for existing callers."""
+
+    num_of_interleave: int
+    vpp_less_memory: bool
+    optimization_level: int
+    memory_limit: int
+    constant_memory: int
+    enable_simulation: bool
+    sim_comm_time: float
+    use_backward_time: bool
+
+
+def _extract_optional_fields(pipeline_cfg: dict) -> _OptionalPipelineFields:
     """Extract and type-convert optional pipeline configuration fields.
 
     Range validation is delegated to :meth:`YamlOptimizationConfig.validate`
@@ -362,7 +375,7 @@ def _extract_optional_fields(pipeline_cfg: dict) -> tuple[int, bool, int, int, i
         "pipeline_config.use_backward_time",
     )
 
-    return (
+    return _OptionalPipelineFields(
         num_of_interleave, vpp_less_memory, optimization_level,
         memory_limit, constant_memory, enable_simulation, sim_comm_time,
         use_backward_time,
@@ -415,24 +428,13 @@ def parse_yaml_for_optimization(yaml_path: str) -> YamlOptimizationConfig:
     pp_degree, num_layer, micro_batch_num = _extract_required_fields(
         pipeline_cfg, yaml_path,
     )
-    (
-        num_of_interleave, vpp_less_memory, optimization_level,
-        memory_limit, constant_memory, enable_simulation, sim_comm_time,
-        use_backward_time,
-    ) = _extract_optional_fields(pipeline_cfg)
+    optional_fields = _extract_optional_fields(pipeline_cfg)
 
     config = YamlOptimizationConfig(
         pp_degree=pp_degree,
         num_layer=num_layer,
         micro_batch_num=micro_batch_num,
-        num_of_interleave=num_of_interleave,
-        vpp_less_memory=vpp_less_memory,
-        optimization_level=optimization_level,
-        memory_limit=memory_limit,
-        constant_memory=constant_memory,
-        enable_simulation=enable_simulation,
-        sim_comm_time=sim_comm_time,
-        use_backward_time=use_backward_time,
+        **optional_fields._asdict(),
     )
     config.validate()
     return config

@@ -19,7 +19,6 @@ import unittest
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 

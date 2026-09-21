@@ -31,7 +31,6 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch
 from torch import nn
@@ -45,6 +44,7 @@ from hyper_parallel.compile.tracer.graph_tracer import trace_model_graph
 # ---------------------------------------------------------------------------
 # Helper: build a minimal model + joint FX graph for testing.
 # ---------------------------------------------------------------------------
+
 
 class TinyModel(nn.Module):
     """A 2-parameter model: linear + bias, suitable for FX tracing."""
@@ -61,16 +61,18 @@ def _make_joint_graph(model, input_tensor, label_tensor):
     """Trace a joint fwd+bwd graph and return the GraphModule."""
     # pylint: disable=C0415
 
-    def train_fn(mdl, inp, lbl):
-        out = mdl(inp)
-        return nn.functional.mse_loss(out, lbl)
+    def train_fn(mdl, *, inp, lbl):
+        return nn.functional.mse_loss(mdl(inp), lbl)
 
-    return trace_model_graph(model, train_fn, input_tensor, label_tensor)
+    return trace_model_graph(
+        model, train_fn, {"inp": input_tensor, "lbl": label_tensor}
+    )
 
 
 # ---------------------------------------------------------------------------
 # Tests: fsdp_degree resolution (TP+FSDP hybrid)
 # ---------------------------------------------------------------------------
+
 
 class TestFsdpDegreeResolution(unittest.TestCase):
     """FSDPPass must use ``pass_config.fsdp_degree`` when set, not
@@ -97,8 +99,11 @@ class TestFsdpDegreeResolution(unittest.TestCase):
 
         pass_obj = FSDPPass(pass_plan=plan)
         pass_obj.run(
-            self.joint.graph_module, config,
-            model=self.model, fsdp_group_name="fsdp", pass_plan=plan,
+            self.joint.graph_module,
+            config,
+            model=self.model,
+            fsdp_group_name="fsdp",
+            pass_plan=plan,
         )
 
         self.assertEqual(pass_obj._fsdp_degree, 2)
@@ -107,6 +112,7 @@ class TestFsdpDegreeResolution(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Tests: _shard_live_model_params uses local rank (TP+FSDP fix)
 # ---------------------------------------------------------------------------
+
 
 class TestShardLiveModelParamsRank(unittest.TestCase):
     """The shard step must use the FSDP group's local rank, not the global
@@ -139,8 +145,11 @@ class TestShardLiveModelParamsRank(unittest.TestCase):
 
         pass_obj = FSDPPass(pass_plan=plan)
         pass_obj.run(
-            self.joint.graph_module, config,
-            model=self.model, fsdp_group_name="fsdp", pass_plan=plan,
+            self.joint.graph_module,
+            config,
+            model=self.model,
+            fsdp_group_name="fsdp",
+            pass_plan=plan,
         )
 
         # weight dim 0 should be halved (4 -> 2)
@@ -150,6 +159,7 @@ class TestShardLiveModelParamsRank(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Tests: TracingContext (TP communication tracing fix)
 # ---------------------------------------------------------------------------
+
 
 class TestTracingContextAvailable(unittest.TestCase):
     """The tracer sets up a ``TracingContext`` during make_fx — this is what
@@ -164,15 +174,17 @@ class TestTracingContextAvailable(unittest.TestCase):
         inp = torch.randn(2, 8)
         lbl = torch.randn(2, 4)
 
-        def train_fn(mdl, i, l):
+        def train_fn(mdl, *, i, l):
             return nn.functional.mse_loss(mdl(i), l)
 
-        joint = trace_model_graph(model, train_fn, inp, lbl)
+        joint = trace_model_graph(model, train_fn, {"i": inp, "l": lbl})
 
         from hyper_parallel.compile.tracer.graph_tracer import extract_module_state
+
         state = extract_module_state(model)
         state_flat, _ = torch.utils._pytree.tree_flatten({"model": state})
-        flat_inputs = list(state_flat) + [inp, lbl]
+        user_flat, _ = torch.utils._pytree.tree_flatten({"i": inp, "l": lbl})
+        flat_inputs = list(state_flat) + list(user_flat)
 
         with torch.no_grad():
             outputs = joint.graph_module(*flat_inputs)
@@ -230,9 +242,13 @@ class TestModelStructure(unittest.TestCase):
     @classmethod
     def setUpClass(cls):  # pylint: disable=C0202
         cls.cfg = LlamaConfig(
-            vocab_size=100, hidden_size=32, intermediate_size=64,
-            num_hidden_layers=2, num_attention_heads=4,
-            num_key_value_heads=2, max_position_embeddings=128,
+            vocab_size=100,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
         )
 
     def _build(self):
@@ -275,9 +291,9 @@ class TestRotaryEmbedding(unittest.TestCase):
         cos, sin = rope(16)
 
         # Reference: inv_freq = theta^(-2i/dim), freqs = outer(pos, inv_freq)
-        inv_freq = 1.0 / (10000.0 ** (
-            torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim
-        ))
+        inv_freq = 1.0 / (
+            10000.0 ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
         pos = torch.arange(16, dtype=torch.float32)
         ref_freqs = torch.outer(pos, inv_freq)
         ref_emb = torch.cat((ref_freqs, ref_freqs), dim=-1)
@@ -289,9 +305,13 @@ class TestRotaryEmbedding(unittest.TestCase):
     def test_rope_applied_to_qk(self):
         """Q and K are rotated by rotary_emb inside Attention.forward."""
         cfg = LlamaConfig(
-            vocab_size=100, hidden_size=32, intermediate_size=64,
-            num_hidden_layers=1, num_attention_heads=4,
-            num_key_value_heads=2, max_position_embeddings=128,
+            vocab_size=100,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
         )
         attn = GroupQueryAttention(cfg)
         torch.manual_seed(0)
@@ -308,8 +328,13 @@ class TestDataSampler(unittest.TestCase):
     def test_sp_data_sampler_yields_full_sequence(self):
         """DataSampler always yields full-sequence data, even in SP mode."""
         sampler_sp = DataSampler(
-            vocab_size=100, batch_size=2, seq_len=128, max_steps=1,
-            tp_size=2, tp_rank=0, sequence_parallel=True,
+            vocab_size=100,
+            batch_size=2,
+            seq_len=128,
+            max_steps=1,
+            tp_size=2,
+            tp_rank=0,
+            sequence_parallel=True,
             device=torch.device("cpu"),
         )
         inp, lbl = sampler_sp.sample()
@@ -317,8 +342,13 @@ class TestDataSampler(unittest.TestCase):
         self.assertEqual(lbl.shape, (2, 128))
 
         sampler_no_sp = DataSampler(
-            vocab_size=100, batch_size=2, seq_len=128, max_steps=1,
-            tp_size=2, tp_rank=0, sequence_parallel=False,
+            vocab_size=100,
+            batch_size=2,
+            seq_len=128,
+            max_steps=1,
+            tp_size=2,
+            tp_rank=0,
+            sequence_parallel=False,
             device=torch.device("cpu"),
         )
         inp2, lbl2 = sampler_no_sp.sample()
@@ -332,9 +362,13 @@ class TestForwardBackward(unittest.TestCase):
     @classmethod
     def setUpClass(cls):  # pylint: disable=C0202
         cls.cfg = LlamaConfig(
-            vocab_size=100, hidden_size=32, intermediate_size=64,
-            num_hidden_layers=2, num_attention_heads=4,
-            num_key_value_heads=2, max_position_embeddings=128,
+            vocab_size=100,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
         )
 
     def _build(self):
@@ -369,9 +403,13 @@ class TestFactory(unittest.TestCase):
     def test_factory_returns_automodel(self):
         """build_model returns an AutoModelAdapterForCausalLM."""
         cfg_dict = {
-            "vocab_size": 100, "hidden_size": 32, "intermediate_size": 64,
-            "num_hidden_layers": 1, "num_attention_heads": 4,
-            "num_key_value_heads": 2, "max_position_embeddings": 128,
+            "vocab_size": 100,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 128,
             "torch_dtype": "float32",
         }
         model = build_model(cfg_dict, torch.device("cpu"))

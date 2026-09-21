@@ -38,7 +38,6 @@ import math
 import os
 import shutil
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"  # pylint: disable=wrong-import-position
 
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402

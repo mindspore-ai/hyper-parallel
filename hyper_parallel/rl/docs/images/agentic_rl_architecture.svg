@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="590" viewBox="0 0 1280 590" role="img" aria-labelledby="title description">
+  <title id="title">Agentic RL 与 Hyper-RL 的训练流程</title>
+  <desc id="description">数据经 SyncTrainer 转为 PromptRecord，内部或外部 runner 使用共享 vLLM 生成 Trajectory，随后构建 ExperienceBatch 更新 Actor，并发布新策略。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M1 1 L9 5 L1 9 Z" fill="#52657a"/>
+    </marker>
+    <marker id="publish-arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M1 1 L9 5 L1 9 Z" fill="#b46b23"/>
+    </marker>
+    <style>
+      .background { fill: #f7f9fc; }
+      .box { fill: #ffffff; stroke: #b6c4d3; stroke-width: 2; rx: 14; }
+      .runner { fill: #eaf2ff; stroke: #7fa8d8; }
+      .shared { fill: #e8f6f1; stroke: #79b8a2; }
+      .output { fill: #f1edff; stroke: #a995d1; }
+      .heading { fill: #23344a; font: 700 27px Arial, "Microsoft YaHei", sans-serif; }
+      .label { fill: #23344a; font: 600 21px Arial, "Microsoft YaHei", sans-serif; text-anchor: middle; }
+      .small { fill: #52657a; font: 17px Arial, "Microsoft YaHei", sans-serif; text-anchor: middle; }
+      .edge { fill: none; stroke: #52657a; stroke-width: 2.5; marker-end: url(#arrow); }
+      .publish { fill: none; stroke: #b46b23; stroke-width: 2.5; stroke-dasharray: 8 7; marker-end: url(#publish-arrow); }
+    </style>
+  </defs>
+
+  <rect class="background" width="1280" height="590"/>
+  <text class="heading" x="48" y="51">Agentic RL：交互与训练共用一条数据链路</text>
+
+  <rect class="box" x="48" y="90" width="180" height="76"/>
+  <text class="label" x="138" y="136">数据集</text>
+  <rect class="box" x="287" y="90" width="190" height="76"/>
+  <text class="label" x="382" y="136">SyncTrainer</text>
+  <rect class="box" x="536" y="90" width="208" height="76"/>
+  <text class="label" x="640" y="136">PromptRecord</text>
+  <rect class="box runner" x="803" y="90" width="220" height="76"/>
+  <text class="label" x="913" y="127">选择 runner</text>
+  <text class="small" x="913" y="150">agentic.runner</text>
+  <path class="edge" d="M228 128 H279"/>
+  <path class="edge" d="M477 128 H528"/>
+  <path class="edge" d="M744 128 H795"/>
+
+  <rect class="box runner" x="618" y="218" width="220" height="76"/>
+  <text class="label" x="728" y="253">AgentRunner</text>
+  <text class="small" x="728" y="277">internal</text>
+  <rect class="box runner" x="892" y="218" width="290" height="76"/>
+  <text class="label" x="1037" y="253">ProgramAgentRunner</text>
+  <text class="small" x="1037" y="277">codex / deepseek</text>
+  <path class="edge" d="M913 166 V190 H728 V210"/>
+  <path class="edge" d="M913 166 V190 H1037 V210"/>
+
+  <rect class="box shared" x="625" y="350" width="210" height="76"/>
+  <text class="label" x="730" y="385">共享 vLLM</text>
+  <text class="small" x="730" y="409">同一策略版本</text>
+  <rect class="box shared" x="921" y="350" width="232" height="76"/>
+  <text class="label" x="1037" y="385">Gateway</text>
+  <text class="small" x="1037" y="409">协议转换与记录</text>
+  <path class="edge" d="M728 294 V342"/>
+  <path class="edge" d="M1037 294 V342"/>
+  <path class="edge" d="M921 388 H843"/>
+
+  <rect class="box output" x="48" y="485" width="198" height="76"/>
+  <text class="label" x="147" y="530">Trajectory</text>
+  <rect class="box output" x="304" y="485" width="244" height="76"/>
+  <text class="label" x="426" y="530">ExperienceBatch</text>
+  <rect class="box output" x="606" y="485" width="205" height="76"/>
+  <text class="label" x="708" y="530">Actor 更新</text>
+  <path class="edge" d="M618 256 H560 V457 H147 V477"/>
+  <path class="edge" d="M892 256 H865 V457 H175 V477"/>
+  <path class="edge" d="M246 523 H296"/>
+  <path class="edge" d="M548 523 H598"/>
+  <path class="publish" d="M811 523 H1200 V446 H730 V434"/>
+  <text class="small" x="1025" y="548">Actor 更新后发布新策略</text>
+</svg>

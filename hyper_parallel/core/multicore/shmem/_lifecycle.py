@@ -16,6 +16,11 @@
 
 from __future__ import annotations
 
+__all__ = [
+    "acquire",
+    "release",
+]
+
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -186,20 +191,13 @@ def release() -> None:
         if _root_uses_distributed:
             dist.barrier(group=_root_group)
 
-        shutdown_succeeded = False
+        _shutdown_failed = True
         try:
             native._shutdown()  # pylint: disable=protected-access
-            shutdown_succeeded = True
         finally:
             _users = 0
             _root_group = None
             _root_uses_distributed = None
             _root_size = None
             _root_ranks = None
-            _shutdown_failed = not shutdown_succeeded
-
-
-__all__ = [
-    "acquire",
-    "release",
-]
+        _shutdown_failed = False

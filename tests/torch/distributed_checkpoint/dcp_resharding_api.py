@@ -31,7 +31,6 @@ from hyper_parallel.core.dtensor.dtensor import distribute_module, distribute_te
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
-from hyper_parallel.platform import get_platform
 from tests.torch.common_net import FullyShardTestNet
 from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
@@ -47,9 +46,8 @@ FULLY_SHARD_MP_POLICY = MixedPrecisionPolicy(
 
 def _make_shared_temp_checkpoint_dir(prefix: str) -> Path:
     """Create one temporary checkpoint directory shared by all distributed ranks."""
-    platform = get_platform()
     path_holder = [None]
-    if platform.get_rank() == 0:
+    if dist.get_rank() == 0:
         path_holder[0] = tempfile.mkdtemp(prefix=prefix)
     dist.broadcast_object_list(path_holder, src=0)
     return Path(path_holder[0])
@@ -78,8 +76,7 @@ def _run_safe_open_reshard_case(
     can know a shard is shared; left off, ``load`` reads every plan alone and the broadcast
     never happens. The cases that do not ask for it keep reading rank by rank as before.
     """
-    platform = get_platform()
-    current_rank = platform.get_rank()
+    current_rank = dist.get_rank()
     load_mesh_size = load_mesh_shape[0] * load_mesh_shape[1]
     mesh_dim_names = ("dp", "tp")
     checkpoint_path = _make_shared_temp_checkpoint_dir(f"test_dcp_safe_open_{case_name}_")
@@ -364,9 +361,8 @@ def test_dcp_safe_open_with_fully_shard_tp_dp_resharding_load() -> None:
     torch.manual_seed(7)
     np.random.seed(7)
 
-    platform = get_platform()
-    current_rank = platform.get_rank()
-    world_size = platform.get_world_size()
+    current_rank = dist.get_rank()
+    world_size = dist.get_world_size()
     checkpoint_path = _make_shared_temp_checkpoint_dir("test_dcp_safe_open_fully_shard_tp_dp_to_tp2_")
 
     try:

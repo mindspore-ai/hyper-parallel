@@ -48,9 +48,11 @@ from torch import nn
 
 
 class FunctionModule(nn.Module):
-    """Wrap an ``autograd.Function`` class as an ``nn.Module`` (boundary FQN
-    mount point).  Transparent to autograd: backward is the Function's own
-    static ``backward``."""
+    """Wrap an ``autograd.Function`` class as an ``nn.Module``.
+
+    This boundary FQN mount point is transparent to autograd: backward is the
+    Function's own static ``backward``.
+    """
 
     def __init__(self, fn: type) -> None:
         """Store the ``autograd.Function`` class wrapped by this module."""

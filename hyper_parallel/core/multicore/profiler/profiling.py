@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+__all__ = []
+
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import struct
@@ -36,9 +38,6 @@ from hyper_parallel.core.multicore.scheduler.config import (
 )
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OperatorNode
 from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
-
-
-__all__ = []
 
 
 CUBE_SLOT_COUNT = NUM_WORKERS_CUBE
@@ -119,6 +118,21 @@ class _ProfileLayout:
             self.aic_record_capacity,
             self.aiv_record_capacity,
         )
+
+
+@dataclass(frozen=True)
+class _CycleTraceConfig:
+    """Resolved hardware and display metadata used while decoding one buffer."""
+
+    rank: int
+    device_id: int | None
+    cycle_frequency_mhz: float
+    detailed_task_names: bool
+    kernel_name: str
+    owner_label: str
+    stage_names: Mapping[int, str]
+    soc_name: str
+    task_stage_names: Mapping[int, str] | None = None
 
 
 def _get_soc_name(device_id: int | None) -> str:
@@ -495,19 +509,26 @@ class _PreparedMegaKernelRuntime:
         return self._metadata.kernel_name
 
     def parse(self, buffer: Any, *, detailed_task_names: bool) -> dict[str, Any]:
-        """Decode one completed invocation buffer."""
+        """Decode one completed invocation buffer.
+
+        Args:
+            buffer: Host-visible bytes copied from the profiling buffer.
+            detailed_task_names: Whether event names include owner and task details.
+        """
         soc_name = _get_soc_name(self._device_id)
         return _parse_cycle_buffer(
-            buffer=buffer,
-            rank=self._rank,
-            device_id=self._device_id,
-            cycle_frequency_mhz=_resolve_cycle_frequency_mhz(soc_name),
-            detailed_task_names=detailed_task_names,
-            kernel_name=self._metadata.kernel_name,
-            owner_label=self._metadata.owner_label,
-            stage_names=self._metadata.stage_names,
-            soc_name=soc_name,
-            task_stage_names=self._metadata.task_stage_names,
+            buffer,
+            _CycleTraceConfig(
+                rank=self._rank,
+                device_id=self._device_id,
+                cycle_frequency_mhz=_resolve_cycle_frequency_mhz(soc_name),
+                detailed_task_names=detailed_task_names,
+                kernel_name=self._metadata.kernel_name,
+                owner_label=self._metadata.owner_label,
+                stage_names=self._metadata.stage_names,
+                soc_name=soc_name,
+                task_stage_names=self._metadata.task_stage_names,
+            ),
             aic_record_capacity=self._layout.aic_record_capacity,
             aiv_record_capacity=self._layout.aiv_record_capacity,
         )
@@ -698,27 +719,62 @@ def _decode_slot_records(
     records = []
     record_offset = slot_offset + CORE_HEADER.size
     for record_index in range(record_count):
-        values = PROFILE_RECORD.unpack_from(raw_buffer, record_offset + record_index * PROFILE_RECORD.size)
-        start_cycle, end_cycle, desc_id, task_id, stage_task_index, owner_id = values
-        if end_cycle < start_cycle:
+        record = PROFILE_RECORD.unpack_from(raw_buffer, record_offset + record_index * PROFILE_RECORD.size)
+        if record[1] < record[0]:
             raise ValueError(
                 f"Profile cycle interval is negative: slot={slot}, record={record_index}, "
-                f"start={start_cycle}, end={end_cycle}"
+                f"start={record[0]}, end={record[1]}"
             )
         records.append(
             {
-                "start_cycle": start_cycle,
-                "end_cycle": end_cycle,
-                "desc_id": desc_id,
-                "task_id": task_id,
-                "stage_task_index": stage_task_index,
-                "owner_id": owner_id,
+                "start_cycle": record[0],
+                "end_cycle": record[1],
+                "desc_id": record[2],
+                "task_id": record[3],
+                "stage_task_index": record[4],
+                "owner_id": record[5],
                 "core_type": core_type,
                 "block_id": block_id,
                 "entry_cycle": entry_cycle,
             }
         )
     return records
+
+
+def _decode_profile_slot(
+    raw_buffer: bytes,
+    slot: int,
+    layout: tuple[int, int, int, int],
+) -> tuple[list[dict[str, int]], int | None, int]:
+    """Decode one initialized slot and return records, entry cycle, and drops."""
+    expected_core_type, expected_block_id, slot_offset, record_capacity = layout
+    header = CORE_HEADER.unpack_from(raw_buffer, slot_offset)
+    if not any(header):
+        return [], None, 0
+    entry_cycle, record_count, dropped_count, core_type, block_id, header_capacity, reserved = header
+    _validate_profile_slot_header(
+        slot,
+        core_type,
+        block_id,
+        expected_core_type,
+        expected_block_id,
+        header_capacity,
+        record_capacity,
+        record_count,
+        reserved,
+    )
+    if record_count == 0:
+        return [], None, dropped_count
+    records = _decode_slot_records(
+        raw_buffer,
+        slot,
+        slot_offset,
+        record_count,
+        core_type,
+        block_id,
+        entry_cycle,
+    )
+    return records, entry_cycle or None, dropped_count
 
 
 def _decode_cycle_records(
@@ -731,30 +787,11 @@ def _decode_cycle_records(
     active_entry_cycles = []
     dropped_records = 0
     for slot, layout in enumerate(_profile_slot_layouts(aic_record_capacity, aiv_record_capacity)):
-        expected_core_type, expected_block_id, slot_offset, record_capacity = layout
-        header = CORE_HEADER.unpack_from(raw_buffer, slot_offset)
-        if not any(header):
-            continue
-        entry_cycle, record_count, dropped_count, core_type, block_id, header_capacity, reserved = header
-        _validate_profile_slot_header(
-            slot,
-            core_type,
-            block_id,
-            expected_core_type,
-            expected_block_id,
-            header_capacity,
-            record_capacity,
-            record_count,
-            reserved,
-        )
+        records, entry_cycle, dropped_count = _decode_profile_slot(raw_buffer, slot, layout)
         dropped_records += dropped_count
-        if record_count == 0:
-            continue
-        if entry_cycle:
+        if entry_cycle is not None:
             active_entry_cycles.append(entry_cycle)
-        raw_records.extend(
-            _decode_slot_records(raw_buffer, slot, slot_offset, record_count, core_type, block_id, entry_cycle)
-        )
+        raw_records.extend(records)
     return raw_records, active_entry_cycles, dropped_records
 
 
@@ -855,30 +892,22 @@ def _duration_trace_event(
 
 def _parse_cycle_buffer(
     buffer: Any,
-    rank: int,
-    device_id: int,
-    cycle_frequency_mhz: float,
-    detailed_task_names: bool,
-    kernel_name: str,
-    owner_label: str,
-    stage_names: Mapping[int, str],
-    soc_name: str,
-    task_stage_names: Mapping[int, str] | None = None,
+    config: _CycleTraceConfig,
+    *,
     aic_record_capacity: int | None = None,
     aiv_record_capacity: int | None = None,
 ) -> dict[str, Any]:
     """Decode a device cycle buffer with already resolved hardware and display metadata."""
-    if cycle_frequency_mhz <= 0:
-        raise ValueError(f"cycle_frequency_mhz must be positive, got {cycle_frequency_mhz}")
-    resolved_stage_names = _resolve_stage_names(stage_names)
-    resolved_task_stage_names = dict(task_stage_names or {})
+    if config.cycle_frequency_mhz <= 0:
+        raise ValueError(f"cycle_frequency_mhz must be positive, got {config.cycle_frequency_mhz}")
+    resolved_stage_names = _resolve_stage_names(config.stage_names)
+    resolved_task_stage_names = dict(config.task_stage_names or {})
     raw_buffer = _as_bytes(buffer)
     aic_record_capacity, aiv_record_capacity, required_buffer_bytes = _resolve_buffer_layout(
         raw_buffer,
         aic_record_capacity,
         aiv_record_capacity,
     )
-    resolved_device_id = rank if device_id is None else device_id
     raw_records, active_entry_cycles, dropped_records = _decode_cycle_records(
         raw_buffer,
         aic_record_capacity,
@@ -892,32 +921,32 @@ def _parse_cycle_buffer(
     anchor_cycle = (
         min(active_entry_cycles) if active_entry_cycles else min(record["start_cycle"] for record in raw_records)
     )
-    trace_events = _thread_metadata_events(rank, resolved_device_id, kernel_name, raw_records)
-    trace_events.extend(
-        _duration_trace_event(
+    resolved_device_id = config.rank if config.device_id is None else config.device_id
+    trace_events = _thread_metadata_events(config.rank, resolved_device_id, config.kernel_name, raw_records)
+    sorted_records = sorted(
+        raw_records,
+        key=lambda item: (item["start_cycle"], item["core_type"], item["block_id"]),
+    )
+    for record in sorted_records:
+        trace_events.append(_duration_trace_event(
             record,
-            rank=rank,
+            rank=config.rank,
             device_id=resolved_device_id,
             anchor_cycle=anchor_cycle,
-            cycle_frequency_mhz=cycle_frequency_mhz,
-            detailed_task_names=detailed_task_names,
-            owner_label=owner_label,
+            cycle_frequency_mhz=config.cycle_frequency_mhz,
+            detailed_task_names=config.detailed_task_names,
+            owner_label=config.owner_label,
             stage_names=resolved_stage_names,
             task_stage_names=resolved_task_stage_names,
-        )
-        for record in sorted(
-            raw_records,
-            key=lambda item: (item["start_cycle"], item["core_type"], item["block_id"]),
-        )
-    )
+        ))
     return {
         "traceEvents": trace_events,
         "megaKernelCycleTrace": {
             "schemaVersion": 1,
-            "rank": rank,
+            "rank": config.rank,
             "deviceId": resolved_device_id,
-            "socName": soc_name,
-            "cycleFrequencyMHz": cycle_frequency_mhz,
+            "socName": config.soc_name,
+            "cycleFrequencyMHz": config.cycle_frequency_mhz,
             "anchorCycle": anchor_cycle,
             "recordCapacityPerCore": {
                 "AIC": aic_record_capacity,
@@ -927,9 +956,9 @@ def _parse_cycle_buffer(
             "recordCount": len(raw_records),
             "droppedRecordCount": dropped_records,
             "profileBufferBytes": required_buffer_bytes,
-            "detailedTaskNames": detailed_task_names,
-            "kernelName": kernel_name,
-            "ownerLabel": owner_label,
+            "detailedTaskNames": config.detailed_task_names,
+            "kernelName": config.kernel_name,
+            "ownerLabel": config.owner_label,
             "warnings": ([] if dropped_records == 0 else [f"Device dropped {dropped_records} cycle trace records"]),
         },
     }

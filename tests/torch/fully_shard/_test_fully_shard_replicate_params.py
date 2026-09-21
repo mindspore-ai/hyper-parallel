@@ -17,7 +17,6 @@
 # pylint: disable=W0611,C0413,C0412,W0613,W0612
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import numpy as np
 import torch
 import torch_npu

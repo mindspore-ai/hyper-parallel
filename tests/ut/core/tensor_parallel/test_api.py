@@ -28,7 +28,6 @@ from unittest.mock import MagicMock, patch
 import torch
 from torch import nn
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.device_mesh import (
     _DEVICE_MESH_MAP,
@@ -42,7 +41,6 @@ from hyper_parallel.core.tensor_parallel.api import (
 )
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
-from hyper_parallel.platform.platform import PlatformType
 
 
 class RecordingParallelStyle(ParallelStyle):
@@ -91,7 +89,6 @@ class TestParallelizeModule(unittest.TestCase):
         _mesh_resources.mesh_stack.clear()
 
     def _setup_mock_platform(self, mock_platform, world_size: int = 4):
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (

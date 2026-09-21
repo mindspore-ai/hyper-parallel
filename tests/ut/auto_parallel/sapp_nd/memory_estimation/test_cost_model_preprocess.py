@@ -29,7 +29,6 @@ Test IDs:
 import os
 import unittest
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 
 def _get_cost_model_config():

@@ -46,9 +46,9 @@ Before creating a new class, check the following in order:
 
 ## `_normalize_*_args` Function
 
-**Purpose:** Unified entry point for all platform call sites (torch / mint / Primitive). Resolves interface differences so that `preprocess` always receives a consistent argument shape regardless of which platform invoked the operator.
+**Purpose:** Unified entry point for every frontend call site (torch / mint / Primitive). Resolves interface differences so that `preprocess` always receives a consistent argument shape regardless of which frontend invoked the operator.
 
-Every operator must define a module-level `_normalize_*_args` function to unify cross-platform interface differences before `preprocess` processes arguments.
+Every operator must define a module-level `_normalize_*_args` function to unify interface differences before `preprocess` processes arguments.
 
 **Must:**
 - Return `(args_tuple, kwargs_dict)`.
@@ -136,13 +136,15 @@ def get_expand_impl(  # pylint: disable=W0237
 - Name all inner closure functions with a leading underscore (e.g. `_expand_impl`, `_row_shard_impl`). Unnamed lambdas are only acceptable for trivial one-expression cases.
 - Define the closure and immediately `return` it — no logic between the closure definition and the return statement.
 - Capture all pre-computed values via closure variables.
-- Use `platform.*` APIs (via the module-level `platform = get_platform()`) for any collective or tensor operations. Do not call `torch.*` or `mindspore.*` directly.
+- Use the shared collective helpers for any distributed operation rather than reaching for a raw
+  framework call inline.
 
 **Must NOT:**
 - Put computation that can be done outside the closure inside the closure — it would execute on every forward pass.
 - Pass `infer_result[1]` (extra_info) to `op_impl` — the dispatch layer calls `op_impl(*local_args, **local_kwargs)` directly; extra_info is only available inside `get_expand_impl`.
 - Raise errors here — all validation must be done in `infer_layout`.
-- Import or call `torch` / `mindspore` directly — use the platform abstraction.
+- Call a raw `dist.*` collective from an op implementation body — go through the shared helpers so
+  the differentiable/eager choice stays explicit.
 
 ---
 

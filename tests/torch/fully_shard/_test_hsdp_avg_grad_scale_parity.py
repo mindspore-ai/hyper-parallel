@@ -20,7 +20,6 @@ from typing import Dict
 
 # pylint: disable=wrong-import-position
 # The platform must be selected before anything imports ``hyper_parallel``.
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import numpy as np
 import torch

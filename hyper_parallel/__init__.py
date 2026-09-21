@@ -15,7 +15,7 @@
 # pylint: disable=undefined-all-variable
 """hyper parallel interface"""
 
-__all__ = ["get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDPModule", "DTensor",
+__all__ = ["DFunction", "fully_shard", "hsdp_sync_stream", "HSDPModule", "DTensor",
            "Layout", "DeviceMesh", "init_device_mesh", "get_current_mesh", "distribute_module",
            "distribute_tensor", "ones", "zeros", "empty", "full", "rand", "randn",
            "Shard", "RaggedShard", "Replicate", "Partial", "Placement",
@@ -36,7 +36,6 @@ __all__ = ["get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDP
 
 from importlib import import_module as _import_module  # pylint: disable=invalid-name
 
-from hyper_parallel.platform import get_platform
 from hyper_parallel.core.shard.dfunction import DFunction
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _mesh_resources, init_device_mesh

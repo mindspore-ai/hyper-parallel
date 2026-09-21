@@ -16,18 +16,15 @@
 import argparse
 import importlib
 import json
+import logging
 import sys
 from pathlib import Path
 
 import torch
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+from hyper_parallel.infer import GenerationConfig, generate
 
-_infer = importlib.import_module("hyper_parallel.infer")
-GenerationConfig = _infer.GenerationConfig
-generate = _infer.generate
+logger = logging.getLogger(__name__)
 
 
 class HFGenerateAdapter(torch.nn.Module):
@@ -257,11 +254,12 @@ def main():
         outputs = _run_alignment(args, model, adapter, input_ids, pad_token_id, eos_token_id)
     result = _build_result(args, tokenizer, input_ids, outputs[:3], outputs[3], device)
     text = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
-    print(text)
+    logger.info("%s", text)
     if args.output:
         Path(args.output).write_text(text + "\n", encoding="utf-8")
     _check_result(result)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     main()

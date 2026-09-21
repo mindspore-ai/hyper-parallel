@@ -1,0 +1,54 @@
+name: 🚀 Feature request
+description: Submit a proposal/request for a new Hyper-Parallel feature
+title: "[Feature]: "
+labels: ["feature"]
+
+body:
+- type: textarea
+  attributes:
+    label: 🚀 功能描述
+    description: >
+      A clear and concise description of the feature proposal. Please outline the motivation for the proposal. Is your feature request related to a specific problem? e.g., *"I'm working on X and would like Y to be possible"*. If this is related to another atomgit issue, please link here too.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: 现有替代方案
+    description: >
+      A description of any alternative solutions or features you've considered, if any.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: 与DFX相关性DF
+    description: >
+      描述一下该功能与DFX的相关性。
+    placeholder: |
+      原则上讲，任何新增功能都需要满足如下条件：
+      - 场景覆盖的业务是否在hyper-parallel的上层应用、竞品方案上已经支持；
+      - 功能是否可以用现有API、新增算子或者新的图优化等多种形式支持；
+      - 功能逻辑相对完整，相对不会导致频繁修改；
+      - 功能的性能增益是否显著；
+      - 是否与现有功能冲突，对其他功能是否有负面影响。
+      - 新增功能性能与DFX产品线的关系。
+- type: textarea
+  attributes:
+    label: 提议的新API
+    description: >
+      描述一下该功能与DFX新增API的相关性，以及对现有API的影响。
+- type: textarea
+  attributes:
+    label: 是否影响现有API
+    description: >
+      描述一下该功能与DFX现有API接口的兼容性问题等。
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: 补充信息
+    description: >
+      添加任何其他上下文或屏幕截图（如相关）。
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!

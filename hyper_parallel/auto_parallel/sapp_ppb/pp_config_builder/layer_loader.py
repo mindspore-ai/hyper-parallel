@@ -28,12 +28,13 @@ try:
     from hyper_parallel.auto_parallel.sapp_ppb.sapp.sapp_pipeline import SappPipeline
     from hyper_parallel.auto_parallel.sapp_ppb.utils import recompute as Recompute
     from hyper_parallel.auto_parallel.sapp_ppb.utils.layer import generate_layers_list
-    SAPP_PPB_AVAILABLE = True
 except ImportError:
     SAPP_PPB_AVAILABLE = False
     SappPipeline = None
     Recompute = None
     generate_layers_list = None  # type: ignore[assignment]
+else:
+    SAPP_PPB_AVAILABLE = True
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +183,8 @@ class LayerBuilder:
         """Whether to use backward time in ILP optimization."""
         return self._use_backward_time
 
-    def _post_process_layers(self, layers: List[Any]) -> None:
+    @staticmethod
+    def _post_process_layers(layers: List[Any]) -> None:
         """Override recompute_considered on HEAD/TAIL layers.
 
         For HEAD/TAIL layers, only NONE recompute is considered.

@@ -405,7 +405,7 @@ consistent intra-group step`）。走 `new_group` 这两个问题都不存在。
 
 ```bash
 # 无 NPU 也可验证（CPU + gloo 后端）
-export HYPER_PARALLEL_PLATFORM=torch HYPER_PARALLEL_TEST_DEVICE_TYPE=cpu
+export HYPER_PARALLEL_TEST_DEVICE_TYPE=cpu
 python -m torch.distributed.run --nproc-per-node=4 -m pytest -s \
     tests/torch/distributed_checkpoint/dcp_async_save.py::test_dcp_async_save_twice_reuses_the_plan_cache
 ```

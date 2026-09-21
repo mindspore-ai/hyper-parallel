@@ -30,6 +30,12 @@ back atomically.
 
 from __future__ import annotations
 
+__all__ = [
+    "qwen3_moe_flash_attention_cp_mask_wrapper",
+    "qwen3_moe_flash_attention_cp_wrapper",
+    "qwen3_moe_flash_attention_ulysses_cp_wrapper",
+]
+
 from functools import wraps
 from typing import Any
 
@@ -276,12 +282,10 @@ def _build_qwen3_moe_flash_attention_ulysses_interface(cp_mesh: Any):
             ulysses_seq_to_head(states, 2, 1, cp_mesh)
             for states in (query_states, key_states, value_states)
         )
-        global_query_length = query_states.shape[2]
-        global_key_length = key_states.shape[2]
         ulysses_attention_mask = _prepare_qwen3_moe_flash_attention_ulysses_mask(
             attention_mask,
-            global_query_length,
-            global_key_length,
+            query_states.shape[2],
+            key_states.shape[2],
         )
         attention_output, attention_weights = run_qwen3_moe_flash_attention(
             module,
@@ -436,10 +440,3 @@ def qwen3_moe_flash_attention_ulysses_cp_wrapper(
             ),
         },
     )
-
-
-__all__ = [
-    "qwen3_moe_flash_attention_cp_mask_wrapper",
-    "qwen3_moe_flash_attention_cp_wrapper",
-    "qwen3_moe_flash_attention_ulysses_cp_wrapper",
-]

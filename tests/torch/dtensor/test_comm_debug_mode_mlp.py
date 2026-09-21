@@ -35,7 +35,6 @@ Coverage:
 """
 import os
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 from pathlib import Path  # pylint: disable=C0413
 

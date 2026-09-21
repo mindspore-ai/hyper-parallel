@@ -930,7 +930,7 @@ def _convert_input_scalar_to_target(
             result = result.to(target_device)
         return result
 
-    mesh, placements = dtensor_info
+    mesh, _ = dtensor_info
     target_device = param.to_local().device
 
     scalar_placements = [Replicate()] * mesh.ndim
@@ -1667,7 +1667,6 @@ def _create_empty_state_tensor(
     dtensor_info = _get_param_dtensor_info(param) if param is not None else None
 
     if dtensor_info is not None:
-        mesh, placements = dtensor_info
         if full_state_dict:
             shape = global_shape
             device = torch.device("cpu") if cpu_offload else param.to_local().device

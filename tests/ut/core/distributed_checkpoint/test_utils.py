@@ -21,10 +21,7 @@ from unittest.mock import patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-import hyper_parallel.platform.platform as _platform_mod
 
-_platform_mod.platform = None
 
 import hyper_parallel.core.distributed_checkpoint.utils as utils_mod
 
@@ -62,8 +59,6 @@ class TestUtil(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild util against the torch platform before every case."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(utils_mod)
 
     def test_infer_intersection_overlapping_1d(self):

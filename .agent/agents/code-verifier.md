@@ -27,7 +27,7 @@ git diff --cached --name-only
 ```
 
 Route: `hyper_parallel/**` → style+pylint+tests · `tests/**` → style+pytest ·
-`ops/yaml` ↔ `parallel_*.py` pairing · `platform/torch|mindspore` → parity ·
+`ops/yaml` ↔ `parallel_*.py` pairing · `core/collectives` → collective semantics ·
 C/C++ → clang-format · md → markdownlint.
 
 ### 2 — Style & lint
@@ -46,10 +46,11 @@ Prefer path-scoped pytest; else `autogit.py test` (`tests/ut`). Skip
 distributed ST without GPU/NPU and document skips. Patterns:
 `.agent/rules/testing.md`.
 
-### 4 — Cross-platform
+### 4 — Collective semantics
 
-If `platform/torch|mindspore` changed → counterpart + `platform/platform.py` API.
-If `core/` changed → no direct `torch`/`mindspore` imports (`get_platform()`).
+If a shared collective helper changed → every caller gets the same signature and
+device/group semantics. If `core/shard/ops/` changed → the `_normalize_*_args`
+route still resolves each frontend (torch / mint / Primitive).
 
 ### 5 — Report
 

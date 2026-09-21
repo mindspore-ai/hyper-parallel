@@ -71,10 +71,9 @@ class SimpleBlendedDataset:
     def _build_interleaved_locations(self) -> list[tuple[int, int]]:
         """Alternate over non-empty Datasets until every sample is exposed."""
         max_size = max(len(dataset) for dataset in self.datasets)
-        locations = [
-            (dataset_id, sample_id)
-            for sample_id in range(max_size)
-            for dataset_id, dataset in enumerate(self.datasets)
-            if sample_id < len(dataset)
-        ]
+        locations = []
+        for sample_id in range(max_size):
+            for dataset_id, dataset in enumerate(self.datasets):
+                if sample_id < len(dataset):
+                    locations.append((dataset_id, sample_id))
         return locations

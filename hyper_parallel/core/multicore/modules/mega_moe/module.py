@@ -16,8 +16,11 @@
 
 from __future__ import annotations
 
+__all__ = ["MegaMoeExperts"]
+
 import math
 import os
+import struct
 from typing import Any
 
 import torch
@@ -32,7 +35,33 @@ from .route import prepare_topk_route, restore_topk_output
 from .spec import _COMMUNICATION_SPLIT, bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace, configure_symmetric_heap
 
-__all__ = ["MegaMoeExperts"]
+
+def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
+    """Validate a positive clamp value that survives float32 serialization."""
+    if swiglu_limit is None:
+        return
+    valid_type = isinstance(swiglu_limit, (int, float)) and not isinstance(
+        swiglu_limit, bool
+    )
+    try:
+        encoded_limit = (
+            struct.unpack("<f", struct.pack("<f", float(swiglu_limit)))[0]
+            if valid_type
+            else 0.0
+        )
+        valid_value = (
+            valid_type
+            and math.isfinite(swiglu_limit)
+            and math.isfinite(encoded_limit)
+            and encoded_limit > 0
+        )
+    except (OverflowError, TypeError, ValueError, struct.error):
+        valid_value = False
+    if not valid_value:
+        raise ValueError(
+            "swiglu_limit must be None or a finite positive float32-representable number, "
+            f"got {swiglu_limit!r}."
+        )
 
 
 def _create_mega_moe_parameters(
@@ -119,6 +148,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         expert_capacity_factor: float | None = None,
+        swiglu_limit: float | None = None,
         ep_size: int = 1,
         ep_group: Any | None = None,
         create_parameters: bool = True,
@@ -136,6 +166,10 @@ class MegaMoeExperts(MulticoreModule):
                 ``None`` reserves the maximum lossless capacity. A finite value
                 of at least 1.0 reserves that multiple of the local routed rows
                 and raises a clear error if a route exceeds it.
+            swiglu_limit: Optional positive, finite float32-representable clamp
+                limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
+                the up branch is clamped to ``[-limit, limit]``. ``None``
+                preserves the legacy unclamped path.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
@@ -154,10 +188,13 @@ class MegaMoeExperts(MulticoreModule):
             num_experts=num_experts,
             top_k=top_k,
             expert_capacity_factor=expert_capacity_factor,
+            swiglu_limit=swiglu_limit,
             ep_size=ep_size,
         )
         if expert_capacity_factor is not None:
             expert_capacity_factor = float(expert_capacity_factor)
+        if swiglu_limit is not None:
+            swiglu_limit = float(swiglu_limit)
         specification = {
             "local_num_tokens": local_num_tokens,
             "hidden_size": hidden_size,
@@ -165,6 +202,7 @@ class MegaMoeExperts(MulticoreModule):
             "num_experts": num_experts,
             "top_k": top_k,
             "expert_capacity_factor": expert_capacity_factor,
+            "swiglu_limit": swiglu_limit,
             "ep_size": ep_size,
             "ep_group": ep_group,
             "dispatch_mode": dispatch_mode,
@@ -176,6 +214,7 @@ class MegaMoeExperts(MulticoreModule):
             num_experts,
             top_k,
             expert_capacity_factor,
+            swiglu_limit,
             ep_size,
             id(ep_group),
             dispatch_mode,
@@ -192,6 +231,7 @@ class MegaMoeExperts(MulticoreModule):
         self.top_k = top_k
         self.expert_capacity_factor = expert_capacity_factor
         self.dispatch_mode = dispatch_mode
+        self.swiglu_limit = swiglu_limit
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
         self._ep_group = ep_group
@@ -212,6 +252,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         expert_capacity_factor: float | None,
+        swiglu_limit: float | None,
         ep_size: int,
     ) -> None:
         """Validate static shape and topology values before allocation."""
@@ -239,6 +280,7 @@ class MegaMoeExperts(MulticoreModule):
                 "local_num_tokens must be divisible by the fixed communication "
                 f"split {_COMMUNICATION_SPLIT}, got {local_num_tokens}."
             )
+        _validate_swiglu_limit(swiglu_limit)
         if expert_capacity_factor is None:
             return
         valid_factor_type = isinstance(

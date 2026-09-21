@@ -4,8 +4,7 @@ description: Rules for distributed system code (DTensor, collectives, stream syn
 paths:
   - hyper_parallel/core/**
   - hyper_parallel/collectives/**
-  - hyper_parallel/platform/torch/fully_shard/**
-  - hyper_parallel/platform/mindspore/fully_shard/**
+  - hyper_parallel/distributed/**
 ---
 
 # Distributed Systems
@@ -18,33 +17,24 @@ paths:
 - Use `SkipDTensorDispatch` context manager when operating on raw local tensors inside gradient hooks
 - Distributed ops are registered via YAML in `core/shard/ops/yaml/`; implementations in `core/shard/ops/parallel_*.py`
 
-## Platform API Calling Conventions
+## Collective Calling Conventions
 
-These Platform conventions apply to framework-neutral components. The Torch-only
-`hyper_parallel/core/multicore/` component uses direct Torch APIs instead. Stream ordering,
-autograd correctness, and memory-lifetime requirements below still apply to Multicore.
+The `platform/` abstraction is gone — these conventions now apply to direct Torch calls and to
+the shared wrappers in `core/context_parallel/utils.py` and `core/dtensor/_utils.py`. Stream
+ordering, autograd correctness, and memory-lifetime requirements below still apply everywhere.
 
-### Module-level `platform` vs `self.platform`
+### `differentiable_*` vs eager collectives
 
-- **Always use module-level `platform = get_platform()`** — never store platform as `self.platform` on instances
-- If you see `self.platform` in existing code, treat it as a bug and fix it to use the module-level `platform`
-
-### `differentiable_*` vs non-differentiable collective APIs
-
-- Code in `TensorRedistribution` and any forward/backward computation path **must** use `platform.differentiable_all_reduce`, `platform.differentiable_reduce_scatter`, etc.
-- Non-differentiable versions (`platform.all_reduce`, `platform.reduce_scatter`) are only for contexts outside autograd (e.g., parameter sync, buffer broadcast)
-- When adding a new collective call, ask: "Does this tensor need gradients?" — if yes, use `differentiable_*`
+- Code in `TensorRedistribution` and any forward/backward computation path **must** use the `differentiable_*` helpers, not the eager ones.
+- Eager `dist.all_reduce` / `dist.reduce_scatter_tensor` are only for contexts outside autograd (e.g., parameter sync, buffer broadcast).
+- When adding a new collective call, ask: "Does this tensor need gradients?" — if yes, use `differentiable_*`.
 
 ### `group` vs `group_info` parameter types
 
-- `platform.all_reduce`, `platform.all_gather_into_tensor`, `platform.reduce_scatter_tensor` expect a **`group_info` object** with `.group` attribute (Torch) or a `str` (MindSpore)
-- `platform.differentiable_all_reduce`, `platform.differentiable_reduce_scatter` expect a **raw `group`** (ProcessGroup or str)
-- `platform.create_group()` returns a **raw group** — wrap it with `SimpleNamespace(group=group)` before passing to non-differentiable APIs
-- When calling any collective API, **check the platform base class signature** in `platform/platform.py` to confirm the expected parameter type
-
-## Communication Ops
-
-- MindSpore platform: use `mindspore.ops.function.comm_func` (or `mindspore.ops.communication`), NOT the deprecated `mindspore.communication.comm_func`
+- The eager helpers in `core/context_parallel/utils.py` expect a **`group_info` object** with a `.group` attribute.
+- The `differentiable_*` helpers in `core/dtensor/_utils.py` expect a **raw group**.
+- `create_group()` (`core/dtensor/_utils.py`) returns a **raw group** — wrap it with `SimpleNamespace(group=group)` before passing it to an eager helper.
+- When in doubt, read the wrapper signature before wiring a call.
 
 ## Stream Synchronization
 

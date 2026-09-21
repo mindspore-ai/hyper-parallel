@@ -30,7 +30,7 @@ Applies to all distributed operator tests under `tests/`. Two test layers are re
 
 **Must NOT:**
 
-- Call `get_platform()` or use any platform instance — platform is mocked via `@patch` in UT.
+- Reach for a real process group or device — the distributed calls are mocked via `@patch` in UT.
 - Add `@arg_mark` to UT tests — that decorator is for ST only.
 
 **infer_layout calls:** pass a single `cache_values` list — `op.infer_layout(cache_values)`, not `op.infer_layout(layouts, extra_args)`.

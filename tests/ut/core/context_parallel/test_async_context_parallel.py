@@ -21,14 +21,12 @@ import numpy as np
 import torch
 from torch import nn
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.context_parallel import async_context_parallel as async_cp_module  # noqa: E402
 from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP, init_device_mesh  # noqa: E402
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard  # noqa: E402
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
-from hyper_parallel.platform.platform import PlatformType  # noqa: E402
 
 
 class _FakeTwoDMesh:
@@ -188,7 +186,6 @@ class TestAsyncContextParallelKwargs(unittest.TestCase):
 
 def _setup_mock_mesh_platform(mock_platform, world_size, rank=0):
     """Configure a mocked device-mesh platform for CPU-only DTensor tests."""
-    mock_platform.platform_type = PlatformType.PYTORCH
     mock_platform.get_rank.return_value = rank
     mock_platform.get_world_size.return_value = world_size
     mock_platform.tensor_to_numpy.side_effect = (

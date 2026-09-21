@@ -26,7 +26,6 @@ Covers:
 """
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"  # pylint: disable=wrong-import-position
 
 import pytest  # noqa: E402
 import torch  # noqa: E402

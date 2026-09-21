@@ -26,10 +26,7 @@ from unittest.mock import patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-import hyper_parallel.platform.platform as _platform_mod
 
-_platform_mod.platform = None
 
 import hyper_parallel.core.distributed_checkpoint.async_persist as staging_mod
 
@@ -52,8 +49,6 @@ class TestAsyncStaging(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the staging module against the torch platform before every case."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(staging_mod)
 
     def test_build_staged_state_dict_copies_tensors_to_cpu(self):
@@ -172,8 +167,6 @@ class TestFileExchange(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the module under test so its enums match the ones these tests pass in."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(staging_mod)
 
     @staticmethod
@@ -291,8 +284,6 @@ class TestResolveAsyncPersistResult(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the module under test and start from an empty plan cache."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(staging_mod)
         staging_mod.StandardSavePlanner.cached_save_result.clear()
 
@@ -409,8 +400,6 @@ class TestCopyDispatch(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the module under test and snapshot its handler registry."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(staging_mod)
         self._registry_backup = dict(staging_mod.DataCopier._registry)
 
@@ -469,8 +458,6 @@ class TestWaitsForTheChildProcess(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the module under test."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(staging_mod)
 
     def test_the_join_wait_blocks_on_the_queue_with_a_timeout(self):

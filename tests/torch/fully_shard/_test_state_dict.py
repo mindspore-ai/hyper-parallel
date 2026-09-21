@@ -28,7 +28,6 @@ Verified scenarios:
   T11 (8-card): meta init -> load_state_dict -> backward (requires_grad regression)
 """
 import os
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import torch

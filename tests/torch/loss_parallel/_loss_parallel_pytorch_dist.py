@@ -26,7 +26,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel import init_device_mesh  # pylint: disable=C0413
 from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0413

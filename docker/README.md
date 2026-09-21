@@ -38,7 +38,7 @@ IMAGE=hyper-parallel:npu bash docker/run_hyper-parallel.sh --name hyper-parallel
 ```bash
 docker exec -it hyper-parallel-npu bash
 source /usr/local/Ascend/cann/set_env.sh
-python3 -c "import hyper_parallel as hp; print(hp.get_platform())"
+python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
 ## 文件说明
@@ -112,7 +112,7 @@ CARDS=auto DEFAULT_CARDS=0,1,2,3 bash docker/run_hyper-parallel.sh
 
 ```bash
 bash docker/run_hyper-parallel.sh --cards 0,1,2,3,4,5,6,7 -- \
-  python3 -c "import hyper_parallel as hp; print(hp.get_platform())"
+  python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
 ## Native 扩展构建
@@ -143,7 +143,7 @@ docker build -f docker/Dockerfile.torch \
 
 ```bash
 source /usr/local/Ascend/cann/set_env.sh
-python3 -c "import hyper_parallel as hp; print(hp.get_platform())"
+python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
 查看包版本：

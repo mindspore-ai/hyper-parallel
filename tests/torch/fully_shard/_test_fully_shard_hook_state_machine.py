@@ -15,7 +15,6 @@
 """Verify Torch fully_shard hook state transitions with activation checkpointing."""
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 os.environ.setdefault("HP_LOG_CONFIG", "FSDP:DEBUG")
 
 # pylint: disable=C0413

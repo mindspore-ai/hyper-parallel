@@ -21,7 +21,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor import dtensor as dtensor_mod
 from hyper_parallel.core.dtensor.dtensor import rand, randn

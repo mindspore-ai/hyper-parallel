@@ -19,7 +19,7 @@ Distributed implementation for Gather operator.
 from typing import Tuple
 
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.core.shard.utils import get_group_local_rank
+from hyper_parallel.core.utils.communication import get_group_local_rank
 from .parallel_ops import DistributedOp
 
 

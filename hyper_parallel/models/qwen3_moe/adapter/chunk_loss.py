@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+__all__ = ["bind_chunk_loss"]
+
 import functools
 from typing import Any
 
@@ -59,46 +61,17 @@ def _align_chunk_loss_inputs(
     return hidden_states, targets
 
 
-def _qwen3_moe_chunk_loss_forward(
+def _assemble_qwen3_moe_chunk_loss(
     model: nn.Module,
-    *,
-    input_ids: torch.LongTensor | None = None,
-    attention_mask: torch.Tensor | None = None,
-    position_ids: torch.LongTensor | None = None,
-    past_key_values: Any | None = None,
-    inputs_embeds: torch.FloatTensor | None = None,
-    use_cache: bool | None = None,
-    output_router_logits: bool | None = None,
-    logits_to_keep: int | torch.Tensor = 0,
+    outputs: Any,
     chunk_loss_targets: torch.Tensor,
     chunk_loss_mask: torch.Tensor | None,
     chunk_loss_chunk_size: int,
     chunk_loss_ignore_index: int,
-    **kwargs: Any,
+    attention_mask: torch.Tensor | None,
+    output_router_logits: bool,
 ) -> ChunkedCausalLMOutput:
-    """Run Qwen3-MoE through final hidden states and skip full logits."""
-    if past_key_values is not None or use_cache:
-        raise ValueError("Qwen3-MoE Chunk Loss training does not support KV cache")
-    if isinstance(logits_to_keep, torch.Tensor) or logits_to_keep != 0:
-        raise ValueError("Qwen3-MoE Chunk Loss requires logits_to_keep=0")
-    if kwargs.get("return_dict") is False:
-        raise ValueError("Qwen3-MoE Chunk Loss requires return_dict=True")
-
-    output_router_logits = (
-        output_router_logits
-        if output_router_logits is not None
-        else bool(getattr(model.config, "output_router_logits", False))
-    )
-    outputs = model.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=None,
-        inputs_embeds=inputs_embeds,
-        use_cache=False,
-        output_router_logits=output_router_logits,
-        **kwargs,
-    )
+    """Build the chunked loss and optional router loss from decoder outputs."""
     hidden_states = outputs.last_hidden_state
     aligned_hidden, aligned_targets = _align_chunk_loss_inputs(
         hidden_states,
@@ -143,6 +116,57 @@ def _qwen3_moe_chunk_loss_forward(
     )
 
 
+def _qwen3_moe_chunk_loss_forward(
+    model: nn.Module,
+    *,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Any | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    use_cache: bool | None = None,
+    output_router_logits: bool | None = None,
+    logits_to_keep: int | torch.Tensor = 0,
+    chunk_loss_targets: torch.Tensor,
+    chunk_loss_mask: torch.Tensor | None,
+    chunk_loss_chunk_size: int,
+    chunk_loss_ignore_index: int,
+    **kwargs: Any,
+) -> ChunkedCausalLMOutput:
+    """Run Qwen3-MoE through final hidden states and skip full logits."""
+    if past_key_values is not None or use_cache:
+        raise ValueError("Qwen3-MoE Chunk Loss training does not support KV cache")
+    if isinstance(logits_to_keep, torch.Tensor) or logits_to_keep != 0:
+        raise ValueError("Qwen3-MoE Chunk Loss requires logits_to_keep=0")
+    if kwargs.get("return_dict") is False:
+        raise ValueError("Qwen3-MoE Chunk Loss requires return_dict=True")
+
+    output_router_logits = (
+        output_router_logits
+        if output_router_logits is not None
+        else bool(getattr(model.config, "output_router_logits", False))
+    )
+    return _assemble_qwen3_moe_chunk_loss(
+        model,
+        model.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=inputs_embeds,
+            use_cache=False,
+            output_router_logits=output_router_logits,
+            **kwargs,
+        ),
+        chunk_loss_targets,
+        chunk_loss_mask,
+        chunk_loss_chunk_size,
+        chunk_loss_ignore_index,
+        attention_mask,
+        output_router_logits,
+    )
+
+
 def bind_chunk_loss(model: nn.Module) -> None:
     """Atomically install the Qwen3-MoE Chunk Loss training forward."""
     if getattr(model, "_hp_qwen3_moe_chunk_loss_bound", False):
@@ -178,6 +202,3 @@ def bind_chunk_loss(model: nn.Module) -> None:
             companion_attrs={"_hp_qwen3_moe_chunk_loss_bound": True},
         )
     )
-
-
-__all__ = ["bind_chunk_loss"]

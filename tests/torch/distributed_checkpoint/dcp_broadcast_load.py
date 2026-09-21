@@ -27,7 +27,6 @@ silently on a zero-filled buffer.
 # pylint: disable=C0413
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import shutil
 from pathlib import Path
@@ -35,13 +34,14 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from hyper_parallel import DTensor
 from hyper_parallel.core.distributed_checkpoint import load, save
 from hyper_parallel.core.distributed_checkpoint.metadata import CHUNK_INFO, ChunkInfo, ChunkStorageMetadata
+from hyper_parallel.core.dtensor._utils import create_group
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_parallel.platform import get_platform
 from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
 _WORLD_SIZE = 4
@@ -72,21 +72,20 @@ _PLAIN_TENSOR_SHAPE = (8, 6)
 
 
 def _setup(seed: int) -> tuple[Any, int]:
-    """Initialize the backend and return the platform plus this rank."""
+    """Initialize the backend and return the process group module plus this rank."""
     init_backend(_DEVICE_TYPE)
     torch.manual_seed(seed)
-    platform = get_platform()
-    world_size = platform.get_world_size()
+    world_size = dist.get_world_size()
     assert world_size == _WORLD_SIZE, f"expect world_size={_WORLD_SIZE}, got {world_size}"
-    return platform, platform.get_rank()
+    return dist, dist.get_rank()
 
 
-def _fresh_checkpoint_dir(platform: Any, rank: int, name: str) -> Path:
+def _fresh_checkpoint_dir(dist_pg: Any, rank: int, name: str) -> Path:
     """Return an empty checkpoint directory, agreed on by every rank."""
     checkpoint_path = Path(f"./{name}")
     if rank == 0 and checkpoint_path.exists():
         shutil.rmtree(checkpoint_path)
-    platform.barrier()
+    dist_pg.barrier()
     return checkpoint_path
 
 
@@ -151,7 +150,7 @@ def _assert_shards_arrived(load_state: dict, expected: dict, rank: int, scenario
         )
 
 
-def _build_groups(platform: Any, rank: int, prebuild_groups: bool) -> Optional[dict]:
+def _build_groups(dist_pg: Any, rank: int, prebuild_groups: bool) -> Optional[dict]:
     """Pre-build the same-shard groups this rank belongs to, or leave them to the load.
 
     ``create_group`` returns a handle only to members of the group, so each rank asks for its
@@ -160,22 +159,22 @@ def _build_groups(platform: Any, rank: int, prebuild_groups: bool) -> Optional[d
     """
     if not prebuild_groups:
         return None
-    return {ranks: platform.create_group(ranks) for ranks in _BROADCAST_GROUP_RANKS if rank in ranks}
+    return {ranks: create_group(ranks) for ranks in _BROADCAST_GROUP_RANKS if rank in ranks}
 
 
 def _run_broadcast_load(scenario: str, checkpoint_name: str, seed: int, prebuild_groups: bool) -> None:
     """Save a (2, 2)-mesh state dict and load it back with broadcasting enabled."""
-    platform, rank = _setup(seed)
+    dist_pg, rank = _setup(seed)
     device_mesh = init_device_mesh(
         device_type=_DEVICE_TYPE, mesh_shape=_MESH_SHAPE, mesh_dim_names=_MESH_DIM_NAMES
     )
-    checkpoint_path = _fresh_checkpoint_dir(platform, rank, checkpoint_name)
+    checkpoint_path = _fresh_checkpoint_dir(dist_pg, rank, checkpoint_name)
 
     state_dict, expected = _build_save_state(device_mesh)
     save(state_dict, checkpoint_id=checkpoint_path, use_collectives=True)
-    platform.barrier()
+    dist_pg.barrier()
 
-    broadcast_groups = _build_groups(platform, rank, prebuild_groups)
+    broadcast_groups = _build_groups(dist_pg, rank, prebuild_groups)
     load_state = _build_poisoned_load_state(device_mesh, rank)
     load(
         load_state,
@@ -186,21 +185,21 @@ def _run_broadcast_load(scenario: str, checkpoint_name: str, seed: int, prebuild
     )
 
     _assert_shards_arrived(load_state, expected, rank, scenario)
-    platform.barrier()
+    dist_pg.barrier()
     if rank == 0:
         shutil.rmtree(checkpoint_path, ignore_errors=True)
 
 
 def _run_plain_tensor_broadcast_load(scenario: str, checkpoint_name: str, prebuild_groups: bool) -> None:
     """Save and load a state dict holding nothing but a CHUNK_INFO-marked plain tensor."""
-    platform, rank = _setup(13)
-    checkpoint_path = _fresh_checkpoint_dir(platform, rank, checkpoint_name)
+    dist_pg, rank = _setup(13)
+    checkpoint_path = _fresh_checkpoint_dir(dist_pg, rank, checkpoint_name)
 
     saved = to_device(torch.randn(*_PLAIN_TENSOR_SHAPE), _DEVICE_TYPE)
     save({_PLAIN_TENSOR_NAME: saved}, checkpoint_id=checkpoint_path, use_collectives=True)
-    platform.barrier()
+    dist_pg.barrier()
 
-    broadcast_groups = _build_groups(platform, rank, prebuild_groups)
+    broadcast_groups = _build_groups(dist_pg, rank, prebuild_groups)
     buffer = _mark_replicated_plain_tensor(_poisoned(_PLAIN_TENSOR_SHAPE, rank))
     load(
         {_PLAIN_TENSOR_NAME: buffer},
@@ -211,7 +210,7 @@ def _run_plain_tensor_broadcast_load(scenario: str, checkpoint_name: str, prebui
     )
 
     _assert_shards_arrived({_PLAIN_TENSOR_NAME: buffer}, {_PLAIN_TENSOR_NAME: saved}, rank, scenario)
-    platform.barrier()
+    dist_pg.barrier()
     if rank == 0:
         shutil.rmtree(checkpoint_path, ignore_errors=True)
 

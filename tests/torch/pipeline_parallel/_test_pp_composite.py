@@ -51,7 +51,6 @@ from __future__ import annotations
 import copy
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from typing import Dict, List, Tuple
 

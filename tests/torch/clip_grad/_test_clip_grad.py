@@ -15,7 +15,6 @@
 """Distributed tests for clip_grad_norm_ FSDP2-aligned precision."""
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import numpy as np  # pylint: disable=C0413
 import torch  # pylint: disable=C0413
 import torch.distributed as dist  # pylint: disable=C0413

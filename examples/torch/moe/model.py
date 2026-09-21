@@ -15,7 +15,7 @@
 """Minimal MoE-style decoder model for Expert Parallelism demos.
 
 Combines a standard Llama-style attention stack with
-:class:`~hyper_parallel.platform.torch.common.moe.MoE` feed-forward layers,
+:class:`~hyper_parallel.components.modules.moe.MoE` feed-forward layers,
 providing a realistic target for :class:`ExpertParallel` sharding.
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Shard as PlShard
-from hyper_parallel.platform.torch.common.moe import (
+from hyper_parallel.components.modules.moe import (
     FeedForward,
     MoE,
 )

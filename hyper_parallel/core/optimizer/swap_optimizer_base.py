@@ -20,9 +20,10 @@ from __future__ import annotations
 import contextlib
 import copy
 import inspect
+import itertools
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -117,18 +118,23 @@ class PipelineSwapRuntime:
         start = 0
         for batch_index in range(swap_times - 1):
             remaining_batches = swap_times - batch_index
-            max_end = len(non_empty_units) - remaining_batches + 1
-            end = start
-            current_cost = 0
-            while end < max_end:
-                next_cost = unit_costs[end]
-                # Compare against the remaining average without introducing floating-point rounding.
+
+            # Compare against the remaining average without introducing floating-point rounding.
+            # Bind the loop state as defaults so the closure captures this iteration's values.
+            def still_gaining(
+                    end: int,
+                    current_cost: int,
+                    next_cost: int,
+                    remaining_batches: int = remaining_batches,
+                    remaining_cost: int = remaining_cost,
+                    start: int = start,
+            ) -> bool:
                 current_distance = abs(remaining_cost - current_cost * remaining_batches)
                 next_distance = abs(remaining_cost - (current_cost + next_cost) * remaining_batches)
-                if end > start and current_distance <= next_distance:
-                    break
-                current_cost += next_cost
-                end += 1
+                return end > start and current_distance <= next_distance
+
+            max_end = len(non_empty_units) - remaining_batches + 1
+            end, current_cost = self._grow_balanced_segment(unit_costs, start, max_end, still_gaining)
             batches.append(non_empty_units[start:end])
             remaining_cost -= current_cost
             start = end
@@ -150,24 +156,40 @@ class PipelineSwapRuntime:
         if self.supports_packed_pipeline(batch_lists):
             return self._run_packed_pipeline(batch_lists, step_context, step_batch)
 
-        self.prefetch(batch_lists[0]) # prefetch 0
-        for index, batch_list in enumerate(batch_lists):
-            self.wait_prefetch(batch_list) # wait_prefetch n
+        try:
+            self.prefetch(batch_lists[0]) # prefetch 0
+            for index, batch_list in enumerate(batch_lists):
+                self.wait_prefetch(batch_list) # wait_prefetch n
 
-            previous_index = index - 1
-            if previous_index >= 0:
-                self.wait_offload(batch_lists[previous_index]) # wait_offload n-1
+                previous_index = index - 1
+                if previous_index >= 0:
+                    self.wait_offload(batch_lists[previous_index]) # wait_offload n-1
 
-            next_index = index + 1
-            if next_index < len(batch_lists):
-                self.prefetch(batch_lists[next_index]) # prefetch n+1
+                next_index = index + 1
+                if next_index < len(batch_lists):
+                    self.prefetch(batch_lists[next_index]) # prefetch n+1
 
-            results.append(step_batch(batch_list, step_context)) # update n
-            self.refresh_swappable_slots(batch_list)
-            self.offload(batch_list) # offload n
+                results.append(step_batch(batch_list, step_context)) # update n
+                self.refresh_swappable_slots(batch_list)
+                self.offload(batch_list) # offload n
 
-        self.wait_offload(batch_lists[-1])
+            self.wait_offload(batch_lists[-1])
+        finally:
+            self._drain_pending_transfers(batch_lists)
         return results
+
+    def _drain_pending_transfers(self, batch_lists: Sequence[Sequence[UpdateUnit]]) -> None:
+        """Settle slots left in an intermediate ``h2d``/``d2h`` state.
+
+        Called from ``run_pipeline``'s ``finally`` so that an exception raised
+        mid-pipeline (for example in ``step_batch``) cannot leave prefetched or
+        offloaded slots holding device storage and a pending stream event. Slots
+        that already reached a terminal state (``device`` or ``host``) are left
+        untouched.
+        """
+        for batch_list in batch_lists:
+            self.wait_prefetch(batch_list)
+            self.wait_offload(batch_list)
 
     def _run_packed_pipeline(
             self,
@@ -211,6 +233,9 @@ class PipelineSwapRuntime:
             self.end_packed_step()
         return results
 
+    # Both hooks below are dispatched through ``self`` from the packed pipeline
+    # above and are overridden per backend, so they stay instance
+    # methods even though the base bodies only discard their arguments.
     def release_packed_step_results(self, results: List[Any]) -> None:
         """Release backend-specific update outputs before staging teardown."""
         del results
@@ -336,9 +361,32 @@ class PipelineSwapRuntime:
                 self.wait_event(event, compute_stream)
             for slot in slots:
                 self.wait_offload_slot(slot)
+                slot.event = None
 
-    def _unit_cost(self, unit: UpdateUnit) -> int:
+    @staticmethod
+    def _unit_cost(unit: UpdateUnit) -> int:
         return sum(slot.storage_nbytes for slot in unit.slots if slot.swappable)
+
+    @staticmethod
+    def _grow_balanced_segment(
+            unit_costs: Sequence[int],
+            start: int,
+            max_end: int,
+            should_stop: Callable[[int, int, int], bool],
+    ) -> Tuple[int, int]:
+        """Extend a segment from ``start`` while ``should_stop`` stays false.
+
+        Returns the exclusive end index and the accumulated cost of ``[start, end)``.
+        """
+        end = start
+        current_cost = 0
+        while end < max_end:
+            next_cost = unit_costs[end]
+            if should_stop(end, current_cost, next_cost):
+                break
+            current_cost += next_cost
+            end += 1
+        return end, current_cost
 
     def _get_copy_stream(self) -> Any:
         if self._copy_stream is None:
@@ -369,7 +417,8 @@ class PipelineSwapRuntime:
         """Return whether ``tensor`` exposes a DTensor local shard."""
         return tensor is not None and callable(getattr(tensor, "to_local", None))
 
-    def validate_packed_devices(self, slots: Sequence[SwapSlot]) -> None:
+    @staticmethod
+    def validate_packed_devices(slots: Sequence[SwapSlot]) -> None:
         """Reject packed host packing when swappable states span multiple local devices.
 
         A packed slot rebinds its live tensor to a CPU host view, so once host
@@ -409,30 +458,40 @@ class PipelineSwapRuntime:
 
         new_buffers: Dict[Any, Any] = {}
         for dtype, dtype_slots in slots_by_dtype.items():
-            total_numel = sum(slot.numel for slot in dtype_slots)
-            host_buffer = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=True)
-            new_buffers[dtype] = host_buffer
-            host_offset = 0
-            for slot in dtype_slots:
-                flat_view = host_buffer.narrow(0, host_offset, slot.numel)
-                host_view = flat_view.view(slot.shape)
-                source = slot.cpu_tensor if slot.cpu_tensor is not None else slot.tensor
-                if source is None:
-                    host_view.zero_()
-                else:
-                    source_tensor = self._storage_tensor(source)
-                    host_view.copy_(source_tensor.detach().reshape(-1).view(slot.shape), non_blocking=False)
-                    if source_tensor.device.type != "cpu" and source is slot.tensor:
-                        self.release_device_storage(slot)
-                slot.host_offset = host_offset
-                slot.cpu_tensor = host_view
-                slot.bind_tensor(host_view)
-                slot.state = "host"
-                slot.event = None
-                host_offset += slot.numel
+            new_buffers[dtype] = self._pack_dtype_slots(dtype, dtype_slots)
 
         self._host_buffers = new_buffers
         self._host_layout_signature = signature
+
+    def _pack_dtype_slots(self, dtype: Any, dtype_slots: Sequence[SwapSlot]) -> Any:
+        """Pack every slot of one dtype into a single pinned host buffer.
+
+        Each slot is re-pointed at its own view inside the new buffer and marked
+        host-resident, so the packed buffer becomes the slot's CPU mirror from
+        here on.  Any device copy that fed the mirror is released immediately
+        afterwards, because the host view now owns the only valid values.
+        """
+        total_numel = sum(slot.numel for slot in dtype_slots)
+        host_buffer = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=True)
+        host_offset = 0
+        for slot in dtype_slots:
+            flat_view = host_buffer.narrow(0, host_offset, slot.numel)
+            host_view = flat_view.view(slot.shape)
+            source = slot.cpu_tensor if slot.cpu_tensor is not None else slot.tensor
+            if source is None:
+                host_view.zero_()
+            else:
+                source_tensor = self._storage_tensor(source)
+                host_view.copy_(source_tensor.detach().reshape(-1).view(slot.shape), non_blocking=False)
+                if source_tensor.device.type != "cpu" and source is slot.tensor:
+                    self.release_device_storage(slot)
+            slot.host_offset = host_offset
+            slot.cpu_tensor = host_view
+            slot.bind_tensor(host_view)
+            slot.state = "host"
+            slot.event = None
+            host_offset += slot.numel
+        return host_buffer
 
     def is_swappable_tensor(self, tensor: Any, min_numel: int) -> bool:
         """Return whether ``tensor`` can participate in swap."""
@@ -493,13 +552,15 @@ class PipelineSwapRuntime:
         cpu_tensor.zero_()
         return cpu_tensor
 
-    def make_device_tensor_like(self, param: Any, saved_tensor: Any) -> Any:
+    @staticmethod
+    def make_device_tensor_like(param: Any, saved_tensor: Any) -> Any:
         """Create a live state tensor on the parameter device."""
         if not isinstance(saved_tensor, torch.Tensor):
             raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
         return saved_tensor.detach().to(device=param.device, dtype=saved_tensor.dtype).clone()
 
-    def make_empty_device_tensor_like(self, param: Any, saved_tensor: Any) -> Any:
+    @staticmethod
+    def make_empty_device_tensor_like(param: Any, saved_tensor: Any) -> Any:
         """Create an uninitialized live state tensor shell on the parameter device."""
         if not isinstance(saved_tensor, torch.Tensor):
             raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
@@ -551,7 +612,8 @@ class PipelineSwapRuntime:
         if storage.size() != 0:
             storage.resize_(0)
 
-    def device_handle(self) -> Any:
+    @staticmethod
+    def device_handle() -> Any:
         """Return the Torch device module (``torch.npu``) that owns streams and events."""
         try:
             return getattr(torch, _DEVICE_TYPE)
@@ -583,7 +645,8 @@ class PipelineSwapRuntime:
             event.record(stream)
         return event
 
-    def wait_event(self, event: Any, stream: Any = None) -> None:
+    @staticmethod
+    def wait_event(event: Any, stream: Any = None) -> None:
         """Make ``stream`` wait for ``event``."""
         if event is None:
             return
@@ -596,12 +659,9 @@ class PipelineSwapRuntime:
         """Make the final, step-specific decision to use the packed pipeline."""
         if not self._packed_enabled or not batches:
             return False
+        units = itertools.chain.from_iterable(batches)
         swappable_slots = [
-            slot
-            for batch in batches
-            for unit in batch
-            for slot in unit.slots
-            if slot.swappable
+            slot for unit in units for slot in unit.slots if slot.swappable
         ]
         if not swappable_slots:
             return False
@@ -630,40 +690,23 @@ class PipelineSwapRuntime:
         to_local = getattr(tensor, "to_local", None)
         return to_local() if callable(to_local) else tensor
 
+    @staticmethod
+    def _first_swappable_slot(batches: Sequence[Sequence[UpdateUnit]]) -> SwapSlot:
+        """Return the first swappable slot across ``batches``, in iteration order."""
+        units = itertools.chain.from_iterable(batches)
+        swappable = (slot for unit in units for slot in unit.slots if slot.swappable)
+        return next(swappable)
+
     def begin_packed_step(self, batches: Sequence[Sequence[UpdateUnit]]) -> None:
         """Build batch transfer plans and materialize two raw staging buffers."""
-        first_slot = next(
-            slot
-            for batch in batches
-            for unit in batch
-            for slot in unit.slots
-            if slot.swappable
-        )
+        first_slot = self._first_swappable_slot(batches)
         # FSDP may leave gradient reductions/reshards queued on auxiliary
         # streams.  A current-stream event cannot cover those streams, so the
         # device-wide synchronization is required before optimizer reads state.
         getattr(torch, first_slot.device.type).synchronize(first_slot.device)
         self._packed_tail_event = None
         self._packed_batch_plans = [self._build_packed_batch_plan(batch) for batch in batches]
-        max_numel_by_dtype: Dict[Any, int] = {}
-        device = None
-        for batch_plan in self._packed_batch_plans:
-            for dtype, region in batch_plan.regions.items():
-                max_numel_by_dtype[dtype] = max(max_numel_by_dtype.get(dtype, 0), region.numel)
-                if device is None and region.slots:
-                    device = region.slots[0].device
-        if device is None:
-            raise RuntimeError("Packed optimizer pipeline has no device-resident state metadata.")
-
-        dtype_layouts = {}
-        byte_offset = 0
-        for dtype in sorted(max_numel_by_dtype, key=str):
-            byte_offset = self._align_bytes(byte_offset)
-            element_size = int(self._host_buffers[dtype].element_size())
-            num_bytes = max_numel_by_dtype[dtype] * element_size
-            dtype_layouts[dtype] = (byte_offset, num_bytes)
-            byte_offset += num_bytes
-        total_bytes = self._align_bytes(byte_offset)
+        dtype_layouts, total_bytes, device = self._packed_layout(self._packed_batch_plans)
 
         for staging_index in range(2):
             arena = self._materialize_staging_arena(staging_index, total_bytes, device)
@@ -766,13 +809,12 @@ class PipelineSwapRuntime:
             # for its tail is sufficient before detaching views and releasing
             # the step-local device allocation.
             self.wait_event(self._packed_tail_event, None)
-        active_slots = {
-            id(slot): slot
-            for batch_plan in self._packed_batch_plans
-            for region in batch_plan.regions.values()
-            for slot in region.slots
-            if slot.state == "device"
-        }
+        active_slots: Dict[int, Any] = {}
+        for batch_plan in self._packed_batch_plans:
+            for region in batch_plan.regions.values():
+                for slot in region.slots:
+                    if slot.state == "device":
+                        active_slots[id(slot)] = slot
         if active_slots:
             compute_stream = self.current_stream()
             synchronize = getattr(compute_stream, "synchronize", None)
@@ -799,7 +841,8 @@ class PipelineSwapRuntime:
         self._packed_offload_events = {}
         self._packed_tail_event = None
 
-    def _build_packed_batch_plan(self, batch: Sequence[UpdateUnit]) -> _PackedBatchPlan:
+    @staticmethod
+    def _build_packed_batch_plan(batch: Sequence[UpdateUnit]) -> _PackedBatchPlan:
         """Group a batch's packed slots into contiguous host regions by dtype."""
         slots_by_dtype: Dict[Any, List[SwapSlot]] = {}
         seen_slots = set()
@@ -873,6 +916,39 @@ class PipelineSwapRuntime:
     @staticmethod
     def _align_bytes(num_bytes: int) -> int:
         return ((num_bytes + _PACKED_ALIGNMENT_BYTES - 1) // _PACKED_ALIGNMENT_BYTES) * _PACKED_ALIGNMENT_BYTES
+
+    def _packed_layout(self, batch_plans: Sequence[_PackedBatchPlan]) -> Tuple[Dict[Any, Tuple[int, int]], int, Any]:
+        """Return the dtype -> (offset, bytes) staging layout shared by every batch."""
+        max_numel_by_dtype: Dict[Any, int] = {}
+        device = None
+        for batch_plan in batch_plans:
+            for dtype, region in batch_plan.regions.items():
+                max_numel_by_dtype[dtype] = max(max_numel_by_dtype.get(dtype, 0), region.numel)
+                if device is None and region.slots:
+                    device = region.slots[0].device
+        if device is None:
+            raise RuntimeError("Packed optimizer pipeline has no device-resident state metadata.")
+
+        dtype_layouts = {}
+        byte_offset = 0
+        for dtype in sorted(max_numel_by_dtype, key=str):
+            byte_offset = self._align_bytes(byte_offset)
+            element_size = int(self._host_buffers[dtype].element_size())
+            num_bytes = max_numel_by_dtype[dtype] * element_size
+            dtype_layouts[dtype] = (byte_offset, num_bytes)
+            byte_offset += num_bytes
+        return dtype_layouts, self._align_bytes(byte_offset), device
+
+
+class GroupArgs(NamedTuple):
+    """Per-parameter argument lists one functional Adam/AdamW step consumes."""
+
+    params: List[Any]
+    grads: List[Any]
+    exp_avgs: List[Any]
+    exp_avg_sqs: List[Any]
+    max_exp_avg_sqs: List[Any]
+    state_steps: List[Any]
 
 
 class OptimizerSwapAdapter:
@@ -986,6 +1062,36 @@ class OptimizerSwapAdapter:
                     slots.extend(self._build_slots(param, state))
         return tuple(slots)
 
+    def _collect_group_args(
+            self,
+            units: Sequence[UpdateUnit],
+            group: Dict[str, Any],
+    ) -> GroupArgs:
+        """Gather the per-parameter argument lists one optimizer step needs.
+
+        Units without a gradient are skipped.  ``max_exp_avg_sqs`` stays empty
+        unless the group is amsgrad, and ``state_steps`` holds ``None`` for new
+        AdamW, which advances the step counter itself.
+        """
+        args = GroupArgs([], [], [], [], [], [])
+        for unit in units:
+            if unit.grad is None:
+                continue
+            state = self.optimizer.state[unit.param]
+            args.params.append(unit.param)
+            args.grads.append(unit.grad)
+            args.exp_avgs.append(self._slot_tensor(unit, "exp_avg", state["exp_avg"]))
+            args.exp_avg_sqs.append(self._slot_tensor(unit, "exp_avg_sq", state["exp_avg_sq"]))
+            if group.get("amsgrad", False):
+                args.max_exp_avg_sqs.append(
+                    self._slot_tensor(unit, "max_exp_avg_sq", state["max_exp_avg_sq"])
+                )
+            if self.is_new_adamw:
+                args.state_steps.append(None)
+            else:
+                args.state_steps.append(state["step"])
+        return args
+
     def step_batch(self, batch: List[UpdateUnit], step_context: Dict[str, Any]) -> None:
         """Run Torch functional Adam/AdamW for one batch."""
         del step_context
@@ -993,103 +1099,115 @@ class OptimizerSwapAdapter:
         for unit in batch:
             by_group[unit.adapter_index].append(unit)
         for group_index, units in by_group.items():
-            group = self.optimizer.param_groups[group_index]
-            state_steps = []
-            params = []
-            grads = []
-            exp_avgs = []
-            exp_avg_sqs = []
-            max_exp_avg_sqs = []
-            for unit in units:
-                if unit.grad is None:
-                    continue
-                state = self.optimizer.state[unit.param]
-                params.append(unit.param)
-                grads.append(unit.grad)
-                exp_avgs.append(self._slot_tensor(unit, "exp_avg", state["exp_avg"]))
-                exp_avg_sqs.append(self._slot_tensor(unit, "exp_avg_sq", state["exp_avg_sq"]))
-                if group.get("amsgrad", False):
-                    max_exp_avg_sqs.append(
-                        self._slot_tensor(unit, "max_exp_avg_sq", state["max_exp_avg_sq"])
-                    )
-                if self.is_new_adamw:
-                    state_steps.append(None)
-                else:
-                    state_steps.append(state["step"])
+            self._step_group(self.optimizer.param_groups[group_index], units)
 
-            if not params:
-                continue
+    def _step_group(self, group: Dict[str, Any], units: List[UpdateUnit]) -> None:
+        """Run one group's parameters through the matching functional Adam/AdamW."""
+        args = self._collect_group_args(units, group)
+        params = args.params
 
-            if self.is_new_adamw:
-                if params and params[0].device.type == "cpu":
-                    # torch.optim._functional.adamw increments tensor state_steps
-                    # internally. New AdamW already advanced group["step"] in
-                    # prepare_step(), so feed step - 1 to preserve outer-step
-                    # semantics for CPU-only tests.
-                    step_tensor = torch.tensor(float(group["step"] - 1), dtype=torch.float32)
-                    torch.optim._functional.adamw(
-                        params,
-                        grads,
-                        exp_avgs,
-                        exp_avg_sqs,
-                        max_exp_avg_sqs,
-                        [step_tensor] * len(params),
-                        amsgrad=group["amsgrad"],
-                        beta1=group["betas"][0],
-                        beta2=group["betas"][1],
-                        lr=group["lr"],
-                        weight_decay=group["weight_decay"],
-                        eps=group["eps"],
-                        maximize=group["maximize"],
-                        foreach=False,
-                        capturable=False,
-                        differentiable=False,
-                        fused=False,
-                        grad_scale=None,
-                        found_inf=None,
-                        has_complex=False,
-                    )
-                else:
-                    _new_adamw_func()(
-                        params,
-                        grads,
-                        exp_avgs,
-                        exp_avg_sqs,
-                        max_exp_avg_sqs,
-                        group["step"],
-                        amsgrad=group["amsgrad"],
-                        beta1=group["betas"][0],
-                        beta2=group["betas"][1],
-                        lr=group["lr"],
-                        weight_decay=group["weight_decay"],
-                        eps=group["eps"],
-                        maximize=group["maximize"],
-                    )
-                continue
+        if not params:
+            return
 
-            func = getattr(torch.optim._functional, self.functional_name)
-            kwargs = {
-                "amsgrad": group["amsgrad"],
-                "beta1": group["betas"][0],
-                "beta2": group["betas"][1],
-                "lr": group["lr"],
-                "weight_decay": group["weight_decay"],
-                "eps": group["eps"],
-                "maximize": group["maximize"],
-                "foreach": False,
-                "capturable": False,
-                "differentiable": False,
-                "fused": bool(group.get("fused", False)),
-                "grad_scale": getattr(self.optimizer, "grad_scale", None),
-                "found_inf": getattr(self.optimizer, "found_inf", None),
-                "has_complex": False,
-            }
-            if self.functional_name == "adam":
-                if "decoupled_weight_decay" in inspect.signature(func).parameters:
-                    kwargs["decoupled_weight_decay"] = self.decoupled_weight_decay or group.get(
-                        "decoupled_weight_decay", False
-                    )
-            func(params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps, **kwargs)
+        if self.is_new_adamw:
+            self._step_new_adamw(
+                group,
+                args.params,
+                args.grads,
+                args.exp_avgs,
+                args.exp_avg_sqs,
+                args.max_exp_avg_sqs,
+            )
+            return
+
+        func = getattr(torch.optim._functional, self.functional_name)
+        kwargs = {
+            "amsgrad": group["amsgrad"],
+            "beta1": group["betas"][0],
+            "beta2": group["betas"][1],
+            "lr": group["lr"],
+            "weight_decay": group["weight_decay"],
+            "eps": group["eps"],
+            "maximize": group["maximize"],
+            "foreach": False,
+            "capturable": False,
+            "differentiable": False,
+            "fused": bool(group.get("fused", False)),
+            "grad_scale": getattr(self.optimizer, "grad_scale", None),
+            "found_inf": getattr(self.optimizer, "found_inf", None),
+            "has_complex": False,
+        }
+        if self.functional_name == "adam":
+            if "decoupled_weight_decay" in inspect.signature(func).parameters:
+                kwargs["decoupled_weight_decay"] = self._decoupled_weight_decay(group)
+        func(
+            args.params,
+            args.grads,
+            args.exp_avgs,
+            args.exp_avg_sqs,
+            args.max_exp_avg_sqs,
+            args.state_steps,
+            **kwargs,
+        )
+
+    def _decoupled_weight_decay(self, group: Dict[str, Any]) -> bool:
+        """Resolve the decoupled weight decay flag for one parameter group."""
+        return self.decoupled_weight_decay or group.get("decoupled_weight_decay", False)
+
+    def _step_new_adamw(
+            self,
+            group: Dict[str, Any],
+            params: Sequence[Any],
+            grads: Sequence[Any],
+            exp_avgs: Sequence[Any],
+            exp_avg_sqs: Sequence[Any],
+            max_exp_avg_sqs: Sequence[Any],
+    ) -> None:
+        """Run the new AdamW functional for one group."""
+        if params and params[0].device.type == "cpu":
+            # torch.optim._functional.adamw increments tensor state_steps
+            # internally. New AdamW already advanced group["step"] in
+            # prepare_step(), so feed step - 1 to preserve outer-step
+            # semantics for CPU-only tests.
+            step_tensor = torch.tensor(float(group["step"] - 1), dtype=torch.float32)
+            torch.optim._functional.adamw(
+                params,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs,
+                [step_tensor] * len(params),
+                amsgrad=group["amsgrad"],
+                beta1=group["betas"][0],
+                beta2=group["betas"][1],
+                lr=group["lr"],
+                weight_decay=group["weight_decay"],
+                eps=group["eps"],
+                maximize=group["maximize"],
+                foreach=False,
+                capturable=False,
+                differentiable=False,
+                fused=False,
+                grad_scale=None,
+                found_inf=None,
+                has_complex=False,
+            )
+            return
+        _new_adamw_func()(
+            params,
+            grads,
+            exp_avgs,
+            exp_avg_sqs,
+            max_exp_avg_sqs,
+            group["step"],
+            amsgrad=group["amsgrad"],
+            beta1=group["betas"][0],
+            beta2=group["betas"][1],
+            lr=group["lr"],
+            weight_decay=group["weight_decay"],
+            eps=group["eps"],
+            maximize=group["maximize"],
+        )
 
     def finish_step(self, step_context: Any) -> Any:
         """Finish one outer optimizer step."""
@@ -1168,7 +1286,7 @@ class OptimizerSwapAdapter:
             exported_state = {}
             for key in self._state_keys_for_param(param):
                 slot = self._slots.get((id(param), key))
-                if slot is not None and slot.state == "host" and slot.cpu_tensor is not None and key in saved_state:
+                if self.has_host_mirror(slot, key, saved_state):
                     exported_state[key] = slot.cpu_tensor.detach().clone()
             for key, value in saved_state.items():
                 if key not in exported_state:
@@ -1176,23 +1294,49 @@ class OptimizerSwapAdapter:
             exported["state"][param_id] = exported_state
         return exported
 
+    @staticmethod
+    def has_host_mirror(slot: Optional[SwapSlot], key: str, saved_state: Dict[str, Any]) -> bool:
+        """Return whether ``slot`` currently owns the authoritative CPU mirror for ``key``.
+
+        A slot qualifies only when it has been offloaded to host *and* still
+        holds a CPU mirror: after :meth:`export_swappable_state`'s device-side
+        fast path, the live tensor may be a storage-released placeholder, so the
+        CPU mirror is the only source of the real optimizer values.
+        """
+        return (
+            slot is not None
+            and slot.state == "host"
+            and slot.cpu_tensor is not None
+            and key in saved_state
+        )
+
     def strip_swappable_state(self, state_dict: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]:
         """Split Adam state tensors out before delegating to Torch loading.
 
         PyTorch's ``load_state_dict`` eagerly restores tensors into the
         optimizer state.  For swap-managed Adam buffers, that would bypass the
         adapter/runtime bookkeeping and can place large tensors directly on the
-        device.  This method therefore deep-copies the checkpoint state dict,
-        removes the Adam buffers that may be swap-managed, and returns them in a
-        side table keyed by the checkpoint parameter id.
+        device.  This method therefore copies the checkpoint state dict's
+        *containers*, removes the Adam buffers that may be swap-managed, and
+        returns them in a side table keyed by the checkpoint parameter id.
+
+        Only the container skeleton is rebuilt: leaf tensors are shared with the
+        caller's checkpoint instead of being duplicated.  The removed buffers are
+        consumed by :meth:`load_swappable_state`, which either takes a reference
+        to the checkpoint storage (CPU checkpoints, where ``to(device="cpu")`` is
+        a no-op) or copies it once into a host mirror.  Deep-copying the whole
+        state dict would hold one extra full copy of every optimizer tensor on
+        host memory for the duration of the load, which for large models is a
+        needless doubling of the checkpoint-loading peak.
 
         The stripped state dict is safe to pass to the wrapped optimizer's
         ``load_state_dict`` for ordinary fields such as parameter groups and
-        step counters.  The removed tensors must be handed to
-        ``load_swappable_state`` afterwards so they can be restored with the
-        correct CPU mirror/device placeholder layout.
+        step counters: Torch does not mutate the tensors it reads from it.  The
+        removed tensors must be handed to ``load_swappable_state`` afterwards so
+        they can be restored with the correct CPU mirror/device placeholder
+        layout.
         """
-        stripped = copy.deepcopy(state_dict)
+        stripped = self._copy_state_dict_containers(state_dict)
         removed: Dict[int, Dict[str, Any]] = {}
         swappable_keys = self._configured_state_keys()
         for param_id, saved_state in list(stripped.get("state", {}).items()):
@@ -1202,6 +1346,35 @@ class OptimizerSwapAdapter:
                 if key in saved_state:
                     removed.setdefault(param_id, {})[key] = saved_state.pop(key)
         return stripped, removed
+
+    @staticmethod
+    def _copy_state_dict_containers(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Shallow-copy a checkpoint state dict, sharing every leaf tensor.
+
+        Rebuilds only the nesting Torch's ``load_state_dict`` walks: the top
+        level, the ``state`` per-parameter mappings, and the ``param_groups``
+        entries.  Do not add tensor copies here: this helper exists to keep the
+        checkpoint-loading host peak free of a duplicate optimizer state.
+        """
+        state = state_dict.get("state")
+        copied_state = (
+            {param_id: dict(saved_state) if isinstance(saved_state, dict) else saved_state
+             for param_id, saved_state in state.items()}
+            if isinstance(state, dict)
+            else state
+        )
+        param_groups = state_dict.get("param_groups")
+        copied_groups = (
+            [dict(group) if isinstance(group, dict) else group for group in param_groups]
+            if isinstance(param_groups, list)
+            else param_groups
+        )
+        copied = {key: value for key, value in state_dict.items() if key not in ("state", "param_groups")}
+        if state is not None:
+            copied["state"] = copied_state
+        if param_groups is not None:
+            copied["param_groups"] = copied_groups
+        return copied
 
     def load_swappable_state(self, original_state_dict: Dict[str, Any], removed: Dict[int, Dict[str, Any]]) -> None:
         """Restore removed Adam buffers under swap runtime control.
@@ -1219,58 +1392,69 @@ class OptimizerSwapAdapter:
         parameter's device and tracked as normal device-resident slots.
         """
         saved_groups = original_state_dict.get("param_groups", [])
-        current_groups = self.optimizer.param_groups
         self._slots = {}
-        saved_ids = []
-        current_params = []
-        for saved_group, current_group in zip(saved_groups, current_groups):
-            saved_ids.extend(saved_group["params"])
-            current_params.extend(current_group["params"])
+        # Walk saved and current parameter groups in order to map checkpoint ids
+        # back to the live parameter objects.
+        saved_ids = [
+            saved_id
+            for saved_group, current_group in zip(saved_groups, self.optimizer.param_groups)
+            for saved_id in saved_group["params"]
+        ]
+        groups = self.optimizer.param_groups
+        current_params = [param for group in groups for param in group["params"]]
         for saved_id, param in zip(saved_ids, current_params):
-            key_to_tensor = removed.get(saved_id, {})
-            if not key_to_tensor:
-                continue
-            state = self.optimizer.state[param]
-            for key, saved_tensor in key_to_tensor.items():
-                cpu_tensor = self._cast_swappable_tensor_to_cpu(param, saved_tensor)
-                if self.runtime.packed_enabled and self.runtime.is_packable_template(param, self.config.min_numel):
-                    if self.runtime.is_distributed_tensor(param):
-                        logical_tensor = torch.zeros_like(
-                            param,
-                            memory_format=torch.preserve_format,
-                        )
-                        slot = self._make_slot(key, logical_tensor)
-                        state[key] = logical_tensor
-                        self.runtime.release_device_storage(slot)
-                    else:
-                        slot = self._make_slot(key, None, template=param)
-                        state[key] = cpu_tensor
-                        slot.tensor = cpu_tensor
-                    slot.cpu_tensor = cpu_tensor
-                    slot.state = "host"
-                    self._slots[(id(param), key)] = slot
-                    continue
-                device_tensor = self.runtime.make_empty_device_tensor_like(param, cpu_tensor)
-                slot = self._make_slot(key, device_tensor)
-                if slot.swappable:
-                    state[key] = device_tensor
-                    slot.cpu_tensor = self.runtime.make_cpu_tensor(cpu_tensor)
-                    slot.state = "host"
-                    self._slots[(id(param), key)] = slot
-                    self.runtime.release_device_storage(slot)
-                else:
-                    device_tensor = self._cast_state_tensor_like_torch(
-                        param,
-                        saved_tensor,
-                        saved_id,
-                        saved_groups,
-                        key,
-                    )
-                    state[key] = device_tensor
-                    self._slots[(id(param), key)] = self._make_slot(key, device_tensor)
+            for key, saved_tensor in removed.get(saved_id, {}).items():
+                self._restore_swappable_entry(param, saved_id, saved_groups, key, saved_tensor)
         if self.runtime.packed_enabled:
             self.runtime.prepare_packed_host(self._ordered_slots())
             self.publish_packed_state()
+
+    def _restore_swappable_entry(
+            self,
+            param: Any,
+            saved_id: int,
+            saved_groups: List[Dict[str, Any]],
+            key: str,
+            saved_tensor: Any,
+    ) -> None:
+        """Restore one removed checkpoint buffer as a host or device-resident slot."""
+        state = self.optimizer.state[param]
+        cpu_tensor = self._cast_swappable_tensor_to_cpu(param, saved_tensor)
+        if self.runtime.packed_enabled and self.runtime.is_packable_template(param, self.config.min_numel):
+            if self.runtime.is_distributed_tensor(param):
+                logical_tensor = torch.zeros_like(
+                    param,
+                    memory_format=torch.preserve_format,
+                )
+                slot = self._make_slot(key, logical_tensor)
+                state[key] = logical_tensor
+                self.runtime.release_device_storage(slot)
+            else:
+                slot = self._make_slot(key, None, template=param)
+                state[key] = cpu_tensor
+                slot.tensor = cpu_tensor
+            slot.cpu_tensor = cpu_tensor
+            slot.state = "host"
+            self._slots[(id(param), key)] = slot
+            return
+        device_tensor = self.runtime.make_empty_device_tensor_like(param, cpu_tensor)
+        slot = self._make_slot(key, device_tensor)
+        if slot.swappable:
+            state[key] = device_tensor
+            slot.cpu_tensor = self.runtime.make_cpu_tensor(cpu_tensor)
+            slot.state = "host"
+            self._slots[(id(param), key)] = slot
+            self.runtime.release_device_storage(slot)
+        else:
+            device_tensor = self._cast_state_tensor_like_torch(
+                param,
+                saved_tensor,
+                saved_id,
+                saved_groups,
+                key,
+            )
+            state[key] = device_tensor
+            self._slots[(id(param), key)] = self._make_slot(key, device_tensor)
 
     def _init_param_state(self, param: Any, grad: Any, group: Dict[str, Any]) -> None:
         """Initialize missing Adam state and swap slots for one parameter."""
@@ -1381,10 +1565,17 @@ class OptimizerSwapAdapter:
         return tuple(result)
 
     @staticmethod
+    def _is_active_device_slot(slot: SwapSlot, key: str) -> bool:
+        """Return whether ``slot`` holds ``key`` live on the local device."""
+        if slot.name != key or not slot.swappable or slot.state != "device":
+            return False
+        return slot.tensor is not None
+
+    @staticmethod
     def _slot_tensor(unit: UpdateUnit, key: str, fallback: Any) -> Any:
         """Return an active swap slot tensor, or the optimizer state fallback."""
         for slot in unit.slots:
-            if slot.name == key and slot.swappable and slot.state == "device" and slot.tensor is not None:
+            if OptimizerSwapAdapter._is_active_device_slot(slot, key):
                 return slot.tensor
         return fallback
 
@@ -1400,8 +1591,8 @@ class OptimizerSwapAdapter:
             result.append(key)
         return tuple(result)
 
+    @staticmethod
     def _cast_state_tensor_like_torch(
-            self,
             param: Any,
             saved_tensor: Any,
             saved_id: int,
@@ -1420,7 +1611,8 @@ class OptimizerSwapAdapter:
             return saved_tensor.detach().to(dtype=param.dtype, device=param.device).clone()
         return saved_tensor.detach().to(device=param.device).clone()
 
-    def _cast_swappable_tensor_to_cpu(self, param: Any, saved_tensor: Any) -> Any:
+    @staticmethod
+    def _cast_swappable_tensor_to_cpu(param: Any, saved_tensor: Any) -> Any:
         """Cast swappable state dtype like PyTorch while keeping values on CPU."""
         if not isinstance(saved_tensor, torch.Tensor):
             raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
@@ -1499,7 +1691,8 @@ class _StagingArena:
 
 def _iter_unique_slots(units: Sequence[UpdateUnit]) -> Iterable[SwapSlot]:
     """Yield slots once by object identity."""
-    return _iter_unique_slot_objects(slot for unit in units for slot in unit.slots)
+    slots = itertools.chain.from_iterable(unit.slots for unit in units)
+    return _iter_unique_slot_objects(slots)
 
 
 def _iter_unique_slot_objects(slots: Iterable[SwapSlot]) -> Iterable[SwapSlot]:

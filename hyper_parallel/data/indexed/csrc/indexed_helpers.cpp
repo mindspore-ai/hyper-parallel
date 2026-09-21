@@ -24,6 +24,18 @@ namespace py = pybind11;
 
 namespace {
 
+void validate_document_ids(const py::array_t<int32_t> &document_index, py::ssize_t sequence_count) {
+  if (document_index.size() == 0) {
+    return;
+  }
+  const int32_t *begin = document_index.data();
+  const int32_t *end = begin + document_index.size();
+  const auto id_extrema = std::minmax_element(begin, end);
+  if (*id_extrema.first < 0 || *id_extrema.second >= sequence_count) {
+    throw py::value_error("Document ID is outside sequence_lengths");
+  }
+}
+
 template <typename T>
 py::array_t<T> build_sample_idx(const py::array_t<int32_t> &sequence_lengths,
                                 const py::array_t<int32_t> &document_index, int64_t sequence_length, int64_t num_epochs,
@@ -55,16 +67,7 @@ py::array_t<T> build_sample_idx(const py::array_t<int32_t> &sequence_lengths,
     throw py::value_error("Document index must not be empty when building samples");
   }
 
-  // Validate once so repeated samples from the same document keep unchecked access.
-  int32_t minimum_document_id = 0;
-  int32_t maximum_document_id = -1;
-  for (py::ssize_t position = 0; position < document_index_buffer.shape(0); ++position) {
-    minimum_document_id = std::min(minimum_document_id, document_index_buffer(position));
-    maximum_document_id = std::max(maximum_document_id, document_index_buffer(position));
-  }
-  if (minimum_document_id < 0 || maximum_document_id >= sequence_length_buffer.shape(0)) {
-    throw py::value_error("Document ID is outside sequence_lengths");
-  }
+  validate_document_ids(document_index, sequence_length_buffer.shape(0));
 
   auto sample_index_buffer = sample_index.template mutable_unchecked<2>();
 
@@ -90,17 +93,16 @@ py::array_t<T> build_sample_idx(const py::array_t<int32_t> &sequence_lengths,
         break;
       }
 
-      if (document_position == document_index_buffer.shape(0) - 1) {
-        if (sample_position != num_samples) {
-          throw py::value_error("The final partial sample was reached before the last sample index");
-        }
-        document_offset = sequence_length_buffer(document_id) - extra_token;
-        break;
+      if (document_position != document_index_buffer.shape(0) - 1) {
+        ++document_position;
+        document_offset = 0;
+        continue;
       }
-
-      // Otherwise, start from the beginning of the next document.
-      ++document_position;
-      document_offset = 0;
+      if (sample_position != num_samples) {
+        throw py::value_error("The final partial sample was reached before the last sample index");
+      }
+      document_offset = sequence_length_buffer(document_id) - extra_token;
+      break;
     }
 
     // Record the sequence.
@@ -159,6 +161,8 @@ void build_blending_indices(py::array_t<int16_t, 0> &dataset_index, py::array_t<
 
 }  // namespace
 
+namespace hyper_parallel {
+
 PYBIND11_MODULE(_indexed_helpers_cpp, module) {
   module.doc() = "Native indexed Dataset helper functions";
 
@@ -175,3 +179,5 @@ PYBIND11_MODULE(_indexed_helpers_cpp, module) {
   module.def("build_blending_indices", &build_blending_indices, py::arg("dataset_index").noconvert(),
              py::arg("dataset_sample_index").noconvert(), py::arg("weights"));
 }
+
+}  // namespace hyper_parallel

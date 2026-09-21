@@ -35,7 +35,6 @@ buffer that happened to be zero.
 # pylint: disable=C0413
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import shutil
 import threading
@@ -44,13 +43,13 @@ from typing import Any, NamedTuple, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from hyper_parallel import DTensor
 from hyper_parallel.core.distributed_checkpoint import load, save
 from hyper_parallel.core.distributed_checkpoint.broadcast import _MAX_BROADCASTS_IN_FLIGHT
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_parallel.platform import get_platform
 from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
 _WORLD_SIZE = 8
@@ -136,21 +135,20 @@ _BATCH_SETTINGS = (0, 6 * 1024 * 1024)
 
 
 def _setup(seed: int) -> tuple[Any, int]:
-    """Initialize the backend and return the platform plus this rank."""
+    """Initialize the backend and return the torch process group plus this rank."""
     init_backend(_DEVICE_TYPE)
     torch.manual_seed(seed)
-    platform = get_platform()
-    world_size = platform.get_world_size()
+    world_size = dist.get_world_size()
     assert world_size == _WORLD_SIZE, f"expect world_size={_WORLD_SIZE}, got {world_size}"
-    return platform, platform.get_rank()
+    return dist, dist.get_rank()
 
 
-def _fresh_checkpoint_dir(platform: Any, rank: int, name: str) -> Path:
+def _fresh_checkpoint_dir(dist_pg: Any, rank: int, name: str) -> Path:
     """Return an empty checkpoint directory, agreed on by every rank."""
     checkpoint_path = Path(f"./{name}")
     if rank == 0 and checkpoint_path.exists():
         shutil.rmtree(checkpoint_path)
-    platform.barrier()
+    dist.barrier()
     return checkpoint_path
 
 
@@ -315,20 +313,20 @@ def _run_pp_load(
     stage split is covered both with the small shards gathered into one broadcast and with
     each going on its own.
     """
-    platform, rank = _setup(seed)
+    dist_pg, rank = _setup(seed)
     mesh = init_device_mesh(
         device_type=_DEVICE_TYPE, mesh_shape=shape.mesh_shape,
         mesh_dim_names=shape.mesh_dim_names,
     )
     stage_mesh = mesh[shape.stage_dims]
     pp_rank = mesh.get_local_rank("pp")
-    checkpoint_path = _fresh_checkpoint_dir(platform, rank, checkpoint_name)
+    checkpoint_path = _fresh_checkpoint_dir(dist_pg, rank, checkpoint_name)
 
     saved = _build_state(specs, shape, stage_mesh, rank, pp_rank, poisoned=False)
     _assert_stages_differ(specs, saved, pp_rank, rank)
     expected = {name: value.to_local().clone() for name, value in saved.items()}
     save(saved, checkpoint_id=checkpoint_path, use_collectives=True)
-    platform.barrier()
+    dist.barrier()
 
     threads_before = threading.active_count()
     for batch_bytes in _BATCH_SETTINGS:
@@ -348,7 +346,7 @@ def _run_pp_load(
         f"{len(_BATCH_SETTINGS)} load(s), up from {threads_before}: a load is leaking a "
         f"thread"
     )
-    platform.barrier()
+    dist.barrier()
     if rank == 0:
         shutil.rmtree(checkpoint_path, ignore_errors=True)
 

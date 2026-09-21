@@ -55,7 +55,6 @@ import unittest
 import unittest.mock
 from types import SimpleNamespace
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch
 from torch import nn

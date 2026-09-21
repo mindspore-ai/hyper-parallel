@@ -29,7 +29,7 @@ APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
     "limitations under the License.",
 )
 BACKEND_IMPORTS = {"torch", "mindspore"}
-PLATFORM_ALLOWED_PARTS = ("hyper_parallel/platform/", "tests/", "scripts/", ".agent/")
+PLATFORM_ALLOWED_PARTS = ("tests/", "scripts/", ".agent/")
 TORCH_ONLY_CORE_PARTS = (
     "hyper_parallel/core/distributed_checkpoint/",
     "hyper_parallel/core/dtensor/",
@@ -101,7 +101,11 @@ def _is_public_function(node: nodes.FunctionDef) -> bool:
 
 
 def _is_platform_agnostic_module(path: str) -> bool:
-    """Check whether backend imports should be blocked for this file."""
+    """Check whether backend imports should be blocked for this file.
+
+    Only shipped library code under ``hyper_parallel/`` is in scope; tests, scripts and
+    agent tooling may import a backend freely.
+    """
     normalized = _normalize_path(path)
     if not normalized.endswith(".py"):
         return False
@@ -132,11 +136,6 @@ class HyperParallelChecker(BaseChecker):
             "Direct backend import '%s' is forbidden in platform-agnostic code",
             "forbidden-backend-import",
             "Used when torch or mindspore is imported outside approved platform-specific modules.",
-        ),
-        "C9003": (
-            "Avoid assigning platform on instances; use module-level platform = get_platform()",
-            "instance-platform-assignment",
-            "Used when code stores platform on self.platform instead of module scope.",
         ),
         "C9004": (
             "Avoid mutating sys.path with insert(0, ...)",
@@ -204,17 +203,6 @@ class HyperParallelChecker(BaseChecker):
         module_name = node.modname or ""
         if _is_forbidden_backend(self._module_path, module_name):
             self.add_message("forbidden-backend-import", node=node, args=(module_name,))
-
-    def visit_assign(self, node: nodes.Assign) -> None:
-        """Detect discouraged instance-level platform storage.
-
-        Args:
-            node: The assignment AST node being visited.
-        """
-        for target in node.targets:
-            if isinstance(target, nodes.AssignAttr) and target.attrname == "platform":
-                if isinstance(target.expr, nodes.Name) and target.expr.name == "self":
-                    self.add_message("instance-platform-assignment", node=node)
 
     def visit_call(self, node: nodes.Call) -> None:
         """Check subprocess and sys.path patterns.

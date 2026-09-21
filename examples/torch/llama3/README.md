@@ -79,8 +79,6 @@ torchrun --nnodes=1 --nproc_per_node=4 fsdp_tp_example.py
 | `LLAMA3_TP_SIZE` | 张量并行宽度 | `2` |
 | `LLAMA3_DEVICE_TYPE` | 设备类型：`npu` 或 `cuda` | `npu` |
 
-脚本会设置 `HYPER_PARALLEL_PLATFORM=torch`。
-
 ---
 
 ## 运行三：TP + 上下文并行（`ContextParallel`）
@@ -103,8 +101,6 @@ torchrun --nnodes=1 --nproc_per_node=4 tp_cp_example.py
 | `LLAMA3_DEVICE_TYPE` | `npu` 或 `cuda` | `npu` |
 
 约束：**`seq_len % cp == 0`**，**`(seq_len / cp) % tp == 0`**（保证 Rowwise embedding 的序列分片均匀），且 **`n_heads` / `n_kv_heads` 能被 `tp` 整除**。
-
-脚本会设置 `HYPER_PARALLEL_PLATFORM=torch`。
 
 ---
 
@@ -153,7 +149,7 @@ torchrun --nnodes=1 --nproc_per_node=8 examples/torch/llama3/dp_tp_cp_sp_fsdp_ex
 
 > **注意：当 `fully_shard` 把 TP-DTensor 权重提升到 ≥3-D mesh 且活动 `(tp,)` 输入仍为 1-D 时（如 `dp=2, fsdp=1, cp=2, tp=2`），库内 layout-infer 路径还不支持权重 mesh 是输入 mesh 超集的情况：先在 `parallel_embedding.infer_layout` 触发 `int - tuple` 类型错误，进一步还会卡在 `parallel_matmul` 的 `x_mesh_shape != w_mesh_shape` 检查上。**如需"纯 DP（不分片参数）+ TP/SP/CP"，建议改用 `(dp=1, fsdp=2, cp=2, tp=2)`（默认）或上面的 HSDP 组合，等库内修复后再启用 `fsdp=1`。
 
-脚本会设置 `HYPER_PARALLEL_PLATFORM=torch`，并在所有 rank 上对 `tokens` / `targets` 做一次广播确保同样输入（冒烟用法，与 `fsdp_tp_example.py` 一致；不是严格的单卡数值基准）。
+脚本在所有 rank 上对 `tokens` / `targets` 做一次广播确保同样输入（冒烟用法，与 `fsdp_tp_example.py` 一致；不是严格的单卡数值基准）。
 
 ---
 

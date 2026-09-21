@@ -23,7 +23,6 @@ import unittest
 from unittest.mock import patch, MagicMock, call
 
 import os
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.dtensor import (
     DTensor,

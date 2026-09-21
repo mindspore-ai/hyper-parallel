@@ -517,7 +517,8 @@ class PipelineSimulator:
                 lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
         return True
 
-    def _process_swap_gap4(self, lines, p, i_b):
+    @staticmethod
+    def _process_swap_gap4(lines, p, i_b):
         r"""process swap when gap == 4."""
         if lines[p][i_b + 1].dual.stage == lines[p][i_b + 2].dual.stage and \
             lines[p][i_b + 2].dual.stage == lines[p][i_b + 3].dual.stage:

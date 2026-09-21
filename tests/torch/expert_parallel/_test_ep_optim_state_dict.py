@@ -37,7 +37,6 @@ import math
 import os
 import shutil
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"  # pylint: disable=wrong-import-position
 
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
@@ -53,7 +52,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel  # noqa: E402
 from hyper_parallel.core.fully_shard.api import fully_shard  # noqa: E402
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy  # noqa: E402
-from hyper_parallel.platform.torch.common import MoE  # noqa: E402
+from hyper_parallel.components.modules.moe import MoE  # noqa: E402
 from tests.torch.utils import init_dist  # noqa: E402  # pylint: enable=wrong-import-position
 
 DIM = 64

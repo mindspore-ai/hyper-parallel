@@ -18,7 +18,6 @@ import os
 import unittest
 from unittest.mock import call, MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.collectives import cc as collectives_cc
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS  # pylint: disable=C0413

@@ -116,6 +116,7 @@ RUN if [ -f /usr/local/Ascend/cann/set_env.sh ]; then \
         . /usr/local/Ascend/cann/set_env.sh; \
     fi \
     && python3 -c \
-        "import hyper_parallel as hp; print('hyper_parallel platform:', hp.get_platform())"
+        "import hyper_parallel; import importlib.metadata as metadata; \
+print('hyper_parallel:', metadata.version('hyper_parallel'))"
 
 CMD ["/bin/bash", "-l"]

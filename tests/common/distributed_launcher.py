@@ -42,7 +42,6 @@ def torchrun_case(
     is not on ``PATH``.
     """
     env = os.environ.copy()
-    env.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
     abs_file = os.path.abspath(file_name)
     max_attempts = 3
     for attempt in range(max_attempts):

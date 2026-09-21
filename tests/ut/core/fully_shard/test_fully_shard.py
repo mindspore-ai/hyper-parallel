@@ -29,7 +29,6 @@ import numpy as np
 import torch
 from torch import nn
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.fully_shard.hsdp_param import (
     HSDPParamV2,
@@ -823,7 +822,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         )
         with patch("hyper_parallel.core.fully_shard.api._validate_module_for_fully_shard"), \
                 patch("hyper_parallel.core.fully_shard.api._extend_module_with_hsdp_interface"), \
-                patch("hyper_parallel.core.fully_shard.api.get_world_size", return_value=8), \
+                patch("hyper_parallel.core.fully_shard.api.dist.get_world_size", return_value=8), \
                 patch("hyper_parallel.core.fully_shard.api.init_device_mesh", return_value=MagicMock()), \
                 self.assertRaisesRegex(ValueError, "not support mesh=None"):
             fully_shard(module, mesh=None)
@@ -885,7 +884,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
             "hyper_parallel.core.fully_shard.api._extend_module_with_hsdp_interface",
             side_effect=_attach_mock_hsdp,
         ), patch(
-            "hyper_parallel.core.fully_shard.api.get_world_size",
+            "hyper_parallel.core.fully_shard.api.dist.get_world_size",
             return_value=8,
         ), patch(
             "hyper_parallel.core.fully_shard.api.init_device_mesh",

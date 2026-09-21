@@ -33,7 +33,6 @@ Key design decisions for CP optimizer state dict testing:
 import math
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"  # pylint: disable=wrong-import-position
 
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402

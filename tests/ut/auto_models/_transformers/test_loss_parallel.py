@@ -32,7 +32,6 @@ import unittest
 from typing import Any, Optional
 from unittest import mock
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch
 import torch.nn.functional as F

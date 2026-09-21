@@ -39,7 +39,10 @@ RUNTIME_FIXED_BYTES = (
 
 def _check_capacity(value: int, name: str, minimum: int = 0) -> None:
     """Reject values that cannot be represented by aligned runtime arrays."""
-    if not isinstance(value, int) or isinstance(value, bool) or value < minimum or value % 16:
+    is_integer = isinstance(value, int) and not isinstance(value, bool)
+    if not is_integer:
+        raise ValueError(f"{name} must be an integer >= {minimum} aligned to 16, got {value!r}.")
+    if value < minimum or value % 16:
         raise ValueError(f"{name} must be an integer >= {minimum} aligned to 16, got {value!r}.")
 
 
@@ -116,8 +119,10 @@ def allocate_runtime_config(
     if not isinstance(task_capacity, int) or isinstance(task_capacity, bool) or task_capacity < 0:
         raise ValueError(f"task_capacity must be a nonnegative integer, got {task_capacity!r}.")
     capacity = (task_capacity + 15) // 16 * 16
-    runtime_config_serialized_size(capacity, event_capacity, local_experts)
+    expected_size = runtime_config_serialized_size(capacity, event_capacity, local_experts)
     cfg = _runtime_config_type(capacity, event_capacity, grouped_matmul_group_list_capacity(local_experts))()
+    if ctypes.sizeof(cfg) != expected_size:
+        raise RuntimeError(f"runtime allocation produced {ctypes.sizeof(cfg)} bytes, expected {expected_size}")
     cfg.task_capacity = capacity
     cfg.event_capacity = event_capacity
     cfg.dynamic_data.dynamic_group_size = local_experts

@@ -15,7 +15,6 @@
 """Test: init_empty_weights -> fully_shard -> materialize -> init, verify consistency."""
 
 import os
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import torch

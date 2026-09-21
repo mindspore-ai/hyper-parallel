@@ -15,13 +15,12 @@
 """Unit tests for init_on_device (PyTorch)."""
 
 import os
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import torch
 from torch import nn
 
-from hyper_parallel.platform.torch.init_weights import init_on_device
+from hyper_parallel.core.dtensor.init_weights import init_on_device
 
 
 class _CustomParameter(nn.Parameter):

@@ -93,7 +93,9 @@ class _CostModVar:
     n_shared_exp: float = 0
     cap_fact: float = 0
     etp: float = 0
-    tokens_per_expert: list = None  # global per-expert token count per microbatch (all EP ranks combined, before all-to-all); None = balanced
+    # Global per-expert token count per microbatch (all EP ranks combined,
+    # before all-to-all); None = balanced.
+    tokens_per_expert: list = None
 
     # CP modeling
     kv_lora_rank: float = 0

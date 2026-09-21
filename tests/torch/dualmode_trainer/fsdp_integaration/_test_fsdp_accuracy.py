@@ -35,7 +35,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, TextIO
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import numpy as np
 import torch
@@ -60,7 +59,7 @@ from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
 )
 from hyper_parallel.trainer.runtime.device import get_device_type
-from hyper_parallel.trainer.config.manager import parse_training_args
+from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config import (
     TrainerConfig,
     normalize_distributed_setup_overrides,

@@ -14,21 +14,21 @@
 # ============================================================================
 """Unit tests for ``hyper_parallel.compile.trainer.GraphTrainer``.
 
-Covers the parts of the trainer that the pass-level tests cannot reach:
+Covers the training-policy parts the compiler-level tests cannot reach:
 
 1. Single-process ``train_step`` / ``train`` (no ``torch.distributed`` init):
    the graph is compiled lazily on the first batch and runs as plain graph
    mode, because ``FSDPPass`` early-returns when distributed is not up.
 2. ``compile`` with ``fsdp_enabled=True`` and *no* dist does not raise -- the
    old hard guard contradicted the FSDP pass's own ``world_size==1`` no-op.
-3. ``_init_device_mesh`` both branches (fallback 1-D mesh over the world, and
-   the external automodel ``MeshContext`` path that back-fills ``fsdp_degree``
-   and registers the FSDP sub-group) -- exercised via mocks so no real
-   backend is needed.
-4. ``optimizer_step`` grad-clip path.
-5. ``train`` loop bookkeeping: ``log_interval`` printing, ``max_steps``,
+3. ``optimizer_step`` grad-clip path.
+4. ``train`` loop bookkeeping: ``log_interval`` printing, ``max_steps``,
    ``log_fn`` callback, and non-iterator iterables.
-6. ``to()`` (device move) and ``set_pytree_pre_hook``.
+5. ``to()`` (device move).
+
+The trainer delegates compilation / execution to ``GraphCompiler``
+(``compile.compiler``); the compiler surface (including ``_init_device_mesh``
+both branches) is covered by ``test_compiler.py``.
 
 Tracing uses a tiny ``nn.Linear`` model and the same joint-graph capture the
 tracer tests validate; only the trainer wiring is asserted here.
@@ -39,9 +39,8 @@ import logging
 import os
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 from torch import nn
@@ -55,17 +54,17 @@ def _make_model() -> nn.Linear:
     return nn.Linear(4, 4)
 
 
-def _mse_train_fn(model, x, y) -> torch.Tensor:
+def _mse_train_fn(model, *, x, y) -> torch.Tensor:
     """Training function: mean-squared error between prediction and target."""
     return ((model(x) - y) ** 2).mean()
 
 
 def _batches(n=2, dim=2):
-    """Yield ``n`` ``(input, label)`` batches."""
+    """Yield ``n`` model-input dicts (the kwargs ``train_fn`` consumes)."""
     x = torch.randn(dim, 4)
     y = torch.randn(dim, 4)
     for _ in range(n):
-        yield x, y
+        yield {"x": x, "y": y}
 
 
 class TestGraphTrainerCompile(unittest.TestCase):
@@ -87,9 +86,11 @@ class TestGraphTrainerCompile(unittest.TestCase):
             device=torch.device("cpu"),
         )
 
-        loss = tr.train_step(torch.randn(2, 4), torch.randn(2, 4))
+        loss = tr.train_step(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
-        self.assertIsNotNone(tr._joint_graph, "compile should populate the joint graph")
+        self.assertIsNotNone(
+            tr._compiler._joint_graph, "compile should populate the joint graph"
+        )
         self.assertIsNotNone(tr.optimizer)
         self.assertIsInstance(loss, torch.Tensor)
         # A real forward/backward ran: the model now holds a non-zero grad.
@@ -107,8 +108,8 @@ class TestGraphTrainerCompile(unittest.TestCase):
         )
         before = model.weight.detach().clone()  # pylint: disable=not-callable
 
-        tr.compile(torch.randn(2, 4), torch.randn(2, 4))
-        tr.train_step(torch.randn(2, 4), torch.randn(2, 4))
+        tr.compile(x=torch.randn(2, 4), y=torch.randn(2, 4))
+        tr.train_step(x=torch.randn(2, 4), y=torch.randn(2, 4))
         tr.optimizer_step()
 
         self.assertFalse(
@@ -128,14 +129,14 @@ class TestGraphTrainerCompile(unittest.TestCase):
             optimizer_config={"lr": 1e-3, "grad_clip": 1.0},
             device=torch.device("cpu"),
         )
-        tr.train_step(torch.randn(2, 4), torch.randn(2, 4))
+        tr.train_step(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
         # A very large loss guarantees an un-clipped gradient of norm > 1.
         with torch.no_grad():
             model.weight.mul_(10.0)
         # Reset the graph so the next step recomputes a huge loss.
-        tr._joint_graph = None
-        tr.train_step(torch.randn(2, 4), torch.randn(2, 4))
+        tr._compiler._joint_graph = None
+        tr.train_step(x=torch.randn(2, 4), y=torch.randn(2, 4))
         grad_norm = float(model.weight.grad.norm())
         self.assertGreater(grad_norm, 1.0)
 
@@ -172,14 +173,14 @@ class TestGraphTrainerTrainLoop(unittest.TestCase):
             pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
-        before = tr.model.weight.detach().clone()
+        before = tr._compiler.model.weight.detach().clone()
         # A list is a non-iterator (re-iterable) iterable: it must be accepted
         # just like a generator, but it can be iterated more than once. Passing
         # a generator here would leave the reiterable regression path uncovered.
         losses = tr.train(list(_batches(2)))
         self.assertEqual(len(losses), 2)
         # The loop advances the optimizer each step, so weights move.
-        self.assertFalse(torch.equal(before, tr.model.weight))
+        self.assertFalse(torch.equal(before, tr._compiler.model.weight))
 
     def test_train_log_interval_prints_on_rank0(self):
         """Test ``train`` logs a loss line on the log_interval (rank 0)."""
@@ -234,170 +235,8 @@ class TestGraphTrainerTrainLoop(unittest.TestCase):
         self.assertEqual(buf.getvalue(), "")
 
 
-class TestGraphTrainerDeviceMesh(unittest.TestCase):
-    """``_init_device_mesh`` fallback and external-mesh branches."""
-
-    def test_init_device_mesh_fallback_registers_fsdp(self):
-        """Test the no-mesh fallback builds a 1-D fsdp mesh over the world."""
-        tr = GraphTrainer(
-            model=_make_model(),
-            train_fn=_mse_train_fn,
-            pass_config=PassConfig(fsdp_enabled=True),
-            device=torch.device("cpu"),
-        )
-        mock_dist = MagicMock()
-        mock_dist.is_initialized.return_value = True
-        mock_dist.get_world_size.return_value = 4
-        mock_dist.get_rank.return_value = 0
-        mock_register = MagicMock()
-        mock_init_mesh = MagicMock()
-
-        # A fake 1-D mesh whose ["fsdp"] sub-mesh has size 4 and a group.
-        fake_sub = MagicMock()
-        fake_sub.size.return_value = 4
-        fake_sub.get_group.return_value = "FAKE_PG"
-        fake_mesh = MagicMock()
-        fake_mesh.__getitem__.return_value = fake_sub
-
-        mock_init_mesh.return_value = fake_mesh
-
-        with (
-            patch("hyper_parallel.compile.trainer.dist", mock_dist),
-            patch(
-                "hyper_parallel.compile.trainer._register_process_group", mock_register
-            ),
-            patch("hyper_parallel.compile.trainer.init_device_mesh", mock_init_mesh),
-        ):
-            tr._init_device_mesh(None)
-
-        mock_init_mesh.assert_called_once()
-        self.assertEqual(
-            fake_mesh.__getitem__.call_args.args,
-            ("fsdp",),
-            "the 1-D fallback mesh must be indexed by its 'fsdp' dim",
-        )
-        self.assertEqual(
-            mock_register.call_args.args[0],
-            "fsdp",
-            "the FSDP group should be registered under the name 'fsdp'",
-        )
-        self.assertEqual(
-            tr.pass_config.fsdp_degree,
-            4,
-            "fallback should back-fill fsdp_degree from the world size",
-        )
-
-    def test_init_device_mesh_external_uses_fsdp_shard_submesh(self):
-        """Test the automodel ``MeshContext`` path back-fills ``fsdp_degree``.
-
-        The FSDP group is a proper sub-group of the world (TP+FSDP hybrid), so
-        ``fsdp_degree`` must come from the sub-mesh, not ``world_size``.
-        """
-        tr = GraphTrainer(
-            model=_make_model(),
-            train_fn=_mse_train_fn,
-            pass_config=PassConfig(fsdp_enabled=True, fsdp_degree=None),
-            device=torch.device("cpu"),
-        )
-
-        # Each axis returns a DISTINCT sub-mesh (different size + group) so a
-        # wrong-axis selection surfaces as the wrong fsdp_degree / group.
-        shard_sub = MagicMock()
-        shard_sub.size.return_value = 2
-        shard_sub.get_group.return_value = "SHARD_PG"
-        repl_sub = MagicMock()
-        repl_sub.size.return_value = 99
-        repl_sub.get_group.return_value = "REPL_PG"
-        tp_sub = MagicMock()
-        tp_sub.size.return_value = 77
-        tp_sub.get_group.return_value = "TP_PG"
-        mock_non_moe = MagicMock()
-        mock_non_moe.mesh_dim_names = ("fsdp_replicate", "fsdp_shard", "tp")
-        mock_non_moe.__getitem__.side_effect = {
-            "fsdp_shard": shard_sub,
-            "fsdp_replicate": repl_sub,
-            "tp": tp_sub,
-        }.__getitem__
-
-        mesh_context = MagicMock()
-        mesh_context.fsdp_non_moe_mesh = mock_non_moe
-        mesh_context.device_mesh = None
-
-        mock_register = MagicMock()
-        with patch(
-            "hyper_parallel.compile.trainer._register_process_group", mock_register
-        ):
-            tr._init_device_mesh(mesh_context)
-
-        self.assertEqual(
-            mock_non_moe.__getitem__.call_args.args,
-            ("fsdp_shard",),
-            "must resolve the fsdp_shard axis of a hybrid mesh",
-        )
-        self.assertEqual(
-            tr.pass_config.fsdp_degree,
-            2,
-            "external mesh should back-fill fsdp_degree from the fsdp_shard sub-mesh",
-        )
-        self.assertEqual(mock_register.call_args.args[0], "fsdp")
-        self.assertEqual(
-            mock_register.call_args.args[1],
-            "SHARD_PG",
-            "the fsdp_shard sub-mesh's group must be the one registered",
-        )
-
-    def test_init_device_mesh_external_falls_back_to_dp_axis(self):
-        """Test an automodel mesh with no ``fsdp_shard`` uses the ``dp`` axis."""
-        tr = GraphTrainer(
-            model=_make_model(),
-            train_fn=_mse_train_fn,
-            pass_config=PassConfig(fsdp_enabled=True, fsdp_degree=None),
-            device=torch.device("cpu"),
-        )
-        # Each axis returns a DISTINCT sub-mesh so picking "dp" (not cp/tp) is
-        # the only way to land on fsdp_degree == 8.
-        dp_sub = MagicMock()
-        dp_sub.size.return_value = 8
-        dp_sub.get_group.return_value = "DPPG"
-        cp_sub = MagicMock()
-        cp_sub.size.return_value = 55
-        cp_sub.get_group.return_value = "CP_PG"
-        tp_sub = MagicMock()
-        tp_sub.size.return_value = 77
-        tp_sub.get_group.return_value = "TP_PG"
-        mock_mesh = MagicMock()
-        mock_mesh.mesh_dim_names = ("dp", "cp", "tp")
-        mock_mesh.__getitem__.side_effect = {
-            "dp": dp_sub,
-            "cp": cp_sub,
-            "tp": tp_sub,
-        }.__getitem__
-
-        mesh_context = MagicMock()
-        mesh_context.fsdp_non_moe_mesh = None
-        mesh_context.device_mesh = mock_mesh
-
-        mock_register = MagicMock()
-        with patch(
-            "hyper_parallel.compile.trainer._register_process_group", mock_register
-        ):
-            tr._init_device_mesh(mesh_context)
-
-        self.assertEqual(
-            mock_mesh.__getitem__.call_args.args,
-            ("dp",),
-            "must fall back to the dp axis when fsdp_shard is absent",
-        )
-        self.assertEqual(
-            tr.pass_config.fsdp_degree,
-            8,
-            "a mesh without fsdp_shard should use the dp axis",
-        )
-        self.assertEqual(mock_register.call_args.args[1], "DPPG")
-
-
 class TestGraphTrainerHelpers(unittest.TestCase):
-    """``to``, ``set_pytree_pre_hook``, and device placement."""
+    """``to`` and device placement."""
 
     def test_to_moves_model_and_device(self):
         """Test ``to`` moves the model and records the device."""
@@ -409,29 +248,10 @@ class TestGraphTrainerHelpers(unittest.TestCase):
         )
         returned = tr.to(torch.device("cpu"))
         self.assertIs(returned, tr, "to() should be chainable")
-        self.assertEqual(tr.device, torch.device("cpu"))
-
-    def test_set_pytree_pre_hook_runs_on_compile(self):
-        """Test the pre-hook fires exactly once, before the first compile."""
-        tr = GraphTrainer(
-            model=_make_model(),
-            train_fn=_mse_train_fn,
-            pass_config=PassConfig(fsdp_enabled=False),
-            device=torch.device("cpu"),
-        )
-        calls = []
-        returned = tr.set_pytree_pre_hook(lambda: calls.append(True))
-        self.assertIs(returned, tr, "set_pytree_pre_hook should be chainable")
-
-        # First train_step triggers lazily and fires the hook.
-        tr.train_step(torch.randn(2, 4), torch.randn(2, 4))
-        self.assertEqual(len(calls), 1, "pre-hook should fire on the first compile")
-        # A second step does NOT recompile, so the hook does not re-fire.
-        tr.train_step(torch.randn(2, 4), torch.randn(2, 4))
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(tr._compiler.device, torch.device("cpu"))
 
     def test_place_on_device_moves_tensors_only(self):
-        """Test ``_place_on_device`` moves tensors and leaves other objects."""
+        """Test ``_place_on_device`` moves tensors and leaves other values."""
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
@@ -439,9 +259,9 @@ class TestGraphTrainerHelpers(unittest.TestCase):
             device=torch.device("cpu"),
         )
         t = torch.randn(2, 4)
-        result = tr._place_on_device((t, "not-a-tensor"))
-        self.assertIsInstance(result[0], torch.Tensor)
-        self.assertEqual(result[1], "not-a-tensor")
+        result = tr._place_on_device({"x": t, "y": "not-a-tensor"})
+        self.assertIsInstance(result["x"], torch.Tensor)
+        self.assertEqual(result["y"], "not-a-tensor")
 
 
 if __name__ == "__main__":

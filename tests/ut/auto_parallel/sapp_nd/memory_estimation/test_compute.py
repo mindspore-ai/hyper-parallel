@@ -44,7 +44,6 @@ import os
 import unittest
 from unittest.mock import MagicMock
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.compute import EvalExpertCompute
 

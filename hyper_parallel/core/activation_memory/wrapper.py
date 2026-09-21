@@ -99,8 +99,9 @@ def _iter_wrappable_callable_attrs(module: nn.Module) -> Iterator[tuple[str, Cal
 
 
 def _mark_wrapped(obj: Any) -> None:
+    """Tag ``obj`` as already wrapped, ignoring objects that reject new attributes."""
     try:
-        obj._is_wrapped = True  # pylint: disable=W0212
+        setattr(obj, "_is_wrapped", True)
     except (AttributeError, TypeError):
         pass
 
@@ -210,6 +211,8 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
                     raise RuntimeError(f"Swap :set an invalid policy {policy_fn(tensor)}")
             group_name = swap_manager.get_current_group_name()
             if not group_name:
+                return tensor.detach()
+            if swap_manager.is_last_group(group_name):
                 return tensor.detach()
             if not self.add_to_storage:
                 swap_manager.add_storage(group_name, self.storage)
@@ -324,6 +327,25 @@ class ActivationWrapper(torch.nn.Module, ABC):
         """
         for param_name, param in super().named_parameters(*args, **kwargs):
             yield param_name.replace(_SWAP_PREFIX, ""), param
+
+    def _fqn_modifiers(self) -> dict[str, str]:
+        """Describe the wrapper's state-dict FQN rewrite to PyTorch DCP.
+
+        Distributed state-dict traversal does not use ``named_modules()`` and
+        therefore cannot infer that this wrapper removes its internal module
+        prefix. Map every direct child state name to the wrapped module so
+        optimizer save and restore use the same canonical FQNs.
+        """
+        wrapped_module = self._swap_wrapped_module
+        exposed_names = set(wrapped_module._modules)  # pylint: disable=protected-access
+        exposed_names.update(wrapped_module._parameters)  # pylint: disable=protected-access
+        exposed_names.update(wrapped_module._buffers)  # pylint: disable=protected-access
+        if (
+                getattr(wrapped_module.__class__, "get_extra_state", nn.Module.get_extra_state)
+                != nn.Module.get_extra_state
+        ):
+            exposed_names.add(nn.modules.module._EXTRA_STATE_KEY_SUFFIX)
+        return {name: _SWAP_WRAPPED_MODULE for name in exposed_names}
 
     @staticmethod
     def _post_state_dict_hook(

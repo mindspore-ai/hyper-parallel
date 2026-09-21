@@ -38,7 +38,6 @@ import sys
 import unittest
 from pathlib import Path
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 from tests.common.mark_utils import arg_mark
 
@@ -86,7 +85,6 @@ print("IMPORT_CLEAN")
             text=True,
             cwd=_REPO_ROOT,
             timeout=300,
-            env={**os.environ, "HYPER_PARALLEL_PLATFORM": "torch"},
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)

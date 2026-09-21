@@ -23,7 +23,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 # Force torch platform before any hyper_parallel imports
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import torch
@@ -75,7 +74,6 @@ class TestParamModuleInfo(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
     def test_basic_param_module_info(self):
@@ -123,7 +121,6 @@ class TestNamedParametersWithDuplicates(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
     def test_returns_named_params(self):
@@ -180,7 +177,6 @@ class TestGetParamModuleInfos(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
     def test_single_module_single_param(self):

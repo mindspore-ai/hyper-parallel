@@ -31,7 +31,6 @@ import os
 import unittest
 from typing import Any, List, Tuple
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 from torch import fx

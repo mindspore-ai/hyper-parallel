@@ -3238,5 +3238,40 @@ class TestCPCommBufferCrossNode(unittest.TestCase):
         self.assertAlmostEqual(buffer, expected, places=4)
 
 
+class TestCPConstraintCallCompatibility(unittest.TestCase):
+    """Keep positional callers compatible when grouping CP validation inputs."""
+
+    def test_legacy_positional_fields_match_keyword_fields(self):
+        """The legacy sp_enabled/num_kv_heads order must not follow dataclass order."""
+        positional = validate_cp_constraints(
+            8192, 2, 1, 1, 8, "gqa", 300.0, 25.0, 8, 0.0, 0.0, 0,
+            "ulysses_cp", 8, False, 4,
+        )
+        keyword = validate_cp_constraints(
+            seq_len=8192, cp_degree=2, tp_degree=1, pp_degree=1,
+            device_per_node=8, attention_type_str="gqa", bw_intra=300.0,
+            bw_inter=25.0, total_devices=8, cp_memory_per_layer=0.0,
+            device_capacity=0.0, num_layers=0, cp_algo="ulysses_cp",
+            attention_heads=8, sp_enabled=False, num_kv_heads=4,
+        )
+        self.assertEqual(positional, keyword)
+        self.assertTrue(positional.is_valid)
+
+    def test_legacy_mixed_arguments_preserve_validation(self):
+        """Positional degrees still reject sequences that CP cannot divide."""
+        result = validate_cp_constraints(8193, 2, attention_heads=8)
+        self.assertFalse(result.is_valid)
+        self.assertFalse(result.seq_len_divisible)
+
+    def test_duplicate_and_excess_arguments_raise_type_error(self):
+        """Grouping arguments must retain ordinary Python call validation."""
+        with self.assertRaises(TypeError):
+            validate_cp_constraints(8192, 2, cp_degree=4)
+        with self.assertRaises(TypeError):
+            validate_cp_constraints(8192, *([1] * 16))
+        with self.assertRaises(TypeError):
+            validate_cp_constraints(CPConstraintParams(8192, 2), unknown_field=True)
+
+
 if __name__ == '__main__':
     unittest.main()

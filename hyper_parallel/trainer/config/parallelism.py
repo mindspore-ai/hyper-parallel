@@ -15,8 +15,6 @@
 """Parallel topology, activation-checkpoint and plan-override configuration.
 
 Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5).
-``FSDP2Config`` / ``FSDP2MixedPrecisionConfig`` / ``CompileConfig`` are
-defined in ``auto_models/build_options.py`` and only re-exported here;
 ``PlanOverride`` stays the YAML DTO that desugars to
 ``auto_models.distributed.recipe_spec.ModuleShardingSpec``.
 """
@@ -29,11 +27,6 @@ from typing import Any, List, Literal, Optional, Union
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.models.build_options import (
-    CompileConfig,
-    FSDP2Config,
-    FSDP2MixedPrecisionConfig,
-)
 from hyper_parallel.models.replacement import (
     ModuleReplacementFactory,
     ModuleReplacementSpec,

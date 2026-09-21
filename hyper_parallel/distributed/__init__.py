@@ -51,6 +51,7 @@ from hyper_parallel.distributed._builder.default_templates import (
 )
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
+    compile_selective_checkpoint_policy,
     make_selective_checkpoint_context_fn,
 )
 from hyper_parallel.distributed.attention_swap import (
@@ -84,6 +85,7 @@ __all__ = [
     "apply_sharding_plan",
     "validate_model_compatibility",
     "_apply_activation_checkpointing",
+    "compile_selective_checkpoint_policy",
     "make_selective_checkpoint_context_fn",
     "apply_attention_swap",
     "attention_swap_policy",

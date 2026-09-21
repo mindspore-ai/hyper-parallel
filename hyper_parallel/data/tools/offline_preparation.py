@@ -23,7 +23,6 @@ import json
 import math
 import multiprocessing
 import os
-import sys
 import time
 import traceback
 import warnings
@@ -36,14 +35,17 @@ from transformers import AutoTokenizer
 try:
     import nltk
     from nltk.tokenize.punkt import PunktLanguageVars
-
-    NLTK_AVAILABLE = True
 except ImportError:
     PunktLanguageVars = object
     NLTK_AVAILABLE = False
+else:
+    NLTK_AVAILABLE = True
 
 # Store generated samples in the indexed ``.bin/.idx`` format.
 from hyper_parallel.data.tools import io as indexed_dataset
+from hyper_parallel.data.dataset_logging import get_dataset_logger
+
+logger = get_dataset_logger(__name__)
 
 
 class CustomLanguageVars(PunktLanguageVars):
@@ -234,9 +236,11 @@ class Partition:
         elapsed = time.time() - proc_start
         docs_per_second = count / elapsed
         megabytes_per_second = total_bytes_processed / elapsed / 1024 / 1024
-        print(
-            f"Processed {count} documents " f"({docs_per_second} docs/s, {megabytes_per_second} MB/s).",
-            file=sys.stderr,
+        logger.info(
+            "Processed %d documents (%s docs/s, %s MB/s).",
+            count,
+            docs_per_second,
+            megabytes_per_second,
         )
         if self.args.find_optimal_num_workers:
             self.performance.append(docs_per_second)
@@ -244,7 +248,7 @@ class Partition:
     def split_sentences(self, file_name: tuple[str, str]) -> None:
         """Split every document in one JSONL partition into sentences."""
         input_file_name, output_file_name = file_name
-        print("Opening", input_file_name)
+        logger.info("Opening %s", input_file_name)
         encoder = Encoder(self.args)
         with open(input_file_name, "r", encoding="utf-8") as input_file, open(
             output_file_name,
@@ -266,6 +270,68 @@ class Partition:
                 pool.close()
                 pool.join()
 
+    def _create_builders(self, output_prefix: str, tokenizer: Any) -> tuple[dict[str, str], dict[str, Any]]:
+        """Create indexed dataset builders for every configured JSON key."""
+        level = "sentence" if self.args.split_sentences else "document"
+        output_idx_files = {}
+        builders = {}
+        for key in self.args.json_keys:
+            output_bin_file = f"{output_prefix}_{key}_{level}.bin"
+            output_idx_files[key] = f"{output_prefix}_{key}_{level}.idx"
+            builders[key] = indexed_dataset.IndexedDatasetBuilder(
+                output_bin_file,
+                dtype=indexed_dataset.DType.optimal_dtype(len(tokenizer)),
+            )
+        return output_idx_files, builders
+
+    def _get_chunk_size(self) -> int | None:
+        """Return the packed chunk size including the shifted target token."""
+        pack_to_seq_len = getattr(self.args, "pack_to_seq_len", None)
+        return pack_to_seq_len + 1 if pack_to_seq_len is not None else None
+
+    def _write_encoded_document(
+        self,
+        builders: dict[str, Any],
+        document: dict[str, list[int]],
+        sentence_lengths: dict[str, list[int]],
+        token_buffers: dict[str, list[int]],
+        chunk_size: int | None,
+    ) -> None:
+        """Write one encoded document, optionally packing fixed-size chunks."""
+        for key in self.args.json_keys:
+            if chunk_size is None:
+                builders[key].add_document(document[key], sentence_lengths[key])
+                continue
+            token_buffers[key].extend(document[key])
+            complete_length = len(token_buffers[key]) // chunk_size * chunk_size
+            for offset in range(0, complete_length, chunk_size):
+                chunk = token_buffers[key][offset : offset + chunk_size]
+                builders[key].add_document(chunk, [chunk_size])
+            del token_buffers[key][:complete_length]
+
+    def _process_encoded_documents(
+        self,
+        pool: Any,
+        encoder: Encoder,
+        input_file_name: str,
+        builders: dict[str, Any],
+        token_buffers: dict[str, list[int]],
+        chunk_size: int | None,
+        proc_start: float,
+    ) -> None:
+        """Encode input records and write them to the indexed dataset builders."""
+        total_bytes_processed = 0
+        with open(input_file_name, "r", encoding="utf-8") as input_file:
+            encoded_docs = pool.imap(encoder.encode, input_file, 32)
+            for count, (document, sentence_lengths, bytes_processed) in enumerate(encoded_docs, start=1):
+                if self.args.find_optimal_num_workers and count > self.args.max_documents:
+                    break
+                total_bytes_processed += bytes_processed
+                self._write_encoded_document(
+                    builders, document, sentence_lengths, token_buffers, chunk_size
+                )
+                self.print_processing_stats(count, proc_start, total_bytes_processed)
+
     def process_json_file(self, file_name: tuple[str, str]) -> list[float]:
         """Tokenize one JSONL partition into indexed dataset .bin/.idx files.
 
@@ -276,7 +342,7 @@ class Partition:
             Throughput measurements collected while benchmarking workers.
         """
         input_file_name, output_prefix = file_name
-        print("Opening", input_file_name)
+        logger.info("Opening %s", input_file_name)
 
         startup_start = time.time()
         encoder = Encoder(self.args)
@@ -285,48 +351,16 @@ class Partition:
         # in-flight tasks finish; a 'with' block would terminate() them.
         pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)  # pylint: disable=R1732
 
-        level = "sentence" if self.args.split_sentences else "document"
-
-        output_bin_files = {}
-        output_idx_files = {}
-        builders = {}
-
-        keys = self.args.json_keys
-        for key in keys:
-            output_bin_files[key] = f"{output_prefix}_{key}_{level}.bin"
-            output_idx_files[key] = f"{output_prefix}_{key}_{level}.idx"
-            builders[key] = indexed_dataset.IndexedDatasetBuilder(
-                output_bin_files[key],
-                dtype=indexed_dataset.DType.optimal_dtype(len(tokenizer)),
-            )
-
-        startup_end = time.time()
-        proc_start = time.time()
-        total_bytes_processed = 0
-        print("Time to startup:", startup_end - startup_start)
-        pack_to_seq_len = getattr(self.args, "pack_to_seq_len", None)
-        chunk_size = pack_to_seq_len + 1 if pack_to_seq_len is not None else None
-        token_buffers = {key: [] for key in keys}
+        output_idx_files, builders = self._create_builders(output_prefix, tokenizer)
+        timing = (time.time() - startup_start, time.time())
+        logger.info("Time to startup: %s", timing[0])
+        chunk_size = self._get_chunk_size()
+        token_buffers = {key: [] for key in self.args.json_keys}
         try:
-            with open(input_file_name, "r", encoding="utf-8") as fin:
-                encoded_docs = pool.imap(encoder.encode, fin, 32)
-                for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
-                    if self.args.find_optimal_num_workers and i > self.args.max_documents:
-                        break
-                    total_bytes_processed += bytes_processed
-                    for key in keys:
-                        if chunk_size is None:
-                            builders[key].add_document(doc[key], sentence_lens[key])
-                            continue
-                        token_buffers[key].extend(doc[key])
-                        complete_length = len(token_buffers[key]) // chunk_size * chunk_size
-                        for offset in range(0, complete_length, chunk_size):
-                            chunk = token_buffers[key][offset : offset + chunk_size]
-                            builders[key].add_document(chunk, [chunk_size])
-                        del token_buffers[key][:complete_length]
-                    self.print_processing_stats(i, proc_start, total_bytes_processed)
-
-            for key in keys:
+            self._process_encoded_documents(
+                pool, encoder, input_file_name, builders, token_buffers, chunk_size, timing[1]
+            )
+            for key in self.args.json_keys:
                 builders[key].finalize(output_idx_files[key])
         finally:
             for builder in builders.values():
@@ -444,13 +478,15 @@ def find_optimal_num_workers(
     if not results:
         raise ValueError("No worker performance measurements were collected")
     results.sort(key=lambda item: item[1], reverse=True)
-    print("\nWorker performance results:")
+    logger.info("Worker performance results:")
     for position, (workers, average_rate) in enumerate(results, start=1):
-        print(f"{position}. {workers} workers: {average_rate:.4f} docs/s")
+        logger.info("%d. %d workers: %.4f docs/s", position, workers, average_rate)
     best_workers, best_rate = results[0]
-    print(
-        f"Best configuration: {best_workers} total workers "
-        f"({best_workers // partitions} per partition), {best_rate:.4f} docs/s."
+    logger.info(
+        "Best configuration: %d total workers (%d per partition), %.4f docs/s.",
+        best_workers,
+        best_workers // partitions,
+        best_rate,
     )
 
 
@@ -676,9 +712,9 @@ def _write_input_partitions(
 ) -> None:
     """Distribute input records across partition files."""
     outputs = [open(name["partition"], "w", encoding="utf-8") for name in names]  # pylint: disable=R1732
+    partition_index = 0
+    line_count = 0
     try:
-        partition_index = 0
-        line_count = 0
         for input_file_name in input_files:
             open_file = gzip.open if input_file_name.endswith(".gz") else open
             with open_file(input_file_name, "rt", encoding="utf-8") as input_file:
@@ -708,7 +744,9 @@ def _split_partitions(args: argparse.Namespace, workers: int, names: list[dict[s
         process = multiprocessing.Process(target=_split_sentences_worker, args=(args, workers, name, queue))
         process.start()
         processes.append(process)
-    _wait_for_processes(processes, queue)
+    split_results = _wait_for_processes(processes, queue)
+    if any(result is not None for result in split_results):
+        raise RuntimeError("Sentence-splitting workers returned unexpected results")
 
 
 def _encode_partitions(
@@ -742,7 +780,7 @@ def prepare_offline_dataset(args: argparse.Namespace) -> None:
     performance = {}
     input_files = _resolve_input_files(args.dataset_name_or_path)
     for workers in worker_candidates:
-        print(f"Processing data with {workers} workers.")
+        logger.info("Processing data with %d workers.", workers)
         workers_per_partition = workers // args.partitions
 
         if args.split_sentences:

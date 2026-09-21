@@ -44,8 +44,7 @@ __attribute__((format(printf, 5, 6)))
 void Line(Level level, int32_t root_rank, const char *file, int line, const char *format, ...) noexcept;
 
 /** @brief Write one Runtime-owned failure without changing the supplied Status. */
-void Failure(const char *file, int line, DfxOperation operation, DfxPhase phase, int32_t root_rank,
-             const Status &error) noexcept;
+void Failure(const char *file, int line, const DfxFailure &failure) noexcept;
 
 }  // namespace hyper_parallel::multicore::shmem::runtime::log
 

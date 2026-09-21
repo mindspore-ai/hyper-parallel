@@ -21,7 +21,6 @@ import torch.distributed as dist
 from torch import nn
 
 # pylint: disable=wrong-import-position
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 rank = os.environ.get("RANK")
 if rank is not None:
     os.environ["RANK_ID"] = rank
@@ -39,7 +38,7 @@ from hyper_parallel.core.expert_parallel import (
     ExpertTensorParallel,
 )
 from hyper_parallel.core.dtensor.placement_types import Shard
-from hyper_parallel.platform.torch.common import FeedForward, MoE
+from hyper_parallel.components.modules.moe import FeedForward, MoE
 from tests.torch.expert_parallel.templates import get_template
 from tests.torch.expert_parallel.validator import (
     validate_template,

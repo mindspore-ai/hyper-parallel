@@ -16,6 +16,7 @@
 # pylint: disable=C9006,C9007
 import logging
 
+import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.dtensor import _utils
@@ -108,7 +109,7 @@ class TensorRedistribution:
         split_dim = args[0]
         split_size = args[1]
         idx = rank_list.index(self.rank_id)
-        return _utils.chunk(x, split_dim, split_size, idx)
+        return torch.chunk(x, split_size, dim=split_dim)[idx]
 
     @staticmethod
     def _construct_all_to_all(x, *args):

@@ -54,10 +54,8 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
+    def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure common mock-platform attributes used across tests."""
-        if platform_type is not None:
-            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (
@@ -866,8 +864,10 @@ class TestSdpaHelperMethods(unittest.TestCase):
         self.assertEqual(adj_mask.shape[2], local_q_len)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_expanded_impl_with_sequence_parallelism(self, mock_mesh_platform):
+    @patch("hyper_parallel.core.shard.ops.parallel_scaled_dot_product_attention.dist")
+    def test_expanded_impl_with_sequence_parallelism(self, mock_op_dist, mock_mesh_platform):
         """expanded_impl with SP active calls _adjust_attn_mask_for_sp and then func."""
+        mock_op_dist.get_rank.return_value = 0
         self._setup_mock_platform(mock_mesh_platform, world_size=8)
         mesh = init_device_mesh(
             device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("sp", "mp")

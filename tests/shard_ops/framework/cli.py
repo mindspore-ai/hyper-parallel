@@ -24,10 +24,8 @@ Flag-style::
     python -m tests.shard_ops.framework --case sort_2d_dp_last_dim
     python -m tests.shard_ops.framework --case-glob "sort_*" --tag sort
 
-framework is auto-derived from the file path, ``HYPER_PARALLEL_PLATFORM``
-env var, or defaults to ``torch``.  ``--device-type`` defaults from
-``HYPER_PARALLEL_TEST_DEVICE_TYPE`` or the framework default (cpu for
-torch).
+framework defaults to ``torch``.  ``--device-type`` defaults from
+``HYPER_PARALLEL_TEST_DEVICE_TYPE`` or the framework default (cpu).
 """
 import argparse
 import os

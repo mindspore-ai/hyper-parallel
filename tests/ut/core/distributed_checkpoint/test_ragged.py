@@ -19,7 +19,6 @@ from unittest.mock import patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.distributed_checkpoint.ragged import (
     _decompose_flat_interval,

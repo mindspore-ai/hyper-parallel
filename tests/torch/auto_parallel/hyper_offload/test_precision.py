@@ -20,7 +20,6 @@ a reference forward+backward pass, across common module types.
 
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import pytest

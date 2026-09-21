@@ -34,7 +34,6 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.utils import shape_utils  # pylint: disable=wrong-import-position
 

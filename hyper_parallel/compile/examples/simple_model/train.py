@@ -23,7 +23,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Iterator, Tuple
+from typing import Dict, Iterator
 
 import torch
 import torch.distributed as dist
@@ -108,7 +108,7 @@ def build_pass_plan(config: dict) -> PassPlan:
 
 
 def train_fn(
-    model: torch.nn.Module, input_ids: torch.Tensor, labels: torch.Tensor
+    model: torch.nn.Module, *, input_ids: torch.Tensor, labels: torch.Tensor
 ) -> torch.Tensor:
     """Training function"""
     logits = model(input_ids)
@@ -178,19 +178,20 @@ def main() -> None:  # pylint: disable=too-many-locals
     max_steps = config["train"]["max_steps"]
     log_interval = config["logging"]["log_interval"]
 
-    # The data iterator yields ``(input, label)`` batches. train drives the whole
-    # loop: it compiles on the first batch, moves each batch onto the trainer's
+    # The data iterator yields dicts of model inputs. train drives the whole
+    # loop: it compiles on the first batch, moves each batch onto the compiler's
     # device, runs a step + optimizer update, and logs on ``log_interval``.
-    # Batches are produced on CPU; ``train`` moves them onto ``trainer.device``.
+    # Batches are produced on CPU; ``train`` moves them onto the compiler's
+    # device.
     g_input_ids = torch.randint(0, vocab_size, (1, max_seq_len))
     g_labels = torch.randint(0, vocab_size, (1, max_seq_len))
 
-    def data_iter() -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+    def data_iter() -> Iterator[Dict[str, torch.Tensor]]:
         """Yield the same synthetic batch each step (demo workload)."""
         for _ in range(max_steps):
             input_ids = g_input_ids
             labels = g_labels
-            yield input_ids, labels
+            yield {"input_ids": input_ids, "labels": labels}
 
     _LOG.info("\nStarting training...")
     trainer.train(data_iter(), max_steps=max_steps, log_interval=log_interval)

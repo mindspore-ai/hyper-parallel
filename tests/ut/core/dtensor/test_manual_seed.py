@@ -20,7 +20,6 @@ import unittest
 import warnings
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.random import is_rng_supported_mesh, manual_seed
 from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
@@ -65,13 +64,13 @@ class TestManualSeed(unittest.TestCase):
     def tearDown(self) -> None:
         _OP_DISPATCHER._rng_tracker = None
 
-    def test_no_op_on_cpu_mesh_does_not_touch_dispatcher_seed(self):
+    @patch("hyper_parallel.core.dtensor.random.torch.manual_seed")
+    def test_no_op_on_cpu_mesh_does_not_touch_dispatcher_seed(self, mock_torch_manual_seed):
         """Unsupported mesh: early return; no ``torch.manual_seed``."""
         mesh = MagicMock()
         mesh.device_type = "cpu"
-        with patch("hyper_parallel.core.dtensor.random._utils.manual_seed") as mock_ms:
-            manual_seed(42, mesh)
-        mock_ms.assert_not_called()
+        manual_seed(42, mesh)
+        mock_torch_manual_seed.assert_not_called()
 
     @patch("hyper_parallel.core.dtensor.random.OffsetBasedRNGTracker")
     @patch("hyper_parallel.core.dtensor.random.is_rng_supported_mesh", return_value=True)

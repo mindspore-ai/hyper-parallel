@@ -43,7 +43,7 @@ from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.tensor_parallel import parallelize_module
 from hyper_parallel.core.tensor_parallel.style import PrepareModuleInputOutput
-from hyper_parallel.platform.torch.common import FeedForward, MoE
+from hyper_parallel.components.modules.moe import FeedForward, MoE
 from tests.torch.utils import init_dist
 
 

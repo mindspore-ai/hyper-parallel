@@ -33,9 +33,7 @@ import numpy as np
 
 # Set platform to torch for testing
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.device_mesh import (
     DeviceMesh,
     _DEVICE_MESH_MAP,
@@ -195,7 +193,6 @@ class TestDeviceMesh(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
-        self.platform = get_platform()
 
     def tearDown(self):
         """Clean up after each test method."""
@@ -304,7 +301,7 @@ class TestDeviceMesh(unittest.TestCase):
         Expected behavior: DeviceMesh should have correct shape (2, 2).
         """
         self._setup_mock_platform(mock_utils, world_size=4)
-        mesh_tensor = self.platform.tensor([[0, 2], [1, 3]])
+        mesh_tensor = np.array([[0, 2], [1, 3]], dtype=np.int32)
 
         device_mesh = DeviceMesh("npu", mesh_tensor, mesh_dim_names=("dp", "tp"))
 

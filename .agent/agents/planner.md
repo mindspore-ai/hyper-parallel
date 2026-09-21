@@ -36,7 +36,7 @@ Produce a structured plan with:
 2. **Affected files**: List of files to create/modify/delete with rationale
 3. **Implementation order**: Sequence of changes (dependencies first)
 4. **Key decisions**: Design choices and tradeoffs
-5. **Risk areas**: Stream sync, memory management, cross-platform compatibility
+5. **Risk areas**: Stream sync, memory management, collective ordering
 6. **Testing strategy**: What tests to add/modify, how to verify
 
 ## Constraints

@@ -42,6 +42,7 @@ _HP_TO_INTERNAL: Dict[str, str] = {
     "seq_length": "max_position_embeddings",
 }
 
+
 def _normalize_model_spec(model_spec: Dict[str, Any]) -> Dict[str, Any]:
     """Rename non-standard config overrides keys to canonical names.
 

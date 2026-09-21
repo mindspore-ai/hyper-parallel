@@ -28,56 +28,19 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
-from torch._C._distributed_c10d import ProcessGroup
 from torch.nn.utils.rnn import PackedSequence
-
-import torch.distributed as dist
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Placement
+from hyper_parallel.core.utils.communication import get_device_handle
+from hyper_parallel.core.utils.communication import get_group_local_rank
 
 DType = torch.dtype
 
 
 # ---------------------------------------------------------------------------
-# Process group helpers
-# ---------------------------------------------------------------------------
-
-def get_group_local_rank(group: Optional[ProcessGroup] = None) -> int:
-    """Return the current rank's index within ``group``.
-
-    Args:
-        group: The group to index into. ``None`` uses the default group.
-
-    Returns:
-        int: The rank of the current process inside ``group``.
-    """
-    return dist.get_rank(group=group)
-
-
-def get_world_size() -> int:
-    """Return the number of processes in the default distributed group.
-
-    Returns:
-        int: The world size.
-    """
-    return dist.get_world_size()
-
-
 # Module traversal
 # ---------------------------------------------------------------------------
-
-def get_cells_and_names(cell: nn.Module):
-    """Return every nested module and its name.
-
-    Args:
-        cell: The root module to traverse.
-
-    Returns:
-        An iterator of ``(name, module)`` pairs.
-    """
-    return cell.named_modules()
-
 
 def get_modules(module: nn.Module):
     """Return every sub-module contained in ``module``.
@@ -113,25 +76,6 @@ def buffers_dict(cell: nn.Module):
         An iterator of ``(name, buffer)`` pairs.
     """
     return cell.named_buffers()
-
-
-def get_device_handle(device_type: str = "npu"):
-    """Return the ``torch`` device module for ``device_type``.
-
-    Args:
-        device_type: Device backend name, e.g. ``"npu"`` or ``"cuda"``.
-
-    Returns:
-        The matching ``torch.<device_type>`` module.
-
-    Raises:
-        RuntimeError: If torch exposes no module for ``device_type``.
-    """
-    try:
-        handle = getattr(torch, device_type)
-    except AttributeError as e:
-        raise RuntimeError(f"Failed to resolve device handle: 'torch.{device_type}'.") from e
-    return handle
 
 
 # ---------------------------------------------------------------------------
@@ -403,3 +347,34 @@ class SourceShardMetaInfo:
     mesh: DeviceMesh
     placements: tuple[Placement, ...]
     origin_is_dtensor: bool = False
+
+
+__all__ = [
+    # Module traversal and tensor plumbing.
+    "DType",
+    "get_modules",
+    "parameters_dict",
+    "buffers_dict",
+    "load_into_param",
+    "cast_fp_tensor",
+    "apply_to_tensors",
+    "profiler_record",
+    # Grad-reduce handle choreography.
+    "grad_ready_stream",
+    "set_grad_reduce_handle",
+    "wait_grad_handle",
+    # Precision/offload policies and mesh metadata.
+    "MixedPrecisionPolicy",
+    "OffloadPolicy",
+    "CPUOffloadPolicy",
+    "CommFusionPolicy",
+    "DataParallelMeshInfo",
+    "FSDPMeshInfo",
+    "DDPMeshInfo",
+    "HSDPMeshInfo",
+    "SourceShardMetaInfo",
+    # Re-exported from :mod:`hyper_parallel.core.utils.communication` because
+    # callers here and in the tests reach them through this module.
+    "get_device_handle",
+    "get_group_local_rank",
+]

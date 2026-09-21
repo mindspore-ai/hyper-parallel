@@ -18,7 +18,6 @@
 import os
 import unittest
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 import torch  # pylint: disable=wrong-import-position

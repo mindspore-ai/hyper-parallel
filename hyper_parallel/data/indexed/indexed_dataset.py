@@ -182,7 +182,8 @@ class IndexedPretrainDatasetBuilder:
         config = build_gpt_dataset_config(data_paths, self.data_config)
         return config
 
-    def _select_dataset_type(self, config: GPTDatasetConfig) -> type:
+    @staticmethod
+    def _select_dataset_type(config: GPTDatasetConfig) -> type:
         """Select GPT, Mock GPT, or MR GPT Dataset."""
         if config.mock:
             return MockGPTDataset

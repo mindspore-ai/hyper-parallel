@@ -35,7 +35,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Iterator, Tuple
+from typing import Dict, Iterator
 
 import torch
 import torch.distributed as dist
@@ -121,7 +121,7 @@ class PPDemoModel(nn.Module):
 
 
 def train_fn(
-    model: nn.Module, input_ids: torch.Tensor, labels: torch.Tensor
+    model: nn.Module, *, input_ids: torch.Tensor, labels: torch.Tensor
 ) -> torch.Tensor:
     """Next-token loss; computed at the root, so it lands on the LAST stage."""
     logits = model(input_ids)
@@ -214,15 +214,15 @@ def main() -> None:  # pylint: disable=too-many-locals
     # every full batch it receives into matching microbatches at runtime.
     # ``compile`` does NOT move its sample tensors, so place them on the
     # trainer's device here (``train_step`` does the same per batch).
-    sample_input, sample_label = trainer._place_on_device(  # pylint: disable=protected-access
-        (batch[:microbatch], labels[:microbatch])
+    inputs = trainer._place_on_device(  # pylint: disable=protected-access
+        {"input_ids": batch[:microbatch], "labels": labels[:microbatch]}
     )
-    trainer.compile(sample_input, sample_label)
+    trainer.compile(**inputs)
 
-    def data_iter() -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+    def data_iter() -> Iterator[Dict[str, torch.Tensor]]:
         """Yield the same synthetic batch each step (demo workload)."""
         for _ in range(steps):
-            yield batch, labels
+            yield {"input_ids": batch, "labels": labels}
 
     losses = trainer.train(
         data_iter(), max_steps=steps, log_interval=config["logging"]["log_interval"]

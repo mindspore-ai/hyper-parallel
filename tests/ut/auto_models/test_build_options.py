@@ -22,7 +22,6 @@ import unittest
 from dataclasses import fields
 from pathlib import Path
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch
 
@@ -253,7 +252,6 @@ class TestBuildOptionsBoundary(unittest.TestCase):
             text=True,
             cwd=_REPO_ROOT,
             timeout=300,
-            env={**os.environ, "HYPER_PARALLEL_PLATFORM": "torch"},
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)

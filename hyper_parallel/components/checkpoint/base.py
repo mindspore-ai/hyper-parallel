@@ -28,6 +28,10 @@ Swapping the persistence backend is therefore a matter of registering another
 :class:`CheckpointerBase`, with no change to the callback.
 """
 
+__all__ = [
+    "CheckpointerBase",
+]
+
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
@@ -105,8 +109,3 @@ class CheckpointerBase(ABC):
         directory holds no usable checkpoint.
         """
         raise NotImplementedError
-
-
-__all__ = [
-    "CheckpointerBase",
-]

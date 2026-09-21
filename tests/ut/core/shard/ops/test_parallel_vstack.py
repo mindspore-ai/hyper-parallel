@@ -60,7 +60,6 @@ class TestVstackDistributedOp(unittest.TestCase):
         """Configure common mock-platform attributes used across tests."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.platform_type = MagicMock()
 
     def _make_2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2 mesh via init_device_mesh."""

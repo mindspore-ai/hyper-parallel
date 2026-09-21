@@ -29,7 +29,6 @@ _EXPORT_MODULES = (
 def _run_isolated(script: str) -> subprocess.CompletedProcess:
     """Run ``script`` in a fresh interpreter with the local checkout."""
     env = os.environ.copy()
-    env["HYPER_PARALLEL_PLATFORM"] = "torch"
     repo_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
     )

@@ -33,7 +33,7 @@ Ground every answer in the current code under `hyper_parallel/core/tensor_parall
 
 - `ParallelStyle` — abstract base; subclasses implement `apply(module: Module, device_mesh: DeviceMesh) -> Module`.
 - `src_data_rank: Optional[int]` — rank used when a style shards or broadcasts from a **logical global** tensor; may be ignored by styles until they integrate `distribute_tensor` / parameter initialization paths.
-- Uses `get_platform()` and `platform.Module` for backend-neutral module typing.
+- Styles type their arguments with `torch.nn.Module` directly; there is no backend indirection left.
 
 ### Integration: context parallel
 

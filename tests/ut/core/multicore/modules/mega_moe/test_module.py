@@ -140,6 +140,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         try:
             self.assertEqual(experts.local_num_tokens, 128)
             self.assertIsNone(experts.expert_capacity_factor)
+            self.assertIsNone(experts.swiglu_limit)
             self.assertEqual(
                 experts._resource_group.specification,
                 {
@@ -149,6 +150,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                     "num_experts": 4,
                     "top_k": 2,
                     "expert_capacity_factor": None,
+                    "swiglu_limit": None,
                     "ep_size": 2,
                     "ep_group": None,
                     "dispatch_mode": "push",
@@ -249,6 +251,63 @@ class TestMegaMoeExperts(unittest.TestCase):
         with patch.object(mega_moe_module.dist, "all_gather_object") as gather:
             mega_moe_module._validate_resource_layout((), torch.empty(0), SimpleNamespace(ep_size=1))
         gather.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_constructor_validates_and_records_swiglu_limit(
+        self,
+        mock_create_parameters: Mock,
+    ) -> None:
+        """Feature: validate the model-facing SwiGLU clamp option.
+
+        Description: Construct experts with one valid limit and several invalid
+            or non-float32-representable values.
+        Expectation: The valid limit is retained and invalid limits fail before
+            parameter allocation.
+        """
+        mock_create_parameters.return_value = (object(), object())
+        experts = MegaMoeExperts(
+            local_num_tokens=128,
+            hidden_size=16,
+            intermediate_size=8,
+            num_experts=4,
+            top_k=2,
+            swiglu_limit=10,
+            ep_size=2,
+        )
+        try:
+            self.assertEqual(experts.swiglu_limit, 10.0)
+            self.assertEqual(
+                experts._resource_group.specification["swiglu_limit"],
+                10.0,
+            )
+        finally:
+            experts.close()
+
+        for invalid_limit in (
+            0,
+            -1,
+            1e-50,
+            1e39,
+            float("nan"),
+            float("inf"),
+            True,
+            "10",
+        ):
+            with (
+                self.subTest(swiglu_limit=invalid_limit),
+                self.assertRaisesRegex(ValueError, "swiglu_limit"),
+            ):
+                MegaMoeExperts(
+                    local_num_tokens=128,
+                    hidden_size=16,
+                    intermediate_size=8,
+                    num_experts=4,
+                    top_k=2,
+                    swiglu_limit=invalid_limit,
+                    ep_size=2,
+                )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
               essential_mark="essential")

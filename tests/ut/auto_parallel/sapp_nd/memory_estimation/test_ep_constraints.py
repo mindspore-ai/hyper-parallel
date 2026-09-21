@@ -35,11 +35,11 @@ import os
 import unittest
 from unittest.mock import MagicMock
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.validators.ep_constraints import (
     ConstraintResult,
     EpConstraints,
+    StageExperts,
 )
 
 
@@ -152,41 +152,35 @@ class TestEpPpStageFeasibility(unittest.TestCase):
     def test_c4_dense_only(self):
         """AP-EP-06-01: Dense-only stage (n_moe=0) trivially passes."""
         result = EpConstraints.check_ep_pp_stage_feasibility(
-            n_moe_layers=0, n_exp=8, ep=4, dp=1,
-            h=4096, hff_exp=14336, bytes_p=2,
-            device_capacity_gb=80.0, zero_level=2, t_exp=1,
+            StageExperts(n_moe_layers=0, n_exp=8, h=4096, hff_exp=14336, bytes_p=2),
+            ep=4, dp=1, device_capacity_gb=80.0, zero_level=2, t_exp=1,
         )
         self.assertTrue(result.passed)
 
     def test_c4_feasible(self):
         """AP-EP-06-02: Small model fits within device capacity."""
         result = EpConstraints.check_ep_pp_stage_feasibility(
-            n_moe_layers=2, n_exp=8, ep=4, dp=1,
-            h=256, hff_exp=512, bytes_p=2,
-            device_capacity_gb=80.0, zero_level=2, t_exp=1,
+            StageExperts(n_moe_layers=2, n_exp=8, h=256, hff_exp=512, bytes_p=2),
+            ep=4, dp=1, device_capacity_gb=80.0, zero_level=2, t_exp=1,
         )
         self.assertTrue(result.passed)
 
     def test_c4_infeasible(self):
         """AP-EP-06-03: Large model exceeds device capacity."""
         result = EpConstraints.check_ep_pp_stage_feasibility(
-            n_moe_layers=61, n_exp=256, ep=8, dp=1,
-            h=7168, hff_exp=18432, bytes_p=2,
-            device_capacity_gb=10.0, zero_level=2, t_exp=1,
+            StageExperts(n_moe_layers=61, n_exp=256, h=7168, hff_exp=18432, bytes_p=2),
+            ep=8, dp=1, device_capacity_gb=10.0, zero_level=2, t_exp=1,
         )
         self.assertFalse(result.passed)
 
     def test_c4_zero3_relief(self):
         """AP-EP-06-04: ZeRO-3 provides more memory relief than ZeRO-2."""
-        kwargs = {
-            "n_moe_layers": 8, "n_exp": 64, "ep": 4, "dp": 2,
-            "h": 4096, "hff_exp": 14336, "bytes_p": 2,
-            "device_capacity_gb": 80.0, "t_exp": 1,
-        }
+        experts = StageExperts(n_moe_layers=8, n_exp=64, h=4096, hff_exp=14336, bytes_p=2)
+        kwargs = {"ep": 4, "dp": 2, "device_capacity_gb": 80.0, "t_exp": 1}
         r_z2 = EpConstraints.check_ep_pp_stage_feasibility(
-            zero_level=2, **kwargs)
+            experts, zero_level=2, **kwargs)
         r_z3 = EpConstraints.check_ep_pp_stage_feasibility(
-            zero_level=3, **kwargs)
+            experts, zero_level=3, **kwargs)
         # ZeRO-3 total <= ZeRO-2 total (ZeRO-3 shards more aggressively)
         self.assertLessEqual(
             float(r_z3.message.split("=")[1].split("GB")[0]),
@@ -196,25 +190,58 @@ class TestEpPpStageFeasibility(unittest.TestCase):
     def test_c4_ep_zero(self):
         """ep=0 is illegal for stage feasibility."""
         result = EpConstraints.check_ep_pp_stage_feasibility(
-            n_moe_layers=4, n_exp=8, ep=0, dp=1,
-            h=4096, hff_exp=14336, bytes_p=2,
-            device_capacity_gb=80.0, zero_level=2, t_exp=1,
+            StageExperts(n_moe_layers=4, n_exp=8, h=4096, hff_exp=14336, bytes_p=2),
+            ep=0, dp=1, device_capacity_gb=80.0, zero_level=2, t_exp=1,
         )
         self.assertFalse(result.passed)
 
     def test_c4_nffmm2_mlp(self):
-        """n_ffMM=2 (standard MLP) estimates lower memory than n_ffMM=3 (SwiGLU)."""
-        kwargs = {
-            "n_moe_layers": 4, "n_exp": 8, "ep": 4, "dp": 1,
-            "h": 4096, "hff_exp": 14336, "bytes_p": 2,
-            "device_capacity_gb": 80.0, "zero_level": 2, "t_exp": 1,
-        }
-        r3 = EpConstraints.check_ep_pp_stage_feasibility(n_ffMM=3, **kwargs)
-        r2 = EpConstraints.check_ep_pp_stage_feasibility(n_ffMM=2, **kwargs)
+        """n_ff_mm=2 (standard MLP) estimates lower memory than n_ff_mm=3 (SwiGLU)."""
+        shape = {"n_moe_layers": 4, "n_exp": 8, "h": 4096, "hff_exp": 14336, "bytes_p": 2}
+        kwargs = {"ep": 4, "dp": 1, "device_capacity_gb": 80.0, "zero_level": 2, "t_exp": 1}
+        r3 = EpConstraints.check_ep_pp_stage_feasibility(
+            StageExperts(n_ff_mm=3, **shape), **kwargs)
+        r2 = EpConstraints.check_ep_pp_stage_feasibility(
+            StageExperts(n_ff_mm=2, **shape), **kwargs)
         # Both should pass (small model), but MLP estimates 2/3 the memory
         mem_3 = float(r3.message.split("=")[1].split("GB")[0])
         mem_2 = float(r2.message.split("=")[1].split("GB")[0])
         self.assertAlmostEqual(mem_2, mem_3 * 2 / 3, places=1)
+
+    def test_legacy_numeric_keyword_and_positional_calls(self):
+        """Legacy numeric calls and StageExperts must compute identical memory."""
+        expected = EpConstraints.check_ep_pp_stage_feasibility(
+            StageExperts(4, 8, 4096, 14336, 2, n_ff_mm=2),
+            ep=4, dp=2, device_capacity_gb=80.0, zero_level=3, t_exp=2,
+        )
+        positional = EpConstraints.check_ep_pp_stage_feasibility(
+            4, 8, 4, 2, 4096, 14336, 2, 80.0, 3, 2, 2,
+        )
+        keyword = EpConstraints.check_ep_pp_stage_feasibility(
+            n_moe_layers=4, n_exp=8, ep=4, dp=2, h=4096, hff_exp=14336,
+            bytes_p=2, device_capacity_gb=80.0, zero_level=3, t_exp=2, n_ffMM=2,
+        )
+        self.assertEqual(positional, expected)
+        self.assertEqual(keyword, expected)
+
+    def test_legacy_defaults_and_mixed_arguments(self):
+        """Omitted optional numeric inputs keep the original defaults."""
+        expected = EpConstraints.check_ep_pp_stage_feasibility(
+            StageExperts(2, 8, 256, 512, 2), ep=4, dp=1, device_capacity_gb=80.0,
+        )
+        actual = EpConstraints.check_ep_pp_stage_feasibility(
+            2, 8, ep=4, dp=1, h=256, hff_exp=512, bytes_p=2, device_capacity_gb=80.0,
+        )
+        self.assertEqual(actual, expected)
+
+    def test_legacy_argument_validation(self):
+        """The compatibility adapter rejects missing, duplicate and unknown fields."""
+        with self.assertRaises(TypeError):
+            EpConstraints.check_ep_pp_stage_feasibility(n_moe_layers=1)
+        with self.assertRaises(TypeError):
+            EpConstraints.check_ep_pp_stage_feasibility(1, 8, n_exp=8)
+        with self.assertRaises(TypeError):
+            EpConstraints.check_ep_pp_stage_feasibility(1, 8, 1, 1, 256, 512, 2, 80, typo=True)
 
 
 class TestValidateAll(unittest.TestCase):

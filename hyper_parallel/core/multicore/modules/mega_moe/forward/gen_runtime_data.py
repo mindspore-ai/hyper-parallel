@@ -31,6 +31,7 @@ Outputs (per rank):
     <output_dir>/runtime_config_input_rank_<i>.bin
 """
 import argparse
+from dataclasses import dataclass
 import os
 
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
@@ -57,6 +58,15 @@ from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
 from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
 from hyper_parallel.core.multicore.scheduler.scheduler import revise_task_queue
 from hyper_parallel.core.multicore.tasks.utils import add_dynamic_data, add_terminate
+
+
+@dataclass(frozen=True)
+class _GenerationContext:
+    """Prepared arguments, topology and graph for forward data generation."""
+
+    args: argparse.Namespace
+    task_values: TaskSplitValue
+    graph: ComputeGraph
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,26 +138,27 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
 
 
 def write_bin(path: str, data: bytes) -> None:
-    """Write binary data to a file, creating parent directories if needed."""
+    """Write binary data to a file, creating parent directories if needed.
+
+    Args:
+        path: Destination file path.
+        data: Serialized payload bytes.
+    """
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     with open(path, 'wb') as f:
         f.write(data)
     print(f"  wrote {len(data):>10,} bytes → {path}")
 
 
-def main() -> None:
-    """Entry point for forward pass runtime data generation."""
-    args = parse_args()
-    out  = args.output_dir
-
-    tsv   = TaskSplitValue(
+def _prepare_generation(args: argparse.Namespace) -> _GenerationContext:
+    """Build and propagate the forward graph from command-line arguments."""
+    task_values = TaskSplitValue(
         tp=args.tp, ep=args.ep,
         seq_size=args.seq_size,
         all_expert_num=args.all_expert_num,
         top_k=args.top_k,
     )
-    num_groups = tsv.single_rank_expert_num
-    graph = build_forward_graph(tsv,
+    graph = build_forward_graph(task_values,
                                 dispatch_sv=128,  up_proj_sv=4096,
                                 swiglu_sv=128,    down_proj_sv=4096,
                                 combine_sv=128,
@@ -155,8 +166,14 @@ def main() -> None:
                                 intermediate_size=args.intermediate_size,
                                 dtype_size=args.dtype_size,
                                 num_cube_cores=args.num_cube_cores)
-    # Compute task_num for each operator via split-axis propagation
-    graph.propagate_splits(tsv)
+    graph.propagate_splits(task_values)
+    return _GenerationContext(args, task_values, graph)
+
+
+def _describe_graph(context: _GenerationContext) -> None:
+    """Print the resolved forward task counts."""
+    args = context.args
+    graph = context.graph
 
     dispatch_op  = graph.get_op("dispatch")
     up_proj_op   = graph.get_op("up_proj")
@@ -170,7 +187,15 @@ def main() -> None:
           f"swiglu={swiglu_op.task_num}  down_proj={down_proj_op.task_num}  "
           f"combine={combine_op.task_num}")
 
-    # ── Tiling files (rank-independent) ──────────────────────────────────────
+
+def _write_tiling_files(context: _GenerationContext) -> None:
+    """Write all rank-independent forward tiling files."""
+    args = context.args
+    graph = context.graph
+    num_groups = context.task_values.single_rank_expert_num
+    up_proj_op = graph.get_op("up_proj")
+    swiglu_op = graph.get_op("swiglu")
+    down_proj_op = graph.get_op("down_proj")
     up_proj_bytes   = get_up_proj_tiling_bytes(up_proj_op.split_value,
                                                hidden_size=args.hidden_size,
                                                intermediate_size=args.intermediate_size,
@@ -184,25 +209,43 @@ def main() -> None:
     swiglu_bytes    = get_swiglu_tiling_bytes(swiglu_op.split_value,
                                               intermediate_size=args.intermediate_size)
 
-    write_bin(os.path.join(out, 'up_proj_tiling.bin'),   up_proj_bytes)
-    write_bin(os.path.join(out, 'swiglu_tiling.bin'),    swiglu_bytes)
-    write_bin(os.path.join(out, 'down_proj_tiling.bin'), down_proj_bytes)
+    write_bin(os.path.join(args.output_dir, 'up_proj_tiling.bin'), up_proj_bytes)
+    write_bin(os.path.join(args.output_dir, 'swiglu_tiling.bin'), swiglu_bytes)
+    write_bin(os.path.join(args.output_dir, 'down_proj_tiling.bin'), down_proj_bytes)
 
-    # ── Event counters + workspace (rank-independent) ─────────────────────────
-    # Reserve the same event capacity as the online workspace and runtime.
-    write_bin(os.path.join(out, 'all_event_counters.bin'),
-              bytes(event_workspace_bytes(tsv.ep, tsv.all_expert_num)))
-    # gmm_workspace: 256 MiB zeros — kernel-internal scratch buffer
-    write_bin(os.path.join(out, 'gmm_workspace.bin'),
+
+def _write_common_buffers(context: _GenerationContext) -> None:
+    """Write event-counter and GMM workspace payloads."""
+    task_values = context.task_values
+    output_dir = context.args.output_dir
+    write_bin(os.path.join(output_dir, 'all_event_counters.bin'),
+              bytes(event_workspace_bytes(task_values.ep, task_values.all_expert_num)))
+    write_bin(os.path.join(output_dir, 'gmm_workspace.bin'),
               bytes(256 * 1024 * 1024))
 
-    # ── RuntimeConfig files (one per rank) ───────────────────────────────────
+
+def _write_runtime_configs(context: _GenerationContext) -> None:
+    """Write one forward runtime configuration per EP rank."""
+    args = context.args
     for rank_id in range(args.ep):
-        cfg  = build_config_for_rank(graph, tsv, rank_id, num_cube_cores=args.num_cube_cores)
+        cfg = build_config_for_rank(
+            context.graph,
+            context.task_values,
+            rank_id,
+            num_cube_cores=args.num_cube_cores,
+        )
         data = serialize_runtime_config(cfg)
-        path = os.path.join(out, f'runtime_config_input_rank_{rank_id}.bin')
+        path = os.path.join(args.output_dir, f'runtime_config_input_rank_{rank_id}.bin')
         write_bin(path, data)
 
+
+def main() -> None:
+    """Entry point for forward pass runtime data generation."""
+    context = _prepare_generation(parse_args())
+    _describe_graph(context)
+    _write_tiling_files(context)
+    _write_common_buffers(context)
+    _write_runtime_configs(context)
     print("[fwd] done.")
 
 

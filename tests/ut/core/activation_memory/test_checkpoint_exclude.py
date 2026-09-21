@@ -25,7 +25,6 @@ from unittest.mock import patch, sentinel
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 _checkpoint_exclude = importlib.import_module("hyper_parallel.core.activation_memory.checkpoint_exclude")
 

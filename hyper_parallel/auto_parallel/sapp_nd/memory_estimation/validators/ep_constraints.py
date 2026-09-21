@@ -22,6 +22,8 @@ Four constraints that any valid EP strategy must satisfy:
 """
 from __future__ import annotations
 from dataclasses import dataclass
+from inspect import Parameter, Signature
+from typing import Any
 
 
 @dataclass
@@ -34,6 +36,38 @@ class ConstraintResult:
 
     def __bool__(self):
         return self.passed
+
+
+@dataclass(frozen=True)
+class StageExperts:
+    """Expert weights hosted by one pipeline stage.
+
+    Attributes:
+        n_moe_layers: Number of MoE layers in this PP stage.
+        n_exp: Number of experts per MoE layer.
+        h: Model hidden dimension.
+        hff_exp: Expert FFN hidden dimension (per expert).
+        bytes_p: Bytes per parameter.
+        n_ff_mm: Number of feedforward linear layers per expert
+            (SwiGLU: 3, standard MLP: 2).
+    """
+
+    n_moe_layers: int
+    n_exp: int
+    h: int
+    hff_exp: int
+    bytes_p: int
+    n_ff_mm: int = 3
+
+
+_LEGACY_STAGE_SIGNATURE = Signature([
+    Parameter(name, Parameter.POSITIONAL_OR_KEYWORD)
+    for name in ("n_moe_layers", "n_exp", "ep", "dp", "h", "hff_exp", "bytes_p", "device_capacity_gb")
+] + [
+    Parameter("zero_level", Parameter.POSITIONAL_OR_KEYWORD, default=2),
+    Parameter("t_exp", Parameter.POSITIONAL_OR_KEYWORD, default=1),
+    Parameter("n_ffMM", Parameter.POSITIONAL_OR_KEYWORD, default=3),
+])
 
 
 class EpConstraints:
@@ -107,36 +141,50 @@ class EpConstraints:
             f"{required}/{total_devices} devices used")
 
     @staticmethod
-    def check_ep_pp_stage_feasibility(
-        n_moe_layers: int,
-        n_exp: int,
+    def check_ep_pp_stage_feasibility(*args: Any, **kwargs: Any) -> ConstraintResult:
+        """Check stage memory using StageExperts or the legacy numeric arguments.
+
+        Args:
+            *args: A StageExperts object followed by ep, dp and capacity, or the
+                legacy order n_moe_layers, n_exp, ep, dp, h, hff_exp, bytes_p,
+                device_capacity_gb, zero_level, t_exp, n_ffMM.
+            **kwargs: Named fields in the selected form. Legacy n_ffMM remains
+                accepted and maps to StageExperts.n_ff_mm.
+
+        Returns:
+            Whether the stage expert memory fits the device capacity.
+        """
+        if (args and isinstance(args[0], StageExperts)) or "experts" in kwargs:
+            return EpConstraints._check_stage_experts(*args, **kwargs)
+        bound = _LEGACY_STAGE_SIGNATURE.bind(*args, **kwargs)
+        bound.apply_defaults()
+        values = bound.arguments
+        experts = StageExperts(
+            **{key: values.pop(key) for key in ("n_moe_layers", "n_exp", "h", "hff_exp", "bytes_p")},
+            n_ff_mm=values.pop("n_ffMM"),
+        )
+        return EpConstraints._check_stage_experts(experts, **values)
+
+    @staticmethod
+    def _check_stage_experts(
+        experts: StageExperts,
         ep: int,
         dp: int,
-        h: int,
-        hff_exp: int,
-        bytes_p: int,
         device_capacity_gb: float,
         zero_level: int = 2,
         t_exp: int = 1,
-        n_ffMM: int = 3,  # pylint: disable=invalid-name
     ) -> ConstraintResult:
         """C4: EP+PP stage expert memory must fit within device capacity.
 
         Args:
-            n_moe_layers: Number of MoE layers in this PP stage.
-            n_exp: Number of experts per MoE layer.
+            experts: Expert weights hosted by this PP stage.
             ep: Expert parallelism degree.
             dp: Data parallelism degree (for ZeRO sharding).
-            h: Model hidden dimension.
-            hff_exp: Expert FFN hidden dimension (per expert).
-            bytes_p: Bytes per parameter.
             device_capacity_gb: Device memory capacity in GB.
             zero_level: ZeRO optimizer sharding level (2 or 3).
             t_exp: Expert TP degree (= etp if etp > 1, else tp).
-            n_ffMM: Number of feedforward linear layers per expert
-                (SwiGLU: 3, standard MLP: 2).
         """
-        if n_moe_layers <= 0:
+        if experts.n_moe_layers <= 0:
             return ConstraintResult(
                 "ep_pp_stage_feasibility", True,
                 "Dense-only stage, no expert memory")
@@ -144,9 +192,11 @@ class EpConstraints:
             return ConstraintResult(
                 "ep_pp_stage_feasibility", False,
                 f"ep={ep} must be >= 1")
-        experts_per_rank = n_exp / ep
-        params_per_expert = n_ffMM * h * hff_exp / max(t_exp, 1)
-        param_bytes = n_moe_layers * experts_per_rank * params_per_expert * bytes_p
+        experts_per_rank = experts.n_exp / ep
+        params_per_expert = experts.n_ff_mm * experts.h * experts.hff_exp / max(t_exp, 1)
+        param_bytes = (
+            experts.n_moe_layers * experts_per_rank * params_per_expert * experts.bytes_p
+        )
         os_bytes = param_bytes * 2
         grad_bytes = param_bytes
         if zero_level >= 3:
@@ -180,13 +230,18 @@ class EpConstraints:
         ]
         if ccfg.p > 1 and ccfg.n_exp > 1:
             n_moe_per_stage = getattr(ccfg, 'n_lay', 1) // ccfg.p
-            results.append(cls.check_ep_pp_stage_feasibility(
+            experts = StageExperts(
                 n_moe_layers=n_moe_per_stage,
                 n_exp=ccfg.n_exp,
-                ep=ccfg.ep, dp=ccfg.d, h=ccfg.h,
-                hff_exp=ccfg.hff_exp, bytes_p=ccfg.bytes_p,
+                h=ccfg.h,
+                hff_exp=ccfg.hff_exp,
+                bytes_p=ccfg.bytes_p,
+                n_ff_mm=max(getattr(ccfg, 'n_ffMM', 3), 1),
+            )
+            results.append(cls.check_ep_pp_stage_feasibility(
+                experts,
+                ep=ccfg.ep, dp=ccfg.d,
                 device_capacity_gb=device_capacity_gb,
                 zero_level=int(ccfg.comm_d_exp), t_exp=t_exp,
-                n_ffMM=max(getattr(ccfg, 'n_ffMM', 3), 1),
             ))
         return results

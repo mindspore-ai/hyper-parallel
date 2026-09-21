@@ -151,32 +151,5 @@ _preload_libgomp_early_for_static_tls()
 
 
 def pytest_configure(config) -> None:  # pylint: disable=unused-argument
-    """Import ``dtensor`` under PyTorch before collection loads tests that set ``mindspore`` at import time."""
-    os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-    import hyper_parallel.platform.platform as _pp  # pylint: disable=import-outside-toplevel
-
-    _pp.platform = None
+    """Import ``dtensor`` early so collection does not race the torch backend binding."""
     import hyper_parallel.core.dtensor.dtensor  # noqa: F401 pylint: disable=unused-import
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _restore_torch_platform_between_ut_modules(request):
-    """Many ``tests/ut`` modules temporarily set ``HYPER_PARALLEL_PLATFORM=mindspore``; reset for the next module."""
-    yield
-    try:
-        from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # pylint: disable=import-outside-toplevel
-            restore_torch_platform_for_ut,
-        )
-
-        restore_torch_platform_for_ut()
-    # Best-effort: teardown must not abort pytest on import/platform edge cases.
-    except (  # pragma: no cover
-        ImportError,
-        ModuleNotFoundError,
-        OSError,
-        RuntimeError,
-        ValueError,
-        AttributeError,
-        TypeError,
-    ):
-        pass

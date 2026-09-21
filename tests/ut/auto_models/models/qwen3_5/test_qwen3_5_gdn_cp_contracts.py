@@ -23,7 +23,6 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 import torch
@@ -47,7 +46,7 @@ from hyper_parallel.models.qwen3_5.adapter.distributed import (
 )
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.config import entries_to_plan_overrides
-from hyper_parallel.trainer.config.manager import parse_training_args
+from hyper_parallel.trainer.config.parser import parse_training_args
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
 

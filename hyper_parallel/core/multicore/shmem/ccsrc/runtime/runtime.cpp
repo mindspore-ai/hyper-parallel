@@ -18,14 +18,6 @@
 #include "cann/host.h"
 #include "runtime/log.h"
 
-#define HP_SM_RECORD_FAILURE(operation, phase, root_rank, error)           \
-  do {                                                                     \
-    RecordFailure(operation, phase, root_rank, error, __FILE__, __LINE__); \
-  } while (false)
-
-#define HP_SM_FAIL_INITIALIZATION(phase, root_rank, error) \
-  FailInitialization(phase, root_rank, error, __FILE__, __LINE__)
-
 namespace hyper_parallel::multicore::shmem::runtime {
 namespace {
 
@@ -48,11 +40,7 @@ const char *StateName(State state) {
 }
 
 const char *DataEngineName(DataEngine engine) {
-  switch (engine) {
-    case DataEngine::Mte:
-      return "mte";
-  }
-  return "unknown";
+  return engine == DataEngine::Mte ? "mte" : "unknown";
 }
 
 DfxPhase PhaseForDeviceStatus(const Status &status) {
@@ -75,26 +63,26 @@ Status Runtime::Initialize(const RootWorldInfo &root, const Config &config,
     const Status error =
       MakeError(ErrorCode::InvalidState, "Runtime state must be Uninitialized for initialization, but got state=" +
                                            std::string(StateName(state_)));
-    HP_SM_RECORD_FAILURE(DfxOperation::Initialize, DfxPhase::Validation, root.root_rank, error);
+    RecordFailure(DfxOperation::Initialize, DfxPhase::Validation, root.root_rank, error, __FILE__, __LINE__);
     return error;
   }
 
   const Status validation = ValidateInitialInput(root, config, effective_bootstrap_endpoint);
   if (validation.error_code != ErrorCode::Ok) {
-    return HP_SM_FAIL_INITIALIZATION(DfxPhase::Validation, root.root_rank, validation);
+    return FailInitialization(DfxPhase::Validation, root.root_rank, validation, __FILE__, __LINE__);
   }
   root_.emplace(root);
 
   const auto device_identity = cann::host::query_device_identity();
   if (!device_identity.ok()) {
-    return HP_SM_FAIL_INITIALIZATION(DfxPhase::CannCall, root.root_rank, device_identity.error());
+    return FailInitialization(DfxPhase::CannCall, root.root_rank, device_identity.error(), __FILE__, __LINE__);
   }
   device_identity_.emplace(device_identity.value());
   if (device_identity_->model == DeviceModel::kAscend950) {
     const Status error = MakeError(
       ErrorCode::UnsupportedCapability,
       "the first Runtime release supports Ascend 910B and 910C, but got soc_name=" + device_identity_->soc_name);
-    return HP_SM_FAIL_INITIALIZATION(DfxPhase::Validation, root.root_rank, error);
+    return FailInitialization(DfxPhase::Validation, root.root_rank, error, __FILE__, __LINE__);
   }
 
   allocations_.emplace(device_identity_->device_index, next_allocation_id_);
@@ -105,7 +93,7 @@ Status Runtime::Initialize(const RootWorldInfo &root, const Config &config,
   HP_SM_LOG_DEBUG(root.root_rank, "op=Initialize call=aclshmemx_init_attr enter");
   const Status initialize_status = cann::host::initialize(options);
   if (initialize_status.error_code != ErrorCode::Ok) {
-    return HP_SM_FAIL_INITIALIZATION(DfxPhase::CannCall, root.root_rank, initialize_status);
+    return FailInitialization(DfxPhase::CannCall, root.root_rank, initialize_status, __FILE__, __LINE__);
   }
   HP_SM_LOG_DEBUG(root.root_rank, "op=Initialize call=aclshmemx_init_attr ok");
 
@@ -152,12 +140,13 @@ Status Runtime::ValidateShutdown() {
   const int32_t root_rank = RootRankForDfx();
   const Status state_status = RequireReady();
   if (state_status.error_code != ErrorCode::Ok) {
-    HP_SM_RECORD_FAILURE(DfxOperation::Shutdown, DfxPhase::Validation, root_rank, state_status);
+    RecordFailure(DfxOperation::Shutdown, DfxPhase::Validation, root_rank, state_status, __FILE__, __LINE__);
     return state_status;
   }
   const Status device_status = ValidateCurrentDeviceLocked();
   if (device_status.error_code != ErrorCode::Ok) {
-    HP_SM_RECORD_FAILURE(DfxOperation::Shutdown, PhaseForDeviceStatus(device_status), root_rank, device_status);
+    RecordFailure(DfxOperation::Shutdown, PhaseForDeviceStatus(device_status), root_rank, device_status, __FILE__,
+                  __LINE__);
     return device_status;
   }
   if (allocations_->allocated_count() != 0) {
@@ -166,7 +155,7 @@ Status Runtime::ValidateShutdown() {
                 "All symmetric Allocations must be freed before Runtime shutdown, but got allocated_count=" +
                   std::to_string(allocations_->allocated_count()) +
                   ", allocated_bytes=" + std::to_string(allocations_->allocated_bytes()));
-    HP_SM_RECORD_FAILURE(DfxOperation::Shutdown, DfxPhase::Validation, root_rank, error);
+    RecordFailure(DfxOperation::Shutdown, DfxPhase::Validation, root_rank, error, __FILE__, __LINE__);
     return error;
   }
   return Status{};
@@ -178,17 +167,18 @@ Result<AllocationRecord> Runtime::Allocate(const AllocationSpec &spec) {
 
   const Status state_status = RequireReady();
   if (state_status.error_code != ErrorCode::Ok) {
-    HP_SM_RECORD_FAILURE(DfxOperation::Allocate, DfxPhase::Validation, root_rank, state_status);
+    RecordFailure(DfxOperation::Allocate, DfxPhase::Validation, root_rank, state_status, __FILE__, __LINE__);
     return Result<AllocationRecord>::Failure(state_status);
   }
   const Status validation = allocations_->Validate(spec);
   if (validation.error_code != ErrorCode::Ok) {
-    HP_SM_RECORD_FAILURE(DfxOperation::Allocate, DfxPhase::Validation, root_rank, validation);
+    RecordFailure(DfxOperation::Allocate, DfxPhase::Validation, root_rank, validation, __FILE__, __LINE__);
     return Result<AllocationRecord>::Failure(validation);
   }
   const Status device_status = ValidateCurrentDeviceLocked();
   if (device_status.error_code != ErrorCode::Ok) {
-    HP_SM_RECORD_FAILURE(DfxOperation::Allocate, PhaseForDeviceStatus(device_status), root_rank, device_status);
+    RecordFailure(DfxOperation::Allocate, PhaseForDeviceStatus(device_status), root_rank, device_status, __FILE__,
+                  __LINE__);
     return Result<AllocationRecord>::Failure(device_status);
   }
 
@@ -199,7 +189,7 @@ Result<AllocationRecord> Runtime::Allocate(const AllocationSpec &spec) {
   const auto allocation = has_explicit_alignment ? cann::host::aligned_allocate(spec.alignment_bytes, spec.bytes)
                                                  : cann::host::allocate(spec.bytes);
   if (!allocation.ok()) {
-    HP_SM_RECORD_FAILURE(DfxOperation::Allocate, DfxPhase::CannCall, root_rank, allocation.error());
+    RecordFailure(DfxOperation::Allocate, DfxPhase::CannCall, root_rank, allocation.error(), __FILE__, __LINE__);
     return Result<AllocationRecord>::Failure(allocation.error());
   }
 
@@ -214,18 +204,19 @@ Status Runtime::Free(const AllocationView &buffer) {
 
   const Status state_status = RequireReady();
   if (state_status.error_code != ErrorCode::Ok) {
-    HP_SM_RECORD_FAILURE(DfxOperation::Free, DfxPhase::Validation, root_rank, state_status);
+    RecordFailure(DfxOperation::Free, DfxPhase::Validation, root_rank, state_status, __FILE__, __LINE__);
     return state_status;
   }
   const auto record = allocations_->MatchForFree(buffer);
   if (!record.ok()) {
-    HP_SM_RECORD_FAILURE(DfxOperation::Free, DfxPhase::Validation, root_rank, record.error());
+    RecordFailure(DfxOperation::Free, DfxPhase::Validation, root_rank, record.error(), __FILE__, __LINE__);
     return record.error();
   }
 
   const Status device_status = ValidateCurrentDeviceLocked();
   if (device_status.error_code != ErrorCode::Ok) {
-    HP_SM_RECORD_FAILURE(DfxOperation::Free, PhaseForDeviceStatus(device_status), root_rank, device_status);
+    RecordFailure(DfxOperation::Free, PhaseForDeviceStatus(device_status), root_rank, device_status, __FILE__,
+                  __LINE__);
     return device_status;
   }
 
@@ -251,7 +242,7 @@ Status Runtime::Barrier(const StreamView &stream) {
 
   const Status state_status = RequireReady();
   if (state_status.error_code != ErrorCode::Ok) {
-    HP_SM_RECORD_FAILURE(DfxOperation::Barrier, DfxPhase::Validation, root_rank, state_status);
+    RecordFailure(DfxOperation::Barrier, DfxPhase::Validation, root_rank, state_status, __FILE__, __LINE__);
     return state_status;
   }
   if (stream.native_handle == 0 || stream.device_index != device_identity_->device_index) {
@@ -260,7 +251,7 @@ Status Runtime::Barrier(const StreamView &stream) {
                 "barrier Stream must have a nonzero handle on the Runtime-bound device, but got native_handle=" +
                   std::to_string(stream.native_handle) + ", device_index=" + std::to_string(stream.device_index) +
                   ", bound device_index=" + std::to_string(device_identity_->device_index));
-    HP_SM_RECORD_FAILURE(DfxOperation::Barrier, DfxPhase::Validation, root_rank, error);
+    RecordFailure(DfxOperation::Barrier, DfxPhase::Validation, root_rank, error, __FILE__, __LINE__);
     return error;
   }
 
@@ -291,7 +282,7 @@ DfxSnapshot Runtime::DebugState() const {
 void Runtime::RecordLeak(uint64_t allocation_id, uintptr_t allocation_base, uint64_t allocation_bytes) {
   std::lock_guard<std::mutex> lock(mutex_);
   leaked_allocations_.push_back(
-    AllocationRecord{allocation_id, allocation_base, allocation_bytes, /*alignment_bytes=*/0});
+    AllocationRecord{allocation_id, allocation_base, allocation_bytes, 0});
 }
 
 Status Runtime::Shutdown() {
@@ -303,7 +294,7 @@ Status Runtime::Shutdown() {
   if (state_ != State::Ready) {
     const Status error = MakeError(ErrorCode::InvalidState, "Runtime state must be Ready for shutdown, but got state=" +
                                                               std::string(StateName(state_)));
-    HP_SM_RECORD_FAILURE(DfxOperation::Shutdown, DfxPhase::Validation, RootRankForDfx(), error);
+    RecordFailure(DfxOperation::Shutdown, DfxPhase::Validation, RootRankForDfx(), error, __FILE__, __LINE__);
     return error;
   }
 
@@ -315,7 +306,7 @@ Status Runtime::Shutdown() {
       MakeError(ErrorCode::InvalidState,
                 "All symmetric Allocations must be freed before Runtime shutdown, but got allocated_count=" +
                   std::to_string(allocated_count) + ", allocated_bytes=" + std::to_string(allocated_bytes));
-    HP_SM_RECORD_FAILURE(DfxOperation::Shutdown, DfxPhase::Validation, root_rank, error);
+    RecordFailure(DfxOperation::Shutdown, DfxPhase::Validation, root_rank, error, __FILE__, __LINE__);
     return error;
   }
 
@@ -323,7 +314,7 @@ Status Runtime::Shutdown() {
   const Status finalize_status = cann::host::finalize();
   if (finalize_status.error_code != ErrorCode::Ok) {
     state_ = State::ShutdownFailed;
-    HP_SM_RECORD_FAILURE(DfxOperation::Shutdown, DfxPhase::CannCall, root_rank, finalize_status);
+    RecordFailure(DfxOperation::Shutdown, DfxPhase::CannCall, root_rank, finalize_status, __FILE__, __LINE__);
     return finalize_status;
   }
   HP_SM_LOG_DEBUG(root_rank, "op=Shutdown call=aclshmem_finalize ok");
@@ -391,7 +382,7 @@ int32_t Runtime::RootRankForDfx() const noexcept { return root_.has_value() ? ro
 void Runtime::RecordFailure(DfxOperation operation, DfxPhase phase, int32_t root_rank, const Status &error,
                             const char *file, int line) {
   latest_failure_.emplace(DfxFailure{operation, phase, root_rank, error});
-  log::Failure(file, line, operation, phase, root_rank, error);
+  log::Failure(file, line, *latest_failure_);
 }
 
 Status Runtime::FailInitialization(DfxPhase phase, int32_t root_rank, const Status &error, const char *file, int line) {
@@ -407,6 +398,3 @@ Status Runtime::FailInitialization(DfxPhase phase, int32_t root_rank, const Stat
 }
 
 }  // namespace hyper_parallel::multicore::shmem::runtime
-
-#undef HP_SM_FAIL_INITIALIZATION
-#undef HP_SM_RECORD_FAILURE

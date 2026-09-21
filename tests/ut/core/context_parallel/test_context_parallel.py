@@ -21,7 +21,6 @@ from unittest.mock import MagicMock, patch
 import torch
 from torch import nn
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.context_parallel import context_parallel as cp_module  # noqa: E402
 from hyper_parallel.core.context_parallel.context_parallel import ContextParallel  # noqa: E402
@@ -29,7 +28,6 @@ from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_ME
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard  # noqa: E402
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
-from hyper_parallel.platform.platform import PlatformType  # noqa: E402
 
 
 def _patch_torch_dist_rank(world_size=1):
@@ -88,7 +86,6 @@ class TestContextParallel(unittest.TestCase):
 
     @staticmethod
     def _setup_mock_platform(mock_platform, world_size=1):
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.Tensor = torch.Tensor
@@ -152,7 +149,7 @@ class TestContextParallel(unittest.TestCase):
         module = _IdentityModule()
         mesh = _FakeMesh(2, rank_list=(0, 1))
 
-        with patch.object(cp_module.utils, "get_rank", return_value=0):
+        with patch.object(cp_module.dist, "get_rank", return_value=0):
             ContextParallel(ulysses_degree=1, load_balance=True).apply(module, mesh)
 
         self.assertIsInstance(module.forward, partial)

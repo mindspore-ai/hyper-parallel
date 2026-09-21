@@ -23,59 +23,12 @@ from hyper_parallel.core.pipeline_parallel import _p2p
 class TestPipelineGroups(unittest.TestCase):
     """Verify communicator creation order and startup synchronization."""
 
-    @mock.patch("hyper_parallel.core.pipeline_parallel._p2p.dist.group")
     @mock.patch("torch.distributed.barrier")
-    @mock.patch("torch.distributed.get_rank", return_value=0)
-    @mock.patch("torch.distributed.get_world_size", return_value=2)
-    def test_prepare_batch_p2p_group_serializes_group_root(
-            self, mock_world_size, mock_rank, mock_barrier, mock_default_group):
-        """A group root serializes HCCL initialization after members rendezvous."""
-        group = MagicMock()
-        group.group_name = "edge-0-2"
-        group_store = group.get_group_store.return_value
-        group_store.add.return_value = 2
-        default_store = mock_default_group.WORLD.get_group_store.return_value
-        default_store.compare_set.side_effect = [b"edge-0-2", b""]
+    def test_prepare_batch_p2p_group_uses_public_barrier(self, mock_barrier):
+        """Prepare batched P2P without relying on private ProcessGroup APIs."""
+        _p2p.prepare_batch_p2p_group(mock.sentinel.pp_group)
 
-        _p2p.prepare_batch_p2p_group(group)
-
-        mock_world_size.assert_called_once_with(group=group)
-        mock_rank.assert_called_once_with(group=group)
-        group_store.add.assert_called_once_with(
-            "hyper_parallel_p2p_group_init_ready:edge-0-2", 1)
-        group_store.set.assert_has_calls([
-            mock.call("hyper_parallel_p2p_group_init_ready:edge-0-2_done", "1"),
-            mock.call("hyper_parallel_p2p_group_init_root_ready:edge-0-2", "1"),
-        ])
-        default_store.compare_set.assert_has_calls([
-            mock.call("hyper_parallel_p2p_group_init_lock", "", "edge-0-2"),
-            mock.call("hyper_parallel_p2p_group_init_lock", "edge-0-2", ""),
-        ])
-        mock_barrier.assert_called_once_with(group=group)
-
-
-    @mock.patch("hyper_parallel.core.pipeline_parallel._p2p.dist.group")
-    @mock.patch("torch.distributed.barrier")
-    @mock.patch("torch.distributed.get_rank", return_value=1)
-    @mock.patch("torch.distributed.get_world_size", return_value=2)
-    def test_prepare_batch_p2p_group_waits_for_group_root(
-            self, mock_world_size, mock_rank, mock_barrier, mock_default_group):
-        """A non-root member waits until its group root owns the initialization lock."""
-        group = MagicMock()
-        group.group_name = "edge-0-2"
-        group_store = group.get_group_store.return_value
-        group_store.add.return_value = 1
-
-        _p2p.prepare_batch_p2p_group(group)
-
-        mock_world_size.assert_called_once_with(group=group)
-        mock_rank.assert_called_once_with(group=group)
-        group_store.wait.assert_has_calls([
-            mock.call(["hyper_parallel_p2p_group_init_ready:edge-0-2_done"]),
-            mock.call(["hyper_parallel_p2p_group_init_root_ready:edge-0-2"]),
-        ])
-        mock_default_group.WORLD.get_group_store.assert_not_called()
-        mock_barrier.assert_called_once_with(group=group)
+        mock_barrier.assert_called_once_with(group=mock.sentinel.pp_group)
 
 
     def test_create_p2p_multi_stream_groups_creates_local_edges_in_stable_order(self) -> None:

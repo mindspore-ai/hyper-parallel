@@ -25,18 +25,47 @@ from torch.nn import Module
 
 from hyper_parallel.core.pipeline_parallel.mpipe.executor import MPipeTransposeExecutor
 
-from hyper_parallel.core.pipeline_parallel.scheduler import (
-    MetaStep,
-    MetaStepType,
-    ScheduleInterleaved1F1B,
-)
+from hyper_parallel.core.pipeline_parallel.scheduler import ScheduleInterleaved1F1B
 from hyper_parallel.core.pipeline_parallel.mpipe.sampler import mpipe_owned_micros
 from hyper_parallel.core.pipeline_parallel.mpipe.step_types import MpipeStepType
+from hyper_parallel.core.pipeline_parallel.utils import MetaStep, MetaStepType
 
 if TYPE_CHECKING:
     from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
 
 logger = logging.getLogger(__name__)
+
+# (data, features, graph input) step types of the transpose-prefix transfers.
+_PREFIX_SEND_TYPES = (MetaStepType.DATA_SEND, MpipeStepType.MPIPE_FWD_SEND, MpipeStepType.MPIPE_GRAPH_SEND)
+_PREFIX_RECV_TYPES = (MetaStepType.DATA_RECV, MpipeStepType.MPIPE_FWD_RECV, MpipeStepType.MPIPE_GRAPH_RECV)
+
+
+def _prefix_owned_micros(rank, num_transpose_micro_batches, micro_batch_num, overflow_mode):
+    """Micros ``rank`` transposes in its prefix (under ``"min"`` only ``rank``
+    itself; rank 0's overflow micros are loaded inline in its body order)."""
+    nt = num_transpose_micro_batches
+    if rank >= nt:
+        return []
+    if overflow_mode == "min":
+        return [rank]
+    return [m for m in range(micro_batch_num) if m % nt == rank]
+
+
+def _prefix_transfer_steps(micros, step_types, is_dataload_only, ship_graph):
+    """Type-major transfer block: all data, then all features, then all graph inputs.
+
+    The sending ranks and rank 0 both build their block here, so the send and
+    receive orders match; otherwise the meta recv drifts and decodes garbage
+    shapes. Dataload-only ships the data alone; ``ship_graph`` adds the input
+    ship-back for the centralized stage-0 backward.
+    """
+    data_type, fwd_type, graph_type = step_types
+    steps = [MetaStep(m, data_type, -1) for m in micros]
+    if not is_dataload_only:
+        steps += [MetaStep(m, fwd_type, -1) for m in micros]
+        if ship_graph:
+            steps += [MetaStep(m, graph_type, -1) for m in micros]
+    return steps
 
 
 class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
@@ -339,11 +368,11 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         if (not self._has_trainable_preprocess and
                 self._num_visual_layers is not None and
                 self._num_transpose_layers >= self._num_visual_layers):
-            self._DATA_KEYS = ("input_ids",) + tuple(
+            self._data_keys = ("input_ids",) + tuple(
                 k for k in self.kwargs_batch_dim if k != "pixel_values"
             )
         else:
-            self._DATA_KEYS = ("input_ids",) + tuple(self.kwargs_batch_dim)
+            self._data_keys = ("input_ids",) + tuple(self.kwargs_batch_dim)
 
         # Length-M so overflow micros and VPP chunks index in bounds; the
         # prefix key -1 ships owner to rank 0, body stages chain via stages[0].
@@ -385,12 +414,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         receives only the feature gradient later (``MPIPE_GRAD_RECV_WITH_BACKWARD``).
         """
         nt = num_transpose_micro_batches
-        if rank >= nt:
-            owned = []
-        elif overflow_mode == "min":
-            owned = [rank]
-        else:
-            owned = sorted(m for m in range(micro_batch_num) if m % nt == rank)
+        owned = _prefix_owned_micros(rank, nt, micro_batch_num, overflow_mode)
         is_dataload_only = num_transpose_layers == 0
         prefix = []
         if has_trainable and not is_dataload_only:
@@ -400,33 +424,16 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
             prefix.append(MetaStep(m, MetaStepType.DATA_LOAD, -1))
             if not is_dataload_only:
                 prefix.append(MetaStep(m, MpipeStepType.MPIPE_TRANSPOSE_FWD, -1))
-        # Type-major send order must match rank 0's receive block below, or
-        # the meta recv drifts and decodes garbage shapes.
+        ship_graph = has_trainable and not owner_backward
         if rank != 0:
-            for m in owned:
-                prefix.append(MetaStep(m, MetaStepType.DATA_SEND, -1))
-            if not is_dataload_only:
-                for m in owned:
-                    prefix.append(MetaStep(m, MpipeStepType.MPIPE_FWD_SEND, -1))
-                if has_trainable and not owner_backward:
-                    for m in owned:
-                        prefix.append(MetaStep(m, MpipeStepType.MPIPE_GRAPH_SEND, -1))
-        if rank == 0:
-            # Non-owned = micros rank 0 didn't transpose locally ("min":
-            # overflow micros load inline, so they are not received).
-            if overflow_mode == "min":
-                non_owned = list(range(1, nt))
-            else:
-                non_owned = [m for m in range(micro_batch_num) if m not in set(owned)]
-            for m in non_owned:
-                prefix.append(MetaStep(m, MetaStepType.DATA_RECV, -1))
-            if not is_dataload_only:
-                for m in non_owned:
-                    prefix.append(MetaStep(m, MpipeStepType.MPIPE_FWD_RECV, -1))
-                if has_trainable and not owner_backward:
-                    for m in non_owned:
-                        prefix.append(MetaStep(m, MpipeStepType.MPIPE_GRAPH_RECV, -1))
-        return prefix
+            return prefix + _prefix_transfer_steps(owned, _PREFIX_SEND_TYPES, is_dataload_only, ship_graph)
+        # Non-owned = micros rank 0 didn't transpose locally ("min":
+        # overflow micros load inline, so they are not received).
+        if overflow_mode == "min":
+            non_owned = list(range(1, nt))
+        else:
+            non_owned = [m for m in range(micro_batch_num) if m not in owned]
+        return prefix + _prefix_transfer_steps(non_owned, _PREFIX_RECV_TYPES, is_dataload_only, ship_graph)
 
     @staticmethod
     def _build_owner_backward_suffix(rank, num_transpose_micro_batches, micro_batch_num, overflow_mode):

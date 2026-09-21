@@ -42,23 +42,22 @@ Use these rules as the default coding style and convention set for HyperParallel
 - Order imports clearly: standard library, third-party, then first-party.
 - Keep import placement consistent with module export structure such as `__all__`.
 
-### Import placement (non-platform vs platform backends)
+### Import placement
 
-- **Default (most of the repo):** Put runtime `import` / `from … import` at **module top** (after the license header and any module docstring). Do **not** put imports inside functions, methods, or nested class bodies except the narrow exceptions under “Other exceptions” below. Applies to e.g. `core/`, `collectives/`, `tests/`, and **platform-agnostic** files such as `platform/platform.py`.
-- **Platform backend implementations** (`hyper_parallel/platform/torch/**`, `hyper_parallel/platform/mindspore/**`): Use **lazy imports inside methods** (lazy import / lazy init) for `torch`, `mindspore`, and their submodules as needed. This avoids pulling in the wrong framework at module import time, reduces import-order/cycle issues, and keeps the other backend unloadable when not in use. Add `# pylint: disable=C0415` on those lines.
-- **Torch-only Multicore** (`hyper_parallel/core/multicore/**`): use direct module-level Torch imports.
+- **Default:** Put runtime `import` / `from … import` at **module top** (after the license header and any module docstring). Do **not** put imports inside functions, methods, or nested class bodies except the narrow exceptions under “Other exceptions” below. Applies to e.g. `core/`, `collectives/`, `tests/`.
+- **Multicore** (`hyper_parallel/core/multicore/**`): use direct module-level Torch imports.
   The component root may export its business APIs; the HyperParallel root must not export them.
-  Do not implement lazy framework dispatch. Native-library
-  initialization may still be deferred until an operation needs the activated payload.
-- **Torch-only DFunction** (`hyper_parallel/core/shard/dfunction.py`): import Torch at module scope
-  and inherit directly from `torch.autograd.Function`; do not add Platform dispatch or MindSpore support.
-- **Torch-only Pipeline** (`hyper_parallel/core/pipeline_parallel/**`): import Torch APIs
+  Native-library initialization may still be deferred until an operation needs the activated payload.
+- **DFunction** (`hyper_parallel/core/shard/dfunction.py`): import Torch at module scope
+  and inherit directly from `torch.autograd.Function`.
+- **Pipeline** (`hyper_parallel/core/pipeline_parallel/**`): import Torch APIs
   directly at module scope; keep stage execution, micro-batches, and P2P inside the core component.
-- **Other exceptions** (outside platform backends; each should include a brief comment explaining why):
+- **Other exceptions** (each should include a brief comment explaining why):
   - Import-time circular dependency that cannot be fixed by restructuring.
-  - Optional dependencies that may be missing at runtime.
+  - Optional dependencies that may be missing at runtime — e.g. `torch_npu` and Omni custom
+    operators, which a plain `import hyper_parallel` must not pull in.
   - Type-only symbols: prefer `from typing import TYPE_CHECKING` and an `if TYPE_CHECKING:` block at module scope instead of importing inside methods.
-- Outside `platform/torch/` and `platform/mindspore/`, do not use local imports for convenience; do not blanket-suppress `C0415` unless the case matches an exception above.
+- Do not use local imports for convenience; do not blanket-suppress `C0415` unless the case matches an exception above.
 - Validate inputs at boundaries.
 - Raise `ValueError` with descriptive messages for invalid values.
 - Do not rely on `assert` for runtime input validation or business logic checks.
@@ -94,8 +93,7 @@ rank = config["rank"]
 - Prefer the logging framework over `print`, `sys.stdout.write`, or `sys.stderr.write` in production code.
 - Define instance attributes in `__init__` unless there is a deliberate and well-documented reason not to.
 - Avoid direct access to another class's protected members unless no stable public API exists and the coupling is explicitly justified.
-- Platform-agnostic code must go through the `get_platform()` abstraction.
-- Do not import `torch` or `mindspore` directly in platform-agnostic code.
+- The `platform/` abstraction and the MindSpore backend are gone: use native Torch APIs directly.
 - Avoid GPU-CPU synchronization in hot paths. In training loops, avoid patterns such as `.item()`, `.numpy()`, and `print(tensor)`.
 - Prefer `os.path` or `pathlib` helpers over manual string concatenation for filesystem paths.
 - Do not mutate `sys.path` with patterns such as `insert(0, ...)` unless there is no alternative and the reason is documented.
@@ -143,30 +141,32 @@ Incorrect:
 subprocess.run("git status", shell=True, check=True)
 ```
 
-## Platform Reference Convention
+## Collective Reference Convention
 
-- If a file needs platform APIs, define `platform = get_platform()` once at module scope.
-- Do not store platform on instances such as `self.platform`. This creates ambiguity between module-level and instance-level references and can hide bugs.
-- When a class method needs platform access, reference the module-level `platform` variable directly.
-- When copying code between methods, verify every `platform.*` call uses the correct API variant for the context, especially `differentiable_*` vs non-differentiable APIs.
+- Import `torch.distributed` once at module scope and call `dist.*` directly, or use the shared
+  helpers in `hyper_parallel/core/context_parallel/utils.py` and
+  `hyper_parallel/core/dtensor/_utils.py` when the shape is fixed.
+- When copying code between methods, check which collective variant the context needs —
+  `differentiable_*` in forward/backward paths, the eager ones elsewhere.
+- `create_group()` takes a rank list and returns a raw process group; helpers that expect a
+  `group_info` wrapper need `.group` unwrapped, and vice versa.
 
-### Example: Platform-Agnostic Code Must Not Import Backends Directly
+### Example: All-Reduce Inside an Autograd Path
 
 Correct:
 
 ```python
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.dtensor._utils import differentiable_all_reduce
 
-platform = get_platform()
-result = platform.all_reduce(tensor)
+result = differentiable_all_reduce(tensor, "sum", group)
 ```
 
-Incorrect:
+Outside autograd, the eager call is fine:
 
 ```python
 import torch.distributed as dist
 
-result = dist.all_reduce(tensor)
+dist.all_reduce(tensor, group=group)
 ```
 
 ## Fix Over Evade (pylint / UT / ST)

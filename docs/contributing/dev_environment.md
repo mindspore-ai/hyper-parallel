@@ -68,8 +68,8 @@ pip install pytest pylint markdownlint
 - **Errors**：使用 `ValueError` 配合描述性消息，仅在边界处验证
 - **Imports**：
   - `core/`、`collectives/`、`tests/` 等：模块顶部 import
-  - `platform/torch/**`、`platform/mindspore/**`：方法内 lazy import torch/mindspore
-  - `core/multicore/**`：Torch-only 组件，模块顶部直接 import Torch，不使用 Platform 分发
+  - `core/**`：模块顶部直接 import Torch，不做后端分发
+  - `core/multicore/**`：可选依赖（如 `torch_npu`、共享内存库）放在方法内 lazy import
 
 ## Git 工作流
 

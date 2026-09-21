@@ -30,7 +30,6 @@ import sys
 import types
 import unittest.mock
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import pytest
 from torch import nn

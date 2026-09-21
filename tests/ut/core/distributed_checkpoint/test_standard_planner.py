@@ -22,10 +22,7 @@ from unittest.mock import patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-import hyper_parallel.platform.platform as _platform_mod
 
-_platform_mod.platform = None
 
 import hyper_parallel.core.distributed_checkpoint.standard_planner as planner_mod
 
@@ -66,8 +63,6 @@ class TestStandardPlanner(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the planner module before every case so the plan cache starts empty."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(planner_mod)
         StandardSavePlanner.cached_save_result.clear()
 

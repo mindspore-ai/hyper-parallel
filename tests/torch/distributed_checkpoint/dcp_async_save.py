@@ -16,7 +16,6 @@
 # pylint: disable=C0413
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import shutil
 from pathlib import Path

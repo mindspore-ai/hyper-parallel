@@ -44,6 +44,14 @@ def _get_attribute(root: Any, path: str) -> Any:
     return value
 
 
+def _is_named_layer(item: Any) -> bool:
+    """Return whether an item is a valid ``(fqn, module)`` pair."""
+    if not isinstance(item, tuple) or len(item) != 2:
+        return False
+    name, layer = item
+    return isinstance(name, str) and isinstance(layer, nn.Module)
+
+
 def _normalize_declared_layers(declared: Any) -> list[tuple[str, nn.Module]]:
     """Normalize the model-owned decoder-layer contract."""
     if isinstance(declared, nn.ModuleList):
@@ -59,12 +67,7 @@ def _normalize_declared_layers(declared: Any) -> list[tuple[str, nn.Module]]:
         if isinstance(item, nn.Module):
             layers.append((str(index), item))
             continue
-        if (
-            isinstance(item, tuple)
-            and len(item) == 2
-            and isinstance(item[0], str)
-            and isinstance(item[1], nn.Module)
-        ):
+        if _is_named_layer(item):
             layers.append(item)
             continue
         raise TypeError(

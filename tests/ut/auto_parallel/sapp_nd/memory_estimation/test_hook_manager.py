@@ -29,7 +29,6 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch, PropertyMock
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.compute import EvalExpertCompute
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import (

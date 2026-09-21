@@ -61,16 +61,13 @@ class TestParallelMatMul(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
+    def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure common mock-platform attributes used across tests.
 
-        Args:
-            mock_platform: The MagicMock object injected by @patch.
-            platform_type: Optional PlatformType to set on the mock.
-            world_size: Value returned by mock_platform.get_world_size().
+            Args:
+                mock_platform: The MagicMock object injected by @patch.
+                world_size: Value returned by mock_platform.get_world_size().
         """
-        if platform_type is not None:
-            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
 
@@ -438,7 +435,6 @@ class TestParallelLinear(unittest.TestCase):
         """Mock a 2x4 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.platform_type = MagicMock()
         return init_device_mesh(
             device_type="cpu",
             mesh_shape=(2, 4),
@@ -650,7 +646,6 @@ class TestParallelLinear(unittest.TestCase):
         """
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 4
-        mock_platform.platform_type = MagicMock()
         mesh_2x2 = init_device_mesh(device_type="cpu", mesh_shape=(2, 2),
                                     mesh_dim_names=("dp", "mp"), init_backend=False)
         mock_platform.get_world_size.return_value = 8
@@ -687,16 +682,13 @@ class TestParallelBatchMatMul(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
+    def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure common mock-platform attributes used across tests.
 
-        Args:
-            mock_platform: The MagicMock object injected by @patch.
-            platform_type: Optional PlatformType to set on the mock.
-            world_size: Value returned by mock_platform.get_world_size().
+            Args:
+                mock_platform: The MagicMock object injected by @patch.
+                world_size: Value returned by mock_platform.get_world_size().
         """
-        if platform_type is not None:
-            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
 
@@ -846,10 +838,8 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
+    def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure common mock-platform attributes used across tests."""
-        if platform_type is not None:
-            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
 

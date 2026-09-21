@@ -1,71 +1,71 @@
-# The CODEOWNERS file is used to define the maintainer of a specific file or directory in the code repository.
-# Its main purpose is to automatically request designated maintainer to conduct code review in Pull Request (PR),
-# in order to clarify code ownership, improve code quality, and accelerate the review process.
+# GitHub code owners: each rule is a path pattern followed by space-separated
+# GitHub usernames (@user) or organization teams (@org/team).
+# Owners must have write access to the PR's base repository. A fork does not
+# inherit its upstream repository's collaborator permissions.
+# Review requests use this file from the PR's base branch, not its head branch.
+# The last matching rule wins; specific rules replace the default owners.
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
-# The lines starting with # are comments.
-# Each line corresponds to a specified file or directory and maintainer by @ splitting.
-# The rules are applied from top to bottom, and the last matching rule will take effect.
-
-# If the file in PR does not match rule, the default maintainers will be designated to conduct code review.
-* @yangzhenzhang @suteng @yao_yf
+# Default owners for paths without a more specific rule.
+* @yangzhenzhang02 @suteng @yaoyifanx
 
 # The maintainers of hyper_parallel/auto_parallel.
-/hyper_parallel/auto_parallel/ @bj-wang
+/hyper_parallel/auto_parallel/ @bj-wang @Hrxwhr
 /hyper_parallel/auto_parallel/fast-tuner/ @ChaoRanCaaat
 
 
 # The maintainers of hyper_parallel/collectives.
-/hyper_parallel/collectives/ @changzherui1
+/hyper_parallel/collectives/ @changzherui1 @changzherui
 
 
 # The maintainers of hyper_parallel/core.
-/hyper_parallel/core/ @yangzhenzhang
-/hyper_parallel/core/activation_checkpoint/ @DavidFFFan
-/hyper_parallel/core/distributed_checkpoint/ @zhangbuxue
+/hyper_parallel/core/ @yangzhenzhang02
+/hyper_parallel/core/distributed_checkpoint/ @zhangbuxue @xiaoyuxing-010818
 /hyper_parallel/core/fully_shard/ @Meng107
-/hyper_parallel/core/hsdp/ @kisnwang
 /hyper_parallel/core/pipeline_parallel/ @lichen666
-/hyper_parallel/core/shard/ @yangzhenzhang
-/hyper_parallel/core/shard/ops/ @david-he91
+/hyper_parallel/core/shard/ @yangzhenzhang02
+/hyper_parallel/core/shard/ops/ @davidhe91
 
-
-# The maintainers of hyper_parallel/platform.
-/hyper_parallel/platform/ @yangzhenzhang
-/hyper_parallel/platform/mindspore/ @yangzhenzhang
-/hyper_parallel/platform/mindspore/hsdp/ @kisnwang
-/hyper_parallel/platform/mindspore/fully_shard/ @DavidFFFan
-
-/hyper_parallel/platform/torch/ @yangzhenzhang
-/hyper_parallel/platform/torch/activation_checkpoint/ @DavidFFFan
-/hyper_parallel/platform/torch/fully_shard/ @Meng107
-/hyper_parallel/platform/torch/hsdp/ @kisnwang
 
 # The maintainers of hyper_parallel/compile.
-/hyper_parallel/compile/ @kisnwang @zhenyu10
+/hyper_parallel/compile/ @kisnwangg @yu-chen-code
 
 # The maintainers of tests.
 /tests/ @liuchongming74
-/tests/ut/core/distributed_checkpoint/ @zhangbuxue
-/tests/ut/platform/mindspore/ @yangzhenzhang
-/tests/ut/core/context_parallel/ @yangzhenzhang
-/tests/ut/compile/ @kisnwang @zhenyu10
+/tests/ut/core/distributed_checkpoint/ @zhangbuxue @xiaoyuxing-010818
+/hyper_parallel/core/activation_memory/ @DavidFFFan
+/tests/ut/core/context_parallel/ @yangzhenzhang02
+/tests/ut/compile/ @kisnwangg @yu-chen-code
 
-/tests/torch/ @yangzhenzhang
-/tests/torch/activation_checkpoint/ @DavidFFFan
-/tests/torch/distributed_checkpoint/ @zhangbuxue
+/tests/torch/ @yangzhenzhang02
+/tests/torch/activation_memory/ @DavidFFFan
+/tests/torch/distributed_checkpoint/ @zhangbuxue @xiaoyuxing-010818
 /tests/torch/fully_shard/ @Meng107
 /tests/torch/pipeline_parallel/ @lichen666
-/tests/torch/process_group/ @changzherui1
-/tests/torch/shard/ @yangzhenzhang
+/tests/torch/process_group/ @changzherui1 @changzherui
+/tests/torch/shard/ @yangzhenzhang02
 
 
 # The maintainers of other code directories.
-/.jenkins/ @yangzhenzhang
-/docs/ @yangzhenzhang @gemini524
-/.gitmodules  @yangzhenzhang
-/requirements.txt  @yangzhenzhang
-/setup.py  @yangzhenzhang
+/.jenkins/ @yangzhenzhang02
+/docs/ @yangzhenzhang02 @gemini524
+/requirements.txt  @yangzhenzhang02
+/setup.py  @yangzhenzhang02
 
-/hyper_parallel/core/multicore/ @david-he91 @probiotics_53
-/tests/ut/core/multicore/ @david-he91 @probiotics_53
-/tests/torch/multicore/ @david-he91 @probiotics_53
+/hyper_parallel/core/multicore/ @davidhe91 @Probiotics5333
+/tests/ut/core/multicore/ @davidhe91 @Probiotics5333
+/tests/torch/multicore/ @davidhe91 @Probiotics5333
+
+# Hyper-RL code and Qwen3 adapters.
+/hyper_parallel/rl/ @yangzhenzhang02 @suteng @yaoyifanx @bj-wang
+/hyper_parallel/models/qwen3/ @yangzhenzhang02 @suteng @yaoyifanx @bj-wang
+
+# Hyper-RL tests.
+/tests/ut/rl/ @liuchongming74 @bj-wang
+/hyper_parallel/rl/tests/ @yangzhenzhang02 @bj-wang
+/tests/common/rl_st_cases.py @liuchongming74 @bj-wang
+
+# Hyper-RL documentation and development rules.
+/docs/rl-*.md @yangzhenzhang02 @gemini524 @bj-wang
+/.agent/rules/hyper-rl.md @yangzhenzhang02 @suteng @yaoyifanx @bj-wang
+/.agent/rules/rl/ @yangzhenzhang02 @suteng @yaoyifanx @bj-wang

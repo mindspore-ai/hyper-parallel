@@ -30,7 +30,6 @@ _REPO_ROOT = os.path.abspath(os.path.join(_TEST_DIR, "..", "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 

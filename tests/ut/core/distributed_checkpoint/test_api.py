@@ -24,10 +24,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-import hyper_parallel.platform.platform as _platform_mod
 
-_platform_mod.platform = None
 
 import hyper_parallel.core.distributed_checkpoint.api as api_mod
 import hyper_parallel.core.distributed_checkpoint.standard_planner as planner_mod
@@ -48,8 +45,6 @@ class TestApi(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the api and planner modules so each case starts from a clean plan cache."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(planner_mod)
         importlib.reload(api_mod)
         planner_mod.StandardSavePlanner.cached_save_result.clear()
@@ -161,8 +156,6 @@ class TestCreatePersistProcess(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the api module so the recorded targets are the objects it holds."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(planner_mod)
         importlib.reload(api_mod)
 
@@ -286,8 +279,6 @@ class TestSaveImplStorageComm(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the api module before every case."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(planner_mod)
         importlib.reload(api_mod)
 

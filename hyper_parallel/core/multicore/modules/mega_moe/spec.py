@@ -47,6 +47,7 @@ class MegaMoeSpec:
     dispatch_split: int = _COMMUNICATION_SPLIT
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
+    swiglu_limit: float | None = None
 
     @property
     def local_experts(self) -> int:
@@ -143,6 +144,7 @@ def bind_mega_moe_spec(
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
     expert_capacity_factor = specification["expert_capacity_factor"]
+    swiglu_limit = specification["swiglu_limit"]
     receive_capacity = _resolve_receive_capacity(
         expert_capacity_factor,
         local_num_tokens * top_k,
@@ -161,4 +163,5 @@ def bind_mega_moe_spec(
         rank_id=rank_id,
         num_cube_cores=num_cube_cores,
         dispatch_mode=specification.get("dispatch_mode", "push"),
+        swiglu_limit=swiglu_limit,
     )

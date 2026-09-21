@@ -68,6 +68,8 @@ def _load_native() -> None:
 
 
 # ---------------------------------------------------------------------------
+
+
 # Python wrappers — thin pass-through to the registered C++ ops
 # ---------------------------------------------------------------------------
 
@@ -131,6 +133,10 @@ def mega_moe(
     Writes in-place to: dispatch_target, up_proj_y, swiglu_out, down_proj_y,
                         combine_target.
     All output tensors must be pre-allocated with correct shapes.
+
+    Args:
+        dispatch_target: First tensor in the fixed flat forward ABI; the complete parameter groups are documented
+            below and retain their registered schema order.
 
     Parameters
     ----------
@@ -230,6 +236,10 @@ def mega_moe_grad(
     event counters. Integer arguments describe the rank-local topology and
     shape. Output and workspace tensors must be pre-allocated; the operator
     writes gradients and communication results in place.
+
+    Args:
+        dispatch_target: First tensor in the fixed flat backward ABI; remaining tensor and topology arguments retain
+            their registered schema order.
     """
     _load_native()
     torch.ops.hyper_parallel.mega_moe_grad(
@@ -307,6 +317,10 @@ def mega_moe_with_profile_buffer(
     Writes in-place to: dispatch_target, up_proj_y, swiglu_out, down_proj_y,
                         combine_target.
     All output tensors must be pre-allocated with correct shapes.
+
+    Args:
+        dispatch_target: First tensor in the fixed profiled-forward ABI; the complete parameter groups are documented
+            below and retain their registered schema order.
 
     Parameters
     ----------
@@ -408,6 +422,10 @@ def mega_moe_grad_with_profile_buffer(
     ordinary-NPU-memory ``profile_buffer``. Device workers write cycle records
     directly into that buffer. All output and workspace tensors remain
     caller-owned and are written in place.
+
+    Args:
+        dispatch_target: First tensor in the fixed profiled-backward ABI; remaining tensor and topology arguments
+            retain their registered schema order.
     """
     _load_native()
     torch.ops.hyper_parallel.mega_moe_grad(

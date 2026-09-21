@@ -32,7 +32,6 @@ def mean_global_loss(
     step_token_counts: dict[str, torch.Tensor],
     device_mesh: "MeshContext",
 ) -> dict[str, torch.Tensor]:
-    # FIXME: VeOmni version -> AutoModels version
     """Calculate the global mean loss using explicit mesh information.
 
     FSDP divides gradients over its flattened DP+CP domain, so each local loss

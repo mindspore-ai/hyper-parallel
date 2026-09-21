@@ -1,3 +1,18 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+
 """safe_open-based tensor load behavior for DCP torch reader"""
 from pathlib import Path
 from typing import Any
@@ -70,7 +85,7 @@ def _runtime_imports():
     """Import the reader internals under test, and wrap them the way execute_read calls them.
 
     The imports sit inside the function because every case calls this only after
-    ``init_dist()``, so the DCP modules are first imported with the platform already up.
+    ``init_dist()``, so the DCP modules are first imported with the process group up.
     The wrapper saves each case from repeating how a read of one file is put together.
     """
     # pylint: disable=import-outside-toplevel
@@ -139,9 +154,6 @@ def test_dcp_safe_open_lazy_tensor_lookup():
     with patch(
         "hyper_parallel.core.distributed_checkpoint.filesystem_storage.safe_open",
         side_effect=lambda *args, **kwargs: tensor_file,
-    ), patch(
-        "hyper_parallel.platform.torch.platform.TorchPlatform.load_checkpoint",
-        side_effect=AssertionError("safe_open path should not call load_checkpoint"),
     ):
         load_tensor_file(str(Path("./dummy.safetensors")), [req], planner, storage_data)
 
@@ -173,9 +185,6 @@ def test_dcp_safe_open_slice_lookup():
     with patch(
         "hyper_parallel.core.distributed_checkpoint.filesystem_storage.safe_open",
         side_effect=lambda *args, **kwargs: tensor_file,
-    ), patch(
-        "hyper_parallel.platform.torch.platform.TorchPlatform.load_checkpoint",
-        side_effect=AssertionError("safe_open path should not call load_checkpoint"),
     ):
         load_tensor_file(str(Path("./dummy.safetensors")), [req], planner, storage_data)
 

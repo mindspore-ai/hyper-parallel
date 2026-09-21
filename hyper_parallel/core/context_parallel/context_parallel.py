@@ -16,6 +16,8 @@
 from functools import partial
 from typing import Optional
 
+import torch.distributed as dist
+
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
@@ -822,7 +824,7 @@ class ContextParallel(ParallelStyle):
         """Replace ``module.forward`` with the load-balanced two-sub-FA wrapper."""
         ws = co_submesh.mesh.numel()
         rank_list = list(co_submesh.rank_list)
-        local_idx = rank_list.index(utils.get_rank())
+        local_idx = rank_list.index(dist.get_rank())
         target_idx = ws - 1 - local_idx
         module.forward = partial(
             self._lb_colossal_forward,

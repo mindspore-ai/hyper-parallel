@@ -27,7 +27,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch  # pylint: disable=C0413
 
@@ -36,7 +35,7 @@ from hyper_parallel.core.utils.moe_utils import (  # pylint: disable=C0413
     sync_and_update_expert_bias,
 )
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo  # pylint: disable=C0413
-from hyper_parallel.platform.torch.common.moe import MoE  # pylint: disable=C0413
+from hyper_parallel.components.modules.moe import MoE  # pylint: disable=C0413
 
 
 class TestSyncAndUpdateExpertBias(unittest.TestCase):
@@ -271,6 +270,41 @@ class TestMoEMonitorCallback(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             callback.register(optimizer)
+
+    def test_lbm04c_reregister_replaces_existing_hook(self):
+        """LB-M04c: register() removes the previous hook before replacing it."""
+        model, _ = self._make_model_with_moe_layers(num_layers=1)
+        callback = MoEMonitorCallback(model, lr=1e-3)
+        first_optimizer = MagicMock()
+        second_optimizer = MagicMock()
+        first_handle = MagicMock()
+        second_handle = MagicMock()
+        first_optimizer.register_step_post_hook.return_value = first_handle
+        second_optimizer.register_step_post_hook.return_value = second_handle
+
+        callback.register(first_optimizer)
+        callback.register(second_optimizer)
+
+        first_handle.remove.assert_called_once()
+        second_handle.remove.assert_not_called()
+        self.assertIs(callback._hook_handle, second_handle)
+
+    def test_lbm04d_reregister_runs_callback_once_per_step(self):
+        """LB-M04d: repeated registration triggers one callback per optimizer step."""
+        model, _ = self._make_model_with_moe_layers(num_layers=1)
+        callback = MoEMonitorCallback(model, lr=1e-3)
+        callback.on_step_end = MagicMock()
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        optimizer = torch.optim.SGD(
+            [parameter], lr=1e-3, foreach=False, fused=False
+        )
+
+        callback.register(optimizer)
+        callback.register(optimizer)
+        optimizer.step()
+
+        callback.on_step_end.assert_called_once_with()
+        callback.remove()
 
     @patch("hyper_parallel.core.utils.moe_utils.sync_and_update_expert_bias")
     def test_lbm05_stores_mean_aux_loss(self, mock_sync):  # pylint: disable=W0613

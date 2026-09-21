@@ -19,7 +19,6 @@ import importlib
 import os
 import unittest
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 
 class TestHyperParallelPublicExports(unittest.TestCase):

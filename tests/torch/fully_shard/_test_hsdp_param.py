@@ -15,12 +15,11 @@
 """Test HSDPParamV2 implementation"""
 # pylint: disable=W0611
 import os
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch.distributed as dist
 import torch
 from tests.torch.utils import _DEVICE_TYPE, init_backend
 from tests.torch.common_net import DenseNet
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.dtensor._utils import get_device_handle
 from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
 from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
@@ -36,11 +35,8 @@ from hyper_parallel.core.dtensor.placement_types import Shard, StridedShard, Rep
 from hyper_parallel import DTensor, init_device_mesh
 
 
-platform = get_platform()
-
-
 def _current_device():
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     return torch.device(device_handle.current_device())
 
 
@@ -74,7 +70,7 @@ def test_hsdp_param_v2_fsdp_1d_mesh():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -132,7 +128,7 @@ def test_hsdp_param_v2_hsdp_2d_mesh():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -176,7 +172,7 @@ def test_hsdp_param_v2_sharded_state_transitions():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -242,7 +238,7 @@ def test_hsdp_param_v2_custom_shard_placement():
     # Custom shard placement function - shard along dim 1 instead of default dim 0
     def custom_shard_fn(param):
         return Shard(1)
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     # Create HSDPParamV2 with custom placement
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -290,7 +286,7 @@ def test_hsdp_param_v2_mixed_precision():
         param_dtype=torch.float16,
         reduce_dtype=torch.float32,
     )
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     # Create HSDPParamV2 with mixed precision
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -331,7 +327,7 @@ def test_hsdp_param_v2_all_gather_comm():
     net = DenseNet(in_channels, hidden_size)
     # Initialize weight with rank-based values for verification
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -376,7 +372,7 @@ def test_hsdp_param_v2_prefetch_unshard():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -419,7 +415,7 @@ def test_hsdp_param_v2_unshard_shard_cycle():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -462,7 +458,7 @@ def test_hsdp_param_v2_reduce_scatter_grad():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -530,7 +526,7 @@ def test_hsdp_param_v2_all_reduce_grad():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -584,7 +580,7 @@ def test_hsdp_param_v2_accumulate_grad():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,

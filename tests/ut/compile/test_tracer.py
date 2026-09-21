@@ -33,7 +33,6 @@ import os
 import unittest
 import warnings
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 from torch import nn
@@ -61,12 +60,13 @@ class _LinearWithBuffer(nn.Module):
 
 def _trace_and_run(model, train_fn, x, y):
     """Trace ``model`` and run the joint graph on the same inputs."""
+    inputs = {"x": x, "y": y}
     with warnings.catch_warnings():
         # The patched-autograd-engine warning is expected on stock torch; the
         # joint graph still captures correctly in this environment.
         warnings.simplefilter("ignore", RuntimeWarning)
-        joint = trace_model_graph(model, train_fn, x, y)
-        loss, grads = run_traced_graph(joint, model, x, y)
+        joint = trace_model_graph(model, train_fn, inputs)
+        loss, grads = run_traced_graph(joint, model, inputs)
     return joint, loss, grads
 
 
@@ -158,7 +158,7 @@ class TestRunTracedGraph(unittest.TestCase):
         # Attach an extra buffer so the state keys diverge from the trace.
         model.register_buffer("extra", torch.zeros(1))
         with self.assertRaises(ValueError) as ctx:
-            run_traced_graph(joint, model, x, y)
+            run_traced_graph(joint, model, {"x": x, "y": y})
         self.assertIn("different parameter/buffer names", str(ctx.exception))
 
 

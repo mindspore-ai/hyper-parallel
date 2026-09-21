@@ -51,16 +51,13 @@ class TestParallelMin(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
+    def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure common mock-platform attributes used across tests.
 
-        Args:
-            mock_platform: The MagicMock object injected by @patch.
-            platform_type: Optional PlatformType to set on the mock.
-            world_size: Value returned by mock_platform.get_world_size().
+            Args:
+                mock_platform: The MagicMock object injected by @patch.
+                world_size: Value returned by mock_platform.get_world_size().
         """
-        if platform_type is not None:
-            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
 
@@ -467,4 +464,4 @@ class TestParallelMin(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-    
+

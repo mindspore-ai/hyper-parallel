@@ -18,7 +18,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 # pylint: disable=C0413
 import torch

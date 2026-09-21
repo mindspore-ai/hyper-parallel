@@ -42,8 +42,8 @@ Workers still import frameworks normally.
 - Spawn from launchers with:
   - `from tests.common.distributed_launcher import torchrun_case`
   - and/or `from tests.common.parallel_case import parallel_run, TorchCase`
-- Keep `tests/torch/__init__.py` limited to
-  setting `HYPER_PARALLEL_PLATFORM` — **never** import `hyper_parallel` there.
+- Keep `tests/torch/__init__.py` limited to package
+  setup — **never** import `hyper_parallel` there.
 - Put worker bodies in `_test_*.py` (or other non-`test_` modules). Launchers only
   pass file + case name into `torchrun_case` / `TorchCase`.
 - For **in-process** ST that must use the framework: use a **thin** `test_*.py`

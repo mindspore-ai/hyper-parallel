@@ -84,6 +84,7 @@ class SappPipeline:
         # logger.output("seq chunk: %s",self.seq_split_num_)
 
         self.problem_ = None
+        self._simulator: Optional[sim.PipelineSimulator] = None
         self.layers_ = layers
         self.layers_sorted_ = {
             Layer.type_enum.HEAD: filter_layer_type(layers,

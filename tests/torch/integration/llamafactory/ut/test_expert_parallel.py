@@ -245,10 +245,12 @@ def test_ep_meta_initialization_preserves_dtensor_and_hsdp_state(monkeypatch):
     hsdp_param = _HSDPParam(expert, old_parameter)
     hsdp_state = types.SimpleNamespace(hsdp_params=[hsdp_param])
     expert.hsdp_scheduler = types.SimpleNamespace(hsdp_state=hsdp_state)
+    dense = torch.nn.Linear(3, 2)
+    dense.register_buffer("shared_scale", expert.scale)
     model = torch.nn.ModuleDict(
         {
             "experts": expert,
-            "dense": torch.nn.Linear(3, 2),
+            "dense": dense,
         }
     )
 
@@ -257,6 +259,7 @@ def test_ep_meta_initialization_preserves_dtensor_and_hsdp_state(monkeypatch):
     assert result is model
     assert all(parameter.is_meta for parameter in model.parameters())
     assert expert.scale.is_meta
+    assert expert.scale is dense.shared_scale
     assert isinstance(expert.weight, DTensor)
     assert expert.weight.device_mesh.to_hash() == old_mesh_hash
     assert tuple(expert.weight.placements) == old_placements

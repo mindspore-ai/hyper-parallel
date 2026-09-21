@@ -14,10 +14,12 @@
 # ============================================================================
 """test_process_group.py"""
 
-from hyper_parallel import (get_platform, init_process_group, destroy_process_group, get_process_group_ranks,
-                            get_backend, split_group)
+import torch.distributed as dist
 
-platform = get_platform()
+from hyper_parallel import (init_process_group, destroy_process_group, get_process_group_ranks,
+                            get_backend, split_group)
+from hyper_parallel.core.dtensor._utils import create_group
+from hyper_parallel.core.utils.communication import get_group_local_rank
 
 
 def test_process_group():
@@ -28,7 +30,7 @@ def test_process_group():
     """
     # init process group
     init_process_group()
-    world_size = platform.get_world_size()
+    world_size = dist.get_world_size()
     # pylint: disable=C0415
     rank_list = get_process_group_ranks()
     assert rank_list == list(range(world_size))
@@ -36,7 +38,7 @@ def test_process_group():
     assert backend == "hccl"
 
     # create process group
-    group = platform.create_group(rank_list=list(range(world_size)))
+    group = create_group(list(range(world_size)))
     assert group is not None
     rank_list = get_process_group_ranks(group)
     assert rank_list == list(range(world_size))
@@ -50,7 +52,7 @@ def test_process_group():
             split_ranks.append([rank, rank + 1])
     split_ranks.pop()
     split_group_from_group = split_group(group, split_ranks)
-    rank_id = platform.get_rank()
+    rank_id = dist.get_rank()
     split_rank = [rank_id]
     if rank_id % 2 == 0:
         split_rank.append(rank_id + 1)
@@ -65,7 +67,7 @@ def test_process_group():
         assert rank_list == split_rank
         backend = get_backend(split_group_from_group)
         assert backend == "hccl"
-        local_rank = platform.get_group_local_rank(split_group_from_group)
+        local_rank = get_group_local_rank(split_group_from_group)
         assert local_rank == rank_id % 2
 
         destroy_process_group(split_group_from_group)

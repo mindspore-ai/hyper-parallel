@@ -23,7 +23,6 @@ import unittest
 import hyper_parallel
 from hyper_parallel.core import multicore
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
-from hyper_parallel.platform.platform import Platform
 from tests.common.mark_utils import arg_mark
 
 
@@ -51,24 +50,12 @@ class TestMulticoreBoundary(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_platform_has_no_component_hooks(self):
-        """Verify removal of shared Platform hooks.
-
-        Feature: Multicore Platform independence.
-        Description: Inspect the shared Platform class for former component hooks.
-        Expectation: Neither Multicore nor SHMEM can be requested from Platform.
-        """
-        self.assertFalse(hasattr(Platform, "get_symmetric_memory_handler"))
-        self.assertFalse(hasattr(Platform, "get_multicore_handler"))
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_runtime_sources_do_not_import_platform_or_mindspore(self):
-        """Verify production sources stay Torch-only and Platform-free.
+        """Verify production sources stay Torch-only.
 
         Feature: Multicore runtime convergence.
         Description: Parse imports in the converged production Python tree.
-        Expectation: Runtime sources import neither MindSpore nor HyperParallel Platform.
+        Expectation: Runtime sources import neither MindSpore nor a HyperParallel Platform layer.
         """
         root = Path(multicore.__file__).parent
         for path in root.rglob("*.py"):

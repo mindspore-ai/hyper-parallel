@@ -23,7 +23,6 @@ from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 # Force torch platform before any hyper_parallel imports
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import torch
@@ -84,7 +83,6 @@ class TestGetRootModules(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
     def test_sibling_modules_both_roots(self):
@@ -159,7 +157,6 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
     def test_single_module_valid(self):
@@ -333,7 +330,6 @@ class TestFullyShardListAPI(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
     def _create_mock_mesh(self):

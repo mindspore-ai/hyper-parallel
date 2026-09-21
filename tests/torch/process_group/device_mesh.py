@@ -14,10 +14,10 @@
 # ============================================================================
 """test_process_group.py"""
 
-from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, DeviceMesh
-from hyper_parallel import get_platform, init_process_group, get_process_group_ranks
+import torch.distributed as dist
 
-platform = get_platform()
+from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, DeviceMesh
+from hyper_parallel import init_process_group, get_process_group_ranks
 
 
 def test_device_mesh_from_1d_group_valid():
@@ -63,8 +63,8 @@ def test_device_mesh_from_2d_group_valid():
     )
     tp_mesh = device_mesh["tp"]
     cp_mesh = device_mesh["cp"]
-    rank_id = platform.get_rank()
-    world_size = platform.get_world_size()
+    rank_id = dist.get_rank()
+    world_size = dist.get_world_size()
     tp_rank_list = tuple(sorted((rank_id, rank_id + 2 if rank_id < world_size // 2 else rank_id - 2)))
     cp_rank_lists = (
         tuple(range(world_size // 2)),

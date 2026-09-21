@@ -15,7 +15,6 @@
 """pipeline schedule"""
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
-from enum import Enum, auto
 from collections import defaultdict
 import itertools
 import bisect
@@ -37,7 +36,7 @@ from hyper_parallel.core.pipeline_parallel.pipeline_swap import (
     swap_wait_offload,
     unregister_layer_swap_hooks,
 )
-from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
+from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec, MetaStep, MetaStepType
 from hyper_parallel.core.pipeline_parallel._microbatch import _MicroBatch
 from hyper_parallel.core.pipeline_parallel._p2p import (
     create_p2p_multi_stream_groups,
@@ -45,125 +44,6 @@ from hyper_parallel.core.pipeline_parallel._p2p import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-class MetaStepType(Enum):
-    """Specify the enumeration type for MetaStep."""
-    DATA_LOAD = auto()
-    DATA_SEND = auto()
-    DATA_RECV = auto()
-    FWD = auto()
-    BWD = auto()
-    BWD_INPUT = auto()
-    BWD_WEIGHT = auto()
-    FWD_RECV = auto()
-    FWD_SEND = auto()
-    BWD_RECV = auto()
-    BWD_SEND = auto()
-    # Composite P2P: a contiguous run of FWD_SEND/FWD_RECV/BWD_SEND/BWD_RECV
-    # coalesced by ``coalesce_p2p`` into one step whose ``sub_steps`` the runtime
-    # groups by peer and issues as ``batch_isend_irecv`` (same-peer send+recv ->
-    # duplex).  Produced under ``p2p_transport="batch"`` or ``"multi_stream"``.
-    BATCH_SEND_RECV = auto()
-    OVERLAP_F_B = auto()
-    OVERLAP_B_F = auto()
-    FSDP_UNSHARD = auto()
-    FSDP_RESHARD = auto()
-    FSDP_REDUCE_GRAD = auto()
-    SWAP_LAUNCH_OFFLOAD = auto()
-    SWAP_WAIT_OFFLOAD = auto()
-    SWAP_LAUNCH_LOAD = auto()
-    SWAP_WAIT_LOAD = auto()
-
-
-class MetaStep:
-    """
-    Meta step of PipelineSchedule.
-    An execution list composed of MetaStep can be constructed
-    and fed into the PipelineSchedule for execution.
-
-    Args:
-        micro_index (int | None): The index of micro-batch.  ``None`` for
-            composite types (``OVERLAP_F_B`` / ``OVERLAP_B_F``) whose real
-            micro index lives in each ``sub_steps`` entry.
-        type (MetaStepType): Specify the type of current step.
-        stage_index (int | None): Stage index of current step.  ``None``
-            for composite types; use ``sub_steps`` to get each direction's
-            stage.
-        sub_steps (tuple[MetaStep, MetaStep] | None): For composite types
-            only: ``(fwd, bwd)`` for ``OVERLAP_F_B``, ``(bwd, fwd)`` for
-            ``OVERLAP_B_F``.
-        boundary_p2p (tuple[MetaStep, ...] | None): For ``OVERLAP_B_F`` under
-            the ``"boundary"`` P2P transport only: P2P steps to issue at the
-            fwd/bwd boundary inside the overlap (the forward's ``FWD_SEND``
-            plus the next slot's recvs), hoisted out of the following gap by
-            ``attach_fwd_boundary_p2p``.  Issued via
-            :meth:`PipelineScheduleRuntime.exec_boundary_p2p`.
-    """
-    def __init__(self, micro_index, meta_type, stage_index, sub_steps=None,
-                 boundary_p2p=None):
-        self._type = meta_type
-        self._micro_index = micro_index
-        self._stage_index = stage_index
-        self._sub_steps = sub_steps
-        self._boundary_p2p = boundary_p2p
-
-    @property
-    def micro_index(self):
-        """Return the micro-batch index of this step."""
-        return self._micro_index
-
-    @property
-    def stage_index(self):
-        """Return the stage index of this step."""
-        return self._stage_index
-
-    @property
-    def type(self):
-        """Return the MetaStepType of this step."""
-        return self._type
-
-    @property
-    def sub_steps(self):
-        """Sub-steps for composite types: ``(fwd, bwd)`` for OVERLAP_F_B,
-        ``(bwd, fwd)`` for OVERLAP_B_F, or ``None``."""
-        return self._sub_steps
-
-    @property
-    def boundary_p2p(self):
-        """P2P steps to issue at the overlap's fwd/bwd boundary, or ``None``."""
-        return self._boundary_p2p
-
-    def __eq__(self, value):
-        if not isinstance(value, MetaStep):
-            return NotImplemented
-        return (self.type == value.type
-                and self.micro_index == value.micro_index
-                and self.stage_index == value.stage_index
-                and self.sub_steps == value.sub_steps)
-
-    def __ne__(self, value):
-        if not isinstance(value, MetaStep):
-            return NotImplemented
-        return not self.__eq__(value)
-
-    def __hash__(self):
-        return hash((self.type, self.micro_index, self.stage_index))
-
-    def __str__(self):
-        if self.sub_steps:
-            sub = ", ".join(str(s) for s in self.sub_steps)
-            return (f"MetaStep(type={self.type}, micro_index={self.micro_index}, "
-                    f"stage_index={self.stage_index}, sub_steps=[{sub}])")
-        return f"MetaStep(type={self.type}, micro_index={self.micro_index}, stage_index={self.stage_index})"
-
-    def __repr__(self):
-        return self.__str__()
-
-    @staticmethod
-    def from_str(step_str):
-        """Parse a MetaStep from its string representation."""
-        pass
 
 
 def generate_stage_to_rank_mapping(real_stage_num, stage_num, style='loop'):
@@ -348,7 +228,7 @@ class PipelineScheduleRuntime(ABC):
         self._kwargs_batch_dim = self._normalize_kwargs_batch_dim(kwargs_batch_dim)
         # Every key on the wire is one DATA_LOAD actually populated. MPipe
         # overrides this in ``construct_exec_order``.
-        self._DATA_KEYS = tuple(self._kwargs_batch_dim or ())  # pylint: disable=invalid-name
+        self._data_keys = tuple(self._kwargs_batch_dim or ())
         self._output_concat_dim = output_concat_dim
         self.split_micro_batch = _MicroBatch(
             self.micro_batch_num, self._args_batch_dim, self._kwargs_batch_dim)
@@ -1179,75 +1059,85 @@ class PipelineScheduleRuntime(ABC):
             return
         if step_type == MetaStepType.DATA_LOAD:
             if stage_index <= 0:
-                device = self.stages[0].device
-                micro_batch = next(self.data_iterator)
-                if isinstance(micro_batch, list):
-                    micro_batch = micro_batch[micro_index]
-                micro_batch = {
-                    key: (value.to(device, non_blocking=True) if hasattr(value, "to") else value)
-                    for key, value in micro_batch.items()
-                }
-                input_ids = micro_batch["input_ids"]
-                labels = micro_batch["labels"]
-                # Ignore the final token after shifting next-token targets.
-                pad_col = torch.full_like(labels[..., :1], -100)
-                targets = torch.cat([labels[..., 1:], pad_col], dim=-1).contiguous()
-                n_valid = max(int((targets != -100).sum().item()), 1)
-                if getattr(self, "_pp_fsdp_composed", False):
-                    nt = torch.full((1,), n_valid).to(device)
-                    dist.all_reduce(nt, group=self._dp_group_info.group)
-                    n_valid = max(int(nt.item()), 1)
-                self.last_local_tokens += n_valid
-
-                micro_batch["targets"] = targets
-                for key in self.kwargs_batch_dim:
-                    if key in kwarg_mbs[micro_index].keys():
-                        kwarg_mbs[micro_index][key] = torch.cat(
-                            [kwarg_mbs[micro_index][key], micro_batch[key]], dim=0)
-                    else:
-                        kwarg_mbs[micro_index][key] = micro_batch[key]
-                arg_mbs[micro_index] = [input_ids]
-
+                self._exec_data_load(micro_index, arg_mbs, kwarg_mbs)
         elif step_type == MetaStepType.DATA_SEND:
-            if getattr(self, "_data_dst", False):
-                dst_stage_idx = self._data_dst[stage_index][micro_index]
-            else:
-                dst_stage_idx = self.stages[0].dst_stage
-            dst = self.stages[0]._global_rank(dst_stage_idx)  # pylint: disable=protected-access
-            # One meta round-trip per DATA_SEND instead of K; the matching
-            # DATA_RECV unpacks the list in the same order.
-            metas = []
-            tensors = []
-            for key in self._DATA_KEYS:
-                tensor = (arg_mbs[micro_index][0] if key == "input_ids"
-                            else kwarg_mbs[micro_index][key])
-                metas.append([tuple(tensor.shape), tensor.dtype])
-                tensors.append(tensor)
-            dist.send_object_list(metas, dst)
-            handles = [dist.isend(t, dst) for t in tensors]
-            self._wait_p2p(handles)
-
+            self._exec_data_send(stage_index, micro_index, arg_mbs, kwarg_mbs)
         elif step_type == MetaStepType.DATA_RECV:
-            if getattr(self, "_data_src", False):
-                src_stage_idx = self._data_src[stage_index][micro_index]
+            self._exec_data_recv(stage_index, micro_index, arg_mbs, kwarg_mbs)
+
+    def _exec_data_load(self, micro_index: int, arg_mbs: list, kwarg_mbs: list) -> None:
+        """Load the next micro-batch onto stage 0's device and stage it as ``micro_index``'s input."""
+        device = self.stages[0].device
+        micro_batch = next(self.data_iterator)
+        if isinstance(micro_batch, list):
+            micro_batch = micro_batch[micro_index]
+        micro_batch = {
+            key: (value.to(device, non_blocking=True) if hasattr(value, "to") else value)
+            for key, value in micro_batch.items()
+        }
+        input_ids = micro_batch["input_ids"]
+        labels = micro_batch["labels"]
+        # Ignore the final token after shifting next-token targets.
+        pad_col = torch.full_like(labels[..., :1], -100)
+        targets = torch.cat([labels[..., 1:], pad_col], dim=-1).contiguous()
+        n_valid = max(int((targets != -100).sum().item()), 1)
+        if getattr(self, "_pp_fsdp_composed", False):
+            nt = torch.full((1,), n_valid).to(device)
+            dist.all_reduce(nt, group=self._dp_group_info.group)
+            n_valid = max(int(nt.item()), 1)
+        self.last_local_tokens += n_valid
+
+        micro_batch["targets"] = targets
+        for key in self.kwargs_batch_dim:
+            if key in kwarg_mbs[micro_index].keys():
+                kwarg_mbs[micro_index][key] = torch.cat(
+                    [kwarg_mbs[micro_index][key], micro_batch[key]], dim=0)
             else:
-                src_stage_idx = self.stages[0].src_stage
-            src = self.stages[0]._global_rank(src_stage_idx)  # pylint: disable=protected-access
-            device = self.stages[0].device
-            # One recv_object_list unpacks every key's (shape, dtype) at
-            # once, matching the packed DATA_SEND above.
-            metas: list = [None] * len(self._DATA_KEYS)
-            dist.recv_object_list(metas, src)
-            handles = []
-            for key, meta in zip(self._DATA_KEYS, metas):
-                shape, dtype = meta
-                buffer = torch.empty(shape, dtype=dtype, device=device)
-                handles.append(dist.irecv(buffer, src))
-                if key == "input_ids":
-                    arg_mbs[micro_index] = [buffer]
-                else:
-                    kwarg_mbs[micro_index][key] = buffer
-            self._wait_p2p(handles)
+                kwarg_mbs[micro_index][key] = micro_batch[key]
+        arg_mbs[micro_index] = [input_ids]
+
+    def _exec_data_send(self, stage_index: int, micro_index: int, arg_mbs: list, kwarg_mbs: list) -> None:
+        """Send ``micro_index``'s data keys to the stage that consumes them."""
+        if getattr(self, "_data_dst", False):
+            dst_stage_idx = self._data_dst[stage_index][micro_index]
+        else:
+            dst_stage_idx = self.stages[0].dst_stage
+        dst = self.stages[0]._global_rank(dst_stage_idx)  # pylint: disable=protected-access
+        # One meta round-trip per DATA_SEND instead of K; the matching
+        # DATA_RECV unpacks the list in the same order.
+        metas = []
+        tensors = []
+        for key in self._data_keys:
+            tensor = (arg_mbs[micro_index][0] if key == "input_ids"
+                      else kwarg_mbs[micro_index][key])
+            metas.append([tuple(tensor.shape), tensor.dtype])
+            tensors.append(tensor)
+        dist.send_object_list(metas, dst)
+        handles = [dist.isend(t, dst) for t in tensors]
+        self._wait_p2p(handles)
+
+    def _exec_data_recv(self, stage_index: int, micro_index: int, arg_mbs: list, kwarg_mbs: list) -> None:
+        """Receive ``micro_index``'s data keys and stage them as its input."""
+        if getattr(self, "_data_src", False):
+            src_stage_idx = self._data_src[stage_index][micro_index]
+        else:
+            src_stage_idx = self.stages[0].src_stage
+        src = self.stages[0]._global_rank(src_stage_idx)  # pylint: disable=protected-access
+        device = self.stages[0].device
+        # One recv_object_list unpacks every key's (shape, dtype) at
+        # once, matching the packed DATA_SEND above.
+        metas: list = [None] * len(self._data_keys)
+        dist.recv_object_list(metas, src)
+        handles = []
+        for key, meta in zip(self._data_keys, metas):
+            shape, dtype = meta
+            buffer = torch.empty(shape, dtype=dtype, device=device)
+            handles.append(dist.irecv(buffer, src))
+            if key == "input_ids":
+                arg_mbs[micro_index] = [buffer]
+            else:
+                kwarg_mbs[micro_index][key] = buffer
+        self._wait_p2p(handles)
 
     def _exec_pipeline_swap_step(self, cur_step, arg_mbs, kwarg_mbs):
         """Execute a pipeline activation-swap control step."""

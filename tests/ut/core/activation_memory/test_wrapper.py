@@ -29,7 +29,6 @@ from unittest.mock import MagicMock, call, patch, sentinel
 import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.activation_memory.api import (
     CheckpointPolicy,
@@ -332,6 +331,7 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
         original_ref = weakref.ref(original)
         fake_manager = MagicMock()
         fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager.is_last_group.return_value = False
 
         with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
             saved_tensors = AsyncSaveOnCpu(group_swap=True)
@@ -362,12 +362,30 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
         x = torch.randn(2, requires_grad=True)
         fake_manager = MagicMock()
         fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager.is_last_group.return_value = False
 
         with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
             with AsyncSaveOnCpu(policy_fn=lambda tensor: CheckpointPolicy.MUST_SWAP, group_swap=True):
                 (x * x).sum()
 
         fake_manager.add_storage.assert_called_once()
+
+    def test_skips_storage_registration_for_last_group(self):
+        """Last groups should keep saved tensors on device without registering swap storage."""
+        tensor = torch.randn(2, requires_grad=True)
+        fake_manager = MagicMock()
+        fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager.is_last_group.return_value = True
+
+        with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
+            saved_tensors = AsyncSaveOnCpu(group_swap=True)
+            packed = saved_tensors.pack_hook(tensor)
+
+        self.assertIsNot(packed, tensor)
+        self.assertFalse(packed.requires_grad)
+        self.assertTrue(torch.equal(packed, tensor))
+        fake_manager.is_last_group.assert_called_once_with("group0")
+        fake_manager.add_storage.assert_not_called()
 
 
 class TestSwapTensorWrapper(unittest.TestCase):

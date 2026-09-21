@@ -17,8 +17,8 @@
 Merges the former ``components/loss/loss_parallel_ops.py`` kernel with the
 ``loss_parallel_ops_common.py`` validation helpers into a single private
 production implementation. The leading underscore marks this module as
-internal: the generic DTensor loss API stays in ``core.tensor_parallel`` /
-``platform`` (frozen), while AutoModels production loss uses this module.
+internal: the generic DTensor loss API stays in ``core.tensor_parallel``
+(frozen), while AutoModels production loss uses this module.
 
 The public-in-package entry is :func:`vocab_parallel_cross_entropy_local`:
 it takes the *local* logits shard plus the global vocabulary size, the mesh
@@ -30,17 +30,31 @@ DTensor wrapper are absorbed by :func:`_resolve_class_mesh_dim`.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple, TYPE_CHECKING
+from typing import Any, NamedTuple, Optional, Tuple, TYPE_CHECKING
 
 import torch
+import torch.distributed.nn.functional as dist_func
 from torch import Tensor
-
-from hyper_parallel.platform import get_platform
 
 if TYPE_CHECKING:
     from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 
-platform = get_platform()
+_REDUCE_OP_MAP = {
+    "sum": torch.distributed.ReduceOp.SUM,
+    "prod": torch.distributed.ReduceOp.PRODUCT,
+    "max": torch.distributed.ReduceOp.MAX,
+    "min": torch.distributed.ReduceOp.MIN,
+    "all": torch.distributed.ReduceOp.MIN,
+    "avg": torch.distributed.ReduceOp.SUM,
+}
+
+
+def _differentiable_all_reduce(data: Tensor, op: str, group: Any) -> Tensor:
+    """Autograd-aware all-reduce: backward is an identity, the loss is scaled by world size."""
+    if not data.is_contiguous() or data.storage_offset() != 0:
+        data = data.contiguous()
+    reduce_op = _REDUCE_OP_MAP.get(op, torch.distributed.ReduceOp.SUM)
+    return dist_func.all_reduce(data, op=reduce_op, group=group)
 
 __all__ = [
     "vocab_parallel_cross_entropy_local",
@@ -154,13 +168,13 @@ def distributed_log_softmax(
     max_local = logits_local.max(dim=dim, keepdim=True).values
 
     group = mesh.get_group(mesh_dim)
-    max_global = platform.differentiable_all_reduce(max_local, op="max", group=group)
+    max_global = _differentiable_all_reduce(max_local, op="max", group=group)
 
     exp_local = (logits_local - max_global).exp()
 
     sum_local = exp_local.sum(dim=dim, keepdim=True)
 
-    sum_global = platform.differentiable_all_reduce(sum_local, op="sum", group=group)
+    sum_global = _differentiable_all_reduce(sum_local, op="sum", group=group)
 
     log_softmax = logits_local - max_global - sum_global.log()
 
@@ -247,6 +261,89 @@ def distributed_nll_loss_forward(
     )
 
 
+class _CrossEntropyGradients(NamedTuple):
+    """Gradients aligned with the eight inputs of the autograd function."""
+
+    input_local: Tensor
+    target: None = None
+    weight: None = None
+    ignore_index: None = None
+    reduction: None = None
+    vocab_size: None = None
+    mesh: None = None
+    mesh_dim: None = None
+
+
+class _CrossEntropyContext(NamedTuple):
+    """State required by the custom cross-entropy backward pass."""
+
+    log_probs_local: Tensor
+    target: Tensor
+    weight: Optional[Tensor]
+    total_weight: Tensor
+    target_mask: Tensor
+    vocab_start_tensor: Tensor
+    reduction: str
+    ignore_index: int
+    vocab_start: int
+    vocab_end: int
+
+
+def _compute_cross_entropy_gradient(
+    state: _CrossEntropyContext,
+    grad_output: Tensor,
+) -> Tensor:
+    """Compute the local logits gradient for one reduction mode."""
+    target_flat = state.target.flatten()
+    softmax_local = state.log_probs_local.exp()
+    ignore_mask = target_flat != state.ignore_index
+
+    if state.weight is not None:
+        # Ignore positions can contain -100, so use a valid class index before
+        # masking their gradients out below.
+        safe_target = torch.where(ignore_mask, target_flat, torch.zeros_like(target_flat))
+        sample_weights = state.weight[safe_target]
+    else:
+        sample_weights = None
+
+    if state.reduction == "mean":
+        grad_scale = grad_output / state.total_weight.clamp(min=1e-12)
+    elif state.reduction == "sum":
+        grad_scale = grad_output
+    else:
+        grad_scale = grad_output.flatten()
+
+    in_vocab_mask = (target_flat >= state.vocab_start) & (target_flat < state.vocab_end) & ignore_mask
+    grad_scale_expanded = (
+        grad_scale.unsqueeze(-1) if state.reduction == "none" else grad_scale.reshape(1, 1)
+    )
+    if sample_weights is not None:
+        grad_scale_expanded = grad_scale_expanded * sample_weights.unsqueeze(-1)
+    grad_input = softmax_local * grad_scale_expanded
+    local_targets = torch.where(
+        in_vocab_mask, target_flat - state.vocab_start, torch.zeros_like(target_flat)
+    )
+
+    if in_vocab_mask.any():
+        row_indices = torch.arange(target_flat.numel(), device=state.target.device, dtype=torch.long)
+        if state.reduction == "none":
+            grad_values = -grad_scale
+        else:
+            grad_values = -grad_scale.expand_as(target_flat)
+        if sample_weights is not None:
+            grad_values = grad_values * sample_weights
+        grad_input = grad_input.contiguous()
+        grad_input[row_indices[in_vocab_mask], local_targets[in_vocab_mask]] += grad_values[in_vocab_mask]
+
+    if not ignore_mask.all():
+        if state.reduction == "none":
+            grad_input[~ignore_mask] = 0.0
+        else:
+            ignore_indices_expanded = (~ignore_mask).unsqueeze(-1).expand_as(grad_input)
+            grad_input[ignore_indices_expanded] = 0.0
+    return grad_input
+
+
 class DistributedCrossEntropyFunction(torch.autograd.Function):
     """K3: Fused backward for distributed cross_entropy."""
 
@@ -262,175 +359,55 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
         mesh: DeviceMesh,
         mesh_dim: int,
     ) -> Tensor:
-        """Forward pass."""
-        local_vocab_size = input_local.shape[-1]
-        rank = mesh.get_local_rank(mesh_dim)
-        tp_size = mesh.size(mesh_dim)
-        vocab_start = _compute_vocab_start(vocab_size, tp_size, rank)
-        vocab_end = vocab_start + local_vocab_size
-
+        """Forward pass with shared context setup for each reduction mode."""
+        ctx.vocab_start = _compute_vocab_start(
+            vocab_size, mesh.size(mesh_dim), mesh.get_local_rank(mesh_dim)
+        )
+        ctx.vocab_end = ctx.vocab_start + input_local.shape[-1]
+        ctx.reduction = reduction
+        ctx.ignore_index = ignore_index
         log_probs_local = distributed_log_softmax(
             input_local, dim=-1, mesh=mesh, mesh_dim=mesh_dim
         )
-
-        loss, total_weight, target_mask, vocab_start_tensor = distributed_nll_loss_forward(
+        nll_result = distributed_nll_loss_forward(
             log_probs_local,
             target,
             weight,
             ignore_index,
             reduction,
-            vocab_start,
-            vocab_end,
+            ctx.vocab_start,
+            ctx.vocab_end,
         )
-
-        if reduction == "mean":
+        loss, total_weight = nll_result[:2]
+        if reduction in ("mean", "sum"):
             group = mesh.get_group(mesh_dim)
-            total_loss = platform.differentiable_all_reduce(loss, op="sum", group=group)
-            total_weight_sum = platform.differentiable_all_reduce(
-                total_weight, op="sum", group=group
-            )
-
-            ctx.save_for_backward(
-                log_probs_local,
-                target,
-                weight,
-                total_weight_sum,
-                target_mask,
-                vocab_start_tensor,
-            )
-            ctx.reduction = reduction
-            ctx.ignore_index = ignore_index
-            ctx.vocab_size = vocab_size
-            ctx.local_vocab_size = local_vocab_size
-            ctx.mesh = mesh
-            ctx.mesh_dim = mesh_dim
-            ctx.vocab_start = vocab_start
-            ctx.vocab_end = vocab_end
-
-            if total_weight_sum.item() == 0:
-                return torch.tensor(float('nan'), dtype=total_loss.dtype, device=total_loss.device)
-            return total_loss / total_weight_sum
-        if reduction == "sum":
-            group = mesh.get_group(mesh_dim)
-            total_loss = platform.differentiable_all_reduce(loss, op="sum", group=group)
-
-            ctx.save_for_backward(
-                log_probs_local,
-                target,
-                weight,
-                torch.zeros(1, dtype=loss.dtype, device=loss.device),
-                target_mask,
-                vocab_start_tensor,
-            )
-            ctx.reduction = reduction
-            ctx.ignore_index = ignore_index
-            ctx.vocab_size = vocab_size
-            ctx.local_vocab_size = local_vocab_size
-            ctx.mesh = mesh
-            ctx.mesh_dim = mesh_dim
-            ctx.vocab_start = vocab_start
-            ctx.vocab_end = vocab_end
-
-            return total_loss
+            loss = _differentiable_all_reduce(loss, op="sum", group=group)
+            if reduction == "mean":
+                total_weight = _differentiable_all_reduce(
+                    total_weight, op="sum", group=group
+                )
+        if reduction != "mean":
+            total_weight = torch.zeros(1, dtype=loss.dtype, device=loss.device)
         ctx.save_for_backward(
-            log_probs_local,
-            target,
-            weight,
-            torch.zeros(1, dtype=loss.dtype, device=loss.device),
-            target_mask,
-            vocab_start_tensor,
+            log_probs_local, target, weight, total_weight, nll_result[2], nll_result[3]
         )
-        ctx.reduction = reduction
-        ctx.ignore_index = ignore_index
-        ctx.vocab_size = vocab_size
-        ctx.local_vocab_size = local_vocab_size
-        ctx.mesh = mesh
-        ctx.mesh_dim = mesh_dim
-        ctx.vocab_start = vocab_start
-        ctx.vocab_end = vocab_end
-
+        if reduction == "mean":
+            if total_weight.item() == 0:
+                return torch.tensor(float('nan'), dtype=loss.dtype, device=loss.device)
+            return loss / total_weight
         return loss
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[Optional[Tensor], ...]:
         """Backward pass (vectorized implementation)."""
-        (
-            log_probs_local,
-            target,
-            weight,
-            total_weight,
-            _,
-            _,
-        ) = ctx.saved_tensors
-
-        reduction = ctx.reduction
-        ignore_index = ctx.ignore_index
-        _ = ctx.local_vocab_size
-        vocab_start = ctx.vocab_start
-        vocab_end = ctx.vocab_end
-        _ = ctx.mesh
-        _ = ctx.mesh_dim
-
-        batch_size = target.numel()
-        target_flat = target.flatten()
-
-        softmax_local = log_probs_local.exp()
-
-        ignore_mask = target_flat != ignore_index
-
-        if weight is not None:
-            # Ignore positions may contain -100, which is not a valid class
-            # index. Use a harmless index there; their gradients are masked
-            # below and therefore do not contribute to the result.
-            safe_target = torch.where(
-                ignore_mask, target_flat, torch.zeros_like(target_flat)
-            )
-            sample_weights = weight[safe_target]
-        else:
-            sample_weights = None
-
-        if reduction == "mean":
-            grad_scale = grad_output / total_weight.clamp(min=1e-12)
-        elif reduction == "sum":
-            grad_scale = grad_output
-        else:
-            grad_scale = grad_output.flatten()
-
-        in_vocab_mask = (target_flat >= vocab_start) & (target_flat < vocab_end) & ignore_mask
-
-        if reduction == "none":
-            grad_scale_expanded = grad_scale.unsqueeze(-1)
-        else:
-            grad_scale_expanded = grad_scale.reshape(1, 1)
-        if sample_weights is not None:
-            grad_scale_expanded = grad_scale_expanded * sample_weights.unsqueeze(-1)
-        grad_input = softmax_local * grad_scale_expanded
-
-        local_targets = torch.where(in_vocab_mask, target_flat - vocab_start, torch.zeros_like(target_flat))
-
-        if in_vocab_mask.any():
-            row_indices = torch.arange(batch_size, device=target.device, dtype=torch.long)
-
-            if reduction == "none":
-                grad_values = -grad_scale
-                if sample_weights is not None:
-                    grad_values = grad_values * sample_weights
-            else:
-                grad_values = -grad_scale.expand_as(target_flat)
-                if sample_weights is not None:
-                    grad_values = grad_values * sample_weights
-
-            grad_input = grad_input.contiguous()
-            grad_input[row_indices[in_vocab_mask], local_targets[in_vocab_mask]] += grad_values[in_vocab_mask]
-
-        if not ignore_mask.all():
-            if reduction == "none":
-                grad_input[~ignore_mask] = 0.0
-            else:
-                ignore_indices_expanded = (~ignore_mask).unsqueeze(-1).expand_as(grad_input)
-                grad_input[ignore_indices_expanded] = 0.0
-
-        return grad_input, None, None, None, None, None, None, None
+        state = _CrossEntropyContext(
+            *ctx.saved_tensors,
+            reduction=ctx.reduction,
+            ignore_index=ctx.ignore_index,
+            vocab_start=ctx.vocab_start,
+            vocab_end=ctx.vocab_end,
+        )
+        return _CrossEntropyGradients(_compute_cross_entropy_gradient(state, grad_output))
 
 
 def vocab_parallel_cross_entropy_local(

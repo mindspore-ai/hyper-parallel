@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+__all__ = ["ProfilerAction", "mega_kernel_profile", "merge_chrome_traces", "schedule"]
+
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import json
 from pathlib import Path
@@ -29,9 +31,6 @@ import torch
 from hyper_parallel.core.multicore.profiler.profiling import _PreparedMegaKernelRuntime
 from hyper_parallel.core.multicore.profiler.trace_merger import merge_chrome_traces
 from hyper_parallel.core.multicore.scheduler.config import RuntimeConfigC
-
-
-__all__ = ["ProfilerAction", "mega_kernel_profile", "merge_chrome_traces", "schedule"]
 
 
 class ProfilerAction(Enum):
@@ -128,6 +127,66 @@ class _RawInvocation:
     direction: str
     step: int
     invocation_id: int
+
+
+@dataclass
+class _TraceAccumulator:
+    """Aggregate parsed invocations into one capture window."""
+
+    global_anchor: int
+    trace_events: list[dict[str, Any]] = field(default_factory=list)
+    metadata_keys: set[tuple[Any, Any, Any]] = field(default_factory=set)
+    dropped_count: int = 0
+    record_count: int = 0
+    invocation_metadata: list[dict[str, Any]] = field(default_factory=list)
+
+    def append(self, invocation: _RawInvocation, trace: dict[str, Any]) -> None:
+        """Append one parsed invocation and shift it to the window anchor.
+
+        Args:
+            invocation: Invocation identity and captured bytes.
+            trace: Parsed standalone trace for the invocation.
+        """
+        metadata = trace["megaKernelCycleTrace"]
+        shift_us = (metadata["anchorCycle"] - self.global_anchor) / metadata["cycleFrequencyMHz"]
+        self.dropped_count += metadata["droppedRecordCount"]
+        self.record_count += metadata["recordCount"]
+        self.invocation_metadata.append({
+            "invocationId": invocation.invocation_id,
+            "step": invocation.step,
+            "direction": invocation.direction,
+            "kernelName": invocation.runtime.kernel_name,
+            "rank": metadata.get("rank", invocation.runtime.rank),
+            "deviceId": metadata.get("deviceId", invocation.runtime.device_id),
+            "anchorCycle": metadata["anchorCycle"],
+            "recordCount": metadata["recordCount"],
+            "droppedRecordCount": metadata["droppedRecordCount"],
+        })
+        self._append_events(trace["traceEvents"], invocation, shift_us)
+
+    def _append_events(
+        self,
+        events: list[dict[str, Any]],
+        invocation: _RawInvocation,
+        shift_us: float,
+    ) -> None:
+        """Deduplicate metadata events and shift duration events."""
+        for event in events:
+            if event["ph"] == "M":
+                key = (event["name"], event["pid"], event["tid"])
+                if key not in self.metadata_keys:
+                    self.metadata_keys.add(key)
+                    self.trace_events.append(event)
+                continue
+            copied_event = dict(event)
+            copied_event["ts"] += shift_us
+            copied_event["args"] = {
+                **event.get("args", {}),
+                "invocation_id": invocation.invocation_id,
+                "step": invocation.step,
+                "direction": invocation.direction,
+            }
+            self.trace_events.append(copied_event)
 
 
 class _MegaKernelCall:
@@ -272,7 +331,11 @@ class TorchMegaKernelProfiler:
         self._action = next_action
 
     def export_chrome_trace(self, path: str | Path) -> dict[str, Any]:
-        """Write the most recently completed internal capture window."""
+        """Write the most recently completed internal capture window.
+
+        Args:
+            path: Destination path for the Chrome Trace JSON object.
+        """
         if self._last_trace is None:
             raise RuntimeError(
                 "no completed MegaKernel capture window is available; "
@@ -304,7 +367,13 @@ class TorchMegaKernelProfiler:
         event_counters: Any,
         direction: str,
     ) -> _MegaKernelCall:
-        """Reserve a profiling buffer and register one pending kernel call."""
+        """Reserve a profiling buffer and register one pending kernel call.
+
+        Args:
+            runtime: Prepared runtime configuration and profiling metadata.
+            event_counters: Device event-counter storage.
+            direction: Kernel direction label included in trace metadata.
+        """
         if len(self._pending) >= self._max_pending_calls:
             self._drain(keep=self._action is not ProfilerAction.WARMUP)
         invocation_id = self._next_invocation_id
@@ -329,7 +398,11 @@ class TorchMegaKernelProfiler:
         return call
 
     def complete_call(self, call: _MegaKernelCall) -> None:
-        """Validate that a successfully launched call belongs to this session."""
+        """Validate that a successfully launched call belongs to this session.
+
+        Args:
+            call: Pending kernel call that completed launch.
+        """
         if call not in self._pending:
             raise RuntimeError("completed MegaKernel profiling call is not pending")
 
@@ -353,7 +426,11 @@ class TorchMegaKernelProfiler:
         return profile_buffer, profile_buffer_key
 
     def cancel_call(self, call: _MegaKernelCall) -> None:
-        """Cancel a pending call and release its profiling buffer."""
+        """Cancel a pending call and release its profiling buffer.
+
+        Args:
+            call: Pending kernel call to cancel.
+        """
         if call in self._pending:
             self._pending.remove(call)
         self._release_profile_buffer(call, cache=False)
@@ -459,54 +536,14 @@ class TorchMegaKernelProfiler:
             )
             for invocation in invocations
         ]
-        anchors = [trace["megaKernelCycleTrace"]["anchorCycle"] for _, trace in parsed_invocations]
-        global_anchor = min(anchors)
-        trace_events: list[dict[str, Any]] = []
-        metadata_keys = set()
-        dropped_count = 0
-        record_count = 0
-        invocation_metadata = []
-
+        global_anchor = min(trace["megaKernelCycleTrace"]["anchorCycle"] for _, trace in parsed_invocations)
+        accumulator = _TraceAccumulator(global_anchor)
         for invocation, trace in parsed_invocations:
-            metadata = trace["megaKernelCycleTrace"]
-            frequency = metadata["cycleFrequencyMHz"]
-            shift_us = (metadata["anchorCycle"] - global_anchor) / frequency
-            dropped_count += metadata["droppedRecordCount"]
-            record_count += metadata["recordCount"]
-            invocation_metadata.append(
-                {
-                    "invocationId": invocation.invocation_id,
-                    "step": invocation.step,
-                    "direction": invocation.direction,
-                    "kernelName": invocation.runtime.kernel_name,
-                    "rank": metadata.get("rank", invocation.runtime.rank),
-                    "deviceId": metadata.get("deviceId", invocation.runtime.device_id),
-                    "anchorCycle": metadata["anchorCycle"],
-                    "recordCount": metadata["recordCount"],
-                    "droppedRecordCount": metadata["droppedRecordCount"],
-                }
-            )
-            for event in trace["traceEvents"]:
-                if event["ph"] == "M":
-                    key = (event["name"], event["pid"], event["tid"])
-                    if key in metadata_keys:
-                        continue
-                    metadata_keys.add(key)
-                    trace_events.append(event)
-                    continue
-                copied_event = dict(event)
-                copied_event["ts"] += shift_us
-                copied_event["args"] = {
-                    **event.get("args", {}),
-                    "invocation_id": invocation.invocation_id,
-                    "step": invocation.step,
-                    "direction": invocation.direction,
-                }
-                trace_events.append(copied_event)
+            accumulator.append(invocation, trace)
 
-        metadata_events = [event for event in trace_events if event["ph"] == "M"]
+        metadata_events = [event for event in accumulator.trace_events if event["ph"] == "M"]
         duration_events = sorted(
-            (event for event in trace_events if event["ph"] != "M"),
+            (event for event in accumulator.trace_events if event["ph"] != "M"),
             key=lambda event: (event["ts"], event["pid"], event["tid"]),
         )
         return {
@@ -516,11 +553,15 @@ class TorchMegaKernelProfiler:
                 "windowIndex": self._window_index,
                 "anchorCycle": global_anchor,
                 "invocationCount": len(invocations),
-                "recordCount": record_count,
-                "droppedRecordCount": dropped_count,
+                "recordCount": accumulator.record_count,
+                "droppedRecordCount": accumulator.dropped_count,
                 "detailedTaskNames": self._detailed_task_names,
-                "invocations": invocation_metadata,
-                "warnings": ([] if dropped_count == 0 else [f"Device dropped {dropped_count} cycle trace records"]),
+                "invocations": accumulator.invocation_metadata,
+                "warnings": (
+                    []
+                    if accumulator.dropped_count == 0
+                    else [f"Device dropped {accumulator.dropped_count} cycle trace records"]
+                ),
             },
         }
 
@@ -539,7 +580,13 @@ def prepare_mega_kernel_call(
     direction: str,
     fallback_event_counters: Any,
 ) -> _MegaKernelCall:
-    """Select fast or profiled launch arguments for one Torch MegaKernel call."""
+    """Select fast or profiled launch arguments for one MegaKernel call.
+
+    Args:
+        runtime: Prepared runtime configuration and profiling metadata.
+        direction: Kernel direction label included in trace metadata.
+        fallback_event_counters: Storage reused when profiling is inactive.
+    """
     with _ACTIVE_LOCK:
         profiler = _ACTIVE_PROFILER
     if profiler is None or not profiler.is_capture_enabled():
@@ -565,11 +612,11 @@ def mega_kernel_profile(
     max_pending_calls: int = 16,
 ) -> TorchMegaKernelProfiler:
     # pylint: disable=redefined-outer-name
-    """Create the standalone Torch MegaKernel profiler.
+    """Create the standalone MegaKernel profiler.
 
     The returned context manager records only MegaKernel-internal events. It
-    does not start torch.profiler and its export operation does not merge
-    with an external trace.
+    does not start an external framework profiler, and its export operation
+    does not merge with an external trace.
 
     Args:
         schedule: Optional step schedule. Without one, all calls are retained.
@@ -579,7 +626,7 @@ def mega_kernel_profile(
             intermediate D2H drain and reuse.
 
     Returns:
-        Torch standalone MegaKernel profiler context manager.
+        Standalone MegaKernel profiler context manager.
     """
     return TorchMegaKernelProfiler(
         schedule=schedule,

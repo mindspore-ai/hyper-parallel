@@ -16,7 +16,6 @@
 
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import unittest
 from unittest.mock import patch, MagicMock, Mock
@@ -161,16 +160,17 @@ class TestConstructAllSplit(_MockedTestCase):
     """Tests for ConstructAllSplit."""
     def test_basic(self):
         """Test basic."""
+        from hyper_parallel.core.dtensor import tensor_redistribution as tr_mod
         from hyper_parallel.core.dtensor.tensor_redistribution import TensorRedistribution
         tr = TensorRedistribution()
         tr.rank_id = 0
-        x = MagicMock()
-        self.mock_tr_platform.chunk.return_value = "chunked"
+        x = torch.arange(16).reshape(2, 8)
 
-        # args: (split_dim, split_size, group)
-        result = tr._construct_all_split(x, 0, 4, [0, 1, 2, 3])
-        self.mock_tr_platform.chunk.assert_called_once_with(x, 0, 4, 0)
-        self.assertEqual(result, "chunked")
+        # args: (split_dim, split_size, group); rank 0 -> index 0 of the split.
+        with patch.object(tr_mod.torch, "chunk", wraps=torch.chunk) as mock_chunk:
+            result = tr._construct_all_split(x, 1, 4, [0, 1, 2, 3])
+        mock_chunk.assert_called_once_with(x, 4, dim=1)
+        self.assertTrue(torch.equal(result, x.chunk(4, dim=1)[0]))
 
 
 class TestConstructAllToAll(_MockedTestCase):

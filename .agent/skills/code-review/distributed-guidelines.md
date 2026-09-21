@@ -1,7 +1,7 @@
 # Distributed System Guidelines
 
 This document covers distributed system correctness for HyperParallel PR reviews
-**with Bad/Good examples**. 
+**with Bad/Good examples**.
 
 **Hard-rule source of truth:** `.agent/rules/distributed.md` (shortlist also in
 `.agent/rules/project-overview.md`). Do not treat this file as a second copy of
@@ -197,44 +197,51 @@ swap_group.wait_load()
 
 The `wait_load()` implementation should free CPU storage after loading back to device. If it doesn't, memory grows linearly with model depth.
 
-## Cross-Platform Compatibility
+## Collective Calling Conventions
 
 ### Rules
 
-1. **Platform-agnostic code must not import torch or mindspore directly** — use `get_platform()` abstraction
-2. **Changes in `platform/torch/` should have matching `platform/mindspore/` changes** — or explicit justification why not
-3. **New platform APIs must be defined in the abstract base class first** (`platform/platform.py`)
-4. **Collective operations must go through `platform.*`** — never call raw framework collective APIs
+1. **Autograd paths go through the `differentiable_*` helpers** — `differentiable_all_reduce`,
+   `differentiable_reduce_scatter`, `differentiable_all_to_all_single(_async)`,
+   `differentiable_variable_all_gather` in `core/dtensor/_utils.py` and
+   `core/context_parallel/utils.py`. Raw `dist.*` calls there drop the graph.
+2. **Group arguments are process groups**, not rank lists — resolve once with
+   `create_group(rank_list)` or `layout.get_comm_group_by_axis(dev_dim)`, then pass `group`
+   down; no positional group juggling at the call site.
+3. **Every collective needs its `wait()` on the async path** — an `async_op=True` work object
+   that is never waited on both leaks and reorders.
+4. **Bounds and shapes are settled before the call** — `torch.chunk` / `input_splits` must line
+   up with `output_splits` on every rank, or the collective hangs rather than raising.
 
 ### Common Pitfalls
 
 | Pitfall | Example | Fix |
 |---------|---------|-----|
-| torch-specific API in core | `torch.cuda.synchronize()` in `core/` | Use `platform.synchronize()` |
-| Device string format | Hardcoding `"cuda:0"` | Use `platform.get_device()` |
-| Grad API difference | `tensor.grad` vs `.gradient()` | Use platform wrapper |
-| Process group creation | Raw `dist.new_group()` | Use `platform.create_group()` |
+| Raw collective on an autograd path | `dist.all_reduce(grad)` in a backward-reachable fn | `differentiable_all_reduce(grad, op, group)` |
+| Dropped async handle | `dist.all_gather(..., async_op=True)` never waited | `wait_async_tensor(work)` / `work.wait()` |
+| Rank list where a group is expected | `all_reduce(x, [0, 1])` | `create_group([0, 1])` then pass the handle |
+| Splits disagree across ranks | `input_splits` computed from local shape only | derive from the global shape, identical on all ranks |
+| Sync in a hot path | `torch.npu.synchronize()` inside the step | sync only at the boundary that needs it |
 
-## Platform API Calling Conventions
+## All-Reduce / Reduce-Scatter Example
 
-**Canonical bullets:** `.agent/rules/distributed.md` § Platform API Calling Conventions
-(`get_platform()` module-level, `differentiable_*` on autograd paths, `group` vs `group_info`).
+**Canonical bullets:** `.agent/rules/distributed.md` § Collective Calling Conventions.
 Checklist: `review-checklist.md`. Below: one Bad/Good set for review speed.
 
-**Bad:** `self.platform = get_platform()` then `self.platform.reduce_scatter(...)` in autograd code;
-or `platform.all_reduce(grad, raw_pg)` when the API expects `group_info`.
+**Bad:** a raw `dist.reduce_scatter_tensor` on a tensor that still needs gradients; or passing a
+rank list where the helper expects an already-resolved process group.
 
 **Good:**
 ```python
-platform = get_platform()  # module-level
+from hyper_parallel.core.dtensor._utils import create_group, differentiable_reduce_scatter
+
 
 def _reduce_scatter_along_dev_dim_with_axis(self, x, axis, op, layout, dev_dim):
     group = layout.get_comm_group_by_axis(dev_dim)
-    return platform.differentiable_reduce_scatter(x, dev_num, axis, op, group)
+    return differentiable_reduce_scatter(x, dev_num, axis, op, group)
 
-group = platform.create_group(group_ranks)
-group_info = group if isinstance(group, str) else SimpleNamespace(group=group)
-platform.all_reduce(grad, group_info)
+
+group = create_group(group_ranks)   # resolve the ranks to a group exactly once
 ```
 
 ## Review Checklist Summary
@@ -244,7 +251,9 @@ When reviewing a PR, ask these questions:
 1. **Stream sync**: Does any tensor cross a stream boundary? Is there an event/wait?
 2. **Memory lifecycle**: Is every intermediate buffer freed after consumption?
 3. **Gradient cleanup**: Are grad references nulled after use?
-4. **Platform parity**: Does the other backend need a matching change?
+4. **Collective semantics**: Is the autograd path on a `differentiable_*` helper? Is every async
+   work object waited on? Do the splits agree on every rank?
 5. **DTensor invariants**: Is `is_partial()` called correctly? Is partial state reduced before redistribution?
-6. **Platform API conventions**: See `distributed.md` — module-level `platform`, `differentiable_*` on autograd paths, `group` vs `group_info`.
+6. **Group plumbing**: Is the process group resolved once and threaded through, rather than
+   re-created or passed as a rank list?
 7. If still unsure about correctness, **flag it** — silent bugs are worse than false positives.

@@ -15,7 +15,9 @@
 """End-to-end context-parallel generate check."""
 import argparse
 import json
+import logging
 import math
+import sys
 from pathlib import Path
 
 import torch
@@ -23,6 +25,22 @@ import torch.distributed as dist
 from torch import nn
 
 from hyper_parallel.infer import GenerationConfig, generate, get_sequence_shard_info
+
+logger = logging.getLogger(__name__)
+
+
+def _sort_cache_shards(starts, lengths, keys, values):
+    """Sort gathered cache shards by their global sequence start."""
+    cache_shards = []
+    for rank_start, rank_len, key, value in zip(starts, lengths, keys, values):
+        cache_shards.append(
+            (
+                int(rank_start.item()),
+                key.narrow(-2, 0, int(rank_len.item())),
+                value.narrow(-2, 0, int(rank_len.item())),
+            )
+        )
+    return sorted(cache_shards)
 
 
 def _init_weights(module: nn.Module, vocab_size: int) -> None:
@@ -144,18 +162,11 @@ class ContextParallelTinyAttentionLM(FullTinyAttentionLM):
         dist.all_gather(gathered_keys, padded_key)
         dist.all_gather(gathered_values, padded_value)
 
-        gathered = sorted(
-            (
-                int(rank_start.item()),
-                key.narrow(-2, 0, int(rank_len.item())),
-                value.narrow(-2, 0, int(rank_len.item())),
-            )
-            for rank_start, rank_len, key, value in zip(
-                starts,
-                lengths,
-                gathered_keys,
-                gathered_values,
-            )
+        gathered = _sort_cache_shards(
+            starts,
+            lengths,
+            gathered_keys,
+            gathered_values,
         )
         full_key = torch.cat([item[1] for item in gathered], dim=-2)
         full_value = torch.cat([item[2] for item in gathered], dim=-2)
@@ -274,7 +285,7 @@ def main():
                 for output in gathered_prefix_outputs
             ),
         }
-        print(json.dumps(result, indent=2))
+        logger.info("%s", json.dumps(result, indent=2))
         if args.output:
             output_path = Path(args.output)
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -285,4 +296,5 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     main()

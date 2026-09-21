@@ -40,7 +40,7 @@ def calculate_mtp_loss(  # pylint: disable=unused-argument
         Summed MTP loss over all depths.
     """
     total_mtp_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
-    for depth_idx, logits in enumerate(mtp_per_depth_logits):
+    for logits in mtp_per_depth_logits:
         logits_shifted = logits[..., :-1, :].contiguous()
         labels_shifted = labels[..., 1:].contiguous()
         depth_loss = loss_fn(

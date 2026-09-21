@@ -17,7 +17,6 @@
 from copy import deepcopy
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 import torch_npu
 from torch import nn, optim

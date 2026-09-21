@@ -34,7 +34,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch  # noqa: E402  pylint: disable=wrong-import-position
 from torch import nn  # noqa: E402  pylint: disable=wrong-import-position
@@ -184,7 +183,7 @@ class TestMPipeTransposeRealConstructor(unittest.TestCase):
         assert schedule.num_transpose_micro_batches == 4  # min(PP=4, M=8)
         assert schedule._overlap_b_f is False, \
             "MPipe must force overlap_b_f off on the base schedule"
-        assert schedule._DATA_KEYS == ("input_ids",)
+        assert schedule._data_keys == ("input_ids",)
         assert sorted(schedule.exec_order.keys()) == [0, 1, 2, 3]
         # Frozen: no broadcast, no stage-0-backward input transport, no retain.
         for order in schedule.exec_order.values():
@@ -250,7 +249,7 @@ class TestMPipeTransposeRealConstructor(unittest.TestCase):
             constructor.
         Expectation: ``less_memory`` reaches the interleaved base, the
             consumer is exposed via the property, the overflow mode drives
-            ``owned_micros``, and the kwarg spec extends ``_DATA_KEYS``.
+            ``owned_micros``, and the kwarg spec extends ``_data_keys``.
         """
         consumer = lambda ctx, micro, out: None  # noqa: E731  pylint: disable=unnecessary-lambda-assignment
         schedule, _ = _build_real_schedule(
@@ -263,7 +262,7 @@ class TestMPipeTransposeRealConstructor(unittest.TestCase):
         # "min": rank 0 absorbs the overflow micros, other owners keep one.
         assert schedule.owned_micros(0) == frozenset({0, 4, 5, 6, 7})
         assert schedule.owned_micros(1) == frozenset({1})
-        assert schedule._DATA_KEYS == ("input_ids", "attention_mask")
+        assert schedule._data_keys == ("input_ids", "attention_mask")
 
 
 class TestMPipeTransposeRunWithDataIterator(unittest.TestCase):

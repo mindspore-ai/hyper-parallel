@@ -22,13 +22,15 @@ import warnings
 
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
+
+import torch
+import torch.distributed as dist
+
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
-from hyper_parallel.platform import get_platform
 
-platform = get_platform()
-Tensor = platform.Tensor
+Tensor = torch.Tensor
 
 SPARSE_DEFAULT_MASK = 0
 SPARSE_ALL_MASK = 1
@@ -429,8 +431,6 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
         For dynamic shapes, uses torch.where to preserve the symbolic computation graph.
         For static shapes, uses direct conditional assignment.
         """
-
-        import torch  # pylint: disable=import-outside-toplevel
 
         if device is None:
             device = torch.device("cpu")
@@ -1292,7 +1292,7 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
             return 0
 
         if isinstance(dim_map, str):
-            rank = platform.get_rank()
+            rank = dist.get_rank()
             rank_list = layout.mesh.get_rank_list_along_axis(dim_map)
             if rank in rank_list:
                 return rank_list.index(rank)
@@ -1310,7 +1310,7 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
                     f"Using the last axis for split_id calculation."
                 )
             axis_name = non_none_axes[-1]
-            rank = platform.get_rank()
+            rank = dist.get_rank()
             rank_list = layout.mesh.get_rank_list_along_axis(axis_name)
             if rank in rank_list:
                 return rank_list.index(rank)

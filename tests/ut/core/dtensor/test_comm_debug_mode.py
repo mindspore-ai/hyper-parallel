@@ -21,7 +21,6 @@ from unittest.mock import Mock
 
 # Must be set before hyper_parallel is imported: it selects the backend at
 # import time, and every assertion below assumes the Torch backend.
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"  # pylint: disable=wrong-import-position
 
 import torch  # pylint: disable=wrong-import-position
 

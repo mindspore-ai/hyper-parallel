@@ -13,10 +13,3 @@
 # limitations under the License.
 # ============================================================================
 """Torch fully_shard unit test package setup."""
-import os
-
-from hyper_parallel.platform import platform as platform_module
-
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-platform_module.platform = None

@@ -55,7 +55,7 @@ from unittest.mock import patch, MagicMock
 import numpy as np
 
 # Import the module to test
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.dtensor import DTensor
 ...
 ```
 
@@ -66,17 +66,12 @@ Create a test class inheriting from `unittest.TestCase`:
 ```python
 class Test<Component>(unittest.TestCase):
     """Unit tests for <Component> functionality."""
-    
+
     def setUp(self):
         """Set up test fixtures before each test method."""
-        # Configure environment, choose torch or mindspore platform
-        import os
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        
-        # Initialize common test objects
-        self.platform = get_platform()
+        # Unit tests never build a real process group; patch the collectives instead
         self.device = torch.device("cpu")  # Always use CPU for unit tests
-    
+
     def tearDown(self):
         """Clean up after each test method (if needed)."""
         pass
@@ -84,22 +79,24 @@ class Test<Component>(unittest.TestCase):
 
 ### Step 4: Mock Distributed Environment
 
-HyperParallel tests should never rely on actual distributed communication. Always mock `torch.distributed` calls:
+HyperParallel tests should never rely on actual distributed communication. Patch the name **where
+the module under test looks it up**, not the global `torch.distributed` attribute — an implementation
+that does `from torch.distributed import all_gather` is invisible to `@patch("torch.distributed.all_gather")`.
 
 ```python
-@patch('torch.distributed.all_gather')
-def test_all_gather_function(self, mock_all_gather):
+@patch("hyper_parallel.core.dtensor._utils.dist")
+def test_all_gather_function(self, mock_dist):
     """Test all_gather functionality with mocked distributed communication."""
     # Arrange
-    mock_all_gather.return_value = [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])]
-    tensor = torch.tensor([1.0, 2.0])
-    
+    mock_dist.get_world_size.return_value = 2
+    tensor = torch.tensor([1.0, 2.0], device=self.device)
+
     # Act
-    result = self.platform.some_function_that_uses_all_gather(tensor)
-    
+    result = some_helper_that_all_gathers(tensor)
+
     # Assert
-    mock_all_gather.assert_called_once()
-    self.assertTrue(torch.allclose(result, torch.tensor([1.0, 2.0, 3.0, 4.0])))
+    mock_dist.all_gather.assert_called_once()
+    self.assertEqual(result.device.type, "cpu")
 ```
 
 ### Step 5: Avoid Hardware Dependencies
@@ -111,10 +108,10 @@ def test_tensor_operation(self):
     """Test tensor operation without GPU dependency."""
     # Always use CPU device explicitly
     tensor = torch.randn(2, 2, device=self.device)
-    
+
     # Perform operation
-    result = self.platform.some_tensor_operation(tensor)
-    
+    result = tensor_chunk_helper(tensor, chunks=2, dim=0)
+
     # Assert
     self.assertEqual(result.device.type, "cpu")
     # Add more assertions...
@@ -132,10 +129,10 @@ def test_dtensor_operation(self, mock_dtensor_from_local):
     mock_dtensor = MagicMock(spec=DTensor)
     mock_dtensor._local_tensor = torch.tensor([1.0, 2.0])
     mock_dtensor_from_local.return_value = mock_dtensor
-    
+
     # Act
-    result = self.platform.some_dtensor_operation(torch.tensor([1.0, 2.0]))
-    
+    result = dtensor_helper(torch.tensor([1.0, 2.0]))
+
     # Assert
     mock_dtensor_from_local.assert_called_once()
     # Add more assertions...
@@ -150,10 +147,10 @@ def test_invalid_input(self):
     """Test error handling for invalid input."""
     # Arrange
     invalid_input = "not a tensor"
-    
+
     # Act & Assert
     with self.assertRaises(TypeError):
-        self.platform.some_function(invalid_input)
+        dtensor_helper(invalid_input)
 ```
 
 ### Step 8: Use Helper Methods
@@ -174,10 +171,10 @@ def test_with_mock_dtensor(self, mock_dtensor_from_local):
     """Test with mock DTensor using helper method."""
     # Arrange
     mock_dtensor = self._create_mock_dtensor(mock_dtensor_from_local, [1.0, 2.0, 3.0])
-    
+
     # Act
-    result = self.platform.some_function(mock_dtensor)
-    
+    result = dtensor_helper(mock_dtensor)
+
     # Assert
     # ... assertions ...
 ```
@@ -188,10 +185,14 @@ def test_with_mock_dtensor(self, mock_dtensor_from_local):
 
 | Distributed Operation | Mock Pattern |
 | --------------------- | ------------ |
-| `torch.distributed.all_gather` | `@patch('torch.distributed.all_gather')` |
-| `torch.distributed.all_reduce` | `@patch('torch.distributed.all_reduce')` |
-| `torch.distributed.reduce_scatter` | `@patch('torch.distributed.reduce_scatter')` |
-| `torch.distributed.new_group` | `@patch('torch.distributed.new_group')` |
+| `dist.all_gather` | `@patch("<module under test>.dist")` |
+| `dist.all_reduce` | `@patch("<module under test>.dist")` |
+| `dist.reduce_scatter_tensor` | `@patch("<module under test>.dist")` |
+| `dist.new_group` | `@patch("<module under test>.dist")` |
+| a `hyper_parallel` collective helper | `@patch("<module under test>.<helper_name>")` |
+
+Patch the whole `dist` module attribute when the implementation resolves several collectives from
+it; patch the individual helper when it was imported by name into the module.
 
 ### Testing Parameterized Functions
 
@@ -205,10 +206,10 @@ def test_parameterized_function(self):
         (4, 5, 9),
         (10, -2, 8)
     ]
-    
+
     for input1, input2, expected in test_cases:
         with self.subTest(input1=input1, input2=input2):
-            result = self.platform.add(input1, input2)
+            result = add_helper(input1, input2)
             self.assertEqual(result, expected)
 ```
 
@@ -228,10 +229,10 @@ def test_nested_structure_processing(self):
             "value": 10
         }
     }
-    
+
     # Act
-    result = self.platform.process_nested_structure(test_data)
-    
+    result = process_nested_structure(test_data)
+
     # Assert
     self.assertTrue(torch.allclose(result["tensor1"], torch.tensor([2.0, 4.0])))  # Assuming doubling operation
     # Add more assertions...
@@ -256,36 +257,37 @@ def test_nested_structure_processing(self):
 pytest tests/ut
 
 # Run specific test file
-pytest tests/ut/platform/torch/test_platform.py
+pytest tests/ut/collectives/test_cc.py
 
 # Run specific test class
-pytest tests/ut/platform/torch/test_platform::TestTorchPlatformCore
+pytest tests/ut/collectives/test_cc.py::TestProcessGroupWrappers
 
 # Run specific test method
-pytest tests/ut/platform/torch/test_platform::TestTorchPlatformCore::test_device_type
+pytest tests/ut/collectives/test_cc.py::TestProcessGroupWrappers::test_get_group_local_rank_forwards_group
 
 # Run with verbose output
-pytest -v tests/ut/platform/torch/test_platform.py
+pytest -v tests/ut/collectives/test_cc.py
 
 # Run with coverage report. Besides HTML, also supports json and markdown formats.
 pytest --cov=hyper_parallel --cov-report=html tests/ut
 
 # Run specific test file with coverage report. Besides HTML, also supports json and markdown formats.
-pytest --cov=hyper_parallel --cov-report=html tests/ut/platform/torch/test_platform.py
+pytest --cov=hyper_parallel --cov-report=html tests/ut/collectives/test_cc.py
 
 # Run specific test class with coverage report. Besides HTML, also supports json and markdown formats.
-pytest --cov=hyper_parallel --cov-report=html tests/ut/platform/torch/test_platform::TestTorchPlatformCore
+pytest --cov=hyper_parallel --cov-report=html tests/ut/core/expert_parallel/test_expert_parallel.py
 
 # Run specific test method with coverage report. Besides HTML, also supports json and markdown formats.
-pytest --cov=hyper_parallel --cov-report=html tests/ut/platform/torch/test_platform::TestTorchPlatformCore::test_device_type
+pytest --cov=hyper_parallel --cov-report=html tests/ut/collectives/test_cc.py::TestProcessGroupWrappers::test_get_group_local_rank_forwards_group
 ```
 
 ## Reference Implementations
 
 | Test File | Description | Key Patterns |
 | --------- | ----------- | ------------ |
-| `tests/ut/platform/torch/test_platform.py` | Core platform functionality tests | Mocking distributed communication, device management |
-| `tests/ut/platform/torch/fully_shard/test_fully_shard.py` | Fully sharded parameter tests | Mocking DTensor, state transitions |
+| `tests/ut/compile/test_tpsp.py` | Compile-pass tests over a sharded graph | Patching the module-level `dist`, mock process group |
+| `tests/ut/core/expert_parallel/test_expert_parallel.py` | Expert-parallel rank resolution | Patching the module-level `dist`, `assert_called` |
+| `tests/ut/core/fully_shard/test_fully_shard.py` | Fully sharded parameter tests | Mocking DTensor, state transitions |
 
 ## Integration with Development Workflow
 

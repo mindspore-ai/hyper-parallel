@@ -238,12 +238,13 @@ class PipelineStageBase:
         if self.is_last_stage:
             self.fwd_outputs_cache.pop(micro_index, None)
 
-    def get_last_stage_sens(self, last_stage_outputs: Any) -> Any:
+    @staticmethod
+    def get_last_stage_sens(last_stage_outputs: Any) -> Any:
         """Get last stage sens"""
         p_sens = None
         if isinstance(last_stage_outputs, (list, tuple)):
             p_sens = []
-            for _, out_i in enumerate(last_stage_outputs):
+            for out_i in last_stage_outputs:
                 if isinstance(out_i, hyper_parallel.DTensor):
                     repeat_num = out_i.layout.repeat_num()
                     sens_i = torch.full_like(out_i.to_local(), 1.0 / repeat_num)

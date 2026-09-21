@@ -15,6 +15,7 @@
 """Activation checkpointing helpers for distributed model components."""
 
 import logging
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -28,7 +29,11 @@ from hyper_parallel.core.activation_memory.api import (
     create_selective_checkpoint_contexts,
     ignore_sac_ops as _ignore_sac_ops,
 )
-from hyper_parallel.core.activation_memory.swap import SwapManager
+from hyper_parallel.core.activation_memory.swap import (
+    SwapManager,
+    _teardown_wired_swap_layers,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -106,46 +111,45 @@ def _ffpa_forward_ops() -> tuple:
     )
 
 
+_SELECTIVE_AC_COMPUTE_OP_NAMES = (
+    "aten.mm",
+    "aten.addmm",
+    "aten.bmm",
+    "aten.linear",
+    "aten._scaled_mm",
+    "aten._scaled_dot_product_cudnn_attention",
+    "aten._scaled_dot_product_efficient_attention",
+    "aten._scaled_dot_product_flash_attention",
+    "aten._scaled_dot_product_flash_attention_for_cpu",
+    "aten._scaled_dot_product_fused_attention_overrideable",
+    "aten.scaled_dot_product_attention",
+    "npu.npu_fusion_attention_v3",
+    "aten._flex_attention",
+    "aten.topk",
+    "aten.max",
+)
+
+_SELECTIVE_AC_COMM_OP_NAMES = (
+    "aten.all_to_all_single",
+    "aten.reduce_scatter_tensor",
+    "_c10d_functional.all_to_all_single",
+    "_c10d_functional.reduce_scatter_tensor",
+    "c10d.allreduce_",
+)
+
+
 def _build_selective_ac_must_save_ops():
     """Build the expensive/communication operator set for selective AC."""
     save_ops = set(_default_compute_intensive_ops())
     compute_ops = _existing_ops(
-        *(
-            _resolve_torch_op(name)
-            for name in (
-                "aten.mm",
-                "aten.addmm",
-                "aten.bmm",
-                "aten.linear",
-                "aten._scaled_mm",
-                "aten._scaled_dot_product_cudnn_attention",
-                "aten._scaled_dot_product_efficient_attention",
-                "aten._scaled_dot_product_flash_attention",
-                "aten._scaled_dot_product_flash_attention_for_cpu",
-                "aten._scaled_dot_product_fused_attention_overrideable",
-                "aten.scaled_dot_product_attention",
-                "npu.npu_fusion_attention_v3",
-                "aten._flex_attention",
-                "aten.topk",
-                "aten.max",
-            )
-        ),
+        *(_resolve_torch_op(name) for name in _SELECTIVE_AC_COMPUTE_OP_NAMES),
         _resolve_op_attr(torch, "_higher_order_ops.flex_attention"),
         _resolve_op_attr(torch, "_higher_order_ops.inductor_compiled_code"),
         _resolve_op_attr(torch.ops, "torch_attn._varlen_attn.default"),
         *_ffpa_forward_ops(),
     )
     comm_ops = _existing_ops(
-        *(
-            _resolve_torch_op(name)
-            for name in (
-                "aten.all_to_all_single",
-                "aten.reduce_scatter_tensor",
-                "_c10d_functional.all_to_all_single",
-                "_c10d_functional.reduce_scatter_tensor",
-                "c10d.allreduce_",
-            )
-        ),
+        *(_resolve_torch_op(name) for name in _SELECTIVE_AC_COMM_OP_NAMES),
         _resolve_op_attr(torch.ops, "deepep.dispatch.default"),
         _resolve_op_attr(torch.ops, "deepep.combine.default"),
         _resolve_op_attr(torch.ops, "hybridep.dispatch.default"),
@@ -291,6 +295,20 @@ def ensure_profiler_ops_sac_ignored() -> None:
     ignore_sac_ops(ops_to_ignore)
 
 
+_FSDP_SAC_IGNORED_OP_NAMES = (
+    "fsdp.all_gather_copy_in",
+    "fsdp.split_with_sizes_copy",
+    "fsdp.chunk_cat",
+    "fsdp.copy_",
+    "c10d._allgather_base_",
+    "aten.empty.memory_format",
+    "aten.empty_like",
+    "aten.view",
+)
+
+_FSDP_SAC_IGNORED_OPS = [_resolve_torch_op(name) for name in _FSDP_SAC_IGNORED_OP_NAMES]
+
+
 def ensure_fsdp_ops_sac_ignored() -> None:
     """Keep FSDP parameter-lifecycle operators out of selective-AC replay.
 
@@ -299,25 +317,38 @@ def ensure_fsdp_ops_sac_ignored() -> None:
     copy and collective operators manage parameters rather than model
     activations, and therefore must not be matched against the forward replay.
     """
-    ignore_sac_ops(
-        [
-            _resolve_torch_op(op_name)
-            for op_name in (
-                "fsdp.all_gather_copy_in",
-                "fsdp.split_with_sizes_copy",
-                "fsdp.chunk_cat",
-                "fsdp.copy_",
-                "c10d._allgather_base_",
-                "aten.empty.memory_format",
-                "aten.empty_like",
-                "aten.view",
-            )
-        ]
-    )
+    ignore_sac_ops(_FSDP_SAC_IGNORED_OPS)
+
+
+def compile_selective_checkpoint_policy(
+    ctx: Any,
+    func: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> CheckpointPolicy:
+    """Choose a stateless selective-checkpoint policy for compile mode.
+
+    Args:
+        ctx: Checkpoint context supplied by the native selective-checkpoint API.
+        func: The operator being traced.
+        *args: Operator arguments (unused).
+        **kwargs: Operator keyword arguments (unused).
+
+    Returns:
+        The checkpoint policy for ``func``.
+    """
+    del ctx, args, kwargs
+    if func in _SELECTIVE_AC_FORCE_RECOMPUTE_OPS:
+        return CheckpointPolicy.MUST_RECOMPUTE
+    if func in _SELECTIVE_AC_MATMUL_OPS:
+        return CheckpointPolicy.MUST_SAVE
+    if func in _SELECTIVE_AC_MUST_SAVE_OPS:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.MUST_RECOMPUTE
 
 
 def _make_selective_checkpoint_policy_fn() -> Callable:
-    """Create an isolated selective activation checkpointing policy."""
+    """Create an isolated eager selective activation checkpointing policy."""
     matmul_counts = {False: 0, True: 0}
 
     def selective_checkpointing_policy(
@@ -497,6 +528,30 @@ def _is_checkpoint_wrapped(module: nn.Module) -> bool:
     )
 
 
+def _warn_if_nothing_wrapped(
+    wrapped_count: int,
+    activation_checkpoint: str,
+    containers: list[_LayerContainerInfo],
+) -> None:
+    """Warn when a checkpointing request wrapped no module at all.
+
+    Every wrapping strategy either probes for known submodule names or skips
+    modules that are already wrapped, so a zero count silently leaves the model
+    running fully eager and memory-unbounded.
+    """
+    if wrapped_count != 0 or not containers:
+        return
+    layer_count = sum(len(container.blocks) for container in containers)
+    logger.warning(
+        "%s activation checkpointing wrapped no module on %d layer(s) in %s; the "
+        "model is running without activation checkpointing. Expected submodule "
+        "names may not match this architecture, or the layers are already wrapped.",
+        activation_checkpoint.capitalize(),
+        layer_count,
+        ", ".join(container.path for container in containers),
+    )
+
+
 def _find_checkpoint_wrappers(module: nn.Module, prefix: str = "") -> dict[str, nn.Module]:
     """Find outermost checkpoint wrappers by their relative module paths."""
     if _is_checkpoint_wrapped(module):
@@ -521,9 +576,26 @@ def _register_forward_prefetch_layers(containers: list[_LayerContainerInfo]) -> 
             for relative_path, wrapper in _find_checkpoint_wrappers(current_block).items():
                 wrapper_chains.setdefault(relative_path, []).append(wrapper)
 
+        wired_modules: list[nn.Module] = []
         for wrappers in wrapper_chains.values():
             for current_wrapper, next_wrapper in zip(wrappers, wrappers[1:]):
                 swap_manager.set_forward_prefetch_layer(current_wrapper, next_wrapper)
+                wired_modules.extend((current_wrapper, next_wrapper))
+        wired_modules = list(dict.fromkeys(wired_modules))  # dedupe, keep order
+
+        # swap layers registered above live in the process-wide SwapManager
+        # singleton and are never torn down otherwise, so a long-lived process
+        # that rebuilds or discards models leaks SwapGroup entries and hook
+        # handles.  Tear them down when the container is collected.  The
+        # container must not be a finalizer argument (that would keep it alive);
+        # only the wired child modules are captured, and the callback receives
+        # them directly because the container is unreachable at that point.
+        if wired_modules:
+            weakref.finalize(
+                container_info.container,
+                _teardown_wired_swap_layers,
+                wired_modules,
+            )
 
 
 def _wrap_first_existing_attr(
@@ -558,6 +630,16 @@ def _wrap_first_existing_attr(
     return 0
 
 
+def _eager_checkpoint_kwargs(swap_inputs: bool) -> dict[str, Any]:
+    """Build the eager-mode checkpoint keyword arguments.
+
+    Compile mode drops ``swap_inputs`` entirely, but eager checkpointing accepts
+    it in both states: ``False`` keeps ordinary recomputation, while ``True``
+    offloads the checkpoint inputs to host memory.
+    """
+    return {"swap_inputs": swap_inputs}
+
+
 def apply_submodule_checkpointing(
     layers: list[nn.Module],
     has_kv_sharing: bool,
@@ -574,7 +656,7 @@ def apply_submodule_checkpointing(
         swap_inputs: Whether checkpoint inputs should be offloaded in eager
             execution. This is ignored in compile mode.
     """
-    checkpoint_kwargs = {"swap_inputs": swap_inputs} if not enable_compile else {}
+    checkpoint_kwargs = {} if enable_compile else _eager_checkpoint_kwargs(swap_inputs)
 
     def submodule_checkpoint_wrapper(module: nn.Module) -> nn.Module:
         """Wrap one selected layer submodule with checkpointing."""
@@ -639,21 +721,34 @@ def _detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:
         ):
             continue
         if getattr(sub_config, "use_cache", None) is not False:
-            try:
-                sub_config.use_cache = False
-            except Exception:  # pylint: disable=broad-exception-caught
-                # Configuration objects may reject assignment with custom errors.
-                pass
+            _try_disable_use_cache(sub_config)
     return False
 
 
-def _apply_activation_checkpointing(
-    model: nn.Module,
+def _try_disable_use_cache(sub_config: Any) -> None:
+    """Best-effort disable of ``use_cache`` on one config object."""
+    try:
+        sub_config.use_cache = False
+    except Exception:  # pylint: disable=broad-exception-caught
+        # Configuration objects may reject assignment with custom errors.
+        pass
+
+
+def _validate_activation_checkpoint_config(
     activation_checkpoint: Optional[str],
-    enable_compile: bool = False,
-    swap_inputs: bool = False,
-) -> nn.Module:
-    """Apply full or selective recomputation to discovered transformer layers."""
+    swap_inputs: bool,
+    enable_compile: bool,
+) -> None:
+    """Validate the activation-checkpoint options and warn about ignored ones.
+
+    Args:
+        activation_checkpoint: Requested recomputation mode.
+        swap_inputs: Whether checkpoint inputs should be offloaded.
+        enable_compile: Whether wrapped regions will be compiled.
+
+    Raises:
+        ValueError: The mode or ``swap_inputs`` has an unsupported value.
+    """
     if activation_checkpoint not in ("full", "selective"):
         raise ValueError(
             "activation_checkpoint.mode must be 'full' or 'selective', but got "
@@ -671,109 +766,212 @@ def _apply_activation_checkpointing(
             "input swapping will be disabled."
         )
 
+
+def _resolve_activation_checkpoint_containers(
+    model: nn.Module,
+) -> list[_LayerContainerInfo]:
+    """Discover the repeated-block containers that activation checkpointing targets.
+
+    Args:
+        model: Model to inspect.
+
+    Returns:
+        The discovered containers, in registration order.
+
+    Raises:
+        ValueError: No container advertises HuggingFace checkpointing support.
+    """
     containers = _find_transformer_layer_container_infos(model)
     if not containers:
         raise ValueError(
             f"{type(model).__name__} has no module with a 'gradient_checkpointing' "
             "attribute and a non-empty repeated block container"
         )
+    return containers
 
+
+def _apply_selective_checkpointing(
+    containers: list[_LayerContainerInfo],
+    ac_layers: list[nn.Module],
+    has_kv_sharing: bool,
+    *,
+    enable_compile: bool,
+    swap_inputs: bool,
+) -> int:
+    """Wrap every discovered layer for selective recomputation.
+
+    KV-shared models fall back to submodule checkpointing so attention does not
+    write the cache again during backward recomputation.
+
+    Args:
+        containers: The repeated-block containers to wrap.
+        ac_layers: Every block selected from ``containers``.
+        has_kv_sharing: Whether attention submodules must stay outside the
+            recomputation regions.
+        enable_compile: Whether the wrapped regions will be compiled.
+        swap_inputs: Whether checkpoint inputs should be offloaded in eager
+            execution. Ignored in compile mode.
+
+    Returns:
+        The number of layers, or submodules in the KV-shared fallback, wrapped.
+    """
+    if has_kv_sharing:
+        logger.warning(
+            "Selective activation checkpointing is not supported for KV-shared models; "
+            "falling back to submodule activation checkpointing."
+        )
+        return apply_submodule_checkpointing(
+            ac_layers,
+            has_kv_sharing,
+            enable_compile=enable_compile,
+            swap_inputs=swap_inputs,
+        )
+
+    if enable_compile:
+        def compile_checkpoint_wrapper(layer: nn.Module) -> nn.Module:
+            """Wrap one layer with the compile-compatible SAC policy."""
+            return checkpoint_wrapper(
+                layer,
+                policy_fn=compile_selective_checkpoint_policy,
+            )
+
+        return _wrap_layer_containers(containers, compile_checkpoint_wrapper)
+
+    def eager_checkpoint_wrapper(layer: nn.Module, **checkpoint_kwargs: Any) -> nn.Module:
+        """Wrap one layer with eager selective checkpointing."""
+        return checkpoint_wrapper(
+            layer,
+            swap_inputs=swap_inputs,
+            **checkpoint_kwargs,
+        )
+
+    return _wrap_layer_containers(
+        containers,
+        eager_checkpoint_wrapper,
+        context_fn=make_selective_checkpoint_context_fn(),
+    )
+
+
+def _apply_full_checkpointing(
+    model: nn.Module,
+    containers: list[_LayerContainerInfo],
+    ac_layers: list[nn.Module],
+    has_kv_sharing: bool,
+    *,
+    enable_compile: bool,
+    swap_inputs: bool,
+) -> Optional[int]:
+    """Wrap discovered layers for full recomputation.
+
+    Prefers the HuggingFace-native implementation when every eligibility check
+    passes, and otherwise uses Hyper Parallel's wrappers.
+
+    Args:
+        model: Model whose layers should be wrapped.
+        containers: The repeated-block containers to wrap.
+        ac_layers: Every block selected from ``containers``.
+        has_kv_sharing: Whether attention submodules must stay outside the
+            recomputation regions.
+        enable_compile: Whether the wrapped regions will be compiled.
+        swap_inputs: Whether checkpoint inputs should be offloaded in eager
+            execution. Ignored in compile mode.
+
+    Returns:
+        The number of wrapped submodules, or ``None`` when the HuggingFace-native
+        implementation was enabled instead, in which case no per-layer wrapping
+        happened and swap prefetch chains must not be registered.
+    """
+    if _should_use_hf_native_gradient_checkpointing(
+        model,
+        ac_layers,
+        enable_compile=enable_compile,
+    ):
+        if swap_inputs:
+            logger.warning(
+                "activation_checkpoint.swap_inputs is not supported by Hugging Face native "
+                "gradient checkpointing for now; input swapping will be disabled."
+            )
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+        logger.info("Using HuggingFace native gradient checkpointing for discovered layers.")
+        return None
+
+    if has_kv_sharing:
+        return apply_submodule_checkpointing(
+            ac_layers,
+            has_kv_sharing,
+            enable_compile=enable_compile,
+            swap_inputs=swap_inputs,
+        )
+
+    def full_checkpoint_wrapper(layer: nn.Module) -> nn.Module:
+        """Wrap one complete transformer layer for full recomputation."""
+        if enable_compile:
+            return checkpoint_wrapper(layer)
+        return checkpoint_wrapper(layer, **_eager_checkpoint_kwargs(swap_inputs))
+
+    return _wrap_layer_containers(containers, full_checkpoint_wrapper)
+
+
+def _apply_activation_checkpointing(
+    model: nn.Module,
+    activation_checkpoint: Optional[str],
+    enable_compile: bool = False,
+    swap_inputs: bool = False,
+) -> nn.Module:
+    """Apply full or selective recomputation to discovered transformer layers.
+
+    Validates the requested options, discovers the repeated-block containers that
+    advertise HuggingFace checkpointing support, then delegates to the
+    mode-specific wrapper. Swap prefetch chains are registered afterwards for
+    every configuration that wrapped the layers itself.
+    """
+    _validate_activation_checkpoint_config(
+        activation_checkpoint,
+        swap_inputs,
+        enable_compile,
+    )
+    containers = _resolve_activation_checkpoint_containers(model)
     ac_layers = _flatten_layer_container_infos(containers)
     has_kv_sharing = _detect_kv_sharing_and_maybe_disable_cache(model)
 
-    # Selective recomputation normally wraps whole layers. KV-shared models
-    # instead use submodule checkpointing so attention does not write the cache
-    # again during backward recomputation.
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+
     if activation_checkpoint == "selective":
-        if hasattr(model, "gradient_checkpointing_disable"):
-            model.gradient_checkpointing_disable()
-        if has_kv_sharing:
-            logger.warning(
-                "Selective activation checkpointing is not supported for KV-shared models; "
-                "falling back to submodule activation checkpointing."
-            )
-            apply_submodule_checkpointing(
-                ac_layers,
-                has_kv_sharing,
-                enable_compile=enable_compile,
-                swap_inputs=swap_inputs,
-            )
-        else:
-            if enable_compile:
-                ensure_profiler_ops_sac_ignored()
-                ensure_fsdp_ops_sac_ignored()
-
-                def compile_checkpoint_wrapper(layer: nn.Module) -> nn.Module:
-                    """Wrap one layer with the compile-compatible SAC policy."""
-                    return checkpoint_wrapper(
-                        layer,
-                        policy_fn=_make_selective_checkpoint_policy_fn(),
-                    )
-
-                wrapped_count = _wrap_layer_containers(
-                    containers,
-                    compile_checkpoint_wrapper,
-                )
-            else:
-                def eager_checkpoint_wrapper(layer: nn.Module, **checkpoint_kwargs: Any) -> nn.Module:
-                    """Wrap one layer with eager selective checkpointing."""
-                    return checkpoint_wrapper(
-                        layer,
-                        swap_inputs=swap_inputs,
-                        **checkpoint_kwargs,
-                    )
-
-                wrapped_count = _wrap_layer_containers(
-                    containers,
-                    eager_checkpoint_wrapper,
-                    context_fn=make_selective_checkpoint_context_fn(),
-                )
-            logger.info(
-                "Selective activation checkpointing applied to %d layer(s) in: %s",
-                wrapped_count,
-                ", ".join(container.path for container in containers),
-            )
-
-    elif activation_checkpoint == "full":
-        # Prefer the HF-native implementation when all eligibility checks
-        # pass. Otherwise use Hyper Parallel's submodule wrappers.
-        if _should_use_hf_native_gradient_checkpointing(
-            model,
+        wrapped_count = _apply_selective_checkpointing(
+            containers,
             ac_layers,
+            has_kv_sharing,
             enable_compile=enable_compile,
-        ):
-            if swap_inputs:
-                logger.warning(
-                    "activation_checkpoint.swap_inputs is not supported by Hugging Face native "
-                    "gradient checkpointing for now; input swapping will be disabled."
-                )
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
-            logger.info("Using HuggingFace native gradient checkpointing for discovered layers.")
+            swap_inputs=swap_inputs,
+        )
+        _warn_if_nothing_wrapped(wrapped_count, activation_checkpoint, containers)
+        logger.info(
+            "Selective activation checkpointing applied to %d layer(s) in: %s",
+            wrapped_count,
+            ", ".join(container.path for container in containers),
+        )
+    else:
+        wrapped_count = _apply_full_checkpointing(
+            model,
+            containers,
+            ac_layers,
+            has_kv_sharing,
+            enable_compile=enable_compile,
+            swap_inputs=swap_inputs,
+        )
+        if wrapped_count is None:
+            # The HuggingFace-native path returns early in the original flow and
+            # therefore skips both the warning and the swap prefetch registration.
             return model
-
-        if hasattr(model, "gradient_checkpointing_disable"):
-            model.gradient_checkpointing_disable()
-        if has_kv_sharing:
-            wrapped_count = apply_submodule_checkpointing(
-                ac_layers,
-                has_kv_sharing,
-                enable_compile=enable_compile,
-                swap_inputs=swap_inputs,
-            )
-        else:
-            def full_checkpoint_wrapper(layer: nn.Module) -> nn.Module:
-                """Wrap one complete transformer layer for full recomputation."""
-                if enable_compile:
-                    return checkpoint_wrapper(layer)
-                return checkpoint_wrapper(layer, swap_inputs=swap_inputs)
-
-            wrapped_count = _wrap_layer_containers(containers, full_checkpoint_wrapper)
+        _warn_if_nothing_wrapped(wrapped_count, activation_checkpoint, containers)
         logger.info(
             "%s activation checkpointing wrapped %d submodule(s) in: %s",
             activation_checkpoint.capitalize(),
             wrapped_count,
             ", ".join(container.path for container in containers),
         )
+
     if swap_inputs and not enable_compile:
         _register_forward_prefetch_layers(containers)
     return model

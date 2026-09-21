@@ -198,6 +198,9 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 
 ### Platform Abstraction（平台抽象）
 
+> **状态更新：v1.0.0 之后已移除。** `hyper_parallel/platform/` 抽象层、`get_platform()` 及 MindSpore 后端
+> 已从主线删除，库现在直接基于原生 PyTorch。以下为 v1.0.0 发布时的状态，仅作历史记录。
+
 - 双后端支持：PyTorch（GPU/NPU）+ MindSpore（Ascend NPU）
 - `get_platform()` 统一抽象接口
 - Platform-specific 实现：

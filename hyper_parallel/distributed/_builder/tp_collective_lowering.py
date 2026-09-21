@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Replicate, Shard
-from hyper_parallel.distributed import _collectives
+from hyper_parallel.core.utils import communication
 
 logger = logging.getLogger(__name__)
 
@@ -41,20 +41,20 @@ class TPExecutionOp:
     def execute(self, tensor: Any) -> Any:
         """Execute the differentiable collective selected during lowering."""
         if self.kind == "all_gather":
-            return _collectives.differentiable_all_gather_concat(
+            return communication.differentiable_all_gather_concat(
                 tensor,
                 self.group,
                 self.group_size,
                 self.tensor_dim,
             )
         if self.kind == "all_reduce":
-            return _collectives.differentiable_all_reduce(
+            return communication.differentiable_all_reduce(
                 tensor,
                 self.reduce_op,
                 self.group,
             )
         if self.kind == "reduce_scatter":
-            return _collectives.differentiable_reduce_scatter(
+            return communication.differentiable_reduce_scatter(
                 tensor,
                 self.group_size,
                 self.tensor_dim,
@@ -62,7 +62,7 @@ class TPExecutionOp:
                 self.group,
             )
         if self.kind == "all_reduce_shard":
-            reduced = _collectives.differentiable_all_reduce(
+            reduced = communication.differentiable_all_reduce(
                 tensor,
                 self.reduce_op,
                 self.group,

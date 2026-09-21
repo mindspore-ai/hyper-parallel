@@ -25,7 +25,6 @@ import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 # The launcher activates CANN and the multicore payload before importing this
 # worker. Framework imports stay out of the ``test_mega_moe.py`` launcher.
@@ -38,7 +37,7 @@ from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.multicore import MegaMoeExperts
-from hyper_parallel.platform.torch.common import GroupedExperts
+from hyper_parallel.components.modules.moe import GroupedExperts
 
 # pylint: enable=wrong-import-position
 

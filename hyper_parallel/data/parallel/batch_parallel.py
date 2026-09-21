@@ -303,7 +303,10 @@ class TPBatchBroadcaster:
 
         # Broadcast only model fields that cannot be regenerated locally.
         for field in ("input_ids", "labels"):
-            dist.broadcast(parallel_batch[field], group=tp_group, group_src=0)
+            tensor = parallel_batch.get(field)
+            if tensor is None:
+                raise ValueError(f"parallel batch requires {field!r}")
+            dist.broadcast(tensor, group=tp_group, group_src=0)
 
         # Packed boundaries remain global across CP ranks and variable in size.
         if local_cu_seq_lens is not None:

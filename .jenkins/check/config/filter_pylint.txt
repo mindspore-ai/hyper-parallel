@@ -21,35 +21,6 @@
 "hyper-parallel/hyper_parallel/core/fully_shard/"                     "unused-variable"
 "hyper-parallel/hyper_parallel/core/dtensor/"                         "protected-access"
 
-# 2. Platform Implementation: hyper_parallel/platform/torch/fully_shard/
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "consider-using-from-import"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "no-value-for-parameter"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "protected-access"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "missing-function-docstring"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "no-else-return"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "unidiomatic-typecheck"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "unused-import"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "missing-final-newline"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "import-outside-toplevel"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "no-else-raise"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "unnecessary-pass"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "inconsistent-return-statements"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "trailing-whitespace"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "bad-indentation"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "line-too-long"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "unused-variable"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "unused-argument"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "missing-module-docstring"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "useless-parent-delegation"
-"hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "wrong-import-order"
-
-"hyper-parallel/hyper_parallel/platform/mindspore/fully_shard/"       "protected-access"
-"hyper-parallel/hyper_parallel/platform/mindspore/fully_shard/"       "missing-function-docstring"
-"hyper-parallel/hyper_parallel/platform/mindspore/fully_shard/"       "no-else-return"
-"hyper-parallel/hyper_parallel/platform/mindspore/fully_shard/"       "unidiomatic-typecheck"
-"hyper-parallel/hyper_parallel/platform/mindspore/fully_shard/"       "import-outside-toplevel"
-"hyper-parallel/hyper_parallel/platform/mindspore/fully_shard/"       "inconsistent-return-statements"
-
 # 3. Tests fully_shard: tests/torch/fully_shard/
 "hyper-parallel/tests/torch/fully_shard/"                             "trailing-whitespace"
 "hyper-parallel/tests/torch/fully_shard/"                             "line-too-long"
@@ -89,10 +60,6 @@
 # 7. Code static analysis fixes - shard ops
 "hyper-parallel/hyper_parallel/core/shard/ops/"                         "arguments-differ"
 "hyper-parallel/hyper_parallel/core/shard/ops/"                         "line-too-long"
-
-# 8. MindSpore HSDP
-"hyper-parallel/hyper_parallel/platform/mindspore/hsdp/"                "arguments-renamed"
-"hyper-parallel/hyper_parallel/platform/mindspore/hsdp/"                "broad-exception-caught"
 
 # 9. Context Parallel tests — torch_npu and SDPA are runtime-only, not resolvable in lint env
 "hyper-parallel/tests/torch/context_parallel/"                          "no-member"
@@ -136,6 +103,7 @@
 #     forward signature for drop-in class patching; some native-only arguments are
 #     intentionally unused because CP applies RoPE after sequence/head exchange.
 "hyper-parallel/hyper_parallel/integration/llamafactory/context_parallel/models/qwen3_vl/qwen3vl_forward.py" "unused-argument"
+"hyper-parallel/hyper_parallel/integration/llamafactory/context_parallel/models/qwen3_vl/qwen3vl_forward.py" "too-many-arguments"
 
 "hyper-parallel/hyper_parallel/core/pipeline_parallel/scheduler.py"     "unnecessary-pass"
 
@@ -148,6 +116,5 @@
 # 19. Graph-mode compile package — a torch.fx-based compiler that reaches into
 #     torch internals (torch._guards, torch._subclasses, torch.fx.experimental,
 #     torch.nn.utils.stateless, torch.distributed.device_mesh). These have no
-#     public API and no get_platform() equivalent (mindspore has no FX-tracing
-#     surface); moving the package under platform/torch/ is tracked separately.
+#     public API, so the raw imports stay.
 "hyper-parallel/hyper_parallel/compile/"                                   "forbidden-backend-import"

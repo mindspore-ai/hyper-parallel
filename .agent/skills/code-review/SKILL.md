@@ -2,7 +2,7 @@
 name: code-review
 description: >
   Review HyperParallel changes for distributed correctness, stream sync,
-  memory safety, cross-platform parity, and code quality. Use for /code-review,
+  memory safety, collective semantics, and code quality. Use for /code-review,
   PR review, or when the user asks to review/check changes.
 ---
 
@@ -47,8 +47,8 @@ git log upstream/master..HEAD --oneline
 | Risk | Patterns |
 |------|----------|
 | CRITICAL | `**/fully_shard/**`, async collectives, `non_blocking`, cross-stream |
-| HIGH | `core/dtensor/**`, `platform/torch|mindspore/**`, `core/pipeline_parallel/**` |
-| MEDIUM | `core/shard/ops/**`, `core/activation_checkpoint/**` |
+| HIGH | `core/dtensor/**`, `core/collectives/**`, `core/pipeline_parallel/**` |
+| MEDIUM | `core/shard/ops/**`, `core/activation_memory/**` |
 | LOW | `tests/**`, docs, examples |
 
 ## Output skeleton
@@ -69,11 +69,11 @@ git log upstream/master..HEAD --oneline
 
 ## Principles
 
-1. No repetition across sections  
-2. Distributed-first (sync/memory before style)  
-3. Specific paths + actionable fixes  
-4. Always check other backend when touching `platform/`  
-5. Style is blocking  
+1. No repetition across sections
+2. Distributed-first (sync/memory before style)
+3. Specific paths + actionable fixes
+4. Always check every caller when touching a shared collective helper
+5. Style is blocking
 
 ## References
 
