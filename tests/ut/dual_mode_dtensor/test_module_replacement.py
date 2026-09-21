@@ -438,9 +438,11 @@ class TestModuleReplacementPlan(unittest.TestCase):
 
                 @module_replacement
                 def replace_checked(
-                    *, module: nn.Linear, module_fqn: str, context: Mapping[str, Any]
+                    *, module: nn.Linear, module_fqn: str, context: Mapping[str, Any],
+                    case_state=(calls, source_refs, weight_refs),
                 ) -> nn.Module:
                     """Require previous source storage to be gone before allocating."""
+                    calls, source_refs, weight_refs = case_state
                     for index in range(len(calls)):
                         self.assertIsNone(
                             source_refs[index](),
