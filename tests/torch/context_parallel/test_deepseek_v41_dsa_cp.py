@@ -26,10 +26,30 @@ _WORKER = str(Path(__file__).resolve().parent / "_test_deepseek_v41_dsa_cp.py")
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_deepseek_v41_dsa_cp_gloo():
-    """Compare two-rank async KV-all-gather CP with a full-sequence baseline."""
+    """
+    Feature: deepseek v41 dsa cp
+    Description: Compare two-rank async KV-all-gather CP with a full-sequence baseline.
+    Expectation: Deepseek v41 dsa cp gloo.
+    """
     torchrun_case(
         _WORKER,
         "test_deepseek_v41_dsa_cp_gloo",
         master_port=13981,
+        num_proc=2,
+    )
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_deepseek_v41_indexer_tp_gloo():
+    """Feature: Tensor-parallel compressed attention indexer.
+
+    Description: Compare two head shards with the full indexer and KL objective.
+    Expectation: Full/Reindex selections, loss and input gradients agree.
+    """
+    torchrun_case(
+        _WORKER,
+        "test_deepseek_v41_indexer_tp_gloo",
+        master_port=13982,
         num_proc=2,
     )

@@ -39,6 +39,8 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41AttentionPlaceholder,
 )
 
+from tests.common.mark_utils import arg_mark
+
 
 class _CPMesh:
     """Minimal mesh interface backed by the initialized world group."""
@@ -105,8 +107,14 @@ def _position_embeddings(position_ids: torch.Tensor) -> dict[str, tuple[torch.Te
     return {"main": embeddings, "compress": embeddings}
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
 def test_deepseek_v41_dsa_cp_gloo():
-    """Async CP matches output, hidden gradient, and replicated parameter gradient."""
+    """
+    Feature:  test deepseek v41 dsa cp
+    Description: Async CP matches output, hidden gradient, and replicated parameter gradient.
+    Expectation: Deepseek v41 dsa cp gloo.
+    """
     dist.init_process_group("gloo")
     try:
         rank = dist.get_rank()
@@ -179,8 +187,14 @@ def test_deepseek_v41_dsa_cp_gloo():
         dist.destroy_process_group()
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
 def test_deepseek_v41_indexer_tp_gloo():
-    """Head-sharded Indexer matches Full/Reindex selection and KL gradients."""
+    """
+    Feature:  test deepseek v41 dsa cp
+    Description: Head-sharded Indexer matches Full/Reindex selection and KL gradients.
+    Expectation: Deepseek v41 indexer tp gloo.
+    """
     dist.init_process_group("gloo")
     try:
         rank = dist.get_rank()
@@ -239,62 +253,70 @@ def test_deepseek_v41_indexer_tp_gloo():
         )
         torch.testing.assert_close(actual_reindex, expected_reindex)
 
-        full_inputs = [
-            index_query.clone().requires_grad_(),
-            index_key.clone().requires_grad_(),
-            merge_weight.clone().requires_grad_(),
-        ]
-        local_inputs = [
-            index_query[:, :, local_head_slice].clone().requires_grad_(),
-            index_key.clone().requires_grad_(),
-            merge_weight[:, :, local_head_slice].clone().requires_grad_(),
-        ]
-        attention_query = torch.randn(1, 4, 8, 5)
-        compressed_key = torch.randn(1, 4, 5)
-        sinks = torch.randn(4)
-        expected_loss = shared_compressed_indexer_kl_loss(
-            *full_inputs,
-            attention_query,
-            compressed_key,
-            expected_topk,
-            sinks,
-            attention_scale=5**-0.5,
-            loss_coeff=0.1,
-            query_chunk_size=2,
-        )
-        actual_loss = shared_compressed_indexer_kl_loss(
-            *local_inputs,
-            attention_query[:, local_head_slice],
-            compressed_key,
-            actual_topk,
-            sinks[local_head_slice],
-            attention_scale=5**-0.5,
-            loss_coeff=0.1,
-            query_chunk_size=2,
-            tp_context=tp_context,
-        )
-        expected_loss.backward()
-        actual_loss.backward()
-
-        torch.testing.assert_close(actual_loss, expected_loss, rtol=1.0e-5, atol=1.0e-6)
-        torch.testing.assert_close(
-            local_inputs[0].grad,
-            full_inputs[0].grad[:, :, local_head_slice],
-            rtol=1.0e-5,
-            atol=1.0e-6,
-        )
-        torch.testing.assert_close(
-            local_inputs[2].grad,
-            full_inputs[2].grad[:, :, local_head_slice],
-            rtol=1.0e-5,
-            atol=1.0e-6,
-        )
-        dist.all_reduce(local_inputs[1].grad)
-        torch.testing.assert_close(
-            local_inputs[1].grad,
-            full_inputs[1].grad,
-            rtol=1.0e-5,
-            atol=1.0e-6,
+        _assert_indexer_tp_gradients(
+            index_query, index_key, merge_weight, local_head_slice, expected_topk, actual_topk, tp_context,
         )
     finally:
         dist.destroy_process_group()
+
+
+def _assert_indexer_tp_gradients(index_query, index_key, merge_weight, local_head_slice,
+                                 expected_topk, actual_topk, tp_context):
+    """Compare head-sharded KL loss and all three indexer input gradients."""
+    full_inputs = [
+        index_query.clone().requires_grad_(),
+        index_key.clone().requires_grad_(),
+        merge_weight.clone().requires_grad_(),
+    ]
+    local_inputs = [
+        index_query[:, :, local_head_slice].clone().requires_grad_(),
+        index_key.clone().requires_grad_(),
+        merge_weight[:, :, local_head_slice].clone().requires_grad_(),
+    ]
+    attention_query = torch.randn(1, 4, 8, 5)
+    compressed_key = torch.randn(1, 4, 5)
+    sinks = torch.randn(4)
+    expected_loss = shared_compressed_indexer_kl_loss(
+        *full_inputs,
+        attention_query,
+        compressed_key,
+        expected_topk,
+        sinks,
+        attention_scale=5**-0.5,
+        loss_coeff=0.1,
+        query_chunk_size=2,
+    )
+    actual_loss = shared_compressed_indexer_kl_loss(
+        *local_inputs,
+        attention_query[:, local_head_slice],
+        compressed_key,
+        actual_topk,
+        sinks[local_head_slice],
+        attention_scale=5**-0.5,
+        loss_coeff=0.1,
+        query_chunk_size=2,
+        tp_context=tp_context,
+    )
+    expected_loss.backward()
+    actual_loss.backward()
+
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=1.0e-5, atol=1.0e-6)
+    torch.testing.assert_close(
+        local_inputs[0].grad,
+        full_inputs[0].grad[:, :, local_head_slice],
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+    torch.testing.assert_close(
+        local_inputs[2].grad,
+        full_inputs[2].grad[:, :, local_head_slice],
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+    dist.all_reduce(local_inputs[1].grad)
+    torch.testing.assert_close(
+        local_inputs[1].grad,
+        full_inputs[1].grad,
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )

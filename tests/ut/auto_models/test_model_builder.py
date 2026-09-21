@@ -38,7 +38,11 @@ class TestValidateModelInitDtype(unittest.TestCase):
               card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
     def test_matching_dtype_preserves_dtensor_runtime_metadata(self, mock_get_rank) -> None:
-        """Validation must retain optimizer metadata on a matching DTensor."""
+        """
+        Feature: model builder
+        Description: Validation must retain optimizer metadata on a matching DTensor.
+        Expectation: Matching dtype preserves dtensor runtime metadata.
+        """
         del mock_get_rank
         mesh = DeviceMesh(
             "cpu",
@@ -67,7 +71,11 @@ class TestValidateModelInitDtype(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
     def test_mismatched_dtype_fails_without_converting_parameter(self) -> None:
-        """Validation must reject rather than convert a mismatched parameter."""
+        """
+        Feature: model builder
+        Description: Validation must reject rather than convert a mismatched parameter.
+        Expectation: Mismatched dtype fails without converting parameter.
+        """
         parameter = nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
         model = nn.Module()
         model.register_parameter("weight", parameter)

@@ -79,7 +79,13 @@ class NgramHashMapping(nn.Module):
         segment_starts: torch.Tensor | None = None,
         token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return global flat-table rows shaped ``[batch, seq, hash_columns]``."""
+        """Return global flat-table rows shaped ``[batch, seq, hash_columns]``.
+
+        Args:
+            input_ids: Token IDs in batch and sequence order.
+            segment_starts: Start offset of the packed sample containing each token.
+            token_mask: Mask selecting live tokens and excluding padding.
+        """
         if input_ids.ndim != 2:
             raise ValueError(f"Engram expects input_ids [B,S], got {tuple(input_ids.shape)}")
         compressed = self.token_map[input_ids]
@@ -283,7 +289,14 @@ class EngramModule(nn.Module):
         segment_starts: torch.Tensor | None = None,
         token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run replicated single-card/EP1 Engram."""
+        """Run replicated single-card/EP1 Engram.
+
+        Args:
+            hidden_states: Input token representations.
+            input_ids: Token IDs in batch and sequence order.
+            segment_starts: Start offset of the packed sample containing each token.
+            token_mask: Mask selecting live tokens and excluding padding.
+        """
         hash_ids = self._aligned_hash_ids(hidden_states, input_ids, segment_starts, token_mask)
         fused = self._fuse(hidden_states, self.embed(hash_ids))
         if token_mask is None:
@@ -306,7 +319,22 @@ class EngramModule(nn.Module):
         tp_rank: int = 0,
         tp_size: int = 1,
     ) -> torch.Tensor:
-        """Run CP/TP sequence alignment and sparse EP lookup."""
+        """Run CP/TP sequence alignment and sparse EP lookup.
+
+        Args:
+            hidden_states: Input token representations.
+            input_ids: Token IDs in batch and sequence order.
+            segment_starts: Start offset of the packed sample containing each token.
+            token_mask: Mask selecting live tokens and excluding padding.
+            ep_group: Expert-parallel process group.
+            ep_rank: Group-local expert-parallel rank.
+            ep_size: Number of ranks in the expert-parallel group.
+            cp_group: Context-parallel process group.
+            cp_rank: Group-local context-parallel rank.
+            cp_size: Number of context-parallel ranks.
+            tp_rank: Group-local tensor-parallel rank.
+            tp_size: Number of tensor-parallel ranks.
+        """
         hash_ids = self._aligned_hash_ids(
             hidden_states,
             input_ids,

@@ -314,6 +314,43 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertEqual(tuple(exp_avg.to_local().shape), (2,))
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
+    def test_local_ep_autograd_gradient_preserves_main_parameter_layout(self, mock_get_rank):
+        """Feature: EP gradients in mixed-precision optimization.
+
+        Description: Backpropagate through a sharded parameter's local tensor.
+        Expectation: Adam updates the shard and retains global moment metadata.
+        """
+        del mock_get_rank
+        for dtype in (torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                mesh = DeviceMesh("cpu", [0, 1], mesh_dim_names=("ep",), _init_backend=False)
+                parameter = nn.Parameter(DTensor.from_local(
+                    torch.ones(2, dtype=dtype), mesh, (Shard(0),),
+                ))
+                parameter.model_name = "weight"
+                model = nn.Module()
+                model.register_parameter("weight", parameter)
+                adamw = CoreAdamW([parameter], lr=0.1)
+                optimizer = Float16OptimizerWithFloat16Params(
+                    ChainedOptimizer(model, {"adamw": adamw}), model,
+                )
+                parameter.to_local().sum().backward()
+                self.assertNotIsInstance(parameter.grad, DTensor)
+                with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+                    optimizer.step()
+                main_param = parameter.main_param
+                self.assertIsInstance(main_param.grad, DTensor)
+                self.assertEqual(tuple(main_param.grad.shape), (4,))
+                self.assertEqual(tuple(main_param.grad.placements), (Shard(0),))
+                self.assertEqual(tuple(adamw.state[main_param]["exp_avg"].shape), (4,))
+                torch.testing.assert_close(main_param.to_local(), torch.full((2,), 0.899))
+                if dtype == torch.bfloat16:
+                    self.assertIsNone(parameter.grad)
+                else:
+                    self.assertIsInstance(parameter.grad, DTensor)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=15)
     def test_empty_uneven_main_grad_preserves_optimizer_state_global_shape(
             self,
@@ -449,7 +486,7 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         """
         model, optimizer = _build_optimizer()
         original_model_low = model.low.detach().clone()  # pylint: disable=not-callable
-        original_main_low = model.low.main_param.detach().clone()
+        original_main_low = torch.detach(model.low.main_param).clone()
         model.low.main_grad = torch.tensor([0.5, -0.25], dtype=torch.float32)
         model.fp32.main_grad = torch.tensor([1.0], dtype=torch.float32)
 

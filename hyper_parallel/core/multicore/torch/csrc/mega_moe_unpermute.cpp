@@ -15,12 +15,11 @@
 #include <ATen/MemoryOverlap.h>
 #include <torch/library.h>
 #include <tuple>
-#include "cached_op_api.h"
+#include "csrc/cached_op_api.h"
 
 namespace {
 
 using UnpermuteOutputs = std::tuple<at::Tensor &, at::Tensor &>;
-
 
 void check_unpermute_shapes(const at::Tensor &tokens, const at::Tensor &grad, const at::Tensor &indices,
                             const at::Tensor &probs, const at::Tensor &grad_tokens, const at::Tensor &grad_probs) {
@@ -59,10 +58,10 @@ UnpermuteOutputs unpermute_grad_npu(const at::Tensor &tokens, const at::Tensor &
   auto contiguous_grad = grad.contiguous();
   const c10::optional<at::IntArrayRef> restore_shape = c10::nullopt;
   bool padded_mode = false;
-  static const hyper_parallel::multicore::CachedOpApi api(
-      "aclnnMoeTokenUnpermuteGrad", "aclnnMoeTokenUnpermuteGradGetWorkspaceSize");
-  hyper_parallel::multicore::execute_cached_op(
-      api, tokens, contiguous_grad, indices, probs, padded_mode, restore_shape, grad_tokens, grad_probs);
+  static const hyper_parallel::multicore::CachedOpApi api("aclnnMoeTokenUnpermuteGrad",
+                                                          "aclnnMoeTokenUnpermuteGradGetWorkspaceSize");
+  hyper_parallel::multicore::execute_cached_op(api, tokens, contiguous_grad, indices, probs, padded_mode, restore_shape,
+                                               grad_tokens, grad_probs);
   return {grad_tokens, grad_probs};
 }
 

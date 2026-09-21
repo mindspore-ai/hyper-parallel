@@ -233,7 +233,11 @@ class FSDP2Manager:
         excluded_subtree_module_fqns = excluded_subtree_module_fqns or set()
 
         def is_inside_declared_subtree(module_fqn: str) -> bool:
-            """Whether one module is inside an automatic-discovery exclusion."""
+            """Whether one module is inside an automatic-discovery exclusion.
+
+            Args:
+                module_fqn: Fully qualified module name relative to the model root.
+            """
             return any(
                 module_fqn == declared_fqn
                 or module_fqn.startswith(f"{declared_fqn}.")

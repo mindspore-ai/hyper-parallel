@@ -37,6 +37,8 @@ from hyper_parallel.distributed.activation_checkpoint import (
     apply_submodule_checkpointing,
 )
 
+from tests.common.mark_utils import arg_mark
+
 
 _ACTIVATION_CHECKPOINT_MODULE = (
     "hyper_parallel.distributed.activation_checkpoint"
@@ -180,8 +182,14 @@ class TestTransformerBlockDiscovery(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "gradient_checkpointing"):
             _apply_activation_checkpointing(_UnmarkedDiscoveryModel(), "selective")
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_kv_sharing_overrides_hf_native_full_checkpointing(self):
-        """Mutable cross-layer training state keeps attention outside replay."""
+        """
+        Feature: activation checkpoint
+        Description: Mutable cross-layer training state keeps attention outside replay.
+        Expectation: Kv sharing overrides hf native full checkpointing.
+        """
         model = _DiscoveryOwner()
         model.decoder["2"] = _CheckpointableSubmodules()
         model.decoder["7"] = _CheckpointableSubmodules()

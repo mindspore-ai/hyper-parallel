@@ -112,7 +112,11 @@ class TestMaterializedState(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
     def test_builder_rebuilds_non_persistent_buffers_after_to_empty(self) -> None:
-        """The scratch build path restores constant and factory-derived state."""
+        """
+        Feature: materialization
+        Description: The scratch build path restores constant and factory-derived state.
+        Expectation: Builder rebuilds non persistent buffers after to empty.
+        """
         model = _DerivedBufferModule().to(device="meta")
         model.factory_contexts.clear()
 
@@ -149,7 +153,11 @@ class TestMaterializedState(unittest.TestCase):
               card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.models._transformers.model_builder.get_model_adapter")
     def test_native_hf_adapter_registers_existing_buffer(self, mock_get_adapter) -> None:
-        """A family adapter supports an HF class without changing its inheritance."""
+        """
+        Feature: materialization
+        Description: A family adapter supports an HF class without changing its inheritance.
+        Expectation: Native hf adapter registers existing buffer.
+        """
         model = _NativeHfStyleModule()
 
         def _register_native_state(root: nn.Module) -> None:
@@ -187,7 +195,11 @@ class TestMaterializedState(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
     def test_strict_hook_rejects_parameter_mutation(self) -> None:
-        """A model hook cannot silently overwrite checkpoint-owned parameters."""
+        """
+        Feature: materialization
+        Description: A model hook cannot silently overwrite checkpoint-owned parameters.
+        Expectation: Strict hook rejects parameter mutation.
+        """
         model = _InvalidHookModule()
         context = MaterializationContext(
             reason="checkpoint_load",
@@ -202,7 +214,11 @@ class TestMaterializedState(unittest.TestCase):
               card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.models._transformers.model_builder.CheckpointManager")
     def test_builder_rebuilds_buffers_after_checkpoint_load(self, mock_manager_cls) -> None:
-        """The pretrained path rebuilds runtime state after load finalization."""
+        """
+        Feature: materialization
+        Description: The pretrained path rebuilds runtime state after load finalization.
+        Expectation: Builder rebuilds buffers after checkpoint load.
+        """
         model = _DerivedBufferModule().to(device="meta")
         model.factory_contexts.clear()
 
@@ -237,7 +253,11 @@ class TestMaterializedState(unittest.TestCase):
               card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
     def test_rebuild_preserves_dtensor_layout(self, mock_get_rank) -> None:
-        """A global source is sliced into existing rank-local DTensor storage."""
+        """
+        Feature: materialization
+        Description: A global source is sliced into existing rank-local DTensor storage.
+        Expectation: Rebuild preserves dtensor layout.
+        """
         del mock_get_rank
         model = _DerivedBufferModule()
         mesh = DeviceMesh(
@@ -268,7 +288,11 @@ class TestMaterializedState(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
     def test_checkpoint_finalizer_does_not_initialize_non_persistent_buffers(self) -> None:
-        """Runtime buffers do not expand pretrained finalization into random init."""
+        """
+        Feature: materialization
+        Description: Runtime buffers do not expand pretrained finalization into random init.
+        Expectation: Checkpoint finalizer does not initialize non persistent buffers.
+        """
         model = _CheckpointModel()
         report = LoadReport(
             loaded_keys=("weight",),

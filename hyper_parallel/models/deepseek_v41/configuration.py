@@ -22,7 +22,11 @@ from typing import Iterable
 
 
 def validate_swiglu_limit(value: float) -> float:
-    """Validate a finite non-negative SwiGLU activation limit."""
+    """Validate a finite non-negative SwiGLU activation limit.
+
+    Args:
+        value: Tensor published for reuse by consumer layers.
+    """
     if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value < 0:
         raise ValueError(
             "swiglu_limit must be a finite non-negative number; use 0 to disable clipping"

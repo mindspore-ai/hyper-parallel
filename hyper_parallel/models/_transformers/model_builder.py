@@ -462,6 +462,28 @@ def apply_model_infrastructure(
     materialization/loading -> per-layer compile. Placement validation keeps
     the DTensor placement path and skips compile, while FSDP2 consumes DTensor
     parameter layouts in both modes.
+
+    Args:
+        model: Model receiving the configured infrastructure.
+        mesh: Device mesh defining the available parallel axes.
+        sharding_planner: Planner that derives the model sharding contracts.
+        fsdp2_manager: Manager that applies fully sharded parameter ownership.
+        peft_config: Optional parameter-efficient fine-tuning configuration.
+        qat_config: Optional quantization-aware training configuration.
+        fp8_config: Optional FP8 execution configuration.
+        freeze_config: Rules selecting parameters that remain frozen.
+        compile_config: Optional compilation configuration.
+        activation_checkpoint: Activation recomputation configuration.
+        activation_swap: Activation offload configuration.
+        swap_inputs: Whether wrapped module inputs are eligible for offload.
+        is_meta_device: Whether parameters are awaiting materialization from the meta device.
+        is_hf_model: Whether the model uses the external Transformers implementation.
+        device: Device on which output tensors are allocated.
+        load_base_model: Whether source checkpoint weights should be loaded.
+        pretrained_path: Directory or checkpoint identifier containing source weights.
+        validate_placement: Whether to verify distributed parameter placement.
+        low_precision_config: Optional low-precision training policy.
+        model_init_dtype: Expected dtype of initialized model parameters.
     """
 
     distributed_setup = kwargs.get("distributed_setup")

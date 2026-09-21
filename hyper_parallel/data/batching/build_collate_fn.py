@@ -160,7 +160,7 @@ class DataBatchAdapter:
     ) -> Mapping[str, Any]:
         """Merge prepared items into one batch mapping.
 
-        The default policy delegates to PyTorch collation and therefore
+        The default policy delegates to the default tensor collation and therefore
         supports mappings whose corresponding fields have compatible shapes.
         Model adapters may override this hook for variable-size modality
         fields, cumulative offsets, or derived ownership metadata.
@@ -273,12 +273,7 @@ class TextPackingCollator(DataCollator):
             raise ValueError("model_samples must contain at least one Online sample")
 
         prepared_samples = self.batch_adapter.prepare_items(model_samples, self.context)
-        if not isinstance(prepared_samples, Sequence) or isinstance(prepared_samples, (str, bytes)):
-            raise TypeError("DataBatchAdapter.prepare_items must return a sequence of mappings")
-        if not prepared_samples:
-            raise ValueError("DataBatchAdapter.prepare_items must retain at least one item")
-        if any(not isinstance(item, Mapping) for item in prepared_samples):
-            raise TypeError("DataBatchAdapter.prepare_items must return only mappings")
+        _validate_prepared_online_samples(prepared_samples)
 
         sequence_lengths = []
         values_by_field = {"input_ids": [], "labels": []}
@@ -361,7 +356,7 @@ def build_indexed_collate_fn() -> Callable[[list[Any]], Any]:
     """Build default collation for fixed-length Indexed samples.
 
     Returns:
-        PyTorch default collation.
+        the default tensor collation.
     """
     collate_fn = default_collate
 
@@ -407,3 +402,13 @@ def build_online_text_collate_fn(
     collate_fn = MainCollator(packing_collator=packing_collator)
 
     return collate_fn
+
+
+def _validate_prepared_online_samples(prepared_samples) -> None:
+    """Reject invalid adapter outputs before packing token fields."""
+    if not isinstance(prepared_samples, Sequence) or isinstance(prepared_samples, (str, bytes)):
+        raise TypeError("DataBatchAdapter.prepare_items must return a sequence of mappings")
+    if not prepared_samples:
+        raise ValueError("DataBatchAdapter.prepare_items must retain at least one item")
+    if any(not isinstance(item, Mapping) for item in prepared_samples):
+        raise TypeError("DataBatchAdapter.prepare_items must return only mappings")

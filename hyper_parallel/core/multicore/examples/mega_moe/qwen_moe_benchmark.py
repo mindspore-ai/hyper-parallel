@@ -51,7 +51,7 @@ from hyper_parallel.platform.torch.common import GroupedExperts
 
 _WORLD_SIZE = 8
 _BATCH_SIZE = 1
-_SEQUENCE_LENGTH = 1024
+_SEQUENCE_LENGTH = 4096
 _DTYPE = torch.bfloat16
 _RTOL = 2e-2
 _ATOL = 2e-3
@@ -609,6 +609,10 @@ def _write_result(
                 "batch_size": _BATCH_SIZE,
                 "sequence_length": _SEQUENCE_LENGTH,
                 "hidden_size": config.hidden_size,
+                "intermediate_size": config.intermediate_size,
+                "shared_expert_intermediate_size": config.shared_expert_intermediate_size,
+                "num_attention_heads": config.num_attention_heads,
+                "num_key_value_heads": config.num_key_value_heads,
                 "num_layers": config.num_layers,
                 "num_experts": config.num_experts,
                 "top_k": config.top_k,
@@ -626,6 +630,7 @@ def _write_result(
             },
             "warmup_steps": args.warmup_steps,
             "measured_steps": args.measured_steps,
+            "seed": args.seed,
             "comparison": {
                 "accuracy": accuracy,
                 "performance": {

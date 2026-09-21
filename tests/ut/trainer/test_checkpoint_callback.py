@@ -24,6 +24,8 @@ import torch
 from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
 from hyper_parallel.trainer.state import TrainerState
 
+from tests.common.mark_utils import arg_mark
+
 
 def _checkpoint_config(restore_from: str) -> SimpleNamespace:
     """Build the checkpoint configuration used by callback unit tests."""
@@ -46,6 +48,8 @@ def _checkpoint_config(restore_from: str) -> SimpleNamespace:
 class TestCheckpointerCallback(unittest.TestCase):
     """Tests for checkpoint restore policy and trainer state handling."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.empty_cache")
     @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.validate_model_init_dtype")
     @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.build_checkpointer")
@@ -55,7 +59,11 @@ class TestCheckpointerCallback(unittest.TestCase):
             mock_validate_model_init_dtype: MagicMock,
             mock_empty_cache: MagicMock,
     ) -> None:
-        """Weights-only restore should retain fresh progress and define its start position."""
+        """
+        Feature: checkpoint callback
+        Description: Weights-only restore should retain fresh progress and define its start position.
+        Expectation: Weights only restore initializes fresh start position.
+        """
         with tempfile.TemporaryDirectory() as restore_path:
             checkpointer = MagicMock()
             mock_build_checkpointer.return_value = checkpointer

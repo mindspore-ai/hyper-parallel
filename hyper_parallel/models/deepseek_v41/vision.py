@@ -69,7 +69,11 @@ class DeepseekV41VisionRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Normalize a patch sequence while retaining its activation dtype."""
+        """Normalize a patch sequence while retaining its activation dtype.
+
+        Args:
+            hidden_states: Input token representations.
+        """
         data_type = hidden_states.dtype
         hidden_fp32 = hidden_states.float()
         normalized = hidden_fp32 * torch.rsqrt(hidden_fp32.square().mean(-1, keepdim=True) + self.eps)
@@ -85,7 +89,11 @@ class DeepseekV41VisionPatchEmbed(nn.Module):
         self.proj = nn.Linear(3 * patch_size ** 2, hidden_size)
 
     def forward(self, patches: torch.Tensor) -> torch.Tensor:
-        """Embed ``[patches, 3, patch, patch]`` RGB patches."""
+        """Embed ``[patches, 3, patch, patch]`` RGB patches.
+
+        Args:
+            patches: Image patches presented to the vision encoder.
+        """
         if patches.ndim != 4 or patches.shape[1] != 3:
             raise ValueError(f"pixel patches must have shape [N, 3, P, P], got {tuple(patches.shape)}")
         return self.proj(patches.flatten(1))
@@ -117,7 +125,13 @@ class DeepseekV41VisionAttention(nn.Module):
             cosine: torch.Tensor,
             sine: torch.Tensor,
     ) -> torch.Tensor:
-        """Run full bidirectional attention for one image's patch sequence."""
+        """Run full bidirectional attention for one image's patch sequence.
+
+        Args:
+            hidden_states: Input token representations.
+            cosine: Cosine rotary embedding values.
+            sine: Sine rotary embedding values.
+        """
         token_count = hidden_states.shape[0]
         query, key, value = (
             value.view(token_count, self.num_attention_heads, self.head_dim)
@@ -146,7 +160,11 @@ class DeepseekV41VisionMLP(nn.Module):
         self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply the vision SwiGLU MLP."""
+        """Apply the vision SwiGLU MLP.
+
+        Args:
+            hidden_states: Input token representations.
+        """
         gate, up = self.w1(hidden_states).chunk(2, dim=-1)
         return self.w2(functional.silu(gate) * up)
 
@@ -168,7 +186,13 @@ class DeepseekV41VisionBlock(nn.Module):
             cosine: torch.Tensor,
             sine: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply attention then MLP residual updates."""
+        """Apply attention then MLP residual updates.
+
+        Args:
+            hidden_states: Input token representations.
+            cosine: Cosine rotary embedding values.
+            sine: Sine rotary embedding values.
+        """
         hidden_states = hidden_states + self.attn(self.norm1(hidden_states), cosine, sine)
         return hidden_states + self.mlp(self.norm2(hidden_states))
 
@@ -238,7 +262,13 @@ class DeepseekV41VisionAligner(nn.Module):
         self.w2 = nn.Linear(llm_hidden_size, llm_hidden_size)
 
     def forward(self, hidden_states: torch.Tensor, grid_height: int, grid_width: int) -> torch.Tensor:
-        """Downsample one image's ViT grid to the LLM image-token grid."""
+        """Downsample one image's ViT grid to the LLM image-token grid.
+
+        Args:
+            hidden_states: Input token representations.
+            grid_height: Height of the image patch grid.
+            grid_width: Width of the image patch grid.
+        """
         if hidden_states.ndim != 2 or hidden_states.shape[0] != grid_height * grid_width:
             raise ValueError("aligner features must be [grid_height * grid_width, vision_hidden]")
         ratio = self.downsample_ratio

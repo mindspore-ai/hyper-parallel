@@ -24,9 +24,17 @@ from hyper_parallel.core.multicore.torch import ops
 from tests.torch.multicore import _test_mega_moe as baseline
 from tests.torch.multicore._mega_moe_utils import write_evidence
 
+from tests.common.mark_utils import arg_mark
 
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
 def test_moe_token_unpermute_grad_out() -> None:
-    """Check changing inputs and reused outputs on default and non-default streams."""
+    """
+    Feature:  test moe token unpermute grad
+    Description: Check changing inputs and reused outputs on default and non-default streams.
+    Expectation: Moe token unpermute grad out.
+    """
     records = []
     streams = (torch.npu.current_stream(), torch.npu.Stream())
     for dtype in (torch.bfloat16, torch.float16, torch.float32):

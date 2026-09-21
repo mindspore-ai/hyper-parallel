@@ -20,7 +20,15 @@ import os
 
 from hyper_parallel.core.multicore.examples.mega_moe.deepseek_v41_precision import main
 
+from tests.common.mark_utils import arg_mark
 
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
 def test_deepseek_v41_megamoe() -> None:
-    """Run the standalone DSV4.1 oracle on this torchrun rank."""
+    """
+    Feature:  test deepseek v41 megamoe
+    Description: Run the standalone DSV4.1 oracle on this torchrun rank.
+    Expectation: Deepseek v41 megamoe.
+    """
     main(json.loads(os.environ["HP_DSV41_MEGAMOE_ARGUMENTS"]))

@@ -50,7 +50,12 @@ def detect_dtensor_backend(
         adamw_params: List[Any],
         muon_params: List[Any],
 ) -> str:
-    """Detect and set the DTensor backend ('torch' or 'hyper') from parameter lists."""
+    """Select the native or HyperParallel DTensor backend from parameter lists.
+
+    Args:
+        adamw_params: Parameter groups managed by AdamW.
+        muon_params: Parameter groups managed by Muon.
+    """
     global _DTENSOR_BACKEND  # pylint: disable=global-statement
 
     sample_param = _extract_first_param(muon_params)
@@ -125,7 +130,7 @@ def get_replicate_cls():
 
 
 def get_strided_shard_cls():
-    """Return the StridedShard placement class. Returns _NEVER_MATCH for 'torch'."""
+    """Return StridedShard, or a never-matching class for the native backend."""
     if _DTENSOR_BACKEND == "torch":
         return _NeverMatch
 
@@ -149,18 +154,31 @@ def _resolve_dtensor_union():
 
 
 def is_dtensor(tensor: Any) -> bool:
-    """Return whether ``tensor`` is a native or HyperParallel DTensor."""
+    """Return whether ``tensor`` is a native or HyperParallel DTensor.
+
+    Args:
+        tensor: Tensor to inspect or communicate.
+    """
     dtensor_type = _LAZY_CACHE.get("DTensor") or _resolve_dtensor_union()
     return isinstance(tensor, dtensor_type)
 
 
 def to_local_if_dtensor(tensor: Any) -> Any:
-    """Return the local shard if `tensor` is a DTensor, otherwise return as-is."""
+    """Return the local shard if `tensor` is a DTensor, otherwise return as-is.
+
+    Args:
+        tensor: Tensor to inspect or communicate.
+    """
     return tensor.to_local() if is_dtensor(tensor) else tensor
 
 
 def device_meshes_are_compatible(lhs: Any, rhs: Any) -> bool:
-    """Return whether two device meshes describe the same topology."""
+    """Return whether two device meshes describe the same topology.
+
+    Args:
+        lhs: First mesh in the compatibility comparison.
+        rhs: Second mesh in the compatibility comparison.
+    """
     if lhs is rhs:
         return True
     lhs_hash = getattr(lhs, "to_hash", None)

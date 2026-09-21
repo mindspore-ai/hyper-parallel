@@ -26,5 +26,9 @@ _WORKER = str(Path(__file__).resolve().parent / "_test_engram_parallel.py")
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_engram_ep_lookup_cp_hash_gloo():
-    """Run the four-process sparse-table and sequence-boundary precision case."""
+    """
+    Feature: engram parallel
+    Description: Run the four-process sparse-table and sequence-boundary precision case.
+    Expectation: Engram ep lookup cp hash gloo.
+    """
     torchrun_case(_WORKER, "test_engram_ep_lookup_cp_hash_gloo", num_proc=4)

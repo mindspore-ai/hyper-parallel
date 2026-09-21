@@ -230,7 +230,11 @@ class PipelinedMhcModule(nn.Module):
         self,
         hidden_streams: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Produce the coefficients consumed by the following sublayer."""
+        """Produce the coefficients consumed by the following sublayer.
+
+        Args:
+            hidden_streams: Residual streams consumed by manifold-constrained mixing.
+        """
         flattened = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         mix = F.linear(  # pylint: disable=not-callable
             flattened, self.fn.float()
@@ -260,7 +264,14 @@ def pipelined_mhc_post(
     post: torch.Tensor,
     combine: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply the shared high-performance mHC post path to 4-D streams."""
+    """Apply the shared high-performance mHC post path to 4-D streams.
+
+    Args:
+        sublayer_output: Output of the attention or feed-forward sublayer.
+        residual: Residual streams carried around the sublayer.
+        post: Post-mixing weights applied to the sublayer output.
+        combine: Weights combining the residual streams.
+    """
     num_stream = residual.shape[-2]
     flattened = mhc_post(
         sublayer_output,

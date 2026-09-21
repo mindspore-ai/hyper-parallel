@@ -1,0 +1,3 @@
+[codespell]
+# CANN is the Ascend SDK; astroid is the Pylint parser dependency.
+ignore-words-list = cann,astroid

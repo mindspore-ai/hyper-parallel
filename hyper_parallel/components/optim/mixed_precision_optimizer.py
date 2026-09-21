@@ -48,6 +48,8 @@ def _copy_tensor(destination: torch.Tensor, source: torch.Tensor) -> None:
 def _gradient_for_param(
         optimizer_param: nn.Parameter,
         gradient: torch.Tensor,
+        *,
+        allow_local_gradient: bool = False,
 ) -> torch.Tensor:
     """Return a validated gradient matching an optimizer parameter.
 
@@ -59,6 +61,20 @@ def _gradient_for_param(
     """
     optimizer_is_dtensor = is_dtensor(optimizer_param)
     gradient_is_dtensor = is_dtensor(gradient)
+    if optimizer_is_dtensor and not gradient_is_dtensor and allow_local_gradient:
+        optimizer_local = to_local_if_dtensor(optimizer_param)
+        if tuple(gradient.shape) != tuple(optimizer_local.shape):
+            raise ValueError("Local autograd gradient must match its optimizer parameter shard")
+        # EP local computation returns a local autograd gradient. Restore the
+        # owning parameter's explicit metadata, including uneven global shapes.
+        gradient = type(optimizer_param).from_local(
+            gradient.detach(),
+            optimizer_param.device_mesh,
+            optimizer_param.placements,
+            shape=optimizer_param.shape,
+            stride=optimizer_param.stride(),
+        )
+        gradient_is_dtensor = True
     if optimizer_is_dtensor != gradient_is_dtensor:
         raise TypeError(
             "Optimizer parameter and gradient must both be DTensors or both be local tensors"
@@ -222,17 +238,24 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 main_param.grad = (
                     None
                     if model_gradient is None
-                    else _gradient_for_param(main_param, model_gradient)
+                    else _gradient_for_param(
+                        main_param,
+                        model_gradient,
+                        allow_local_gradient=model_param.main_grad is None,
+                    )
                 )
                 model_param.grad = None
 
         for fp32_group in self.fp32_from_fp32_groups:
             for model_param in fp32_group:
                 model_gradient = model_param.main_grad
+                if model_gradient is None and is_dtensor(model_param):
+                    model_gradient = model_param.grad
                 if model_gradient is not None:
                     model_param.grad = _gradient_for_param(
                         model_param,
                         model_gradient,
+                        allow_local_gradient=model_param.main_grad is None,
                     )
 
     @torch.no_grad()

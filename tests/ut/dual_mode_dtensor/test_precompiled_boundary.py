@@ -51,6 +51,8 @@ from hyper_parallel.core.dtensor.placement_types import (
     Shard,
 )
 
+from tests.common.mark_utils import arg_mark
+
 
 class _FakeMesh:
     mesh_dim_names = ("tp", "cp")
@@ -501,8 +503,14 @@ def test_tied_weights_consistency():
         "case: explicit_tied_pairs_override"
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
 def test_error_paths():
-    """Error paths family: fail-fast raises for source shard contract violations."""
+    """
+    Feature: precompiled boundary
+    Description: Error paths family: fail-fast raises for source shard contract violations.
+    Expectation: Error paths.
+    """
     # --- case: fsdp_owned_axis_shard_rejected ---
     # weight declared Shard on an FSDP-owned axis (e.g. cp) -> fail-fast.
     plan = ShardingPlan(mesh_dim_names=("cp", "tp"))

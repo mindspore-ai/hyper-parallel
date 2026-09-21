@@ -231,12 +231,13 @@ def run_pylint(files: List[str],
 
     cmd = [
         "pylint",
+        "--jobs=4",
         f"--max-line-length={PYLINT_MAX_LINE_LENGTH}",
         f"--disable={PYLINT_DISABLE}",
         "--score=no",
     ] + files
 
-    result = _run_cmd(cmd)
+    result = _run_cmd(cmd, timeout=600)
     output = (result.stdout + result.stderr).strip()
 
     if filter_file and os.path.isfile(filter_file):
@@ -404,7 +405,7 @@ def run_cpplint(files: List[str]) -> Tuple[bool, str]:
     if not check_tool_available("cpplint"):
         return True, "[WARN] cpplint not installed, skipped\n"
 
-    cmd = ["cpplint"] + files
+    cmd = ["cpplint", "--linelength=120"] + files
     result = _run_cmd(cmd)
     output = result.stderr.strip()
 

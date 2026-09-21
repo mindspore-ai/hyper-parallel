@@ -368,7 +368,12 @@ class TextTokenBatcher:
             raise ValueError("batch_context.token_budget must match token_budget")
 
     def put_item(self, model_sample: Mapping[str, Any], output_index_entry: Any | None = None) -> None:
-        """Append one ModelSample and its physical budget cost."""
+        """Append one ModelSample and its physical budget cost.
+
+        Args:
+            model_sample: Prepared model sample to add to the buffer.
+            output_index_entry: Dataset index metadata describing the selected sample.
+        """
         sample_length = self.item_cost(model_sample)
 
         buffered_sample = (model_sample, sample_length)
@@ -377,7 +382,11 @@ class TextTokenBatcher:
         self.buffer_token_count += sample_length
 
     def item_cost(self, model_sample: Mapping[str, Any]) -> int:
-        """Validate and return one adapter-defined physical item cost."""
+        """Validate and return one adapter-defined physical item cost.
+
+        Args:
+            model_sample: Prepared model sample to add to the buffer.
+        """
         sample_cost = self.batch_adapter.item_cost(model_sample, self.batch_context)
         try:
             resolved_cost = operator.index(sample_cost)
@@ -458,7 +467,13 @@ class _IndexBufferDynamicBatchRuntime:
             saved_by_idx: bool,
             batcher: TextTokenBatcher,
     ) -> tuple[list[tuple[Mapping[str, Any], int]], list[Any]]:
-        """Rebuild buffered ModelSamples from output index and sample index."""
+        """Rebuild buffered ModelSamples from output index and sample index.
+
+        Args:
+            saved_buffer: Buffered samples restored from the checkpoint.
+            saved_by_idx: Checkpoint samples indexed by dataset position.
+            batcher: Batching policy managing buffered samples.
+        """
         if not saved_by_idx:
             if saved_buffer:
                 raise ValueError("save_by_idx=True cannot restore a checkpoint containing full samples")
@@ -499,7 +514,13 @@ class _FullBufferDynamicBatchRuntime:
             saved_by_idx: bool,
             batcher: TextTokenBatcher,
     ) -> tuple[list[tuple[Mapping[str, Any], int]], list[Any]]:
-        """Restore full samples that cannot be fetched behind the cursor."""
+        """Restore full samples that cannot be fetched behind the cursor.
+
+        Args:
+            saved_buffer: Buffered samples restored from the checkpoint.
+            saved_by_idx: Checkpoint samples indexed by dataset position.
+            batcher: Batching policy managing buffered samples.
+        """
         if saved_by_idx:
             if saved_buffer and self.replay_dataset is None:
                 raise ValueError("An index-buffer checkpoint requires a replayable Dataset")
@@ -585,22 +606,7 @@ class DynamicBatchDataLoader:
         self.batch_collate_fn = collate_fn
         self.dp_world_size = resolved_dp_world_size
         token_budget = batch_size * max_seq_len
-        resolved_batch_context = batch_context or DataBatchContext(
-            source_type="online",
-            token_budget=token_budget,
-        )
-        if resolved_batch_context.token_budget not in (None, token_budget):
-            raise ValueError(
-                "batch_context.token_budget must match batch_size * max_seq_len: "
-                f"context={resolved_batch_context.token_budget}, resolved={token_budget}"
-            )
-        if resolved_batch_context.token_budget is None:
-            resolved_batch_context = DataBatchContext(
-                source_type=resolved_batch_context.source_type,
-                sequence_parallel_size=resolved_batch_context.sequence_parallel_size,
-                token_budget=token_budget,
-                pad_token_id=resolved_batch_context.pad_token_id,
-            )
+        resolved_batch_context = _resolve_online_batch_context(batch_context, token_budget)
         resolved_batch_adapter = batch_adapter or DataBatchAdapter()
         self.batcher = TextTokenBatcher(
             token_budget=token_budget,
@@ -628,22 +634,7 @@ class DynamicBatchDataLoader:
             if callable(enable_source_resume):
                 enable_source_resume()
 
-        resolved_save_by_idx = not is_iterable if save_by_idx is None else save_by_idx
-        # Mapping Datasets are replayable through an adapter; iterable sources must opt in.
-        replay_dataset = dataset if is_iterable else _OutputIndexDataset(dataset)
-        supports_replay = not is_iterable or _supports_output_index_for_resume(dataset)
-        if resolved_save_by_idx and not supports_replay:
-            raise ValueError("save_by_idx=True requires get_item() and output_index_for_resume")
-
-        if is_iterable and hasattr(dataset, "output_index_for_resume"):
-            dataset.output_index_for_resume = resolved_save_by_idx
-
-        if resolved_save_by_idx:
-            self._runtime = _IndexBufferDynamicBatchRuntime(replay_dataset)
-        else:
-            # Retain replay access only to load an earlier index-buffer checkpoint.
-            checkpoint_replay_dataset = replay_dataset if supports_replay else None
-            self._runtime = _FullBufferDynamicBatchRuntime(dataset, checkpoint_replay_dataset)
+        self._runtime = _make_dynamic_batch_runtime(dataset, save_by_idx, is_iterable)
 
         self.source_dataloader = FixedBatchDataLoader(
             dataset=self._runtime.source_dataset,
@@ -714,7 +705,11 @@ class DynamicBatchDataLoader:
         return checkpoint_state
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
-        """Restore the future source cursor and unconsumed dynamic buffer."""
+        """Restore the future source cursor and unconsumed dynamic buffer.
+
+        Args:
+            state_dict: Serialized state to restore.
+        """
         checkpoint_state = copy.deepcopy(dict(state_dict))
         saved_dp_world_size = checkpoint_state.get("dp_world_size", self.dp_world_size)
         if saved_dp_world_size != self.dp_world_size:
@@ -751,3 +746,46 @@ class DynamicBatchDataLoader:
     def set_epoch(self, epoch: int) -> None:
         """Forward epoch state to the stateful source DataLoader."""
         self.source_dataloader.set_epoch(epoch)
+
+
+def _resolve_online_batch_context(batch_context, token_budget):
+    """Attach the resolved token budget while preserving model batch metadata."""
+    resolved_batch_context = batch_context or DataBatchContext(
+        source_type="online",
+        token_budget=token_budget,
+    )
+    if resolved_batch_context.token_budget not in (None, token_budget):
+        raise ValueError(
+            "batch_context.token_budget must match batch_size * max_seq_len: "
+            f"context={resolved_batch_context.token_budget}, resolved={token_budget}"
+        )
+    if resolved_batch_context.token_budget is None:
+        resolved_batch_context = DataBatchContext(
+            source_type=resolved_batch_context.source_type,
+            sequence_parallel_size=resolved_batch_context.sequence_parallel_size,
+            token_budget=token_budget,
+            pad_token_id=resolved_batch_context.pad_token_id,
+        )
+    return resolved_batch_context
+
+
+def _make_dynamic_batch_runtime(dataset, save_by_idx, is_iterable):
+    """Select checkpoint replay storage for map-style or iterable samples."""
+    resolved_save_by_idx = not is_iterable if save_by_idx is None else save_by_idx
+    # Mapping Datasets are replayable through an adapter; iterable sources must opt in.
+    replay_dataset = dataset if is_iterable else _OutputIndexDataset(dataset)
+    supports_replay = not is_iterable or _supports_output_index_for_resume(dataset)
+    if resolved_save_by_idx and not supports_replay:
+        raise ValueError("save_by_idx=True requires get_item() and output_index_for_resume")
+
+    if is_iterable and hasattr(dataset, "output_index_for_resume"):
+        dataset.output_index_for_resume = resolved_save_by_idx
+
+    if resolved_save_by_idx:
+        runtime = _IndexBufferDynamicBatchRuntime(replay_dataset)
+    else:
+        # Retain replay access only to load an earlier index-buffer checkpoint.
+        checkpoint_replay_dataset = replay_dataset if supports_replay else None
+        runtime = _FullBufferDynamicBatchRuntime(dataset, checkpoint_replay_dataset)
+
+    return runtime

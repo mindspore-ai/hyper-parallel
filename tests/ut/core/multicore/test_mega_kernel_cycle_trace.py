@@ -99,8 +99,14 @@ def _parse(buffer: bytes, *, detailed_task_names: bool = False) -> dict:
 class TestMegaKernelCycleTrace(unittest.TestCase):
     """Validate schema, timing, naming, fallback, and corruption checks."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_parse_aiv_tail_above_former_limit(self):
-        """Decode the record beyond slot 256 without losing the vector tail."""
+        """
+        Feature: mega kernel cycle trace
+        Description: Decode the record beyond slot 256 without losing the vector tail.
+        Expectation: Parse aiv tail above former limit.
+        """
         capacity = 272
         buffer = bytearray(_profile_buffer_bytes_for_capacities(16, capacity))
         offset = CUBE_SLOT_COUNT * (CORE_HEADER.size + 16 * PROFILE_RECORD.size)
