@@ -227,6 +227,24 @@ class SwiGluTilingDataC(ctypes.Structure):
     ]
 
 
+class ClippedSwiGluTilingDataC(ctypes.Structure):
+    """Serialized CANN ClippedSwiglu/ClippedSwigluGrad tiling values."""
+
+    _fields_ = [
+        ("core_num_all", ctypes.c_int64),
+        ("dim_batch_size", ctypes.c_int64),
+        ("dim_2h", ctypes.c_int64),
+        ("is_long_h", ctypes.c_int64),
+        ("is_group", ctypes.c_int64),
+        ("is_interleaved", ctypes.c_int64),
+        ("alpha", ctypes.c_float),
+        ("limit", ctypes.c_float),
+        ("bias", ctypes.c_float),
+        ("ub_max_pair", ctypes.c_int64),
+        ("group_num", ctypes.c_int64),
+    ]
+
+
 # ── Topology + runtime counters ───────────────────────────────────────────────
 
 @dataclass

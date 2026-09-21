@@ -14,9 +14,12 @@
 # ============================================================================
 """MoE-FFN backward compute graph."""
 
+from __future__ import annotations
+
 from hyper_parallel.core.multicore.scheduler.graph import (
     ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType,
 )
+from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 from hyper_parallel.core.multicore.tasks.alltoall import AllToAllFillConfig, AllToAllType
 from hyper_parallel.core.multicore.tasks.gmm import GmmFillConfig
 from hyper_parallel.core.multicore.tasks.swiglu import SwiGLUFillConfig
@@ -102,7 +105,7 @@ def _build_bwd_tensor_specs(tsv, hidden_size, intermediate_size, dtype_size):
 
 
 def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
-                         swiglu_sv, num_cube_cores):
+                         swiglu_sv, num_cube_cores, swiglu_limit=None):
     """Create dispatch, act_grad, w2_grad, swiglu_grad operator nodes."""
     (target, target_offset, src, src_offset, size_d,
      w2_grad_x1, w2_grad_y, act_grad_weight, act_grad_y,
@@ -158,7 +161,7 @@ def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
             task_num_fn=lambda tsv: (tsv.per_expert_seq // swiglu_sv) * tsv.single_rank_expert_num,
         ),
         tiling_position=_TILING_POS_SWIGLU_GRAD,
-        fill_config=SwiGLUFillConfig(),
+        fill_config=SwiGLUFillConfig(clamp_limit=swiglu_limit),
     )
     return dispatch, act_grad, w2_grad, swiglu_grad
 
@@ -210,7 +213,7 @@ def _build_bwd_ops_second(specs, *, gate_grad_sv, w1_grad_sv, combine_sv, num_cu
     return gate_grad, combine, w1_grad
 
 
-def build_backward_graph(tsv, *,
+def build_backward_graph(tsv: TaskSplitValue, *,
                          dispatch_sv:   int = 128,
                          act_grad_sv:   int = 4096,
                          w2_grad_sv:    int = 4096,
@@ -221,7 +224,8 @@ def build_backward_graph(tsv, *,
                          hidden_size:       int = 7168,
                          intermediate_size: int = 2048,
                          dtype_size:        int = 2,
-                         num_cube_cores:    int = 24) -> ComputeGraph:
+                         num_cube_cores:    int = 24,
+                         swiglu_limit:      float | None = None) -> ComputeGraph:
     """Build the MoE-FFN backward DAG.
 
     Execution order:
@@ -255,6 +259,7 @@ def build_backward_graph(tsv, *,
         tsv, specs,
         dispatch_sv=dispatch_sv, act_grad_sv=act_grad_sv,
         w2_grad_sv=w2_grad_sv, swiglu_sv=swiglu_sv, num_cube_cores=num_cube_cores,
+        swiglu_limit=swiglu_limit,
     )
     gate_grad, combine, w1_grad = _build_bwd_ops_second(
         specs,
