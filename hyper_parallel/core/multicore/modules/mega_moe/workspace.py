@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import threading
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,15 +50,19 @@ def _round_up(value: int, granularity: int) -> int:
     return (value + granularity - 1) // granularity * granularity
 
 
-def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -> int:
+def _spec_workspace_bytes(
+    specification: Mapping[str, Any], element_size: int, *, receive_capacity: int | None = None,
+) -> int:
     """Return planned symmetric bytes for one execution-resource group."""
     local_tokens = specification["local_num_tokens"]
     routed_slots = local_tokens * specification["top_k"]
     capacity = _resolve_receive_capacity(
-        specification["expert_capacity_factor"],
+        specification["initial_capacity_factor"],
         routed_slots,
         specification["ep_size"],
     )
+    if receive_capacity is not None:
+        capacity = receive_capacity
     if specification.get("dispatch_mode", "push") == "pull":
         capacity = routed_slots
     tensor_bytes = (
@@ -70,12 +75,15 @@ def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -
 def configure_symmetric_heap(
     active_specifications: tuple[Any, ...],
     tensor: torch.Tensor,
+    *,
+    write_environment: bool = True,
 ) -> int:
     """Size the fixed SHMEM heap once for all active resource groups.
 
     Args:
         active_specifications: Specifications for every live compatible resource group.
         tensor: First input tensor used to determine element size.
+        write_environment: Preserve legacy environment publication for standalone callers.
 
     Returns:
         Configured symmetric heap size in bytes.
@@ -90,7 +98,8 @@ def configure_symmetric_heap(
     required_bytes = _round_up(required_bytes, _HEAP_GRANULARITY_BYTES)
     configured = os.getenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE")
     if configured is None:
-        os.environ["HYPER_PARALLEL_SHMEM_HEAP_SIZE"] = str(required_bytes)
+        if write_environment:
+            os.environ["HYPER_PARALLEL_SHMEM_HEAP_SIZE"] = str(required_bytes)
         return required_bytes
     try:
         configured_bytes = int(configured)
@@ -136,6 +145,8 @@ class MegaMoeWorkspace:
     event_counter_bytes: int = MIN_EVENT_CAPACITY * 4
     forward_ready_initialized: bool = False
     backward_ready_initialized: bool = False
+    capacity_floor: int = 0
+    heap_manager: Any | None = field(default=None, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
 
     def ensure(self, spec: MegaMoeSpec, dtype: Any, device: Any) -> None:
@@ -146,7 +157,16 @@ class MegaMoeWorkspace:
             dtype: Element dtype for symmetric data buffers.
             device: Device that owns local and symmetric buffers.
         """
-        requested_capacity = spec.receive_capacity
+        with self._access():
+            self._ensure_buffers(spec, dtype, device)
+
+    def _access(self) -> Any:
+        """Exclude submissions during a root heap rebuild."""
+        return self.heap_manager.access() if self.heap_manager is not None else nullcontext()
+
+    def _ensure_buffers(self, spec: MegaMoeSpec, dtype: Any, device: Any) -> None:
+        """Allocate this workspace at its current monotonic capacity."""
+        requested_capacity = max(spec.receive_capacity, self.capacity_floor)
         if self.expert_buffer is not None or self.source_buffer is not None:
             compatible = (
                 self.dispatch_mode == spec.dispatch_mode
@@ -230,13 +250,13 @@ class MegaMoeWorkspace:
 
     def wait_for_reuse(self) -> None:
         """Order count exchange after the previous workspace lease."""
-        with self.lock:
+        with self._access(), self.lock:
             if self.used:
                 torch.npu.current_stream(self.device).wait_event(self.completion_event)
 
     def claim(self) -> None:
         """Claim the serial workspace and order it after the previous stream."""
-        with self.lock:
+        with self._access(), self.lock:
             if self.in_use:
                 raise RuntimeError("MegaMoe execution resources do not support concurrent calls.")
             if self.used:
@@ -245,7 +265,7 @@ class MegaMoeWorkspace:
 
     def release(self) -> None:
         """Record completion ordering and release the serial workspace lease."""
-        with self.lock:
+        with self._access(), self.lock:
             if not self.in_use:
                 raise RuntimeError("MegaMoe workspace was released without an active lease.")
             self.completion_event.record(torch.npu.current_stream())
@@ -282,7 +302,7 @@ class MegaMoeWorkspace:
 
     def close(self) -> None:
         """Synchronize, release all buffers, and reset the workspace."""
-        with self.lock:
+        with self._access(), self.lock:
             if self.in_use:
                 raise RuntimeError("cannot close MegaMoe workspace during an active call.")
             if self.expert_buffer is None and self.source_buffer is None and self.gmm_workspace is None:

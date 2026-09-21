@@ -14,6 +14,8 @@
 # ============================================================================
 """Unit tests for MegaKernel Host profiling metadata and buffer planning."""
 
+from __future__ import annotations
+
 import struct
 import unittest
 
@@ -50,8 +52,6 @@ from hyper_parallel.core.multicore.scheduler.graph import (
     SplitSpec,
 )
 from hyper_parallel.core.multicore.scheduler.runtime import allocate_runtime_config
-
-from tests.common.mark_utils import arg_mark
 
 
 def _runtime_config(task_capacity: int = 16) -> RuntimeConfigC:
@@ -104,7 +104,8 @@ class TestMegaKernelProfilingMetadata(unittest.TestCase):
         for task_id in range(3):
             runtime_config.all_tasks[task_id].task_index = task_id
 
-        def resolve_owner(_, task_desc, context):
+        def resolve_owner(_: OperatorNode, task_desc: TaskDescC, context: int) -> int:
+            """Resolve each task owner relative to its context."""
             return context + task_desc.task_index
 
         _apply_mega_kernel_profile_graph(
@@ -315,14 +316,8 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         self.assertEqual(layout.buffer_size, 53760)
         self.assertLess(layout.buffer_size, MAX_PROFILE_BUFFER_BYTES)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_layout_preserves_records_above_former_limit(self) -> None:
-        """
-        Feature: profiling
-        Description: Size both core types for the full schedule, including its tail.
-        Expectation: Both core types allocate 272 slots for all 258 required records.
-        """
+        """Keep all 258 records and reject a capacity that overflows the Device ABI."""
         runtime_config = _runtime_config(2048)
         runtime_config.num_workers = 48
         runtime_config.all_tasks[0] = _three_record_task()
@@ -335,15 +330,6 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         self.assertEqual(layout.aic_record_capacity, 272)
         self.assertEqual(layout.aiv_required_records, 258)
         self.assertEqual(layout.aiv_record_capacity, 272)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_record_capacity_rejects_abi_overflow(self) -> None:
-        """
-        Feature: profiling
-        Description: Do not silently truncate a requirement that cannot fit the slot ABI.
-        Expectation: The largest valid capacity succeeds and overflow raises ValueError.
-        """
         self.assertEqual(_round_up_record_capacity(MAX_RECORDS_PER_CORE), MAX_RECORDS_PER_CORE)
         with self.assertRaisesRegex(ValueError, "record limit"):
             _round_up_record_capacity(MAX_RECORDS_PER_CORE + 1)
@@ -354,7 +340,8 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         runtime_config.num_workers = 48
         created_profile_tensors = []
 
-        def profile_tensor_factory(tensor):
+        def profile_tensor_factory(tensor: bytes) -> bytes:
+            """Enable profiling in a copy without changing the normal runtime."""
             enabled = bytearray(tensor)
             struct.pack_into(
                 "<I",

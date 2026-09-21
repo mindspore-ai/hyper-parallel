@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 
 _COMMUNICATION_SPLIT = 128
+_DEFAULT_CAPACITY_FACTOR = 1.25
 
 
 @dataclass(frozen=True)
@@ -37,13 +38,14 @@ class MegaMoeSpec:
     intermediate_size: int
     num_experts: int
     top_k: int
-    expert_capacity_factor: float | None
+    initial_capacity_factor: float | None
     receive_capacity: int
     ep_size: int
     ep_group: Any | None
     rank_id: int
     num_cube_cores: int
     dispatch_mode: str = "push"
+    capacity_growth_factor: float | None = _DEFAULT_CAPACITY_FACTOR
     dispatch_split: int = _COMMUNICATION_SPLIT
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
@@ -59,11 +61,6 @@ class MegaMoeSpec:
         """Return routed rows produced by local Top-K expansion."""
         return self.local_num_tokens * self.top_k
 
-    @property
-    def capacity_is_lossless(self) -> bool:
-        """Return whether capacity covers the worst possible route."""
-        return self.expert_capacity_factor is None
-
 
 def _align_capacity(capacity: int) -> int:
     """Align one receive capacity to the fixed communication split."""
@@ -75,16 +72,43 @@ def _align_capacity(capacity: int) -> int:
 
 
 def _resolve_receive_capacity(
-    expert_capacity_factor: float | None,
+    initial_capacity_factor: float | None,
     routed_slots: int,
     ep_size: int,
 ) -> int:
-    """Resolve lossless or explicitly bounded receive capacity."""
-    if expert_capacity_factor is None:
-        requested = ep_size * routed_slots
-    else:
-        requested = math.ceil(routed_slots * expert_capacity_factor)
+    """Resolve initial receive rows without exceeding the lossless route bound."""
+    factor = 1.0 if initial_capacity_factor is None else initial_capacity_factor
+    requested = math.ceil(min(factor, ep_size) * routed_slots)
     return _align_capacity(requested)
+
+
+def _resolve_capacity_factors(
+    dispatch_mode: str,
+    initial_capacity_factor: float | None,
+    capacity_growth_factor: float | None,
+) -> tuple[float | None, float | None]:
+    """Resolve push defaults and reject capacity knobs for pull before allocation."""
+    if dispatch_mode not in ("push", "pull"):
+        raise ValueError("dispatch_mode must be push or pull")
+    if dispatch_mode == "pull":
+        if initial_capacity_factor is not None or capacity_growth_factor is not None:
+            raise ValueError("initial_capacity_factor and capacity_growth_factor are only supported for push")
+        return None, None
+    factors = {
+        "initial_capacity_factor": (
+            _DEFAULT_CAPACITY_FACTOR if initial_capacity_factor is None else initial_capacity_factor),
+        "capacity_growth_factor": (
+            _DEFAULT_CAPACITY_FACTOR if capacity_growth_factor is None else capacity_growth_factor),
+    }
+    for name, value in factors.items():
+        valid_type = isinstance(value, (int, float)) and not isinstance(value, bool)
+        try:
+            valid = valid_type and math.isfinite(value) and value >= 1.0
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ValueError(f"{name} must be a finite number at least 1.0, got {value!r}")
+    return float(factors["initial_capacity_factor"]), float(factors["capacity_growth_factor"])
 
 
 def bind_mega_moe_spec(
@@ -143,10 +167,10 @@ def bind_mega_moe_spec(
 
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
-    expert_capacity_factor = specification["expert_capacity_factor"]
+    initial_capacity_factor = specification["initial_capacity_factor"]
     swiglu_limit = specification["swiglu_limit"]
     receive_capacity = _resolve_receive_capacity(
-        expert_capacity_factor,
+        initial_capacity_factor,
         local_num_tokens * top_k,
         ep_size,
     )
@@ -156,7 +180,7 @@ def bind_mega_moe_spec(
         intermediate_size=specification["intermediate_size"],
         num_experts=specification["num_experts"],
         top_k=top_k,
-        expert_capacity_factor=expert_capacity_factor,
+        initial_capacity_factor=initial_capacity_factor,
         receive_capacity=receive_capacity,
         ep_size=ep_size,
         ep_group=ep_group,
@@ -164,4 +188,5 @@ def bind_mega_moe_spec(
         num_cube_cores=num_cube_cores,
         dispatch_mode=specification.get("dispatch_mode", "push"),
         swiglu_limit=swiglu_limit,
+        capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),
     )

@@ -35,6 +35,8 @@ class TestRuntimeLifecycle(unittest.TestCase):
             get_rank=Mock(return_value=0),
             barrier=Mock(),
             broadcast_object_list=Mock(),
+            all_gather_object=Mock(
+                side_effect=lambda output, value, **_kw: output.__setitem__(slice(None), [value] * 2)),
         )
         self.torch = SimpleNamespace(npu=SimpleNamespace(synchronize=Mock()))
         self.native = SimpleNamespace(
@@ -42,6 +44,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
             _get_unique_id=Mock(return_value=b"group-bootstrap"),
             _validate_shutdown=Mock(),
             _shutdown=Mock(),
+            _debug_state=Mock(return_value={"config": {"heap_size_bytes": 128}}),
         )
         self.framework_patch = patch.object(_lifecycle, "_torch_modules", return_value=(self.torch, self.dist))
         self.native_patch = patch.object(_lifecycle, "_load_native", return_value=self.native)
@@ -120,67 +123,30 @@ class TestRuntimeLifecycle(unittest.TestCase):
         _lifecycle.release()
 
     def test_subgroup_uses_local_coordinates_and_isolated_bootstrap(self) -> None:
-        """Initialize and close a noncontiguous EP group without WORLD collectives."""
+        """Keep root/peer bootstrap group-local and propagate root failure without a reference."""
         group = object()
         self.dist.get_process_group_ranks.return_value = [2, 5]
         self.dist.get_world_size.return_value = 8
-
-        _lifecycle.acquire(group)
-        _lifecycle._host_barrier()  # pylint: disable=protected-access
-        _lifecycle.release()
-
-        self.native._get_unique_id.assert_called_once_with()
-        self.dist.broadcast_object_list.assert_called_once_with(
-            [b"group-bootstrap", None], src=2, group=group
-        )
-        self.native._initialize.assert_called_once_with(0, 2, b"group-bootstrap")
-        self.assertEqual(self.dist.barrier.call_args_list, [call(group=group)] * 3)
-
-    def test_subgroup_peer_receives_root_unique_id(self) -> None:
-        """Do not generate a second unique ID on a non-root EP member."""
-        group = object()
-        self.dist.get_process_group_ranks.return_value = [1, 3]
-        self.dist.get_world_size.return_value = 4
-        self.dist.get_rank.return_value = 1
-
-        def broadcast(payload: list, **_kwargs: object) -> None:
-            payload[:] = [b"peer-bootstrap", None]
-
-        self.dist.broadcast_object_list.side_effect = broadcast
-        _lifecycle.acquire(group)
-        self.native._get_unique_id.assert_not_called()
-        self.native._initialize.assert_called_once_with(1, 2, b"peer-bootstrap")
-        _lifecycle.release()
-
-    def test_subgroup_bootstrap_failure_does_not_acquire_reference(self) -> None:
-        """Publish root failure to the group before rejecting initialization."""
-        group = object()
-        self.dist.get_process_group_ranks.return_value = [2, 5]
-        self.dist.get_world_size.return_value = 8
-        self.native._get_unique_id.side_effect = RuntimeError("UID unavailable")
-
-        with self.assertRaisesRegex(RuntimeError, "UID unavailable"):
-            _lifecycle.acquire(group)
-
-        self.dist.broadcast_object_list.assert_called_once()
-        self.native._initialize.assert_not_called()
-        self.assertEqual(_lifecycle._reference_count(), 0)  # pylint: disable=protected-access
-
-    def test_subgroup_equivalent_membership_reuses_bootstrap(self) -> None:
-        """Share resources across equivalent local EP handles, but not another EP domain."""
-        group, equivalent, different = object(), object(), object()
-        self.dist.get_world_size.return_value = 8
-        self.dist.get_process_group_ranks.side_effect = lambda selected: (
-            [2, 5] if selected is not different else [2, 6]
-        )
-        _lifecycle.acquire(group)
-        _lifecycle.acquire(equivalent)
-        with self.assertRaisesRegex(RuntimeError, "different ordered membership"):
-            _lifecycle.acquire(different)
-        self.native._get_unique_id.assert_called_once()
-        self.assertEqual(_lifecycle._reference_count(), 2)  # pylint: disable=protected-access
-        _lifecycle.release()
-        _lifecycle.release()
+        for rank, failure in ((0, None), (1, None), (0, RuntimeError("UID unavailable"))):
+            self.dist.get_rank.return_value = rank
+            self.native._get_unique_id.side_effect = failure
+            self.native._initialize.reset_mock()
+            self.dist.broadcast_object_list.side_effect = (
+                lambda payload, **_kw: payload.__setitem__(0, b"group-bootstrap") if rank else None)
+            if failure:
+                with self.assertRaisesRegex(RuntimeError, "UID unavailable"):
+                    _lifecycle.acquire(group)
+                self.native._initialize.assert_not_called()
+            else:
+                _lifecycle.acquire(group)
+                self.native._initialize.assert_called_once_with(rank, 2, b"group-bootstrap")
+                _lifecycle._host_barrier()  # pylint: disable=protected-access
+                _lifecycle.release()
+                self.dist.barrier.assert_called_with(group=group)
+            self.assertEqual(_lifecycle._reference_count(), 0)  # pylint: disable=protected-access
+            payload = [None, f"RuntimeError: {failure}"] if failure else [b"group-bootstrap", None]
+            self.dist.broadcast_object_list.assert_called_with(
+                payload, src=2, group=group)
 
     def test_nonmember_is_rejected_before_any_collective(self) -> None:
         """Reject nonmembers locally instead of entering a foreign EP collective."""
@@ -307,6 +273,47 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertTrue(_lifecycle._shutdown_failed)  # pylint: disable=protected-access
         with self.assertRaisesRegex(RuntimeError, "Native shutdown failure"):
             _lifecycle.acquire()
+
+    def test_explicit_heap_and_collective_reinitialize(self) -> None:
+        """Keep references and obtain a fresh bootstrap ID only after finalization."""
+        for invalid in (True, 0, -1, 1.5):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _lifecycle.acquire(heap_size_bytes=invalid)
+        _lifecycle.acquire(heap_size_bytes=64)
+        self.native._initialize.assert_called_once_with(0, 2, b"group-bootstrap", 64)
+        _lifecycle.acquire(heap_size_bytes=128)
+        with self.assertRaisesRegex(RuntimeError, "smaller"):
+            _lifecycle.acquire(heap_size_bytes=256)
+        ordered = Mock()
+        for name in ("_validate_shutdown", "_shutdown", "_get_unique_id", "_initialize"):
+            ordered.attach_mock(getattr(self.native, name), name)
+        self.native._get_unique_id.return_value = b"fresh-bootstrap"
+        timings = _lifecycle._reinitialize(256)
+        self.assertEqual(ordered.mock_calls, [call._validate_shutdown(), call._shutdown(),
+                                            call._get_unique_id(), call._initialize(0, 2, b"fresh-bootstrap", 256)])
+        self.assertEqual(set(timings), {"finalize_ms", "bootstrap_ms", "initialize_ms"})
+        self.assertEqual(_lifecycle._reference_count(), 2)
+        self.assertIs(_lifecycle._root_group, self.world)
+        _lifecycle.release()
+        _lifecycle.release()
+
+    def test_reinitialize_converges_peer_failure_before_next_stage(self) -> None:
+        """Stop before bootstrap on a peer finalize failure and poison all later API use."""
+        _lifecycle.acquire()
+        self.dist.all_gather_object.side_effect = (
+            lambda output, value, **_kw: output.__setitem__(slice(None),
+                                                          [value, "peer finalize failed"]
+                                                          if self.native._shutdown.called else [value] * 2))
+        with self.assertRaisesRegex(RuntimeError, "peer finalize failed"):
+            _lifecycle._reinitialize(256)
+        self.native._get_unique_id.assert_not_called()
+        self.assertEqual(self.native._initialize.call_count, 1)
+        self.assertEqual(_lifecycle._reference_count(), 1)
+        self.assertTrue(_lifecycle._shutdown_failed)
+        for operation in (_lifecycle.acquire, _lifecycle.release,
+                          _lifecycle._runtime_access(Mock())):
+            with self.assertRaises(RuntimeError):
+                operation()
 
     def test_release_without_reference_is_rejected(self) -> None:
         """Expose an unmatched release instead of silently underflowing the user count."""

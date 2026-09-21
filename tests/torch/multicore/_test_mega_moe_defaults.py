@@ -75,7 +75,7 @@ def _validate_pair(shape: baseline.MoeShape, factor: float | None, scope: str) -
     """Compare real output, every gradient and one update at the measured shape."""
     start_shmem_lifetime()
     os.environ.pop("HYPER_PARALLEL_SHMEM_HEAP_SIZE", None)
-    mega, common = baseline.new_layers(shape, expert_capacity_factor=factor)
+    mega, common = baseline.new_layers(shape, initial_capacity_factor=factor)
     try:
         if scope == "router_experts":
             reference = _run_router_layer(common, shape)
@@ -98,7 +98,7 @@ def _measurement_layer(shape: baseline.MoeShape, backend: str, factor: float | N
     if backend == "common":
         return baseline.new_common_moe(shape)
     start_shmem_lifetime()
-    mega, common = baseline.new_layers(shape, expert_capacity_factor=factor)
+    mega, common = baseline.new_layers(shape, initial_capacity_factor=factor)
     del common
     gc.collect()
     torch.npu.empty_cache()
@@ -178,7 +178,7 @@ def _measure_backend(
 
 
 def test_mega_moe_default_capacity_acceptance() -> None:
-    """Record same-shape default/bounded A/B and Router-inclusive F/F+B costs."""
+    """Record same-shape initial-factor A/B and Router-inclusive F/F+B costs."""
     shape = baseline.performance_shape()
     comparisons = []
     for factor in (None, 1.5):

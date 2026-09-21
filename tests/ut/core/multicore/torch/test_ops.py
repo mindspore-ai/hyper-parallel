@@ -23,8 +23,6 @@ from unittest.mock import patch
 from hyper_parallel.core.multicore._loader import NativeComponentUnavailableError
 from hyper_parallel.core.multicore.torch import ops
 
-from tests.common.mark_utils import arg_mark
-
 
 class TestTorchOps(unittest.TestCase):
     """Native initialization is cached, but Torch itself is imported normally."""
@@ -52,57 +50,23 @@ class TestTorchOps(unittest.TestCase):
         ):
             ops._load_native()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
-              essential_mark="essential")
     def test_successful_registration_is_cached(self):
-        """Feature: successful registration is cached.
-
-        Description: Call native registration twice with a compatible mocked adapter.
-        Expectation: Load the adapter only once across repeated operation calls.
-        """
+        """Load the adapter only once across repeated operation calls."""
         with (
             patch.object(ops, "get_multicore_paths", return_value=(Path("vendor"), Path("good.so"))),
             patch.object(ops, "preload_vendor_library") as preload,
             patch.object(ops.torch.ops, "load_library") as load,
-            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_transport_version", return_value=1, create=True),
-            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_grad", self._backward_op(), create=True),
+            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_transport_version",
+                         return_value=1, create=True) as version,
+            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_grad", self._backward_op(), create=True) as backward,
         ):
             ops._load_native()
             ops._load_native()
-        preload.assert_called_once_with(Path("vendor"))
-        load.assert_called_once_with("good.so")
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
-              essential_mark="essential")
-    def test_adapter_rejects_stale_backward_alias_schema(self) -> None:
-        """Feature: adapter rejects stale backward alias schema.
-
-        Description: Load a mocked adapter with disjoint receive and gradient alias sets.
-        Expectation: Reject adapters with disjoint dY/dX alias sets before sharing receive storage.
-        """
-        with (
-            patch.object(ops, "get_multicore_paths", return_value=(Path("vendor"), Path("old.so"))),
-            patch.object(ops, "preload_vendor_library"),
-            patch.object(ops.torch.ops, "load_library"),
-            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_transport_version", return_value=1, create=True),
-            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_grad", self._backward_op("e"), create=True),
-            self.assertRaisesRegex(NativeComponentUnavailableError, "backward dispatch storage reuse"),
-        ):
-            ops._load_native()
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
-              essential_mark="essential")
-    def test_adapter_rejects_incompatible_transport_protocol(self) -> None:
-        """Feature: adapter rejects incompatible transport protocol.
-
-        Description: Load a mocked adapter with an older transport version.
-        Expectation: Reject a native payload whose header interpretation differs before any launch.
-        """
-        with (
-            patch.object(ops, "get_multicore_paths", return_value=(Path("vendor"), Path("old.so"))),
-            patch.object(ops, "preload_vendor_library"),
-            patch.object(ops.torch.ops, "load_library"),
-            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_transport_version", return_value=0, create=True),
-            self.assertRaisesRegex(NativeComponentUnavailableError, "transport ABI mismatch"),
-        ):
-            ops._load_native()
+            preload.assert_called_once_with(Path("vendor"))
+            load.assert_called_once_with("good.so")
+            for protocol, alias, message in ((0, "a", "transport ABI"), (1, "e", "storage reuse")):
+                ops._load_native.cache_clear()
+                version.return_value = protocol
+                backward.default._schema = self._backward_op(alias).default._schema
+                with self.assertRaisesRegex(NativeComponentUnavailableError, message):
+                    ops._load_native()
