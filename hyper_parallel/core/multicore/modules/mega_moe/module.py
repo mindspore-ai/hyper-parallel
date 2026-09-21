@@ -133,6 +133,7 @@ class MegaMoeExperts(MulticoreModule):
         swiglu_limit: float | None = None,
         ep_size: int = 1,
         ep_group: Any | None = None,
+        create_parameters: bool = True,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -154,6 +155,7 @@ class MegaMoeExperts(MulticoreModule):
                 to cover the complete Torch distributed world.
             ep_group: Torch expert-parallel process group with the same rank
                 ordering as the complete distributed world.
+            create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
         """
         self._validate_topology(
             local_num_tokens=local_num_tokens,
@@ -206,11 +208,13 @@ class MegaMoeExperts(MulticoreModule):
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
         self._ep_group = ep_group
-        self.gate_up_weight, self.down_weight = _create_mega_moe_parameters(
-            self.local_experts,
-            hidden_size,
-            intermediate_size,
-        )
+        if create_parameters:
+            self.gate_up_weight, self.down_weight = _create_mega_moe_parameters(
+                self.local_experts, hidden_size, intermediate_size,
+            )
+        else:
+            self.register_parameter("gate_up_weight", None)
+            self.register_parameter("down_weight", None)
 
     @staticmethod
     def _validate_topology(
@@ -273,12 +277,13 @@ class MegaMoeExperts(MulticoreModule):
                 f"got {expert_capacity_factor!r}."
             )
 
-    def _validate_tensors(self, hidden_states: torch.Tensor) -> None:
+    def _validate_tensors(self, hidden_states: torch.Tensor, expert_weights: tuple) -> None:
         """Validate activation and parameter metadata before acquiring resources."""
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_npu:
             raise TypeError("MegaMoeExperts requires BF16 NPU hidden states.")
-        weight1 = self.gate_up_weight
-        weight2 = self.down_weight
+        weight1, weight2 = expert_weights
+        if weight1 is None or weight2 is None:
+            raise ValueError("Parameterless MegaMoe requires explicit expert_weights")
         expected_weight1 = (
             self.local_experts,
             self.hidden_size,
@@ -313,6 +318,7 @@ class MegaMoeExperts(MulticoreModule):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         tokens_per_expert: torch.Tensor | None,
+        expert_weights: tuple,
     ) -> torch.Tensor:
         """Validate input shapes and return flattened local token states."""
         if hidden_states.ndim < 2 or hidden_states.shape[-1] != self.hidden_size:
@@ -343,7 +349,7 @@ class MegaMoeExperts(MulticoreModule):
                 f"tokens_per_expert must have shape ({self.num_experts},), "
                 f"got {tuple(tokens_per_expert.shape)}."
             )
-        self._validate_tensors(hidden_flat)
+        self._validate_tensors(hidden_flat, expert_weights)
         return hidden_flat
 
     def forward(
@@ -353,6 +359,7 @@ class MegaMoeExperts(MulticoreModule):
         topk_weights: torch.Tensor,
         *,
         tokens_per_expert: torch.Tensor | None = None,
+        expert_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Route token states through the configured experts.
 
@@ -360,6 +367,7 @@ class MegaMoeExperts(MulticoreModule):
             hidden_states: Tensor ending in ``hidden_size``.
             topk_ids: Global expert IDs shaped ``[local_num_tokens, top_k]``.
             topk_weights: Router weights with the same shape as ``topk_ids``.
+            expert_weights: Current unsharded weights owned by an outer module; never cached by this executor.
             tokens_per_expert: Optional trusted exact global-expert histogram.
                 Supplying Router-produced counts skips histogram recomputation.
 
@@ -371,11 +379,13 @@ class MegaMoeExperts(MulticoreModule):
             The steady-state path validates metadata but deliberately does not
             rebuild and compare the histogram.
         """
+        weights = ((self.gate_up_weight, self.down_weight) if expert_weights is None else expert_weights)
         hidden_flat = self._validate_forward_inputs(
             hidden_states,
             topk_ids,
             topk_weights,
             tokens_per_expert,
+            weights,
         )
         resources = self._get_execution_resources(hidden_flat)
         # The expert autograd bridge consumes permutation gradients before the
@@ -392,8 +402,8 @@ class MegaMoeExperts(MulticoreModule):
         expert_output = execute_mega_moe_with_permutation(
             hidden_flat,
             topk_ids,
-            self.gate_up_weight,
-            self.down_weight,
+            weights[0],
+            weights[1],
             route,
             resources.plan,
             resources.workspace,
