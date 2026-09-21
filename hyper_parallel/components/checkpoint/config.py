@@ -27,10 +27,10 @@ class CheckpointingConfig:
 
     Following design doc 04_checkpoint.md.
 
-    ``model_save_format``, ``save_consolidated``, ``staging_dir`` and
-    ``best_metric_key`` are declared by the design doc but not yet consumed by
-    :class:`~hyper_parallel.trainer.callbacks.checkpoint_callback.CheckpointerCallback`;
-    they are reserved for the consolidated HuggingFace-format export.
+    ``save_hf_weights`` additionally exports a Transformers-compatible model
+    under the current global-step directory. The remaining consolidated-export
+    fields are declared by the design doc but are not yet consumed by
+    :class:`~hyper_parallel.trainer.callbacks.checkpoint_callback.CheckpointerCallback`.
     """
 
     # Master switch for the *write* path only. Restoring is governed solely by
@@ -45,6 +45,7 @@ class CheckpointingConfig:
     is_peft: bool = False  # persist trainable (adapter) weights only
     save_optimizer: bool = True
     save_train_state: bool = True
+    save_hf_weights: bool = False
     # Where the per-step training state (step/epoch, lr_scheduler, dataloader
     # position, RNG) is written:
     #   True  --- one torch.save file per rank under ``extra_state/``. Always

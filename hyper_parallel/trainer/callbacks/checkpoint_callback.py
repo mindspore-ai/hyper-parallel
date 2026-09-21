@@ -30,6 +30,7 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     MixedPrecisionOptimizer,
 )
+from hyper_parallel.models._transformers import CheckpointManager
 from hyper_parallel.core.distributed_checkpoint.utils import flatten_state_dict
 from hyper_parallel.models._transformers.model_builder import (
     validate_model_init_dtype,
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
 
 
 logger = create_logger(__name__)
+_HF_CHECKPOINT_DIR = "hf_ckpt"
 
 
 def _as_list(value: Any) -> List[Any]:
@@ -85,10 +87,10 @@ class CheckpointerCallback(Callback):
     LR scheduler, the dataloader position, and the CPU / device / Python RNG
     states.
 
-    Saving and restoring are independent: ``save_ckpt`` gates the write path,
-    ``restore_from`` the read path. Turning saving off while pointing at a
-    checkpoint is therefore a supported combination --- start from these weights
-    and write nothing further.
+    DCP saving, Hugging Face export, and restoring are independently controlled
+    by ``save_ckpt``, ``save_hf_weights``, and ``restore_from``. This permits a
+    restore-only run as well as exporting Hugging Face weights from an existing
+    DCP checkpoint without writing another DCP checkpoint.
 
     Restore runs in :meth:`on_train_begin`, i.e. after the model, optimizer,
     scheduler and dataloader exist but before the first training step.
@@ -110,7 +112,13 @@ class CheckpointerCallback(Callback):
         self._is_peft = ckpt_cfg.is_peft
         self._save_optimizer = ckpt_cfg.save_optimizer
         self._save_train_state = ckpt_cfg.save_train_state
+        self._save_hf_weights = ckpt_cfg.save_hf_weights
         self._save_extra_state_per_rank = ckpt_cfg.save_extra_state_per_rank
+
+        if self._save_hf_weights and self._is_peft:
+            raise ValueError(
+                "checkpoint.save_hf_weights does not yet support PEFT checkpoints"
+            )
 
         self._restore_from = ckpt_cfg.restore_from
         self._restore_optimizer = ckpt_cfg.restore_optimizer
@@ -129,8 +137,12 @@ class CheckpointerCallback(Callback):
                 raise ValueError("Host PP checkpoint requires per-rank extra state")
 
         self._last_saved_step: int = -1
+        self._last_hf_saved_step: int = -1
         self.checkpointer = build_checkpointer(
             extra_state_per_rank=self._save_extra_state_per_rank,
+        )
+        self._hf_checkpoint_manager = (
+            CheckpointManager(trainer.model) if self._save_hf_weights else None
         )
 
     # ------------------------------------------------------------------
@@ -145,11 +157,13 @@ class CheckpointerCallback(Callback):
         """
         logger.info(
             "Checkpoint configuration: "
-            "checkpoint_dir=%s, save_ckpt=%s, save_steps=%s, save_epochs=%s, "
+            "checkpoint_dir=%s, save_ckpt=%s, save_hf_weights=%s, "
+            "save_steps=%s, save_epochs=%s, "
             "is_async=%s, is_peft=%s, "
             "save_extra_state_per_rank=%s, restore_from=%s",
             self._checkpoint_dir,
             self._save_ckpt,
+            self._save_hf_weights,
             self._save_steps,
             self._save_epochs,
             self._is_async,
@@ -209,6 +223,15 @@ class CheckpointerCallback(Callback):
             # synchronously regardless of ``is_async``.
             self._save_checkpoint(state, force_sync=True)
         self.wait_for_pending_save()
+        if (
+            self._save_hf_weights
+            and state.global_step > 0
+            and state.global_step != self._last_hf_saved_step
+        ):
+            save_dir = os.path.join(
+                self._checkpoint_dir, f"{STEP_PREFIX}{state.global_step}"
+            )
+            self._save_hf_checkpoint(save_dir, state.global_step)
 
     def wait_for_pending_save(self) -> None:
         """Block until the checkpointer's in-flight async save is persisted."""
@@ -342,6 +365,53 @@ class CheckpointerCallback(Callback):
         # mode: otherwise on_epoch_end would queue the same step again while the
         # first save is still in flight.
         self._last_saved_step = state.global_step
+        if self._save_hf_weights:
+            # The full-weight gather is memory-intensive, so never overlap it
+            # with an asynchronous DCP persistence job.
+            self.wait_for_pending_save()
+            self._save_hf_checkpoint(save_dir, state.global_step)
+
+    def _save_hf_checkpoint(self, save_dir: str, global_step: int) -> None:
+        """Collect and export one Transformers-compatible model checkpoint."""
+        if self._hf_checkpoint_manager is None:
+            raise RuntimeError("Hugging Face checkpoint manager is not initialized")
+
+        hf_dir = os.path.join(save_dir, _HF_CHECKPOINT_DIR)
+        logger.info(
+            "Saving Hugging Face weights: global_step=%s, dir=%s",
+            global_step,
+            hf_dir,
+        )
+
+        write_assets = self._hf_checkpoint_manager.save_pretrained(hf_dir)
+        if write_assets:
+            self._save_hf_assets(hf_dir)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        self._last_hf_saved_step = global_step
+        if write_assets:
+            logger.info(
+                "Hugging Face checkpoint saved successfully: global_step=%s, dir=%s",
+                global_step,
+                hf_dir,
+            )
+
+    def _save_hf_assets(self, hf_dir: str) -> None:
+        """Write the tokenizer or processor assets next to exported weights."""
+        processor = getattr(self.trainer, "processor", None)
+        if processor is not None:
+            processor.save_pretrained(hf_dir)
+            return
+
+        chat_template = getattr(self.trainer, "chat_template", None)
+        if chat_template is not None:
+            chat_template.save_pretrained(hf_dir)
+            return
+
+        tokenizer = getattr(self.trainer, "tokenizer", None)
+        if tokenizer is not None:
+            tokenizer.save_pretrained(hf_dir)
 
     # ------------------------------------------------------------------
     # Load / restore
