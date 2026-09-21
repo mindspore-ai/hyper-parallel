@@ -415,6 +415,9 @@ class _IndexReader:
             self.document_count = struct.unpack("<Q", f.read(8))[0]
             payload_offset = f.tell()
 
+        if self.document_count == 0:
+            raise ValueError(f"Indexed Dataset must contain an initial document boundary: {idx_path}")
+
         # memory-map the whole file for fast zero-copy slicing
         self._mmap = numpy.memmap(idx_path, mode="r", order="C")
         self._buffer = memoryview(self._mmap)
@@ -452,13 +455,23 @@ class _IndexReader:
                 + self.document_indices.nbytes,
             ).copy()
 
+        expected_pointers = numpy.cumsum(self.sequence_lengths, dtype=numpy.int64)
+        expected_pointers -= self.sequence_lengths.astype(numpy.int64)
+        expected_pointers *= self.dtype_size
+        if not numpy.array_equal(self.sequence_pointers, expected_pointers):
+            raise ValueError("Sequence pointers do not match sequence lengths")
+
         sequence_length_count = self.sequence_lengths.shape[0]
         if sequence_length_count != len(self):
             raise ValueError("Sequence length count does not match the dataset length")
         if sequence_length_count != self.sequence_count:
             raise ValueError("Sequence length count does not match the index sequence count")
-        if sequence_length_count != self.document_indices[-1]:
-            raise ValueError("Sequence length count does not match the final document index")
+        if (
+            self.document_indices[0] != 0
+            or sequence_length_count != self.document_indices[-1]
+            or numpy.any(numpy.diff(self.document_indices) < 0)
+        ):
+            raise ValueError("Document boundaries are not monotonic or do not match the sequence count")
 
         logger.info("Sequences: %d | Documents: %d", len(self), self.document_indices.shape[0] - 1)
 
