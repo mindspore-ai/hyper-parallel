@@ -46,6 +46,8 @@ _CUSTOM_OP_SOURCES = [
     os.path.join(_CC_DIR, "sparse_flash_mla.cc"),
     os.path.join(_CC_DIR, "sparse_flash_mla_grad.cc"),
     os.path.join(_CC_DIR, "sparse_lightning_indexer_kl_loss_grad.cc"),
+    os.path.join(_CC_DIR, "chunk_kda_fwd.cc"),
+    os.path.join(_CC_DIR, "chunk_kda_bwd.cc"),
 ]
 
 
@@ -64,7 +66,7 @@ except ImportError:
     _custom_ops = _build_custom_ops()
 else:
     # Rebuild stale source-tree extensions that predate newly added symbols.
-    if not hasattr(_custom_ops, "npu_mhc_pre_clamp_sinkhorn"):
+    if not hasattr(_custom_ops, "npu_mhc_pre_clamp_sinkhorn") or not hasattr(_custom_ops, "npu_chunk_kda_bwd"):
         _custom_ops = _build_custom_ops()
 
 
@@ -762,3 +764,316 @@ class NpuSparseLightningIndexerKlLossGradDFunction(DFunction):  # pylint: disabl
         # cmp_residual_k, layout, mask_mode, cmp_ratio.
         return (d_query, d_key, d_weights,
                 None, None, None, None, None, None, None, None, None, None)
+
+
+def _canonical_chunk_indices(cu_seqlens, chunk_size):
+    """Build flattened ``(sequence, local_chunk)`` metadata."""
+    if cu_seqlens is None:
+        return None
+    indices = []
+    for sequence, (begin, end) in enumerate(zip(cu_seqlens, cu_seqlens[1:])):
+        for chunk in range((int(end) - int(begin) + chunk_size - 1) // chunk_size):
+            indices.extend((sequence, chunk))
+    return indices
+
+
+def _canonicalize_chunk_kda_inputs(q, k, v, g, beta, layout):
+    """Convert public inputs to dense BNSD or packed NTD."""
+    if layout in ("BNSD", "NTD"):
+        return q, k, v, g, beta
+    if layout == "BSND":
+        return (
+            ms.ops.transpose(q, (0, 2, 1, 3)).contiguous(),
+            ms.ops.transpose(k, (0, 2, 1, 3)).contiguous(),
+            ms.ops.transpose(v, (0, 2, 1, 3)).contiguous(),
+            ms.ops.transpose(g, (0, 2, 1, 3)).contiguous(),
+            ms.ops.transpose(beta, (0, 2, 1)).contiguous(),
+        )
+    if layout == "TND":
+        return (
+            ms.ops.transpose(q, (1, 0, 2)).contiguous(),
+            ms.ops.transpose(k, (1, 0, 2)).contiguous(),
+            ms.ops.transpose(v, (1, 0, 2)).contiguous(),
+            ms.ops.transpose(g, (1, 0, 2)).contiguous(),
+            ms.ops.transpose(beta, (1, 0)).contiguous(),
+        )
+    raise ValueError("Chunk KDA layout must be BSND, BNSD, TND, or NTD.")
+
+
+def _restore_chunk_kda_gradients(dq, dk, dv, dg, db, layout):
+    """Restore gradients from canonical layout to the public input layout."""
+    if layout == "BSND":
+        return (
+            ms.ops.transpose(dq, (0, 2, 1, 3)).contiguous(),
+            ms.ops.transpose(dk, (0, 2, 1, 3)).contiguous(),
+            ms.ops.transpose(dv, (0, 2, 1, 3)).contiguous(),
+            ms.ops.transpose(dg, (0, 2, 1, 3)).contiguous(),
+            ms.ops.transpose(db, (0, 2, 1)).contiguous(),
+        )
+    if layout == "TND":
+        return (
+            ms.ops.transpose(dq, (1, 0, 2)).contiguous(),
+            ms.ops.transpose(dk, (1, 0, 2)).contiguous(),
+            ms.ops.transpose(dv, (1, 0, 2)).contiguous(),
+            ms.ops.transpose(dg, (1, 0, 2)).contiguous(),
+            ms.ops.transpose(db, (1, 0)).contiguous(),
+        )
+    return dq, dk, dv, dg, db
+
+
+def _validate_chunk_kda_fwd_options(chunk_size, output_final_state, safe_gate,
+                                    lower_bound, use_gate_in_kernel, a_log,
+                                    dt_bias, state_v_first):
+    """Validate forward attributes independent of tensor layout."""
+    if chunk_size not in (64, 128):
+        raise ValueError("Chunk KDA forward supports chunk_size=64 or 128.")
+    if output_final_state not in (True, False):
+        raise ValueError("output_final_state must be a bool.")
+    if state_v_first not in (True, False):
+        raise ValueError("state_v_first must be a bool.")
+    if use_gate_in_kernel and a_log is None:
+        raise ValueError("a_log is required when use_gate_in_kernel=True.")
+    if not use_gate_in_kernel and (a_log is not None or dt_bias is not None):
+        raise ValueError("a_log and dt_bias require use_gate_in_kernel=True.")
+    if safe_gate and use_gate_in_kernel and not -5.0 <= lower_bound < 0.0:
+        raise ValueError("lower_bound must be in [-5, 0) when safe_gate=True.")
+
+
+def _validate_chunk_kda_fwd_layout(q, layout, cu_seqlens, chunk_indices, chunk_size):
+    """Validate layout metadata and return canonical chunk indices."""
+    if layout not in ("BSND", "BNSD", "TND", "NTD"):
+        raise ValueError("Chunk KDA layout must be BSND, BNSD, TND, or NTD.")
+    rank = len(q.shape)
+    is_packed = layout in ("TND", "NTD")
+    if is_packed and (rank != 3 or cu_seqlens is None):
+        raise ValueError("TND/NTD require rank-3 inputs and cu_seqlens.")
+    if not is_packed and rank != 4:
+        raise ValueError("BSND/BNSD require rank-4 inputs.")
+    if not is_packed and cu_seqlens is not None and q.shape[0] != 1:
+        raise ValueError("Rank-4 variable-length Chunk KDA requires B=1.")
+    if cu_seqlens is not None and chunk_indices is None:
+        chunk_indices = _canonical_chunk_indices(cu_seqlens, chunk_size)
+    if (cu_seqlens is None) != (chunk_indices is None):
+        raise ValueError("cu_seqlens and chunk_indices must be supplied together.")
+    return chunk_indices
+
+
+def _validate_chunk_kda_fwd(q, chunk_size, layout, output_final_state,
+                            safe_gate, lower_bound, use_gate_in_kernel,
+                            a_log, dt_bias, cu_seqlens, chunk_indices,
+                            state_v_first):
+    """Validate the full forward-only capability exposed by FLA-NPU."""
+    _validate_chunk_kda_fwd_options(
+        chunk_size, output_final_state, safe_gate, lower_bound,
+        use_gate_in_kernel, a_log, dt_bias, state_v_first
+    )
+    return _validate_chunk_kda_fwd_layout(q, layout, cu_seqlens, chunk_indices, chunk_size)
+
+
+def _validate_chunk_kda_autograd(q, v, chunk_size, layout, cu_seqlens,
+                                 initial_state, disable_recompute,
+                                 state_v_first):
+    """Validate the narrower capability supported by fused backward."""
+    if initial_state is not None:
+        raise ValueError("initial_state is not supported until backward provides dht/dh0 semantics.")
+    if not disable_recompute:
+        raise ValueError("disable_recompute=False is not supported by the fused backward kernel.")
+    if state_v_first:
+        raise ValueError("state_v_first=True is not supported by the fused backward kernel.")
+    if chunk_size != 64:
+        raise ValueError("Differentiable Chunk KDA currently supports only chunk_size=64.")
+    if q.shape[-1] != 128 or v.shape[-1] != 128:
+        raise ValueError("Differentiable Chunk KDA currently requires K=V=128.")
+    if layout in ("BSND", "BNSD") and cu_seqlens is not None:
+        raise ValueError("Differentiable Chunk KDA does not support rank-4 variable-length inputs.")
+
+
+def _run_chunk_kda_fwd(q, k, v, g, beta, scale, chunk_size, layout,
+                       output_final_state, safe_gate, lower_bound,
+                       use_gate_in_kernel, a_log, dt_bias, cu_seqlens,
+                       chunk_indices, initial_state=None,
+                       state_v_first=False):
+    """Run the shared Chunk KDA forward implementation."""
+    chunk_indices = _validate_chunk_kda_fwd(
+        q, chunk_size, layout, output_final_state, safe_gate, lower_bound,
+        use_gate_in_kernel, a_log, dt_bias, cu_seqlens, chunk_indices,
+        state_v_first
+    )
+    q_head, k_head, v_head, g_head, beta_head = _canonicalize_chunk_kda_inputs(
+        q, k, v, g, beta, layout
+    )
+    canonical_layout = "NTD" if len(q_head.shape) == 3 else "BNSD"
+    result = _custom_ops.npu_chunk_kda_fwd(
+        q_head, k_head, v_head, g_head, beta_head, scale, chunk_size,
+        canonical_layout, True, safe_gate, lower_bound,
+        use_gate_in_kernel, a_log, dt_bias, initial_state, cu_seqlens,
+        chunk_indices, state_v_first
+    )
+    canonical_inputs = (q_head, k_head, v_head, g_head, beta_head)
+    return result, canonical_inputs, chunk_indices
+
+
+def _run_chunk_kda_bwd(q, k, v, beta, gk, aqk, akk, w, qg, kg, v_new, h,
+                       d_o, scale, chunk_size, layout="BNSD", raw_g=None,
+                       a_log=None, dt_bias=None, cu_seqlens=None,
+                       chunk_indices=None, safe_gate=False,
+                       use_gate_in_kernel=False, lower_bound=-5.0):
+    """Run backward after canonicalizing layout and adapting GQA heads."""
+    zero_gate = ms.ops.zeros_like(gk)
+    q, k, v, raw_head, beta = _canonicalize_chunk_kda_inputs(
+        q, k, v, raw_g if raw_g is not None else zero_gate, beta, layout
+    )
+    canonical_layout = "NTD" if len(q.shape) == 3 else "BNSD"
+    if layout == "BSND":
+        d_o = ms.ops.transpose(d_o, (0, 2, 1, 3)).contiguous()
+    elif layout == "TND":
+        d_o = ms.ops.transpose(d_o, (1, 0, 2)).contiguous()
+    head_axis = 0 if canonical_layout == "NTD" else 1
+    heads = q.shape[head_axis]
+    value_heads = v.shape[head_axis]
+    if value_heads < heads or value_heads % heads != 0:
+        raise ValueError("Chunk KDA requires HV >= H and HV % H == 0.")
+    ratio = value_heads // heads
+    q_kernel = q if ratio == 1 else ms.ops.repeat_interleave(q, ratio, axis=head_axis).contiguous()
+    k_kernel = k if ratio == 1 else ms.ops.repeat_interleave(k, ratio, axis=head_axis).contiguous()
+    bias_head = None if dt_bias is None else dt_bias.reshape((value_heads, 128))
+    outputs = _custom_ops.npu_chunk_kda_bwd(
+        q_kernel, k_kernel, v, beta, gk, aqk, akk, w, qg, kg, v_new, h,
+        d_o, raw_head if use_gate_in_kernel else None,
+        a_log if use_gate_in_kernel else None, bias_head,
+        cu_seqlens, chunk_indices, scale, chunk_size, safe_gate,
+        use_gate_in_kernel, lower_bound, canonical_layout
+    )
+    dq, dk, dv, db, dg, d_a, d_bias = outputs
+    if ratio != 1:
+        if canonical_layout == "BNSD":
+            batch, _, tokens, dim = dq.shape
+            dq = dq.reshape((batch, heads, ratio, tokens, dim)).sum(axis=2)
+            dk = dk.reshape((batch, heads, ratio, tokens, dim)).sum(axis=2)
+        else:
+            _, tokens, dim = dq.shape
+            dq = dq.reshape((heads, ratio, tokens, dim)).sum(axis=1)
+            dk = dk.reshape((heads, ratio, tokens, dim)).sum(axis=1)
+    dq, dk, dv, dg, db = _restore_chunk_kda_gradients(dq, dk, dv, dg, db, layout)
+    if dt_bias is not None:
+        d_bias = d_bias.reshape(dt_bias.shape)
+    return dq, dk, dv, db, dg, d_a, d_bias
+
+
+class NpuChunkKdaDFunction(DFunction):
+    """Differentiable Chunk KDA wrapper for dense and packed layouts."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, g, beta, scale, chunk_size, layout,
+                output_final_state, safe_gate, lower_bound,
+                use_gate_in_kernel, a_log, dt_bias, cu_seqlens,
+                chunk_indices):
+        """Run forward and retain the intermediates required by backward."""
+        _validate_chunk_kda_autograd(
+            q, v, chunk_size, layout, cu_seqlens, None, True, False
+        )
+        result, canonical_inputs, chunk_indices = _run_chunk_kda_fwd(
+            q, k, v, g, beta, scale, chunk_size, layout,
+            output_final_state, safe_gate, lower_bound, use_gate_in_kernel,
+            a_log, dt_bias, cu_seqlens, chunk_indices
+        )
+        q_head, k_head, v_head, g_head, beta_head = canonical_inputs
+        saved = [q_head, k_head, v_head, beta_head, result[2], result[3], result[4],
+                 result[5], result[7], result[8], result[9], result[10], g_head]
+        if a_log is not None:
+            saved.append(a_log)
+        if dt_bias is not None:
+            saved.append(dt_bias)
+        ctx.save_for_backward(*saved)
+        ctx.has_a_log = a_log is not None
+        ctx.has_dt_bias = dt_bias is not None
+        ctx.scale = scale
+        ctx.chunk_size = chunk_size
+        ctx.layout = layout
+        ctx.cu_seqlens = cu_seqlens
+        ctx.chunk_indices = chunk_indices
+        ctx.safe_gate = safe_gate
+        ctx.lower_bound = lower_bound
+        ctx.use_gate_in_kernel = use_gate_in_kernel
+        return result[0], result[1] if output_final_state else None
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """Run fused backward and reject unsupported final-state gradients."""
+        grad_attn = grad_outputs[0]
+        grad_state = grad_outputs[1] if len(grad_outputs) > 1 else None
+        if grad_state is not None:
+            raise RuntimeError(
+                "Chunk KDA final_state is not differentiable in the current integration. "
+                "Do not include final_state in the training loss."
+            )
+        if grad_attn is None:
+            return (None,) * 16
+        saved = ctx.saved_tensors
+        q, k, v, beta, gk, aqk, akk, w, qg, kg, v_new, h, raw_g = saved[:13]
+        index = 13
+        a_log = saved[index] if ctx.has_a_log else None
+        index += int(ctx.has_a_log)
+        dt_bias = saved[index] if ctx.has_dt_bias else None
+        grad_attn = (ms.ops.transpose(grad_attn, (0, 2, 1, 3)).contiguous()
+                     if len(q.shape) == 4
+                     else ms.ops.transpose(grad_attn, (1, 0, 2)).contiguous())
+        outputs = _run_chunk_kda_bwd(
+            q, k, v, beta, gk, aqk, akk, w, qg, kg, v_new, h,
+            grad_attn, ctx.scale, ctx.chunk_size,
+            "NTD" if len(q.shape) == 3 else "BNSD",
+            raw_g=raw_g, a_log=a_log, dt_bias=dt_bias,
+            cu_seqlens=ctx.cu_seqlens, chunk_indices=ctx.chunk_indices,
+            safe_gate=ctx.safe_gate, use_gate_in_kernel=ctx.use_gate_in_kernel,
+            lower_bound=ctx.lower_bound,
+        )
+        dq, dk, dv, db, dg, d_a, d_bias = outputs
+        dq, dk, dv, dg, db = _restore_chunk_kda_gradients(
+            dq, dk, dv, dg, db, ctx.layout
+        )
+        return (dq, dk, dv, dg, db, None, None, None, None, None,
+                None, None, d_a if ctx.use_gate_in_kernel else None,
+                d_bias if ctx.has_dt_bias else None, None, None)
+
+
+def npu_chunk_kda_fwd(q, k, v, g, beta, scale, chunk_size, layout="BNSD",
+                      output_final_state=False, safe_gate=False, lower_bound=-5.0,
+                      use_gate_in_kernel=False, a_log=None, dt_bias=None,
+                      cu_seqlens=None, chunk_indices=None,
+                      initial_state=None, disable_recompute=True,
+                      state_v_first=False,
+                      return_intermediates=False):
+    """Run forward-only KDA, restricting backward intermediates when requested."""
+    if return_intermediates not in (True, False):
+        raise ValueError("return_intermediates must be a bool.")
+    if return_intermediates:
+        _validate_chunk_kda_autograd(
+            q, v, chunk_size, layout, cu_seqlens, initial_state,
+            disable_recompute, state_v_first
+        )
+    result, _, _ = _run_chunk_kda_fwd(
+        q, k, v, g, beta, scale, chunk_size, layout, output_final_state,
+        safe_gate, lower_bound, use_gate_in_kernel, a_log, dt_bias,
+        cu_seqlens, chunk_indices, initial_state, state_v_first
+    )
+    public_outputs = (result[0], result[1] if output_final_state else None)
+    if not return_intermediates:
+        return public_outputs
+    intermediates = (result[2], result[3], result[4], result[5],
+                     result[7], result[8], result[9], result[10])
+    return public_outputs + (intermediates,)
+
+
+def npu_chunk_kda_bwd(q, k, v, beta, gk, aqk, akk, w, qg, kg, v_new, h,
+                      d_o, scale, chunk_size, layout="BNSD", raw_g=None,
+                      a_log=None, dt_bias=None, cu_seqlens=None,
+                      chunk_indices=None, safe_gate=False,
+                      use_gate_in_kernel=False, lower_bound=-5.0):
+    """Stateless explicit Chunk KDA backward operator."""
+    outputs = _run_chunk_kda_bwd(
+        q, k, v, beta, gk, aqk, akk, w, qg, kg, v_new, h,
+        d_o, scale, chunk_size, layout, raw_g, a_log, dt_bias,
+        cu_seqlens, chunk_indices, safe_gate, use_gate_in_kernel, lower_bound
+    )
+    return outputs[:5] + (outputs[5] if use_gate_in_kernel else None,
+                          outputs[6] if dt_bias is not None else None)
