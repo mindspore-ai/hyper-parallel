@@ -43,7 +43,7 @@ _LOGGER_ATTR_SNAPSHOT = {
 import torch  # pylint: disable=wrong-import-position
 from torch import nn  # pylint: disable=wrong-import-position
 
-from hyper_parallel import DeviceMesh, DTensor, Replicate
+from hyper_parallel import DeviceMesh, DTensor, Replicate, Shard, SkipDTensorDispatch
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
 )
@@ -55,9 +55,7 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
 from hyper_parallel.core.optimizer.adamw import AdamW as CoreAdamW
 from hyper_parallel.core.optimizer.muon import Muon as CoreMuon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
-from hyper_parallel.core.distributed_checkpoint import (
-    save as dcp_save,
-)
+from hyper_parallel.core.distributed_checkpoint import save as dcp_save
 from tests.common.mark_utils import arg_mark
 
 
@@ -195,6 +193,187 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertTrue(torch.equal(muon.state[model.muon_param]["momentum_buffer"], torch.zeros(2, 2)))
         self.assertTrue(torch.equal(model.adamw_param, expected_adamw))
         self.assertTrue(torch.equal(model.muon_param, expected_muon))
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
+    def test_initialize_hyper_optimizer_state_preserves_dtensor_layout(
+            self,
+            mock_get_rank,
+    ):
+        """Materialize optimizer moments with the parameter's DTensor layout.
+
+        Feature: DTensor optimizer-state materialization.
+        Description: Initialize AdamW and Muon state for sharded parameters.
+        Expectation: Moments and exported state retain global and local layout.
+        """
+        del mock_get_rank
+        mesh = DeviceMesh(
+            "cpu",
+            [0, 1],
+            mesh_dim_names=("dp",),
+            _init_backend=False,
+        )
+        model = nn.Module()
+        parameter = nn.Parameter(
+            DTensor.from_local(torch.ones(2), mesh, (Shard(0),))
+        )
+        model.register_parameter("weight", parameter)
+        muon_parameter = nn.Parameter(
+            DTensor.from_local(torch.ones(2, 2), mesh, (Shard(0),))
+        )
+        model.register_parameter("muon_weight", muon_parameter)
+        adamw = CoreAdamW([parameter], lr=0.1)
+        with patch.object(CoreMuon, "reset_optimizer_parameters"):
+            muon = CoreMuon([muon_parameter], lr=0.1)
+        optimizer = ChainedOptimizer(
+            model,
+            {"adamw": adamw, "muon": muon},
+            flatten=True,
+        )
+
+        self.assertEqual(tuple(parameter.shape), (4,))
+        self.assertTrue(initialize_optimizer_state(optimizer))
+
+        exp_avg = adamw.state[parameter]["exp_avg"]
+        self.assertIsInstance(exp_avg, DTensor)
+        self.assertEqual(tuple(exp_avg.shape), (4,))
+        self.assertEqual(tuple(exp_avg.to_local().shape), (2,))
+        self.assertEqual(exp_avg.device_mesh.rank_list, mesh.rank_list)
+        self.assertEqual(exp_avg.device_mesh.mesh_dim_names, mesh.mesh_dim_names)
+        self.assertEqual(tuple(exp_avg.placements), (Shard(0),))
+        momentum = muon.state[muon_parameter]["momentum_buffer"]
+        self.assertIsInstance(momentum, DTensor)
+        self.assertEqual(tuple(momentum.shape), (4, 2))
+        self.assertEqual(tuple(momentum.to_local().shape), (2, 2))
+        self.assertEqual(tuple(momentum.placements), (Shard(0),))
+
+        state_dict = optimizer.state_dict()
+        checkpoint_exp_avg = state_dict["state.weight.exp_avg"]
+        self.assertIsInstance(checkpoint_exp_avg, DTensor)
+        self.assertEqual(tuple(checkpoint_exp_avg.shape), (4,))
+        self.assertEqual(tuple(checkpoint_exp_avg.to_local().shape), (2,))
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
+    def test_main_grad_and_adam_state_preserve_dtensor_layout(
+            self,
+            mock_get_rank,
+    ):
+        """Keep main gradients and Adam moments distributed through optimizer step.
+
+        Feature: Mixed-precision DTensor optimizer step.
+        Description: Bridge an FSDP main_grad to a sharded FP32 main parameter.
+        Expectation: The optimizer gradient and Adam moment remain DTensors.
+        """
+        del mock_get_rank
+        mesh = DeviceMesh(
+            "cpu",
+            [0, 1],
+            mesh_dim_names=("dp",),
+            _init_backend=False,
+        )
+        model = nn.Module()
+        parameter = nn.Parameter(
+            DTensor.from_local(
+                torch.ones(2, dtype=torch.bfloat16),
+                mesh,
+                (Shard(0),),
+            )
+        )
+        parameter.model_name = "weight"
+        model.register_parameter("weight", parameter)
+        adamw = CoreAdamW([parameter], lr=0.1)
+        optimizer = Float16OptimizerWithFloat16Params(
+            ChainedOptimizer(model, {"adamw": adamw}),
+            model,
+        )
+        main_param = parameter.main_param
+        gradient_mesh = DeviceMesh(
+            "cpu",
+            [0, 1],
+            mesh_dim_names=("dp",),
+            _init_backend=False,
+        )
+        self.assertIsNot(gradient_mesh, main_param.device_mesh)
+        self.assertEqual(gradient_mesh.to_hash(), main_param.device_mesh.to_hash())
+        parameter.main_grad = DTensor.from_local(
+            torch.full((2,), 0.25, dtype=torch.float32),
+            gradient_mesh,
+            (Shard(0),),
+        )
+
+        with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+            optimizer.step()
+
+        exp_avg = adamw.state[main_param]["exp_avg"]
+        self.assertIsInstance(main_param.grad, DTensor)
+        self.assertEqual(tuple(main_param.grad.shape), (4,))
+        self.assertEqual(tuple(main_param.grad.to_local().shape), (2,))
+        self.assertIsInstance(exp_avg, DTensor)
+        self.assertEqual(tuple(exp_avg.shape), (4,))
+        self.assertEqual(tuple(exp_avg.to_local().shape), (2,))
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=15)
+    def test_empty_uneven_main_grad_preserves_optimizer_state_global_shape(
+            self,
+            mock_get_rank,
+    ):
+        """Keep logical optimizer-state shape on an empty uneven FSDP shard.
+
+        Feature: Mixed-precision optimizer state for uneven DTensor shards.
+        Description: Bind an empty local main_grad whose logical shape is non-empty.
+        Expectation: Adam moments inherit the main_grad's global layout unchanged.
+        """
+        del mock_get_rank
+        mesh = DeviceMesh(
+            "cpu",
+            list(range(16)),
+            mesh_dim_names=("fsdp",),
+            _init_backend=False,
+        )
+        model = nn.Module()
+        parameter = nn.Parameter(
+            DTensor.from_local(
+                torch.empty(0, dtype=torch.bfloat16),
+                mesh,
+                (Shard(0, uneven_shard=True),),
+                shape=(16,),
+                stride=(1,),
+            )
+        )
+        parameter.model_name = "sinks"
+        model.register_parameter("sinks", parameter)
+        adamw = CoreAdamW([parameter], lr=0.1)
+        optimizer = Float16OptimizerWithFloat16Params(
+            ChainedOptimizer(model, {"adamw": adamw}),
+            model,
+        )
+        main_param = parameter.main_param
+        gradient_mesh = DeviceMesh(
+            "cpu",
+            list(range(16)),
+            mesh_dim_names=("fsdp",),
+            _init_backend=False,
+        )
+        main_gradient = DTensor.from_local(
+            torch.empty(0, dtype=torch.float32),
+            gradient_mesh,
+            (Shard(0, uneven_shard=True),),
+            shape=(16,),
+            stride=(1,),
+        )
+        parameter.main_grad = main_gradient
+
+        with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+            optimizer.step()
+
+        exp_avg = adamw.state[main_param]["exp_avg"]
+        self.assertIs(main_param.grad, main_gradient)
+        self.assertIsInstance(exp_avg, DTensor)
+        self.assertEqual(tuple(exp_avg.shape), (16,))
+        self.assertEqual(tuple(exp_avg.to_local().shape), (0,))
+        self.assertEqual(tuple(exp_avg.placements), (Shard(0, uneven_shard=True),))
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_groups_separate_low_precision_and_native_fp32_params(self):

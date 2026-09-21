@@ -14,7 +14,7 @@
 # ============================================================================
 """Ascend grouped-GEMM implementation for packed SwiGLU experts."""
 
-from typing import Any
+from typing import Any, Callable, Optional
 
 
 _NPU_GROUPED_MATMUL = None
@@ -83,6 +83,7 @@ def npu_grouped_swiglu(
     gate_up_weight: Any,
     down_weight: Any,
     tokens_per_expert: Any,
+    apply_gate: Optional[Callable[[Any], Any]] = None,
 ) -> Any:
     """Run packed local SwiGLU experts with two grouped GEMMs.
 
@@ -91,6 +92,8 @@ def npu_grouped_swiglu(
         gate_up_weight: Packed projection weights with shape ``[E, 2I, H]``.
         down_weight: Down projection weights with shape ``[E, H, I]``.
         tokens_per_expert: Token count for each local expert, shape ``[E]``.
+        apply_gate: Optional model-specific activation over the packed gate/up
+            projection. Defaults to fused SwiGLU.
 
     Returns:
         Expert-major output with shape ``[T, H]``.
@@ -115,7 +118,11 @@ def npu_grouped_swiglu(
         gate_up_weight.transpose(1, 2),
         group_list,
     )
-    intermediate = torch_npu.npu_swiglu(gate_up, dim=-1)
+    intermediate = (
+        torch_npu.npu_swiglu(gate_up, dim=-1)
+        if apply_gate is None
+        else apply_gate(gate_up)
+    )
     return grouped_matmul.apply(
         intermediate,
         down_weight.transpose(1, 2),

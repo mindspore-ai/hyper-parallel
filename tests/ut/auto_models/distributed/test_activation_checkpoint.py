@@ -180,6 +180,27 @@ class TestTransformerBlockDiscovery(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "gradient_checkpointing"):
             _apply_activation_checkpointing(_UnmarkedDiscoveryModel(), "selective")
 
+    def test_kv_sharing_overrides_hf_native_full_checkpointing(self):
+        """Mutable cross-layer training state keeps attention outside replay."""
+        model = _DiscoveryOwner()
+        model.decoder["2"] = _CheckpointableSubmodules()
+        model.decoder["7"] = _CheckpointableSubmodules()
+        with (
+            patch(
+                f"{_ACTIVATION_CHECKPOINT_MODULE}._detect_kv_sharing_and_maybe_disable_cache",
+                return_value=True,
+            ),
+            patch(
+                f"{_ACTIVATION_CHECKPOINT_MODULE}._should_use_hf_native_gradient_checkpointing",
+                return_value=True,
+            ),
+        ):
+            _apply_activation_checkpointing(model, "full")
+
+        for block in model.decoder.values():
+            self.assertIsInstance(block.self_attn, nn.Linear)
+            self.assertTrue(hasattr(block.mlp, "_wrapped_module"))
+
 
 class TestActivationCheckpointSwapInputs(unittest.TestCase):
     """Tests for activation checkpoint input-swapping configuration."""

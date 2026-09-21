@@ -1,15 +1,15 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  *
  * PyTorch TORCH_LIBRARY_IMPL for hyper_parallel::mega_moe_grad.
  *
- * NPU implementation calls aclnnHyperMegaMoeGrad via EXEC_NPU_CMD_EXT
- * from the public torch_npu C++ extension header.
+ * NPU implementation calls aclnnHyperMegaMoeGrad via the cached public
+ * torch_npu extension bridge.
  * Meta implementation is a no-op (output tensors pre-allocated by caller).
  */
 #include <torch/library.h>
 #include <tuple>
-#include "op_plugin/include/npu_cpp_extension.h"
+#include "cached_op_api.h"
 
 namespace {
 
@@ -56,7 +56,9 @@ BwdReturn mega_moe_grad_npu(
     int64_t expert_num,
     int64_t hidden_size,
     int64_t seq_size) {
-    EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeGrad,
+    static const hyper_parallel::multicore::CachedOpApi api(
+        "aclnnHyperMegaMoeGrad", "aclnnHyperMegaMoeGradGetWorkspaceSize");
+    hyper_parallel::multicore::execute_cached_op(api,
         dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size,
         hidden, hidden_dw, w2, act_grad_y, gate, grad_gate, w1, gate_dx, grad_x,
         combine_target_off, combine_src_off, combine_size,

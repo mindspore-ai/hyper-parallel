@@ -45,18 +45,20 @@ static_assert(sizeof(CycleTraceRecord) == 32, "Unexpected cycle trace record siz
 
 class CycleTraceRecorder {
  public:
-  static constexpr uint32_t MAX_RECORDS_PER_CORE = 256;
+  static constexpr uint32_t MAX_RECORDS_PER_CORE =
+    ((0xFFFFFFFFU - sizeof(CycleTraceCoreHeader)) / sizeof(CycleTraceRecord) / 16) * 16;
 
   __aicore__ inline void Init(uint32_t worker_id, GM_ADDR profile_buffer, uint32_t aic_record_capacity,
                              uint32_t aiv_record_capacity) {
-    aic_record_capacity =
-      aic_record_capacity > MAX_RECORDS_PER_CORE ? MAX_RECORDS_PER_CORE : aic_record_capacity;
-    aiv_record_capacity =
-      aiv_record_capacity > MAX_RECORDS_PER_CORE ? MAX_RECORDS_PER_CORE : aiv_record_capacity;
-    uint32_t aic_stride_bytes =
-      sizeof(CycleTraceCoreHeader) + aic_record_capacity * sizeof(CycleTraceRecord);
-    uint32_t aiv_stride_bytes =
-      sizeof(CycleTraceCoreHeader) + aiv_record_capacity * sizeof(CycleTraceRecord);
+    if (aic_record_capacity > MAX_RECORDS_PER_CORE || aiv_record_capacity > MAX_RECORDS_PER_CORE ||
+        aic_record_capacity % 16 != 0 || aiv_record_capacity % 16 != 0) {
+      AscendC::Trap();
+      return;
+    }
+    uint64_t aic_stride_bytes =
+      sizeof(CycleTraceCoreHeader) + static_cast<uint64_t>(aic_record_capacity) * sizeof(CycleTraceRecord);
+    uint64_t aiv_stride_bytes =
+      sizeof(CycleTraceCoreHeader) + static_cast<uint64_t>(aiv_record_capacity) * sizeof(CycleTraceRecord);
 #ifdef __DAV_C220_CUBE__
     uint32_t core_type = 1;
     record_capacity_ = aic_record_capacity;

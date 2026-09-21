@@ -51,6 +51,35 @@ logger = logging.getLogger(__name__)
 MODEL_ARCH_MAPPING = OrderedDict([])
 
 
+def register_custom_model(
+        architecture: str,
+        module_path: str,
+        class_name: str,
+) -> None:
+    """Register one lazily imported custom model implementation.
+
+    Args:
+        architecture: Exact value stored in ``config.architectures[0]``.
+        module_path: Importable module containing the model class.
+        class_name: Model class exported by ``module_path``.
+
+    Raises:
+        ValueError: If the architecture is empty or already has a different
+            registration.
+    """
+    if not all(isinstance(value, str) and value for value in (architecture, module_path, class_name)):
+        raise ValueError("custom model registration values must be non-empty strings")
+    entry = (module_path, class_name)
+    existing = MODEL_ARCH_MAPPING.get(architecture)
+    if existing is not None and tuple(existing[:2]) != entry:
+        raise ValueError(
+            f"conflicting custom model registration for {architecture!r}: "
+            f"{existing!r} vs {entry!r}"
+        )
+    MODEL_ARCH_MAPPING[architecture] = entry
+    _resolve_custom_model_cls.cache_clear()
+
+
 @lru_cache(maxsize=128)
 def _resolve_custom_model_cls(arch_name: str) -> Optional[type]:
     """Lazy-load model class from MODEL_ARCH_MAPPING.

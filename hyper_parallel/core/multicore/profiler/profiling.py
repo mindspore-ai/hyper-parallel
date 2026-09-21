@@ -45,9 +45,11 @@ CUBE_SLOT_COUNT = NUM_WORKERS_CUBE
 VECTOR_SLOT_COUNT = NUM_WORKERS_VECTOR
 CORE_SLOT_COUNT = CUBE_SLOT_COUNT + VECTOR_SLOT_COUNT
 RECORD_CAPACITY_ALIGNMENT = 16
-MAX_RECORDS_PER_CORE = 256
 CORE_HEADER = struct.Struct("<QIIIIII32x")
 PROFILE_RECORD = struct.Struct("<QQIIII")
+# Keep each slot representable by the Device ABI; allocate only the graph's actual requirement.
+MAX_RECORDS_PER_CORE = ((0xFFFFFFFF - CORE_HEADER.size) // PROFILE_RECORD.size
+                        // RECORD_CAPACITY_ALIGNMENT * RECORD_CAPACITY_ALIGNMENT)
 MAX_CORE_STRIDE_BYTES = CORE_HEADER.size + MAX_RECORDS_PER_CORE * PROFILE_RECORD.size
 MAX_PROFILE_BUFFER_BYTES = CORE_SLOT_COUNT * MAX_CORE_STRIDE_BYTES
 INVALID_OWNER_ID = 0xFFFFFFFF
@@ -159,11 +161,12 @@ def _profile_buffer_bytes_for_capacities(aic_record_capacity: int, aiv_record_ca
 
 
 def _round_up_record_capacity(required_records: int) -> int:
-    """Round a per-worker requirement up to 16 records and enforce the 256-record limit."""
+    """Round the full per-worker requirement without silently dropping records."""
     aligned_capacity = (
         (required_records + RECORD_CAPACITY_ALIGNMENT - 1) // RECORD_CAPACITY_ALIGNMENT * RECORD_CAPACITY_ALIGNMENT
     )
-    return min(aligned_capacity, MAX_RECORDS_PER_CORE)
+    _validate_record_capacity(aligned_capacity, "per-worker")
+    return aligned_capacity
 
 
 def _records_for_task(task_desc: TaskDescC) -> int:
@@ -544,6 +547,8 @@ def _as_bytes(buffer: Any) -> bytes:
 
 
 def _validate_record_capacity(record_capacity: int, core_name: str) -> None:
+    if record_capacity < 0:
+        raise ValueError(f"{core_name} profile record capacity must be nonnegative: {record_capacity}")
     if record_capacity > MAX_RECORDS_PER_CORE:
         raise ValueError(
             f"{core_name} profile record capacity exceeds the {MAX_RECORDS_PER_CORE}-record limit: "

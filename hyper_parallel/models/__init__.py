@@ -47,12 +47,31 @@ if TYPE_CHECKING:
         HyperAutoModelForImageTextToText,
         HyperAutoModelForSequenceClassification,
     )
+    from hyper_parallel.models.materialization import (
+        MaterializationContext,
+        MaterializationReason,
+        MaterializedStateHook,
+        RebuildableBufferSpec,
+        rebuild_materialized_state,
+        register_materialized_state_hook,
+        register_rebuildable_buffer,
+    )
 
 
 _LAZY_FACADE_EXPORTS = {
     "HyperAutoModelForCausalLM": "hyper_parallel.models._transformers",
     "HyperAutoModelForImageTextToText": "hyper_parallel.models._transformers",
     "HyperAutoModelForSequenceClassification": "hyper_parallel.models._transformers",
+}
+
+_LAZY_MATERIALIZATION_EXPORTS = {
+    "MaterializationContext",
+    "MaterializationReason",
+    "MaterializedStateHook",
+    "RebuildableBufferSpec",
+    "rebuild_materialized_state",
+    "register_materialized_state_hook",
+    "register_rebuildable_buffer",
 }
 
 __all__ = [
@@ -62,11 +81,18 @@ __all__ = [
     "HyperAutoModelForCausalLM",
     "HyperAutoModelForImageTextToText",
     "HyperAutoModelForSequenceClassification",
+    "MaterializationContext",
+    "MaterializationReason",
+    "MaterializedStateHook",
     "ModelAdapterSpec",
     "ModelBuildOptions",
+    "RebuildableBufferSpec",
     "get_model_adapter",
     "normalize_build_options",
+    "rebuild_materialized_state",
+    "register_materialized_state_hook",
     "register_model_adapter",
+    "register_rebuildable_buffer",
 ]
 
 
@@ -74,6 +100,11 @@ def __getattr__(name):  # pylint: disable=invalid-name
     """Lazy attribute access keeps the package import side-effect free."""
     if name in _LAZY_FACADE_EXPORTS:
         module = _import_module(_LAZY_FACADE_EXPORTS[name])
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
+    if name in _LAZY_MATERIALIZATION_EXPORTS:
+        module = importlib.import_module(".materialization", __name__)
         value = getattr(module, name)
         globals()[name] = value
         return value
@@ -86,4 +117,4 @@ def __getattr__(name):  # pylint: disable=invalid-name
 
 def __dir__():  # pylint: disable=invalid-name
     """Include lazy facade exports in ``dir()``."""
-    return sorted(set(globals()) | set(_LAZY_FACADE_EXPORTS))
+    return sorted(set(globals()) | set(_LAZY_FACADE_EXPORTS) | _LAZY_MATERIALIZATION_EXPORTS)

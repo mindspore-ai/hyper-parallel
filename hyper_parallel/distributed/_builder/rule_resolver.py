@@ -49,8 +49,18 @@ def _last_segment(fqn: str) -> str:
 
 _GLOB_CHARS = ("*", "?", "[")
 
+
 def _is_glob_key(key: str) -> bool:
     return any(c in key for c in _GLOB_CHARS)
+
+
+def _can_insert_glob(user_spec: ModuleShardingSpec) -> bool:
+    """Return whether a glob declares a concrete boundary contract."""
+    return any(
+        isinstance(getattr(user_spec, attr), dict)
+        for attr in ("params", "in_src", "in_dst", "out_src", "out_dst")
+    )
+
 
 def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
                           derive: bool = True) -> None:
@@ -84,8 +94,14 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
       FQNs) is **allowed** since D-14 (05 §13), subject only to the
       param-uniqueness invariant (``_check_param_uniqueness``);
     - **glob keys** (containing ``*``/``?``/``[``): merge-applied to
-      every matching boundary (fnmatchcase, ``*`` spans dots); a
-      pattern hitting nothing warns loudly. Glob keys never insert.
+      every matching derived/previously inserted boundary (fnmatchcase,
+      ``*`` spans dots). A glob declaring at least one concrete contract
+      dict additionally expands against the final model's
+      ``named_modules`` and inserts every unmatched module using the exact
+      insert validation above. Injection-only/attribute-only globs remain
+      merge-only for existing boundaries and fail fast if they match a real
+      model module without a boundary, so a broad partial override cannot
+      silently ignore or create communication boundaries.
 
     Notes:
     - exact keys must exist in the model's ``named_modules`` (typo
@@ -101,7 +117,8 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
     if not entries:
         return
 
-    module_names = {name for name, _ in model.named_modules()}
+    module_names = [name for name, _ in model.named_modules()]
+    module_name_set = set(module_names)
     for key, user_spec, source in entries:
         if not isinstance(user_spec, ModuleShardingSpec):
             raise TypeError(
@@ -109,7 +126,7 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
                 f"got {type(user_spec).__name__}"
             )
         _validate_override_axes(key, user_spec, source, plan)
-        if not _is_glob_key(key) and key not in module_names:
+        if not _is_glob_key(key) and key not in module_name_set:
             raise ValueError(
                 f"{source} FQN not found in the model's "
                 f"named_modules: {key!r} (check spelling; in PP "
@@ -120,12 +137,67 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
         if _is_glob_key(key):
             hits = [fqn for fqn in plan.modules
                     if fnmatch.fnmatchcase(fqn, key)]
-            if not hits:
+            model_hits = [
+                fqn for fqn in module_names
+                if fqn not in plan.modules and fnmatch.fnmatchcase(fqn, key)
+            ]
+            inserted = []
+            can_insert = _can_insert_glob(user_spec)
+            if model_hits and not can_insert:
+                configured_fields = [
+                    attr
+                    for attr in (
+                        "local_compute_fn", "inner_target", "inner_wrapper",
+                        "inner_out_src", "region_dispatch", "out_names",
+                        "tp_divide_attrs",
+                    )
+                    if getattr(user_spec, attr) is not None
+                ]
+                preview = model_hits[:8]
+                omitted = len(model_hits) - len(preview)
+                matched = f"{preview}"
+                if omitted:
+                    matched += f" (and {omitted} more)"
+                example_fqn = model_hits[0]
+                raise ValueError(
+                    f"{source}[{key!r}] matched {len(model_hits)} module(s) "
+                    "in the final model that have no planner-derived "
+                    f"boundary: {matched}. The override declares only "
+                    f"merge-only fields {configured_fields or ['none']} and "
+                    "no concrete params/in_src/in_dst/out_src/out_dst "
+                    "contract, so it cannot create those boundaries. This "
+                    "usually means the modules did not match a built-in "
+                    "template while the YAML assumed there was a boundary "
+                    "to merge into. Fix it by either: (1) declaring the "
+                    "module's complete parameter and I/O contract in this "
+                    "glob (a concrete contract makes it insert-capable); "
+                    "(2) adding a preceding full-contract glob and keeping "
+                    "this entry as a later injection-only merge; or (3) if "
+                    "the module should be built in, fixing its sharding role/"
+                    "template recognition. Narrow the glob if these modules "
+                    "were not intended targets.\nSuggested draft for the "
+                    f"first unmatched module {example_fqn!r} (placements are "
+                    "placeholders; replace the exact match with the original "
+                    "glob only when all matched modules share this contract):\n"
+                    + _suggest_insert_skeleton(model, example_fqn)
+                )
+            if can_insert:
+                for fqn in model_hits:
+                    _insert_spec(
+                        plan,
+                        fqn,
+                        user_spec,
+                        source,
+                        model,
+                        derive=derive,
+                    )
+                    inserted.append(fqn)
+            if not hits and not inserted:
                 logger.warning(
-                    "%s match=%r hit no boundary spec — check the "
+                    "%s match=%r hit no boundary spec or model module — check the "
                     "spelling (plan boundaries: %s)",
-                    source, key, sorted(plan.modules)[:8])
-                continue
+                    source, key, sorted(plan.modules)[:8],
+                )
             for fqn in hits:
                 _warn_dropped_params(
                     source, key, fqn, plan.modules[fqn], user_spec)
@@ -140,7 +212,8 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
                         source, key)
         else:
             _insert_spec(plan, key, user_spec, source, model,
-                              derive=derive)
+                         derive=derive)
+
 
 _CONTRACT_FIELDS = ("params", "in_src", "in_dst",
                     "out_src", "out_dst", "out_names")
@@ -150,6 +223,7 @@ _CONTRACT_FIELDS = ("params", "in_src", "in_dst",
 #            synonymous with the default unset value, self-documenting)
 #   "none" — explicitly clear (params/in_src/in_dst → {}, out_* → None)
 _CONTRACT_SENTINELS = ("auto", "none")
+
 
 def _iter_named_placements(spec: ModuleShardingSpec):
     """Yield (attr, name, named) for every concrete NamedPlacement in an
@@ -206,6 +280,7 @@ def _validate_override_axes(key, user_spec, source, plan) -> None:
                     f"An unknown axis is silently ignored by "
                     f"resolve_placements, so fail fast (suspected typo)")
 
+
 def _merge_contract_field(derived: ModuleShardingSpec,
                           user_spec: ModuleShardingSpec, attr: str) -> None:
     """Merge one contract field: "unset inherits, written is honored" (2026-08-05).
@@ -253,6 +328,7 @@ def _warn_dropped_params(source, key, fqn, derived, user_spec) -> None:
                 "the de-sharding is intentional, ignore this warning "
                 "(params={} or 'none' explicitly clears all)",
                 source, key, fqn, len(dropped), dropped)
+
 
 def _merge_into(derived: ModuleShardingSpec,
                 user_spec: ModuleShardingSpec) -> None:

@@ -1,10 +1,10 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  *
  * PyTorch TORCH_LIBRARY_IMPL for hyper_parallel::mega_moe.
  *
- * NPU implementation calls aclnnHyperMegaMoe via EXEC_NPU_CMD_EXT
- * (from the public torch_npu C++ extension header), which handles:
+ * NPU implementation calls aclnnHyperMegaMoe via the cached public
+ * torch_npu extension bridge, which handles:
  *   1. at::Tensor -> aclTensor conversion
  *   2. aclnnHyperMegaMoeGetWorkspaceSize() call + workspace alloc
  *   3. aclnnHyperMegaMoe(workspace, size, executor, stream) call
@@ -13,7 +13,7 @@
  */
 #include <torch/library.h>
 #include <tuple>
-#include "op_plugin/include/npu_cpp_extension.h"
+#include "cached_op_api.h"
 
 namespace {
 
@@ -50,7 +50,9 @@ mega_moe_npu(
     int64_t expert_num,
     int64_t hidden_size,
     int64_t seq_size) {
-    EXEC_NPU_CMD_EXT(aclnnHyperMegaMoe,
+    static const hyper_parallel::multicore::CachedOpApi api(
+        "aclnnHyperMegaMoe", "aclnnHyperMegaMoeGetWorkspaceSize");
+    hyper_parallel::multicore::execute_cached_op(api,
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
         up_proj_weight, up_proj_glist,

@@ -23,7 +23,7 @@ Phase 2  communication boundary grouping (two passes: first group by owning
 Phase 3  semantic role inference (explicit FQN patterns > structural guards
          > parameter role combinations)
 Phase 4  template lookup to generate spec (_build_spec_from_template)
-Phase 4.5 user plan_overrides merge (_merge_plan_overrides, 05 §3.6.7)
+Phase 4.5 user plan_overrides merge/insert (_merge_plan_overrides, 05 §3.6.7)
 Phase 5  _is_terminal marking only (D-14, 05 §13: compile-time chain
          propagation/validation removed — specs are fully self-declared and
          each module vouches for its own propagation in validate mode)
@@ -54,6 +54,7 @@ from hyper_parallel.core.dtensor.placement_types import (
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.distributed.recipe_spec import (
     DP,
+    EP,
     TP,
     ModuleShardingSpec,
 )
@@ -132,8 +133,11 @@ class ShardingPlanner:
       inserted as-is and must be fully self-declared — an override with
       empty params AND empty contracts fails fast ("no template matched");
     - **glob keys** (containing ``*``/``?``/``[``): merge-applied to every
-      matching boundary; a pattern hitting nothing warns loudly. Glob keys
-      never insert new boundaries.
+      matching boundary. A glob with a concrete parameter or I/O contract
+      also expands against the final model tree and inserts unmatched modules
+      with the same validation as exact insert mode. Partial globs carrying
+      only injection/attribute changes remain merge-only and fail if they
+      target a model module for which no boundary was derived.
 
     The YAML transport (``hyper_parallel.trainer.config.PlanOverride``) is
     converted to this dict by ``entries_to_plan_overrides()`` on the trainer
@@ -241,11 +245,14 @@ class ShardingPlanner:
         model: Any,
         *,
         tp_size: int,
+        ep_size: int,
+        mesh: DeviceMesh,
         mesh_dim_names: Tuple[str, ...],
     ) -> None:
         """Normalize overrides and finish placement-dependent boundary metadata."""
         _merge_plan_overrides(self._plan_overrides, plan, model, derive=self._derive)
         _normalize_contract_fields(plan)
+        self._mark_virtual_ep_parameters(plan, ep_size, mesh)
         _finalize_tp_local_attr_plans(plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names)
         self._finalize_deferred_biases(plan, model, mesh_dim_names)
         self._finalize_fused_expert_tp_guard(plan, tp_size=tp_size)
@@ -359,10 +366,15 @@ class ShardingPlanner:
             param_ndims=param_ndims,
         )
 
-        # Phase 4.5: unified override pass — merge mode (unset fields inherit
-        # the derived spec) / insert mode (fully self-declared only) / glob.
+        # Phase 4.5: merge derived matches and expand fully declared globs
+        # against the final model tree to insert new boundaries.
         self._finalize_boundary_specs(
-            plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names
+            plan,
+            model,
+            tp_size=tp_size,
+            ep_size=ep_size,
+            mesh=mesh,
+            mesh_dim_names=mesh_dim_names,
         )
 
         # D-14 invariants (05 §13.2/§13.3): full self-declaration + param
@@ -717,11 +729,8 @@ class ShardingPlanner:
     # ── Phase 4 post-processing: MoE EP marking (D-09/D-10, 05 §6.4.7/§6.4.8) ──
 
     @staticmethod
-    def _validate_ep_extend(ep_extend, mesh, model) -> None:
-        """D-10 TP-extend-EP validation (05 §6.4.8): ep_size must not
-        exceed the dense region and must divide it;
-        num_experts % ep_size == 0 (each rank holds num_experts/ep_size
-        complete experts).
+    def _validate_ep_domain(ep_extend, mesh) -> None:
+        """Validate that virtual EP evenly partitions the dense rank domain.
 
         The dense region = all ranks of the non-pp mesh axes
         (dp_replicate × dp_cp × tp).
@@ -732,7 +741,7 @@ class ShardingPlanner:
         for name, size in zip(names, shape):
             if name == "pp" and size > 1:
                 raise NotImplementedError(
-                    "D-10 TP-extend-EP v1 does not support pp>1 "
+                    "virtual EP v1 does not support pp>1 "
                     "(split the mesh by stage before calling)"
                 )
             if name != "pp":
@@ -742,12 +751,53 @@ class ShardingPlanner:
                 f"ep_size ({ep_extend}) must not exceed and must divide "
                 f"the dense region (dp_replicate × dp_cp × tp = {domain})"
             )
+
+    @classmethod
+    def _validate_ep_extend(cls, ep_extend, mesh, model) -> None:
+        """Validate virtual EP plus the routed-expert count constraint."""
+        cls._validate_ep_domain(ep_extend, mesh)
         num_experts = (getattr(getattr(model, "config", None), "num_experts", None)
                        or getattr(getattr(model, "config", None), "n_routed_experts", 0))
         if num_experts and num_experts % ep_extend != 0:
             raise ValueError(
                 f"num_experts ({num_experts}) must be divisible by ep_size ({ep_extend})"
             )
+
+    @classmethod
+    def _mark_virtual_ep_parameters(
+        cls,
+        plan: ShardingPlan,
+        ep_size: int,
+        mesh: DeviceMesh,
+    ) -> None:
+        """Map explicit virtual-EP parameters to the derived expert mesh.
+
+        This deliberately keys off placement semantics rather than parameter
+        names, so routed experts and sparse lookup tables use one mechanism.
+        The boundary still has to inject its matching all-to-all computation.
+        """
+        if ep_size <= 1 or "ep" in tuple(getattr(mesh, "mesh_dim_names", ()) or ()):
+            return
+        marked = []
+        for fqn, spec in plan.modules.items():
+            if getattr(spec, "_ep_size", 0):  # pylint: disable=protected-access
+                continue
+            ep_params = [
+                name
+                for name, named in (spec.params or {}).items()
+                if isinstance((named or {}).get(EP), Shard)
+            ]
+            if ep_params:
+                spec._ep_size = ep_size  # pylint: disable=protected-access
+                marked.append((fqn, ep_params))
+        if not marked:
+            return
+        cls._validate_ep_domain(ep_size, mesh)
+        logger.info(
+            "virtual EP: mapped explicitly EP-sharded parameters to the "
+            "derived expert mesh: %s",
+            marked,
+        )
 
     # per-expert parameter pattern: experts.<idx>.<proj>.weight (legacy HF /
     # in-house MoE layouts).
@@ -837,7 +887,8 @@ class ShardingPlanner:
                 spec.params[stacked] = _multi_dim(
                     tp=None, cp=Replicate(), ep=template.moe_expert_placement
                 )
-                spec._ep_stack[stacked] = sources  # pylint: disable=protected-access  # planner owns the spec DSL internals
+                # The planner owns the spec DSL internals.
+                spec._ep_stack[stacked] = sources  # pylint: disable=protected-access
             spec.region_dispatch = None
             return
         if batched:
@@ -1358,7 +1409,8 @@ class ShardingPlanner:
         )
         terminal = sorted_fqns[-1] if sorted_fqns else None
         for fqn, spec in plan.modules.items():
-            spec._is_terminal = fqn == terminal  # pylint: disable=protected-access  # planner owns the spec DSL internals
+            # The planner owns the spec DSL internals.
+            spec._is_terminal = fqn == terminal  # pylint: disable=protected-access
         return plan
 
     def _topological_sort_by_forward_order(self, fqns: List[str], model) -> List[str]:
