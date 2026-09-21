@@ -19,7 +19,11 @@ import struct
 from dataclasses import asdict
 
 import torch
+import torch.distributed as dist
+import torch_npu
 
+from hyper_parallel.components.functional.grouped_matmul import grouped_matmul
+from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.multicore.scheduler.runtime import RUNTIME_HEADER_BYTES
 from tests.torch.multicore import _test_mega_moe as baseline
 from tests.torch.multicore._mega_moe_utils import (
@@ -93,3 +97,46 @@ def test_mega_moe_group_list_isolation() -> None:
         finally:
             mega.close()
     write_evidence({"dispatch_mode": dispatch_mode, "cases": records, "memory": memory_sample()})
+
+
+def test_mega_moe_subgroups() -> None:
+    """Feature: Independent noncontiguous EP groups with externally owned weights.
+
+    Description: Compare both transports against an unsharded oracle with fresh weights each step.
+    Expectation: Group-local routing, outputs and input/router/expert gradients agree.
+    """
+    groups = [dist.new_group(ranks) for ranks in ([0, 2], [1, 3])]
+    group = groups[baseline.RANK % 2]
+    rank = dist.get_rank(group)
+    for mode in ("push", "pull"):
+        layer = MegaMoeExperts(local_num_tokens=128, hidden_size=512, intermediate_size=128,
+                               num_experts=4, top_k=2, ep_size=2, ep_group=group,
+                               create_parameters=False, dispatch_mode=mode)
+        try:
+            for step in range(2):
+                torch.manual_seed(123 + step + baseline.RANK % 2)
+                tensors = [torch.randn(shape).to(baseline.DEVICE, torch.bfloat16).mul_(0.02).requires_grad_()
+                           for shape in ((256, 512), (4, 512, 256), (4, 128, 512))]
+                hidden, gate_up, down = tensors
+                ids = (torch.arange(512, device=baseline.DEVICE).reshape(256, 2) + step).remainder(4).int()
+                probs = torch.full((256, 2), 0.5, device=baseline.DEVICE, requires_grad=True)
+                permuted, mapping = torch_npu.npu_moe_token_permute(hidden, ids)
+                counts = torch.bincount(ids.flatten().long(), minlength=4).cumsum(0)
+                activation = torch_npu.npu_swiglu(grouped_matmul(permuted, gate_up, group_list=counts))
+                expected = torch_npu.npu_moe_token_unpermute(
+                    grouped_matmul(activation, down, group_list=counts), mapping, probs=probs)
+                expected.sum().backward()
+                token_slice, expert_slice = slice(rank * 128, (rank + 1) * 128), slice(rank * 2, (rank + 1) * 2)
+                local = [tensor[index].detach().clone().requires_grad_()
+                         for tensor, index in ((hidden, token_slice), (probs, token_slice),
+                                               (gate_up, expert_slice), (down, expert_slice))]
+                actual = layer(local[0], ids[token_slice], local[1], expert_weights=tuple(local[2:]))
+                actual.sum().backward()
+                baseline.assert_close("subgroup output", actual, expected[token_slice])
+                for observed, reference, index in zip(local, (hidden, probs, gate_up, down),
+                                                       (token_slice, token_slice, expert_slice, expert_slice)):
+                    baseline.assert_close("subgroup gradient", observed.grad, reference.grad[index])
+                assert not list(layer.parameters())
+        finally:
+            layer.close()
+    write_evidence({"noncontiguous_subgroups": True, "external_weights": True, "both_transports": True})

@@ -23,13 +23,15 @@ import os
 import statistics
 import time
 from dataclasses import dataclass, fields
+from itertools import product
 from pathlib import Path
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
-# The launcher activates CANN and the multicore payload before importing this
+# The launcher activates the Ascend runtime and multicore payload before importing this
 # worker. Framework imports stay out of the ``test_mega_moe.py`` launcher.
 # pylint: disable=wrong-import-position
+import pytest
 import torch
 import torch.distributed as dist
 import torch_npu
@@ -38,7 +40,9 @@ from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.core.multicore.torch import ops
 from hyper_parallel.platform.torch.common import GroupedExperts
+from tests.torch.multicore._mega_moe_utils import write_evidence
 
 # pylint: enable=wrong-import-position
 
@@ -229,7 +233,7 @@ def new_layers(
     shape: MoeShape,
     *,
     expert_capacity_factor: float | None = None,
-    dispatch_mode: str = "push",
+    dispatch_mode: str | None = None,
 ) -> tuple[MegaMoeExperts, torch.nn.Module]:
     """Construct parameter-aligned MegaMoe and common expert layers.
 
@@ -249,7 +253,7 @@ def new_layers(
         num_experts=shape.num_experts,
         top_k=shape.top_k,
         expert_capacity_factor=expert_capacity_factor,
-        dispatch_mode=dispatch_mode,
+        dispatch_mode=dispatch_mode or os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push"),
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(device=DEVICE, dtype=torch.bfloat16)
@@ -787,3 +791,77 @@ def test_mega_moe_fwd_bwd_performance() -> None:
         print(f"PERF_RESULT_JSON={path}")
         print(json.dumps(result, sort_keys=True))
     dist.barrier()
+
+
+def test_mega_moe_native_permutation() -> None:
+    """Feature: Cached native permutation bridges.
+
+    Description: Reuse buffers with changing routes, strided gradients and alternating streams.
+    Expectation: All three operators match native references; invalid aliases and shapes fail.
+    """
+    ops._load_native()  # pylint: disable=protected-access
+    streams = (torch.npu.current_stream(), torch.npu.Stream())
+    comparisons = 0
+    for dtype, index_dtype, shape, strided in product(
+        (torch.bfloat16, torch.float16, torch.float32), (torch.int32, torch.int64),
+        ((1, 1, 32), (17, 2, 96), (128, 8, 512)), (False, True),
+    ):
+        tokens, top_k, hidden = shape
+        source = torch.empty(tokens, hidden, device=DEVICE, dtype=dtype)
+        ids = torch.empty(tokens, top_k, device=DEVICE, dtype=index_dtype)
+        output = torch.empty(tokens * top_k, hidden, device=DEVICE, dtype=dtype)
+        mapping = torch.empty(tokens * top_k, device=DEVICE, dtype=torch.int32)
+        probs = torch.empty(tokens, top_k, device=DEVICE, dtype=torch.float32)
+        grad_tokens, grad_probs = torch.empty_like(output), torch.empty_like(probs)
+        buffers = (output, mapping, grad_tokens, grad_probs)
+        pointers = tuple(t.data_ptr() for t in buffers)
+        torch.npu.synchronize()
+        for repeat in range(3):
+            stream = streams[repeat % 2]
+            with torch.npu.stream(stream):
+                source.normal_()
+                ids.random_(0, 1 if repeat == 0 else 16)
+                probs.uniform_()
+                expected, expected_mapping = torch_npu.npu_moe_token_permute(source, ids)
+                for tensor in (output, grad_tokens, grad_probs):
+                    tensor.fill_(float("nan"))
+                mapping.fill_(-1)
+                actual = torch.ops.hyper_parallel.moe_token_permute_out(source, ids, output, mapping)
+                dy, dx = torch.randn_like(output), torch.randn_like(source)
+                if strided:
+                    dy, dx = dy.T.contiguous().T, dx.T.contiguous().T
+                expected_dx = torch_npu.npu_moe_token_permute_grad(source, dy, ids, expected_mapping)
+                actual_dx = ops.moe_token_permute_grad(dy, mapping, tokens, top_k)
+                expected_grads = torch_npu.npu_moe_token_unpermute_grad(expected, dx, expected_mapping, probs)
+                ops.mega_moe_unpermute_grad_out(output, dx, mapping, probs, grad_tokens, grad_probs)
+                source.fill_(float("nan"))
+                dy.fill_(float("nan"))
+                dx.fill_(float("nan"))
+            stream.synchronize()
+            torch.testing.assert_close(
+                (*actual, actual_dx, grad_tokens, grad_probs),
+                (expected, expected_mapping.flatten(), expected_dx, *expected_grads), rtol=0, atol=0)
+            assert pointers == tuple(t.data_ptr() for t in buffers)
+            assert actual_dx.data_ptr() != dy.data_ptr()
+            comparisons += 1
+    for device, tokens in (("meta", 17), (DEVICE, 0)):
+        source = torch.empty(tokens, 32, device=device)
+        ids = torch.empty(tokens, 2, dtype=torch.int32, device=device)
+        output = torch.empty(tokens * 2, 32, device=device)
+        mapping = torch.empty(tokens * 2, dtype=torch.int32, device=device)
+        torch.ops.hyper_parallel.moe_token_permute_out(source, ids, output, mapping)
+        assert ops.moe_token_permute_grad(output, mapping, tokens, 2).shape == source.shape
+        probs = torch.empty(tokens, 2, device=device)
+        ops.mega_moe_unpermute_grad_out(
+            output, source, mapping, probs, torch.empty_like(output), torch.empty_like(probs))
+    source = torch.empty(17, 32, device=DEVICE)
+    ids = torch.zeros(17, 1, dtype=torch.int32, device=DEVICE)
+    mapping = torch.empty(17, dtype=torch.int32, device=DEVICE)
+    with pytest.raises(RuntimeError, match="overlap|single memory location"):
+        torch.ops.hyper_parallel.moe_token_permute_out(source, ids, source, mapping)
+    with pytest.raises(RuntimeError, match="all top-k rows"):
+        torch.ops.hyper_parallel.moe_token_permute_out(source, ids, source[:1], mapping)
+    probs = torch.ones(17, 1, device=DEVICE)
+    with pytest.raises(RuntimeError, match="overlap|single memory location"):
+        ops.mega_moe_unpermute_grad_out(source, source.clone(), mapping, probs, source, torch.empty_like(probs))
+    write_evidence({"comparisons": comparisons, "task_queue": os.getenv("TASK_QUEUE_ENABLE"), "exact": True})

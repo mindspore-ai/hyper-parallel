@@ -27,8 +27,6 @@ from hyper_parallel.core.multicore.scheduler.config import (
 )
 from hyper_parallel.core.multicore.scheduler.runtime import allocate_runtime_config
 
-from tests.common.mark_utils import arg_mark
-
 
 class TestTaskSplitValue(unittest.TestCase):
     """Validate scheduler topology before runtime-config serialization."""
@@ -53,7 +51,7 @@ class TestTaskSplitValue(unittest.TestCase):
                 self.assertEqual(values.single_rank_expert_num, local_experts)
 
     def test_rejects_values_that_break_runtime_arithmetic(self) -> None:
-        """Reject zero divisors and uneven partitions."""
+        """Reject zero divisors, uneven partitions, and oversized scratch use."""
         cases = (
             ({"tp": 0}, "tp must be a positive integer"),
             ({"ep": 0}, "ep must be a positive integer"),
@@ -128,14 +126,8 @@ class TestValidateRuntimeConfig(unittest.TestCase):
 class TestReadyHandshakeConfig(unittest.TestCase):
     """Keep ready state inside the single graph-sized runtime contract."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
-              essential_mark="essential")
     def test_ready_event_uses_expanded_counter_capacity(self) -> None:
-        """Feature: ready event uses expanded counter capacity.
-
-        Description: Configure ready events for 1024 experts distributed over 64 ranks.
-        Expectation: Reserve the ready event and its atomic lanes beyond event 1024.
-        """
+        """Reserve the ready event and its atomic lanes beyond event 1024."""
         values = TaskSplitValue(tp=1, ep=64, seq_size=128, all_expert_num=1024, top_k=2)
         config = allocate_runtime_config(16, mega_moe_event_capacity(1024, 64))
         configure_ready_handshake(config, values)

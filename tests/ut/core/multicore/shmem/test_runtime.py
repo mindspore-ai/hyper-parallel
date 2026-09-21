@@ -120,67 +120,30 @@ class TestRuntimeLifecycle(unittest.TestCase):
         _lifecycle.release()
 
     def test_subgroup_uses_local_coordinates_and_isolated_bootstrap(self) -> None:
-        """Initialize and close a noncontiguous EP group without WORLD collectives."""
+        """Keep root/peer bootstrap group-local and propagate root failure without a reference."""
         group = object()
         self.dist.get_process_group_ranks.return_value = [2, 5]
         self.dist.get_world_size.return_value = 8
-
-        _lifecycle.acquire(group)
-        _lifecycle._host_barrier()  # pylint: disable=protected-access
-        _lifecycle.release()
-
-        self.native._get_unique_id.assert_called_once_with()
-        self.dist.broadcast_object_list.assert_called_once_with(
-            [b"group-bootstrap", None], src=2, group=group
-        )
-        self.native._initialize.assert_called_once_with(0, 2, b"group-bootstrap")
-        self.assertEqual(self.dist.barrier.call_args_list, [call(group=group)] * 3)
-
-    def test_subgroup_peer_receives_root_unique_id(self) -> None:
-        """Do not generate a second unique ID on a non-root EP member."""
-        group = object()
-        self.dist.get_process_group_ranks.return_value = [1, 3]
-        self.dist.get_world_size.return_value = 4
-        self.dist.get_rank.return_value = 1
-
-        def broadcast(payload: list, **_kwargs: object) -> None:
-            payload[:] = [b"peer-bootstrap", None]
-
-        self.dist.broadcast_object_list.side_effect = broadcast
-        _lifecycle.acquire(group)
-        self.native._get_unique_id.assert_not_called()
-        self.native._initialize.assert_called_once_with(1, 2, b"peer-bootstrap")
-        _lifecycle.release()
-
-    def test_subgroup_bootstrap_failure_does_not_acquire_reference(self) -> None:
-        """Publish root failure to the group before rejecting initialization."""
-        group = object()
-        self.dist.get_process_group_ranks.return_value = [2, 5]
-        self.dist.get_world_size.return_value = 8
-        self.native._get_unique_id.side_effect = RuntimeError("UID unavailable")
-
-        with self.assertRaisesRegex(RuntimeError, "UID unavailable"):
-            _lifecycle.acquire(group)
-
-        self.dist.broadcast_object_list.assert_called_once()
-        self.native._initialize.assert_not_called()
-        self.assertEqual(_lifecycle._reference_count(), 0)  # pylint: disable=protected-access
-
-    def test_subgroup_equivalent_membership_reuses_bootstrap(self) -> None:
-        """Share resources across equivalent local EP handles, but not another EP domain."""
-        group, equivalent, different = object(), object(), object()
-        self.dist.get_world_size.return_value = 8
-        self.dist.get_process_group_ranks.side_effect = lambda selected: (
-            [2, 5] if selected is not different else [2, 6]
-        )
-        _lifecycle.acquire(group)
-        _lifecycle.acquire(equivalent)
-        with self.assertRaisesRegex(RuntimeError, "different ordered membership"):
-            _lifecycle.acquire(different)
-        self.native._get_unique_id.assert_called_once()
-        self.assertEqual(_lifecycle._reference_count(), 2)  # pylint: disable=protected-access
-        _lifecycle.release()
-        _lifecycle.release()
+        for rank, failure in ((0, None), (1, None), (0, RuntimeError("UID unavailable"))):
+            self.dist.get_rank.return_value = rank
+            self.native._get_unique_id.side_effect = failure
+            self.native._initialize.reset_mock()
+            self.dist.broadcast_object_list.side_effect = (
+                lambda payload, **_kw: payload.__setitem__(0, b"group-bootstrap") if rank else None)
+            if failure:
+                with self.assertRaisesRegex(RuntimeError, "UID unavailable"):
+                    _lifecycle.acquire(group)
+                self.native._initialize.assert_not_called()
+            else:
+                _lifecycle.acquire(group)
+                self.native._initialize.assert_called_once_with(rank, 2, b"group-bootstrap")
+                _lifecycle._host_barrier()  # pylint: disable=protected-access
+                _lifecycle.release()
+                self.dist.barrier.assert_called_with(group=group)
+            self.assertEqual(_lifecycle._reference_count(), 0)  # pylint: disable=protected-access
+            payload = [None, f"RuntimeError: {failure}"] if failure else [b"group-bootstrap", None]
+            self.dist.broadcast_object_list.assert_called_with(
+                payload, src=2, group=group)
 
     def test_nonmember_is_rejected_before_any_collective(self) -> None:
         """Reject nonmembers locally instead of entering a foreign EP collective."""

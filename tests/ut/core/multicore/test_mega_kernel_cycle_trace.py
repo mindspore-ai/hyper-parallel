@@ -25,8 +25,6 @@ from hyper_parallel.core.multicore.profiler.profiling import (
     _profile_buffer_bytes_for_capacities,
 )
 
-from tests.common.mark_utils import arg_mark
-
 
 _AIC_CAPACITY = 16
 _AIV_CAPACITY = 16
@@ -79,7 +77,7 @@ def _profile_buffer(
     return buffer
 
 
-def _parse(buffer: bytes, *, detailed_task_names: bool = False) -> dict:
+def _parse(buffer: bytes, *, detailed_task_names: bool = False, aiv_capacity: int = _AIV_CAPACITY) -> dict:
     return _parse_cycle_buffer(
         buffer=buffer,
         rank=3,
@@ -92,35 +90,24 @@ def _parse(buffer: bytes, *, detailed_task_names: bool = False) -> dict:
         soc_name="Ascend910B3",
         task_stage_names={9: "GMM1"},
         aic_record_capacity=_AIC_CAPACITY,
-        aiv_record_capacity=_AIV_CAPACITY,
+        aiv_record_capacity=aiv_capacity,
     )
 
 
 class TestMegaKernelCycleTrace(unittest.TestCase):
     """Validate schema, timing, naming, fallback, and corruption checks."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_parse_aiv_tail_above_former_limit(self) -> None:
-        """
-        Feature: mega kernel cycle trace
-        Description: Decode the record beyond slot 256 without losing the vector tail.
-        Expectation: All 257 events are decoded with zero dropped records.
-        """
-        capacity = 272
-        buffer = bytearray(_profile_buffer_bytes_for_capacities(16, capacity))
-        offset = CUBE_SLOT_COUNT * (CORE_HEADER.size + 16 * PROFILE_RECORD.size)
-        CORE_HEADER.pack_into(buffer, offset, 100, 257, 0, 2, 0, capacity, 0)
+        """Decode the 257th vector record instead of silently dropping the tail."""
+        buffer = bytearray(_profile_buffer_bytes_for_capacities(16, 272))
+        offset = _slot_offset(2, 0)
+        CORE_HEADER.pack_into(buffer, offset, 100, 257, 0, 2, 0, 272, 0)
         for index in range(257):
             PROFILE_RECORD.pack_into(buffer, offset + CORE_HEADER.size + index * PROFILE_RECORD.size,
                                      110 + index * 2, 111 + index * 2, 0x10002, index, index, INVALID_OWNER_ID)
-        trace = _parse_cycle_buffer(buffer=buffer, rank=0, device_id=0, cycle_frequency_mhz=50.0,
-                                   detailed_task_names=False, kernel_name="Test", owner_label="Expert",
-                                   stage_names={0x10002: "GMM1"}, soc_name="Ascend910C",
-                                   aic_record_capacity=16, aiv_record_capacity=capacity)
+        trace = _parse(buffer, aiv_capacity=272)
         events = [event for event in trace["traceEvents"] if event["ph"] == "X"]
-        self.assertEqual(len(events), 257)
-        self.assertEqual(events[-1]["args"]["task_id"], 256)
+        self.assertEqual((len(events), events[-1]["args"]["task_id"]), (257, 256))
         self.assertEqual(trace["megaKernelCycleTrace"]["droppedRecordCount"], 0)
 
     def test_parse_converts_cycles_and_preserves_raw_identifiers(self):
@@ -166,14 +153,8 @@ class TestMegaKernelCycleTrace(unittest.TestCase):
                 self.assertEqual(event["name"], expected_name)
                 self.assertEqual(event["args"]["task_stage"], "GMM1")
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
-              essential_mark="essential")
     def test_unknown_task_type_uses_generic_fallback(self):
-        """Feature: unknown task type uses generic fallback.
-
-        Description: Parse a cycle record containing an unregistered task identifier.
-        Expectation: Keep a record readable when a concrete Kernel has no stage rule.
-        """
+        """Keep a record readable when a concrete Kernel has no stage rule."""
         trace = _parse(_profile_buffer(desc_id=0x20000 + 999))
         event = next(event for event in trace["traceEvents"] if event["ph"] == "X")
 

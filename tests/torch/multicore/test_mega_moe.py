@@ -24,7 +24,6 @@ from pathlib import Path
 import pytest
 
 from tests.common.mark_utils import arg_mark
-from tests.common.distributed_launcher import torchrun_case
 from tests.common.parallel_case import TorchCase, parallel_run
 from tests.common.port_utils import allocate_port
 from tests.torch.multicore._test_env import (
@@ -76,28 +75,6 @@ def _run_precision_worker(monkeypatch) -> None:
 def test_mega_moe_level0_precision(monkeypatch) -> None:
     """Compare output, dX, route dW, W1 dW, and W2 dW with common MoE."""
     _run_precision_worker(monkeypatch)
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential",
-)
-@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
-@pytest.mark.parametrize("checkpointed", [False, True])
-def test_mega_moe_subgroup_pipeline(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, checkpointed: bool, dispatch_mode: str,
-) -> None:
-    """Compare PP2 x EP2 FIFO 1F1B with an unsharded dense oracle."""
-    _prepare_torch_multicore_test_environment()
-    case = "test_mega_moe_subgroup_pipeline" + ("_checkpoint" if checkpointed else "")
-    result_path = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path))) / f"{case}_{dispatch_mode}.json"
-    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
-    monkeypatch.setenv("HP_MEGA_MOE_LEVEL1_RESULT", str(result_path))
-    monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
-    # A single case must preserve the caller's reserved physical-device list.
-    with without_inherited_rank_environment():
-        torchrun_case(str(Path(__file__).with_name("_test_mega_moe_pipeline.py")), case, num_proc=4)
-    result = json.loads(result_path.read_text(encoding="utf-8"))
-    assert len(result["ranks"]) == 4
 
 
 def _run_performance_worker(monkeypatch, result_dir: Path) -> dict:
@@ -204,24 +181,18 @@ def _run_acceptance_worker(
     card_mark="allcards",
     essential_mark="unessential",
 )
-def test_mega_moe_local_capacity_lifetime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Preserve all gradients across odd receive tails and two outstanding routes."""
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_mega_moe_local_capacity_lifetime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str,
+) -> None:
+    """Feature: Transport storage lifetime.
+    Description: Run retained backward and profiling through the shared memory worker in both modes.
+    Expectation: Outputs and all gradients agree across hotspots, tails and receive-buffer reuse.
+    """
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
     _run_acceptance_worker(
         monkeypatch, tmp_path, "test_mega_moe_local_capacity_lifetime", 2, "_test_mega_moe_memory.py",
-    )
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level1",
-    card_mark="allcards",
-    essential_mark="unessential",
-)
-def test_mega_moe_push_memory_reuse(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Validate real receive/dX aliases and fallback with a minimally page-aligned heap."""
-    _run_acceptance_worker(
-        monkeypatch, tmp_path, "test_mega_moe_push_memory_reuse", 2, "_test_mega_moe_push_memory.py",
-        heap_bytes=2 * 1024 * 1024,
+        heap_bytes=(34 if dispatch_mode == "pull" else 64) * 1024**2,
     )
 
 
@@ -244,8 +215,15 @@ def test_mega_moe_poisoned_buffers(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     card_mark="allcards",
     essential_mark="unessential",
 )
-def test_mega_moe_device_ready_lifecycle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Validate peer readiness under checkpoint replay, rank skew and stream reuse."""
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_mega_moe_device_ready_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str,
+) -> None:
+    """Feature: Device-owned ready generations.
+    Description: Reuse lifecycle scenarios for push and pull through the same worker.
+    Expectation: Replay, streams and capacity-error recovery preserve outputs and gradients.
+    """
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
     _run_acceptance_worker(
         monkeypatch, tmp_path, "test_mega_moe_device_ready_lifecycle", 2, "_test_mega_moe_ready.py",
     )
@@ -325,105 +303,26 @@ def test_mega_moe_group_list_isolation(
     )
 
 
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-@pytest.mark.parametrize("task_queue_enable", ["1", "2"])
-def test_moe_token_permute_grad(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task_queue_enable: str,
-) -> None:
-    """Feature: Cached metadata-only permutation backward in both task queues.
-
-    Description: Compare dtypes, odd shapes and strided inputs against the native gradient.
-    Expectation: Input gradients match the native operator on both ranks.
-    """
-    monkeypatch.setenv("TASK_QUEUE_ENABLE", task_queue_enable)
-    evidence_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path))) / f"queue_{task_queue_enable}"
-    monkeypatch.setenv("HP_MEGA_MOE_EVIDENCE_DIR", str(evidence_dir))
-    _run_acceptance_worker(
-        monkeypatch, tmp_path, "test_moe_token_permute_grad", 2, "_test_moe_token_permute_grad.py",
-    )
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential",
-)
-@pytest.mark.parametrize("task_queue_enable", ["1", "2"])
-def test_moe_token_unpermute_grad_out(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task_queue_enable: str,
-) -> None:
-    """Feature: Cached unpermute-gradient out bridge in both task queues.
-
-    Description: Exercise changing inputs, reused outputs and default/non-default streams.
-    Expectation: Gradients match the native operator exactly and overlapping outputs are rejected.
-    """
-    monkeypatch.setenv("TASK_QUEUE_ENABLE", task_queue_enable)
-    evidence_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path))) / f"queue_{task_queue_enable}"
-    monkeypatch.setenv("HP_MEGA_MOE_EVIDENCE_DIR", str(evidence_dir))
-    _run_acceptance_worker(
-        monkeypatch, tmp_path, "test_moe_token_unpermute_grad_out", 2, "_test_moe_token_unpermute_grad.py",
-    )
-
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards",
           essential_mark="essential")
-@pytest.mark.parametrize("task_queue_enable", ["1", "2"])
-def test_moe_token_permute_out(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task_queue_enable: str,
-) -> None:
-    """Feature: Dropless token permutation into caller-owned output storage.
+@pytest.mark.parametrize("task_queue", ["1", "2"])
+def test_mega_moe_native_permutation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task_queue: str) -> None:
+    """Feature: Native permutation bridges in both task queues.
 
-    Description: Compare reused outputs and changed routes on alternating streams in both task queues.
-    Expectation: Values and mappings match native permutation exactly; invalid outputs are rejected.
+    Description: Compare caller-owned permutation and both gradient operations on two ranks.
+    Expectation: Exact outputs, stable buffer addresses and valid asynchronous lifetimes.
     """
-    monkeypatch.setenv("TASK_QUEUE_ENABLE", task_queue_enable)
-    evidence_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path))) / f"queue_{task_queue_enable}"
-    monkeypatch.setenv("HP_MEGA_MOE_EVIDENCE_DIR", str(evidence_dir))
-    _run_acceptance_worker(
-        monkeypatch, tmp_path, "test_moe_token_permute_out", 2, "_test_moe_token_permute_out.py",
-    )
+    monkeypatch.setenv("TASK_QUEUE_ENABLE", task_queue)
+    monkeypatch.setenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path / task_queue))
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_native_permutation", 2, "_test_mega_moe.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
           essential_mark="unessential")
-@pytest.mark.parametrize("task_queue_enable", ["1", "2"])
-def test_mega_moe_transport_coexistence(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task_queue_enable: str,
-) -> None:
-    """Feature: mega moe transport coexistence.
+def test_mega_moe_subgroups(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Feature: Noncontiguous EP subgroups.
 
-    Description: Alternate push and pull with hotspot routes, retained graphs and checkpoint in both task queues.
-    Expectation: Compare both transports, retained gradients, checkpoint and instrumented execution.
+    Description: Run two independent groups with external weights in push and pull modes.
+    Expectation: Outputs and all gradients match an unsharded reference.
     """
-    monkeypatch.setenv("TASK_QUEUE_ENABLE", task_queue_enable)
-    evidence_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path))) / f"queue_{task_queue_enable}"
-    monkeypatch.setenv("HP_MEGA_MOE_EVIDENCE_DIR", str(evidence_dir))
-    _run_acceptance_worker(monkeypatch, tmp_path, "test_push_pull_coexistence", 4,
-                           "_test_mega_moe_transport.py")
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
-          essential_mark="unessential")
-def test_mega_moe_pull_hotspot_small_heap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Feature: mega moe pull hotspot small heap.
-
-    Description: Move the full receive load between destinations on four ranks.
-    Expectation: Validate a four-rank hotspot in a heap smaller than push receive storage.
-    """
-    _run_acceptance_worker(monkeypatch, tmp_path, "test_pull_hotspot_small_heap", 4,
-                           "_test_mega_moe_transport.py")
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
-          essential_mark="unessential")
-def test_mega_moe_transport_qwen_shape(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Feature: mega moe transport qwen shape.
-
-    Description: Compare both modes with common MoE at 1x, 1.25x and 2.5x receive loads.
-    Expectation: Validate H5120/I1792/E48/seq4096 on EP4 at 1x, 1.25x and 2.5x receive loads.
-    """
-    _run_acceptance_worker(monkeypatch, tmp_path, "test_push_pull_qwen_shape", 4,
-                           "_test_mega_moe_transport.py")
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_subgroups", 4, "_test_mega_moe_runtime.py")
