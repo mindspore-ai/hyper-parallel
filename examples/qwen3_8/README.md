@@ -29,9 +29,9 @@ GDN 融合算子。两个训练 YAML 通过 `plan_overrides[*].replace_module` �
 | Hugging Face Hub | 1.22.0 |
 | Safetensors | 0.8.0 |
 | TorchData | 0.11.0 |
-| Datasets | 4.5.0 |
+| Datasets | 4.0.0 |
 | NumPy | 1.26.4 |
-| Einops | 0.8.1 |
+| Einops | 0.8.2 |
 | PyYAML | 6.0.3 |
 
 运行高性能 GDN 融合算子需要 Ascend 驱动、固件和 CANN 9.1.0；Python 3.11 中安装匹配的
@@ -45,8 +45,13 @@ cd /path/to/hyper-parallel
 source /home/chaoran/cann/cann-9.1.0/set_env.sh
 export HYPER_PARALLEL_PLATFORM=torch
 
-python3 -m pip install -r examples/qwen3_8/requirements.txt \
-  --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi
+python3 -m pip download --no-deps \
+  --index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi \
+  -d /tmp/qwen3_8-wheels triton-ascend==3.2.2
+sed '/^psutil==/d' examples/qwen3_8/requirements.txt > /tmp/qwen3_8-resolved.txt
+python3 -m pip install --index-url=https://repo.huaweicloud.com/repository/pypi/simple \
+  --find-links=/tmp/qwen3_8-wheels -r /tmp/qwen3_8-resolved.txt
+python3 -m pip install --no-deps psutil==7.2.2
 python3 -m pip install -e . --no-deps
 ```
 
@@ -56,6 +61,7 @@ Transformers 5.13.0 等 Python 依赖。`pip install -e . --no-deps` 安装当�
 [`components/functional/_gdn_triton`](../../hyper_parallel/components/functional/_gdn_triton)；不需要另装 FLA、
 AscendC GDN 扩展或 `causal-conv1d`。Triton-Ascend 与普通 Triton 共用 `triton` 包路径，安装后不要再
 单独升级普通 Triton；相关说明见[官方安装指南](https://github.com/triton-lang/triton-ascend/blob/main/docs/en/installation_guide.md)。
+分阶段安装 psutil 是因为成功实验使用 7.2.2，而 Triton-Ascend 3.2.2 的依赖声明固定为 6.0.0。
 
 依次检查 NPU、PyTorch/torch-npu 和算子依赖：
 
@@ -174,3 +180,18 @@ torchrun --standalone --nproc_per_node=8 \
 `micro_batch_size=1` 和同一高性能 GDN 融合算子，仅 CP 从 1 改为 2。
 
 性能参考（steps 11–100 平均）：FSDP + CP + 高性能 GDN 融合算子为 10.04 s/step。
+
+## 5. A3 训练镜像
+
+[`docker/Dockerfile.qwen3_8-a3`](../../docker/Dockerfile.qwen3_8-a3) 以 CANN 9.1.0 A3、Python 3.11
+为基础，固定了上述 FSDP+CP 实验的 PyTorch、torch-npu、高性能算子及数据处理依赖，并安装当前仓库源码。
+镜像构建时还会编译 offline Indexed Dataset 使用的 C++ 索引模块。
+在 ARM64 构建机的仓库根目录执行：
+
+```bash
+docker build -f docker/Dockerfile.qwen3_8-a3 -t hyper-parallel:qwen3_8-a3 .
+```
+
+镜像不包含模型权重、Indexed Dataset 或输出目录；在 A3 训练节点启动容器时挂载这些目录，
+再执行第 3 节的 FSDP+CP `torchrun` 命令。构建机上不需要 A3 NPU，但算子执行和训练性能仍需在
+A3 机器上验证。
