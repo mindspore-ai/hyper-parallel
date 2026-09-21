@@ -46,6 +46,7 @@ python3 -c "import hyper_parallel as hp; print(hp.get_platform())"
 | 文件 | 说明 |
 | --- | --- |
 | `Dockerfile.hyper-parallel-npu` | 通用 HyperParallel NPU 镜像，默认 PyTorch 2.9 后端 |
+| `Dockerfile.qwen3_8-a3` | Qwen3.8 FSDP+CP 高性能融合算子实验的 A3 / Python 3.11 镜像 |
 | `Dockerfile.torch` | PyTorch 后端镜像，安装 `hyper_parallel[torch29]` |
 | `Dockerfile.mindspore` | MindSpore 后端镜像，安装 `hyper_parallel[mindspore]` |
 | `build_hyper-parallel_npu.sh` | 简化构建脚本，构建后自动做 import smoke test |
