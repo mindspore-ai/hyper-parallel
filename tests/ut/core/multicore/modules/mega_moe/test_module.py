@@ -170,10 +170,50 @@ class TestMegaMoeExperts(unittest.TestCase):
             resources.plan,
             resources.workspace,
             topk_weights=None,
+            workspace_claimed=False,
         )
         mock_restore.assert_called_once_with(
             expert_output, route.unpermute_mapping, topk_weights
         )
+
+    def test_pull_forward_releases_route_lease_on_success_and_failure(self) -> None:
+        """Keep preparation and execution within one lease, including every failure boundary."""
+        experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                                 num_experts=4, top_k=2, ep_size=2, dispatch_mode="pull").bfloat16()
+        self.addCleanup(experts.close)
+        hidden = torch.ones(2, 64, 16, dtype=torch.bfloat16)
+        ids, probs = torch.zeros(128, 2, dtype=torch.int32), torch.full((128, 2), 0.5)
+        calls = Mock()
+        resources = SimpleNamespace(spec=object(), plan=object(), workspace=calls.workspace)
+        stages = (calls.workspace.ensure, calls.workspace.claim, calls.prepare, calls.execute)
+        names = ["workspace.ensure", "workspace.claim", "prepare", "execute"]
+
+        def _prepare(*_args, **_kwargs):
+            self.assertFalse(torch.is_grad_enabled())
+            return object()
+
+        with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+              patch.object(experts, "_get_execution_resources", return_value=resources),
+              patch.object(mega_moe_module, "prepare_topk_route", calls.prepare),
+              patch.object(mega_moe_module, "execute_mega_moe_with_permutation", calls.execute),
+              patch.object(mega_moe_module, "restore_topk_output") as restore):
+            for failure in (None, 0, 1, 2, 3):
+                calls.reset_mock(side_effect=True)
+                calls.prepare.side_effect = _prepare
+                calls.execute.return_value = hidden + 1
+                if failure is None:
+                    torch.testing.assert_close(experts(hidden, ids, probs), hidden + 1)
+                    self.assertTrue(calls.execute.call_args.kwargs["workspace_claimed"])
+                    self.assertIs(calls.execute.call_args.kwargs["topk_weights"], probs)
+                else:
+                    stages[failure].side_effect = RuntimeError("injected failure")
+                    with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                        experts(hidden, ids, probs)
+                expected = names if failure is None else names[:failure + 1]
+                if failure not in (0, 1):
+                    expected = expected + ["workspace.release"]
+                self.assertEqual([entry[0] for entry in calls.mock_calls], expected)
+            restore.assert_not_called()
 
     def test_forward_rejects_invalid_weights_before_resource_creation(self) -> None:
         """Reject invalid expert weights before initializing native resources."""

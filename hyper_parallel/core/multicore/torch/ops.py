@@ -31,7 +31,7 @@ Forward and backward ACLNN symbols are packaged in one component-owned
 ``hyper_parallel_multicore_nn`` vendor. Source the packaged ``set_env.bash``
 before starting the application or framework Python process so CANN can discover that vendor.
 """
-__all__ = ["mega_moe", "mega_moe_grad", "moe_token_permute_grad"]
+__all__ = ["mega_moe", "mega_moe_grad", "moe_token_permute_grad", "moe_token_permute_out"]
 
 from functools import lru_cache
 
@@ -70,6 +70,24 @@ def _load_native() -> None:
 # ---------------------------------------------------------------------------
 # Python wrappers — thin pass-through to the registered C++ ops
 # ---------------------------------------------------------------------------
+
+
+def moe_token_permute_out(
+    tokens: torch.Tensor,
+    indices: torch.Tensor,
+    output: torch.Tensor,
+    mapping: torch.Tensor,
+) -> None:
+    """Permute all routed rows directly into caller-owned contiguous storage.
+
+    Args:
+        tokens: Contiguous token states shaped ``[tokens, hidden]``.
+        indices: Contiguous INT32/INT64 expert IDs shaped ``[tokens, top_k]``.
+        output: Output shaped ``[tokens * top_k, hidden]``, matching token dtype.
+        mapping: Independent INT32 inverse mapping shaped ``[tokens * top_k]``.
+    """
+    _load_native()
+    torch.ops.hyper_parallel.moe_token_permute_out(tokens, indices, output, mapping)
 
 
 def mega_moe_unpermute_grad_out(

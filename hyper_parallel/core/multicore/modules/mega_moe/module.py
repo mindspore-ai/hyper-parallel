@@ -368,28 +368,37 @@ class MegaMoeExperts(MulticoreModule):
             weights,
         )
         resources = self._get_execution_resources(hidden_flat)
-        # The expert autograd bridge consumes permutation gradients before the
-        # workspace can be reused, so route preparation needs no separate node.
-        with torch.no_grad():
-            route = prepare_topk_route(
+        pull = self.dispatch_mode == "pull"
+        if pull:
+            resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
+            resources.workspace.claim()
+        try:
+            # Pull writes its permutation into SHMEM, so its lease must cover
+            # route preparation as well as execution and output restoration.
+            with torch.no_grad():
+                route = prepare_topk_route(
+                    hidden_flat,
+                    topk_ids,
+                    topk_weights,
+                    resources.spec,
+                    tokens_per_expert,
+                    workspace=resources.workspace,
+                )
+            expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,
-                topk_weights,
-                resources.spec,
-                tokens_per_expert,
-                workspace=resources.workspace,
+                weights[0],
+                weights[1],
+                route,
+                resources.plan,
+                resources.workspace,
+                topk_weights=topk_weights if pull else None,
+                workspace_claimed=pull,
             )
-        expert_output = execute_mega_moe_with_permutation(
-            hidden_flat,
-            topk_ids,
-            weights[0],
-            weights[1],
-            route,
-            resources.plan,
-            resources.workspace,
-            topk_weights=topk_weights if self.dispatch_mode == "pull" else None,
-        )
-        if self.dispatch_mode == "pull":
+        finally:
+            if pull:
+                resources.workspace.release()
+        if pull:
             return expert_output.reshape_as(hidden_states)
         output = restore_topk_output(
             expert_output,

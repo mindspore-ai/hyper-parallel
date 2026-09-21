@@ -179,10 +179,37 @@ class TestMegaMoeRoute(unittest.TestCase):
         self.assertTrue(torch.equal(metadata.group_list, torch.tensor([10, 22])))
         self.assertEqual(metadata.expert_capacity, 22)
         self.assertEqual((spec.dispatch_split, spec.combine_split, spec.swiglu_split), (128, 128, 128))
-        with patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather_counts), \
-                patch.object(route_module, "_permute_topk_input", side_effect=permute_input):
-            pull = prepare_topk_route(hidden_states, topk_ids, topk_weights,
-                                      replace(spec, dispatch_mode="pull"), supplied_counts)
+        events.clear()
+        workspace.in_use, workspace.source_buffer = True, torch.empty_like(routed_tokens)
+        workspace.wait_for_reuse.reset_mock()
+        pull_spec = replace(spec, dispatch_mode="pull")
+
+        def _permute_out(tokens, indices, output, mapping):
+            self.assertIs(tokens, hidden_states)
+            self.assertIs(output, workspace.source_buffer)
+            self.assertTrue(indices.is_contiguous())
+            self.assertEqual(mapping.dtype, torch.int32)
+            events.append("permute-out")
+            output.copy_(routed_tokens)
+            mapping.copy_(unpermute_mapping)
+
+        with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather_counts) as gather,
+              patch.object(route_module.multicore_ops, "moe_token_permute_out", side_effect=_permute_out),
+              patch.object(route_module, "_permute_topk_input") as allocating):
+            first, pull = [prepare_topk_route(hidden_states, topk_ids.T.contiguous().T, topk_weights,
+                                              pull_spec, supplied_counts, workspace) for _ in range(2)]
+            self.assertIs(pull.routed_tokens, workspace.source_buffer)
+            self.assertNotEqual(first.unpermute_mapping.data_ptr(), pull.unpermute_mapping.data_ptr())
+            torch.testing.assert_close(first.unpermute_mapping, unpermute_mapping)
+            for active, source in ((False, workspace.source_buffer), (True, None)):
+                workspace.in_use, workspace.source_buffer = active, source
+                gather.reset_mock()
+                with self.assertRaisesRegex(RuntimeError, "initialized, claimed workspace"):
+                    prepare_topk_route(hidden_states, topk_ids, topk_weights, pull_spec, supplied_counts, workspace)
+                gather.assert_not_called()
+        allocating.assert_not_called()
+        workspace.wait_for_reuse.assert_not_called()
+        self.assertEqual(events, ["gather", "permute-out", "wait"] * 2)
         self.assertEqual(pull.metadata.dispatch_src_off.tolist(), [3, 6, 11, 18])
         self.assertEqual(pull.metadata.dispatch_target_off.tolist(), [0, 10, 3, 14])
         self.assertEqual(pull.metadata.dispatch_size.tolist(), [3, 4, 7, 8])

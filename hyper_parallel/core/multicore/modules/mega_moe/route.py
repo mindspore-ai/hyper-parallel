@@ -23,6 +23,8 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
+from hyper_parallel.core.multicore.torch import ops as multicore_ops
+
 from .spec import MegaMoeSpec
 
 if TYPE_CHECKING:
@@ -194,6 +196,17 @@ def _permute_topk_input(
     )
 
 
+def _permute_topk_input_out(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep the inverse mapping owned while writing rows into leased SHMEM."""
+    mapping = torch.empty(topk_ids.numel(), dtype=torch.int32, device=topk_ids.device)
+    multicore_ops.moe_token_permute_out(hidden_states, topk_ids.contiguous(), output, mapping)
+    return output, mapping
+
+
 def _compute_route_metadata(
     counts: torch.Tensor,
     counts_by_source: torch.Tensor,
@@ -257,17 +270,27 @@ def prepare_topk_route(
         topk_weights: Router weights paired with ``topk_ids``.
         spec: Bound shape and expert-parallel specification.
         tokens_per_expert: Optional trusted Router histogram.
-        workspace: Optional lease owner ordered before the count exchange.
+        workspace: Optional workspace ordered before the count exchange. Pull
+            requires an initialized, caller-held lease covering route execution.
 
     Returns:
         Permuted tokens and exact native route metadata.
     """
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
     counts = _resolve_counts(flat_ids, tokens_per_expert, spec)
+    permutation_output = None
     if workspace is not None:
-        workspace.wait_for_reuse()
+        if spec.dispatch_mode == "pull":
+            if not workspace.in_use or workspace.source_buffer is None:
+                raise RuntimeError("Pull permutation requires an initialized, claimed workspace.")
+            permutation_output = workspace.source_buffer
+        else:
+            workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, spec)
-    routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
+    if permutation_output is None:
+        routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
+    else:
+        routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output)
     received_counts = _finish_count_gather(counts_by_source, count_work, spec)
     expert_capacity, maximum_received_slots = _expert_capacity(counts_by_source, spec)
     return PreparedTopKRoute(

@@ -826,7 +826,8 @@ def test_mega_moe_native_permutation() -> None:
                 for tensor in (output, grad_tokens, grad_probs):
                     tensor.fill_(float("nan"))
                 mapping.fill_(-1)
-                actual = torch.ops.hyper_parallel.moe_token_permute_out(source, ids, output, mapping)
+                ops.moe_token_permute_out(source, ids, output, mapping)
+                actual = (output, mapping)
                 dy, dx = torch.randn_like(output), torch.randn_like(source)
                 if strided:
                     dy, dx = dy.T.contiguous().T, dx.T.contiguous().T
@@ -849,7 +850,7 @@ def test_mega_moe_native_permutation() -> None:
         ids = torch.empty(tokens, 2, dtype=torch.int32, device=device)
         output = torch.empty(tokens * 2, 32, device=device)
         mapping = torch.empty(tokens * 2, dtype=torch.int32, device=device)
-        torch.ops.hyper_parallel.moe_token_permute_out(source, ids, output, mapping)
+        ops.moe_token_permute_out(source, ids, output, mapping)
         assert ops.moe_token_permute_grad(output, mapping, tokens, 2).shape == source.shape
         probs = torch.empty(tokens, 2, device=device)
         ops.mega_moe_unpermute_grad_out(

@@ -41,7 +41,8 @@ def _dispatch_and_source(spec: Any, workspace: Any, rows: Any, capacity: int) ->
     if getattr(spec, "dispatch_mode", "push") == "push":
         return _workspace_tensor(workspace.expert_buffer, "expert_buffer"), rows
     source = _workspace_tensor(workspace.source_buffer, "source_buffer")
-    source.copy_(rows)
+    if rows is not source:
+        source.copy_(rows)
     dispatch = torch.empty((capacity, spec.hidden_size), dtype=rows.dtype, device=rows.device)
     return dispatch, source
 
@@ -288,6 +289,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         workspace: MegaMoeWorkspace,
         permutation: tuple[Any, Any, Any] | None,
         topk_weights: torch.Tensor | None,
+        workspace_claimed: bool,
     ) -> Any:
         """Launch the legacy forward op and save owned backward inputs.
 
@@ -302,6 +304,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             permutation: Optional routed rows, expert IDs and inverse mapping
                 when the first tensor argument contains original token rows.
             topk_weights: Optional Router weights for pull source-output gradients.
+            workspace_claimed: Whether the caller owns the forward workspace lease.
 
         Returns:
             Owned expert-major output rows.
@@ -317,8 +320,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 permutation_inputs = (unpermute_mapping,)
         ctx.has_permutation = permutation is not None
         ctx.has_unpermute = topk_weights is not None
-        workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
-        workspace.claim()
+        if workspace_claimed:
+            if not workspace.in_use:
+                raise RuntimeError("MegaMoe forward requires the caller-held workspace lease.")
+        else:
+            workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
+            workspace.claim()
         profile_call = None
         try:
             dispatch, source = _dispatch_and_source(spec, workspace, routed_tokens, metadata.expert_capacity)
@@ -381,7 +388,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         finally:
             if profile_call is not None:
                 profile_call.cancel()
-            workspace.release()
+            if not workspace_claimed:
+                workspace.release()
 
     @staticmethod
     # pylint: disable-next=arguments-differ
@@ -461,7 +469,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             # before allocating the owned token gradient; SHMEM stays leased.
             del dispatch, act_grad, swiglu_grad, gate_dx
             grad_input = _restore_input_gradient(ctx, grad_x, permutation_inputs)
-            return grad_input, grad_weight1, grad_weight2, None, None, None, None, grad_topk_weights
+            return grad_input, grad_weight1, grad_weight2, None, None, None, None, grad_topk_weights, None
         finally:
             if profile_call is not None:
                 profile_call.cancel()
@@ -489,7 +497,7 @@ def execute_mega_moe(
     Returns:
         Expert-major output rows with independent storage.
     """
-    return _MegaMoeFunction.apply(routed_tokens, weight1, weight2, route, plan, workspace, None, None)
+    return _MegaMoeFunction.apply(routed_tokens, weight1, weight2, route, plan, workspace, None, None, False)
 
 
 def execute_mega_moe_with_permutation(
@@ -502,6 +510,7 @@ def execute_mega_moe_with_permutation(
     workspace: MegaMoeWorkspace,
     *,
     topk_weights: torch.Tensor | None = None,
+    workspace_claimed: bool = False,
 ) -> torch.Tensor:
     """Include input permutation backward within the workspace lease.
 
@@ -514,6 +523,8 @@ def execute_mega_moe_with_permutation(
         plan: Shape-specific native descriptors.
         workspace: Reusable communication buffers.
         topk_weights: Optional Router probabilities for integrated pull output unpermutation.
+        workspace_claimed: Borrow a caller-held forward lease without releasing it.
+            Backward always acquires its own lease on the original workspace.
 
     Returns:
         Owned expert-major rows, or token-major rows when topk_weights is provided,
@@ -528,4 +539,5 @@ def execute_mega_moe_with_permutation(
         workspace,
         (route.routed_tokens, topk_ids, route.unpermute_mapping),
         topk_weights,
+        workspace_claimed,
     )
