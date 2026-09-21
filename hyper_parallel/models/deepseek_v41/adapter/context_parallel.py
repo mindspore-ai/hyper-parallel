@@ -84,13 +84,6 @@ def deepseek_v41_shared_attention_parallel_wrapper(
     and index keys use asynchronous differentiable all-gather. Projection
     GEMMs overlap communication. Indexer Q/merge heads remain TP-local and
     reduce their score and KL-target contributions before global Top-K.
-
-    Args:
-        target_module: Module being configured for parallel execution.
-        mesh: Device mesh defining the available parallel axes.
-        tp_mesh: Tensor-parallel mesh, when enabled.
-        cp_mesh: Context-parallel mesh, when enabled.
-        ep_mesh: Expert-parallel mesh, when enabled.
     """
     del mesh, ep_mesh
     wrapper_name = "deepseek_v41_shared_attention_parallel_wrapper"

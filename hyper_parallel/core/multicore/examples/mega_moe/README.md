@@ -41,11 +41,10 @@ The selected mode is included in the JSON model configuration.
 | --- | --- |
 | Topology | TP1, EP8 |
 | Dtype | BF16 |
-| Batch / sequence per rank | 1 / 4096 |
-| Hidden size / layers | 5120 / 2 |
-| Routed experts / TopK | 48 / 8 |
-| Routed / shared expert intermediate size | 1792 / 1792 |
-| Attention heads / KV heads / head dimension | 40 / 8 / 128 |
+| Batch / sequence per rank | 1 / 1024 |
+| Hidden size / layers | 2048 / 8 |
+| Routed experts / TopK | 16 / 8 |
+| Expert intermediate size | 512 |
 | Optimizer | HyperParallel AdamW, FP32 master / BF16 model |
 | Comparison order | common A, then MegaMoe B |
 | Default timing | 3 warmup + 5 measured optimizer steps |

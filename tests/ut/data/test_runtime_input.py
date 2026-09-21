@@ -76,11 +76,7 @@ class TestRuntimeInputAdapter(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_parallel_batch_merges_non_attention_runtime_inputs(self):
-        """
-        Feature: runtime input
-        Description: A model adapter can extend a dense batch with modality metadata.
-        Expectation: Parallel batch merges non attention runtime inputs.
-        """
+        """A model adapter can extend a dense batch with modality metadata."""
         batch_runtime = ParallelBatch.__new__(ParallelBatch)
         batch_runtime.runtime_input_adapter = _ModalityRuntimeAdapter()
         batch_runtime.source_type = "online"
@@ -122,11 +118,7 @@ class TestRuntimeInputAdapter(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_runtime_context_is_feature_neutral(self):
-        """
-        Feature: runtime input
-        Description: The public context stores generic topology and opaque options.
-        Expectation: Runtime context is feature neutral.
-        """
+        """The public context stores generic topology and opaque options."""
         context = RuntimeInputContext(
             source_type="online",
             local_input_shape=(1, 8),
@@ -141,11 +133,7 @@ class TestRuntimeInputAdapter(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_dynamic_batching_uses_adapter_physical_item_cost(self):
-        """
-        Feature: runtime input
-        Description: Selection budgets transformed physical tokens, not raw lengths.
-        Expectation: Dynamic batching uses adapter physical item cost.
-        """
+        """Selection budgets transformed physical tokens, not raw lengths."""
         context = DataBatchContext(
             source_type="online",
             token_budget=6,

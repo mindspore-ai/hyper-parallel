@@ -41,10 +41,6 @@ def get_is_hf_model(config: PretrainedConfig, force_hf: bool = False) -> bool:
     Returns:
         True: Use HF native AutoModel.from_pretrained()
         False: Use Hyper-Parallel custom implementation
-
-    Args:
-        config: Model configuration or configuration source.
-        force_hf: Explicit override selecting the external model implementation.
     """
     if force_hf:
         return True

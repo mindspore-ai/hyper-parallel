@@ -83,8 +83,6 @@ from hyper_parallel.core.dtensor.placement_types import (
 )
 from tests.ut.dual_mode_dtensor.conftest import _ensure_pg
 
-from tests.common.mark_utils import arg_mark
-
 
 # ==========================================================================
 # Shared helpers (merged from the private helpers of the original test
@@ -110,8 +108,7 @@ class _TinyModel(nn.Module):
 
 
 class _TinyMultiOutputMod(nn.Module):
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return three outputs to exercise multi-output layout boundaries."""
+    def forward(self, x):
         return x, x + 1, x + 2
 
 
@@ -448,16 +445,10 @@ def test_local_compute_fn_resolution(make_mesh):
 #          TestLocalRegionWithCustomComputeFn
 # ==========================================================================
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 def test_custom_compute_fn_executes_in_region(make_mesh):
-    """
-    Feature: ep moe local region
-    Description: End-to-end execution of a custom compute_fn: apply derives the gated
-        injection, and in both production and validate modes the compute_fn
-        receives (module, local tensor).
-    Expectation: Custom compute fn executes in region.
-    """
+    """End-to-end execution of a custom compute_fn: apply derives the gated
+    injection, and in both production and validate modes the compute_fn
+    receives (module, local tensor)."""
     mesh = make_mesh((1,), ("tp",))
 
     # ── case: test_derived_gate_via_apply_path ──
@@ -575,17 +566,11 @@ def test_custom_compute_fn_executes_in_region(make_mesh):
 # Sources: the 6 raises cases of TestTargetLocalComputeFn
 # ==========================================================================
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 @pytest.mark.skipif(not _HAS_TRAINER_CONFIG,
                     reason="trainer.config import chain needs newer transformers")
 def test_local_compute_fn_contract_errors(make_mesh):
-    """
-    Feature: ep moe local region
-    Description: local_compute_fn injection discipline and contract fail-fast
-        (sequential pytest.raises).
-    Expectation: Local compute fn contract errors.
-    """
+    """local_compute_fn injection discipline and contract fail-fast
+    (sequential pytest.raises)."""
     mesh = make_mesh((1,), ("tp",))
 
     # ── case: test_target_bad_return_raises ──
@@ -639,7 +624,7 @@ def test_local_compute_fn_contract_errors(make_mesh):
             _TinyMod(), spec, mesh, ("tp",), expert_mesh=None)
 
     # ── case: test_target_typo_config_key_raises ──
-    # Configuring a key the factory does not declare (typo in router) ->
+    # Configuring a key the factory does not declare (typo in rounter) ->
     # fail-fast listing the legal parameters -- config keys bind by name, and
     # a typo must not be silently swallowed.
     spec = _identity_spec()

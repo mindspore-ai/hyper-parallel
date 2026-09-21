@@ -88,7 +88,6 @@ add_library(hyper_parallel_mega_moe_torch SHARED
 target_compile_definitions(hyper_parallel_mega_moe_torch PRIVATE
     _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI})
 target_include_directories(hyper_parallel_mega_moe_torch PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
     ${Python3_INCLUDE_DIRS}
     ${TORCH_INCLUDE_ROOT}
     ${TORCH_INCLUDE_ROOT}/torch/csrc/api/include

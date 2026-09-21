@@ -93,13 +93,7 @@ def deepseek_v41_ep_compute_fn(
                 hidden_states: torch.Tensor,
                 input_ids: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            """Run the text-only source contract without visual routing state.
-
-            Args:
-                module: Module whose current parameters or execution policy are used.
-                hidden_states: Input token representations.
-                input_ids: Token IDs in batch and sequence order.
-            """
+            """Run the text-only source contract without visual routing state."""
             del input_ids
             return _routed_and_shared_forward(module, hidden_states, None, ep_group)
 
@@ -111,14 +105,7 @@ def deepseek_v41_ep_compute_fn(
             input_ids: torch.Tensor | None = None,
             image_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the multimodal source contract with optional visual routing state.
-
-        Args:
-            module: Module whose current parameters or execution policy are used.
-            hidden_states: Input token representations.
-            input_ids: Token IDs in batch and sequence order.
-            image_mask: Mask identifying image tokens in the language sequence.
-        """
+        """Run the multimodal source contract with optional visual routing state."""
         del input_ids
         return _routed_and_shared_forward(module, hidden_states, image_mask, ep_group)
 
@@ -161,15 +148,7 @@ def deepseek_v41_engram_compute_fn(
             segment_starts: torch.Tensor | None = None,
             token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Route hash-row requests and run the exact V4.1 fusion.
-
-        Args:
-            module: Module whose current parameters or execution policy are used.
-            hidden_states: Input token representations.
-            input_ids: Token IDs in batch and sequence order.
-            segment_starts: Start offset of the packed sample containing each token.
-            token_mask: Mask selecting live tokens and excluding padding.
-        """
+        """Route hash-row requests and run the exact V4.1 fusion."""
         return module.parallel_forward(
             hidden_states,
             input_ids,

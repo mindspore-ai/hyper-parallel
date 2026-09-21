@@ -37,8 +37,6 @@ from hyper_parallel.trainer.config.manager import parse_training_args
 from examples.training_demo.train_deepseek_v41_megamoe import MegaMoeTextTrainer
 from tests.ut.auto_models.models.deepseek_v41.test_deepseek_v41_crop import _tiny_config, _write_engram_assets
 
-from tests.common.mark_utils import arg_mark
-
 _TARGET = "tests.torch.multicore._test_deepseek_v41_megamoe_training."
 
 
@@ -150,14 +148,8 @@ def _check_checkpoint(base, directory):
         torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 def test_deepseek_v41_megamoe_training() -> None:
-    """
-    Feature:  test deepseek v41 megamoe training
-    Description: Exercise real Trainer accumulation, FP32 main parameters and checkpoint.
-    Expectation: Deepseek v41 megamoe training.
-    """
+    """Exercise real Trainer accumulation, FP32 main parameters and checkpoint."""
     root = Path(os.environ["HP_DSV41_TRAINING_OUTPUT"])
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     ep_size = int(os.environ.get("HP_DSV41_TRAINING_EP", "2"))

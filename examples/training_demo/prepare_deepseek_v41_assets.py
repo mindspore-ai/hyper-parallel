@@ -181,11 +181,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Prepare the requested local assets.
-
-    Args:
-        argv: Optional command-line arguments; defaults to the process arguments.
-    """
+    """Prepare the requested local assets."""
     args = _parse_args(argv)
     prepare_deepseek_v41_assets(
         Path(args.model_dir).expanduser().resolve(),

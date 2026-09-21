@@ -12,8 +12,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
-#define HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
+#ifndef HYPER_PARALLEL_MULTICORE_CACHED_OP_API_H_
+#define HYPER_PARALLEL_MULTICORE_CACHED_OP_API_H_
 
 #include "op_plugin/include/npu_cpp_extension.h"
 
@@ -118,4 +118,4 @@ void execute_cached_op(const CachedOpApi &api, Args &...args) {
 
 }  // namespace hyper_parallel::multicore
 
-#endif  // HYPER_PARALLEL_CORE_MULTICORE_TORCH_CSRC_CACHED_OP_API_H_
+#endif  // HYPER_PARALLEL_MULTICORE_CACHED_OP_API_H_

@@ -185,11 +185,7 @@ class VLMTrainer:
         )
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        """Execute one VLM training step.
-
-        Args:
-            data_iterator: Iterator yielding prepared micro-batches.
-        """
+        """Execute one VLM training step."""
         config = self.base.config
         first_training_batch = self.base.get_batch(data_iterator)
         num_micro_steps = self.base.num_micro_batches

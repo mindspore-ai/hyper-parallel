@@ -6,7 +6,7 @@
 #include <ATen/Functions.h>
 #include <c10/core/DeviceGuard.h>
 #include <torch/library.h>
-#include "csrc/cached_op_api.h"
+#include "cached_op_api.h"
 
 namespace {
 
@@ -32,8 +32,8 @@ at::Tensor moe_token_permute_grad_npu(const at::Tensor &grad, const at::Tensor &
   auto output = allocate_token_gradient(grad, sorted_indices, num_tokens, top_k);
   if (output.numel() != 0) {
     bool padded_mode = false;
-    static const hyper_parallel::multicore::CachedOpApi api("aclnnMoeTokenPermuteGrad",
-                                                            "aclnnMoeTokenPermuteGradGetWorkspaceSize");
+    static const hyper_parallel::multicore::CachedOpApi api(
+        "aclnnMoeTokenPermuteGrad", "aclnnMoeTokenPermuteGradGetWorkspaceSize");
     hyper_parallel::multicore::execute_cached_op(api, grad, sorted_indices, top_k, padded_mode, output);
   }
   return output;

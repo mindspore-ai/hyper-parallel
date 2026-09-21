@@ -49,8 +49,6 @@ from tests.ut.dual_mode_dtensor.conftest import (
     ep_archetype_injection,
 )
 
-from tests.common.mark_utils import arg_mark
-
 
 # ==========================================================================
 # Source: test_s1_plan_overrides.py
@@ -562,22 +560,14 @@ def test_axis_and_dp_validation(tiny_llama, make_mesh):
         "q_proj.weight"][TP] == Shard(0), f"case: {case}"
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 def test_fully_declared_glob_inserts_model_boundaries(tiny_llama, make_mesh):
-    """
-    Feature: plan overrides
-    Description: A concrete glob contract creates every matching final-model boundary.
-    Expectation: Fully declared glob inserts model boundaries.
-    """
+    """A concrete glob contract creates every matching final-model boundary."""
     class _PointwiseBoundary(nn.Module):
-        def __init__(self) -> None:
-            """Create one parameter owned by the declared boundary."""
+        def __init__(self):
             super().__init__()
             self.coefficient = nn.Parameter(torch.ones(1))
 
-        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            """Scale the input without changing its shape."""
+        def forward(self, hidden_states):
             return hidden_states * self.coefficient
 
     for layer in tiny_llama.model.layers:
@@ -614,14 +604,8 @@ def test_fully_declared_glob_inserts_model_boundaries(tiny_llama, make_mesh):
         )
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 def test_incomplete_glob_for_unplanned_module_fails(tiny_llama, make_mesh):
-    """
-    Feature: plan overrides
-    Description: A merge-only glob fails when its real modules have no built-in boundary.
-    Expectation: Incomplete glob for unplanned module fails.
-    """
+    """A merge-only glob fails when its real modules have no built-in boundary."""
     for layer in tiny_llama.model.layers:
         layer.boundary_marker = nn.Identity()
 
@@ -648,18 +632,12 @@ def test_incomplete_glob_for_unplanned_module_fails(tiny_llama, make_mesh):
         )
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 def test_derive_false(tiny_llama, make_mesh):
-    """
-    Feature: plan overrides
-    Description: derive=False family: template derivation is disabled; the plan contains
-        only the specs explicitly declared via plan_overrides (all insert mode) —
-        replaces the post-processing plan.modules pruning style (multimodal
-        encoder_dp ViT bridging scenario: any derived TP collective inside the
-        subtree is mathematically wrong).
-    Expectation: Derive false.
-    """
+    """derive=False family: template derivation is disabled; the plan contains
+    only the specs explicitly declared via plan_overrides (all insert mode) —
+    replaces the post-processing plan.modules pruning style (multimodal
+    encoder_dp ViT bridging scenario: any derived TP collective inside the
+    subtree is mathematically wrong)."""
     mesh = make_mesh((1,), ("tp",))
 
     def _bridge_spec():
@@ -1025,16 +1003,10 @@ def test_yaml_dsl_merge(tiny_llama, make_mesh, caplog):
 # S1.14: PlanOverride desugaring (entries_to_plan_overrides) + explicit-injection preflight (single process).
 # ==========================================================================
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 @pytest.mark.skipif(not _HAS_TRAINER_CONFIG,
                     reason="trainer.config import chain needs newer transformers")
 def test_plan_override_desugar():
-    """
-    Feature: plan overrides
-    Description: PlanOverride / entries_to_plan_overrides desugaring family (pure unit tests, no model).
-    Expectation: Plan override desugar.
-    """
+    """PlanOverride / entries_to_plan_overrides desugaring family (pure unit tests, no model)."""
 
     # ── case: to_override_basic ──────────────────────────────────────────
     case = "to_override_basic"
@@ -1109,7 +1081,7 @@ def test_plan_override_desugar():
         when="sequence_parallel",
         params={"weight": {"tp": "replicate"}},
     )
-    assert not entries_to_plan_overrides([entry]), f"case: {case}"
+    assert entries_to_plan_overrides([entry]) == {}, f"case: {case}"
     overrides = entries_to_plan_overrides(
         [entry], sequence_parallel=True
     )

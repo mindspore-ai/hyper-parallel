@@ -18,13 +18,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
 from typing import Any, Iterable, Optional, Tuple
 
 from astroid import nodes
 from pylint.checkers import BaseChecker
 
 APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
+    "Copyright 2026 Huawei Technologies Co., Ltd",
     "Licensed under the Apache License, Version 2.0",
     "limitations under the License.",
 )
@@ -243,10 +243,7 @@ class HyperParallelChecker(BaseChecker):
         except OSError:
             return
         header_window = "\n".join(content.splitlines()[:16])
-        copyright_present = re.search(
-            r"Copyright \d{4}(?:-\d{4})? Huawei Technologies Co\., Ltd", header_window,
-        )
-        if copyright_present and all(snippet in header_window for snippet in APACHE_HEADER_SNIPPETS):
+        if all(snippet in header_window for snippet in APACHE_HEADER_SNIPPETS):
             return
         self.add_message("missing-apache-license-header", node=node)
 

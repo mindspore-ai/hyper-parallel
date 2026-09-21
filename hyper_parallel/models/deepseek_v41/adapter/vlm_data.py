@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 import torch  # pylint: disable=forbidden-backend-import
 from PIL import Image, ImageOps
-from torch.utils.data import default_collate  # pylint: disable=forbidden-backend-import
+from torch.utils.data import default_collate
 from transformers import AutoTokenizer
 
 from hyper_parallel.data.batching.build_collate_fn import DataBatchContext

@@ -269,11 +269,7 @@ class TestDeepseekV41EngramScaling(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_default_validation_table_has_unique_synchronized_buckets(self):
-        """
-        Feature: deepseek v41 crop
-        Description: The 4-layer crop shrinks the active layer-1 table to 100,776 rows.
-        Expectation: Default validation table has unique synchronized buckets.
-        """
+        """The 4-layer crop shrinks the active layer-1 table to 100,776 rows."""
         primes, table_sizes = build_scaled_engram_buckets(
             [1],
             bucket_base=4096,
@@ -289,11 +285,7 @@ class TestDeepseekV41EngramScaling(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_dead_token_blocks_all_older_ngram_history(self):
-        """
-        Feature: deepseek v41 crop
-        Description: A masked token prevents longer n-grams from crossing its boundary.
-        Expectation: Dead token blocks all older ngram history.
-        """
+        """A masked token prevents longer n-grams from crossing its boundary."""
         with tempfile.TemporaryDirectory() as directory:
             assets = json.loads(_write_engram_assets(directory).read_text(encoding="utf-8"))
             mapping = NgramHashMapping(assets, layer_id=1)
@@ -307,11 +299,7 @@ class TestDeepseekV41EngramScaling(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_family_and_custom_model_are_discovered_lazily(self):
-        """
-        Feature: deepseek v41 crop
-        Description: AutoModel path selection discovers the family without preheating.
-        Expectation: Family and custom model are discovered lazily.
-        """
+        """AutoModel path selection discovers the family without preheating."""
         code = (
             "import sys\n"
             "from types import SimpleNamespace\n"
@@ -337,11 +325,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_v41_query_projection_has_no_post_qb_norm(self):
-        """
-        Feature: deepseek v41 crop
-        Description: V4.1 sends wq_b output directly into RoPE, unlike inherited V4.
-        Expectation: V41 query projection has no post qb norm.
-        """
+        """V4.1 sends wq_b output directly into RoPE, unlike inherited V4."""
         with tempfile.TemporaryDirectory() as directory:
             config = _tiny_config(_write_engram_assets(directory))
             placeholder = DeepseekV41AttentionPlaceholder(config, 0)
@@ -377,11 +361,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_ratio_one_compressor_has_no_gate_and_keeps_every_token(self):
-        """
-        Feature: deepseek v41 crop
-        Description: The released ratio-one path is norm(wkv(x)), with no gate weight.
-        Expectation: Ratio one compressor has no gate and keeps every token.
-        """
+        """The released ratio-one path is norm(wkv(x)), with no gate weight."""
         with tempfile.TemporaryDirectory() as directory:
             config = _tiny_config(_write_engram_assets(directory))
             model = DeepseekV41CroppedForCausalLM(config)
@@ -406,11 +386,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_official_checkpoint_names_route_to_v41_structure(self):
-        """
-        Feature: deepseek v41 crop
-        Description: V4.1-specific leaves avoid the incompatible V4 Indexer mapping.
-        Expectation: Official checkpoint names route to v41 structure.
-        """
+        """V4.1-specific leaves avoid the incompatible V4 Indexer mapping."""
         register_deepseek_v41_checkpoint_mapping()
         with tempfile.TemporaryDirectory() as directory:
             config = _tiny_config(_write_engram_assets(directory))
@@ -456,11 +432,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_training_state_keeps_multiple_source_groups_addressable(self):
-        """
-        Feature: deepseek v41 crop
-        Description: A later Full layer cannot overwrite an earlier source dependency.
-        Expectation: Training state keeps multiple source groups addressable.
-        """
+        """A later Full layer cannot overwrite an earlier source dependency."""
         state = SharedAttentionState()
         source_two = torch.randn(1, 2, 8, requires_grad=True)
         source_eight = torch.randn(1, 2, 8, requires_grad=True)
@@ -475,11 +447,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_full_checkpoint_keeps_shared_attention_autograd_graph(self):
-        """
-        Feature: deepseek v41 crop
-        Description: KV-sharing fallback recomputes MLP but keeps source attention live.
-        Expectation: Full checkpoint keeps shared attention autograd graph.
-        """
+        """KV-sharing fallback recomputes MLP but keeps source attention live."""
         with tempfile.TemporaryDirectory() as directory:
             torch.manual_seed(23)
             model = DeepseekV41CroppedForCausalLM(
@@ -502,11 +470,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_shared_source_consumer_and_engram_receive_gradients(self):
-        """
-        Feature: deepseek v41 crop
-        Description: Layer 2 publishes compressed KV and layer 3 consumes it in backward.
-        Expectation: Shared source consumer and engram receive gradients.
-        """
+        """Layer 2 publishes compressed KV and layer 3 consumes it in backward."""
         with tempfile.TemporaryDirectory() as directory:
             torch.manual_seed(11)
             model = DeepseekV41CroppedForCausalLM(_tiny_config(_write_engram_assets(directory)))
@@ -548,11 +512,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_native_vision_span_injects_trainable_image_features(self):
-        """
-        Feature: deepseek v41 crop
-        Description: A V4.1 image span reaches vision, aligner, router, and LM loss.
-        Expectation: Native vision span injects trainable image features.
-        """
+        """A V4.1 image span reaches vision, aligner, router, and LM loss."""
         with tempfile.TemporaryDirectory() as directory:
             torch.manual_seed(17)
             config = _tiny_config(_write_engram_assets(directory))
@@ -598,11 +558,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_vlm_batch_builds_v41_packed_sequence_from_right_padding(self):
-        """
-        Feature: deepseek v41 crop
-        Description: VLM right-padding maps to V4.1 compact DSA metadata, not a dense mask.
-        Expectation: Vlm batch builds v41 packed sequence from right padding.
-        """
+        """VLM right-padding maps to V4.1 compact DSA metadata, not a dense mask."""
         get_batch = build_vlm_get_batch(
             mesh_context=SimpleNamespace(tp_size=1, cp_size=1, pp_size=1),
             device=torch.device("cpu"),
@@ -629,11 +585,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_vlm_adapter_owns_variable_image_field_collation(self):
-        """
-        Feature: deepseek v41 crop
-        Description: The model adapter merges V4.1 patches, offsets, grids, and ownership.
-        Expectation: Vlm adapter owns variable image field collation.
-        """
+        """The model adapter merges V4.1 patches, offsets, grids, and ownership."""
         adapter = DeepseekV41VLMBatchAdapter(
             SimpleNamespace(v41_compress_ratios=[2], pad_token_id=0)
         )
@@ -675,11 +627,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_packed_samples_do_not_share_attention_or_engram_context(self):
-        """
-        Feature: deepseek v41 crop
-        Description: Compact boundaries isolate CSA2, sliding windows, and Engram n-grams.
-        Expectation: Packed samples do not share attention or engram context.
-        """
+        """Compact boundaries isolate CSA2, sliding windows, and Engram n-grams."""
         with tempfile.TemporaryDirectory() as directory:
             torch.manual_seed(13)
             model = DeepseekV41CroppedForCausalLM(_tiny_config(_write_engram_assets(directory)))
@@ -702,11 +650,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_online_packing_aligns_every_sample_to_compressor_groups(self):
-        """
-        Feature: deepseek v41 crop
-        Description: Online packing pads each sample boundary to the CSA2 ratio.
-        Expectation: Online packing aligns every sample to compressor groups.
-        """
+        """Online packing pads each sample boundary to the CSA2 ratio."""
         adapter = DeepseekV41BatchAdapter(
             SimpleNamespace(v41_compress_ratios=[0, 2], pad_token_id=0)
         )
@@ -726,11 +670,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_online_recipe_declares_one_model_owned_batch_adapter(self):
-        """
-        Feature: deepseek v41 crop
-        Description: One configured adapter owns packing and forward runtime extensions.
-        Expectation: Online recipe declares one model owned batch adapter.
-        """
+        """One configured adapter owns packing and forward runtime extensions."""
         examples_dir = Path(__file__).resolve().parents[5] / "examples/training_demo"
         for recipe_name in (
                 "train_deepseek_v41_online.yaml",
@@ -764,11 +704,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_recipes_leave_fsdp_output_dtype_unset(self):
-        """
-        Feature: deepseek v41 crop
-        Description: Model recipes must not downcast the FP32 objective at the FSDP boundary.
-        Expectation: Recipes leave fsdp output dtype unset.
-        """
+        """Model recipes must not downcast the FP32 objective at the FSDP boundary."""
         examples_dir = Path(__file__).resolve().parents[5] / "examples/training_demo"
         for recipe_name in (
                 "train_deepseek_v41_online.yaml",
@@ -781,11 +717,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_meta_materialization_restores_hash_buffers(self):
-        """
-        Feature: deepseek v41 crop
-        Description: Non-persistent hash metadata survives the trainer's meta build path.
-        Expectation: Meta materialization restores hash buffers.
-        """
+        """Non-persistent hash metadata survives the trainer's meta build path."""
         with tempfile.TemporaryDirectory() as directory:
             assets_path = _write_engram_assets(directory)
             config = _tiny_config(assets_path)
@@ -829,11 +761,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_recipe_replacements_preserve_parameter_identities(self):
-        """
-        Feature: deepseek v41 crop
-        Description: The YAML replacement rules atomically install mHC and Engram modules.
-        Expectation: Recipe replacements preserve parameter identities.
-        """
+        """The YAML replacement rules atomically install mHC and Engram modules."""
         recipe_path = Path(__file__).resolve().parents[5] / (
             "examples/training_demo/train_deepseek_v41_online.yaml"
         )
@@ -851,11 +779,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_engram_fsdp_units_separate_expert_table_from_dense_gate_weights(self):
-        """
-        Feature: deepseek v41 crop
-        Description: Engram table and projection are child units while q/k stay dense-owned.
-        Expectation: Engram fsdp units separate expert table from dense gate weights.
-        """
+        """Engram table and projection are child units while q/k stay dense-owned."""
         with tempfile.TemporaryDirectory() as directory:
             model = DeepseekV41CroppedForCausalLM(_tiny_config(_write_engram_assets(directory)))
             _replace_v41_modules(model)
@@ -869,11 +793,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_full_depth_recipe_preserves_released_shared_attention_roles(self):
-        """
-        Feature: deepseek v41 crop
-        Description: Wildcard rules cover every Full, Reindex, Reuse, and Engram layer.
-        Expectation: Full depth recipe preserves released shared attention roles.
-        """
+        """Wildcard rules cover every Full, Reindex, Reuse, and Engram layer."""
         class _FakeMesh:
             mesh_dim_names = ("dp_shard", "tp")
             mesh_shape = (2, 2)
@@ -977,11 +897,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_online_recipe_covers_v41_only_parameters_for_tp2_ep4(self):
-        """
-        Feature: deepseek v41 crop
-        Description: The YAML recipe owns every mHC and Engram boundary for TP2/EP4.
-        Expectation: Online recipe covers v41 only parameters for tp2 ep4.
-        """
+        """The YAML recipe owns every mHC and Engram boundary for TP2/EP4."""
         class _FakeMesh:
             mesh_dim_names = ("dp_shard", "tp")
             mesh_shape = (2, 2)
@@ -1053,11 +969,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_engram_tp_sequence_slice_keeps_left_ngram_context(self):
-        """
-        Feature: deepseek v41 crop
-        Description: TP sequence rank one hashes the same rows as the full sequence.
-        Expectation: Engram tp sequence slice keeps left ngram context.
-        """
+        """TP sequence rank one hashes the same rows as the full sequence."""
         with tempfile.TemporaryDirectory() as directory:
             model = DeepseekV41CroppedForCausalLM(_tiny_config(_write_engram_assets(directory)))
             _replace_v41_modules(model)
@@ -1077,11 +989,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_shared_attention_cp_uses_global_kv_and_offsets(self):
-        """
-        Feature: deepseek v41 crop
-        Description: CP keeps local queries while gathering raw, compressed, and index KV.
-        Expectation: Shared attention cp uses global kv and offsets.
-        """
+        """CP keeps local queries while gathering raw, compressed, and index KV."""
         with tempfile.TemporaryDirectory() as directory:
             torch.manual_seed(19)
             model = DeepseekV41CroppedForCausalLM(
@@ -1142,11 +1050,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_compressed_indexer_uses_ratio_aware_causal_boundary(self):
-        """
-        Feature: deepseek v41 crop
-        Description: A compressed key becomes visible only after its source group closes.
-        Expectation: Compressed indexer uses ratio aware causal boundary.
-        """
+        """A compressed key becomes visible only after its source group closes."""
         query = torch.ones(1, 6, 2, 4)
         key = torch.tensor(
             [[[1.0, 0.0, 0.0, 0.0],
@@ -1171,11 +1075,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_hierarchical_candidate_blocks_pin_newest_reachable_block(self):
-        """
-        Feature: deepseek v41 crop
-        Description: Candidate selection uses block maxima and pins the partial tail.
-        Expectation: Hierarchical candidate blocks pin newest reachable block.
-        """
+        """Candidate selection uses block maxima and pins the partial tail."""
         logits = torch.tensor(
             [[[
                 10.0, 9.0,
@@ -1204,11 +1104,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_reindex_scores_only_compact_candidate_blocks(self):
-        """
-        Feature: deepseek v41 crop
-        Description: Reindex returns global ids from the compact candidate subset.
-        Expectation: Reindex scores only compact candidate blocks.
-        """
+        """Reindex returns global ids from the compact candidate subset."""
         query = torch.ones(1, 12, 1, 1)
         key = torch.tensor([[[1.0], [10.0], [9.0], [8.0], [7.0], [6.0]]])
         merge_weight = torch.ones(1, 12, 1)
@@ -1234,11 +1130,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_compressed_indexer_kl_updates_only_indexer_inputs(self):
-        """
-        Feature: deepseek v41 crop
-        Description: PanGu-style sparse KL detaches the main-attention teacher.
-        Expectation: Compressed indexer kl updates only indexer inputs.
-        """
+        """PanGu-style sparse KL detaches the main-attention teacher."""
         torch.manual_seed(23)
         index_query = torch.randn(1, 4, 2, 3, requires_grad=True)
         index_key = torch.randn(1, 4, 3, requires_grad=True)
@@ -1271,11 +1163,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_compressed_indexer_kl_matches_direct_autograd(self):
-        """
-        Feature: deepseek v41 crop
-        Description: Precomputed PanGu-style gradients match a direct sparse KL graph.
-        Expectation: Compressed indexer kl matches direct autograd.
-        """
+        """Precomputed PanGu-style gradients match a direct sparse KL graph."""
         torch.manual_seed(29)
         source_tensors = (
             torch.randn(1, 4, 2, 3),
@@ -1341,11 +1229,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_cp_window_indices_use_global_query_offset(self):
-        """
-        Feature: deepseek v41 crop
-        Description: Rank-one local queries address the preceding global sliding window.
-        Expectation: Cp window indices use global query offset.
-        """
+        """Rank-one local queries address the preceding global sliding window."""
         indices = _window_indices(
             batch_size=1,
             sequence_length=4,
@@ -1362,11 +1246,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_online_recipe_injects_v41_cp_wrapper(self):
-        """
-        Feature: deepseek v41 crop
-        Description: An active CP axis selects the V4.1 wrapper on every attention boundary.
-        Expectation: Online recipe injects v41 cp wrapper.
-        """
+        """An active CP axis selects the V4.1 wrapper on every attention boundary."""
         class _FakeMesh:
             mesh_dim_names = ("dp_shard", "cp")
             mesh_shape = (2, 2)
@@ -1410,7 +1290,6 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
         """Create the smallest MoE and mesh accepted by the EP factory."""
         class _Experts(nn.Module):
             def __init__(self) -> None:
-                """Provide the expert metadata required by the EP factory."""
                 super().__init__()
                 self.num_experts = 1
                 self.act_fn = F.silu
@@ -1421,7 +1300,6 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
 
         class _TextMoe(nn.Module):
             def __init__(self) -> None:
-                """Build identity branches for signature validation."""
                 super().__init__()
                 self.gate = nn.Identity()
                 self.experts = _Experts()
@@ -1433,7 +1311,6 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
                     hidden_states: torch.Tensor,
                     input_ids: torch.Tensor | None = None,
             ) -> torch.Tensor:
-                """Preserve hidden states while accepting model routing metadata."""
                 del input_ids
                 return hidden_states
 
@@ -1444,24 +1321,21 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
                     input_ids: torch.Tensor | None = None,
                     image_mask: torch.Tensor | None = None,
             ) -> torch.Tensor:
-                """Preserve hidden states while accepting model routing metadata."""
                 del input_ids, image_mask
                 return hidden_states
 
         class _EpAxis:
             @staticmethod
             def size() -> int:
-                """Represent a single expert rank."""
                 return 1
 
         class _EpMesh:
             @staticmethod
             def get_group(name: str) -> None:
-                """Use the default group in the single-rank fixture."""
                 del name
+                return None
 
             def __getitem__(self, name: str) -> _EpAxis:
-                """Resolve the expert axis without a distributed runtime."""
                 del self
                 del name
                 return _EpAxis()
@@ -1471,11 +1345,7 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_ep_factory_matches_text_and_multimodal_forward_signatures(self):
-        """
-        Feature: deepseek v41 crop
-        Description: The EP closure exposes only arguments accepted by its source MoE.
-        Expectation: Ep factory matches text and multimodal forward signatures.
-        """
+        """The EP closure exposes only arguments accepted by its source MoE."""
         expected_parameters = {
             False: ["module", "hidden_states", "input_ids"],
             True: ["module", "hidden_states", "input_ids", "image_mask"],
@@ -1503,11 +1373,7 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_ep_factory_enables_grouped_gemm_with_model_specific_gate(self):
-        """
-        Feature: deepseek v41 crop
-        Description: The V4.1 factory preserves its clamp hook in grouped-GEMM mode.
-        Expectation: Ep factory enables grouped gemm with model specific gate.
-        """
+        """The V4.1 factory preserves its clamp hook in grouped-GEMM mode."""
         module, ep_mesh = self._build_signature_fixture(multimodal=False)
         deepseek_v41_ep_compute_fn(
             module=module,
@@ -1524,14 +1390,9 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     @patch("hyper_parallel.distributed.expert_parallel.experts.npu_grouped_swiglu")
     def test_grouped_expert_uses_model_specific_gate(self, grouped_swiglu):
-        """
-        Feature: deepseek v41 crop
-        Description: The grouped local expert forwards the V4 clamp hook to its kernel helper.
-        Expectation: Grouped expert uses model specific gate.
-        """
+        """The grouped local expert forwards the V4 clamp hook to its kernel helper."""
         class _Experts(nn.Module):
             def __init__(self) -> None:
-                """Provide the expert metadata required by the EP factory."""
                 """Create a two-expert packed-weight holder."""
                 super().__init__()
                 self.num_experts = 2
@@ -1569,14 +1430,9 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_fused_expert_uses_model_specific_gate(self):
-        """
-        Feature: deepseek v41 crop
-        Description: The generic local expert calls the V4 clamp hook when supplied.
-        Expectation: Fused expert uses model specific gate.
-        """
+        """The generic local expert calls the V4 clamp hook when supplied."""
         class _Experts(nn.Module):
             def __init__(self) -> None:
-                """Provide the expert metadata required by the EP factory."""
                 """Create one deterministic fused expert."""
                 super().__init__()
                 self.num_experts = 1

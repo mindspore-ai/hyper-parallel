@@ -58,8 +58,6 @@ from hyper_parallel.core.activation_memory.wrapper import (
     swap_wrapper,
 )
 
-from tests.common.mark_utils import arg_mark
-
 _api_module = importlib.import_module("hyper_parallel.core.activation_memory.api")
 _checkpoint_exclude = importlib.import_module("hyper_parallel.core.activation_memory.checkpoint_exclude")
 _swap_module = importlib.import_module("hyper_parallel.core.activation_memory.swap")
@@ -246,14 +244,8 @@ class TestActivationWrapper(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Subclasses should implement forward"):
             ActivationWrapper.forward(sentinel.wrapper)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_flat_optimizer_state_uses_stable_fqns(self) -> None:
-        """
-        Feature: wrapper
-        Description: DCP optimizer restore should not expose the wrapper prefix.
-        Expectation: Flat optimizer state uses stable fqns.
-        """
+        """DCP optimizer restore should not expose the wrapper prefix."""
         source = torch.nn.Module()
         source.block = ckpt_wrapper(_TinyModule())
         source_optimizer = torch.optim.AdamW(source.parameters())

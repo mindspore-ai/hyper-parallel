@@ -188,13 +188,7 @@ def _coerce_literal(value: object, choices: tuple, *, path: str) -> object:
 
 
 def coerce_value(value: object, annotation: object, *, path: str) -> object:
-    """Validate and normalize one target argument or typed CLI override.
-
-    Args:
-        value: Tensor published for reuse by consumer layers.
-        annotation: Target configuration type used to coerce the supplied value.
-        path: Path relative to the owning model or checkpoint.
-    """
+    """Validate and normalize one target argument or typed CLI override."""
 
     # A nested target is a deferred instance of the annotated runtime type.
     # Its constructor arguments are validated when its own node is resolved;

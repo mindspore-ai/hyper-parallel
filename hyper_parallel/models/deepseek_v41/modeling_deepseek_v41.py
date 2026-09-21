@@ -115,14 +115,7 @@ class DeepseekV41EngramPlaceholder(nn.Module):
         segment_starts: torch.Tensor | None = None,
         token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Fail when the required Engram replacement was not applied.
-
-        Args:
-            hidden_states: Input token representations.
-            input_ids: Token IDs in batch and sequence order.
-            segment_starts: Start offset of the packed sample containing each token.
-            token_mask: Mask selecting live tokens and excluding padding.
-        """
+        """Fail when the required Engram replacement was not applied."""
         del hidden_states, input_ids, segment_starts, token_mask
         raise RuntimeError("DeepSeek-V4.1 Engram requires its module replacement")
 
@@ -154,10 +147,6 @@ class DeepseekV41TopKRouter(nn.Module):
 
         ``bias`` and ``bias_vl`` select experts only; the gathered routing
         weights intentionally use the unbiased scores, matching V4.1.
-
-        Args:
-            hidden_states: Input token representations.
-            image_mask: Mask identifying image tokens in the language sequence.
         """
         flattened = hidden_states.reshape(-1, self.hidden_size)
         logits = functional.linear(  # pylint: disable=not-callable
@@ -221,12 +210,7 @@ class DeepseekV41Compressor(nn.Module):
             hidden_states: torch.Tensor,
             compress_position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return unrotated and RoPE-rotated compressed KV tensors.
-
-        Args:
-            hidden_states: Input token representations.
-            compress_position_embeddings: Rotary embeddings at compressed key positions.
-        """
+        """Return unrotated and RoPE-rotated compressed KV tensors."""
         batch_size, sequence_length, _ = hidden_states.shape
         if self.compress_ratio == 1:
             latent = self.norm(self.wkv(hidden_states))
@@ -280,16 +264,7 @@ class DeepseekV41Indexer(nn.Module):
             cp_context: SharedAttentionCPContext | None = None,
             query_offset: int = 0,
     ) -> torch.Tensor:
-        """Fail because the high-performance replacement owns Indexer execution.
-
-        Args:
-            hidden_states: Input token representations.
-            query_residual: Residual query projections before indexer transformation.
-            latent: Latent key/value projections before compression.
-            compress_position_embeddings: Rotary embeddings at compressed key positions.
-            cp_context: Context-parallel metadata for global sequence reconstruction.
-            query_offset: Global sequence offset of the first local query.
-        """
+        """Fail because the high-performance replacement owns Indexer execution."""
         del hidden_states, query_residual, latent, compress_position_embeddings
         del cp_context, query_offset
         raise RuntimeError("DeepSeek-V4.1 Indexer requires its module replacement")
@@ -330,15 +305,7 @@ class DeepseekV41AttentionPlaceholder(DeepseekV4Attention):
             past_key_values: Any | None = None,
             **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Fail when the required V4.1 forward replacement was not applied.
-
-        Args:
-            hidden_states: Input token representations.
-            position_embeddings: Rotary cosine and sine tensors for token positions.
-            position_ids: Token positions within each packed sample.
-            attention_mask: Mask restricting which key positions each query can attend to.
-            past_key_values: Optional attention cache from earlier decoding steps.
-        """
+        """Fail when the required V4.1 forward replacement was not applied."""
         del hidden_states, position_embeddings, position_ids, attention_mask, past_key_values, kwargs
         raise RuntimeError("DeepSeek-V4.1 shared attention requires its module replacement")
 
@@ -547,9 +514,32 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
             span_embeddings[image_slots] = image_features.to(span_embeddings.dtype)
         return merged
 
-    def _prepare_image_embeddings(self, inputs_embeds, token_types, pixel_values, image_patch_offsets,
-                                  image_vit_grid_hw, image_llm_grid_hw, image_batch_indices, image_token_starts):
-        """Validate optional image fields before inserting projected visual tokens."""
+    def forward(
+            self,
+            input_ids: torch.LongTensor | None = None,
+            attention_mask: torch.Tensor | None = None,
+            position_ids: torch.LongTensor | None = None,
+            past_key_values: Any | None = None,
+            inputs_embeds: torch.FloatTensor | None = None,
+            use_cache: bool | None = None,
+            token_types: torch.LongTensor | None = None,
+            pixel_values: torch.Tensor | None = None,
+            image_patch_offsets: torch.LongTensor | None = None,
+            image_vit_grid_hw: torch.LongTensor | None = None,
+            image_llm_grid_hw: torch.LongTensor | None = None,
+            image_batch_indices: torch.LongTensor | None = None,
+            image_token_starts: torch.LongTensor | None = None,
+            **kwargs: Any,
+    ) -> MoeModelOutputWithPast:
+        """Execute image injection, Engram, shared attention, and pipelined mHC."""
+        if use_cache or past_key_values is not None:
+            raise NotImplementedError("the V4.1 validation crop supports training without KV cache")
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("specify exactly one of input_ids or inputs_embeds")
+        if input_ids is None:
+            raise ValueError("input_ids are required while Engram is enabled")
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
         image_inputs = (
             pixel_values,
             image_patch_offsets,
@@ -573,54 +563,6 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
                 image_batch_indices,
                 image_token_starts,
             )
-        return inputs_embeds
-
-    def forward(
-            self,
-            input_ids: torch.LongTensor | None = None,
-            attention_mask: torch.Tensor | None = None,
-            position_ids: torch.LongTensor | None = None,
-            past_key_values: Any | None = None,
-            inputs_embeds: torch.FloatTensor | None = None,
-            use_cache: bool | None = None,
-            token_types: torch.LongTensor | None = None,
-            pixel_values: torch.Tensor | None = None,
-            image_patch_offsets: torch.LongTensor | None = None,
-            image_vit_grid_hw: torch.LongTensor | None = None,
-            image_llm_grid_hw: torch.LongTensor | None = None,
-            image_batch_indices: torch.LongTensor | None = None,
-            image_token_starts: torch.LongTensor | None = None,
-            **kwargs: Any,
-    ) -> MoeModelOutputWithPast:
-        """Execute image injection, Engram, shared attention, and pipelined mHC.
-
-        Args:
-            input_ids: Token IDs in batch and sequence order.
-            attention_mask: Mask restricting which key positions each query can attend to.
-            position_ids: Token positions within each packed sample.
-            past_key_values: Optional attention cache from earlier decoding steps.
-            inputs_embeds: Optional token embeddings supplied instead of token IDs.
-            use_cache: Whether to populate the decoding key/value cache.
-            token_types: Modality identifiers associated with sequence positions.
-            pixel_values: Flattened image patches supplied by the VLM adapter.
-            image_patch_offsets: Offsets delimiting each image in the flattened patch tensor.
-            image_vit_grid_hw: Patch-grid height and width for each image.
-            image_llm_grid_hw: Projected language-token grid height and width for each image.
-            image_batch_indices: Batch row owning each image.
-            image_token_starts: Start position of each image span in the token sequence.
-        """
-        if use_cache or past_key_values is not None:
-            raise NotImplementedError("the V4.1 validation crop supports training without KV cache")
-        if (input_ids is None) == (inputs_embeds is None):
-            raise ValueError("specify exactly one of input_ids or inputs_embeds")
-        if input_ids is None:
-            raise ValueError("input_ids are required while Engram is enabled")
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-        inputs_embeds = self._prepare_image_embeddings(
-            inputs_embeds, token_types, pixel_values, image_patch_offsets, image_vit_grid_hw,
-            image_llm_grid_hw, image_batch_indices, image_token_starts,
-        )
         if token_types is not None and token_types.shape != input_ids.shape:
             raise ValueError("token_types must have the same shape as input_ids")
         image_mask = None if token_types is None else token_types >= 0
@@ -700,11 +642,7 @@ class DeepseekV41CroppedForCausalLM(DeepseekV4ForCausalLM):
 
     @classmethod
     def from_config(cls, config: Any, **kwargs: Any) -> "DeepseekV41CroppedForCausalLM":
-        """Construct the validation model from its translated HF configuration.
-
-        Args:
-            config: Model configuration or configuration source.
-        """
+        """Construct the validation model from its translated HF configuration."""
         del kwargs
         return cls(config)
 

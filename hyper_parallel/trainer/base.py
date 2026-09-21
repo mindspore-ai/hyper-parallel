@@ -149,8 +149,6 @@ class BaseTrainer(Stateful, ABC):
     moe_mesh: Any
 
     # Data
-    data_transform: Any
-    num_micro_batches: int
     train_dataset: Dataset
     collate_fn: Any
     train_dataloader: Any
@@ -680,11 +678,7 @@ class BaseTrainer(Stateful, ABC):
             self,
             data_iterator: Any,
     ) -> Dict[str, float]:
-        """Execute one optimizer update from the next dataloader batch.
-
-        Args:
-            data_iterator: Iterator yielding prepared micro-batches.
-        """
+        """Execute one optimizer update from the next dataloader batch."""
         config = self.config
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)

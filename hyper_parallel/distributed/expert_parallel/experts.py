@@ -188,12 +188,6 @@ def bind_local_expert_forward(
     point) so nested FSDP hooks unshard/reshard around the local SwiGLU
     computation. ``apply_gate`` supplies model-specific fused gate/up
     semantics when the default activation-times-up rule is insufficient.
-
-    Args:
-        module: Module whose current parameters or execution policy are used.
-        ep_size: Number of ranks in the expert-parallel group.
-        use_grouped_gemm: Whether to use grouped matrix multiplications for expert projections.
-        apply_gate: Optional model-specific activation applied to the fused gate/up projection.
     """
     global_expert_count = _get_global_expert_count(module)
     if global_expert_count % ep_size != 0:

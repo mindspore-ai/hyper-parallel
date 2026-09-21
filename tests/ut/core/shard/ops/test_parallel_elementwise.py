@@ -28,8 +28,6 @@ from hyper_parallel.core.dtensor.device_mesh import (
 )
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
-from tests.common.mark_utils import arg_mark
-
 
 def _extract_test_input_shapes(extra_args):
     """Extract input shapes from extra_args dict."""
@@ -197,14 +195,8 @@ class TestParallelElementwiseOps(unittest.TestCase):
         assert cache_values[1] is y_layout
         assert cache_values[2] == [(4, 8), (4, 8)]
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_torch_clamp_family_uses_elementwise_layout_inference(self):
-        """
-        Feature: parallel elementwise
-        Description: Torch clamp variants preserve the input element-wise layout.
-        Expectation: Torch clamp family uses elementwise layout inference.
-        """
+        """Torch clamp variants preserve the input element-wise layout."""
         for op_name in ("clamp", "clamp_min", "clamp_max"):
             registered_op = get_distributed_op(op_name)
             self.assertIsInstance(

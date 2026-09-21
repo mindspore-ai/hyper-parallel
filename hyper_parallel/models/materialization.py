@@ -62,21 +62,6 @@ class _ProtectedStateSnapshot:
     version: int | None
 
 
-
-def _validate_rebuildable_buffer_registration(module, name, persistent):
-    """Validate rebuildable buffer registration."""
-    if not isinstance(module, nn.Module):
-        raise TypeError(f"module must be torch.nn.Module, got {type(module).__name__}")
-    if not isinstance(name, str) or not name or "." in name:
-        raise ValueError(f"Rebuildable buffer name must be a direct non-empty name, got {name!r}")
-    if persistent:
-        raise ValueError(
-            "Rebuildable buffers must be non-persistent; register checkpoint state "
-            "with nn.Module.register_buffer instead"
-        )
-
-
-
 def _factory_initial_value(
     factory: Callable[[MaterializationContext], torch.Tensor],
 ) -> torch.Tensor:
@@ -124,21 +109,40 @@ def register_rebuildable_buffer(
     adapter support an unmodified native HF module. Otherwise exactly one recipe
     must be supplied, and a missing buffer is registered without changing the
     module's class.
-
-    Args:
-        module: Module whose current parameters or execution policy are used.
-        name: Buffer name relative to the owning module.
-        value: Canonical buffer value to clone when materializing the module.
-        factory: Callback rebuilding the buffer on its final device.
-        persistent: Whether the buffer is included in the state dictionary.
-        preserve_layout: Whether to preserve the registered distributed buffer layout.
     """
-    _validate_rebuildable_buffer_registration(module, name, persistent)
+    if not isinstance(module, nn.Module):
+        raise TypeError(f"module must be torch.nn.Module, got {type(module).__name__}")
+    if not isinstance(name, str) or not name or "." in name:
+        raise ValueError(f"Rebuildable buffer name must be a direct non-empty name, got {name!r}")
+    if persistent:
+        raise ValueError(
+            "Rebuildable buffers must be non-persistent; register checkpoint state "
+            "with nn.Module.register_buffer instead"
+        )
+
     specs = module.__dict__.setdefault("_hp_rebuildable_buffer_specs", {})
     if name in specs:
         raise ValueError(f"Rebuildable buffer {name!r} is already registered")
 
-    existing, has_existing, value = _resolve_rebuildable_recipe(module, name, value, factory)
+    existing = module._buffers.get(name)  # pylint: disable=protected-access
+    has_existing = name in module._buffers  # pylint: disable=protected-access
+    if has_existing:
+        if existing is None:
+            raise ValueError(f"Existing rebuildable buffer {name!r} cannot be None")
+        non_persistent = module._non_persistent_buffers_set  # pylint: disable=protected-access
+        if name not in non_persistent:
+            raise ValueError(
+                f"Existing buffer {name!r} is persistent and must be restored from checkpoint"
+            )
+        if value is None and factory is None:
+            value = existing
+    elif (value is None) == (factory is None):
+        raise ValueError(
+            "A new rebuildable buffer requires exactly one of value and factory"
+        )
+
+    if has_existing and value is not None and factory is not None:
+        raise ValueError("Exactly one of value and factory may define a rebuildable buffer")
     initial_value = value if value is not None else _factory_initial_value(factory)
     if not isinstance(initial_value, torch.Tensor):
         raise TypeError(
@@ -168,12 +172,7 @@ def register_materialized_state_hook(
     module: nn.Module,
     hook: MaterializedStateHook,
 ) -> None:
-    """Register an adapter-owned recovery hook without modifying a model class.
-
-    Args:
-        module: Module whose current parameters or execution policy are used.
-        hook: Callback restoring model-specific materialized state.
-    """
+    """Register an adapter-owned recovery hook without modifying a model class."""
     if not isinstance(module, nn.Module):
         raise TypeError(f"module must be torch.nn.Module, got {type(module).__name__}")
     if not callable(hook):
@@ -303,12 +302,7 @@ def rebuild_materialized_state(
     model: nn.Module,
     context: MaterializationContext,
 ) -> None:
-    """Restore declared model state once after storage and weights are ready.
-
-    Args:
-        model: Model receiving the configured infrastructure.
-        context: Batch context shared by preparation, collation and finalization.
-    """
+    """Restore declared model state once after storage and weights are ready."""
     protected = _protected_model_state(model) if context.strict else {}
     for module_fqn, module in model.named_modules():
         specs = module.__dict__.get("_hp_rebuildable_buffer_specs", {})
@@ -342,27 +336,3 @@ __all__ = [
     "register_materialized_state_hook",
     "register_rebuildable_buffer",
 ]
-
-
-def _resolve_rebuildable_recipe(module, name, value, factory):
-    """Resolve an existing non-persistent buffer or validate a new recipe."""
-    existing = module._buffers.get(name)  # pylint: disable=protected-access
-    has_existing = name in module._buffers  # pylint: disable=protected-access
-    if has_existing:
-        if existing is None:
-            raise ValueError(f"Existing rebuildable buffer {name!r} cannot be None")
-        non_persistent = module._non_persistent_buffers_set  # pylint: disable=protected-access
-        if name not in non_persistent:
-            raise ValueError(
-                f"Existing buffer {name!r} is persistent and must be restored from checkpoint"
-            )
-        if value is None and factory is None:
-            value = existing
-    elif (value is None) == (factory is None):
-        raise ValueError(
-            "A new rebuildable buffer requires exactly one of value and factory"
-        )
-
-    if has_existing and value is not None and factory is not None:
-        raise ValueError("Exactly one of value and factory may define a rebuildable buffer")
-    return existing, has_existing, value

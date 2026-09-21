@@ -63,12 +63,7 @@ class DeepseekV41BatchAdapter(DataBatchAdapter, RuntimeInputAdapter):
             item: Mapping[str, Any],
             context: DataBatchContext,
     ) -> int:
-        """Charge dynamic batching for compression-aligned physical tokens.
-
-        Args:
-            item: One source sample before collation.
-            context: Batch context shared by preparation, collation and finalization.
-        """
+        """Charge dynamic batching for compression-aligned physical tokens."""
         del context
         sequence_length = int(item["input_ids"].shape[-1])
         return sequence_length + (-sequence_length) % self.compression_alignment
@@ -78,12 +73,7 @@ class DeepseekV41BatchAdapter(DataBatchAdapter, RuntimeInputAdapter):
             items: Sequence[Mapping[str, Any]],
             context: DataBatchContext,
     ) -> list[Mapping[str, Any]]:
-        """Pad each packed text item so CSA2 groups never cross boundaries.
-
-        Args:
-            items: Source samples to prepare and collate together.
-            context: Batch context shared by preparation, collation and finalization.
-        """
+        """Pad each packed text item so CSA2 groups never cross boundaries."""
         del context
         prepared_items = []
         for item in items:
@@ -109,20 +99,12 @@ class DeepseekV41BatchAdapter(DataBatchAdapter, RuntimeInputAdapter):
         return prepared_items
 
     def constraints(self, context: DataBatchContext) -> BatchConstraints:
-        """Require the final physical sequence to align with every CSA2 rate.
-
-        Args:
-            context: Batch context shared by preparation, collation and finalization.
-        """
+        """Require the final physical sequence to align with every CSA2 rate."""
         del context
         return BatchConstraints(sequence_multiple=self.compression_alignment)
 
     def state_signature(self, context: DataBatchContext) -> Mapping[str, Any]:
-        """Describe settings that determine dynamic selection and padding.
-
-        Args:
-            context: Batch context shared by preparation, collation and finalization.
-        """
+        """Describe settings that determine dynamic selection and padding."""
         del context
         return {
             "compression_alignment": self.compression_alignment,

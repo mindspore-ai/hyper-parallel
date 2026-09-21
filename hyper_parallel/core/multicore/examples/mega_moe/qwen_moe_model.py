@@ -49,19 +49,19 @@ class QwenMoeConfig:
     """
 
     vocab_size: int = 32000
-    hidden_size: int = 5120
-    num_layers: int = 2
-    num_attention_heads: int = 40
-    num_key_value_heads: int = 8
-    max_seq_len: int = 4096
+    hidden_size: int = 2048
+    num_layers: int = 8
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 2
+    max_seq_len: int = 1024
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10_000_000.0
-    num_experts: int = 48
+    num_experts: int = 16
     top_k: int = 8
-    intermediate_size: int = 1792
-    shared_expert_intermediate_size: int = 1792
+    intermediate_size: int = 512
+    shared_expert_intermediate_size: int = 512
     routed_scaling_factor: float = 1.0
-    local_num_tokens: int = 4096
+    local_num_tokens: int = 1024
     expert_capacity_factor: float | None = None
     ep_size: int = 8
     dispatch_mode: str = "push"

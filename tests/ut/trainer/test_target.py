@@ -23,8 +23,6 @@ from hyper_parallel.trainer.config.resolver import (
 )
 from hyper_parallel.trainer.config.target import Target
 
-from tests.common.mark_utils import arg_mark
-
 
 class _Dependency:
     """Small injectable dependency constructed from a nested target."""
@@ -45,14 +43,8 @@ def _build_parent(
 class TestNestedTarget(unittest.TestCase):
     """Nested targets preserve delayed construction and YAML round trips."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_nested_targets_are_built_before_parent(self):
-        """
-        Feature: target
-        Description: Direct and container dependencies should be runtime instances.
-        Expectation: Nested targets are built before parent.
-        """
+        """Direct and container dependencies should be runtime instances."""
         module_path = __name__
         node = {
             "_target_": f"{module_path}._build_parent",
@@ -79,14 +71,8 @@ class TestNestedTarget(unittest.TestCase):
         self.assertEqual(options["dependencies"][0].value, 11)
         self.assertEqual(target.to_dict(), node)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_nested_target_reports_its_full_config_path(self):
-        """
-        Feature: target
-        Description: An invalid dependency target should identify the nested argument.
-        Expectation: Nested target reports its full config path.
-        """
+        """An invalid dependency target should identify the nested argument."""
         node = {
             "_target_": f"{__name__}._build_parent",
             "dependency": {
@@ -101,14 +87,8 @@ class TestNestedTarget(unittest.TestCase):
         ):
             resolve_component(node, expected_type=Target[Any], path="$.target")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_runtime_argument_overrides_nested_target(self):
-        """
-        Feature: target
-        Description: Trainer-supplied runtime values should retain highest precedence.
-        Expectation: Runtime argument overrides nested target.
-        """
+        """Trainer-supplied runtime values should retain highest precedence."""
         configured = Target(
             _build_parent,
             target_path=f"{__name__}._build_parent",

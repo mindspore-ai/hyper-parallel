@@ -128,7 +128,7 @@ class ShardingPlanner:
       ``inner_target`` / ``inner_wrapper`` non-None, ``region_dispatch=False``)
       always win; internal flags (``_ep_size`` / ``_ep_stack`` /
       ``_needs_cp_attn``) always inherit. This is how
-      CP/EP compute injection is declared — no need to redeclare contracts;
+      CP/EP compute injection is declared — no need to re-declare contracts;
     - **insert mode** (exact key misses every derived boundary): the spec is
       inserted as-is and must be fully self-declared — an override with
       empty params AND empty contracts fails fast ("no template matched");

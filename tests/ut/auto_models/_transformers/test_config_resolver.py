@@ -44,11 +44,7 @@ class TestEmptyMappingFallback(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_deepseek_v41_registers_lazily(self):
-        """
-        Feature: config resolver
-        Description: Family discovery registers the V4.1 custom architecture.
-        Expectation: Deepseek v41 registers lazily.
-        """
+        """Family discovery registers the V4.1 custom architecture."""
         self.assertIsInstance(registry.MODEL_ARCH_MAPPING, OrderedDict)
         spec = registry.get_model_adapter("deepseek_v41")
         self.assertIsNotNone(spec)
@@ -72,11 +68,7 @@ class TestEmptyMappingFallback(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_get_is_hf_model(self):
-        """
-        Feature: config resolver
-        Description: Unknown and missing architectures select the HF implementation.
-        Expectation: Get is hf model.
-        """
+        """Unknown and missing architectures select the HF implementation."""
         config = SimpleNamespace(architectures=["Qwen3MoeForCausalLM"])
         self.assertTrue(config_resolver.get_is_hf_model(config))
         self.assertTrue(config_resolver.get_is_hf_model(SimpleNamespace(architectures=[])))
@@ -88,11 +80,7 @@ class TestEmptyMappingFallback(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_custom_model_resolution_triggers_family_discovery(self):
-        """
-        Feature: config resolver
-        Description: AutoModel path selection should not require registry preheating.
-        Expectation: Custom model resolution triggers family discovery.
-        """
+        """AutoModel path selection should not require registry preheating."""
         config = SimpleNamespace(
             model_type="lazy_family",
             architectures=["LazyFamilyForCausalLM"],

@@ -25,20 +25,12 @@ from hyper_parallel.data.batching.build_collate_fn import (
 from hyper_parallel.data.vlm.collator import VLMCollator
 from hyper_parallel.data.vlm.get_batch import VLMBatchProcessor
 
-from tests.common.mark_utils import arg_mark
-
 
 class TestVLMCollator(unittest.TestCase):
     """VLM collation delegates field semantics to the batch adapter."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_default_adapter_collates_fixed_shape_mappings(self):
-        """
-        Feature: collator
-        Description: The default adapter retains PyTorch collation for generic fields.
-        Expectation: Default adapter collates fixed shape mappings.
-        """
+        """The default adapter retains PyTorch collation for generic fields."""
         collator = VLMCollator()
 
         batch = collator([
@@ -57,32 +49,23 @@ class TestVLMCollator(unittest.TestCase):
         torch.testing.assert_close(batch["input_ids"], torch.tensor([[1, 2], [4, 5]]))
         torch.testing.assert_close(batch["model_feature"], torch.tensor([[3], [6]]))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_collator_runs_adapter_lifecycle_in_order(self):
-        """
-        Feature: collator
-        Description: Preparation, custom collation, and finalization share one context.
-        Expectation: Collator runs adapter lifecycle in order.
-        """
+        """Preparation, custom collation, and finalization share one context."""
         events = []
 
         class _LifecycleAdapter(DataBatchAdapter):
-            def prepare_items(self, items: list[dict], context: DataBatchContext) -> list[dict]:
-                """Record preparation and preserve the input samples."""
+            def prepare_items(self, items, context):
                 events.append(("prepare", context.source_type))
                 return items
 
-            def collate_items(self, items: list[dict], context: DataBatchContext) -> dict:
-                """Stack token fields and record the shared context."""
+            def collate_items(self, items, context):
                 events.append(("collate", context.source_type))
                 return {
                     "input_ids": torch.stack([item["input_ids"] for item in items]),
                     "labels": torch.stack([item["labels"] for item in items]),
                 }
 
-            def finalize_batch(self, batch: dict, context: DataBatchContext) -> dict:
-                """Attach the context marker after collation."""
+            def finalize_batch(self, batch, context):
                 events.append(("finalize", context.source_type))
                 return {**batch, "adapter_marker": context.source_type}
 
@@ -102,14 +85,8 @@ class TestVLMCollator(unittest.TestCase):
         )
         self.assertEqual(batch["adapter_marker"], "multimodal")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_batch_processor_forwards_adapter_defined_model_fields(self):
-        """
-        Feature: collator
-        Description: Unknown modality fields reach the model without a framework allowlist.
-        Expectation: Batch processor forwards adapter defined model fields.
-        """
+        """Unknown modality fields reach the model without a framework allowlist."""
         model_inputs, loss_inputs = VLMBatchProcessor.prepare_batch({
             "input_ids": torch.tensor([[1, 2]]),
             "labels": torch.tensor([[-100, 2]]),

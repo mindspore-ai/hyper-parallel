@@ -31,119 +31,6 @@ from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.models.deepseek_v41.configuration import validate_swiglu_limit
 
 
-
-
-
-def _configure_validation_vision(config, source, vision_num_hidden_layers):
-    """Configure validation vision."""
-    vision = source["vision_config"]
-    released_vision_layers = int(vision["num_hidden_layers"])
-    if vision_num_hidden_layers is not None:
-        if not 0 < vision_num_hidden_layers <= released_vision_layers:
-            raise ValueError(
-                "vision_num_hidden_layers must be in [1, "
-                f"{released_vision_layers}], got {vision_num_hidden_layers}"
-            )
-    config.v41_vision_enabled = vision_num_hidden_layers is not None
-    config.v41_vision_num_hidden_layers = (
-        released_vision_layers if vision_num_hidden_layers is None else vision_num_hidden_layers
-    )
-    config.v41_vision_hidden_size = int(vision["hidden_size"])
-    config.v41_vision_num_attention_heads = int(vision["num_attention_heads"])
-    config.v41_vision_intermediate_size = int(vision["intermediate_size"])
-    config.v41_vision_patch_size = int(vision["patch_size"])
-    config.v41_vision_rope_theta = float(vision["rope_theta"])
-    config.v41_vision_downsample_ratio = int(vision["downsample_ratio"])
-    config.v41_vision_max_image_tokens = int(vision["max_image_tokens"])
-    config.v41_vision_min_pixels = int(vision["min_pixels"])
-    config.v41_vision_max_wh_ratio = vision["max_wh_ratio"]
-    config.v41_image_token_id = int(source["image_token_id"])
-
-
-def _configure_validation_indexer(config, text, num_hidden_layers, exercise_post_training_indexer, indexer_loss_coeff):
-    """Configure validation indexer."""
-    source_candidate_layer = int(text.get("candidate_source_layer_id", -1))
-    config.v41_candidate_source_layer_id = (
-        source_candidate_layer if source_candidate_layer < num_hidden_layers else -1
-    )
-    config.v41_candidate_topk_blocks = int(text.get("candidate_topk_blocks", 0))
-    config.v41_candidate_block_size = int(text.get("candidate_block_size", 1))
-    config.v41_indexer_loss_coeff = float(indexer_loss_coeff)
-    if exercise_post_training_indexer:
-        # At 4K with ratio 2 this retains 1024 candidates for Top-512. The
-        # released 2048-block value would retain every key in this short crop.
-        config.v41_candidate_topk_blocks = min(config.v41_candidate_topk_blocks, 128)
-        released_candidate_layer = int(text["candidate_source_layer_id"])
-        released_reindex_layer = next(
-            layer_id for layer_id in text["index_source_layer_ids"]
-            if layer_id > released_candidate_layer
-        )
-        if released_reindex_layer >= num_hidden_layers:
-            source_layer = config.v41_kv_source_layer_ids[-1]
-            reindex_layer = num_hidden_layers - 1
-            if reindex_layer <= source_layer:
-                raise ValueError("the validation crop has no layer available for Reindex")
-            config.v41_index_source_layer_ids = sorted(
-                set(config.v41_index_source_layer_ids + [reindex_layer])
-            )
-            config.v41_candidate_source_layer_id = source_layer
-            config.v41_validation_reindex_remap = {
-                "released_full_layer": released_candidate_layer,
-                "released_reindex_layer": released_reindex_layer,
-                "crop_full_layer": source_layer,
-                "crop_reindex_layer": reindex_layer,
-            }
-
-
-def _build_validation_text_config(source, text, num_hidden_layers, resolved_routed_experts, effective_swiglu_limit):
-    """Build validation text config."""
-    config = DeepseekV4Config(  # pylint: disable=unexpected-keyword-arg
-        vocab_size=text["vocab_size"],
-        hidden_size=text["hidden_size"],
-        moe_intermediate_size=text["moe_intermediate_size"],
-        num_hidden_layers=num_hidden_layers,
-        num_attention_heads=text["num_attention_heads"],
-        num_key_value_heads=text["num_key_value_heads"],
-        head_dim=text["head_dim"],
-        q_lora_rank=text["q_lora_rank"],
-        num_experts_per_tok=text["num_experts_per_tok"],
-        n_routed_experts=resolved_routed_experts,
-        n_shared_experts=text["n_shared_experts"],
-        scoring_func=text["scoring_func"],
-        norm_topk_prob=text["norm_topk_prob"],
-        routed_scaling_factor=text["routed_scaling_factor"],
-        max_position_embeddings=text["max_position_embeddings"],
-        rope_theta=text["rope_theta"],
-        rope_parameters=text["rope_scaling"],
-        layer_types=["sliding_attention"] * num_hidden_layers,
-        mlp_layer_types=["moe"] * num_hidden_layers,
-        compress_rates={"compressed_sparse_attention": 2, "heavily_compressed_attention": 2},
-        compress_rope_theta=text["compress_rope_theta"],
-        hc_mult=text["hc_mult"],
-        hc_sinkhorn_iters=text["hc_sinkhorn_iters"],
-        hc_eps=text["hc_eps"],
-        swiglu_limit=effective_swiglu_limit,
-        sliding_window=text["sliding_window"],
-        o_groups=text["o_groups"],
-        o_lora_rank=text["o_lora_rank"],
-        index_n_heads=text["index_n_heads"],
-        index_head_dim=text["index_head_dim"],
-        index_topk=text["index_topk"],
-        hidden_act=text["hidden_act"],
-        initializer_range=text["initializer_range"],
-        rms_norm_eps=text["rms_norm_eps"],
-        use_cache=False,
-        pad_token_id=source["pad_token_id"],
-        bos_token_id=source["bos_token_id"],
-        eos_token_id=source["eos_token_id"],
-        tie_word_embeddings=text["tie_word_embeddings"],
-        partial_rotary_factor=text["qk_rope_head_dim"] / text["head_dim"],
-        attention_bias=text["attention_bias"],
-        attention_dropout=text["attention_dropout"],
-    )
-    return config
-
-
 def build_deepseek_v41_validation_config(
         config_path: str,
         engram_assets_path: str,
@@ -221,8 +108,49 @@ def build_deepseek_v41_validation_config(
         )
     if resolved_routed_experts < int(text["num_experts_per_tok"]):
         raise ValueError("num_routed_experts must be at least num_experts_per_tok")
-    config = _build_validation_text_config(
-        source, text, num_hidden_layers, resolved_routed_experts, effective_swiglu_limit,
+    config = DeepseekV4Config(  # pylint: disable=unexpected-keyword-arg
+        vocab_size=text["vocab_size"],
+        hidden_size=text["hidden_size"],
+        moe_intermediate_size=text["moe_intermediate_size"],
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=text["num_attention_heads"],
+        num_key_value_heads=text["num_key_value_heads"],
+        head_dim=text["head_dim"],
+        q_lora_rank=text["q_lora_rank"],
+        num_experts_per_tok=text["num_experts_per_tok"],
+        n_routed_experts=resolved_routed_experts,
+        n_shared_experts=text["n_shared_experts"],
+        scoring_func=text["scoring_func"],
+        norm_topk_prob=text["norm_topk_prob"],
+        routed_scaling_factor=text["routed_scaling_factor"],
+        max_position_embeddings=text["max_position_embeddings"],
+        rope_theta=text["rope_theta"],
+        rope_parameters=text["rope_scaling"],
+        layer_types=["sliding_attention"] * num_hidden_layers,
+        mlp_layer_types=["moe"] * num_hidden_layers,
+        compress_rates={"compressed_sparse_attention": 2, "heavily_compressed_attention": 2},
+        compress_rope_theta=text["compress_rope_theta"],
+        hc_mult=text["hc_mult"],
+        hc_sinkhorn_iters=text["hc_sinkhorn_iters"],
+        hc_eps=text["hc_eps"],
+        swiglu_limit=effective_swiglu_limit,
+        sliding_window=text["sliding_window"],
+        o_groups=text["o_groups"],
+        o_lora_rank=text["o_lora_rank"],
+        index_n_heads=text["index_n_heads"],
+        index_head_dim=text["index_head_dim"],
+        index_topk=text["index_topk"],
+        hidden_act=text["hidden_act"],
+        initializer_range=text["initializer_range"],
+        rms_norm_eps=text["rms_norm_eps"],
+        use_cache=False,
+        pad_token_id=source["pad_token_id"],
+        bos_token_id=source["bos_token_id"],
+        eos_token_id=source["eos_token_id"],
+        tie_word_embeddings=text["tie_word_embeddings"],
+        partial_rotary_factor=text["qk_rope_head_dim"] / text["head_dim"],
+        attention_bias=text["attention_bias"],
+        attention_dropout=text["attention_dropout"],
     )
     config.architectures = ["DeepseekV41ForCausalLM"]
     config.v41_source_swiglu_limit = source_swiglu_limit
@@ -235,7 +163,37 @@ def build_deepseek_v41_validation_config(
         layer_id for layer_id in text["index_source_layer_ids"]
         if layer_id < num_hidden_layers
     ]
-    _configure_validation_indexer(config, text, num_hidden_layers, exercise_post_training_indexer, indexer_loss_coeff)
+    source_candidate_layer = int(text.get("candidate_source_layer_id", -1))
+    config.v41_candidate_source_layer_id = (
+        source_candidate_layer if source_candidate_layer < num_hidden_layers else -1
+    )
+    config.v41_candidate_topk_blocks = int(text.get("candidate_topk_blocks", 0))
+    config.v41_candidate_block_size = int(text.get("candidate_block_size", 1))
+    config.v41_indexer_loss_coeff = float(indexer_loss_coeff)
+    if exercise_post_training_indexer:
+        # At 4K with ratio 2 this retains 1024 candidates for Top-512. The
+        # released 2048-block value would retain every key in this short crop.
+        config.v41_candidate_topk_blocks = min(config.v41_candidate_topk_blocks, 128)
+        released_candidate_layer = int(text["candidate_source_layer_id"])
+        released_reindex_layer = next(
+            layer_id for layer_id in text["index_source_layer_ids"]
+            if layer_id > released_candidate_layer
+        )
+        if released_reindex_layer >= num_hidden_layers:
+            source_layer = config.v41_kv_source_layer_ids[-1]
+            reindex_layer = num_hidden_layers - 1
+            if reindex_layer <= source_layer:
+                raise ValueError("the validation crop has no layer available for Reindex")
+            config.v41_index_source_layer_ids = sorted(
+                set(config.v41_index_source_layer_ids + [reindex_layer])
+            )
+            config.v41_candidate_source_layer_id = source_layer
+            config.v41_validation_reindex_remap = {
+                "released_full_layer": released_candidate_layer,
+                "released_reindex_layer": released_reindex_layer,
+                "crop_full_layer": source_layer,
+                "crop_reindex_layer": reindex_layer,
+            }
     config.v41_engram_layer_ids = list(assets["layer_ids"])
     config.v41_engram_num_embeddings = list(assets["num_embeddings"])
     config.v41_engram_bucket_base = int(assets["bucket_base"])
@@ -243,7 +201,28 @@ def build_deepseek_v41_validation_config(
     config.v41_engram_assets_path = str(assets_path)
     config.v41_source_model_type = source["model_type"]
     config.v41_validation_crop = True
-    _configure_validation_vision(config, source, vision_num_hidden_layers)
+    vision = source["vision_config"]
+    released_vision_layers = int(vision["num_hidden_layers"])
+    if vision_num_hidden_layers is not None:
+        if not 0 < vision_num_hidden_layers <= released_vision_layers:
+            raise ValueError(
+                "vision_num_hidden_layers must be in [1, "
+                f"{released_vision_layers}], got {vision_num_hidden_layers}"
+            )
+    config.v41_vision_enabled = vision_num_hidden_layers is not None
+    config.v41_vision_num_hidden_layers = (
+        released_vision_layers if vision_num_hidden_layers is None else vision_num_hidden_layers
+    )
+    config.v41_vision_hidden_size = int(vision["hidden_size"])
+    config.v41_vision_num_attention_heads = int(vision["num_attention_heads"])
+    config.v41_vision_intermediate_size = int(vision["intermediate_size"])
+    config.v41_vision_patch_size = int(vision["patch_size"])
+    config.v41_vision_rope_theta = float(vision["rope_theta"])
+    config.v41_vision_downsample_ratio = int(vision["downsample_ratio"])
+    config.v41_vision_max_image_tokens = int(vision["max_image_tokens"])
+    config.v41_vision_min_pixels = int(vision["min_pixels"])
+    config.v41_vision_max_wh_ratio = vision["max_wh_ratio"]
+    config.v41_image_token_id = int(source["image_token_id"])
     config._attn_implementation = "eager"  # pylint: disable=protected-access
     return config
 

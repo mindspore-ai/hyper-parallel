@@ -147,7 +147,18 @@ def build_source_shard_info(
                 info[full_fqn] = (placements, dense_mesh)
 
     pairs = tied_pairs if tied_pairs is not None else plan.tied_pairs
-    _align_tied_source_placements(info, pairs)
+    if pairs:
+        for a, b in pairs:
+            if a in info and b in info:
+                pa, _ = info[a]
+                pb, _ = info[b]
+                if pa != pb and len(pa) == len(pb):
+                    norm = tuple(
+                        x if isinstance(x, Shard) else y
+                        for x, y in zip(pa, pb)
+                    )
+                    info[a] = (norm, info[a][1])
+                    info[b] = (norm, info[b][1])
     return info
 
 
@@ -368,19 +379,3 @@ def _source_infos_for_fully_shard(
     ):
         return None
     return managed_source_shard_info
-
-
-def _align_tied_source_placements(info, pairs):
-    """Use the finer source sharding for parameters sharing storage."""
-    if pairs:
-        for a, b in pairs:
-            if a in info and b in info:
-                pa, _ = info[a]
-                pb, _ = info[b]
-                if pa != pb and len(pa) == len(pb):
-                    norm = tuple(
-                        x if isinstance(x, Shard) else y
-                        for x, y in zip(pa, pb)
-                    )
-                    info[a] = (norm, info[a][1])
-                    info[b] = (norm, info[b][1])

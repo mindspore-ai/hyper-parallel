@@ -29,7 +29,11 @@ from typing import Any, List, Literal, Optional, Union
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.models import build_options
+from hyper_parallel.models.build_options import (
+    CompileConfig,
+    FSDP2Config,
+    FSDP2MixedPrecisionConfig,
+)
 from hyper_parallel.models.replacement import (
     ModuleReplacementFactory,
     ModuleReplacementSpec,
@@ -37,10 +41,6 @@ from hyper_parallel.models.replacement import (
 )
 
 from hyper_parallel.trainer.config.target import Target
-
-CompileConfig = build_options.CompileConfig
-FSDP2Config = build_options.FSDP2Config
-FSDP2MixedPrecisionConfig = build_options.FSDP2MixedPrecisionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -451,13 +451,6 @@ def entries_to_plan_overrides(
     - two entries sharing the same ``match`` are merged field-wise
       (non-None fields, later entry wins) — the planner's interface is
       exactly this dict.
-
-    Args:
-        entries: Module pattern and sharding specifications to normalize.
-        cp_size: Number of context-parallel ranks.
-        ep_size: Number of ranks in the expert-parallel group.
-        sequence_parallel: Whether activations use tensor-axis sequence sharding.
-        low_precision_enabled: Whether low-precision rules affect placement inference.
     """
     overrides: dict[str, Any] = {}
     for entry in entries:
@@ -520,10 +513,6 @@ def normalize_distributed_setup_overrides(
     when-filtered against the built mesh and compiled into replacement
     rules — so the AutoModels build pipeline consumes only normalized
     objects and never imports trainer config.
-
-    Args:
-        distributed_setup: Resolved process groups and distributed meshes.
-        config: Model configuration or configuration source.
     """
     entries = list(getattr(config, "plan_overrides", None) or [])
     mesh_context = getattr(distributed_setup, "mesh_context", None)

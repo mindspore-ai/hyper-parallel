@@ -87,21 +87,11 @@ class SharedCompressedAttentionState:
         return values[source_layer]
 
     def publish_compressed_kv(self, source_layer: int, value: torch.Tensor) -> None:
-        """Publish compressed K=V while preserving its autograd graph.
-
-        Args:
-            source_layer: Layer identifier that owns the shared tensor.
-            value: Tensor published for reuse by consumer layers.
-        """
+        """Publish compressed K=V while preserving its autograd graph."""
         self.compressed_kv_by_source[source_layer] = value
 
     def require_compressed_kv(self, source_layer: int | None, consumer_layer: int) -> torch.Tensor:
-        """Read compressed K=V from the consumer's configured Full layer.
-
-        Args:
-            source_layer: Layer identifier that owns the shared tensor.
-            consumer_layer: Layer identifier requesting the shared tensor.
-        """
+        """Read compressed K=V from the consumer's configured Full layer."""
         return self._require(
             self.compressed_kv_by_source,
             source_layer,
@@ -110,21 +100,11 @@ class SharedCompressedAttentionState:
         )
 
     def publish_index_key(self, source_layer: int, value: torch.Tensor) -> None:
-        """Publish the Full Indexer's shared key tensor.
-
-        Args:
-            source_layer: Layer identifier that owns the shared tensor.
-            value: Tensor published for reuse by consumer layers.
-        """
+        """Publish the Full Indexer's shared key tensor."""
         self.index_key_by_source[source_layer] = value
 
     def require_index_key(self, source_layer: int | None, consumer_layer: int) -> torch.Tensor:
-        """Read the Indexer key associated with a compressed-KV source.
-
-        Args:
-            source_layer: Layer identifier that owns the shared tensor.
-            consumer_layer: Layer identifier requesting the shared tensor.
-        """
+        """Read the Indexer key associated with a compressed-KV source."""
         return self._require(
             self.index_key_by_source,
             source_layer,
@@ -133,21 +113,11 @@ class SharedCompressedAttentionState:
         )
 
     def publish_topk_indices(self, source_layer: int, value: torch.Tensor) -> None:
-        """Publish one Full/Reindex layer's token selection.
-
-        Args:
-            source_layer: Layer identifier that owns the shared tensor.
-            value: Tensor published for reuse by consumer layers.
-        """
+        """Publish one Full/Reindex layer's token selection."""
         self.topk_indices_by_source[source_layer] = value
 
     def require_topk_indices(self, source_layer: int | None, consumer_layer: int) -> torch.Tensor:
-        """Read the latest configured Full/Reindex selection.
-
-        Args:
-            source_layer: Layer identifier that owns the shared tensor.
-            consumer_layer: Layer identifier requesting the shared tensor.
-        """
+        """Read the latest configured Full/Reindex selection."""
         return self._require(
             self.topk_indices_by_source,
             source_layer,
@@ -156,12 +126,7 @@ class SharedCompressedAttentionState:
         )
 
     def publish_candidate_blocks(self, source_layer: int, value: torch.Tensor) -> None:
-        """Publish hierarchical candidate blocks from the configured source.
-
-        Args:
-            source_layer: Layer identifier that owns the shared tensor.
-            value: Tensor published for reuse by consumer layers.
-        """
+        """Publish hierarchical candidate blocks from the configured source."""
         self.candidate_blocks_by_source[source_layer] = value
 
     def require_candidate_blocks(
@@ -169,12 +134,7 @@ class SharedCompressedAttentionState:
             source_layer: int | None,
             consumer_layer: int,
     ) -> torch.Tensor:
-        """Read hierarchical candidates for a later Reindex layer.
-
-        Args:
-            source_layer: Layer identifier that owns the shared tensor.
-            consumer_layer: Layer identifier requesting the shared tensor.
-        """
+        """Read hierarchical candidates for a later Reindex layer."""
         return self._require(
             self.candidate_blocks_by_source,
             source_layer,
@@ -210,12 +170,7 @@ class SharedCompressedAttentionCPContext:
     launch_sequence: Callable[[torch.Tensor, int], SequenceGatherHandle] | None = None
 
     def launch(self, tensor: torch.Tensor, sequence_dim: int) -> SequenceGatherHandle:
-        """Launch an async gather or create a deferred synchronous gather.
-
-        Args:
-            tensor: Tensor to inspect or communicate.
-            sequence_dim: Tensor dimension containing local sequence positions.
-        """
+        """Launch an async gather or create a deferred synchronous gather."""
         if self.launch_sequence is not None:
             return self.launch_sequence(tensor, sequence_dim)
         return _DeferredSequenceGather(tensor, sequence_dim, self.gather_sequence)
@@ -240,11 +195,7 @@ class SharedCompressedPackedSequence:
     global_sequence_length: int
 
     def local_segment_starts(self, device: torch.device) -> torch.Tensor:
-        """Return each local query's global packed-sample start position.
-
-        Args:
-            device: Device on which output tensors are allocated.
-        """
+        """Return each local query's global packed-sample start position."""
         boundaries = self.cu_seq_lens.to(device=device, dtype=torch.long)
         if boundaries.ndim != 1 or boundaries.numel() < 2 or int(boundaries[0]) != 0:
             raise ValueError("packed cu_seq_lens must be one-dimensional and start with zero")
@@ -264,11 +215,7 @@ class SharedCompressedPackedSequence:
         return boundaries[:-1].index_select(0, segment_ids).unsqueeze(0)
 
     def validate_compression_alignment(self, compress_ratio: int) -> None:
-        """Reject packed samples whose compressor groups would cross boundaries.
-
-        Args:
-            compress_ratio: Number of source tokens represented by each compressed key.
-        """
+        """Reject packed samples whose compressor groups would cross boundaries."""
         if compress_ratio <= 1:
             return
         boundaries = self.cu_seq_lens.to(dtype=torch.long)
@@ -311,16 +258,7 @@ def build_sliding_window_indices(
         query_offset: int = 0,
         key_length: int | None = None,
 ) -> torch.Tensor:
-    """Build fixed-width causal sliding-window indices.
-
-    Args:
-        batch_size: Number of samples in the batch.
-        sequence_length: Number of token positions per sample.
-        window_size: Number of preceding tokens retained by local attention.
-        device: Device on which output tensors are allocated.
-        query_offset: Global sequence offset of the first local query.
-        key_length: Number of available key positions.
-    """
+    """Build fixed-width causal sliding-window indices."""
     if key_length is None:
         key_length = sequence_length
     width = min(key_length, window_size)
@@ -354,17 +292,6 @@ def compressed_causal_topk(
     groups of ``compress_ratio`` source tokens. This implementation retains
     the source rule ``key < floor((query + 1) / ratio)`` while using batched
     matrix multiplication and bounded query chunks on accelerator cores.
-
-    Args:
-        query: Query tensor used to score candidate keys.
-        key: Key tensor used to compute attention or indexer scores.
-        merge_weight: Per-head weights used to combine indexer scores.
-        compress_ratio: Number of source tokens represented by each compressed key.
-        sparse_count: Maximum number of causal keys selected for each query.
-        query_offset: Global sequence offset of the first local query.
-        query_chunk_size: Number of queries processed per temporary score block.
-        reduce_sum: Optional callback that sums partial scores across tensor ranks.
-        minimum_key_indices: Optional earliest allowed key for each packed query.
     """
     if compress_ratio <= 0:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
@@ -427,12 +354,6 @@ def select_candidate_blocks(
     The newest reachable partial block is pinned into the candidate set, then
     the remaining blocks compete by their maximum position score. ``logits``
     must already contain ``-inf`` at causally unreachable positions.
-
-    Args:
-        logits: Scores used to rank candidate compressed keys.
-        compress_lens: Number of causally reachable compressed keys per query.
-        topk_blocks: Number of candidate blocks retained per query.
-        block_size: Number of compressed keys represented by each candidate block.
     """
     if topk_blocks <= 0:
         raise ValueError(f"topk_blocks must be positive, got {topk_blocks}")
@@ -468,12 +389,6 @@ def select_candidate_block_indices(
     Storing block ids uses ``block_size`` times less cross-layer state than
     expanded position ids and avoids the full ``[batch, query, key]`` boolean
     mask used by the released inference reference. Invalid slots are ``-1``.
-
-    Args:
-        logits: Scores used to rank candidate compressed keys.
-        compress_lens: Number of causally reachable compressed keys per query.
-        topk_blocks: Number of candidate blocks retained per query.
-        block_size: Number of compressed keys represented by each candidate block.
     """
     if topk_blocks <= 0:
         raise ValueError(f"topk_blocks must be positive, got {topk_blocks}")
@@ -509,20 +424,7 @@ def compressed_causal_candidates(
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
         minimum_key_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Build compact blockwise candidate ids in bounded query chunks.
-
-    Args:
-        query: Query tensor used to score candidate keys.
-        key: Key tensor used to compute attention or indexer scores.
-        merge_weight: Per-head weights used to combine indexer scores.
-        compress_ratio: Number of source tokens represented by each compressed key.
-        topk_blocks: Number of candidate blocks retained per query.
-        block_size: Number of compressed keys represented by each candidate block.
-        query_offset: Global sequence offset of the first local query.
-        query_chunk_size: Number of queries processed per temporary score block.
-        reduce_sum: Optional callback that sums partial scores across tensor ranks.
-        minimum_key_indices: Optional earliest allowed key for each packed query.
-    """
+    """Build compact blockwise candidate ids in bounded query chunks."""
     _, sequence_length, _, _ = query.shape
     compressed_length = key.shape[1]
     if minimum_key_indices is not None and minimum_key_indices.shape != query.shape[:2]:
@@ -568,21 +470,7 @@ def compressed_causal_topk_and_candidates(
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
         minimum_key_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select Full-layer Top-K and candidate blocks from one score pass.
-
-    Args:
-        query: Query tensor used to score candidate keys.
-        key: Key tensor used to compute attention or indexer scores.
-        merge_weight: Per-head weights used to combine indexer scores.
-        compress_ratio: Number of source tokens represented by each compressed key.
-        sparse_count: Maximum number of causal keys selected for each query.
-        topk_blocks: Number of candidate blocks retained per query.
-        block_size: Number of compressed keys represented by each candidate block.
-        query_offset: Global sequence offset of the first local query.
-        query_chunk_size: Number of queries processed per temporary score block.
-        reduce_sum: Optional callback that sums partial scores across tensor ranks.
-        minimum_key_indices: Optional earliest allowed key for each packed query.
-    """
+    """Select Full-layer Top-K and candidate blocks from one score pass."""
     if compress_ratio <= 0:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
     if query_chunk_size <= 0:
@@ -656,24 +544,30 @@ def compressed_candidate_topk(
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
         minimum_key_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Score only hierarchical candidate blocks and return global key ids.
+    """Score only hierarchical candidate blocks and return global key ids."""
+    if compress_ratio <= 0:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if query_chunk_size <= 0:
+        raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
+    batch_size, sequence_length, _, head_dim = query.shape
+    if key.ndim != 3 or key.shape[0] != batch_size or key.shape[2] != head_dim:
+        raise ValueError(
+            "compressed index key must have shape [batch, compressed_sequence, head_dim]"
+        )
+    if merge_weight.shape != query.shape[:3]:
+        raise ValueError(
+            f"merge_weight must have shape {tuple(query.shape[:3])}, got {tuple(merge_weight.shape)}"
+        )
+    if candidate_blocks.ndim != 3 or candidate_blocks.shape[:2] != query.shape[:2]:
+        raise ValueError(
+            "candidate_blocks must have shape [batch, query, candidate_blocks], "
+            f"got {tuple(candidate_blocks.shape)}"
+        )
+    if minimum_key_indices is not None and minimum_key_indices.shape != query.shape[:2]:
+        raise ValueError("minimum_key_indices must have shape [batch, query]")
 
-    Args:
-        query: Query tensor used to score candidate keys.
-        key: Key tensor used to compute attention or indexer scores.
-        merge_weight: Per-head weights used to combine indexer scores.
-        candidate_blocks: Candidate block IDs selected by the coarse indexer.
-        compress_ratio: Number of source tokens represented by each compressed key.
-        sparse_count: Maximum number of causal keys selected for each query.
-        block_size: Number of compressed keys represented by each candidate block.
-        query_offset: Global sequence offset of the first local query.
-        query_chunk_size: Number of queries processed per temporary score block.
-        reduce_sum: Optional callback that sums partial scores across tensor ranks.
-        minimum_key_indices: Optional earliest allowed key for each packed query.
-    """
-    _validate_candidate_inputs(query, key, merge_weight, candidate_blocks, compress_ratio,
-                               block_size, query_chunk_size, minimum_key_indices)
-    batch_size, sequence_length, _, _ = query.shape
     compressed_length = key.shape[1]
     candidate_width = candidate_blocks.shape[-1] * block_size
     top_k = min(sparse_count, candidate_width)
@@ -739,22 +633,7 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
             query_chunk_size: int,
             reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
     ) -> torch.Tensor:
-        """Compute sparse KL and save only the three Indexer gradients.
-
-        Args:
-            ctx: Autograd context used to retain tensors for backward.
-            index_query: Learned query projections of the sparse indexer.
-            index_key: Learned key projections of the sparse indexer.
-            merge_weight: Per-head weights used to combine indexer scores.
-            attention_query: Attention query projections used as the KL target.
-            compressed_key: Compressed attention keys used as the KL target.
-            topk_indices: Selected compressed key indices for each query.
-            sinks: Per-head attention sink logits.
-            attention_scale: Scale applied to attention dot products.
-            loss_coeff: Coefficient applied to the indexer auxiliary loss.
-            query_chunk_size: Number of queries processed per temporary score block.
-            reduce_sum: Optional callback that sums partial scores across tensor ranks.
-        """
+        """Compute sparse KL and save only the three Indexer gradients."""
         batch_size, sequence_length, _, _ = index_query.shape
         denominator = batch_size * sequence_length
         total_loss = index_query.new_zeros((), dtype=torch.float32)
@@ -837,12 +716,7 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_loss: torch.Tensor) -> tuple:
-        """Return the precomputed Indexer gradients and detach the teacher.
-
-        Args:
-            ctx: Autograd context used to retain tensors for backward.
-            grad_loss: Upstream gradient of the auxiliary loss.
-        """
+        """Return the precomputed Indexer gradients and detach the teacher."""
         grad_index_query, grad_index_key, grad_merge_weight = ctx.saved_tensors
         return (
             grad_index_query * grad_loss,
@@ -871,19 +745,6 @@ def shared_compressed_indexer_kl_loss(
     The target first softmaxes selected main-attention scores per attention
     head, then averages and L1-normalizes across heads. Indexer inputs are
     detached by the caller, so this objective updates only Indexer parameters.
-
-    Args:
-        index_query: Learned query projections of the sparse indexer.
-        index_key: Learned key projections of the sparse indexer.
-        merge_weight: Per-head weights used to combine indexer scores.
-        attention_query: Attention query projections used as the KL target.
-        compressed_key: Compressed attention keys used as the KL target.
-        topk_indices: Selected compressed key indices for each query.
-        sinks: Per-head attention sink logits.
-        attention_scale: Scale applied to attention dot products.
-        loss_coeff: Coefficient applied to the indexer auxiliary loss.
-        query_chunk_size: Number of queries processed per temporary score block.
-        tp_context: Tensor-parallel metadata for score and gradient reduction.
     """
     if query_chunk_size <= 0:
         raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
@@ -947,20 +808,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             query_offset: int = 0,
             minimum_key_indices: torch.Tensor | None = None,
     ) -> SharedCompressedIndexerOutput:
-        """Project local queries and score them against global compressed keys.
-
-        Args:
-            hidden_states: Input token representations.
-            query_residual: Residual query projections before indexer transformation.
-            latent: Latent key/value projections before compression.
-            compress_position_embeddings: Rotary embeddings at compressed key positions.
-            index_key: Learned key projections of the sparse indexer.
-            candidate_blocks: Candidate block IDs selected by the coarse indexer.
-            cp_context: Context-parallel metadata for global sequence reconstruction.
-            tp_context: Tensor-parallel metadata for score and gradient reduction.
-            query_offset: Global sequence offset of the first local query.
-            minimum_key_indices: Optional earliest allowed key for each packed query.
-        """
+        """Project local queries and score them against global compressed keys."""
         batch_size, sequence_length, _ = hidden_states.shape
         cos, sin = compress_position_embeddings
 
@@ -1090,17 +938,7 @@ class _NpuSparseAttentionWithScalarSink(torch.autograd.Function):
             rope_head_dim: int,
             scale: float,
     ) -> torch.Tensor:
-        """Run sparse attention and merge the analytically zero-valued sink.
-
-        Args:
-            ctx: Autograd context used to retain tensors for backward.
-            query: Query tensor used to score candidate keys.
-            key_value: Shared key and value representations.
-            sparse_indices: Key indices retained by sparse attention.
-            sinks: Per-head attention sink logits.
-            rope_head_dim: Number of head dimensions carrying rotary embeddings.
-            scale: Multiplicative attention score scale.
-        """
+        """Run sparse attention and merge the analytically zero-valued sink."""
         import omni_training_custom_ops  # noqa: F401  # pylint: disable=C0415,unused-import
 
         batch_size, num_heads, sequence_length, head_dim = query.shape
@@ -1174,12 +1012,7 @@ class _NpuSparseAttentionWithScalarSink(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
-        """Apply sparse-attention backward and the analytic sink gradient.
-
-        Args:
-            ctx: Autograd context used to retain tensors for backward.
-            grad_output: Upstream output gradient.
-        """
+        """Apply sparse-attention backward and the analytic sink gradient."""
         (
             query,
             key_value,
@@ -1235,16 +1068,7 @@ def npu_sparse_attention_with_scalar_sink(
         rope_head_dim: int,
         scale: float,
 ) -> torch.Tensor:
-    """Run V4.1 sparse attention through enhanced Ascend operators.
-
-    Args:
-        query: Query tensor used to score candidate keys.
-        key_value: Shared key and value representations.
-        sparse_indices: Key indices retained by sparse attention.
-        sinks: Per-head attention sink logits.
-        rope_head_dim: Number of head dimensions carrying rotary embeddings.
-        scale: Multiplicative attention score scale.
-    """
+    """Run V4.1 sparse attention through enhanced Ascend operators."""
     return _NpuSparseAttentionWithScalarSink.apply(
         query,
         key_value,
@@ -1338,38 +1162,16 @@ class SharedCompressedDSAAttention(nn.Module):
         query = query.transpose(1, 2)
         return query_residual, _apply_v41_rope(query, cos, sin)
 
-    def _packed_segment_bounds(self, packed_sequence, hidden_states, query_offset, global_sequence_length):
-        """Check packed geometry and derive per-query causal lower bounds."""
-        batch_size, sequence_length, _ = hidden_states.shape
-        segment_starts = None
-        minimum_key_indices = None
-        if packed_sequence is not None:
-            if batch_size != 1:
-                raise ValueError("V4.1 compact packed attention currently requires micro_batch_size=1")
-            if (
-                    packed_sequence.local_query_start != query_offset
-                    or packed_sequence.local_query_length != sequence_length
-                    or packed_sequence.global_sequence_length != global_sequence_length
-            ):
-                packed_geometry = (
-                    packed_sequence.local_query_start,
-                    packed_sequence.local_query_length,
-                    packed_sequence.global_sequence_length,
-                )
-                raise ValueError(
-                    "packed sequence geometry does not match the local CP shard: "
-                    f"packed={packed_geometry}, "
-                    f"attention={(query_offset, sequence_length, global_sequence_length)}"
-                )
-            packed_sequence.validate_compression_alignment(self.compress_ratio)
-            segment_starts = packed_sequence.local_segment_starts(hidden_states.device)
-            if self.compress_ratio:
-                minimum_key_indices = segment_starts // self.compress_ratio
-
-        return segment_starts, minimum_key_indices
-
-    def _training_context(self, hidden_states, position_ids, attention_mask, past_key_values, kwargs):
-        """Resolve typed training metadata before launching communication."""
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
+            position_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None,
+            past_key_values: Any | None = None,
+            **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Publish or consume compressed KV and execute indexed K=V attention."""
         if past_key_values is not None:
             raise NotImplementedError("shared compressed DSA training does not support KV cache")
         shared_state = kwargs.pop("shared_attention_state", None)
@@ -1411,15 +1213,45 @@ class SharedCompressedDSAAttention(nn.Module):
                 self.compress_ratio,
                 self.is_kv_source,
             )
-        segment_starts, minimum_key_indices = self._packed_segment_bounds(
-            packed_sequence, hidden_states, query_offset, global_sequence_length,
-        )
-        return (shared_state, cp_context, tp_context, query_offset, global_sequence_length,
-                segment_starts, minimum_key_indices)
+        segment_starts = None
+        minimum_key_indices = None
+        if packed_sequence is not None:
+            if batch_size != 1:
+                raise ValueError("V4.1 compact packed attention currently requires micro_batch_size=1")
+            if (
+                    packed_sequence.local_query_start != query_offset
+                    or packed_sequence.local_query_length != sequence_length
+                    or packed_sequence.global_sequence_length != global_sequence_length
+            ):
+                packed_geometry = (
+                    packed_sequence.local_query_start,
+                    packed_sequence.local_query_length,
+                    packed_sequence.global_sequence_length,
+                )
+                raise ValueError(
+                    "packed sequence geometry does not match the local CP shard: "
+                    f"packed={packed_geometry}, "
+                    f"attention={(query_offset, sequence_length, global_sequence_length)}"
+                )
+            packed_sequence.validate_compression_alignment(self.compress_ratio)
+            segment_starts = packed_sequence.local_segment_starts(hidden_states.device)
+            if self.compress_ratio:
+                minimum_key_indices = segment_starts // self.compress_ratio
 
-    def _run_shared_indexer(self, hidden_states, query_residual, latent, position_embeddings,
-                            shared_state, cp_context, tp_context, query_offset, minimum_key_indices):
-        """Publish indexer outputs while outstanding KV gathers progress."""
+        rope_type = "compress" if self.compress_ratio else "main"
+        cos, sin = position_embeddings[rope_type]
+        key_value, raw_kv_handle = self._project_raw_kv(hidden_states, cos, sin, cp_context)
+        query_residual, query = self._project_query(hidden_states, cos, sin)
+
+        compressed_handle = None
+        latent = None
+        if self.is_kv_source:
+            latent, compressed = self.compressor(hidden_states, position_embeddings["compress"])
+            if cp_context is None:
+                shared_state.publish_compressed_kv(self.layer_idx, compressed)
+            else:
+                compressed_handle = cp_context.launch(compressed, 1)
+
         indexer_output = None
         if self.is_index_source:
             index_key = (
@@ -1454,51 +1286,6 @@ class SharedCompressedDSAAttention(nn.Module):
                     self.layer_idx,
                     indexer_output.candidate_blocks,
                 )
-
-        return indexer_output
-
-    def forward(
-            self,
-            hidden_states: torch.Tensor,
-            position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
-            position_ids: torch.Tensor,
-            attention_mask: torch.Tensor | None,
-            past_key_values: Any | None = None,
-            **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Publish or consume compressed KV and execute indexed K=V attention.
-
-        Args:
-            hidden_states: Input token representations.
-            position_embeddings: Rotary cosine and sine tensors for token positions.
-            position_ids: Token positions within each packed sample.
-            attention_mask: Mask restricting which key positions each query can attend to.
-            past_key_values: Optional attention cache from earlier decoding steps.
-        """
-        (shared_state, cp_context, tp_context, query_offset, global_sequence_length,
-         segment_starts, minimum_key_indices) = self._training_context(
-            hidden_states, position_ids, attention_mask, past_key_values, kwargs,
-        )
-        batch_size, sequence_length, _ = hidden_states.shape
-
-        rope_type = "compress" if self.compress_ratio else "main"
-        cos, sin = position_embeddings[rope_type]
-        key_value, raw_kv_handle = self._project_raw_kv(hidden_states, cos, sin, cp_context)
-        query_residual, query = self._project_query(hidden_states, cos, sin)
-
-        compressed_handle = None
-        latent = None
-        if self.is_kv_source:
-            latent, compressed = self.compressor(hidden_states, position_embeddings["compress"])
-            if cp_context is None:
-                shared_state.publish_compressed_kv(self.layer_idx, compressed)
-            else:
-                compressed_handle = cp_context.launch(compressed, 1)
-
-        indexer_output = self._run_shared_indexer(
-            hidden_states, query_residual, latent, position_embeddings, shared_state,
-            cp_context, tp_context, query_offset, minimum_key_indices,
-        )
 
         if raw_kv_handle is not None:
             key_value = raw_kv_handle.wait()
@@ -1535,29 +1322,6 @@ class SharedCompressedDSAAttention(nn.Module):
             combined_key_value = key_value
             sparse_indices = window
 
-        query = self._attach_indexer_loss(query, indexer_output, compressed_kv, tp_context)
-
-        if hidden_states.device.type == "npu":
-            attention_output = npu_sparse_attention_with_scalar_sink(
-                query,
-                combined_key_value,
-                sparse_indices,
-                self.sinks,
-                self.rope_head_dim,
-                self.scaling,
-            )
-        else:
-            attention_output = _reference_sparse_attention(
-                query,
-                combined_key_value,
-                sparse_indices,
-                self.sinks,
-                self.scaling,
-            )
-        return self._project_attention_output(attention_output, cos, sin, batch_size, sequence_length)
-
-    def _attach_indexer_loss(self, query, indexer_output, compressed_kv, tp_context):
-        """Attach the training-only indexer objective to the attention gradient."""
         if (
                 indexer_output is not None
                 and self.training
@@ -1579,10 +1343,23 @@ class SharedCompressedDSAAttention(nn.Module):
             )
             query = aux_loss_auto_scale(query, indexer_loss)
 
-        return query
-
-    def _project_attention_output(self, attention_output, cos, sin, batch_size, sequence_length):
-        """Undo output rotary embedding and apply grouped output projections."""
+        if hidden_states.device.type == "npu":
+            attention_output = npu_sparse_attention_with_scalar_sink(
+                query,
+                combined_key_value,
+                sparse_indices,
+                self.sinks,
+                self.rope_head_dim,
+                self.scaling,
+            )
+        else:
+            attention_output = _reference_sparse_attention(
+                query,
+                combined_key_value,
+                sparse_indices,
+                self.sinks,
+                self.scaling,
+            )
         attention_output = _apply_v41_rope(attention_output.transpose(1, 2), cos, -sin).transpose(1, 2)
         grouped = attention_output.reshape(batch_size, sequence_length, self.num_groups, -1)
         hidden_per_group = grouped.shape[-1]
@@ -1612,30 +1389,3 @@ __all__ = [
     "shared_compressed_indexer_kl_loss",
     "npu_sparse_attention_with_scalar_sink",
 ]
-
-
-def _validate_candidate_inputs(query, key, merge_weight, candidate_blocks, compress_ratio,
-                               block_size, query_chunk_size, minimum_key_indices):
-    """Validate dimensions before indexing compressed candidate blocks."""
-    if compress_ratio <= 0:
-        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
-    if block_size <= 0:
-        raise ValueError(f"block_size must be positive, got {block_size}")
-    if query_chunk_size <= 0:
-        raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
-    batch_size, sequence_length, _, head_dim = query.shape
-    if key.ndim != 3 or key.shape[0] != batch_size or key.shape[2] != head_dim:
-        raise ValueError(
-            "compressed index key must have shape [batch, compressed_sequence, head_dim]"
-        )
-    if merge_weight.shape != query.shape[:3]:
-        raise ValueError(
-            f"merge_weight must have shape {tuple(query.shape[:3])}, got {tuple(merge_weight.shape)}"
-        )
-    if candidate_blocks.ndim != 3 or candidate_blocks.shape[:2] != query.shape[:2]:
-        raise ValueError(
-            "candidate_blocks must have shape [batch, query, candidate_blocks], "
-            f"got {tuple(candidate_blocks.shape)}"
-        )
-    if minimum_key_indices is not None and minimum_key_indices.shape != query.shape[:2]:
-        raise ValueError("minimum_key_indices must have shape [batch, query]")

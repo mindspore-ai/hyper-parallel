@@ -53,11 +53,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Generate the requested JSONL dataset.
-
-    Args:
-        argv: Optional command-line arguments; defaults to the process arguments.
-    """
+    """Generate the requested JSONL dataset."""
     args = _parse_args(argv)
     prepare_online_data(
         Path(args.output).expanduser().resolve(),

@@ -23,8 +23,6 @@ from torch import nn
 
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 
-from tests.common.mark_utils import arg_mark
-
 
 class _EngramSource(nn.Module):
     """Small source-layout fixture accepted by the Engram replacement."""
@@ -61,25 +59,13 @@ class _EngramSource(nn.Module):
             input_ids: torch.Tensor,
             segment_starts: Any = None,
     ) -> None:
-        """The source forward is unused by this worker.
-
-        Args:
-            hidden_states: Input token representations.
-            input_ids: Token IDs in batch and sequence order.
-            segment_starts: Start offset of the packed sample containing each token.
-        """
+        """The source forward is unused by this worker."""
         del hidden_states, input_ids, segment_starts
         raise RuntimeError("fixture forward is intentionally unavailable")
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 def test_engram_ep_lookup_cp_hash_gloo():
-    """
-    Feature:  test engram parallel
-    Description: Four ranks match a replicated table for output, input grad, and table grad.
-    Expectation: Engram ep lookup cp hash gloo.
-    """
+    """Four ranks match a replicated table for output, input grad, and table grad."""
     dist.init_process_group("gloo")
     try:
         rank = dist.get_rank()

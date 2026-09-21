@@ -36,11 +36,7 @@ class VLMBatchProcessor:
 
     @staticmethod
     def normalize_source_batch(source_batch: Mapping[str, Any]) -> dict[str, Any]:
-        """Normalize one collated batch into the VLM training contract.
-
-        Args:
-            source_batch: Raw batch returned by the dataloader.
-        """
+        """Normalize one collated batch into the VLM training contract."""
         batch = dict(source_batch)
         if "input_ids" not in batch:
             raise ValueError("VLM batch must contain 'input_ids'")
@@ -52,11 +48,7 @@ class VLMBatchProcessor:
 
     @staticmethod
     def prepare_batch(batch: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Send adapter-defined fields to the model and isolate loss-only metadata.
-
-        Args:
-            batch: Collated fields supplied by the data batch adapter.
-        """
+        """Send adapter-defined fields to the model and isolate loss-only metadata."""
         model_inputs = {
             field: value
             for field, value in batch.items()
