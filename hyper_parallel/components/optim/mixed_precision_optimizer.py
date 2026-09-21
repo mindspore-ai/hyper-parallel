@@ -20,11 +20,7 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.core.optimizer.dtensor_compat import (
-    device_meshes_are_compatible,
-    is_dtensor,
-    to_local_if_dtensor,
-)
+from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 
 
@@ -49,57 +45,18 @@ def _gradient_for_param(
         optimizer_param: nn.Parameter,
         gradient: torch.Tensor,
 ) -> torch.Tensor:
-    """Return a validated gradient matching an optimizer parameter.
-
-    DTensor optimizer parameters keep a DTensor gradient so lazily-created
-    optimizer state inherits its complete global layout. FSDP ``main_grad`` is
-    already detached from autograd, so the DTensor object itself is preserved.
-    Plain parameters retain the detached local-tensor path used by non-FSDP and
-    third-party integrations.
-    """
-    optimizer_is_dtensor = is_dtensor(optimizer_param)
-    gradient_is_dtensor = is_dtensor(gradient)
-    if optimizer_is_dtensor != gradient_is_dtensor:
-        raise TypeError(
-            "Optimizer parameter and gradient must both be DTensors or both be local tensors"
-        )
-
+    """Return a detached local gradient matching an optimizer parameter."""
     optimizer_local = to_local_if_dtensor(optimizer_param)
-    gradient_local = to_local_if_dtensor(gradient)
-    if tuple(gradient_local.shape) != tuple(optimizer_local.shape):
-        raise ValueError(
-            "Optimizer gradient local shape must match its parameter shard: "
-            f"got {tuple(gradient_local.shape)} and {tuple(optimizer_local.shape)}"
-        )
-    if optimizer_is_dtensor:
-        if tuple(gradient.shape) != tuple(optimizer_param.shape):
-            raise ValueError(
-                "Optimizer gradient global shape must match its parameter: "
-                f"got {tuple(gradient.shape)} and {tuple(optimizer_param.shape)}"
-            )
-        if not device_meshes_are_compatible(
-                gradient.device_mesh,
-                optimizer_param.device_mesh,
-        ):
-            raise ValueError("Optimizer gradient and parameter must use the same device mesh")
-        if tuple(gradient.placements) != tuple(optimizer_param.placements):
-            raise ValueError("Optimizer gradient and parameter must use the same placements")
-        # FSDP main_grad is already an autograd-detached accumulation buffer.
-        # Keep that DTensor object intact: detach() rebuilds an uneven empty
-        # shard without its logical tensor metadata, which makes a subsequent
-        # zeros_like() infer the optimizer state's global shape as zero.
-        prepared_gradient = gradient
-    else:
-        prepared_gradient = gradient_local.detach()
+    gradient_local = to_local_if_dtensor(gradient).detach()
     if (
         gradient_local.device != optimizer_local.device
         or gradient_local.dtype != optimizer_local.dtype
     ):
-        prepared_gradient = prepared_gradient.to(
+        gradient_local = gradient_local.to(
             device=optimizer_local.device,
             dtype=optimizer_local.dtype,
         )
-    return prepared_gradient
+    return gradient_local
 
 
 class MixedPrecisionOptimizer:

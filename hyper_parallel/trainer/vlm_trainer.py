@@ -17,11 +17,9 @@
 from collections import defaultdict
 from typing import Any, Dict
 
-import torch  # pylint: disable=forbidden-backend-import
-
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.utils import clip_grad_norm_
-from hyper_parallel.data.batching import RuntimeInputAdapter, calculate_num_micro_batches
+from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.vlm import build_processor, build_vlm_get_batch
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
@@ -51,7 +49,6 @@ class VLMTrainer:
         self._build_model_assets()
         self._build_data_transform()
         self.base._build_dataset()
-        self.base._build_data_batch_adapter()
 
         # dataloader
         self._build_collate_fn()
@@ -110,12 +107,7 @@ class VLMTrainer:
             micro_batch_size=training_config.micro_batch_size,
             dp_world_size=self.base.mesh.dp_size,
         )
-        self.base.collate_fn = dataloader_config.collate_fn.build(
-            mesh_context=self.base.mesh,
-            tokenizer=self.base.tokenizer,
-            batch_adapter=self.base.data_batch_adapter,
-            batch_context=self.base.data_batch_context,
-        )
+        self.base.collate_fn = dataloader_config.collate_fn.build()
 
     def _build_get_batch(self) -> None:
         """Build the DataLoader-to-VLM batch adapter."""
@@ -129,11 +121,6 @@ class VLMTrainer:
             mesh_context=self.base.mesh,
             device=self.base.device,
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
-            runtime_input_adapter=(
-                self.base.data_batch_adapter
-                if isinstance(self.base.data_batch_adapter, RuntimeInputAdapter)
-                else None
-            ),
         )
 
     @property
@@ -234,7 +221,7 @@ class VLMTrainer:
             else [self.base.optimizer]
         )
         for optimizer in optimizers:
-            with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+            with SkipDTensorDispatch():
                 optimizer.step()
             optimizer.zero_grad()
 

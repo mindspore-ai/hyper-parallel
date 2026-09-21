@@ -28,9 +28,6 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     MixedPrecisionOptimizer,
 )
-from hyper_parallel.models._transformers.model_builder import (
-    validate_model_init_dtype,
-)
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import empty_cache
 from hyper_parallel.trainer.runtime.device import (
@@ -38,6 +35,7 @@ from hyper_parallel.trainer.runtime.device import (
     set_device_rng_state,
 )
 from .base import Callback, TrainerState
+from hyper_parallel.models._transformers.model_builder import apply_model_init_dtype
 
 
 if TYPE_CHECKING:
@@ -347,7 +345,7 @@ class CheckpointerCallback(Callback):
         self.trainer.model.load_state_dict(
             checkpoint_state["model"], strict=not self._is_peft
         )
-        validate_model_init_dtype(
+        apply_model_init_dtype(
             self.trainer.model,
             self.trainer.config.model_init_dtype,
         )
@@ -366,7 +364,6 @@ class CheckpointerCallback(Callback):
         if self._restore_train_state:
             self._apply_extra_state(checkpoint_state["extra_state"])
         else:
-            self._set_start_position_from_state()
             logger.info(
                 "restore_train_state=False: loaded weights only from %s "
                 "(step, scheduler, dataloader and RNG start fresh).",
@@ -389,7 +386,9 @@ class CheckpointerCallback(Callback):
         trainer.state.global_step = extra["global_step"]
         trainer.state.epoch = extra.get("epoch", 0)
 
-        self._set_start_position_from_state()
+        steps_per_epoch = self._steps_per_epoch()
+        trainer.start_epoch = trainer.state.global_step // steps_per_epoch
+        trainer.start_step = trainer.state.global_step % steps_per_epoch
 
         # The restored step is already on disk. Without this, resuming a run that
         # had nothing left to do would have ``on_train_end`` rewrite the very
@@ -431,14 +430,6 @@ class CheckpointerCallback(Callback):
         python_rng = rng_state.get("python")
         if python_rng is not None:
             random.setstate(python_rng)
-
-    def _set_start_position_from_state(self) -> None:
-        """Derive the compatibility start position from the current state."""
-        trainer = self.trainer
-
-        steps_per_epoch = self._steps_per_epoch()
-        trainer.start_epoch = trainer.state.global_step // steps_per_epoch
-        trainer.start_step = trainer.state.global_step % steps_per_epoch
 
 
 __all__ = ["CheckpointerCallback"]

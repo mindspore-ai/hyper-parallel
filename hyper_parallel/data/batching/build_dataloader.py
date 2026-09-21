@@ -26,10 +26,6 @@ import torch
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from hyper_parallel.data.batching.build_collate_fn import (
-    DataBatchAdapter,
-    DataBatchContext,
-)
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 
@@ -111,7 +107,6 @@ def _normalize_source_samples(source_item: Any) -> list[Mapping[str, Any]]:
 def _restore_index_buffer(
         source_dataset: Any,
         saved_buffer: Sequence[Any],
-        batcher: "TextTokenBatcher",
 ) -> list[tuple[Mapping[str, Any], int]]:
     """Rebuild buffered ModelSamples from output index and sample index."""
     restored_buffer = []
@@ -134,7 +129,11 @@ def _restore_index_buffer(
                 f"Buffered sample_idx={resolved_sample_idx} is out of range for output_index={output_index!r}"
             ) from exc
 
-        restored_buffer.append((model_sample, batcher.item_cost(model_sample)))
+        sample_length = int(model_sample["input_ids"].shape[-1])
+        if sample_length <= 0:
+            raise ValueError("Dynamic batching samples must contain at least one token")
+
+        restored_buffer.append((model_sample, sample_length))
 
     return restored_buffer
 
@@ -176,8 +175,6 @@ def build_dataloader(
         collate_fn: Any,
         mesh_context: Any,
         training_config: Any,
-        batch_adapter: DataBatchAdapter | None = None,
-        batch_context: DataBatchContext | None = None,
         max_seq_len: int | None = None,
         default_seed: int = 1234,
 ) -> tuple[tuple[Any | None, ...], tuple[Any | None, ...]]:
@@ -193,8 +190,6 @@ def build_dataloader(
         collate_fn: Collator applied after fixed or dynamic sample selection.
         mesh_context: Data-parallel mesh context.
         training_config: Batch size and random seed configuration.
-        batch_adapter: Model-owned data-batch lifecycle extension.
-        batch_context: Shared facts used by selection and collation.
         max_seq_len: Maximum sample length used to derive dynamic token budget.
         default_seed: Seed used when no training seed is configured.
 
@@ -255,8 +250,6 @@ def build_dataloader(
             batch_size=micro_batch_size,
             dp_world_size=dp_world_size,
             max_seq_len=max_seq_len,
-            batch_adapter=batch_adapter,
-            batch_context=batch_context,
             seed=seed,
         )
         logger.debug(
@@ -290,11 +283,8 @@ class FixedBatchDataLoader(StatefulDataLoader):
             seed: int = 1234,
             pin_memory: bool = False,
             prefetch_factor: int | None = None,
-            dp_world_size: int | None = None,
-            max_seq_len: int | None = None,
     ) -> None:
         """Initialize the stateful DataLoader."""
-        del dp_world_size, max_seq_len
         self.drop_last = drop_last
         self.use_background_prefetcher = use_background_prefetcher
         generator = torch.Generator().manual_seed(seed)
@@ -339,16 +329,10 @@ class TextTokenBatcher:
         token_budget: Target packed-token limit for one forward-backward batch.
             A single sample may exceed this limit and forms a batch by itself.
         min_buffered_samples: Minimum candidate samples buffered before batching.
-        batch_adapter: Model-owned physical item-cost extension.
-        batch_context: Shared framework facts passed to the adapter.
     """
 
     token_budget: int
     min_buffered_samples: int
-    batch_adapter: DataBatchAdapter = field(default_factory=DataBatchAdapter)
-    batch_context: DataBatchContext = field(
-        default_factory=lambda: DataBatchContext(source_type="online")
-    )
     buffer: list[tuple[Mapping[str, Any], int]] = field(default_factory=list, init=False)
     buffer_output_indices: list[Any | None] = field(default_factory=list, init=False)
     buffer_token_count: int = field(default=0, init=False)
@@ -360,32 +344,17 @@ class TextTokenBatcher:
 
         if self.min_buffered_samples <= 0:
             raise ValueError("min_buffered_samples must be positive")
-        if not isinstance(self.batch_adapter, DataBatchAdapter):
-            raise TypeError("batch_adapter must be a DataBatchAdapter")
-        if not isinstance(self.batch_context, DataBatchContext):
-            raise TypeError("batch_context must be a DataBatchContext")
-        if self.batch_context.token_budget not in (None, self.token_budget):
-            raise ValueError("batch_context.token_budget must match token_budget")
 
     def put_item(self, model_sample: Mapping[str, Any], output_index_entry: Any | None = None) -> None:
-        """Append one ModelSample and its physical budget cost."""
-        sample_length = self.item_cost(model_sample)
+        """Append one ModelSample and its token length."""
+        sample_length = int(model_sample["input_ids"].shape[-1])
+        if sample_length <= 0:
+            raise ValueError("Dynamic batching samples must contain at least one token")
 
         buffered_sample = (model_sample, sample_length)
         self.buffer.append(buffered_sample)
         self.buffer_output_indices.append(output_index_entry)
         self.buffer_token_count += sample_length
-
-    def item_cost(self, model_sample: Mapping[str, Any]) -> int:
-        """Validate and return one adapter-defined physical item cost."""
-        sample_cost = self.batch_adapter.item_cost(model_sample, self.batch_context)
-        try:
-            resolved_cost = operator.index(sample_cost)
-        except TypeError as exc:
-            raise TypeError("DataBatchAdapter.item_cost must return an integer") from exc
-        if resolved_cost <= 0:
-            raise ValueError("DataBatchAdapter.item_cost must return a positive integer")
-        return resolved_cost
 
     def is_ready_for_micro_batch(self) -> bool:
         """Report whether both buffer thresholds are satisfied."""
@@ -456,7 +425,6 @@ class _IndexBufferDynamicBatchRuntime:
             self,
             saved_buffer: Sequence[Any],
             saved_by_idx: bool,
-            batcher: TextTokenBatcher,
     ) -> tuple[list[tuple[Mapping[str, Any], int]], list[Any]]:
         """Rebuild buffered ModelSamples from output index and sample index."""
         if not saved_by_idx:
@@ -465,7 +433,7 @@ class _IndexBufferDynamicBatchRuntime:
 
             return [], []
 
-        restored_buffer = _restore_index_buffer(self.source_dataset, saved_buffer, batcher)
+        restored_buffer = _restore_index_buffer(self.source_dataset, saved_buffer)
         restored_indices = list(saved_buffer)
         return restored_buffer, restored_indices
 
@@ -497,23 +465,15 @@ class _FullBufferDynamicBatchRuntime:
             self,
             saved_buffer: Sequence[Any],
             saved_by_idx: bool,
-            batcher: TextTokenBatcher,
     ) -> tuple[list[tuple[Mapping[str, Any], int]], list[Any]]:
         """Restore full samples that cannot be fetched behind the cursor."""
         if saved_by_idx:
             if saved_buffer and self.replay_dataset is None:
                 raise ValueError("An index-buffer checkpoint requires a replayable Dataset")
 
-            restored_buffer = _restore_index_buffer(self.replay_dataset, saved_buffer, batcher)
+            restored_buffer = _restore_index_buffer(self.replay_dataset, saved_buffer)
         else:
-            restored_buffer = []
-            for saved_entry in saved_buffer:
-                if not isinstance(saved_entry, Sequence) or len(saved_entry) != 2:
-                    raise ValueError("Full dynamic buffer entries must contain an item and saved cost")
-                model_sample = saved_entry[0]
-                if not isinstance(model_sample, Mapping):
-                    raise ValueError("Full dynamic buffer entries must contain a mapping item")
-                restored_buffer.append((model_sample, batcher.item_cost(model_sample)))
+            restored_buffer = list(saved_buffer)
         restored_indices = [None] * len(restored_buffer)
         return restored_buffer, restored_indices
 
@@ -541,8 +501,6 @@ class DynamicBatchDataLoader:
         seed: Source DataLoader random seed.
         pin_memory: Whether source samples use pinned host memory.
         prefetch_factor: Number of source batches prefetched by each worker.
-        batch_adapter: Model-owned selection and collation lifecycle extension.
-        batch_context: Shared framework facts used by the adapter.
     """
 
     def __init__(
@@ -562,8 +520,6 @@ class DynamicBatchDataLoader:
             seed: int = 1234,
             pin_memory: bool = False,
             prefetch_factor: int | None = None,
-            batch_adapter: DataBatchAdapter | None = None,
-            batch_context: DataBatchContext | None = None,
     ) -> None:
         """Initialize source reading, token selection, and Online packing."""
         if collate_fn is None:
@@ -585,43 +541,10 @@ class DynamicBatchDataLoader:
         self.batch_collate_fn = collate_fn
         self.dp_world_size = resolved_dp_world_size
         token_budget = batch_size * max_seq_len
-        resolved_batch_context = batch_context or DataBatchContext(
-            source_type="online",
-            token_budget=token_budget,
-        )
-        if resolved_batch_context.token_budget not in (None, token_budget):
-            raise ValueError(
-                "batch_context.token_budget must match batch_size * max_seq_len: "
-                f"context={resolved_batch_context.token_budget}, resolved={token_budget}"
-            )
-        if resolved_batch_context.token_budget is None:
-            resolved_batch_context = DataBatchContext(
-                source_type=resolved_batch_context.source_type,
-                sequence_parallel_size=resolved_batch_context.sequence_parallel_size,
-                token_budget=token_budget,
-                pad_token_id=resolved_batch_context.pad_token_id,
-            )
-        resolved_batch_adapter = batch_adapter or DataBatchAdapter()
         self.batcher = TextTokenBatcher(
             token_budget=token_budget,
             min_buffered_samples=min_buffered_samples,
-            batch_adapter=resolved_batch_adapter,
-            batch_context=resolved_batch_context,
         )
-        adapter_state_signature = resolved_batch_adapter.state_signature(resolved_batch_context)
-        if not isinstance(adapter_state_signature, Mapping):
-            raise TypeError("DataBatchAdapter.state_signature must return a mapping")
-        adapter_type = type(resolved_batch_adapter)
-        self.batch_adapter_signature = {
-            "adapter_type": f"{adapter_type.__module__}.{adapter_type.__qualname__}",
-            "context": {
-                "source_type": resolved_batch_context.source_type,
-                "sequence_parallel_size": resolved_batch_context.sequence_parallel_size,
-                "token_budget": resolved_batch_context.token_budget,
-                "pad_token_id": resolved_batch_context.pad_token_id,
-            },
-            "adapter_state": dict(adapter_state_signature),
-        }
         is_iterable = _is_iterable_dataset(dataset)
         if batch_sampler is not None:
             enable_source_resume = getattr(batch_sampler, "enable_source_batch_resume", None)
@@ -707,7 +630,6 @@ class DynamicBatchDataLoader:
             "save_by_idx": self._runtime.save_by_idx,
             "buffer": self._runtime.get_buffer_state(self.batcher),
             "buffer_token_count": self.batcher.buffer_token_count,
-            "batch_adapter_signature": self.batch_adapter_signature,
         }
         checkpoint_state = copy.deepcopy(state)
 
@@ -723,19 +645,11 @@ class DynamicBatchDataLoader:
                 f"saved_dp_world_size={saved_dp_world_size}, current_dp_world_size={self.dp_world_size}"
             )
 
-        saved_adapter_signature = checkpoint_state.get("batch_adapter_signature", {})
-        if saved_adapter_signature != self.batch_adapter_signature:
-            raise ValueError(
-                "Online dataloader batch adapter changed across resume: "
-                f"saved={saved_adapter_signature!r}, current={self.batch_adapter_signature!r}"
-            )
-
         previous_save_by_idx = bool(checkpoint_state.get("save_by_idx", False))
         saved_buffer = checkpoint_state["buffer"]
         restored_buffer, restored_indices = self._runtime.restore_buffer(
             saved_buffer,
             previous_save_by_idx,
-            self.batcher,
         )
 
         restored_token_count = sum(sample_length for _, sample_length in restored_buffer)

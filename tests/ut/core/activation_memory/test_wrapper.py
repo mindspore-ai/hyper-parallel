@@ -27,11 +27,6 @@ from typing import Any, Callable, cast
 from unittest.mock import MagicMock, call, patch, sentinel
 
 import torch
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_optimizer_state_dict,
-    set_optimizer_state_dict,
-)
 from torch.utils.checkpoint import DefaultDeviceType
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
@@ -243,39 +238,6 @@ class TestActivationWrapper(unittest.TestCase):
         """The base forward contract should fail clearly when bypassing abstraction."""
         with self.assertRaisesRegex(ValueError, "Subclasses should implement forward"):
             ActivationWrapper.forward(sentinel.wrapper)
-
-    def test_flat_optimizer_state_uses_stable_fqns(self) -> None:
-        """DCP optimizer restore should not expose the wrapper prefix."""
-        source = torch.nn.Module()
-        source.block = ckpt_wrapper(_TinyModule())
-        source_optimizer = torch.optim.AdamW(source.parameters())
-        source_optimizer.zero_grad()
-        for parameter in source.parameters():
-            parameter.grad = torch.zeros_like(parameter)
-        source_optimizer.step()
-
-        options = StateDictOptions(flatten_optimizer_state_dict=True)
-        optimizer_state = get_optimizer_state_dict(
-            source,
-            source_optimizer,
-            options=options,
-        )
-        self.assertTrue(optimizer_state)
-        self.assertTrue(
-            all("_swap_wrapped_module" not in key for key in optimizer_state)
-        )
-
-        target = torch.nn.Module()
-        target.block = ckpt_wrapper(_TinyModule())
-        target_optimizer = torch.optim.AdamW(target.parameters())
-        set_optimizer_state_dict(
-            target,
-            target_optimizer,
-            optim_state_dict=optimizer_state,
-            options=options,
-        )
-
-        self.assertEqual(len(target_optimizer.state), len(list(target.parameters())))
 
 
 class TestBaseCheckFn(unittest.TestCase):

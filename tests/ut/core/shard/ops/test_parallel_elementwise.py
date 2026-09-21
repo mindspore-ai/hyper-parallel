@@ -21,7 +21,6 @@ import numpy as np
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_elementwise import ElementWiseDistributedOp, AddDistributedOp
-from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
 from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP
@@ -194,16 +193,6 @@ class TestParallelElementwiseOps(unittest.TestCase):
         assert cache_values[0] is x_layout
         assert cache_values[1] is y_layout
         assert cache_values[2] == [(4, 8), (4, 8)]
-
-    def test_torch_clamp_family_uses_elementwise_layout_inference(self):
-        """Torch clamp variants preserve the input element-wise layout."""
-        for op_name in ("clamp", "clamp_min", "clamp_max"):
-            registered_op = get_distributed_op(op_name)
-            self.assertIsInstance(
-                registered_op,
-                ElementWiseDistributedOp,
-                msg=f"Expected {op_name} to use element-wise inference, got {registered_op!r}",
-            )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_single_input_partial_0(self, mock_platform):

@@ -560,79 +560,7 @@ def test_axis_and_dp_validation(tiny_llama, make_mesh):
         "q_proj.weight"][TP] == Shard(0), f"case: {case}"
 
 
-def test_fully_declared_glob_inserts_model_boundaries(tiny_llama, make_mesh):
-    """A concrete glob contract creates every matching final-model boundary."""
-    class _PointwiseBoundary(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.coefficient = nn.Parameter(torch.ones(1))
-
-        def forward(self, hidden_states):
-            return hidden_states * self.coefficient
-
-    for layer in tiny_llama.model.layers:
-        layer.attn_hc = _PointwiseBoundary()
-
-    activation = {TP: Replicate()}
-    override = ModuleShardingSpec(
-        params={"coefficient": {TP: Replicate()}},
-        in_src={"hidden_states": activation},
-        in_dst={"hidden_states": activation},
-        out_src={TP: Replicate()},
-        out_dst={TP: Replicate()},
-    )
-    mesh = make_mesh((1,), ("tp",))
-    plan = ShardingPlanner(plan_overrides={
-        "model.layers.*.attn_hc": override,
-    }).plan(tiny_llama, mesh, tp_size=2)
-
-    expected = {
-        "model.layers.0.attn_hc",
-        "model.layers.1.attn_hc",
-    }
-    actual = {
-        module_fqn for module_fqn in plan.modules
-        if module_fqn.endswith(".attn_hc")
-    }
-    assert actual == expected, (
-        f"glob boundary expansion mismatch: expected={expected}, got={actual}"
-    )
-    for module_fqn in expected:
-        assert plan.modules[module_fqn].params == override.params, (
-            f"glob boundary params mismatch at {module_fqn}: "
-            f"expected={override.params}, got={plan.modules[module_fqn].params}"
-        )
-
-
-def test_incomplete_glob_for_unplanned_module_fails(tiny_llama, make_mesh):
-    """A merge-only glob fails when its real modules have no built-in boundary."""
-    for layer in tiny_llama.model.layers:
-        layer.boundary_marker = nn.Identity()
-
-    mesh = make_mesh((1,), ("tp",))
-    with pytest.raises(ValueError) as error:
-        ShardingPlanner(plan_overrides={
-            "model.layers.*.boundary_marker": ModuleShardingSpec(
-                region_dispatch=False,
-            ),
-        }).plan(tiny_llama, mesh, tp_size=2)
-
-    message = str(error.value)
-    expected_fragments = (
-        "matched 2 module(s) in the final model",
-        "have no planner-derived boundary",
-        "no concrete params/in_src/in_dst/out_src/out_dst contract",
-        "declaring the module's complete parameter and I/O contract",
-        "Suggested draft",
-        "model.layers.0.boundary_marker",
-    )
-    for fragment in expected_fragments:
-        assert fragment in message, (
-            f"incomplete-glob DFX is missing {fragment!r}: {message}"
-        )
-
-
-def test_derive_false(tiny_llama, make_mesh):
+def test_derive_false(tiny_llama, make_mesh, caplog):
     """derive=False family: template derivation is disabled; the plan contains
     only the specs explicitly declared via plan_overrides (all insert mode) —
     replaces the post-processing plan.modules pruning style (multimodal
@@ -683,15 +611,19 @@ def test_derive_false(tiny_llama, make_mesh):
             plan_overrides={"": ModuleShardingSpec(params="auto")},
             derive=False).plan(tiny_llama, mesh, tp_size=2)
 
-    # ── case: derive_false_partial_glob_fails ────────────────────────────
-    # derive=False: matching real modules with a merge-only glob cannot rely
-    # on a derived boundary and must fail with the missing-contract reason.
-    with pytest.raises(ValueError, match="no planner-derived boundary"):
-        ShardingPlanner(
+    # ── case: derive_false_glob_hits_nothing_warns ───────────────────────
+    # derive=False: a glob key has no derived boundary to hit -> loud warning
+    # (globs never insert).
+    case = "derive_false_glob_hits_nothing_warns"
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        plan = ShardingPlanner(
             plan_overrides={
                 "": _bridge_spec(),
                 "*.mlp": ModuleShardingSpec(region_dispatch=False)},
             derive=False).plan(tiny_llama, mesh, tp_size=2)
+    assert "hit no boundary spec" in caplog.text, f"case: {case}"
+    assert set(plan.modules) == {""}, f"case: {case}"
 
 
 @pytest.mark.skipif(not _HAS_TRAINER_CONFIG,
@@ -1073,19 +1005,6 @@ def test_plan_override_desugar():
     spec = overrides["*.mlp"]
     assert spec.region_dispatch is False, f"case: {case}"
     assert spec.inner_target == "self", f"case: {case}"
-
-    # ── case: sequence_parallel_when ────────────────────────────────────
-    case = "sequence_parallel_when"
-    entry = PlanOverride(
-        match="*.mhc",
-        when="sequence_parallel",
-        params={"weight": {"tp": "replicate"}},
-    )
-    assert entries_to_plan_overrides([entry]) == {}, f"case: {case}"
-    overrides = entries_to_plan_overrides(
-        [entry], sequence_parallel=True
-    )
-    assert set(overrides) == {"*.mhc"}, f"case: {case}"
 
     # ── case: tp_divide_attrs_later_entry_replaces ───────────────────────
     case = "tp_divide_attrs_later_entry_replaces"

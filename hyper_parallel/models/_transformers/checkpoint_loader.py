@@ -1022,7 +1022,7 @@ def _finalize_model_loading(
     initialization_targets = [
         target
         for target in targets.values()
-        if not target.is_non_persistent and target.fqn in missing_keys
+        if target.is_non_persistent or target.fqn in missing_keys
     ]
     missing_sharded = [
         target.fqn

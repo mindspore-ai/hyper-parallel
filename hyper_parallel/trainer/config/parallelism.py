@@ -95,19 +95,14 @@ class PlanOverride:
             It receives ``module``, ``module_fqn``, and a read-only context,
             and must return a structure-preserving replacement. A list
             ``match`` is supported only for replacement-only entries.
-        match: fqn or fqn glob. Globs first merge matching planner boundaries;
-            a glob with a concrete params/I/O contract also expands against
-            the final model's ``named_modules`` and creates missing boundaries.
-            A merge-only glob fails if it matches a real module that has no
-            planner boundary, with a suggested contract skeleton.
-            ``*`` spans dots, so ``"*.self_attn"`` hits
+        match: fqn or fqn glob matched (fnmatchcase) against the plan's
+            boundary FQNs — ``*`` spans dots, so ``"*.self_attn"`` hits
             ``model.layers.0.self_attn``.
         when: optional activation condition. Sharding actions accept ``"cp"``
-            (active when cp_size>1), ``"ep"`` (ep_size>1),
-            ``"sequence_parallel"``, or ``"low_precision"`` (active when
-            online low precision is enabled). A replacement action accepts
-            only ``"low_precision"``; module replacement must not depend on
-            the parallel topology.
+            (active when cp_size>1), ``"ep"`` (ep_size>1), or
+            ``"low_precision"`` (active when online low precision is
+            enabled). A replacement action accepts only ``"low_precision"``;
+            module replacement must not depend on the parallel topology.
         local_compute_fn: a Target whose callable is a **factory** — must be
             decorated ``@local_compute`` (injection discipline); the mesh
             family ``mesh``/``tp_mesh``/``cp_mesh``/``ep_mesh`` is mandatory
@@ -167,11 +162,8 @@ class PlanOverride:
             YAML form ``{name: {axis: placement_str}}`` (out_* also accept
             the scalar shorthand ``{axis: placement_str}``), or the sentinels
             ``"auto"`` / ``"none"``. Merge mode (match hits a derived
-            boundary): an omitted field inherits and an explicit ``{}``
-            clears. Insert mode (misses every boundary): nothing can inherit;
-            at least one concrete parameter/I/O field must declare the new
-            boundary, and all fields required by that module's contract must
-            be written explicitly.
+            boundary): usually omitted — empty inherits the derived contract;
+            insert mode (misses every boundary): all must be fully declared.
         tp_divide_attrs: optional module-instance integer attributes divided
             exactly by the active TP size when the module forward runs on
             local tensors. Omit for no user adjustment; an explicit empty
@@ -179,9 +171,7 @@ class PlanOverride:
     """
 
     match: Union[str, List[str]]
-    when: Optional[Literal[
-        "cp", "ep", "sequence_parallel", "low_precision"
-    ]] = None
+    when: Optional[Literal["cp", "ep", "low_precision"]] = None
     module_type: Optional[str] = None
     exact_type: bool = False
     replace_module: Optional[Target[Any]] = None
@@ -320,7 +310,7 @@ class PlanOverride:
         }
 
 
-_WHEN_CONDITIONS = ("cp", "ep", "sequence_parallel", "low_precision")
+_WHEN_CONDITIONS = ("cp", "ep", "low_precision")
 
 
 def _import_module_type(path: str) -> type:
@@ -438,7 +428,6 @@ def _validate_when(entry: PlanOverride) -> None:
 
 def entries_to_plan_overrides(
         entries: "List[PlanOverride]", *, cp_size: int = 1, ep_size: int = 1,
-        sequence_parallel: bool = False,
         low_precision_enabled: bool = False,
 ) -> "dict[str, Any]":
     """Desugar PlanOverride entries into a ``plan_overrides`` dict.
@@ -475,7 +464,6 @@ def entries_to_plan_overrides(
             active = {
                 "cp": cp_size > 1,
                 "ep": ep_size > 1,
-                "sequence_parallel": sequence_parallel,
                 "low_precision": low_precision_enabled,
             }[entry.when]
             if not active:
@@ -540,7 +528,6 @@ def normalize_distributed_setup_overrides(
             entries,
             cp_size=getattr(mesh_context, "cp_size", 1),
             ep_size=getattr(mesh_context, "ep_size", 1),
-            sequence_parallel=getattr(mesh_context, "sequence_parallel", False),
             low_precision_enabled=low_precision_enabled,
         )
         if entries

@@ -534,11 +534,7 @@ compressed attention adapter 使用。
 - `position_ids`：默认为全局位置在当前 CP slice 上的区间；`reset_position_ids` 可按 sequence 边界归零。
 - `loss_mask`：`labels >= 0` 的位置参与 loss；`eod_mask_loss` 可额外屏蔽 EOD。
 - dense attention：根据 `cu_seq_lens`、causal 语义和 sliding window 生成 mask。
-- 模型扩展输入：通过通用 `RuntimeInputAdapter` 生成 compressed attention、模态路由等 forward 元数据。
-
-模型若对物理 batch 有额外约束，可在 `dataloader.batch_adapter` 配置一个 `DataBatchAdapter`。同一实例依次参与
-dynamic item cost、collate 前 item 变换、最终 batch 约束/收尾以及 forward runtime input 构建；模型可通过多继承同时
-实现 `DataBatchAdapter` 和 `RuntimeInputAdapter`，框架无需增加模型专用字段。
+- compressed attention：通过 `AttentionRuntimeAdapter` 生成 `packed_seq_params`。
 
 Indexed Dataset 仍保留 `create_ltor_fields_in_dataloader` 兼容配置，但统一训练路径由
 `ParallelBatch` 在 CP/TP 分发后构建实际使用的 LTR 字段。
@@ -562,9 +558,6 @@ dataset:
 dataloader:
   _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
   min_buffered_samples: 200
-  # 可选：模型侧通用 batch 扩展，不与 attention 或 sample alignment 绑定。
-  # batch_adapter:
-  #   _target_: my_model.adapter.MyDataBatchAdapter
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
   get_batch:
@@ -642,8 +635,8 @@ data/
 │   ├── dataloader.py                   # Trainer iterator 策略的 DataLoader 构建
 │   ├── data_collator.py                # micro-batch 组 collator
 │   ├── get_batch.py                    # DataLoader batch 到模型/loss 输入
-│   ├── runtime_input.py                 # 模型侧 forward runtime input 扩展
-│   └── sequence_boundaries.py          # Online/Indexed sequence 边界
+│   ├── sequence_boundaries.py          # Online/Indexed sequence 边界
+│   └── attention_runtime.py            # dense mask 与 compressed adapter 接口
 ├── parallel/
 │   ├── dataloader_parallel.py          # Dataset/DataLoader rank 所有权与 cache barrier
 │   ├── batch_sampler.py                # DP mapping-style sampler

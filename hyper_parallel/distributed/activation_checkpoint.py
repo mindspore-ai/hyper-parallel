@@ -737,7 +737,7 @@ def _apply_activation_checkpointing(
     elif activation_checkpoint == "full":
         # Prefer the HF-native implementation when all eligibility checks
         # pass. Otherwise use Hyper Parallel's submodule wrappers.
-        if not has_kv_sharing and _should_use_hf_native_gradient_checkpointing(
+        if _should_use_hf_native_gradient_checkpointing(
             model,
             ac_layers,
             enable_compile=enable_compile,
