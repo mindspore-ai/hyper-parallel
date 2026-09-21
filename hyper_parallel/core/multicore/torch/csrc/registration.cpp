@@ -12,6 +12,8 @@
 #include <torch/library.h>
 
 TORCH_LIBRARY(hyper_parallel, m) {
+  m.def("moe_token_permute_out(Tensor tokens, Tensor indices, Tensor(a!) output, Tensor(b!) mapping) "
+        "-> (Tensor(a!), Tensor(b!))");
   m.def(
     "mega_moe_unpermute_grad_out(Tensor permuted_tokens, Tensor grad_output, "
     "Tensor sorted_indices, Tensor probs, Tensor(a!) grad_permuted, Tensor(b!) grad_probs) "

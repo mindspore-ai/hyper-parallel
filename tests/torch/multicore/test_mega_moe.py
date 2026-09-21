@@ -368,6 +368,25 @@ def test_moe_token_unpermute_grad_out(
     )
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards",
+          essential_mark="essential")
+@pytest.mark.parametrize("task_queue_enable", ["1", "2"])
+def test_moe_token_permute_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task_queue_enable: str,
+) -> None:
+    """Feature: Dropless token permutation into caller-owned output storage.
+
+    Description: Compare reused outputs and changed routes on alternating streams in both task queues.
+    Expectation: Values and mappings match native permutation exactly; invalid outputs are rejected.
+    """
+    monkeypatch.setenv("TASK_QUEUE_ENABLE", task_queue_enable)
+    evidence_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path))) / f"queue_{task_queue_enable}"
+    monkeypatch.setenv("HP_MEGA_MOE_EVIDENCE_DIR", str(evidence_dir))
+    _run_acceptance_worker(
+        monkeypatch, tmp_path, "test_moe_token_permute_out", 2, "_test_moe_token_permute_out.py",
+    )
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
           essential_mark="unessential")
 @pytest.mark.parametrize("task_queue_enable", ["1", "2"])
