@@ -35,6 +35,8 @@ class TestRuntimeLifecycle(unittest.TestCase):
             get_rank=Mock(return_value=0),
             barrier=Mock(),
             broadcast_object_list=Mock(),
+            all_gather_object=Mock(
+                side_effect=lambda output, value, **_kw: output.__setitem__(slice(None), [value] * 2)),
         )
         self.torch = SimpleNamespace(npu=SimpleNamespace(synchronize=Mock()))
         self.native = SimpleNamespace(
@@ -42,6 +44,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
             _get_unique_id=Mock(return_value=b"group-bootstrap"),
             _validate_shutdown=Mock(),
             _shutdown=Mock(),
+            _debug_state=Mock(return_value={"config": {"heap_size_bytes": 128}}),
         )
         self.framework_patch = patch.object(_lifecycle, "_torch_modules", return_value=(self.torch, self.dist))
         self.native_patch = patch.object(_lifecycle, "_load_native", return_value=self.native)
@@ -270,6 +273,47 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertTrue(_lifecycle._shutdown_failed)  # pylint: disable=protected-access
         with self.assertRaisesRegex(RuntimeError, "Native shutdown failure"):
             _lifecycle.acquire()
+
+    def test_explicit_heap_and_collective_reinitialize(self) -> None:
+        """Keep references and obtain a fresh bootstrap ID only after finalization."""
+        for invalid in (True, 0, -1, 1.5):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _lifecycle.acquire(heap_size_bytes=invalid)
+        _lifecycle.acquire(heap_size_bytes=64)
+        self.native._initialize.assert_called_once_with(0, 2, b"group-bootstrap", 64)
+        _lifecycle.acquire(heap_size_bytes=128)
+        with self.assertRaisesRegex(RuntimeError, "smaller"):
+            _lifecycle.acquire(heap_size_bytes=256)
+        ordered = Mock()
+        for name in ("_validate_shutdown", "_shutdown", "_get_unique_id", "_initialize"):
+            ordered.attach_mock(getattr(self.native, name), name)
+        self.native._get_unique_id.return_value = b"fresh-bootstrap"
+        timings = _lifecycle._reinitialize(256)
+        self.assertEqual(ordered.mock_calls, [call._validate_shutdown(), call._shutdown(),
+                                            call._get_unique_id(), call._initialize(0, 2, b"fresh-bootstrap", 256)])
+        self.assertEqual(set(timings), {"finalize_ms", "bootstrap_ms", "initialize_ms"})
+        self.assertEqual(_lifecycle._reference_count(), 2)
+        self.assertIs(_lifecycle._root_group, self.world)
+        _lifecycle.release()
+        _lifecycle.release()
+
+    def test_reinitialize_converges_peer_failure_before_next_stage(self) -> None:
+        """Stop before bootstrap on a peer finalize failure and poison all later API use."""
+        _lifecycle.acquire()
+        self.dist.all_gather_object.side_effect = (
+            lambda output, value, **_kw: output.__setitem__(slice(None),
+                                                          [value, "peer finalize failed"]
+                                                          if self.native._shutdown.called else [value] * 2))
+        with self.assertRaisesRegex(RuntimeError, "peer finalize failed"):
+            _lifecycle._reinitialize(256)
+        self.native._get_unique_id.assert_not_called()
+        self.assertEqual(self.native._initialize.call_count, 1)
+        self.assertEqual(_lifecycle._reference_count(), 1)
+        self.assertTrue(_lifecycle._shutdown_failed)
+        for operation in (_lifecycle.acquire, _lifecycle.release,
+                          _lifecycle._runtime_access(Mock())):
+            with self.assertRaises(RuntimeError):
+                operation()
 
     def test_release_without_reference_is_rejected(self) -> None:
         """Expose an unmatched release instead of silently underflowing the user count."""

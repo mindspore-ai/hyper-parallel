@@ -27,10 +27,11 @@ from hyper_parallel.core.multicore import shmem
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
+from .heap_manager import get_heap_manager, root_members
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import _COMMUNICATION_SPLIT, bind_mega_moe_spec
-from .workspace import MegaMoeWorkspace, configure_symmetric_heap
+from .workspace import MegaMoeWorkspace
 
 __all__ = ["MegaMoeExperts"]
 
@@ -83,11 +84,12 @@ class _MegaMoeExecutionResources:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
         _validate_resource_layout(active_specifications, tensor, self.spec)
-        configure_symmetric_heap(active_specifications, tensor)
-        shmem.acquire(self.spec.ep_group)
+        self.heap_manager = get_heap_manager(self.spec, tensor, active_specifications)
+        shmem.acquire(self.spec.ep_group, heap_size_bytes=self.heap_manager.heap_bytes)
         try:
             self.plan = build_mega_moe_plan(self.spec, tensor.device)
             self.workspace = MegaMoeWorkspace(shared=shared)
+            self.heap_manager.bind(self, specification)
         except Exception:
             shmem.release()
             raise
@@ -97,9 +99,11 @@ class _MegaMoeExecutionResources:
         """Release the workspace and leave the shared SHMEM lifecycle."""
         if self._closed:
             return
-        self.workspace.close()
-        shmem.release()
-        self._closed = True
+        with self.heap_manager.access():
+            self.workspace.close()
+            shmem.release()
+            self.heap_manager.remove(self)
+            self._closed = True
 
 
 class MegaMoeExperts(MulticoreModule):
@@ -123,6 +127,7 @@ class MegaMoeExperts(MulticoreModule):
         ep_group: Any | None = None,
         create_parameters: bool = True,
         dispatch_mode: str = "push",
+        capacity_policy: str = "static",
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -136,6 +141,8 @@ class MegaMoeExperts(MulticoreModule):
                 ``None`` reserves the maximum lossless capacity. A finite value
                 of at least 1.0 reserves that multiple of the local routed rows
                 and raises a clear error if a route exceeds it.
+            capacity_policy: "static" keeps the configured bound; "grow" rebuilds the push heap on overflow.
+                Growth requires a finite initial expert_capacity_factor and serial EP execution.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
@@ -145,6 +152,10 @@ class MegaMoeExperts(MulticoreModule):
                 PP/DP groups bootstrap independently; one process can have only
                 one ordered EP membership active in SHMEM at a time.
         """
+        if capacity_policy not in ("static", "grow"):
+            raise ValueError("capacity_policy must be static or grow")
+        if capacity_policy == "grow" and (dispatch_mode != "push" or expert_capacity_factor is None):
+            raise ValueError("grow capacity_policy requires push and a finite initial expert_capacity_factor")
         if dispatch_mode not in ("push", "pull"):
             raise ValueError("dispatch_mode must be push or pull")
         self._validate_topology(
@@ -168,6 +179,7 @@ class MegaMoeExperts(MulticoreModule):
             "ep_size": ep_size,
             "ep_group": ep_group,
             "dispatch_mode": dispatch_mode,
+            "capacity_policy": capacity_policy,
         }
         compatibility_key = (
             local_num_tokens,
@@ -179,11 +191,12 @@ class MegaMoeExperts(MulticoreModule):
             ep_size,
             id(ep_group),
             dispatch_mode,
+            capacity_policy,
         )
         super().__init__(
             resource_specification=specification,
             resource_compatibility_key=compatibility_key,
-            resource_scope_key=("mega_moe", id(ep_group)),
+            resource_scope_key=("mega_moe", root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
         self.local_num_tokens = local_num_tokens
         self.hidden_size = hidden_size
@@ -191,6 +204,7 @@ class MegaMoeExperts(MulticoreModule):
         self.num_experts = num_experts
         self.top_k = top_k
         self.expert_capacity_factor = expert_capacity_factor
+        self.capacity_policy = capacity_policy
         self.dispatch_mode = dispatch_mode
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
@@ -367,6 +381,8 @@ class MegaMoeExperts(MulticoreModule):
             tokens_per_expert,
             weights,
         )
+        if self.capacity_policy == "grow" and torch.npu.is_current_stream_capturing():
+            raise RuntimeError("MegaMoe grow capacity_policy does not support graph capture")
         resources = self._get_execution_resources(hidden_flat)
         pull = self.dispatch_mode == "pull"
         if pull:
@@ -384,6 +400,8 @@ class MegaMoeExperts(MulticoreModule):
                     tokens_per_expert,
                     workspace=resources.workspace,
                 )
+            if self.capacity_policy == "grow":
+                resources.heap_manager.ensure_capacity(resources, route.maximum_received_slots)
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,

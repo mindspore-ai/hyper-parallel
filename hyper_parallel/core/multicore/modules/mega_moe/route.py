@@ -165,7 +165,7 @@ def _validate_bounded_capacity(
     spec: MegaMoeSpec,
 ) -> None:
     """Raise a coordinated error when an explicit factor is too small."""
-    if spec.capacity_is_lossless:
+    if spec.capacity_is_lossless or getattr(spec, "capacity_policy", "static") == "grow":
         return
     if maximum_received_slots <= spec.receive_capacity:
         return

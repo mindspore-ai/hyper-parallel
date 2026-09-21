@@ -326,3 +326,17 @@ def test_mega_moe_subgroups(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     Expectation: Outputs and all gradients match an unsharded reference.
     """
     _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_subgroups", 4, "_test_mega_moe_runtime.py")
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential",
+)
+@pytest.mark.parametrize("variant", ["single", "shared", "mixed", "checkpoint"])
+def test_mega_moe_heap_growth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, variant: str) -> None:
+    """Feature: Collective push heap growth.
+    Description: Rebuild after one forward while keeping both autograd graphs live.
+    Expectation: Repeated reverse backwards match common EP and the old heap is invalidated.
+    """
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
+    monkeypatch.setenv("HP_MEGA_MOE_GROWTH_CASE", variant)
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_heap_growth", 2, "_test_mega_moe_memory.py")

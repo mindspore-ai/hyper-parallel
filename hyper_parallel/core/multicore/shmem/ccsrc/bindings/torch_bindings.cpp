@@ -409,14 +409,19 @@ py::bytes GetUniqueId() {
   return py::bytes(UnwrapOperation(cann::host::get_unique_id(), "GetUniqueId"));
 }
 
-void Initialize(int32_t root_rank, int32_t root_size, const py::bytes &unique_id) {
+void Initialize(int32_t root_rank, int32_t root_size, const py::bytes &unique_id, uint64_t heap_size_bytes) {
   const auto config = runtime::LoadConfigFromEnvironment();
   if (!config.ok()) {
     ThrowStatus(config.error(), DfxOperation::Initialize, DfxPhase::Validation);
   }
-  RequireOk(Runtime::Instance().Initialize(RootWorldInfo{root_rank, root_size}, config.value(),
-                                           config.value().bootstrap_endpoint_base, static_cast<std::string>(unique_id)),
-            DfxOperation::Initialize);
+  auto effective_config = config.value();
+  if (heap_size_bytes != 0) {
+    effective_config.heap_size_bytes = heap_size_bytes;
+  }
+  RequireOk(
+    Runtime::Instance().Initialize(RootWorldInfo{root_rank, root_size}, effective_config,
+                                   effective_config.bootstrap_endpoint_base, static_cast<std::string>(unique_id)),
+    DfxOperation::Initialize);
 }
 
 at::Tensor Empty(const std::vector<int64_t> &shape, c10::ScalarType dtype, const std::optional<int64_t> &alignment) {
@@ -730,6 +735,21 @@ py::dict FailureDict(const runtime::DfxFailure &failure) {
   return result;
 }
 
+py::object AllocationList(const std::optional<std::vector<AllocationRecord>> &records) {
+  if (!records.has_value()) {
+    return py::none();
+  }
+  py::list allocations;
+  for (const AllocationRecord &record : *records) {
+    py::dict entry;
+    entry["allocation_id"] = py::cast(record.allocation_id);
+    entry["allocation_base"] = py::cast(record.allocation_base);
+    entry["allocation_bytes"] = py::cast(record.allocation_bytes);
+    allocations.append(std::move(entry));
+  }
+  return allocations;
+}
+
 py::dict DebugState() {
   const DfxSnapshot snapshot = Runtime::Instance().DebugState();
   py::dict result;
@@ -761,32 +781,8 @@ py::dict DebugState() {
   result["max_allocated_bytes"] = snapshot.max_allocated_bytes.has_value()
                                     ? py::cast(*snapshot.max_allocated_bytes)
                                     : py::none();
-  if (snapshot.active_allocations.has_value()) {
-    py::list allocations;
-    for (const AllocationRecord &record : *snapshot.active_allocations) {
-      py::dict entry;
-      entry["allocation_id"] = py::cast(record.allocation_id);
-      entry["allocation_base"] = py::cast(record.allocation_base);
-      entry["allocation_bytes"] = py::cast(record.allocation_bytes);
-      allocations.append(std::move(entry));
-    }
-    result["active_allocations"] = std::move(allocations);
-  } else {
-    result["active_allocations"] = py::none();
-  }
-  if (snapshot.leaked_allocations.has_value()) {
-    py::list leaks;
-    for (const AllocationRecord &record : *snapshot.leaked_allocations) {
-      py::dict entry;
-      entry["allocation_id"] = py::cast(record.allocation_id);
-      entry["allocation_base"] = py::cast(record.allocation_base);
-      entry["allocation_bytes"] = py::cast(record.allocation_bytes);
-      leaks.append(std::move(entry));
-    }
-    result["leaked_allocations"] = std::move(leaks);
-  } else {
-    result["leaked_allocations"] = py::none();
-  }
+  result["active_allocations"] = AllocationList(snapshot.active_allocations);
+  result["leaked_allocations"] = AllocationList(snapshot.leaked_allocations);
   result["latest_failure"] =
     snapshot.latest_failure.has_value() ? py::object(FailureDict(*snapshot.latest_failure)) : py::none();
   return result;
@@ -801,7 +797,7 @@ PYBIND11_MODULE(hyper_parallel_shmem_torch, module) {
   module.doc() = "Private Torch binding for the Hyper-Parallel SHMEM Runtime";
   module.def("_get_unique_id", &bindings::GetUniqueId);
   module.def("_initialize", &bindings::Initialize, py::arg("root_rank"), py::arg("root_size"),
-             py::arg("unique_id") = py::bytes());
+             py::arg("unique_id") = py::bytes(), py::arg("heap_size_bytes") = 0);
   module.def("_empty", &bindings::Empty, py::arg("shape"), py::arg("dtype"), py::arg("alignment") = std::nullopt);
   module.def("_free", &bindings::Free, py::arg("tensor"));
   module.def("_barrier", &bindings::Barrier, py::kw_only(), py::arg("blocking") = true);

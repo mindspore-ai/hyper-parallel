@@ -233,6 +233,7 @@ def new_layers(
     shape: MoeShape,
     *,
     expert_capacity_factor: float | None = None,
+    capacity_policy: str = "static",
     dispatch_mode: str | None = None,
 ) -> tuple[MegaMoeExperts, torch.nn.Module]:
     """Construct parameter-aligned MegaMoe and common expert layers.
@@ -241,6 +242,7 @@ def new_layers(
         shape: Local token and expert dimensions.
         expert_capacity_factor: Optional explicit receive bound.
         dispatch_mode: MegaMoe dispatch transport.
+        capacity_policy: Static bound or managed heap growth.
 
     Returns:
         MegaMoe and common expert modules with identical local parameters.
@@ -253,6 +255,7 @@ def new_layers(
         num_experts=shape.num_experts,
         top_k=shape.top_k,
         expert_capacity_factor=expert_capacity_factor,
+        capacity_policy=capacity_policy,
         dispatch_mode=dispatch_mode or os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push"),
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,

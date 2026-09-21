@@ -43,7 +43,7 @@ from hyper_parallel.components.optim import (
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
-from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.core.multicore import MegaMoeExperts, shmem
 from hyper_parallel.core.optimizer import get_hyper_optimizer
 from hyper_parallel.platform.torch.common import GroupedExperts
 
@@ -161,6 +161,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--expert-capacity-factor", type=_capacity_factor, default=None)
     parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
+    parser.add_argument("--capacity-policy", choices=("static", "grow"), default="static")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--output",
@@ -578,7 +579,15 @@ def _measure_backend(
         loss, latency = _timed_step(workload)
         latencies.append(latency)
         losses.append(float(loss.float().cpu().item()))
+    managers = {}
+    for layer in workload.model.layers:
+        if isinstance(layer.mlp.experts, MegaMoeExperts):
+            manager = layer.mlp.experts._resource_group.resources.heap_manager
+            managers[id(manager)] = manager
+    state = shmem.debug_state() if managers else {}
     return {
+        "shmem_heap_bytes": state.get("config", {}).get("heap_size_bytes", 0),
+        "heap_growth": [record for manager in managers.values() for record in manager.growth_records],
         "validation": validation,
         "first_optimizer_step_ms": first_step_ms,
         "steady_state_optimizer_step_ms": {
@@ -614,6 +623,7 @@ def _write_result(
                 "top_k": config.top_k,
                 "expert_capacity_factor": config.expert_capacity_factor,
                 "dispatch_mode": config.dispatch_mode,
+                "capacity_policy": config.capacity_policy,
                 "dtype": "bfloat16",
             },
             "optimizer": {
@@ -737,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
         QwenMoeConfig(),
         expert_capacity_factor=args.expert_capacity_factor,
         dispatch_mode=args.dispatch_mode,
+        capacity_policy=args.capacity_policy,
     )
     models: dict[str, QwenMoeModel] = {}
     try:

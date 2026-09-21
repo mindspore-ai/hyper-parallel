@@ -118,7 +118,24 @@ pull 仍需普通 HBM 容纳热点接收数据，不会消除计算激活的负�
 push 和 pull 的 dispatch/combine 通信任务均固定为 128 行，不根据接收负载动态切换。
 
 显式设置不小于 1 的有限 factor 时，容量改为 `ceil(T * K * factor)` 再对齐。
-超过容量时，所有 EP rank 在进入 native kernel 前报 `capacity overflow`。
+默认 `capacity_policy="static"` 下超过容量时，所有 EP rank 在进入 native kernel 前报 `capacity overflow`。
+
+push 可显式设置 `capacity_policy="grow", expert_capacity_factor=1.0`，从较小的 heap 开始运行。
+路由超过当前容量时，同一 EP root 的所有 rank 完成在途工作，释放全部受管对称 buffer，
+finalize 旧 SHMEM runtime，再使用 fresh bootstrap ID 初始化更大的 heap 并重建 workspace，继续本次 forward。
+目标容量为 `align128(max(本次最大接收量, 1.5 × 当前容量))`，不超过原有无损上界；回落时不缩容。
+该路径复用已有路由 counts，未溢出的 forward 不增加负载 collective。
+
+共享层、独立的 push/pull workspace 和尚未绑定的层统一计入预算。
+逻辑 workspace 对象保持稳定，因此扩容前的 forward 支持延迟或重复 backward、checkpoint 重算及串行交替 stream。
+首版要求每个 root 串行执行，不支持图捕获；同一 root 下的静态层也不能保留使用旧地址的捕获图。
+外部持有的专家参数不属于 heap，扩容不会移动它们。
+
+若显式设置 `HYPER_PARALLEL_SHMEM_HEAP_SIZE`，它是固定预算；grow 只在预算内增加逻辑容量。
+超过预算、存在未受管 SHMEM owner/allocation 或活动租约时，在销毁前拒绝本次扩容。
+已开始释放后若重建失败，整个 runtime 进入不可继续使用的状态，需退出并重启训练进程。
+自动预算不再写入环境变量；实际 heap 大小应读取 `shmem.debug_state()["config"]["heap_size_bytes"]`。
+扩容有一次性同步和初始化开销，极端路由仍会增加 heap 和普通 HBM 用量。
 应根据显存和路由负载选择容量，确保显式容量覆盖实际接收量。
 
 ### 资源共享与关闭

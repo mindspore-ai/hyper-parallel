@@ -15,6 +15,7 @@
 """Unit tests for the model-facing MegaMoe module."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, PropertyMock, patch
 
@@ -58,6 +59,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                     "ep_size": 2,
                     "ep_group": None,
                     "dispatch_mode": "push",
+                    "capacity_policy": "static",
                 },
             )
             mock_create_parameters.assert_called_once_with(2, 16, 8)
@@ -75,6 +77,9 @@ class TestMegaMoeExperts(unittest.TestCase):
             ({"expert_capacity_factor": 0.999}, "expert_capacity_factor"),
             ({"num_experts": 35}, "divisible"),
             ({"dispatch_mode": "invalid"}, "dispatch_mode"),
+            ({"capacity_policy": "invalid"}, "capacity_policy"),
+            ({"capacity_policy": "grow"}, "finite"),
+            ({"capacity_policy": "grow", "expert_capacity_factor": 1.0, "dispatch_mode": "pull"}, "push"),
         ):
             with (
                 self.subTest(overrides=overrides),
@@ -86,6 +91,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                     intermediate_size=8,
                     num_experts=overrides.get("num_experts", 4),
                     dispatch_mode=overrides.get("dispatch_mode", "push"),
+                    capacity_policy=overrides.get("capacity_policy", "static"),
                     top_k=2,
                     expert_capacity_factor=overrides.get("expert_capacity_factor"),
                     ep_size=2,
@@ -321,7 +327,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 "bind_mega_moe_spec",
                 return_value=bound_spec,
             ),
-            patch.object(mega_moe_module, "configure_symmetric_heap"),
+            patch.object(mega_moe_module, "get_heap_manager",
+                         return_value=Mock(heap_bytes=1024, access=nullcontext)),
             patch.object(mega_moe_module.shmem, "acquire") as mock_acquire,
             patch.object(mega_moe_module.shmem, "release") as mock_release,
             patch.object(
@@ -335,7 +342,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                 shared=False,
                 active_specifications=(),
             )
-            mock_acquire.assert_called_once_with(root_group)
+            mock_acquire.assert_called_once_with(root_group, heap_size_bytes=1024)
             mock_build_plan.assert_called_once_with(bound_spec, "npu:0")
             mock_release.assert_not_called()
             resources.close()
@@ -355,7 +362,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 "bind_mega_moe_spec",
                 return_value=bound_spec,
             ),
-            patch.object(mega_moe_module, "configure_symmetric_heap"),
+            patch.object(mega_moe_module, "get_heap_manager",
+                         return_value=Mock(heap_bytes=1024, access=nullcontext)),
             patch.object(mega_moe_module.shmem, "acquire") as mock_acquire,
             patch.object(mega_moe_module.shmem, "release") as mock_release,
             patch.object(
@@ -372,7 +380,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                 active_specifications=(),
             )
 
-        mock_acquire.assert_called_once_with(root_group)
+        mock_acquire.assert_called_once_with(root_group, heap_size_bytes=1024)
         mock_release.assert_called_once_with()
 
     def test_workspace_close_failure_keeps_shmem_user(self) -> None:
@@ -381,6 +389,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
         )
         resources.workspace = Mock()
+        resources.heap_manager = Mock(access=nullcontext)
         resources.workspace.close.side_effect = RuntimeError("workspace busy")
         resources._closed = False  # pylint: disable=protected-access
 
@@ -399,6 +408,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
         )
         resources.workspace = Mock()
+        resources.heap_manager = Mock(access=nullcontext)
         resources._closed = False  # pylint: disable=protected-access
 
         with (

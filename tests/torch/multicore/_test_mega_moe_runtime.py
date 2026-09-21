@@ -99,6 +99,14 @@ def test_mega_moe_group_list_isolation() -> None:
     write_evidence({"dispatch_mode": dispatch_mode, "cases": records, "memory": memory_sample()})
 
 
+def _subgroup_route(mode: str, step: int) -> torch.Tensor:
+    """Make only the first noncontiguous subgroup overflow on its second step."""
+    ids = (torch.arange(512, device=baseline.DEVICE).reshape(256, 2) + step).remainder(4).int()
+    if mode == "grow" and step == 1 and baseline.RANK % 2 == 0:
+        ids.remainder_(2)
+    return ids
+
+
 def test_mega_moe_subgroups() -> None:
     """Feature: Independent noncontiguous EP groups with externally owned weights.
 
@@ -108,17 +116,19 @@ def test_mega_moe_subgroups() -> None:
     groups = [dist.new_group(ranks) for ranks in ([0, 2], [1, 3])]
     group = groups[baseline.RANK % 2]
     rank = dist.get_rank(group)
-    for mode in ("push", "pull"):
+    for mode in ("push", "pull", "grow"):
         layer = MegaMoeExperts(local_num_tokens=128, hidden_size=512, intermediate_size=128,
                                num_experts=4, top_k=2, ep_size=2, ep_group=group,
-                               create_parameters=False, dispatch_mode=mode)
+                               create_parameters=False, dispatch_mode="push" if mode == "grow" else mode,
+                               capacity_policy="grow" if mode == "grow" else "static",
+                               expert_capacity_factor=1.0 if mode == "grow" else None)
         try:
             for step in range(2):
                 torch.manual_seed(123 + step + baseline.RANK % 2)
                 tensors = [torch.randn(shape).to(baseline.DEVICE, torch.bfloat16).mul_(0.02).requires_grad_()
                            for shape in ((256, 512), (4, 512, 256), (4, 128, 512))]
                 hidden, gate_up, down = tensors
-                ids = (torch.arange(512, device=baseline.DEVICE).reshape(256, 2) + step).remainder(4).int()
+                ids = _subgroup_route(mode, step)
                 probs = torch.full((256, 2), 0.5, device=baseline.DEVICE, requires_grad=True)
                 permuted, mapping = torch_npu.npu_moe_token_permute(hidden, ids)
                 counts = torch.bincount(ids.flatten().long(), minlength=4).cumsum(0)
@@ -137,6 +147,9 @@ def test_mega_moe_subgroups() -> None:
                                                        (token_slice, token_slice, expert_slice, expert_slice)):
                     baseline.assert_close("subgroup gradient", observed.grad, reference.grad[index])
                 assert not list(layer.parameters())
+                if mode == "grow":
+                    expected_epoch = int(step == 1 and baseline.RANK % 2 == 0)
+                    assert layer._resource_group.resources.heap_manager.epoch == expected_epoch
         finally:
             layer.close()
     write_evidence({"noncontiguous_subgroups": True, "external_weights": True, "both_transports": True})

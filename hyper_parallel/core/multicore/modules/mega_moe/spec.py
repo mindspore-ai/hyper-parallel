@@ -44,6 +44,7 @@ class MegaMoeSpec:
     rank_id: int
     num_cube_cores: int
     dispatch_mode: str = "push"
+    capacity_policy: str = "static"
     dispatch_split: int = _COMMUNICATION_SPLIT
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
@@ -161,4 +162,5 @@ def bind_mega_moe_spec(
         rank_id=rank_id,
         num_cube_cores=num_cube_cores,
         dispatch_mode=specification.get("dispatch_mode", "push"),
+        capacity_policy=specification.get("capacity_policy", "static"),
     )

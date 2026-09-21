@@ -65,11 +65,16 @@ class QwenMoeConfig:
     expert_capacity_factor: float | None = None
     ep_size: int = 8
     dispatch_mode: str = "push"
+    capacity_policy: str = "static"
 
     def __post_init__(self) -> None:
         """Validate the fixed optimizer-step topology."""
         if self.dispatch_mode not in ("push", "pull"):
             raise ValueError("dispatch_mode must be push or pull.")
+        if self.capacity_policy not in ("static", "grow"):
+            raise ValueError("capacity_policy must be static or grow.")
+        if self.capacity_policy == "grow" and (self.dispatch_mode != "push" or self.expert_capacity_factor is None):
+            raise ValueError("grow requires push and a finite expert_capacity_factor.")
         positive = {
             "vocab_size": self.vocab_size,
             "hidden_size": self.hidden_size,
@@ -240,6 +245,7 @@ class QwenMoeBlock(nn.Module):
             ep_size=config.ep_size,
             ep_group=ep_group,
             dispatch_mode=config.dispatch_mode,
+            capacity_policy=config.capacity_policy,
         )
         shared_source = nn.Module()
         shared_source.gate_proj = nn.Linear(config.hidden_size, config.shared_expert_intermediate_size, bias=False)

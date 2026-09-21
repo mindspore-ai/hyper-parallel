@@ -25,8 +25,10 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+
 import torch_npu
 
+from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore._loader import get_multicore_paths
 from tests.common.port_utils import allocate_port
 
@@ -48,7 +50,7 @@ def memory_sample() -> dict[str, int]:
         "reserved_bytes": torch.npu.memory_reserved(),
         "device_used_bytes": total_bytes - free_bytes,
         # The external SHMEM heap is absent from Torch allocator statistics.
-        "shmem_heap_bytes": int(os.environ.get("HYPER_PARALLEL_SHMEM_HEAP_SIZE", "0")),
+        "shmem_heap_bytes": (shmem.debug_state().get("config") or {}).get("heap_size_bytes", 0),
     }
 
 

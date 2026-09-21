@@ -113,3 +113,21 @@ not affect steady-state timing. Timing is plain A/B, not A/B/B/A, and uses the
 rank-maximum complete optimizer-step latency after independent warmup. This
 random-weight benchmark validates integration; it does not establish checkpoint
 convergence.
+
+### Push 按需扩容
+
+默认保持静态无损容量。以平均负载为初始容量并在溢出时在线重建 heap：
+
+```bash
+bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \
+  --dispatch-mode push --capacity-policy grow --expert-capacity-factor 1.0
+```
+
+`--capacity-policy grow` 只支持 push 和有限初始 capacity factor。
+结果中的 `shape.capacity_policy` 记录策略；MegaMoE backend 的 `shmem_heap_bytes` 来自实际 runtime，
+`heap_growth` 记录每次扩容前后 heap 大小、各 workspace 容量及同步、释放、finalize、bootstrap、初始化和分配耗时。
+这些记录是 rank 0 的阶段计时，不是所有 rank 耗时的最大值。
+
+此 runner 只在首个 optimizer step 比较 common 与 MegaMoE 的数值。
+后续参数更新可能导致路由逐渐分叉，稳态耗时不能直接视为相同通信负载下的后端比较。
+研究容量策略的开销时，应另用固定参数和固定路由，分别报告稳态与扩容步。
