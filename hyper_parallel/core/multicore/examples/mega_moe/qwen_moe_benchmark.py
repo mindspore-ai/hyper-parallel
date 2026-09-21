@@ -51,7 +51,7 @@ from hyper_parallel.platform.torch.common import GroupedExperts
 
 _WORLD_SIZE = 8
 _BATCH_SIZE = 1
-_SEQUENCE_LENGTH = 1024
+_SEQUENCE_LENGTH = QwenMoeConfig.local_num_tokens
 _DTYPE = torch.bfloat16
 _RTOL = 2e-2
 _ATOL = 2e-3
