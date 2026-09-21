@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for unified multicore payload lookup and OPP diagnostics."""
 
+import ctypes
 import os
 import shutil
 import tempfile
@@ -24,6 +25,7 @@ from unittest.mock import patch
 
 from hyper_parallel.core.multicore import _loader
 from hyper_parallel.core.multicore._loader import NativeComponentUnavailableError
+from tests.common.mark_utils import arg_mark
 
 
 class TestMulticoreNative(unittest.TestCase):
@@ -48,6 +50,37 @@ class TestMulticoreNative(unittest.TestCase):
         adapter.write_bytes(b"adapter")
         self.shmem_root = self.native_root.parent / "shmem" / "lib"
         (self.shmem_root / "shmem").mkdir(parents=True)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_vendor_preload_keeps_dependency_symbols_local(self) -> None:
+        """Feature: Vendor dependency symbol isolation.
+
+        Description: Preload the component-owned ACLNN library through its exact path.
+        Expectation: Use RTLD_LOCAL so dependency symbols are not exposed globally.
+        """
+        library = self.vendor_root / "op_api" / "lib" / "libcust_opapi.so"
+        with patch.object(_loader.ctypes, "CDLL") as load:
+            _loader.preload_vendor_library(self.vendor_root)
+        load.assert_called_once_with(str(library), mode=ctypes.RTLD_LOCAL)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_vendor_preload_preserves_library_failure_and_cause(self) -> None:
+        """Feature: Vendor load failure diagnostics.
+
+        Description: Simulate a missing dependency while preloading the vendor library.
+        Expectation: Report the failed library and retain the original loader exception as the cause.
+        """
+        library = self.vendor_root / "op_api" / "lib" / "libcust_opapi.so"
+        error = OSError("missing dependency")
+        with patch.object(_loader.ctypes, "CDLL", side_effect=error) as load:
+            with self.assertRaisesRegex(NativeComponentUnavailableError, "HP-NATIVE-VENDOR-LOAD-FAILED") as raised:
+                _loader.preload_vendor_library(self.vendor_root)
+        load.assert_called_once_with(str(library), mode=ctypes.RTLD_LOCAL)
+        self.assertIn(str(library), str(raised.exception))
+        self.assertIn(str(error), str(raised.exception))
+        self.assertIs(raised.exception.__cause__, error)
 
     def test_component_paths_accept_sourced_environment_without_modifying_it(self):
         """Lookup accepts the sourced vendor paths without changing the process environment."""

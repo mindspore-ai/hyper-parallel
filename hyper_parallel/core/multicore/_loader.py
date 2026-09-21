@@ -78,10 +78,13 @@ def get_multicore_paths() -> tuple[Path, Path]:
 
 
 def preload_vendor_library(vendor_root: Path) -> None:
-    """Load the exact component-owned ACLNN library without global SONAME search."""
+    """Load the exact ACLNN library without exposing its dependency symbols globally."""
     library_path = vendor_root / "op_api" / "lib" / "libcust_opapi.so"
     try:
-        ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
+        # CANN libraries can export identically named globals. Global promotion
+        # can bind their independent destructors to the same object at exit.
+        # ACLNN entry points are resolved through the vendor library handle.
+        ctypes.CDLL(str(library_path), mode=ctypes.RTLD_LOCAL)
     except OSError as error:
         raise NativeComponentUnavailableError(
             f"[HP-NATIVE-VENDOR-LOAD-FAILED] library={library_path} error={error}."
