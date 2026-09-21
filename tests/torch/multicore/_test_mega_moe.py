@@ -232,31 +232,32 @@ def _copy_common_weights_to_mega(
 def new_layers(
     shape: MoeShape,
     *,
-    expert_capacity_factor: float | None = None,
-    capacity_policy: str = "static",
+    initial_capacity_factor: float | None = None,
+    capacity_growth_factor: float | None = None,
     dispatch_mode: str | None = None,
 ) -> tuple[MegaMoeExperts, torch.nn.Module]:
     """Construct parameter-aligned MegaMoe and common expert layers.
 
     Args:
         shape: Local token and expert dimensions.
-        expert_capacity_factor: Optional explicit receive bound.
+        initial_capacity_factor: Optional initial push receive factor.
         dispatch_mode: MegaMoe dispatch transport.
-        capacity_policy: Static bound or managed heap growth.
+        capacity_growth_factor: Optional push growth multiplier.
 
     Returns:
         MegaMoe and common expert modules with identical local parameters.
     """
     common_moe = new_common_moe(shape)
+    mode = dispatch_mode or os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
     mega = MegaMoeExperts(
         local_num_tokens=shape.local_num_tokens,
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
         top_k=shape.top_k,
-        expert_capacity_factor=expert_capacity_factor,
-        capacity_policy=capacity_policy,
-        dispatch_mode=dispatch_mode or os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push"),
+        initial_capacity_factor=initial_capacity_factor if mode == "push" else None,
+        capacity_growth_factor=capacity_growth_factor if mode == "push" else None,
+        dispatch_mode=mode,
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(device=DEVICE, dtype=torch.bfloat16)
@@ -514,7 +515,7 @@ def _run_precision_case() -> None:
     finally:
         mega.close()
 
-    bounded, bounded_common = new_layers(shape, expert_capacity_factor=1.5)
+    bounded, bounded_common = new_layers(shape, initial_capacity_factor=1.5)
     topk_ids, topk_weights, tokens_per_expert = make_balanced_route(shape)
     try:
         bounded_common_result = run_layer(
@@ -538,21 +539,10 @@ def _run_precision_case() -> None:
             shape,
             "single_destination",
         )
-        try:
-            bounded(
-                hidden_states,
-                overflow_ids,
-                overflow_weights,
-                tokens_per_expert=overflow_counts,
-            )
-        except RuntimeError as error:
-            assert "capacity overflow" in str(error), (
-                f"rank={RANK}: bounded overflow reported the wrong error: {error}."
-            )
-        else:
-            raise AssertionError(
-                f"rank={RANK}: bounded MegaMoe accepted an overflowing route."
-            )
+        reference = run_layer(bounded_common, hidden_states, overflow_ids, overflow_weights,
+                              overflow_counts, grad_output)
+        actual = run_layer(bounded, hidden_states, overflow_ids, overflow_weights, overflow_counts, grad_output)
+        assert_results_close(reference, actual)
     finally:
         bounded.close()
 
@@ -591,7 +581,7 @@ def _new_performance_layer(
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
         top_k=shape.top_k,
-        expert_capacity_factor=1.5,
+        initial_capacity_factor=1.5 if os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push") == "push" else None,
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(

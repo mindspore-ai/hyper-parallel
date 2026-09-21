@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 from typing import Any
 
@@ -30,7 +29,7 @@ from .function import execute_mega_moe_with_permutation
 from .heap_manager import get_heap_manager, root_members
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
-from .spec import _COMMUNICATION_SPLIT, bind_mega_moe_spec
+from .spec import _COMMUNICATION_SPLIT, _resolve_capacity_factors, bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace
 
 __all__ = ["MegaMoeExperts"]
@@ -110,7 +109,7 @@ class MegaMoeExperts(MulticoreModule):
     """Execute Router-selected local experts with the Torch MegaMoe kernel.
 
     Serial model layers can call :meth:`share_execution_resources` before
-    their first forward to share one lossless-capacity workspace while keeping
+    their first forward to share one automatically growing workspace while keeping
     independent parameters and optimizer state.
     """
 
@@ -122,12 +121,12 @@ class MegaMoeExperts(MulticoreModule):
         intermediate_size: int,
         num_experts: int,
         top_k: int,
-        expert_capacity_factor: float | None = None,
         ep_size: int = 1,
         ep_group: Any | None = None,
         create_parameters: bool = True,
         dispatch_mode: str = "push",
-        capacity_policy: str = "static",
+        initial_capacity_factor: float | None = None,
+        capacity_growth_factor: float | None = None,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -137,12 +136,11 @@ class MegaMoeExperts(MulticoreModule):
             intermediate_size: SwiGLU intermediate dimension per expert.
             num_experts: Global routed-expert count.
             top_k: Experts selected for every token.
-            expert_capacity_factor: Optional bounded receive-capacity multiplier.
-                ``None`` reserves the maximum lossless capacity. A finite value
-                of at least 1.0 reserves that multiple of the local routed rows
-                and raises a clear error if a route exceeds it.
-            capacity_policy: "static" keeps the configured bound; "grow" rebuilds the push heap on overflow.
-                Growth requires a finite initial expert_capacity_factor and serial EP execution.
+            initial_capacity_factor: Push initial receive rows as a multiple of local routed rows.
+                Defaults to 1.25 for push; omitted for pull. Must be finite and at least 1.0.
+            capacity_growth_factor: Push capacity multiplier on overflow, defaulting to 1.25.
+                Must be finite and at least 1.0; 1.0 grows only to the current route demand.
+                The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             ep_size: Expert-parallel degree, equal to the size of ep_group.
@@ -152,34 +150,27 @@ class MegaMoeExperts(MulticoreModule):
                 PP/DP groups bootstrap independently; one process can have only
                 one ordered EP membership active in SHMEM at a time.
         """
-        if capacity_policy not in ("static", "grow"):
-            raise ValueError("capacity_policy must be static or grow")
-        if capacity_policy == "grow" and (dispatch_mode != "push" or expert_capacity_factor is None):
-            raise ValueError("grow capacity_policy requires push and a finite initial expert_capacity_factor")
-        if dispatch_mode not in ("push", "pull"):
-            raise ValueError("dispatch_mode must be push or pull")
+        initial_capacity_factor, capacity_growth_factor = _resolve_capacity_factors(
+            dispatch_mode, initial_capacity_factor, capacity_growth_factor)
         self._validate_topology(
             local_num_tokens=local_num_tokens,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_experts=num_experts,
             top_k=top_k,
-            expert_capacity_factor=expert_capacity_factor,
             ep_size=ep_size,
         )
-        if expert_capacity_factor is not None:
-            expert_capacity_factor = float(expert_capacity_factor)
         specification = {
             "local_num_tokens": local_num_tokens,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": num_experts,
             "top_k": top_k,
-            "expert_capacity_factor": expert_capacity_factor,
+            "initial_capacity_factor": initial_capacity_factor,
             "ep_size": ep_size,
             "ep_group": ep_group,
             "dispatch_mode": dispatch_mode,
-            "capacity_policy": capacity_policy,
+            "capacity_growth_factor": capacity_growth_factor,
         }
         compatibility_key = (
             local_num_tokens,
@@ -187,11 +178,11 @@ class MegaMoeExperts(MulticoreModule):
             intermediate_size,
             num_experts,
             top_k,
-            expert_capacity_factor,
+            initial_capacity_factor,
             ep_size,
             id(ep_group),
             dispatch_mode,
-            capacity_policy,
+            capacity_growth_factor,
         )
         super().__init__(
             resource_specification=specification,
@@ -203,8 +194,8 @@ class MegaMoeExperts(MulticoreModule):
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.top_k = top_k
-        self.expert_capacity_factor = expert_capacity_factor
-        self.capacity_policy = capacity_policy
+        self.initial_capacity_factor = initial_capacity_factor
+        self.capacity_growth_factor = capacity_growth_factor
         self.dispatch_mode = dispatch_mode
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
@@ -225,7 +216,6 @@ class MegaMoeExperts(MulticoreModule):
         intermediate_size: int,
         num_experts: int,
         top_k: int,
-        expert_capacity_factor: float | None,
         ep_size: int,
     ) -> None:
         """Validate static shape and topology values before allocation."""
@@ -252,23 +242,6 @@ class MegaMoeExperts(MulticoreModule):
             raise ValueError(
                 "local_num_tokens must be divisible by the fixed communication "
                 f"split {_COMMUNICATION_SPLIT}, got {local_num_tokens}."
-            )
-        if expert_capacity_factor is None:
-            return
-        valid_factor_type = isinstance(
-            expert_capacity_factor,
-            (int, float),
-        ) and not isinstance(expert_capacity_factor, bool)
-        try:
-            valid_factor_value = valid_factor_type and math.isfinite(
-                expert_capacity_factor
-            )
-        except OverflowError:
-            valid_factor_value = False
-        if not valid_factor_value or expert_capacity_factor < 1.0:
-            raise ValueError(
-                "expert_capacity_factor must be None or a finite number at least 1.0, "
-                f"got {expert_capacity_factor!r}."
             )
 
     def _validate_tensors(self, hidden_states: torch.Tensor, expert_weights: tuple) -> None:
@@ -381,8 +354,8 @@ class MegaMoeExperts(MulticoreModule):
             tokens_per_expert,
             weights,
         )
-        if self.capacity_policy == "grow" and torch.npu.is_current_stream_capturing():
-            raise RuntimeError("MegaMoe grow capacity_policy does not support graph capture")
+        if self.dispatch_mode == "push" and torch.npu.is_current_stream_capturing():
+            raise RuntimeError("MegaMoe push heap growth does not support graph capture")
         resources = self._get_execution_resources(hidden_flat)
         pull = self.dispatch_mode == "pull"
         if pull:
@@ -400,7 +373,7 @@ class MegaMoeExperts(MulticoreModule):
                     tokens_per_expert,
                     workspace=resources.workspace,
                 )
-            if self.capacity_policy == "grow":
+            if not pull:
                 resources.heap_manager.ensure_capacity(resources, route.maximum_received_slots)
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,

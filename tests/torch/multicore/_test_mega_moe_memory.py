@@ -95,7 +95,7 @@ def test_mega_moe_local_capacity_lifetime() -> None:
     results = []
     for factor in (None, 1.5):
         start_shmem_lifetime()
-        mega, common = baseline.new_layers(shape, expert_capacity_factor=factor)
+        mega, common = baseline.new_layers(shape, initial_capacity_factor=factor)
         resources = mega._get_execution_resources(baseline.make_data(shape)[0])  # pylint: disable=protected-access
         assert resources.plan.reuse_backward_dispatch
         original = ops.mega_moe_grad_with_profile_buffer
@@ -180,14 +180,14 @@ def test_mega_moe_heap_growth() -> None:
     os.environ.pop("HYPER_PARALLEL_SHMEM_HEAP_SIZE", None)
     start_shmem_lifetime()
     shape = baseline.MoeShape(local_num_tokens=4096, hidden_size=1024)
-    mega, common = baseline.new_layers(shape, expert_capacity_factor=1.0, capacity_policy="grow")
+    mega, common = baseline.new_layers(shape, initial_capacity_factor=1.0, capacity_growth_factor=2.0)
     variant = os.getenv("HP_MEGA_MOE_GROWTH_CASE", "single")
     managed, references, handles = [mega], [common], []
     companions = []
     pending = []
     lazy = lazy_reference = small = None
     if variant == "shared":
-        second, reference = baseline.new_layers(shape, expert_capacity_factor=1.0, capacity_policy="grow")
+        second, reference = baseline.new_layers(shape, initial_capacity_factor=1.0, capacity_growth_factor=2.0)
         managed.append(second)
         references.append(reference)
         MegaMoeExperts.share_execution_resources(managed)

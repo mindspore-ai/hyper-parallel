@@ -26,14 +26,14 @@ forward and therefore reuse one SHMEM runtime/workspace. The benchmark calls
 acquire and release their SHMEM references internally; model code only closes
 `MegaMoeExperts` (through `QwenMoeModel.close()`) and never calls SHMEM directly.
 
-The public `MegaMoeExperts` API and this benchmark default
-`expert_capacity_factor` to `None`, which reserves the maximum lossless receive
-capacity. An explicit factor such as `1.5` keeps the workspace bounded, but a
-route that exceeds that capacity fails before native execution with a clear
-error. Use `--dispatch-mode pull` to store only local source and combine rows in
-SHMEM while allocating received rows in ordinary HBM. The default is
-`--dispatch-mode push`; both choices retain the shared memory optimizations.
-The selected mode is included in the JSON model configuration.
+Select the transport with `--dispatch-mode push|pull` (default: push).
+Push starts with `--initial-capacity-factor 1.25` and grows on overflow using
+`--capacity-growth-factor 1.25`. Both factors are finite numbers of at least one;
+a growth factor of `1.0` allocates only the current demand. Set the initial
+factor to the EP size to reserve the full lossless upper bound at startup.
+Pull accepts neither factor: its SHMEM contains local source/combine rows,
+while received rows use ordinary HBM. Both transports retain all routed tokens.
+The old `--expert-capacity-factor` and `--capacity-policy` options were removed.
 
 ## Workload
 
@@ -114,19 +114,20 @@ rank-maximum complete optimizer-step latency after independent warmup. This
 random-weight benchmark validates integration; it does not establish checkpoint
 convergence.
 
-### Push 按需扩容
-
-默认保持静态无损容量。以平均负载为初始容量并在溢出时在线重建 heap：
+### 配置 dispatch 与 push 容量
 
 ```bash
 bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \
-  --dispatch-mode push --capacity-policy grow --expert-capacity-factor 1.0
+  --dispatch-mode push --initial-capacity-factor 1.25 --capacity-growth-factor 1.25
+
+bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \
+  --dispatch-mode pull
 ```
 
-`--capacity-policy grow` 只支持 push 和有限初始 capacity factor。
-结果中的 `shape.capacity_policy` 记录策略；MegaMoE backend 的 `shmem_heap_bytes` 来自实际 runtime，
-`heap_growth` 记录每次扩容前后 heap 大小、各 workspace 容量及同步、释放、finalize、bootstrap、初始化和分配耗时。
-这些记录是 rank 0 的阶段计时，不是所有 rank 耗时的最大值。
+结果中的 `shape.dispatch_mode`、`shape.initial_capacity_factor` 和 `shape.capacity_growth_factor`
+记录生效配置；pull 的两个因子为 `null`。MegaMoE backend 的 `shmem_heap_bytes` 来自实际 runtime，
+`heap_growth` 记录扩容前后 heap 大小、各 workspace 容量及各重建阶段耗时，计时来自 rank 0。
+容量回落时不缩容；倍数作用于接收行数，而非整个 heap 的字节数。
 
 此 runner 只在首个 optimizer step 比较 common 与 MegaMoE 的数值。
 后续参数更新可能导致路由逐渐分叉，稳态耗时不能直接视为相同通信负载下的后端比较。

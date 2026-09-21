@@ -154,31 +154,9 @@ def _expert_capacity(
     # One host transfer serves both the coordinated overflow check and local
     # allocation; the existing gathered counts require no extra collective.
     loads = destination_loads.tolist()
-    _validate_bounded_capacity(max(loads), spec)
     # Keep a non-null ABI argument on ranks whose experts receive no tokens.
     # Source outputs and symmetric communication buffers retain their own sizes.
     return max(1, loads[spec.rank_id]), max(loads)
-
-
-def _validate_bounded_capacity(
-    maximum_received_slots: int,
-    spec: MegaMoeSpec,
-) -> None:
-    """Raise a coordinated error when an explicit factor is too small."""
-    if spec.capacity_is_lossless or getattr(spec, "capacity_policy", "static") == "grow":
-        return
-    if maximum_received_slots <= spec.receive_capacity:
-        return
-    raise RuntimeError(
-        "MegaMoe receive capacity overflow: "
-        f"configured_capacity={spec.receive_capacity}, "
-        f"actual_maximum={maximum_received_slots}, "
-        f"expert_capacity_factor={spec.expert_capacity_factor}, "
-        f"ep_size={spec.ep_size}, local_num_tokens={spec.local_num_tokens}, "
-        f"top_k={spec.top_k}. Set expert_capacity_factor=None for lossless "
-        "capacity or choose a larger factor. In-kernel multi-wave overflow "
-        "execution is not implemented yet."
-    )
 
 
 def _permute_topk_input(

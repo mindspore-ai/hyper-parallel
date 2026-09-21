@@ -37,22 +37,22 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     """Validate SHMEM planning without allocating accelerator memory."""
 
     @staticmethod
-    def _specification(expert_capacity_factor):
+    def _specification(initial_capacity_factor):
         """Build a fixed capacity-planning specification."""
         return {
             "local_num_tokens": 128,
             "hidden_size": 16,
             "num_experts": 8,
             "top_k": 2,
-            "expert_capacity_factor": expert_capacity_factor,
+            "initial_capacity_factor": 1.25 if initial_capacity_factor is None else initial_capacity_factor,
             "ep_size": 8,
         }
 
-    def test_capacity_planning_covers_lossless_and_bounded_modes(self) -> None:
-        """Reserve the EP maximum by default and align explicit factors."""
+    def test_capacity_planning_defaults_aligns_and_caps_initial_factor(self) -> None:
+        """Align the default initial factor and cap finite factors at the EP maximum."""
         specification = self._specification(None)
         routed_slots = 256
-        expected_capacity = 2048
+        expected_capacity = 384
         element_size = 2
         expected_bytes = (
             (expected_capacity + routed_slots)
@@ -63,7 +63,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         )
 
         actual_capacity = _resolve_receive_capacity(
-            specification["expert_capacity_factor"],
+            specification["initial_capacity_factor"],
             routed_slots,
             specification["ep_size"],
         )
@@ -71,6 +71,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
 
         self.assertEqual(actual_capacity, expected_capacity)
         self.assertEqual(actual_bytes, expected_bytes)
+        self.assertEqual(_resolve_receive_capacity(1e308, routed_slots, 8), 2048)
         self.assertEqual(
             _resolve_receive_capacity(
                 1.5,
@@ -84,11 +85,11 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         """Round the full push receive/return capacity to physical pages for all resource groups."""
         reference = torch.empty(0, dtype=torch.bfloat16)
         for ep in (4, 8):
-            for factor, expected_mib in ((None, (ep + 1) * 320 + 2), (1.0, 642), (1.5, 802)):
+            for factor, expected_mib in ((ep, (ep + 1) * 320 + 2), (1.25, 722), (1.5, 802)):
                 for groups in (1, 2):
                     with self.subTest(ep=ep, factor=factor, groups=groups), patch.dict(os.environ, {}, clear=True):
                         spec = {"local_num_tokens": 4096, "hidden_size": 5120, "top_k": 8, "num_experts": 48,
-                                "ep_size": ep, "expert_capacity_factor": factor}
+                                "ep_size": ep, "initial_capacity_factor": factor}
                         actual = workspace_module.configure_symmetric_heap((spec,) * groups, reference)
                         self.assertEqual(actual, (groups * (expected_mib - 2) + 2) * 1024**2)
                         os.environ.pop("HYPER_PARALLEL_SHMEM_HEAP_SIZE")
@@ -99,7 +100,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     def test_explicit_heap_requires_sufficient_aligned_capacity(self) -> None:
         """Accept page-aligned capacity while rejecting undersized and partial physical pages."""
         spec = {"local_num_tokens": 4096, "hidden_size": 5120, "top_k": 8, "num_experts": 48,
-                "ep_size": 4, "expert_capacity_factor": None}
+                "ep_size": 4, "initial_capacity_factor": 4.0}
         reference = torch.empty(0, dtype=torch.bfloat16)
         for mib, error in ((1602, None), (1664, None), (1600, RuntimeError), (1603, ValueError), (0, ValueError)):
             with self.subTest(mib=mib), patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_HEAP_SIZE": str(mib * 1024**2)}):

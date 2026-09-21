@@ -57,7 +57,7 @@ def _spec_workspace_bytes(
     local_tokens = specification["local_num_tokens"]
     routed_slots = local_tokens * specification["top_k"]
     capacity = _resolve_receive_capacity(
-        specification["expert_capacity_factor"],
+        specification["initial_capacity_factor"],
         routed_slots,
         specification["ep_size"],
     )

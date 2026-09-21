@@ -4,17 +4,21 @@
 基线：`84519c6f055352d5627688f2a5e0601f306dbde7`。
 工作目录：`/home/feiran/hyper-parallel-megamoe-push-heap-growth`。
 
+本报告性能数据采集于 `fa4c5fd0` 接口版本。后续配置已收敛为 `dispatch_mode`，
+加上仅供 push 使用的 `initial_capacity_factor`（默认1.25）、`capacity_growth_factor`（默认1.25）。
+下文 static/grow 是原实验标签；当前要复现 static 无损预算，设置初始因子为 EP 大小。
+
 ## 1. 已实现的行为
 
-- `capacity_policy="grow"` 是显式选项，只支持 push 和有限初始 `expert_capacity_factor`；默认 static 不变。
+- push 自动扩容，通过初始容量因子和增长因子配置；pull 不接受容量因子。
 - 复用既有 counts all-gather 的最大目的 rank 接收量；未溢出时不增加一次负载 collective。
-- 超限时按 `align128(max(实际需求, 1.5 × 当前容量))` 增长，保守上界为 `EP × T × K`；不缩容。
+- 超限时按 `align128(max(实际需求, capacity_growth_factor × 当前容量))` 增长，保守上界为 `EP × T × K`；不缩容。
 - 同一 root 的所有 managed workspace 统一重建，包括共享层、独立 push/pull 和延迟绑定资源。
 - 同步设备、释放所有对称 allocations、finalize、fresh bootstrap、init、重新分配，最后发布新 epoch。
 - Python workspace 身份、专家权重和独立保存的 autograd 数据保留；旧物理 tensor storage 变为无效。
 - 显式 heap 环境变量是固定预算；几何增长余量放不下时先尝试最小必要容量。自动预算不写环境变量。
 - 预检查拒绝预算不足、未知 owner/allocation、活动租约和不一致布局。破坏性阶段失败后禁止继续调用。
-- Qwen runner 新增 `--capacity-policy`，结果记录真实 heap 和分阶段重建耗时。
+- Qwen runner 使用 `--initial-capacity-factor` 与 `--capacity-growth-factor`，记录真实 heap 和分阶段重建耗时。
 
 核心代码在 `mega_moe/heap_manager.py`，原 workspace、route、模块和 SHMEM lifecycle 只增加必要接入。
 native binding 增加可选显式 heap 字节参数；对重复的 allocation 诊断序列化做了小幅抽取以通过复杂度检查。
@@ -95,7 +99,7 @@ bootstrap约9 ms、initialize约124 ms。该次发生在 workspace 首次分配�
 
 按连续热点实验每次约2.3秒估算，若每100个训练 step 扩一次，平均摊入约23 ms/step；
 若每1000个 step 扩一次，则约2.3 ms/step。这是简单摊销估算，非实际长训结果。
-建议保留 opt-in；初始 factor 应结合已知路由分布，避免训练早期频繁跨档。
+初始 factor 和增长 factor 应结合已知路由分布，避免训练早期频繁跨档。
 
 ## 5. 边界与门禁状态
 
@@ -120,7 +124,7 @@ build/venv/bin/python -m pytest -q tests/torch/multicore/test_mega_moe.py \
   -k 'heap_growth or local_capacity_lifetime or device_ready_lifecycle or subgroups'
 PYTHON_BIN="$PWD/build/venv/bin/python" \
   bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \
-  --dispatch-mode push --capacity-policy grow --expert-capacity-factor 1.0 \
+  --dispatch-mode push --initial-capacity-factor 1.0 --capacity-growth-factor 1.5 \
   --warmup-steps 1 --measured-steps 1
 ```
 
@@ -132,3 +136,19 @@ PYTHON_BIN="$PWD/build/venv/bin/python" \
 - 同名 `*-hbm.jsonl`：整卡 HBM 原始采样；`measure_qwen.py` / `run_suite.py` 为复现脚本。
 - `controlled-routes.json` / `controlled_routes.py`：连续热点逐 rank 计时、容量、增长阶段及对照脚本。
 - `checks-final.log`、`markdownlint-final.log`、`autogit-check.log`、`autogit-baseline-findings.log`。
+
+## 7. 配置收敛后复验
+
+配置已统一为 `dispatch_mode="push" | "pull"`；push 默认
+`initial_capacity_factor=1.25`、`capacity_growth_factor=1.25`，也支持显式覆盖。
+pull 不接受这两个数值参数。增长因子1.0表示只扩到当前需求，初始因子设为 EP 大小可预留无损上界。
+旧 `expert_capacity_factor`、`capacity_policy` 及其 CLI 参数已移除，资源共享兼容性包含两个新因子。
+
+本轮119个UT、545个subtest通过；11个设备回归覆盖 push/pull、共享资源、checkpoint、子组和增长。
+Qwen 默认规格以1步 warmup、1步 measurement复验，新默认值均为1.25，实际 heap 为722 MiB，
+本次未发生扩容；初始参数、forward、梯度和更新参数比较全部通过。
+这是短程接口与精度验证，不作为新的稳态性能数据。
+pylint、lizard、Markdown lint、diff检查和AGENTS目录检查通过。
+
+原始记录位于 `build/validation/heap-config/`：`ut-final.log`、`st.log`、`cli-final.log`、
+`qwen-default.json`、`qwen-default.log`、`checks-final.log`、`markdownlint.log`。

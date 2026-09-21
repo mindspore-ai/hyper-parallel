@@ -120,8 +120,8 @@ def test_mega_moe_subgroups() -> None:
         layer = MegaMoeExperts(local_num_tokens=128, hidden_size=512, intermediate_size=128,
                                num_experts=4, top_k=2, ep_size=2, ep_group=group,
                                create_parameters=False, dispatch_mode="push" if mode == "grow" else mode,
-                               capacity_policy="grow" if mode == "grow" else "static",
-                               expert_capacity_factor=1.0 if mode == "grow" else None)
+                               capacity_growth_factor=1.25 if mode == "grow" else None,
+                               initial_capacity_factor=1.0 if mode == "grow" else None)
         try:
             for step in range(2):
                 torch.manual_seed(123 + step + baseline.RANK % 2)

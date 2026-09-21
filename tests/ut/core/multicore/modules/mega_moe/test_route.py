@@ -27,7 +27,6 @@ from hyper_parallel.core.multicore.modules.mega_moe import route as route_module
 from hyper_parallel.core.multicore.modules.mega_moe.route import (
     _expert_capacity,
     _resolve_counts,
-    _validate_bounded_capacity,
     prepare_topk_route,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -41,7 +40,7 @@ class TestMegaMoeRoute(unittest.TestCase):
         *,
         ep_size: int = 1,
         rank_id: int = 0,
-        expert_capacity_factor: float | None = None,
+        initial_capacity_factor: float | None = None,
         receive_capacity: int = 128,
     ) -> MegaMoeSpec:
         """Build a small CPU-only route specification."""
@@ -51,7 +50,7 @@ class TestMegaMoeRoute(unittest.TestCase):
             intermediate_size=2,
             num_experts=4,
             top_k=2,
-            expert_capacity_factor=expert_capacity_factor,
+            initial_capacity_factor=initial_capacity_factor,
             receive_capacity=receive_capacity,
             ep_size=ep_size,
             ep_group=None,
@@ -76,22 +75,6 @@ class TestMegaMoeRoute(unittest.TestCase):
             torch.equal(computed, expected),
             f"computed counts mismatch: expected={expected}, got={computed}",
         )
-
-    def test_capacity_checks_only_explicit_bounded_mode(self) -> None:
-        """Reuse the gathered maximum and reject explicit bounded overflow."""
-        spec = self._spec(ep_size=2, expert_capacity_factor=None)
-        _validate_bounded_capacity(8, spec)
-        bounded_spec = self._spec(
-            ep_size=2,
-            expert_capacity_factor=1.0,
-            receive_capacity=4,
-        )
-
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "configured_capacity=4, actual_maximum=8",
-        ):
-            _validate_bounded_capacity(8, bounded_spec)
 
     def test_async_count_gather_overlaps_permute_and_builds_metadata(self) -> None:
         """Wait after permutation and derive every native offset from counts."""
@@ -233,16 +216,13 @@ class TestMegaMoeRoute(unittest.TestCase):
                     self.assertEqual(rank_spec.receive_capacity, 256)
                     self.assertEqual(rank_spec.routed_slots, 4)
 
-    def test_overflow_is_rejected_on_every_rank_including_empty_destinations(self) -> None:
-        """A cold rank must report the same hot-rank overflow before execution."""
+    def test_overflow_load_is_reported_on_every_rank_including_empty_destinations(self) -> None:
+        """Both hot and empty ranks report the same maximum so push can grow before execution."""
         counts = torch.tensor([[4, 0, 0, 0], [4, 0, 0, 0]], dtype=torch.int32)
         for rank in range(2):
-            spec = self._spec(ep_size=2, rank_id=rank, expert_capacity_factor=1.0, receive_capacity=4)
-            with (
-                self.subTest(rank=rank),
-                self.assertRaisesRegex(RuntimeError, "configured_capacity=4, actual_maximum=8"),
-            ):
-                _expert_capacity(counts, spec)
+            spec = self._spec(ep_size=2, rank_id=rank, initial_capacity_factor=1.0, receive_capacity=4)
+            with self.subTest(rank=rank):
+                self.assertEqual(_expert_capacity(counts, spec), (8 if rank == 0 else 1, 8))
 
 
 if __name__ == "__main__":

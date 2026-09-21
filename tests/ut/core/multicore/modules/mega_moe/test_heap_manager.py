@@ -32,7 +32,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         """Bind a CPU-only root with mocked native and NPU lifecycle operations."""
         self.specification = {"local_num_tokens": 4096, "top_k": 8, "hidden_size": 5120,
                               "intermediate_size": 1792, "num_experts": 48, "ep_size": 8,
-                              "expert_capacity_factor": 1.0, "dispatch_mode": "push", "capacity_policy": "grow"}
+                              "initial_capacity_factor": 1.0, "dispatch_mode": "push", "capacity_growth_factor": 1.5}
         self.spec = SimpleNamespace(**self.specification, ep_group=None, rank_id=0, routed_slots=32768,
                                     receive_capacity=32768)
         self.addCleanup(patch.stopall)
@@ -60,6 +60,15 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                 with self.subTest(received=received):
                     self.manager.ensure_capacity(self.resource, received)
                     rebuild.assert_called_with([capacity], heap_mib * 1024**2)
+
+    def test_configurable_growth_multiplier(self) -> None:
+        """Honor minimal growth, custom headroom and the lossless bound even for huge factors."""
+        with patch.object(self.manager, "_rebuild") as rebuild:
+            for factor, capacity in ((1.0, 32896), (1.25, 40960), (2.0, 65536), (1e308, 262144)):
+                with self.subTest(factor=factor):
+                    self.spec.capacity_growth_factor = factor
+                    self.manager.ensure_capacity(self.resource, 32769)
+                    self.assertEqual(rebuild.call_args.args[0], [capacity])
 
     def test_explicit_budget_uses_minimum_capacity_before_rejecting(self) -> None:
         """Fit a route without growth headroom and preserve the heap when even the minimum will not fit."""
@@ -119,7 +128,8 @@ class TestMegaMoeHeapManager(unittest.TestCase):
 
     def test_growth_preserves_lazy_reservations_and_logical_workspace(self) -> None:
         """Keep the object held by old autograd contexts while allocating its next generation lazily."""
-        other = dict(self.specification, hidden_size=1024, dispatch_mode="pull", capacity_policy="static")
+        other = dict(self.specification, hidden_size=1024, dispatch_mode="pull",
+                     initial_capacity_factor=None, capacity_growth_factor=None)
         self.manager._reserve((other,))
         workspace = self.resource.workspace
         expected = self.manager._required_bytes([49152, 32768])

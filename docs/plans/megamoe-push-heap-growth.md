@@ -44,9 +44,9 @@
 
 ## 3. 建议的接口和容量策略
 
-### 3.1 首版以显式启用方式接入
+### 3.1 收敛后的配置接口
 
-建议增加 `capacity_policy="static" | "grow"`，名称在实现时保持统一：
+先选择 `dispatch_mode="push" | "pull"`；push 使用以下两个容量因子，pull 不接受这两个数值参数：
 
 ```python
 experts = MegaMoeExperts(
@@ -57,17 +57,16 @@ experts = MegaMoeExperts(
     top_k=8,
     ep_size=8,
     dispatch_mode="push",
-    expert_capacity_factor=1.0,
-    capacity_policy="grow",
+    initial_capacity_factor=1.25,
+    capacity_growth_factor=1.25,
 )
 ```
 
-- `static` 保持当前语义：`None` 预留最坏情况；有限因子超限时一致报错。
-- `grow` 首版仅用于 push，要求显式提供有限的初始 `expert_capacity_factor`，避免把 `None` 悄悄改成新语义。
-  该因子成为初始容量，不再是 token 丢弃或最大可执行负载的阈值。
-- 策略与初始因子纳入资源共享兼容性检查。运行时扩容不修改共享组成员关系。
-- 模型 shape、dtype、device、EP 成员及专家数仍为静态；这里不解决动态序列长度或动态拓扑。
-- 先以显式启用方式通过验证，再依据实测决定是否改变 push 的默认策略；默认变更不混入第一阶段。
+- push 默认初始因子1.25、增长因子1.25；因子必须为有限数且不小于1。
+- 不再提供静态/动态策略开关；push 超限时自动扩容。初始因子设为 EP 大小即可预留无损上界。
+- 增长因子1.0表示只分配当次需求；任意配置均受 EP 无损上界约束。
+- 两个因子纳入资源共享兼容性和各 rank 布局一致性检查；移除旧 `expert_capacity_factor`、`capacity_policy`。
+- 模型 shape、dtype、device、EP 成员及专家数仍为静态。
 
 ### 3.2 增长规则
 
@@ -80,10 +79,10 @@ R_max <= C:
 
 R_max > C:
     upper = align128(EP × N)                  # 沿用当前保守无损上界
-    C_new = min(upper, align128(max(R_max, ceil(1.5 × C))))
+    C_new = min(upper, align128(max(R_max, ceil(capacity_growth_factor × C))))
 ```
 
-1.5倍为首版待测的内部增长系数，避免每次小幅增长都重建；初期不增加额外公开调参接口。
+增长系数默认1.25，可显式配置，以权衡预留空间和重建频率。
 当几何增长余量超过显式预算、但 `align128(R_max)` 能放下时，缩减余量后重算，不能仅因增长余量报 OOM。
 资源清单、目标容量、最终 heap 字节数必须由所有 EP rank 校验一致。
 
@@ -95,9 +94,10 @@ R_max > C:
 
 | 接收容量 | 接收区 + 返回区及开销后的 heap | 说明 |
 | --- | --- | --- |
-| `1.0 × N` | 642 MiB | 建议初始容量 |
-| `1.5 × N` | 802 MiB | 从1.0倍第一次增长且需求未超过1.5倍 |
-| `2.25 × N` | 1042 MiB | 从1.5倍增长且需求未超过2.25倍 |
+| `1.0 × N` | 642 MiB | 较小初始容量 |
+| `1.25 × N` | 722 MiB | 当前默认初始容量 |
+| `1.5 × N` | 802 MiB | 示例容量档位 |
+| `2.25 × N` | 1042 MiB | 示例容量档位 |
 | `8.0 × N` | 2882 MiB | 当前 EP8 静态无损预算 |
 
 这些是 heap 预算，不是整网峰值 HBM；实际增长可能直接跨过多个档位。
@@ -137,7 +137,7 @@ R_max > C:
 
 1. 启动已有 count all-gather，与 push 的普通 HBM permutation 重叠。
 2. 等待 count work 完成，得到 `R_rank`、`R_max` 和本轮独立的 mapping / 路由元数据。
-3. static 执行原有越界检查；grow 与协调者的当前容量比较，必要时进入重建流程。
+3. push 与协调者的当前容量比较，必要时进入重建；pull 按实际接收量分配普通 HBM。
 4. 成功后才取得当前 workspace 的执行租约并启动本轮 forward kernel。
 
 push 的 permutation 输出不在 SHMEM 中，可以跨越此次重建继续使用。

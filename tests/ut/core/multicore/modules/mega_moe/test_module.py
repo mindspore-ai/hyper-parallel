@@ -29,11 +29,11 @@ class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
-    def test_constructor_defaults_to_lossless_capacity(
+    def test_constructor_defaults_to_growing_push(
         self,
         mock_create_parameters: Mock,
     ) -> None:
-        """Expose local-token topology with a lossless default capacity."""
+        """Resolve the push-only defaults before registering resource compatibility."""
         mock_create_parameters.return_value = (object(), object())
 
         experts = MegaMoeExperts(
@@ -46,7 +46,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         )
         try:
             self.assertEqual(experts.local_num_tokens, 128)
-            self.assertIsNone(experts.expert_capacity_factor)
+            self.assertEqual(experts.initial_capacity_factor, 1.25)
             self.assertEqual(
                 experts._resource_group.specification,
                 {
@@ -55,11 +55,11 @@ class TestMegaMoeExperts(unittest.TestCase):
                     "intermediate_size": 8,
                     "num_experts": 4,
                     "top_k": 2,
-                    "expert_capacity_factor": None,
+                    "initial_capacity_factor": 1.25,
                     "ep_size": 2,
                     "ep_group": None,
                     "dispatch_mode": "push",
-                    "capacity_policy": "static",
+                    "capacity_growth_factor": 1.25,
                 },
             )
             mock_create_parameters.assert_called_once_with(2, 16, 8)
@@ -74,12 +74,18 @@ class TestMegaMoeExperts(unittest.TestCase):
         """Reject invalid capacity and token split during construction."""
         for overrides, message in (
             ({"local_num_tokens": 129}, "divisible"),
-            ({"expert_capacity_factor": 0.999}, "expert_capacity_factor"),
+            ({"initial_capacity_factor": 0.999}, "initial_capacity_factor"),
             ({"num_experts": 35}, "divisible"),
             ({"dispatch_mode": "invalid"}, "dispatch_mode"),
-            ({"capacity_policy": "invalid"}, "capacity_policy"),
-            ({"capacity_policy": "grow"}, "finite"),
-            ({"capacity_policy": "grow", "expert_capacity_factor": 1.0, "dispatch_mode": "pull"}, "push"),
+            ({"capacity_growth_factor": 0.999}, "capacity_growth_factor"),
+            ({"initial_capacity_factor": float("nan")}, "initial_capacity_factor"),
+            ({"capacity_growth_factor": float("inf")}, "capacity_growth_factor"),
+            ({"initial_capacity_factor": True}, "initial_capacity_factor"),
+            ({"capacity_growth_factor": True}, "capacity_growth_factor"),
+            ({"initial_capacity_factor": "1.0"}, "initial_capacity_factor"),
+            ({"capacity_growth_factor": 10**400}, "capacity_growth_factor"),
+            ({"initial_capacity_factor": 1.0, "dispatch_mode": "pull"}, "push"),
+            ({"capacity_growth_factor": 1.5, "dispatch_mode": "pull"}, "push"),
         ):
             with (
                 self.subTest(overrides=overrides),
@@ -91,13 +97,31 @@ class TestMegaMoeExperts(unittest.TestCase):
                     intermediate_size=8,
                     num_experts=overrides.get("num_experts", 4),
                     dispatch_mode=overrides.get("dispatch_mode", "push"),
-                    capacity_policy=overrides.get("capacity_policy", "static"),
+                    capacity_growth_factor=overrides.get("capacity_growth_factor"),
                     top_k=2,
-                    expert_capacity_factor=overrides.get("expert_capacity_factor"),
+                    initial_capacity_factor=overrides.get("initial_capacity_factor"),
                     ep_size=2,
                 )
 
         mock_create_parameters.assert_not_called()
+
+    def test_transport_factors_and_sharing_compatibility(self) -> None:
+        """Keep pull independent of capacity knobs and reject sharing different push growth factors."""
+        arguments = {"local_num_tokens": 128, "hidden_size": 16, "intermediate_size": 8,
+                     "num_experts": 4, "top_k": 2, "ep_size": 2, "create_parameters": False}
+        layers = [MegaMoeExperts(**arguments, dispatch_mode="pull"),
+                  MegaMoeExperts(**arguments, initial_capacity_factor=2.0, capacity_growth_factor=1.0),
+                  MegaMoeExperts(**arguments, initial_capacity_factor=2.0, capacity_growth_factor=2.0)]
+        try:
+            self.assertIsNone(layers[0].initial_capacity_factor)
+            self.assertIsNone(layers[0].capacity_growth_factor)
+            self.assertEqual(layers[1].initial_capacity_factor, 2.0)
+            self.assertEqual(layers[1].capacity_growth_factor, 1.0)
+            with self.assertRaises(ValueError):
+                MegaMoeExperts.share_execution_resources(layers[1:])
+        finally:
+            for layer in layers:
+                layer.close()
 
     def test_resource_layout_requires_all_ranks_to_agree(self) -> None:
         """Reject incompatible symmetric allocations before initializing SHMEM."""
@@ -132,9 +156,9 @@ class TestMegaMoeExperts(unittest.TestCase):
         topk_weights = torch.full((128, 2), 0.5)
         tokens_per_expert = torch.tensor([256, 0, 0, 0], dtype=torch.int32)
         expected = hidden_states.reshape(128, 16) + 1
-        resources = SimpleNamespace(spec=object(), plan=object(), workspace=object())
+        resources = SimpleNamespace(spec=object(), plan=object(), workspace=object(), heap_manager=Mock())
         route = SimpleNamespace(
-            routed_tokens=object(), metadata=object(), unpermute_mapping=object()
+            routed_tokens=object(), metadata=object(), unpermute_mapping=object(), maximum_received_slots=512
         )
         expert_output = object()
 
@@ -142,6 +166,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             patch.object(
                 torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True
             ),
+            patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
             patch.object(experts, "_get_execution_resources", return_value=resources),
             patch.object(
                 mega_moe_module, "prepare_topk_route", return_value=route
@@ -167,6 +192,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             hidden_flat, topk_ids, topk_weights, resources.spec, tokens_per_expert,
             workspace=resources.workspace,
         )
+        resources.heap_manager.ensure_capacity.assert_called_once_with(resources, 512)
         mock_execute.assert_called_once_with(
             hidden_flat,
             topk_ids,

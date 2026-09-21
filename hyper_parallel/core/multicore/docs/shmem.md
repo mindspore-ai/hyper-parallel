@@ -37,7 +37,8 @@ MegaMoE 可内部调用 `acquire(root_group, heap_size_bytes=...)` 显式传递�
 此入口使用独立 unique ID，包括完整 WORLD root；后续共享引用只能请求不超过已有 heap 的大小。
 环境变量仍用于普通 SHMEM 生命周期；MegaMoE 的自动预算不会回写环境变量。
 
-push 的 `capacity_policy="grow"` 由 root 级协调者管理所有 workspace：核对 owner 和 allocation 清单，
+push 超过由 `initial_capacity_factor` 初始化的容量时，按 `capacity_growth_factor` 增长，
+由 root 级协调者管理所有 workspace：核对 owner 和 allocation 清单，
 同步设备与 EP 控制通信，释放对称 buffer，finalize，生成并分发 fresh unique ID，init，然后重建 buffer。
 SDK 的 bootstrap 是全局状态，必须先 finalize 再获取新 ID。
 整个过程中保留逻辑引用计数和 HCCL ProcessGroup，不对无关 WORLD 成员发起 collective。

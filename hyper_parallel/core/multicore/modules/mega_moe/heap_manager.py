@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -96,7 +97,7 @@ class MegaMoeHeapManager:
     def _reserve(self, specifications: tuple[Any, ...]) -> None:
         for item in specifications:
             if not any(entry.specification is item for entry in self.entries):
-                capacity = _resolve_receive_capacity(item["expert_capacity_factor"],
+                capacity = _resolve_receive_capacity(item["initial_capacity_factor"],
                                                      item["local_num_tokens"] * item["top_k"], item["ep_size"])
                 self.entries.append(_Entry(item, capacity))
 
@@ -114,8 +115,8 @@ class MegaMoeHeapManager:
             if required <= self.heap_bytes:
                 return
             try:
-                if not any(entry.specification.get("capacity_policy") == "grow" for entry in self.entries):
-                    raise RuntimeError("Create all static MegaMoe resources before initializing the heap")
+                if not any(entry.specification.get("dispatch_mode", "push") == "push" for entry in self.entries):
+                    raise RuntimeError("Create all pull MegaMoe resources before initializing the heap")
                 target = self._budget(required)
                 self._rebuild(capacities, target)
             except Exception:
@@ -179,7 +180,7 @@ class MegaMoeHeapManager:
             upper = _align_capacity(spec.ep_size * spec.routed_slots)
             if maximum_received_slots > upper:
                 raise ValueError("MegaMoe route exceeds the lossless token bound")
-            requested = max(maximum_received_slots, (3 * current + 1) // 2)
+            requested = max(maximum_received_slots, math.ceil(min(upper, current * spec.capacity_growth_factor)))
             capacities[index] = min(upper, _align_capacity(requested))
             required = self._required_bytes(capacities)
             if self.heap_limit is not None and required > self.heap_limit:
