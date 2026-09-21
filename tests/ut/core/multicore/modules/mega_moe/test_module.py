@@ -27,6 +27,89 @@ from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_external_weights_preserve_ownership_and_gradients(self) -> None:
+        """Feature: Externally owned expert weights.
+
+        Description: Replace external weights between consecutive forwards.
+        Expectation: Each current weight receives gradients without module registration or caching.
+        """
+        hidden = torch.ones(128, 16, dtype=torch.bfloat16)
+        ids = torch.zeros(128, 2, dtype=torch.int32)
+        probabilities = torch.full((128, 2), 0.5)
+        resources = SimpleNamespace(spec=object(), plan=object(), workspace=object())
+        route = SimpleNamespace(unpermute_mapping=object())
+
+        def _execute(states, _ids, gate_up, down, *_args, **_kwargs):
+            """Model a differentiable expert bridge without native resources."""
+            return states * (gate_up.sum() + down.sum())
+
+        experts = MegaMoeExperts(
+            local_num_tokens=128, hidden_size=16, intermediate_size=8,
+            num_experts=4, top_k=2, ep_size=2,
+            create_parameters=False,
+        )
+        self.addCleanup(experts.close)
+        self.assertEqual(list(experts.parameters()), [])
+        self.assertEqual(dict(experts.state_dict()), {})
+        previous_weights = None
+        with (
+            patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+            patch.object(experts, "_get_execution_resources", return_value=resources),
+            patch.object(mega_moe_module, "prepare_topk_route", return_value=route),
+            patch.object(mega_moe_module, "execute_mega_moe_with_permutation", side_effect=_execute) as bridge,
+            patch.object(mega_moe_module, "restore_topk_output", side_effect=lambda output, *_args: output),
+        ):
+            for value in (1.0, 2.0):
+                weights = (
+                    torch.full((2, 16, 16), value, dtype=torch.bfloat16, requires_grad=True),
+                    torch.full((2, 8, 16), value, dtype=torch.bfloat16, requires_grad=True),
+                )
+                output = experts(hidden, ids, probabilities, expert_weights=weights)
+                output.sum().backward()
+                self.assertIs(bridge.call_args.args[2], weights[0])
+                self.assertIs(bridge.call_args.args[3], weights[1])
+                for weight in weights:
+                    torch.testing.assert_close(weight.grad, torch.full_like(weight, hidden.numel()))
+                if previous_weights is not None:
+                    for weight in previous_weights:
+                        torch.testing.assert_close(weight.grad, torch.full_like(weight, hidden.numel()))
+                previous_weights = weights
+        self.assertIsNone(experts.gate_up_weight)
+        self.assertIsNone(experts.down_weight)
+        self.assertEqual(dict(experts.state_dict()), {})
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
+    def test_external_weights_validate_before_resource_allocation(self) -> None:
+        """Feature: External expert weight validation.
+
+        Description: Supply missing, incorrectly shaped or incorrectly typed external weights.
+        Expectation: Reject invalid inputs before acquiring native execution resources.
+        """
+        experts = MegaMoeExperts(
+            local_num_tokens=128, hidden_size=16, intermediate_size=8,
+            num_experts=4, top_k=2, ep_size=2, create_parameters=False,
+        )
+        self.addCleanup(experts.close)
+        hidden = torch.ones(128, 16, dtype=torch.bfloat16)
+        ids = torch.zeros(128, 2, dtype=torch.int32)
+        probabilities = torch.full((128, 2), 0.5)
+        down = torch.ones(2, 8, 16, dtype=torch.bfloat16)
+        cases = (
+            (None, ValueError, "explicit expert_weights"),
+            ((torch.ones(2, 16, 8, dtype=torch.bfloat16), down), ValueError, "gate_up_weight must have shape"),
+            ((torch.ones(2, 16, 16), down), TypeError, "BF16"),
+        )
+        with (
+            patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+            patch.object(experts, "_get_execution_resources") as acquire,
+        ):
+            for weights, error, message in cases:
+                with self.subTest(message=message), self.assertRaisesRegex(error, message):
+                    experts(hidden, ids, probabilities, expert_weights=weights)
+        acquire.assert_not_called()
+
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     def test_constructor_defaults_to_lossless_capacity(
         self,
