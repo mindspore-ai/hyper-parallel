@@ -20,6 +20,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from hyper_parallel.codegen.plan.spec_fields import (
+    INJECTION_SPEC_FIELDS,
+    PARAM_PLAN_SPEC_FIELDS,
+)
+
 # ---------------------------------------------------------------------------
 # Placement serialization (placement_types.py)
 # ---------------------------------------------------------------------------
@@ -326,38 +331,62 @@ def freeze_param_plan(plan: Any) -> dict[str, dict[str, Any]]:
     generated file never has to guess.  Placement values are always strings
     via :func:`placement_to_string`; parameter names are kept as declared
     (with the ``.weight`` / ``.bias`` suffix).
+
+    Which fields are frozen (and how) is declared in
+    :mod:`hyper_parallel.codegen.plan.spec_fields` — the table both sides
+    of the meta boundary walk, so freeze and rebuild cannot drift apart.
     """
     modules = getattr(plan, "modules", {}) or {}
     result: dict[str, dict[str, Any]] = {}
     for fqn, spec in modules.items():
         entry: dict[str, Any] = {}
-        params = getattr(spec, "params", None)
-        if params:
-            entry["params"] = {
-                name: {
-                    str(getattr(axis, "value", axis)): placement_to_string(placement)
-                    for axis, placement in named.items()
-                }
-                for name, named in params.items()
-            }
-        for field_name in ("in_src", "in_dst", "out_src", "out_dst"):
-            value = getattr(spec, field_name, None)
-            if value is not None:
-                entry[field_name] = named_placement_to_dict(value)
-        # The declared output *order* is separate from the ``out_src`` dict's
-        # serialized key order.  Freeze it explicitly so the runtime resolves
-        # tuple indices against the spec's declared order (``declared_out_names``
-        # prefers ``entry["out_names"]``), not a sorted/insertion key order that
-        # could swap e.g. ``hidden``/``aux`` and redistribute the wrong output.
-        out_names = getattr(spec, "out_names", None)
-        if out_names:
-            entry["out_names"] = list(out_names)
-        for flag in ("is_boundary", "region_dispatch", "needs_cp_attn"):
-            value = getattr(spec, flag, None)
-            if value is not None:
-                entry[flag] = value
+        for field in PARAM_PLAN_SPEC_FIELDS:
+            frozen = _freeze_spec_field(field, getattr(spec, field.name, None))
+            if frozen is not _MISSING:
+                entry[field.key] = frozen
         result[fqn] = entry
     return result
+
+
+#: Sentinel distinguishing "field absent from the frozen entry" from a
+#: legitimately frozen ``None``/empty value (``{"params": {}}``).
+_MISSING = object()
+
+
+def _freeze_spec_field(field: Any, value: Any) -> Any:
+    """Serialize one spec field per its :class:`SpecField` kind contract.
+
+    Returns ``_MISSING`` when the field must not appear in the frozen
+    output.  The write condition is part of the kind (see spec_fields.py):
+    ``params`` uses ``is not None`` so an explicit empty dict ("shards
+    nothing") survives — a truthy check here used to drop it and leave the
+    rebuilt spec with ``params=None``, which Phase A cannot iterate.
+    """
+    kind = field.freeze
+    if kind in ("placement_map", "named_placements", "scalar",
+                "value_to_dict", "plain", "attr_list"):
+        if value is None:
+            return _MISSING
+    elif not value:  # name_list / dict_copy / int_truthy: truthy to write
+        return _MISSING
+    if kind == "placement_map":
+        return {
+            name: {
+                str(getattr(axis, "value", axis)): placement_to_string(placement)
+                for axis, placement in named.items()
+            }
+            for name, named in value.items()
+        }
+    if kind == "named_placements":
+        return named_placement_to_dict(value)
+    if kind in ("name_list", "attr_list"):
+        return list(value)
+    if kind == "value_to_dict":
+        return _value_to_dict(value)
+    if kind == "dict_copy":
+        return dict(value)
+    # scalar / plain / int_truthy: the value is already JSON-safe.
+    return value
 
 
 def freeze_injections(plan: Any) -> list[dict[str, Any]]:
@@ -368,26 +397,17 @@ def freeze_injections(plan: Any) -> list[dict[str, Any]]:
     file must attach at apply time.  ``Target`` values are resolved to their
     ``to_dict()`` form; callables are recorded by name (they cannot cross
     the meta boundary — the generated file re-resolves them from the same
-    runtime registry).
+    runtime registry).  Field set and write conditions come from
+    :mod:`hyper_parallel.codegen.plan.spec_fields`.
     """
     modules = getattr(plan, "modules", {}) or {}
     injections: list[dict[str, Any]] = []
     for fqn, spec in modules.items():
         entry: dict[str, Any] = {}
-        if getattr(spec, "inner_wrapper", None) is not None:
-            entry["inner_wrapper"] = _value_to_dict(spec.inner_wrapper)
-        if getattr(spec, "inner_target", None) is not None:
-            entry["inner_target"] = spec.inner_target
-        if getattr(spec, "inner_out_src", None) is not None:
-            entry["inner_out_src"] = _value_to_dict(spec.inner_out_src)
-        if getattr(spec, "local_compute_fn", None) is not None:
-            entry["local_compute_fn"] = _value_to_dict(spec.local_compute_fn)
-        # Preserve expert pre-stacking and extended expert-parallel metadata
-        # required when sharding expert parameters.
-        if getattr(spec, "_ep_stack", None):
-            entry["ep_stack"] = dict(spec._ep_stack)
-        if getattr(spec, "_ep_size", 0):
-            entry["ep_size"] = spec._ep_size
+        for field in INJECTION_SPEC_FIELDS:
+            frozen = _freeze_spec_field(field, getattr(spec, field.name, None))
+            if frozen is not _MISSING:
+                entry[field.key] = frozen
         if entry:
             injections.append({"match": fqn, **entry})
     return injections

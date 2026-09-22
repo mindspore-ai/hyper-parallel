@@ -56,6 +56,9 @@ from hyper_parallel.codegen.plan.boundary_forms import (
     declared_out_names,
     is_boundary_entry,
 )
+# Pure placement parsing (freeze.py imports no torch), needed by both the
+# meta->plan rebuild and its per-field deserializer below.
+from hyper_parallel.codegen.plan.freeze import parse_named_placement
 
 # ``sharding/apply`` imports torch at module level, so it is deliberately not
 # imported here: runtime.py must stay importable without torch (generation-time
@@ -1292,13 +1295,19 @@ def _rebuild_live_plan_from_meta(meta: CodegenMeta):
     ``_replicate_tied_weights``) can consume this plan exactly as they consume
     a planner-produced one.
 
-    Mapping gaps (meta does not freeze planner-internal fields):
+    Which fields cross the meta boundary is declared in
+    :mod:`hyper_parallel.codegen.plan.spec_fields` — freeze and this rebuild
+    walk the same table, so the two sides cannot drift apart.  Exempt fields
+    (never frozen):
     - ``ModuleShardingSpec._deferred_bias_params`` (D-22) — only consumed by
       native Phase C, kept codegen-owned here;
     - ``_is_terminal`` — validate-mode only, not used in production;
-    - ``_tp_local_attr_plan`` — native ``maybe_update_head_counts`` falls back
-      to the ``tp_divide_attrs``/placement-based backward-compatible path, so
-      its absence is benign for a reconstructed spec.
+    - ``_tp_local_attr_plan`` — planner-derived; the rebuilt spec leaves it
+      None and ``maybe_update_head_counts`` takes its backward-compatible
+      path (auto attrs via the head-sharded heuristic, user attrs via the
+      rebuilt ``tp_divide_attrs``);
+    - ``_needs_cp_attn`` / ``_resolved_inner_*`` — apply-time preflight and
+      introspection state, not consumed on the rebuild path.
 
     Injection-side fields (``local_compute_fn`` / ``inner_wrapper`` /
     ``inner_out_src``) are reconstructed with the same :func:`_injection_target`
@@ -1307,7 +1316,10 @@ def _rebuild_live_plan_from_meta(meta: CodegenMeta):
     """
     from hyper_parallel.distributed.plan import ShardingPlan
     from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
-    from hyper_parallel.codegen.plan.freeze import parse_named_placement
+    from hyper_parallel.codegen.plan.spec_fields import (
+        INJECTION_SPEC_FIELDS,
+        PARAM_PLAN_SPEC_FIELDS,
+    )
 
     by_fqn: dict[str, Any] = {}
     for rule in meta.injections or []:
@@ -1317,45 +1329,13 @@ def _rebuild_live_plan_from_meta(meta: CodegenMeta):
     modules: dict[str, Any] = {}
     for fqn, entry in (meta.param_plan or {}).items():
         inj = by_fqn.get(fqn, {})
-        spec = ModuleShardingSpec(
-            params=parse_named_placement(entry.get("params") or {}) or None,
-            in_src=parse_named_placement(entry.get("in_src") or {}) or None,
-            in_dst=parse_named_placement(entry.get("in_dst") or {}) or None,
-            out_src=(
-                parse_named_placement(entry["out_src"]) if entry.get("out_src") else None
-            ),
-            out_dst=(
-                parse_named_placement(entry["out_dst"]) if entry.get("out_dst") else None
-            ),
-            out_names=list(entry["out_names"]) if entry.get("out_names") else None,
-            is_boundary=(
-                bool(entry["is_boundary"])
-                if entry.get("is_boundary") is not None
-                else True
-            ),
-            region_dispatch=entry.get("region_dispatch"),
-            inner_wrapper=(
-                _injection_target(inj["inner_wrapper"])
-                if inj.get("inner_wrapper") is not None
-                else None
-            ),
-            inner_target=inj.get("inner_target"),
-            inner_out_src=(
-                _injection_target(inj["inner_out_src"])
-                if inj.get("inner_out_src") is not None
-                else None
-            ),
-            local_compute_fn=(
-                _injection_target(inj["local_compute_fn"])
-                if inj.get("local_compute_fn") is not None
-                else None
-            ),
-        )
-        if inj.get("ep_stack"):
-            spec._ep_stack = dict(inj["ep_stack"])  # pylint: disable=protected-access
-        if inj.get("ep_size"):
-            spec._ep_size = inj["ep_size"]  # pylint: disable=protected-access
-        modules[fqn] = spec
+        kwargs: dict[str, Any] = {
+            field.name: _rebuild_spec_field(field, entry)
+            for field in PARAM_PLAN_SPEC_FIELDS
+        }
+        for field in INJECTION_SPEC_FIELDS:
+            kwargs[field.name] = _rebuild_spec_field(field, inj)
+        modules[fqn] = ModuleShardingSpec(**kwargs)
 
     return ShardingPlan(
         modules=modules,
@@ -1363,6 +1343,41 @@ def _rebuild_live_plan_from_meta(meta: CodegenMeta):
         mesh_dim_names=tuple(meta.mesh_dim_names or ()),
         tied_pairs=[tuple(pair) for pair in (meta.tied_pairs or [])],
     )
+
+
+def _rebuild_spec_field(field: Any, source: dict[str, Any]) -> Any:
+    """Deserialize one spec field per its :class:`SpecField` kind contract.
+
+    The inverse of freeze's ``_freeze_spec_field``: reads the field's meta
+    key from the frozen entry (param-plan fields) or injection rule
+    (injection fields) and restores the live value.  Absent keys restore the
+    dataclass defaults — ``None`` for optional declarations, ``True`` for
+    ``is_boundary`` (pre-flag metas), ``{}``/``0`` for the EP internals —
+    matching what ``_rebuild_live_plan_from_meta`` passed positionally
+    before the table drove both sides.
+    """
+    kind, key = field.rebuild, field.key
+    if kind == "placement_map":
+        # Key absent/None -> None (not declared); an explicit {} ("shards
+        # nothing") must round-trip as {} — Phase A iterates params.items()
+        # and a None there is the crash this rebuild must not reintroduce.
+        if source.get(key) is None:
+            return None
+        return parse_named_placement(source[key])
+    if kind == "named_placements":
+        return parse_named_placement(source[key]) if source.get(key) else None
+    if kind in ("name_list", "attr_list"):
+        return list(source[key]) if source.get(key) is not None else None
+    if kind == "bool_default_true":
+        return bool(source[key]) if source.get(key) is not None else True
+    if kind == "injection_target":
+        return _injection_target(source[key]) if source.get(key) is not None else None
+    if kind == "dict_copy":
+        return dict(source[key]) if source.get(key) else {}
+    if kind == "int_truthy":
+        return source.get(key) or 0
+    # opt_scalar
+    return source.get(key)
 
 
 def _parallelize_via_native_apply(
