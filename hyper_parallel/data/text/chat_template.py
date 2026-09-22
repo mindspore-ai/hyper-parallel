@@ -23,7 +23,20 @@ Canonical merge (05 §11.3) of the former
 
 import os
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, MutableMapping, Optional, Sequence, Type, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Type,
+    Union,
+)
 
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
@@ -295,7 +308,7 @@ class DefaultTemplate(ChatTemplate):
 class TokenizerTemplate(ChatTemplate):
     """Use the tokenizer's native chat template and train only selected messages."""
 
-    _RESERVED_TEMPLATE_KWARGS = frozenset({"messages", "tokenize", "add_generation_prompt", "return_dict"})
+    _RESERVED_TEMPLATE_KWARGS = frozenset({"messages", "tools", "tokenize", "add_generation_prompt", "return_dict"})
     _REASONING_EFFORTS = frozenset({"low", "medium", "xhigh"})
 
     def __init__(
@@ -346,21 +359,29 @@ class TokenizerTemplate(ChatTemplate):
 
     def _apply_chat_template(
             self,
-            messages: Sequence[Dict[str, str]],
+            messages: Sequence[Mapping[str, Any]],
             *,
             tokenize: bool,
             return_dict: bool,
+            tools: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> Any:
         """Render messages with one consistent set of native-template arguments."""
+        template_kwargs = dict(self.chat_template_kwargs)
+        if tools:
+            template_kwargs["tools"] = tools
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=tokenize,
             add_generation_prompt=False,
             return_dict=return_dict,
-            **self.chat_template_kwargs,
+            **template_kwargs,
         )
 
-    def _log_first_template(self, messages: Sequence[Dict[str, str]]) -> None:
+    def _log_first_template(
+            self,
+            messages: Sequence[Mapping[str, Any]],
+            tools: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> None:
         """Log the first raw conversation and native-template rendering once."""
         if not self.log_first_rendered_template or self._has_logged_first_rendered_template:
             return
@@ -372,9 +393,13 @@ class TokenizerTemplate(ChatTemplate):
             messages,
             tokenize=False,
             return_dict=False,
+            tools=tools,
         )
         logger.info("First chat-template input messages: %r", messages)
-        logger.info("First chat-template kwargs: %r", self.chat_template_kwargs)
+        template_kwargs = dict(self.chat_template_kwargs)
+        if tools:
+            template_kwargs["tools"] = tools
+        logger.info("First chat-template kwargs: %r", template_kwargs)
         logger.info("First rendered chat template:\n%s", rendered_template)
         self._has_logged_first_rendered_template = True
 
@@ -396,8 +421,9 @@ class TokenizerTemplate(ChatTemplate):
 
     def encode_messages(
             self,
-            messages: Sequence[Dict[str, str]],
+            messages: Sequence[Mapping[str, Any]],
             max_seq_len: int = 8192,
+            tools: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> Dict[str, List[int]]:
         """Encode messages with the tokenizer chat template and mask non-assistant loss.
 
@@ -407,6 +433,7 @@ class TokenizerTemplate(ChatTemplate):
         Args:
             messages: Conversation records with ``role``, ``content``, and optional ``loss_mask``.
             max_seq_len: Maximum sequence length kept from the end of the encoding.
+            tools: Optional tool definitions forwarded to the native tokenizer template.
 
         Returns:
             Model inputs with input_ids, attention_mask, and labels.
@@ -414,7 +441,7 @@ class TokenizerTemplate(ChatTemplate):
         Raises:
             ValueError: If the template rewrites or shortens an earlier conversation prefix.
         """
-        self._log_first_template(messages)
+        self._log_first_template(messages, tools)
         input_ids: List[int] = []
         labels: List[int] = []
         previous_length = 0
@@ -424,6 +451,7 @@ class TokenizerTemplate(ChatTemplate):
                 messages[:end],
                 tokenize=True,
                 return_dict=True,
+                tools=tools,
             )
             current_ids = encoded["input_ids"]
             current_length = len(current_ids)
