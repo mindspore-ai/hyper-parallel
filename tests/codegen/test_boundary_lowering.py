@@ -392,3 +392,144 @@ def test_tp_collective_allows_kwargs_and_tuple_output():
     assert "_hyper_output_0 = self._hyper_tp.reduce_scatter(outputs[0], dim=1)" in text
     assert "outputs = (_hyper_output_0, *outputs[1:])" in text
     assert "self._hyper_boundary" not in text
+
+
+# ---------------------------------------------------------------------------
+# D-22: deferred bias exit hook rendering
+# ---------------------------------------------------------------------------
+
+_HOOK_LINE = "outputs = self._hyper_deferred_bias(outputs)"
+
+
+def _generic_entry() -> dict:
+    """A generic-form boundary (cp transition is not TP-lowerable)."""
+    return {
+        "is_boundary": True,
+        "in_src": {"x": {"tp": "R", "cp": "S(1)"}},
+        "in_dst": {"x": {"tp": "R", "cp": "R"}},
+        "out_src": {"output": {"tp": "P(sum)", "cp": "S(1)"}},
+        "out_dst": {"output": {"tp": "R", "cp": "S(1)"}},
+    }
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_generic_deferred_bias_hook_renders_last():
+    """D-22: the exit hook is the LAST statement of the generic exit block.
+
+    Feature: codegen-lowering
+    Description: A generic-form boundary whose frozen entry carries
+        ``deferred_bias_params`` is lowered; the rowwise bias is suppressed
+        inside the region and must be re-added once, after the output
+        redistribution and the to-local unwrap.
+    Expectation: The hook line is emitted after ``redistribute_outputs`` and
+        after ``hyper_to_local_if_dtensor``.
+    """
+    entry = _generic_entry()
+    entry["deferred_bias_params"] = ["o_proj.bias"]
+    plan, classes = _single_plan(entry)
+    plan["mesh_dim_names"] = ("cp", "tp")
+
+    text = lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
+
+    hook_at = text.index(_HOOK_LINE)
+    assert hook_at > text.index("self._hyper_boundary.redistribute_outputs(outputs)")
+    assert hook_at > text.index("hyper_to_local_if_dtensor(outputs)")
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_tp_collective_deferred_bias_hook_renders_after_exit_ops():
+    """D-22: the static template re-adds the bias after the exit reduction.
+
+    Feature: codegen-lowering
+    Description: A tp_collective boundary whose frozen entry carries deferred
+        bias params renders the hook after the output-side bare operators (the
+        Partial -> R all_reduce / reduce_scatter IS the exit reduction the
+        deferral waits for) and before the return.
+    Expectation: The hook line sits after the reduce_scatter call and before
+        ``return outputs``.
+    """
+    entry = _tp_collective_entry()
+    entry["deferred_bias_params"] = ["o_proj.bias"]
+    plan, classes = _single_plan(entry)
+    plan["mesh_dim_names"] = ("tp",)
+
+    text = lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
+
+    hook_at = text.index(_HOOK_LINE)
+    assert hook_at > text.index(
+        "outputs = self._hyper_tp.reduce_scatter(outputs, dim=1)"
+    )
+    assert hook_at < text.index("return outputs")
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_local_region_deferred_bias_hook_renders():
+    """D-22: the local-region template carries the hook through its exit block.
+
+    Feature: codegen-lowering
+    Description: A region boundary (``local_compute_fn``) whose entry carries
+        deferred bias params embeds the shared output-redistribute block, so
+        the hook line must appear there too.
+    Expectation: The region body contains the hook line after the
+        ``hyper_to_local_if_dtensor`` unwrap.
+    """
+    entry = _identity_entry()
+    entry["deferred_bias_params"] = ["o_proj.bias"]
+    plan, classes = _single_plan(entry)
+    plan["injections"] = [
+        {"match": "blocks.alpha", "local_compute_fn": {"_target_": "some.factory"}},
+    ]
+
+    text = lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
+
+    assert "HYPER LOCAL REGION" in text
+    hook_at = text.index(_HOOK_LINE)
+    assert hook_at > text.index("hyper_to_local_if_dtensor(outputs)")
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_no_deferred_bias_no_hook_line():
+    """Entries without deferred params emit no hook (byte-stable artifacts).
+
+    Feature: codegen-lowering
+    Description: Generic and static boundaries whose entries carry no
+        ``deferred_bias_params`` key are lowered.
+    Expectation: No ``_hyper_deferred_bias`` reference appears — the emitted
+        bytes for non-deferring plans are unchanged by the D-22 feature.
+    """
+    for entry in (_generic_entry(), _tp_collective_entry()):
+        plan, classes = _single_plan(entry)
+        plan["mesh_dim_names"] = ("cp", "tp")
+
+        text = lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
+        assert "_hyper_deferred_bias" not in text
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_identity_boundary_with_deferred_bias_fails_fast():
+    """D-22: an identity-pruned boundary cannot carry deferred bias params.
+
+    Feature: codegen-lowering
+    Description: An all-identity boundary whose entry declares deferred bias
+        params is lowered. The identity form leaves the original forward
+        untouched, so the suppressed bias would never be re-added.
+    Expectation: ``NotImplementedError`` is raised at generation time instead
+        of silently dropping the bias at train time.
+    """
+    entry = _identity_entry()
+    entry["deferred_bias_params"] = ["o_proj.bias"]
+    plan, classes = _single_plan(entry)
+    plan["mesh_dim_names"] = ("tp",)
+
+    try:
+        lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
+    except NotImplementedError as exc:
+        assert "identity" in str(exc)
+        assert "deferred bias" in str(exc)
+    else:
+        raise AssertionError("identity + deferred bias must fail fast")

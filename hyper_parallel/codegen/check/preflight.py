@@ -196,7 +196,7 @@ def verify_boundary_forms(meta: Any, layout: Any) -> None:
         else getattr(source, "module_name", "")
     )
 
-    for class_name, _form, emitted, func, _injection in iter_emitted_forms(
+    for class_name, _form, emitted, func, _injection, _deferred_bias in iter_emitted_forms(
         source_text,
         meta,
         boundary_classes=boundary_classes,

@@ -31,6 +31,7 @@ import types
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 from torch import nn
 
@@ -1106,3 +1107,317 @@ def test_apply_inner_wrapper_carries_cp_to_the_rendered_component(monkeypatch):
     )
 
     assert _WRAPPED_TARGETS == ["RenderedAttention"]
+
+
+# ---------------------------------------------------------------------------
+# D-22 deferred bias: install-time suppression / re-add pair
+# ---------------------------------------------------------------------------
+
+
+class RowwiseLinear(nn.Module):
+    """Rowwise-sharded projection (weight ``S(ndim-1)``) carrying a full bias.
+
+    The D-22 shape: the boundary exit reduces Partial outputs along the TP
+    axis, so the bias must leave the region forward and be re-added exactly
+    once at the exit.  With ``x=[[1,1]]`` the arithmetic is assertable —
+    suppressed matmul ``[[2,2]]``, re-added bias ``[5,7]`` → ``[[7,9]]``.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor([[2.0, 0.0], [0.0, 2.0]]))
+        self.bias = nn.Parameter(torch.tensor([5.0, 7.0]))
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight, self.bias)
+
+
+class BiasExitBoundary:
+    """InstalledBoundary double: passthrough, recording the exit evidence.
+
+    ``seen_at_exit`` captures what the boundary exit sees before the
+    deferred-bias hook runs — asserting the re-add happens after the output
+    redistribution, never inside the region.
+    """
+
+    def __init__(self, entry, mesh_context, mesh_dim_names=None, *, module=None):
+        self.entry = entry
+        self.module = module
+        self.dense_mesh = mesh_context
+        self.active_dim_names = tuple(mesh_dim_names or ())
+        self.sides = []
+        self.seen_at_exit = None
+
+    def redistribute_inputs(self, payload):
+        self.sides.append("in")
+        return payload
+
+    def redistribute_outputs(self, outputs):
+        self.sides.append("out")
+        self.seen_at_exit = outputs
+        return outputs
+
+    def rewrap_outputs(self, output):
+        return output
+
+
+class BiasedLeaf(nn.Module):
+    """Imported-class boundary: a rowwise ``o_proj`` child owns the bias."""
+
+    def __init__(self):
+        super().__init__()
+        self.o_proj = RowwiseLinear()
+
+    def forward(self, x):
+        return self.o_proj(x)
+
+
+class LoweredBiased(nn.Module):
+    """Source-lowered boundary whose forward mirrors the emitted template.
+
+    Compute through ``_forward_impl``, then the boundary exit
+    redistribution, then the emitted D-22 hook — the exit order the emitter
+    guarantees (redistribute → ``hyper_to_local_if_dtensor`` → re-add,
+    collapsed here to the two calls the double can observe).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.o_proj = RowwiseLinear()
+
+    def _forward_impl(self, x):
+        return self.o_proj(x)
+
+    def forward(self, x):
+        args, kwargs = self._hyper_boundary.redistribute_inputs(((x,), {}))
+        outputs = self._forward_impl(*args, **kwargs)
+        outputs = self._hyper_boundary.redistribute_outputs(outputs)
+        outputs = self._hyper_deferred_bias(outputs)
+        return outputs
+
+
+class SelfBiasedLowered(nn.Module):
+    """Source-lowered boundary whose OWN bias is the deferred param."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor([[2.0, 0.0], [0.0, 2.0]]))
+        self.bias = nn.Parameter(torch.tensor([5.0, 7.0]))
+
+    def _forward_impl(self, x):
+        return torch.nn.functional.linear(x, self.weight, self.bias)
+
+    def forward(self, x):
+        args, kwargs = self._hyper_boundary.redistribute_inputs(((x,), {}))
+        outputs = self._forward_impl(*args, **kwargs)
+        outputs = self._hyper_boundary.redistribute_outputs(outputs)
+        outputs = self._hyper_deferred_bias(outputs)
+        return outputs
+
+
+class StaticBiasedLeaf(nn.Module):
+    """Class-shaped ``tp_collective`` boundary with a deferred child bias.
+
+    The body mirrors the emitted static template (identity ``to_local`` in,
+    ``reduce_scatter`` out) plus the D-22 hook line the emitter appends
+    after the output operators.
+    """
+
+    _hyper_boundary_form = "tp_collective"
+
+    def __init__(self):
+        super().__init__()
+        self.o_proj = RowwiseLinear()
+
+    def _forward_impl(self, x):
+        return self.o_proj(x)
+
+    def forward(self, x):
+        x = self._hyper_tp.to_local(x)
+        outputs = self._forward_impl(x)
+        outputs = self._hyper_tp.reduce_scatter(outputs, dim=1)
+        outputs = self._hyper_deferred_bias(outputs)
+        return outputs
+
+
+def _deferred_entry(*, self_owned: bool = False) -> dict:
+    """A boundary entry carrying the D-22 ``deferred_bias_params`` key."""
+    entry = _entry()
+    entry["deferred_bias_params"] = ["bias"] if self_owned else ["o_proj.bias"]
+    return entry
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_install_deferred_bias_pair_on_imported_class(monkeypatch):
+    """Imported-class boundaries suppress inside and re-add after the exit.
+
+    Feature: boundary-install-d22
+    Description: An entry with ``deferred_bias_params`` installs the native
+        suppression on the child owner (an instance-level ``o_proj.forward``)
+        plus the ``_hyper_deferred_bias`` exit hook; the boundary forward
+        wrapper applies the hook after ``redistribute_outputs``.
+    Expectation: The child runs bias-free inside the region (the exit sees
+        ``[[2,2]]``), the returned output carries the bias exactly once
+        (``[[7,9]]``), and the child's bias Parameter is restored.
+    """
+    model = nn.Module()
+    model.self_attn = BiasedLeaf()
+    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
+
+    runtime.hyper_install_boundaries(
+        model,
+        {"self_attn": _deferred_entry()},
+        mesh_context="mesh",
+        mesh_dim_names=("tp",),
+    )
+
+    assert model.self_attn._codegen_boundary_wrapped is True
+    assert callable(model.self_attn._hyper_deferred_bias)
+    out = model.self_attn(torch.tensor([[1.0, 1.0]]))
+    assert torch.equal(out, torch.tensor([[7.0, 9.0]]))
+    installed = model.self_attn._hyper_boundary
+    assert installed.sides == ["in", "out"]
+    assert torch.equal(installed.seen_at_exit, torch.tensor([[2.0, 2.0]]))
+    # The suppression wrapped the child owner's forward; the bias Parameter
+    # survived the call untouched.
+    assert "forward" in model.self_attn.o_proj.__dict__
+    assert torch.equal(model.self_attn.o_proj.bias, torch.tensor([5.0, 7.0]))
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_install_deferred_bias_pair_on_lowered_boundary(monkeypatch):
+    """Source-lowered boundaries rely on the emitted hook line, not a wrapper.
+
+    Feature: boundary-install-d22
+    Description: A lowered boundary (``_forward_impl``) with a deferred child
+        bias only binds ``_hyper_boundary`` and the suppression pair — the
+        emitted forward's own ``self._hyper_deferred_bias`` line performs the
+        re-add after the exit redistribution.
+    Expectation: No second forward wrapper is installed; the exit sees the
+        bias-free ``[[2,2]]`` and the module returns ``[[7,9]]``.
+    """
+    model = nn.Module()
+    model.self_attn = LoweredBiased()
+    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
+
+    runtime.hyper_install_boundaries(
+        model,
+        {"self_attn": _deferred_entry()},
+        mesh_context="mesh",
+        mesh_dim_names=("tp",),
+    )
+
+    assert not hasattr(model.self_attn, "_codegen_boundary_wrapped")
+    assert isinstance(model.self_attn._hyper_boundary, BiasExitBoundary)
+    out = model.self_attn(torch.tensor([[1.0, 1.0]]))
+    assert torch.equal(out, torch.tensor([[7.0, 9.0]]))
+    installed = model.self_attn._hyper_boundary
+    assert installed.sides == ["in", "out"]
+    assert torch.equal(installed.seen_at_exit, torch.tensor([[2.0, 2.0]]))
+    # The child owner's forward is the suppressed one.
+    assert "forward" in model.self_attn.o_proj.__dict__
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_install_deferred_bias_self_owned_wraps_impl_not_forward(monkeypatch):
+    """A dotless deferred path wraps ``_forward_impl``, never ``forward``.
+
+    Feature: boundary-install-d22
+    Description: When the boundary's OWN bias is deferred, a source-lowered
+        boundary must wrap the extracted ``_forward_impl`` the rewritten
+        forward calls.  Wrapping ``forward`` instead (the native placement)
+        would keep the bias hidden while the emitted
+        ``self._hyper_deferred_bias(outputs)`` reads it at the exit — the
+        bias would be suppressed and never re-added.
+    Expectation: The instance carries a wrapped ``_forward_impl`` and no
+        instance ``forward``; the output still carries the bias exactly once.
+    """
+    model = nn.Module()
+    model.self_attn = SelfBiasedLowered()
+    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
+
+    runtime.hyper_install_boundaries(
+        model,
+        {"self_attn": _deferred_entry(self_owned=True)},
+        mesh_context="mesh",
+        mesh_dim_names=("tp",),
+    )
+
+    # The one codegen-specific deviation from the native placement, locked.
+    assert "_forward_impl" in model.self_attn.__dict__
+    assert "forward" not in model.self_attn.__dict__
+    out = model.self_attn(torch.tensor([[1.0, 1.0]]))
+    assert torch.equal(out, torch.tensor([[7.0, 9.0]]))
+    assert torch.equal(model.self_attn.bias, torch.tensor([5.0, 7.0]))
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_install_rejects_deferred_bias_on_external_state_inline(monkeypatch):
+    """An external-state inline boundary cannot run the D-22 exit hook.
+
+    Feature: boundary-install-d22
+    Description: A class declared in ``meta.external_state_classes`` has its
+        forward replaced by the inline strategy body — the boundary exit (and
+        with it the deferred-bias re-add) never runs there, so a deferred
+        bias would be suppressed and silently dropped from every forward.
+    Expectation: ``hyper_install_boundaries`` fails fast with a
+        ``NotImplementedError`` naming the deferred params.
+    """
+    generated = _component_module()
+    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
+    model = nn.Module()
+    model.mlp = Qwen3MoeSparseMoeBlock()
+
+    with pytest.raises(NotImplementedError, match="defers bias params"):
+        runtime.hyper_install_boundaries(
+            model,
+            {"mlp": _deferred_entry()},
+            mesh_context="mesh",
+            mesh_dim_names=("tp",),
+            generated_module=generated,
+        )
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_static_tp_fallback_preserves_deferred_bias(monkeypatch):
+    """The generic fallback keeps the D-22 exit the static template carried.
+
+    Feature: boundary-install-d22
+    Description: When the live mesh rejects the static ``tp_collective``
+        forward (no lowerer), the fallback replaces the forward with the
+        generic redistribute engine — which would orphan the emitted
+        ``self._hyper_deferred_bias`` line.  The suppression pair is
+        installed before the fallback wraps, so the fallback re-applies the
+        hook after its exit redistribution.
+    Expectation: ``_hyper_tp`` is not bound, the forward is replaced, and the
+        output still carries the bias exactly once (``[[7,9]]``, with the
+        exit having seen the bias-free ``[[2,2]]``).
+    """
+    from hyper_parallel.distributed._builder import tp_collective_lowering
+
+    monkeypatch.setattr(
+        tp_collective_lowering, "create_tp_collective_lowerer", lambda mesh, dims: None
+    )
+    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
+
+    model = nn.Module()
+    model.self_attn = StaticBiasedLeaf()
+    runtime.hyper_install_boundaries(
+        model,
+        {"self_attn": _deferred_entry()},
+        mesh_context=FakeDenseMesh(),
+        mesh_dim_names=("tp",),
+    )
+
+    assert not hasattr(model.self_attn, "_hyper_tp")
+    assert "forward" in model.self_attn.__dict__
+    out = model.self_attn(torch.tensor([[1.0, 1.0]]))
+    assert torch.equal(out, torch.tensor([[7.0, 9.0]]))
+    installed = model.self_attn._hyper_boundary
+    assert installed.sides == ["in", "out"]
+    assert torch.equal(installed.seen_at_exit, torch.tensor([[2.0, 2.0]]))

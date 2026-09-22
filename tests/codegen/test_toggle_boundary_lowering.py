@@ -28,6 +28,8 @@ import importlib.machinery
 import sys
 import types
 
+import pytest
+
 # ``classify_tp_transition`` (pulled lazily by the toggle template) probes
 # ``torch.npu``; a CPU-only checkout needs the same stub the attention test uses.
 import torch  # noqa: E402
@@ -234,3 +236,24 @@ def test_toggle_forward_runs_when_switch_off():
     alpha.cp_enable = False
     alpha.ep_enable = False
     assert alpha.forward(3) == 6
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_toggle_deferred_bias_fails_fast():
+    """A deferred-bias boundary is rejected by the toggle template up front.
+
+    Feature: codegen-toggle-lowering
+    Description: The toggle template decomposes the boundary exit into
+        per-axis guarded segments and has no single boundary-exit point to
+        hang the D-22 deferred-bias re-add on; emitting nothing would
+        silently drop the suppressed bias.
+    Expectation: ``lower_forward_boundaries_toggle`` raises
+        ``NotImplementedError`` naming the deferred bias params instead of
+        emitting a forward that can never re-add them.
+    """
+    plan, classes = _toggle_plan(out_reducible=True)
+    plan["param_plan"]["blocks.alpha"]["deferred_bias_params"] = ["o_proj.bias"]
+
+    with pytest.raises(NotImplementedError, match="deferred bias params"):
+        lower_forward_boundaries_toggle(SOURCE_TEXT, plan, boundary_classes=classes)

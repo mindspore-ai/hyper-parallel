@@ -122,24 +122,36 @@ def lower_forward_boundaries(
     """
     edits: list[TextEdit] = []
     needs_runtime_helper_import = False
-    for class_name, form, emitted, func, injection in iter_emitted_forms(
+    for class_name, form, emitted, func, injection, deferred_bias in iter_emitted_forms(
         source_text,
         frozen_plan,
         boundary_classes=boundary_classes,
         module_name=module_name,
     ):
-        del class_name
         if emitted == FORM_IDENTITY:
             # Pruned: the runtime's install path covers the exact no-op /
             # to-local semantics with its generic wrapper, so leaving the
             # original forward untouched is behavior-preserving.
+            if deferred_bias:
+                # D-22: an unrewritten forward never calls the exit hook, so
+                # the suppressed bias would silently vanish — fail fast
+                # instead (the planner defers only rowwise-bias exits that
+                # reduce, which classify as non-identity, so this is a
+                # mis-declared plan, not a supported shape).
+                raise NotImplementedError(
+                    f"lower_forward_boundaries: boundary class {class_name!r} "
+                    "prunes to identity but declares deferred bias params; an "
+                    "identity forward has no exit hook to re-add them"
+                )
             continue
         # Every emitted forward body (generic, local-region) ends with the
         # runtime helper ``hyper_to_local_if_dtensor``; that helper is a
         # dependency of the templates, not of any declaration, so the lowerer
         # must import it itself — otherwise the artifact is not self-contained.
         needs_runtime_helper_import = True
-        body = _build_forward_body(source_text, injection, func, form, emitted)
+        body = _build_forward_body(
+            source_text, injection, func, form, emitted, deferred_bias
+        )
         # Keep the original forward as ``_forward_impl``. The
         # extracted method is inserted BEFORE the ``def forward`` (zero-width
         # edit at ``def_offset``), and the rewritten body replaces the original
@@ -216,10 +228,14 @@ def iter_emitted_forms(
     (``check/preflight.verify_boundary_forms``): classification
     (:func:`classify_boundary_form`) plus the structural gates
     (:func:`resolve_emitted_form`), per boundary class.  Yields
-    ``(class_name, form, emitted, func, injection)`` — ``form`` the
-    classifier's verdict, ``emitted`` the form actually rendered after the
-    gates, ``func`` the class's ``forward`` :class:`FunctionInfo`, and
-    ``injection`` the class's frozen injection rule (``None`` when absent).
+    ``(class_name, form, emitted, func, injection, deferred_bias)`` —
+    ``form`` the classifier's verdict, ``emitted`` the form actually
+    rendered after the gates, ``func`` the class's ``forward``
+    :class:`FunctionInfo`, ``injection`` the class's frozen injection rule
+    (``None`` when absent), and ``deferred_bias`` whether the class's
+    canonical entry carries D-22 deferred bias params (the emitted exit
+    then calls ``self._hyper_deferred_bias(outputs)`` after the output
+    redistribution).
 
     Boundary classes are iterated in sorted ``class_name`` order.  The
     grouping walks ``param_plan``, whose insertion order is NOT stable
@@ -249,7 +265,8 @@ def iter_emitted_forms(
         injection = injection_by_class.get(class_name)
         form = classify_boundary_form(canonical_entry, mesh_dim_names, injection)
         emitted = resolve_emitted_form(source_text, func, form)
-        yield class_name, form, emitted, func, injection
+        deferred_bias = bool(canonical_entry.get("deferred_bias_params"))
+        yield class_name, form, emitted, func, injection, deferred_bias
 
 
 def resolve_emitted_form(
@@ -528,7 +545,7 @@ def lower_forward_boundaries_toggle(
     guarded segment per *axis* rather than one merged verdict over all axes.
     """
     edits: list[TextEdit] = []
-    for class_name, _form, emitted, func, injection in iter_emitted_forms(
+    for class_name, _form, emitted, func, injection, deferred_bias in iter_emitted_forms(
         source_text,
         frozen_plan,
         boundary_classes=boundary_classes,
@@ -544,6 +561,18 @@ def lower_forward_boundaries_toggle(
                 f"for {_class_for_fqn(class_name, boundary_classes, build_source_index(source_text), module_name)!r}; "
                 "the toggle template assumes a dense (non-MoE) boundary. Split the "
                 "plan or keep the default parallel mode for MoE topologies."
+            )
+        if deferred_bias:
+            # D-22: the toggle template decomposes the exit into per-axis
+            # guarded segments and has no single boundary-exit point to hang
+            # the deferred-bias re-add on; emitting nothing would silently
+            # drop the suppressed bias. Fail fast and point at the mode that
+            # supports deferral.
+            raise NotImplementedError(
+                f"toggle forward: boundary class {class_name!r} declares "
+                "deferred bias params (D-22); the toggle template has no "
+                "boundary exit hook to re-add them — use the default "
+                "parallel mode for plans that defer rowwise biases"
             )
         body = _render_toggle_forward(
             source_text,
@@ -815,6 +844,7 @@ def _build_forward_body(
     func: FunctionInfo,
     form: BoundaryForm,
     emitted: str,
+    deferred_bias: bool = False,
 ) -> str:
     """Render the rewritten forward body for one boundary class.
 
@@ -825,12 +855,17 @@ def _build_forward_body(
     operators on ``self._hyper_tp`` instead; ``__hyper_compute__`` is bound by
     ``hyper_bind_compute`` for the local-region shape. Either way the class
     stays runtime-importable without a mesh.
+
+    ``deferred_bias`` (D-22) appends the exit hook call
+    ``self._hyper_deferred_bias(outputs)`` after the output redistribution —
+    the runtime binds that hook when it installs the native
+    suppression/restore pair.
     """
     if emitted == FORM_TP_COLLECTIVE:
-        return _render_tp_collective_forward(source_text, func, form)
+        return _render_tp_collective_forward(source_text, func, form, deferred_bias)
 
     input_redist = _render_input_redistribute(func)
-    out_redist = _render_output_redistribute()
+    out_redist = _render_output_redistribute(deferred_bias)
 
     local = injection.get("local_compute_fn") if injection else None
     if local is not None:
@@ -878,7 +913,7 @@ def _render_input_redistribute(func: FunctionInfo) -> str:
     )
 
 
-def _render_output_redistribute() -> str:
+def _render_output_redistribute(deferred_bias: bool = False) -> str:
     """Render the output-side boundary exit (no signature to bind).
 
     Mirrors the native ``_wrap_local_region_forward`` exit order exactly:
@@ -896,12 +931,23 @@ def _render_output_redistribute() -> str:
     any downstream DTensor dispatch would then make placement-based decisions
     on false metadata (e.g. ``AddDistributedOp`` zeroing a replicated operand
     on non-zero coordinates of the partial axis).
+
+    ``deferred_bias`` (D-22) appends the exit hook AFTER ``to_local``: the
+    rowwise bias was suppressed inside the region so the exit reduction sees
+    a pure matmul contribution, and the hook re-adds it exactly once on the
+    reduced local output — Megatron RowParallelLinear semantics.  The hook is
+    bound at install time (``module._hyper_deferred_bias``); the emitted call
+    is conditional on the plan declaring deferred params, so the two sides
+    cannot disagree about whether a boundary defers.
     """
-    return (
-        "        outputs = self._hyper_boundary.rewrap_outputs(outputs)\n"
-        "        outputs = self._hyper_boundary.redistribute_outputs(outputs)\n"
-        "        outputs = hyper_to_local_if_dtensor(outputs)"
-    )
+    lines = [
+        "        outputs = self._hyper_boundary.rewrap_outputs(outputs)",
+        "        outputs = self._hyper_boundary.redistribute_outputs(outputs)",
+        "        outputs = hyper_to_local_if_dtensor(outputs)",
+    ]
+    if deferred_bias:
+        lines.append("        outputs = self._hyper_deferred_bias(outputs)")
+    return "\n".join(lines)
 
 
 def _ordered_notes(notes: dict[str, str]) -> list[str]:
@@ -940,7 +986,12 @@ def _render_plain_redistribute(
 # static tp_collective template
 # ---------------------------------------------------------------------------
 
-def _render_tp_collective_forward(source_text: str, func: FunctionInfo, form: BoundaryForm) -> str:
+def _render_tp_collective_forward(
+    source_text: str,
+    func: FunctionInfo,
+    form: BoundaryForm,
+    deferred_bias: bool = False,
+) -> str:
     """Static boundary: bare TP operators, semantics of ``RedistOp.execute``.
 
     The rendered body is instruction-equivalent to the generic engine with the
@@ -958,6 +1009,11 @@ def _render_tp_collective_forward(source_text: str, func: FunctionInfo, form: Bo
     runtime re-validates the emitted form against the live mesh; on mismatch
     the runtime replaces this forward with the generic engine, so the baked
     calls never run unvalidated.
+
+    ``deferred_bias`` (D-22) appends ``self._hyper_deferred_bias(outputs)``
+    after the output ops — the Partial(sum) -> R all_reduce above is exactly
+    the exit reduction the deferral waits for, so the bias re-add lands once,
+    on the reduced output.
     """
     lines = [
         "        # [HYPER TP-COLLECTIVE] statically lowered boundary — the runtime",
@@ -982,6 +1038,12 @@ def _render_tp_collective_forward(source_text: str, func: FunctionInfo, form: Bo
     for name, op in form.out_ops.items():
         lines.append(f"        # {form.out_notes[name]}")
         lines.extend(_render_output_tp_call(name, op, form, tuple_output))
+    if deferred_bias:
+        lines.append("")
+        lines.append(
+            "        # [HYPER D-22] deferred bias re-added once, after the exit reduction"
+        )
+        lines.append("        outputs = self._hyper_deferred_bias(outputs)")
     lines.append("")
     lines.append("        return outputs")
     return "\n".join(lines)

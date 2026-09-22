@@ -62,6 +62,10 @@ class SpecField:
         group: Meta section — one of the ``GROUP_*`` constants.
         freeze: Freeze-side serializer kind; ``""`` for exempt fields.
         rebuild: Rebuild-side deserializer kind; ``""`` for exempt fields.
+        post_init: The dataclass field is ``init=False`` (planner-internal
+            output like ``_deferred_bias_params``) — the rebuild sets it
+            via ``setattr`` after construction instead of a constructor
+            kwarg.
 
     Serializer kinds (freeze side, dispatched in freeze.py):
 
@@ -96,6 +100,7 @@ class SpecField:
     group: str
     freeze: str = ""
     rebuild: str = ""
+    post_init: bool = False
 
 
 #: Every ``ModuleShardingSpec`` field, classified.  Order is load-bearing:
@@ -128,6 +133,16 @@ SPEC_FIELDS: tuple[SpecField, ...] = (
               freeze="scalar", rebuild="bool_default_true"),
     SpecField("region_dispatch", "region_dispatch", GROUP_PARAM_PLAN,
               freeze="scalar", rebuild="opt_scalar"),
+    # _deferred_bias_params: D-22 (rowwise bias defer) — the planner-computed
+    #   bias param paths (e.g. ("o_proj.bias",)) whose addition is deferred
+    #   until AFTER the boundary exit TP reduction (Megatron
+    #   RowParallelLinear semantics).  Frozen so the emitted forward can
+    #   call ``self._hyper_deferred_bias(outputs)`` at the exit and the
+    #   install path can run the native suppression/restore pair
+    #   (``_install_bias_suppression`` / ``_maybe_add_deferred_biases``).
+    #   ``init=False`` on the dataclass — rebuilt via setattr (post_init).
+    SpecField("_deferred_bias_params", "deferred_bias_params", GROUP_PARAM_PLAN,
+              freeze="name_list", rebuild="tuple_empty", post_init=True),
     # ── Frozen into meta.injections rules ──
     SpecField("inner_wrapper", "inner_wrapper", GROUP_INJECTIONS,
               freeze="value_to_dict", rebuild="injection_target"),
@@ -148,10 +163,6 @@ SPEC_FIELDS: tuple[SpecField, ...] = (
     #   path: auto attrs via the _is_head_sharded heuristic, user attrs via
     #   the rebuilt tp_divide_attrs — both sources survive.
     SpecField("_tp_local_attr_plan", "", GROUP_EXEMPT),
-    # _deferred_bias_params: D-22 (rowwise bias defer) is consumed only by
-    #   native Phase C today; the codegen D-22 work item owns moving this
-    #   into the frozen groups.
-    SpecField("_deferred_bias_params", "", GROUP_EXEMPT),
     # _is_terminal: validate-mode propagation marker, not production state.
     SpecField("_is_terminal", "", GROUP_EXEMPT),
     # _needs_cp_attn: apply-time preflight metadata (attention boundary
@@ -179,6 +190,12 @@ PARAM_PLAN_SPEC_FIELDS: tuple[SpecField, ...] = fields_for_group(GROUP_PARAM_PLA
 #: The injections section (``meta.injections`` rule keys, minus "match").
 INJECTION_SPEC_FIELDS: tuple[SpecField, ...] = fields_for_group(GROUP_INJECTIONS)
 
+#: ``init=False`` dataclass fields in the frozen groups — the rebuild sets
+#: them via ``setattr`` after constructing the spec.
+POST_INIT_SPEC_FIELDS: tuple[SpecField, ...] = tuple(
+    field for field in SPEC_FIELDS if field.post_init
+)
+
 #: Every meta key that may appear in a frozen entry/rule (both groups).
 FROZEN_SPEC_KEYS: frozenset[str] = frozenset(
     field.key for field in SPEC_FIELDS if field.key
@@ -192,6 +209,7 @@ __all__ = [
     "GROUP_PARAM_PLAN",
     "INJECTION_SPEC_FIELDS",
     "PARAM_PLAN_SPEC_FIELDS",
+    "POST_INIT_SPEC_FIELDS",
     "SPEC_FIELDS",
     "SpecField",
     "fields_for_group",

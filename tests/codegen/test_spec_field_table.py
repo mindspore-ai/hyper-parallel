@@ -25,8 +25,9 @@ the table honest in three ways:
   gap in production;
 - legacy shape: a spec shaped like the committed 129 artifact freezes to
   the exact legacy key order, so regenerated modeling files stay
-  byte-stable (only the two intended fixes — ``tp_divide_attrs`` frozen,
-  ``params={}`` kept — may diverge from the pre-table behavior);
+  byte-stable (only the three intended changes — ``tp_divide_attrs``
+  frozen, ``params={}`` kept, ``_deferred_bias_params`` frozen (D-22) —
+  may diverge from the pre-table behavior);
 - round-trip: the committed artifact's meta rebuilds into a live plan and
   re-freezes to the same param_plan (injections compared per ``match`` —
   their rule order follows ``param_plan``'s sorted JSON order on rebuild,
@@ -47,6 +48,7 @@ from hyper_parallel.codegen.plan.spec_fields import (
     GROUP_EXEMPT,
     GROUP_INJECTIONS,
     GROUP_PARAM_PLAN,
+    POST_INIT_SPEC_FIELDS,
     SPEC_FIELDS,
 )
 from hyper_parallel.codegen.runtime import _rebuild_live_plan_from_meta
@@ -68,7 +70,7 @@ _KNOWN_FREEZE_KINDS = frozenset({
 _KNOWN_REBUILD_KINDS = frozenset({
     "placement_map", "named_placements", "name_list", "attr_list",
     "bool_default_true", "opt_scalar", "injection_target",
-    "dict_copy", "int_truthy", "",
+    "dict_copy", "int_truthy", "tuple_empty", "",
 })
 
 _S0 = Shard(0)
@@ -132,12 +134,36 @@ class TestTableCoversSpecFields(unittest.TestCase):
                 self.assertTrue(field.key, field.name)
 
     def test_exempt_fields_are_deliberate(self):
-        """The exempt set is exactly the six documented planner internals."""
+        """The exempt set is exactly the five documented planner internals."""
         exempt = {field.name for field in SPEC_FIELDS if field.group == GROUP_EXEMPT}
         self.assertEqual(exempt, {
-            "_tp_local_attr_plan", "_deferred_bias_params", "_is_terminal",
+            "_tp_local_attr_plan", "_is_terminal",
             "_needs_cp_attn", "_resolved_inner_wrapper", "_resolved_inner_target",
         })
+
+    def test_post_init_fields_match_dataclass_init_false(self):
+        """``post_init`` marks exactly the frozen fields the dataclass cannot
+        take as constructor kwargs.
+
+        ``_rebuild_live_plan_from_meta`` constructs ``ModuleShardingSpec(**kwargs)``
+        and then sets ``post_init`` fields via ``setattr`` — passing an
+        ``init=False`` field as a kwarg is a ``TypeError``, and forgetting to
+        mark one silently drops it from the rebuilt spec.  Both directions of
+        that drift fail here.
+        """
+        post_init_names = {field.name for field in POST_INIT_SPEC_FIELDS}
+        self.assertEqual(post_init_names, {"_deferred_bias_params"})
+        for field in SPEC_FIELDS:
+            dataclass_init = ModuleShardingSpec.__dataclass_fields__[field.name].init
+            if field.group == GROUP_EXEMPT:
+                self.assertFalse(field.post_init, field.name)
+            else:
+                self.assertEqual(
+                    field.post_init, not dataclass_init,
+                    f"{field.name}: post_init={field.post_init} but dataclass "
+                    f"init={dataclass_init} — the rebuild constructs the spec "
+                    "from table kwargs and setattr's post_init fields",
+                )
 
 
 class TestFreezeLegacyShape(unittest.TestCase):
@@ -221,6 +247,81 @@ class TestFreezeLegacyShape(unittest.TestCase):
         frozen = freeze_param_plan(SimpleNamespace(modules={"m.c": spec}))
         self.assertNotIn("needs_cp_attn", frozen["m.c"])
         self.assertNotIn("_needs_cp_attn", frozen["m.c"])
+
+
+class TestDeferredBiasRoundTrip(unittest.TestCase):
+    """D-22: the deferred-bias param paths cross the boundary as a name list."""
+
+    def test_freeze_writes_truthy_tuple_as_list(self):
+        """A planner-computed tuple freezes to a JSON list, after region_dispatch."""
+        spec = SimpleNamespace(
+            params={"o_proj.weight": {"tp": _S0}},
+            is_boundary=True,
+            region_dispatch=False,
+            _deferred_bias_params=("o_proj.bias",),
+        )
+        frozen = freeze_param_plan(SimpleNamespace(modules={"m.a": spec}))
+        entry = frozen["m.a"]
+        self.assertEqual(entry["deferred_bias_params"], ["o_proj.bias"])
+        # Table order: the D-22 key lands after region_dispatch (the legacy
+        # freeze order plus the new trailing field).
+        self.assertEqual(
+            list(entry.keys()),
+            ["params", "is_boundary", "region_dispatch", "deferred_bias_params"],
+        )
+
+    def test_freeze_omits_empty_and_missing_deferred(self):
+        """Empty tuple / absent attribute produce NO key (byte-stable metas)."""
+        for spec in (
+            SimpleNamespace(params={}, is_boundary=True, _deferred_bias_params=()),
+            SimpleNamespace(params={}, is_boundary=True),
+        ):
+            frozen = freeze_param_plan(SimpleNamespace(modules={"m.a": spec}))
+            self.assertNotIn("deferred_bias_params", frozen["m.a"])
+
+    def test_rebuild_restores_tuple_and_default_empty(self):
+        """Rebuild gives consumers a tuple; absent key restores the () default."""
+        meta = SimpleNamespace(
+            param_plan={
+                "m.a": {
+                    "params": {"w.weight": {"tp": "S(0)"}},
+                    "is_boundary": True,
+                    "deferred_bias_params": ["o_proj.bias"],
+                },
+                "m.b": {"params": {"w.weight": {"tp": "S(0)"}}, "is_boundary": True},
+            },
+            injections=[], special_handlers={}, mesh_dim_names=("tp",),
+            tied_pairs=[],
+        )
+        plan = _rebuild_live_plan_from_meta(meta)
+        # Consumers (the native suppression/restore pair) iterate the tuple.
+        self.assertEqual(plan.modules["m.a"]._deferred_bias_params, ("o_proj.bias",))
+        self.assertEqual(plan.modules["m.b"]._deferred_bias_params, ())
+
+    def test_rebuilt_spec_is_constructed_then_setattr(self):
+        """The init=False field must not travel as a constructor kwarg."""
+        meta = SimpleNamespace(
+            param_plan={"m.a": {"params": {}, "is_boundary": True,
+                                "deferred_bias_params": ["bias"]}},
+            injections=[], special_handlers={}, mesh_dim_names=("tp",),
+            tied_pairs=[],
+        )
+        plan = _rebuild_live_plan_from_meta(meta)
+        self.assertEqual(plan.modules["m.a"]._deferred_bias_params, ("bias",))
+
+    def test_full_cycle_preserves_deferred_params(self):
+        """freeze(rebuild(meta)) keeps the D-22 key verbatim."""
+        meta = SimpleNamespace(
+            param_plan={"m.a": {"params": {}, "is_boundary": True,
+                                "deferred_bias_params": ["o_proj.bias", "bias"]}},
+            injections=[], special_handlers={}, mesh_dim_names=("tp",),
+            tied_pairs=[],
+        )
+        plan = _rebuild_live_plan_from_meta(meta)
+        refrozen = freeze_param_plan(plan)
+        self.assertEqual(
+            refrozen["m.a"]["deferred_bias_params"], ["o_proj.bias", "bias"]
+        )
 
 
 class TestCommittedMetaRoundTrip(unittest.TestCase):

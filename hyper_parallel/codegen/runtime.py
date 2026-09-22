@@ -361,6 +361,9 @@ class _FrozenBoundarySpec:
         )
         self.out_names = list(entry["out_names"]) if entry.get("out_names") else None
         self.region_dispatch = entry.get("region_dispatch")
+        # D-22: the native suppression/restore pair reads this off the spec
+        # object it is handed, so the frozen view mirrors it.
+        self._deferred_bias_params = tuple(entry.get("deferred_bias_params") or ())
         for key in ("inner_wrapper", "inner_target", "inner_out_src", "local_compute_fn"):
             if injection is not None and key in injection:
                 setattr(self, key, _injection_target(injection[key]))
@@ -705,21 +708,68 @@ def _is_external_state_inline_module(module: Any, generated_module: Any = None) 
     return cls.__module__ == module_name and cls.__name__ in class_names
 
 
-def _wrap_installed_boundary_forward(module: Any, installed: InstalledBoundary) -> None:
+def _install_deferred_bias_pair(module: Any, spec: Any, *, lowered: bool) -> None:
+    """Install the D-22 bias-suppression / deferred-re-add pair on one boundary.
+
+    Reuses the native Phase C primitives (``_make_bias_free_forward`` /
+    ``_maybe_add_deferred_biases`` from ``forward_rewriter``) so the hiding
+    semantics cannot drift from the trainer's path; the exit hook is bound as
+    ``module._hyper_deferred_bias``, which the emitted forward templates call
+    after the output redistribution.
+
+    The one codegen-specific adjustment vs the native
+    ``_install_bias_suppression`` loop: on a source-lowered boundary
+    (``lowered=True``) a deferred param path with no dot — the boundary's OWN
+    bias — wraps the extracted ``_forward_impl`` (the compute forward the
+    rewritten ``forward`` calls), not ``forward`` itself: wrapping
+    ``forward`` would keep the bias hidden while the emitted
+    ``self._hyper_deferred_bias(outputs)`` reads it at the exit.  Child-owned
+    paths and imported-class boundaries keep the native placement exactly.
+    """
+    from hyper_parallel.distributed._builder.forward_rewriter import (  # pylint: disable=C0415
+        _make_bias_free_forward,
+        _maybe_add_deferred_biases,
+    )
+
+    for param_path in spec._deferred_bias_params:  # pylint: disable=protected-access
+        owner_path = param_path.rpartition(".")[0]
+        if owner_path:
+            owner = module.get_submodule(owner_path)
+            owner.forward = _make_bias_free_forward(owner, owner.forward)
+        elif lowered:
+            module._forward_impl = _make_bias_free_forward(
+                module, module._forward_impl
+            )
+        else:
+            module.forward = _make_bias_free_forward(module, module.forward)
+    module._hyper_deferred_bias = functools.partial(
+        _maybe_add_deferred_biases, module, spec
+    )
+
+
+def _wrap_installed_boundary_forward(
+    module: Any, installed: InstalledBoundary, spec: Any = None
+) -> None:
     """Install native-style boundary entry/exit redistribution on one module.
 
     The compiled plan is captured once at install time instead of being
-    re-derived on every call.
+    re-derived on every call.  When ``spec`` carries D-22 deferred bias
+    params, the wrapper also re-adds them after the exit redistribution —
+    the native Phase C exit order (suppress inside, reduce, add once).
     """
     if getattr(module, "_codegen_boundary_wrapped", False):
         return
     original_forward = module.forward
+    deferred_bias = spec is not None and bool(spec._deferred_bias_params)
 
     @functools.wraps(original_forward)
     def codegen_boundary_forward(*args: Any, **kwargs: Any) -> Any:
         redist_args, redist_kwargs = installed.redistribute_inputs((args, kwargs))
         outputs = original_forward(*redist_args, **redist_kwargs)
-        return installed.redistribute_outputs(outputs)
+        outputs = installed.redistribute_outputs(outputs)
+        if deferred_bias:
+            outputs = module._hyper_deferred_bias(outputs)
+        return outputs
 
     module.forward = codegen_boundary_forward
     module._codegen_boundary_wrapped = True
@@ -732,14 +782,21 @@ def _wrap_static_fallback_forward(module: Any, installed: InstalledBoundary) -> 
     The static template's body references ``self._hyper_tp``, which this
     install path refused to bind; replacing ``module.forward`` wholesale
     keeps the class runnable — the compiled plan carries the same
-    transitions through the generic redistribute engine.
+    transitions through the generic redistribute engine.  A D-22 exit hook
+    already bound on the module (``_hyper_deferred_bias``, installed before
+    this fallback wraps) is re-applied after the exit redistribution, so the
+    fallback preserves the deferred-bias semantics the emitted template had.
     """
     impl = module._forward_impl
+    deferred_bias = getattr(module, "_hyper_deferred_bias", None)
 
     def generic_boundary_forward(*args: Any, **kwargs: Any) -> Any:
         redist_args, redist_kwargs = installed.redistribute_inputs((args, kwargs))
         outputs = impl(*redist_args, **redist_kwargs)
-        return installed.redistribute_outputs(outputs)
+        outputs = installed.redistribute_outputs(outputs)
+        if deferred_bias is not None:
+            outputs = deferred_bias(outputs)
+        return outputs
 
     module.forward = generic_boundary_forward
 
@@ -872,6 +929,15 @@ def hyper_install_boundaries(
     re-validation in :func:`_install_static_tp_operators`; a mismatch replaces
     the forward with the generic engine.
 
+    A boundary whose frozen entry carries ``deferred_bias_params`` (D-22)
+    additionally gets the native suppression/restore pair installed
+    (:func:`_install_deferred_bias_pair`): child ``Linear`` forwards run
+    bias-free inside the region and the exit hook
+    ``module._hyper_deferred_bias`` re-adds each bias exactly once after the
+    output redistribution — the same order the emitted templates encode. An
+    external-state inline boundary cannot run that exit hook and fails fast
+    instead of silently dropping the bias.
+
     Boundaries are installed in post-order (deepest FQN first) via the native
     ``_boundary_post_order_key`` — the same D-14 invariant 2 ordering as the
     applier's Phase C driving loop, so inner wrappers exist before an outer
@@ -906,8 +972,26 @@ def hyper_install_boundaries(
                 entry, mesh_context, mesh_dim_names, module=module
             )
             if _is_external_state_inline_module(module, generated_module):
+                # D-22: an inline-strategy class body never passes through
+                # this boundary exit, so a deferred bias would be suppressed
+                # but never re-added — fail fast instead of silently
+                # dropping the bias from every forward.
+                if entry.get("deferred_bias_params"):
+                    raise NotImplementedError(
+                        f"hyper_install_boundaries: boundary {fqn!r} defers bias "
+                        f"params {entry['deferred_bias_params']}, but its class is "
+                        "an external-state inline strategy the D-22 exit hook "
+                        "cannot run in"
+                    )
                 continue
             module._hyper_boundary = installed
+            if entry.get("deferred_bias_params"):
+                # Before _install_static_tp_operators: the static-fallback
+                # wrap captures module._forward_impl at wrap time, so the
+                # suppression must already be in place there.
+                _install_deferred_bias_pair(
+                    module, _FrozenBoundarySpec(entry, injection), lowered=True
+                )
             _install_static_tp_operators(
                 module,
                 entry,
@@ -934,7 +1018,11 @@ def hyper_install_boundaries(
         # wrapper below closes over it, so introspection and debugging see the
         # same object the generated source-lowered forwards would.
         module._hyper_boundary = installed
-        _wrap_installed_boundary_forward(module, installed)
+        if spec._deferred_bias_params:
+            # Native order: suppression first, so the wrapper below captures
+            # the suppressed forward as its original (D-22, Phase C identity).
+            _install_deferred_bias_pair(module, spec, lowered=False)
+        _wrap_installed_boundary_forward(module, installed, spec=spec)
 
 
 # ---------------------------------------------------------------------------
@@ -1297,10 +1385,10 @@ def _rebuild_live_plan_from_meta(meta: CodegenMeta):
 
     Which fields cross the meta boundary is declared in
     :mod:`hyper_parallel.codegen.plan.spec_fields` — freeze and this rebuild
-    walk the same table, so the two sides cannot drift apart.  Exempt fields
-    (never frozen):
-    - ``ModuleShardingSpec._deferred_bias_params`` (D-22) — only consumed by
-      native Phase C, kept codegen-owned here;
+    walk the same table, so the two sides cannot drift apart.  ``init=False``
+    fields (``_deferred_bias_params``, D-22) are rebuilt via ``setattr``
+    after construction (``POST_INIT_SPEC_FIELDS``).  Exempt fields (never
+    frozen):
     - ``_is_terminal`` — validate-mode only, not used in production;
     - ``_tp_local_attr_plan`` — planner-derived; the rebuilt spec leaves it
       None and ``maybe_update_head_counts`` takes its backward-compatible
@@ -1319,6 +1407,7 @@ def _rebuild_live_plan_from_meta(meta: CodegenMeta):
     from hyper_parallel.codegen.plan.spec_fields import (
         INJECTION_SPEC_FIELDS,
         PARAM_PLAN_SPEC_FIELDS,
+        POST_INIT_SPEC_FIELDS,
     )
 
     by_fqn: dict[str, Any] = {}
@@ -1332,10 +1421,16 @@ def _rebuild_live_plan_from_meta(meta: CodegenMeta):
         kwargs: dict[str, Any] = {
             field.name: _rebuild_spec_field(field, entry)
             for field in PARAM_PLAN_SPEC_FIELDS
+            if not field.post_init
         }
         for field in INJECTION_SPEC_FIELDS:
             kwargs[field.name] = _rebuild_spec_field(field, inj)
-        modules[fqn] = ModuleShardingSpec(**kwargs)
+        spec = ModuleShardingSpec(**kwargs)
+        for field in POST_INIT_SPEC_FIELDS:
+            value = _rebuild_spec_field(field, entry)
+            if value is not None:
+                setattr(spec, field.name, value)
+        modules[fqn] = spec
 
     return ShardingPlan(
         modules=modules,
@@ -1376,6 +1471,10 @@ def _rebuild_spec_field(field: Any, source: dict[str, Any]) -> Any:
         return dict(source[key]) if source.get(key) else {}
     if kind == "int_truthy":
         return source.get(key) or 0
+    if kind == "tuple_empty":
+        # D-22 param paths: absent/empty restores the dataclass default ()
+        # — consumers iterate the tuple, so None would crash.
+        return tuple(source[key]) if source.get(key) else ()
     # opt_scalar
     return source.get(key)
 
