@@ -328,8 +328,10 @@ class TestMegaMoeExperts(unittest.TestCase):
         mock_create_resources.assert_not_called()
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    @patch.object(MegaMoeExperts, "_retain_runtime", return_value=None)
     def test_shared_layers_create_once_and_close_after_last_owner(
         self,
+        mock_retain_runtime: Mock,
         mock_create_parameters: Mock,
     ) -> None:
         """Keep parameters independent while one serial resource group is shared."""
@@ -358,6 +360,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             resolved = [
                 layer._get_execution_resources(input_tensor) for layer in layers
             ]
+        mock_retain_runtime.assert_called_once()
 
         self.assertTrue(shared_group.shared)
         self.assertEqual(len(shared_group.members), len(layers))
@@ -373,6 +376,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         for layer in layers[:-1]:
             layer.close()
         resources.close.assert_not_called()
+        layers[-1].close()
         layers[-1].close()
         resources.close.assert_called_once_with()
 
@@ -446,6 +450,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         )
         resources.workspace = Mock()
         resources.workspace.close.side_effect = RuntimeError("workspace busy")
+        resources._workspace_closed = False  # pylint: disable=protected-access
         resources._closed = False  # pylint: disable=protected-access
 
         with (
@@ -463,6 +468,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
         )
         resources.workspace = Mock()
+        resources._workspace_closed = False  # pylint: disable=protected-access
         resources._closed = False  # pylint: disable=protected-access
 
         with (
@@ -477,6 +483,11 @@ class TestMegaMoeExperts(unittest.TestCase):
 
         resources.workspace.close.assert_called_once_with()
         self.assertFalse(resources._closed)  # pylint: disable=protected-access
+
+        with patch.object(mega_moe_module.shmem, "release") as release:
+            resources.close()
+        resources.workspace.close.assert_called_once_with()
+        release.assert_called_once_with()
 
 
 if __name__ == "__main__":
