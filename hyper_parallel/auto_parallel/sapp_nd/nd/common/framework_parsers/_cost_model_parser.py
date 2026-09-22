@@ -88,12 +88,12 @@ class _CostModelParser(ABC):
     #         "grad":0, #zero 1
     #         "os+grad":0, #zero 2
     #         "p+os+grad":0, # zero 3
-    #         "p+os":0 # zero2 mindspore
+    #         "p+os":0 # zero2
     #     }
     #     shard_strat[strategy]
 
     def init_hff(self):
-        """MindFormers format for FFn hidden size"""
+        """Llama-style FFN hidden size from hidden size and scaling factors."""
         # Assuming following 3 variables are already parsed
         hidden_size = self.ccfg.h
         ffn_dim_multiplier = self.ccfg.fdm

@@ -561,13 +561,13 @@ class SappSolver:
     def add_multimodal_recompute_constraint(
             self, prob: Any, variables: Any,
             sorted_layers: Dict[Layer.type_enum, List[Layer]]) -> Any:
-        """Keep recomputation schemes consistent across BODY layer types (MindFormer constraint)."""
+        """Keep recomputation schemes consistent across BODY layer types."""
 
         considered = Recompute.get_used_list(self.recompute_considered_)
         if len(considered) > 2:
-            logger.error("Careful: MindFormer does not allow a fine recomputation scheme "
-                         "for heterogeneous models. Pipeline balancing is currently unable to "
-                         "comply with MF constraint for more than 1 recomputation type.")
+            logger.error("Heterogeneous models do not support a fine recomputation scheme. "
+                         "Pipeline balancing currently supports at most one recomputation type "
+                         "across BODY layer types.")
             return prob
 
         if len(considered) < 2:

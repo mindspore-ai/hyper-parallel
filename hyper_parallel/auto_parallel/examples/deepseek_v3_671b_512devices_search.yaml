@@ -2,7 +2,7 @@
 # HyperParallel Auto Parallel Strategy Search 鈥?DeepSeek V3 @ 512 cards
 # ============================================================================
 # Search configuration for DeepSeek V3 (61 MoE layers, 256 experts, MLA).
-# Model parameters match ``hyper_deepseek_v3.yaml`` (MindFormers ``deepseek.yaml``).
+# Model parameters match ``hyper_deepseek_v3.yaml``.
 #
 # Parallelism dimensions:
 #   scalar (e.g. cp: 1) 鈫?fixed input

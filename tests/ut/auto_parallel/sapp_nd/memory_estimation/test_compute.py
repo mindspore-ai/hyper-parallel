@@ -287,8 +287,8 @@ class TestSharedExpertCompute(unittest.TestCase):
     def test_etp1_falls_back_to_tp(self):
         """CT-S04: etp=1 falls back to tp (etp=1 means "off", same as etp=0).
 
-        In MindFormers, expert_model_parallel=1 means "disabled".
-        With etp>1 check, etp=1 falls back to tp, matching this intent.
+        An expert tensor-parallel degree of 1 is treated as disabled.
+        The etp>1 check makes etp=1 fall back to tp.
         """
         ccfg_etp0 = _make_ccfg(s=1024, b=4, h=4096, hff=14336, n_shared_exp=1,
                                tp=2, etp=0, cp=1)
