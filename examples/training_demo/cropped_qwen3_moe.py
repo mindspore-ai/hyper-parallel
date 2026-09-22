@@ -37,6 +37,9 @@ def build_cropped_qwen3_moe(
         compile_config: CompileConfig | dict[str, Any] | None = None,
         activation_checkpoint: str | None = None,
         activation_swap: str = "none",
+        codegen: bool = False,
+        modeling_backend: str | None = None,
+        codegen_config: Any | None = None,
 ) -> PreTrainedModel:
     """Create a Qwen3-MoE model with fewer decoder layers and random weights.
 
@@ -56,6 +59,10 @@ def build_cropped_qwen3_moe(
         compile_config: Optional Trainer-provided compile configuration.
         activation_checkpoint: Activation checkpoint mode.
         activation_swap: Activation swap mode.
+        codegen: Select the codegen ``gen`` backend for this build.
+        modeling_backend: Explicit ``"hf"``/``"custom"``/``"gen"`` override.
+        codegen_config: Trainer config carrying the codegen settings; forwarded
+            so the artifact bundle can be prepared from the config identity.
 
     Returns:
         A parallelized, randomly initialized cropped Qwen3-MoE model.
@@ -86,4 +93,7 @@ def build_cropped_qwen3_moe(
         compile_config=compile_config,
         activation_checkpoint=activation_checkpoint,
         activation_swap=activation_swap,
+        codegen=codegen,
+        modeling_backend=modeling_backend,
+        codegen_config=codegen_config,
     )

@@ -21,7 +21,7 @@ from collections import Counter, OrderedDict, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable
 
 import torch
 from huggingface_hub import snapshot_download
@@ -53,28 +53,6 @@ class LoadReport:
     loaded_keys: tuple[str, ...]
     missing_keys: tuple[str, ...]
     unexpected_keys: tuple[str, ...]
-
-
-class DCPBackend(Protocol):
-    """Contract implemented by the distributed-checkpoint subsystem."""
-
-    def load(
-        self,
-        state_dict: dict[str, Any],
-        *,
-        checkpoint_id: str | Path,
-        **kwargs: Any,
-    ) -> Any:
-        """Load a DCP checkpoint into the supplied sharded state dict."""
-
-    def save(
-        self,
-        state_dict: dict[str, Any],
-        *,
-        checkpoint_id: str | Path,
-        **kwargs: Any,
-    ) -> Any:
-        """Save the supplied sharded state dict as DCP."""
 
 
 @dataclass(frozen=True)
@@ -470,15 +448,9 @@ def _base_weight_mapping(weights_mapping, replacement_mapping):
 class CheckpointManager:
     """Manage pretrained and resumable checkpoints for one finalized model."""
 
-    def __init__(
-        self,
-        model: nn.Module,
-        *,
-        dcp_backend: DCPBackend | None = None,
-    ) -> None:
-        """Bind the manager to one finalized model and an optional DCP backend."""
+    def __init__(self, model: nn.Module) -> None:
+        """Bind the manager to one finalized model."""
         self.model = model
-        self.dcp_backend = dcp_backend
 
     def load_checkpoint(
         self,
@@ -694,34 +666,6 @@ class CheckpointManager:
         )
         return True
 
-    def load_dcp(
-        self,
-        checkpoint_id: str | Path,
-        *,
-        strict: bool = True,
-        **kwargs: Any,
-    ) -> Any:
-        """Delegate DCP loading, then apply the restored sharded model state."""
-        backend = self._require_dcp_backend()
-        model_state = self.model.state_dict()
-        state_dict = {"model": model_state}
-        result = backend.load(
-            state_dict,
-            checkpoint_id=checkpoint_id,
-            **kwargs,
-        )
-        self.model.load_state_dict(state_dict["model"], strict=strict)
-        return result
-
-    def save_dcp(self, checkpoint_id: str | Path, **kwargs: Any) -> Any:
-        """Delegate sharded model-state saving to the configured DCP backend."""
-        backend = self._require_dcp_backend()
-        return backend.save(
-            {"model": self.model.state_dict()},
-            checkpoint_id=checkpoint_id,
-            **kwargs,
-        )
-
     def _convert_group(
         self,
         group: _LoadGroup,
@@ -781,14 +725,6 @@ class CheckpointManager:
             if keep_state_dict:
                 gathered[name] = value.cpu() if isinstance(value, torch.Tensor) else value
         return gathered
-
-    def _require_dcp_backend(self) -> DCPBackend:
-        if self.dcp_backend is None:
-            raise NotImplementedError(
-                "DCP backend is not configured; inject the distributed-checkpoint "
-                "implementation through CheckpointManager(dcp_backend=...)"
-            )
-        return self.dcp_backend
 
     @staticmethod
     def _is_main_process() -> bool:
@@ -1086,13 +1022,3 @@ def _finalize_model_loading(
         len(finalized_report.unexpected_keys),
     )
     return finalized_report
-
-
-def load_pretrained_weights(
-    model: nn.Module,
-    pretrained_path: str,
-    *,
-    strict: bool = True,
-) -> LoadReport:
-    """Backward-compatible functional wrapper around CheckpointManager."""
-    return CheckpointManager(model).load_checkpoint(pretrained_path, strict=strict)
