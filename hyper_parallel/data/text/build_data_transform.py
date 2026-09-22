@@ -23,6 +23,7 @@ styles.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -94,9 +95,41 @@ def _normalize_conversation(messages: Any) -> list[dict[str, Any]]:
     return normalized_messages
 
 
-def _encode_messages(chat_template: Any, messages: Sequence[Mapping[str, Any]], max_seq_len: int) -> dict[str, Any]:
+def _normalize_tools(tools: Any, tools_key: str) -> list[dict[str, Any]] | None:
+    """Normalize an explicitly configured tools field for native chat templates."""
+    if tools is None or tools is False:
+        return None
+    if isinstance(tools, str):
+        if not tools:
+            return None
+        try:
+            tools = json.loads(tools)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Tools field {tools_key!r} must contain valid JSON") from exc
+        if tools is None or tools is False:
+            return None
+    if not isinstance(tools, Sequence) or isinstance(tools, (str, bytes)):
+        raise ValueError(f"Tools field {tools_key!r} must be a sequence of mappings")
+
+    normalized_tools = []
+    for tool in tools:
+        if not isinstance(tool, Mapping):
+            raise ValueError(f"Every entry in tools field {tools_key!r} must be a mapping")
+        normalized_tools.append(dict(tool))
+    return normalized_tools or None
+
+
+def _encode_messages(
+        chat_template: Any,
+        messages: Sequence[Mapping[str, Any]],
+        max_seq_len: int,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Encode normalized messages into a shifted causal-language-model sample."""
-    encoded = chat_template.encode_messages(messages, max_seq_len=max_seq_len)
+    encode_kwargs = {"max_seq_len": max_seq_len}
+    if tools:
+        encode_kwargs["tools"] = tools
+    encoded = chat_template.encode_messages(messages, **encode_kwargs)
     input_ids = torch.tensor(encoded["input_ids"], dtype=torch.int64)
     labels = torch.tensor(encoded["labels"], dtype=torch.int64)
     return {
@@ -168,6 +201,7 @@ class TextConversationTransform:
     chat_template: Any
     max_seq_len: int
     text_keys: str | Sequence[str] = "conversation"
+    tools_key: str | None = None
 
     def __post_init__(self) -> None:
         """Validate the chat template and sequence length configuration."""
@@ -175,11 +209,16 @@ class TextConversationTransform:
             raise ValueError("chat_template is required for conversation data")
         if self.max_seq_len <= 0:
             raise ValueError("max_seq_len must be positive")
+        if self.tools_key is not None and (not isinstance(self.tools_key, str) or not self.tools_key):
+            raise ValueError("tools_key must be a non-empty string or None")
 
     def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Encode one conversation record."""
         messages = _normalize_conversation(_get_record_value(sample, self.text_keys))
-        return [_encode_messages(self.chat_template, messages, self.max_seq_len)]
+        tools = None
+        if self.tools_key is not None:
+            tools = _normalize_tools(sample.get(self.tools_key), self.tools_key)
+        return [_encode_messages(self.chat_template, messages, self.max_seq_len, tools)]
 
 
 @dataclass
@@ -252,6 +291,7 @@ def build_llm_data_transform(
         chat_template: Any = None,
         max_seq_len: int,
         text_keys: str | Sequence[str] = "text",
+        tools_key: str | None = None,
         column_mapping: Mapping[str, str] | None = None,
         input_separator: str = "\n\n",
 ) -> Callable[[Any], Any]:
@@ -263,6 +303,7 @@ def build_llm_data_transform(
         chat_template: Chat template used by conversation transforms.
         max_seq_len: Maximum model sequence length.
         text_keys: Field or candidate fields containing the source text.
+        tools_key: Optional field containing tool definitions for conversation data.
         column_mapping: Logical instruction/input/output fields mapped to source columns.
         input_separator: Separator inserted between non-empty instruction and input fields.
 
@@ -273,10 +314,14 @@ def build_llm_data_transform(
         ValueError: If ``data_type`` is unsupported.
     """
     if data_type == "plaintext":
+        if tools_key is not None:
+            raise ValueError("tools_key is only supported for conversation data")
         data_transform = PlaintextTransform(tokenizer, max_seq_len, text_keys)
     elif data_type == "conversation":
-        data_transform = TextConversationTransform(chat_template, max_seq_len, text_keys)
+        data_transform = TextConversationTransform(chat_template, max_seq_len, text_keys, tools_key)
     elif data_type == "instruction":
+        if tools_key is not None:
+            raise ValueError("tools_key is only supported for conversation data")
         if column_mapping is None:
             raise ValueError("column_mapping is required for instruction data")
         data_transform = TextInstructionTransform(

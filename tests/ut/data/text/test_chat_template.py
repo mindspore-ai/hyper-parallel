@@ -150,10 +150,59 @@ class TestChatTemplateGoldens(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_tokenizer_template_forwards_sample_tools(self):
+        """tokenizer: forward tool definitions together with static rendering options."""
+        class RecordingTokenizer(FakeTokenizer):
+            """Record keyword arguments forwarded to the native template."""
+
+            def __init__(self):
+                super().__init__()
+                self.template_kwargs = []
+
+            def apply_chat_template(
+                    self,
+                    messages: Any,
+                    tokenize: bool = True,
+                    add_generation_prompt: bool = False,
+                    return_dict: bool = True,
+                    **kwargs: Any,
+            ) -> Any:
+                """Record native-template options before delegating to the fake tokenizer."""
+                self.template_kwargs.append(kwargs)
+                return super().apply_chat_template(
+                    messages,
+                    tokenize=tokenize,
+                    add_generation_prompt=add_generation_prompt,
+                    return_dict=return_dict,
+                )
+
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        tokenizer = RecordingTokenizer()
+        template = chat_template.build_chat_template(
+            "tokenizer",
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        template.encode_messages(
+            [
+                {"role": "user", "content": "Question"},
+                {"role": "assistant", "content": "Answer"},
+            ],
+            tools=tools,
+        )
+
+        self.assertEqual(tokenizer.template_kwargs, [
+            {"enable_thinking": True, "tools": tools},
+            {"enable_thinking": True, "tools": tools},
+        ])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_template_validates_rendering_kwargs(self):
         """tokenizer: reject Trainer-owned arguments and invalid known reasoning options."""
         invalid_kwargs = (
             ({"tokenize": False}, "Trainer-owned arguments"),
+            ({"tools": []}, "Trainer-owned arguments"),
             ({"enable_thinking": "yes"}, "enable_thinking must be a bool"),
             ({"preserve_thinking": 1}, "preserve_thinking must be a bool"),
             ({"reasoning_effort": "high"}, "reasoning_effort must be one of"),
