@@ -17,12 +17,21 @@
 _hp_multicore_lib=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
 _hp_multicore_vendor="${_hp_multicore_lib}/vendors/hyper_parallel_multicore_nn"
 _hp_multicore_op_api="${_hp_multicore_vendor}/op_api/lib"
+_hp_multicore_shmem_lib="${_hp_multicore_lib}/../shmem/lib"
+_hp_multicore_shmem_private="${_hp_multicore_shmem_lib}/shmem"
 
-if [[ ! -d "${_hp_multicore_vendor}" || ! -f "${_hp_multicore_op_api}/libcust_opapi.so" ]]; then
-    echo "[HP-NATIVE-PAYLOAD-MISSING] multicore vendor is incomplete under ${_hp_multicore_vendor}." >&2
+if [[ ! -d "${_hp_multicore_vendor}" \
+      || ! -f "${_hp_multicore_op_api}/libcust_opapi.so" \
+      || ! -f "${_hp_multicore_shmem_lib}/libhyper_parallel_shmem_ops.so" \
+      || ! -f "${_hp_multicore_shmem_private}/libhyper_parallel_shmem.so" ]]; then
+    echo "[HP-NATIVE-PAYLOAD-MISSING] multicore payload is incomplete under ${_hp_multicore_lib}." >&2
     unset _hp_multicore_lib _hp_multicore_vendor _hp_multicore_op_api
+    unset _hp_multicore_shmem_lib _hp_multicore_shmem_private
     return 1 2>/dev/null || exit 1
 fi
+
+_hp_multicore_shmem_lib=$(cd "${_hp_multicore_shmem_lib}" >/dev/null 2>&1 && pwd)
+_hp_multicore_shmem_private=$(cd "${_hp_multicore_shmem_private}" >/dev/null 2>&1 && pwd)
 
 case ":${ASCEND_CUSTOM_OPP_PATH:-}:" in
     *":${_hp_multicore_vendor}:"*) ;;
@@ -32,5 +41,14 @@ case ":${LD_LIBRARY_PATH:-}:" in
     *":${_hp_multicore_op_api}:"*) ;;
     *) export LD_LIBRARY_PATH="${_hp_multicore_op_api}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
 esac
+case ":${LD_LIBRARY_PATH:-}:" in
+    *":${_hp_multicore_shmem_lib}:"*) ;;
+    *) export LD_LIBRARY_PATH="${_hp_multicore_shmem_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+esac
+case ":${LD_LIBRARY_PATH:-}:" in
+    *":${_hp_multicore_shmem_private}:"*) ;;
+    *) export LD_LIBRARY_PATH="${_hp_multicore_shmem_private}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+esac
 
 unset _hp_multicore_lib _hp_multicore_vendor _hp_multicore_op_api
+unset _hp_multicore_shmem_lib _hp_multicore_shmem_private

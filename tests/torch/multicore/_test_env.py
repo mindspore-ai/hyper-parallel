@@ -45,6 +45,8 @@ def _active_multicore_vendor_roots() -> list[Path]:
         for vendor_root in vendor_roots
         if (vendor_root / "op_api" / "lib" / "libcust_opapi.so").is_file()
         and (vendor_root / "op_api" / "lib").resolve() in library_roots
+        and (vendor_root.parents[1].parent / "shmem" / "lib").resolve() in library_roots
+        and (vendor_root.parents[1].parent / "shmem" / "lib" / "shmem").resolve() in library_roots
     ]
 
 

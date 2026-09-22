@@ -23,6 +23,9 @@ namespace optiling {
 const uint64_t BLOCK_SIZE = 32;
 const uint64_t BUFFER_NUM = 2;
 constexpr int64_t MAX_EXPERT_NUM_PER_RANK = 16;
+constexpr int64_t MIN_RUNTIME_CONFIG_BYTES = 64;
+constexpr int64_t MAX_RUNTIME_CONFIG_BYTES_EXCLUSIVE = int64_t{1} << 32;
+constexpr int64_t MIN_EVENT_COUNTER_BYTES = 4096;
 static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   OP_CHECK_NULL_WITH_CONTEXT(context, context);
   auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
@@ -86,6 +89,20 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   tiling.set_seqSize(seqSize);
   tiling.set_coreNum(static_cast<int64_t>(coreNum));
 
+  auto runtimeShape = context->GetInputShape(20);
+  auto eventShape = context->GetInputShape(21);
+  OP_CHECK_NULL_WITH_CONTEXT(context, runtimeShape);
+  OP_CHECK_NULL_WITH_CONTEXT(context, eventShape);
+  int64_t runtimeBytes = runtimeShape->GetStorageShape().GetShapeSize();
+  int64_t eventBytes = eventShape->GetStorageShape().GetShapeSize();
+  if (runtimeBytes < MIN_RUNTIME_CONFIG_BYTES || runtimeBytes >= MAX_RUNTIME_CONFIG_BYTES_EXCLUSIVE ||
+      eventBytes < MIN_EVENT_COUNTER_BYTES) {
+    OP_LOGE(context->GetNodeName(), "Invalid runtime/event byte lengths: %ld/%ld.", runtimeBytes, eventBytes);
+    return ge::GRAPH_FAILED;
+  }
+  tiling.set_runtimeConfigBytes(runtimeBytes);
+  tiling.set_eventCounterBytes(eventBytes);
+
   auto rawTilingData = context->GetRawTilingData();
   OP_CHECK_NULL_WITH_CONTEXT(context, rawTilingData);
   tiling.SaveToBuffer(rawTilingData->GetData(), rawTilingData->GetCapacity());
@@ -93,7 +110,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
 
   size_t *currentWorkspace = context->GetWorkspaceSizes(1);
   OP_CHECK_NULL_WITH_CONTEXT(context, currentWorkspace);
-  currentWorkspace[0] = 95420928;
+  // The composed kernels have no user workspace; retain the CANN library reserve.
+  currentWorkspace[0] = ascendcPlatform.GetLibApiWorkSpaceSize();
   return ge::GRAPH_SUCCESS;
 }
 

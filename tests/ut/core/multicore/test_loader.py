@@ -46,13 +46,20 @@ class TestMulticoreNative(unittest.TestCase):
         )
         adapter.parent.mkdir(parents=True)
         adapter.write_bytes(b"adapter")
+        self.shmem_root = self.native_root.parent / "shmem" / "lib"
+        (self.shmem_root / "shmem").mkdir(parents=True)
 
     def test_component_paths_accept_sourced_environment_without_modifying_it(self):
         """Lookup accepts the sourced vendor paths without changing the process environment."""
         op_api_root = self.vendor_root / "op_api" / "lib"
         environment = {
             "ASCEND_CUSTOM_OPP_PATH": os.pathsep.join(["preexisting", str(self.vendor_root)]),
-            "LD_LIBRARY_PATH": os.pathsep.join(["existing-lib", str(op_api_root)]),
+            "LD_LIBRARY_PATH": os.pathsep.join([
+                "existing-lib",
+                str(op_api_root),
+                str(self.shmem_root),
+                str(self.shmem_root / "shmem"),
+            ]),
         }
         with patch.dict(os.environ, environment, clear=True), patch.object(
             _loader, "_component_root", return_value=self.native_root

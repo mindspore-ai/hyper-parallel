@@ -56,7 +56,8 @@ aclTensor *CreateContiguousTensorList(const aclTensor *tensorList, aclOpExecutor
   return tensor;
 }
 
-static void SetTransposedTensorListContiguous(HyperMegaMoeGradParams &params, aclOpExecutor *executorPtr) {
+static void SetTransposedTensorListContiguous(hyper_parallel::multicore::HyperMegaMoeGradParams &params,
+                                              aclOpExecutor *executorPtr) {
   aclTensor *hidden = CreateContiguousTensorList(params.hidden, executorPtr);
   params.hidden = hidden;
 
@@ -100,6 +101,7 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
   const aclTensor *act_grad_tiling, const aclTensor *gate_grad_tiling, const aclTensor *w1_grad_tiling,
   const aclTensor *w2_grad_tiling, const aclTensor *swiglu_grad_tiling, const aclTensor *gmm_workspace,
   const aclTensor *swiglu_grad_workspace, const aclTensor *runtime_config, const aclTensor *all_event_counters,
+  const aclTensor *profile_buffer,
   int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, uint64_t *workspaceSize,
   aclOpExecutor **executor) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
@@ -108,14 +110,15 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
                         weight, y, gate, grad_gate, w1, gate_dx, grad_x, combine_target_off, combine_src_off,
                         combine_size, permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling,
                         w1_grad_tiling, w2_grad_tiling, swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
-                        runtime_config, all_event_counters, rankId, ep, expert_num, hidden_size, seq_size),
+                        runtime_config, all_event_counters, profile_buffer, rankId, ep, expert_num, hidden_size,
+                        seq_size),
                  DFX_OUT(dispatch_target, hidden_dw, y, grad_gate, gate_dx, grad_x, gate_dw));
 
   auto uniqueExecutor = CREATE_EXECUTOR();
   aclOpExecutor *executorPtr = uniqueExecutor.get();
   CHECK_RET(executorPtr != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
 
-  HyperMegaMoeGradParams params{hidden, w1, permute_out, weight};
+  hyper_parallel::multicore::HyperMegaMoeGradParams params{hidden, w1, permute_out, weight};
   SetTransposedTensorListContiguous(params, executorPtr);
 
 // Create contiguous tensors in a batch and check for null pointers.
@@ -148,6 +151,7 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
   MAKE_CONTIGUOUS_CHECK(swiglu_grad_workspace);
   MAKE_CONTIGUOUS_CHECK(runtime_config);
   MAKE_CONTIGUOUS_CHECK(all_event_counters);
+  MAKE_CONTIGUOUS_CHECK(profile_buffer);
 
 #undef MAKE_CONTIGUOUS_CHECK
 
@@ -167,8 +171,8 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
     dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size, params.hidden, hidden_dw, params.weight,
     y, gate, grad_gate, params.w1, gate_dx, grad_x, combine_target_off, combine_src_off, combine_size,
     params.permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
-    swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, rankId, ep,
-    expert_num, hidden_size, seq_size, executorPtr);
+    swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, profile_buffer,
+    rankId, ep, expert_num, hidden_size, seq_size, executorPtr);
   bool bwd_output_success = std::all_of(bwd_output.begin(), bwd_output.end(), [](const aclTensor* ptr) {
     return ptr != nullptr;
   });

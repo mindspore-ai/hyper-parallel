@@ -14,10 +14,16 @@
  * limitations under the License.
  */
 
+#include "data_plane/rma.h"
+#include "data_plane/sync.h"
 #include "kernel_operator.h"
 #include "shmem.h"
 
 using namespace AscendC;
+
+namespace shmem_data_plane = hyper_parallel::multicore::shmem::data_plane;
+
+namespace hyper_parallel::multicore {
 
 template <typename T>
 __aicore__ inline void CopyGmSingleValueToUb(GM_ADDR gm_addr, T *result) {
@@ -70,7 +76,7 @@ class PutMemSignalKernel {
     uint64_t copy_ub_size = device_state->mte_config.ub_size;
     __ubuf__ T *ping_buff = reinterpret_cast<__ubuf__ T *>(copy_ub);
     __ubuf__ T *pong_buff = reinterpret_cast<__ubuf__ T *>(copy_ub + copy_ub_size / 2);
-    auto ptr = aclshmem_ptr(target_ptr, target_pe_);
+    auto ptr = shmem_data_plane::remote_ptr(target_ptr, target_pe_);
     __gm__ T *remote_ptr = reinterpret_cast<__gm__ T *>(ptr);
     uint64_t block_size = copy_ub_size / 2 / sizeof(T) * sizeof(T);
     uint64_t remain = (size_per_core * sizeof(T)) % block_size;
@@ -105,9 +111,9 @@ class PutMemSignalKernel {
     // Write signal after data transfer
     auto signal_ptr = signal_ + signal_offset_;
     if (non_blocking_) {
-      aclshmem_fence();
+      shmem_data_plane::fence();
     } else {
-      aclshmem_fence();
+      shmem_data_plane::fence();
     }
     // Sync ensure corresponding tasks are done
     if (aiv_num_ > 1) {
@@ -117,8 +123,9 @@ class PutMemSignalKernel {
     }
 
     if (aiv_idx_ == 0) {
-      aclshmemx_signal_op(signal_ptr, signal_value_, signal_op_ == 1 ? ACLSHMEM_SIGNAL_ADD : ACLSHMEM_SIGNAL_SET,
-                          target_pe_);
+      shmem_data_plane::signal(signal_ptr, signal_value_,
+                               signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
+                               target_pe_);
     }
   }
 
@@ -143,11 +150,13 @@ class PutMemSignalKernel {
   uint32_t aiv_num_ = 0;
 };
 
+}  // namespace hyper_parallel::multicore
+
 extern "C" inline __aicore__ void put_mem_signal_kernel(GM_ADDR target, int64_t target_offset, GM_ADDR src,
                                                         int64_t src_offset, int64_t size, GM_ADDR signal,
                                                         int64_t signal_offset, int64_t signal_value, GM_ADDR workspace,
                                                         int64_t signal_op, int64_t target_pe, bool non_blocking) {
-  PutMemSignalKernel<DTYPE_DISPATCH_TARGET> op;
+  hyper_parallel::multicore::PutMemSignalKernel<DTYPE_DISPATCH_TARGET> op;
   op.Init(target, target_offset, src, src_offset, size, signal, signal_offset, signal_value, signal_op, target_pe,
           non_blocking, workspace);
   op.Process();

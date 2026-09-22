@@ -22,7 +22,9 @@ The Qwen Router computes `topk_ids`, `topk_weights`, and
 Each decoder layer keeps independent expert parameters and optimizer state.
 All serial MegaMoe layers call `share_execution_resources()` before first
 forward and therefore reuse one SHMEM runtime/workspace. The benchmark calls
-`QwenMoeModel.close()` before destroying the process group.
+`QwenMoeModel.close()` before destroying the process group. Execution resources
+acquire and release their SHMEM references internally; model code only closes
+`MegaMoeExperts` (through `QwenMoeModel.close()`) and never calls SHMEM directly.
 
 The public `MegaMoeExperts` API and this benchmark default
 `expert_capacity_factor` to `None`, which reserves the maximum lossless receive
@@ -74,7 +76,7 @@ bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh
 
 `NNODES * NPROC_PER_NODE` must equal EP8. This minimal benchmark uses one
 SHMEM communicator over the full Torch world. The launcher sets
-`SHMEM_IP_PORT` from `SHMEM_HOST` (defaulting to `MASTER_ADDR`) and
+`HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT` from `SHMEM_HOST` (defaulting to `MASTER_ADDR`) and
 `SHMEM_PORT`; subgroup endpoint discovery is intentionally outside this PR.
 
 ## Output

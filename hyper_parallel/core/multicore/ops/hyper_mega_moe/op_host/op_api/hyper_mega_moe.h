@@ -27,6 +27,7 @@ const std::array<const aclTensor *, 5> HyperMegaMoe(
   const aclTensor *combine_target_off, const aclTensor *combine_src_off, const aclTensor *combine_size,
   const aclTensor *gmm_workspace, const aclTensor *up_proj_tiling, const aclTensor *swiglu_tiling,
   const aclTensor *down_proj_tiling, const aclTensor *runtime_config, const aclTensor *all_event_counters,
+  const aclTensor *profile_buffer,
   int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, aclOpExecutor *executor);
 }  // namespace l0op
 

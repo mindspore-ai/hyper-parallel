@@ -16,16 +16,79 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch_npu
 
+from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_call
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from .plan import MegaMoePlan
-from .route import RouteMetadata
+from .route import PreparedTopKRoute, RouteMetadata
 from .workspace import MegaMoeWorkspace
 
+
+@dataclass(frozen=True)
+class _ForwardIntermediates:
+    """Forward tensors owned by one autograd invocation."""
+
+    up_proj: Any
+    activation: Any
+    down_proj: Any
+
+
+@dataclass(frozen=True)
+class _SavedBackwardState:
+    """Forward tensors and route metadata restored by backward."""
+
+    dispatch: Any
+    up_proj: Any
+    activation: Any
+    weight1: Any
+    weight2: Any
+    group_list: Any
+    dispatch_src_off: Any
+    dispatch_target_off: Any
+    dispatch_size: Any
+    combine_src_off: Any
+    combine_target_off: Any
+    combine_size: Any
+
+
+@dataclass(frozen=True)
+class _BackwardIntermediates:
+    """Backward tensors owned by one autograd invocation."""
+
+    grad_weight1: Any
+    grad_weight2: Any
+    act_grad: Any
+    swiglu_grad: Any
+    gate_dx: Any
+
+
+@dataclass(frozen=True)
+class _ForwardExecution:
+    """Borrowed workspace and profiler state for one forward launch."""
+
+    dispatch: Any
+    combine: Any
+    profile_call: Any
+    gmm_workspace: Any
+    intermediates: _ForwardIntermediates
+
+
+@dataclass(frozen=True)
+class _BackwardExecution:
+    """Borrowed workspace and profiler state for one backward launch."""
+
+    dispatch: Any
+    grad_x: Any
+    profile_call: Any
+    gmm_workspace: Any
+    swiglu_workspace: Any
+    intermediates: _BackwardIntermediates
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -40,19 +103,20 @@ def _allocate_forward_intermediates(
     capacity: int,
     routed_tokens: Any,
     dispatch: Any,
-) -> tuple[Any, Any, Any]:
-    """Allocate forward tensors outside the autograd bridge."""
-    up_proj = torch.zeros(
+) -> _ForwardIntermediates:
+    """Allocate outputs whose received rows are overwritten before use."""
+    # GMM and SwiGLU cover the received prefix; an empty rank reads no rows.
+    up_proj = torch.empty(
         (capacity, spec.intermediate_size * 2),
         dtype=routed_tokens.dtype,
         device=routed_tokens.device,
     )
-    activation = torch.zeros(
+    activation = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=routed_tokens.dtype,
         device=routed_tokens.device,
     )
-    return up_proj, activation, torch.zeros_like(dispatch)
+    return _ForwardIntermediates(up_proj, activation, torch.empty_like(dispatch[:capacity]))
 
 
 def _allocate_backward_intermediates(
@@ -61,45 +125,141 @@ def _allocate_backward_intermediates(
     grad_output: Any,
     weight1: Any,
     weight2: Any,
-) -> tuple[Any, Any, Any, Any, Any]:
-    """Allocate zero-safe backward tensors outside the autograd bridge."""
+) -> _BackwardIntermediates:
+    """Allocate overwritten activations and zero-safe expert gradients."""
     grad_weight2 = torch.zeros_like(weight2)
-    act_grad = torch.zeros(
+    act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
         device=grad_output.device,
     )
-    swiglu_grad = torch.zeros(
+    swiglu_grad = torch.empty(
         (capacity, spec.intermediate_size * 2),
         dtype=grad_output.dtype,
         device=grad_output.device,
     )
-    gate_dx = torch.zeros(
+    gate_dx = torch.empty(
         (capacity, spec.hidden_size),
         dtype=grad_output.dtype,
         device=grad_output.device,
     )
     # Empty experts must retain exact zero gradients on the baseline kernel.
     grad_weight1 = torch.zeros_like(weight1)
-    return grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx
+    return _BackwardIntermediates(grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx)
+
+
+def _saved_backward_state(saved_tensors: tuple[Any, ...]) -> _SavedBackwardState:
+    """Restore named kernel state from the flat autograd tensor tuple."""
+    return _SavedBackwardState(*saved_tensors[:12])
+
+
+def _prepare_forward_execution(
+    workspace: MegaMoeWorkspace,
+    plan: MegaMoePlan,
+    routed_tokens: Any,
+    capacity: int,
+) -> _ForwardExecution:
+    """Resolve workspace, profiler, and intermediate tensors for forward."""
+    dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
+    combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
+    profile_call = None
+    try:
+        events = workspace.prepare_event_counters(forward=True)
+        profile_call = prepare_mega_kernel_call(
+            plan.fwd_runtime,
+            direction="forward",
+            fallback_event_counters=events,
+        )
+        return _ForwardExecution(
+            dispatch=dispatch,
+            combine=combine,
+            profile_call=profile_call,
+            gmm_workspace=_workspace_tensor(workspace.gmm_workspace, "gmm_workspace"),
+            intermediates=_allocate_forward_intermediates(
+                plan.spec,
+                capacity,
+                routed_tokens,
+                dispatch,
+            ),
+        )
+    except Exception:
+        if profile_call is not None:
+            profile_call.cancel()
+        raise
+
+
+def _prepare_backward_execution(
+    workspace: MegaMoeWorkspace,
+    plan: MegaMoePlan,
+    saved: _SavedBackwardState,
+    grad_output: Any,
+) -> _BackwardExecution:
+    """Resolve workspace, profiler, and intermediate tensors for backward."""
+    dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
+    grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
+    profile_call = None
+    try:
+        events = workspace.prepare_event_counters(forward=False)
+        profile_call = prepare_mega_kernel_call(
+            plan.bwd_runtime,
+            direction="backward",
+            fallback_event_counters=events,
+        )
+        return _BackwardExecution(
+            dispatch=dispatch,
+            grad_x=grad_x,
+            profile_call=profile_call,
+            gmm_workspace=_workspace_tensor(workspace.gmm_workspace, "gmm_workspace"),
+            swiglu_workspace=_workspace_tensor(
+                workspace.swiglu_grad_workspace,
+                "swiglu_grad_workspace",
+            ),
+            intermediates=_allocate_backward_intermediates(
+                plan.spec,
+                saved.dispatch.shape[0],
+                grad_output,
+                saved.weight1,
+                saved.weight2,
+            ),
+        )
+    except Exception:
+        if profile_call is not None:
+            profile_call.cancel()
+        raise
+
+
+def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any, ...]) -> Any:
+    """Return an owned input gradient while the workspace lease is held."""
+    if not ctx.needs_input_grad[0]:
+        return None
+    if not ctx.has_permutation:
+        return grad_x.clone()
+    (unpermute_mapping,) = permutation_inputs
+    spec = ctx.plan.spec
+    # Consume the shared gradient before release records completion.
+    # The permutation gradient owns its reduced [T, H] output.
+    return torch_npu.npu_moe_token_permute_grad_v2(
+        grad_x, unpermute_mapping, spec.local_num_tokens, grad_x.dtype, spec.top_k
+    )
 
 
 def _save_forward_state(
     ctx: Any,
     plan: MegaMoePlan,
     workspace: MegaMoeWorkspace,
-    dispatch: Any,
+    saved_dispatch: Any,
     up_proj: Any,
     activation: Any,
     weight1: Any,
     weight2: Any,
     metadata: RouteMetadata,
+    permutation_inputs: tuple[Any, ...] = (),
 ) -> None:
     """Save owned forward tensors and route state for backward."""
     ctx.plan = plan
     ctx.workspace = workspace
     ctx.save_for_backward(
-        dispatch.clone(),
+        saved_dispatch,
         up_proj,
         activation,
         weight1,
@@ -111,16 +271,106 @@ def _save_forward_state(
         metadata.combine_src_off,
         metadata.combine_target_off,
         metadata.combine_size,
+        *permutation_inputs,
+    )
+
+
+def _launch_forward_kernel(
+    plan: MegaMoePlan,
+    metadata: RouteMetadata,
+    routed_tokens: Any,
+    weight1: Any,
+    weight2: Any,
+    execution: _ForwardExecution,
+) -> None:
+    """Launch the internal forward ABI with prepared buffers and metadata."""
+    spec = plan.spec
+    multicore_ops.mega_moe_with_profile_buffer(
+        execution.dispatch,
+        metadata.dispatch_target_off * spec.hidden_size,
+        routed_tokens.contiguous(),
+        metadata.dispatch_src_off * spec.hidden_size,
+        metadata.dispatch_size * spec.hidden_size,
+        weight1.contiguous(),
+        metadata.group_list,
+        execution.intermediates.up_proj,
+        execution.intermediates.activation,
+        weight2.contiguous(),
+        metadata.group_list,
+        execution.intermediates.down_proj,
+        execution.combine,
+        metadata.combine_target_off * spec.hidden_size,
+        metadata.combine_src_off * spec.hidden_size,
+        metadata.combine_size * spec.hidden_size,
+        execution.gmm_workspace,
+        plan.up_proj_tiling,
+        plan.swiglu_tiling,
+        plan.down_proj_tiling,
+        execution.profile_call.runtime_config,
+        execution.profile_call.event_counters,
+        execution.profile_call.profile_buffer,
+        spec.rank_id,
+        spec.ep_size,
+        spec.num_experts,
+        spec.hidden_size,
+        spec.local_num_tokens,
+    )
+
+
+def _launch_backward_kernel(
+    plan: MegaMoePlan,
+    saved: _SavedBackwardState,
+    grad_output: Any,
+    execution: _BackwardExecution,
+) -> None:
+    """Launch the internal backward ABI with prepared buffers and metadata."""
+    spec = plan.spec
+    gradients = execution.intermediates
+    multicore_ops.mega_moe_grad_with_profile_buffer(
+        execution.dispatch,
+        saved.dispatch_target_off * spec.hidden_size,
+        grad_output.contiguous(),
+        saved.dispatch_src_off * spec.hidden_size,
+        saved.dispatch_size * spec.hidden_size,
+        saved.activation,
+        gradients.grad_weight2,
+        saved.weight2,
+        gradients.act_grad,
+        saved.up_proj,
+        gradients.swiglu_grad,
+        saved.weight1,
+        gradients.gate_dx,
+        execution.grad_x,
+        saved.combine_target_off * spec.hidden_size,
+        saved.combine_src_off * spec.hidden_size,
+        saved.combine_size * spec.hidden_size,
+        saved.dispatch,
+        gradients.grad_weight1,
+        saved.group_list,
+        plan.act_grad_tiling,
+        plan.gate_grad_tiling,
+        plan.w1_grad_tiling,
+        plan.w2_grad_tiling,
+        plan.swiglu_grad_tiling,
+        execution.gmm_workspace,
+        execution.swiglu_workspace,
+        execution.profile_call.runtime_config,
+        execution.profile_call.event_counters,
+        execution.profile_call.profile_buffer,
+        spec.rank_id,
+        spec.ep_size,
+        spec.num_experts,
+        spec.hidden_size,
+        spec.local_num_tokens,
     )
 
 
 # Torch declares variadic autograd hooks; concrete functions use operator-specific signatures.
-class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
-    torch.autograd.Function
-):
+class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
     """Autograd bridge for the in-place forward/backward custom ops."""
 
     @staticmethod
+    # pylint: disable-next=arguments-differ
     def forward(
         ctx: Any,
         routed_tokens: Any,
@@ -129,6 +379,7 @@ class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
         route: RouteMetadata,
         plan: MegaMoePlan,
         workspace: MegaMoeWorkspace,
+        permutation: tuple[Any, Any, Any] | None,
     ) -> Any:
         """Launch the legacy forward op and save owned backward inputs.
 
@@ -140,81 +391,65 @@ class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
             route: Route offsets, sizes and group metadata.
             plan: Shape-specific forward and backward descriptors.
             workspace: Reusable directional execution buffers.
+            permutation: Optional routed rows, expert IDs and inverse mapping
+                when the first tensor argument contains original token rows.
 
         Returns:
             Owned expert-major output rows.
         """
         spec = plan.spec
         metadata = route
+        permutation_inputs = ()
+        if permutation is not None:
+            routed_tokens, _, unpermute_mapping = permutation
+            if ctx.needs_input_grad[0]:
+                permutation_inputs = (unpermute_mapping,)
+        ctx.has_permutation = permutation is not None
         workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
         workspace.claim()
+        execution = None
         try:
-            dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
-            combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
-            events = _workspace_tensor(
-                workspace.forward_event_counters,
-                "forward_event_counters",
-            )
-            gmm_workspace = _workspace_tensor(
-                workspace.gmm_workspace, "gmm_workspace"
-            )
-            dispatch.zero_()
-            combine.zero_()
-            events.zero_()
-            capacity = workspace.expert_capacity
-            up_proj, activation, down_proj = _allocate_forward_intermediates(
-                spec,
-                capacity,
+            # Dispatch and combine overwrite disjoint route ranges before consumers run.
+            capacity = metadata.expert_capacity
+            execution = _prepare_forward_execution(
+                workspace,
+                plan,
                 routed_tokens,
-                dispatch,
+                capacity,
             )
-            workspace.symmetric_memory.barrier()
-            multicore_ops.mega_moe(
-                dispatch,
-                metadata.dispatch_target_off * spec.hidden_size,
-                routed_tokens.contiguous(),
-                metadata.dispatch_src_off * spec.hidden_size,
-                metadata.dispatch_size * spec.hidden_size,
-                weight1.contiguous(),
-                metadata.group_list,
-                up_proj,
-                activation,
-                weight2.contiguous(),
-                metadata.group_list,
-                down_proj,
-                combine,
-                metadata.combine_target_off * spec.hidden_size,
-                metadata.combine_src_off * spec.hidden_size,
-                metadata.combine_size * spec.hidden_size,
-                gmm_workspace,
-                plan.up_proj_tiling,
-                plan.swiglu_tiling,
-                plan.down_proj_tiling,
-                plan.fwd_runtime_config,
-                events,
-                spec.rank_id,
-                spec.ep_size,
-                spec.num_experts,
-                spec.hidden_size,
-                spec.local_num_tokens,
+            _launch_forward_kernel(
+                plan,
+                metadata,
+                routed_tokens,
+                weight1,
+                weight2,
+                execution,
             )
-            output = combine.clone()
+            execution.profile_call.complete()
+            output = execution.combine.clone()
+            # Combine has consumed down_proj on this stream. Retain its owned
+            # storage for backward before the next call reuses SHMEM dispatch.
+            execution.intermediates.down_proj.copy_(execution.dispatch[:capacity])
             _save_forward_state(
                 ctx,
                 plan,
                 workspace,
-                dispatch,
-                up_proj,
-                activation,
+                execution.intermediates.down_proj,
+                execution.intermediates.up_proj,
+                execution.intermediates.activation,
                 weight1,
                 weight2,
                 metadata,
+                permutation_inputs,
             )
             return output
         finally:
+            if execution is not None:
+                execution.profile_call.cancel()
             workspace.release()
 
     @staticmethod
+    # pylint: disable-next=arguments-differ
     def backward(ctx: Any, grad_output: Any) -> tuple[Any, ...]:
         """Launch the legacy backward op into zero-safe gradient buffers.
 
@@ -227,94 +462,38 @@ class _MegaMoeFunction(  # pylint: disable=abstract-method,arguments-differ
         """
         plan = ctx.plan
         workspace = ctx.workspace
-        spec = plan.spec
-        (
-            saved_dispatch,
-            up_proj,
-            activation,
-            weight1,
-            weight2,
-            group_list,
-            dispatch_src_off,
-            dispatch_target_off,
-            dispatch_size,
-            combine_src_off,
-            combine_target_off,
-            combine_size,
-        ) = ctx.saved_tensors
+        saved = _saved_backward_state(ctx.saved_tensors)
+        permutation_inputs = ctx.saved_tensors[12:]
         workspace.claim()
+        execution = None
         try:
-            dispatch = _workspace_tensor(workspace.expert_buffer, "expert_buffer")
-            grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
-            events = _workspace_tensor(
-                workspace.backward_event_counters,
-                "backward_event_counters",
-            )
-            gmm_workspace = _workspace_tensor(
-                workspace.gmm_workspace, "gmm_workspace"
-            )
-            swiglu_workspace = _workspace_tensor(
-                workspace.swiglu_grad_workspace,
-                "swiglu_grad_workspace",
-            )
-            dispatch.zero_()
-            grad_x.zero_()
-            events.zero_()
-            capacity = workspace.expert_capacity
-            (
-                grad_weight1,
-                grad_weight2,
-                act_grad,
-                swiglu_grad,
-                gate_dx,
-            ) = _allocate_backward_intermediates(
-                spec,
-                capacity,
+            execution = _prepare_backward_execution(
+                workspace,
+                plan,
+                saved,
                 grad_output,
-                weight1,
-                weight2,
             )
-            workspace.symmetric_memory.barrier()
-            multicore_ops.mega_moe_grad(
-                dispatch,
-                dispatch_target_off * spec.hidden_size,
-                grad_output.contiguous(),
-                dispatch_src_off * spec.hidden_size,
-                dispatch_size * spec.hidden_size,
-                activation,
-                grad_weight2,
-                weight2,
-                act_grad,
-                up_proj,
-                swiglu_grad,
-                weight1,
-                gate_dx,
-                grad_x,
-                combine_target_off * spec.hidden_size,
-                combine_src_off * spec.hidden_size,
-                combine_size * spec.hidden_size,
-                saved_dispatch,
-                grad_weight1,
-                group_list,
-                plan.act_grad_tiling,
-                plan.gate_grad_tiling,
-                plan.w1_grad_tiling,
-                plan.w2_grad_tiling,
-                plan.swiglu_grad_tiling,
-                gmm_workspace,
-                swiglu_workspace,
-                plan.bwd_runtime_config,
-                events,
-                spec.rank_id,
-                spec.ep_size,
-                spec.num_experts,
-                spec.hidden_size,
-                spec.local_num_tokens,
+            _launch_backward_kernel(
+                plan,
+                saved,
+                grad_output,
+                execution,
             )
-            return grad_x.clone(), grad_weight1, grad_weight2, None, None, None
+            execution.profile_call.complete()
+            grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
+            return (
+                grad_input,
+                execution.intermediates.grad_weight1,
+                execution.intermediates.grad_weight2,
+                None,
+                None,
+                None,
+                None,
+            )
         finally:
+            if execution is not None:
+                execution.profile_call.cancel()
             workspace.release()
-
 
 
 def execute_mega_moe(
@@ -338,4 +517,39 @@ def execute_mega_moe(
     Returns:
         Expert-major output rows with independent storage.
     """
-    return _MegaMoeFunction.apply(routed_tokens, weight1, weight2, route, plan, workspace)
+    return _MegaMoeFunction.apply(routed_tokens, weight1, weight2, route, plan, workspace, None)
+
+
+def execute_mega_moe_with_permutation(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    weight1: torch.Tensor,
+    weight2: torch.Tensor,
+    route: PreparedTopKRoute,
+    plan: MegaMoePlan,
+    workspace: MegaMoeWorkspace,
+) -> torch.Tensor:
+    """Include input permutation backward within the workspace lease.
+
+    Args:
+        hidden_states: Original flattened token rows.
+        topk_ids: Expert IDs used to prepare the routed rows.
+        weight1: Local gate and up-projection weights.
+        weight2: Local down-projection weights.
+        route: Rows and metadata prepared without recording autograd operations.
+        plan: Shape-specific native descriptors.
+        workspace: Reusable communication buffers.
+
+    Returns:
+        Owned expert-major output rows, differentiable with respect to the
+        original token rows and local expert weights.
+    """
+    return _MegaMoeFunction.apply(
+        hidden_states,
+        weight1,
+        weight2,
+        route.metadata,
+        plan,
+        workspace,
+        (route.routed_tokens, topk_ids, route.unpermute_mapping),
+    )

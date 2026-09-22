@@ -34,6 +34,7 @@ from prepare_dependencies import verify_git_dependency
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _LOCK_PATH = Path(__file__).with_name("dependencies.lock.json")
 _MULTICORE_OPS = _REPO_ROOT / "hyper_parallel" / "core" / "multicore" / "ops"
+_SHMEM_CCSRC = _REPO_ROOT / "hyper_parallel" / "core" / "multicore" / "shmem" / "ccsrc"
 _OPS_NN_PATHS = (
     "activation/swi_glu/op_kernel",
     "activation/swi_glu_grad/op_kernel",
@@ -180,6 +181,14 @@ def _compose_hyper_parallel_ops(
     transformer_copy: Path,
 ) -> None:
     """Compose HP operator code with selected adapted upstream kernel sources."""
+    shmem_root = source_root / "shmem"
+    shmem_root.mkdir(parents=True)
+    (shmem_root / "cann").mkdir()
+    shutil.copy2(_SHMEM_CCSRC / "cann" / "device.h", shmem_root / "cann" / "device.h")
+    shutil.copy2(_SHMEM_CCSRC / "cann" / "signal.h", shmem_root / "cann" / "signal.h")
+    (shmem_root / "data_plane").mkdir()
+    shutil.copy2(_SHMEM_CCSRC / "data_plane" / "rma.h", shmem_root / "data_plane" / "rma.h")
+    shutil.copy2(_SHMEM_CCSRC / "data_plane" / "sync.h", shmem_root / "data_plane" / "sync.h")
     for operator_name in _HYPER_OPERATORS:
         operator_root = source_root / operator_name
         shutil.copytree(_MULTICORE_OPS / operator_name, operator_root)
@@ -208,6 +217,8 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_moe_grad" / "op_host" / "hyper_mega_moe_grad_def.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "hyper_mega_moe_grad.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad" / "swi_glu_grad.cpp",
+        source_root / "shmem" / "data_plane" / "rma.h",
+        source_root / "shmem" / "data_plane" / "sync.h",
     )
     missing = [str(path) for path in required_paths if not path.is_file()]
     if missing:

@@ -7,22 +7,24 @@
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
+#include "aclnn_hyper_mega_moe.h"
+
+#include "aclnn/aclnn_base.h"
+#include "aclnn_kernels/cast.h"
+#include "aclnn_kernels/common/op_error_check.h"
 #include "aclnn_kernels/contiguous.h"
 #include "aclnn_kernels/reshape.h"
-#include "aclnn/aclnn_base.h"
 #include "opdev/common_types.h"
-#include "opdev/shape_utils.h"
 #include "opdev/data_type_utils.h"
 #include "opdev/format_utils.h"
+#include "opdev/make_op_executor.h"
 #include "opdev/op_dfx.h"
 #include "opdev/op_executor.h"
 #include "opdev/op_log.h"
-#include "opdev/tensor_view_utils.h"
-#include "opdev/make_op_executor.h"
-#include "aclnn_kernels/common/op_error_check.h"
 #include "opdev/platform.h"
-#include "aclnn_kernels/cast.h"
-#include "aclnn_hyper_mega_moe.h"
+#include "opdev/shape_utils.h"
+#include "opdev/tensor_view_utils.h"
+
 #include "hyper_mega_moe.h"
 
 #ifdef __cplusplus
@@ -37,6 +39,7 @@ aclnnStatus aclnnHyperMegaMoeGetWorkspaceSize(
   const aclTensor *combine_target_off, const aclTensor *combine_src_off, const aclTensor *combine_size,
   const aclTensor *gmm_workspace, const aclTensor *up_proj_tiling, const aclTensor *swiglu_tiling,
   const aclTensor *down_proj_tiling, const aclTensor *runtime_config, const aclTensor *all_event_counters,
+  const aclTensor *profile_buffer,
   int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, uint64_t *workspaceSize,
   aclOpExecutor **executor) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
@@ -45,7 +48,7 @@ aclnnStatus aclnnHyperMegaMoeGetWorkspaceSize(
     DFX_IN(dispatch_target, dispatch_target_off, dispatch_src, dispatch_src_off, dispatch_size, weight, up_proj_glist,
            y, swiglu_out, down_proj_weight, down_proj_glist, down_proj_y, combine_target, combine_target_off,
            combine_src_off, combine_size, gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
-           runtime_config, all_event_counters, rankId, ep, expert_num, hidden_size, seq_size),
+           runtime_config, all_event_counters, profile_buffer, rankId, ep, expert_num, hidden_size, seq_size),
     DFX_OUT(dispatch_target, y, swiglu_out, down_proj_y, combine_target));
   auto uniqueExecutor = CREATE_EXECUTOR();
   aclOpExecutor *executorPtr = uniqueExecutor.get();
@@ -77,6 +80,7 @@ aclnnStatus aclnnHyperMegaMoeGetWorkspaceSize(
   MAKE_CONTIGUOUS_CHECK(down_proj_tiling);
   MAKE_CONTIGUOUS_CHECK(runtime_config);
   MAKE_CONTIGUOUS_CHECK(all_event_counters);
+  MAKE_CONTIGUOUS_CHECK(profile_buffer);
 
 #undef MAKE_CONTIGUOUS_CHECK
 
@@ -84,6 +88,7 @@ aclnnStatus aclnnHyperMegaMoeGetWorkspaceSize(
     dispatch_target, dispatch_target_off, dispatch_src, dispatch_src_off, dispatch_size, weight, up_proj_glist, y,
     swiglu_out, down_proj_weight, down_proj_glist, down_proj_y, combine_target, combine_target_off, combine_src_off,
     combine_size, gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling, runtime_config, all_event_counters,
+    profile_buffer,
     rankId, ep, expert_num, hidden_size, seq_size, uniqueExecutor.get());
   bool fwd_output_success = std::all_of(fwd_output.begin(), fwd_output.end(), [](const aclTensor* ptr) {
     return ptr != nullptr;

@@ -85,7 +85,7 @@ def _build_fwd_tensor_specs(tsv, hidden_size, intermediate_size, dtype_size):
 
 
 def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
-                   down_proj_sv, combine_sv, num_cube_cores):
+                   down_proj_sv, combine_sv, num_cube_cores, swiglu_limit=None):
     """Create all OperatorNode objects for the forward graph."""
     (target, target_offset, src, src_offset, size_d,
      up_proj_weight, up_proj_glist, up_proj_y, swiglu_out,
@@ -93,6 +93,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
      combine_out, target_offset_c, src_offset_c, size_c) = specs
     dispatch = OperatorNode(
         name="dispatch", op_type=OpType.ALLTOALL,
+        diagnostic_name="Dispatch",
         inputs=[target_offset, src, src_offset, size_d],
         outputs=[target],
         param_positions=[1, 2, 3, 4, 0],
@@ -107,6 +108,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
     )
     up_proj = OperatorNode(
         name="up_proj", op_type=OpType.GMM,
+        diagnostic_name="GMM1",
         inputs=[target, up_proj_weight, up_proj_glist], outputs=[up_proj_y],
         param_positions=[0, 5, 6, 7], split_value=up_proj_sv,
         split_spec=SplitSpec(
@@ -119,6 +121,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
     )
     swiglu = OperatorNode(
         name="swiglu", op_type=OpType.SWIGLU,
+        diagnostic_name="SwiGLU",
         inputs=[up_proj_y], outputs=[swiglu_out],
         param_positions=[7, 8], split_value=swiglu_sv,
         split_spec=SplitSpec(
@@ -126,10 +129,11 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
             task_num_fn=lambda tsv: (tsv.per_expert_seq // swiglu_sv) * tsv.single_rank_expert_num,
         ),
         tiling_position=_TILING_POS_SWIGLU,
-        fill_config=SwiGLUFillConfig(),
+        fill_config=SwiGLUFillConfig(clamp_limit=swiglu_limit),
     )
     down_proj = OperatorNode(
         name="down_proj", op_type=OpType.GMM,
+        diagnostic_name="GMM2",
         inputs=[swiglu_out, down_proj_weight, down_proj_glist], outputs=[down_proj_y],
         param_positions=[8, 9, 10, 11], split_value=down_proj_sv,
         split_spec=SplitSpec(
@@ -142,6 +146,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
     )
     combine = OperatorNode(
         name="combine", op_type=OpType.ALLTOALL,
+        diagnostic_name="Combine",
         inputs=[target_offset_c, down_proj_y, src_offset_c, size_c], outputs=[combine_out],
         param_positions=[13, 11, 14, 15, 12], split_value=combine_sv,
         split_spec=SplitSpec(
@@ -163,7 +168,8 @@ def build_forward_graph(tsv, *,
                         hidden_size:       int = 7168,
                         intermediate_size: int = 2048,
                         dtype_size:        int = 2,
-                        num_cube_cores:    int = 24) -> ComputeGraph:
+                        num_cube_cores:    int = 24,
+                        swiglu_limit:      float | None = None) -> ComputeGraph:
     """Build the MoE-FFN forward DAG: dispatch -> up_proj -> swiglu -> down_proj -> combine.
 
     Operator execution order and param_positions (C++ memory slots):
@@ -184,6 +190,8 @@ def build_forward_graph(tsv, *,
         intermediate_size: FFN intermediate dimension after SwiGLU halving.
         dtype_size: bytes per activation element (2=bf16, 4=fp32).
         num_cube_cores: number of AIC cube cores on the target device.
+        swiglu_limit: optional positive clamp limit for SwiGLU; ``None`` keeps
+            the original unclamped operator path.
 
     Returns:
         A fully-connected ComputeGraph ready for propagate_splits().
@@ -193,6 +201,7 @@ def build_forward_graph(tsv, *,
         tsv, specs,
         dispatch_sv=dispatch_sv, up_proj_sv=up_proj_sv, swiglu_sv=swiglu_sv,
         down_proj_sv=down_proj_sv, combine_sv=combine_sv, num_cube_cores=num_cube_cores,
+        swiglu_limit=swiglu_limit,
     )
     graph = ComputeGraph()
     (graph.add_op(dispatch).add_op(up_proj).add_op(swiglu).add_op(down_proj).add_op(combine)

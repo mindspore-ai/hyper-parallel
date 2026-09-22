@@ -18,6 +18,7 @@ project(hyper_parallel_multicore_vendor LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+include(${CMAKE_CURRENT_LIST_DIR}/../hardening.cmake)
 
 set(HP_MULTICORE_SOURCE_ROOT "" CACHE PATH "Assembled HyperMegaMoe source root")
 set(HP_SHMEM_SDK_ROOT "" CACHE PATH "Installed SHMEM SDK root")

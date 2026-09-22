@@ -16,23 +16,51 @@
 
 from __future__ import annotations
 
+__all__ = ["MegaMoeExperts"]
+
 import math
+import struct
 from typing import Any
 
 import torch
 
+from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore.scheduler.config import MAX_EXPERT_NUM_PER_RANK
-from hyper_parallel.core.multicore.shmem.lifecycle import acquire_symmetric_memory
 
 from ..module import MulticoreModule
-from .function import execute_mega_moe
+from .function import execute_mega_moe_with_permutation
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import _COMMUNICATION_SPLIT, bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace, configure_symmetric_heap
 
 
-__all__ = ["MegaMoeExperts"]
+def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
+    """Validate a positive clamp value that survives float32 serialization."""
+    if swiglu_limit is None:
+        return
+    valid_type = isinstance(swiglu_limit, (int, float)) and not isinstance(
+        swiglu_limit, bool
+    )
+    try:
+        encoded_limit = (
+            struct.unpack("<f", struct.pack("<f", float(swiglu_limit)))[0]
+            if valid_type
+            else 0.0
+        )
+        valid_value = (
+            valid_type
+            and math.isfinite(swiglu_limit)
+            and math.isfinite(encoded_limit)
+            and encoded_limit > 0
+        )
+    except (OverflowError, TypeError, ValueError, struct.error):
+        valid_value = False
+    if not valid_value:
+        raise ValueError(
+            "swiglu_limit must be None or a finite positive float32-representable number, "
+            f"got {swiglu_limit!r}."
+        )
 
 
 def _create_mega_moe_parameters(
@@ -54,7 +82,7 @@ def _create_mega_moe_parameters(
 
 
 class _MegaMoeExecutionResources:
-    """Own one shape-bound plan, SHMEM handle, and workspace."""
+    """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
 
     def __init__(
         self,
@@ -67,27 +95,22 @@ class _MegaMoeExecutionResources:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
         configure_symmetric_heap(active_specifications, tensor)
-        self.symmetric_memory = acquire_symmetric_memory(self.spec.ep_group)
+        shmem.acquire(self.spec.ep_group)
         try:
             self.plan = build_mega_moe_plan(self.spec, tensor.device)
-            self.workspace = MegaMoeWorkspace(
-                symmetric_memory=self.symmetric_memory,
-                shared=shared,
-            )
+            self.workspace = MegaMoeWorkspace(shared=shared)
         except Exception:
-            self.symmetric_memory.close()
+            shmem.release()
             raise
         self._closed = False
 
     def close(self) -> None:
-        """Release the workspace and last-owned SHMEM lifecycle."""
+        """Release the workspace and leave the shared SHMEM lifecycle."""
         if self._closed:
             return
+        self.workspace.close()
+        shmem.release()
         self._closed = True
-        try:
-            self.workspace.close()
-        finally:
-            self.symmetric_memory.close()
 
 
 class MegaMoeExperts(MulticoreModule):
@@ -107,6 +130,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         expert_capacity_factor: float | None = None,
+        swiglu_limit: float | None = None,
         ep_size: int = 1,
         ep_group: Any | None = None,
     ) -> None:
@@ -122,6 +146,10 @@ class MegaMoeExperts(MulticoreModule):
                 ``None`` reserves the maximum lossless capacity. A finite value
                 of at least 1.0 reserves that multiple of the local routed rows
                 and raises a clear error if a route exceeds it.
+            swiglu_limit: Optional positive, finite float32-representable clamp
+                limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
+                the up branch is clamped to ``[-limit, limit]``. ``None``
+                preserves the legacy unclamped path.
             ep_size: Expert-parallel degree. The current SHMEM path requires it
                 to cover the complete Torch distributed world.
             ep_group: Torch expert-parallel process group with the same rank
@@ -134,10 +162,13 @@ class MegaMoeExperts(MulticoreModule):
             num_experts=num_experts,
             top_k=top_k,
             expert_capacity_factor=expert_capacity_factor,
+            swiglu_limit=swiglu_limit,
             ep_size=ep_size,
         )
         if expert_capacity_factor is not None:
             expert_capacity_factor = float(expert_capacity_factor)
+        if swiglu_limit is not None:
+            swiglu_limit = float(swiglu_limit)
         specification = {
             "local_num_tokens": local_num_tokens,
             "hidden_size": hidden_size,
@@ -145,6 +176,7 @@ class MegaMoeExperts(MulticoreModule):
             "num_experts": num_experts,
             "top_k": top_k,
             "expert_capacity_factor": expert_capacity_factor,
+            "swiglu_limit": swiglu_limit,
             "ep_size": ep_size,
             "ep_group": ep_group,
         }
@@ -155,6 +187,7 @@ class MegaMoeExperts(MulticoreModule):
             num_experts,
             top_k,
             expert_capacity_factor,
+            swiglu_limit,
             ep_size,
             id(ep_group),
         )
@@ -169,6 +202,7 @@ class MegaMoeExperts(MulticoreModule):
         self.num_experts = num_experts
         self.top_k = top_k
         self.expert_capacity_factor = expert_capacity_factor
+        self.swiglu_limit = swiglu_limit
         self.ep_size = ep_size
         self.local_experts = num_experts // ep_size
         self._ep_group = ep_group
@@ -187,6 +221,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         expert_capacity_factor: float | None,
+        swiglu_limit: float | None,
         ep_size: int,
     ) -> None:
         """Validate static shape and topology values before allocation."""
@@ -219,6 +254,7 @@ class MegaMoeExperts(MulticoreModule):
                 "local_num_tokens must be divisible by the fixed communication "
                 f"split {_COMMUNICATION_SPLIT}, got {local_num_tokens}."
             )
+        _validate_swiglu_limit(swiglu_limit)
         if expert_capacity_factor is None:
             return
         valid_factor_type = isinstance(
@@ -342,18 +378,23 @@ class MegaMoeExperts(MulticoreModule):
             tokens_per_expert,
         )
         resources = self._get_execution_resources(hidden_flat)
-        route = prepare_topk_route(
+        # The expert autograd bridge consumes permutation gradients before the
+        # workspace can be reused, so route preparation needs no separate node.
+        with torch.no_grad():
+            route = prepare_topk_route(
+                hidden_flat,
+                topk_ids,
+                topk_weights,
+                resources.spec,
+                tokens_per_expert,
+                workspace=resources.workspace,
+            )
+        expert_output = execute_mega_moe_with_permutation(
             hidden_flat,
             topk_ids,
-            topk_weights,
-            resources.spec,
-            tokens_per_expert,
-        )
-        expert_output = execute_mega_moe(
-            route.routed_tokens,
             self.gate_up_weight,
             self.down_weight,
-            route.metadata,
+            route,
             resources.plan,
             resources.workspace,
         )

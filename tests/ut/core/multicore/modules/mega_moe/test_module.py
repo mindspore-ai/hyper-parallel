@@ -20,8 +20,8 @@ from unittest.mock import Mock, PropertyMock, patch
 
 import torch
 
-from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
+from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 
 
 class TestMegaMoeExperts(unittest.TestCase):
@@ -46,6 +46,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         try:
             self.assertEqual(experts.local_num_tokens, 128)
             self.assertIsNone(experts.expert_capacity_factor)
+            self.assertIsNone(experts.swiglu_limit)
             self.assertEqual(
                 experts._resource_group.specification,
                 {
@@ -55,6 +56,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                     "num_experts": 4,
                     "top_k": 2,
                     "expert_capacity_factor": None,
+                    "swiglu_limit": None,
                     "ep_size": 2,
                     "ep_group": None,
                 },
@@ -90,6 +92,61 @@ class TestMegaMoeExperts(unittest.TestCase):
 
         mock_create_parameters.assert_not_called()
 
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_constructor_validates_and_records_swiglu_limit(
+        self,
+        mock_create_parameters: Mock,
+    ) -> None:
+        """Feature: validate the model-facing SwiGLU clamp option.
+
+        Description: Construct experts with one valid limit and several invalid
+            or non-float32-representable values.
+        Expectation: The valid limit is retained and invalid limits fail before
+            parameter allocation.
+        """
+        mock_create_parameters.return_value = (object(), object())
+        experts = MegaMoeExperts(
+            local_num_tokens=128,
+            hidden_size=16,
+            intermediate_size=8,
+            num_experts=4,
+            top_k=2,
+            swiglu_limit=10,
+            ep_size=2,
+        )
+        try:
+            self.assertEqual(experts.swiglu_limit, 10.0)
+            self.assertEqual(
+                experts._resource_group.specification["swiglu_limit"],
+                10.0,
+            )
+        finally:
+            experts.close()
+
+        for invalid_limit in (
+            0,
+            -1,
+            1e-50,
+            1e39,
+            float("nan"),
+            float("inf"),
+            True,
+            "10",
+        ):
+            with (
+                self.subTest(swiglu_limit=invalid_limit),
+                self.assertRaisesRegex(ValueError, "swiglu_limit"),
+            ):
+                MegaMoeExperts(
+                    local_num_tokens=128,
+                    hidden_size=16,
+                    intermediate_size=8,
+                    num_experts=4,
+                    top_k=2,
+                    swiglu_limit=invalid_limit,
+                    ep_size=2,
+                )
+
     def test_forward_passes_router_inputs_and_restores_shape(self) -> None:
         """Preserve Router inputs, expert parameters and the caller's shape."""
         experts = MegaMoeExperts(
@@ -121,7 +178,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                 mega_moe_module, "prepare_topk_route", return_value=route
             ) as mock_prepare,
             patch.object(
-                mega_moe_module, "execute_mega_moe", return_value=expert_output
+                mega_moe_module, "execute_mega_moe_with_permutation", return_value=expert_output
             ) as mock_execute,
             patch.object(
                 mega_moe_module, "restore_topk_output", return_value=expected
@@ -138,13 +195,15 @@ class TestMegaMoeExperts(unittest.TestCase):
         hidden_flat = mock_prepare.call_args.args[0]
         torch.testing.assert_close(hidden_flat, hidden_states.reshape(128, 16))
         mock_prepare.assert_called_once_with(
-            hidden_flat, topk_ids, topk_weights, resources.spec, tokens_per_expert
+            hidden_flat, topk_ids, topk_weights, resources.spec, tokens_per_expert,
+            workspace=resources.workspace,
         )
         mock_execute.assert_called_once_with(
-            route.routed_tokens,
+            hidden_flat,
+            topk_ids,
             experts.gate_up_weight,
             experts.down_weight,
-            route.metadata,
+            route,
             resources.plan,
             resources.workspace,
         )
@@ -231,6 +290,108 @@ class TestMegaMoeExperts(unittest.TestCase):
         resources.close.assert_not_called()
         layers[-1].close()
         resources.close.assert_called_once_with()
+
+    def test_execution_resource_pairs_shmem_acquire_and_release(self) -> None:
+        """Pair one SHMEM reference with one execution-resource lifetime."""
+        root_group = object()
+        bound_spec = SimpleNamespace(ep_group=root_group)
+        workspace = Mock()
+
+        with (
+            patch.object(
+                mega_moe_module,
+                "bind_mega_moe_spec",
+                return_value=bound_spec,
+            ),
+            patch.object(mega_moe_module, "configure_symmetric_heap"),
+            patch.object(mega_moe_module.shmem, "acquire") as mock_acquire,
+            patch.object(mega_moe_module.shmem, "release") as mock_release,
+            patch.object(mega_moe_module, "build_mega_moe_plan", return_value=object()),
+            patch.object(mega_moe_module, "MegaMoeWorkspace", return_value=workspace),
+        ):
+            resources = mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
+                {},
+                SimpleNamespace(device="npu:0"),
+                shared=False,
+                active_specifications=(),
+            )
+            mock_acquire.assert_called_once_with(root_group)
+            mock_release.assert_not_called()
+            resources.close()
+            resources.close()
+
+        workspace.close.assert_called_once_with()
+        mock_release.assert_called_once_with()
+
+    def test_execution_resource_construction_failure_releases_shmem(self) -> None:
+        """Release the acquired SHMEM reference when resource construction fails."""
+        root_group = object()
+        bound_spec = SimpleNamespace(ep_group=root_group)
+
+        with (
+            patch.object(
+                mega_moe_module,
+                "bind_mega_moe_spec",
+                return_value=bound_spec,
+            ),
+            patch.object(mega_moe_module, "configure_symmetric_heap"),
+            patch.object(mega_moe_module.shmem, "acquire") as mock_acquire,
+            patch.object(mega_moe_module.shmem, "release") as mock_release,
+            patch.object(
+                mega_moe_module,
+                "build_mega_moe_plan",
+                side_effect=RuntimeError("plan failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "plan failed"),
+        ):
+            mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
+                {},
+                SimpleNamespace(device="npu:0"),
+                shared=False,
+                active_specifications=(),
+            )
+
+        mock_acquire.assert_called_once_with(root_group)
+        mock_release.assert_called_once_with()
+
+    def test_workspace_close_failure_keeps_shmem_user(self) -> None:
+        """Do not leave SHMEM when a workspace cannot release its resources."""
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(  # pylint: disable=protected-access
+            mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
+        )
+        resources.workspace = Mock()
+        resources.workspace.close.side_effect = RuntimeError("workspace busy")
+        resources._closed = False  # pylint: disable=protected-access
+
+        with (
+            patch.object(mega_moe_module.shmem, "release") as mock_release,
+            self.assertRaisesRegex(RuntimeError, "workspace busy"),
+        ):
+            resources.close()
+
+        mock_release.assert_not_called()
+        self.assertFalse(resources._closed)  # pylint: disable=protected-access
+
+    def test_shmem_release_failure_keeps_execution_resource_open(self) -> None:
+        """Keep the resource open when its SHMEM reference cannot be released."""
+        resources = mega_moe_module._MegaMoeExecutionResources.__new__(  # pylint: disable=protected-access
+            mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
+        )
+        resources.workspace = Mock()
+        resources._closed = False  # pylint: disable=protected-access
+
+        with (
+            patch.object(
+                mega_moe_module.shmem,
+                "release",
+                side_effect=RuntimeError("release failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "release failed"),
+        ):
+            resources.close()
+
+        resources.workspace.close.assert_called_once_with()
+        self.assertFalse(resources._closed)  # pylint: disable=protected-access
 
 
 if __name__ == "__main__":

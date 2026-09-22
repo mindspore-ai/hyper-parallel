@@ -68,6 +68,7 @@ target_include_directories(cust_opapi PRIVATE
 )
 target_link_directories(cust_opapi PRIVATE ${CANN_ARCH_LIBRARY})
 target_link_libraries(cust_opapi PRIVATE opapi_math)
+hp_enable_elf_hardening(cust_opapi)
 
 file(GLOB GROUP_PROTO_SOURCES ${ASCEND_AUTOGEN_PATH}/group_op_proto/*.cc)
 file(GLOB OP_PROTO_SOURCES ${ASCEND_AUTOGEN_PATH}/op_proto.cc)
@@ -84,6 +85,7 @@ target_include_directories(cust_op_proto PRIVATE
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
 )
+hp_enable_elf_hardening(cust_op_proto)
 
 file(GLOB FALLBACK_SOURCES ${ASCEND_AUTOGEN_PATH}/fallback_*.cpp)
 set_source_files_properties(${FALLBACK_SOURCES} PROPERTIES GENERATED TRUE)
@@ -101,6 +103,7 @@ target_include_directories(cust_optiling PRIVATE
 )
 target_link_directories(cust_optiling PRIVATE ${CANN_ARCH_LIBRARY})
 target_link_libraries(cust_optiling PRIVATE ops_base)
+hp_enable_elf_hardening(cust_optiling)
 
 npu_op_package_add(${package_name}
     LIBRARY cust_optiling cust_opapi cust_op_proto

@@ -17,15 +17,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
-
 import torch_npu
 
 from .spec import MegaMoeSpec
 
+if TYPE_CHECKING:
+    from .workspace import MegaMoeWorkspace
 
 
 @dataclass(frozen=True)
@@ -137,27 +138,32 @@ def _finish_count_gather(
     return counts_by_source[:, local_start:local_end].contiguous()
 
 
-def _maximum_destination_load(
+def _expert_capacity(
     counts_by_source: torch.Tensor,
     spec: MegaMoeSpec,
 ) -> int:
-    """Return the global maximum used only by explicit bounded capacity."""
+    """Validate the global bound and size rank-local computation tensors."""
     destination_loads = counts_by_source.reshape(
         spec.ep_size,
         spec.ep_size,
         spec.local_experts,
     ).sum(dim=(0, 2), dtype=torch.int32)
-    return int(destination_loads.max().item())
+    # One host transfer serves both the coordinated overflow check and local
+    # allocation; the existing gathered counts require no extra collective.
+    loads = destination_loads.tolist()
+    _validate_bounded_capacity(max(loads), spec)
+    # Keep a non-null ABI argument on ranks whose experts receive no tokens.
+    # Source outputs and symmetric communication buffers retain their own sizes.
+    return max(1, loads[spec.rank_id])
 
 
 def _validate_bounded_capacity(
-    counts_by_source: torch.Tensor,
+    maximum_received_slots: int,
     spec: MegaMoeSpec,
 ) -> None:
     """Raise a coordinated error when an explicit factor is too small."""
     if spec.capacity_is_lossless:
         return
-    maximum_received_slots = _maximum_destination_load(counts_by_source, spec)
     if maximum_received_slots <= spec.receive_capacity:
         return
     raise RuntimeError(
@@ -192,6 +198,7 @@ def _compute_route_metadata(
     counts_by_source: torch.Tensor,
     received_counts: torch.Tensor,
     spec: MegaMoeSpec,
+    expert_capacity: int,
 ) -> RouteMetadata:
     """Build exact element offsets without padding or route truncation."""
     counts_i32 = counts.to(dtype=torch.int32).contiguous()
@@ -227,7 +234,7 @@ def _compute_route_metadata(
         group_list=(
             local_destination_prefix[:, -1] + local_destination_counts[:, -1]
         ).to(torch.int64),
-        expert_capacity=spec.receive_capacity,
+        expert_capacity=expert_capacity,
     )
 
 
@@ -237,6 +244,7 @@ def prepare_topk_route(
     topk_weights: torch.Tensor,
     spec: MegaMoeSpec,
     tokens_per_expert: torch.Tensor | None,
+    workspace: MegaMoeWorkspace | None = None,
 ) -> PreparedTopKRoute:
     """Overlap Top-K permutation with count exchange and build route metadata.
 
@@ -246,16 +254,19 @@ def prepare_topk_route(
         topk_weights: Router weights paired with ``topk_ids``.
         spec: Bound shape and expert-parallel specification.
         tokens_per_expert: Optional trusted Router histogram.
+        workspace: Optional lease owner ordered before the count exchange.
 
     Returns:
         Permuted tokens and exact native route metadata.
     """
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
     counts = _resolve_counts(flat_ids, tokens_per_expert, spec)
+    if workspace is not None:
+        workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, spec)
     routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
     received_counts = _finish_count_gather(counts_by_source, count_work, spec)
-    _validate_bounded_capacity(counts_by_source, spec)
+    expert_capacity = _expert_capacity(counts_by_source, spec)
     return PreparedTopKRoute(
         routed_tokens=routed_tokens,
         unpermute_mapping=unpermute_mapping,
@@ -266,6 +277,7 @@ def prepare_topk_route(
             counts_by_source,
             received_counts,
             spec,
+            expert_capacity,
         ),
     )
 

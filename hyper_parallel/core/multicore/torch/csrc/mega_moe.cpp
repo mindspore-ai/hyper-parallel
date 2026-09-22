@@ -12,16 +12,19 @@
  * Meta implementation is a no-op (all output tensors are pre-allocated by caller).
  */
 #include <torch/library.h>
+
 #include <tuple>
+
 #include "op_plugin/include/npu_cpp_extension.h"
 
 namespace {
 
+using FwdReturn = std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&>;
+
 // ---------------------------------------------------------------------------
 // NPU device implementation
 // ---------------------------------------------------------------------------
-std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&>
-mega_moe_npu(
+FwdReturn mega_moe_npu(
     at::Tensor& dispatch_target,           // pos  0 — inplace write, declared return
     const at::Tensor& dispatch_target_off,  // pos  1
     const at::Tensor& dispatch_src,        // pos  2
@@ -44,6 +47,7 @@ mega_moe_npu(
     const at::Tensor& down_proj_tiling,    // pos 19
     const at::Tensor& runtime_config,      // pos 20
     const at::Tensor& all_event_counters,  // pos 21
+    const at::Tensor& profile_buffer,      // pos 22
     int64_t rank_id,
     int64_t ep,
     int64_t expert_num,
@@ -57,47 +61,45 @@ mega_moe_npu(
         down_proj_weight, down_proj_glist, down_proj_y,
         combine_target, combine_target_off, combine_src_off, combine_size,
         gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
-        runtime_config, all_event_counters,
+        runtime_config, all_event_counters, profile_buffer,
         rank_id, ep, expert_num, hidden_size, seq_size);
-    return std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&>(
-        dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target);
+    return FwdReturn(dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target);
 }
 
 // ---------------------------------------------------------------------------
 // Meta device implementation (shape inference only, no compute)
 // All output buffers are pre-allocated by caller — nothing to do here.
 // ---------------------------------------------------------------------------
-std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&>
-mega_moe_meta(
+FwdReturn mega_moe_meta(
     at::Tensor& dispatch_target,
-    const at::Tensor& /*dispatch_target_off*/,
-    const at::Tensor& /*dispatch_src*/,
-    const at::Tensor& /*dispatch_src_off*/,
-    const at::Tensor& /*dispatch_size*/,
-    const at::Tensor& /*up_proj_weight*/,
-    const at::Tensor& /*up_proj_glist*/,
+    const at::Tensor& /* dispatch_target_off */,
+    const at::Tensor& /* dispatch_src */,
+    const at::Tensor& /* dispatch_src_off */,
+    const at::Tensor& /* dispatch_size */,
+    const at::Tensor& /* up_proj_weight */,
+    const at::Tensor& /* up_proj_glist */,
     at::Tensor& up_proj_y,
     at::Tensor& swiglu_out,
-    const at::Tensor& /*down_proj_weight*/,
-    const at::Tensor& /*down_proj_glist*/,
+    const at::Tensor& /* down_proj_weight */,
+    const at::Tensor& /* down_proj_glist */,
     at::Tensor& down_proj_y,
     at::Tensor& combine_target,
-    const at::Tensor& /*combine_target_off*/,
-    const at::Tensor& /*combine_src_off*/,
-    const at::Tensor& /*combine_size*/,
-    const at::Tensor& /*gmm_workspace*/,
-    const at::Tensor& /*up_proj_tiling*/,
-    const at::Tensor& /*swiglu_tiling*/,
-    const at::Tensor& /*down_proj_tiling*/,
-    const at::Tensor& /*runtime_config*/,
-    const at::Tensor& /*all_event_counters*/,
-    int64_t /*rank_id*/,
-    int64_t /*ep*/,
-    int64_t /*expert_num*/,
-    int64_t /*hidden_size*/,
-    int64_t /*seq_size*/) {
-    return std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&>(
-        dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target);
+    const at::Tensor& /* combine_target_off */,
+    const at::Tensor& /* combine_src_off */,
+    const at::Tensor& /* combine_size */,
+    const at::Tensor& /* gmm_workspace */,
+    const at::Tensor& /* up_proj_tiling */,
+    const at::Tensor& /* swiglu_tiling */,
+    const at::Tensor& /* down_proj_tiling */,
+    const at::Tensor& /* runtime_config */,
+    const at::Tensor& /* all_event_counters */,
+    const at::Tensor& /* profile_buffer */,
+    int64_t /* rank_id */,
+    int64_t /* ep */,
+    int64_t /* expert_num */,
+    int64_t /* hidden_size */,
+    int64_t /* seq_size */) {
+    return FwdReturn(dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target);
 }
 
 }  // namespace

@@ -18,9 +18,8 @@ foreach(SUB_DIR ${CURRENT_DIRS})
         set_target_properties(${SUB_DIR} PROPERTIES
             OUTPUT_NAME ${SUB_DIR}
             LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
-            INSTALL_RPATH "$ORIGIN/../../${SYMMETRIC_MEMORY_INSTALL_HOME}/lib:"
-            "$ORIGIN/../../shmem/shmem/lib:"
-            "$ORIGIN/../../shmem/memfabric_hybrid/lib"
+            SKIP_BUILD_RPATH TRUE
+            SKIP_INSTALL_RPATH TRUE
         )
     endif()
 endforeach()

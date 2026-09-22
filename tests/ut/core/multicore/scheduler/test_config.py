@@ -20,11 +20,14 @@ from hyper_parallel.core.multicore.scheduler.config import (
     MAX_EXPERT_NUM_PER_RANK,
     MAX_GROUP_LIST,
     NUM_WORKERS_CUBE,
-    RuntimeConfigC,
-    TaskType,
     TaskSplitValue,
+    TaskType,
+    configure_ready_handshake,
+    event_workspace_bytes,
+    mega_moe_event_capacity,
     validate_runtime_config,
 )
+from hyper_parallel.core.multicore.scheduler.runtime import allocate_runtime_config
 
 
 class TestTaskSplitValue(unittest.TestCase):
@@ -86,7 +89,7 @@ class TestValidateRuntimeConfig(unittest.TestCase):
             all_expert_num=4,
             top_k=2,
         )
-        self.config = RuntimeConfigC()
+        self.config = allocate_runtime_config(1)
         self.config.num_workers = 2 * NUM_WORKERS_CUBE
         self.config.dynamic_data.dynamic_group_size = self.values.single_rank_expert_num
         self.config.task_num = 1
@@ -118,6 +121,41 @@ class TestValidateRuntimeConfig(unittest.TestCase):
                 task.task_index = task_index
                 task.task_split_num = task_split_num
                 validate_runtime_config(self.config, self.values, NUM_WORKERS_CUBE)
+
+
+class TestReadyHandshakeConfig(unittest.TestCase):
+    """Keep ready state inside the single graph-sized runtime contract."""
+
+    def test_ready_event_uses_expanded_counter_capacity(self) -> None:
+        """Reserve the ready event and its atomic lanes beyond event 1024."""
+        values = TaskSplitValue(tp=1, ep=64, seq_size=128, all_expert_num=1024, top_k=2)
+        config = allocate_runtime_config(16, mega_moe_event_capacity(1024, 64))
+        configure_ready_handshake(config, values)
+        rebuilt = type(config).from_buffer_copy(bytes(config))
+        self.assertEqual(rebuilt.ready_event, values.all_event_num + 3)
+        self.assertGreater(rebuilt.ready_event, 1024)
+        self.assertEqual(rebuilt.all_event_num_triggers[rebuilt.ready_event], 1)
+        self.assertEqual(event_workspace_bytes(64, 1024), 1088 * 4 + 65 * 64)
+        with self.assertRaisesRegex(ValueError, "event_capacity"):
+            configure_ready_handshake(allocate_runtime_config(16), values)
+
+    def test_ready_atomic_tail_crosses_event_alignment_boundary(self) -> None:
+        """Include ready's final zero lanes when termination alone fits."""
+        values = TaskSplitValue(tp=1, ep=71, seq_size=128, all_expert_num=1065, top_k=2)
+        capacity = mega_moe_event_capacity(values.all_expert_num, values.ep)
+        config = allocate_runtime_config(16, capacity)
+        configure_ready_handshake(config, values)
+        self.assertEqual(capacity, 1136)
+        self.assertEqual(config.ready_event, 1114)
+        self.assertLessEqual(config.ready_event + 8, capacity)
+
+    def test_single_rank_disables_handshake_and_persistent_tail(self) -> None:
+        """EP1 needs neither a peer event nor persistent signal storage."""
+        values = TaskSplitValue(tp=1, ep=1, seq_size=128, all_expert_num=4, top_k=2)
+        config = allocate_runtime_config(16)
+        configure_ready_handshake(config, values)
+        self.assertEqual(config.ready_event, 0)
+        self.assertEqual(event_workspace_bytes(1, 4), 4096)
 
 
 if __name__ == "__main__":

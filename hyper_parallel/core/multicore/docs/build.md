@@ -22,8 +22,9 @@ Multicore 只有 `--multicore on|off` 开关，默认 on。SHMEM 是内部组件
 不同 Python、CPU、Torch/PTA 或 CANN 构建环境的制品不能默认互换。
 
 组件会在生成私有 SHMEM、复用缓存、生成单 SoC vendor、合并多 SoC vendor 和安装 Torch adapter 后校验
-最终制品。校验覆盖 ACLNN API、kernel object/metadata、ELF 架构、私有 SONAME、相对 RUNPATH 和运行时
-依赖；失败会由本组件入口直接返回非零，不依赖额外 validation 脚本。
+最终制品。校验覆盖 ACLNN API、kernel object/metadata、ELF 架构、私有 SONAME、运行时依赖及共享库安全
+属性。随包共享库不携带 RPATH/RUNPATH，并启用 RELRO、BIND_NOW、不可执行栈、栈保护和
+FORTIFY_SOURCE；Release 共享库会删除静态符号表。失败由本组件入口直接返回非零。
 
 只编译 Multicore、不生成 wheel：
 

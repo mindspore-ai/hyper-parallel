@@ -24,7 +24,7 @@ import os
 import statistics
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +38,7 @@ import torch_npu
 from qwen_moe_model import QwenMoeConfig, QwenMoeModel
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
-from hyper_parallel.auto_models.components.optim import (
+from hyper_parallel.components.optim import (
     Float16OptimizerWithFloat16Params,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -67,6 +67,28 @@ class _Workload:
     labels: torch.Tensor
     world_size: int
     device: torch.device
+
+
+@dataclass
+class _TensorComparison:
+    """Device-side pass state and per-tensor comparison diagnostics."""
+
+    passed: torch.Tensor
+    tensor_names: list[str] = field(default_factory=list)
+    absolute_errors: list[torch.Tensor] = field(default_factory=list)
+    normalized_errors: list[torch.Tensor] = field(default_factory=list)
+
+
+@dataclass
+class _BenchmarkContext:
+    """Runtime values and owned models shared by all benchmark phases."""
+
+    args: argparse.Namespace
+    rank: int
+    world_size: int
+    device: torch.device
+    config: QwenMoeConfig
+    models: dict[str, QwenMoeModel] = field(default_factory=dict)
 
 
 class _CommonExpertsAdapter(torch.nn.Module):
@@ -107,7 +129,14 @@ class _CommonExpertsAdapter(torch.nn.Module):
         *,
         tokens_per_expert: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the common routed-expert implementation."""
+        """Run the common routed-expert implementation.
+
+        Args:
+            hidden_states: Routed-expert input activations.
+            topk_ids: Selected expert identifiers.
+            topk_weights: Routing weights for selected experts.
+            tokens_per_expert: Optional token counts for each expert.
+        """
         if tokens_per_expert is None:
             tokens_per_expert = torch.bincount(
                 topk_ids.reshape(-1).to(torch.int64), minlength=self.module.num_experts,
@@ -144,7 +173,11 @@ def _capacity_factor(value: str) -> float | None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse the minimal optimizer benchmark interface."""
+    """Parse the minimal optimizer benchmark interface.
+
+    Args:
+        argv: Optional command-line arguments; ``None`` reads the process arguments.
+    """
     parser = argparse.ArgumentParser(
         description="Run an eight-NPU Qwen MoE optimizer-step benchmark.",
     )
@@ -333,13 +366,10 @@ def _optimizer_step(
     _synchronize_dense_gradients(workload.model, workload.world_size)
     gradients = None
     if capture_gradients:
-        gradients = {
-            name: tensor.detach().clone()
-            for name, tensor in _canonical_tensors(
-                workload.model,
-                gradients=True,
-            ).items()
-        }
+        gradients = {}
+        canonical_gradients = _canonical_tensors(workload.model, gradients=True)
+        for name, tensor in canonical_gradients.items():
+            gradients[name] = tensor.detach().clone()
     with SkipDTensorDispatch():
         workload.optimizer.step()
     return loss.detach(), logits.detach(), gradients
@@ -502,53 +532,78 @@ def _compare_tensor_maps(
             f"{name} tensor names differ: common={sorted(common_tensors)}, "
             f"mega={sorted(mega_tensors)}."
         )
-    passed = torch.ones((), dtype=torch.int32, device=device)
-    tensor_names = []
-    absolute_errors = []
-    normalized_errors = []
+    comparison = _TensorComparison(
+        passed=torch.ones((), dtype=torch.int32, device=device)
+    )
     for tensor_name, common_tensor in common_tensors.items():
-        tensor_names.append(tensor_name)
-        mega_tensor = mega_tensors[tensor_name]
-        if mega_tensor.shape != common_tensor.shape:
-            raise RuntimeError(
-                f"{name}.{tensor_name} shape differs: common={tuple(common_tensor.shape)}, "
-                f"mega={tuple(mega_tensor.shape)}."
-            )
-        common_float = common_tensor.detach().float()
-        mega_float = mega_tensor.detach().float()
-        difference = (mega_float - common_float).abs()
-        passed = torch.minimum(
-            passed,
-            torch.isclose(
-                mega_float,
-                common_float,
-                rtol=rtol,
-                atol=atol,
-            )
-            .all()
-            .to(torch.int32),
+        _compare_tensor_pair(
+            name,
+            tensor_name,
+            common_tensor,
+            mega_tensors[tensor_name],
+            comparison,
+            rtol=rtol,
+            atol=atol,
         )
-        absolute_errors.append(difference.max())
-        tolerance = atol + rtol * common_float.abs()
-        normalized_errors.append(
-            (difference / tolerance.clamp_min(torch.finfo(torch.float32).tiny)).max()
+    return _finalize_tensor_comparison(name, comparison, rtol=rtol, atol=atol)
+
+
+def _compare_tensor_pair(
+    comparison_name: str,
+    tensor_name: str,
+    common_tensor: torch.Tensor,
+    mega_tensor: torch.Tensor,
+    comparison: _TensorComparison,
+    *,
+    rtol: float,
+    atol: float,
+) -> None:
+    """Accumulate device-side diagnostics for one corresponding tensor pair."""
+    comparison.tensor_names.append(tensor_name)
+    if mega_tensor.shape != common_tensor.shape:
+        raise RuntimeError(
+            f"{comparison_name}.{tensor_name} shape differs: common={tuple(common_tensor.shape)}, "
+            f"mega={tuple(mega_tensor.shape)}."
         )
-    absolute_by_tensor = torch.stack(absolute_errors)
-    normalized_by_tensor = torch.stack(normalized_errors)
-    dist.all_reduce(passed, op=dist.ReduceOp.MIN)
+    common_float = common_tensor.detach().float()
+    mega_float = mega_tensor.detach().float()
+    difference = (mega_float - common_float).abs()
+    comparison.passed = torch.minimum(
+        comparison.passed,
+        torch.isclose(mega_float, common_float, rtol=rtol, atol=atol)
+        .all()
+        .to(torch.int32),
+    )
+    comparison.absolute_errors.append(difference.max())
+    tolerance = atol + rtol * common_float.abs()
+    normalized_error = difference / tolerance.clamp_min(torch.finfo(torch.float32).tiny)
+    comparison.normalized_errors.append(normalized_error.max())
+
+
+def _finalize_tensor_comparison(
+    name: str,
+    comparison: _TensorComparison,
+    *,
+    rtol: float,
+    atol: float,
+) -> dict[str, Any]:
+    """Reduce accumulated diagnostics and return the public result mapping."""
+    absolute_by_tensor = torch.stack(comparison.absolute_errors)
+    normalized_by_tensor = torch.stack(comparison.normalized_errors)
+    dist.all_reduce(comparison.passed, op=dist.ReduceOp.MIN)
     dist.all_reduce(absolute_by_tensor, op=dist.ReduceOp.MAX)
     dist.all_reduce(normalized_by_tensor, op=dist.ReduceOp.MAX)
     maximum_absolute, absolute_index = absolute_by_tensor.max(dim=0)
     maximum_normalized, normalized_index = normalized_by_tensor.max(dim=0)
     result = {
-        "passed": bool(passed.cpu().item()),
-        "tensor_count": len(common_tensors),
+        "passed": bool(comparison.passed.cpu().item()),
+        "tensor_count": len(comparison.tensor_names),
         "rtol": rtol,
         "atol": atol,
         "max_absolute_error": float(maximum_absolute.cpu().item()),
-        "max_absolute_error_tensor": tensor_names[int(absolute_index.cpu().item())],
+        "max_absolute_error_tensor": comparison.tensor_names[int(absolute_index.cpu().item())],
         "max_normalized_error": float(maximum_normalized.cpu().item()),
-        "max_normalized_error_tensor": tensor_names[int(normalized_index.cpu().item())],
+        "max_normalized_error_tensor": comparison.tensor_names[int(normalized_index.cpu().item())],
     }
     if not result["passed"]:
         raise RuntimeError(f"Qwen common/MegaMoe {name} comparison failed: {result}.")
@@ -563,7 +618,8 @@ def _measure_backend(
 ) -> dict[str, Any]:
     """Finish warmup and measure one backend after its compared first step."""
     for _ in range(args.warmup_steps - 1):
-        _timed_step(workload)
+        warmup_loss, warmup_latency = _timed_step(workload)
+        del warmup_loss, warmup_latency
     latencies = []
     losses = []
     for _ in range(args.measured_steps):
@@ -713,6 +769,58 @@ def _compare_first_step_accuracy(
     return accuracy, first_steps
 
 
+def _prepare_benchmark(argv: list[str] | None) -> _BenchmarkContext:
+    """Parse arguments and initialize the distributed benchmark runtime."""
+    args = parse_args(argv)
+    rank, world_size, device = _init_runtime()
+    config = replace(
+        QwenMoeConfig(),
+        expert_capacity_factor=args.expert_capacity_factor,
+    )
+    return _BenchmarkContext(args, rank, world_size, device, config)
+
+
+def _build_benchmark_workloads(context: _BenchmarkContext) -> dict[str, _Workload]:
+    """Construct deterministic common and MegaMoe workloads."""
+    input_ids, labels = _build_batch(
+        context.config,
+        context.rank,
+        context.args.seed,
+        context.device,
+    )
+    for backend in ("common", "mega_moe"):
+        context.models[backend] = _build_backend_model(
+            context.config,
+            context.device,
+            context.args.seed,
+            backend,
+        )
+    return {
+        backend: _build_workload(
+            model,
+            context.args,
+            input_ids,
+            labels,
+            context.world_size,
+            context.device,
+        )
+        for backend, model in context.models.items()
+    }
+
+
+def _measure_backends(
+    workloads: dict[str, _Workload],
+    first_steps: dict[str, tuple[dict[str, Any], float]],
+    args: argparse.Namespace,
+) -> dict[str, dict[str, Any]]:
+    """Measure both backends after their compared first steps."""
+    measurements = {}
+    for backend in ("common", "mega_moe"):
+        validation, latency_ms = first_steps[backend]
+        measurements[backend] = _measure_backend(workloads[backend], validation, latency_ms, args)
+    return measurements
+
+
 def main(argv: list[str] | None = None) -> int:
     """Compare common and MegaMoe Qwen accuracy, then time A and B.
 
@@ -722,64 +830,25 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         Zero after the distributed comparison completes successfully.
     """
-    args = parse_args(argv)
-    rank, world_size, device = _init_runtime()
-    config = replace(
-        QwenMoeConfig(),
-        expert_capacity_factor=args.expert_capacity_factor,
-    )
-    models: dict[str, QwenMoeModel] = {}
+    context = _prepare_benchmark(argv)
     try:
-        input_ids, labels = _build_batch(config, rank, args.seed, device)
-        for backend in ("common", "mega_moe"):
-            models[backend] = _build_backend_model(
-                config,
-                device,
-                args.seed,
-                backend,
-            )
-        workloads = {
-            backend: _build_workload(
-                model,
-                args,
-                input_ids,
-                labels,
-                world_size,
-                device,
-            )
-            for backend, model in models.items()
-        }
+        workloads = _build_benchmark_workloads(context)
         accuracy, first_steps = _compare_first_step_accuracy(
-            models,
+            context.models,
             workloads,
-            device,
+            context.device,
         )
-        common_validation, common_first_ms = first_steps["common"]
-        mega_validation, mega_first_ms = first_steps["mega_moe"]
-        backends = {
-            "common": _measure_backend(
-                workloads["common"],
-                common_validation,
-                common_first_ms,
-                args,
-            ),
-            "mega_moe": _measure_backend(
-                workloads["mega_moe"],
-                mega_validation,
-                mega_first_ms,
-                args,
-            ),
-        }
+        backends = _measure_backends(workloads, first_steps, context.args)
         _write_result(
-            args,
-            config,
-            rank,
+            context.args,
+            context.config,
+            context.rank,
             accuracy,
             backends,
         )
         return 0
     finally:
-        for model in models.values():
+        for model in context.models.values():
             model.close()
         if dist.is_initialized():
             dist.destroy_process_group()

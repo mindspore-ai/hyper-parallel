@@ -171,6 +171,32 @@ function require_nonempty_artifact() {
     fi
 }
 
+function validate_shared_library_security() {
+    local library=$1
+    local dynamic_section
+    local program_headers
+    dynamic_section=$(readelf -d "${library}")
+    program_headers=$(readelf -W -l "${library}")
+    if grep -Eq '(RPATH|RUNPATH)' <<< "${dynamic_section}"; then
+        fail "RUNPATH_FOUND" "Shared library must not contain RPATH/RUNPATH: ${library}." 20
+    fi
+    if ! grep -q 'GNU_RELRO' <<< "${program_headers}"; then
+        fail "RELRO_MISSING" "Shared library is missing GNU_RELRO: ${library}." 20
+    fi
+    if ! grep -Eq '\(BIND_NOW\)|FLAGS[^]]*BIND_NOW|FLAGS_1[^]]*NOW' <<< "${dynamic_section}"; then
+        fail "BIND_NOW_MISSING" "Shared library is missing BIND_NOW: ${library}." 20
+    fi
+    if grep -Eq 'GNU_STACK.*RWE' <<< "${program_headers}"; then
+        fail "EXECUTABLE_STACK_FOUND" "Shared library has an executable stack: ${library}." 20
+    fi
+    if grep -Eq '\(TEXTREL\)' <<< "${dynamic_section}"; then
+        fail "TEXT_RELOCATION_FOUND" "Shared library contains text relocations: ${library}." 20
+    fi
+    if readelf -W -S "${library}" | grep -q '\.symtab'; then
+        fail "STATIC_SYMBOL_TABLE_FOUND" "Release shared library is not stripped: ${library}." 20
+    fi
+}
+
 function validate_multicore_vendor() {
     local vendor_root=$1
     local soc_list=$2
@@ -182,14 +208,10 @@ function validate_multicore_vendor() {
     local required_symbol
     local soc
     local artifact
-    local runpath_entry
-    local runpath_value
-    local search_path
     local symbol_table
     local -a forbidden_files=()
     local -a libraries=()
     local -a artifacts=()
-    local -a search_paths=()
     local -a validation_socs=()
     local -a required_symbols=(
         aclnnHyperMegaMoe
@@ -271,16 +293,10 @@ function validate_multicore_vendor() {
         fail "CANN_VENDOR_SONAME_INVALID" \
             "Expected libcust_opapi.so SONAME in ${library}." 12
     fi
-    while IFS= read -r runpath_entry; do
-        runpath_value=$(sed -n 's/.*\[\(.*\)\].*/\1/p' <<< "${runpath_entry}")
-        IFS=':' read -r -a search_paths <<< "${runpath_value}"
-        for search_path in "${search_paths[@]}"; do
-            if [[ "${search_path}" == /* ]]; then
-                fail "CANN_VENDOR_ABSOLUTE_RUNPATH_FOUND" \
-                    "Build-machine absolute RPATH/RUNPATH found in ${library}: ${search_path}." 12
-            fi
-        done
-    done < <(grep -E '(RPATH|RUNPATH)' <<< "${dynamic_section}" || true)
+    if grep -Eq '(RPATH|RUNPATH)' <<< "${dynamic_section}"; then
+        fail "CANN_VENDOR_RUNPATH_FOUND" \
+            "CANN vendor library must not contain RPATH/RUNPATH: ${library}." 12
+    fi
     ldd_output=$(ldd -r "${library}" 2>&1)
     if grep -Eq 'not found|undefined symbol:' <<< "${ldd_output}"; then
         fail "CANN_VENDOR_RUNTIME_LINK_FAILED" \
@@ -443,6 +459,7 @@ function calculate_vendor_fingerprint() {
                 hyper_parallel/core/multicore/build.sh \
                 hyper_parallel/core/multicore/_build/assemble_multicore_source.py \
                 hyper_parallel/core/multicore/_build/merge_multicore_vendors.py \
+                hyper_parallel/core/multicore/cmake/hardening.cmake \
                 hyper_parallel/core/multicore/shmem/_build/shmem_sdk.sh
             while IFS= read -r -d '' source_file; do
                 sha256sum "${source_file}"
@@ -600,20 +617,10 @@ while IFS= read -r adapter_library; do
         fail "HOST_ELF_ARCHITECTURE_MISMATCH" \
             "Host adapter machine '${elf_machine}' does not match '${EXPECTED_ELF_MACHINE}': ${adapter_library}." 15
     fi
-    if ! grep -E '(RPATH|RUNPATH).*\$ORIGIN' <<< "${dynamic_section}" >/dev/null; then
-        fail "RELATIVE_RUNPATH_MISSING" \
-            "Host adapter has no component-relative \$ORIGIN RUNPATH: ${adapter_library}." 17
+    if grep -Eq '(RPATH|RUNPATH)' <<< "${dynamic_section}"; then
+        fail "RUNPATH_FOUND" \
+            "Host adapter must not contain RPATH/RUNPATH: ${adapter_library}." 16
     fi
-    while IFS= read -r runpath_entry; do
-        runpath_value=$(sed -n 's/.*\[\(.*\)\].*/\1/p' <<< "${runpath_entry}")
-        IFS=':' read -r -a search_paths <<< "${runpath_value}"
-        for search_path in "${search_paths[@]}"; do
-            if [[ "${search_path}" == /* ]]; then
-                fail "ABSOLUTE_RUNPATH_FOUND" \
-                    "Host adapter contains a build-machine RPATH/RUNPATH: ${adapter_library}: ${search_path}." 16
-            fi
-        done
-    done < <(grep -E '(RPATH|RUNPATH)' <<< "${dynamic_section}" || true)
     if grep -E '\(NEEDED\).*libcust_opapi\.so' <<< "${dynamic_section}" >/dev/null; then
         fail "GENERIC_VENDOR_DT_NEEDED_FOUND" \
             "Host adapter directly depends on generic libcust_opapi.so: ${adapter_library}." 18
@@ -630,6 +637,10 @@ while IFS= read -r adapter_library; do
         esac
     done
 done < <(find "${OUTPUT_ROOT}/framework" -type f -name '*.so' -print)
+
+while IFS= read -r packaged_library; do
+    validate_shared_library_security "${packaged_library}"
+done < <(find "${COMPONENT_ROOT}/core/multicore" -type f -name '*.so' -print)
 
 trap - ERR
 echo "INFO: multicore build completed"

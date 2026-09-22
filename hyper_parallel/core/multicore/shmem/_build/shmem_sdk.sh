@@ -105,6 +105,7 @@ print(hashlib.sha256(encoded).hexdigest())
             "${gcc_path}" --version 2>&1 || true
             "${gxx_path}" --version 2>&1 || true
             sha256sum "${cann_version_file}" \
+                "${project_root}/hyper_parallel/core/multicore/cmake/hardening.cmake" \
                 "${project_root}/hyper_parallel/core/multicore/shmem/cmake/shmem_wrapper/CMakeLists.txt" \
                 "${project_root}/hyper_parallel/core/multicore/shmem/_build/shmem_sdk.sh"
         } | sha256sum | awk '{print substr($1, 1, 16)}'

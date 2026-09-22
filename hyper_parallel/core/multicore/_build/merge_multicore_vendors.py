@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
@@ -45,6 +46,18 @@ _HOST_SOC_PRIORITY = {
     "ascend910_93": 0,
     "ascend910b": 1,
 }
+
+
+@dataclass(frozen=True)
+class _MergeContext:
+    """Validated paths and provenance shared by all merge phases."""
+
+    inputs: list[tuple[str, Path]]
+    output: Path
+    base_soc: str
+    base_vendor: Path
+    base_common_files: dict[str, str]
+    host_input_identity: str
 
 
 def _parse_args() -> argparse.Namespace:
@@ -98,19 +111,24 @@ def _is_soc_payload(relative_path: Path, soc: str) -> bool:
 
 def _common_files(vendor_root: Path, soc: str) -> dict[str, str]:
     """Hash all host/source payload that must be byte-identical across SoC builds."""
-    return {
-        str(relative_path): _sha256(path)
-        for path in sorted(vendor_root.rglob("*"))
-        if path.is_file()
-        for relative_path in (path.relative_to(vendor_root),)
-        if not _is_soc_payload(relative_path, soc) and relative_path != _SUPPORTED_OPS_PATH
-    }
+    common_files = {}
+    for path in sorted(vendor_root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative_path = path.relative_to(vendor_root)
+        if _is_soc_payload(relative_path, soc) or relative_path == _SUPPORTED_OPS_PATH:
+            continue
+        common_files[str(relative_path)] = _sha256(path)
+    return common_files
 
 
 def _readelf(path: Path, *arguments: str) -> str:
     """Return one readelf inspection, rejecting malformed host libraries."""
+    readelf = shutil.which("readelf")
+    if readelf is None:
+        raise ValueError("Cannot inspect host ELF because readelf is unavailable.")
     result = subprocess.run(
-        ["readelf", *arguments, str(path)],
+        [readelf, *arguments, str(path)],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -146,12 +164,16 @@ def _host_elf_abi_fingerprint(path: Path) -> dict[str, list[str]]:
     }
 
 
-def _host_elf_abi_mismatches(relative_path: str, base_file: Path, candidate_file: Path) -> list[str]:
+def _host_elf_abi_mismatches(
+    relative_path: str,
+    base_fingerprints: dict[str, dict[str, list[str]]],
+    candidate_file: Path,
+) -> list[str]:
     """Return mismatched ABI fields for one known, discarded host ELF variant."""
     if relative_path not in _HOST_ELF_PATHS:
         return ["unsupported_path"]
     try:
-        base_fingerprint = _host_elf_abi_fingerprint(base_file)
+        base_fingerprint = base_fingerprints[relative_path]
         candidate_fingerprint = _host_elf_abi_fingerprint(candidate_file)
     except ValueError as error:
         return [f"inspection_error={error}"]
@@ -162,20 +184,30 @@ def _host_elf_abi_mismatches(relative_path: str, base_file: Path, candidate_file
     )
 
 
-def _require_soc_payload(vendor_root: Path, soc: str) -> tuple[Path, Path, Path]:
-    """Require kernel binaries, binary indexes, and package config for one SoC."""
+def _soc_payload_paths(vendor_root: Path, soc: str) -> tuple[Path, Path, Path]:
+    """Return the required payload paths for one SoC."""
     kernel_path = vendor_root / _KERNEL_ROOT / soc
     kernel_config_path = vendor_root / _KERNEL_CONFIG_ROOT / soc
     config_path = vendor_root / _CONFIG_ROOT / soc
-    for path in (kernel_path, kernel_config_path, config_path):
-        if not path.is_dir() or not any(child.is_file() for child in path.rglob("*")):
-            raise ValueError(f"Missing compiled {soc} vendor payload: {path}")
     return kernel_path, kernel_config_path, config_path
 
 
+def _validate_soc_payload(vendor_root: Path, soc: str) -> None:
+    """Require kernel binaries, binary indexes, and package config for one SoC."""
+    for path in _soc_payload_paths(vendor_root, soc):
+        if not path.is_dir() or not any(child.is_file() for child in path.rglob("*")):
+            raise ValueError(f"Missing compiled {soc} vendor payload: {path}")
+
+
+def _require_soc_payload(vendor_root: Path, soc: str) -> tuple[Path, Path, Path]:
+    """Validate and return all required payload paths for one SoC."""
+    _validate_soc_payload(vendor_root, soc)
+    return _soc_payload_paths(vendor_root, soc)
+
+
 def _compare_host_payload(
-    base_vendor: Path,
     base_common_files: dict[str, str],
+    base_host_fingerprints: dict[str, dict[str, list[str]]],
     soc: str,
     vendor_root: Path,
 ) -> list[str]:
@@ -196,7 +228,7 @@ def _compare_host_payload(
     for relative_path in changed_candidates:
         mismatches = _host_elf_abi_mismatches(
             relative_path,
-            base_vendor / relative_path,
+            base_host_fingerprints,
             vendor_root / relative_path,
         )
         if not mismatches:
@@ -225,7 +257,7 @@ def _normalize_inputs(inputs: list[tuple[str, Path]]) -> tuple[list[tuple[str, P
             raise ValueError(f"Duplicate SoC vendor input: {soc}")
         if vendor_root.name != _VENDOR_NAME or not vendor_root.is_dir():
             raise ValueError(f"Expected input vendor root named {_VENDOR_NAME}: {vendor_root}")
-        _require_soc_payload(vendor_root, soc)
+        _validate_soc_payload(vendor_root, soc)
         normalized_inputs.append((soc, vendor_root))
         seen_socs.add(soc)
     normalized_inputs.sort(
@@ -297,53 +329,112 @@ def _merge_supported_ops(
     return len(merged)
 
 
+def _prepare_merge(
+    inputs: list[tuple[str, Path]],
+    output: Path,
+    host_input_identities: dict[str, str],
+) -> _MergeContext:
+    """Normalize inputs and select the canonical common-host vendor."""
+    normalized_inputs, seen_socs = _normalize_inputs(inputs)
+    host_input_identity = _validate_host_input_identities(host_input_identities, seen_socs)
+    validated_output = _validate_output(output, normalized_inputs)
+    base_soc, base_vendor = normalized_inputs[0]
+    return _MergeContext(
+        inputs=normalized_inputs,
+        output=validated_output,
+        base_soc=base_soc,
+        base_vendor=base_vendor,
+        base_common_files=_common_files(base_vendor, base_soc),
+        host_input_identity=host_input_identity,
+    )
+
+
+def _validate_common_host_payload(context: _MergeContext) -> list[str]:
+    """Validate the retained host payload and all discarded variants."""
+    base_host_libraries = sorted(set(context.base_common_files) & _HOST_ELF_PATHS)
+    if not base_host_libraries:
+        raise ValueError(f"Base vendor contains no recognized host ELF: {context.base_vendor}")
+    base_host_fingerprints = {
+        relative_path: _host_elf_abi_fingerprint(context.base_vendor / relative_path)
+        for relative_path in base_host_libraries
+    }
+
+    discarded_host_variants: list[str] = []
+    for soc, vendor_root in context.inputs[1:]:
+        discarded_host_variants.extend(
+            _compare_host_payload(
+                context.base_common_files,
+                base_host_fingerprints,
+                soc,
+                vendor_root,
+            )
+        )
+    return discarded_host_variants
+
+
+def _copy_vendor_payloads(context: _MergeContext) -> int:
+    """Copy the selected host vendor and each additional SoC payload."""
+    shutil.rmtree(context.output, ignore_errors=True)
+    shutil.copytree(context.base_vendor, context.output)
+    for soc, vendor_root in context.inputs[1:]:
+        kernel_path, kernel_config_path, config_path = _require_soc_payload(vendor_root, soc)
+        shutil.copytree(kernel_path, context.output / _KERNEL_ROOT / soc)
+        shutil.copytree(kernel_config_path, context.output / _KERNEL_CONFIG_ROOT / soc)
+        shutil.copytree(config_path, context.output / _CONFIG_ROOT / soc)
+    return _merge_supported_ops(context.inputs, context.output)
+
+
+def _require_merged_opapi(context: _MergeContext) -> Path:
+    """Return the single merged operator API library."""
+    libraries = sorted(context.output.rglob("libcust_opapi.so"))
+    if len(libraries) != 1:
+        raise ValueError(f"Merged vendor must contain one libcust_opapi.so, found {libraries}")
+    return libraries[0]
+
+
+def _build_merge_report(
+    context: _MergeContext,
+    discarded_host_variants: list[str],
+    supported_ops_entries: int,
+    opapi_library: Path,
+) -> dict[str, Any]:
+    """Build the stable machine-readable merge report."""
+    return {
+        "schema_version": 1,
+        "status": "PASSED",
+        "vendor_root": str(context.output),
+        "supported_socs": [soc for soc, _ in context.inputs],
+        "host_vendor_soc": context.base_soc,
+        "host_payload_files": len(context.base_common_files),
+        "host_input_identity": context.host_input_identity,
+        "discarded_host_variants": discarded_host_variants,
+        "supported_ops_entries": supported_ops_entries,
+        "libcust_opapi_sha256": _sha256(opapi_library),
+    }
+
+
 def merge_vendors(
     inputs: list[tuple[str, Path]],
     output: Path,
     host_input_identities: dict[str, str],
 ) -> dict[str, Any]:
-    """Retain one provenanced host vendor and merge verified per-SoC kernels."""
-    normalized_inputs, seen_socs = _normalize_inputs(inputs)
-    host_input_identity = _validate_host_input_identities(host_input_identities, seen_socs)
-    output = _validate_output(output, normalized_inputs)
-    base_soc, base_vendor = normalized_inputs[0]
-    base_common_files = _common_files(base_vendor, base_soc)
-    base_host_libraries = sorted(set(base_common_files) & _HOST_ELF_PATHS)
-    if not base_host_libraries:
-        raise ValueError(f"Base vendor contains no recognized host ELF: {base_vendor}")
-    for relative_path in base_host_libraries:
-        _host_elf_abi_fingerprint(base_vendor / relative_path)
+    """Retain one provenanced host vendor and merge verified per-SoC kernels.
 
-    discarded_host_variants: list[str] = []
-    for soc, vendor_root in normalized_inputs[1:]:
-        discarded_host_variants.extend(
-            _compare_host_payload(base_vendor, base_common_files, soc, vendor_root)
-        )
-
-    shutil.rmtree(output, ignore_errors=True)
-    shutil.copytree(base_vendor, output)
-    for soc, vendor_root in normalized_inputs[1:]:
-        kernel_path, kernel_config_path, config_path = _require_soc_payload(vendor_root, soc)
-        shutil.copytree(kernel_path, output / _KERNEL_ROOT / soc)
-        shutil.copytree(kernel_config_path, output / _KERNEL_CONFIG_ROOT / soc)
-        shutil.copytree(config_path, output / _CONFIG_ROOT / soc)
-    supported_ops_entries = _merge_supported_ops(normalized_inputs, output)
-
-    libraries = sorted(output.rglob("libcust_opapi.so"))
-    if len(libraries) != 1:
-        raise ValueError(f"Merged vendor must contain one libcust_opapi.so, found {libraries}")
-    return {
-        "schema_version": 1,
-        "status": "PASSED",
-        "vendor_root": str(output),
-        "supported_socs": [soc for soc, _ in normalized_inputs],
-        "host_vendor_soc": base_soc,
-        "host_payload_files": len(base_common_files),
-        "host_input_identity": host_input_identity,
-        "discarded_host_variants": discarded_host_variants,
-        "supported_ops_entries": supported_ops_entries,
-        "libcust_opapi_sha256": _sha256(libraries[0]),
-    }
+    Args:
+        inputs: Ordered SoC and vendor-root pairs.
+        output: Destination directory for the merged vendor payload.
+        host_input_identities: Build identities keyed by SoC name.
+    """
+    context = _prepare_merge(inputs, output, host_input_identities)
+    discarded_host_variants = _validate_common_host_payload(context)
+    supported_ops_entries = _copy_vendor_payloads(context)
+    opapi_library = _require_merged_opapi(context)
+    return _build_merge_report(
+        context,
+        discarded_host_variants,
+        supported_ops_entries,
+        opapi_library,
+    )
 
 
 def main() -> int:
