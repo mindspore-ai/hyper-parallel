@@ -37,6 +37,7 @@ Registries:
 - ``SPECIAL_HANDLERS``: {handler_name: callable(module, param_name, mesh)} —
   lives in ``_builder/special_handlers.py``.
 """
+# pylint: disable=forbidden-backend-import
 
 import copy
 import logging
@@ -1240,7 +1241,7 @@ class ShardingPlanner:
                 full = prefix + pname
                 if full in seen:
                     raise ValueError(
-                        f"param {full!r} is declared by two boundaries: "
+                        f"[HP-PLAN-003] param {full!r} is declared by two boundaries: "
                         f"{seen[full]!r} and {fqn!r} — each parameter must be "
                         f"sharded by exactly one boundary (D-14, 05 §13.3); "
                         f"drop it from one of the specs (an outer boundary "
@@ -1256,7 +1257,7 @@ class ShardingPlanner:
         for fqn, spec in plan.modules.items():
             if spec.is_boundary and spec.in_dst and not spec.in_src:
                 raise ValueError(
-                    f"boundary {fqn!r} declares in_dst but an empty in_src — "
+                    f"[HP-PLAN-005] boundary {fqn!r} declares in_dst but an empty in_src — "
                     f"chain fill was removed (D-14, 05 §13.2); declare in_src "
                     f"explicitly (keys must mirror in_dst)"
                 )
@@ -1378,7 +1379,7 @@ class ShardingPlanner:
         more = (f"  ... and {len(uncovered) - 20} more\n"
                 if len(uncovered) > 20 else "")
         msg = (
-            f"plan-time coverage check failed: {len(uncovered)} trainable "
+            f"[HP-PLAN-004] plan-time coverage check failed: {len(uncovered)} trainable "
             f"parameter(s) are not covered by any spec.params / "
             f"special_handlers:\n{lines}\n{more}"
             "An uncovered parameter is never sharded (kept replicated) AND is "

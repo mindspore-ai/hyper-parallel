@@ -4,10 +4,10 @@
 输入输出和约束。对应实现主要位于：
 
 - `hyper_parallel/data/omni/omni_transform.py`
-- `hyper_parallel/models/deepseek_v41/adapter/processor.py`
-- `hyper_parallel/models/deepseek_v41/adapter/encoding.py`
-- `hyper_parallel/models/deepseek_v41/adapter/image_processor.py`
-- `hyper_parallel/models/deepseek_v41/adapter/transform_fn.py`
+- `hyper_parallel/models/deepseek_v41/adapter/data/processor.py`
+- `hyper_parallel/models/deepseek_v41/adapter/data/encoding.py`
+- `hyper_parallel/models/deepseek_v41/adapter/data/image_processor.py`
+- `hyper_parallel/models/deepseek_v41/adapter/data/transform_fn.py`
 
 ## 1. 支持范围
 

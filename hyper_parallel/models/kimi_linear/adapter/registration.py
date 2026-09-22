@@ -15,9 +15,9 @@
 """Architecture identity for the Kimi Linear text-model family."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
-from hyper_parallel.models.kimi_k3.adapter.registration import (
-    _load_context_parallel,
-    _load_sharding_rules,
+from hyper_parallel.models.kimi_k3.adapter import load_context_parallel
+from hyper_parallel.models.kimi_k3.adapter.policies.sharding import (
+    build_parameter_sharding_rules,
 )
 from hyper_parallel.models.registry import register_model_adapter
 
@@ -25,8 +25,8 @@ from hyper_parallel.models.registry import register_model_adapter
 KIMI_LINEAR_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="KimiLinearForCausalLM",
     model_type="kimi_linear",
-    context_parallel=_load_context_parallel,
-    sharding_rules=_load_sharding_rules,
+    context_parallel=load_context_parallel,
+    sharding_rules=build_parameter_sharding_rules,
 )
 
 register_model_adapter(KIMI_LINEAR_ADAPTER_SPEC)

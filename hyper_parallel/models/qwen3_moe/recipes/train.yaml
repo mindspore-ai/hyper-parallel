@@ -55,17 +55,17 @@ plan_overrides:
       - model.norm
     module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
     replace_module:
-      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_rms_norm
+      _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_rms_norm
   - match: "*.self_attn"
     module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
     replace_module:
-      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_flash_attention
+      _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_flash_attention
   # The experts module is always the same grouped-GEMM implementation;
   # enabling EP changes only token dispatch/combine around this boundary.
   - match: "*.mlp.experts"
     module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts
     replace_module:
-      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_grouped_experts
+      _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_grouped_experts
   # This CP wrapper accepts Online global block masks and falls back to an
   # implicit offset-aware causal mask for Offline Indexed Dataset input.
   - match: "*.self_attn"

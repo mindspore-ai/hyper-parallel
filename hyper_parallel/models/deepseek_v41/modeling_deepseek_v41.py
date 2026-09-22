@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Training-capable DeepSeek-V4.1 validation crop.
+"""Training-capable DeepSeek-V4.1 model implementation.
 
 The public V4.1 repository contains an inference-only implementation. This
 module reuses the Transformers 5.13 DeepSeek-V4 building blocks for the
 unchanged text path and implements the V4.1-only Engram, cross-layer shared
-compressed attention, and pipelined mHC semantics.
+compressed attention, and pipelined mHC semantics. The production-named model
+class accepts both full and explicitly cropped configurations; current validation
+assets exercise only ``v41_model_mode="validation_crop"``.
 """
 
 from __future__ import annotations
@@ -42,16 +44,19 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 )
 
 from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
+from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
-from hyper_parallel.components.modules.mhc import pipelined_mhc_post
+from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionCPContext as SharedAttentionCPContext,
     SharedCompressedPackedSequence as SharedPackedSequence,
     SharedCompressedAttentionState as SharedAttentionState,
-    SharedCompressedDSAAttention as DeepseekV41SharedCompressedAttention,
+    SharedCompressedDSAAttention,
+    SharedCompressedDSAAttentionBase,
+    SharedCompressedDSAIndexer,
     build_sliding_window_indices as _window_indices,
 )
-from hyper_parallel.models.deepseek_v41.adapter.image_processor import (
+from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE,
     IMAGE_END,
     IMAGE_NEW_LINE,
@@ -61,6 +66,20 @@ from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
 )
+
+_FULL_MODEL_MODE = "full"
+_VALIDATION_CROP_MODE = "validation_crop"
+
+
+def _resolve_v41_model_mode(config: Any) -> str:
+    """Resolve and validate the explicit full-versus-crop construction mode."""
+    model_mode = getattr(config, "v41_model_mode", _FULL_MODEL_MODE)
+    if model_mode not in {_FULL_MODEL_MODE, _VALIDATION_CROP_MODE}:
+        raise ValueError(
+            "v41_model_mode must be 'full' or 'validation_crop', "
+            f"got {model_mode!r}"
+        )
+    return model_mode
 
 
 def _initialize_embedding_shard_safe(module: nn.Embedding, std: float) -> None:
@@ -81,8 +100,8 @@ def _initialize_embedding_shard_safe(module: nn.Embedding, std: float) -> None:
         to_local()[module.padding_idx - row_start].zero_()
 
 
-class DeepseekV41EngramPlaceholder(nn.Module):
-    """Parameter-owning Engram whose forward is supplied by replacement."""
+class DeepseekV41Engram(nn.Module):
+    """Reference V4.1 Engram owned and executed by the model architecture."""
 
     def __init__(self, config: Any, layer_id: int, assets: dict[str, Any]) -> None:
         """Create the scaled table and the V4.1 gated residual projection."""
@@ -114,15 +133,39 @@ class DeepseekV41EngramPlaceholder(nn.Module):
         self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size))
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor,
-        segment_starts: torch.Tensor | None = None,
-        token_mask: torch.Tensor | None = None,
+            self,
+            hidden_states: torch.Tensor,
+            input_ids: torch.Tensor,
+            segment_starts: torch.Tensor | None = None,
+            token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Fail when the required Engram replacement was not applied."""
-        del hidden_states, input_ids, segment_starts, token_mask
-        raise RuntimeError("DeepSeek-V4.1 Engram requires its module replacement")
+        """Apply the released hash lookup and gated residual update."""
+        hash_ids = self.hash_mapping(input_ids, segment_starts, token_mask)
+        embeddings = self.embed(hash_ids)
+        key_value = self.wkv(embeddings.flatten(start_dim=-2))
+        key, value = key_value.split(
+            [self.hc_mult * self.hidden_size, self.hidden_size],
+            dim=-1,
+        )
+        key = key.float().unflatten(-1, (self.hc_mult, self.hidden_size))
+        hidden_fp32 = hidden_states.float()
+        weight = self.q_weight.float() * self.k_weight.float()
+        reciprocal_std = torch.rsqrt(hidden_fp32.square().mean(-1) + self.eps)
+        reciprocal_std = reciprocal_std * torch.rsqrt(key.square().mean(-1) + self.eps)
+        dot = (hidden_fp32 * weight * key).sum(-1)
+        dot = dot * reciprocal_std * self.hidden_size**-0.5
+        root = dot.abs().clamp_min(self.clamp_value).sqrt()
+        gate = torch.sigmoid(torch.where(dot < 0, -root, root))
+        fused = (
+            hidden_fp32 + gate.unsqueeze(-1) * value.float().unsqueeze(-2)
+        ).to(hidden_states.dtype)
+        if token_mask is None:
+            return fused
+        return torch.where(
+            token_mask.to(torch.bool).unsqueeze(-1).unsqueeze(-1),
+            fused,
+            hidden_states,
+        )
 
 
 class DeepseekV41TopKRouter(nn.Module):
@@ -236,8 +279,8 @@ class DeepseekV41Compressor(nn.Module):
         return latent, rotated
 
 
-class DeepseekV41Indexer(nn.Module):
-    """Parameter owner for a V4.1 Full or Reindex Lightning Indexer."""
+class _DeepseekV41IndexerState(nn.Module):
+    """Construct the released Full or Reindex Lightning Indexer state."""
 
     def __init__(self, config: Any, compress_ratio: int, layer_idx: int) -> None:
         """Create layer-local queries and Full-only shared-key projections."""
@@ -259,24 +302,17 @@ class DeepseekV41Indexer(nn.Module):
             self.wk = nn.Linear(config.head_dim, self.head_dim, bias=False)
             self.k_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-    def forward(
-            self,
-            hidden_states: torch.Tensor,
-            query_residual: torch.Tensor,
-            latent: torch.Tensor,
-            compress_position_embeddings: tuple[torch.Tensor, torch.Tensor],
-            *,
-            cp_context: SharedAttentionCPContext | None = None,
-            query_offset: int = 0,
-    ) -> torch.Tensor:
-        """Fail because the high-performance replacement owns Indexer execution."""
-        del hidden_states, query_residual, latent, compress_position_embeddings
-        del cp_context, query_offset
-        raise RuntimeError("DeepSeek-V4.1 Indexer requires its module replacement")
+
+class DeepseekV41Indexer(SharedCompressedDSAIndexer):
+    """Reference Full/Reindex module owned by the V4.1 architecture."""
+
+    def __init__(self, config: Any, compress_ratio: int, layer_idx: int) -> None:
+        """Create the released Indexer state and attach its reference semantics."""
+        super().__init__(_DeepseekV41IndexerState(config, compress_ratio, layer_idx))
 
 
-class DeepseekV41AttentionPlaceholder(DeepseekV4Attention):
-    """Parameter-owning attention whose forward must be replaced by the adapter."""
+class _DeepseekV41AttentionState(DeepseekV4Attention):
+    """Construct the released V4.1 attention parameter tree."""
 
     def __init__(self, config: Any, layer_idx: int) -> None:
         """Create V4 parameters plus the source-only compressor and indexer."""
@@ -301,18 +337,74 @@ class DeepseekV41AttentionPlaceholder(DeepseekV4Attention):
         if self.is_index_source:
             self.indexer = DeepseekV41Indexer(config, self.compress_ratio, layer_idx)
 
+
+class DeepseekV41Attention(SharedCompressedDSAAttentionBase):
+    """Reference shared compressed attention owned by the model architecture."""
+
+    def __init__(self, config: Any, layer_idx: int) -> None:
+        """Create the canonical parameter tree with non-fused reference execution."""
+        super().__init__(
+            _DeepseekV41AttentionState(config, layer_idx),
+            replace_indexer=False,
+            use_optimized_sparse_attention=False,
+        )
+
+
+class DeepseekV41PipelinedHyperConnection(nn.Module):
+    """Reference pipelined mHC coefficient module owned by V4.1."""
+
+    def __init__(self, module: nn.Module) -> None:
+        """Adopt the V4 parameter layout without enabling fused kernels."""
+        super().__init__()
+        self.input_norm = module.input_norm
+        self.fn = module.fn
+        self.base = module.base
+        self.scale = module.scale
+        self.hc_mult = int(module.hc_mult)
+        self.hc_sinkhorn_iters = int(module.hc_sinkhorn_iters)
+        self.hc_eps = float(module.hc_eps)
+        self.train(module.training)
+
     def forward(
             self,
-            hidden_states: torch.Tensor,
-            position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
-            position_ids: torch.Tensor,
-            attention_mask: torch.Tensor | None,
-            past_key_values: Any | None = None,
-            **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Fail when the required V4.1 forward replacement was not applied."""
-        del hidden_states, position_embeddings, position_ids, attention_mask, past_key_values, kwargs
-        raise RuntimeError("DeepSeek-V4.1 shared attention requires its module replacement")
+            hidden_streams: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute V4.1 pre, post, and residual mixing coefficients."""
+        flattened = self.input_norm(hidden_streams.flatten(start_dim=2).float())
+        mix = functional.linear(flattened, self.fn.float())  # pylint: disable=not-callable
+        num_stream = self.hc_mult
+        pre, post, residual = mix.split(
+            [num_stream, num_stream, num_stream * num_stream],
+            dim=-1,
+        )
+        pre_bias, post_bias, residual_bias = self.base.split(
+            [num_stream, num_stream, num_stream * num_stream]
+        )
+        pre_scale, post_scale, residual_scale = self.scale.unbind(0)
+        pre = torch.sigmoid(pre * pre_scale + pre_bias) + self.hc_eps
+        post = 2 * torch.sigmoid(post * post_scale + post_bias)
+        residual = residual.view(*residual.shape[:-1], num_stream, num_stream)
+        residual = residual * residual_scale + residual_bias.view(num_stream, num_stream)
+        residual = sinkhorn_knopps(residual, self.hc_sinkhorn_iters, self.hc_eps)
+        return pre, post, residual
+
+
+def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
+    """Preserve special initialization after V4.1 changes the HF source type."""
+    if isinstance(module, (DeepseekV41Engram, EngramModule)):
+        module.q_weight.fill_(1.0)
+        module.k_weight.fill_(1.0)
+    elif isinstance(module, DeepseekV41TopKRouter):
+        nn.init.normal_(module.weight, mean=0.0, std=std)
+        module.bias.zero_()
+        if module.bias_vl is not None:
+            module.bias_vl.zero_()
+    elif isinstance(module, (DeepseekV41Attention, SharedCompressedDSAAttention)):
+        module.sinks.zero_()
+    elif isinstance(module, (DeepseekV41PipelinedHyperConnection, PipelinedMhcModule)):
+        nn.init.normal_(module.fn, mean=0.0, std=std)
+        module.base.zero_()
+        module.scale.fill_(1.0)
 
 
 def _hc_pre(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
@@ -378,14 +470,15 @@ def _v41_decoder_layer_forward(
     return hidden_states, ffn_pre
 
 
-class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
+class DeepseekV41Model(DeepseekV4PreTrainedModel):
     """Depth-configurable V4.1 backbone with optional native vision support."""
 
     def __init__(self, config: Any) -> None:
-        """Create the cropped backbone and attach active V4.1 modules."""
+        """Create the configured backbone and attach active V4.1 modules."""
         super().__init__(config)
+        self.model_mode = _resolve_v41_model_mode(config)
         if config.num_hidden_layers < 1:
-            raise ValueError("DeepseekV41CroppedModel requires at least one decoder layer")
+            raise ValueError("DeepseekV41Model requires at least one decoder layer")
         if len(config.v41_compress_ratios) != config.num_hidden_layers:
             raise ValueError(
                 "v41_compress_ratios must contain one entry per decoder layer, "
@@ -410,13 +503,15 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
         )
         for layer_idx in range(config.num_hidden_layers):
             layer = self.layers[layer_idx]
-            layer.self_attn = DeepseekV41AttentionPlaceholder(config, layer_idx)
+            layer.attn_hc = DeepseekV41PipelinedHyperConnection(layer.attn_hc)
+            layer.ffn_hc = DeepseekV41PipelinedHyperConnection(layer.ffn_hc)
+            layer.self_attn = DeepseekV41Attention(config, layer_idx)
             layer.forward = MethodType(_v41_decoder_layer_forward, layer)
+            layer.mlp.gate = DeepseekV41TopKRouter(config)
             if bool(getattr(config, "v41_vision_enabled", False)):
-                layer.mlp.gate = DeepseekV41TopKRouter(config)
                 layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)
         for layer_id in assets["layer_ids"]:
-            self.layers[layer_id].engram = DeepseekV41EngramPlaceholder(config, layer_id, assets)
+            self.layers[layer_id].engram = DeepseekV41Engram(config, layer_id, assets)
         self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.vision = None
@@ -437,15 +532,8 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
             _initialize_embedding_shard_safe(module, self.config.initializer_range)
             return
         super()._init_weights(module)
-        if isinstance(module, (DeepseekV41EngramPlaceholder, EngramModule)):
-            module.q_weight.fill_(1.0)
-            module.k_weight.fill_(1.0)
-        elif isinstance(module, DeepseekV41TopKRouter):
-            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            module.bias.zero_()
-            if module.bias_vl is not None:
-                module.bias_vl.zero_()
-        elif isinstance(module, DeepseekV41CroppedModel) and module.vision is not None:
+        _initialize_v41_owned_module(module, self.config.initializer_range)
+        if isinstance(module, DeepseekV41Model) and module.vision is not None:
             nn.init.normal_(module.image_start, mean=0.0, std=self.config.initializer_range)
             nn.init.normal_(module.image_end, mean=0.0, std=self.config.initializer_range)
             nn.init.normal_(module.image_newline, mean=0.0, std=self.config.initializer_range)
@@ -566,7 +654,31 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
             image_sequence_start: int = 0,
             **kwargs: Any,
     ) -> MoeModelOutputWithPast:
-        """Execute image injection, Engram, shared attention, and pipelined mHC."""
+        """Execute image injection, Engram, shared attention, and pipelined mHC.
+
+        Args:
+            input_ids: Input token IDs.
+            attention_mask: Compact sample-boundary metadata.
+            position_ids: Token position IDs.
+            past_key_values: Unsupported KV-cache state.
+            inputs_embeds: Precomputed token embeddings.
+            use_cache: Whether to request KV-cache output.
+            token_types: Text and image token-type IDs.
+            pixel_values: Flattened ViT patch tensor.
+            image_patch_offsets: Image offsets in ``pixel_values``.
+            image_vit_grid_hw: Per-image ViT grid dimensions.
+            image_llm_grid_hw: Per-image LLM grid dimensions.
+            image_batch_indices: Batch index for each image.
+            image_token_starts: Global token start for each image span.
+            image_sequence_start: Global start of this CP sequence shard.
+            **kwargs: Additional decoder-layer keyword arguments.
+
+        Returns:
+            Decoder hidden state and optional cache metadata.
+        """
+        # The conditions below enforce one ordered forward contract across text,
+        # vision, Engram, shared-attention, mHC, and gradient-checkpointing paths.
+        #lizard forgives(cyclomatic_complexity)
         if use_cache or past_key_values is not None:
             raise NotImplementedError("the V4.1 validation crop supports training without KV cache")
         if (input_ids is None) == (inputs_embeds is None):
@@ -645,13 +757,14 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
         return MoeModelOutputWithPast(last_hidden_state=hidden_states)
 
 
-class DeepseekV41CroppedForCausalLM(DeepseekV4ForCausalLM):
-    """Causal-LM facade for the depth-configurable V4.1 validation backbone."""
+class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
+    """Causal-LM facade shared by full and validation-crop configurations."""
 
     def __init__(self, config: Any) -> None:
-        """Create the cropped backbone and unchanged causal-LM facade."""
+        """Create the configured backbone and unchanged causal-LM facade."""
         DeepseekV4PreTrainedModel.__init__(self, config)  # pylint: disable=non-parent-init-called
-        self.model = DeepseekV41CroppedModel(config)
+        self.model = DeepseekV41Model(config)
+        self.model_mode = self.model.model_mode
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.router_aux_loss_coef = config.router_aux_loss_coef
@@ -666,27 +779,22 @@ class DeepseekV41CroppedForCausalLM(DeepseekV4ForCausalLM):
             _initialize_embedding_shard_safe(module, self.config.initializer_range)
             return
         super()._init_weights(module)
-        if isinstance(module, (DeepseekV41EngramPlaceholder, EngramModule)):
-            module.q_weight.fill_(1.0)
-            module.k_weight.fill_(1.0)
-        elif isinstance(module, DeepseekV41TopKRouter):
-            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            module.bias.zero_()
-            if module.bias_vl is not None:
-                module.bias_vl.zero_()
+        _initialize_v41_owned_module(module, self.config.initializer_range)
 
     @classmethod
-    def from_config(cls, config: Any, **kwargs: Any) -> "DeepseekV41CroppedForCausalLM":
-        """Construct the validation model from its translated HF configuration."""
+    def from_config(cls, config: Any, **kwargs: Any) -> "DeepseekV41ForCausalLM":
+        """Construct the model from its translated V4.1 configuration."""
         del kwargs
         return cls(config)
 
 
 __all__ = [
-    "DeepseekV41AttentionPlaceholder",
-    "DeepseekV41CroppedForCausalLM",
-    "DeepseekV41EngramPlaceholder",
-    "DeepseekV41SharedCompressedAttention",
+    "DeepseekV41Attention",
+    "DeepseekV41Engram",
+    "DeepseekV41ForCausalLM",
+    "DeepseekV41Indexer",
+    "DeepseekV41Model",
+    "DeepseekV41PipelinedHyperConnection",
     "DeepseekV41TopKRouter",
     "SharedAttentionCPContext",
     "SharedAttentionState",

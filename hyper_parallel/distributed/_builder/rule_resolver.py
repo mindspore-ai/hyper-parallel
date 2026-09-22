@@ -128,7 +128,7 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
         _validate_override_axes(key, user_spec, source, plan)
         if not _is_glob_key(key) and key not in module_name_set:
             raise ValueError(
-                f"{source} FQN not found in the model's "
+                f"[HP-PLAN-001] {source} FQN not found in the model's "
                 f"named_modules: {key!r} (check spelling; in PP "
                 f"scenarios plan each single-part model separately)"
             )
@@ -160,7 +160,7 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
                     matched += f" (and {omitted} more)"
                 example_fqn = model_hits[0]
                 raise ValueError(
-                    f"{source}[{key!r}] matched {len(model_hits)} module(s) "
+                    f"[HP-PLAN-002] {source}[{key!r}] matched {len(model_hits)} module(s) "
                     "in the final model that have no planner-derived "
                     f"boundary: {matched}. The override declares only "
                     f"merge-only fields {configured_fields or ['none']} and "

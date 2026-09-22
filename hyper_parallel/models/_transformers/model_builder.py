@@ -21,6 +21,7 @@ plan/apply sharding -> activation checkpoint/swap -> FSDP2 ->
 materialize/load -> compile. This module consumes only normalized
 AutoModels objects and never imports trainer config (05 §15.2.6).
 """
+# pylint: disable=forbidden-backend-import
 
 import logging
 from typing import Any, Dict, Literal, Optional, Union
@@ -345,6 +346,7 @@ def _apply_pre_sharding_features(
     fp8_config: Optional[Any],
 ) -> None:
     """Apply or report optional features that precede sharding."""
+    del model
     if peft_config is not None:
         logger.warning("PEFT injection not implemented in stub")
     if qat_config is not None:
@@ -382,6 +384,7 @@ def _apply_activation_features(
     compile_for_execution: bool,
     mesh: Optional[MeshContext],
     swap_inputs: bool = False,
+    selection: Optional[Any] = None,
 ) -> nn.Module:
     """Apply activation checkpointing and attention swap in execution order."""
     if activation_checkpoint not in (None, "off"):
@@ -390,6 +393,7 @@ def _apply_activation_features(
             activation_checkpoint,
             enable_compile=compile_for_execution,
             swap_inputs=swap_inputs,
+            selection=selection,
         )
     validate_attention_swap(
         activation_swap,
@@ -417,7 +421,8 @@ def _materialize_and_load_model(
         load_report = CheckpointManager(model).load_checkpoint(
             pretrained_path, strict=False, weights_mapping=weights_mapping
         )
-        _finalize_model_loading(model, load_report, strict=True)
+        load_report = _finalize_model_loading(model, load_report, strict=True)
+        model._hp_checkpoint_load_report = load_report  # pylint: disable=protected-access
         reason = "checkpoint_load"
     else:
         _initialize_model_weights(model)
@@ -444,6 +449,7 @@ def apply_model_infrastructure(
     freeze_config: Optional[Any] = None,
     compile_config: Optional[Union[CompileConfig, dict]] = None,
     activation_checkpoint: Optional[str] = None,
+    activation_checkpoint_selection: Optional[Any] = None,
     activation_swap: str = "none",
     swap_inputs: bool = False,
     is_meta_device: bool = False,
@@ -504,6 +510,7 @@ def apply_model_infrastructure(
         compile_for_execution,
         mesh,
         swap_inputs=swap_inputs,
+        selection=activation_checkpoint_selection,
     )
     # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
     # as DTensors, and FSDP derives their source layouts directly.

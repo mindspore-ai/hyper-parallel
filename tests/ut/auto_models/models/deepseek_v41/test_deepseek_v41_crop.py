@@ -18,12 +18,10 @@
 import inspect
 import json
 import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from typing import Optional
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
@@ -40,18 +38,10 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
 )
 
 from hyper_parallel import init_empty_weights
-from hyper_parallel.components.checkpoint.weight_conversion import (
-    WeightConverter,
-    WeightRenaming,
-    get_model_conversion_mapping,
-    rename_source_key,
-)
-from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
+from hyper_parallel.components.modules.engram import EngramModule
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
-    SharedCompressedPackedSequence,
     SharedCompressedDSAAttention,
-    SharedCompressedDSAIndexer,
     compressed_candidate_topk,
     compressed_causal_topk,
     select_candidate_block_indices,
@@ -59,13 +49,12 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     shared_compressed_indexer_kl_loss,
 )
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_parallel.data.batching import ParallelBatch
-from hyper_parallel.data.batching.build_collate_fn import (
-    DataBatchContext,
-    TextPackingCollator,
+from hyper_parallel.data.batching import (
+    OmniPackingLoader,
+    OmniParallelBatch,
+    TokenBatchLoader,
+    build_online_text_collate_fn,
 )
-from hyper_parallel.data.vlm.collator import VLMCollator
-from hyper_parallel.data.vlm.get_batch import build_vlm_get_batch
 from hyper_parallel.distributed._builder.forward_rewriter import (
     validate_local_compute_signature,
 )
@@ -80,34 +69,25 @@ from hyper_parallel.distributed.recipe_spec import EP, TP, ModuleShardingSpec
 from hyper_parallel.models._transformers.model_builder import (
     _materialize_and_load_model,
 )
-from hyper_parallel.models.deepseek_v41.adapter.checkpoint import (
-    register_deepseek_v41_checkpoint_mapping,
+from hyper_parallel.models.deepseek_v41.adapter.data.runtime import DeepseekV41Runtime
+from hyper_parallel.models.deepseek_v41.adapter.data.transform_fn import (
+    build_deepseek_v41_omni_transform,
 )
-from hyper_parallel.models.deepseek_v41.adapter.expert_parallel import (
+from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_engram_compute_fn,
     deepseek_v41_ep_compute_fn,
 )
+from hyper_parallel.models.deepseek_v41.adapter.policies.sharding import (
+    get_fsdp_wrap_modules,
+)
 from hyper_parallel.models.deepseek_v41.adapter.registration import (
-    _get_fsdp_wrap_modules,
-)
-from hyper_parallel.models.deepseek_v41.adapter.packed_sequence import (
-    DeepseekV41BatchAdapter,
-)
-from hyper_parallel.models.deepseek_v41.adapter.replacements import (
-    replace_deepseek_v41_shared_attention,
-)
-from hyper_parallel.models.deepseek_v41.adapter.vlm_data import (
-    DeepseekV41VLMBatchAdapter,
-    build_deepseek_v41_vlm_data_transform,
-)
-from hyper_parallel.models.deepseek_v41.configuration import (
-    build_scaled_engram_buckets,
+    DEEPSEEK_V41_ADAPTER_SPEC,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
-    DeepseekV41AttentionPlaceholder,
-    DeepseekV41Compressor,
-    DeepseekV41CroppedForCausalLM,
-    DeepseekV41SharedCompressedAttention,
+    DeepseekV41Attention,
+    DeepseekV41Engram,
+    DeepseekV41ForCausalLM,
+    DeepseekV41PipelinedHyperConnection,
     SharedAttentionCPContext,
     SharedAttentionState,
     _window_indices,
@@ -121,7 +101,7 @@ from hyper_parallel.trainer.config import (
     entries_to_module_replacements,
     entries_to_plan_overrides,
 )
-from hyper_parallel.trainer.config.manager import parse_training_args
+from hyper_parallel.trainer.config.parser import parse_training_args
 from tests.common.mark_utils import arg_mark
 
 
@@ -129,6 +109,7 @@ def _write_engram_assets(
         directory: str,
         num_hidden_layers: int = 4,
         layer_ids: tuple[int, ...] = (1,),
+        head_dim: int = 4,
 ) -> Path:
     """Write a minimal but internally consistent scaled Engram asset."""
     available_primes = (
@@ -145,7 +126,7 @@ def _write_engram_assets(
         "bucket_base": 16,
         "max_ngram_size": 3,
         "num_heads": 2,
-        "head_dim": 4,
+        "head_dim": head_dim,
         "primes": primes,
         "num_embeddings": [
             sum(value for row in layer_primes for value in row)
@@ -157,6 +138,78 @@ def _write_engram_assets(
     }
     path = Path(directory) / "engram.json"
     path.write_text(json.dumps(assets), encoding="utf-8")
+    return path
+
+
+def _write_released_config(directory: str) -> Path:
+    """Write a release-shaped config whose dimensions have exact crop ratios."""
+    text_config = {
+        "vocab_size": 64,
+        "hidden_size": 256,
+        "moe_intermediate_size": 128,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 1,
+        "head_dim": 64,
+        "qk_rope_head_dim": 32,
+        "q_lora_rank": 128,
+        "o_lora_rank": 128,
+        "o_groups": 8,
+        "hidden_act": "silu",
+        "swiglu_limit": 10.0,
+        "rms_norm_eps": 1.0e-6,
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "initializer_range": 0.02,
+        "tie_word_embeddings": False,
+        "max_position_embeddings": 4096,
+        "rope_theta": 10000.0,
+        "rope_scaling": None,
+        "n_routed_experts": 384,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 6,
+        "scoring_func": "sqrtsoftplus",
+        "norm_topk_prob": True,
+        "routed_scaling_factor": 1.5,
+        "sliding_window": 128,
+        "compress_ratios": [0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
+        "compress_rope_theta": 160000.0,
+        "kv_source_layer_ids": [2, 8, 14, 20],
+        "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+        "index_n_heads": 32,
+        "index_head_dim": 64,
+        "index_topk": 512,
+        "candidate_source_layer_id": 20,
+        "candidate_topk_blocks": 2048,
+        "candidate_block_size": 8,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "hc_eps": 1.0e-6,
+        "engram_layer_ids": [1, 14],
+        "engram_head_dim": 32,
+    }
+    source = {
+        "model_type": "deepseek_v41",
+        "pad_token_id": 0,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "image_token_id": 3,
+        "text_config": text_config,
+        "vision_config": {
+            "num_hidden_layers": 32,
+            "hidden_size": 128,
+            "num_attention_heads": 16,
+            "intermediate_size": 192,
+            "patch_size": 14,
+            "rope_theta": 10000.0,
+            "downsample_ratio": 3,
+            "max_image_tokens": 1024,
+            "min_pixels": 295936,
+            "max_wh_ratio": None,
+        },
+    }
+    path = Path(directory) / "config.json"
+    path.write_text(json.dumps(source), encoding="utf-8")
     return path
 
 
@@ -230,7 +283,7 @@ def _tiny_config(
     config.v41_engram_bucket_base = 16
     config.v41_engram_assets_path = str(assets_path)
     config.v41_source_model_type = "deepseek_v41"
-    config.v41_validation_crop = True
+    config.v41_model_mode = "validation_crop"
     config.v41_vision_enabled = False
     config.v41_vision_num_hidden_layers = 1
     config.v41_vision_hidden_size = 32
@@ -247,462 +300,75 @@ def _tiny_config(
     return config
 
 
-def _replace_v41_modules(model: DeepseekV41CroppedForCausalLM) -> None:
-    """Apply the recipe's attention, mHC, and Engram replacements."""
-    for layer_index, layer in enumerate(model.model.layers):
-        layer.self_attn = replace_deepseek_v41_shared_attention(
-            module=layer.self_attn,
-            module_fqn=f"model.layers.{layer_index}.self_attn",
-            context={},
-        )
-        layer.attn_hc = PipelinedMhcModule(module=layer.attn_hc)
-        layer.ffn_hc = PipelinedMhcModule(module=layer.ffn_hc)
-    for layer_index in model.config.v41_engram_layer_ids:
-        engram = model.model.layers[layer_index].engram
-        model.model.layers[layer_index].engram = EngramModule(module=engram)
-
-
 class TestDeepseekV41EngramScaling(unittest.TestCase):
     """Scaled Engram tables retain the source hash-layout invariants."""
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_default_validation_table_has_unique_synchronized_buckets(self):
-        """The 4-layer crop shrinks the active layer-1 table to 100,776 rows."""
-        primes, table_sizes = build_scaled_engram_buckets(
-            [1],
-            bucket_base=4096,
-            max_ngram_size=4,
-            num_heads=8,
-        )
-        flattened = [value for ngram in primes[0] for value in ngram]
-        self.assertEqual(table_sizes, [100776])
-        self.assertEqual(sum(flattened), table_sizes[0])
-        self.assertEqual(len(flattened), len(set(flattened)))
-        self.assertTrue(all(value >= 4096 for value in flattened))
+    def test_online_recipes_wire_omni_data_pipeline(self):
+        """Validate the released DeepSeek text and VLM recipes.
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_dead_token_blocks_all_older_ngram_history(self):
-        """A masked token prevents longer n-grams from crossing its boundary."""
-        with tempfile.TemporaryDirectory() as directory:
-            assets = json.loads(_write_engram_assets(directory).read_text(encoding="utf-8"))
-            mapping = NgramHashMapping(assets, layer_id=1)
-            token_mask = torch.tensor([[True, True, False, True, True]])
-            first = mapping(torch.tensor([[1, 2, 3, 4, 5]]), token_mask=token_mask)
-            second = mapping(torch.tensor([[9, 10, 3, 4, 5]]), token_mask=token_mask)
-
-            self.assertTrue(torch.equal(first[:, 2], second[:, 2]))
-            self.assertTrue(torch.equal(first[:, 3, mapping.num_heads:], second[:, 3, mapping.num_heads:]))
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_family_and_custom_model_are_discovered_lazily(self):
-        """AutoModel path selection discovers the family without preheating."""
-        code = (
-            "import sys\n"
-            "from types import SimpleNamespace\n"
-            "from hyper_parallel.models._transformers.config_resolver import get_is_hf_model\n"
-            "from hyper_parallel.models import registry\n"
-            "registration = 'hyper_parallel.models.deepseek_v41.adapter.registration'\n"
-            "model_module = 'hyper_parallel.models.deepseek_v41.modeling_deepseek_v41'\n"
-            "assert registration not in sys.modules\n"
-            "assert model_module not in sys.modules\n"
-            "config = SimpleNamespace(model_type='deepseek_v41', "
-            "architectures=['DeepseekV41ForCausalLM'])\n"
-            "assert get_is_hf_model(config) is False\n"
-            "assert registration in sys.modules\n"
-            "model_cls = registry._resolve_custom_model_cls(config.architectures[0])\n"
-            "assert model_cls.__name__ == 'DeepseekV41CroppedForCausalLM'\n"
-        )
-        subprocess.run([sys.executable, "-c", code], check=True)
-
-
-class TestDeepseekV41CroppedModel(unittest.TestCase):
-    """Engram and shared compressed attention execute together."""
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_v41_query_projection_has_no_post_qb_norm(self):
-        """V4.1 sends wq_b output directly into RoPE, unlike inherited V4."""
-        with tempfile.TemporaryDirectory() as directory:
-            config = _tiny_config(_write_engram_assets(directory))
-            placeholder = DeepseekV41AttentionPlaceholder(config, 0)
-            self.assertFalse(hasattr(placeholder, "q_b_norm"))
-            attention = replace_deepseek_v41_shared_attention(
-                module=placeholder,
-                module_fqn="model.layers.0.self_attn",
-                context={},
-            )
-            hidden_states = torch.randn(1, 4, config.hidden_size)
-            position_ids = torch.zeros(1, 4, dtype=torch.long)
-            model = DeepseekV41CroppedForCausalLM(config)
-            cos, sin = model.model.rotary_emb(
-                hidden_states,
-                position_ids=position_ids,
-                layer_type="main",
-            )
-            query_residual, query = attention._project_query(  # pylint: disable=protected-access
-                hidden_states,
-                cos,
-                sin,
-            )
-            expected = attention.q_b_proj(query_residual).view(
-                1,
-                4,
-                -1,
-                attention.head_dim,
-            ).transpose(1, 2)
-
-        self.assertFalse(hasattr(attention, "q_b_norm"))
-        torch.testing.assert_close(query, expected)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_ratio_one_compressor_has_no_gate_and_keeps_every_token(self):
-        """The released ratio-one path is norm(wkv(x)), with no gate weight."""
-        with tempfile.TemporaryDirectory() as directory:
-            config = _tiny_config(_write_engram_assets(directory))
-            model = DeepseekV41CroppedForCausalLM(config)
-            compressor = DeepseekV41Compressor(config, compress_ratio=1)
-            hidden_states = torch.randn(1, 5, config.hidden_size, requires_grad=True)
-            position_ids = torch.arange(5).unsqueeze(0)
-            position_embeddings = model.model.rotary_emb(
-                hidden_states,
-                position_ids=position_ids,
-                layer_type="compress",
-            )
-            latent, rotated = compressor(hidden_states, position_embeddings)
-            expected = compressor.norm(compressor.wkv(hidden_states))
-            (latent.sum() + rotated.sum()).backward()
-
-        self.assertFalse(hasattr(compressor, "wgate"))
-        self.assertNotIn("wgate.weight", compressor.state_dict())
-        self.assertEqual(latent.shape[1], hidden_states.shape[1])
-        torch.testing.assert_close(latent, expected)
-        self.assertGreater(compressor.wkv.weight.grad.norm().item(), 0.0)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_official_checkpoint_names_route_to_v41_structure(self):
-        """V4.1-specific leaves avoid the incompatible V4 Indexer mapping."""
-        register_deepseek_v41_checkpoint_mapping()
-        with tempfile.TemporaryDirectory() as directory:
-            config = _tiny_config(_write_engram_assets(directory))
-            config.v41_vision_enabled = True
-            model = DeepseekV41CroppedForCausalLM(config)
-            mapping = get_model_conversion_mapping(model)
-            renamings = [item for item in mapping if isinstance(item, WeightRenaming)]
-            converters = [item for item in mapping if isinstance(item, WeightConverter)]
-            targets = model.state_dict()
-            examples = {
-                "layers.0.attn.wq_b.weight": "model.layers.0.self_attn.q_b_proj.weight",
-                "layers.2.attn.compressor.wkv.weight": (
-                    "model.layers.2.self_attn.compressor.wkv.weight"
-                ),
-                "layers.2.attn.compressor.wgate.weight": (
-                    "model.layers.2.self_attn.compressor.wgate.weight"
-                ),
-                "layers.2.attn.indexer.wq_b.weight": (
-                    "model.layers.2.self_attn.indexer.q_b_proj.weight"
-                ),
-                "layers.1.engram.embed.weight": "model.layers.1.engram.embed.weight",
-                "vision.blocks.0.attn.wqkv.weight": "model.vision.blocks.0.attn.wqkv.weight",
-                "aligner.w1.weight": "model.aligner.w1.weight",
-                "image_start": "model.image_start",
-            }
-            routed = {
-                source: rename_source_key(
-                    source,
-                    renamings,
-                    converters,
-                    base_model_prefix=model.base_model_prefix,
-                    meta_state_dict=targets,
-                )[0]
-                for source in examples
-            }
-
-        self.assertEqual(routed, examples)
-        self.assertNotIn(
-            "model.layers.2.self_attn.compressor.kv_proj.weight",
-            routed.values(),
-        )
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_training_state_keeps_multiple_source_groups_addressable(self):
-        """A later Full layer cannot overwrite an earlier source dependency."""
-        state = SharedAttentionState()
-        source_two = torch.randn(1, 2, 8, requires_grad=True)
-        source_eight = torch.randn(1, 2, 8, requires_grad=True)
-        state.publish_compressed_kv(2, source_two)
-        state.publish_compressed_kv(8, source_eight)
-
-        self.assertIs(state.require_compressed_kv(2, 7), source_two)
-        self.assertIs(state.require_compressed_kv(8, 13), source_eight)
-        with self.assertRaisesRegex(RuntimeError, "layer 1.*source layer None"):
-            state.require_compressed_kv(None, 1)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_full_checkpoint_keeps_shared_attention_autograd_graph(self):
-        """KV-sharing fallback recomputes MLP but keeps source attention live."""
-        with tempfile.TemporaryDirectory() as directory:
-            torch.manual_seed(23)
-            model = DeepseekV41CroppedForCausalLM(
-                _tiny_config(_write_engram_assets(directory))
-            )
-            _replace_v41_modules(model)
-            _apply_activation_checkpointing(model, "full")
-            source_attention = model.model.layers[2].self_attn
-            output = model(
-                input_ids=torch.randint(3, 64, (1, 8)),
-                labels=torch.randint(3, 64, (1, 8)),
-            )
-            output.loss.backward()
-
-        self.assertGreater(model.config.num_kv_shared_layers, 0)
-        self.assertIsInstance(source_attention, SharedCompressedDSAAttention)
-        self.assertTrue(hasattr(model.model.layers[2].mlp, "_wrapped_module"))
-        self.assertGreater(source_attention.compressor.wkv.weight.grad.norm().item(), 0.0)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_shared_source_consumer_and_engram_receive_gradients(self):
-        """Layer 2 publishes compressed KV and layer 3 consumes it in backward."""
-        with tempfile.TemporaryDirectory() as directory:
-            torch.manual_seed(11)
-            model = DeepseekV41CroppedForCausalLM(_tiny_config(_write_engram_assets(directory)))
-            source_keys = [
-                set(layer.self_attn.state_dict())
-                for layer in model.model.layers
-            ]
-            _replace_v41_modules(model)
-            replacement_keys = [
-                set(layer.self_attn.state_dict())
-                for layer in model.model.layers
-            ]
-            self.assertEqual(source_keys, replacement_keys)
-            input_ids = torch.randint(3, 64, (1, 8))
-            output = model(input_ids=input_ids, labels=input_ids)
-            output.loss.backward()
-
-            source = model.model.layers[2].self_attn
-            consumer = model.model.layers[3].self_attn
-            self.assertIsInstance(source, DeepseekV41SharedCompressedAttention)
-            self.assertIsInstance(consumer, DeepseekV41SharedCompressedAttention)
-            self.assertIsInstance(source, SharedCompressedDSAAttention)
-            self.assertIsInstance(source.indexer, SharedCompressedDSAIndexer)
-            self.assertTrue(hasattr(source, "compressor"))
-            self.assertTrue(hasattr(source, "indexer"))
-            self.assertFalse(hasattr(consumer, "compressor"))
-            self.assertTrue(hasattr(consumer, "indexer"))
-            self.assertFalse(hasattr(consumer.indexer, "wk"))
-            self.assertFalse(hasattr(consumer.indexer, "k_norm"))
-            self.assertIsNotNone(model.model.layers[1].engram.embed.weight.grad)
-            self.assertGreater(model.model.layers[1].engram.embed.weight.grad.norm().item(), 0.0)
-            self.assertIsNotNone(source.compressor.wkv.weight.grad)
-            self.assertGreater(source.compressor.wkv.weight.grad.norm().item(), 0.0)
-            self.assertIsNotNone(source.indexer.q_b_proj.weight.grad)
-            self.assertGreater(source.indexer.q_b_proj.weight.grad.norm().item(), 0.0)
-            self.assertIsNotNone(consumer.indexer.q_b_proj.weight.grad)
-            self.assertGreater(consumer.indexer.q_b_proj.weight.grad.norm().item(), 0.0)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_native_vision_span_injects_trainable_image_features(self):
-        """A V4.1 image span reaches vision, aligner, router, and LM loss."""
-        with tempfile.TemporaryDirectory() as directory:
-            torch.manual_seed(17)
-            config = _tiny_config(_write_engram_assets(directory))
-            config.v41_vision_enabled = True
-            model = DeepseekV41CroppedForCausalLM(config)
-            image_boundaries = torch.stack([
-                model.model.image_start,
-                model.model.image_newline,
-                model.model.image_end,
-            ])
-            self.assertTrue(torch.isfinite(image_boundaries).all())
-            self.assertGreater(torch.count_nonzero(image_boundaries).item(), 0)
-            self.assertLess(image_boundaries.abs().max().item(), 0.5)
-            _replace_v41_modules(model)
-            input_ids = torch.tensor([[5, 6, 3, 3, 3, 3, 7, 8]])
-            token_types = torch.tensor([[-1, -1, 0, 1, 2, 3, -1, -1]])
-            labels = input_ids.clone()
-            labels[:, :6] = -100
-            output = model(
-                input_ids=input_ids,
-                labels=labels,
-                token_types=token_types,
-                pixel_values=torch.randn(9, 3, 2, 2),
-                image_patch_offsets=torch.tensor([0, 9]),
-                image_vit_grid_hw=torch.tensor([[3, 3]]),
-                image_llm_grid_hw=torch.tensor([[1, 1]]),
-                image_batch_indices=torch.tensor([0]),
-                image_token_starts=torch.tensor([2]),
-                packed_seq_params=SharedCompressedPackedSequence(
-                    cu_seq_lens=torch.tensor([0, 8]),
-                    local_query_start=0,
-                    local_query_length=8,
-                    global_sequence_length=8,
-                ),
-            )
-            output.loss.backward()
-
-        self.assertIsNotNone(model.model.vision.patch_embed.proj.weight.grad)
-        self.assertIsNotNone(model.model.aligner.w1.weight.grad)
-        self.assertIsNotNone(model.model.image_start.grad)
-        self.assertIsNotNone(model.model.layers[0].mlp.gate.bias_vl)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_vlm_batch_builds_v41_packed_sequence_from_right_padding(self):
-        """VLM right-padding maps to V4.1 compact DSA metadata, not a dense mask."""
-        get_batch = build_vlm_get_batch(
-            mesh_context=SimpleNamespace(tp_size=1, cp_size=1, pp_size=1),
-            device=torch.device("cpu"),
-            attention_mode="compressed",
-            cp_algorithm="colossal",
-            runtime_input_adapter=DeepseekV41BatchAdapter(
-                SimpleNamespace(v41_compress_ratios=[2], pad_token_id=0)
-            ),
-        )
-        model_inputs, _ = get_batch(
-            iter(()),
-            external_batch={
-                "input_ids": torch.tensor([[1, 2, 3, 4, 0, 0, 0, 0]]),
-                "labels": torch.tensor([[-100, -100, 3, 4, -100, -100, -100, -100]]),
-                "attention_mask": torch.tensor([[1, 1, 1, 1, 0, 0, 0, 0]]),
-            },
-        )
-
-        self.assertNotIn("attention_mask", model_inputs)
-        packed = model_inputs["packed_seq_params"]
-        self.assertIsInstance(packed, SharedCompressedPackedSequence)
-        self.assertEqual(packed.cu_seq_lens.tolist(), [0, 4, 8])
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_vlm_adapter_owns_variable_image_field_collation(self):
-        """The model adapter merges V4.1 patches, offsets, grids, and ownership."""
-        adapter = DeepseekV41VLMBatchAdapter(
-            SimpleNamespace(v41_compress_ratios=[2], pad_token_id=0)
-        )
-        collator = VLMCollator(
-            context=DataBatchContext(source_type="online"),
-            batch_adapter=adapter,
-        )
-        first = {
-            "input_ids": torch.tensor([1, 2, 3, 4]),
-            "labels": torch.tensor([-100, -100, 3, 4]),
-            "attention_mask": torch.ones(4, dtype=torch.long),
-            "token_types": torch.tensor([-1, 0, 1, 3]),
-            "pixel_values": torch.ones(2, 3, 2, 2),
-            "image_patch_offsets": torch.tensor([0, 2]),
-            "image_vit_grid_hw": torch.tensor([[1, 2]]),
-            "image_llm_grid_hw": torch.tensor([[1, 1]]),
-            "image_token_starts": torch.tensor([1]),
-        }
-        second = {
-            "input_ids": torch.tensor([5, 6, 7, 8]),
-            "labels": torch.tensor([-100, -100, 7, 8]),
-            "attention_mask": torch.ones(4, dtype=torch.long),
-            "token_types": torch.tensor([0, 1, 2, 3]),
-            "pixel_values": torch.full((3, 3, 2, 2), 2.0),
-            "image_patch_offsets": torch.tensor([0, 1, 3]),
-            "image_vit_grid_hw": torch.tensor([[1, 1], [1, 2]]),
-            "image_llm_grid_hw": torch.tensor([[1, 1], [1, 1]]),
-            "image_token_starts": torch.tensor([0, 2]),
-        }
-
-        batch = collator([first, second])
-
-        self.assertEqual(batch["input_ids"].shape, (2, 4))
-        self.assertEqual(batch["pixel_values"].shape, (5, 3, 2, 2))
-        torch.testing.assert_close(batch["image_patch_offsets"], torch.tensor([0, 2, 3, 5]))
-        torch.testing.assert_close(batch["image_batch_indices"], torch.tensor([0, 1, 1]))
-        torch.testing.assert_close(batch["image_token_starts"], torch.tensor([1, 0, 2]))
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_packed_samples_do_not_share_attention_or_engram_context(self):
-        """Compact boundaries isolate CSA2, sliding windows, and Engram n-grams."""
-        with tempfile.TemporaryDirectory() as directory:
-            torch.manual_seed(13)
-            model = DeepseekV41CroppedForCausalLM(_tiny_config(_write_engram_assets(directory)))
-            _replace_v41_modules(model)
-            model.eval()
-            first = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10]])
-            second = first.clone()
-            second[:, :4] = torch.tensor([11, 12, 13, 14])
-            packed = SharedCompressedPackedSequence(
-                cu_seq_lens=torch.tensor([0, 4, 8], dtype=torch.int32),
-                local_query_start=0,
-                local_query_length=8,
-                global_sequence_length=8,
-            )
-            first_output = model.model(input_ids=first, packed_seq_params=packed).last_hidden_state
-            second_output = model.model(input_ids=second, packed_seq_params=packed).last_hidden_state
-
-        torch.testing.assert_close(first_output[:, 4:], second_output[:, 4:])
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_online_packing_aligns_every_sample_to_compressor_groups(self):
-        """Online packing pads each sample boundary to the CSA2 ratio."""
-        adapter = DeepseekV41BatchAdapter(
-            SimpleNamespace(v41_compress_ratios=[0, 2], pad_token_id=0)
-        )
-        collator = TextPackingCollator(
-            context=DataBatchContext(source_type="online"),
-            batch_adapter=adapter,
-        )
-        batch = collator([
-            {"input_ids": torch.tensor([1, 2, 3]), "labels": torch.tensor([2, 3, 4])},
-            {"input_ids": torch.tensor([5, 6]), "labels": torch.tensor([6, 7])},
-        ])
-
-        torch.testing.assert_close(batch["input_ids"], torch.tensor([[1, 2, 3, 0, 5, 6]]))
-        torch.testing.assert_close(batch["labels"], torch.tensor([[2, 3, 4, -100, 6, 7]]))
-        torch.testing.assert_close(batch["cu_seq_lens"], torch.tensor([0, 4, 6], dtype=torch.int32))
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_online_recipe_declares_one_model_owned_batch_adapter(self):
-        """One configured adapter owns packing and forward runtime extensions."""
+        Feature: Omni data lifecycle recipe wiring.
+        Description: Resolve both recipes through the typed Trainer config.
+        Expectation: Generic loaders and model runtime metadata match each modality.
+        """
         recipe_path = Path(__file__).resolve().parents[5] / (
-            "examples/training_demo/train_deepseek_v41_online.yaml"
+            "examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml"
         )
 
         recipe = parse_training_args([str(recipe_path)])
-        get_batch_target = recipe.dataloader.get_batch
-        batch_adapter_target = recipe.dataloader.batch_adapter
 
-        self.assertIs(get_batch_target._target_, ParallelBatch)  # pylint: disable=protected-access
-        self.assertIsNone(get_batch_target.runtime_input_adapter)
-        self.assertIsInstance(batch_adapter_target, Target)
+        self.assertEqual(recipe.activation_checkpoint.selection.layer_count, 0)
+        self.assertIsNone(recipe.activation_checkpoint.selection.layer_indices)
         self.assertIs(  # pylint: disable=protected-access
-            batch_adapter_target._target_,
-            DeepseekV41BatchAdapter,
+            recipe.dataloader._target_,
+            TokenBatchLoader,
         )
+        self.assertIs(  # pylint: disable=protected-access
+            recipe.dataloader.collate_fn._target_,
+            build_online_text_collate_fn,
+        )
+        text_runtime = recipe.dataloader.get_batch.runtime_input_adapter.build()
+        self.assertEqual(text_runtime.runtime_input_fields(), ("packed_seq_params",))
 
         vlm_recipe = parse_training_args([
             str(recipe_path.with_name("train_deepseek_v41_vlm_online.yaml"))
         ])
         self.assertIs(  # pylint: disable=protected-access
             vlm_recipe.dataset.data_transform._target_,
-            build_deepseek_v41_vlm_data_transform,
+            build_deepseek_v41_omni_transform,
         )
         self.assertIs(  # pylint: disable=protected-access
-            vlm_recipe.dataloader.batch_adapter._target_,
-            DeepseekV41VLMBatchAdapter,
+            vlm_recipe.dataloader._target_,
+            OmniPackingLoader,
+        )
+        self.assertIs(  # pylint: disable=protected-access
+            vlm_recipe.dataloader.get_batch._target_,
+            OmniParallelBatch,
+        )
+        self.assertIs(  # pylint: disable=protected-access
+            vlm_recipe.dataloader.get_batch.runtime_input_adapter._target_,
+            DeepseekV41Runtime,
+        )
+        vlm_runtime = vlm_recipe.dataloader.get_batch.runtime_input_adapter.build()
+        self.assertEqual(
+            vlm_runtime.runtime_input_fields(),
+            ("packed_seq_params", "position_ids", "image_sequence_start"),
         )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_recipes_leave_fsdp_output_dtype_unset(self):
-        """Model recipes must not downcast the FP32 objective at the FSDP boundary."""
-        examples_dir = Path(__file__).resolve().parents[5] / "examples/training_demo"
+        """Keep the FP32 objective outside FSDP output casting.
+
+        Feature: DeepSeek recipe precision policy.
+        Description: Resolve the text and VLM mixed-precision configurations.
+        Expectation: Neither recipe declares an FSDP output dtype.
+        """
+        examples_dir = (
+            Path(__file__).resolve().parents[5]
+            / "examples/training_demo/deepseek_v41"
+        )
         for recipe_name in (
                 "train_deepseek_v41_online.yaml",
                 "train_deepseek_v41_vlm_online.yaml",
@@ -714,13 +380,18 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_meta_materialization_restores_hash_buffers(self):
-        """Non-persistent hash metadata survives the trainer's meta build path."""
+        """Restore hash metadata through meta-device materialization.
+
+        Feature: Engram meta initialization.
+        Description: Materialize a model after wrapping its Engram child module.
+        Expectation: Non-persistent hash buffers match the source assets.
+        """
         with tempfile.TemporaryDirectory() as directory:
             assets_path = _write_engram_assets(directory)
             config = _tiny_config(assets_path)
             config.v41_vision_enabled = True
             with ContextManagers([no_init_weights(), init_empty_weights()]):
-                model = DeepseekV41CroppedForCausalLM(config)
+                model = DeepseekV41ForCausalLM(config)
             self.assertTrue(next(model.parameters()).is_meta)
             source_engram = model.model.layers[1].engram
             model.model.layers[1].engram = EngramModule(module=source_engram)
@@ -757,31 +428,108 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_recipe_replacements_preserve_parameter_identities(self):
-        """The YAML replacement rules atomically install mHC and Engram modules."""
+    def test_model_directly_constructs_canonical_modules(self):
+        """Construct the canonical architecture without replacement rules.
+
+        Feature: Native DeepSeek V4.1 module construction.
+        Description: Build the cropped model before applying optional optimizations.
+        Expectation: Every specialized module uses its canonical model-owned type.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            model = DeepseekV41ForCausalLM(_tiny_config(_write_engram_assets(directory)))
+        self.assertIsInstance(
+            model.model.layers[0].attn_hc,
+            DeepseekV41PipelinedHyperConnection,
+        )
+        self.assertNotIsInstance(model.model.layers[0].attn_hc, PipelinedMhcModule)
+        self.assertIsInstance(model.model.layers[0].self_attn, DeepseekV41Attention)
+        self.assertNotIsInstance(model.model.layers[0].self_attn, SharedCompressedDSAAttention)
+        self.assertIsInstance(model.model.layers[1].engram, DeepseekV41Engram)
+        self.assertNotIsInstance(model.model.layers[1].engram, EngramModule)
+        self.assertTrue(torch.equal(model.model.layers[0].self_attn.sinks, torch.zeros(4)))
+        self.assertTrue(torch.equal(model.model.layers[0].attn_hc.base, torch.zeros(8)))
+        self.assertTrue(torch.equal(model.model.layers[0].attn_hc.scale, torch.ones(3)))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_optional_replacements_preserve_state_keys_and_parameters(self):
+        """Preserve model identity across optional module replacements.
+
+        Feature: DeepSeek optimization replacements.
+        Description: Compare state, outputs, and gradients before and after replacement.
+        Expectation: Replacement modules preserve all observable model values.
+        """
         recipe_path = Path(__file__).resolve().parents[5] / (
-            "examples/training_demo/train_deepseek_v41_online.yaml"
+            "examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml"
         )
         recipe = parse_training_args([str(recipe_path)])
-        rules = entries_to_module_replacements(recipe.plan_overrides)
         with tempfile.TemporaryDirectory() as directory:
-            model = DeepseekV41CroppedForCausalLM(_tiny_config(_write_engram_assets(directory)))
-            engram_weight = model.model.layers[1].engram.embed.weight
-            replacement_plan = compile_module_replacements(model, rules)
-            apply_module_replacements(model, replacement_plan, weights_mapping=[])
+            model = DeepseekV41ForCausalLM(_tiny_config(_write_engram_assets(directory)))
+
+        model.eval()
+        input_ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10]])
+        reference_output = model(input_ids=input_ids, labels=input_ids)
+        reference_output.loss.backward()
+        gradient_names = (
+            "model.layers.0.attn_hc.fn",
+            "model.layers.1.engram.wkv.weight",
+            "model.layers.2.self_attn.q_a_proj.weight",
+        )
+        reference_gradients = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if name in gradient_names
+        }
+        self.assertEqual(set(reference_gradients), set(gradient_names))
+        model.zero_grad(set_to_none=True)
+        state_keys = set(model.state_dict())
+        parameter_ids = {name: id(parameter) for name, parameter in model.named_parameters()}
+        attention_entries = [
+            entry
+            for entry in recipe.plan_overrides
+            if entry.module_type
+            == "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention"
+        ]
+        self.assertEqual(len(attention_entries), 1)
+        self.assertEqual(
+            attention_entries[0].replace_module.to_dict()["_target_"],
+            "hyper_parallel.components.modules.shared_compressed_dsa_attention."
+            "SharedCompressedDSAAttention",
+        )
+        self.assertIsNone(DEEPSEEK_V41_ADAPTER_SPEC.replacements)
+        rules = entries_to_module_replacements(recipe.plan_overrides)
+        replacement_plan = compile_module_replacements(model, rules)
+        apply_module_replacements(model, replacement_plan)
+
+        candidate_output = model(input_ids=input_ids, labels=input_ids)
+        candidate_output.loss.backward()
+
+        self.assertEqual(set(model.state_dict()), state_keys)
+        self.assertEqual(
+            {name: id(parameter) for name, parameter in model.named_parameters()},
+            parameter_ids,
+        )
         self.assertIsInstance(model.model.layers[0].attn_hc, PipelinedMhcModule)
+        self.assertIsInstance(model.model.layers[0].self_attn, SharedCompressedDSAAttention)
         self.assertIsInstance(model.model.layers[1].engram, EngramModule)
-        self.assertIs(model.model.layers[1].engram.embed.weight, engram_weight)
+        torch.testing.assert_close(candidate_output.logits, reference_output.logits)
+        torch.testing.assert_close(candidate_output.loss, reference_output.loss)
+        candidate_parameters = dict(model.named_parameters())
+        for name, reference_gradient in reference_gradients.items():
+            torch.testing.assert_close(candidate_parameters[name].grad, reference_gradient)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_engram_fsdp_units_separate_expert_table_from_dense_gate_weights(self):
-        """Engram table and projection are child units while q/k stay dense-owned."""
-        with tempfile.TemporaryDirectory() as directory:
-            model = DeepseekV41CroppedForCausalLM(_tiny_config(_write_engram_assets(directory)))
-            _replace_v41_modules(model)
+        """Separate Engram expert tables from dense gate weights.
 
-        units = _get_fsdp_wrap_modules(model)
+        Feature: Engram FSDP unit selection.
+        Description: Resolve wrap units for a model containing an Engram layer.
+        Expectation: Table and projection children are units while q/k remain dense-owned.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            model = DeepseekV41ForCausalLM(_tiny_config(_write_engram_assets(directory)))
+        units = get_fsdp_wrap_modules(model)
 
         self.assertIn("model.layers.1.engram.embed", units)
         self.assertIn("model.layers.1.engram.wkv", units)
@@ -790,28 +538,33 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_full_depth_recipe_preserves_released_shared_attention_roles(self):
-        """Wildcard rules cover every Full, Reindex, Reuse, and Engram layer."""
+        """Cover all released shared-attention layer roles.
+
+        Feature: Full-depth recipe wildcard expansion.
+        Description: Apply the recipe plan to the released decoder-depth layout.
+        Expectation: Full, Reindex, Reuse, and Engram layers all receive valid rules.
+        """
         class _FakeMesh:
             mesh_dim_names = ("dp_shard", "tp")
             mesh_shape = (2, 2)
 
         recipe_path = Path(__file__).resolve().parents[5] / (
-            "examples/training_demo/train_deepseek_v41_online.yaml"
+            "examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml"
         )
         recipe = parse_training_args([str(recipe_path)])
-        rules = entries_to_module_replacements(recipe.plan_overrides)
         with tempfile.TemporaryDirectory() as directory:
             assets_path = _write_engram_assets(
                 directory,
                 num_hidden_layers=40,
                 layer_ids=(1, 14),
             )
-            model = DeepseekV41CroppedForCausalLM(
+            model = DeepseekV41ForCausalLM(
                 _tiny_config(assets_path, num_hidden_layers=40)
             )
-            replacement_plan = compile_module_replacements(model, rules)
-            apply_module_replacements(model, replacement_plan, weights_mapping=[])
 
+        replacement_rules = entries_to_module_replacements(recipe.plan_overrides)
+        replacement_plan = compile_module_replacements(model, replacement_rules)
+        apply_module_replacements(model, replacement_plan)
         overrides = entries_to_plan_overrides(
             recipe.plan_overrides,
             cp_size=1,
@@ -894,13 +647,18 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_online_recipe_covers_v41_only_parameters_for_tp2_ep4(self):
-        """The YAML recipe owns every mHC and Engram boundary for TP2/EP4."""
+        """Own every V4.1-only parameter under TP2 and EP4.
+
+        Feature: Hybrid-parallel recipe coverage.
+        Description: Resolve parameter placements for mHC and Engram boundaries.
+        Expectation: Every model-specific parameter has an unambiguous owner.
+        """
         class _FakeMesh:
             mesh_dim_names = ("dp_shard", "tp")
             mesh_shape = (2, 2)
 
         recipe_path = Path(__file__).resolve().parents[5] / (
-            "examples/training_demo/train_deepseek_v41_online.yaml"
+            "examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml"
         )
         recipe = parse_training_args([str(recipe_path)])
         overrides = entries_to_plan_overrides(
@@ -916,8 +674,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = _tiny_config(_write_engram_assets(directory))
             with ContextManagers([no_init_weights(), init_empty_weights()]):
-                model = DeepseekV41CroppedForCausalLM(config)
-            _replace_v41_modules(model)
+                model = DeepseekV41ForCausalLM(config)
             plan = ShardingPlanner(plan_overrides=overrides).plan(
                 model,
                 _FakeMesh(),
@@ -966,11 +723,15 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_engram_tp_sequence_slice_keeps_left_ngram_context(self):
-        """TP sequence rank one hashes the same rows as the full sequence."""
+        """Keep left n-gram context across TP sequence slices.
+
+        Feature: Engram sequence-parallel hashing.
+        Description: Compare rank-one local hashes with the matching full-sequence rows.
+        Expectation: The local slice produces identical hash identifiers.
+        """
         with tempfile.TemporaryDirectory() as directory:
-            model = DeepseekV41CroppedForCausalLM(_tiny_config(_write_engram_assets(directory)))
-            _replace_v41_modules(model)
-            engram = model.model.layers[1].engram
+            model = DeepseekV41ForCausalLM(_tiny_config(_write_engram_assets(directory)))
+            engram = EngramModule(module=model.model.layers[1].engram)
             input_ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10]])
             full_hashes = engram.hash_mapping(input_ids)
             hidden = torch.zeros(1, 4, 2, 32)
@@ -986,13 +747,17 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_shared_attention_cp_uses_global_kv_and_offsets(self):
-        """CP keeps local queries while gathering raw, compressed, and index KV."""
+        """Use global KV state and offsets under context parallelism.
+
+        Feature: Shared-attention context parallelism.
+        Description: Execute local queries against gathered raw and compressed KV state.
+        Expectation: CP output matches the corresponding global-sequence result.
+        """
         with tempfile.TemporaryDirectory() as directory:
             torch.manual_seed(19)
-            model = DeepseekV41CroppedForCausalLM(
+            model = DeepseekV41ForCausalLM(
                 _tiny_config(_write_engram_assets(directory))
             )
-            _replace_v41_modules(model)
             attention = model.model.layers[2].self_attn
             hidden_states = torch.randn(1, 4, model.config.hidden_size)
             position_ids = torch.arange(4, 8).unsqueeze(0)
@@ -1047,7 +812,12 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_compressed_indexer_uses_ratio_aware_causal_boundary(self):
-        """A compressed key becomes visible only after its source group closes."""
+        """Apply ratio-aware causal boundaries to compressed keys.
+
+        Feature: Compressed indexer causal masking.
+        Description: Select keys while successive source groups become complete.
+        Expectation: A compressed key appears only after its source group closes.
+        """
         query = torch.ones(1, 6, 2, 4)
         key = torch.tensor(
             [[[1.0, 0.0, 0.0, 0.0],
@@ -1072,7 +842,12 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_hierarchical_candidate_blocks_pin_newest_reachable_block(self):
-        """Candidate selection uses block maxima and pins the partial tail."""
+        """Pin the newest reachable hierarchical candidate block.
+
+        Feature: Hierarchical compressed-key selection.
+        Description: Select candidate blocks from maxima with a partial tail.
+        Expectation: The newest causally reachable block is always retained.
+        """
         logits = torch.tensor(
             [[[
                 10.0, 9.0,
@@ -1101,7 +876,12 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_reindex_scores_only_compact_candidate_blocks(self):
-        """Reindex returns global ids from the compact candidate subset."""
+        """Score only the compact reindex candidate subset.
+
+        Feature: Compressed candidate reindexing.
+        Description: Select top keys from explicitly chosen compact blocks.
+        Expectation: Returned identifiers map back to the correct global keys.
+        """
         query = torch.ones(1, 12, 1, 1)
         key = torch.tensor([[[1.0], [10.0], [9.0], [8.0], [7.0], [6.0]]])
         merge_weight = torch.ones(1, 12, 1)
@@ -1127,7 +907,12 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_compressed_indexer_kl_updates_only_indexer_inputs(self):
-        """PanGu-style sparse KL detaches the main-attention teacher."""
+        """Update only indexer inputs from sparse KL loss.
+
+        Feature: PanGu-style compressed-indexer distillation.
+        Description: Backpropagate sparse KL through student and teacher inputs.
+        Expectation: Indexer inputs receive gradients while the teacher stays detached.
+        """
         torch.manual_seed(23)
         index_query = torch.randn(1, 4, 2, 3, requires_grad=True)
         index_key = torch.randn(1, 4, 3, requires_grad=True)
@@ -1160,7 +945,12 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_compressed_indexer_kl_matches_direct_autograd(self):
-        """Precomputed PanGu-style gradients match a direct sparse KL graph."""
+        """Match direct autograd for compressed-indexer KL gradients.
+
+        Feature: Precomputed sparse-KL gradient injection.
+        Description: Compare custom backward values with a direct reference graph.
+        Expectation: Every indexer input gradient is numerically identical.
+        """
         torch.manual_seed(29)
         source_tensors = (
             torch.randn(1, 4, 2, 3),
@@ -1226,7 +1016,12 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_cp_window_indices_use_global_query_offset(self):
-        """Rank-one local queries address the preceding global sliding window."""
+        """Apply the global query offset to CP sliding windows.
+
+        Feature: Context-parallel window indexing.
+        Description: Build rank-one local indices against an eight-token global key set.
+        Expectation: Each local query addresses its preceding global window.
+        """
         indices = _window_indices(
             batch_size=1,
             sequence_length=4,
@@ -1243,13 +1038,18 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_online_recipe_injects_v41_cp_wrapper(self):
-        """An active CP axis selects the V4.1 wrapper on every attention boundary."""
+        """Inject the V4.1 wrapper on every active CP boundary.
+
+        Feature: Recipe-driven context-parallel wrapping.
+        Description: Resolve plan overrides with a nontrivial CP mesh.
+        Expectation: Every attention boundary selects the model-owned CP wrapper.
+        """
         class _FakeMesh:
             mesh_dim_names = ("dp_shard", "cp")
             mesh_shape = (2, 2)
 
         recipe_path = Path(__file__).resolve().parents[5] / (
-            "examples/training_demo/train_deepseek_v41_online.yaml"
+            "examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml"
         )
         recipe = parse_training_args([str(recipe_path)])
         overrides = entries_to_plan_overrides(
@@ -1260,8 +1060,7 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = _tiny_config(_write_engram_assets(directory))
             with ContextManagers([no_init_weights(), init_empty_weights()]):
-                model = DeepseekV41CroppedForCausalLM(config)
-            _replace_v41_modules(model)
+                model = DeepseekV41ForCausalLM(config)
             plan = ShardingPlanner(plan_overrides=overrides).plan(
                 model,
                 _FakeMesh(),
@@ -1287,6 +1086,7 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
         """Create the smallest MoE and mesh accepted by the EP factory."""
         class _Experts(nn.Module):
             def __init__(self) -> None:
+                """Create a one-expert signature fixture."""
                 super().__init__()
                 self.num_experts = 1
                 self.act_fn = F.silu
@@ -1297,6 +1097,7 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
 
         class _TextMoe(nn.Module):
             def __init__(self) -> None:
+                """Create the text-only MoE signature fixture."""
                 super().__init__()
                 self.gate = nn.Identity()
                 self.experts = _Experts()
@@ -1306,8 +1107,9 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
             def forward(
                     self,
                     hidden_states: torch.Tensor,
-                    input_ids: torch.Tensor | None = None,
+                    input_ids: Optional[torch.Tensor] = None,
             ) -> torch.Tensor:
+                """Expose the text MoE production-compatible signature."""
                 del input_ids
                 return hidden_states
 
@@ -1315,24 +1117,27 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
             def forward(
                     self,
                     hidden_states: torch.Tensor,
-                    input_ids: torch.Tensor | None = None,
-                    image_mask: torch.Tensor | None = None,
+                    input_ids: Optional[torch.Tensor] = None,
+                    image_mask: Optional[torch.Tensor] = None,
             ) -> torch.Tensor:
+                """Expose the multimodal MoE production-compatible signature."""
                 del input_ids, image_mask
                 return hidden_states
 
         class _EpAxis:
             @staticmethod
             def size() -> int:
+                """Return the one-rank expert axis size."""
                 return 1
 
         class _EpMesh:
             @staticmethod
             def get_group(name: str) -> None:
+                """Return the local fixture's absent process group."""
                 del name
-                return None
 
             def __getitem__(self, name: str) -> _EpAxis:
+                """Resolve the expert axis by name."""
                 del self
                 del name
                 return _EpAxis()
@@ -1342,7 +1147,12 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_ep_factory_matches_text_and_multimodal_forward_signatures(self):
-        """The EP closure exposes only arguments accepted by its source MoE."""
+        """Match EP closures to text and multimodal MoE signatures.
+
+        Feature: DeepSeek expert-parallel compute factories.
+        Description: Inspect closures created for text-only and multimodal source modules.
+        Expectation: Each closure exposes only arguments accepted by its source MoE.
+        """
         expected_parameters = {
             False: ["module", "hidden_states", "input_ids"],
             True: ["module", "hidden_states", "input_ids", "image_mask"],
@@ -1370,7 +1180,12 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_fused_expert_uses_model_specific_gate(self):
-        """The generic local expert calls the V4 clamp hook when supplied."""
+        """Use the model-specific gate in the fused local expert.
+
+        Feature: DeepSeek fused expert activation.
+        Description: Run a deterministic expert with the V4 clamp hook installed.
+        Expectation: The generic expert applies the supplied model gate exactly once.
+        """
         class _Experts(nn.Module):
             def __init__(self) -> None:
                 """Create one deterministic fused expert."""

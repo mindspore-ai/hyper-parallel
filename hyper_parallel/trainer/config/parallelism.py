@@ -18,11 +18,12 @@ Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5).
 ``PlanOverride`` stays the YAML DTO that desugars to
 ``auto_models.distributed.recipe_spec.ModuleShardingSpec``.
 """
+# pylint: disable=unused-import
 
 import importlib
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Union
 
 from torch import nn  # pylint: disable=forbidden-backend-import
@@ -51,6 +52,70 @@ class AcceleratorConfig:
 
 
 @dataclass
+class ActivationCheckpointSelection:
+    """Select adapter-declared safe recompute regions and exact layer coverage.
+
+    ``layer_count`` selects the contiguous prefix ``[0, layer_count)`` from
+    the flattened layer-container order. ``layer_indices`` selects explicit
+    zero-based entries from that same order.
+    """
+
+    source: Literal["default", "model_adapter_safe_regions"] = "default"
+    layer_count: Optional[int] = None
+    layer_indices: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        """Validate the mutually exclusive layer-count and layer-index selectors."""
+        if self.source not in ("default", "model_adapter_safe_regions"):
+            raise ValueError(
+                "activation_checkpoint.selection.source must be default or "
+                "model_adapter_safe_regions"
+            )
+        selectors = (self.layer_count is not None, self.layer_indices is not None)
+        if self.source == "default" and any(selectors):
+            raise ValueError(
+                "activation_checkpoint.selection.layer_count and layer_indices "
+                "are only valid when "
+                "selection.source=model_adapter_safe_regions"
+            )
+        if self.source == "model_adapter_safe_regions" and sum(selectors) != 1:
+            raise ValueError(
+                "activation_checkpoint.selection requires exactly one of "
+                "layer_count or layer_indices when "
+                "selection.source=model_adapter_safe_regions"
+            )
+        if self.layer_count is not None and (
+            isinstance(self.layer_count, bool)
+            or not isinstance(self.layer_count, int)
+            or self.layer_count < 0
+        ):
+            raise ValueError(
+                "activation_checkpoint.selection.layer_count must be a "
+                "non-negative integer"
+            )
+        if self.layer_indices is None:
+            return
+        if not isinstance(self.layer_indices, list) or not self.layer_indices:
+            raise ValueError(
+                "activation_checkpoint.selection.layer_indices must be a "
+                "non-empty list of non-negative integers"
+            )
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in self.layer_indices
+        ):
+            raise ValueError(
+                "activation_checkpoint.selection.layer_indices must contain "
+                "only non-negative integers"
+            )
+        if len(set(self.layer_indices)) != len(self.layer_indices):
+            raise ValueError(
+                "activation_checkpoint.selection.layer_indices must not "
+                "contain duplicates"
+            )
+
+
+@dataclass
 class ActivationCheckpointConfig:
     """Activation-checkpoint options exposed by the initial YAML schema.
 
@@ -60,6 +125,9 @@ class ActivationCheckpointConfig:
 
     mode: Optional[Literal["off", "full", "selective"]] = "off"
     swap_inputs: bool = False
+    selection: ActivationCheckpointSelection = field(
+        default_factory=ActivationCheckpointSelection
+    )
 
     def __post_init__(self) -> None:
         """Reject ambiguous values for activation input swapping."""

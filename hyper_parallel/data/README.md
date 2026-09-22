@@ -309,7 +309,7 @@ for each image:
 
 ```yaml
 data_transform:
-  _target_: hyper_parallel.models.deepseek_v41.adapter.transform_fn.build_deepseek_v41_omni_transform
+  _target_: hyper_parallel.models.deepseek_v41.adapter.data.transform_fn.build_deepseek_v41_omni_transform
   max_seq_len: 4096
 
 dataloader:
@@ -415,10 +415,10 @@ dataloader:
 ```yaml
 dataset:
   model_assets:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.processor.build_deepseek_v41_processor
+    _target_: hyper_parallel.models.deepseek_v41.adapter.data.processor.build_deepseek_v41_processor
     config_path: /models/DeepSeek-V4.1-Flash
   data_transform:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.transform_fn.build_deepseek_v41_omni_transform
+    _target_: hyper_parallel.models.deepseek_v41.adapter.data.transform_fn.build_deepseek_v41_omni_transform
     max_seq_len: 4096
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   data_path: /data/train.jsonl

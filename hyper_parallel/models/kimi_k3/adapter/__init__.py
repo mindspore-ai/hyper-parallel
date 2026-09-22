@@ -13,3 +13,16 @@
 # limitations under the License.
 # ============================================================================
 """Adapters for the Kimi K3 model family."""
+
+from types import ModuleType
+
+
+def load_context_parallel() -> ModuleType:
+    """Return the shared Kimi Delta Attention CP module lazily."""
+    from hyper_parallel.models.kimi_k3.adapter.distributed import (  # pylint: disable=C0415
+        context_parallel,
+    )
+    return context_parallel
+
+
+__all__ = ["load_context_parallel"]

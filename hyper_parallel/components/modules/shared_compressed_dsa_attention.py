@@ -25,7 +25,7 @@ keeps validation independent of optional NPU packages.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -33,6 +33,7 @@ import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
+from hyper_parallel.models.replacement import module_replacement
 
 
 class SequenceGatherHandle(Protocol):
@@ -768,7 +769,7 @@ def shared_compressed_indexer_kl_loss(
 
 
 class SharedCompressedDSAIndexer(nn.Module):
-    """Accelerator-oriented V4.1 compressed Lightning Indexer replacement."""
+    """Reusable V4.1 compressed Lightning Indexer semantics."""
 
     def __init__(self, module: nn.Module) -> None:
         """Transfer the source projections without changing checkpoint names."""
@@ -1079,18 +1080,29 @@ def npu_sparse_attention_with_scalar_sink(
     )
 
 
-class SharedCompressedDSAAttention(nn.Module):
-    """High-performance V4.1 shared compressed attention replacement."""
+class SharedCompressedDSAAttentionBase(nn.Module):
+    """Shared V4.1 attention semantics with selectable reference execution."""
 
-    def __init__(self, module: nn.Module) -> None:
-        """Transfer source state and install the compressed indexer module."""
+    def __init__(
+            self,
+            module: nn.Module,
+            *,
+            replace_indexer: bool,
+            use_optimized_sparse_attention: bool,
+    ) -> None:
+        """Transfer source state and configure the execution implementation."""
         super().__init__()
         for name, child in module._modules.items():  # pylint: disable=protected-access
             self.add_module(name, child)
         for name, parameter in module._parameters.items():  # pylint: disable=protected-access
             self.register_parameter(name, parameter)
-        if hasattr(self, "indexer"):
-            self.indexer = SharedCompressedDSAIndexer(self.indexer)
+        indexer = getattr(self, "indexer", None)
+        if (
+                replace_indexer
+                and indexer is not None
+                and not isinstance(indexer, SharedCompressedDSAIndexer)
+        ):
+            self.indexer = SharedCompressedDSAIndexer(indexer)
         self.config = module.config
         self.layer_idx = module.layer_idx
         self.num_heads = module.num_heads
@@ -1106,6 +1118,7 @@ class SharedCompressedDSAAttention(nn.Module):
         self.rope_head_dim = module.config.qk_rope_head_dim
         self.sliding_window = module.sliding_window
         self.scaling = module.scaling
+        self.use_optimized_sparse_attention = use_optimized_sparse_attention
         self.train(module.training)
 
     @staticmethod
@@ -1343,7 +1356,7 @@ class SharedCompressedDSAAttention(nn.Module):
             )
             query = aux_loss_auto_scale(query, indexer_loss)
 
-        if hidden_states.device.type == "npu":
+        if self.use_optimized_sparse_attention and hidden_states.device.type == "npu":
             attention_output = npu_sparse_attention_with_scalar_sink(
                 query,
                 combined_key_value,
@@ -1373,12 +1386,39 @@ class SharedCompressedDSAAttention(nn.Module):
         return self.o_b_proj(projected), None
 
 
+@module_replacement
+class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
+    """High-performance V4.1 shared compressed attention replacement."""
+
+    def __init__(
+        self,
+        module: nn.Module,
+        module_fqn: str = "",
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Transfer source state and enable accelerator-oriented execution.
+
+        Args:
+            module: Source attention module exposing the shared-compressed DSA
+                structural contract.
+            module_fqn: Fully qualified source name supplied by replacement.
+            context: Read-only replacement context supplied by Trainer.
+        """
+        del module_fqn, context
+        super().__init__(
+            module,
+            replace_indexer=True,
+            use_optimized_sparse_attention=True,
+        )
+
+
 __all__ = [
     "SharedCompressedAttentionCPContext",
     "SharedCompressedAttentionState",
     "SharedCompressedPackedSequence",
     "SharedCompressedAttentionTPContext",
     "SharedCompressedDSAAttention",
+    "SharedCompressedDSAAttentionBase",
     "SharedCompressedDSAIndexer",
     "build_sliding_window_indices",
     "compressed_candidate_topk",

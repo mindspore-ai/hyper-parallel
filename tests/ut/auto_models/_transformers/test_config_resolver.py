@@ -51,11 +51,11 @@ class TestEmptyMappingFallback(unittest.TestCase):
             registry.MODEL_ARCH_MAPPING["DeepseekV41ForCausalLM"],
             (
                 "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
-                "DeepseekV41CroppedForCausalLM",
+                "DeepseekV41ForCausalLM",
             ),
         )
         model_cls = registry._resolve_custom_model_cls("DeepseekV41ForCausalLM")
-        self.assertEqual(model_cls.__name__, "DeepseekV41CroppedForCausalLM")
+        self.assertEqual(model_cls.__name__, "DeepseekV41ForCausalLM")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

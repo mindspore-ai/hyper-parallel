@@ -13,7 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Activation checkpointing helpers for distributed model components."""
+# pylint: disable=forbidden-backend-import
 
+import fnmatch
 import logging
 import weakref
 from collections.abc import Callable
@@ -33,7 +35,8 @@ from hyper_parallel.core.activation_memory.swap import (
     SwapManager,
     _teardown_wired_swap_layers,
 )
-
+from hyper_parallel.models.adapter_spec import RecomputePolicy
+from hyper_parallel.models.registry import get_model_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -725,6 +728,159 @@ def _detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:
     return False
 
 
+def _adapter_recompute_spec(model: nn.Module):
+    """Resolve a model-owned recompute declaration without family branches."""
+    config = getattr(model, "config", None)
+    identities = [getattr(config, "model_type", None)]
+    identities.extend(getattr(config, "architectures", None) or ())
+    adapter_spec = None
+    for identity in identities:
+        if not identity:
+            continue
+        adapter_spec = get_model_adapter(identity)
+        if adapter_spec is not None:
+            break
+    provider = getattr(adapter_spec, "recompute", None)
+    if provider is None or not callable(provider):
+        raise ValueError(
+            "activation_checkpoint.selection.source=model_adapter_safe_regions "
+            "requires ModelAdapterSpec.recompute"
+        )
+    recompute_policy = provider()  # pylint: disable=not-callable
+    if not isinstance(recompute_policy, RecomputePolicy):
+        raise TypeError("ModelAdapterSpec.recompute must return RecomputePolicy")
+    return recompute_policy
+
+
+def _selected_checkpoint_layer_fqns(
+    containers: list[_LayerContainerInfo],
+    selection: Any,
+) -> set[str]:
+    """Select a leading layer count or exact layer indices."""
+    blocks = [block for container in containers for block in container.blocks]
+    layer_count = getattr(selection, "layer_count", None)
+    layer_indices = getattr(selection, "layer_indices", None)
+    if (layer_count is None) == (layer_indices is None):
+        raise ValueError(
+            "model-adapter safe recompute requires exactly one of "
+            "selection.layer_count or selection.layer_indices"
+        )
+    if layer_indices is not None:
+        if not isinstance(layer_indices, (list, tuple)) or not layer_indices:
+            raise ValueError(
+                "model-adapter safe recompute layer_indices must be a non-empty sequence"
+            )
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in layer_indices
+        ):
+            raise ValueError(
+                "model-adapter safe recompute layer_indices must contain only "
+                "non-negative integers"
+            )
+        if len(set(layer_indices)) != len(layer_indices):
+            raise ValueError(
+                "model-adapter safe recompute layer_indices must not contain duplicates"
+            )
+        if max(layer_indices) >= len(blocks):
+            raise ValueError(
+                "model-adapter safe recompute layer index "
+                f"{max(layer_indices)} exceeds the maximum index {len(blocks) - 1}"
+            )
+        return {blocks[index].fqn for index in layer_indices}
+
+    if isinstance(layer_count, bool) or not isinstance(layer_count, int) or layer_count < 0:
+        raise ValueError(
+            "model-adapter safe recompute layer_count must be a non-negative integer"
+        )
+    if layer_count > len(blocks):
+        raise ValueError(
+            f"adapter recompute layer_count {layer_count} exceeds discovered layers {len(blocks)}"
+        )
+    if layer_count == 0:
+        return set()
+    return {blocks[index].fqn for index in range(layer_count)}
+
+
+def _apply_model_adapter_safe_checkpointing(
+    model: nn.Module,
+    containers: list[_LayerContainerInfo],
+    ac_layers: list[nn.Module],
+    selection: Any,
+    *,
+    enable_compile: bool,
+    swap_inputs: bool,
+) -> nn.Module:
+    """Wrap only model-adapter-declared safe regions in the selected layers."""
+    recompute_spec = _adapter_recompute_spec(model)
+    selected_layer_fqns = _selected_checkpoint_layer_fqns(containers, selection)
+    if not selected_layer_fqns:
+        logger.info("Model-adapter safe recompute selected zero layers")
+        return model
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    checkpoint_kwargs = {"swap_inputs": swap_inputs} if not enable_compile else {}
+    module_by_fqn = dict(model.named_modules())
+    selected_targets = []
+    for module_fqn, module in module_by_fqn.items():
+        if not any(
+            module_fqn.startswith(f"{layer_fqn}.")
+            for layer_fqn in selected_layer_fqns
+        ):
+            continue
+        if not any(
+            fnmatch.fnmatchcase(module_fqn, pattern)
+            for pattern in recompute_spec.safe_module_patterns
+        ):
+            continue
+        if any(
+            fnmatch.fnmatchcase(module_fqn, pattern)
+            for pattern in recompute_spec.no_replay_module_patterns
+        ):
+            raise ValueError(
+                f"[HP-STATE-002] safe recompute target {module_fqn!r} is also a no-replay producer"
+            )
+        selected_targets.append((module_fqn, module))
+    if not selected_targets:
+        raise ValueError(
+            "model adapter safe recompute patterns matched no module in the selected layers"
+        )
+    selected_ids = {id(module) for _, module in selected_targets}
+    for module_fqn, module in selected_targets:
+        if any(
+            child is not module and id(child) in selected_ids
+            for child in module.modules()
+        ):
+            raise ValueError(
+                "model adapter safe recompute patterns selected nested targets: "
+                f"{module_fqn}"
+            )
+    wrapped_count = 0
+    for module_fqn, module in sorted(
+        selected_targets,
+        key=lambda item: item[0].count("."),
+        reverse=True,
+    ):
+        if "." in module_fqn:
+            parent_fqn, child_name = module_fqn.rsplit(".", 1)
+            parent = module_by_fqn[parent_fqn]
+        else:
+            parent, child_name = model, module_fqn
+        if _is_checkpoint_wrapped(module):
+            continue
+        setattr(parent, child_name, checkpoint_wrapper(module, **checkpoint_kwargs))
+        wrapped_count += 1
+    if swap_inputs and not enable_compile:
+        _register_forward_prefetch_layers(containers)
+    logger.info(
+        "Model-adapter safe recompute wrapped %d region(s) across %d/%d layers",
+        wrapped_count,
+        len(selected_layer_fqns),
+        len(ac_layers),
+    )
+    return model
+
+
 def _try_disable_use_cache(sub_config: Any) -> None:
     """Best-effort disable of ``use_cache`` on one config object."""
     try:
@@ -917,6 +1073,7 @@ def _apply_activation_checkpointing(
     activation_checkpoint: Optional[str],
     enable_compile: bool = False,
     swap_inputs: bool = False,
+    selection: Optional[Any] = None,
 ) -> nn.Module:
     """Apply full or selective recomputation to discovered transformer layers.
 
@@ -937,6 +1094,20 @@ def _apply_activation_checkpointing(
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
 
+    selection_source = getattr(selection, "source", "default")
+    if selection_source == "model_adapter_safe_regions":
+        return _apply_model_adapter_safe_checkpointing(
+            model,
+            containers,
+            ac_layers,
+            selection,
+            enable_compile=enable_compile,
+            swap_inputs=swap_inputs,
+        )
+
+    # Selective recomputation normally wraps whole layers. KV-shared models
+    # instead use submodule checkpointing so attention does not write the cache
+    # again during backward recomputation.
     if activation_checkpoint == "selective":
         wrapped_count = _apply_selective_checkpointing(
             containers,

@@ -1,4 +1,13 @@
-# Cropped Hugging Face training demos
+# Training demos
+
+The root keeps the shared `train_text.py` entry point. Model-owned builders,
+recipes, data preparation, launchers, and validation manifests are grouped by
+family:
+
+- `qwen3_moe/`: cropped and full-model Qwen3-MoE text demos;
+- `deepseek_v41/`: DeepSeek-V4.1 text/VLM crops and validation tooling.
+
+## Qwen3-MoE cropped Hugging Face demos
 
 These examples build a layer-cropped Qwen3-30B-A3B model with
 `HyperAutoModelForCausalLM.from_config`. They read the complete Hugging Face
@@ -12,7 +21,7 @@ YAML can directly control placement validation:
 
 ```yaml
 model:
-  _target_: examples.training_demo.cropped_qwen3_moe.build_cropped_qwen3_moe
+  _target_: examples.training_demo.qwen3_moe.cropped_qwen3_moe.build_cropped_qwen3_moe
   validate_placement: true
 ```
 
@@ -44,15 +53,15 @@ implicit model or weight download. Prepare the runtime according to the
 project installation guide before launching the example.
 
 ```bash
-bash examples/training_demo/run_parallel_offline.sh /path/to/Qwen3-30B-A3B
-bash examples/training_demo/run_parallel_online.sh /path/to/Qwen3-30B-A3B
+bash examples/training_demo/qwen3_moe/run_parallel_offline.sh /path/to/Qwen3-30B-A3B
+bash examples/training_demo/qwen3_moe/run_parallel_online.sh /path/to/Qwen3-30B-A3B
 ```
 
 The default topology uses eight devices with TP=2, CP=2, EP=2, and FSDP. To
 enable placement validation without editing YAML:
 
 ```bash
-bash examples/training_demo/run_parallel_offline.sh \
+bash examples/training_demo/qwen3_moe/run_parallel_offline.sh \
     /path/to/Qwen3-30B-A3B \
     --model.validate_placement=true
 ```
@@ -61,7 +70,7 @@ Additional typed overrides are forwarded to the Trainer. For example, a
 one-step smoke test is:
 
 ```bash
-bash examples/training_demo/run_parallel_offline.sh \
+bash examples/training_demo/qwen3_moe/run_parallel_offline.sh \
     /path/to/Qwen3-30B-A3B \
     --training.train_iters=1
 ```
@@ -73,7 +82,7 @@ Logs and generated data are stored under `output/training_demo`.
 Both full-model launchers load all 48 layers and the complete Hugging Face
 checkpoint through `HyperAutoModelForCausalLM.from_pretrained`. Online uses the
 packaged `hyper_parallel/models/qwen3_moe/recipes/train.yaml`;
-Offline uses `examples/training_demo/train_parallel_full_offline.yaml` because
+Offline uses `examples/training_demo/qwen3_moe/train_parallel_full_offline.yaml` because
 the two data paths instantiate different Dataset, DataLoader, and collate
 targets. Ordinary values can be overridden on the command line, but the typed
 configuration interface intentionally does not replace `_target_` values.
@@ -84,7 +93,7 @@ and uses a 128-token smoke-test length by default; an appended typed override
 can increase the sequence length:
 
 ```bash
-bash examples/training_demo/run_parallel_full_online.sh \
+bash examples/training_demo/qwen3_moe/run_parallel_full_online.sh \
     /path/to/Qwen3-30B-A3B
 ```
 
@@ -93,7 +102,7 @@ or downloads one implicitly. Pass the dataset prefix without the `.bin` or
 `.idx` suffix:
 
 ```bash
-bash examples/training_demo/run_parallel_full_offline.sh \
+bash examples/training_demo/qwen3_moe/run_parallel_full_offline.sh \
     /path/to/Qwen3-30B-A3B \
     /path/to/offline_text_document
 ```
@@ -106,7 +115,7 @@ overrides may be appended to either command.
 
 ## DeepSeek-V4.1 Engram and shared compressed attention
 
-`train_deepseek_v41_online.yaml` is a four-layer, randomly initialized
+`deepseek_v41/train_deepseek_v41_online.yaml` is a four-layer, randomly initialized
 DeepSeek-V4.1 text crop. Four layers are the minimum that execute all requested
 paths: layer 1 owns Engram, layer 2 publishes compressed KV and Lightning
 Indexer selections plus compact hierarchical candidate blocks, and layer 3
@@ -118,7 +127,7 @@ crop. Raw KV, shared compressed KV, and compressed index K use PanGu-style
 asynchronous KV-all-gather CP.
 
 The Engram table is scaled consistently instead of truncating a checkpoint
-table. `prepare_deepseek_v41_assets.py` changes every active hash bucket to a
+table. `deepseek_v41/prepare_deepseek_v41_assets.py` changes every active hash bucket to a
 different prime near 4096, then recomputes offsets and the embedding row count.
 For the active layer-1 table this changes 384,006,168 rows to 100,776 rows while
 retaining 3 n-gram orders, 8 hash heads, and a 256-wide embedding. The tokenizer
@@ -128,18 +137,18 @@ Online packing emits compact sample boundaries instead of a dense `[S,S]`
 attention mask. Each packed sample is aligned to the encoder compression ratio,
 so neither CSA2 compressor groups nor Engram n-grams cross sample boundaries.
 
-Prepare the shell using
-[`current_hf_model_environment.md`](../../docs/guide/trainer/current_hf_model_environment.md),
-then run TP1 first. A successful TP1 run creates a marker required by TP2:
+Prepare the shell using the project
+[`installation guide`](../../docs/installation.md), then run TP1 first. A
+successful TP1 run creates a marker required by TP2:
 
 ```bash
-bash examples/training_demo/run_deepseek_v41_online.sh \
+bash examples/training_demo/deepseek_v41/run_deepseek_v41_online.sh \
     /path/to/DeepSeek-V4.1-Flash tp1
 
-bash examples/training_demo/run_deepseek_v41_online.sh \
+bash examples/training_demo/deepseek_v41/run_deepseek_v41_online.sh \
     /path/to/DeepSeek-V4.1-Flash tp2
 
-bash examples/training_demo/run_deepseek_v41_online.sh \
+bash examples/training_demo/deepseek_v41/run_deepseek_v41_online.sh \
     /path/to/DeepSeek-V4.1-Flash cp2
 ```
 
@@ -152,16 +161,15 @@ does not use Ulysses sequence-to-head exchange. The launcher reads only local
 config/tokenizer files and creates the scaled Engram metadata plus deterministic
 Online JSONL under `output/training_demo/deepseek_v41`.
 
-The algorithm comparison, TP/CP/EP placement rationale, parameter inventory,
-and validation results are recorded in
-[`deepseek_v41_mhc_engram_migration_report.md`](../../docs/guide/trainer/deepseek_v41_mhc_engram_migration_report.md).
-The DSA module and CP design, including why the legacy MLA/DSA Ulysses wrapper
-does not fit CSA2, are documented in
-[`deepseek_v41_dsa_cp_adapter_analysis.md`](../../docs/guide/trainer/deepseek_v41_dsa_cp_adapter_analysis.md).
+The model-owned Engram, CSA2, TP/CP/EP, checkpoint, and validation declarations
+live together in the
+[`deepseek_v41` adapter](../../hyper_parallel/models/deepseek_v41/adapter/).
+The generic workflow is documented in the
+[`model-integration validation guide`](../../docs/guide/trainer/model_integration_validation.md).
 
-## DeepSeek-V4.1 native multimodal Online smoke
+## DeepSeek-V4.1 multimodal Online smoke
 
-The multimodal recipe adds the native V4.1 ViT, 3x3 aligner, image-boundary
+The custom validation crop adds the V4.1 ViT, 3x3 aligner, image-boundary
 embeddings, image-aware MoE routing, and OpenAI-messages image data transform.
 It uses one vision block and 16 routed experts for the validation crop while
 retaining the released model dimensions. The model adapter declares per-vision
@@ -171,7 +179,7 @@ the generic FSDP manager contains no DeepSeek-specific branches.
 Prepare the environment and the local image JSONL, then run:
 
 ```bash
-bash examples/training_demo/run_deepseek_v41_vlm_online.sh \
+bash examples/training_demo/deepseek_v41/run_deepseek_v41_vlm_online.sh \
     /path/to/DeepSeek-V4.1-Flash \
     /path/to/train.jsonl
 ```
@@ -179,8 +187,7 @@ bash examples/training_demo/run_deepseek_v41_vlm_online.sh \
 The default data path is
 `output/training_demo/deepseek_v41/mm_data/deepseek_v41_messages/train.jsonl`.
 The launcher removes a stale success marker before starting and recreates it
-only after all 16 ranks complete. FSDP design, parameter ownership, validation
-evidence, and remaining full-model work are recorded in
-[`deepseek_v41_multimodal_fsdp_report.md`](../../docs/guide/trainer/deepseek_v41_multimodal_fsdp_report.md).
-The 16-card, 4K, 100-step Online result and reproducible loss curve are in
-[`deepseek_v41_flash_hyperparallel_100step_report.md`](../../docs/guide/trainer/deepseek_v41_flash_hyperparallel_100step_report.md).
+only after all 16 ranks complete. Use
+[`deepseek_v41_validation.yaml`](deepseek_v41/deepseek_v41_validation.yaml) to
+generate reproducible structure, module-parity, precision, checkpoint, and
+performance evidence for the selected local environment.

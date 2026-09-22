@@ -15,6 +15,7 @@
 """Unit tests for model-agnostic activation-checkpoint block discovery."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 from torch import Tensor, nn
@@ -25,6 +26,7 @@ from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
     _find_transformer_block_modules,
     _find_transformer_layer_container_infos,
+    _selected_checkpoint_layer_fqns,
     _wrap_layer_containers,
     apply_submodule_checkpointing,
 )
@@ -152,6 +154,44 @@ class TestTransformerBlockDiscovery(unittest.TestCase):
         blocks, _ = _find_transformer_block_modules(owner)
 
         self.assertEqual([block.child_name for block in blocks], ["2"])
+
+    def test_layer_count_selects_leading_flattened_layers(self):
+        """A layer count should select a contiguous prefix in flattened order."""
+        containers = _find_transformer_layer_container_infos(_DiscoveryModel())
+
+        selected = _selected_checkpoint_layer_fqns(
+            containers,
+            SimpleNamespace(layer_count=2, layer_indices=None),
+        )
+
+        self.assertEqual(
+            selected,
+            {"text_tower.decoder.2", "text_tower.decoder.7"},
+        )
+
+    def test_layer_indices_select_exact_flattened_layers(self):
+        """Explicit indices should select only the requested flattened layers."""
+        containers = _find_transformer_layer_container_infos(_DiscoveryModel())
+
+        selected = _selected_checkpoint_layer_fqns(
+            containers,
+            SimpleNamespace(layer_count=None, layer_indices=[1, 3]),
+        )
+
+        self.assertEqual(
+            selected,
+            {"text_tower.decoder.7", "image_tower.decoder.7"},
+        )
+
+    def test_layer_indices_reject_out_of_range_index(self):
+        """Explicit indices should fail before wrapping when an index is absent."""
+        containers = _find_transformer_layer_container_infos(_DiscoveryModel())
+
+        with self.assertRaisesRegex(ValueError, "exceeds the maximum index 3"):
+            _selected_checkpoint_layer_fqns(
+                containers,
+                SimpleNamespace(layer_count=None, layer_indices=[4]),
+            )
 
     def test_wrapping_uses_actual_container_child_names(self):
         """Wrapping should preserve arbitrary ModuleDict keys."""

@@ -34,7 +34,7 @@ import unittest.mock
 import pytest
 from torch import nn
 
-from hyper_parallel.models.qwen3_moe.adapter.replacements import (
+from hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement import (
     _validate_batched_experts_contract,
     replace_qwen3_moe_grouped_experts,
 )

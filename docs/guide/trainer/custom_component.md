@@ -53,7 +53,11 @@ YAML 解析结果为 `list[PlanOverride]`；Trainer 侧先归一化为替换规�
 
 完整实现可参考 [`RMSNorm`](../../../hyper_parallel/components/modules/rms_norm.py#L31-L82)。
 
-模型族自带的替换工厂、CP wrapper 和 EP compute 工厂收敛在该族的 `models/<family>/adapter/` 下（当前交付 Qwen3-MoE：`adapter/replacements.py`、`adapter/attention.py`、`adapter/distributed/`），在 YAML 中通过 `_target_` 直接引用，唯一训练入口为 `models/<family>/recipes/train.yaml`。
+模型族 adapter 按职责统一划分：模块/权重转换位于 `adapter/conversion/`，数据编码、processor、
+transform 和 runtime-input 位于 `adapter/data/`，模型前向合约位于 `adapter/runtime/`，CP/EP
+实现位于 `adapter/distributed/`，并行与重计算策略位于 `adapter/policies/`，验收声明位于
+`adapter/validation/`。没有对应职责的模型无需创建空目录。YAML 通过 `_target_` 直接引用具体实现，
+唯一训练入口为 `models/<family>/recipes/train.yaml`。
 
 ## 3. 接入新的组件实现
 
@@ -83,7 +87,7 @@ self.loss_fn(model_output=outputs, labels=labels)
 
 1. `bind_model(model, distributed_setup)`：Loss 构建后调用一次，用于绑定已完成 FSDP 的模型族
    adapter；
-2. `prepare_model_inputs(model_inputs, loss_inputs)`：每个 micro-batch 前调用，把 batch adapter
+2. `prepare_model_inputs(model_inputs, loss_inputs)`：每个 micro-batch 前调用，把 get-batch runtime
    产生的独立 loss-only 字段转换为模型内 loss 协议。
 
 普通 loss 不实现这两个方法时，Trainer 行为保持不变。
@@ -178,5 +182,5 @@ optimizer:
 
 - [`_build_model_assets()`](../../../hyper_parallel/trainer/vlm_trainer.py#L66-L85)：根据模型路径构建 processor，并取得 processor 中的 tokenizer。
 - [`_build_data_transform()`](../../../hyper_parallel/trainer/vlm_trainer.py#L87-L97) 和 [`_build_collate_fn()`](../../../hyper_parallel/trainer/vlm_trainer.py#L99-L110)：将 processor 传给多模态样本转换，并构建多模态 collator。
-- [`_build_get_batch()`](../../../hyper_parallel/trainer/vlm_trainer.py#L112-L127)：根据并行 mesh 创建 `parallel_context`，再构建 DataLoader 到模型输入的 batch adapter。
+- [`_build_get_batch()`](../../../hyper_parallel/trainer/vlm_trainer.py#L112-L127)：根据并行 mesh 创建 `parallel_context`，再构建 DataLoader 到模型输入的 get-batch runtime。
 - [`train_step()`](../../../hyper_parallel/trainer/vlm_trainer.py#L177-L205)：从 `get_batch` 取得 `model_inputs` 和 `loss_inputs`，分别用于模型前向/反向和 Loss token 统计。

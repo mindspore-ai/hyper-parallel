@@ -15,6 +15,9 @@
 """Architecture identity and GDN sharding rules for Qwen3.5."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.qwen3_5.adapter.policies.sharding import (
+    build_parameter_sharding_rules,
+)
 from hyper_parallel.models.registry import register_model_adapter
 
 
@@ -26,31 +29,18 @@ def _load_context_parallel():
     return context_parallel
 
 
-def _load_sharding_rules():
-    """Return GDN parameter roles not covered by generic naming rules."""
-    from hyper_parallel.distributed.tensor_parallel.param_role import (  # pylint: disable=C0415
-        ParamRole,
-    )
-    return [
-        ("in_proj_qkv", ParamRole.FUSED_QKV),
-        (["in_proj_z", "in_proj_b", "in_proj_a", "conv1d"], ParamRole.COLWISE),
-        (["A_log", "dt_bias"], ParamRole.COLWISE),
-        ("out_proj", ParamRole.ROWWISE),
-    ]
-
-
 QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5ForConditionalGeneration",
     model_type="qwen3_5",
     context_parallel=_load_context_parallel,
-    sharding_rules=_load_sharding_rules,
+    sharding_rules=build_parameter_sharding_rules,
 )
 
 QWEN3_5_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5ForCausalLM",
     model_type="qwen3_5_text",
     context_parallel=_load_context_parallel,
-    sharding_rules=_load_sharding_rules,
+    sharding_rules=build_parameter_sharding_rules,
 )
 
 register_model_adapter(QWEN3_5_ADAPTER_SPEC)

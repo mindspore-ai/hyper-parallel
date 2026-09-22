@@ -153,7 +153,7 @@ Qwen2-VL Causal LM 在计算 loss 时处理位移。transform 返回单条样本
 
 `build_online_omni_mapping_dataset()` 会检查 transform 是 `OmniDataTransform`，因此单独实现一个
 `__call__(record)` 的类不能直接替代它。可参考
-[`DeepseekV41OmniTransform`](../../../hyper_parallel/models/deepseek_v41/adapter/transform_fn.py)
+[`DeepseekV41OmniTransform`](../../../hyper_parallel/models/deepseek_v41/adapter/data/transform_fn.py)
 的模型专用实现。
 
 ## 5. 运行示例与检查

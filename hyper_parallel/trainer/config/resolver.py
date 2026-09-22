@@ -41,6 +41,10 @@ from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 
 
+_NONE_TYPE = types.NoneType  # pylint: disable=no-member
+_UNION_TYPE = types.UnionType  # pylint: disable=no-member
+
+
 class ConfigResolutionError(ValueError):
     """A target or typed configuration value is invalid."""
 
@@ -101,7 +105,7 @@ def import_target(target_path: str, *, location: str) -> object:
 
 def _is_union(annotation: object) -> bool:
     """Return whether the annotation is a ``Union`` or a PEP 604 union."""
-    return get_origin(annotation) in (Union, types.UnionType)
+    return get_origin(annotation) in (Union, _UNION_TYPE)
 
 
 def _annotation_name(annotation: object) -> str:
@@ -160,8 +164,8 @@ def _normalize_sequence(
 
 def _require_none_allowed(annotation: object, *, path: str) -> None:
     """Accept ``None`` only when the annotation permits it."""
-    if annotation is types.NoneType or (
-        _is_union(annotation) and types.NoneType in get_args(annotation)
+    if annotation is _NONE_TYPE or (
+        _is_union(annotation) and _NONE_TYPE in get_args(annotation)
     ):
         return None
     raise ConfigResolutionError(path, f"expected {_annotation_name(annotation)}, got None")
@@ -170,7 +174,7 @@ def _require_none_allowed(annotation: object, *, path: str) -> None:
 def _normalize_union(value: object, annotation: object, *, path: str) -> object:
     """Normalize a value against the first compatible union member."""
     members = get_args(annotation)
-    non_none_members = tuple(member for member in members if member is not types.NoneType)
+    non_none_members = tuple(member for member in members if member is not _NONE_TYPE)
     if len(non_none_members) == 1 and len(non_none_members) != len(members):
         return normalize_value(value, non_none_members[0], path=path)
 
@@ -453,7 +457,7 @@ def replace_override_path(config: object, parts: list[str], value: object, *, pa
 def _resolve_union(node: object, annotation: object, *, path: str) -> object:
     """Resolve a YAML value against a compatible non-``None`` union member."""
     non_none_members = [
-        member for member in get_args(annotation) if member is not types.NoneType
+        member for member in get_args(annotation) if member is not _NONE_TYPE
     ]
     if len(non_none_members) == 1:
         # Single-member union (e.g. Optional[Target]): resolve directly so the

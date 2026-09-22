@@ -12,43 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""registration: architecture ID / capability contract for Qwen2-MoE.
+"""Register the Qwen2-MoE adapter capabilities.
 
-Registers the family's ``ModelAdapterSpec`` with the shared
-``models/registry.py`` (adjust doc §7.2). Only ``sharding_rules`` is
-declared: the shared_expert_gate naming override (accuracy fix F2,
-accuracy_fix_plan.md §2) moved here from the planner's transitional
-``ARCH_OVERRIDES`` table. The family otherwise uses HF-native modeling
-code with the generic templates.
-
-The provider stays lazy so registry discovery keeps working on CPU-only
-checkouts; this module itself never imports Trainer/Data or torch.
+The family contributes only declarative sharding rules and otherwise uses the
+HF-native implementation with generic framework templates.
 """
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.qwen2_moe.adapter.policies.sharding import (
+    build_parameter_sharding_rules,
+)
 from hyper_parallel.models.registry import register_model_adapter
-
-
-def _load_sharding_rules():
-    """Return the shared_expert_gate naming override (lazy provider).
-
-    shared_expert_gate is a scalar-gate Linear(H, 1) computed per token —
-    "the parameter must be replicated" ≠ "the module has router semantics",
-    so it is forced to REPLICATED (never MOE_GATE, which would anchor a
-    spurious router boundary; never SHARED_EXPERT, which would shard its
-    single row — see accuracy_problem.md 10.1).
-    """
-    from hyper_parallel.distributed.tensor_parallel.param_role import (  # pylint: disable=C0415
-        ParamRole,
-    )
-    return [
-        (["shared_expert_gate"], ParamRole.REPLICATED),
-    ]
 
 
 QWEN2_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen2MoeForCausalLM",
     model_type="qwen2_moe",
-    sharding_rules=_load_sharding_rules,
+    sharding_rules=build_parameter_sharding_rules,
 )
 register_model_adapter(QWEN2_MOE_ADAPTER_SPEC)
