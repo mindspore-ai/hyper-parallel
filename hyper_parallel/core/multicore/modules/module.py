@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import itertools
 import weakref
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Callable, Iterable
+from typing import Any, Optional
 
 import torch
+import torch.distributed as dist
 
+from .. import _automatic
 
 
 class _ExecutionResourceGroup:
@@ -45,6 +47,10 @@ class _ExecutionResourceGroup:
         self.resources = None
         self.binding = None
         self.shared = False
+        self.binding_id = None
+        self.closing = False
+        self.closed = False
+        self.module_type = None
 
 
 class _MulticoreResourceManager:
@@ -54,7 +60,45 @@ class _MulticoreResourceManager:
         """Initialize empty process resource state."""
         self._next_group_id = itertools.count()
         self._next_member_token = itertools.count()
+        self._next_binding_id = itertools.count()
         self._groups: dict[int, _ExecutionResourceGroup] = {}
+        self.runtime_release: Optional[Callable[[], None]] = None
+        self._runtime_released = False
+
+    def recycle(self, target: _ExecutionResourceGroup, binding: Any, signature: Any) -> None:
+        """Reconcile orphan slots on first binding, never on a local GC decision.
+
+        Args:
+            target: New owner requesting resources.
+            binding: Local device and dtype binding.
+            signature: Rank-independent configuration to compare across peers.
+        """
+        bound = self._bound_groups(self._groups.values())
+        manifest = tuple((group.binding_id, group.resources.lifecycle_signature()) for group in bound)
+        states = []
+        for group in bound:
+            idle = not group.members and not group.closing and group.resources.can_close()
+            compatible = (
+                (group.compatibility_key, group.binding, group.scope_key, group.shared, group.module_type)
+                == (target.compatibility_key, binding, target.scope_key, target.shared, target.module_type)
+            )
+            states.append((idle, compatible))
+        peers = self._exchange((manifest, signature, states))
+        if any(peer[:2] != (manifest, signature) for peer in peers):
+            raise RuntimeError("multicore resource binding order or specifications differ across ranks")
+        reusable = None
+        for index, group in enumerate(bound):
+            if not all(peer[2][index][0] for peer in peers):
+                continue
+            if reusable is None and all(peer[2][index][1] for peer in peers):
+                reusable = group
+            else:
+                self._close_group_collectively(group)
+        if reusable is not None:
+            target.resources, reusable.resources = reusable.resources, None
+            target.binding, target.binding_id = reusable.binding, reusable.binding_id
+            reusable.closed = True
+            self._groups.pop(reusable.identifier)
 
     def create_group(
         self,
@@ -91,36 +135,80 @@ class _MulticoreResourceManager:
         group.members.add(member_token)
         return member_token
 
-    def retire(
-        self,
-        group_id: int,
-        member_token: int,
-        *,
-        close_resources: bool,
-    ) -> None:
-        """Retire one member and optionally close the last native owner.
+    def retire(self, group_id: int, member_token: int) -> None:
+        """Retire membership; native resources wait for coordinated shutdown.
 
         Args:
             group_id: Identifier of the resource group.
             member_token: Membership token to retire.
-            close_resources: Whether to close resources after the last member exits.
         """
         group = self._groups.get(group_id)
         if group is None:
             return
         group.members.discard(member_token)
-        if group.members:
+        if group.members or group.resources is not None:
             return
-        resources = group.resources
-        if resources is None:
-            self._groups.pop(group_id, None)
-            return
-        if not close_resources:
-            return
+        group.closed = True
+        self._groups.pop(group_id, None)
+
+    @staticmethod
+    def _exchange(value: Any) -> list[Any]:
+        """Exchange lifecycle metadata on the complete distributed world."""
+        return _automatic.exchange(value)
+
+    def close_groups(self, groups: Iterable[_ExecutionResourceGroup] | None = None) -> None:
+        """Close all automatic owners, or the last explicit member's group.
+
+        Args:
+            groups: Selected groups, or all registered groups for automatic cleanup.
+        """
+        groups = list(self._groups.values() if groups is None else groups)
+        bound = self._bound_groups(groups)
+        self._validate_collective_close(bound)
+        for group in bound:
+            self._close_group_collectively(group)
+        for group in groups:
+            if group.resources is None:
+                group.closed = True
+                group.members.clear()
+                self._groups.pop(group.identifier, None)
+        if self.runtime_release is not None and not any(group.resources is not None
+                                                        for group in self._groups.values()):
+            _automatic.collective_call(lambda: self._release_runtime(self.runtime_release))
+            self.runtime_release = None
+            self._runtime_released = False
+
+    def _release_runtime(self, release: Callable[[], None]) -> None:
+        """Keep successful local release idempotent until every peer acknowledges it."""
+        if not self._runtime_released:
+            release()
+            self._runtime_released = True
+
+    @staticmethod
+    def _bound_groups(groups: Iterable[_ExecutionResourceGroup]) -> list[_ExecutionResourceGroup]:
+        """Order native owners by collective binding rather than local construction."""
+        return sorted((group for group in groups if group.resources is not None), key=lambda group: group.binding_id)
+
+    def _validate_collective_close(self, bound: list[_ExecutionResourceGroup]) -> None:
+        """Require matching idle resources on every rank before release."""
+        manifest = tuple((group.binding_id, group.resources.lifecycle_signature()) for group in bound)
+        ready = all(group.resources.can_close() for group in bound)
+        peers = self._exchange((manifest, ready))
+        if any(peer[0] != manifest for peer in peers):
+            raise RuntimeError("multicore resource manifests differ across ranks")
+        if not all(peer[1] for peer in peers):
+            raise RuntimeError("multicore cleanup requires idle workspaces and no pending backward graphs")
+
+    def _close_group_collectively(self, group: _ExecutionResourceGroup) -> None:
+        """Keep a failed group reachable and prevent peers from advancing past it."""
+        group.closing = True
+        _automatic.collective_call(group.resources.close)
+        # Commit ownership only after peers also succeed; retries need the same manifest.
         group.resources = None
         group.binding = None
-        self._groups.pop(group_id, None)
-        resources.close()
+        group.closed = True
+        group.members.clear()
+        self._groups.pop(group.identifier, None)
 
     def active_specifications(self, scope_key: Any) -> tuple[Any, ...]:
         """Return one specification per live or native-bound resource group.
@@ -165,7 +253,6 @@ class MulticoreModule(torch.nn.Module):
             _RESOURCE_MANAGER.retire,
             group.identifier,
             member_token,
-            close_resources=False,
         )
 
     @classmethod
@@ -205,8 +292,12 @@ class MulticoreModule(torch.nn.Module):
             raise TypeError(
                 f"all shared modules must be {cls.__name__} instances, got {actual}."
             )
-        if any(member._resource_closed for member in members):  # pylint: disable=protected-access
+        if any(member._resource_closed or member._resource_group.closed  # pylint: disable=protected-access
+               for member in members):
             raise RuntimeError("closed multicore modules cannot share execution resources.")
+        if any(member._resource_group.closing  # pylint: disable=protected-access
+               for member in members):
+            raise RuntimeError("closing multicore modules cannot share execution resources.")
         concrete_types = {type(member) for member in members}
         if len(concrete_types) != 1:
             raise TypeError("shared multicore execution requires one concrete module type.")
@@ -237,7 +328,6 @@ class MulticoreModule(torch.nn.Module):
         _RESOURCE_MANAGER.retire(
             old_group.identifier,
             old_token,
-            close_resources=False,
         )
         member_token = _RESOURCE_MANAGER.add_member(target)
         self._resource_group = target
@@ -247,16 +337,21 @@ class MulticoreModule(torch.nn.Module):
             _RESOURCE_MANAGER.retire,
             target.identifier,
             member_token,
-            close_resources=False,
         )
 
     def _get_execution_resources(self, tensor: Any) -> Any:
         """Create or return resources bound to ``tensor`` device and dtype."""
-        if self._resource_closed:
+        if self._resource_closed or self._resource_group.closed:
             raise RuntimeError("cannot execute a closed multicore module.")
+        if self._resource_group.closing:
+            raise RuntimeError("cannot execute a closing multicore module; finish cleanup before reuse.")
         group = self._resource_group
         binding = self._execution_binding(tensor)
         if group.resources is None:
+            group.module_type = type(self)
+            _RESOURCE_MANAGER.recycle(group, binding, self._resource_signature(tensor))
+        if group.resources is None:
+            _automatic.register(_RESOURCE_MANAGER.close_groups, self._root_group())
             active_specs = _RESOURCE_MANAGER.active_specifications(group.scope_key)
             group.resources = self._create_execution_resources(
                 tensor,
@@ -264,12 +359,26 @@ class MulticoreModule(torch.nn.Module):
                 active_specifications=active_specs,
             )
             group.binding = binding
+            group.binding_id = next(_RESOURCE_MANAGER._next_binding_id)  # pylint: disable=protected-access
+            if _RESOURCE_MANAGER.runtime_release is None:
+                self._retain_runtime(_RESOURCE_MANAGER)
         elif binding != group.binding:
             raise ValueError(
                 "multicore resources are bound to the first input device/dtype "
                 f"{group.binding}, got {binding}."
             )
         return group.resources
+
+    def _resource_signature(self, tensor: Any) -> Any:
+        """Identify a collective first binding without rank-local device indices."""
+        return type(self).__module__, type(self).__qualname__, str(tensor.dtype)
+
+    def _retain_runtime(self, manager: _MulticoreResourceManager) -> None:
+        """Optionally pin the runtime across orphan replacement allocations."""
+
+    def _root_group(self) -> Any:
+        """Return the communication dependency used by these resources."""
+        return dist.group.WORLD
 
     @staticmethod
     def _execution_binding(tensor: Any) -> tuple[Any, Any]:
@@ -290,13 +399,21 @@ class MulticoreModule(torch.nn.Module):
         raise NotImplementedError
 
     def close(self) -> None:
-        """Release this module's membership and last-owned native resources."""
+        """Release this member, closing shared resources only after the last member.
+
+        Call in the same order on all WORLD ranks after the last backward.
+        Recoverable failures retain ownership for retry; partially closed modules
+        cannot execute again. Native communication failures may require restart.
+        """
         if self._resource_closed:
             return
+        group = self._resource_group
+        if group.resources is not None and group.members == {self._resource_member_token}:
+            _RESOURCE_MANAGER.close_groups((group,))
+        elif group.closed:
+            # A previous attempt may have freed buffers but failed the final runtime release.
+            _RESOURCE_MANAGER.close_groups(())
+        else:
+            _RESOURCE_MANAGER.retire(group.identifier, self._resource_member_token)
         self._resource_closed = True
         self._resource_finalizer.detach()
-        _RESOURCE_MANAGER.retire(
-            self._resource_group.identifier,
-            self._resource_member_token,
-            close_resources=True,
-        )
