@@ -103,12 +103,27 @@ class _MegaMoeExecutionResources:
             shmem.release()
             raise
         self._closed = False
+        self._workspace_closed = False
+
+    def lifecycle_signature(self) -> tuple[Any, ...]:
+        """Identify allocations independently of process-local group addresses."""
+        return (
+            "mega_moe", self.spec.local_num_tokens, self.spec.hidden_size,
+            self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
+            self.spec.receive_capacity, self.spec.ep_size,
+        )
+
+    def can_close(self) -> bool:
+        """Report whether neither an active call nor a backward graph needs buffers."""
+        return self._workspace_closed or self.workspace.can_close()
 
     def close(self) -> None:
         """Release the workspace and leave the shared SHMEM lifecycle."""
         if self._closed:
             return
-        self.workspace.close()
+        if not self._workspace_closed:
+            self.workspace.close()
+            self._workspace_closed = True
         shmem.release()
         self._closed = True
 
@@ -120,6 +135,21 @@ class MegaMoeExperts(MulticoreModule):
     their first forward to share one lossless-capacity workspace while keeping
     independent parameters and optimizer state.
     """
+
+    def _resource_signature(self, tensor: Any) -> Any:
+        """Compare static configuration without process-local group identities."""
+        return (super()._resource_signature(tensor), self._resource_group.compatibility_key[:-1],
+                self._resource_group.shared)
+
+    def _retain_runtime(self, manager: Any) -> None:
+        """Pin SHMEM while the resource pool can replace orphan workspaces."""
+        # Keep SHMEM initialized when replacing the last orphan with a new shape.
+        shmem.acquire(self._ep_group)
+        manager.runtime_release = shmem.release
+
+    def _root_group(self) -> Any:
+        """Identify the actual Root communicator needed during teardown."""
+        return self._ep_group if self._ep_group is not None else super()._root_group()
 
     def __init__(
         self,

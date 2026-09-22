@@ -24,6 +24,7 @@ __all__ = [
 import threading
 from typing import TYPE_CHECKING, Any
 
+from .. import _automatic
 from ._runtime import _load_native, _torch_modules
 
 if TYPE_CHECKING:
@@ -126,6 +127,15 @@ def acquire(root_group: ProcessGroup | None = None) -> None:
         _users = 1
 
 
+def _prepare_shutdown() -> None:
+    """Validate local shutdown preconditions before any peer enters the barrier."""
+    torch, dist = _torch_modules()
+    if bool(dist.is_initialized()) != _root_uses_distributed:
+        raise RuntimeError("torch.distributed state changed during the active SHMEM Runtime lifecycle")
+    _load_native()._validate_shutdown()  # pylint: disable=protected-access
+    torch.npu.synchronize()
+
+
 def release() -> None:
     """Release one SHMEM Runtime reference and shut down the last reference.
 
@@ -140,26 +150,23 @@ def release() -> None:
     global _users, _shutdown_failed, _root_group, _root_uses_distributed, _root_size  # pylint: disable=global-statement
 
     with _lock:
+        if _shutdown_failed:
+            raise RuntimeError("SHMEM Runtime cannot be released after a Native shutdown failure; restart the process")
         if _users <= 0:
             raise RuntimeError("SHMEM Runtime has no active reference to release")
         if _users > 1:
             _users -= 1
             return
 
-        torch, dist = _torch_modules()
-        distributed_is_initialized = bool(dist.is_initialized())
-        if distributed_is_initialized != _root_uses_distributed:
-            raise RuntimeError("torch.distributed state changed during the active SHMEM Runtime lifecycle")
-
-        native = _load_native()
-        native._validate_shutdown()  # pylint: disable=protected-access
-        torch.npu.synchronize()
+        _automatic.collective_call(_prepare_shutdown)
+        _, dist = _torch_modules()
         if _root_uses_distributed:
             dist.barrier(group=_root_group)
 
         _shutdown_failed = True
         try:
-            native._shutdown()  # pylint: disable=protected-access
+            # All peers become terminal if any Native shutdown fails; none may reinitialize alone.
+            _automatic.collective_call(_load_native()._shutdown)  # pylint: disable=protected-access
         finally:
             _users = 0
             _root_group = None

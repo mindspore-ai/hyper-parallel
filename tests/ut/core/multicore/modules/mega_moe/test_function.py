@@ -17,15 +17,38 @@
 import unittest
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import function as function_module
+from hyper_parallel.core.multicore.modules.mega_moe.function import _MegaMoeFunction
 
 
 class TestMegaMoeFunction(unittest.TestCase):
     """Exercise real autograd contexts with mocked communication and kernels."""
+
+    def test_backward_unpacks_saved_tensors_once(self) -> None:
+        """Checkpoint unpack hooks must only be consumed once per backward call."""
+        tensors = tuple(torch.ones(1) for _ in range(13))
+        context = Mock()
+        gradient = torch.ones(1)
+        execution = Mock()
+        with (
+            patch.object(type(context), "saved_tensors", create=True,
+                         new_callable=PropertyMock, side_effect=[tensors, RuntimeError("duplicate unpack")]) as unpack,
+            patch.object(function_module, "_prepare_backward_execution", return_value=execution),
+            patch.object(function_module, "_launch_backward_kernel"),
+            patch.object(function_module, "_restore_input_gradient", return_value=gradient) as restore,
+            patch.object(function_module, "_release_completed_graph"),
+        ):
+            result = _MegaMoeFunction.backward(context, gradient)
+        unpack.assert_called_once_with()
+        restore.assert_called_once_with(context, execution.grad_x, tensors[12:])
+        self.assertIs(result[0], gradient)
+        self.assertIs(result[1], execution.intermediates.grad_weight1)
+        self.assertIs(result[2], execution.intermediates.grad_weight2)
+        context.workspace.release.assert_called_once_with()
 
     def test_deferred_backward_keeps_local_owned_storage_after_workspace_reuse(self) -> None:
         """Retain each route's data and capacity across grow/shrink and reverse backward."""
