@@ -121,7 +121,7 @@ def lower_forward_boundaries(
     at runtime — no per-boundary global constant is emitted.
     """
     edits: list[TextEdit] = []
-    needs_local_compute_import = False
+    needs_runtime_helper_import = False
     for class_name, form, emitted, func, injection in iter_emitted_forms(
         source_text,
         frozen_plan,
@@ -134,13 +134,11 @@ def lower_forward_boundaries(
             # to-local semantics with its generic wrapper, so leaving the
             # original forward untouched is behavior-preserving.
             continue
-        if injection and injection.get("local_compute_fn") is not None:
-            # The local-region body (``_render_local_compute``) calls
-            # ``hyper_to_local_if_dtensor``; that runtime helper is a
-            # dependency of this template, not of any declaration, so the
-            # lowerer must import it itself — otherwise the artifact is not
-            # self-contained.
-            needs_local_compute_import = True
+        # Every emitted forward body (generic, local-region) ends with the
+        # runtime helper ``hyper_to_local_if_dtensor``; that helper is a
+        # dependency of the templates, not of any declaration, so the lowerer
+        # must import it itself — otherwise the artifact is not self-contained.
+        needs_runtime_helper_import = True
         body = _build_forward_body(source_text, injection, func, form, emitted)
         # Keep the original forward as ``_forward_impl``. The
         # extracted method is inserted BEFORE the ``def forward`` (zero-width
@@ -163,20 +161,21 @@ def lower_forward_boundaries(
             "cannot safely rewrite: " + ", ".join(nested)
         )
     patched = apply_edits(source_text, edits)
-    if needs_local_compute_import:
-        patched = _add_local_compute_import(patched)
+    if needs_runtime_helper_import:
+        patched = _add_runtime_helper_import(patched)
     return patched
 
 
-#: Runtime helper the local-region forward template calls. The template (and
-#: this constant) must stay in sync — see ``_render_local_compute``.
-_LOCAL_COMPUTE_IMPORT = (
+#: Runtime helper the emitted forward templates call. The templates (and
+#: this constant) must stay in sync — see ``_render_local_compute`` and
+#: ``_render_output_redistribute``.
+_RUNTIME_HELPER_IMPORT = (
     "from hyper_parallel.codegen.runtime import hyper_to_local_if_dtensor"
 )
 
 
-def _add_local_compute_import(source_text: str) -> str:
-    """Ensure the local-region template's runtime helper is imported.
+def _add_runtime_helper_import(source_text: str) -> str:
+    """Ensure the forward templates' runtime helper is imported.
 
     The helper is a template dependency, so nothing in the declarations
     contributes it; without this the generated artifact raises ``NameError`` at
@@ -188,7 +187,7 @@ def _add_local_compute_import(source_text: str) -> str:
     edit = insert_after_imports(
         source_text,
         index.import_end,
-        _LOCAL_COMPUTE_IMPORT,
+        _RUNTIME_HELPER_IMPORT,
         default_offset=index.docstring_end or 0,
     )
     return apply_edits(source_text, [edit]) if edit is not None else source_text
@@ -880,19 +879,28 @@ def _render_input_redistribute(func: FunctionInfo) -> str:
 
 
 def _render_output_redistribute() -> str:
-    """Render the output-side redistribute chain (no signature to bind).
+    """Render the output-side boundary exit (no signature to bind).
 
-    Mirrors the native boundary exit: the plan's ``out_dst`` transition first,
-    then the Step-3 local->DTensor ``out_src`` re-wrap.  Native guards that
-    re-wrap with ``if not isinstance(output, DTensor)``; the shared
-    ``rewrap_declared_outputs`` applies the same rule internally (a DTensor
-    passes straight through) and returns its input untouched when the boundary
-    declares no ``out_src``, so emitting it unconditionally is equivalent and
-    cannot corrupt an output a CP/EP all-to-all left without DTensor metadata.
+    Mirrors the native ``_wrap_local_region_forward`` exit order exactly:
+    Step-3 re-wrap first (local -> DTensor per ``out_src``), then the Step-4
+    ``out_src -> out_dst`` redistribute, then ``to_local`` so the boundary
+    always hands its caller a plain local tensor.
+
+    The order is load-bearing, not stylistic. The compute output is the
+    ``out_src`` *local shard* (e.g. a Partial(sum) partial sum). Re-wrapping
+    first attaches the matching ``out_src`` metadata, and the redistribute then
+    lowers the declared transition (e.g. reduce/all-reduce) to the ``out_dst``
+    value. Reversing the two — redistribute first, re-wrap second — would wrap
+    the already-reduced value with the stale ``out_src`` metadata (a DTensor
+    whose values are reduced but whose placements still say Partial(sum)), and
+    any downstream DTensor dispatch would then make placement-based decisions
+    on false metadata (e.g. ``AddDistributedOp`` zeroing a replicated operand
+    on non-zero coordinates of the partial axis).
     """
     return (
+        "        outputs = self._hyper_boundary.rewrap_outputs(outputs)\n"
         "        outputs = self._hyper_boundary.redistribute_outputs(outputs)\n"
-        "        outputs = self._hyper_boundary.rewrap_outputs(outputs)"
+        "        outputs = hyper_to_local_if_dtensor(outputs)"
     )
 
 
