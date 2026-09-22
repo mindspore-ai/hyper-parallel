@@ -1,0 +1,58 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Qwen3.8 FSDP + CP + high-performance GDN, targeting Ascend A3 (ARM64).
+FROM quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.11
+
+ENV HYPER_PARALLEL_PLATFORM=torch \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    BUILD_MULTICORE_EXTENSION=off \
+    BUILD_SHMEM_EXTENSION=off
+
+WORKDIR /workspace/hyper-parallel
+
+COPY examples/qwen3_8/requirements.txt /tmp/qwen3_8-requirements.txt
+# The measured environment uses psutil 7.2.2, while triton-ascend 3.2.2
+# declares psutil 6.0.0. Resolve the remaining packages first, then reproduce
+# the measured psutil version without re-resolving Triton-Ascend.
+RUN python3 -m pip download --no-deps \
+       --index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
+       --dest /tmp/qwen3_8-wheels triton-ascend==3.2.2 \
+    && sed '/^psutil==/d' /tmp/qwen3_8-requirements.txt > /tmp/qwen3_8-resolved.txt \
+    && python3 -m pip install \
+       --index-url https://repo.huaweicloud.com/repository/pypi/simple \
+       --find-links=/tmp/qwen3_8-wheels -r /tmp/qwen3_8-resolved.txt \
+    && python3 -m pip install --no-deps psutil==7.2.2
+
+COPY . /workspace/hyper-parallel
+RUN bash hyper_parallel/data/indexed/build.sh \
+    && HYPER_PARALLEL_NATIVE_OUTPUT_ROOT=/workspace/hyper-parallel/build/native/payload/hyper_parallel \
+       python3 -m pip install --no-build-isolation --no-deps . \
+    && python3 -c "import importlib.metadata as m; \
+assert m.version('torch') == '2.9.0'; \
+assert m.version('torch-npu') == '2.9.0.post6'; \
+assert m.version('triton-ascend') == '3.2.2'; \
+assert m.version('psutil') == '7.2.2'; \
+assert m.version('pybind11') == '3.1.0'" \
+    && cd /tmp \
+    && TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 -c "from pathlib import Path; \
+import hyper_parallel; \
+from hyper_parallel.data.indexed._indexed_helpers_cpp import build_sample_index_int32; \
+from hyper_parallel.components.modules import TritonGDN; \
+import triton, triton.backends.ascend; \
+assert triton.__version__ == '3.2.0'; \
+assert (Path(hyper_parallel.__file__).parent / 'components/functional/gated_delta_net.py').is_file()"
+
+CMD ["/bin/bash"]

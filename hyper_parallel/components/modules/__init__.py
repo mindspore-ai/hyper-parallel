@@ -24,6 +24,8 @@ from typing import Any
 
 
 _EXPORT_TO_MODULE = {
+    "AscendCGDN": "gdn_ascendc",
+    "TritonGDN": "gdn_triton",
     "DeepseekV32DSAAttention": "dsa_attention",
     "DSAAttention": "dsa_attention",
     "GQAAttention": "gqa_attention",
