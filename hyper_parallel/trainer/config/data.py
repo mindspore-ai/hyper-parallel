@@ -29,6 +29,8 @@ class ModelAssetsConfig:
     """Tokenizer and chat-template configuration for text datasets."""
 
     chat_template: Optional[Union[str, Target[Any]]] = None
+    chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
+    log_first_chat_template: bool = False
     tokenizer: Optional[Target[Any]] = None
 
 

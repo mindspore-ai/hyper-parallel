@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for LLM data transforms."""
 
+import json
 import unittest
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -54,6 +55,25 @@ class _RecordingChatTemplate:
             "input_ids": input_ids[-max_seq_len:],
             "labels": labels[-max_seq_len:],
         }
+
+
+class _ToolsRecordingChatTemplate(_RecordingChatTemplate):
+    """Record optional tool definitions in addition to normalized messages."""
+
+    def __init__(self) -> None:
+        """Initialize message and tool recording."""
+        super().__init__()
+        self.tools = None
+
+    def encode_messages(
+            self,
+            messages: Sequence[Mapping[str, Any]],
+            max_seq_len: int,
+            tools: Sequence[Mapping[str, Any]],
+    ) -> dict[str, list[int]]:
+        """Record configured tools before encoding the conversation."""
+        self.tools = [dict(tool) for tool in tools]
+        return super().encode_messages(messages, max_seq_len)
 
 
 class TestTextConversationTransform(unittest.TestCase):
@@ -113,6 +133,61 @@ class TestTextConversationTransform(unittest.TestCase):
             with self.subTest(messages=messages):
                 with self.assertRaises(ValueError):
                     transform({"conversation": messages})
+
+    def test_tools_are_forwarded_only_when_tools_key_is_configured(self):
+        """Keep tools opt-in and accept JSON-serialized tool definitions."""
+        messages = [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "Answer"},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get current weather.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        default_template = _RecordingChatTemplate()
+        TextConversationTransform(default_template, max_seq_len=32, text_keys="messages")(
+            {"messages": messages, "tools": tools}
+        )
+        self.assertEqual(default_template.messages, messages)
+
+        tools_template = _ToolsRecordingChatTemplate()
+        TextConversationTransform(
+            tools_template,
+            max_seq_len=32,
+            text_keys="messages",
+            tools_key="tools",
+        )({"messages": messages, "tools": json.dumps(tools)})
+        self.assertEqual(tools_template.tools, tools)
+
+    def test_empty_configured_tools_use_the_standard_template_call(self):
+        """Treat missing, false, and empty per-sample tools as ordinary conversations."""
+        messages = [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "Answer"},
+        ]
+        for tools in (None, False, [], ""):
+            with self.subTest(tools=tools):
+                chat_template = _RecordingChatTemplate()
+                transform = TextConversationTransform(
+                    chat_template,
+                    max_seq_len=32,
+                    text_keys="messages",
+                    tools_key="tools",
+                )
+                sample = {"messages": messages}
+                if tools is not None:
+                    sample["tools"] = tools
+
+                transform(sample)
+
+                self.assertEqual(chat_template.messages, messages)
 
 
 class TestTextInstructionTransform(unittest.TestCase):
