@@ -25,6 +25,7 @@ module surface (single registry, shared IGNORE_INDEX, DatasetLogger).
 
 import os
 import unittest
+from typing import Any
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
@@ -82,6 +83,95 @@ class TestChatTemplateGoldens(unittest.TestCase):
         template = chat_template.build_chat_template("default", FakeTokenizer())
         with self.assertRaises(KeyError):
             template.encode_messages(messages)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_tokenizer_template_logs_first_rendering_once(self):
+        """tokenizer: optionally log one raw conversation and its native rendering."""
+        template = chat_template.build_chat_template(
+            "tokenizer",
+            FakeTokenizer(),
+            log_first_rendered_template=True,
+        )
+        messages = [{"role": "user", "content": "Hi"}]
+
+        with self.assertLogs("hyper_parallel.data.text.chat_template", level="INFO") as captured:
+            template.encode_messages(messages)
+            template.encode_messages(messages)
+
+        output = "\n".join(captured.output)
+        self.assertEqual(output.count("First chat-template input messages"), 1)
+        self.assertEqual(output.count("First rendered chat template"), 1)
+        self.assertIn("<user>Hi</user>", output)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_tokenizer_template_forwards_rendering_kwargs(self):
+        """tokenizer: use identical native-template kwargs for every incremental rendering."""
+        class RecordingTokenizer(FakeTokenizer):
+            """Record keyword arguments forwarded to the native template."""
+
+            def __init__(self):
+                super().__init__()
+                self.template_kwargs = []
+
+            def apply_chat_template(
+                    self,
+                    messages: Any,
+                    tokenize: bool = True,
+                    add_generation_prompt: bool = False,
+                    return_dict: bool = True,
+                    **kwargs: Any,
+            ) -> Any:
+                """Record native-template options before delegating to the fake tokenizer."""
+                self.template_kwargs.append(kwargs)
+                return super().apply_chat_template(
+                    messages,
+                    tokenize=tokenize,
+                    add_generation_prompt=add_generation_prompt,
+                    return_dict=return_dict,
+                )
+
+        tokenizer = RecordingTokenizer()
+        template = chat_template.build_chat_template(
+            "tokenizer",
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": True, "reasoning_effort": "medium"},
+        )
+        template.encode_messages([
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "Answer"},
+        ])
+
+        self.assertEqual(tokenizer.template_kwargs, [
+            {"enable_thinking": True, "reasoning_effort": "medium"},
+            {"enable_thinking": True, "reasoning_effort": "medium"},
+        ])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_tokenizer_template_validates_rendering_kwargs(self):
+        """tokenizer: reject Trainer-owned arguments and invalid known reasoning options."""
+        invalid_kwargs = (
+            ({"tokenize": False}, "Trainer-owned arguments"),
+            ({"enable_thinking": "yes"}, "enable_thinking must be a bool"),
+            ({"preserve_thinking": 1}, "preserve_thinking must be a bool"),
+            ({"reasoning_effort": "high"}, "reasoning_effort must be one of"),
+        )
+        for kwargs, expected_error in invalid_kwargs:
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, expected_error):
+                chat_template.build_chat_template(
+                    "tokenizer",
+                    FakeTokenizer(),
+                    chat_template_kwargs=kwargs,
+                )
+
+        with self.assertRaisesRegex(ValueError, "require chat_template='tokenizer'"):
+            chat_template.build_chat_template(
+                "chatml",
+                FakeTokenizer(),
+                chat_template_kwargs={"enable_thinking": True},
+            )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

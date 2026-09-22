@@ -71,6 +71,10 @@ compile:
 dataset:
   model_assets:
     chat_template: tokenizer
+    chat_template_kwargs:
+      enable_thinking: true
+      reasoning_effort: medium
+    log_first_chat_template: true
     tokenizer:
       _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: /home/chaoran/models/Qwen3.8-27B

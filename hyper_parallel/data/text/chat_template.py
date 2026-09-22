@@ -21,6 +21,7 @@ Canonical merge (05 §11.3) of the former
 ``IGNORE_INDEX`` shared from the constants module.
 """
 
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, MutableMapping, Optional, Sequence, Type, Union
 
@@ -186,17 +187,36 @@ def _janus_labels(content_ids: List[int], image_token_id: int, loss_mask: int, t
     return content_ids
 
 
-def build_chat_template(template_name: str, tokenizer: "PreTrainedTokenizer") -> "ChatTemplate":
+def build_chat_template(
+        template_name: str,
+        tokenizer: "PreTrainedTokenizer",
+        *,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        log_first_rendered_template: bool = False,
+) -> "ChatTemplate":
     """Build the registered chat template for a tokenizer.
 
     Args:
         template_name: Registry key of the chat template implementation.
         tokenizer: Hugging Face tokenizer used for encoding and special tokens.
+        chat_template_kwargs: Optional keyword arguments forwarded to the tokenizer's native chat template.
+        log_first_rendered_template: Whether the native tokenizer template logs its first rendered conversation.
 
     Returns:
         The configured chat template instance.
+
+    Raises:
+        ValueError: If native-template options are requested for a non-tokenizer template.
     """
-    return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer)
+    if template_name != "tokenizer":
+        if chat_template_kwargs or log_first_rendered_template:
+            raise ValueError("Native chat-template options require chat_template='tokenizer'")
+        return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer)
+    return CHAT_TEMPLATE_REGISTRY[template_name](
+        tokenizer,
+        chat_template_kwargs=chat_template_kwargs,
+        log_first_rendered_template=log_first_rendered_template,
+    )
 
 
 class ChatTemplate(ABC):
@@ -277,6 +297,89 @@ class DefaultTemplate(ChatTemplate):
 class TokenizerTemplate(ChatTemplate):
     """Use the tokenizer's native chat template and train only selected messages."""
 
+    _RESERVED_TEMPLATE_KWARGS = frozenset({"messages", "tokenize", "add_generation_prompt", "return_dict"})
+    _REASONING_EFFORTS = frozenset({"low", "medium", "xhigh"})
+
+    def __init__(
+            self,
+            tokenizer: Any,
+            chat_template_kwargs: Optional[Dict[str, Any]] = None,
+            log_first_rendered_template: bool = False,
+    ) -> None:
+        """Initialize the native tokenizer template wrapper.
+
+        Args:
+            tokenizer: Tokenizer providing the native Jinja chat template.
+            chat_template_kwargs: Keyword arguments forwarded to every native chat-template rendering.
+            log_first_rendered_template: Whether to log the first input messages and their fully rendered template.
+
+        Raises:
+            ValueError: If a reserved argument is configured or a known reasoning option is invalid.
+        """
+        super().__init__(tokenizer)
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
+        self._validate_chat_template_kwargs()
+        self.log_first_rendered_template = log_first_rendered_template
+        self._has_logged_first_rendered_template = False
+
+    def _validate_chat_template_kwargs(self) -> None:
+        """Validate Trainer-owned arguments and known Qwen reasoning options."""
+        reserved_kwargs = self._RESERVED_TEMPLATE_KWARGS.intersection(self.chat_template_kwargs)
+        if reserved_kwargs:
+            raise ValueError(
+                "chat_template_kwargs cannot override Trainer-owned arguments: "
+                f"{sorted(reserved_kwargs)!r}"
+            )
+
+        enable_thinking = self.chat_template_kwargs.get("enable_thinking")
+        if enable_thinking is not None and not isinstance(enable_thinking, bool):
+            raise ValueError("chat_template_kwargs.enable_thinking must be a bool")
+
+        preserve_thinking = self.chat_template_kwargs.get("preserve_thinking")
+        if preserve_thinking is not None and not isinstance(preserve_thinking, bool):
+            raise ValueError("chat_template_kwargs.preserve_thinking must be a bool")
+
+        reasoning_effort = self.chat_template_kwargs.get("reasoning_effort")
+        if reasoning_effort is not None and reasoning_effort not in self._REASONING_EFFORTS:
+            raise ValueError(
+                "chat_template_kwargs.reasoning_effort must be one of "
+                f"{sorted(self._REASONING_EFFORTS)!r}"
+            )
+
+    def _apply_chat_template(
+            self,
+            messages: Sequence[Dict[str, str]],
+            *,
+            tokenize: bool,
+            return_dict: bool,
+    ) -> Any:
+        """Render messages with one consistent set of native-template arguments."""
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=False,
+            return_dict=return_dict,
+            **self.chat_template_kwargs,
+        )
+
+    def _log_first_template(self, messages: Sequence[Dict[str, str]]) -> None:
+        """Log the first raw conversation and native-template rendering once."""
+        if not self.log_first_rendered_template or self._has_logged_first_rendered_template:
+            return
+        if os.environ.get("RANK", "0") != "0":
+            self._has_logged_first_rendered_template = True
+            return
+
+        rendered_template = self._apply_chat_template(
+            messages,
+            tokenize=False,
+            return_dict=False,
+        )
+        logger.info("First chat-template input messages: %r", messages)
+        logger.info("First chat-template kwargs: %r", self.chat_template_kwargs)
+        logger.info("First rendered chat template:\n%s", rendered_template)
+        self._has_logged_first_rendered_template = True
+
     def _update_prefix_labels(
             self,
             previous_ids: List[int],
@@ -313,15 +416,15 @@ class TokenizerTemplate(ChatTemplate):
         Raises:
             ValueError: If the template rewrites or shortens an earlier conversation prefix.
         """
+        self._log_first_template(messages)
         input_ids: List[int] = []
         labels: List[int] = []
         previous_length = 0
 
         for end, message in enumerate(messages, start=1):
-            encoded = self.tokenizer.apply_chat_template(
+            encoded = self._apply_chat_template(
                 messages[:end],
                 tokenize=True,
-                add_generation_prompt=False,
                 return_dict=True,
             )
             current_ids = encoded["input_ids"]
