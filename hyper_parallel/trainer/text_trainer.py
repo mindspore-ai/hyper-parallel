@@ -292,6 +292,13 @@ class TextTrainer:
         }
 
     def train(self) -> None:
+        """Train and close model-owned resources even when a step fails."""
+        try:
+            self._train()
+        finally:
+            self.base._close_model_runtime_resources()
+
+    def _train(self) -> None:
         """Run the configured global optimizer steps by Dataset epoch."""
         config = self.base.config
         self.on_train_begin()
