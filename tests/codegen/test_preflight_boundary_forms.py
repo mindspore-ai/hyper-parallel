@@ -155,6 +155,31 @@ def _meta():
     )
 
 
+def _bias_plan() -> tuple[dict, dict]:
+    """The frozen plan, with Alpha deferring its rowwise bias (D-22)."""
+    plan, classes = _plan()
+    plan["param_plan"]["blocks.alpha"]["deferred_bias_params"] = ["o_proj.bias"]
+    return plan, classes
+
+
+def _render_bias() -> str:
+    """Render the bundle with the D-22 exit line on the Alpha boundary."""
+    plan, classes = _bias_plan()
+    return lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
+
+
+def _bias_meta():
+    """A meta double whose Alpha entry declares deferred bias params."""
+    plan, classes = _bias_plan()
+    return SimpleNamespace(
+        param_plan=plan["param_plan"],
+        injections=[],
+        mesh_dim_names=("tp",),
+        boundary_classes=classes,
+        source={"module_name": ""},
+    )
+
+
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
 def test_emitted_forms_pass_verification(tmp_path):
@@ -199,6 +224,46 @@ def test_stray_attribute_reference_fails_verification(tmp_path):
     Expectation: ``RuntimeError`` naming the class.
     """
     text = _render().replace("self._hyper_tp.", "self._hyper_boundary.")
+
+    with pytest.raises(RuntimeError, match="Alpha"):
+        verify_boundary_forms(_meta(), _layout(tmp_path, text))
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_deferred_bias_boundary_passes_verification(tmp_path):
+    """A tp_collective boundary deferring its rowwise bias passes the check.
+
+    Feature: codegen-preflight
+    Description: The D-22 exit call ``self._hyper_deferred_bias(outputs)``
+        is part of the static template for a class whose frozen entry
+        declares deferred bias params — the attribute allowlist the emitter
+        and the preflight share must accept it.
+    Expectation: No exception.
+    """
+    text = _render_bias()
+    assert "self._hyper_deferred_bias(outputs)" in text
+
+    verify_boundary_forms(_bias_meta(), _layout(tmp_path, text))
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_undeclared_deferred_bias_call_fails_verification(tmp_path):
+    """A deferred-bias exit call on a non-deferring class fails the check.
+
+    Feature: codegen-preflight
+    Description: ``self._hyper_deferred_bias`` is allowed only for classes
+        whose frozen entry declares deferred bias params; the same call on
+        a plain tp_collective boundary is drift.
+    Expectation: ``RuntimeError`` naming the class.
+    """
+    text = _render().replace(
+        "        return outputs",
+        "        outputs = self._hyper_deferred_bias(outputs)\n"
+        "        return outputs",
+        1,
+    )
 
     with pytest.raises(RuntimeError, match="Alpha"):
         verify_boundary_forms(_meta(), _layout(tmp_path, text))

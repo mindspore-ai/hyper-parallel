@@ -155,7 +155,9 @@ def verify_boundary_forms(meta: Any, layout: Any) -> None:
       from the static template, or ``TOGGLE_FORM_MARKER`` from the opt-in
       switch template) and the extracted ``_forward_impl``, and the rewritten
       forward references only the static template's own attributes
-      (``self._hyper_tp`` / ``self._forward_impl``);
+      (``self._hyper_tp`` / ``self._forward_impl``) — plus the D-22 exit call
+      ``self._hyper_deferred_bias`` when the class's frozen entry declares
+      deferred bias params;
     - ``generic`` / ``region``: the extracted ``_forward_impl`` without the
       marker (the compiled-plan / local-compute engines own the forward);
     - a fully inlined component body (no ``_forward_impl``, no marker): its
@@ -196,7 +198,7 @@ def verify_boundary_forms(meta: Any, layout: Any) -> None:
         else getattr(source, "module_name", "")
     )
 
-    for class_name, _form, emitted, func, _injection, _deferred_bias in iter_emitted_forms(
+    for class_name, _form, emitted, func, _injection, deferred_bias in iter_emitted_forms(
         source_text,
         meta,
         boundary_classes=boundary_classes,
@@ -282,7 +284,12 @@ def verify_boundary_forms(meta: Any, layout: Any) -> None:
                     "artifact"
                 )
             body = source_text[func.body_start:func.body_end]
-            stray = re.search(r"self\._hyper_(?!tp\b)", body)
+            # The static template's own channel is ``self._hyper_tp``; a
+            # class whose frozen entry declares D-22 deferred bias params
+            # additionally calls ``self._hyper_deferred_bias`` at the exit
+            # (bound at install time).  Anything else is drift.
+            allowed = "tp|deferred_bias" if deferred_bias else "tp"
+            stray = re.search(rf"self\._hyper_(?!({allowed})\b)", body)
             if stray is not None:
                 raise RuntimeError(
                     f"codegen preflight: static tp_collective forward on "
