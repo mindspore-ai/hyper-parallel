@@ -1,0 +1,62 @@
+# Qwen2-MoE Muon + AdamW checkpoint resume configuration.
+model:
+  _target_: torch.nn.Identity
+
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  fp32_main_params: true
+  muon_config:
+    muon_lr: 0.001
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_ns_steps: 3
+  adamw_config:
+    adamw_lr: 0.0001
+    adamw_weight_decay: 0.0
+
+model_init_dtype: bfloat16
+
+training:
+  backend: hccl
+  global_batch_size: 8
+  micro_batch_size: 2
+  seed: 31415
+
+accelerator:
+  tp_size: 1
+  cp_size: 2
+  ep_size: 2
+  pp_size: 1
+  sequence_parallel: true
+  loss_parallel: false
+
+plan_overrides:
+  - match: "*.self_attn"
+    when: cp
+    region_dispatch: false
+    inner_target: "self"
+    inner_wrapper: sdpa_hf
+  - match: "*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.distributed.expert_parallel.recipes.qwen2moe_ep_compute_fn
+
+fsdp_config:
+  dp_shard_size: 2
+  edp_shard_size: 2
+  # The shared gate has shape (1, hidden_size), so it cannot be evenly split
+  # across the two expert FSDP shards and must remain replicated.
+  replicate_params:
+    - model.layers.0.mlp.shared_expert_gate.weight
+    - model.layers.1.mlp.shared_expert_gate.weight
+    - model.layers.2.mlp.shared_expert_gate.weight
+    - model.layers.3.mlp.shared_expert_gate.weight
+  reshard_after_forward: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: true

@@ -242,6 +242,7 @@ def _prime_optimizer_state(
             group["lr"] = 0.0
         if "weight_decay" in group:
             group["weight_decay"] = 0.0
+    # zeros_like must retain DTensor dispatch so newly created state keeps the parameter mesh and placements.
     with SkipDTensorDispatch(no_skip={torch.zeros_like}):
         optimizer.step()
 
@@ -259,6 +260,7 @@ def _materialize_hyper_optimizer_state(
         return False
 
     param_ids = {id(param) for param in params}
+    # zeros_like must retain DTensor dispatch so newly created state keeps the parameter mesh and placements.
     with SkipDTensorDispatch(no_skip={torch.zeros_like}):
         for group in optimizer.param_groups:
             group["step"] = group.get("step") or 0
