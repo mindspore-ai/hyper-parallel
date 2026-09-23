@@ -70,6 +70,9 @@ class TrainerConfig:
     activation_swap: Literal["none", "attention"] = "none"
     compile: CompileConfig = field(default_factory=CompileConfig)
 
+    # codegen
+    codegen: bool = False
+
     # data
     dataset: Optional[DatasetConfig] = None
     dataloader: Optional[DataLoaderConfig] = None

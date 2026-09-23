@@ -137,6 +137,9 @@ def _sigmoid_group_router(module, hidden_states):
 
 
 MOE_ROUTER_ADAPTERS = {
+    "softmax_topk": _softmax_topk_router,
+    "topk_router_module": _topk_router_module,
+    "sigmoid_group": _sigmoid_group_router,
     "default": _softmax_topk_router,
     "qwen2moe": _topk_router_module,
     "qwen2_moe": _topk_router_module,

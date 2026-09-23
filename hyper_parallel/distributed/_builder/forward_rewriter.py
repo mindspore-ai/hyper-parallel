@@ -537,27 +537,34 @@ def _validate_outputs(outputs, spec, mesh_dim_names, module_name, stage):
 # MoE EP local region (05 §4.4.3 + D-03')
 # ────────────────────────────────────────────────────────────────────────────
 
-def _rewrap_local_outputs(output, spec, mesh, mesh_dim_names, module_name):
-    """Wrap every declared local Tensor output with its ``out_src`` layout."""
-    declared = spec.out_src or {}
-    if not declared:
-        return output
+def rewrap_declared_outputs(output, entries, mesh, *, label, resolve=None):
+    """Re-wrap declared local-region outputs with their ``out_src`` layout.
 
+    The single execution mechanism behind both the native local-region skeleton
+    (:func:`_rewrap_local_outputs`) and the codegen runtime
+    (``InstalledBoundary.rewrap_outputs``).  Callers only differ in how they
+    obtain the placements: the native side resolves a live ``spec`` per call
+    (``resolve``), codegen replays placements it pre-resolved from the frozen
+    JSON contract at install time (``resolve`` left ``None``).
+
+    Args:
+        output: Forward output: a tensor, or a tuple/list of tensors.
+        entries: ``(output_index, out_name, raw_placement)`` per declared output.
+        mesh: Mesh the re-wrapped DTensors are created on.
+        label: Caller prefix for the error messages.
+        resolve: Optional callable turning a raw placement into a tuple of
+            placements; identity when the entries are already resolved.
+
+    Returns:
+        The output with every declared plain-tensor item re-wrapped as a
+        DTensor (``None`` and already-DTensor items pass through).
+    """
     is_sequence = isinstance(output, (tuple, list))
     items = list(output) if is_sequence else [output]
-    out_names = list(getattr(spec, "out_names", None) or declared.keys())
-    name_to_idx = {name: index for index, name in enumerate(out_names)}
-
-    for out_name, named_placement in declared.items():
-        index = name_to_idx.get(out_name)
-        if index is None:
-            raise ValueError(
-                f"{module_name}: out_src declares output {out_name!r}, but "
-                f"out_names={out_names!r} does not contain it"
-            )
+    for index, out_name, raw_placement in entries:
         if index >= len(items):
             raise ValueError(
-                f"{module_name}: out_src maps output {out_name!r} to index "
+                f"{label}: out_src maps output {out_name!r} to index "
                 f"{index}, but forward returned only {len(items)} output(s)"
             )
         item = items[index]
@@ -567,11 +574,11 @@ def _rewrap_local_outputs(output, spec, mesh, mesh_dim_names, module_name):
             continue
         if not isinstance(item, torch.Tensor):
             raise TypeError(
-                f"{module_name}: declared output {out_name!r} at index "
+                f"{label}: declared output {out_name!r} at index "
                 f"{index} must be a Tensor or None, got {type(item).__name__}"
             )
-        placements = tuple(resolve_placements(named_placement, mesh_dim_names))
-        items[index] = DTensor.from_local(item, mesh, placements)
+        placements = resolve(raw_placement) if resolve is not None else raw_placement
+        items[index] = DTensor.from_local(item, mesh, tuple(placements))
 
     if isinstance(output, tuple):
         return tuple(items)
@@ -579,10 +586,34 @@ def _rewrap_local_outputs(output, spec, mesh, mesh_dim_names, module_name):
         return items
     if len(items) != 1:
         raise ValueError(
-            f"{module_name}: scalar forward output cannot satisfy "
-            f"{len(declared)} declared out_src entries"
+            f"{label}: scalar forward output cannot satisfy "
+            f"{len(entries)} declared out_src entries"
         )
     return items[0]
+
+
+def _rewrap_local_outputs(output, spec, mesh, mesh_dim_names, module_name):
+    """Wrap every declared local Tensor output with its ``out_src`` layout."""
+    declared = spec.out_src or {}
+    if not declared:
+        return output
+
+    out_names = list(getattr(spec, "out_names", None) or declared.keys())
+    name_to_idx = {name: index for index, name in enumerate(out_names)}
+    entries = []
+    for out_name, named_placement in declared.items():
+        index = name_to_idx.get(out_name)
+        if index is None:
+            raise ValueError(
+                f"{module_name}: out_src declares output {out_name!r}, but "
+                f"out_names={out_names!r} does not contain it"
+            )
+        entries.append((index, out_name, named_placement))
+    return rewrap_declared_outputs(
+        output, entries, mesh,
+        label=module_name,
+        resolve=lambda named: tuple(resolve_placements(named, mesh_dim_names)),
+    )
 
 
 def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
@@ -1041,9 +1072,18 @@ def _wrap_vocab_parallel_embedding(module, tp_mesh):
     interval [lo, hi) are zeroed and indices are shifted by the offset, so the
     output is naturally a Partial contribution and the boundary exit's
     Partial->Shard(1) reduction is unchanged.
+
+    The interval must come from the *local* vocab shard. The applier reaches
+    this after the Phase C one-shot ``_local_params_context`` unwrap (plain
+    local parameter), but a caller may install the boundary while the weight
+    is still a DTensor -- ``DTensor.shape`` is the global shape and would give
+    a wrong interval -- so the local shard is read explicitly.
     """
     original_forward = module.forward
-    v_local = module.weight.shape[0]
+    weight = module.weight
+    to_local = getattr(weight, "to_local", None)
+    local_weight = to_local() if callable(to_local) else weight
+    v_local = local_weight.shape[0]
     lo = tp_mesh.get_local_rank() * v_local
     hi = lo + v_local
 

@@ -48,6 +48,9 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
 )
+from hyper_parallel.distributed.expert_parallel.routing import (
+    MOE_ROUTER_ADAPTERS,
+)
 
 
 @dataclass(frozen=True)
@@ -381,6 +384,100 @@ def ep_routed_forward(
         dispatch.dispatch_order,
         output_shape,
     )
+
+
+def _merge_shared_none(
+    module: Any,
+    hidden_states: torch.Tensor,
+    routed: torch.Tensor,
+) -> torch.Tensor:
+    """Routed branch only (no shared expert)."""
+    del module, hidden_states
+    return routed
+
+
+def _merge_shared_additive(
+    module: Any,
+    hidden_states: torch.Tensor,
+    routed: torch.Tensor,
+) -> torch.Tensor:
+    """Compose ``routed + module.shared_experts(x)`` (DeepSeek-V3 / GLM-4-MoE).
+
+    ``module.shared_experts(...)`` is a planned nested TP boundary: its exit
+    already performs the TP reduction (nested-boundary call contract) — do NOT
+    all-reduce its return value.
+    """
+    return routed + module.shared_experts(hidden_states)
+
+
+def _merge_shared_gated(
+    module: Any,
+    hidden_states: torch.Tensor,
+    routed: torch.Tensor,
+) -> torch.Tensor:
+    """Compose ``routed + sigmoid(shared_expert_gate(x)) * shared_expert(x)``.
+
+    Qwen2-MoE layout.  ``module.shared_expert(...)`` is a planned nested TP
+    boundary — the reduction contract is documented on
+    :func:`_merge_shared_additive`.
+    """
+    shared = module.shared_expert(hidden_states)
+    gate = torch.sigmoid(module.shared_expert_gate(hidden_states))
+    return routed + gate * shared
+
+
+# The three shared-branch merges, keyed by the STRUCTURAL mode both call paths
+# select: the native archetype factories in ``recipes.py`` (as their
+# ``combine``) and the generated inline EP body through ``moe_ep_forward``.
+# Keeping the composition here is the single source of truth — the expression
+# exists once, so it cannot drift between the two paths.
+SHARED_MERGE_MODES: dict[str, Callable[[Any, torch.Tensor, torch.Tensor], torch.Tensor]] = {
+    "none": _merge_shared_none,
+    "additive": _merge_shared_additive,
+    "gated": _merge_shared_gated,
+}
+
+
+def moe_ep_forward(
+    module: Any,
+    hidden_states: torch.Tensor,
+    *,
+    router_kind: str,
+    shared: str = "none",
+    ep_group: Any,
+) -> torch.Tensor:
+    """Shared routed-MoE forward surfaced to generated inline EP artifacts.
+
+    The single framework-generic EP body used across model families in
+    place of per-family strategy strings: runs the routed branch and merges
+    the shared branch according to ``shared``. Router semantics are selected
+    by ``router_kind`` — a STRUCTURAL key (``softmax_topk`` /
+    ``topk_router_module`` / ``sigmoid_group``), never a model name.
+
+    ``shared`` selects an entry of :data:`SHARED_MERGE_MODES` — the same
+    merges the native archetype factories pass as their ``combine``:
+      * ``"none"``     — routed output only.
+      * ``"additive"`` — ``routed + module.shared_experts(x)``
+                         (DeepSeek-V3 / GLM-4-MoE).
+      * ``"gated"``    — ``routed + sigmoid(module.shared_expert_gate(x)) *
+                         module.shared_expert(x)`` (Qwen2-MoE).
+
+    Keeps the same numeric contract as ``ep_routed_forward`` plus the
+    ``combine`` step of the runtime EP recipes.
+    """
+    merge = SHARED_MERGE_MODES.get(shared)
+    if merge is None:
+        raise ValueError(
+            f"moe_ep_forward: unknown shared merge mode {shared!r} "
+            f"(expected one of {sorted(SHARED_MERGE_MODES)})"
+        )
+    routed = ep_routed_forward(
+        module,
+        hidden_states,
+        router_fn=MOE_ROUTER_ADAPTERS[router_kind],
+        ep_group=ep_group,
+    )
+    return merge(module, hidden_states, routed)
 
 
 def require_attrs(module: Any, *names: str, owner: str = "") -> None:
