@@ -85,6 +85,29 @@ class ShardingTemplate:
     region_dispatch: Optional[bool] = None
     needs_cp_attn: bool = False   # CP: inner attention needs a CP-aware forward
 
+    # ── Structural-template flags (Phase 4 materialization switches) ──
+    # is_boundary=False: the boundary owns parameters but no I/O contract
+    # (param-only spec).  Used by architecture leaves whose parameters are
+    # replicated while the module itself is not a communication boundary
+    # (MHC pre-modules, DSA attention sink parameters).  Such a template's
+    # sp_*/nosp_* fields stay empty and are never filled into the spec.
+    is_boundary: bool = True
+    # head_count_owner_parent: the head-sharded projection of this boundary
+    # lives in a nested leaf while the cached head-count attributes
+    # (num_heads/...) live on the PARENT module.  The planner records the
+    # parent in spec._head_count_owner (D-17) so the applier adjusts the owner
+    # exactly once after sharding this leaf.
+    head_count_owner_parent: bool = False
+    # loss_parallel_out_dst: the boundary produces the vocab-parallel terminal
+    # output, so out_src/out_dst follow the plan-level loss_parallel decision
+    # (Shard(-1) when true, Replicate otherwise) and the input contracts are
+    # normalized to the canonical CP sequence layout.
+    loss_parallel_out_dst: bool = False
+    # cp_sharded_input: the CP data pipeline has already sharded input_ids
+    # along CP (05 §6.3.4 shard_batch_for_cp), so the boundary must not
+    # scatter the sequence a second time.
+    cp_sharded_input: bool = False
+
 
 def _multi_dim(tp=None, cp=None, ep=None) -> NamedPlacement:
     """Build multi-dim placement dict, filtering out None dims."""
@@ -106,6 +129,38 @@ def _hid(tp_p, cp_p, ep_p=None) -> Dict[str, NamedPlacement]:
 def _out(tp_p, cp_p, ep_p=None) -> NamedPlacement:
     """Shorthand for the single-output (scalar shorthand) contract."""
     return _multi_dim(tp=tp_p, cp=cp_p, ep=ep_p or Replicate())
+
+
+def sequence_identity_fields(
+    input_key: str, *, sp_placement: Placement,
+) -> Dict[str, object]:
+    """Template fields for a sequence-preserving (identity) boundary.
+
+    Used by the structural families whose modules must leave the incoming
+    activation layout untouched: while the sequence is TP-sharded the
+    boundary is an identity on *sp_placement* (``Shard(1)`` — each rank keeps
+    its own chunk); with ``sequence_parallel=False`` there is no sequence
+    shard to preserve and the same identity is ``Replicate``.  Every field
+    gets a fresh dict — templates are shared objects and only the spec
+    materialized from them is deep-copied.
+    """
+    def _inputs(placement: Placement) -> Dict[str, NamedPlacement]:
+        return {input_key: {TP: placement}}
+
+    def _outputs(placement: Placement) -> NamedPlacement:
+        return {TP: placement}
+
+    return {
+        "norm_placement": Replicate(),
+        "sp_in_src": _inputs(sp_placement),
+        "sp_in_dst": _inputs(sp_placement),
+        "sp_out_src": _outputs(sp_placement),
+        "sp_out_dst": _outputs(sp_placement),
+        "nosp_in_src": _inputs(Replicate()),
+        "nosp_in_dst": _inputs(Replicate()),
+        "nosp_out_src": _outputs(Replicate()),
+        "nosp_out_dst": _outputs(Replicate()),
+    }
 
 
 # ── TEMPLATES: complete templates for the 7 semantic roles (05 §3.5, declared over TP+CP+EP) ──
@@ -173,6 +228,7 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         nosp_in_dst={"input": _multi_dim(tp=Replicate(), cp=Shard(1), ep=Replicate())},
         nosp_out_src=_out(Partial(), Shard(1)),
         nosp_out_dst=_out(Replicate(), Shard(1)),
+        cp_sharded_input=True,
     ),
 
     # ── LM Head (weight Shard(0), output Shard(-1); out_dst is overridden according to loss_parallel) ──
@@ -192,6 +248,7 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         nosp_in_dst=_hid(Replicate(), Shard(1)),
         nosp_out_src=_out(Shard(-1), Shard(1)),
         nosp_out_dst=_out(Replicate(), Shard(1)),
+        loss_parallel_out_dst=True,
     ),
 
     # ── MoE Gate (Router: weight replicated, output redistributes → EP) ──
@@ -225,6 +282,16 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         region_dispatch=False,           # MoE forward has its own a2a; dispatch not allowed
     ),
 }
+
+
+# Boundary types derived from module capabilities live in
+# ``_builder/model_structure.py`` (per architecture family, next to the rules
+# that produce them) as ``STRUCTURAL_TEMPLATES``.  They stay out of TEMPLATES
+# because this table is the complete table of the 7 semantic roles (asserted
+# by the template-contract test: every entry fully declares its SP/non-SP
+# contracts), while a structural entry may be param-only (``is_boundary=False``,
+# no contracts at all) or declare only the mesh axes its architecture uses.
+
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -308,11 +375,17 @@ def _placement_for_role(
 
 
 def _build_spec_from_template(
-    templates, boundary_fqn: str, group: List[Tuple[str, ParamRole]],
+    boundary_fqn: str, group: List[Tuple[str, ParamRole]],
     template: ShardingTemplate, sequence_parallel: bool, loss_parallel: bool,
     mesh_dim_names: Tuple[str, ...], param_ndims: Optional[Dict[str, int]] = None,
 ) -> Optional[ModuleShardingSpec]:
-    """Template + ParamRole → ModuleShardingSpec (05 §3.5 Template Mapping)."""
+    """Template + ParamRole → ModuleShardingSpec (05 §3.5 Template Mapping).
+
+    Data-driven: every special case is declared by the template's own flags
+    (``is_boundary`` / ``loss_parallel_out_dst`` / ``cp_sharded_input``), so
+    the same function serves the semantic-role table and the structural
+    tables alike.
+    """
     has_tp = "tp" in mesh_dim_names
     has_cp = "cp" in mesh_dim_names
     has_ep = "ep" in mesh_dim_names
@@ -330,6 +403,13 @@ def _build_spec_from_template(
         if placement is not None:
             spec.params[param_path] = placement
 
+    # Param-only template: the boundary owns parameters but no I/O contract
+    # (the module is not a communication boundary).  Leave every contract
+    # field empty and mark the spec accordingly.
+    if not template.is_boundary:
+        spec.is_boundary = False
+        return spec
+
     # Step 2: select the I/O contract per the SP switch (deep copy, so
     # chain propagation cannot dirty the shared templates)
     if sequence_parallel:
@@ -343,11 +423,11 @@ def _build_spec_from_template(
         spec.out_src = copy.deepcopy(template.nosp_out_src)
         spec.out_dst = copy.deepcopy(template.nosp_out_dst)
 
-    # Step 2.5: lm_head's out_dst depends on loss_parallel (a runtime
-    # decision).
+    # Step 2.5: the terminal vocab-parallel boundary (lm_head) derives its
+    # out_dst from the plan-level loss_parallel decision (a runtime choice).
     # The CP dim is always Shard(1) (D-07/R8): under CP the loss is
     # computed on the local chunk; no gather is performed.
-    if template is templates.get("lm_head"):
+    if template.loss_parallel_out_dst:
         cp_placement = Shard(1) if has_cp else Replicate()
         for input_contract in (spec.in_src, spec.in_dst):
             for placements in input_contract.values():
@@ -369,7 +449,7 @@ def _build_spec_from_template(
     # the template's default Replicate, otherwise the boundary would
     # scatter the already-sharded chunk a second time (the sequence
     # would be sharded twice).
-    if template is templates.get("embed") and has_cp:
+    if template.cp_sharded_input and has_cp:
         spec.in_src = {"input": _multi_dim(tp=Replicate(), cp=Shard(1),
                                            ep=Replicate())}
         spec.in_dst = {"input": _multi_dim(tp=Replicate(), cp=Shard(1),

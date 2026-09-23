@@ -25,7 +25,7 @@ semantic role (attention/mlp/...).
 
 import logging
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -137,9 +137,15 @@ class ParameterClassifier:
       1. ``arch_overrides[arch]`` — explicit (pattern | [patterns], ParamRole)
          overrides (legacy full-name substring semantics — they are explicit
          user intent);
-      2. default naming rules (first match; each rule declares its match mode,
+      2. ``structural_rules`` — ``fn(param_fqn) -> Optional[ParamRole]``
+         predicates derived from the *instantiated* model's structure
+         (``_builder/model_structure.py``).  They sit between the explicit
+         arch rules and the default naming rules because they are gated by a
+         structure actually discovered in this model, while the defaults are
+         pure naming heuristics;
+      3. default naming rules (first match; each rule declares its match mode,
          see ``_build_default_rules``);
-      3. no match → ``ParamRole.SKIP``.
+      4. no match → ``ParamRole.SKIP``.
 
     User-supplied ``name_rules`` may use either the current 3-tuple form
     ``(patterns, role, mode)`` or the legacy 2-tuple form ``(patterns, role)``
@@ -150,6 +156,9 @@ class ParameterClassifier:
         self,
         name_rules: Optional[List[tuple]] = None,
         arch_overrides: Optional[Dict[str, list]] = None,
+        structural_rules: Optional[
+            Sequence[Callable[[str], Optional[ParamRole]]]
+        ] = None,
     ) -> None:
         """Initialize the classifier.
 
@@ -158,11 +167,15 @@ class ParameterClassifier:
                 ``_build_default_rules()`` when None.
             arch_overrides: ``{arch: [(pattern | [patterns], ParamRole)]}``
                 per-architecture overrides; empty when None.
+            structural_rules: Structure-derived predicates checked after the
+                arch overrides and before the default naming rules; empty
+                when None.
         """
         self._name_rules = (
             name_rules if name_rules is not None else _build_default_rules()
         )
         self._arch_overrides = arch_overrides if arch_overrides is not None else {}
+        self._structural_rules = tuple(structural_rules or ())
 
     def classify(self, model: Any, arch: str = "") -> Dict[str, ParamRole]:
         """Iterate over all named parameters and return {param_fqn: ParamRole}.
@@ -202,7 +215,13 @@ class ParameterClassifier:
             patterns = [pattern] if isinstance(pattern, str) else list(pattern)
             if _match_any(name_lower, [p.lower() for p in patterns]):
                 return forced_role
-        # 2. Default naming rules (first match)
+        # 2. Structure-derived rules (model_structure facts; see the class
+        #    docstring for why they outrank the default naming rules)
+        for rule in self._structural_rules:
+            role = rule(name_lower)
+            if role is not None:
+                return role
+        # 3. Default naming rules (first match)
         for rule in self._name_rules:
             if len(rule) == 3:
                 patterns, default_role, mode = rule
@@ -214,5 +233,5 @@ class ParameterClassifier:
                     return default_role
             elif _match_rule(name_lower, patterns, mode):
                 return default_role
-        # 3. Fallback
+        # 4. Fallback
         return ParamRole.SKIP

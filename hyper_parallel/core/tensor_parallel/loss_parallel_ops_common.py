@@ -183,7 +183,7 @@ def _validate_cross_entropy_params(
     else:
         raise ValueError(
             "input must be a DTensor when using loss_parallel. "
-            f"Got type: {type(input)}"
+            f"Got type: {type(input_tensor)}"
         )
 
     if weight is not None and _is_dtensor(weight):

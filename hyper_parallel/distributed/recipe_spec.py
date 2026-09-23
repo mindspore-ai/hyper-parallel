@@ -387,6 +387,11 @@ class ModuleShardingSpec:
     # "self" when the boundary module itself is wrapped. Nothing is located
     # silently: the resolved target is always visible here and in the INFO log.
     _resolved_inner_target: Optional[str] = None
+    # Architecture templates whose TP head-sharded projection is represented
+    # by a nested leaf boundary can point at the module that owns the cached
+    # head-count attributes.  The applier adjusts that owner after sharding
+    # the tagged leaf (D-17); None keeps the normal same-boundary detection.
+    _head_count_owner: Optional[str] = None
     # D-09 (05 §6.4.7): EP pass-through for HF-native MoE. A non-empty _ep_stack
     # means per-expert parameters must be pre-stacked into [E, ...] in Phase A.
     # Since the explicit-injection rework the compute side is NOT auto-injected:
@@ -606,7 +611,11 @@ def _make_decorator(kind: str) -> Callable[[Callable[..., Any]], Callable[..., A
                 "injection discipline requires explicitly receiving "
                 f"{sorted(required)} (all filled by the framework by name at "
                 "apply time; the user merely uses them)")
-        fn._injection_meta = InjectionMeta(kind=kind, context=frozenset(context))
+        # Attach via setattr for symmetry with require_injection_meta's
+        # getattr below: the metadata is framework-owned and hangs off an
+        # arbitrary user function, not a class instance we control.
+        setattr(fn, "_injection_meta",
+                InjectionMeta(kind=kind, context=frozenset(context)))
         return fn
 
     return decorator

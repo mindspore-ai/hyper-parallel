@@ -29,6 +29,8 @@ import unittest
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
+from hyper_parallel.components import optim
+
 from tests.common.mark_utils import arg_mark
 
 
@@ -83,6 +85,7 @@ class TestShardingConfigContracts(unittest.TestCase):
                 ("_needs_cp_attn", "False"),
                 ("_resolved_inner_wrapper", "None"),
                 ("_resolved_inner_target", "None"),
+                ("_head_count_owner", "None"),
                 ("_ep_stack", "<factory> {}"),
                 ("_ep_size", "0"),
             ],
@@ -133,6 +136,10 @@ class TestShardingConfigContracts(unittest.TestCase):
                 ("nosp_out_dst", "None"),
                 ("region_dispatch", "None"),
                 ("needs_cp_attn", "False"),
+                ("is_boundary", "True"),
+                ("head_count_owner_parent", "False"),
+                ("loss_parallel_out_dst", "False"),
+                ("cp_sharded_input", "False"),
             ],
         )
 
@@ -248,8 +255,6 @@ class TestOptimizerContracts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_wrapper_signatures(self):
         """AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged."""
-        import hyper_parallel.components.optim as optim
-
         self.assertEqual(
             str(inspect.signature(optim.AdamW.__init__)),
             "(self, adamw_config: dict, model: torch.nn.modules.module.Module, "
@@ -282,7 +287,6 @@ class TestOptimizerContracts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_module_all(self):
         """optim package and mixed_precision_optimizer ``__all__`` stay unchanged."""
-        import hyper_parallel.components.optim as optim
         from hyper_parallel.components.optim import mixed_precision_optimizer
 
         self.assertEqual(

@@ -15,13 +15,14 @@
 """planner: ShardingPlanner 6-phase derivation pipeline (05 §3.6 canonical).
 
 Phase 1  parameter role classification (ParameterClassifier + the family's
-         ModelAdapterSpec.sharding_rules from models/registry.py)
+         ModelAdapterSpec.sharding_rules from models/registry.py + the
+         structure-derived rules of ``_builder/model_structure.py``)
 Phase 2  communication boundary grouping (two passes: first group by owning
          module, then merge upward depth-first — fixes the flaw in the
          05 §3.6.6 pseudocode where "single-parameter group inference"
          misjudges a q_proj leaf module as an mlp boundary)
-Phase 3  semantic role inference (explicit FQN patterns > structural guards
-         > parameter role combinations)
+Phase 3  semantic role inference (structure-derived boundary types > explicit
+         FQN patterns > structural guards > parameter role combinations)
 Phase 4  template lookup to generate spec (_build_spec_from_template)
 Phase 4.5 user plan_overrides merge/insert (_merge_plan_overrides, 05 §3.6.7)
 Phase 5  _is_terminal marking only (D-14, 05 §13: compile-time chain
@@ -29,11 +30,19 @@ Phase 5  _is_terminal marking only (D-14, 05 §13: compile-time chain
          each module vouches for its own propagation in validate mode)
 Phase 6  special parameter handler collection (SPECIAL_HANDLERS)
 
+Architectures whose module structure the generic naming rules cannot
+classify (DSA attention leaves, MHC pre-modules, MTP previous-state
+projections, dispatcher-owned shared experts) declare their knowledge as
+Phase 1/2/3 rules through ``_builder/model_structure.py`` — there is one
+derivation path for every boundary, and no second pass over the model.
+
 Registries:
 - family sharding rules: ``ModelAdapterSpec.sharding_rules`` providers in
   ``models/<family>/adapter/registration.py``, resolved lazily through
   ``models/registry.py::get_model_adapter`` (any spelling — model_type,
   HF architecture or canonical arch name);
+- structural families: ``_builder/model_structure.py`` (families are matched
+  from module capabilities, never from config.architectures/model_type);
 - ``SPECIAL_HANDLERS``: {handler_name: callable(module, param_name, mesh)} —
   lives in ``_builder/special_handlers.py``.
 """
@@ -73,6 +82,12 @@ from hyper_parallel.distributed._builder.default_templates import (
     _multi_dim,
 )
 from hyper_parallel.distributed._builder.function_module import FunctionModule
+from hyper_parallel.distributed._builder.model_structure import (
+    EMPTY_STRUCTURE,
+    STRUCTURAL_TEMPLATES,
+    ModelStructure,
+    detect_model_structure,
+)
 from hyper_parallel.distributed._builder.rule_resolver import (
     _last_segment,
     _merge_plan_overrides,
@@ -90,7 +105,6 @@ logger = logging.getLogger(__name__)
 # ``models/<family>/adapter/registration.py`` (DeepSeek MLA, Qwen2-MoE
 # shared_expert_gate), discovered through ``models/registry.py``. The
 # planner core stays family-agnostic (05 §15.9 step 1).
-
 
 # Leaf-segment guard for projection/container segment names: these segment
 # names are not boundary containers themselves; inference returns unknown
@@ -176,10 +190,14 @@ class ShardingPlanner:
                 "every trainable parameter must be covered by the plan"
                 hard error to a warning (exploratory debugging only).
         """
-        self._classifier = ParameterClassifier()
         self._templates = TEMPLATES
+        self._structural_templates = STRUCTURAL_TEMPLATES
         self._special_handler_patterns = dict(_SPECIAL_HANDLER_PATTERNS)
         self._plan_overrides = dict(plan_overrides or {})
+        # Structure facts for the model currently being planned (Phase 1/2/3).
+        # Empty until plan() discovers them; direct calls to the Phase helpers
+        # therefore behave exactly like the generic derivation path.
+        self._structure: ModelStructure = EMPTY_STRUCTURE
         # derive=False: skip template derivation entirely — the plan contains
         # ONLY the plan_overrides specs (every key is insert mode and must be
         # fully self-declared). This replaces post-hoc pruning of
@@ -217,12 +235,12 @@ class ShardingPlanner:
             return
         for boundary_fqn, group in boundary_groups.items():
             boundary_type = self._infer_boundary_type(boundary_fqn, group)
-            template = self._templates.get(boundary_type)
+            template = (self._templates.get(boundary_type)
+                        or self._structural_templates.get(boundary_type))
             if template is None:
                 logger.warning("No template for boundary_type=%s at %s", boundary_type, boundary_fqn)
                 continue
             spec = _build_spec_from_template(
-                self._templates,
                 boundary_fqn,
                 group,
                 template,
@@ -233,6 +251,11 @@ class ShardingPlanner:
             )
             if spec is None:
                 continue
+            if template.head_count_owner_parent:
+                # The head-sharded projection lives in this leaf while the
+                # cached head-count attributes live on the parent module
+                # (D-17): point the applier at the owner.
+                spec._head_count_owner = boundary_fqn.rsplit(".", 1)[0]  # pylint: disable=protected-access
             if boundary_type == "moe_mlp":
                 self._mark_hf_native_moe(
                     spec, group, boundary_fqn, template, mesh_dim_names, arch,
@@ -331,6 +354,11 @@ class ShardingPlanner:
         """
         arch = self._get_architecture(model)
         self._check_overrides_no_dp()   # fail-first: the plan's coordinate system = a single dp slice
+        # Structural facts, discovered once and shared by Phases 1-3 (the
+        # family matchers run on module capabilities, so they need the
+        # instantiated module tree).
+        self._structure = detect_model_structure(
+            model, dict(model.named_modules()))
         mesh_dim_names = self._build_mesh_dim_names(mesh, tp_size, cp_size, ep_size)
         # D-10 TP-extend-EP (05 §6.4.8): ep_size is the extended EP group
         # size (the a2a communication domain, extended from the TP group to
@@ -568,10 +596,11 @@ class ShardingPlanner:
             )
 
     def _classify_all_params(self, model, arch: str) -> Dict[str, ParamRole]:
-        """Phase 1 entry: default naming rules plus the family's declared
-        sharding rules (``ModelAdapterSpec.sharding_rules``, resolved through
-        the models registry — the planner core carries no per-family
-        knowledge)."""
+        """Phase 1 entry: default naming rules, the family's declared sharding
+        rules (``ModelAdapterSpec.sharding_rules``, resolved through the models
+        registry — the planner core carries no per-family knowledge) and the
+        structure-derived rules (``_builder/model_structure.py``), in that
+        order of decreasing priority."""
         from hyper_parallel.models.registry import (  # pylint: disable=import-outside-toplevel
             get_model_adapter,
         )
@@ -579,9 +608,10 @@ class ShardingPlanner:
         rules = []
         if spec is not None and spec.sharding_rules is not None:
             rules = list(spec.sharding_rules())
-        if not rules:
-            return self._classifier.classify(model, arch)
-        classifier = ParameterClassifier(arch_overrides={arch: rules})
+        classifier = ParameterClassifier(
+            arch_overrides={arch: rules},
+            structural_rules=self._structure.role_rules(),
+        )
         return classifier.classify(model, arch)
 
     # ── Phase 2 ─────────────────────────────────────────────────────────
@@ -642,6 +672,21 @@ class ShardingPlanner:
                     # will match later → skipped)
                     origin = ".".join(params[0][0].split(".")[:-1]) if params else mfqn
                     groups.setdefault(origin, params)
+
+        # Pass 3: seed the boundaries that own no parameter at all.  A module
+        # with zero direct parameters can never surface from the parameter
+        # tree above, yet some structural families declare it as a real
+        # communication boundary (e.g. DSA rotary_emb / the sparse indexer);
+        # their Phase 3 type is derived from the FQN by _infer_boundary_type.
+        for seed_fqn in self._structure.paramless_boundary_fqns:
+            if groups.setdefault(seed_fqn, []):
+                logger.warning(
+                    "structural boundary seed %r already owns %d parameter(s) "
+                    "— the boundary type is derived from the module structure "
+                    "but its parameters are classified by Phase 1; check the "
+                    "family's paramless_boundary_fqns list",
+                    seed_fqn, len(groups[seed_fqn]),
+                )
         return groups
 
     # ── Phase 3 ─────────────────────────────────────────────────────────
@@ -695,11 +740,17 @@ class ShardingPlanner:
         """Identify the semantic role from the module FQN + the group's
         parameter roles.
 
-        Priority: explicit FQN patterns > leaf-segment guard > MoE roles >
-        parameter role combinations > default.
+        Priority: structure-derived types (families matched from module
+        capabilities — they own architecture-specific contracts and therefore
+        outrank the generic patterns) > explicit FQN patterns > leaf-segment
+        guard > MoE roles > parameter role combinations > default.
         """
         fqn_lower = fqn.lower()
         seg = _last_segment(fqn)
+
+        structural_type = self._structure.boundary_type(fqn)
+        if structural_type is not None:
+            return structural_type
 
         explicit_type = self._explicit_boundary_type(fqn_lower, seg)
         if explicit_type is not None:
@@ -972,7 +1023,6 @@ class ShardingPlanner:
             spec, expert_params, stacks, batched, boundary_fqn, template
         )
         self._set_extended_ep_contract(spec, ep_extend)
-
 
     @staticmethod
     def _finalize_fused_expert_tp_guard(plan: ShardingPlan, *, tp_size: int) -> None:
