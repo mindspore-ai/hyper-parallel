@@ -30,6 +30,7 @@ def build_parameter_sharding_rules() -> list[tuple[list[str] | str, Any]]:
             ParamRole.REPLICATED,
         ),
         (["engram", "attn_hc", "ffn_hc"], ParamRole.REPLICATED),
+        (["dspark"], ParamRole.REPLICATED),
         (["q_b_proj", "o_a_proj", "sinks"], ParamRole.COLWISE),
         ("o_b_proj", ParamRole.ROWWISE),
     ]

@@ -588,6 +588,17 @@ class BaseTrainer(Stateful, ABC):
             device_mesh=self.mesh,
         )
         loss = torch.stack(list(loss_dict.values())).sum()
+        # Model-declared extra metrics join the logged mapping only after
+        # the backward loss is fixed: log-only, never part of the loss.
+        extra_metrics = getattr(outputs, "extra_metrics", None)
+        if extra_metrics is None:
+            model_ref = getattr(self, "model", None)
+            extra_metrics = getattr(model_ref, "_pending_extra_metrics", None)
+            if extra_metrics is not None:
+                model_ref._pending_extra_metrics = None
+        if extra_metrics:
+            for name, value in extra_metrics.items():
+                loss_dict[name] = value.detach().float()
         return loss, loss_dict
 
     def forward_backward_step(

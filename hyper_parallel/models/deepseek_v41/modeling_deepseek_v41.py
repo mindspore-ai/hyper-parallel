@@ -45,6 +45,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 
 from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
+from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
@@ -405,6 +406,8 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
         nn.init.normal_(module.fn, mean=0.0, std=std)
         module.base.zero_()
         module.scale.fill_(1.0)
+    elif isinstance(module, DeepseekV41DSpark):
+        module.init_weights(std)
 
 
 def _hc_pre(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
@@ -739,7 +742,10 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
         shared_state = SharedAttentionState()
-        for layer in self.layers:
+        dspark_layer_ids = tuple(getattr(self.config, "v41_dspark_target_layer_ids", ()) or ())
+        self.dspark_target_hiddens = [] if dspark_layer_ids else None
+        self.dspark_inputs_embeds = inputs_embeds.detach() if dspark_layer_ids else None
+        for layer_index, layer in enumerate(self.layers):
             hidden_states, pre_mix = layer(
                 hidden_states,
                 pre_mix=pre_mix,
@@ -753,8 +759,66 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                 image_mask=image_mask,
                 **kwargs,
             )
+            if self.dspark_target_hiddens is not None and layer_index in dspark_layer_ids:
+                # DSpark trains without gradients into the backbone
+                # (V4.1 report section 2.4.3), so targets detach here.
+                self.dspark_target_hiddens.append(_hc_pre(hidden_states, pre_mix).detach())
         hidden_states = self.norm(_hc_pre(hidden_states, pre_mix))
         return MoeModelOutputWithPast(last_hidden_state=hidden_states)
+
+
+def _dspark_sparse_moe_forward(
+        self: nn.Module,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        image_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Drafter MoE forward that recomputes the shared expert in backward.
+
+    The routed-expert container performs the expert-parallel dispatch and
+    must not sit inside a recomputed region (its collectives would
+    interleave with FSDP backward collectives), but the shared expert is
+    purely local, so checkpointing it trims the drafter's resident
+    activations on the long flattened draft stream.
+
+    Args:
+        self: Bound HF MoE module (gate / experts / shared_experts).
+        hidden_states: ``[batch, seq, hidden]`` FFN input.
+        input_ids: Unused router-correction hook argument.
+        image_mask: Visual-token mask forwarded to the router.
+
+    Returns:
+        Combined routed plus shared expert output.
+    """
+    del input_ids
+    batch_size, sequence_length, hidden_size = hidden_states.shape
+    _, weights, indices = self.gate(hidden_states, image_mask=image_mask)
+    routed = self.experts(hidden_states.view(-1, hidden_size), indices, weights)
+    if torch.is_grad_enabled() and self.training:
+        shared = torch.utils.checkpoint.checkpoint(
+            self.shared_experts, hidden_states, use_reentrant=False)
+    else:
+        shared = self.shared_experts(hidden_states)
+    return routed.view(batch_size, sequence_length, hidden_size) + shared
+
+
+def _build_dspark_mlp(config: Any) -> nn.Module:
+    """Build one DSpark-stage MoE FFN reusing the crop expert container."""
+    import copy  # local: config templates are cloned only when DSpark is on  # pylint: disable=C0415
+
+    dspark_config = copy.deepcopy(config)
+    experts = int(getattr(config, "v41_dspark_n_routed_experts", config.num_local_experts))
+    dspark_config.n_routed_experts = experts
+    dspark_config.num_local_experts = experts
+    dspark_config.num_experts_per_tok = int(getattr(config, "v41_dspark_top_k", config.num_experts_per_tok))
+    mlp = DeepseekV4DecoderLayer(dspark_config, 0).mlp
+    mlp.gate = DeepseekV41TopKRouter(dspark_config)
+    mlp.forward = MethodType(_dspark_sparse_moe_forward, mlp)
+    return mlp
+
+
+class DeepseekV41CroppedForCausalLM(DeepseekV4ForCausalLM):
+    """Causal-LM facade for the four-layer V4.1 validation backbone."""
 
 
 class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
@@ -770,6 +834,11 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.dspark = None
+        self.dspark_loss_coeff = 0.0
+        if int(getattr(config, "v41_dspark_depth", 0) or 0) > 0:
+            self.dspark = DeepseekV41DSpark(config, mlp_factory=lambda: _build_dspark_mlp(config))
+            self.dspark_loss_coeff = float(getattr(config, "v41_dspark_loss_coeff", 1.0))
         self.post_init()
 
     @torch.no_grad()
@@ -780,6 +849,48 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             return
         super()._init_weights(module)
         _initialize_v41_owned_module(module, self.config.initializer_range)
+
+    def forward(
+            self,
+            input_ids: torch.LongTensor | None = None,
+            labels: torch.LongTensor | None = None,
+            **kwargs: Any,
+    ) -> Any:  # pylint: disable=arguments-differ
+        """Run the causal LM and, when enabled, add the DSpark objective.
+
+        Args:
+            input_ids: Input token ids forwarded to the V4 causal LM.
+            labels: Supervised labels; DSpark runs only when present.
+            **kwargs: Remaining Transformers forward arguments.
+
+        Returns:
+            The causal-LM output with the DSpark objective folded into
+            ``loss`` and drafter metrics attached when enabled.
+        """
+        outputs = super().forward(input_ids=input_ids, labels=labels, **kwargs)
+        # The trainer may keep labels on its loss-only path, so the drafter
+        # must not depend on them: it supervises from input_ids when absent.
+        if self.dspark is not None and input_ids is not None:
+            targets = getattr(self.model, "dspark_target_hiddens", None)
+            if not targets:
+                raise RuntimeError("DSpark is enabled but no backbone target hiddens were collected")
+            dspark_loss, dspark_metrics = self.dspark(
+                targets, input_ids, labels, self.model.dspark_inputs_embeds, self.lm_head
+            )
+            dspark_term = self.dspark_loss_coeff * dspark_loss
+            # The trainer's default ModelOutputLoss backpropagates
+            # model_output.loss, so the drafter objective must join that
+            # field with its graph attached; a logits-side auxiliary hook
+            # would be dead because the HF loss is already built from the
+            # original logits. The drafter share stays observable through
+            # the dspark_* metrics.
+            if outputs.loss is not None:
+                outputs.loss = outputs.loss + dspark_term
+            outputs.extra_metrics = dspark_metrics
+            # Some output-object hand-offs rebuild the ModelOutput and drop
+            # non-field attributes; the module attribute is the stable path.
+            self._pending_extra_metrics = dspark_metrics
+        return outputs
 
     @classmethod
     def from_config(cls, config: Any, **kwargs: Any) -> "DeepseekV41ForCausalLM":

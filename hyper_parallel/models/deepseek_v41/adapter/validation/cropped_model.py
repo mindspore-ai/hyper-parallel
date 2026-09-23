@@ -51,6 +51,10 @@ def build_deepseek_v41_validation_config(
         num_routed_experts: int = 16,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        dspark_depth: int = 0,
+        dspark_target_layer_ids: list[int] | None = None,
+        dspark_loss_coeff: float = 1.0,
+        dspark_confidence_coeff: float = 0.1,
 ) -> DeepseekV4Config:
     """Translate the released config into a depth-preserving parameter crop.
 
@@ -233,6 +237,30 @@ def build_deepseek_v41_validation_config(
     config.v41_vision_min_pixels = int(vision["min_pixels"])
     config.v41_vision_max_wh_ratio = vision["max_wh_ratio"]
     config.v41_image_token_id = int(source["image_token_id"])
+    config.v41_dspark_depth = int(dspark_depth)
+    if config.v41_dspark_depth > 0:
+        # The crop preserves depth, so the last three layers are the released
+        # dspark_target_layer_ids; they feed main_proj.
+        default_targets = list(range(max(0, released_hidden_layers - 3), released_hidden_layers))
+        config.v41_dspark_target_layer_ids = list(dspark_target_layer_ids or default_targets)
+        config.v41_dspark_block_size = int(text.get("dspark_block_size", 5))
+        config.v41_dspark_markov_rank = int(text.get("dspark_markov_rank", 256))
+        config.v41_dspark_noise_token_id = int(
+            text.get("dspark_noise_token_id", source["pad_token_id"]))
+        config.v41_dspark_n_routed_experts = min(
+            int(text.get("dspark_n_routed_experts", resolved_routed_experts)),
+            resolved_routed_experts,
+        )
+        config.v41_dspark_top_k = min(
+            int(text.get("dspark_num_experts_per_tok", 3)),
+            config.v41_dspark_n_routed_experts,
+        )
+        # Released drafter sliding window (technical report 2.4.3).
+        config.v41_dspark_window = 128
+        config.v41_dspark_loss_coeff = float(dspark_loss_coeff)
+        config.v41_dspark_confidence_coeff = float(dspark_confidence_coeff)
+    else:
+        config.v41_dspark_target_layer_ids = []
     config._attn_implementation = "eager"  # pylint: disable=protected-access
     return config
 
@@ -246,6 +274,10 @@ def build_cropped_deepseek_v41(
         num_routed_experts: int = 16,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        dspark_depth: int = 0,
+        dspark_target_layer_ids: list[int] | None = None,
+        dspark_loss_coeff: float = 1.0,
+        dspark_confidence_coeff: float = 0.1,
         torch_dtype: str = "bfloat16",
         validate_placement: bool = False,
         distributed_setup: DistributedSetup | None = None,
@@ -268,6 +300,11 @@ def build_cropped_deepseek_v41(
         exercise_post_training_indexer: Exercise the released Full/Reindex
             hierarchy at its native layer indices.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
+        dspark_depth: Trainable DSpark stage count; 0 disables the drafter.
+        dspark_target_layer_ids: Backbone layers feeding the drafter; defaults
+            to the last three, matching the released layout.
+        dspark_loss_coeff: Drafter objective weight.
+        dspark_confidence_coeff: Confidence-head BCE weight.
         torch_dtype: Forward dtype accepted by the model builder.
         validate_placement: Enable DTensor placement validation.
         distributed_setup: Trainer-provided parallel topology.
@@ -290,6 +327,10 @@ def build_cropped_deepseek_v41(
         num_routed_experts=num_routed_experts,
         exercise_post_training_indexer=exercise_post_training_indexer,
         indexer_loss_coeff=indexer_loss_coeff,
+        dspark_depth=dspark_depth,
+        dspark_target_layer_ids=dspark_target_layer_ids,
+        dspark_loss_coeff=dspark_loss_coeff,
+        dspark_confidence_coeff=dspark_confidence_coeff,
     )
     return HyperAutoModelForCausalLM.from_config(
         config,
