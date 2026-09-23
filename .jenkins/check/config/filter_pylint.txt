@@ -136,3 +136,18 @@
 # 24. DSA functional exports are resolved lazily by components.functional;
 #     pylint cannot infer that the exported operator proxies are callable.
 "hyper-parallel/hyper_parallel/components/modules/dsa_attention.py"        "not-callable"
+
+# 27. Codegen tests — contract tests target the _hp_* installation seams on
+#     purpose; fakes keep the native signatures (some formals unused by
+#     design); _-prefixed formals mark intentionally unused arguments;
+#     test-local imports run after monkeypatching or inside fixtures; the
+#     toggle test executes generated source by design.
+"hyper-parallel/tests/codegen/"                                        "protected-access"
+"hyper-parallel/tests/codegen/"                                        "unused-argument"
+"hyper-parallel/tests/codegen/"                                        "import-outside-toplevel"
+"hyper-parallel/tests/codegen/"                                        "invalid-name"
+"hyper-parallel/tests/codegen/"                                        "redefined-outer-name"
+"hyper-parallel/tests/codegen/"                                        "reimported"
+"hyper-parallel/tests/codegen/"                                        "wrong-import-position"
+"hyper-parallel/tests/codegen/"                                        "exec-used"
+"hyper-parallel/tests/codegen/"                                        "consider-using-from-import"
