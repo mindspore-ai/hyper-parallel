@@ -162,3 +162,19 @@
 #     parameter for signature compatibility; the backend is resolved
 #     internally from force_hf/codegen.
 "hyper-parallel/hyper_parallel/models/_transformers/auto_model.py"     "unused-argument"
+
+
+# 23. Codegen tests — contract tests target the _hp_* installation seams on
+#     purpose; fakes keep the native signatures (some formals unused by
+#     design); _-prefixed formals mark intentionally unused arguments;
+#     test-local imports run after monkeypatching or inside fixtures; the
+#     toggle test executes generated source by design.
+"hyper-parallel/tests/codegen/"                                        "protected-access"
+"hyper-parallel/tests/codegen/"                                        "unused-argument"
+"hyper-parallel/tests/codegen/"                                        "import-outside-toplevel"
+"hyper-parallel/tests/codegen/"                                        "invalid-name"
+"hyper-parallel/tests/codegen/"                                        "redefined-outer-name"
+"hyper-parallel/tests/codegen/"                                        "reimported"
+"hyper-parallel/tests/codegen/"                                        "wrong-import-position"
+"hyper-parallel/tests/codegen/"                                        "exec-used"
+"hyper-parallel/tests/codegen/"                                        "consider-using-from-import"
