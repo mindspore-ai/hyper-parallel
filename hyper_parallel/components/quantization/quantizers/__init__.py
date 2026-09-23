@@ -21,9 +21,13 @@ from hyper_parallel.components.quantization.quantizers.hifloat8 import (
 from hyper_parallel.components.quantization.quantizers.mxfp8 import (
     MXFP8Quantizer,
 )
+from hyper_parallel.components.quantization.quantizers.w4a8 import W4A8Quantizer
+from hyper_parallel.components.quantization.quantizers.fake_w4a8 import FakeW4A8Quantizer
 
 __all__ = [
     "HiFloat8Quantizer",
     "MXFP8Quantizer",
     "Quantizer",
+    "W4A8Quantizer",
+    "FakeW4A8Quantizer",
 ]

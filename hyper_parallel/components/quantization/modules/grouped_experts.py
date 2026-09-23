@@ -12,27 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Packed-expert module executing its projections in MXFP8 GMMs."""
+"""Canonical low-precision adapter for DeepSeek-V3 grouped experts.
 
-from typing import Optional
+``GroupedExperts`` is the single canonical grouped-experts shell: it only
+orchestrates routing, activation, and token ordering.  Gate/up and down
+projections run through the bound ``GroupedLinear``, whose
+instance is picked exclusively in ``strategy_factory``.
+"""
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.quantization.functional import (
-    LowPrecisionCapabilityError,
-    npu_quant_grouped_linear,
+    GroupedLinear,
+    _GroupedLinearFunction,
 )
-from hyper_parallel.components.quantization.quantizers import (
-    MXFP8Quantizer,
+from hyper_parallel.components.quantization.ops.npu_mxfp8 import LowPrecisionCapabilityError
+from hyper_parallel.components.quantization.ops.npu_w4a8 import (
+    W4A8CapabilityError,
 )
-
+from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import (
+    MXFP8GroupedLinear,
+)
 
 _EXPERT_PARAMETER_NAMES = ("gate_up_proj", "down_proj")
 
 
-class MXFP8GroupedExperts(nn.Module):
-    """Preserve packed expert parameters while changing their GMM boundary."""
+class GroupedExperts(nn.Module):
+    """Canonical low-precision shell for DeepSeek-V3 grouped experts.
+
+    The bound grouped-linear compute may select MXFP8, native W4A8, or fake
+    W4A8. The shell owns no quantizer; it holds only the ``grouped_linear``
+    instance selected by ``strategy_factory``.
+    """
 
     def __init__(
         self,
@@ -41,7 +53,7 @@ class MXFP8GroupedExperts(nn.Module):
         intermediate_dim: int,
         *,
         fqn: str = "",
-        quantizer: Optional[MXFP8Quantizer] = None,
+        grouped_linear: GroupedLinear | None = None,
     ) -> None:
         """Create an unbound packed-expert module."""
 
@@ -57,7 +69,11 @@ class MXFP8GroupedExperts(nn.Module):
         self.hidden_dim = hidden_dim
         self.intermediate_dim = intermediate_dim
         self.fqn = fqn
-        self.quantizer = quantizer if quantizer is not None else MXFP8Quantizer()
+        self.grouped_linear = (
+            grouped_linear
+            if grouped_linear is not None
+            else MXFP8GroupedLinear()
+        )
 
     @classmethod
     def from_module(
@@ -65,8 +81,8 @@ class MXFP8GroupedExperts(nn.Module):
         source: nn.Module,
         *,
         fqn: str,
-        quantizer: Optional[MXFP8Quantizer] = None,
-    ) -> "MXFP8GroupedExperts":
+        grouped_linear: GroupedLinear | None = None,
+    ) -> "GroupedExperts":
         """Create a no-allocation shell retaining the source registrations."""
 
         parameter_names = tuple(source._parameters)  # pylint: disable=protected-access
@@ -116,7 +132,11 @@ class MXFP8GroupedExperts(nn.Module):
         converted.hidden_dim = gate_up_proj.shape[2]
         converted.intermediate_dim = gate_up_proj.shape[1] // 2
         converted.fqn = fqn
-        converted.quantizer = quantizer if quantizer is not None else MXFP8Quantizer()
+        converted.grouped_linear = (
+            grouped_linear
+            if grouped_linear is not None
+            else MXFP8GroupedLinear()
+        )
         if hasattr(source, "config"):
             converted.config = source.config
         converted.training = source.training
@@ -130,23 +150,23 @@ class MXFP8GroupedExperts(nn.Module):
         """Run already expert-major tokens through the two low-precision GMMs."""
 
         try:
-            gate_up = npu_quant_grouped_linear(
+            gate_up = _GroupedLinearFunction.apply(
                 sorted_inputs,
                 self.gate_up_proj,
                 tokens_per_expert,
-                self.quantizer,
-                group_list_type=1,
+                self.grouped_linear,
+                1,
             )
             gate, up = gate_up.chunk(2, dim=-1)
             intermediate = self.act_fn(gate) * up
-            return npu_quant_grouped_linear(
+            return _GroupedLinearFunction.apply(
                 intermediate,
                 self.down_proj,
                 tokens_per_expert,
-                self.quantizer,
-                group_list_type=1,
+                self.grouped_linear,
+                1,
             )
-        except LowPrecisionCapabilityError as exc:
+        except (LowPrecisionCapabilityError, W4A8CapabilityError) as exc:
             target = self.fqn or "<unknown>"
             raise LowPrecisionCapabilityError(
                 f"Low-precision grouped-expert target {target!r} cannot run: {exc}"
@@ -162,7 +182,7 @@ class MXFP8GroupedExperts(nn.Module):
 
         if hidden_states.ndim != 2:
             raise ValueError(
-                "Packed MXFP8 experts require two-dimensional hidden_states, "
+                "Grouped experts require two-dimensional hidden_states, "
                 f"but got shape {tuple(hidden_states.shape)}."
             )
         if top_k_index.shape != top_k_weights.shape or top_k_index.ndim != 2:
@@ -204,4 +224,4 @@ class MXFP8GroupedExperts(nn.Module):
         ).sum(dim=1)
 
 
-__all__ = ["MXFP8GroupedExperts"]
+__all__ = ["GroupedExperts"]

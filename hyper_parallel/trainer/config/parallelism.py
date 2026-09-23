@@ -23,10 +23,15 @@ import importlib
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, List, Literal, Optional, Union
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import (
+    LowPrecisionConfig,
+    LowPrecisionDtypeScheme,
+)
 from hyper_parallel.models.replacement import (
     ModuleReplacementFactory,
     ModuleReplacementSpec,
@@ -96,6 +101,11 @@ class PlanOverride:
             ``"low_precision"`` (active when online low precision is
             enabled). A replacement action accepts only ``"low_precision"``;
             module replacement must not depend on the parallel topology.
+        low_precision_dtype_scheme: a named ``training.low_precision.
+            dtype_schemes`` entry bound to this match. Only valid on
+            ``when="low_precision"`` replacement entries; the resolved scheme
+            is injected into the replacement factory context so the strategy
+            factory never resolves a catalog at replacement time.
         local_compute_fn: a Target whose callable is a **factory** — must be
             decorated ``@local_compute`` (injection discipline); the mesh
             family ``mesh``/``tp_mesh``/``cp_mesh``/``ep_mesh`` is mandatory
@@ -165,6 +175,7 @@ class PlanOverride:
 
     match: Union[str, List[str]]
     when: Optional[Literal["cp", "ep", "low_precision"]] = None
+    low_precision_dtype_scheme: Optional[str] = None
     module_type: Optional[str] = None
     exact_type: bool = False
     replace_module: Optional[Target[Any]] = None
@@ -338,7 +349,10 @@ def _import_module_type(path: str) -> type:
     raise ValueError(f"plan_overrides.module_type {path!r} could not be imported")
 
 
-def _target_replacement_factory(target: Target[Any]) -> ModuleReplacementFactory:
+def _target_replacement_factory(
+    target: Target[Any],
+    low_precision_policy: Optional[LowPrecisionDtypeScheme] = None,
+) -> ModuleReplacementFactory:
     """Bind a YAML Target's static args to the replacement factory protocol."""
 
     if not getattr(target._target_, "_hp_module_replacement", False):  # pylint: disable=protected-access
@@ -355,6 +369,10 @@ def _target_replacement_factory(target: Target[Any]) -> ModuleReplacementFactory
         context: Mapping[str, Any],
     ) -> nn.Module:
         """Build one replacement module by delegating to the bound YAML Target."""
+        if low_precision_policy is not None:
+            factory_context = dict(context)
+            factory_context["low_precision"] = low_precision_policy
+            context = MappingProxyType(factory_context)
         return target.build(module=module, module_fqn=module_fqn, context=context)
 
     return factory
@@ -364,9 +382,11 @@ def entries_to_module_replacements(
     entries: List[PlanOverride],
     *,
     low_precision_enabled: bool = False,
+    low_precision_config: Optional[LowPrecisionConfig] = None,
 ) -> tuple[ModuleReplacementSpec, ...]:
-    """Desugar active YAML replacement actions without involving sharding."""
+    """Desugar replacement actions and bind their named dtype schemes."""
 
+    effective_config = low_precision_config if low_precision_enabled else None
     rules = []
     for entry in entries:
         if entry.replace_module is None:
@@ -379,6 +399,24 @@ def entries_to_module_replacements(
             )
         if entry.when == "low_precision" and not low_precision_enabled:
             continue
+        if entry.low_precision_dtype_scheme is not None and (
+            not isinstance(entry.low_precision_dtype_scheme, str)
+            or not entry.low_precision_dtype_scheme.strip()
+        ):
+            raise ValueError(
+                f"plan_overrides match={entry.match!r}: "
+                "low_precision_dtype_scheme must be a non-empty string"
+            )
+        if entry.low_precision_dtype_scheme is not None and entry.when != "low_precision":
+            raise ValueError(
+                f"plan_overrides match={entry.match!r} sets "
+                "low_precision_dtype_scheme but is not a low-precision entry"
+            )
+        if entry.when == "low_precision" and effective_config is None:
+            raise ValueError(
+                f"plan_overrides match={entry.match!r} enables a low-precision "
+                "replacement but training.low_precision is missing"
+            )
         if entry.module_type is None:
             raise ValueError(
                 f"plan_overrides match={entry.match!r} uses replace_module but omits module_type"
@@ -388,10 +426,13 @@ def entries_to_module_replacements(
                 f"plan_overrides match={entry.match!r} replace_module must be a YAML Target"
             )
         patterns = (entry.match,) if isinstance(entry.match, str) else tuple(entry.match)
+        policy = None
+        if entry.when == "low_precision" and effective_config is not None:
+            policy = effective_config.resolve_dtype_scheme(entry.low_precision_dtype_scheme)
         rules.append(
             ModuleReplacementSpec(
                 match=patterns,
-                factory=_target_replacement_factory(entry.replace_module),
+                factory=_target_replacement_factory(entry.replace_module, policy),
                 module_type=_import_module_type(entry.module_type),
                 exact_type=entry.exact_type,
             )
@@ -515,6 +556,7 @@ def normalize_distributed_setup_overrides(
     distributed_setup.module_replacements = entries_to_module_replacements(
         entries,
         low_precision_enabled=low_precision_enabled,
+        low_precision_config=getattr(distributed_setup, "low_precision_config", None),
     )
     distributed_setup.plan_overrides = (
         entries_to_plan_overrides(

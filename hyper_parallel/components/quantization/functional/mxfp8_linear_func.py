@@ -18,7 +18,7 @@ from typing import Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.components.quantization.functional.npu_mxfp8 import (
+from hyper_parallel.components.quantization.ops.npu_mxfp8 import (
     mxfp8_matmul,
 )
 from hyper_parallel.components.quantization.quantizers.mxfp8 import (

@@ -29,6 +29,10 @@ from hyper_parallel.components.quantization.tensor.mxfp8_tensor import (
     MXFP8TensorStorage,
 )
 from hyper_parallel.components.quantization.tensor.quantized_tensor import QuantizedTensor
+from hyper_parallel.components.quantization.tensor.w4a8_tensor import (
+    W4A8Tensor,
+    W4A8TensorStorage,
+)
 
 __all__ = [
     "HiFloat8Tensor",
@@ -37,4 +41,6 @@ __all__ = [
     "MXFP8TensorStorage",
     "QuantizedTensor",
     "QuantizedTensorStorage",
+    "W4A8Tensor",
+    "W4A8TensorStorage",
 ]

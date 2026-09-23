@@ -156,11 +156,11 @@ class MXFP8NpuOps:
             )
         return grouped_quant(
             tensor,
+            # A5 GroupedDynamicMxQuant's groupIndex contract is int32.
             group_list.to(torch.int32),
             round_mode="rint",
             dst_type=quant_dtype or torch.float8_e4m3fn,
             blocksize=32,
-            scale_alg=1,
         )
 
     def quant_grouped_matmul(
@@ -185,6 +185,8 @@ class MXFP8NpuOps:
                 "The active torch_npu stack does not provide "
                 f"npu_grouped_matmul; torch_npu={version}."
             )
+        # A5 GroupedMatmul's groupList contract is int64.
+        group_list = group_list.to(torch.int64)
         return grouped_matmul(
             [x1],
             [x2],

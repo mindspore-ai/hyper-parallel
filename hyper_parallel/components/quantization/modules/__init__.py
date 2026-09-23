@@ -24,8 +24,8 @@ from hyper_parallel.components.quantization.modules.hifloat8_linear import (
 from hyper_parallel.components.quantization.modules.linear import (
     QuantizedLinearBase,
 )
-from hyper_parallel.components.quantization.modules.mxfp8_grouped_linear import (
-    MXFP8GroupedExperts,
+from hyper_parallel.components.quantization.modules.grouped_experts import (
+    GroupedExperts,
 )
 from hyper_parallel.components.quantization.modules.mxfp8_linear import (
     MXFP8Linear,
@@ -35,7 +35,7 @@ from hyper_parallel.components.quantization.modules.mxfp8_linear import (
 __all__ = [
     "HiFloat8GroupedExperts",
     "HiFloat8Linear",
-    "MXFP8GroupedExperts",
+    "GroupedExperts",
     "MXFP8Linear",
     "QuantizedLinearBase",
     "replace_hifloat8_linear",

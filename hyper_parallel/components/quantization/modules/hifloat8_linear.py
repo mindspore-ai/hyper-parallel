@@ -27,7 +27,7 @@ from hyper_parallel.components.quantization.functional.hifloat8_linear_func impo
 from hyper_parallel.components.quantization.modules.linear import (
     QuantizedLinearBase,
 )
-from hyper_parallel.components.quantization.functional.npu_hifloat8 import (
+from hyper_parallel.components.quantization.ops.npu_hifloat8 import (
     validate_hifloat8_runtime,
 )
 from hyper_parallel.components.quantization.quantizers.hifloat8 import (

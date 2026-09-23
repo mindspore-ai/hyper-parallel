@@ -27,7 +27,7 @@ from hyper_parallel.components.quantization.functional.mxfp8_linear_func import 
 from hyper_parallel.components.quantization.modules.linear import (
     QuantizedLinearBase,
 )
-from hyper_parallel.components.quantization.functional.npu_mxfp8 import (
+from hyper_parallel.components.quantization.ops.npu_mxfp8 import (
     validate_npu_runtime,
 )
 from hyper_parallel.components.quantization.quantizers.mxfp8 import (
