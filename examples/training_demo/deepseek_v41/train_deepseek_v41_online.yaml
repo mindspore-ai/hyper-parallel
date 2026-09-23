@@ -183,6 +183,9 @@ dataset:
     data_type: plaintext
     text_keys: text
     max_seq_len: 4096
+    # A short trailing window breaks both the CSA compression-ratio alignment
+    # and the context-parallel shard size once it lands in a batch.
+    drop_ragged_tail: true
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
   data_path: ./output/training_demo/deepseek_v41/online_4k.jsonl
   data_config:
