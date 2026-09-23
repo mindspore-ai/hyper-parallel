@@ -58,6 +58,9 @@ class NormalizedConfig:
             ``cp_algo`` (``"colossalai_cp"`` | ``"ulysses_cp"`` | ``"hybrid_cp"``,
             default ``"colossalai_cp"``).
         pp_config: Pipeline-parallel specific configuration.
+        parallelism_summary: One line naming what every parallelism
+            dimension resolved to, so a dimension that was silently pinned
+            or silently freed is visible.
         resolved_strategy: Final resolved strategy, populated after search.
     """
 
@@ -67,6 +70,7 @@ class NormalizedConfig:
     constraint: Dict[str, Any] = field(default_factory=dict)
     estimator: Dict[str, Any] = field(default_factory=dict)
     pp_config: Dict[str, Any] = field(default_factory=dict)
+    parallelism_summary: str = ""
     resolved_strategy: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:

@@ -1575,9 +1575,8 @@ class TestSappNDRunND(unittest.TestCase):
         Description: Cover the TIME performance-type branch and the
             ``cp > 1`` CP debugger info block in ``estimate_from_mem_comm``.
         Expectation: With ``ttype=PerformanceType.TIME`` and ``cp > 1``,
-            the debugger receives both the standard comm keys and the
-            CP-specific detail keys (CP_KV_VOLUME, CP_EXPOSED_TIME,
-            CP_TOPOLOGY, CP_BANDWIDTH).
+            the debugger receives the standard comm keys and nothing but
+            ``PerfParts`` keys, so the debug CSV row stays numeric.
         """
         cfg = _make_perf_cfg(cp=2, n_exp=2)
         stages = [[[LayerType.NOT_REC_LAYER, LayerType.OUTPUT_LAYER]],
@@ -1600,10 +1599,8 @@ class TestSappNDRunND(unittest.TestCase):
             )
         self.assertEqual(len(comm), 2)
         self.assertGreater(comm[0], 0)
-        self.assertIn("CP_KV_VOLUME", debugger.info)
-        self.assertIn("CP_EXPOSED_TIME", debugger.info)
-        self.assertIn("CP_TOPOLOGY", debugger.info)
-        self.assertIn("CP_BANDWIDTH", debugger.info)
+        self.assertIn(Debug.PerfParts.CP_COMM, debugger.info)
+        self.assertTrue(all(isinstance(part, Debug.PerfParts) for part in debugger.info))
 
     def test_framework_parsers_with_synthetic_configs(self) -> None:
         """

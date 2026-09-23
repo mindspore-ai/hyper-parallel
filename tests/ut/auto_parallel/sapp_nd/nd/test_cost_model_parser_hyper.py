@@ -17,11 +17,17 @@
 How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/nd/test_cost_model_parser_hyper.py -v
 """
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import patch
 
+import yaml
+
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalAttn
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
@@ -1307,6 +1313,58 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(parser._bytes_from_dtype("float8"), 1)
         self.assertEqual(parser._bytes_from_dtype("float64"), 8)
         self.assertEqual(parser._bytes_from_dtype(""), 4)
+
+
+class TestHybridLayerStack(unittest.TestCase):
+    """A hybrid stack prices each layer with its own attention flavour."""
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_full_layers_after_linear_ones_get_full_attention_back(self, mock_hf):
+        """
+        Feature: hybrid attention stack on the memory path.
+        Description: The memory backbone applies each layer's hook in place,
+            one layer after the next.  Record the attention fields each
+            layer of [linear, linear, full, linear, full] is priced with.
+        Expectation: A full layer gets the full-attention fields back rather
+            than keeping those of the linear layers before it.
+        """
+        linear_kind, full_kind = "linear_attention", "full_attention"
+        mock_hf.return_value = SimpleNamespace(
+            model_type="qwen3_5_moe", hidden_size=1024, num_hidden_layers=5,
+            num_attention_heads=8, num_key_value_heads=2, head_dim=128,
+            vocab_size=32000, max_position_embeddings=8192, num_experts=16,
+            num_experts_per_tok=4, moe_intermediate_size=256, attn_output_gate=True,
+            layer_types=[linear_kind, linear_kind, full_kind, linear_kind, full_kind],
+            linear_num_key_heads=8, linear_key_head_dim=64, linear_num_value_heads=16,
+            linear_value_head_dim=64, linear_conv_kernel_dim=4,
+        )
+        # Without recompute, so the backbone prices the attention activations.
+        config = _auto_models_config(accelerator={"tp_size": 1, "ep_size": 1, "pp_size": 1},
+                                     activation_checkpoint={"mode": "none"})
+        seen = {}
+
+        def spy(ccfg: Any, ctx: Any) -> float:
+            """The real score formula, recording each layer's fields at its first visit."""
+            if isinstance(ctx.current_lay_id, int):
+                seen.setdefault(ctx.current_lay_id, (
+                    ccfg.attn_kind, ccfg.a, ccfg.dh, ccfg.n_kv,
+                    ccfg.n_softmax, ccfg.n_linrec, ccfg.attn_extra_p,
+                ))
+            return EvalAttn.attn_score_activations(ccfg, ctx)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "train.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(config, handle)
+            evaluator = EvaluatorV2(path, framework="hyper_v2", log_level=0)
+        evaluator.set_attn_eval_fun(score=spy)
+        evaluator.estimate_peak()
+
+        full = ("full", 8, 128, 2, 1, 0, 0)
+        # Conv over q, k and v, plus two gates per value head.
+        linear = ("linear", 16, 64, 8, 0, 1, 4 * (2 * 8 * 64 + 16 * 64) + 2 * 1024 * 16)
+        self.assertEqual([seen[lay_id] for lay_id in sorted(seen)],
+                         [linear, linear, full, linear, full])
 
 
 if __name__ == "__main__":

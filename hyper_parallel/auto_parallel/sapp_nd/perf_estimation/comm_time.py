@@ -33,6 +33,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_blo
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import NetworkLevel, PerformanceType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_layer_custom_configs,
+    get_model_order,
     get_table_quantity,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
@@ -469,18 +470,19 @@ def prepare_context():
     return ctx
 
 
-def _accumulate_stage_comm(param, stage):
+def _accumulate_stage_comm(param, stage, stage_id):
     """Sum the per-layer DP, TP, EP and CP communication volumes of one stage."""
     comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0}
-    for chunk in stage:
-        for layer in chunk:
+    for chunk_id, chunk in enumerate(stage):
+        for lay_id, layer in enumerate(chunk):
             param["ctx"].current_node = layer
+            position = (stage_id, chunk_id, lay_id)
             if (
                 layer
                 not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
-                and param["flatten"]
+                and position in param["hooks"]
             ):
-                custom_fun = param["flatten"].pop(0)
+                custom_fun = param["hooks"][position]
                 if custom_fun:
                     custom_fun(param["cfg"])
                 logger.info("is layer moe ? %s", param["cfg"].n_exp > 1)
@@ -517,13 +519,15 @@ def estimate_from_mem_comm(*args, **kwargs):
     )
     param["ctx"] = prepare_context()
 
-    # For layer type
-    param["flatten"] = sum(
+    # Each layer's group hook, in model order; layers past the declared
+    # counts get no entry, so no hook and no DP term.
+    flatten = sum(
         [[f[1]] * f[0] for f in param["cfg"].layer_custom_config], []
     )
+    param["hooks"] = dict(zip(get_model_order(param["cfg"], param["stages"]), flatten))
     comms = {Dim.DP: [], Dim.TP: [], Dim.EP: [], Dim.CP: []}
-    for stage in param["stages"]:
-        comm = _accumulate_stage_comm(param, stage)
+    for stage_id, stage in enumerate(param["stages"]):
+        comm = _accumulate_stage_comm(param, stage, stage_id)
 
         if param["ccfg"].ttype == PerformanceType.TIME:
             for dim, ov in zip([Dim.DP, Dim.TP, Dim.CP], [0.0, 0.0, 0.0]):
@@ -576,11 +580,13 @@ def estimate_from_mem_comm(*args, **kwargs):
         param["debugger"].info[PerfParts.EP_COMM] = comms[Dim.EP]
         param["debugger"].info[PerfParts.CP_COMM] = comms[Dim.CP]
         if param["cfg"].cp > 1:
+            # Logged, not stored: debugger.info must hold only numeric PerfParts,
+            # which the debug CSV and the score table are built from.
             cp_comm_details = cp_comm_layer_detailed(param["cfg"], param["ctx"])
-            param["debugger"].info["CP_KV_VOLUME"] = cp_comm_details.total_kv_volume
-            param["debugger"].info["CP_EXPOSED_TIME"] = cp_comm_details.exposed_comm_time
-            param["debugger"].info["CP_TOPOLOGY"] = cp_comm_details.topology
-            param["debugger"].info["CP_BANDWIDTH"] = cp_comm_details.effective_bandwidth
+            logger.info("CP_KV_VOLUME = %s", cp_comm_details.total_kv_volume)
+            logger.info("CP_EXPOSED_TIME = %s", cp_comm_details.exposed_comm_time)
+            logger.info("CP_TOPOLOGY = %s", cp_comm_details.topology)
+            logger.info("CP_BANDWIDTH = %s", cp_comm_details.effective_bandwidth)
 
     res = []
     for i, c in enumerate(comms[Dim.TP]):

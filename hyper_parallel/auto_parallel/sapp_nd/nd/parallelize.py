@@ -108,6 +108,10 @@ class ParallelizeLayer:
 
     def bound_space(self) -> None:
         """Set bounds for parallel dimensions"""
+        # Bounds live on the module-level dimensions: start each search from
+        # none, or it keeps the tightest bound any earlier search set.
+        for dim in Dim.ALL_DIMS:
+            dim.reset_bound()
         vpp = (
             1
             if Dim.VPP in self.config.dimensions
@@ -543,8 +547,7 @@ class ParallelizeLayer:
             str(self.config.dimensions),
         )
         if self.enable_debug:
-            file_path = os.path.dirname(os.path.realpath(__file__))
-            output_path = os.path.join(file_path, "output")
+            output_path = Debug.output_dir()
             if scored_space:
                 Debug.plot_nd(
                     scored_space,

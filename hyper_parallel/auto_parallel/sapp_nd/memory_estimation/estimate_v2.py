@@ -55,6 +55,23 @@ class EvaluatorV2(_Utils, _HookManager):
             hook = list(self._ccfg.hooks_dict.values())[0]
             hook(self)
 
+    def _estimate_on_copy(self, *args) -> Any:
+        """Run the backbone on a copy of the config, leaving the caller's intact.
+
+        The backbone applies each layer's hook in place, one layer after the
+        next. Run on the caller's config, it would leave the last layer's
+        state behind for whatever reads that config next, which in a search
+        is the next candidate.
+        """
+        caller = self._ccfg
+        self._ccfg = copy.deepcopy(caller)
+        self._overhead_obj._ccfg = self._ccfg
+        try:
+            return self._estimate_backbone(*args)
+        finally:
+            self._ccfg = caller
+            self._overhead_obj._ccfg = caller
+
     def estimate_peak(
         self,
         stages: list = None,
@@ -63,13 +80,9 @@ class EvaluatorV2(_Utils, _HookManager):
         plot: bool = False,
     ) -> float:
         """Peak stage memory estimation"""
-        original_ccfg = copy.deepcopy(self._ccfg)
-        res = self._estimate_backbone(
+        res = self._estimate_on_copy(
             stages, verbose, False, spec_stage_id, plot
         )
-        self._ccfg = original_ccfg
-        self._ccfg.parser.ccfg = self._ccfg
-        self._overhead_obj._ccfg = self._ccfg
         insights, _ = res
         stage_mems = [i["Static"] + i["Dynamic"] for i in insights]
         peak_mem = max(stage_mems)
@@ -85,11 +98,7 @@ class EvaluatorV2(_Utils, _HookManager):
 
     def estimate_peak_insight(self, stages: list = None) -> list:
         """subcomponents' proportion estimation"""
-        original_ccfg = copy.deepcopy(self._ccfg)
-        insights, _ = self._estimate_backbone(stages, False, False, -1, False)
-        self._ccfg = original_ccfg
-        self._ccfg.parser.ccfg = self._ccfg
-        self._overhead_obj._ccfg = self._ccfg
+        insights, _ = self._estimate_on_copy(stages, False, False, -1, False)
         return insights
 
     def estimate_layer_memory(
@@ -99,11 +108,7 @@ class EvaluatorV2(_Utils, _HookManager):
         logger.info(device_type)
         if self.ppb:
             return self.ppb
-        original_ccfg = copy.deepcopy(self._ccfg)
-        res = self._estimate_backbone(stages, False, ppb_format, -1, False)
-        self._ccfg = original_ccfg
-        self._ccfg.parser.ccfg = self._ccfg
-        self._overhead_obj._ccfg = self._ccfg
+        res = self._estimate_on_copy(stages, False, ppb_format, -1, False)
         _, ppb = res
         self.ppb = ppb
         return ppb

@@ -15,6 +15,7 @@
 """Getters"""
 
 from copy import deepcopy
+from typing import Any, Dict, List, Tuple
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 
@@ -37,6 +38,44 @@ def get_layer_custom_configs(cfg):
         lccfgs.append((lccfg, nb_layers))
 
     return lccfgs
+
+
+def get_model_order(cfg: Any, stages: List) -> List[Tuple[int, int, int]]:
+    """Positions ``(stage, chunk, index)`` of the regular layers, in model order.
+
+    Model order runs chunk by chunk across the stages, and back up them in
+    the second chunk of a V schedule; walking the stages one at a time is
+    only the same order without interleaving.  This is the order the memory
+    backbone gives layers their groups in.
+    """
+    positions = [
+        (stage_id, chunk_id, lay_id)
+        for chunk_id in range(cfg.vp)
+        for stage_id in range(cfg.p)
+        for lay_id, layer in enumerate(stages[stage_id][chunk_id])
+        if layer not in (LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER)
+    ]
+    if cfg.pp_sched == "zero_bubble_v":
+        # First-chunk entries less the embedding, as the memory backbone counts.
+        first = sum(len(stage[0]) for stage in stages) - 1
+        positions = positions[:first] + positions[first:][::-1]
+    return positions
+
+
+def get_layer_configs_by_position(cfg: Any, stages: List) -> Dict[Tuple[int, int, int], Any]:
+    """Map each regular layer's position to the config it is priced with.
+
+    Each group of ``layer_custom_config`` covers exactly its own count of
+    layers in model order; layers past the declared counts keep the last
+    group, as a configuration with no custom groups keeps ``cfg``.
+    """
+    lccfgs = get_layer_custom_configs(cfg)
+    per_layer = [lccfg for lccfg, count in lccfgs for _ in range(count)]
+    last = lccfgs[-1][0]
+    return {
+        position: per_layer[idx] if idx < len(per_layer) else last
+        for idx, position in enumerate(get_model_order(cfg, stages))
+    }
 
 
 def get_recomp_factor(lccfg, layer, op_name):
