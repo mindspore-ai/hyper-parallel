@@ -67,6 +67,7 @@ class PlaintextTransform:
     tokenizer: Any
     max_seq_len: int
     text_keys: str | Sequence[str] = "text"
+    drop_ragged_tail: bool = False
 
     def __post_init__(self) -> None:
         """Validate the tokenizer and sequence length configuration."""
@@ -85,7 +86,16 @@ class PlaintextTransform:
 
         transformed = []
         for start in range(0, len(token_ids) - 1, self.max_seq_len):
-            text = torch.tensor(token_ids[start:start + self.max_seq_len + 1], dtype=torch.long)
+            window = token_ids[start:start + self.max_seq_len + 1]
+            if (self.drop_ragged_tail and start > 0
+                    and len(window) < self.max_seq_len + 1):
+                # Opt-in for models whose packed-sample boundaries must stay
+                # aligned, such as the V4.1 CSA compression ratio and the
+                # context-parallel shard size: a short tail window violates
+                # both once it lands in a batch. Off by default, so every
+                # other model keeps the trailing partial window.
+                break
+            text = torch.tensor(window, dtype=torch.long)
             model_sample = {
                 "input_ids": text[:-1],
                 "labels": text[1:],
@@ -147,6 +157,7 @@ def build_text_transform(
     chat_template: Any = None,
     max_seq_len: int,
     text_keys: str | Sequence[str] = "text",
+    drop_ragged_tail: bool = False,
 ) -> Callable[[Any], Any]:
     """Build the transform selected by the text data type.
 
@@ -156,6 +167,8 @@ def build_text_transform(
         chat_template: Chat template used by conversation transforms.
         max_seq_len: Maximum model sequence length.
         text_keys: Field or candidate fields containing the source text.
+        drop_ragged_tail: Drop the trailing partial window of a multi-window
+            plaintext record instead of emitting it as a shorter sample.
 
     Returns:
         The configured text sample transform.
@@ -164,7 +177,8 @@ def build_text_transform(
         ValueError: If ``data_type`` is unsupported.
     """
     if data_type == "plaintext":
-        data_transform = PlaintextTransform(tokenizer, max_seq_len, text_keys)
+        data_transform = PlaintextTransform(
+            tokenizer, max_seq_len, text_keys, drop_ragged_tail)
     elif data_type == "conversation":
         data_transform = TextConversationTransform(chat_template, max_seq_len, text_keys)
     else:

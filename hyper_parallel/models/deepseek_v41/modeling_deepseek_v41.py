@@ -289,6 +289,10 @@ class _DeepseekV41IndexerState(nn.Module):
         self.num_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
         self.index_topk = config.index_topk
+        # Query rows processed per indexer scoring pass. Larger chunks cut the
+        # Python-loop launch count but enlarge the transient fp32 score
+        # buffer; 256 is the released default, ~1024 measured fastest at 32K.
+        self.query_chunk_size = int(getattr(config, "v41_indexer_query_chunk_size", 256) or 256)
         self.owns_key = layer_idx in config.v41_kv_source_layer_ids
         candidate_source = int(getattr(config, "v41_candidate_source_layer_id", -1))
         self.is_candidate_source = layer_idx == candidate_source

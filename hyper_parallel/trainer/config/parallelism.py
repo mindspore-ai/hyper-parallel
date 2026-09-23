@@ -128,11 +128,19 @@ class ActivationCheckpointConfig:
     selection: ActivationCheckpointSelection = field(
         default_factory=ActivationCheckpointSelection
     )
+    # Escape hatch for SAC's cached-tensor mutation check: safe when
+    # every in-place rewrite of a cached operator output is
+    # deterministic, so the recompute replays the same values (the
+    # CSA indexer's masked_fill_ family).
+    allow_cache_entry_mutation: bool = False
 
     def __post_init__(self) -> None:
         """Reject ambiguous values for activation input swapping."""
         if not isinstance(self.swap_inputs, bool):
             raise TypeError("activation_checkpoint.swap_inputs must be a bool")
+        if not isinstance(self.allow_cache_entry_mutation, bool):
+            raise TypeError(
+                "activation_checkpoint.allow_cache_entry_mutation must be a bool")
 
 
 @dataclass
