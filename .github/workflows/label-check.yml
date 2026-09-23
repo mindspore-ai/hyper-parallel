@@ -1,0 +1,19 @@
+name: Label Gate Check
+
+on:
+  pull_request:
+    types: [labeled, unlabeled, opened, synchronize, reopened]
+
+jobs:
+  label-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for required label
+        run: |
+          LABELS="${{ join(github.event.pull_request.labels.*.name, ',') }}"
+          if echo "$LABELS" | grep -qE '(^|,)(ci-pipeline-passed|ci-pipeline-passed-but-overtime)(,|$)'; then
+            echo "Required label present: $LABELS"
+          else
+            echo "Neither required label found. Current labels: $LABELS"
+            exit 1
+          fi
