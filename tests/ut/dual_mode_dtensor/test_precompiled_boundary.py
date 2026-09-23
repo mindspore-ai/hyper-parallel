@@ -13,7 +13,7 @@ tied weights consistency family, error paths family.
 
 The real-process-group redistribute IO / local_region families moved to the
 Gate-2 CPU Gloo integration worker
-tests/torch/auto_models/distributed/_test_precompiled_boundary_gloo.py —
+tests/st/auto_models/distributed/_test_precompiled_boundary_gloo.py —
 Gate-1 unit tests must not initialize process groups.
 """
 
@@ -304,7 +304,7 @@ def test_compile_output_plan():
 # Source: test_s2_boundary_io.py
 # S2.5: _get_arg/_set_arg dual channels (pure-python, no process group).
 # The real-process-group redistribute IO cases moved to Gate-2:
-# tests/torch/auto_models/distributed/_test_precompiled_boundary_gloo.py
+# tests/st/auto_models/distributed/_test_precompiled_boundary_gloo.py
 # ==========================================================================
 
 def test_get_set_arg():

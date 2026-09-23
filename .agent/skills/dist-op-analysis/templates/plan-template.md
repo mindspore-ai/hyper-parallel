@@ -88,7 +88,7 @@
 
 ### 文件四：PyTorch ST（如适用）
 
-- 用例文件：`tests/torch/shard/ops/cases/case_{op_name}.py`
+- 用例文件：`tests/st/shard/ops/cases/case_{op_name}.py`
 - 使用声明式 `OpShardCase` 框架（同上）
 - tags：`("cpu_level0", "npu_level0")`（4 卡）；2 卡/8 卡用 level1
 - **placement 元组长度 == mesh ndim**

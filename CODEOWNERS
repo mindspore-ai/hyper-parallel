@@ -37,13 +37,13 @@
 /tests/ut/core/context_parallel/ @yangzhenzhang02
 /tests/ut/compile/ @kisnwangg @yu-chen-code
 
-/tests/torch/ @yangzhenzhang02
-/tests/torch/activation_memory/ @DavidFFFan
-/tests/torch/distributed_checkpoint/ @zhangbuxue @xiaoyuxing-010818
-/tests/torch/fully_shard/ @Meng107
-/tests/torch/pipeline_parallel/ @lichen666
-/tests/torch/process_group/ @changzherui1 @changzherui
-/tests/torch/shard/ @yangzhenzhang02
+/tests/st/ @yangzhenzhang02
+/tests/st/activation_memory/ @DavidFFFan
+/tests/st/distributed_checkpoint/ @zhangbuxue @xiaoyuxing-010818
+/tests/st/fully_shard/ @Meng107
+/tests/st/pipeline_parallel/ @lichen666
+/tests/st/process_group/ @changzherui1 @changzherui
+/tests/st/shard/ @yangzhenzhang02
 
 
 # The maintainers of other code directories.
@@ -54,7 +54,7 @@
 
 /hyper_parallel/core/multicore/ @davidhe91 @Probiotics5333
 /tests/ut/core/multicore/ @davidhe91 @Probiotics5333
-/tests/torch/multicore/ @davidhe91 @Probiotics5333
+/tests/st/multicore/ @davidhe91 @Probiotics5333
 
 # Hyper-RL code and Qwen3 adapters.
 /hyper_parallel/rl/ @yangzhenzhang02 @suteng @yaoyifanx @bj-wang

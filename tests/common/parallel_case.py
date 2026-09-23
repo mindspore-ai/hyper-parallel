@@ -61,7 +61,7 @@ def run_case(visible_devices: list, case: TorchCase) -> None:
     else:
         # set visible devices for current case
         os.environ['ASCEND_RT_VISIBLE_DEVICES'] = ','.join(map(str, visible_devices))
-    # Import the thin launcher only — never tests.torch.utils (imports torch /
+    # Import the thin launcher only — never tests.st.utils (imports torch /
     # torch_npu) in this wrapper process.
     # pylint: disable=C0415
     from tests.common.distributed_launcher import torchrun_case

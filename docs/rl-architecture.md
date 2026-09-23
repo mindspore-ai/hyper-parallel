@@ -92,7 +92,7 @@ Torch 原生规则；RL 文档不另行声明它们必须经过 Platform，也�
   这些用例包括真实 CPU 计算和外部依赖替身，不等同于 NPU 全流程验收。
 - ST：`hyper_parallel/rl/tests/st/test_rl_st.py` 调用 `st_runtime.py`；实际 NPU 配方及配置生成由
   `tests/common/rl_st_cases.py` 共享。该文件同时供独立部署的 UT 读取，UT 不依赖独立 ST 目录。
-- 真实 RL ST 已迁入 RL 子项目，暂不由主项目 `tests/torch/` 门禁收集；手动执行仍需指定模型、数据和设备。
+- 真实 RL ST 已迁入 RL 子项目，暂不由主项目 `tests/st/` 门禁收集；手动执行仍需指定模型、数据和设备。
   PR 默认门禁通过不能证明 RL ST 已执行；运行入口见 [ST 操作说明](../hyper_parallel/rl/README.md#系统测试)。
 - 文档检查：目录校验器仅检查 AGENTS 中的 Skills/Agents 清单；Markdown 链接、代码符号、配置及测试对应关系
   需要单独核对，不能把目录校验通过当作语义验证。
