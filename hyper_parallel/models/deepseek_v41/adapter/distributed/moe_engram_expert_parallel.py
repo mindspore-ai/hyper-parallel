@@ -20,6 +20,7 @@ import inspect
 from typing import Any, Callable
 
 import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
@@ -27,6 +28,9 @@ from hyper_parallel.distributed.expert_parallel.experts import (
     require_attrs,
 )
 from hyper_parallel.distributed.recipe_spec import local_compute
+from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
+    DeepseekV41MegaMoeExperts, _swiglu_limit,
+)
 
 
 def _router(
@@ -114,6 +118,44 @@ def deepseek_v41_ep_compute_fn(
 
 
 @local_compute
+def deepseek_v41_megamoe_compute_fn(
+        *, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: Any,
+) -> Callable:
+    """Bind a declaratively replaced expert module to the full EP mesh.
+
+    The source router, visual routing bias and shared experts retain their
+    original semantics. Parameter sharding and FSDP remain framework-owned.
+    """
+    del mesh
+    require_attrs(module, "gate", "experts", "shared_experts", owner="DeepSeek-V4.1 MegaMoe")
+    if module.is_hash:
+        raise ValueError("DeepSeek-V4.1 MegaMoe requires learned routing")
+    if any(axis is not None and axis.size() > 1 for axis in (tp_mesh, cp_mesh)):
+        raise ValueError("DSV4.1 MegaMoe requires TP=CP=PP=1")
+    if not isinstance(module.experts, DeepseekV41MegaMoeExperts):
+        raise TypeError("MegaMoe compute requires the DeepseekV41MegaMoeExperts module replacement")
+    if _swiglu_limit(module.shared_experts.limit) != module.experts.swiglu_limit:
+        raise ValueError("Routed and shared experts must have the same swiglu_limit")
+    ep_group = None if ep_mesh is None else ep_mesh.get_group("ep")
+    ep_size = 1 if ep_mesh is None else ep_mesh["ep"].size()
+    if dist.is_initialized() and (ep_size != dist.get_world_size() or (
+            ep_group is not None and dist.get_process_group_ranks(ep_group) != list(range(ep_size)))):
+        raise ValueError("MegaMoe requires whole-world EP in global rank order")
+    module.experts.configure(ep_group, ep_size, module.gate.top_k)
+
+    def compute_fn(
+            module: Any, hidden_states: torch.Tensor,
+            input_ids: torch.Tensor | None = None, image_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run original routing and shared experts around the MegaMoe call."""
+        del input_ids
+        indices, weights = _router(module, hidden_states, image_mask)
+        return module.experts(hidden_states, indices, weights) + module.shared_experts(hidden_states)
+
+    return compute_fn
+
+
+@local_compute
 def deepseek_v41_engram_compute_fn(
         *,
         module: Any,
@@ -168,4 +210,4 @@ def deepseek_v41_engram_compute_fn(
     return compute_fn
 
 
-__all__ = ["deepseek_v41_engram_compute_fn", "deepseek_v41_ep_compute_fn"]
+__all__ = ["deepseek_v41_engram_compute_fn", "deepseek_v41_ep_compute_fn", "deepseek_v41_megamoe_compute_fn"]

@@ -15,6 +15,7 @@
 """Unit tests for the model-facing MegaMoe module."""
 
 import unittest
+
 from types import SimpleNamespace
 from unittest.mock import Mock, PropertyMock, patch
 
@@ -22,6 +23,7 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
+from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeExperts(unittest.TestCase):

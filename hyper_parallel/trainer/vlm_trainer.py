@@ -231,6 +231,13 @@ class VLMTrainer:
         return step_metrics
 
     def train(self) -> None:
+        """Train and close model-owned resources even when a step fails."""
+        try:
+            self._train()
+        finally:
+            self.base._close_model_runtime_resources()
+
+    def _train(self) -> None:
         """Run the VLM training loop."""
         config = self.base.config
         self.on_train_begin()
