@@ -174,6 +174,7 @@ class TextParallelBatch:
             *,
             source_type: str,
             attention_mode: str = "dense",
+            preserve_loss_mask: bool = False,
             causal: bool = True,
             sliding_window: int | None = None,
             reset_position_ids: bool = False,
@@ -191,6 +192,7 @@ class TextParallelBatch:
             pp_shared_data: Whether pipeline stages share the prepared batch.
             source_type: ``online`` or ``indexed`` DataLoader batch contract.
             attention_mode: ``dense`` or ``compressed`` attention representation.
+            preserve_loss_mask: Preserve explicit Dataset weights and their dtype.
             causal: Whether attention uses left-to-right causal semantics.
             sliding_window: Sliding-window size, or ``None`` for full attention.
             reset_position_ids: Whether positions restart at sequence boundaries.
@@ -230,6 +232,7 @@ class TextParallelBatch:
 
         self.pp_shared_data = pp_shared_data
         self.labels_are_shifted = bool(self.data_config.get("labels_are_shifted", True))
+        self.preserve_loss_mask = preserve_loss_mask or bool(self.data_config.get("preserve_loss_mask", False))
         create_attention_mask = bool(
             self.data_config.get("create_attention_mask_in_dataloader", attention_mode == "dense")
         )
@@ -266,10 +269,12 @@ class TextParallelBatch:
         canonical_batch = self._normalize_source_batch(source_batch)
         cu_seq_lens = self._resolve_sequence_boundaries(canonical_batch)
         cp_local_batch = self.cp_sharder.shard(canonical_batch)
-        parallel_batch = self.tp_broadcaster.broadcast(
-            cp_local_batch,
-            cu_seq_lens,
-        )
+        if self.preserve_loss_mask:
+            if cp_local_batch is not None:
+                cp_local_batch["cu_seq_lens"] = cu_seq_lens
+            parallel_batch = self.tp_broadcaster.broadcast(cp_local_batch, broadcast_all_fields=True)
+        else:
+            parallel_batch = self.tp_broadcaster.broadcast(cp_local_batch, cu_seq_lens)
         self._log_batch_flow(canonical_batch, parallel_batch)
 
         position_ids = self._build_local_position_ids(
@@ -429,7 +434,12 @@ class TextParallelBatch:
 
     def _build_loss_mask(self, parallel_batch: Mapping[str, Any]) -> Any:
         """Build the local loss mask from labels and input IDs."""
-        loss_mask = (parallel_batch["labels"] >= 0).to(dtype=torch.int64)
+        if self.preserve_loss_mask:
+            if "loss_mask" not in parallel_batch:
+                raise ValueError("preserve_loss_mask requires explicit Dataset loss_mask")
+            loss_mask = parallel_batch["loss_mask"].masked_fill(parallel_batch["labels"] < 0, 0)
+        else:
+            loss_mask = (parallel_batch["labels"] >= 0).to(dtype=torch.int64)
 
         if self.eod_mask_loss:
             eod_token_id = getattr(self.tokenizer, "eod", None)

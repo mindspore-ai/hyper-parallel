@@ -1,0 +1,189 @@
+# Run the configured JT model through the standard Trainer training loop.
+# Model fields are native HF/JT options; exported weights are configured separately.
+model:
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder.build_jt_model
+  config:
+    architectures: [JTDeepseekV3ForCausalLM]
+    vocab_size: 512
+    hidden_size: 256
+    intermediate_size: 512
+    moe_intermediate_size: 128
+    num_hidden_layers: 2
+    num_attention_heads: 8
+    num_key_value_heads: 8
+    n_shared_experts: 1
+    n_routed_experts: 8
+    routed_scaling_factor: 2.827
+    kv_lora_rank: 512
+    q_lora_rank: 128
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    qk_nope_head_dim: 128
+    n_group: 1
+    topk_group: 1
+    num_experts_per_tok: 2
+    norm_topk_prob: true
+    hidden_act: silu
+    max_position_embeddings: 262400
+    initializer_range: 0.02
+    rms_norm_eps: 1.0e-6
+    first_k_dense_replace: 1
+    mlp_layer_types: [dense, sparse]
+    layer_types: [full_attention, full_attention]
+    attention_dropout: 0.0
+    rope_parameters: {rope_type: default, rope_theta: 5000000}
+    rope_interleave: true
+    tie_word_embeddings: false
+    use_cache: false
+    attention_bias: false
+    mlp_bias: false
+    # Model-owned MTP and routing options, not a foreign configuration document.
+    num_nextn_predict_layers: 1
+    mtp_loss_factor: 0.3
+    use_pad_tokens: true
+    moe_aux_loss_coeff: 0.0001
+    moe_router_enable_expert_bias: true
+    moe_router_bias_update_rate: 0.001
+  source_tp_size: 8
+  reference_weights: /path/to/initial_weights
+loss_fn:
+  _target_: hyper_parallel.components.losses.ModelOutputLoss
+  pass_loss_inputs: true
+  check_valid_labels: false
+model_init_dtype: float32
+plan_overrides:
+  # The base model is executable; replacements select acceleration and JT MTP precision.
+  - match:
+      - "model.layers.*.self_attn"
+      - "mtp.layers.*.transformer_layer.self_attn"
+    module_type: hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.JTDeepseekV3Attention
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.JTDeepseekV3MLAAttention
+  - match: "mtp.execution"
+    module_type: hyper_parallel.components.modules.mtp.DeepseekV3MTPExecution
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.conversion.jt_mtp.JTDeepseekV3MTPExecution
+  - match: "*.self_attn"
+    params:
+      linear_qkv.weight: {tp: replicate}
+      q_b_proj.weight: {tp: "shard(0)"}
+      kv_b_proj.weight: {tp: "shard(0)"}
+      o_proj.weight: {tp: "shard(1)"}
+    region_dispatch: false
+    in_src:
+      hidden_states: {tp: "shard(1)"}
+    in_dst:
+      hidden_states: {tp: "shard(1)"}
+  - match: "*.self_attn.*_layernorm"
+    in_src:
+      hidden_states: {tp: "shard(1)"}
+    in_dst:
+      hidden_states: {tp: "shard(1)"}
+    out_src: {tp: "shard(1)"}
+    out_dst: {tp: replicate}
+  - match: "*.self_attn.key_rope_gather"
+    in_src:
+      input: {tp: "shard(1)"}
+    in_dst:
+      input: {tp: "shard(1)"}
+    out_src: {tp: "shard(1)"}
+    out_dst: {tp: replicate}
+  - match: "*.mlp.shared_experts"
+    params:
+      gate_proj.weight: {tp: replicate}
+      up_proj.weight: {tp: replicate}
+      down_proj.weight: {tp: replicate}
+    in_src:
+      x: {tp: "shard(1)"}
+    in_dst:
+      x: {tp: "shard(1)"}
+    out_src: {tp: "shard(1)"}
+    out_dst: {tp: "shard(1)"}
+  - match: "mtp.layers.*.eh_proj"
+    params:
+      weight: {tp: replicate}
+    in_src:
+      input: {tp: "shard(1)"}
+    in_dst:
+      input: {tp: "shard(1)"}
+    out_src: {tp: "shard(1)"}
+    out_dst: {tp: "shard(1)"}
+  - match: "mtp.layers.*.transformer_layer.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.distributed.jt_expert_parallel.jt_deepseek_v3_ep_compute
+training:
+  train_iters: 10
+  lr_scheduler_iters: 8
+  max_grad_norm: 1.0
+  global_batch_size: 1
+  micro_batch_size: 1
+  backend: hccl
+  init_device: cpu
+  seed: 42
+  # The configured model adapter retains the NPU execution policy.
+  enable_full_determinism: false
+accelerator:
+  tp_size: 8
+  ep_size: 8
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: true
+  loss_parallel: true
+fsdp_config:
+  dp_shard_size: 1
+activation_checkpoint:
+  mode: "off"
+activation_swap: none
+dataset:
+  _target_: hyper_parallel.data.indexed.supervised_dataset.IndexedSupervisedDataset
+  data_path: /path/to/supervised_prefix
+  sequence_length: 262144
+  model_assets:
+    tokenizer: null
+  data_transform: null
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_default_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: indexed
+    attention_mode: compressed
+    preserve_loss_mask: true
+  sampler_type: single
+  drop_last: true
+  num_workers: 0
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.Muon
+  muon_config:
+    lr: 2.4e-5
+    weight_decay: 0.1
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+    ns_variant: legacy
+    ns_epsilon: 1.0e-7
+    matched_adamw_rms: 0.2
+  adamw_config:
+    adamw_lr: 2.4e-5
+    adamw_weight_decay: 0.1
+    adamw_betas: [0.9, 0.95]
+    adamw_eps: 1.0e-8
+  adapter:
+    _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.muon_adapter.optimizer_adapter
+    qk_clip_threshold: 100.0
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 2.4e-5
+    min_lr: 2.4e-6
+    lr_warmup_steps: 0
+    lr_decay_ratio: 1.0
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./outputs/jt_deepseek_v3

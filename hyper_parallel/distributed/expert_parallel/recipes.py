@@ -86,6 +86,8 @@ The factory must RETURN the compute fn
 tensors inside the local-region skeleton.
 """
 
+from __future__ import annotations
+
 from typing import Any, Callable
 
 import torch
@@ -95,6 +97,7 @@ from hyper_parallel.distributed.expert_parallel.routing import (
 )
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
+    EPDispatchPolicy,
     ep_routed_forward,
     require_attrs,
 )
@@ -143,6 +146,8 @@ def build_ep_compute(
     expected_attrs,
     combine: Callable,
     use_grouped_gemm: bool = False,
+    dispatch_policy: EPDispatchPolicy | None = None,
+    aggregate_fn: Callable | None = None,
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
     interface, bind the local expert entry point, and close over the
@@ -170,10 +175,17 @@ def build_ep_compute(
         # archetype and for Qwen3 when grouped GEMM is disabled.
         bind_local_expert_forward(module, ep_mesh["ep"].size())
 
+    adapter_kwargs = {}
+    if dispatch_policy is not None:
+        module.experts.ep_stable_sort = dispatch_policy.topk_major
+        adapter_kwargs["dispatch_policy"] = dispatch_policy
+    if aggregate_fn is not None:
+        adapter_kwargs["aggregate_fn"] = aggregate_fn
+
     def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the routed branch and compose the MoE block output."""
         routed = ep_routed_forward(
-            module, hidden_states, router_fn=router_fn, ep_group=ep_group)
+            module, hidden_states, router_fn=router_fn, ep_group=ep_group, **adapter_kwargs)
         return combine(module, hidden_states, routed)
 
     return compute_fn

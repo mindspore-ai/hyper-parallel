@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-
 """data.parallel.batch_parallel: CP-aware batch sharding.
 
 ``shard_batch_for_cp``: data-pipeline CP sharding (aligned with the THD
@@ -33,6 +32,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+# Batch transport uses the existing Torch distributed runtime.
+# pylint: disable=forbidden-backend-import
 import torch
 import torch.distributed as dist
 
@@ -53,6 +54,10 @@ def shard_batch_for_cp(batch: dict[str, Any], cp_mesh: DeviceMesh) -> dict[str, 
     Sharding strategy: pad to a multiple of 2*cp, then slice the token
     interval [cp_rank*chunk, (cp_rank+1)*chunk); the seq_lens family is
     recomputed separately (_shard_seq_lens_for_cp).
+
+    Args:
+        batch: Token tensors and sequence metadata.
+        cp_mesh: Context-parallel mesh selecting the local interval.
     """
     cp_size = cp_mesh.size()
     if cp_size <= 1:
@@ -216,6 +221,11 @@ class CPBatchSharder:
             "input_ids": input_ids,
             "labels": canonical_batch["labels"],
         }
+
+        if "loss_mask" in canonical_batch:
+            if canonical_batch["loss_mask"].shape != input_ids.shape:
+                raise ValueError("Explicit loss_mask must match input_ids")
+            cp_batch["loss_mask"] = canonical_batch["loss_mask"]
 
         cp_size = self.parallel_context.cp_world_size
         if cp_size <= 1:

@@ -14,13 +14,16 @@
 # ============================================================================
 """Per-step structured terminal logging callback."""
 
-import logging
+from __future__ import annotations
+
 from typing import Any
+
+from hyper_parallel.trainer.runtime.logging import create_logger
 
 from .base import Callback, TrainerState
 
 
-logger = logging.getLogger(__name__)
+logger = create_logger(__name__)
 
 
 class LoggingCallback(Callback):
@@ -35,6 +38,7 @@ class LoggingCallback(Callback):
         super().__init__(trainer)
         self.logging_steps = trainer.config.training.logging_steps
         self._last_logged_step: int | None = None
+        self._last_collected_step: int | None = None
 
     @staticmethod
     def _format_value(value: Any) -> str:
@@ -43,7 +47,7 @@ class LoggingCallback(Callback):
         if callable(item):
             value = item()
         try:
-            return f"{float(value):.6g}"
+            return f"{float(value):.9g}"
         except (TypeError, ValueError):
             return str(value)
 
@@ -65,9 +69,42 @@ class LoggingCallback(Callback):
             return
         logger.info("%s", message)
 
+    def _collect_provider_metrics(self, state: TrainerState) -> None:
+        """Collect optional model/optimizer scalar metrics on every rank once per step.
+
+        Providers own aggregation and distributed semantics, may use collectives,
+        and must return detached, namespaced scalars. Metrics are observation only
+        and never enter Trainer's loss dictionary or backward computation.
+        """
+        if self._last_collected_step == state.global_step:
+            return
+        optimizers = getattr(self.trainer, "optimizer", None)
+        optimizers = optimizers if isinstance(optimizers, list) else [optimizers]
+        metrics = dict(getattr(self.trainer, "step_env_metrics", {}))
+        additions = {}
+        for provider in [getattr(self.trainer, "model", None), *optimizers]:
+            collect = getattr(provider, "get_logging_metrics", None)
+            if not callable(collect):
+                continue
+            supplied = collect()
+            duplicates = (metrics.keys() | additions.keys()) & supplied.keys()
+            if duplicates:
+                raise ValueError(f"Logging metric names collide: {sorted(duplicates)}")
+            additions.update(supplied)
+        metrics.update(additions)
+        self.trainer.step_env_metrics = metrics
+        self.trainer.step_train_metrics = {**getattr(self.trainer, "step_train_metrics", {}), **additions}
+        self._last_collected_step = state.global_step
+
     def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:
-        """Log all shared environment metrics at the configured cadence."""
+        """Log all shared environment metrics at the configured cadence.
+
+        Args:
+            state: Current optimizer step and epoch.
+            **kwargs: Other callback observations, excluded from loss computation.
+        """
         del kwargs
+        self._collect_provider_metrics(state)
         if (
             self.logging_steps <= 0
             or getattr(self.trainer, "global_rank", 0) != 0

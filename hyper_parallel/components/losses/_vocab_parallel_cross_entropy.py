@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from typing import Any, Optional, Tuple, TYPE_CHECKING
 
+# AutoModels loss components implement the Torch Trainer contract.
+# pylint: disable=forbidden-backend-import
 import torch
 from torch import Tensor
 
@@ -349,6 +351,9 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
         ctx.vocab_start = vocab_start
         ctx.vocab_end = vocab_end
 
+        if reduction == "none":
+            # Each vocabulary shard contributes once to the replicated token loss.
+            return platform.differentiable_all_reduce(loss, op="sum", group=mesh.get_group(mesh_dim))
         return loss
 
     @staticmethod

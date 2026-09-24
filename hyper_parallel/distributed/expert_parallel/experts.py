@@ -32,6 +32,9 @@ Nothing in this module probes model structure with getattr fallback chains.
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 import torch
 import torch.distributed as dist
@@ -45,6 +48,15 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
 )
+
+
+@dataclass(frozen=True)
+class EPDispatchPolicy:
+    """Optional token dtype and stable top-k ordering; generic defaults are unchanged."""
+
+    token_dtype: torch.dtype | None = None
+    weight_dtype: torch.dtype | None = None
+    topk_major: bool = False
 
 
 def resolve_swiglu_weights(
@@ -90,7 +102,7 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
     the parent MoE forward, allows nested FSDP forward hooks to unshard and
     reshard expert parameters around the local computation.
     """
-    token_order = local_expert_indices.argsort()
+    token_order = local_expert_indices.argsort(stable=getattr(experts, "ep_stable_sort", False))
     sorted_states = dispatched_states[token_order]
     local_expert_counts = torch.bincount(
         local_expert_indices,
@@ -227,16 +239,24 @@ def _prepare_ep_dispatch(
     global_expert_count: int,
     ep_size: int,
     ep_group: Any,
-):
+    policy: EPDispatchPolicy | None = None,
+) -> tuple:
     """Sort routed tokens and exchange per-rank dispatch counts."""
+    policy = policy or EPDispatchPolicy()
     flattened_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    if policy.token_dtype is not None:
+        flattened_states = flattened_states.to(policy.token_dtype)
     token_count = flattened_states.shape[0]
     experts_per_token = topk_indices.shape[1]
     expert_indices = topk_indices.reshape(-1)
-    expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
+    expert_weights = topk_weights.reshape(-1).to(policy.weight_dtype or flattened_states.dtype)
     source_indices = torch.arange(token_count, device=flattened_states.device).repeat_interleave(experts_per_token)
+    if policy.topk_major:
+        expert_indices = topk_indices.T.contiguous().reshape(-1)
+        expert_weights = topk_weights.T.contiguous().reshape(-1).to(policy.weight_dtype or flattened_states.dtype)
+        source_indices = torch.arange(token_count, device=flattened_states.device).repeat(experts_per_token)
     destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
-    dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort()
+    dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort(stable=policy.topk_major)
     dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
     dispatched_indices = expert_indices[dispatch_order].unsqueeze(-1).contiguous()
     send_counts_tensor = torch.bincount(destination_ranks, minlength=ep_size)
@@ -296,6 +316,8 @@ def ep_routed_forward(
     *,
     router_fn: Callable,
     ep_group: Any,
+    dispatch_policy: EPDispatchPolicy | None = None,
+    aggregate_fn: Callable | None = None,
 ) -> torch.Tensor:
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
@@ -354,6 +376,7 @@ def ep_routed_forward(
         global_expert_count=global_expert_count,
         ep_size=ep_size,
         ep_group=ep_group,
+        policy=dispatch_policy,
     )
     (
         source_token_indices,
@@ -373,7 +396,8 @@ def ep_routed_forward(
         ep_group,
         expert_offset,
     )
-    return _aggregate_ep_outputs(
+    aggregate = aggregate_fn or _aggregate_ep_outputs
+    return aggregate(
         combined_expert_outputs,
         flattened_expert_weights,
         source_token_indices,

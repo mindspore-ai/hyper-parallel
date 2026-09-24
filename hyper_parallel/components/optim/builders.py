@@ -20,7 +20,7 @@ algorithm implementations stay in ``hyper_parallel.core.optimizer``.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
@@ -117,6 +117,7 @@ class Muon:
             model: nn.Module,
             extra_adamw_name_keywords: Optional[List[str]] = None,
             no_decay_params: Optional[List[str]] = None,
+            adapter: Optional[Callable] = None,
     ) -> None:
         """Build a mixed Muon and fallback AdamW runtime for ``model``.
 
@@ -126,6 +127,7 @@ class Muon:
             model: Module whose trainable parameters are optimized.
             extra_adamw_name_keywords: Additional names routed to AdamW.
             no_decay_params: Optional names excluded from weight decay.
+            adapter: Optional model adapter called with model and optimizer before training.
         """
         self.muon_config = muon_config
         self.adamw_config = adamw_config
@@ -160,6 +162,8 @@ class Muon:
             muon_kwargs=muon_config,
             adamw_kwargs=adamw_config,
         )
+        if adapter is not None:
+            adapter(model, self.optimizer)
 
     @staticmethod
     def split_muon_adamw_params(

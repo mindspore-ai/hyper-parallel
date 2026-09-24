@@ -14,6 +14,8 @@
 # ============================================================================
 """Loss module that reads the loss produced by a model."""
 
+from __future__ import annotations
+
 from typing import Any, Dict, Optional, Union
 
 # AutoModels loss components implement the Transformers/PyTorch Trainer API.
@@ -26,6 +28,36 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 class ModelOutputLoss(torch.nn.Module):
     """Return the loss field from a Transformers-style model output."""
 
+    def __init__(self, *, pass_loss_inputs: bool = False, check_valid_labels: bool = True) -> None:
+        """Configure supervision forwarding and causal-label checks.
+
+        Args:
+            pass_loss_inputs: Forward supervision under its public batch names.
+            check_valid_labels: Zero loss when shifted causal labels are all ignored.
+                Disable for complete model-owned objectives that can include auxiliary losses.
+        """
+        super().__init__()
+        self.pass_loss_inputs = pass_loss_inputs
+        self.check_valid_labels = check_valid_labels
+
+    def prepare_model_inputs(self, model_inputs: dict, loss_inputs: dict) -> dict:
+        """Pass supervision to model-owned objectives without renaming or shifting.
+
+        Args:
+            model_inputs: Forward fields from the public batch runtime.
+            loss_inputs: Supervision and token-accounting fields from that runtime.
+
+        Returns:
+            A new dictionary preserving each supplied tensor by identity.
+        """
+        result = dict(model_inputs)
+        if self.pass_loss_inputs:
+            for name, value in loss_inputs.items():
+                if name in result and result[name] is not value:
+                    raise ValueError(f"Conflicting model and loss input: {name}")
+                result[name] = value
+        return result
+
     def forward(  # pylint: disable=unused-argument
         self,
         *,
@@ -36,15 +68,13 @@ class ModelOutputLoss(torch.nn.Module):
 
         Args:
             model_output: Model output exposing a ``loss`` attribute.
-            labels: Labels associated with the output. This default loss keeps
-                the argument only to share the trainer-facing call signature
-                with replaceable loss modules.
+            labels: Causal targets used by the optional valid-label check.
 
         Returns:
             The loss tensor or named loss mapping from ``model_output.loss``.
         """
         local_loss = model_output.loss
-        if labels is None or not isinstance(local_loss, torch.Tensor):
+        if not self.check_valid_labels or labels is None or not isinstance(local_loss, torch.Tensor):
             return local_loss
 
         # Causal LM loss shifts labels by one position. A CP-local slice may
