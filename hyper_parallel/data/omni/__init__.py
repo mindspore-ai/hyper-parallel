@@ -20,10 +20,22 @@ from hyper_parallel.data.omni.omni_transform import (
     build_auto_processor,
 )
 from hyper_parallel.data.omni.build_dataset import build_online_omni_mapping_dataset
+from hyper_parallel.data.omni.kimi_transform import (
+    KimiOmniTransform,
+    KimiPackingOmniTransform,
+    KimiVLMChatTransform,
+    build_kimi_omni_transform,
+    build_kimi_vlm_data_transform,
+)
 
 __all__ = [
     "AutoProcessorTransform",
+    "KimiOmniTransform",
+    "KimiPackingOmniTransform",
+    "KimiVLMChatTransform",
     "OmniDataTransform",
     "build_auto_processor",
+    "build_kimi_omni_transform",
+    "build_kimi_vlm_data_transform",
     "build_online_omni_mapping_dataset",
 ]
