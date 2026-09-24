@@ -19,6 +19,7 @@
 """
 
 from hyper_parallel.platform.mindspore.custom_ops.custom_op_impl import (
+    NpuChunkKdaDFunction,
     NpuFlashAttentionVarLenV4DFunction,
     NpuDenseLightningIndexerGradKlLossDFunction,
     NpuDenseLightningIndexerSoftmaxLseDFunction,
@@ -29,6 +30,8 @@ from hyper_parallel.platform.mindspore.custom_ops.custom_op_impl import (
     NpuSparseFlashMlaDFunction,
     NpuSparseLightningIndexerGradKlLossDFunction,
     NpuSparseLightningIndexerKlLossGradDFunction,
+    npu_chunk_kda_bwd as _npu_chunk_kda_bwd,
+    npu_chunk_kda_fwd as _npu_chunk_kda_fwd,
     npu_sparse_flash_mla_grad as _npu_sparse_flash_mla_grad,
 )
 
@@ -90,3 +93,18 @@ class MindSporeCustomOps:
     def npu_sparse_lightning_indexer_kl_loss_grad(*args, **kwargs):
         """Sparse lightning indexer KL-loss gradient via custom NPU operator."""
         return NpuSparseLightningIndexerKlLossGradDFunction.apply(*args, **kwargs)
+
+    @staticmethod
+    def npu_chunk_kda_fwd(*args, **kwargs):
+        """Run the explicit Chunk KDA forward operator without autograd."""
+        return _npu_chunk_kda_fwd(*args, **kwargs)
+
+    @staticmethod
+    def npu_chunk_kda(*args, **kwargs):
+        """Run differentiable Chunk KDA with automatic backward dispatch."""
+        return NpuChunkKdaDFunction.apply(*args, **kwargs)
+
+    @staticmethod
+    def npu_chunk_kda_bwd(*args, **kwargs):
+        """Run the explicit dense Chunk KDA backward operator."""
+        return _npu_chunk_kda_bwd(*args, **kwargs)
