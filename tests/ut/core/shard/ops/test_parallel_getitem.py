@@ -19,7 +19,13 @@ import numpy as np
 import torch
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
-from hyper_parallel.core.dtensor.placement_types import RaggedShard, Replicate, Shard
+from hyper_parallel.core.dtensor.placement_types import (
+    _StridedRaggedShard,
+    RaggedShard,
+    Replicate,
+    Shard,
+    StridedShard,
+)
 from hyper_parallel.core.shard.ops.parallel_getitem import (
     GetItemDistributedOp,
     _key_cache_descriptor,
@@ -622,6 +628,163 @@ class TestGetItemDistributedOp(unittest.TestCase):
         with patch.object(self_layout.mesh, "get_local_rank", return_value=1):
             with self.assertRaisesRegex(ValueError, "requires a contiguous local tensor"):
                 impl(local_parent, 6)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_strided_sharded_int_zero_mutates_only_owner(self, mock_platform):
+        """Zero only the selected row for every owner coordinate and local row."""
+        mesh = self._make_2x2_mesh(mock_platform)
+        self_layout = _build_layout(
+            mesh,
+            (StridedShard(0, split_factor=2), Shard(0)),
+            2,
+        )
+        cases = (
+            (0, (0, 0), 0),
+            (1, (0, 0), 1),
+            (2, (1, 0), 0),
+            (4, (0, 1), 0),
+            (6, (1, 1), 0),
+            (7, (1, 1), 1),
+            (-1, (1, 1), 1),
+        )
+
+        for padding_idx, owner_coordinate, local_index in cases:
+            with self.subTest(
+                padding_idx=padding_idx,
+                owner_coordinate=owner_coordinate,
+                local_index=local_index,
+            ):
+                key_desc, kind = _key_cache_descriptor(padding_idx)
+                cache_values = [self_layout, key_desc, (8, 4), kind]
+                infer_result = getitem_op.infer_layout(cache_values)
+                impl = getitem_op.get_expand_impl(
+                    lambda tensor, key: tensor[key],
+                    infer_result,
+                    cache_values,
+                )
+
+                expected_placements = tuple(
+                    _StridedRaggedShard(
+                        (0,),
+                        tuple(int(rank == coordinate) for rank in range(2)),
+                        split_factor=2 if mesh_dim == 0 else 1,
+                    )
+                    for mesh_dim, coordinate in enumerate(owner_coordinate)
+                )
+                self.assertEqual(
+                    tuple(infer_result[0][0].placements),
+                    expected_placements,
+                )
+
+                owner_parent = torch.arange(8).reshape(2, 4) + 1
+                expected_owner = owner_parent.clone()
+                expected_owner[local_index].zero_()
+                with patch.object(
+                    self_layout.mesh,
+                    "get_local_rank",
+                    side_effect=lambda mesh_dim, coordinate=owner_coordinate: coordinate[mesh_dim],
+                ):
+                    result = impl(owner_parent, padding_idx)
+                    result.zero_()
+                self.assertTrue(
+                    torch.equal(owner_parent, expected_owner),
+                    f"Owner local weight mismatch: expected={expected_owner}, got={owner_parent}",
+                )
+
+                non_owner_coordinate = (1 - owner_coordinate[0], owner_coordinate[1])
+                non_owner_parent = torch.arange(8).reshape(2, 4) + 1
+                expected_non_owner = non_owner_parent.clone()
+                with patch.object(
+                    self_layout.mesh,
+                    "get_local_rank",
+                    side_effect=lambda mesh_dim, coordinate=non_owner_coordinate: coordinate[mesh_dim],
+                ):
+                    result = impl(non_owner_parent, padding_idx)
+                    result.zero_()
+                self.assertTrue(
+                    torch.equal(non_owner_parent, expected_non_owner),
+                    (f"Non-owner local weight changed: expected={expected_non_owner}, "
+                     f"got={non_owner_parent}"),
+                )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_replicated_strided_sharded_int_zero_mutates_each_replica_owner(
+        self,
+        mock_platform,
+    ):
+        """Zero the target row on every replica while leaving non-owners unchanged."""
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        self_layout = _build_layout(
+            mesh,
+            (Replicate(), StridedShard(0, split_factor=2), Shard(0)),
+            2,
+        )
+        padding_idx = 4
+        key_desc, kind = _key_cache_descriptor(padding_idx)
+        cache_values = [self_layout, key_desc, (8, 4), kind]
+        infer_result = getitem_op.infer_layout(cache_values)
+        impl = getitem_op.get_expand_impl(
+            lambda tensor, key: tensor[key],
+            infer_result,
+            cache_values,
+        )
+
+        self.assertEqual(
+            tuple(infer_result[0][0].placements),
+            (
+                Replicate(),
+                _StridedRaggedShard((0,), (1, 0), split_factor=2),
+                _StridedRaggedShard((0,), (0, 1), split_factor=1),
+            ),
+        )
+
+        for replica_coordinate in (0, 1):
+            with self.subTest(replica_coordinate=replica_coordinate):
+                owner_coordinate = (replica_coordinate, 0, 1)
+                owner_parent = torch.arange(8).reshape(2, 4) + 1
+                expected_owner = owner_parent.clone()
+                expected_owner[0].zero_()
+                with patch.object(
+                    self_layout.mesh,
+                    "get_local_rank",
+                    side_effect=lambda mesh_dim, coordinate=owner_coordinate: coordinate[mesh_dim],
+                ):
+                    result = impl(owner_parent, padding_idx)
+                    result.zero_()
+                self.assertTrue(
+                    torch.equal(owner_parent, expected_owner),
+                    f"Replica owner mismatch: expected={expected_owner}, got={owner_parent}",
+                )
+
+        non_owner_coordinate = (0, 1, 1)
+        non_owner_parent = torch.arange(8).reshape(2, 4) + 1
+        expected_non_owner = non_owner_parent.clone()
+        with patch.object(
+            self_layout.mesh,
+            "get_local_rank",
+            side_effect=lambda mesh_dim: non_owner_coordinate[mesh_dim],
+        ):
+            result = impl(non_owner_parent, padding_idx)
+            result.zero_()
+        self.assertTrue(
+            torch.equal(non_owner_parent, expected_non_owner),
+            (f"Replicated non-owner changed: expected={expected_non_owner}, "
+             f"got={non_owner_parent}"),
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist")
+    def test_strided_sharded_int_rejects_non_divisible_dim0(self, mock_platform):
+        """Keep ordinary StridedShard restricted to exactly divisible dimensions."""
+        mesh = self._make_2x2_mesh(mock_platform)
+        self_layout = _build_layout(
+            mesh,
+            (StridedShard(0, split_factor=2), Shard(0)),
+            2,
+        )
+        key_desc, kind = _key_cache_descriptor(2)
+
+        with self.assertRaisesRegex(ValueError, "should be divisible"):
+            getitem_op.infer_layout([self_layout, key_desc, (10, 4), kind])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_partial_slice_on_sharded_dim(self, mock_platform):

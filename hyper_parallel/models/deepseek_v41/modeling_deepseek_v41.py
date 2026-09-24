@@ -43,10 +43,10 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     apply_rotary_pos_emb,
 )
 
-from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
+# pylint: disable=unused-import
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionCPContext as SharedAttentionCPContext,
     SharedCompressedPackedSequence as SharedPackedSequence,
@@ -83,21 +83,11 @@ def _resolve_v41_model_mode(config: Any) -> str:
 
 
 def _initialize_embedding_shard_safe(module: nn.Embedding, std: float) -> None:
-    """Initialize an embedding and clear its global padding row shard-safely."""
+    """Initialize an embedding and clear its global padding row through DTensor."""
     nn.init.normal_(module.weight, mean=0.0, std=std)
     if module.padding_idx is None:
         return
-    weight = module.weight
-    layout = getattr(weight, "layout", None)
-    to_local = getattr(weight, "to_local", None)
-    if layout is None or not callable(to_local):
-        weight[module.padding_idx].zero_()
-        return
-    inner_rank = layout.rank_list.index(layout.mesh.rank)
-    slice_area = infer_slice_area_by_layout(layout, inner_rank, weight.shape)
-    row_start, row_end = slice_area[0]
-    if row_start <= module.padding_idx < row_end:
-        to_local()[module.padding_idx - row_start].zero_()
+    module.weight[module.padding_idx].zero_()
 
 
 class DeepseekV41Engram(nn.Module):
@@ -678,7 +668,6 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         """
         # The conditions below enforce one ordered forward contract across text,
         # vision, Engram, shared-attention, mHC, and gradient-checkpointing paths.
-        #lizard forgives(cyclomatic_complexity)
         if use_cache or past_key_values is not None:
             raise NotImplementedError("the V4.1 validation crop supports training without KV cache")
         if (input_ids is None) == (inputs_embeds is None):

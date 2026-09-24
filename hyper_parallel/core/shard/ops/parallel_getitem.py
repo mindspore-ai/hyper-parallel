@@ -19,18 +19,33 @@ Supports basic indexing (int, slice, None, Ellipsis) which produces views,
 and advanced indexing (list, LongTensor) which produces copies.
 BoolTensor masks are not supported because the output shape is data-dependent.
 """
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 import torch
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.core.dtensor.placement_types import RaggedShard, Shard, StridedShard
+from hyper_parallel.core.dtensor.placement_types import (
+    _StridedRaggedShard,
+    RaggedShard,
+    Replicate,
+    Shard,
+    StridedShard,
+)
 from .parallel_ops import DistributedOp
 
 _BASIC = "basic"
 _ADVANCED = "advanced"
 _BOOL_MASK = "bool_mask"
+
+
+class _StridedRaggedIndexInfo(NamedTuple):
+    """Owner metadata for dim-zero indexing across a strided shard chain."""
+
+    shard_axes: tuple[int, ...]
+    owner_coordinates: tuple[int, ...]
+    local_index: int
+    output_global_shape: tuple[int, ...]
 
 
 def _normalize___getitem___args(self_t, key):
@@ -279,6 +294,140 @@ def _is_full_slice_action(action, global_shape) -> bool:
     )
 
 
+def _is_dim0_int_full_slice(expanded_actions, global_shape, kind) -> bool:
+    """Return whether an index selects one row and keeps all trailing dims."""
+    return (
+        kind == _BASIC
+        and len(global_shape) >= 2
+        and bool(expanded_actions)
+        and expanded_actions[0][0] == "int"
+        and expanded_actions[0][-1] == 0
+        and all(
+            _is_full_slice_action(action, global_shape)
+            for action in expanded_actions[1:]
+        )
+    )
+
+
+def _dim0_shard_axes(placements) -> tuple[int, ...]:
+    """Return mesh axes that shard tensor dimension zero."""
+    return tuple(
+        mesh_dim
+        for mesh_dim, placement in enumerate(placements)
+        if isinstance(placement, Shard) and placement.is_shard(0)
+    )
+
+
+def _other_axes_are_replicated(placements, shard_axes) -> bool:
+    """Return whether every non-dim-zero-shard mesh axis is replicated."""
+    shard_axis_set = set(shard_axes)
+    return all(
+        mesh_dim in shard_axis_set or placement.is_replicate()
+        for mesh_dim, placement in enumerate(placements)
+    )
+
+
+def _build_regular_ragged_result(self_layout, output_global_shape, global_dim0, index):
+    """Build the original one-dimensional Shard(0) ragged result."""
+    placements = tuple(self_layout.placements)
+    placement = placements[0] if len(placements) == 1 else None
+    if (
+        len(self_layout.mesh_shape) != 1
+        or not isinstance(placement, Shard)
+        or not placement.is_shard(0)
+    ):
+        return None
+
+    mesh_size = self_layout.mesh.size(0)
+    if global_dim0 % mesh_size != 0:
+        return None
+
+    rows_per_rank = global_dim0 // mesh_size
+    owner_rank = index // rows_per_rank
+    local_index = index % rows_per_rank
+    local_units = tuple(1 if rank == owner_rank else 0 for rank in range(mesh_size))
+    output_layout = Layout.from_device_mesh(self_layout.mesh)
+    output_layout.set_placements(
+        (RaggedShard(tuple(range(len(output_global_shape))), local_units),)
+    )
+    output_layout.placement_to_tensor_map(len(output_global_shape))
+    return output_layout, (owner_rank, local_index, output_global_shape)
+
+
+def _strided_owner_info(self_layout, placements, shard_axes, global_dim0, index):
+    """Return local row index and owner coordinate for a strided shard chain."""
+    total_shard_count = 1
+    for mesh_dim in shard_axes:
+        total_shard_count *= self_layout.mesh_shape[mesh_dim]
+    if global_dim0 % total_shard_count != 0:
+        raise ValueError(
+            "For __getitem__, StridedShard dim 0 size should be divisible "
+            "by the total shard count, but got "
+            f"dim0={global_dim0}, total_shard_count={total_shard_count}."
+        )
+
+    rows_per_shard = global_dim0 // total_shard_count
+    combined_shard_rank = index // rows_per_shard
+    local_index = index % rows_per_shard
+    shard_order = sorted(
+        shard_axes,
+        key=lambda mesh_dim: (
+            placements[mesh_dim].split_factor
+            if isinstance(placements[mesh_dim], StridedShard)
+            else 1
+        ),
+    )
+    owner_by_axis = {}
+    for mesh_dim in reversed(shard_order):
+        owner_by_axis[mesh_dim] = combined_shard_rank % self_layout.mesh_shape[mesh_dim]
+        combined_shard_rank //= self_layout.mesh_shape[mesh_dim]
+    owner_coordinate = tuple(owner_by_axis[mesh_dim] for mesh_dim in shard_axes)
+    return owner_coordinate, local_index
+
+
+def _build_strided_ragged_result(
+    self_layout,
+    placements,
+    shard_axes,
+    output_global_shape,
+    global_dim0,
+    index,
+):
+    """Build the multi-axis strided ragged result and owner metadata."""
+    owner_coordinate, local_index = _strided_owner_info(
+        self_layout, placements, shard_axes, global_dim0, index
+    )
+    output_dims = tuple(range(len(output_global_shape)))
+    output_placements = [Replicate() for _ in placements]
+    for mesh_dim, owner_axis_coordinate in zip(shard_axes, owner_coordinate):
+        local_units = tuple(
+            int(coordinate == owner_axis_coordinate)
+            for coordinate in range(self_layout.mesh_shape[mesh_dim])
+        )
+        input_placement = placements[mesh_dim]
+        split_factor = (
+            input_placement.split_factor
+            if isinstance(input_placement, StridedShard)
+            else 1
+        )
+        output_placements[mesh_dim] = _StridedRaggedShard(
+            output_dims,
+            local_units,
+            split_factor,
+        )
+
+    output_layout = Layout.from_device_mesh(self_layout.mesh)
+    output_layout.set_placements(tuple(output_placements))
+    output_layout.placement_to_tensor_map(len(output_global_shape))
+    info = _StridedRaggedIndexInfo(
+        shard_axes,
+        owner_coordinate,
+        local_index,
+        output_global_shape,
+    )
+    return output_layout, info
+
+
 class GetItemDistributedOp(DistributedOp):
     """Distributed implementation for tensor.__getitem__.
 
@@ -442,32 +591,14 @@ class GetItemDistributedOp(DistributedOp):
                 )
 
     @staticmethod
-    def _supports_shard_dim0_int(
-            self_layout, expanded_actions, global_shape, kind, placement):
-        """Return whether integer indexing can preserve a Shard(0) layout."""
-        if kind != _BASIC or len(global_shape) < 2:
-            return False
-        if len(self_layout.mesh_shape) != 1 or not expanded_actions:
-            return False
-        first_action = expanded_actions[0]
-        if first_action[0] != "int" or first_action[-1] != 0:
-            return False
-        if not all(
-                _is_full_slice_action(action, global_shape)
-                for action in expanded_actions[1:]
-        ):
-            return False
-        if not isinstance(placement, Shard) or isinstance(placement, StridedShard):
-            return False
-        return placement.is_shard(0)
-
-    @staticmethod
     def _infer_shard_dim0_int(self_layout, expanded_actions, global_shape, kind):
         """Return the owner-only RaggedShard layout and local index, if supported."""
-        placement = self_layout.placements[0] if len(self_layout.placements) == 1 else None
-        if not GetItemDistributedOp._supports_shard_dim0_int(
-                self_layout, expanded_actions, global_shape, kind, placement
-        ):
+        placements = tuple(self_layout.placements)
+        if not _is_dim0_int_full_slice(expanded_actions, global_shape, kind):
+            return None
+
+        shard_axes = _dim0_shard_axes(placements)
+        if not shard_axes or not _other_axes_are_replicated(placements, shard_axes):
             return None
 
         index = expanded_actions[0][1]
@@ -475,22 +606,20 @@ class GetItemDistributedOp(DistributedOp):
         if index < -global_dim0 or index >= global_dim0:
             return None
 
-        mesh_size = self_layout.mesh.size(0)
-        if global_dim0 % mesh_size != 0:
-            return None
-
-        rows_per_rank = global_dim0 // mesh_size
-        owner_rank, local_index = divmod(index % global_dim0, rows_per_rank)
+        normalized_index = index if index >= 0 else index + global_dim0
         output_global_shape = tuple(global_shape[1:])
-
-        output_layout = Layout.from_device_mesh(self_layout.mesh)
-        ragged_shard = RaggedShard(
-            tuple(range(len(output_global_shape))),
-            tuple(1 if rank == owner_rank else 0 for rank in range(mesh_size)),
+        if not any(isinstance(placements[mesh_dim], StridedShard) for mesh_dim in shard_axes):
+            return _build_regular_ragged_result(
+                self_layout, output_global_shape, global_dim0, normalized_index
+            )
+        return _build_strided_ragged_result(
+            self_layout,
+            placements,
+            shard_axes,
+            output_global_shape,
+            global_dim0,
+            normalized_index,
         )
-        output_layout.set_placements((ragged_shard,))
-        output_layout.placement_to_tensor_map(len(output_global_shape))
-        return output_layout, (owner_rank, local_index, output_global_shape)
 
     def infer_layout(self, cache_values: list) -> tuple:  # pylint: disable=W0221
         """Infer output layout for __getitem__.
@@ -572,7 +701,15 @@ class GetItemDistributedOp(DistributedOp):
 
         input_layout = cache_values[0]
         output_layout = infer_result[0][0]
-        owner_rank, local_index, output_global_shape = info
+        if isinstance(info, _StridedRaggedIndexInfo):
+            shard_axes = info.shard_axes
+            owner_coordinates = info.owner_coordinates
+            local_index = info.local_index
+            output_global_shape = info.output_global_shape
+        else:
+            owner_rank, local_index, output_global_shape = info
+            shard_axes = (0,)
+            owner_coordinates = (owner_rank,)
 
         def ragged_getitem_impl(local_input: torch.Tensor, local_key: object) -> DTensor:
             """Return the selected owner view or an empty non-owner view."""
@@ -583,8 +720,11 @@ class GetItemDistributedOp(DistributedOp):
                     "requires a contiguous local tensor."
                 )
 
-            local_rank = input_layout.mesh.get_local_rank(0)
-            if local_rank == owner_rank:
+            is_owner = all(
+                input_layout.mesh.get_local_rank(mesh_dim) == owner_coordinate
+                for mesh_dim, owner_coordinate in zip(shard_axes, owner_coordinates)
+            )
+            if is_owner:
                 local_view = func(local_input, local_index).view(-1)
             else:
                 local_view = local_input.view(-1)[:0]
