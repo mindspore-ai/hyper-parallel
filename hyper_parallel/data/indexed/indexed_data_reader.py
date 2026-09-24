@@ -41,6 +41,13 @@ _DTYPES = {
 }
 
 
+def _normalize_prefix(path_prefix: str) -> str:
+    """Return an indexed dataset prefix from a prefix or either data suffix."""
+    if path_prefix.endswith((".idx", ".bin")):
+        return path_prefix[:-4]
+    return path_prefix
+
+
 class _IndexReader:
     """Memory-map the compact sequence metadata stored in an index file."""
 
@@ -57,7 +64,10 @@ class _IndexReader:
                 raise ValueError(f"Unsupported indexed Dataset version {version}; expected {_INDEX_VERSION}")
 
             dtype_code = struct.unpack("<B", stream.read(1))[0]
-            self.dtype = np.dtype(_DTYPES[dtype_code])
+            try:
+                self.dtype = np.dtype(_DTYPES[dtype_code])
+            except KeyError as error:
+                raise ValueError(f"Unsupported indexed Dataset dtype code {dtype_code}") from error
             self.dtype_size = self.dtype.itemsize
 
             self.sequence_count = struct.unpack("<Q", stream.read(8))[0]
@@ -82,9 +92,20 @@ class _IndexReader:
             offset=offset + self.sequence_lengths.nbytes + self.sequence_pointers.nbytes,
         )
 
-        # Each document is a half-open sequence range; the final boundary must equal the sequence count.
-        if self.document_indices.size == 0 or self.document_indices[-1] != self.sequence_count:
-            raise ValueError("Indexed Dataset document boundaries do not match its sequence count")
+        # Each document is a half-open sequence range. Megatron writes the initial
+        # zero boundary and a final boundary equal to the sequence count.
+        if (
+            self.document_indices.size == 0
+            or self.document_indices[0] != 0
+            or self.document_indices[-1] != self.sequence_count
+            or np.any(np.diff(self.document_indices) < 0)
+        ):
+            raise ValueError("Indexed Dataset document boundaries are not monotonic or do not match its sequence count")
+
+        expected_pointers = np.cumsum(self.sequence_lengths, dtype=np.int64) - self.sequence_lengths.astype(np.int64)
+        expected_pointers *= self.dtype_size
+        if not np.array_equal(self.sequence_pointers, expected_pointers):
+            raise ValueError("Indexed Dataset sequence pointers do not match sequence lengths")
 
     def __del__(self) -> None:
         """Close the index metadata mmap when it is no longer referenced."""
@@ -133,6 +154,7 @@ class IndexedDataReader:
             mmap: Whether to memory-map the token payload.
         """
         start_time = time.time()
+        path_prefix = _normalize_prefix(path_prefix)
         index_path = path_prefix + ".idx"
         data_path = path_prefix + ".bin"
         if not os.path.isfile(index_path) or not os.path.isfile(data_path):
@@ -148,6 +170,14 @@ class IndexedDataReader:
                 self.index = _IndexReader(index_path)
                 if self.reuse_index:
                     IndexedDataReader.cached_index_reader = self.index
+
+        expected_bytes = int(self.index.sequence_lengths.sum()) * self.index.dtype_size
+        actual_bytes = os.path.getsize(data_path)
+        if actual_bytes < expected_bytes:
+            raise ValueError(
+                f"Indexed Dataset binary payload is truncated: expected at least {expected_bytes} bytes, "
+                f"got {actual_bytes}"
+            )
 
         self.bin_buffer_mmap = None
         self.bin_buffer = None

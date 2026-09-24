@@ -246,6 +246,20 @@ Indexed 路径使用共同前缀的两个文件：
 `sequence_pointers[i]` 是第 i 条 sequence 在 `.bin` 中的字节偏移，不是 JSON 或 `{text: ...}`。
 `sequence_lengths[i]` 是 token 数。
 
+外部 Megatron 文本预训练数据可以直接加载，无需重新 tokenize。建议先执行兼容性检查：
+
+```bash
+python -m hyper_parallel.data.tools.megatron_dataset \
+    --input-prefix /data/megatron/train_text_document
+```
+
+检查通过后，将该 prefix 配置到现有 `data_path`。变长文档使用
+`is_dataset_from_mr: false`（`GPTDataset`）；Megatron 已预切为
+`seq_length + 1` 的定长 record 时使用 `is_dataset_from_mr: true`
+（`GPTFromMRDataset`）。需要复制到独立目录时，可为命令增加
+`--output-prefix`；该操作只复制并校验 `.idx/.bin`，不改动 token 内容。
+详见 `docs/guide/data/megatron_dataset_compatibility.md`。
+
 ```text
 sequence_id = 1
     ↓
