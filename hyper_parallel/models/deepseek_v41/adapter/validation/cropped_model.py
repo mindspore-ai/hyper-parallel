@@ -51,6 +51,7 @@ def build_deepseek_v41_validation_config(
         num_routed_experts: int = 16,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        fused_indexer: bool = True,
 ) -> DeepseekV4Config:
     """Translate the released config into a depth-preserving parameter crop.
 
@@ -198,6 +199,7 @@ def build_deepseek_v41_validation_config(
     config.v41_candidate_topk_blocks = int(text.get("candidate_topk_blocks", 0))
     config.v41_candidate_block_size = int(text.get("candidate_block_size", 1))
     config.v41_indexer_loss_coeff = float(indexer_loss_coeff)
+    config.v41_fused_indexer = bool(fused_indexer)
     if exercise_post_training_indexer:
         # At 4K with eight-token blocks this retains 1024 candidates for
         # Top-512. The released 2048-block value would retain every key.
@@ -246,6 +248,7 @@ def build_cropped_deepseek_v41(
         num_routed_experts: int = 16,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        fused_indexer: bool = True,
         torch_dtype: str = "bfloat16",
         validate_placement: bool = False,
         distributed_setup: DistributedSetup | None = None,
@@ -268,6 +271,8 @@ def build_cropped_deepseek_v41(
         exercise_post_training_indexer: Exercise the released Full/Reindex
             hierarchy at its native layer indices.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
+        fused_indexer: Use the fused Lightning-Indexer operator when it is
+            available; the torch path is used either way when it is not.
         torch_dtype: Forward dtype accepted by the model builder.
         validate_placement: Enable DTensor placement validation.
         distributed_setup: Trainer-provided parallel topology.
@@ -290,6 +295,7 @@ def build_cropped_deepseek_v41(
         num_routed_experts=num_routed_experts,
         exercise_post_training_indexer=exercise_post_training_indexer,
         indexer_loss_coeff=indexer_loss_coeff,
+        fused_indexer=fused_indexer,
     )
     return HyperAutoModelForCausalLM.from_config(
         config,

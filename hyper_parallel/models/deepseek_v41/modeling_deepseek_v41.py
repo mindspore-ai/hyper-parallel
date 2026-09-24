@@ -296,6 +296,7 @@ class _DeepseekV41IndexerState(nn.Module):
         self.candidate_topk_blocks = int(getattr(config, "v41_candidate_topk_blocks", 0))
         self.candidate_block_size = int(getattr(config, "v41_candidate_block_size", 1))
         self.loss_coeff = float(getattr(config, "v41_indexer_loss_coeff", 0.0))
+        self.fused_indexer = bool(getattr(config, "v41_fused_indexer", True))
         self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
         if self.owns_key:

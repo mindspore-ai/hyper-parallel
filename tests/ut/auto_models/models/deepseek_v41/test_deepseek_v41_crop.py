@@ -1220,5 +1220,29 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
         torch.testing.assert_close(output, expected)
 
 
+class TestFusedIndexerCropSwitch(unittest.TestCase):
+    """The crop entry carries the fused-indexer switch into the config."""
+
+    @staticmethod
+    def _build(**kwargs):
+        """Build a validation config from the release-shaped fixtures."""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = _write_released_config(directory)
+            assets = _write_engram_assets(directory, num_hidden_layers=40, head_dim=8)
+            from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (  # pylint: disable=C0415
+                build_deepseek_v41_validation_config,
+            )
+            return build_deepseek_v41_validation_config(
+                str(config_path.parent), str(assets), **kwargs)
+
+    def test_default_keeps_the_fused_path_enabled(self):
+        """The operator is used when present unless the recipe says otherwise."""
+        self.assertTrue(self._build().v41_fused_indexer)
+
+    def test_recipe_can_disable_the_fused_path(self):
+        """A recipe can pin the torch path without touching the environment."""
+        self.assertFalse(self._build(fused_indexer=False).v41_fused_indexer)
+
+
 if __name__ == "__main__":
     unittest.main()
