@@ -18,6 +18,7 @@ import importlib
 import os
 import queue
 import tempfile
+import traceback
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
@@ -351,7 +352,8 @@ class TestResolveAsyncPersistResult(unittest.TestCase):
         """
         Feature: resolve_async_persist_result callback errors.
         Description: Persistence succeeded but the user callback raises.
-        Expectation: The future raises rather than reporting a clean save.
+        Expectation: The future raises the callback's own exception, with its traceback,
+            rather than reporting a clean save or flattening it into a RuntimeError.
         """
         result_queue = queue.Queue()
         result_queue.put((staging_mod.AsyncPersistStatus.SUCCESS, (self._metadata(), {})))
@@ -363,9 +365,20 @@ class TestResolveAsyncPersistResult(unittest.TestCase):
 
         staging_mod.resolve_async_persist_result(_FinishedProc(), result_queue, future, boom)
 
-        with self.assertRaises(RuntimeError) as ctx:
+        # Caught by hand rather than with assertRaises, which strips the traceback
+        # off the exception it stores to break reference cycles.
+        try:
             future.result(timeout=0)
-        self.assertIn("callback exploded", str(ctx.exception))
+        except ValueError as exc:
+            self.assertIn("callback exploded", str(exc))
+            frames = [frame.name for frame in traceback.extract_tb(exc.__traceback__)]
+            self.assertIn(
+                "boom",
+                frames,
+                f"the callback's own frame must survive in the traceback, got={frames}",
+            )
+        else:
+            raise AssertionError("a failing callback must fail the future")
 
     def test_an_unexpected_status_fails_the_future(self):
         """

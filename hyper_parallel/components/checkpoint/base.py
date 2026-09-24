@@ -100,6 +100,16 @@ class CheckpointerBase(ABC):
         """
         return
 
+    def raise_for_failed_async_save(self) -> None:
+        """Re-raise an in-flight async save's failure, without waiting for it.
+
+        Callers use this to learn about a failure at their next convenient point
+        rather than at their next save, which may be thousands of steps away. A
+        save still running is left alone, so it is cheap enough to call every
+        step. Backends without async support inherit this no-op.
+        """
+        return
+
     def find_latest_checkpoint(self, checkpoint_dir: str) -> Optional[str]:
         """Return the newest resumable checkpoint under ``checkpoint_dir``.
 
