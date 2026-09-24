@@ -283,18 +283,21 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, 'module replacement'):
             deepseek_v41_megamoe_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=None)
 
-    def test_resources_shared_and_closed_on_training_error(self):
-        """The generic Trainer lifecycle shares workspaces and closes on exceptions."""
+    def test_resources_shared_without_trainer_cleanup_on_error(self):
+        """Training failures preserve shared executors for automatic runtime cleanup."""
         model = nn.ModuleList([DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=128) for _ in range(2)])
         for experts in model:
             experts.configure(None, 1, 2)
         resources = ModelRuntimeResources(model)
+        self.addCleanup(resources.close)
         resources.prepare()
         self.assertIs(model[0]._executor._resource_group, model[1]._executor._resource_group)
         trainer = BaseTrainer.__new__(BaseTrainer)
+        trainer.config = SimpleNamespace()
         trainer.model_runtime_resources = resources
-        trainer._train = Mock(side_effect=RuntimeError('training failure'))
+        trainer.on_train_begin = Mock(side_effect=RuntimeError('training failure'))
         with self.assertRaisesRegex(RuntimeError, 'training failure'):
             trainer.train()
-        self.assertTrue(all(experts._executor is None for experts in model))
+        self.assertTrue(all(experts._executor is not None for experts in model))
         resources.close()
+        self.assertTrue(all(experts._executor is None for experts in model))

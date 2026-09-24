@@ -842,23 +842,9 @@ class BaseTrainer(Stateful, ABC):
         dist.barrier()
 
         synchronize()
-        self._close_model_runtime_resources()
         destroy_process_group()
 
-    def _close_model_runtime_resources(self) -> None:
-        """Release model-owned resources before destroying communication groups."""
-        resources = getattr(self, "model_runtime_resources", None)
-        if resources is not None:
-            resources.close()
-
     def train(self) -> None:
-        """Train and close model resources on both completion and failure."""
-        try:
-            self._train()
-        finally:
-            self._close_model_runtime_resources()
-
-    def _train(self) -> None:
         """Run the configured training loop."""
         config: TrainerConfig = self.config
         self.on_train_begin()

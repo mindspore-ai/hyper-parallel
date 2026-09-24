@@ -66,21 +66,25 @@ SwiGLU limit 从原模块读取，并要求 routed/shared experts 一致。
 边界和 loss 输入保持原样。容量 4096、真实 224/240 时仍按 4096 行执行专家，
 因此本轮没有动态 token 计算量收益。超过容量时应调大配置，不能截断输入。
 
-通用 `ModelRuntimeModule` / `ModelRuntimeResources` 接口负责资源生命周期：
+通用 `ModelRuntimeModule` / `ModelRuntimeResources` 接口负责构建阶段的资源准备：
 
 - 共用模型构建完成后、第一次前向前准备显式参与的模块；MegaMoe 在这里共享兼容层的 workspace。
-- 训练结束回调后、分布式进程组销毁前关闭资源，Base/Text/VLM 三个训练入口的异常也进入清理。
-- 准备失败会回滚；关闭失败仍尝试其余模块，并允许重试失败的参与者。
+- 准备失败会回滚；需要提前关闭时，调用方仍可显式关闭资源并重试失败的参与者。
 - 普通模块不参与；Trainer 不导入 DSV4.1 或 multicore，也不根据 MegaMoe 类型分支。
 
-不依赖 Python 析构触发 SHMEM 释放。非 Trainer 调用方应显式创建、准备和关闭
-`ModelRuntimeResources(model)`，并保证每个参与模块已完成并行绑定。
+MegaMoe 运行时自动在 WORLD / SHMEM Root 通信组关闭前清理资源，并在正常进程退出时
+通过 `atexit` 尝试清理。Base/Text/VLM Trainer 不再增加释放资源的 `try/finally`，
+训练异常原样传播。GC 仅登记成员退出，不触发 collective；自动清理仍要求各 rank 同序进入，
+且没有在途调用或待反向图，通信故障和强制退出不保证安全释放。
+详见 [Multicore 生命周期说明](../../../hyper_parallel/core/multicore/README.md)。
+非 Trainer 调用方应在并行绑定后创建并准备 `ModelRuntimeResources(model)` 以共享 workspace；
+通常无需显式关闭，需要提前回收时可调用其 `close()`。
 
 ## 验证
 
 当前 CPU 回归覆盖外部权重更新、输出与全部梯度、固定补位、空 batch、真实 VLM router
 及图像 token 梯度、checkpoint 往返、meta 初始化、YAML Target 解析与实际替换、
-native EP 默认行为，以及资源共享、关闭顺序、异常回滚和关闭重试。
+native EP 默认行为，以及资源共享、自动关闭边界、异常传播、准备回滚和关闭重试。
 CPU 数值测试替换了 native executor，只验证适配语义。
 
 ```bash
