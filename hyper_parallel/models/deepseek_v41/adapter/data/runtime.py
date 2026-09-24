@@ -19,8 +19,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedPackedSequence,
 )
@@ -84,17 +82,12 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
                 local_query_start=cp_rank * local_sequence_length,
                 local_query_length=local_sequence_length,
                 global_sequence_length=cp_size * local_sequence_length,
-            )
+            ).prepare(batch["input_ids"].device, ())
         }
         cp_start = runtime_inputs["packed_seq_params"].local_query_start
         if self.include_position_ids:
             input_ids = batch["input_ids"]
-            position_ids = torch.arange(
-                cp_start,
-                cp_start + local_sequence_length,
-                device=input_ids.device,
-                dtype=torch.long,
-            ).unsqueeze(0)
+            position_ids = runtime_inputs["packed_seq_params"].local_positions(input_ids.device)
             runtime_inputs["position_ids"] = position_ids
         if self.include_image_sequence_start:
             runtime_inputs["image_sequence_start"] = cp_start
