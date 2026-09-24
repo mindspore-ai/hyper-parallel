@@ -97,7 +97,8 @@ class TestModelRuntimeResources(unittest.TestCase):
         resources.close()
         self.assertEqual(events[-1], ('close', 'b'))
 
-    def test_trainer_closes_after_callbacks_before_process_group(self):
+    def test_trainer_delegates_cleanup_to_process_group_teardown(self):
+        """Trainer preserves callback ordering without invoking model close hooks."""
         events = []
         trainer = BaseTrainer.__new__(BaseTrainer)
         trainer.state = None
@@ -111,22 +112,25 @@ class TestModelRuntimeResources(unittest.TestCase):
             distributed.is_initialized.return_value = True
             trainer.on_train_end()
             trainer.destroy_distributed()
-        self.assertEqual(events[-3:], ['callback', ('close', 'expert'), 'destroy'])
+        self.assertEqual(events, [('prepare', ('expert',)), 'callback', 'destroy'])
 
-    def test_composed_trainers_close_on_failure(self):
-        """Text/VLM own their loops and must both clean up the composed base."""
-        for trainer_type in (TextTrainer, VLMTrainer):
+    def test_trainers_preserve_failure_without_manual_cleanup(self):
+        """A cleanup error must not replace the original training exception."""
+        for trainer_type in (BaseTrainer, TextTrainer, VLMTrainer):
             with self.subTest(trainer=trainer_type.__name__):
-                events = []
                 trainer = trainer_type.__new__(trainer_type)
-                trainer.base = BaseTrainer.__new__(BaseTrainer)
-                resources = ModelRuntimeResources(nn.ModuleList([_Participant(events, 'expert')]))
-                resources.prepare()
-                trainer.base.model_runtime_resources = resources
-                trainer._train = Mock(side_effect=ValueError('step failed'))
-                with self.assertRaisesRegex(ValueError, 'step failed'):
+                base = trainer
+                if trainer_type is not BaseTrainer:
+                    base = trainer.base = BaseTrainer.__new__(BaseTrainer)
+                base.config = SimpleNamespace()
+                resources = Mock(close=Mock(side_effect=RuntimeError('cleanup failed')))
+                base.model_runtime_resources = resources
+                failure = ValueError('training failed')
+                trainer.on_train_begin = Mock(side_effect=failure)
+                with self.assertRaises(ValueError) as caught:
                     trainer.train()
-                self.assertEqual(events[-1], ('close', 'expert'))
+                self.assertIs(caught.exception, failure)
+                resources.close.assert_not_called()
 
     def test_shared_model_build_prepares_resources(self):
         """The stage used by both composed Trainers prepares the final model."""
@@ -147,5 +151,5 @@ class TestModelRuntimeResources(unittest.TestCase):
         with patch('hyper_parallel.trainer.base.model_integration_runtime.build_model_integration_session'):
             trainer._build_model()
         self.assertEqual(events, [('prepare', ('expert',))])
-        trainer._close_model_runtime_resources()
+        trainer.model_runtime_resources.close()
         self.assertEqual(events[-1], ('close', 'expert'))
