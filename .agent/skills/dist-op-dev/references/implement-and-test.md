@@ -28,7 +28,7 @@ Most other `parallel_*.py` use **legacy** dispatch — do not copy those signatu
 
 ## PyTorch ST (if applicable)
 
-`tests/torch/shard/ops/cases/case_{op_name}.py` — same framework with
+`tests/st/shard/ops/cases/case_{op_name}.py` — same framework with
 `torch.*`. Tags often `("cpu_level0", "npu_level0")`.
 
 ## Run tests
@@ -38,15 +38,15 @@ npu-smi info >/dev/null 2>&1 && echo "ascend" || echo "no-ascend"
 
 pytest -vs tests/ut/core/shard/ops/test_parallel_{op_name}.py
 
-pytest -vs tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_level0
-pytest -vs tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_level1
+pytest -vs tests/st/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_level0
+pytest -vs tests/st/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_level1
 # Ascend only:
-pytest -vs tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_ascend_level0
-pytest -vs tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_ascend_level1
+pytest -vs tests/st/shard/ops/test_shard_ops_suite.py::test_shard_ops_ascend_level0
+pytest -vs tests/st/shard/ops/test_shard_ops_suite.py::test_shard_ops_ascend_level1
 
 HYPER_PARALLEL_SHARD_CASE_FILTER="{op}_ops_*" \
-  pytest tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_level0 -vs
-python -m tests.shard_ops.framework --case {op}_ops_dp --num-proc 4
+  pytest tests/st/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_level0 -vs
+python -m tests.st.shard.framework --case {op}_ops_dp --num-proc 4
 ```
 
 `--num-proc` == `math.prod(mesh_shape)`. Non-Ascend: UT + Torch gloo only.

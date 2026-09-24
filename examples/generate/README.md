@@ -8,7 +8,7 @@ performance baseline script.
 ## Functional tests
 
 ```bash
-python -m pytest tests/torch/generate -q
+python -m pytest tests/st/generate -q
 ```
 
 Expected result:

@@ -3,7 +3,7 @@ name: distributed-op-testing
 description: Testing constraints for HyperParallel distributed operators. Covers UT and ST file structure, naming, forbidden patterns, and assertion format.
 paths:
   - tests/ut/core/shard/ops/**
-  - tests/torch/shard/ops/**
+  - tests/st/shard/ops/**
 ---
 
 # Distributed Operator Testing Constraints
@@ -13,7 +13,7 @@ Applies to all distributed operator tests under `tests/`. Two test layers are re
 | Layer | Directory | Purpose |
 |-------|-----------|---------|
 | UT | `tests/ut/core/shard/ops/` | CPU-only logic verification; covers all error paths |
-| ST (PyTorch) | `tests/torch/shard/ops/` | Real multi-card distributed execution; success paths only |
+| ST (PyTorch) | `tests/st/shard/ops/` | Real multi-card distributed execution; success paths only |
 
 ---
 
@@ -64,12 +64,12 @@ Applies to all distributed operator tests under `tests/`. Two test layers are re
 
 ## ST — New Framework (OpShardCase)
 
-ST tests for shard ops use the declarative `OpShardCase` framework under `tests/shard_ops/framework/`.
+ST tests for shard ops use the declarative `OpShardCase` framework under `tests/st/shard/framework/`.
 
 ### Directory Layout
 
 ```text
-tests/torch/shard/ops/
+tests/st/shard/ops/
 ├── test_shard_ops_suite.py      # pytest entry for all Torch cases
 ├── cases/                       # one file per operator
 │   ├── __init__.py              # auto-discovers case_*.py
@@ -87,7 +87,7 @@ Each `cases/case_{op}.py` defines test functions and registers cases:
 ```python
 import torch
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from tests.shard_ops.framework import (
+from tests.st.shard.framework import (
     CompareSpec, InputSpec, OpShardCase, register,
 )
 
@@ -159,8 +159,8 @@ _GROUPS_CPU_LEVEL0 = build_suite_groups(
 
 ```bash
 # Torch (CPU default)
-python -m tests.shard_ops.framework --case sort_ops_2d_dp --num-proc 4
-python -m tests.shard_ops.framework --device-type npu --case sort_ops_2d_dp --num-proc 4
+python -m tests.st.shard.framework --case sort_ops_2d_dp --num-proc 4
+python -m tests.st.shard.framework --device-type npu --case sort_ops_2d_dp --num-proc 4
 ```
 
 - `--num-proc` **must equal `math.prod(mesh_shape)`** (2 for `(2,)`, 4 for `(2,2)`, 8 for `(2,2,2)`); a mismatch makes ranks ≠ mesh size and HCCL hangs.
@@ -169,7 +169,7 @@ python -m tests.shard_ops.framework --device-type npu --case sort_ops_2d_dp --nu
 
 ```bash
 HYPER_PARALLEL_SHARD_CASE_FILTER="sort_ops_*" \
-  pytest tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_level0 -vs
+  pytest tests/st/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_level0 -vs
 ```
 
 ### Gate Routing

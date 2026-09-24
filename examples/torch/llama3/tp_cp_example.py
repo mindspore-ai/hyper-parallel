@@ -20,7 +20,7 @@ Uses :class:`model.Llama3Model` (``model.py``) with a 2-D ``DeviceMesh`` ``(tp, 
   parallel + Colwise/Rowwise on the **TP** submesh only).
 * ``ContextParallel(..., ulysses_degree=1).apply(..., mesh["cp"])`` — Colossal CP on
   **every** ``layer.attention.sdpa_core`` (BSHD Q/K/V hooks), aligned with
-  ``tests/torch/context_parallel/_test_context_parallel.py`` ``test_tp_cp_combination_npu``.
+  ``tests/st/context_parallel/_test_context_parallel.py`` ``test_tp_cp_combination_npu``.
 
 Each CP rank feeds the token slice ``global[:, cp * S/cp : (cp+1) * S/cp]``; ``Llama3Model.forward``
 uses ``rope_seq_start`` so RoPE matches that global window (``freqs_cis`` is sliced after

@@ -281,7 +281,7 @@ Each direction requires complete recipes, learning results, and resource-cost co
 ## System tests
 
 RL ST lives in `hyper_parallel/rl/tests/st/` and is temporarily excluded from the main-project
-`tests/torch/` PR gate. All six real-NPU scenarios and their acceptance checks are retained.
+`tests/st/` PR gate. All six real-NPU scenarios and their acceptance checks are retained.
 A passing main-project gate does not prove that these scenarios ran. Shared recipes remain in
 `tests/common/rl_st_cases.py` for both UT and standalone ST.
 

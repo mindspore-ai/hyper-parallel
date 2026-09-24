@@ -79,6 +79,6 @@ FSDP2 interactions): use agent **`activation-dev`** and
 
 Use lightweight checks for local regressions, then validate with real training runs.
 
-- unit tests under `tests/torch/integration/llamafactory/`
+- unit tests under `tests/st/integration/llamafactory/`
 - syntax/static checks when editing integration files
 - end-to-end validation with actual LlamaFactory training for correctness and performance
