@@ -4,6 +4,8 @@ HyperParallel 的 Context Parallel（CP）是面向注意力计算边界的 `Par
 
 CP 不负责切分数据集、token ids 或整层 Transformer 输入。启用 CP 后，调用模型前仍需要让每个 CP rank 只拿到自己的序列切片，并保证 position ids、RoPE 起始位置和 attention mask 与全局序列窗口对齐。
 
+GQA/GatedGQA 组件也可通过 `attention_interface` 显式选择[流式 KV attention](stream_kv_gqa.md)，用有界 KV panel 控制中间量显存。该接口单独说明 Ascend、输入布局与精度约束，不改变下面 `ContextParallel` 的默认行为。
+
 ## 适用边界
 
 | 接口 | 真实作用 |

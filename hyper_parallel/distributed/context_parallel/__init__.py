@@ -30,6 +30,7 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     ulysses_head_to_seq,
     ulysses_seq_to_head,
 )
+from hyper_parallel.distributed.context_parallel.stream_kv import StreamKVConfig, StreamKVGQAAttention
 from hyper_parallel.distributed.context_parallel.wrappers import (
     INNER_WRAPPER_REGISTRY,
     INNER_WRAPPER_REQUIREMENTS,
@@ -54,6 +55,8 @@ __all__ = [
     "AsyncCPCollective",
     "INNER_WRAPPER_REGISTRY",
     "INNER_WRAPPER_REQUIREMENTS",
+    "StreamKVConfig",
+    "StreamKVGQAAttention",
     "async_cp_allgather_launch",
     "async_ulysses_seq_to_head_launch",
     "flex_cp_allgather",
