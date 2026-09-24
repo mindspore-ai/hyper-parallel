@@ -4,16 +4,71 @@ on:
   pull_request:
     types: [labeled, unlabeled, opened, synchronize, reopened]
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   label-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
+
     steps:
       - name: Check for required label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SETTLE_SECONDS: "5"
+          MAX_ATTEMPTS: "10"
+          RETRY_INTERVAL_SECONDS: "3"
+        shell: bash
         run: |
-          LABELS="${{ join(github.event.pull_request.labels.*.name, ',') }}"
-          if echo "$LABELS" | grep -qE '(^|,)(ci-pipeline-passed|ci-pipeline-passed-but-overtime)(,|$)'; then
-            echo "Required label present: $LABELS"
+          set -uo pipefail
+
+          # Jenkins 会连续删除旧状态标签并添加新标签。
+          # 等待操作收敛，避免根据中间状态产生失败的 check run。
+          echo "Waiting ${SETTLE_SECONDS}s for label updates to settle..."
+          sleep "${SETTLE_SECONDS}"
+
+          labels=""
+          successful_queries=0
+
+          for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+            echo "Querying current PR labels (${attempt}/${MAX_ATTEMPTS})..."
+
+            if labels="$(
+              gh api \
+                --method GET \
+                "repos/${GH_REPO}/pulls/${PR_NUMBER}" \
+                --jq '.labels[].name'
+            )"; then
+              successful_queries=$((successful_queries + 1))
+
+              display_labels="$(
+                printf '%s\n' "${labels}" |
+                  paste -sd ',' -
+              )"
+              echo "Current labels: ${display_labels:-<none>}"
+
+              if printf '%s\n' "${labels}" |
+                   grep -qxE 'ci-pipeline-passed|ci-pipeline-passed-but-overtime'; then
+                echo "Required pipeline-passed label is present."
+                exit 0
+              fi
+            else
+              echo "::warning::Failed to query current PR labels."
+            fi
+
+            if ((attempt < MAX_ATTEMPTS)); then
+              sleep "${RETRY_INTERVAL_SECONDS}"
+            fi
+          done
+
+          if ((successful_queries == 0)); then
+            echo "::error::Unable to query the current PR labels."
           else
-            echo "Neither required label found. Current labels: $LABELS"
-            exit 1
+            echo "::error::Neither ci-pipeline-passed nor ci-pipeline-passed-but-overtime is present."
           fi
+
+          exit 1

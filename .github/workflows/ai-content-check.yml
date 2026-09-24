@@ -1,0 +1,58 @@
+name: AI Content Gate Check
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  ai-content-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Check PR content and commit messages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          readonly forbidden_keywords='claude|anthropic|chatgpt|openai|copilot|gemini|codex|cursor[[:space:]-]*ai'
+          readonly forbidden_pattern="(^|[^[:alnum:]_])(${forbidden_keywords})([^[:alnum:]_]|$)"
+          violations=0
+
+          check_content() {
+            local source="$1"
+            local content="$2"
+
+            if printf '%s\n' "${content}" | grep -Eiq "${forbidden_pattern}"; then
+              echo "::error::Forbidden AI-assistant keyword found in ${source}."
+              violations=$((violations + 1))
+            fi
+          }
+
+          pr_title="$(jq -r '.pull_request.title // ""' "${GITHUB_EVENT_PATH}")"
+          pr_body="$(jq -r '.pull_request.body // ""' "${GITHUB_EVENT_PATH}")"
+          commit_messages="$(
+            gh api \
+              --paginate \
+              "repos/${GH_REPO}/pulls/${PR_NUMBER}/commits" \
+              --jq '.[].commit.message'
+          )"
+
+          check_content "PR title" "${pr_title}"
+          check_content "PR description" "${pr_body}"
+          check_content "commit messages" "${commit_messages}"
+
+          if ((violations > 0)); then
+            echo "Remove AI tool or vendor references and describe only the business changes."
+            exit 1
+          fi
+
+          echo "PR content and commit messages do not contain forbidden AI-assistant keywords."
