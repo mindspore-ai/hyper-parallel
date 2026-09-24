@@ -545,16 +545,23 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
                 except Exception:
                     await _cancel_active_completions(active)
                     raise
-                if len(records) != request.child_count:
-                    raise RuntimeError(
-                        "vLLM admitted parent returned an unexpected child count: "
-                        f"expected={request.child_count}, received={len(records)}"
-                    )
-                for offset, record in enumerate(records):
-                    results[request.start_row + offset] = record
+                self._store_completion_records(results, request, records)
         if any(record is None for record in results):
             raise RuntimeError("vLLM async admission completed with missing output rows")
         return [record for record in results if record is not None]
+
+    @staticmethod
+    def _store_completion_records(
+        results: list[Any], request: _CompletionRequest, records: list[Any],
+    ) -> None:
+        """Validate child count and restore this request to its original rows."""
+        if len(records) != request.child_count:
+            raise RuntimeError(
+                "vLLM admitted parent returned an unexpected child count: "
+                f"expected={request.child_count}, received={len(records)}"
+            )
+        for offset, record in enumerate(records):
+            results[request.start_row + offset] = record
 
     def generate_tokens(
         self,
@@ -1076,12 +1083,18 @@ class VLLMGenerationEngine:
         )
         prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompt_token_ids]
         outputs = client.generate(prompts, sampling_params=sampling, use_tqdm=False)
+        return self._inprocess_records(outputs, settings.collect_log_probs)
+
+    def _inprocess_records(
+        self, outputs: Any, collect_log_probs: bool,
+    ) -> list[tuple[list[int], Optional[list[float]]]]:
+        """Read generated token IDs and optional sampled log-probabilities."""
         records = []
         for request_output in outputs:
             completion = request_output.outputs[0]
             token_log_probs = (
                 self._sampled_log_probs(completion)
-                if settings.collect_log_probs
+                if collect_log_probs
                 else None
             )
             records.append((list(completion.token_ids), token_log_probs))

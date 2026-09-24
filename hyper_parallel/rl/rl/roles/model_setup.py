@@ -14,6 +14,23 @@
 # ============================================================================
 """Model identity and role construction shared by training and rollout."""
 
+__all__ = [
+    "HYPER_MODEL_IMPLEMENTATION",
+    "HYPER_QWEN3_ARCHITECTURE",
+    "ModelRegistration",
+    "NATIVE_MODEL_IMPLEMENTATION",
+    "NATIVE_QWEN3_ARCHITECTURE",
+    "SUPPORTED_MODEL_IMPLEMENTATIONS",
+    "VLLMModelRegistration",
+    "architecture_for_implementation",
+    "build_role_model",
+    "build_role_optimizer",
+    "iter_hsdp_roots",
+    "normalize_model_implementation",
+    "resolve_vllm_model",
+]
+
+
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -169,23 +186,6 @@ def iter_hsdp_roots(model: torch.nn.Module) -> Iterator[HSDPModule]:
         if isinstance(candidate, HSDPModule) and id(candidate) not in seen:
             seen.add(id(candidate))
             yield candidate
-
-
-__all__ = [
-    "HYPER_MODEL_IMPLEMENTATION",
-    "HYPER_QWEN3_ARCHITECTURE",
-    "ModelRegistration",
-    "NATIVE_MODEL_IMPLEMENTATION",
-    "NATIVE_QWEN3_ARCHITECTURE",
-    "SUPPORTED_MODEL_IMPLEMENTATIONS",
-    "VLLMModelRegistration",
-    "architecture_for_implementation",
-    "build_role_model",
-    "build_role_optimizer",
-    "iter_hsdp_roots",
-    "normalize_model_implementation",
-    "resolve_vllm_model",
-]
 
 
 def _model_boolean(model: Mapping[str, Any], name: str, default: bool) -> bool:

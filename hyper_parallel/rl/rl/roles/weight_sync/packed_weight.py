@@ -14,6 +14,16 @@
 # ============================================================================
 """Whole-parameter buckets for vLLM load_weights publication."""
 
+__all__ = [
+    "PackedWeight",
+    "PackedWeightAck",
+    "PackedWeightBucket",
+    "build_packed_weight_buckets",
+    "materialize_packed_weight_bucket",
+    "unpack_packed_weights",
+]
+
+
 from dataclasses import dataclass, replace
 from math import prod
 from typing import Any, Mapping, Optional
@@ -232,13 +242,3 @@ def _unpack_canonical_rows(tensor: Any, rows: list[Mapping[str, Any]]) -> list[t
             raise ValueError(f"Canonical row ranges for {name!r} are incomplete")
         weights.append((name, torch.cat(tensors, dim=0)))
     return weights
-
-
-__all__ = [
-    "PackedWeight",
-    "PackedWeightAck",
-    "PackedWeightBucket",
-    "build_packed_weight_buckets",
-    "materialize_packed_weight_bucket",
-    "unpack_packed_weights",
-]

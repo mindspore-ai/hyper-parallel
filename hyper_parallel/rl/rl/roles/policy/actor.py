@@ -18,8 +18,6 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 
-from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
-from hyper_parallel.core.utils import clip_grad_norm_
 from rl.algorithm.loss import RLAlgorithm
 from rl.consistency import trainer_sequence_log_probs
 from rl.dataset.contracts import ExperienceBatch
@@ -28,6 +26,9 @@ from rl.utils.monitoring.metrics import (
     ActorMicroBatchMetrics,
     ActorUpdateMetrics,
 )
+
+from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
+from hyper_parallel.core.utils import clip_grad_norm_
 
 
 # Role execution uses explicit compute/update APIs; forward remains the Module default.

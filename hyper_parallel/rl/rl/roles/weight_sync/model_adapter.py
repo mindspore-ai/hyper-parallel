@@ -368,9 +368,8 @@ def _native_qwen3_direct_tensors(
         parameter_shape = tuple(int(size) for size in parameter.shape)
         destination_starts = (0,) * len(parameter_shape)
         if name in ("model.embed_tokens.weight", "lm_head.weight"):
-            partition_size = parameter_shape[0]
-            source_start = tp_rank * partition_size
-            local_size = max(0, min(partition_size, vocab_size - source_start))
+            source_start = tp_rank * parameter_shape[0]
+            local_size = max(0, min(parameter_shape[0], vocab_size - source_start))
             if local_size <= 0:
                 raise ValueError(
                     f"Native Qwen3 vocabulary shard {tp_rank} contains no Actor rows"

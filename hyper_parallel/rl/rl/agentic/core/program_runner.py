@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol, Sequence
 
 import torch
@@ -174,11 +175,27 @@ def build_harness_trajectory(
     status_resolver: StatusResolver | None = None,
 ) -> Trajectory:
     """Merge one external harness trace without decoding or re-tokenizing."""
-    if not completion_records:
-        raise ValueError(f"{label} trajectory requires at least one captured completion")
-    ordered = sorted(completion_records, key=lambda record: int(record.get("ordinal", 0)))
-    traces = [_trace(record, label) for record in ordered]
-    eot_id = _end_of_turn_id(traces, end_of_turn_token_id, label)
+    fields = _harness_trajectory_fields(
+        label, runner_name, prompt, completion_records, end_of_turn_token_id,
+        max_episode_tokens, metadata, max_prefix_rewrite, tool_history_field, status_resolver,
+    )
+    return Trajectory(
+        trajectory_id=f"{prompt.prompt_id}:{policy_version}:{sample_index}",
+        prompt_id=prompt.prompt_id,
+        group_id=prompt.prompt_id,
+        policy_version=policy_version,
+        **fields,
+        reward=float(reward),
+        reward_components={str(name): float(value) for name, value in reward_components.items()},
+        done=True,
+        worker_policy_version=policy_version,
+    )
+
+
+def _merge_harness_traces(
+    traces: Sequence[Mapping[str, Any]], eot_id: int | None, label: str, max_prefix_rewrite: int,
+) -> tuple[list[int], list[int], list[float | None]]:
+    """Merge completion tokens and interstitial observations in trace order."""
     prompt_ids = list(traces[0]["prompt_ids"])
     token_ids = list(prompt_ids)
     action_mask = [0] * len(prompt_ids)
@@ -200,43 +217,84 @@ def build_harness_trajectory(
         token_logprobs.extend(trace["response_logprobs"])
         previous_prompt = list(trace["prompt_ids"])
         previous_response = response_ids
+    return token_ids, action_mask, token_logprobs
+
+
+@dataclass(frozen=True)
+class _PreparedHarnessTrace:
+    """Validated token trace and the source records needed for metadata."""
+    ordered: list[Mapping[str, Any]]
+    traces: list[dict[str, Any]]
+    prompt_length: int
+    token_ids: list[int]
+    action_mask: list[int]
+    token_logprobs: list[float | None]
+    prototype: Any
+
+
+def _prepare_harness_trace(
+    label: str, prompt: PromptRecord, completion_records: Sequence[Mapping[str, Any]],
+    end_of_turn_token_id: int | None, max_episode_tokens: int | None, max_prefix_rewrite: int,
+) -> _PreparedHarnessTrace:
+    """Validate and merge captured token traces before constructing tensors."""
+    if not completion_records:
+        raise ValueError(f"{label} trajectory requires at least one captured completion")
+    ordered = sorted(completion_records, key=lambda record: int(record.get("ordinal", 0)))
+    traces = [_trace(record, label) for record in ordered]
+    eot_id = _end_of_turn_id(traces, end_of_turn_token_id, label)
+    token_ids, action_mask, token_logprobs = _merge_harness_traces(traces, eot_id, label, max_prefix_rewrite)
     _validate_harness_tokens(label, token_ids, action_mask, token_logprobs, max_episode_tokens)
     prototype = prompt.metadata.get("input_ids")
     if prototype is None or not torch.is_tensor(prototype):
         raise ValueError(f"{label} trajectory requires PromptRecord metadata input_ids")
+    return _PreparedHarnessTrace(
+        ordered=ordered,
+        traces=traces,
+        prompt_length=len(traces[0]["prompt_ids"]),
+        token_ids=token_ids,
+        action_mask=action_mask,
+        token_logprobs=token_logprobs,
+        prototype=prototype,
+    )
+
+
+def _harness_trajectory_fields(
+    label: str, runner_name: str, prompt: PromptRecord,
+    completion_records: Sequence[Mapping[str, Any]], end_of_turn_token_id: int | None,
+    max_episode_tokens: int | None, metadata: Mapping[str, Any] | None,
+    max_prefix_rewrite: int, tool_history_field: str, status_resolver: StatusResolver | None,
+) -> dict[str, Any]:
+    """Build token tensors and metadata shared by external harness trajectories."""
+    trace = _prepare_harness_trace(
+        label, prompt, completion_records, end_of_turn_token_id, max_episode_tokens, max_prefix_rewrite
+    )
     trajectory_metadata = dict(metadata or {})
     trajectory_metadata.update({
         "runner": runner_name,
-        f"{runner_name}_completion_count": len(ordered),
+        f"{runner_name}_completion_count": len(trace.ordered),
         "tool_history": [
-            record.get("original_request", {}).get(tool_history_field, []) for record in ordered
+            record.get("original_request", {}).get(tool_history_field, []) for record in trace.ordered
         ],
-        "gateway_records": json.loads(json.dumps(ordered)),
+        "gateway_records": json.loads(json.dumps(trace.ordered)),
     })
     truncated, terminal_reason = (
-        status_resolver(traces, trajectory_metadata) if status_resolver else (False, "completed")
+        status_resolver(trace.traces, trajectory_metadata) if status_resolver else (False, "completed")
     )
-    return Trajectory(
-        trajectory_id=f"{prompt.prompt_id}:{policy_version}:{sample_index}",
-        prompt_id=prompt.prompt_id,
-        group_id=prompt.prompt_id,
-        policy_version=policy_version,
-        turns=_trajectory_turns(len(prompt_ids), action_mask, len(ordered), label, runner_name),
-        token_ids=prototype.new_tensor(token_ids),
-        attention_mask=prototype.new_ones((len(token_ids),)),
-        action_mask=prototype.new_tensor(action_mask, dtype=torch.bool),
-        rollout_log_probs=prototype.new_tensor(
-            [float(value) if value is not None else 0.0 for value in token_logprobs[1:]],
+    return {
+        "turns": _trajectory_turns(
+            trace.prompt_length, trace.action_mask, len(trace.ordered), label, runner_name
+        ),
+        "token_ids": trace.prototype.new_tensor(trace.token_ids),
+        "attention_mask": trace.prototype.new_ones((len(trace.token_ids),)),
+        "action_mask": trace.prototype.new_tensor(trace.action_mask, dtype=torch.bool),
+        "rollout_log_probs": trace.prototype.new_tensor(
+            [float(value) if value is not None else 0.0 for value in trace.token_logprobs[1:]],
             dtype=torch.float32,
         ),
-        reward=float(reward),
-        reward_components={str(name): float(value) for name, value in reward_components.items()},
-        done=True,
-        truncated=truncated,
-        terminal_reason=terminal_reason,
-        metadata=trajectory_metadata,
-        worker_policy_version=policy_version,
-    )
+        "truncated": truncated,
+        "terminal_reason": terminal_reason,
+        "metadata": trajectory_metadata,
+    }
 
 
 def request_gateway_json(

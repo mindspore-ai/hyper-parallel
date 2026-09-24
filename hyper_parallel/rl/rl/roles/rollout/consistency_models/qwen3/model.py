@@ -25,13 +25,14 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from hyper_parallel import DeviceMesh, distribute_tensor, mark_created_groups
-from hyper_parallel.distributed import validate_model_compatibility
 from rl.roles.qwen3_builder import (
     Qwen3ShardingPlanner as ShardingPlanner,
     apply_qwen3_sharding_plan as apply_sharding_plan,
 )
 from rl.roles.rollout.consistency_models.qwen3.attention import Qwen3PagedAttention
+
+from hyper_parallel import DeviceMesh, distribute_tensor, mark_created_groups
+from hyper_parallel.distributed import validate_model_compatibility
 
 
 def join_prefix(prefix: str, suffix: str) -> str:
@@ -308,15 +309,15 @@ class HyperQwen3ForCausalLM(Qwen3ForCausalLM):
             self.config.tie_word_embeddings
             and "lm_head.weight" in parameters
             and "lm_head.weight" not in loaded_parameters
-            and tied_embedding_weight is not None
         ):
-            _load_parameter(
-                parameters["lm_head.weight"],
-                tied_embedding_weight,
-                tp_mesh=self._tp_mesh,
-                placements=self._tp_placements.get("lm_head.weight"),
-            )
-            loaded_parameters.add("lm_head.weight")
+            if tied_embedding_weight is not None:
+                _load_parameter(
+                    parameters["lm_head.weight"],
+                    tied_embedding_weight,
+                    tp_mesh=self._tp_mesh,
+                    placements=self._tp_placements.get("lm_head.weight"),
+                )
+                loaded_parameters.add("lm_head.weight")
 
         missing_parameters = set(parameters).difference(loaded_parameters)
         if require_all and missing_parameters:

@@ -273,6 +273,27 @@ class AgentRunner:
         active_rows = [
             row for row, was_active in enumerate(active_before_generation) if was_active
         ]
+        action_texts = self._decode_active_rows(active_rows, response_ids, response_mask)
+        for action_index, row in enumerate(active_rows):
+            session = sessions[row]
+            active_sessions.append(session)
+            actions.append(self._decoded_action(action_texts[action_index], row, result, response_ids, response_mask))
+        return active_sessions, actions
+
+    @staticmethod
+    def _decoded_action(text: str, row: int, result: Any, response_ids: Any, response_mask: Any) -> Action:
+        """Keep decoded text, action tokens and log-probabilities on the same row."""
+        token_mask = response_mask[row]
+        action_tokens = response_ids[row][token_mask]
+        action_log_probs = (
+            None
+            if result.rollout_log_probs is None
+            else result.rollout_log_probs[row][token_mask]
+        )
+        return Action(text, action_tokens, action_log_probs)
+
+    def _decode_active_rows(self, active_rows: list[int], response_ids: Any, response_mask: Any) -> list[str]:
+        """Decode only active response rows with the configured tokenizer path."""
         response_values = response_ids[active_rows].detach().cpu().tolist()
         mask_values = response_mask[active_rows].detach().cpu().tolist()
         decoded_ids = [
@@ -286,20 +307,7 @@ class AgentRunner:
             ]
         else:
             action_texts = self._batch_decode(decoded_ids, skip_special_tokens=True)
-        for action_index, row in enumerate(active_rows):
-            session = sessions[row]
-            token_mask = response_mask[row]
-            action_tokens = response_ids[row][token_mask]
-            action_log_probs = (
-                None
-                if result.rollout_log_probs is None
-                else result.rollout_log_probs[row][token_mask]
-            )
-            active_sessions.append(session)
-            actions.append(
-                Action(action_texts[action_index], action_tokens, action_log_probs)
-            )
-        return active_sessions, actions
+        return action_texts
 
     async def _apply_generation_result(
         self,

@@ -14,6 +14,9 @@
 # ============================================================================
 """Pure single-node runtime, DP, and TP topology mapping for vLLM rollout."""
 
+__all__ = ["VLLMRolloutTopology", "resolve_vllm_rollout_topology"]
+
+
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -140,9 +143,6 @@ def resolve_vllm_rollout_topology(
         host=host,
         port=configured_port,
     )
-
-
-__all__ = ["VLLMRolloutTopology", "resolve_vllm_rollout_topology"]
 
 
 def _parallel_sizes(config: Mapping[str, object]) -> tuple[int, int]:

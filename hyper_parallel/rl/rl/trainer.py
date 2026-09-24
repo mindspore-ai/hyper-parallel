@@ -26,12 +26,6 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 
-from hyper_parallel import hsdp_sync_stream
-from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
-from hyper_parallel.trainer.runtime.distributed import (
-    create_distributed_setup_from_config,
-    initialize_distributed,
-)
 from rl.agentic.codex import CodexRuntime
 from rl.agentic.ds_harness import DeepSeekRuntime
 from rl.algorithm.loss import build_algorithm
@@ -85,6 +79,13 @@ from rl.utils.monitoring.metrics import (
     summarize_training_diagnostics,
 )
 from rl.utils.monitoring.tracker import TrainingTracker
+
+from hyper_parallel import hsdp_sync_stream
+from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
+from hyper_parallel.trainer.runtime.distributed import (
+    create_distributed_setup_from_config,
+    initialize_distributed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -237,62 +238,66 @@ class SyncTrainer:
         """Run synchronous rollout, learning, publication, and checkpointing."""
         completed = False
         try:
-            self.checkpoints.validate_resume()
-            self.checkpoints.begin(self.state)
-            if self.state.global_step > self.rollout_engine.policy_version:
-                self._release_training_state_for_rollout()
-                self.rollout_engine.prepare_for_training()
-                self.rollout_engine.update_weights(
-                    PolicySnapshot(
-                        version=self.state.global_step,
-                        model_name=self.model_registration.name,
-                        payload=self.actor.actor_model,
-                    )
-                )
-                self._release_training_state_for_rollout()
-                self.rollout_engine.prepare_for_rollout()
-            else:
-                self._release_training_state_for_rollout()
-            if hasattr(self, "sampler"):
-                self.sampler.set_epoch(self.state.epoch)
-            data_iterator = iter(self.train_dataloader)
-            while self.state.global_step < self.state.max_steps:
-                batch, data_iterator = self._next_batch(data_iterator)
-                self._train_step(batch)
-            save_final = bool(
-                required_mapping(
-                    required_mapping(self.resolved_config, "train"),
-                    "checkpoint",
-                ).get("save_final", True)
-            )
-            if (
-                save_final
-                and self.evaluator is not None
-                and self.evaluator.last_step != self.state.global_step
-            ):
-                validation_metrics, validation_samples = self.evaluator.run(
-                    self.state.global_step
-                )
-                self._tracker.log(
-                    validation_metrics,
-                    step=self.state.global_step,
-                    sample_tables={"validation/samples": validation_samples},
-                )
-            if save_final and uses_colocated_vllm(self.resolved_config):
-                if self.rollout_engine.phase == "rollout":
-                    self.rollout_engine.prepare_for_training()
-                    self._release_training_state_for_rollout()
-                elif self.rollout_engine.phase != "training":
-                    raise RuntimeError(
-                        "Final checkpoint requires colocated vLLM in training residency, "
-                        f"got phase={self.rollout_engine.phase!r}"
-                    )
-            self.checkpoints.finalize(self.state)
-            completed = True
+            completed = self._train_and_checkpoint()
         finally:
             if completed:
                 dist.barrier()
             self._cleanup()
+
+    def _train_and_checkpoint(self) -> bool:
+        """Run training and final checkpointing, returning only after success."""
+        self.checkpoints.validate_resume()
+        self.checkpoints.begin(self.state)
+        if self.state.global_step > self.rollout_engine.policy_version:
+            self._release_training_state_for_rollout()
+            self.rollout_engine.prepare_for_training()
+            self.rollout_engine.update_weights(
+                PolicySnapshot(
+                    version=self.state.global_step,
+                    model_name=self.model_registration.name,
+                    payload=self.actor.actor_model,
+                )
+            )
+            self._release_training_state_for_rollout()
+            self.rollout_engine.prepare_for_rollout()
+        else:
+            self._release_training_state_for_rollout()
+        if hasattr(self, "sampler"):
+            self.sampler.set_epoch(self.state.epoch)
+        data_iterator = iter(self.train_dataloader)
+        while self.state.global_step < self.state.max_steps:
+            batch, data_iterator = self._next_batch(data_iterator)
+            self._train_step(batch)
+        save_final = bool(
+            required_mapping(
+                required_mapping(self.resolved_config, "train"),
+                "checkpoint",
+            ).get("save_final", True)
+        )
+        if (
+            save_final
+            and self.evaluator is not None
+            and self.evaluator.last_step != self.state.global_step
+        ):
+            validation_metrics, validation_samples = self.evaluator.run(
+                self.state.global_step
+            )
+            self._tracker.log(
+                validation_metrics,
+                step=self.state.global_step,
+                sample_tables={"validation/samples": validation_samples},
+            )
+        if save_final and uses_colocated_vllm(self.resolved_config):
+            if self.rollout_engine.phase == "rollout":
+                self.rollout_engine.prepare_for_training()
+                self._release_training_state_for_rollout()
+            elif self.rollout_engine.phase != "training":
+                raise RuntimeError(
+                    "Final checkpoint requires colocated vLLM in training residency, "
+                    f"got phase={self.rollout_engine.phase!r}"
+                )
+        self.checkpoints.finalize(self.state)
+        return True
 
     def _prepare_experience(
         self,

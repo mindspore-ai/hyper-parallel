@@ -14,6 +14,9 @@
 # ============================================================================
 """HCCL routes from Trainer producers to rollout workers."""
 
+__all__ = ["HCCLWeightTransport"]
+
+
 import logging
 import socket
 import time
@@ -160,6 +163,14 @@ class HCCLWeightTransport:
              "expected_tensor_parallel_size": self._tensor_parallel_size},
             join, timeout=180,
         )
+        self._validate_route_workers(worker_results, group_id, tp_rank)
+        if local_rank == source_rank:
+            self._groups[route] = group
+        self._group_ids[route] = group_id
+
+    @staticmethod
+    def _validate_route_workers(worker_results: Any, group_id: str, tp_rank: int) -> None:
+        """Validate joined and skipped worker acknowledgements for one route."""
         if not isinstance(worker_results, list) or not worker_results:
             raise RuntimeError(
                 f"Direct reshard group {group_id!r} returned invalid workers: {worker_results}"
@@ -182,9 +193,6 @@ class HCCLWeightTransport:
                 raise RuntimeError(
                     f"Direct reshard group {group_id!r} returned invalid skip ACK: {result}"
                 )
-        if local_rank == source_rank:
-            self._groups[route] = group
-        self._group_ids[route] = group_id
 
     def ensure_groups(
         self,
@@ -484,6 +492,3 @@ class HCCLWeightTransport:
         self._packed_group = None
         self._packed_group_id = None
         self._endpoint = None
-
-
-__all__ = ["HCCLWeightTransport"]

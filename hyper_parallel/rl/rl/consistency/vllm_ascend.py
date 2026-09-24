@@ -14,6 +14,9 @@
 # ============================================================================
 """Consistency-only patches for the pinned vLLM-Ascend runtime."""
 
+__all__ = ["install_partial_prefill_rng_fix", "patch_partial_prefill_rng"]
+
+
 # The pinned vLLM runner exposes partial-prefill sampling only through these private hooks.
 # pylint: disable=protected-access
 from functools import wraps
@@ -93,6 +96,3 @@ def install_partial_prefill_rng_fix() -> None:
     except ImportError as error:
         raise ValueError(f"vLLM-Ascend model runner is unavailable: {error}") from error
     patch_partial_prefill_rng(NPUModelRunner)
-
-
-__all__ = ["install_partial_prefill_rng_fix", "patch_partial_prefill_rng"]

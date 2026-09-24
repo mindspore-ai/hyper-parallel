@@ -260,7 +260,7 @@ class ActorRolloutWeightSync:
                     raise RuntimeError(
                         "vLLM did not remain paused after the publication cache reset"
                     )
-            synchronized_call(
+            _ = synchronized_call(
                 "post-publication pause check",
                 verify_post_publication_pause,
             )

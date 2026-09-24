@@ -170,10 +170,10 @@ def direct_reshard_workers(
     representative_dp_rank = dp_ranks[0]
     representatives = []
     for tp_rank in range(tensor_parallel_size):
-        representative = by_coordinate[(representative_dp_rank, tp_rank)]
+        representative = by_coordinate.get((representative_dp_rank, tp_rank))
         tensors = representative.get("tensors")
         if any(
-            by_coordinate[(dp_rank, tp_rank)].get("tensors") != tensors
+            by_coordinate.get((dp_rank, tp_rank)).get("tensors") != tensors
             for dp_rank in dp_ranks[1:]
         ):
             raise RuntimeError(

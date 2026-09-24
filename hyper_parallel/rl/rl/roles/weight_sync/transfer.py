@@ -14,6 +14,12 @@
 # ============================================================================
 """One publication transaction composed with a data strategy and an IPC/HCCL transport."""
 
+__all__ = [
+    "WeightPublisher",
+    "build_weight_transfer",
+]
+
+
 import logging
 from typing import Any, Mapping, Optional, Union
 
@@ -387,9 +393,3 @@ def build_weight_transfer(
         else FullGatherStrategy(source)
     )
     return WeightPublisher(primary, transport)
-
-
-__all__ = [
-    "WeightPublisher",
-    "build_weight_transfer",
-]

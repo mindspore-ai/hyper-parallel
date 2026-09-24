@@ -38,30 +38,7 @@ def build_experience_batch(
     """Pad canonical trajectories into the shared rollout batch contract."""
     if not trajectories:
         raise ValueError("At least one trajectory is required")
-    max_length = max(int(trajectory.token_ids.numel()) for trajectory in trajectories)
-    first = trajectories[0].token_ids
-    sequences = first.new_full(
-        (len(trajectories), max_length), settings.pad_token_id
-    )
-    attention_mask = first.new_zeros(
-        (len(trajectories), max_length), dtype=torch.bool
-    )
-    action_mask = attention_mask.clone()
-    any_log_probs = any(
-        trajectory.rollout_log_probs is not None for trajectory in trajectories
-    )
-    collect_log_probs = settings.collect_log_probs or any_log_probs
-    if collect_log_probs and not all(
-        trajectory.rollout_log_probs is not None for trajectory in trajectories
-    ):
-        raise ValueError("Trajectories must consistently provide rollout log-probabilities")
-    old_log_probs = None
-    if collect_log_probs:
-        old_log_probs = torch.zeros(
-            (len(trajectories), max_length - 1),
-            dtype=torch.float32,
-            device=first.device,
-        )
+    sequences, attention_mask, action_mask, old_log_probs = _allocate_experience_tensors(trajectories, settings)
     for row, trajectory in enumerate(trajectories):
         length = int(trajectory.token_ids.numel())
         sequences[row, :length] = trajectory.token_ids
@@ -72,7 +49,7 @@ def build_experience_batch(
     rewards = torch.tensor(
         [trajectory.reward for trajectory in trajectories],
         dtype=torch.float32,
-        device=first.device,
+        device=sequences.device,
     )
     responses = tuple(
         "\n".join(turn.content for turn in trajectory.turns if turn.role == "assistant")
@@ -97,6 +74,37 @@ def build_experience_batch(
         worker_policy_version=worker_versions.pop(),
         metadata=batch_metadata,
     )
+
+
+def _allocate_experience_tensors(
+    trajectories: tuple[Trajectory, ...], settings: GenerationSettings,
+) -> tuple[Any, Any, Any, Optional[Any]]:
+    """Allocate padded token, mask and optional log-probability tensors."""
+    max_length = max(int(trajectory.token_ids.numel()) for trajectory in trajectories)
+    first = trajectories[0].token_ids
+    sequences = first.new_full(
+        (len(trajectories), max_length), settings.pad_token_id
+    )
+    attention_mask = first.new_zeros(
+        (len(trajectories), max_length), dtype=torch.bool
+    )
+    action_mask = attention_mask.clone()
+    any_log_probs = any(
+        trajectory.rollout_log_probs is not None for trajectory in trajectories
+    )
+    collect_log_probs = settings.collect_log_probs or any_log_probs
+    if collect_log_probs and not all(
+        trajectory.rollout_log_probs is not None for trajectory in trajectories
+    ):
+        raise ValueError("Trajectories must consistently provide rollout log-probabilities")
+    old_log_probs = None
+    if collect_log_probs:
+        old_log_probs = torch.zeros(
+            (len(trajectories), max_length - 1),
+            dtype=torch.float32,
+            device=first.device,
+        )
+    return sequences, attention_mask, action_mask, old_log_probs
 
 
 class ExperiencePreparer:

@@ -425,6 +425,17 @@ def receive_direct_reshard(
     if group is None:
         raise RuntimeError(f"Direct reshard HCCL group {group_id!r} is not initialized")
 
+    received_bytes = _receive_direct_buckets(worker, group, buckets)
+    worker._hyper_pending_policy_version = version
+    return _receive_ack(
+        topology,
+        received_bytes,
+        bucket_count=len(buckets),
+    )
+
+
+def _receive_direct_buckets(worker: Any, group: Any, buckets: list[Mapping[str, Any]]) -> int:
+    """Receive, synchronize and apply each bucket in publication order."""
     parameters = dict(worker.model_runner.get_model().named_parameters())
     received_bytes = 0
     for bucket in buckets:
@@ -439,12 +450,7 @@ def receive_direct_reshard(
             transport="Direct reshard rollout",
         )
         del packed
-    worker._hyper_pending_policy_version = version
-    return _receive_ack(
-        topology,
-        received_bytes,
-        bucket_count=len(buckets),
-    )
+    return received_bytes
 
 
 def _ipc_worker(

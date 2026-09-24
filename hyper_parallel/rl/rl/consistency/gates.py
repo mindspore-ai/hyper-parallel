@@ -14,6 +14,13 @@
 # ============================================================================
 """Distributed numerical consistency gates."""
 
+__all__ = [
+    "measure_post_update_old_policy_mismatch",
+    "validate_consistency_forward_inputs",
+    "validate_pre_update_consistency",
+]
+
+
 from typing import Any, Optional
 
 import torch
@@ -178,13 +185,6 @@ def measure_post_update_old_policy_mismatch(
         "training/post_update_old_policy_mismatch_count": float(mismatch_count),
         "training/post_update_negative_control_valid": float(mismatch_count > 0),
     }
-
-
-__all__ = [
-    "measure_post_update_old_policy_mismatch",
-    "validate_consistency_forward_inputs",
-    "validate_pre_update_consistency",
-]
 
 
 def _populate_pre_update_record(experience, actor_log_probs, expected_policy_version, record, rank):

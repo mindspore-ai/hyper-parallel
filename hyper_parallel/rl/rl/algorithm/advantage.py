@@ -133,20 +133,7 @@ class GAEAdvantageEstimator:
         value_fp = values.float()
         if bootstrap_values is not None and tuple(bootstrap_values.shape) != (values.shape[0],):
             raise ValueError("GAE bootstrap_values must contain one value per sequence")
-        advantages = value_fp.new_zeros(value_fp.shape)
-        next_value = (value_fp.new_zeros(values.shape[0]) if bootstrap_values is None
-                      else bootstrap_values.detach().float())
-        running = value_fp.new_zeros(values.shape[0])
-        last_action = action_mask.bool().any(dim=1)
-        for index in range(values.shape[1] - 1, -1, -1):
-            active = action_mask[:, index].bool()
-            token_reward = rewards.float() * last_action
-            delta = token_reward + self.gamma * next_value - value_fp[:, index]
-            candidate = delta + self.gamma * self.gae_lambda * running
-            running = candidate.where(active, running)
-            next_value = value_fp[:, index].where(active, next_value)
-            advantages[:, index] = running * active
-            last_action = last_action & ~active
+        advantages = self._estimate_advantages(rewards, action_mask, value_fp, bootstrap_values)
         numeric_mask = action_mask.bool()
         returns = (advantages + value_fp) * numeric_mask.to(value_fp.dtype)
         if self.normalize:
@@ -157,3 +144,23 @@ class GAEAdvantageEstimator:
                     selected - selected.mean()
                 ) / (selected.std(unbiased=False) + self.epsilon)
         return TargetOutput(advantages=advantages, returns=returns)
+
+    def _estimate_advantages(
+        self, rewards: Any, action_mask: Any, value_fp: Any, bootstrap_values: Optional[Any],
+    ) -> Any:
+        """Run the action-masked GAE recurrence in reverse token order."""
+        advantages = value_fp.new_zeros(value_fp.shape)
+        next_value = (value_fp.new_zeros(value_fp.shape[0]) if bootstrap_values is None
+                      else bootstrap_values.detach().float())
+        running = value_fp.new_zeros(value_fp.shape[0])
+        last_action = action_mask.bool().any(dim=1)
+        for index in range(value_fp.shape[1] - 1, -1, -1):
+            active = action_mask[:, index].bool()
+            token_reward = rewards.float() * last_action
+            delta = token_reward + self.gamma * next_value - value_fp[:, index]
+            candidate = delta + self.gamma * self.gae_lambda * running
+            running = candidate.where(active, running)
+            next_value = value_fp[:, index].where(active, next_value)
+            advantages[:, index] = running * active
+            last_action = last_action & ~active
+        return advantages

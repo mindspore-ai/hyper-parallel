@@ -23,21 +23,6 @@ from typing import Any, Mapping, Optional
 
 import torch
 
-from hyper_parallel.components.checkpoint.config import CheckpointingConfig
-from hyper_parallel.components.optim import AdamW, MultiLRScheduler
-from hyper_parallel.models.build_options import (
-    FSDP2Config,
-    FSDP2MixedPrecisionConfig,
-)
-from hyper_parallel.trainer.config import (
-    AcceleratorConfig,
-    ActivationCheckpointConfig,
-    MixedPrecisionConfig,
-    OptimizerConfig,
-    Target,
-    TrainerConfig,
-    TrainingConfig,
-)
 from rl.agentic.core.types import InteractionMode
 from rl.agentic.envs.environment import ENVIRONMENTS, load_agentic_module
 from rl.algorithm.loss import RLAlgorithm
@@ -54,6 +39,22 @@ from rl.roles.policy.critic import build_value_model
 from rl.roles.qwen3_builder import build_causal_lm
 from rl.roles.rollout import ROLLOUT_ENGINES
 from rl.roles.weight_sync.config import resolve_weight_sync_config
+
+from hyper_parallel.components.checkpoint.config import CheckpointingConfig
+from hyper_parallel.components.optim import AdamW, MultiLRScheduler
+from hyper_parallel.models.build_options import (
+    FSDP2Config,
+    FSDP2MixedPrecisionConfig,
+)
+from hyper_parallel.trainer.config import (
+    AcceleratorConfig,
+    ActivationCheckpointConfig,
+    MixedPrecisionConfig,
+    OptimizerConfig,
+    Target,
+    TrainerConfig,
+    TrainingConfig,
+)
 
 _HCCL_MIN_PORT = 1024
 _HCCL_MAX_PORT = 65520
@@ -281,7 +282,7 @@ def _validate_vllm_basics(vllm: Mapping[str, Any]) -> tuple[str, int, int]:
         raise ValueError("The vLLM rollout path requires bfloat16")
     if str(vllm.get("host", "127.0.0.1")) not in ("127.0.0.1", "localhost"):
         raise ValueError("The external vLLM server must bind to loopback")
-    _validate_vllm_port(vllm)
+    _ = _validate_vllm_port(vllm)
     utilization = float(vllm.get("gpu_memory_utilization", 0.9))
     if not 0 < utilization < 1:
         raise ValueError("rollout.vllm.gpu_memory_utilization must be between 0 and 1")
@@ -601,7 +602,7 @@ def _validate_checkpoint(checkpoint: Mapping[str, Any]) -> None:
         raise ValueError("checkpoint.verify_reload requires checkpoint.save_final=true")
     if save_steps < 0:
         raise ValueError("checkpoint.save_steps must be non-negative")
-    _path_value(checkpoint, "output_dir")
+    _ = _path_value(checkpoint, "output_dir")
 
 
 def _validate_logging(config: Mapping[str, Any]) -> None:
@@ -732,7 +733,7 @@ def _validate_automatic_limit_inputs(
         (vllm, "block_size", "rollout.vllm"),
     )
     for section, field, prefix in positive_fields:
-        _positive_integer(section, field, prefix)
+        _ = _positive_integer(section, field, prefix)
     data_parallel_size = _positive_integer(
         vllm, "data_parallel_size", "rollout.vllm"
     )
@@ -851,6 +852,21 @@ def resolve_vllm_automatic_limits(config: Mapping[str, Any]) -> dict[str, Any]:
             data, rollout, agentic, train, accelerator, vllm
         )
     )
+    kv_capacity = _automatic_kv_limit(
+        data, rollout, agentic, vllm, text_config, tensor_parallel_size, max_observation_tokens
+    )
+    workload_capacity = _automatic_workload_capacity(train, accelerator, rollout, data_parallel_size)
+    vllm["max_num_seqs"] = min(
+        workload_capacity, kv_capacity, int(vllm["max_num_batched_tokens"])
+    )
+    return resolved
+
+
+def _automatic_kv_limit(
+    data: Mapping[str, Any], rollout: Mapping[str, Any], agentic: Mapping[str, Any],
+    vllm: Mapping[str, Any], text_config: Any, tensor_parallel_size: int, max_observation_tokens: int,
+) -> int:
+    """Resolve the existing dtype and context bounded KV capacity."""
     dtype = str(vllm.get("dtype", "bfloat16"))
     dtype_bytes = {"bfloat16": 2, "bf16": 2}.get(dtype)
     if dtype_bytes is None:
@@ -865,20 +881,21 @@ def resolve_vllm_automatic_limits(config: Mapping[str, Any]) -> dict[str, Any]:
         context_tokens,
         dtype_bytes,
     )
+    return kv_capacity
+
+
+def _automatic_workload_capacity(
+    train: Mapping[str, Any], accelerator: Mapping[str, Any],
+    rollout: Mapping[str, Any], data_parallel_size: int,
+) -> int:
+    """Compute the number of generated children per rollout replica."""
     trainer_dp_size = _trainer_data_parallel_size(accelerator)
     global_children = (
         trainer_dp_size
         * int(train.get("prompt_batch_size", 1))
         * int(rollout["num_return_sequences"])
     )
-    workload_capacity = math.ceil(global_children / data_parallel_size)
-    max_num_batched_tokens = int(vllm["max_num_batched_tokens"])
-    vllm["max_num_seqs"] = min(
-        workload_capacity,
-        kv_capacity,
-        max_num_batched_tokens,
-    )
-    return resolved
+    return math.ceil(global_children / data_parallel_size)
 
 
 def build_model_registration(config: Mapping[str, Any]) -> ModelRegistration:

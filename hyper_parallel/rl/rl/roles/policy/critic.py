@@ -21,15 +21,16 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 
+from rl.algorithm.loss import RLAlgorithm
+from rl.dataset.contracts import ExperienceBatch
+from rl.roles.qwen3_builder import build_causal_lm
+from rl.utils.monitoring.metrics import CriticUpdateMetrics
+
 from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
-from rl.algorithm.loss import RLAlgorithm
-from rl.dataset.contracts import ExperienceBatch
-from rl.roles.qwen3_builder import build_causal_lm
-from rl.utils.monitoring.metrics import CriticUpdateMetrics
 
 
 class ValueHead(torch.nn.Module):
@@ -108,7 +109,7 @@ class Critic(torch.nn.Module):  # pylint: disable=abstract-method
         max_grad_norm: float,
     ) -> None:
         """Initialize the trainable Critic and its distributed optimizer settings."""
-        torch.nn.Module.__init__(self)
+        super().__init__()
         if not algorithm.requirements.roles.critic:
             raise ValueError(f"Algorithm '{algorithm.name}' does not require a Critic")
         if optimizer is None:

@@ -14,6 +14,9 @@
 # ============================================================================
 """Environment lifecycle contracts and composition utilities."""
 
+__all__ = ["ENVIRONMENTS", "Environment", "ToolEnvironment", "load_agentic_module"]
+
+
 import sys
 
 from rl.agentic.envs import environment as _environment
@@ -21,5 +24,3 @@ from rl.agentic.envs.environment import ENVIRONMENTS, Environment, ToolEnvironme
 
 
 sys.modules.setdefault(f"{__name__}.base", _environment)
-
-__all__ = ["ENVIRONMENTS", "Environment", "ToolEnvironment", "load_agentic_module"]

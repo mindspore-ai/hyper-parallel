@@ -189,7 +189,8 @@ class JsonFunctionCallProtocol:
             tool_calls=tuple(self._tool_call(value, index) for index, value in enumerate(raw_calls))
         )
 
-    def format_tool_results(self, results: Sequence[ToolResult], context: TurnContext) -> str:
+    @staticmethod
+    def format_tool_results(results: Sequence[ToolResult], context: TurnContext) -> str:
         """Serialize correlated tool results for the next model turn."""
         del context
         payload = {"tool_results": [

@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+__all__ = ["run_qwen3_flash_attention"]
+
+
 from typing import Any
 
 # This adapter targets the PyTorch-native Transformers Qwen3 implementation
@@ -112,6 +115,3 @@ def run_qwen3_flash_attention(
         **sparse_kwargs,
     )[0]
     return attention_output.transpose(1, 2).contiguous(), None
-
-
-__all__ = ["run_qwen3_flash_attention"]
