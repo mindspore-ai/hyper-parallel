@@ -63,6 +63,7 @@ class TextTrainer:
         self.base._build_optimizer()
         self.base._build_lr_scheduler()
         self.base._build_training_context()
+        self.base._build_graph_compiler()
         self.base._init_callbacks()
 
     def _build_model_assets(self) -> None:

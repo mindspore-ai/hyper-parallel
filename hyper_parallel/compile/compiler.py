@@ -38,7 +38,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.distributed_c10d import _register_process_group
 
-from .pass_config import PassConfig
+from .pass_config import PassConfig, build_pass_config_from_trainer_config
 from .graph_parallel_plan import GraphParallelPlan
 from .passes.pipeline import PassPipeline
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
@@ -59,8 +59,9 @@ class GraphCompiler:
         self,
         model: torch.nn.Module,
         train_fn: Callable,
-        pass_config: PassConfig,
+        pass_config: Optional[PassConfig] = None,
         parallel_plan: Optional[GraphParallelPlan] = None,
+        trainer_config: Optional[Any] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
     ) -> None:
@@ -68,9 +69,13 @@ class GraphCompiler:
         Args:
             model: Model to compile
             train_fn: Training function signature: (model, input, label) -> loss
-            pass_config: Parallel configuration
+            pass_config: Parallel configuration. When omitted, the compiler
+                projects ``trainer_config`` onto a graph-mode ``PassConfig``;
+                if both are omitted, it uses ``PassConfig()``.
             parallel_plan: GraphParallelPlan declaring which modules to shard
                 (optional; enables declarative sharding)
+            trainer_config: Optional trainer topology used only to infer a
+                default ``PassConfig`` when ``pass_config`` is omitted.
             device: Device to place the model and run the graph on. Defaults
                 to the NPU device when available, otherwise CPU.
             mesh_context: Optional automodel ``MeshContext`` carrying a
@@ -82,8 +87,11 @@ class GraphCompiler:
         """
         self.model = model
         self.train_fn = train_fn
-        self.pass_config = pass_config
         self.parallel_plan = parallel_plan
+        self.pass_config = self._resolve_pass_config(
+            pass_config=pass_config,
+            trainer_config=trainer_config,
+        )
         self._mesh_context = mesh_context
         self.device = device or (
             torch.device("npu")
@@ -91,9 +99,36 @@ class GraphCompiler:
             else torch.device("cpu")
         )
 
-        pass_config.validate()
+        self.pass_config.validate()
 
         self._joint_graph = None
+        self._pytree_pre_hook: Optional[Callable[[], None]] = None
+
+    @staticmethod
+    def _resolve_pass_config(
+        *,
+        pass_config: Optional[PassConfig],
+        trainer_config: Optional[Any],
+    ) -> PassConfig:
+        """Resolve pass configuration from explicit or trainer-level input."""
+        if pass_config is not None:
+            return pass_config
+        if trainer_config is not None:
+            return build_pass_config_from_trainer_config(trainer_config)
+        return PassConfig()
+
+    @staticmethod
+    def _resolve_pass_config(
+        *,
+        pass_config: Optional[PassConfig],
+        trainer_config: Optional[Any],
+    ) -> PassConfig:
+        """Resolve pass configuration from explicit or trainer-level input."""
+        if pass_config is not None:
+            return pass_config
+        if trainer_config is not None:
+            return build_pass_config_from_trainer_config(trainer_config)
+        return PassConfig()
 
     @property
     def is_compiled(self) -> bool:
@@ -111,6 +146,9 @@ class GraphCompiler:
             **inputs: Model inputs, forwarded to ``train_fn`` as keyword
                 arguments and used to trace the joint graph
         """
+        if self._pytree_pre_hook is not None:
+            self._pytree_pre_hook()
+
         if self.pass_config.fsdp_enabled and dist.is_initialized():
             # Only build the FSDP mesh when distributed is actually up.
             # ``FSDPPass`` early-returns when ``world_size == 1``, so a
@@ -143,16 +181,24 @@ class GraphCompiler:
                 arguments (must live on the compiler's device)
 
         Returns:
-            loss: Loss value
+            tuple: ``(loss, loss_dict)`` — the backward loss and the named
+            loss values emitted by ``train_fn`` as extra graph outputs after
+            the gradients (empty when ``train_fn`` returned a bare loss
+            tensor).
         """
         if self._joint_graph is None:
             self.compile(**inputs)
 
-        loss, grads = self._run_graph(**inputs)
+        loss, grads, loss_dict = self._run_graph(**inputs)
 
         self._accumulate_grads(grads)
 
-        return loss
+        return loss, loss_dict
+
+    def set_pytree_pre_hook(self, hook: Callable[[], None]) -> "GraphCompiler":
+        """Register a no-arg hook run immediately before first compilation."""
+        self._pytree_pre_hook = hook
+        return self
 
     def to(self, device: torch.device) -> "GraphCompiler":
         """Move the model to ``device`` and remember it for graph execution."""

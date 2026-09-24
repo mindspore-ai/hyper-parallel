@@ -55,8 +55,9 @@ class GraphTrainer:
         self,
         model: torch.nn.Module,
         train_fn: Callable,
-        pass_config: PassConfig,
+        pass_config: Optional[PassConfig] = None,
         parallel_plan: Optional[GraphParallelPlan] = None,
+        trainer_config: Optional[Any] = None,
         optimizer_config: Optional[dict] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
@@ -65,9 +66,15 @@ class GraphTrainer:
         Args:
             model: Model to train
             train_fn: Training function signature: (model, input, label) -> loss
-            pass_config: Parallel configuration
+            pass_config: Parallel configuration. When omitted, GraphTrainer
+                uses ``trainer_config`` to project topology intent onto a
+                graph-mode ``PassConfig``; if ``trainer_config`` is also
+                omitted, it falls back to ``PassConfig()``.
             parallel_plan: GraphParallelPlan declaring which modules to shard
                 (optional; enables declarative sharding)
+            trainer_config: Optional eager trainer config used only to infer a
+                default graph-mode ``PassConfig`` when ``pass_config`` is not
+                provided.
             optimizer_config: Optimizer configuration
             device: Device to place the model and run training on. Defaults to
                 the NPU device when available, otherwise CPU.
@@ -85,6 +92,7 @@ class GraphTrainer:
             train_fn=train_fn,
             pass_config=pass_config,
             parallel_plan=parallel_plan,
+            trainer_config=trainer_config,
             device=device,
             mesh_context=mesh_context,
         )
@@ -124,6 +132,11 @@ class GraphTrainer:
             self.compile(**inputs)
 
         return self._compiler.forward_backward(**inputs)
+
+    @property
+    def pass_config(self) -> PassConfig:
+        """Return the compiler-owned graph pass configuration."""
+        return self._compiler.pass_config
 
     def to(self, device: torch.device) -> "GraphTrainer":
         """Move the model to ``device`` and remember it for batch placement.
@@ -199,7 +212,7 @@ class GraphTrainer:
 
             inputs = self._place_on_device(batch)
 
-            loss = self.train_step(**inputs)
+            loss, _loss_dict = self.train_step(**inputs)
             self.optimizer_step()
             losses.append(loss)
 

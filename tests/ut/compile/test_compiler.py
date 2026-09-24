@@ -80,7 +80,7 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
             device=torch.device("cpu"),
         )
 
-        loss = comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
+        loss, _loss_dict = comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
         self.assertIsNotNone(
             comp._joint_graph, "compile should populate the joint graph"
@@ -101,7 +101,7 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
         )
 
         comp.compile(x=torch.randn(2, 4), y=torch.randn(2, 4))
-        loss = comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
+        loss, _loss_dict = comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
         self.assertIsInstance(loss, torch.Tensor)
         self.assertIsNotNone(model.weight.grad)
@@ -159,6 +159,21 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
 
 class TestGraphCompilerDevice(unittest.TestCase):
     """``to`` (device move)."""
+
+    def test_pytree_pre_hook_runs_before_lazy_compile(self):
+        """The compiler should run tracer setup before its first lazy compile."""
+        comp = GraphCompiler(
+            model=_make_model(),
+            train_fn=_mse_train_fn,
+            pass_config=PassConfig(fsdp_enabled=False),
+            device=torch.device("cpu"),
+        )
+        calls = []
+        comp.set_pytree_pre_hook(lambda: calls.append("hook"))
+
+        comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
+
+        self.assertEqual(calls, ["hook"])
 
     def test_to_moves_model_and_device(self):
         """Test ``to`` moves the model and records the device."""

@@ -172,6 +172,33 @@ def resolve_reduce_op(op: Union[str, Any]) -> Any:
     return _OP_MAP.get(op, dist.ReduceOp.SUM) if isinstance(op, str) else op
 
 
+def _is_tracing_or_compiling() -> bool:
+    """Return True if we are inside a make_fx trace or torch.compile.
+
+    ``TracingContext.get()`` raises ``RuntimeError`` when no trace is active,
+    so we catch it and return False.
+    """
+    if torch.compiler.is_compiling():
+        return True
+    try:
+        return torch._guards.TracingContext.get() is not None  # pylint: disable=protected-access
+    except Exception:  # pylint: disable=W0718
+        return False
+
+
+def _reduce_op_to_str(reduce_op: Any) -> str:
+    """Map a ``dist.ReduceOp`` to the string name ``_functional_collectives`` expects."""
+    op_str = {
+        dist.ReduceOp.SUM: 'sum',
+        dist.ReduceOp.PRODUCT: 'product',
+        dist.ReduceOp.MAX: 'max',
+        dist.ReduceOp.MIN: 'min',
+    }.get(reduce_op, 'sum')
+    if hasattr(dist.ReduceOp, 'AVG') and reduce_op == dist.ReduceOp.AVG:
+        op_str = 'avg'
+    return op_str
+
+
 class _TorchContiguousGrad(torch.autograd.Function):  # pylint: disable=abstract-method
     """Autograd identity that materializes gradients before upstream collectives."""
 
@@ -353,16 +380,49 @@ def differentiable_all_gather_concat(data: Tensor, group, concat_size: int, conc
     """
     del concat_size
     data = ensure_contiguous(data)
-    output = [
-        _TorchContiguousGrad.apply(tensor)
-        for tensor in dist_func.all_gather(data, group=group)
-    ]
+    # Eager path: use legacy autograd API (dist_func.all_gather) to preserve
+    # original numerical behavior. Compile/graph-trace path: use functional
+    # collectives (fc.all_gather_single) for torch.compile / make_fx.
     if rank_list is not None:
         group_ranks = dist.get_process_group_ranks(group)
         if tuple(rank_list) != tuple(group_ranks):
+            # Rank subset gathering (not common path) — same for both modes.
+            output = [
+                _TorchContiguousGrad.apply(tensor)
+                for tensor in dist_func.all_gather(data, group=group)
+            ]
             rank_to_idx = {int(rank): idx for idx, rank in enumerate(group_ranks)}
             output = [output[rank_to_idx[int(rank)]] for rank in rank_list]
-    return torch.cat(output, dim=concat_dim)
+            return torch.cat(output, dim=concat_dim)
+    if not _is_tracing_or_compiling():
+        # Eager: original implementation using torch.distributed.nn.functional.
+        output = [
+            _TorchContiguousGrad.apply(tensor)
+            for tensor in dist_func.all_gather(data, group=group)
+        ]
+        return torch.cat(output, dim=concat_dim)
+    # Compile: use functional collective API for torch.compile compatibility.
+    # all_gather_single only reliably supports gather_dim=0; for other dims we
+    # gather on dim 0 then reshape to avoid _maybe_view_chunk_cat view() bugs
+    # in Dynamo fake tensor tracing.
+    group_size = dist.get_world_size(group)
+    import torch.distributed._functional_collectives as fc  # pylint: disable=C0415
+    gathered = fc.all_gather_single(data, 0, group)
+    if hasattr(gathered, 'wait'):
+        gathered = gathered.wait()
+    if concat_dim == 0:
+        return gathered
+    # Reshape from [group_size * d0, d1, ...] to [d0 * group_size, d1, ...]
+    # by moving the group_size factor from dim 0 to concat_dim.
+    orig_shape = list(data.shape)
+    gathered_shape = [orig_shape[0] * group_size] + orig_shape[1:]
+    gathered = gathered.view(gathered_shape)
+    # Move group_size from dim 0 to concat_dim via unflatten + movedim + flatten
+    unflattened = gathered.unflatten(0, (group_size, orig_shape[0]))
+    moved = torch.movedim(unflattened, 0, concat_dim)
+    result_shape = list(orig_shape)
+    result_shape[concat_dim] *= group_size
+    return moved.reshape(result_shape).contiguous()
 
 
 def differentiable_all_to_all_single(input_tensor: Tensor, input_splits: Sequence[int],
@@ -413,24 +473,44 @@ def differentiable_all_to_all(input_data: Tensor, output_shape: Sequence[int], g
 def differentiable_all_reduce(data: Tensor, op: Union[str, Any], group) -> Tensor:
     """Autograd-aware all-reduce with string or ``ReduceOp`` *op*."""
     data = ensure_contiguous(data)
-    return dist_func.all_reduce(data, op=resolve_reduce_op(op), group=group)
+    reduce_op = resolve_reduce_op(op)
+    # Eager: use legacy autograd API. Compile/graph-trace: use functional collectives.
+    if not _is_tracing_or_compiling():
+        return dist_func.all_reduce(data, op=reduce_op, group=group)
+    # Compile: use functional collective API for torch.compile compatibility.
+    # fc.all_reduce expects a string reduceOp and a ProcessGroup.
+    import torch.distributed._functional_collectives as fc  # pylint: disable=C0415
+    return fc.all_reduce(data, _reduce_op_to_str(reduce_op), group)
 
 
 def differentiable_reduce_scatter(data: Tensor, dev_num: int, axis: int,
                                   op: Union[str, Any], group) -> Tensor:
     """Autograd-aware reduce-scatter splitting ``axis`` into ``dev_num`` parts."""
     data = ensure_contiguous(data)
-    input_tuple = torch.chunk(data, dev_num, dim=axis)
-    output_tensor = torch.empty(input_tuple[0].shape, device=data.device, dtype=data.dtype)
+    reduce_op = resolve_reduce_op(op)
 
-    output_tensor = dist_func.reduce_scatter(
-        output_tensor, input_tuple, op=resolve_reduce_op(op), group=group
-    )
+    # Eager: use legacy autograd API. Compile/graph-trace: use functional collectives.
+    if not _is_tracing_or_compiling():
+        input_tuple = torch.chunk(data, dev_num, dim=axis)
+        output_tensor = torch.empty(input_tuple[0].shape, device=data.device, dtype=data.dtype)
+        output_tensor = dist_func.reduce_scatter(
+            output_tensor, input_tuple, op=reduce_op, group=group
+        )
+        # 'avg' maps to SUM in _OP_MAP, so the division stays manual.
+        if op == 'avg':
+            output_tensor = output_tensor / dev_num
+        return output_tensor
 
+    # Compile: use functional collective API for torch.compile compatibility.
+    # fc.reduce_scatter_single expects a string reduceOp, scatter_dim, and group.
+    import torch.distributed._functional_collectives as fc  # pylint: disable=C0415
+    result = fc.reduce_scatter_single(data, _reduce_op_to_str(reduce_op), axis, group)
+    if hasattr(result, 'wait'):
+        result = result.wait()
     # 'avg' maps to SUM in _OP_MAP, so the division stays manual.
     if op == 'avg':
-        output_tensor = output_tensor / dev_num
-    return output_tensor
+        result = result / dev_num
+    return result
 
 
 def differentiable_variable_all_gather(

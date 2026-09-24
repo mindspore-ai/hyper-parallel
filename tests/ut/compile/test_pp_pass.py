@@ -898,7 +898,7 @@ class TestScheduleGradEquivalence(unittest.TestCase):
         # Reference: single-card full-batch gradient on the plain joint graph
         # (traced at the FULL batch, since there is no micro-batching).
         ref_jg, ref_model, x, y = _tiny_lm_joint_graph(batch=4)
-        _, ref_grads = run_traced_graph(ref_jg, ref_model, {"x": x, "y": y})
+        _, ref_grads, _ = run_traced_graph(ref_jg, ref_model, {"x": x, "y": y})
         ref_fqns = [name for name, p in ref_model.named_parameters() if p.requires_grad]
         ref_by_fqn = {n: g.clone() for n, g in zip(ref_fqns, ref_grads)}
 
@@ -972,7 +972,7 @@ class TestScheduleGradEquivalence(unittest.TestCase):
         )
 
         ref_jg, ref_model, x, aux, y = _tiny_gated_joint_graph(batch=4)
-        _, ref_grads = run_traced_graph(ref_jg, ref_model, {"x": x, "aux": aux, "y": y})
+        _, ref_grads, _ = run_traced_graph(ref_jg, ref_model, {"x": x, "aux": aux, "y": y})
         ref_fqns = [name for name, p in ref_model.named_parameters() if p.requires_grad]
         ref_by_fqn = {n: g.clone() for n, g in zip(ref_fqns, ref_grads)}
 

@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 def instantiate_infrastructure(
     distributed_setup: Optional[DistributedSetup] = None,
     device: Optional[torch.device] = None,
+    compile_config: Optional[CompileConfig] = None,
     **kwargs: Any,
 ) -> tuple[Any, Any]:
     """Instantiate distributed infrastructure components.
@@ -91,10 +92,18 @@ def instantiate_infrastructure(
         allow_uncovered_params=getattr(
             distributed_setup, "allow_uncovered_params", False))
 
+    graph_mode_requested = (
+        compile_config.selects_graph_compiler()
+        if compile_config is not None
+        else False
+    )
+
     # FSDP2Manager: build from strategy config if available
     fsdp2_manager = None
     mesh = distributed_setup.mesh_context if distributed_setup is not None else None
     strategy_cfg = distributed_setup.strategy_config if distributed_setup is not None else None
+    if graph_mode_requested:
+        strategy_cfg = None
     if strategy_cfg is not None:
         fsdp2_manager = _instantiate_fsdp2(
             config=strategy_cfg,

@@ -28,7 +28,7 @@ follows the same contract: intent here, runtime guard in ``PpPass``.
 __all__ = ["PassConfig"]
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -120,3 +120,36 @@ class PassConfig:
             raise ValueError(
                 f"pp_microbatch_size must be >= 1, got {self.pp_microbatch_size}"
             )
+
+
+def build_pass_config_from_trainer_config(
+    config: Any,
+    *,
+    fsdp_enabled: Optional[bool] = None,
+    enable_overlap: bool = False,
+) -> PassConfig:
+    """Project trainer topology intent onto graph-mode pass config.
+
+    This helper stays in the pass-config module because it computes the
+    graph-pass surface from the trainer topology without altering runtime
+    objects. Accepting ``Any`` keeps this module importable without the
+    trainer package.
+    """
+    accelerator = config.accelerator
+    if fsdp_enabled is None:
+        fsdp_enabled = (
+            config.fsdp_config.dp_shard_size > 1
+            or config.fsdp_config.edp_shard_size > 1
+        )
+    fsdp_degree = config.fsdp_config.dp_shard_size if fsdp_enabled else None
+    return PassConfig(
+        enable_overlap=enable_overlap,
+        fsdp_enabled=fsdp_enabled,
+        fsdp_degree=fsdp_degree,
+        tp_size=accelerator.tp_size,
+        sequence_parallel=accelerator.sequence_parallel,
+        loss_parallel=accelerator.loss_parallel,
+    )
+
+
+__all__ = ["PassConfig", "build_pass_config_from_trainer_config"]

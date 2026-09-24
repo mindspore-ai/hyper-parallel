@@ -47,6 +47,7 @@ from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerB
 from transformers.modeling_outputs import ModelOutput
 
 from hyper_parallel import HSDPModule, SkipDTensorDispatch
+from hyper_parallel.compile.compiler import GraphCompiler
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.trainer.config import (
@@ -433,6 +434,42 @@ class BaseTrainer(Stateful, ABC):
         else:
             self.model_fwd_context = nullcontext()
         self.model_bwd_context = nullcontext()
+        self.graph_compiler: Optional[GraphCompiler] = None
+
+    def _build_graph_compiler(self) -> None:
+        """Build the optional joint-graph compiler for this trainer runtime."""
+        if not self.config.compile.selects_graph_compiler():
+            return
+        self.graph_compiler = GraphCompiler(
+            model=self.model,
+            train_fn=self._graph_train_fn,
+            trainer_config=self.config,
+            device=self.device,
+            mesh_context=self.mesh,
+        )
+
+    def _graph_train_fn(
+            self,
+            model: torch.nn.Module,
+            model_inputs: Dict[str, Any],
+            labels: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Wrap the BaseTrainer forward/loss logic for joint-graph capture."""
+        model_fwd_context = (
+            self.model_fwd_context()
+            if callable(self.model_fwd_context)
+            else self.model_fwd_context
+        )
+        with model_fwd_context:
+            outputs = model(**model_inputs, use_cache=False)
+        # postforward adds the token-weighted global aggregation used by the
+        # eager path; it embeds .item()/all_reduce, which the tracer must be
+        # able to capture for this to compile. Both the backward loss and the
+        # named per-key losses are returned: the tracer emits the loss_dict
+        # values as extra graph outputs (after the gradients), so
+        # multi-key losses keep per-key logging parity with the eager path.
+        loss, loss_dict = self.postforward(outputs, labels)
+        return loss, loss_dict
 
     def _init_callbacks(self):
         """Initialize callbacks."""
@@ -610,26 +647,40 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
-            model_fwd_context = (
-                self.model_fwd_context()
-                if callable(self.model_fwd_context)
-                else self.model_fwd_context
-            )
-            with model_fwd_context:
-                outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
+            if self.graph_compiler is not None:
+                if self.config.training.empty_cache_before_backward:
+                    logger.warning(
+                        "training.empty_cache_before_backward is ignored in graph compiler mode "
+                        "because forward and backward execute in one joint graph"
+                    )
+                # The traced ``loss_dict`` values flow back as extra graph
+                # outputs (emitted after the gradients), so the logging
+                # metrics keep per-key parity with the eager path.
+                loss, loss_dict = self.graph_compiler.forward_backward(
+                    model_inputs=micro_batch,
+                    labels=labels,
+                )
+            else:
+                model_fwd_context = (
+                    self.model_fwd_context()
+                    if callable(self.model_fwd_context)
+                    else self.model_fwd_context
+                )
+                with model_fwd_context:
+                    outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-            # with use_parallel_state("base"):
-            loss, loss_dict = self.postforward(outputs, labels)
-            # The loss graph owns everything required for backward. Releasing
-            # the model output here avoids retaining large vocabulary logits
-            # until the whole backward pass finishes.
-            del outputs
-            if self.config.training.empty_cache_before_backward:
-                empty_cache()
+                # with use_parallel_state("base"):
+                loss, loss_dict = self.postforward(outputs, labels)
+                # The loss graph owns everything required for backward. Releasing
+                # the model output here avoids retaining large vocabulary logits
+                # until the whole backward pass finishes.
+                del outputs
+                if self.config.training.empty_cache_before_backward:
+                    empty_cache()
 
-            # Backward pass
-            with self.model_bwd_context:
-                loss.backward()
+                # Backward pass
+                with self.model_bwd_context:
+                    loss.backward()
 
             del micro_batch
             return loss, loss_dict

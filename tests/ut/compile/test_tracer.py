@@ -66,8 +66,8 @@ def _trace_and_run(model, train_fn, x, y):
         # joint graph still captures correctly in this environment.
         warnings.simplefilter("ignore", RuntimeWarning)
         joint = trace_model_graph(model, train_fn, inputs)
-        loss, grads = run_traced_graph(joint, model, inputs)
-    return joint, loss, grads
+        loss, grads, loss_dict = run_traced_graph(joint, model, inputs)
+    return joint, loss, grads, loss_dict
 
 
 class TestTraceModelGraph(unittest.TestCase):
@@ -76,7 +76,7 @@ class TestTraceModelGraph(unittest.TestCase):
     def test_state_is_leading_placeholders_not_get_attr(self):
         """Test parameters/buffers are static inputs, never get_attr nodes."""
         model = _LinearWithBuffer()
-        joint, _, _ = _trace_and_run(
+        joint, _, _, _ = _trace_and_run(
             model,
             lambda m, x, y: ((m(x) - y) ** 2).mean(),
             torch.randn(2, 4),
@@ -95,7 +95,7 @@ class TestTraceModelGraph(unittest.TestCase):
     def test_state_fqns_and_param_flag(self):
         """Test state_fqns order and the buffer-vs-param flag."""
         model = _LinearWithBuffer()
-        joint, _, _ = _trace_and_run(
+        joint, _, _, _ = _trace_and_run(
             model,
             lambda m, x, y: ((m(x) - y) ** 2).mean(),
             torch.randn(2, 4),
@@ -109,7 +109,7 @@ class TestTraceModelGraph(unittest.TestCase):
     def test_param_names_only_trainable(self):
         """Test ``param_names`` lists trainable parameter names."""
         model = _LinearWithBuffer()
-        joint, _, _ = _trace_and_run(
+        joint, _, _, _ = _trace_and_run(
             model,
             lambda m, x, y: ((m(x) - y) ** 2).mean(),
             torch.randn(2, 4),
@@ -127,7 +127,7 @@ class TestRunTracedGraph(unittest.TestCase):
         x = torch.randn(2, 4)
         y = torch.randn(2, 4)
 
-        joint, loss, grads = _trace_and_run(
+        joint, loss, grads, _ = _trace_and_run(
             model,
             lambda m, x, y: ((m(x) - y) ** 2).mean(),
             x,
@@ -143,12 +143,45 @@ class TestRunTracedGraph(unittest.TestCase):
         for got, expected in zip(grads, ref_grads):
             self.assertTrue(torch.allclose(got, expected, atol=1e-5))
 
+    def test_loss_dict_outputs_match_train_fn(self):
+        """A train_fn returning (loss, loss_dict) emits named loss graph outputs."""
+        model = _LinearWithBuffer()
+        x = torch.randn(2, 4)
+        y = torch.randn(2, 4)
+
+        def _train_fn(m, x, y):
+            local = ((m(x) - y) ** 2).mean()
+            return local, {"foundation_loss": local.detach(), "scaled": local.detach() * 2}
+
+        joint, loss, grads, loss_dict = _trace_and_run(model, _train_fn, x, y)
+
+        ref_loss = ((model(x) - y) ** 2).mean()
+        self.assertTrue(torch.isclose(loss, ref_loss, atol=1e-5).item())
+        # The loss_dict outputs carry the traced names and values.
+        self.assertEqual(set(loss_dict), {"foundation_loss", "scaled"})
+        self.assertTrue(
+            torch.allclose(loss_dict["foundation_loss"], ref_loss.detach(), atol=1e-5)
+        )
+        self.assertTrue(
+            torch.allclose(loss_dict["scaled"], ref_loss.detach() * 2, atol=1e-5)
+        )
+        # The key metadata tells passes where the gradient range ends.
+        self.assertEqual(len(joint.graph_module.loss_dict_keys), 2)
+        self.assertEqual(
+            joint.graph_module.loss_dict_keys, ["foundation_loss", "scaled"]
+        )
+        # Grads still flow only through the scalar loss.
+        ref_grads = torch.autograd.grad(ref_loss, [model.lin.weight, model.lin.bias])
+        self.assertEqual(len(grads), len(ref_grads))
+        for got, expected in zip(grads, ref_grads):
+            self.assertTrue(torch.allclose(got, expected, atol=1e-5))
+
     def test_run_raises_on_state_mismatch(self):
         """Test ``run_traced_graph`` raises when the model's state changed."""
         model = _LinearWithBuffer()
         x = torch.randn(2, 4)
         y = torch.randn(2, 4)
-        joint, _, _ = _trace_and_run(
+        joint, _, _, _ = _trace_and_run(
             model,
             lambda m, x, y: ((m(x) - y) ** 2).mean(),
             x,
