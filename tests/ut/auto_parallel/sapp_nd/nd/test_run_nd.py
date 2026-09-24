@@ -1702,7 +1702,7 @@ class TestSappNDRunND(unittest.TestCase):
         """
         parser_calls = []
         parser = SimpleNamespace(
-            config_shard_emb=lambda: parser_calls.append("embed"),
+            config_shard_emb=lambda cfg: parser_calls.append(("embed", cfg)),
             config_dp_tp_exp=lambda cfg: parser_calls.append(("dp_tp", cfg.d, cfg.t)),
             config_optimizer_shard=lambda cfg: parser_calls.append(("optimizer", cfg.os_max_shard)),
             config_comm_flag=lambda cfg: parser_calls.append(("comm", cfg.sp)),
@@ -1774,7 +1774,7 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertEqual(cost_cfg.get_strategy()["dp"], 4)
         self.assertEqual(cost_cfg.gbs, 8)
-        self.assertIn("embed", parser_calls)
+        self.assertIn(("embed", cost_cfg), parser_calls)
 
         cost_cfg.offset = []
         with self.assertRaises(AttributeError):

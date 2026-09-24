@@ -33,10 +33,6 @@ class Registry(MutableMapping):
     domain registries that consume it instead of living in a utils package.
     """
 
-    # Class instance object, so that a call to `register` can be reflected into all other files correctly, even if
-    # a new instance is created (in order to locally override a given function)
-    registry = []
-
     def __init__(self, name: str) -> None:
         """Initialize the registry.
 
@@ -45,7 +41,7 @@ class Registry(MutableMapping):
                 error messages.
         """
         self._name = name
-        self.registry.append(name)
+        self.registry = [name]
         self._local_mapping = {}
         self._global_mapping = {}
 
@@ -75,8 +71,11 @@ class Registry(MutableMapping):
         self._local_mapping.update({key: value})
 
     def __delitem__(self, key: str) -> None:
-        """Delete the local override for ``key``."""
-        del self._local_mapping[key]
+        """Delete every registration for ``key`` from this registry."""
+        if key not in self._local_mapping and key not in self._global_mapping:
+            raise KeyError(key)
+        self._local_mapping.pop(key, None)
+        self._global_mapping.pop(key, None)
 
     def __iter__(self) -> Iterator[str]:
         """Iterate over all valid keys, local overrides taking precedence."""
@@ -86,6 +85,10 @@ class Registry(MutableMapping):
     def __len__(self) -> int:
         """Return the number of distinct registered keys."""
         return len(self._global_mapping.keys() | self._local_mapping.keys())
+
+    def __contains__(self, key: object) -> bool:
+        """Return whether ``key`` has a local or global registration."""
+        return key in self._local_mapping or key in self._global_mapping
 
     def register(
         self,
@@ -118,7 +121,14 @@ class Registry(MutableMapping):
             return cls_or_func
 
         def decorator(cls_or_func: Union[Type, Callable]) -> Union[Type, Callable]:
-            """Register the decorated class or function under ``key``."""
+            """Register the decorated class or function under ``key``.
+
+            Args:
+                cls_or_func: Decorated class or callable.
+
+            Returns:
+                The registered class or callable unchanged.
+            """
             if key in self._global_mapping:
                 raise ValueError(
                     f"{self._name} for '{key}' is already registered. Cannot register duplicate {self._name}."
