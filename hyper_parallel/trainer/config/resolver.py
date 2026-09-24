@@ -36,7 +36,10 @@ from hyper_parallel.trainer.config.data import (
     DatasetConfig,
     ModelAssetsConfig,
 )
-from hyper_parallel.trainer.config.optimization import OptimizerConfig
+from hyper_parallel.trainer.config.optimization import (
+    OptimizerConfig,
+    OptimizerSwapConfig,
+)
 from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 
@@ -723,7 +726,7 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
 
 
 def _resolve_optimizer_config(node: object, *, path: str) -> OptimizerConfig:
-    """Resolve an ``OptimizerConfig`` with its FP32 main-parameter policy."""
+    """Resolve an optimizer target with its precision and swap policies."""
     if not isinstance(node, Mapping):
         raise ConfigResolutionError(path, "Optimizer configuration must be a YAML mapping")
 
@@ -733,9 +736,15 @@ def _resolve_optimizer_config(node: object, *, path: str) -> OptimizerConfig:
         bool,
         path=f"{path}.fp32_main_params",
     )
+    swap = normalize_value(
+        target_node.pop("swap", {}),
+        OptimizerSwapConfig,
+        path=f"{path}.swap",
+    )
     return OptimizerConfig(
         target=_resolve_target(target_node, path=path),
         fp32_main_params=fp32_main_params,
+        swap=swap,
     )
 
 

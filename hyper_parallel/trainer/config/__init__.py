@@ -35,6 +35,7 @@ __all__ = [
     "MixedPrecisionConfig",
     "ModelIntegrationConfig",
     "OptimizerConfig",
+    "OptimizerSwapConfig",
     "ProfilingConfig",
     "Target",
     "TrainerConfig",
@@ -55,6 +56,7 @@ from hyper_parallel.trainer.config.data import (
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,
+    OptimizerSwapConfig,
 )
 from hyper_parallel.trainer.config.parallelism import (
     AcceleratorConfig,

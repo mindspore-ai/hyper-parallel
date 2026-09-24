@@ -50,6 +50,7 @@ from hyper_parallel import HSDPModule, SkipDTensorDispatch
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.trainer.config import (
+    OptimizerSwapConfig,
     TrainerConfig,
     normalize_distributed_setup_overrides,
     save_configs,
@@ -71,8 +72,14 @@ from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
+from hyper_parallel.core.optimizer import (
+    ChainedOptimizer,
+    SwapOptimizerConfig,
+    swap_optimizer,
+)
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
+    MixedPrecisionOptimizer,
 )
 from hyper_parallel.trainer.runtime import fsdp as fsdp_runtime
 from hyper_parallel.trainer.runtime import model_integration as model_integration_runtime
@@ -101,6 +108,59 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hyper_parallel.data.text.chat_template import ChatTemplate
+
+
+def _to_swap_optimizer_config(config: OptimizerSwapConfig) -> SwapOptimizerConfig:
+    """Translate the trainer-facing swap section into the core swap config.
+
+    Args:
+        config: Resolved ``optimizer.swap`` configuration section.
+
+    Returns:
+        The backend-neutral swap configuration consumed by ``swap_optimizer``.
+    """
+    return SwapOptimizerConfig(
+        swap_times=config.swap_times,
+        state_keys=config.state_keys,
+        min_numel=config.min_numel,
+        include_master_params=config.include_master_params,
+        # ``None`` means "leave it to the backend default", not "off": the core
+        # config declares ``packed_swap: bool = True``, so pass that default
+        # through rather than letting ``None`` read as a hard False.
+        packed_swap=True if config.packed_swap is None else config.packed_swap,
+    )
+
+
+def _attach_optimizer_swap(optimizer: Any, config: OptimizerSwapConfig) -> Any:
+    """Attach optimizer-state swap to every Adam/AdamW leaf of ``optimizer``.
+
+    Every YAML optimizer target returns a ``ChainedOptimizer`` of leaf
+    optimizers -- also for a single AdamW -- and the fp32 main-parameter wrapper
+    keeps the same leaf containers. The swap runtime wraps one concrete
+    Adam/AdamW and delegates everything else, so it is attached to the leaves
+    and the outer object keeps dispatching.
+
+    Args:
+        optimizer: Optimizer built by the configured target, optionally already
+            wrapped for fp32 main parameters.
+        config: Resolved ``optimizer.swap`` configuration section.
+
+    Returns:
+        The optimizer carrying swap-wrapped leaves. A leaf the swap runtime does
+        not support fails here, before the first training step.
+    """
+    swap_config = _to_swap_optimizer_config(config)
+    chained = optimizer.optimizer if isinstance(optimizer, MixedPrecisionOptimizer) else optimizer
+    if not isinstance(chained, ChainedOptimizer):
+        return swap_optimizer(optimizer, swap_config)
+
+    names = list(chained.optimizers_dict)
+    leaves = [swap_optimizer(chained.optimizers_dict[name], swap_config) for name in names]
+    # In place: the fp32 main-parameter wrapper aliases both containers.
+    chained.chained_optimizers[:] = leaves
+    for name, leaf in zip(names, leaves):
+        chained.optimizers_dict[name] = leaf
+    return optimizer
 
 
 class BaseTrainer(Stateful, ABC):
@@ -440,6 +500,11 @@ class BaseTrainer(Stateful, ABC):
             if config.optimizer.fp32_main_params
             else optimizer
         )
+        # Swap is attached after the fp32 main-parameter wrap: that wrapper owns
+        # the master parameters ``include_master_params`` swaps, and the lr
+        # scheduler built right after reads ``self.optimizer.param_groups``.
+        if config.optimizer.swap.enabled:
+            self.optimizer = _attach_optimizer_swap(self.optimizer, config.optimizer.swap)
 
     def _build_lr_scheduler(self):
         config: TrainerConfig = self.config
