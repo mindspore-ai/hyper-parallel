@@ -22,8 +22,8 @@ they never branch on model class names themselves (05 §15.9 step 1,
 adjust doc §4/§7.2). This module holds only the data contract, never
 model-class-name branches.
 
-Provider fields stay ``None`` until the family's adapter modules land
-(Qwen3-MoE: replacements/attention in M2, distributed rules in M3).
+Provider fields are lazy callables so registry discovery does not import
+model implementations or optional Transformers model packages.
 """
 
 from dataclasses import dataclass
@@ -40,6 +40,9 @@ class ModelAdapterSpec:
             their own model class name here.
         model_type: HF ``config.model_type`` (e.g. ``"qwen3_moe"``) — the
             registry lookup key.
+        min_transformers_version: minimum Transformers release containing
+            the model family. ``None`` keeps registration independent of the
+            installed Transformers version for custom or remote-code models.
         replacements: provider returning the family's module-replacement
             declarations (pointing at the generic high-performance
             ``modules`` entries — never re-implementing kernels).
@@ -57,10 +60,14 @@ class ModelAdapterSpec:
             never carries per-family knowledge.
         loss: provider returning model-family output-loss adapters that must
             intercept the model before a full terminal output is materialized.
+        init_weights: provider returning a model-family initializer with the
+            signature ``initializer(model)``. When present, the initializer
+            owns the complete weight-initialization contract for that family.
     """
 
     architecture: str
     model_type: str
+    min_transformers_version: Optional[str] = None
     replacements: Optional[Callable[..., Any]] = None
     attention: Optional[Callable[..., Any]] = None
     checkpoint: Optional[Callable[..., Any]] = None
@@ -68,3 +75,4 @@ class ModelAdapterSpec:
     expert_parallel: Optional[Callable[..., Any]] = None
     sharding_rules: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
+    init_weights: Optional[Callable[..., Any]] = None

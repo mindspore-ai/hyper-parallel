@@ -103,6 +103,9 @@ class _BaseHyperAutoModelClass:
         ③ AutoConfig.from_pretrained → hf_config
         ④ get_is_hf_model → custom/HF path
         ⑤ _build_model → meta + shard + load
+
+        Args:
+            pretrained_model_name_or_path: Hugging Face model identifier or local model path.
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
@@ -152,7 +155,7 @@ class _BaseHyperAutoModelClass:
     @classmethod
     def from_config(  # pylint: disable=unused-argument
         cls,
-        config: PretrainedConfig,
+        config: Union[str, PretrainedConfig],
         *model_args: Any,
         distributed_setup: Optional[DistributedSetup] = None,
         device_mesh: Optional[Any] = None,
@@ -171,9 +174,12 @@ class _BaseHyperAutoModelClass:
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
-        """Build model from PretrainedConfig (no weight loading).
+        """Build a model from a pretrained config or its model identifier (no weight loading).
 
         Following design doc 01 §6.1.
+
+        Args:
+            config: Pretrained configuration object, Hugging Face model identifier, or local config path.
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
@@ -183,6 +189,9 @@ class _BaseHyperAutoModelClass:
             distributed_setup=distributed_setup,
             device=_current_device(),
         )
+
+        if isinstance(config, str):
+            config = get_hf_config(config, attn_implementation, torch_dtype, **kwargs)
 
         is_hf_model = get_is_hf_model(config, force_hf=False)
 

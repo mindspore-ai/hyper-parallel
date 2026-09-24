@@ -49,6 +49,7 @@ def _load_sharding_rules():
 QWEN2_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen2MoeForCausalLM",
     model_type="qwen2_moe",
+    min_transformers_version="4.40.0",
     sharding_rules=_load_sharding_rules,
 )
 register_model_adapter(QWEN2_MOE_ADAPTER_SPEC)

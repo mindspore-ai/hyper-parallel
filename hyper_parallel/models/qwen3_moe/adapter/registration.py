@@ -69,6 +69,7 @@ def _load_loss():
 QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3MoeForCausalLM",
     model_type="qwen3_moe",
+    min_transformers_version="4.51.0",
     replacements=_load_replacements,
     attention=_load_attention,
     context_parallel=_load_context_parallel,
