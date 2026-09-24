@@ -755,42 +755,43 @@ class BaseTrainer(Stateful, ABC):
             self.local_rank, self.state.global_step, self.train_iters, self.state.epoch, self.train_epochs,
         )
 
-        start_epoch = self.state.epoch
-        for epoch in range(start_epoch, self.train_epochs):
-            if epoch != start_epoch:
-                self.train_dataloader.set_epoch(epoch)
-                self.data_iterator = HyperIter(
-                    self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
-                )
-            self.state.epoch = epoch
-
-            self.on_epoch_begin()
-
-            start_step = self.state.global_step - epoch * self.train_steps
-            train_steps = min(self.train_steps, self.train_iters - epoch * self.train_steps)
-            for _ in range(start_step, train_steps):
-                try:
-                    self.train_step(self.data_iterator)
-                except StopIteration:
-                    logger.info(
-                        "epoch:%s Dataloader finished with drop_last %s",
-                        epoch,
-                        config.dataloader.drop_last,
+        try:
+            start_epoch = self.state.epoch
+            for epoch in range(start_epoch, self.train_epochs):
+                if epoch != start_epoch:
+                    self.train_dataloader.set_epoch(epoch)
+                    self.data_iterator = HyperIter(
+                        self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
                     )
-                    break
+                self.state.epoch = epoch
 
-            self.on_epoch_end()
-            self.state.epoch = epoch + 1
+                self.on_epoch_begin()
 
-            print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+                start_step = self.state.global_step - epoch * self.train_steps
+                train_steps = min(self.train_steps, self.train_iters - epoch * self.train_steps)
+                for _ in range(start_step, train_steps):
+                    try:
+                        self.train_step(self.data_iterator)
+                    except StopIteration:
+                        logger.info(
+                            "epoch:%s Dataloader finished with drop_last %s",
+                            epoch,
+                            config.dataloader.drop_last,
+                        )
+                        break
 
+                self.on_epoch_end()
+                self.state.epoch = epoch + 1
+
+                print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+
+                if config.dataloader.use_background_prefetcher:
+                    self.data_iterator.stop()
+
+            self.on_train_end()
+        finally:
             if config.dataloader.use_background_prefetcher:
                 self.data_iterator.stop()
-
-        self.on_train_end()
-
-        if config.dataloader.use_background_prefetcher:
-            self.data_iterator.stop()
 
         synchronize()
 
