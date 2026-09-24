@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import hyper_parallel
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
@@ -61,8 +62,14 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import (
     NetworkLevel,
 )
 
-WORK_PATH = os.path.dirname(os.path.abspath(__file__))
-config_path = os.path.join(WORK_PATH, "deepseek.yaml")
+# Gate copies tests out of the source tree, so the shipped yaml is resolved
+# from the installed package rather than by walking up from this file.
+_PACKAGE_ROOT = os.path.dirname(os.path.abspath(hyper_parallel.__file__))
+config_path = os.path.normpath(os.path.join(
+    _PACKAGE_ROOT,
+    "auto_parallel", "sapp_nd", "nd", "yamls",
+    "hyper_deepseek_v3.yaml",
+))
 
 
 def _make_partition_generator(**kwargs: Any) -> PartitionGenerator:
@@ -333,8 +340,8 @@ class TestSappNDRunND(unittest.TestCase):
         """
         Feature: TestSappNDRunND.
         Description: Run the ND search-space generation and performance-ordering
-                     pipeline on the shipped DeepSeek yaml, mirroring what
-                     ``run_nd.py`` does at the CLI entry point.
+                     pipeline on the shipped DeepSeek HyperParallel yaml, mirroring
+                     what ``run_nd.py`` does at the CLI entry point.
         Expectation: ``run_generation_to_ordering`` returns a non-empty scored
                      space whose entries have the documented
                      ``(parallel_config, mem_mb, perf_score, debug_parts)`` shape,
@@ -379,7 +386,7 @@ class TestSappNDRunND(unittest.TestCase):
             dims = Dim.get_dims(["DP", "MP", "PP", "EP", "MB"])
 
             runner = Par.Parallelize(
-                "mindformers",
+                "hyper_v2",
                 config_path,
                 machine,
                 global_batch_size=None,
@@ -839,7 +846,7 @@ class TestSappNDRunND(unittest.TestCase):
                 result = runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
             self.assertEqual(result["space"], [("parallel-config", 128.0, 1.0, {})])
             first_instance = _FakeParallelize.instances[-1]
-            self.assertEqual(first_instance.args[0], "mindformers")
+            self.assertEqual(first_instance.args[0], "hyper_v2")
             self.assertEqual(first_instance.args[1], config_path)
             self.assertEqual(first_instance.args[2].number, 8)
             self.assertEqual(first_instance.kwargs["max_mem"].to_mb().size, 1024)
@@ -936,6 +943,30 @@ class TestSappNDRunND(unittest.TestCase):
                         run_name="__main__",
                     )
             self.assertEqual(_FakeParallelize.instances, [])
+
+    def test_run_nd_cli_hyper_v2_reads_device_num(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: ``-f hyper_v2`` without ``-d`` when the yaml sets
+                     ``context.device_num``.
+        Expectation: The CLI uses that world size, matching the cost-model
+                     parser and the config adapter.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            _FakeParallelize.instances = []
+            yaml_path = os.path.join(tmp_dir, "train.yaml")
+            with open(yaml_path, "w", encoding="utf-8") as handle:
+                handle.write("context:\n  device_num: 32\n")
+            argv = ["run_nd.py", "-f", "hyper_v2", "-y", yaml_path, "-v", "0"]
+            with patch.object(sys, "argv", argv):
+                runpy.run_module(
+                    "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                    run_name="__main__",
+                )
+            instance = _FakeParallelize.instances[-1]
+            self.assertEqual(instance.args[2].number, 32)
 
     def test_run_nd_cli_hyper_v2_with_search_config(self) -> None:
         """
@@ -1475,14 +1506,11 @@ class TestSappNDRunND(unittest.TestCase):
             framework parsers via config_comm_flag — the mechanism that
             estimate_from_mem_comm reads on the search (FLOP) path.
         Expectation: After parsing, both overlap fields hold the documented
-            defaults (0.9 and 0.5).  CostModelParserHyperparallel and
-            CostModelParserMindformers both call the base config_comm_flag,
-            so the hyperparallel path covers both.  CostModelParserMindspeed
-            has an inline copy (see cost_model_parser_mindspeed.py:293-294)
-            but is not tested here per project priority.
+            defaults (0.9 and 0.5).  CostModelParserHyperparallel calls the
+            base config_comm_flag.  CostModelParserMindspeed has an inline
+            copy (see cost_model_parser_mindspeed.py) but is not tested here.
         """
         # --- Hyperparallel path: calls base config_comm_flag ---
-        # (same base method is also called by CostModelParserMindformers)
         with tempfile.TemporaryDirectory() as tmp_dir:
             source_path = os.path.join(tmp_dir, "__init__.py")
             with open(source_path, "w", encoding="utf-8") as source_file:
@@ -1523,7 +1551,7 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(hp_ccfg.comm_tp_overlap, 0.5)
 
         # --- Direct test of base _CostModelParser.config_comm_flag ---
-        # Covers the shared method used by mindformers and hyper parsers.
+        # Covers the shared method used by the PyTorch config parsers.
         ccfg_direct = _ParserCostModelConfig()
         ccfg_direct.d = 2
         ccfg_direct.t = 2

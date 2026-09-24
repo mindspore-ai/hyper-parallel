@@ -96,7 +96,7 @@ def zero_if_none(v: Any, i: int, s: int) -> int:
 def yaml_from_internal(vpp: int, pp: int,
                        lp_variables: Dict[TYPE, Any],
                        nass: List[List[int]]) -> Dict[str, List[List[int]]]:
-    """Convert solver variables into the MindFormers YAML schema.
+    """Convert solver variables into the pipeline YAML schema.
 
     Args:
         vpp: Number of virtual pipeline (VPP) chunks.
@@ -142,7 +142,7 @@ def yaml_from_internal(vpp: int, pp: int,
 def internal_from_yaml(vpp: int, pp: int,
                        yaml_in: Dict[str, Any],
                        nass: List[List[int]]) -> Dict[TYPE, List[List[int]]]:
-    """Convert a MindFormers YAML schema back into per-type layer counts.
+    """Convert a pipeline YAML schema back into per-type layer counts.
 
     Args:
         vpp: Number of virtual pipeline chunks.

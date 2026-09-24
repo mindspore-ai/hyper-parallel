@@ -17,12 +17,37 @@
 import argparse
 import os
 import sys
+from typing import Optional
+
+import yaml
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger, set_verbose_level
 import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+
+
+def _device_num_from_yaml(path: str) -> Optional[int]:
+    """Return ``context.device_num`` when the training yaml declares one.
+
+    Matches :meth:`CostModelParserHyperV2._resolve_data_parallel` and the
+    config-adapter reader: the world size lives in ``context.device_num``,
+    not in the AutoModels accelerator section.
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = yaml.safe_load(handle)
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    context = raw.get("context")
+    if not isinstance(context, dict) or context.get("device_num") is None:
+        return None
+    return int(context["device_num"])
 
 
 def _run_hyper_v2_search(cli_parser, cli_args):
@@ -112,18 +137,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f",
         "--framework",
-        default="mindformers",
+        default="hyper_v2",
         type=str,
         required=False,
-        help="Framework to evaluate in "
-        "[mindformers, mindspeed, hyperparallel, hyper_v2, torchtitan]",
+        help="PyTorch config format to evaluate in "
+        "[hyper_v2, mindspeed, hyperparallel, torchtitan]",
     )
     parser.add_argument(
         "-d",
         "--devices",
         type=int,
         default=None,
-        help="Number of devices. Takes yaml value if unspecified",
+        help="Number of devices. Uses context.device_num from the yaml when omitted",
     )
     parser.add_argument(
         "-b",
@@ -294,14 +319,15 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.framework == "hyper_v2" and args.devices is None:
-        # An AutoModels train.yaml carries no world size: the runtime derives
-        # the data-parallel replicate degree from it at launch. Without -d the
-        # cluster would be inferred as d*t*cp*p, which understates HSDP runs
-        # and silently invalidates every candidate in the search.
+        args.devices = _device_num_from_yaml(args.yaml_config)
+    if args.framework == "hyper_v2" and not args.devices:
+        # An AutoModels train.yaml has no replicate field: the runtime derives
+        # it from the world size. Without -d or context.device_num the cluster
+        # would be inferred as d*t*cp*p and understate HSDP runs.
         parser.error(
-            "-d/--devices is required for hyper_v2: the device count is not "
-            "expressible in an AutoModels train.yaml. Alternatively set "
-            "context.device_num in the config."
+            "-d/--devices is required for hyper_v2 when the yaml has no "
+            "context.device_num. Set one of them so HSDP replicate is not "
+            "inferred as 1."
         )
 
     set_verbose_level(args.verbosity)

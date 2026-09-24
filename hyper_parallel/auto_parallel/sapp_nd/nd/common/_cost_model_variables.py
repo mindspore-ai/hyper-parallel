@@ -126,10 +126,10 @@ class _CostModVar:
     # Applies to both FLOP and TIME paths; the TIME path's
     # estimate_comm_score(overlap=...) call site is zeroed so this is the
     # single source of overlap.
-    # Defaults (dp=0.9, tp=0.5) are validated on MindFormers: they are the
-    # overlap that made the model match real MindFormers step times.  Raw
-    # volume over-counts because communication really does overlap with
-    # compute.  Re-validating for the hyper-parallel target is a follow-up.
+    # Defaults (dp=0.9, tp=0.5) are empirical overlap fractions. Raw volume
+    # over-counts because communication really does overlap with compute.
+    # Re-validate against profiled PyTorch step times before treating these
+    # as hardware constants.
     # Follow-up: source from hardware profiling, then fold into
     # estimate_comm_score (which also needs DP dedup, EP/CP terms, latency).
     comm_dp_overlap: float = 0.9
@@ -207,7 +207,7 @@ class _CostModVar:
         mod_name = None
         if isinstance(input_config, str):
             if input_config.endswith("yaml"):
-                mod_name = "CostModelParserMindformers"
+                mod_name = "CostModelParserHyperV2"
             if input_config.endswith("json"):
                 mod_name = "CostModelParserMindspeed"
             if input_config.endswith("toml"):
@@ -262,6 +262,6 @@ class _CostModVar:
             raise TypeError(
                 f"Expecting path string or Config object for {input_config}"
             )
-        #MindFormers format by default
+        # PyTorch HyperParallel YAML is the default config format.
         self.parser = self.get_framework_parser_naive("yaml")(self)
         self.parser.parse()

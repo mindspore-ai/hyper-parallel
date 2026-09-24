@@ -312,7 +312,6 @@ def write_ppb_config(
     ppb_data = {
         "llm_class": "0",
         "train_yaml": "",
-        "mindformers_dir": "",
         "layer_ratio": 0.33,
         "backward_ratio": 2.0,
         "head_loss": 1.5,
