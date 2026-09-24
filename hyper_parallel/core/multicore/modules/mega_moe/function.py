@@ -273,6 +273,15 @@ def _save_forward_state(
         metadata.combine_size,
         *permutation_inputs,
     )
+    workspace.track_graph(ctx)
+
+
+def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
+    """Keep retained graphs alive; older engines conservatively wait for context GC."""
+    # The engine's retention flag avoids unpacking saved tensors or guessing from output references.
+    keep_graph = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", None)  # pylint: disable=protected-access
+    if keep_graph is not None and not keep_graph():
+        workspace.release_graph(ctx)
 
 
 def _launch_forward_kernel(
@@ -462,8 +471,10 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         """
         plan = ctx.plan
         workspace = ctx.workspace
-        saved = _saved_backward_state(ctx.saved_tensors)
-        permutation_inputs = ctx.saved_tensors[12:]
+        # Non-reentrant checkpoint hooks allow each saved tensor to be unpacked only once.
+        saved_tensors = ctx.saved_tensors
+        saved = _saved_backward_state(saved_tensors)
+        permutation_inputs = saved_tensors[12:]
         workspace.claim()
         execution = None
         try:
@@ -481,6 +492,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             )
             execution.profile_call.complete()
             grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
+            _release_completed_graph(ctx, workspace)
             return (
                 grad_input,
                 execution.intermediates.grad_weight1,
