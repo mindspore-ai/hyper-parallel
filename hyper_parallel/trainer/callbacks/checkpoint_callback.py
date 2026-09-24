@@ -18,7 +18,7 @@ __all__ = ["CheckpointerCallback"]
 
 import os
 import random
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
 
@@ -133,10 +133,12 @@ class CheckpointerCallback(Callback):
         )
         self._load_checkpoint()
 
-    def on_step_end(  # pylint: disable=arguments-differ
-            self, state: TrainerState, **kwargs: Any
-    ) -> None:
-        """Save on the configured step cadence."""
+    def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:  # pylint: disable=arguments-differ
+        """Surface a failed async save, then save on the configured step cadence."""
+        # Asked every step on purpose. An async save that failed can only be
+        # reported on a thread that cannot raise into this loop, so waiting for the
+        # next save to notice would throw away every step in between.
+        self.checkpointer.raise_for_failed_async_save()
         if self._save_steps > 0 and state.global_step % self._save_steps == 0:
             if state.global_step == self._last_saved_step:
                 return
@@ -219,20 +221,22 @@ class CheckpointerCallback(Callback):
             },
         }
 
-    def _steps_per_epoch(self) -> int:
-        """Return the optimizer steps one epoch contains.
+    def _resume_position(self) -> Tuple[int, int]:
+        """Return the ``(epoch, step)`` position the training loop resumes from.
 
-        ``trainer.train_steps`` is the *run total* (``steps_per_epoch *
-        num_train_epochs``), so mapping a restored ``global_step`` back onto an
-        ``(epoch, step)`` position needs the per-epoch count, which is the
-        dataloader's length. An unsized (streaming) loader has no epoch boundary
-        of its own, so the run total stands in for it.
+        Read off the same two values the loops use rather than re-derived from
+        ``global_step``: they re-enter ``state.epoch`` and skip the optimizer steps
+        its predecessors consumed, and ``state.epoch`` is restored from the
+        checkpoint. Dividing ``global_step`` instead would be a second answer that
+        can disagree with the loop, and it would have to divide by
+        ``train_steps`` --- the optimizer steps one epoch holds --- not by the
+        dataloader's length, which counts micro-batches.
+
+        Returns:
+            The epoch training resumes in, and its offset within that epoch.
         """
-        try:
-            steps_per_epoch = len(self.trainer.train_dataloader)
-        except TypeError:
-            steps_per_epoch = 0
-        return max(steps_per_epoch or int(self.trainer.train_steps or 0), 1)
+        state = self.trainer.state
+        return state.epoch, state.global_step - state.epoch * self.trainer.train_steps
 
     # ------------------------------------------------------------------
     # Save
@@ -373,13 +377,17 @@ class CheckpointerCallback(Callback):
             )
 
         empty_cache()
+        # Computed here because this log is the only consumer: the training loops
+        # derive their own starting position from ``state`` instead, so carrying it
+        # on the trainer would be state nobody reads.
+        start_epoch, start_step = self._resume_position()
         logger.info(
             "Checkpoint loaded successfully: path=%s, global_step=%s, "
             "start_epoch=%s, start_step=%s",
             restore_path,
             self.trainer.state.global_step,
-            self.trainer.start_epoch,
-            self.trainer.start_step,
+            start_epoch,
+            start_step,
         )
 
     def _apply_extra_state(self, extra: Dict[str, Any]) -> None:
@@ -387,10 +395,6 @@ class CheckpointerCallback(Callback):
         trainer = self.trainer
         trainer.state.global_step = extra["global_step"]
         trainer.state.epoch = extra.get("epoch", 0)
-
-        steps_per_epoch = self._steps_per_epoch()
-        trainer.start_epoch = trainer.state.global_step // steps_per_epoch
-        trainer.start_step = trainer.state.global_step % steps_per_epoch
 
         # The restored step is already on disk. Without this, resuming a run that
         # had nothing left to do would have ``on_train_end`` rewrite the very

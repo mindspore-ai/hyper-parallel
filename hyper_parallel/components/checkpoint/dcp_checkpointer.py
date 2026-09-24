@@ -24,6 +24,7 @@ __all__ = [
 import gc
 import logging
 import os
+from functools import partial
 from typing import Any, Dict, List, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -384,8 +385,6 @@ class DistributedCheckpointer(CheckpointerBase):
         """Select the ``extra_state`` layout used by :meth:`save`."""
         self.extra_state_per_rank = extra_state_per_rank
         self._async_save_response: Optional[Any] = None
-        self._async_save_dir: Optional[str] = None
-        self._async_save_step: int = -1
 
     # ------------------------------------------------------------------
     # Layout helpers
@@ -508,12 +507,15 @@ class DistributedCheckpointer(CheckpointerBase):
     # ------------------------------------------------------------------
 
     def maybe_wait_for_async_save(self) -> None:
-        """Block until an in-flight async save finishes, then mark it complete.
+        """Block until an in-flight async save finishes.
 
         Safe to call when nothing is pending. This is the single entry point for
         async-save coordination --- it runs before every new save, before a
         restore, and at train end, so two saves never overlap and the process
-        never exits with a half-persisted checkpoint.
+        never exits with a half-persisted checkpoint. Publishing the checkpoint
+        is not done here: the persist callback has already written the pointer by
+        the time the future resolves, and waiting for this call to come around
+        would leave the checkpoint unnamed until the next save.
         """
         if self._async_save_response is None:
             return
@@ -522,36 +524,63 @@ class DistributedCheckpointer(CheckpointerBase):
         try:
             logger.info("[rank %s] waiting for async DCP save to finish...", rank)
             self._async_save_response.persist_completion.result()
-            self._finalize_checkpoint(self._async_save_dir, self._async_save_step)
             logger.info("[rank %s] async DCP save has been finished...", rank)
-        except Exception:
+        except Exception:  # pylint: disable=broad-except
             logger.exception("[rank %s] async DCP save failed", rank)
             raise
         finally:
             self._async_save_response = None
-            self._async_save_dir = None
-            self._async_save_step = -1
 
-    def _finalize_checkpoint(self, save_dir: Optional[str], step: int) -> None:
-        """Publish the finished checkpoint as the newest one.
+    def raise_for_failed_async_save(self) -> None:
+        """Re-raise an in-flight async save's failure as soon as it is known.
 
-        The leading barrier holds rank 0 until every rank has finished writing,
-        so the pointer is never published over a checkpoint that is still being
-        assembled; the trailing one keeps the ranks in step afterwards.
+        Non-blocking: a save still running is left alone, so a training loop can
+        afford to ask every step. That is the point --- the thread that resolves
+        the future cannot propagate anything into the training loop, so a failure
+        otherwise waits for the next :meth:`maybe_wait_for_async_save`, which is
+        the next save, and a long ``save_steps`` interval turns one failed save
+        into thousands of wasted steps.
         """
-        if save_dir is None:
+        response = self._async_save_response
+        if response is None or not response.persist_completion.done():
             return
 
-        _barrier()
+        # Dropped before the raise, so one failed save is reported once rather
+        # than at every step that follows it. The drain has nothing left to wait
+        # for either way.
+        self._async_save_response = None
+        response.persist_completion.result()
+
+    def _publish_latest(self, save_dir: str, step: int) -> None:
+        """Point the latest-checkpoint file at a checkpoint that is fully on disk.
+
+        Deliberately collective-free: the async path calls this from its persist
+        callback, which runs on a background thread while the training loop is
+        still issuing its own collectives, and a ``dist`` call from there would
+        race them. Rank 0 writing on its own is enough, because the persisting
+        child processes coordinate among themselves and rank 0 hosts their
+        coordinator --- its success already implies every rank's shards and the
+        shared ``.metadata`` have landed.
+        """
         if _get_rank() == 0:
             self._write_latest_pointer(os.path.dirname(save_dir), step)
-        _barrier()
 
         logger.info(
             "Distributed checkpoint saved successfully: global_step=%s, dir=%s",
             step,
             save_dir,
         )
+
+    def _finalize_checkpoint(self, save_dir: str, step: int) -> None:
+        """Publish a synchronously written checkpoint as the newest one.
+
+        The leading barrier holds rank 0 until every rank has finished writing,
+        so the pointer is never published over a checkpoint that is still being
+        assembled; the trailing one keeps the ranks in step afterwards. The async
+        path cannot borrow this and publishes from its persist callback instead.
+        """
+        _barrier()
+        self._publish_latest(save_dir, step)
 
     # ------------------------------------------------------------------
     # Save
@@ -589,18 +618,21 @@ class DistributedCheckpointer(CheckpointerBase):
         # collective buffers for the gather pass.
         _empty_cache()
 
-        try:
-            if save_async:
-                self._async_save_response = dcp_async_save(payload, checkpoint_id=path)
-                self._async_save_dir = path
-                self._async_save_step = global_step
-                logger.info("Async DCP save dispatched: %s", path)
-            else:
-                dcp_save(payload, checkpoint_id=path)
-                logger.info("Sync DCP save completed: %s", path)
-        except Exception:
-            logger.exception("Failed to save checkpoint at %s", path)
-            raise
+        if save_async:
+            # Publishing from the persist callback, rather than from the next
+            # ``maybe_wait_for_async_save``, is what keeps the pointer honest:
+            # a run that dies after an async save has landed but before the
+            # next save would otherwise leave a complete checkpoint on disk
+            # that the pointer never names.
+            self._async_save_response = dcp_async_save(
+                payload,
+                checkpoint_id=path,
+                callback=partial(self._publish_latest, path, global_step),
+            )
+            logger.info("Async DCP save dispatched: %s", path)
+        else:
+            dcp_save(payload, checkpoint_id=path)
+            logger.info("Sync DCP save completed: %s", path)
 
         _empty_cache()
 
