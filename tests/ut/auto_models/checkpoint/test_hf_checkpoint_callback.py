@@ -74,7 +74,7 @@ class TestHuggingFaceCheckpointCallback(unittest.TestCase):
 
             step_dir = os.path.join(checkpoint_dir, "global_step_1")
             dcp.save.assert_called_once()
-            dcp.maybe_wait_for_async_save.assert_called_once_with()
+            self.assertEqual(dcp.maybe_wait_for_async_save.call_count, 2)
             checkpoint_manager.return_value.save_pretrained.assert_called_once_with(
                 os.path.join(step_dir, "hf_ckpt")
             )

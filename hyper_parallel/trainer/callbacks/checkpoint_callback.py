@@ -16,8 +16,11 @@
 
 __all__ = ["CheckpointerCallback"]
 
+import math
 import os
 import random
+import shutil
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -31,13 +34,14 @@ from hyper_parallel.components.optim.mixed_precision_optimizer import (
     MixedPrecisionOptimizer,
 )
 from hyper_parallel.models._transformers import CheckpointManager
-from hyper_parallel.trainer.runtime.logging import create_logger
-from hyper_parallel.trainer.runtime.memory import empty_cache
+from hyper_parallel.models._transformers.model_builder import apply_model_init_dtype
 from hyper_parallel.trainer.runtime.device import (
     get_device_rng_state,
     set_device_rng_state,
 )
-from hyper_parallel.models._transformers.model_builder import apply_model_init_dtype
+from hyper_parallel.trainer.runtime.distributed import all_reduce
+from hyper_parallel.trainer.runtime.logging import create_logger
+from hyper_parallel.trainer.runtime.memory import empty_cache
 from .base import Callback, TrainerState
 
 
@@ -47,6 +51,12 @@ if TYPE_CHECKING:
 
 logger = create_logger(__name__)
 _HF_CHECKPOINT_DIR = "hf_ckpt"
+_HF_WEIGHT_FILES = (
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json",
+)
 
 
 def _as_list(value: Any) -> List[Any]:
@@ -98,6 +108,16 @@ class CheckpointerCallback(Callback):
         self._checkpoint_dir = ckpt_cfg.checkpoint_dir
         self._save_steps = ckpt_cfg.save_steps if self._save_ckpt else 0
         self._save_epochs = ckpt_cfg.save_epochs if self._save_ckpt else 0
+        save_time_interval_minutes = float(ckpt_cfg.save_time_interval_minutes)
+        if not math.isfinite(save_time_interval_minutes):
+            raise ValueError("checkpoint.save_time_interval_minutes must be finite")
+        self._save_time_interval_seconds = (
+            max(save_time_interval_minutes, 0.0) * 60.0
+            if self._save_ckpt
+            else 0.0
+        )
+        self._next_time_save: Optional[float] = None
+        self._save_total_limit = ckpt_cfg.save_total_limit
         self._is_async = ckpt_cfg.is_async
         self._is_peft = ckpt_cfg.is_peft
         self._save_optimizer = ckpt_cfg.save_optimizer
@@ -132,7 +152,8 @@ class CheckpointerCallback(Callback):
         logger.info(
             "Checkpoint configuration: "
             "checkpoint_dir=%s, save_ckpt=%s, save_hf_weights=%s, "
-            "save_steps=%s, save_epochs=%s, "
+            "save_steps=%s, save_epochs=%s, save_time_interval_minutes=%s, "
+            "save_total_limit=%s, "
             "is_async=%s, is_peft=%s, "
             "save_extra_state_per_rank=%s, restore_from=%s",
             self._checkpoint_dir,
@@ -140,21 +161,30 @@ class CheckpointerCallback(Callback):
             self._save_hf_weights,
             self._save_steps,
             self._save_epochs,
+            self._save_time_interval_seconds / 60.0,
+            self._save_total_limit,
             self._is_async,
             self._is_peft,
             self._save_extra_state_per_rank,
             self._restore_from,
         )
         self._load_checkpoint()
+        if self._save_time_interval_seconds > 0:
+            self._next_time_save = time.monotonic() + self._save_time_interval_seconds
 
     def on_step_end(  # pylint: disable=arguments-differ
         self, state: TrainerState, **kwargs: Any
     ) -> None:
-        """Save on the configured step cadence."""
-        if self._save_steps > 0 and state.global_step % self._save_steps == 0:
-            if state.global_step == self._last_saved_step:
-                return
+        """Save on either the configured step or elapsed-time cadence."""
+        step_due = self._save_steps > 0 and state.global_step % self._save_steps == 0
+        time_due = self._time_checkpoint_due()
+        if not step_due and not time_due:
+            return
+
+        if state.global_step != self._last_saved_step:
             self._save_checkpoint(state)
+        if time_due:
+            self._advance_time_deadline()
 
     def on_epoch_end(self, state: TrainerState, **kwargs: Any) -> None:
         """Save on the configured epoch cadence."""
@@ -193,10 +223,12 @@ class CheckpointerCallback(Callback):
                 self._checkpoint_dir, f"{STEP_PREFIX}{state.global_step}"
             )
             self._save_hf_checkpoint(save_dir, state.global_step)
+            self._rotate_checkpoints()
 
     def wait_for_pending_save(self) -> None:
         """Block until the checkpointer's in-flight async save is persisted."""
         self.checkpointer.maybe_wait_for_async_save()
+        self._rotate_checkpoints()
 
     # ------------------------------------------------------------------
     # Payload assembly
@@ -261,8 +293,39 @@ class CheckpointerCallback(Callback):
     # Save
     # ------------------------------------------------------------------
 
+    def _time_checkpoint_due(self) -> bool:
+        """Return one rank-consistent decision for the elapsed-time cadence."""
+        if self._next_time_save is None:
+            return False
+
+        local_due = int(time.monotonic() >= self._next_time_save)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return bool(all_reduce(local_due, op="max"))
+        return bool(local_due)
+
+    def _advance_time_deadline(self) -> None:
+        """Move the time deadline forward without accumulating save latency."""
+        if self._next_time_save is None:
+            return
+        now = time.monotonic()
+        elapsed = max(now - self._next_time_save, 0.0)
+        elapsed_intervals = int(elapsed // self._save_time_interval_seconds)
+        self._next_time_save += (elapsed_intervals + 1) * self._save_time_interval_seconds
+
     def _save_checkpoint(self, state: TrainerState, force_sync: bool = False) -> None:
         """Assemble the payload for this step and hand it to the checkpointer."""
+        if (
+                self._save_total_limit is not None
+                and self._save_total_limit > 0
+                and self._is_async
+                and self._last_saved_step >= 0
+        ):
+            # Complete and rotate the preceding async checkpoint before
+            # starting a new one. This temporarily allows limit + 1
+            # directories instead of deleting the last known-good checkpoint
+            # while its replacement is still being written.
+            self.wait_for_pending_save()
+
         save_dir = os.path.join(self._checkpoint_dir, f"{STEP_PREFIX}{state.global_step}")
         save_async = self._is_async and not force_sync
 
@@ -300,8 +363,11 @@ class CheckpointerCallback(Callback):
         if self._save_hf_weights:
             # The full-weight gather is memory-intensive, so never overlap it
             # with an asynchronous DCP persistence job.
-            self.wait_for_pending_save()
+            self.checkpointer.maybe_wait_for_async_save()
             self._save_hf_checkpoint(save_dir, state.global_step)
+            self._rotate_checkpoints()
+        elif not save_async:
+            self._rotate_checkpoints()
 
     def _save_hf_checkpoint(self, save_dir: str, global_step: int) -> None:
         """Collect and export one Transformers-compatible model checkpoint."""
@@ -327,6 +393,120 @@ class CheckpointerCallback(Callback):
                 "Hugging Face checkpoint saved successfully: global_step=%s, dir=%s",
                 global_step,
                 hf_dir,
+            )
+
+    @staticmethod
+    def _checkpoint_step(name: str) -> Optional[int]:
+        """Parse an exact ``global_step_<integer>`` directory name."""
+        if not name.startswith(STEP_PREFIX):
+            return None
+        suffix = name[len(STEP_PREFIX):]
+        if not suffix or not suffix.isascii() or not suffix.isdigit():
+            return None
+        if len(suffix) > 1 and suffix.startswith("0"):
+            return None
+        return int(suffix)
+
+    @staticmethod
+    def _is_complete_checkpoint(path: str) -> bool:
+        """Return whether a managed step directory contains a complete payload."""
+        try:
+            with os.scandir(path) as entries:
+                if any(
+                        entry.is_file(follow_symlinks=False)
+                        and (
+                            entry.name == ".metadata"
+                            or (
+                                entry.name[:-len(".metadata")].isascii()
+                                and entry.name[:-len(".metadata")].isdigit()
+                                and entry.name.endswith(".metadata")
+                            )
+                        )
+                        for entry in entries
+                ):
+                    return True
+        except OSError:
+            return False
+
+        hf_dir = os.path.join(path, _HF_CHECKPOINT_DIR)
+        if os.path.islink(hf_dir) or not os.path.isdir(hf_dir):
+            return False
+        return any(os.path.isfile(os.path.join(hf_dir, name)) for name in _HF_WEIGHT_FILES)
+
+    def _list_managed_checkpoints(self) -> List[tuple[int, str]]:
+        """List completed, non-symlink checkpoint directories from oldest to newest."""
+        checkpoint_root = os.path.realpath(self._checkpoint_dir)
+        try:
+            entries = os.scandir(checkpoint_root)
+        except OSError:
+            return []
+
+        checkpoints = []
+        with entries:
+            for entry in entries:
+                step = self._checkpoint_step(entry.name)
+                if step is None or entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    continue
+                resolved_path = os.path.realpath(entry.path)
+                if os.path.dirname(resolved_path) != checkpoint_root:
+                    logger.warning("Skipping checkpoint outside configured root: %s", entry.path)
+                    continue
+                if self._is_complete_checkpoint(resolved_path):
+                    checkpoints.append((step, resolved_path))
+
+        checkpoints.sort(key=lambda item: item[0])
+        return checkpoints
+
+    def _rotate_checkpoints(self) -> None:
+        """Delete oldest completed checkpoints while preserving active saves."""
+        limit = self._save_total_limit
+        if limit is None or limit <= 0:
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+
+        checkpoints = self._list_managed_checkpoints()
+        delete_count = len(checkpoints) - limit
+        if delete_count <= 0:
+            return
+
+        protected_steps = {
+            step
+            for step in (self._last_saved_step, self._last_hf_saved_step)
+            if step >= 0
+        }
+        deletable = [item for item in checkpoints if item[0] not in protected_steps]
+        if len(deletable) < delete_count:
+            logger.warning(
+                "Checkpoint limit %s cannot be met without deleting an active checkpoint; "
+                "keeping %s completed checkpoints.",
+                limit,
+                len(checkpoints) - len(deletable),
+            )
+            delete_count = len(deletable)
+
+        for step, checkpoint_path in deletable[:delete_count]:
+            # Revalidate immediately before deletion so a replaced path or
+            # symlink can never redirect rotation outside checkpoint_dir.
+            checkpoint_root = os.path.realpath(self._checkpoint_dir)
+            if (
+                    os.path.islink(checkpoint_path)
+                    or not os.path.isdir(checkpoint_path)
+                    or os.path.dirname(os.path.realpath(checkpoint_path)) != checkpoint_root
+                    or self._checkpoint_step(os.path.basename(checkpoint_path)) != step
+            ):
+                logger.warning("Skipping unsafe checkpoint deletion target: %s", checkpoint_path)
+                continue
+            try:
+                shutil.rmtree(checkpoint_path)
+            except OSError as exc:
+                logger.warning("Failed to delete old checkpoint %s: %s", checkpoint_path, exc)
+                continue
+            logger.info(
+                "Deleted old checkpoint due to save_total_limit=%s: %s",
+                limit,
+                checkpoint_path,
             )
 
     def _save_hf_assets(self, hf_dir: str) -> None:
