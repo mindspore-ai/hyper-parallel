@@ -102,6 +102,44 @@ class TestApi(unittest.TestCase):
         mock_rank.assert_called()
         mock_world_size.assert_called()
 
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.is_initialized", return_value=False)
+    @patch(
+        "hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size",
+        side_effect=RuntimeError("no process group"),
+    )
+    @patch(
+        "hyper_parallel.core.distributed_checkpoint.api.dist.get_rank",
+        side_effect=ValueError("no process group"),
+    )
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
+    def test_load_no_dist_without_process_group(
+        self,
+        mock_barrier,
+        mock_rank,
+        mock_world_size,
+        mock_is_initialized,
+    ):
+        """A no-dist load should work without initializing torch.distributed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch(
+                "hyper_parallel.core.distributed_checkpoint.api.dist.get_rank",
+                return_value=0,
+            ), patch(
+                "hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size",
+                return_value=1,
+            ):
+                save({"weight": torch.ones(2)}, checkpoint_id=tmpdir, no_dist=True)
+
+            loaded = {"weight": torch.zeros(2)}
+            load(loaded, checkpoint_id=tmpdir, no_dist=True)
+
+        torch.testing.assert_close(loaded["weight"], torch.ones(2))
+        # DCP timing wrappers tolerate an uninitialized group and record rank 0.
+        mock_rank.assert_called()
+        mock_world_size.assert_not_called()
+        mock_is_initialized.assert_called_once()
+        mock_barrier.assert_called_once()
+
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")

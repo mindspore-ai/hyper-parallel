@@ -36,6 +36,12 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
     rename_source_key,
     revert_weight_conversion,
 )
+from hyper_parallel.core.distributed_checkpoint import (
+    FileSystemReader,
+    TensorStorageMetadata,
+    load as load_dcp_state,
+)
+from hyper_parallel.core.distributed_checkpoint.utils import str_to_dtype
 
 from hyper_parallel import DTensor, Partial, distribute_tensor
 
@@ -627,15 +633,27 @@ class CheckpointManager:
         self,
         save_directory: str | Path,
         *,
+        dcp_checkpoint: str | Path | None = None,
         max_shard_size: int | str = "5GB",
         save_original_format: bool = True,
         **kwargs: Any,
     ) -> bool:
         """Gather model weights and save a Transformers-compatible checkpoint.
 
-        All distributed ranks must call this method. Collectives produce each
-        full tensor on every rank, but only rank 0 retains CPU weights and
-        writes files.
+        When ``dcp_checkpoint`` is provided, rank 0 reconstructs model weights
+        from the completed distributed checkpoint while the other ranks return
+        immediately. This avoids running full-model collectives against the
+        live training parameters. Without a DCP source, all distributed ranks
+        must call this method so the live sharded weights can be gathered.
+
+        Args:
+            save_directory: Destination Hugging Face checkpoint directory.
+            dcp_checkpoint: Optional completed DCP directory containing the
+                model shards to export.
+            max_shard_size: Maximum size of each Hugging Face weight shard.
+            save_original_format: Whether to reverse registered weight
+                conversions before saving.
+            **kwargs: Additional arguments forwarded to ``save_pretrained``.
 
         Returns:
             True on the writing rank and False on all other ranks.
@@ -644,7 +662,12 @@ class CheckpointManager:
         if not callable(save_method):
             raise TypeError("CheckpointManager.save_pretrained requires a Transformers model")
         is_main_process = self._is_main_process()
-        state_dict = self._gather_full_state_dict(keep_state_dict=is_main_process)
+        if dcp_checkpoint is not None:
+            if not is_main_process:
+                return False
+            state_dict = self._load_model_state_dict_from_dcp(dcp_checkpoint)
+        else:
+            state_dict = self._gather_full_state_dict(keep_state_dict=is_main_process)
         if not is_main_process:
             return False
         used_base = getattr(
@@ -673,6 +696,67 @@ class CheckpointManager:
             **kwargs,
         )
         return True
+
+    @staticmethod
+    def _model_key_from_dcp(
+        fqn: str,
+        planner_data: dict[str, tuple[Any, ...]] | None,
+    ) -> str | None:
+        """Return the model-local key for one flattened DCP entry."""
+        path = planner_data.get(fqn) if planner_data is not None else None
+        if path is not None:
+            if len(path) < 2 or path[0] != "model":
+                return None
+            return ".".join(str(part) for part in path[1:])
+        if fqn.startswith("model."):
+            return fqn[len("model."):]
+        return None
+
+    def _load_model_state_dict_from_dcp(
+        self,
+        checkpoint_id: str | Path,
+    ) -> dict[str, torch.Tensor]:
+        """Reconstruct only model tensors from a completed DCP on rank 0."""
+        reader = FileSystemReader(checkpoint_id)
+        metadata = reader.load_metadata()
+        planner_data = metadata.planner_data
+        if planner_data is not None and not isinstance(planner_data, dict):
+            raise TypeError("DCP planner_data must be a mapping for Hugging Face export")
+
+        dcp_state: dict[str, torch.Tensor] = {}
+        model_keys: dict[str, str] = {}
+        seen_model_keys: set[str] = set()
+        for fqn, storage_metadata in metadata.state_dict_metadata.items():
+            model_key = self._model_key_from_dcp(fqn, planner_data)
+            if model_key is None:
+                continue
+            if not isinstance(storage_metadata, TensorStorageMetadata):
+                raise TypeError(
+                    f"DCP model entry {fqn!r} is not a tensor and cannot be exported"
+                )
+            if model_key in seen_model_keys:
+                raise ValueError(f"Duplicate model key {model_key!r} in DCP checkpoint")
+            dcp_state[fqn] = torch.empty(
+                storage_metadata.size,
+                dtype=str_to_dtype(storage_metadata.properties.dtype),
+                device="cpu",
+            )
+            model_keys[fqn] = model_key
+            seen_model_keys.add(model_key)
+
+        if not dcp_state:
+            raise ValueError(f"No model tensors found in DCP checkpoint {checkpoint_id}")
+
+        load_dcp_state(
+            dcp_state,
+            checkpoint_id=checkpoint_id,
+            no_dist=True,
+            broadcast_replicated_tensors=False,
+        )
+        return {
+            model_keys[fqn]: tensor.detach()
+            for fqn, tensor in dcp_state.items()
+        }
 
     def load_dcp(
         self,
