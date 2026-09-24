@@ -60,6 +60,15 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
+  # Optional MegaMoe: uncomment this replacement AND change the MoE
+  # local_compute_fn below to deepseek_v41_megamoe_compute_fn (remove when: ep).
+  # Requires TP=CP=PP=1 and whole-world EP; local_num_tokens is fixed capacity.
+  # - match: "*.mlp.experts"
+  #   module_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts
+  #   replace_module:
+  #     _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
+  #     local_num_tokens: 4096
+  #     expert_capacity_factor: null
   # These replacements are optimizations only: the registered architecture is
   # executable before the Trainer applies any of them.
   - match:

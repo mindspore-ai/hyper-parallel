@@ -74,6 +74,7 @@ from hyper_parallel.components.losses.model_output import ModelOutputLoss
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
 )
+from hyper_parallel.models.runtime_resources import ModelRuntimeResources
 from hyper_parallel.trainer.runtime import fsdp as fsdp_runtime
 from hyper_parallel.trainer.runtime import model_integration as model_integration_runtime
 from hyper_parallel.trainer.runtime.data_iterator import HyperIter
@@ -197,6 +198,7 @@ class BaseTrainer(Stateful, ABC):
         """
 
         self.config: TrainerConfig = config
+        self.model_runtime_resources: ModelRuntimeResources | None = None
 
         # General setup owns distributed initialization as its first stage.
         # ``_build_distributed_setup`` remains a reserved backend hook; the
@@ -327,6 +329,8 @@ class BaseTrainer(Stateful, ABC):
             if getattr(self.config.debug, "check_fsdp_runtime", False)
             else None
         )
+        self.model_runtime_resources = ModelRuntimeResources(self.model)
+        self.model_runtime_resources.prepare()
 
     def _build_loss(self) -> None:
         """Build the configured loss module or use the model-output default."""
