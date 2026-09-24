@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib
 import random
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Sequence
@@ -37,7 +38,13 @@ _MAPPING_ANSWER_KEYS = ("ground_truth", "answer", "solution")
 
 
 def _to_builtin(value: Any) -> Any:
-    return value.tolist() if hasattr(value, "tolist") else value
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, Mapping):
+        return {key: _to_builtin(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_builtin(item) for item in value]
+    return value
 
 
 def _pick_column(
@@ -178,6 +185,36 @@ class _DistributedPromptSampler:
         self.epoch = int(epoch)
 
 
+def validate_row_adapter_config(data: Mapping[str, Any]) -> None:
+    """Validate the mutually exclusive adapted-record and text-column inputs."""
+    row_adapter = data.get("row_adapter")
+    if row_adapter is None:
+        return
+    if (not isinstance(row_adapter, str) or row_adapter.count(":") != 1
+            or not all(part.strip() for part in row_adapter.split(":"))):
+        raise ValueError("data.row_adapter must use module:function syntax")
+    if any(data.get(key) is not None for key in ("prompt_column", "answer_column", "prompt_instruction")):
+        raise ValueError("data.row_adapter owns messages and labels; column/instruction overrides must be omitted")
+
+
+def _load_row_adapter(
+    row_adapter: Optional[str], prompt_column: Optional[str], answer_column: Optional[str],
+    prompt_instruction: Optional[str],
+) -> Any:
+    """Resolve an explicit task adapter independently of text-column inference."""
+    if row_adapter is None:
+        return None
+    validate_row_adapter_config({
+        "row_adapter": row_adapter, "prompt_column": prompt_column,
+        "answer_column": answer_column, "prompt_instruction": prompt_instruction,
+    })
+    module_name, function_name = row_adapter.split(":")
+    adapter = getattr(importlib.import_module(module_name), function_name, None)
+    if not callable(adapter):
+        raise ValueError("data.row_adapter must resolve to a callable")
+    return adapter
+
+
 class PromptDataset:
     """Read tokenized prompt records from supported text parquet layouts."""
 
@@ -190,6 +227,7 @@ class PromptDataset:
         answer_column: Optional[str] = None,
         max_samples: Optional[int] = None,
         prompt_instruction: Optional[str] = None,
+        row_adapter: Optional[str] = None,
     ) -> None:
         """Load and validate a tokenized prompt dataset from parquet."""
         path = Path(parquet_path)
@@ -206,15 +244,16 @@ class PromptDataset:
         frame = pd.read_parquet(path)
         if frame.empty:
             raise ValueError(f"Prompt parquet contains no rows: {path}")
+        self._row_adapter = _load_row_adapter(row_adapter, prompt_column, answer_column, prompt_instruction)
         columns = set(str(column) for column in frame.columns)
         self._prompt_column = _pick_column(
-            columns, prompt_column, _PROMPT_COLUMN_CANDIDATES, "prompt", True
+            columns, prompt_column, _PROMPT_COLUMN_CANDIDATES, "prompt", self._row_adapter is None
         )
         self._answer_column = _pick_column(
             columns, answer_column, _ANSWER_COLUMN_CANDIDATES, "answer", False
         )
         self._answer_column_is_explicit = answer_column is not None
-        if self._answer_column is None and "reward_model" not in columns:
+        if self._row_adapter is None and self._answer_column is None and "reward_model" not in columns:
             raise ValueError(
                 "Prompt parquet is missing required columns: no ground-truth source "
                 "found; expected reward_model.ground_truth or one of "
@@ -235,13 +274,14 @@ class PromptDataset:
         """Return the number of prompt samples."""
         return len(self._records)
 
-    def _tokenize(self, prompt: str, index: int) -> tuple[Any, Any]:
+    def _tokenize(self, prompt: str, index: int, messages: Optional[tuple[Message, ...]] = None) -> tuple[Any, Any]:
         """Tokenize one prompt and enforce its configured length bound."""
         encoded = self._tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
+            ([{"role": message.role, "content": message.content} for message in messages]
+             if messages is not None else [{"role": "user", "content": prompt}]),
             add_generation_prompt=True,
             tokenize=True,
-            truncation=True,
+            truncation=messages is None,
             max_length=self._max_prompt_length,
             return_dict=True,
             tokenizer_kwargs={"return_attention_mask": True},
@@ -256,6 +296,10 @@ class PromptDataset:
                 f"Tokenizer returned invalid input_ids for sample {index}: "
                 f"shape={input_ids.shape}"
             )
+        if messages is not None and input_ids.numel() > self._max_prompt_length:
+            raise ValueError(
+                f"Adapted prompt {index} exceeds max_prompt_length={self._max_prompt_length}; preprocess it"
+            )
         if attention_mask.shape != input_ids.shape:
             raise ValueError(
                 f"Tokenizer attention_mask shape must equal input_ids shape for sample {index}: "
@@ -264,9 +308,34 @@ class PromptDataset:
             )
         return input_ids, attention_mask
 
+    def _adapt_sample(self, record: Mapping[str, Any], index: int) -> dict[str, Any]:
+        """Keep task-owned messages, labels and metadata together through collation."""
+        adapted = self._row_adapter(_to_builtin(record), index)
+        if (not isinstance(adapted, PromptRecord) or not isinstance(adapted.prompt_id, str)
+                or not adapted.prompt_id.strip()):
+            raise ValueError("data.row_adapter must return a PromptRecord with a non-empty string prompt_id")
+        if not adapted.messages or any(
+            not isinstance(message, Message)
+            or message.role not in ("system", "user", "assistant", "tool", "environment")
+            or not isinstance(message.content, str) or not message.content.strip() for message in adapted.messages
+        ):
+            raise ValueError("data.row_adapter returned invalid messages")
+        if not isinstance(adapted.metadata, dict):
+            raise ValueError("data.row_adapter metadata must be a dictionary")
+        prompt = "\n".join(message.content for message in adapted.messages)
+        input_ids, attention_mask = self._tokenize(prompt, index, tuple(adapted.messages))
+        return {
+            "sample_index": index, "prompt_id": adapted.prompt_id,
+            "source_prompt": prompt, "prompt": prompt, "messages": tuple(adapted.messages),
+            "ground_truth": adapted.ground_truth, "metadata": adapted.metadata,
+            "input_ids": input_ids, "attention_mask": attention_mask,
+        }
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         """Return one formatted and tokenized prompt sample."""
         record = self._records[index]
+        if self._row_adapter is not None:
+            return self._adapt_sample(record, index)
         source_prompt, prompt = _normalize_prompt(
             record[self._prompt_column],
             index,
@@ -328,10 +397,12 @@ def build_prompt_records(
     """Attach unpadded input tokens to prompt records consumed by rollout."""
     return tuple(
         PromptRecord(
-            prompt_id=str(int(batch["sample_indices"][index])),
-            messages=(Message("user", batch["prompts"][index]),),
+            prompt_id=(batch["prompt_ids"][index] if "prompt_ids" in batch
+                       else str(int(batch["sample_indices"][index]))),
+            messages=(batch["messages"][index] if "messages" in batch else (Message("user", batch["prompts"][index]),)),
             ground_truth=batch["ground_truths"][index],
             metadata={
+                **(batch["metadata"][index] if "metadata" in batch else {}),
                 "input_ids": input_ids[index][attention_mask[index].bool()].detach()
             },
         )
@@ -360,7 +431,10 @@ def collate_prompt_samples(samples: Sequence[dict[str, Any]], pad_token_id: int)
         "sample_indices": [int(sample["sample_index"]) for sample in samples],
         "source_prompts": [str(sample["source_prompt"]) for sample in samples],
         "prompts": [str(sample["prompt"]) for sample in samples],
-        "ground_truths": [str(sample["ground_truth"]) for sample in samples],
+        "ground_truths": [sample["ground_truth"] for sample in samples],
+        "prompt_ids": [sample.get("prompt_id", str(int(sample["sample_index"]))) for sample in samples],
+        "messages": [sample.get("messages", (Message("user", sample["prompt"]),)) for sample in samples],
+        "metadata": [sample.get("metadata", {}) for sample in samples],
     }
 
 

@@ -26,12 +26,6 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 
-from hyper_parallel import hsdp_sync_stream
-from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
-from hyper_parallel.trainer.runtime.distributed import (
-    create_distributed_setup_from_config,
-    initialize_distributed,
-)
 from rl.agentic.codex import CodexRuntime
 from rl.agentic.ds_harness import DeepSeekRuntime
 from rl.algorithm.loss import build_algorithm
@@ -54,7 +48,7 @@ from rl.consistency import (
     validate_consistency_forward_inputs,
     validate_pre_update_consistency,
 )
-from rl.dataset.batch_builder import ExperiencePreparer, get_bootstrap_values
+from rl.dataset.batch_builder import ExperiencePreparer, get_bootstrap_values, pad_agent_call_batch_for_dp
 from rl.dataset.contracts import ExperienceBatch
 from rl.dataset.data_source import (
     PromptDataset,
@@ -85,6 +79,14 @@ from rl.utils.monitoring.metrics import (
     summarize_training_diagnostics,
 )
 from rl.utils.monitoring.tracker import TrainingTracker
+
+from hyper_parallel import hsdp_sync_stream
+from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
+from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
+from hyper_parallel.trainer.runtime.distributed import (
+    create_distributed_setup_from_config,
+    initialize_distributed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +183,7 @@ class SyncTrainer:
         self.runtime_config = build_runtime_config(self.resolved_config)
         self.state = RLTrainerState(max_steps=self.runtime_config.training.train_iters)
         self._runtime_started = False
+        self._rollout_closed_for_final_checkpoint = False
         self._tracker: Optional[TrainingTracker] = None
         try:
             self._setup_runtime()
@@ -196,7 +199,8 @@ class SyncTrainer:
             cleanup_processes(
                 self._tracker,
                 getattr(self, "rollout_manager", None),
-                getattr(self, "rollout_engine", None),
+                (None if getattr(self, "_rollout_closed_for_final_checkpoint", False)
+                 else getattr(self, "rollout_engine", None)),
                 self._runtime_started,
             )
         finally:
@@ -210,6 +214,7 @@ class SyncTrainer:
         self.distributed_setup = create_distributed_setup_from_config(
             self.runtime_config
         )
+        normalize_distributed_setup_overrides(self.distributed_setup, self.runtime_config)
         # Pure TP still needs a size-one FSDP domain to retain checkpoint
         # layouts and reduce TP-replicated gradients, as in the RL source tree.
         if self.runtime_config.accelerator.tp_size > 1 and self.distributed_setup.strategy_config is None:
@@ -279,14 +284,7 @@ class SyncTrainer:
                     sample_tables={"validation/samples": validation_samples},
                 )
             if save_final and uses_colocated_vllm(self.resolved_config):
-                if self.rollout_engine.phase == "rollout":
-                    self.rollout_engine.prepare_for_training()
-                    self._release_training_state_for_rollout()
-                elif self.rollout_engine.phase != "training":
-                    raise RuntimeError(
-                        "Final checkpoint requires colocated vLLM in training residency, "
-                        f"got phase={self.rollout_engine.phase!r}"
-                    )
+                self._close_rollout_for_final_checkpoint()
             self.checkpoints.finalize(self.state)
             completed = True
         finally:
@@ -353,12 +351,12 @@ class SyncTrainer:
             values = full_values[:, :-1]
             timings["values"] = time.perf_counter() - stage_started
         stage_started = time.perf_counter()
-        experience = self.experience_preparer.prepare(
-            rollout,
-            reference_log_probs=reference_log_probs,
-            values=values,
-            bootstrap_values=bootstrap,
+        prepare = functools.partial(
+            self.experience_preparer.prepare, rollout,
+            reference_log_probs=reference_log_probs, values=values, bootstrap_values=bootstrap,
         )
+        experience = (self._run_rank_synchronized("GRPO target preparation", prepare)
+                      if self.algorithm.name == "grpo" else prepare())
         timings["adv"] = time.perf_counter() - stage_started
         diagnostic_metrics = (
             {}
@@ -412,6 +410,7 @@ class SyncTrainer:
         timings["prepare_training"] = time.perf_counter() - stage_started
         if rollout.old_log_probs is None:
             raise RuntimeError("Training rollout did not produce old_log_probs")
+        rollout = pad_agent_call_batch_for_dp(rollout, self._dp_group_info)
         collect_diagnostics = next_step % self._log_steps == 0 or (
             self.evaluator is not None and self.checkpoints.will_save(next_step)
         )
@@ -488,6 +487,7 @@ class SyncTrainer:
             batch,
             step=step,
             sample_limit=self._log_samples,
+            is_request_owner=bool(getattr(self.rollout_engine, "is_request_owner", True)),
         )
         metrics = build_training_metrics(
             step=step,
@@ -519,8 +519,11 @@ class SyncTrainer:
                 sample_tables={"validation/samples": validation_samples},
             )
         if checkpoint_will_save and uses_colocated_vllm(self.resolved_config):
-            self.rollout_engine.prepare_for_training()
-            self._release_training_state_for_rollout()
+            if step == self.state.max_steps:
+                self._close_rollout_for_final_checkpoint()
+            else:
+                self.rollout_engine.prepare_for_training()
+                self._release_training_state_for_rollout()
         self.checkpoints.complete_step(
             self.state,
             loss=actor_update.total_loss,
@@ -533,6 +536,14 @@ class SyncTrainer:
         ):
             self._release_training_state_for_rollout()
             self.rollout_engine.prepare_for_rollout()
+
+    def _close_rollout_for_final_checkpoint(self) -> None:
+        """Release inference processes and IPC consumers before the final save."""
+        if getattr(self, "_rollout_closed_for_final_checkpoint", False):
+            return
+        self.rollout_engine.close()
+        self._rollout_closed_for_final_checkpoint = True
+        self._release_training_state_for_rollout()
 
     def _validate_runtime_topology(self) -> None:
         """Validate torchrun world size against the resolved Trainer mesh."""
@@ -638,6 +649,7 @@ class SyncTrainer:
             raise ValueError("Tokenizer must define eos_token_id for response truncation")
         self.tokenizer.padding_side = "left"
         dataset_kwargs = {
+            "row_adapter": data_config.get("row_adapter"),
             "tokenizer": self.tokenizer,
             "max_prompt_length": int(data_config["max_prompt_length"]),
             "prompt_column": (
@@ -809,23 +821,27 @@ class SyncTrainer:
         )
         self._configure_rollout_tensor_parallel()
         eos_token_ids = _resolve_eos_token_ids(self.model, self.tokenizer)
+        runner_name = str(agentic_config.get("runner", "internal"))
         manager_kwargs = {
-            "engine": self.rollout_engine,
-            "tokenizer": self.tokenizer,
-            "environment_name": str(agentic_config["environment"]),
-            "max_turns": int(agentic_config["max_turns"]),
-            "max_observation_tokens": int(agentic_config["max_observation_tokens"]),
-            "max_episode_tokens": (
-                None
-                if agentic_config.get("max_episode_tokens") is None
-                else int(agentic_config["max_episode_tokens"])
-            ),
-            "environment_settings": dict(agentic_config),
-            "interaction_mode": agentic_config.get("interaction_mode"),
             "pad_token_id": int(self.tokenizer.pad_token_id),
             "eos_token_id": eos_token_ids[0],
-            "eos_token_ids": eos_token_ids,
         }
+        if runner_name == "internal":
+            manager_kwargs.update({
+                "engine": self.rollout_engine,
+                "tokenizer": self.tokenizer,
+                "environment_name": str(agentic_config["environment"]),
+                "max_turns": int(agentic_config["max_turns"]),
+                "max_observation_tokens": int(agentic_config["max_observation_tokens"]),
+                "max_episode_tokens": (
+                    None
+                    if agentic_config.get("max_episode_tokens") is None
+                    else int(agentic_config["max_episode_tokens"])
+                ),
+                "environment_settings": dict(agentic_config),
+                "interaction_mode": agentic_config.get("interaction_mode"),
+                "eos_token_ids": eos_token_ids,
+            })
         generation_kwargs = {
             "num_return_sequences": int(rollout_config["num_return_sequences"]),
             "max_new_tokens": int(rollout_config["max_new_tokens"]),
@@ -837,7 +853,6 @@ class SyncTrainer:
             "ignore_eos": bool(rollout_config.get("ignore_eos", False)),
             "do_sample": True,
         }
-        runner_name = str(agentic_config.get("runner", "internal"))
         self.codex_runtime: Optional[CodexRuntime] = None
         self.deepseek_runtime: Optional[DeepSeekRuntime] = None
         if runner_name == "codex":
@@ -881,6 +896,9 @@ class SyncTrainer:
                 max_samples=None if max_samples is None else int(max_samples),
                 log_samples=int(evaluation_config.get("log_samples", 0)),
                 progress_steps=int(evaluation_config.get("progress_steps", 0)),
+                data_parallel_rank=int(self.parallel_dims.dp_rank),
+                data_parallel_size=int(self.parallel_dims.dp_size),
+                is_request_owner=int(self.parallel_dims.tp_rank) == 0,
             )
 
     def _build_tracker(self) -> None:

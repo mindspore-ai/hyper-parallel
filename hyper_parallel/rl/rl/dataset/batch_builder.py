@@ -14,19 +14,67 @@
 # ============================================================================
 """Canonical trajectory batching and model-free target preparation."""
 from dataclasses import replace
+import math
 from typing import Any, Mapping, Optional
 
 import torch
 import torch.distributed as dist
 
 from rl.algorithm.loss import RLAlgorithm
-from rl.dataset.contracts import ExperienceBatch, Trajectory
+from rl.dataset.contracts import ExperienceBatch, Trajectory, Turn
+from rl.dataset.episodes import episode_rows
 from rl.roles.rollout.base import GenerationSettings
+from rl.tool_protocol import validate_trainability
 
 
 def _detached(value: Optional[Any]) -> Optional[Any]:
     """Detach an optional algorithm tensor."""
     return None if value is None else value.detach()
+
+
+def _validate_padding_row(row: Trajectory) -> None:
+    """Reserve padding for rows without any episode reward or trainable action."""
+    if row.reward != 0 or row.action_mask.bool().any().item():
+        raise ValueError("DP padding must have zero reward and no action tokens")
+    if any(key in row.metadata for key in ("episode_id", "call_index", "call_count")):
+        raise ValueError("DP padding must not impersonate an episode")
+
+
+def _validate_sampled_actions(row: Trajectory) -> None:
+    """Require finite action probabilities and a real prediction context."""
+    if row.token_ids.ndim != 1 or row.token_ids.numel() < 2:
+        raise ValueError("Trajectory must contain a prompt and at least one action token")
+    mask = row.action_mask[1:].bool()
+    if row.action_mask[0].item() or not mask.any().item():
+        raise ValueError("Trajectory must contain valid next-token actions")
+    if row.rollout_log_probs is not None and not torch.isfinite(row.rollout_log_probs[mask]).all().item():
+        raise ValueError("Trajectory action log probabilities must be finite")
+
+
+def _validate_trajectory_rows(trajectories: tuple[Trajectory, ...]) -> None:
+    """Reject untrainable calls before constructing tensors or targets."""
+    validate_trainability(trajectories)
+    episode_rows(trajectories)
+    for row in trajectories:
+        if not math.isfinite(row.reward):
+            raise ValueError("Trajectory reward must be finite")
+        if row.metadata.get("dp_padding", False):
+            _validate_padding_row(row)
+        else:
+            _validate_sampled_actions(row)
+
+
+def _uses_log_probs(trajectories: tuple[Trajectory, ...], settings: GenerationSettings) -> bool:
+    """Require a consistent next-token probability contract across all rows."""
+    any_log_probs = any(
+        trajectory.rollout_log_probs is not None for trajectory in trajectories
+    )
+    collect_log_probs = settings.collect_log_probs or any_log_probs
+    if collect_log_probs and not all(
+        trajectory.rollout_log_probs is not None for trajectory in trajectories
+    ):
+        raise ValueError("Trajectories must consistently provide rollout log-probabilities")
+    return collect_log_probs
 
 
 def build_experience_batch(
@@ -38,6 +86,7 @@ def build_experience_batch(
     """Pad canonical trajectories into the shared rollout batch contract."""
     if not trajectories:
         raise ValueError("At least one trajectory is required")
+    _validate_trajectory_rows(trajectories)
     max_length = max(int(trajectory.token_ids.numel()) for trajectory in trajectories)
     first = trajectories[0].token_ids
     sequences = first.new_full(
@@ -47,14 +96,7 @@ def build_experience_batch(
         (len(trajectories), max_length), dtype=torch.bool
     )
     action_mask = attention_mask.clone()
-    any_log_probs = any(
-        trajectory.rollout_log_probs is not None for trajectory in trajectories
-    )
-    collect_log_probs = settings.collect_log_probs or any_log_probs
-    if collect_log_probs and not all(
-        trajectory.rollout_log_probs is not None for trajectory in trajectories
-    ):
-        raise ValueError("Trajectories must consistently provide rollout log-probabilities")
+    collect_log_probs = _uses_log_probs(trajectories, settings)
     old_log_probs = None
     if collect_log_probs:
         old_log_probs = torch.zeros(
@@ -99,6 +141,93 @@ def build_experience_batch(
     )
 
 
+def pad_agent_call_batch_for_dp(rollout: ExperienceBatch, dp_group_info: Optional[Any]) -> ExperienceBatch:
+    """Align DP forward/backward counts while padding contributes no loss or reward.
+
+    All DP ranks participate, including ranks with legacy trajectories, so a
+    mixed segmented/legacy rollout cannot skip the alignment collective.
+    Call this before computing any Reference, Critic or advantage tensors.
+    """
+    if dp_group_info is None or dp_group_info.rank_size <= 1:
+        return rollout
+    segmented = any("episode_id" in row.metadata for row in rollout.trajectories)
+    count = rollout.sequences.shape[0]
+    summary = rollout.rewards.new_tensor([int(segmented), count], dtype=torch.int64)
+    dist.all_reduce(summary, op=dist.ReduceOp.MAX, group=dp_group_info.group)
+    has_calls, target = summary.tolist()
+    if not has_calls or target == count:
+        return rollout
+    if any(getattr(rollout, field) is not None for field in (
+        "reference_log_probs", "values", "bootstrap_values", "advantages", "returns",
+    )):
+        raise ValueError("DP call alignment must precede role outputs and target preparation")
+    return _append_padding_rows(rollout, target - count)
+
+
+def _append_padding_rows(rollout: ExperienceBatch, missing: int) -> ExperienceBatch:
+    """Repeat a valid context, clearing all trainable actions and labels."""
+    source = max(range(len(rollout.trajectories)), key=lambda row: rollout.trajectories[row].token_ids.numel())
+    template = rollout.trajectories[source]
+    padding = tuple(replace(
+        template, trajectory_id=f"{template.trajectory_id}:dp-padding:{index}",
+        turns=(Turn("system", "DP alignment padding", 0, template.token_ids.numel(), False),),
+        action_mask=torch.zeros_like(template.action_mask), reward=0.0, reward_components={},
+        rollout_log_probs=None if template.rollout_log_probs is None else torch.zeros_like(template.rollout_log_probs),
+        metadata={"dp_padding": True},
+    ) for index in range(missing))
+    selection = slice(source, source + 1)
+    return replace(
+        rollout, trajectories=rollout.trajectories + padding,
+        sequences=torch.cat((rollout.sequences, rollout.sequences[selection].repeat(missing, 1))),
+        attention_mask=torch.cat((rollout.attention_mask, rollout.attention_mask[selection].repeat(missing, 1))),
+        action_mask=torch.cat((
+            rollout.action_mask, rollout.action_mask.new_zeros((missing, rollout.action_mask.shape[1])),
+        )),
+        rewards=torch.cat((rollout.rewards, rollout.rewards.new_zeros(missing))),
+        old_log_probs=(None if rollout.old_log_probs is None else torch.cat((
+            rollout.old_log_probs, rollout.old_log_probs.new_zeros((missing, rollout.old_log_probs.shape[1])),
+        ))),
+        responses=rollout.responses + ("",) * missing,
+        metadata={**rollout.metadata, "dp_padding_rows": rollout.metadata.get("dp_padding_rows", 0) + missing},
+    )
+
+
+def _uses_episode_targets(algorithm: RLAlgorithm, rollout: ExperienceBatch, values: Any, bootstrap: Any) -> bool:
+    """Reject unsupported per-call algorithms before checking their role inputs."""
+    episode_level = any("episode_id" in row.metadata or row.metadata.get("dp_padding", False)
+                        for row in rollout.trajectories)
+    if episode_level and algorithm.name != "grpo":
+        raise ValueError("Per-call agent trajectories currently require episode-level GRPO")
+    if episode_level and (values is not None or bootstrap is not None):
+        raise ValueError("Per-call GRPO does not accept critic or bootstrap values")
+    return episode_level
+
+
+def _episode_targets(algorithm: RLAlgorithm, rollout: ExperienceBatch) -> Any:
+    """Compute one GRPO reward per episode and map its advantage to real call tokens."""
+    groups = episode_rows(rollout.trajectories)
+    expected_rewards = rollout.rewards.new_tensor([row.reward for row in rollout.trajectories])
+    if not torch.equal(rollout.rewards, expected_rewards):
+        raise ValueError("Per-call reward tensor must match its episode trajectories")
+    padding_rows = [index for index, row in enumerate(rollout.trajectories) if row.metadata.get("dp_padding", False)]
+    if padding_rows and rollout.loss_action_mask[padding_rows].any().item():
+        raise ValueError("DP padding must not contribute to the training loss mask")
+    if not groups:
+        raise ValueError("GRPO requires at least one real episode")
+    first_rows = [rows[0] for rows in groups]
+    targets = algorithm.build_targets(
+        rewards=rollout.rewards[first_rows],
+        action_mask=rollout.loss_action_mask.new_ones((len(groups), 1)),
+        group_ids=tuple(rollout.trajectories[row].group_id for row in first_rows), values=None,
+    )
+    row_to_episode = [0] * len(rollout.trajectories)
+    for index, rows in enumerate(groups):
+        for row in rows:
+            row_to_episode[row] = index
+    advantages = targets.advantages[row_to_episode, 0].unsqueeze(-1) * rollout.loss_action_mask
+    return replace(targets, advantages=advantages)
+
+
 class ExperiencePreparer:
     """Combine completed role outputs into an immutable training batch."""
 
@@ -116,6 +245,8 @@ class ExperiencePreparer:
         bootstrap_values: Optional[Any] = None,
     ) -> ExperienceBatch:
         """Validate role outputs and build algorithm-specific training targets."""
+        _validate_trajectory_rows(rollout.trajectories)
+        episode_level = _uses_episode_targets(self.algorithm, rollout, values, bootstrap_values)
         requirements = self.algorithm.requirements.data
         required_inputs = (
             (requirements.rollout_log_probs, rollout.old_log_probs, "rollout log-probabilities"),
@@ -131,13 +262,16 @@ class ExperiencePreparer:
             if rollout.trajectories
             else None
         )
-        targets = self.algorithm.build_targets(
-            rewards=rollout.rewards,
-            action_mask=rollout.loss_action_mask,
-            group_ids=group_ids,
-            values=detached_values,
-            **({"bootstrap_values": bootstrap_values} if bootstrap_values is not None else {}),
-        )
+        if episode_level:
+            targets = _episode_targets(self.algorithm, rollout)
+        else:
+            targets = self.algorithm.build_targets(
+                rewards=rollout.rewards,
+                action_mask=rollout.loss_action_mask,
+                group_ids=group_ids,
+                values=detached_values,
+                **({"bootstrap_values": bootstrap_values} if bootstrap_values is not None else {}),
+            )
         if requirements.returns and targets.returns is None:
             raise RuntimeError(
                 f"Algorithm '{self.algorithm.name}' declared returns but did not build them"

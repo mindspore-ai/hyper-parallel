@@ -142,29 +142,42 @@ class IPCWeightTransport:
 
     def _validate_results(
         self, results: Any, context: IPCContext, target_tp_rank: int, copied_bytes: int,
+        target_worker_rank: Optional[int] = None, require_all_workers: bool = False,
     ) -> None:
         """Check every returned DP replica without assuming vLLM returns all replicas."""
         if not isinstance(results, list) or not results:
             raise RuntimeError(f"IPC returned invalid receive acknowledgements: {results}")
         expected = {(worker.dp_rank, worker.tp_rank): worker.physical_device_id for worker in context.workers}
+        targets = {coordinate for coordinate in expected
+                   if target_tp_rank < 0 or coordinate[1] == target_tp_rank}
+        if target_worker_rank is not None:
+            targets = {divmod(target_worker_rank, self._tensor_parallel_size)}
+        received = self._received_coordinates(results, expected, targets, copied_bytes)
+        if (target_worker_rank is not None or require_all_workers) and received != set(expected):
+            raise RuntimeError("Expert IPC acknowledgements must cover every physical worker")
+        self._validate_complete_replicas(received)
+
+    def _validate_complete_replicas(self, received) -> None:
+        """Each reporting DP replica must acknowledge all of its TP workers."""
+        for dp_rank in {dp_rank for dp_rank, _ in received}:
+            if {tp_rank for dp, tp_rank in received if dp == dp_rank} != set(range(self._tensor_parallel_size)):
+                raise RuntimeError(f"IPC returned an incomplete TP replica: {received}")
+
+    @staticmethod
+    def _received_coordinates(results, expected, targets, copied_bytes):
+        """Validate each worker identity and byte count before accepting its receipt."""
         received = set()
         for result in results:
             if not isinstance(result, Mapping) or result.get("received") is not True:
                 raise RuntimeError(f"IPC returned invalid receive acknowledgement: {result}")
             coordinate = (int(result["dp_rank"]), int(result["tp_rank"]))
-            expected_bytes = (
-                copied_bytes
-                if target_tp_rank < 0 or coordinate[1] == target_tp_rank
-                else 0
-            )
+            expected_bytes = copied_bytes if coordinate in targets else 0
             if (coordinate in received or coordinate not in expected
                     or result.get("physical_device_id") != expected[coordinate]
                     or int(result.get("bytes", -1)) != expected_bytes):
                 raise RuntimeError(f"IPC acknowledgement differs from the target bucket: {result}")
             received.add(coordinate)
-        for dp_rank in {dp_rank for dp_rank, _ in received}:
-            if {tp_rank for dp, tp_rank in received if dp == dp_rank} != set(range(self._tensor_parallel_size)):
-                raise RuntimeError(f"IPC returned an incomplete TP replica: {results}")
+        return received
 
     @staticmethod
     def _collect_handles(
@@ -194,6 +207,7 @@ class IPCWeightTransport:
     def _receive(
         self, client: VLLMWeightSyncClientMixin, context: IPCContext, method: str,
         payload: Mapping[str, Any], policy_version: int, target_tp_rank: int, copied_bytes: int,
+        target_worker_rank: Optional[int] = None, require_all_workers: bool = False,
     ) -> None:
         """Serialize once on the coordinator and validate receipt before release."""
         def receive() -> None:
@@ -204,7 +218,9 @@ class IPCWeightTransport:
                  "policy_version": int(policy_version)},
                 context.endpoint,
             )
-            self._validate_results(results, context, target_tp_rank, copied_bytes)
+            self._validate_results(
+                results, context, target_tp_rank, copied_bytes, target_worker_rank, require_all_workers,
+            )
 
         coordinator_call("IPC bucket receive", receive)
         synchronized_call(
@@ -214,14 +230,19 @@ class IPCWeightTransport:
     def send_bucket(
         self, client: VLLMWeightSyncClientMixin, context: IPCContext,
         target_tp_rank: int, bucket_index: int, metadata: Mapping[str, Any], packed: Any, policy_version: int,
+        *, target_worker_rank: Optional[int] = None,
     ) -> None:
         """Export one buffer per target NPU and retain it until receipt is known."""
         expected_devices = {worker.physical_device_id for worker in context.workers
                             if worker.tp_rank == target_tp_rank}
+        if target_worker_rank is not None:
+            expected_devices = {worker.physical_device_id for index, worker in enumerate(context.workers)
+                                if index == target_worker_rank}
         try:
             handles = self._collect_handles(context, packed, expected_devices)
             payload = {
-                "buckets_by_target": {target_tp_rank: [{
+                "physical_worker_routes": target_worker_rank is not None,
+                "buckets_by_target": {(target_worker_rank if target_worker_rank is not None else target_tp_rank): [{
                     "target_rank": target_tp_rank, "bucket_index": bucket_index,
                     "metadata": dict(metadata), "ipc_handles": handles,
                 }]},
@@ -230,7 +251,7 @@ class IPCWeightTransport:
             }
             self._receive(
                 client, context, "receive_ipc_direct_reshard", payload, policy_version,
-                target_tp_rank, sum(int(entry["num_bytes"]) for entry in metadata["entries"]),
+                target_tp_rank, sum(int(entry["num_bytes"]) for entry in metadata["entries"]), target_worker_rank,
             )
         except Exception:
             if context.physical_device_id in expected_devices:
@@ -285,6 +306,7 @@ class IPCWeightTransport:
             }
             self._receive(
                 client, context, "receive_ipc_packed_weights", payload, policy_version, -1, total_bytes,
+                require_all_workers=any("canonical_experts" in entry for entry in metadata),
             )
         except Exception:
             self._failed_buffers.append(local_buffer)
@@ -305,7 +327,7 @@ class IPCWeightTransport:
         device = torch.device(device_type, device_handle.current_device())
         rank = dist.get_rank()
         for source_rank in range(plan.source_world_size):
-            for target_rank in range(plan.destination_tp_size):
+            for target_rank in range(plan.destination_worker_size or plan.destination_tp_size):
                 for bucket_index, bucket in enumerate(plan.for_route(source_rank, target_rank)):
                     packed = synchronized_call(
                         "direct IPC bucket packing",
@@ -319,7 +341,8 @@ class IPCWeightTransport:
                     torch.get_device_module().current_stream().synchronize()
                     try:
                         self.send_bucket(client, context, target_rank, bucket_index, bucket.worker_metadata(),
-                                         packed, policy_version)
+                                         packed, policy_version,
+                                         target_worker_rank=target_rank if plan.destination_worker_size else None)
                     finally:
                         # The transport owns any exported buffer whose receive was uncertain.
                         del packed

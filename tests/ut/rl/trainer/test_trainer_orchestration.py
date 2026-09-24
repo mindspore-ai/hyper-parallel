@@ -192,7 +192,7 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
     trainer.checkpoints = SimpleNamespace(will_save=lambda unused_step: False)
     trainer._run_rank_synchronized = lambda _name, callback: callback()
     trainer.parallel_dims = SimpleNamespace(dp_size=1)
-    trainer._dp_group_info = SimpleNamespace(group=None)
+    trainer._dp_group_info = SimpleNamespace(group=None, rank_size=1)
     trainer._release_training_state_for_rollout = lambda: calls.append("release")
     trainer._reshard_model = lambda _model: calls.append("reshard")
     trainer.model_registration = SimpleNamespace(name="qwen")
@@ -410,7 +410,7 @@ def test_trainer_runs_one_complete_synchronous_training_step(
     trainer._log_samples = 0
     trainer.evaluator = None
     trainer._runtime_started = False
-    trainer._dp_group_info = SimpleNamespace(group=None)
+    trainer._dp_group_info = SimpleNamespace(group=None, rank_size=1)
     trainer.parallel_dims = SimpleNamespace(dp_size=1)
     trainer.model_registration = SimpleNamespace(name="qwen")
     batch = {

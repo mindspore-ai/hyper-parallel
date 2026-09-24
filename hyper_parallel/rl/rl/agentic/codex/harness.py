@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import time
 import uuid
 from pathlib import Path
@@ -31,6 +32,7 @@ from rl.agentic.codex.gateway import CodexGateway
 from rl.agentic.core.program_runner import (
     HarnessProgramFactory,
     HarnessRuntime,
+    build_harness_call_trajectories,
     build_harness_trajectory,
     harness_generation_settings,
     load_reward_callable,
@@ -68,6 +70,32 @@ def build_codex_trajectory(
         reward=reward,
         reward_components=reward_components,
         end_of_turn_token_id=end_of_turn_token_id,
+        max_episode_tokens=max_episode_tokens,
+        metadata=metadata,
+    )
+
+
+def build_codex_call_trajectories(
+    *,
+    prompt: PromptRecord,
+    policy_version: int,
+    sample_index: int,
+    completion_records: Sequence[Mapping[str, Any]],
+    reward: float,
+    reward_components: Mapping[str, float],
+    max_episode_tokens: int | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> tuple[Trajectory, ...]:
+    """Keep every Codex action trainable under its real rollout prompt."""
+    return build_harness_call_trajectories(
+        label="Codex",
+        runner_name="codex",
+        prompt=prompt,
+        policy_version=policy_version,
+        sample_index=sample_index,
+        completion_records=completion_records,
+        reward=reward,
+        reward_components=reward_components,
         max_episode_tokens=max_episode_tokens,
         metadata=metadata,
     )
@@ -133,7 +161,10 @@ class CodexRuntime(HarnessRuntime):
 
     def __init__(self, engine: Any, config: Mapping[str, Any]) -> None:
         """Bind the runtime to the existing shared rollout engine."""
-        super().__init__(engine, config, CodexGateway, "Codex", 8200)
+        super().__init__(
+            engine, config, CodexGateway, "Codex", 8200,
+            gateway_options={"max_inflight_requests": int(config.get("max_inflight_requests", 1))},
+        )
 
 
 class CodexAgentProgram:
@@ -157,7 +188,7 @@ class CodexAgentProgram:
         self.end_of_turn_token_id = end_of_turn_token_id
         self.reward_callable = _load_reward_callable(self.config.get("reward_callable"))
 
-    async def run(self) -> Trajectory:
+    async def run(self) -> tuple[Trajectory, ...]:
         """Run Codex, fetch the captured network trace, score it, and convert it."""
         session_id = uuid.uuid4().hex
         artifact_dir, workspace_dir, codex_home = self._prepare_directories(session_id)
@@ -195,16 +226,21 @@ class CodexAgentProgram:
         workspace_dir: Path,
         codex_home: Path,
         timeout: float,
-    ) -> Trajectory:
+    ) -> tuple[Trajectory, ...]:
         """Execute and materialize one already registered Codex session."""
         self._write_codex_config(codex_home, session_id)
         await self._validate_version()
         started = time.perf_counter()
-        final_answer, return_code, diagnostics = await self._run_codex(
-            session_id, artifact_dir, workspace_dir, codex_home
-        )
-        if return_code != 0:
-            raise RuntimeError(f"Codex exited with status {return_code}; see {artifact_dir}")
+        execution_error = None
+        final_answer, diagnostics = "", []
+        try:
+            final_answer, return_code, diagnostics = await self._run_codex(
+                session_id, artifact_dir, workspace_dir, codex_home
+            )
+            if return_code != 0:
+                raise RuntimeError(f"Codex exited with status {return_code}; see {artifact_dir}")
+        except RuntimeError as error:
+            execution_error = error
         captured = await asyncio.to_thread(
             _http_json,
             "GET",
@@ -214,18 +250,26 @@ class CodexAgentProgram:
         )
         if captured.get("policy_version") != self.policy_version:
             raise RuntimeError("Codex gateway returned a different policy version")
-        reward_result = self.reward_callable(final_answer, self.prompt)
-        if not isinstance(reward_result, RewardResult):
-            reward_value = float(reward_result)
-            reward_result = RewardResult(reward_value, {"outcome": reward_value})
-        return build_codex_trajectory(
+        failure = captured.get("failure")
+        if failure is not None:
+            if (not isinstance(failure, Mapping) or failure.get("failure_origin") != "model"
+                    or failure.get("trainable") is not True):
+                raise RuntimeError(f"Codex gateway reported an untrainable failure: {failure}") from execution_error
+            reward_result = RewardResult(0.0, {"outcome": 0.0}, dict(failure))
+        else:
+            if execution_error is not None:
+                raise execution_error
+            reward_result = self.reward_callable(final_answer, self.prompt)
+            if not isinstance(reward_result, RewardResult):
+                reward_value = float(reward_result)
+                reward_result = RewardResult(reward_value, {"outcome": reward_value})
+        return build_codex_call_trajectories(
             prompt=self.prompt,
             policy_version=self.policy_version,
             sample_index=self.sample_index,
             completion_records=captured.get("completions", []),
             reward=reward_result.value,
             reward_components=reward_result.components,
-            end_of_turn_token_id=self.end_of_turn_token_id,
             max_episode_tokens=(
                 None
                 if self.config.get("max_episode_tokens") is None
@@ -254,7 +298,8 @@ class CodexAgentProgram:
         root = Path(
             str(self.config.get("session_root", "/tmp/hyper-rl-codex"))
         ).expanduser().resolve()
-        artifact_dir = root / f"{self.prompt.prompt_id}-{self.sample_index}-{session_id}"
+        # Logical IDs can contain separators; only generated session IDs enter paths.
+        artifact_dir = root / f"{session_id}-{self.sample_index}"
         workspace_dir = artifact_dir / "workspace"
         codex_home = artifact_dir / ".codex"
         artifact_dir.mkdir(parents=True, exist_ok=False)
@@ -355,8 +400,12 @@ class CodexAgentProgram:
             "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 30.0)
+        finally:
+            await _stop_process_group(process)
         installed = (stdout or stderr).decode("utf-8", errors="replace")
         expected = str(self.config.get("version", DEFAULT_CODEX_VERSION))
         matches = re.search(rf"(?<!\d){re.escape(expected)}(?!\d)", installed)
@@ -379,7 +428,7 @@ class CodexAgentProgram:
         if sandbox == "danger-full-access":
             command.append("--dangerously-bypass-approvals-and-sandbox")
         elif sandbox == "workspace-write":
-            command.extend(("--sandbox", sandbox, "--approve-for-me"))
+            command.extend(("--sandbox", sandbox))
         else:
             raise ValueError(f"Unsupported automated Codex sandbox: {sandbox}")
         command.extend(
@@ -415,11 +464,13 @@ class CodexAgentProgram:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
 
         async def drain_stdout() -> None:
+            """Persist events while the process runs to avoid blocked output pipes."""
             if process.stdout is None:
                 return
             with (artifact_dir / "codex-events.jsonl").open("w", encoding="utf-8") as stream:
@@ -433,6 +484,7 @@ class CodexAgentProgram:
                     stream.flush()
 
         async def drain_stderr() -> None:
+            """Persist diagnostics independently of the event stream."""
             if process.stderr is None:
                 return
             with (artifact_dir / "codex-stderr.log").open("w", encoding="utf-8") as stream:
@@ -449,19 +501,16 @@ class CodexAgentProgram:
         stdout_task = asyncio.create_task(drain_stdout())
         stderr_task = asyncio.create_task(drain_stderr())
         try:
-            await asyncio.wait_for(process.wait(), timeout)
+            await asyncio.wait_for(_wait_for_process_exit(process), timeout)
         except asyncio.TimeoutError as error:
-            process.kill()
-            await process.wait()
-            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             raise RuntimeError(f"Codex episode timed out after {timeout} seconds") from error
-        except asyncio.CancelledError:
-            if process.returncode is None:
-                process.kill()
-                await process.wait()
-            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-            raise
-        await asyncio.gather(stdout_task, stderr_task)
+        finally:
+            # Descendants may keep stdout open after the harness exits.
+            await _stop_process_group(process)
+            drain_results = await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        for result in drain_results:
+            if isinstance(result, BaseException):
+                raise RuntimeError("Codex output capture failed") from result
 
         stderr_tail = "\n".join(stderr_lines[-20:]).strip()
         artifact_hint = f"artifacts: {artifact_dir}"
@@ -494,6 +543,30 @@ class CodexAgentProgram:
                 f"{suffix}; {artifact_hint}"
             )
         return final_answer, return_code, diagnostic_events
+
+
+async def _wait_for_process_exit(process: asyncio.subprocess.Process) -> None:
+    """Observe the harness exit even when a tool descendant still owns its output pipes."""
+    while process.returncode is None:
+        await asyncio.sleep(0.05)
+
+
+async def _stop_process_group(process: asyncio.subprocess.Process) -> None:
+    """Reap the harness and its tool descendants on success, failure or cancellation."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(process.wait(), 5.0)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
 
 
 class CodexProgramFactory(HarnessProgramFactory):

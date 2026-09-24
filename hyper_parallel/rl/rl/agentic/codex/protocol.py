@@ -105,7 +105,7 @@ class CodexResponsesProtocol:
         """Convert one Codex Responses request into a non-streaming vLLM request."""
         if not isinstance(body, dict):
             raise ValueError("Responses request must be a JSON object")
-        tools, namespace_aliases, _ = self._tools(body.get("tools", []))
+        tools, namespace_aliases, _ = self._tools(self._request_tools(body))
         messages: list[dict[str, Any]] = []
         instructions = body.get("instructions")
         if isinstance(instructions, str) and instructions:
@@ -157,7 +157,7 @@ class CodexResponsesProtocol:
         message = choice.get("message")
         if not isinstance(message, dict):
             raise ValueError("vLLM response omitted its assistant message")
-        _, _, alias_namespaces = self._tools(original_request.get("tools", []))
+        _, _, alias_namespaces = self._tools(self._request_tools(original_request))
         output: list[dict[str, Any]] = []
         reasoning = message.get("reasoning_content", message.get("reasoning"))
         if isinstance(reasoning, str) and reasoning:
@@ -287,6 +287,7 @@ class CodexResponsesProtocol:
         pending_reasoning = ""
 
         def flush_calls() -> None:
+            """Emit buffered tool calls and their associated reasoning as one message."""
             nonlocal pending_calls, pending_reasoning
             if pending_calls:
                 message: dict[str, Any] = {
@@ -300,9 +301,7 @@ class CodexResponsesProtocol:
                 pending_calls = []
                 pending_reasoning = ""
 
-        for item in items:
-            if not isinstance(item, dict):
-                raise ValueError("Every Responses input item must be an object")
+        for item in self._message_items(items):
             item_type = item.get("type")
             if item_type == "reasoning":
                 flush_calls()
@@ -394,6 +393,35 @@ class CodexResponsesProtocol:
         ]
         remaining = [message for message in messages if message.get("role") != "system"]
         return ([{"role": "system", "content": "\n\n".join(system)}] if system else []) + remaining
+
+    @staticmethod
+    def _message_items(items: list[Any]) -> Iterable[dict[str, Any]]:
+        """Validate message items while omitting declarations already handled as tools."""
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("Every Responses input item must be an object")
+            if item.get("type") != "additional_tools":
+                yield item
+
+    @staticmethod
+    def _request_tools(body: dict[str, Any]) -> list[Any]:
+        """Collect standard and Responses Lite tool declarations before resolving aliases."""
+        tools = body.get("tools", [])
+        if tools is None:
+            tools = []
+        if not isinstance(tools, list):
+            raise ValueError("Responses tools must be a list")
+        collected = list(tools)
+        items = body.get("input", [])
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict) or item.get("type") != "additional_tools":
+                    continue
+                additional = item.get("tools")
+                if not isinstance(additional, list):
+                    raise ValueError("Responses additional_tools must contain a tools list")
+                collected.extend(additional)
+        return collected
 
     @classmethod
     def _tools(

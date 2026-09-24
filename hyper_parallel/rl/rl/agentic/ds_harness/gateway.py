@@ -32,7 +32,22 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from rl.tool_protocol import inspect_tool_response
+
 logger = logging.getLogger(__name__)
+
+
+class _CallBudgetExceeded(ValueError):
+    """Identify exhaustion of the gateway's explicit model-call budget."""
+
+
+class _ToolResponseFailure(RuntimeError):
+    """Preserve the original attribution while terminating one DeepSeek model call."""
+
+    def __init__(self, outcome: dict[str, Any]) -> None:
+        """Retain evidence-based failure fields for the session trace."""
+        super().__init__(outcome["failure_reason"])
+        self.outcome = outcome
 
 
 class DeepSeekChatProtocol:
@@ -126,6 +141,9 @@ class _Session:
     max_completions: int
     generation: dict[str, Any]
     completions: list[dict[str, Any]] = field(default_factory=list)
+    failure: dict[str, Any] | None = None
+    closing: bool = False
+    request_lock: Any = field(default_factory=threading.RLock)
 
 
 class _State:
@@ -133,6 +151,7 @@ class _State:
     def __init__(
         self, backend_url: str, model_name: str, request_timeout: float
     ) -> None:
+        """Initialize independent DeepSeek protocol and per-session trace storage."""
         self.backend_url = backend_url.rstrip("/")
         self.model_name = model_name
         self.request_timeout = request_timeout
@@ -186,6 +205,7 @@ class _State:
         self.event(session_id, "session.registered", payload)
 
     def get(self, session_id: str) -> _Session:
+        """Resolve an existing session without creating implicit request state."""
         with self.lock:
             try:
                 return self.sessions[session_id]
@@ -193,12 +213,31 @@ class _State:
                 raise ValueError(f"Unknown DeepSeek session: {session_id}") from error
 
     def remove(self, session_id: str) -> None:
-        self.get(session_id)
-        self.event(session_id, "session.released", {})
+        """Wait for this session's current request before releasing its trace."""
+        session = self.get(session_id)
+        with session.request_lock:
+            session.closing = True
+            self.event(session_id, "session.released", {})
+            with self.lock:
+                self.sessions.pop(session_id, None)
+
+    def snapshot(self, session_id: str) -> dict[str, Any]:
+        """Seal final admission and include any completed in-flight call and failure."""
+        session = self.get(session_id)
+        with session.request_lock:
+            session.closing = True
+            return {"policy_version": session.policy_version, "completions": list(session.completions),
+                    "failure": session.failure}
+
+    def record_failure(self, session: _Session, outcome: dict[str, Any]) -> None:
+        """Preserve untrainable failures regardless of subsequent model-budget errors."""
         with self.lock:
-            self.sessions.pop(session_id, None)
+            if session.failure is None or (session.failure.get("trainable") is True
+                                           and outcome.get("trainable") is not True):
+                session.failure = dict(outcome)
 
     def save_completion(self, session_id: str, record: dict[str, Any]) -> None:
+        """Capture a raw response with a contiguous completion ordinal."""
         session = self.get(session_id)
         with self.lock:
             record["ordinal"] = len(session.completions)
@@ -242,17 +281,11 @@ class _Handler(BaseHTTPRequestHandler):
         if path.startswith(prefix):
             session_id = unquote(path[len(prefix) :])
             try:
-                session = self.server.state.get(session_id)
+                snapshot = self.server.state.snapshot(session_id)
             except ValueError as error:
                 self._error(HTTPStatus.NOT_FOUND, str(error))
                 return
-            self._json(
-                HTTPStatus.OK,
-                {
-                    "policy_version": session.policy_version,
-                    "completions": session.completions,
-                },
-            )
+            self._json(HTTPStatus.OK, snapshot)
             return
         self._error(HTTPStatus.NOT_FOUND, "Unknown DeepSeek gateway route")
 
@@ -278,7 +311,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             self._proxy_chat(body)
-        except (RuntimeError, ValueError) as error:
+        except (RuntimeError, ValueError, OSError) as error:
             logger.exception("DeepSeek gateway request failed")
             self._error(HTTPStatus.BAD_GATEWAY, str(error))
 
@@ -303,10 +336,33 @@ class _Handler(BaseHTTPRequestHandler):
         if not session_id:
             session_id = self._bearer_token()
         session = self.server.state.get(session_id)
+        with session.request_lock:
+            if session.closing:
+                raise ValueError(f"DeepSeek session is sealed: {session_id}")
+            try:
+                self._complete_chat(session_id, session, original)
+            except _CallBudgetExceeded:
+                self.server.state.record_failure(session, {
+                    "failure_origin": "model", "failure_reason": "call_budget_exhausted", "trainable": True,
+                })
+                raise
+            except _ToolResponseFailure as error:
+                self.server.state.record_failure(session, error.outcome)
+                raise
+            except (RuntimeError, ValueError, OSError) as error:
+                self.server.state.record_failure(session, {
+                    "failure_origin": "infrastructure", "failure_reason": str(error), "trainable": False,
+                })
+                raise
+
+    def _complete_chat(self, session_id: str, session: _Session, original: dict[str, Any]) -> None:
+        """Keep budget checking, backend execution and evidence capture atomic per session."""
         if len(session.completions) >= session.max_completions:
-            raise ValueError(
+            raise _CallBudgetExceeded(
                 f"DeepSeek session exceeded max_completions={session.max_completions}"
             )
+        if session.failure is not None:
+            raise RuntimeError("DeepSeek session has an unresolved request failure")
         protocol_request = dict(original)
         reasoning_effort = session.generation.get("reasoning_effort")
         if reasoning_effort is not None:
@@ -322,6 +378,7 @@ class _Handler(BaseHTTPRequestHandler):
             }
         )
         response = self._backend_request(transformed)
+        outcome = inspect_tool_response(response)
         self.server.state.save_completion(
             session_id,
             {
@@ -331,9 +388,12 @@ class _Handler(BaseHTTPRequestHandler):
                 "response": response,
                 "metadata": {
                     "policy_version": session.policy_version,
+                    **outcome,
                 },
             },
         )
+        if outcome["failure_origin"] is not None:
+            raise _ToolResponseFailure(outcome)
         if bool(original.get("stream")):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream")
@@ -424,6 +484,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # BaseHTTPRequestHandler's first argument is positional; avoid shadowing the format builtin.
     def log_message(self, format_string: str, *args: Any) -> None:  # pylint: disable=arguments-differ
+        """Route HTTP diagnostics through the application logger."""
         logger.debug("DeepSeek gateway: " + format_string, *args)
 
 
@@ -432,6 +493,7 @@ class _GatewayServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address: tuple[str, int], state: _State) -> None:
+        """Bind the request handler to this gateway's protocol and sessions."""
         self.state = state
         super().__init__(address, _Handler)
 

@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 
 SUPPORTED_WEIGHT_SYNC_STRATEGIES = frozenset(("direct_reshard", "full_gather"))
-SUPPORTED_WEIGHT_SYNC_FAMILIES = frozenset(("qwen3",))
+SUPPORTED_WEIGHT_SYNC_FAMILIES = frozenset(("qwen3", "qwen3_moe"))
 
 
 @dataclass(frozen=True)
@@ -43,9 +43,11 @@ def validate_weight_sync_support(
         raise ValueError(f"Unsupported rollout deployment: {deployment!r}")
     if model_family not in SUPPORTED_WEIGHT_SYNC_FAMILIES:
         raise ValueError(
-            "Weight synchronization supports Qwen3 dense only; "
+            "Weight synchronization supports Qwen3 dense and MoE only; "
             f"got family={model_family!r}"
         )
+    if model_family == "qwen3_moe" and deployment != "colocated":
+        raise ValueError("Qwen3 MoE weight synchronization requires colocated deployment")
     if rollout_tp <= 0:
         raise ValueError("rollout tensor_parallel_size must be positive")
     if strategy not in SUPPORTED_WEIGHT_SYNC_STRATEGIES:

@@ -78,6 +78,12 @@ class DestinationTensorLayout:
     destination_starts: Optional[tuple[int, ...]] = None
     destination_permutation: Optional[tuple[int, ...]] = None
     accepted_source_dtypes: tuple[str, ...] = ()
+    worker_rank: Optional[int] = None
+
+    @property
+    def route_rank(self) -> int:
+        """Return the physical worker route, or the shared dense TP route."""
+        return self.tp_rank if self.worker_rank is None else self.worker_rank
 
     @property
     def target_name(self) -> str:
@@ -183,12 +189,13 @@ class TransferBucket:
 
 @dataclass(frozen=True)
 class DirectReshardPlan:
-    """A cached source-rank and destination-TP indexed transfer plan."""
+    """A cached source-rank plan indexed by shared TP or physical worker route."""
 
     source_world_size: int
     destination_tp_size: int
     bucket_size_bytes: int
     buckets: Mapping[tuple[int, int], tuple[TransferBucket, ...]]
+    destination_worker_size: Optional[int] = None
 
     def for_route(self, source_rank: int, tp_rank: int) -> tuple[TransferBucket, ...]:
         """Return all ordered buckets for one source-to-TP route."""
@@ -453,6 +460,8 @@ def resolve_destination_layouts(
     """Resolve per-worker TP metadata into Actor-coordinate destination regions."""
     if not worker_descriptions:
         raise ValueError("Direct reshard rollout layout returned no TP workers")
+    if any("worker_rank" in worker for worker in worker_descriptions):
+        return _resolve_worker_destinations(worker_descriptions, global_shapes)
     workers = sorted(worker_descriptions, key=lambda value: int(value["tp_rank"]))
     tp_size = int(workers[0]["tp_size"])
     if len(workers) != tp_size or [int(worker["tp_rank"]) for worker in workers] != list(range(tp_size)):
@@ -476,6 +485,72 @@ def resolve_destination_layouts(
         global_shape = global_shapes[name]
         tensors = [tensors_by_worker[rank][name] for rank in range(tp_size)]
         layouts.extend(_parameter_destination_layouts(name, tensors, global_shape, tp_size))
+    return tuple(layouts)
+
+
+def _validate_worker_coordinates(workers: Sequence[Mapping[str, Any]]) -> None:
+    """Require a complete DP-major physical worker numbering."""
+    ranks = [int(worker["worker_rank"]) for worker in workers]
+    if sorted(ranks) != list(range(len(workers))):
+        raise ValueError("Direct reshard physical worker ranks must be dense and unique")
+    tp_sizes = {int(worker["tp_size"]) for worker in workers}
+    if len(tp_sizes) != 1 or min(tp_sizes) <= 0:
+        raise ValueError("Direct reshard physical workers require one positive TP size")
+    for worker in workers:
+        tp_rank, tp_size = int(worker["tp_rank"]), int(worker["tp_size"])
+        dp_rank = int(worker["dp_rank"])
+        if not 0 <= tp_rank < tp_size or dp_rank < 0 or int(worker["worker_rank"]) != dp_rank * tp_size + tp_rank:
+            raise ValueError("Direct reshard physical worker coordinates must use DP-major order")
+
+
+def _explicit_worker_destination(tensor, shape, worker):
+    """Resolve one expert tensor region in its physical worker storage."""
+    name = str(tensor["name"])
+    starts = tuple(int(value) for value in tensor["region_starts"])
+    lengths = tuple(int(value) for value in tensor["local_shape"])
+    if (len(starts) != len(shape) or len(lengths) != len(shape) or any(
+            start < 0 or length <= 0 or start + length > size
+            for start, length, size in zip(starts, lengths, shape))):
+        raise ValueError(f"Rollout parameter {name!r} has invalid explicit region")
+    signature = _destination_signature(tensor, name, len(shape))
+    return DestinationTensorLayout(
+        name, signature[3], signature[4], shape, int(worker["tp_rank"]), int(worker["tp_size"]),
+        TensorRegion(starts, lengths), signature[2],
+        tuple(tensor.get("destination_starts", [0] * len(shape))), signature[5], signature[6],
+    )
+
+
+def _worker_tp_destination(name, shape, worker, workers):
+    """Retain ordinary attention TP layout within each physical DP group."""
+    peers = sorted(
+        (peer for peer in workers if int(peer["dp_rank"]) == int(worker["dp_rank"])),
+        key=lambda peer: int(peer["tp_rank"]),
+    )
+    tensors = [next((item for item in peer["tensors"] if item["name"] == name), None) for peer in peers]
+    tp_size = int(worker["tp_size"])
+    if len(peers) != tp_size or any(item is None for item in tensors):
+        raise ValueError(f"Rollout parameter {name!r} has incomplete TP coverage")
+    return _parameter_destination_layouts(name, tensors, shape, tp_size)[int(worker["tp_rank"])]
+
+
+def _resolve_worker_destinations(workers, global_shapes):
+    """Resolve physical worker routes, allowing expert subsets to differ."""
+    _validate_worker_coordinates(workers)
+    layouts = []
+    for worker in workers:
+        tensors = worker["tensors"]
+        if len({tensor["name"] for tensor in tensors}) != len(tensors):
+            raise ValueError("Direct reshard worker has duplicate tensor descriptions")
+        for tensor in tensors:
+            name = str(tensor["name"])
+            if name not in global_shapes:
+                raise ValueError(f"Rollout parameter {name!r} is absent from the Actor policy")
+            shape = global_shapes[name]
+            if "region_starts" in tensor:
+                layout = _explicit_worker_destination(tensor, shape, worker)
+            else:
+                layout = _worker_tp_destination(name, shape, worker, workers)
+            layouts.append(replace(layout, worker_rank=int(worker["worker_rank"])))
     return tuple(layouts)
 
 
@@ -619,12 +694,33 @@ def _validate_coverage(
 ) -> None:
     """Require every destination region to receive each value exactly once."""
     for destination in destinations:
-        actual = coverage.get((name, destination.tp_rank), 0)
+        actual = coverage.get((name, destination.route_rank), 0)
         if actual != destination.region.numel:
             raise ValueError(
-                f"Direct reshard plan covers {actual} values for {name!r} TP rank "
-                f"{destination.tp_rank}, expected {destination.region.numel}"
+                f"Direct reshard plan covers {actual} values for {name!r} destination route "
+                f"{destination.route_rank}, expected {destination.region.numel}"
             )
+
+
+def _validate_transfer_contract(source, destination):
+    """Require identical logical tensors or an explicitly accepted source dtype."""
+    name = source.name
+    dtype_compatible = (
+        source.dtype_name == destination.dtype_name
+        and source.element_size == destination.element_size
+    ) or source.dtype_name in destination.accepted_source_dtypes
+    if source.global_shape != destination.global_shape or not dtype_compatible:
+        raise ValueError(
+            f"Direct reshard tensor contract mismatch for {name!r}: "
+            f"source={(source.global_shape, source.dtype_name)}, "
+            f"destination={(destination.global_shape, destination.dtype_name)}"
+        )
+
+
+def _destination_worker_size(destinations):
+    """Return the physical routing extent only for worker-specific layouts."""
+    worker_ranks = [destination.worker_rank for destination in destinations if destination.worker_rank is not None]
+    return max(worker_ranks) + 1 if worker_ranks else None
 
 
 def build_direct_reshard_plan(
@@ -654,16 +750,7 @@ def build_direct_reshard_plan(
     for name in sorted(sources_by_name):
         for source in sources_by_name[name]:
             for destination in destinations_by_name[name]:
-                dtype_compatible = (
-                    source.dtype_name == destination.dtype_name
-                    and source.element_size == destination.element_size
-                ) or source.dtype_name in destination.accepted_source_dtypes
-                if source.global_shape != destination.global_shape or not dtype_compatible:
-                    raise ValueError(
-                        f"Direct reshard tensor contract mismatch for {name!r}: "
-                        f"source={(source.global_shape, source.dtype_name)}, "
-                        f"destination={(destination.global_shape, destination.dtype_name)}"
-                    )
+                _validate_transfer_contract(source, destination)
                 intersection = _intersect_regions(
                     source.region,
                     destination.region,
@@ -671,9 +758,9 @@ def build_direct_reshard_plan(
                 if intersection is None:
                     continue
                 entry = _transfer_entry(source, destination, intersection)
-                route_entries.setdefault((source.source_rank, destination.tp_rank), []).append(entry)
-                coverage[(name, destination.tp_rank)] = (
-                    coverage.get((name, destination.tp_rank), 0) + entry.numel
+                route_entries.setdefault((source.source_rank, destination.route_rank), []).append(entry)
+                coverage[(name, destination.route_rank)] = (
+                    coverage.get((name, destination.route_rank), 0) + entry.numel
                 )
         _validate_coverage(name, destinations_by_name[name], coverage)
     tp_sizes = {destination.tp_size for destination in destinations}
@@ -695,6 +782,7 @@ def build_direct_reshard_plan(
         destination_tp_size=tp_sizes.pop(),
         bucket_size_bytes=bucket_size_bytes,
         buckets=buckets,
+        destination_worker_size=_destination_worker_size(destinations),
     )
 
 

@@ -62,6 +62,7 @@ class GenerationResult:
     generation_seconds: float
     response_mask: Optional[Any] = None
     worker_policy_version: Optional[int] = None
+    finish_reasons: Optional[tuple[Optional[str], ...]] = None
 
 
 class GenerationEngine(Protocol):

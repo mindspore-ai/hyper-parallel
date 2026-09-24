@@ -23,6 +23,7 @@ from rl.dataset.data_source import (
     build_padded_evaluation_batches,
     build_prompt_records,
 )
+from rl.dataset.episodes import episode_rows
 from rl.roles.rollout.worker import RolloutManager
 from rl.utils.monitoring.metrics import select_round_robin_samples
 
@@ -43,6 +44,9 @@ class Evaluator:
         max_samples: Optional[int],
         log_samples: int,
         progress_steps: int,
+        data_parallel_rank: Optional[int] = None,
+        data_parallel_size: Optional[int] = None,
+        is_request_owner: bool = True,
     ) -> None:
         """Initialize evaluation data, rollout runtime, and progress settings."""
         self.dataset = dataset
@@ -54,6 +58,9 @@ class Evaluator:
         self.log_samples = log_samples
         self.progress_steps = progress_steps
         self.last_step = -1
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_size = data_parallel_size
+        self.is_request_owner = is_request_owner
 
     def run(self, step: int) -> tuple[dict[str, float], list[dict[str, Any]]]:
         """Generate the evaluation split and return rank-zero metrics and samples."""
@@ -61,8 +68,8 @@ class Evaluator:
         world_size = dist.get_world_size()
         batches = build_padded_evaluation_batches(
             dataset_size=len(self.dataset),
-            num_replicas=world_size,
-            rank=rank,
+            num_replicas=world_size if self.data_parallel_size is None else self.data_parallel_size,
+            rank=rank if self.data_parallel_rank is None else self.data_parallel_rank,
             batch_size=self.batch_size,
             max_samples=self.max_samples,
         )
@@ -80,7 +87,7 @@ class Evaluator:
             )
         local = self._collect_local(step, rank, batches)
         gathered: list[Optional[dict[str, Any]]] = [None] * world_size
-        dist.all_gather_object(gathered, local)
+        dist.all_gather_object(gathered, local if self.is_request_owner else None)
         self.last_step = step
         if rank != 0:
             return {}, []
@@ -154,14 +161,18 @@ class Evaluator:
             "generation_seconds": rollout.generation_seconds,
             "samples": [],
         }
-        for local_index, ((_, valid), response) in enumerate(
-            zip(entries, rollout.responses)
-        ):
+        episodes = episode_rows(rollout.trajectories)
+        if len(episodes) != len(entries):
+            raise ValueError("Evaluation requires exactly one complete episode per input prompt")
+        for local_index, ((_, valid), rows) in enumerate(zip(entries, episodes)):
             if not valid:
                 continue
-            reward = float(rollout.rewards[local_index].item())
-            response_length = int(rollout.action_mask[local_index].sum(dim=0).item())
-            record["correct"] += reward
+            first = rows[0]
+            reward = float(rollout.rewards[first].item())
+            response_length = int(rollout.action_mask[rows].sum().item())
+            trajectory = rollout.trajectories[first]
+            response = "\n".join(rollout.responses[row] for row in rows)
+            record["correct"] += float(trajectory.reward_components.get("success", reward))
             record["total"] += 1
             record["generated_tokens"] += response_length
             record["response_length"] += response_length
@@ -172,11 +183,13 @@ class Evaluator:
                         "rank": rank,
                         "prompt": batch["prompts"][local_index],
                         "response": response,
-                        "ground_truth": batch["ground_truths"][local_index],
-                        "extracted_answer": rollout.trajectories[
-                            local_index
-                        ].metadata.get("extracted_answer"),
+                        **({"ground_truth": batch["ground_truths"][local_index]}
+                           if isinstance(batch["ground_truths"][local_index], str) else {}),
+                        "extracted_answer": trajectory.metadata.get("extracted_answer"),
                         "reward": reward,
+                        "reward_components": dict(trajectory.reward_components),
+                        "status": trajectory.metadata.get("status"),
+                        "finish_reason": rollout.trajectories[rows[-1]].metadata.get("finish_reason"),
                     }
                 )
         return record

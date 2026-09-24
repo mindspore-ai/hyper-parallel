@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 import torch
 import torch.distributed as dist
 
+from rl.dataset.episodes import episode_rows
+
 if TYPE_CHECKING:
     from rl.dataset.contracts import ExperienceBatch
 
@@ -322,7 +324,10 @@ def _local_training_diagnostics(
         "values": _masked_statistics(experience.values, mask),
         "return_errors": _masked_statistics(return_errors, mask),
         "action_tokens": int(mask.flatten().sum(dim=0).item()),
-        "total_tokens": int(experience.attention_mask.flatten().sum(dim=0).item()),
+        "total_tokens": int(experience.attention_mask[
+            [index for index, row in enumerate(experience.trajectories) if not row.metadata.get("dp_padding", False)]
+            if experience.trajectories else slice(None)
+        ].sum().item()),
     }
 
 
@@ -465,6 +470,45 @@ def select_round_robin_samples(
     return selected
 
 
+def _rollout_samples(
+    rollout: ExperienceBatch,
+    batch: Mapping[str, Any],
+    episodes: list[list[int]],
+    rewards: list[float],
+    *,
+    step: int,
+    sample_limit: int,
+) -> list[dict[str, Any]]:
+    """Render bounded episode samples without counting each model call as a candidate."""
+    rank = dist.get_rank()
+    batch_rows = {
+        str(prompt_id): row
+        for row, prompt_id in enumerate(batch.get("prompt_ids", batch["sample_indices"]))
+    }
+    samples = []
+    for index, rows in enumerate(episodes[:sample_limit]):
+        trajectory = rollout.trajectories[rows[0]]
+        response = "\n".join(rollout.responses[row] for row in rows)
+        batch_row = batch_rows[trajectory.prompt_id]
+        samples.append(
+            {
+                "step": step,
+                "rank": rank,
+                "prompt": batch["prompts"][batch_row],
+                "response": response,
+                **({"ground_truth": batch["ground_truths"][batch_row]}
+                   if isinstance(batch["ground_truths"][batch_row], str) else {}),
+                "extracted_answer": trajectory.metadata.get("extracted_answer"),
+                "reward": float(rewards[index]),
+                "reward_components": dict(trajectory.reward_components),
+                "terminal_reason": rollout.trajectories[rows[-1]].terminal_reason,
+                "status": trajectory.metadata.get("status"),
+                "finish_reason": rollout.trajectories[rows[-1]].metadata.get("finish_reason"),
+            }
+        )
+    return samples
+
+
 def _local_rollout_record(
     rollout: ExperienceBatch,
     batch: Mapping[str, Any],
@@ -473,38 +517,35 @@ def _local_rollout_record(
     sample_limit: int,
 ) -> dict[str, Any]:
     """Build mergeable rollout statistics and bounded local samples."""
-    response_lengths = rollout.action_mask.sum(dim=-1).detach().cpu().tolist()
-    rewards = rollout.rewards.detach().cpu().tolist()
-    rank = dist.get_rank()
-    batch_rows = {
-        str(int(sample_index)): row
-        for row, sample_index in enumerate(batch["sample_indices"])
-    }
-    samples = []
-    for index, response in enumerate(rollout.responses[:sample_limit]):
-        trajectory = rollout.trajectories[index]
-        batch_row = batch_rows[trajectory.prompt_id]
-        samples.append(
-            {
-                "step": step,
-                "rank": rank,
-                "prompt": batch["prompts"][batch_row],
-                "response": response,
-                "ground_truth": batch["ground_truths"][batch_row],
-                "extracted_answer": trajectory.metadata.get("extracted_answer"),
-                "reward": float(rewards[index]),
-            }
-        )
+    episodes = episode_rows(rollout.trajectories)
+    call_lengths = rollout.action_mask.sum(dim=-1).detach().cpu().tolist()
+    response_lengths = [sum(call_lengths[row] for row in rows) for rows in episodes]
+    all_rewards = rollout.rewards.detach().cpu().tolist()
+    rewards = [all_rewards[rows[0]] for rows in episodes]
+    trajectories = [rollout.trajectories[rows[0]] for rows in episodes]
+    component_sums: dict[str, float] = {}
+    status_counts: dict[str, int] = {}
     group_rewards: dict[str, list[float]] = {}
-    for trajectory, reward in zip(rollout.trajectories, rewards):
+    for trajectory, reward in zip(trajectories, rewards):
+        for name, value in trajectory.reward_components.items():
+            component_sums[name] = component_sums.get(name, 0.0) + float(value)
+        status = trajectory.metadata.get("status")
+        if isinstance(status, str):
+            status_counts[status] = status_counts.get(status, 0) + 1
         group_id = trajectory.group_id or trajectory.prompt_id
         group_rewards.setdefault(group_id, []).append(float(reward))
     return {
+        "component_sums": component_sums,
+        "status_counts": status_counts,
+        "success_sum": sum(
+            float(trajectory.reward_components.get("success", reward))
+            for trajectory, reward in zip(trajectories, rewards)
+        ),
         "reward_sum": float(sum(rewards)),
         "reward_square_sum": float(sum(reward * reward for reward in rewards)),
         "reward_count": len(rewards),
-        "reward_min": float(min(rewards)),
-        "reward_max": float(max(rewards)),
+        "reward_min": float(min(rewards, default=math.inf)),
+        "reward_max": float(max(rewards, default=-math.inf)),
         "zero_std_groups": sum(
             int(max(group) == min(group)) for group in group_rewards.values()
         ),
@@ -513,12 +554,32 @@ def _local_rollout_record(
         "length_min": int(min(response_lengths, default=0)),
         "length_max": int(max(response_lengths, default=0)),
         "truncated_count": sum(
-            int(trajectory.truncated) for trajectory in rollout.trajectories
+            int(any(rollout.trajectories[row].truncated for row in rows)) for rows in episodes
         ),
-        "generated_tokens": int(rollout.action_mask.flatten().sum(dim=0).item()),
+        "generated_tokens": int(sum(response_lengths)),
         "generation_seconds": float(rollout.generation_seconds),
-        "samples": samples,
+        "samples": _rollout_samples(rollout, batch, episodes, rewards, step=step, sample_limit=sample_limit),
     }
+
+
+def _reward_component_metrics(records: list[dict[str, Any]], reward_count: int) -> dict[str, float]:
+    """Average each reward component over all candidates, including missing components."""
+    names = {name for record in records for name in record["component_sums"]}
+    return {
+        f"reward/component/{name}": sum(record["component_sums"].get(name, 0.0) for record in records)
+        / max(reward_count, 1)
+        for name in names
+    }
+
+
+def _status_metrics(records: list[dict[str, Any]]) -> dict[str, float]:
+    """Count environment outcomes across the collected candidates."""
+    counts: dict[str, float] = {}
+    for record in records:
+        for status, count in record["status_counts"].items():
+            key = f"rollout/status/{status}"
+            counts[key] = counts.get(key, 0.0) + count
+    return counts
 
 
 def _rollout_metrics(records: list[dict[str, Any]]) -> dict[str, float]:
@@ -543,11 +604,15 @@ def _rollout_metrics(records: list[dict[str, Any]]) -> dict[str, float]:
         0.0,
     )
     return {
+        **_reward_component_metrics(records, reward_count),
+        **_status_metrics(records),
         "reward/mean": reward_mean,
         "reward/std": math.sqrt(reward_variance),
         "reward/min": min(record["reward_min"] for record in records),
         "reward/max": max(record["reward_max"] for record in records),
-        "reward/accuracy": reward_mean,
+        "reward/accuracy": sum(
+            record["success_sum"] for record in records
+        ) / max(reward_count, 1),
         "reward/zero_std_groups": float(
             sum(record["zero_std_groups"] for record in records)
         ),
@@ -576,8 +641,9 @@ def summarize_rollout(
     *,
     step: int,
     sample_limit: int,
+    is_request_owner: bool = True,
 ) -> tuple[dict[str, float], list[dict[str, Any]]]:
-    """Gather rollout metrics and bounded samples on rank zero."""
+    """Gather logical candidates once per TP group and summarize on rank zero."""
     rank = dist.get_rank()
     local = _local_rollout_record(
         rollout,
@@ -586,7 +652,7 @@ def summarize_rollout(
         sample_limit=sample_limit,
     )
     gathered: list[Optional[dict[str, Any]]] = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, local)
+    dist.all_gather_object(gathered, local if is_request_owner else None)
     if rank != 0:
         return {}, []
     records = [record for record in gathered if record is not None]

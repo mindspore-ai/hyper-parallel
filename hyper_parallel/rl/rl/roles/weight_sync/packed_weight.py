@@ -196,10 +196,45 @@ def unpack_packed_weights(
             raise ValueError(f"Packed weight {entry['name']!r} exceeds its buffer")
         tensor = packed.narrow(0, offset, num_bytes).view(dtype).view(shape)
         rows = entry.get("canonical_rows")
-        if rows is None:
+        experts = entry.get("canonical_experts")
+        if experts is not None:
+            weights.extend(_unpack_canonical_experts(tensor, experts))
+        elif rows is None:
             weights.append((str(entry["name"]), tensor))
         else:
             weights.extend(_unpack_canonical_rows(tensor, rows))
+    return weights
+
+
+def _validate_expert_slice(tensor, starts, lengths, name):
+    """Reject malformed or out-of-bounds singleton expert slices."""
+    if len(starts) != 3 or len(lengths) != 3 or lengths[0] != 1:
+        raise ValueError("Canonical expert conversion requires singleton-expert rank-three slices")
+    if any(start < 0 or size <= 0 or start + size > limit
+           for start, size, limit in zip(starts, lengths, tensor.shape)):
+        raise ValueError(f"Canonical expert slice exceeds storage for {name!r}")
+
+
+def _unpack_canonical_experts(tensor: Any, experts: list[Mapping[str, Any]]) -> list[tuple[str, Any]]:
+    """Validate complete, disjoint expert slices and restore HF projection axes."""
+    if tensor.ndim != 3 or not experts:
+        raise ValueError("Canonical expert conversion requires rank-three storage and non-empty slices")
+    weights = []
+    names = set()
+    ends = [0] * tensor.shape[0]
+    for expert in sorted(experts, key=lambda item: tuple(item["starts"])):
+        starts, lengths = expert["starts"], expert["shape"]
+        name = str(expert["name"])
+        _validate_expert_slice(tensor, starts, lengths, name)
+        if (name in names or starts[1] != 0 or lengths[1] != tensor.shape[1]
+                or starts[2] != ends[starts[0]]):
+            raise ValueError("Canonical expert slices must cover storage exactly once with unique names")
+        names.add(name)
+        ends[starts[0]] += lengths[2]
+        region = tensor[tuple(slice(start, start + size) for start, size in zip(starts, lengths))]
+        weights.append((name, region.squeeze(0).transpose(0, 1)))
+    if any(end != tensor.shape[2] for end in ends):
+        raise ValueError("Canonical expert slices do not cover storage")
     return weights
 
 

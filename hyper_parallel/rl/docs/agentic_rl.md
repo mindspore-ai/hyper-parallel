@@ -10,6 +10,7 @@ Agentic 决定模型如何与任务环境交互；Hyper-RL 决定这些交互数
 ![Agentic RL 与 Hyper-RL 的交互架构](images/agentic_rl_architecture.svg)
 
 三种 runner 共享 `PromptRecord → Trajectory → ExperienceBatch` 训练契约，由同一个 `SyncTrainer` 编排。
+一个 episode 可以包含多条逐调用 `Trajectory`；episode 是奖励单位，训练行保留各次真实生成上下文。
 
 ## 职责边界
 
@@ -49,6 +50,17 @@ DeepSeek 的实现目录是 `rl/agentic/ds_harness/`，YAML 中的 runner 值和
 已完成的 session 仍保留一个 dummy batch row，以保证所有分布式 rank 执行相同数量的 generation collective；
 dummy 输出会被丢弃，不进入训练。
 
+### 单轮 code 环境
+
+`examples.code.agent` 注册 `code_stdio`，使用同一个 internal runner 完成一次 Python stdio 生成与远程判题。
+`data.row_adapter: examples.code.prepare_data:adapt_row` 保留多消息、稳定任务 ID 和私有结构化测试；
+测试不进入 prompt，代码提取不改写训练使用的采样 token/logprob。训练 TP 组仅 request owner 调用环境，
+其他 rank 重放相同 observation、reward 和终止状态，避免重复判题。
+
+全部测试按空白分词精确比较后给二值奖励；HTTP、协议或沙箱服务故障上抛，不能混成候选代码的零分。
+`finish_reason=length` 随 action 传递并记录截断。数据审核、固定镜像部署与运行命令见
+[单轮 code 示例](../examples/code/README.md)。
+
 ### Codex 与 DeepSeek：外部 harness 交互
 
 两条外部路径使用相同的数据面结构：
@@ -62,8 +74,13 @@ dummy 输出会被丢弃，不进入训练。
 7. request-owner 将 trajectory 序列化，并通过 `synchronize_agent_payload()` 同步给同 TP 组的 sibling ranks。
 8. manager 再次读取策略身份；episode 执行期间发生版本变化会直接报错。
 
-Codex Gateway 在 agentic.max_turns 的最后一次模型补全中禁用工具调用，让模型返回最终答案；
-超过该补全次数仍会报错。此前的工具调用和观察仍按原样记录在轨迹中。
+Codex Gateway 按 `agentic.max_turns` 预留模型调用额度，成功、失败和取消路径均释放预留；
+`agentic.codex.max_inflight_requests` 限制共享后端的同时请求数，默认 1。
+最后一次调用仍保留原工具选择，额度用尽不会改写模型动作来强制答案。
+一般调用额度耗尽仍按失败拒绝训练，配置应为最终答案预留调用额度。
+终态读取 session 先封闭新请求，再等待在途请求排空；释放 session 同样排空。
+整组 program 收尾后再同步跨 rank 错误。
+标准 `tools` 与 input 中 `additional_tools` 共用工具名称映射，未知声明明确报错。
 
 Codex 可按配置启动 MCP stdio server。`rl/agentic/mcp_server.py` 只是把现有 `ToolRegistry` 暴露为 MCP
 `tools/list` 和 `tools/call`，不会复制或改写工具实现。
@@ -75,7 +92,7 @@ Codex 可按配置启动 MCP stdio server。`rl/agentic/mcp_server.py` 只是把
 1. `build_prompt_records()` 把 dataloader batch 转成 `PromptRecord`。
 2. 选定的 rollout manager 调用 `generate()`，返回 `ExperienceBatch`。
 3. rollout engine 从 rollout residency 切回 training residency。
-4. `ExperiencePreparer` 根据算法需求计算优势，并补充 reference logprob 或 value。
+4. 逐调用 batch 先按 DP 最大行数补齐，再执行角色前向；`ExperiencePreparer` 根据算法需求准备训练目标。
 5. Actor 使用准备好的 experience 执行更新。
 6. `_publish_policy()` 把 `PolicySnapshot(version=next_step)` 发布到 vLLM。
 7. vLLM 恢复 rollout residency，下一 step 使用新策略生成。
@@ -93,6 +110,40 @@ Agentic 输出与训练侧之间最重要的边界是 token-first 契约：
 
 `build_experience_batch()` 会验证这些 trajectory 的对齐关系，并将其填充成 `ExperienceBatch`；随后算法和 Actor
 只处理标准 batch，不需要知道 episode 来自 internal、Codex 还是 DeepSeek。
+
+## 逐调用轨迹与 episode GRPO
+
+外部 Codex 与 DeepSeek program 每次模型调用返回一条训练行，tokens 严格等于本次真实 prompt 加 sampled action；
+历史被 harness 改写或裁剪也不会伪造连续上下文。`episode_id`、`call_index` 和 `call_count`
+描述完整 episode，缺失、重复调用以及 prompt/group/策略版本/奖励不一致都会报错。
+旧连续轨迹构造器（含 DeepSeek）只有在后续 prompt 精确延续全部已采样 token 时才允许拼接。
+分段路径的 `max_episode_tokens` 校验每次调用的真实 prompt 加 action 长度；调用总数由 `max_turns`
+限制，不把重复上下文累加成单条虚构轨迹的长度。
+
+例如同一道题的两个候选分别调用 2 次和 5 次，最终奖励为 1 和 0：GRPO 对两个 episode 计算优势，
+再映射到七条调用行；准确率为 1/2，不能按调用行算成 2/7。
+每条调用的动作仍参与既有有效 token 均值损失；episode 计奖并不等于每个 episode 的梯度权重相同。
+评估和样例按 episode 汇总，响应长度为其所有调用的动作 token 总数。
+
+DP rank 的调用行数不同会追加 `dp_padding` 行，保留合法上下文供前向执行，但 action mask、奖励和优势为零。
+它们不参与奖励、episode 数、响应长度或损失的有效 token 分母。
+分段轨迹当前只支持 GRPO；Codex/DeepSeek+PPO 在启动前拒绝，现有非分段 PPO 仍按原合同运行。
+
+## 工具失败归因与收尾
+
+固定版本 vLLM/Hermes 只读采集原始 token、engine text、parser 输入和结果，不修改采样动作。
+归因规则为：
+
+- 原始证据一致且模型 JSON 或工具调用封装结构不合法：模型失败，保留该次动作及概率；在剩余调用额度内可重新生成。
+- 原始工具 JSON 合法但解析结果不一致：基础设施失败，不进入训练。
+- 工具调用缺少原始证据或证据互相矛盾：未知失败，不进入训练。
+
+无法训练的失败拒绝整组更新，不能悄悄丢弃候选；同一 session 的后续模型失败不能覆盖已有基础设施失败。
+Codex 格式重采样也计入调用额度和完整 episode；已确认的模型格式错误耗尽额度时形成零奖励终止结果。
+DeepSeek 保留自己的终止方式：已记录证据的模型格式错误或明确调用额度耗尽可形成零奖励终止，
+未知 SDK `error/aborted`、服务错误和解析证据不一致均拒绝训练。
+外部程序结束、超时或取消后清理本程序组的工具子进程；vLLM 先优雅退出，超时才强制终止。
+最终 checkpoint 在评估结束后先释放 vLLM 及其 IPC 消费者，减少保存阶段的资源竞争。
 
 ## 接入自定义 Environment
 
@@ -128,7 +179,7 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 - `rollout.engine` 必须是 `vllm`。
 - `rollout.vllm.logprobs_mode` 必须是 `raw_logprobs`。
 - `rollout.vllm.enable_auto_tool_choice` 必须为 `true`。
-- `rollout.vllm.tool_call_parser` 必须是非空字符串。
+- `rollout.vllm.tool_call_parser` 必须是 `hermes`，原始解析证据仅适配固定镜像中的该解析器。
 - Gateway 端口不能与 vLLM 端口相同。
 - Codex CLI 当前固定验证版本为 `0.152.1`。
 - DeepSeek Harness SDK 当前固定验证版本为 `0.1.1rc1`。
@@ -151,7 +202,8 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 | Codex 适配 | `rl/agentic/codex/` |
 | DeepSeek 适配 | `rl/agentic/ds_harness/` |
 | MCP 工具桥接 | `rl/agentic/mcp_server.py` |
-| 标准训练数据契约 | `rl/dataset/contracts.py`、`batch_builder.py` |
+| 标准训练数据契约与 episode 分组 | `rl/dataset/contracts.py`、`batch_builder.py`、`episodes.py` |
+| 原始工具证据与可训练性 | `rl/tool_protocol.py`、`rl/roles/rollout/vllm_plugin.py` |
 | 共享 vLLM 与策略身份 | `rl/roles/rollout/vllm.py` |
 
 ## 当前实现边界
@@ -162,3 +214,11 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 - External harness 的语义循环可以不同，但必须返回标准、token 对齐且策略身份一致的 `Trajectory`。
 - Agentic UT 可从仓库根目录运行 `pytest -q tests/ut/rl/agentic/agentic_ut.py`；
   独立脚本的 coverage 门槛及已有缺口见 [UT 指南](hyper_rl_ut.md)。
+
+## 验证入口
+
+逐调用轨迹、episode GRPO、DP 补齐及工具失败归因的 CPU 合同位于 `tests/ut/rl/` 的
+`data/`、`agentic/` 和 `trainer/` 模块；入口清单见[功能验证说明](moe_code_agent.md#单元测试)。
+`hyper_parallel/rl/tests/st/test_feature_st.py` 提供独立两进程 Gloo 梯度验证及真实 agent 训练入口。
+Gloo 验证不需要模型；真实训练须显式配置 CLI/SDK、模型、数据、设备与具有不等调用的任务，
+并保留真实参数更新、策略版本和零损失补齐断言。CPU 用例及资源缺失时的 skip 不能代替真机验收。

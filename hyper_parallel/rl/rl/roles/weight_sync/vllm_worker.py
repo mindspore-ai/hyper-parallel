@@ -13,9 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """vLLM worker hooks used by Actor-to-rollout weight synchronization."""
+import asyncio
 import base64
 import os
 import pickle
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -27,6 +29,7 @@ import torch
 from rl.roles.model_setup import (
     HYPER_QWEN3_ARCHITECTURE,
     NATIVE_QWEN3_ARCHITECTURE,
+    NATIVE_QWEN3_MOE_ARCHITECTURE,
 )
 from rl.roles.weight_sync.model_adapter import rollout_tensor_descriptions
 from rl.roles.weight_sync.packed_weight import unpack_packed_weights
@@ -36,6 +39,7 @@ _SUPPORTED_ARCHITECTURES = frozenset(
     (
         HYPER_QWEN3_ARCHITECTURE,
         NATIVE_QWEN3_ARCHITECTURE,
+        NATIVE_QWEN3_MOE_ARCHITECTURE,
     )
 )
 
@@ -46,6 +50,7 @@ class _PatchState:
 
     ascend_lifecycle: bool = False
     engine_core_wake: bool = False
+    dp_rpc: bool = False
 
 
 _patch_state = _PatchState()
@@ -156,6 +161,7 @@ def get_direct_reshard_layout(worker: Any) -> dict[str, Any]:
     model = worker.model_runner.get_model()
     return {
         **topology,
+        "model_type": getattr(getattr(worker.model_config, "hf_config", None), "model_type", "qwen3"),
         "tensors": rollout_tensor_descriptions(
             model, getattr(worker.model_config, "hf_config", None),
             is_hyper=_is_hyper_worker(worker),
@@ -506,7 +512,9 @@ def receive_ipc_direct_reshard(
             "IPC direct payload TP size differs from the worker topology: "
             f"payload={tensor_parallel_size}, worker={worker_tp_size}"
         )
-    buckets = payload["buckets_by_target"].get(tp_rank, ())
+    target_rank = (int(topology["dp_rank"]) * tensor_parallel_size + tp_rank
+                   if payload.get("physical_worker_routes", False) else tp_rank)
+    buckets = payload["buckets_by_target"].get(target_rank, ())
     parameters = dict(worker.model_runner.get_model().named_parameters())
     received_bytes = 0
     imported_buffers = []
@@ -550,6 +558,9 @@ def _load_packed_weights(
     """Load one complete-parameter bucket through the model's vLLM API."""
     weights = unpack_packed_weights(packed, metadata)
     model = worker.model_runner.get_model()
+    if NATIVE_QWEN3_MOE_ARCHITECTURE in _worker_architectures(worker):
+        _load_moe_checkpoint_weights(worker, model, weights)
+        return
     if _is_hyper_worker(worker):
         loaded = model.load_weights(weights, require_all=False)
     else:
@@ -558,6 +569,51 @@ def _load_packed_weights(
         raise RuntimeError(
             "vLLM load_weights did not accept any parameter from a packed bucket"
         )
+
+
+def _load_moe_checkpoint_weights(worker: Any, model: Any, weights: list[tuple[str, Any]]) -> None:
+    """Reload checkpoint tensors with Native layerwise processing and logical coverage."""
+    # Native reload restores loader attributes lost during Ascend expert postprocessing.
+    from vllm.model_executor.model_loader.reload import initialize_layerwise_reload  # pylint: disable=C0415
+
+    if not getattr(worker, "_hyper_layerwise_reload", False):
+        descriptions = get_direct_reshard_layout(worker)["tensors"]
+        worker._hyper_expected_weights = {tensor["name"] for tensor in descriptions}
+        worker._hyper_received_weights = set()
+        with torch.device(worker.device):
+            initialize_layerwise_reload(model)
+        worker._hyper_layerwise_reload = True
+    expected = worker._hyper_expected_weights
+    received = worker._hyper_received_weights
+    expert_prefixes = {name.split(".experts.", maxsplit=1)[0] + ".experts."
+                       for name in expected if ".experts." in name}
+    for name, weight in weights:
+        if name not in expected:
+            match = re.fullmatch(r"(.+\.experts\.)(\d+)(\.(?:gate|up|down)_proj\.weight)", name)
+            if (match and 0 <= int(match[2]) < int(worker.model_config.hf_config.num_experts)
+                    and match[1] in expert_prefixes):
+                continue
+            raise ValueError(f"Unexpected MoE checkpoint weight {name!r}")
+        if name in received:
+            raise ValueError(f"Duplicate MoE checkpoint weight {name!r}")
+        # Layerwise loaders may retain inputs until the other fused projections arrive.
+        # Own their storage before acknowledging and releasing the IPC producer buffer.
+        loaded = model.load_weights([(name, weight.clone())])
+        if not loaded:
+            raise RuntimeError(f"Native MoE loader did not accept local weight {name!r}")
+        received.add(name)
+
+
+def _finalize_moe_checkpoint_reload(worker: Any) -> None:
+    """Require every local logical weight before finalizing Native reload once."""
+    from vllm.model_executor.model_loader.reload import finalize_layerwise_reload  # pylint: disable=C0415
+
+    missing = worker._hyper_expected_weights - worker._hyper_received_weights
+    if missing:
+        raise RuntimeError(f"MoE checkpoint update is incomplete: missing={sorted(missing)}")
+    with torch.device(worker.device):
+        finalize_layerwise_reload(worker.model_runner.get_model(), worker.model_config)
+    torch.npu.current_stream().synchronize()
 
 
 def receive_packed_weights(
@@ -622,6 +678,9 @@ def receive_ipc_packed_weights(
 def _clear_pending_update(worker: Any) -> None:
     """Reset the pending version before a new update starts."""
     worker._hyper_pending_policy_version = None
+    worker._hyper_layerwise_reload = False
+    worker._hyper_expected_weights = set()
+    worker._hyper_received_weights = set()
 
 
 def _worker_architectures(worker: Any) -> frozenset[str]:
@@ -652,6 +711,8 @@ def _finish_custom_weight_update(worker: Any) -> None:
         raise RuntimeError(
             "finish_weight_update requires received weights with a pending policy version"
         )
+    if getattr(worker, "_hyper_layerwise_reload", False):
+        _finalize_moe_checkpoint_reload(worker)
     worker._weight_update_active = False  # pylint: disable=W0212
     worker._is_checkpoint_format = True  # pylint: disable=W0212
     worker._hyper_loaded_policy_version = pending_version
@@ -668,6 +729,27 @@ def _patch_ascend_weight_update_lifecycle() -> None:
         return
     original_start = NPUWorker.start_weight_update
     original_finish = NPUWorker.finish_weight_update
+    original_wake = NPUWorker.wake_up
+
+    def wake_up(worker: Any, tags: Optional[list[str]] = None) -> None:
+        """Keep MoE kernel layout intact until the explicit checkpoint transaction."""
+        if (NATIVE_QWEN3_MOE_ARCHITECTURE not in _worker_architectures(worker)
+                or (tags is not None and "weights" not in tags)):
+            original_wake(worker, tags)
+            return
+        model = worker.model_runner.get_model()
+        experts = [
+            (model.get_submodule(name.rsplit(".", 1)[0]), name.rsplit(".", 1)[1], parameter)
+            for name, parameter in model.named_parameters()
+            if name.endswith((".w13_weight", ".w2_weight"))
+        ]
+        try:
+            original_wake(worker, tags)
+        finally:
+            # Native wake replaces experts with transposed views. Retain the original
+            # kernel Parameters: DP pause consensus can execute dummy batches here.
+            for module, name, parameter in experts:
+                setattr(module, name, parameter)
 
     def start_weight_update(worker: Any, is_checkpoint_format: bool = True) -> None:
         """Start one model-owned direct weight-update transaction."""
@@ -698,6 +780,7 @@ def _patch_ascend_weight_update_lifecycle() -> None:
         if pending_version is not None:
             worker._hyper_loaded_policy_version = pending_version
         worker._hyper_pending_policy_version = None
+    NPUWorker.wake_up = wake_up
     NPUWorker.start_weight_update = start_weight_update
     NPUWorker.finish_weight_update = finish_weight_update
     _patch_state.ascend_lifecycle = True
@@ -723,6 +806,35 @@ def _patch_engine_core_wake_lifecycle() -> None:
     _patch_state.engine_core_wake = True
 
 
+def _patch_dp_weight_rpc() -> None:
+    """Preserve every DP engine result for physical weight publication RPCs."""
+    if _patch_state.dp_rpc:
+        return
+    from vllm.v1.engine.core_client import DPLBAsyncMPClient  # pylint: disable=C0415
+
+    original = DPLBAsyncMPClient.collective_rpc_async
+    weight_methods = frozenset((
+        "get_direct_reshard_layout", "get_policy_version",
+        "receive_ipc_direct_reshard", "receive_ipc_packed_weights",
+    ))
+
+    async def collective_rpc_async(
+        client: Any, method: str, timeout: Optional[float] = None,
+        args: tuple = (), kwargs: Optional[dict[str, Any]] = None,
+    ) -> list[Any]:
+        """Aggregate only weight-control results across the fixed engine group."""
+        if method not in weight_methods:
+            return await original(client, method, timeout, args, kwargs)
+        results = await asyncio.gather(*(
+            client._call_utility_async("collective_rpc", method, timeout, args, kwargs, engine=engine)
+            for engine in client.core_engines
+        ))
+        return [worker for engine_results in results for worker in engine_results]
+
+    DPLBAsyncMPClient.collective_rpc_async = collective_rpc_async
+    _patch_state.dp_rpc = True
+
+
 def install_vllm_weight_sync_hooks(*, private_lifecycle: bool = True) -> None:
     """Install stable worker RPCs and optionally pinned private lifecycle patches."""
     from vllm.v1.worker.worker_base import WorkerBase  # pylint: disable=C0415
@@ -742,3 +854,4 @@ def install_vllm_weight_sync_hooks(*, private_lifecycle: bool = True) -> None:
     if private_lifecycle:
         _patch_ascend_weight_update_lifecycle()
         _patch_engine_core_wake_lifecycle()
+        _patch_dp_weight_rpc()

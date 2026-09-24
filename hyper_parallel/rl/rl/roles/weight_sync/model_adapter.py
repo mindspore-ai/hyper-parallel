@@ -15,6 +15,7 @@
 """Model-owned mappings between Trainer, canonical, and rollout weights."""
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,10 +73,22 @@ class ModelWeightAdapter:
             self._source_config = SimpleNamespace(**json.loads(config_path.read_text(encoding="utf-8")))
         return _canonical_weight_rows(name, self._source_config)
 
+    def _expert_slices(self, name: str, shape: Any) -> list[dict[str, Any]]:
+        """Validate the public GroupedExperts layout before exposing its slices."""
+        if self._model.family != "qwen3_moe" or not _EXPERT_WEIGHT_PATTERN.fullmatch(name):
+            return []
+        if self._source_config is None:
+            config_path = Path(self._model.model.weights_path) / "config.json"
+            self._source_config = SimpleNamespace(**json.loads(config_path.read_text(encoding="utf-8")))
+        return _expert_weight_slices(name, shape, self._source_config)
+
     def packed_metadata(self, metadata: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Attach model-owned row conversion to whole-parameter transfer units."""
         result = []
         for entry in metadata:
+            expert_slices = self._expert_slices(entry["name"], entry["shape"])
+            if expert_slices:
+                entry = {**entry, "canonical_experts": expert_slices}
             rows = self._canonical_rows(entry["name"])
             if rows:
                 if len(entry["shape"]) != 2 or sum(row.length for row in rows) != entry["shape"][0]:
@@ -115,6 +128,10 @@ class ModelWeightAdapter:
             description = describe_source_tensor(mapped_name, tensor, source_rank)
             description["source_name"] = mapped_name
             description["source_starts"] = [0] * len(description["global_shape"])
+            expert_slices = self._expert_slices(mapped_name, description["global_shape"])
+            if expert_slices:
+                descriptions.extend(_expert_source_regions(description, expert_slices))
+                continue
             rows = self._canonical_rows(mapped_name)
             if rows:
                 descriptions.extend(_canonical_source_regions(description, rows))
@@ -148,11 +165,66 @@ def _canonical_source_regions(description: dict[str, Any], rows: tuple) -> list[
     return result
 
 
+_EXPERT_WEIGHT_PATTERN = re.compile(
+    r"(?P<prefix>model\.layers\.\d+\.mlp\.experts)\.(?P<projection>gate_up_proj|down_proj)"
+)
+
+
+def _expert_weight_slices(name: str, shape: Any, config: Any) -> list[dict[str, Any]]:
+    """Describe individual expert projections in GroupedExperts physical axes."""
+    match = _EXPERT_WEIGHT_PATTERN.fullmatch(name)
+    if match is None:
+        return []
+    experts = int(config.num_experts)
+    hidden = int(config.hidden_size)
+    intermediate = int(config.moe_intermediate_size)
+    is_gate_up = match["projection"] == "gate_up_proj"
+    expected = (experts, hidden, 2 * intermediate) if is_gate_up else (experts, intermediate, hidden)
+    if tuple(shape) != expected:
+        raise ValueError(f"GroupedExperts {name!r} has shape {tuple(shape)}, expected {expected}")
+    slices = []
+    for expert in range(experts):
+        projections = (("gate_proj", 0), ("up_proj", intermediate)) if is_gate_up else (("down_proj", 0),)
+        for projection, offset in projections:
+            slices.append({
+                "name": f"{match['prefix']}.{expert}.{projection}.weight",
+                "starts": [expert, 0, offset],
+                "shape": [1, hidden, intermediate] if is_gate_up else [1, intermediate, hidden],
+            })
+    return slices
+
+
+def _expert_source_regions(description: dict[str, Any], slices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Intersect EP/EDP shards without changing physical source tensor axes."""
+    physical_starts = description.get("region_starts")
+    if physical_starts is None:
+        raise ValueError("GroupedExperts publication requires explicit source mesh regions")
+    result = []
+    for entry in slices:
+        starts = [max(left, right) for left, right in zip(physical_starts, entry["starts"])]
+        ends = [min(left + length, right + size) for left, length, right, size in zip(
+            physical_starts, description["local_shape"], entry["starts"], entry["shape"],
+        )]
+        lengths = [end - start for start, end in zip(starts, ends)]
+        if any(length <= 0 for length in lengths):
+            continue
+        result.append({
+            **description,
+            "name": entry["name"],
+            "global_shape": entry["shape"],
+            "local_shape": lengths,
+            "region_starts": [start - base for start, base in zip(starts, entry["starts"])],
+            "source_starts": [start - base for start, base in zip(starts, physical_starts)],
+            "shard_dim": None,
+        })
+    return result
+
+
 def build_model_weight_adapter(
     model: VLLMModelRegistration,
 ) -> ModelWeightAdapter:
     """Return the adapter owned by one registered model family."""
-    if model.family == "qwen3":
+    if model.family in ("qwen3", "qwen3_moe"):
         return ModelWeightAdapter(model)
     raise ValueError(f"Unsupported weight-sync model family: {model.family!r}")
 
@@ -344,7 +416,12 @@ def _native_qwen3_direct_tensors(
     """Describe native vLLM Qwen3 storage in canonical Actor coordinates."""
     tensors = []
     vocab_size = int(hf_config.vocab_size)
+    modules = dict(model.named_modules()) if getattr(hf_config, "model_type", "") == "qwen3_moe" else {}
     for name, parameter in sorted(model.named_parameters(), key=lambda item: item[0]):
+        if name.endswith((".experts.w13_weight", ".experts.w2_weight")):
+            module_name = name.rsplit(".", 1)[0]
+            tensors.extend(_native_expert_descriptions(name, parameter, modules[module_name], hf_config))
+            continue
         if ".qkv_proj." in name:
             tensors.extend(
                 _native_qwen3_qkv_descriptions(
@@ -402,6 +479,62 @@ def _native_qwen3_direct_tensors(
             )
         )
     return tensors
+
+
+def _owned_experts(layer: Any, experts: int) -> list[tuple[int, int]]:
+    """Validate the global-to-local map and return each physical expert owner."""
+    ep_size, tp_size = int(layer.ep_size), int(layer.tp_size)
+    if ep_size > 1:
+        expert_map = layer.expert_map
+        if expert_map is None or int(expert_map.numel()) != experts:
+            raise ValueError("Native EP requires a complete global-to-local expert map")
+        mapping = [int(value) for value in expert_map.tolist()]
+        owned = [(global_id, local_id) for global_id, local_id in enumerate(mapping) if local_id >= 0]
+        if any(value < -1 for value in mapping) or sorted(local_id for _, local_id in owned) != list(range(len(owned))):
+            raise ValueError("Native expert map must uniquely cover local expert storage")
+        if tp_size != 1:
+            raise ValueError("Native EP expert tensors must not retain an expert TP dimension")
+    else:
+        owned = list(enumerate(range(experts)))
+    return owned
+
+
+def _native_expert_descriptions(name: str, parameter: Any, layer: Any, config: Any) -> list[dict[str, Any]]:
+    """Map fixed-image Ascend expert runtime storage using the actual expert map."""
+    experts = int(config.num_experts)
+    hidden = int(config.hidden_size)
+    intermediate = int(config.moe_intermediate_size)
+    ep_size = int(layer.ep_size)
+    tp_size = int(layer.tp_size)
+    tp_rank = int(layer.tp_rank)
+    if ep_size <= 0 or tp_size <= 0 or intermediate % tp_size or not 0 <= tp_rank < tp_size:
+        raise ValueError("Native expert TP coordinates do not divide the intermediate dimension")
+    local_intermediate = intermediate // tp_size
+    owned = _owned_experts(layer, experts)
+    is_gate_up = name.endswith(".w13_weight")
+    expected = ((len(owned), hidden, 2 * local_intermediate) if is_gate_up
+                else (len(owned), local_intermediate, hidden))
+    if tuple(parameter.shape) != expected:
+        raise ValueError(
+            f"Native Ascend expert runtime {name!r} has shape {tuple(parameter.shape)}, expected {expected}"
+        )
+    prefix = name.rsplit(".", 1)[0]
+    descriptions = []
+    shard_dim = 2 if is_gate_up else 1
+    placement = "replicate" if tp_size == 1 else "shard"
+    for global_id, local_id in owned:
+        projections = (("gate_proj", 0), ("up_proj", local_intermediate)) if is_gate_up else (("down_proj", 0),)
+        for projection, offset in projections:
+            logical_shape = ((1, hidden, local_intermediate) if is_gate_up else (1, local_intermediate, hidden))
+            description = _direct_tensor_description(
+                f"{prefix}.{global_id}.{projection}.weight", name, parameter,
+                logical_shape, placement, None if tp_size == 1 else shard_dim,
+                (local_id, 0, offset),
+            )
+            description["region_starts"] = ([0, 0, tp_rank * local_intermediate] if is_gate_up
+                                             else [0, tp_rank * local_intermediate, 0])
+            descriptions.append(description)
+    return descriptions
 
 
 def _hyper_tp_placement(model: Any, name: str, tp_size: int) -> tuple[str, Optional[int]]:

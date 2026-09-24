@@ -34,6 +34,7 @@ from rl.agentic.core.program_runner import (
     HarnessProgramFactory,
     HarnessRuntime,
     build_harness_trajectory,
+    build_harness_call_trajectories,
     harness_generation_settings,
     load_reward_callable,
     request_gateway_json,
@@ -91,6 +92,21 @@ def build_deepseek_trajectory(
     )
 
 
+def _validated_failure(captured: Mapping[str, Any], finish_reason: str) -> dict[str, Any]:
+    """Admit model failures only when the gateway explicitly established their origin."""
+    failure = captured.get("failure")
+    if failure is not None:
+        if (not isinstance(failure, Mapping) or failure.get("failure_origin") != "model"
+                or failure.get("trainable") is not True or failure.get("failure_reason") not in (
+                    "call_budget_exhausted", "invalid_json", "invalid_tool_schema",
+                )):
+            raise RuntimeError(f"DeepSeek gateway failure is not trainable: {failure!r}")
+        return dict(failure)
+    if finish_reason in {"error", "aborted"}:
+        raise RuntimeError(f"DeepSeek Harness {finish_reason} has unknown failure origin")
+    return {}
+
+
 def _load_reward_callable(value: Any) -> RewardCallable:
     return load_reward_callable(value, "agentic.deepseek.reward_callable", "DeepSeek")
 
@@ -142,7 +158,7 @@ class DeepSeekRuntime(HarnessRuntime):
 
 
 class DeepSeekAgentProgram:
-    """Run one DeepSeek Harness episode and return one immutable trajectory."""
+    """Run one DeepSeek Harness episode and retain each real model-call context."""
 
     def __init__(
         self,
@@ -164,7 +180,7 @@ class DeepSeekAgentProgram:
         self.end_of_turn_token_id = end_of_turn_token_id
         self.reward_callable = _load_reward_callable(self.config.get("reward_callable"))
 
-    async def run(self) -> Trajectory:
+    async def run(self) -> tuple[Trajectory, ...]:
         """Run the SDK, fetch exact network evidence, score, and convert it."""
         session_id = uuid.uuid4().hex
         artifact_dir, workspace_dir, session_root = self._prepare_directories(
@@ -202,37 +218,18 @@ class DeepSeekAgentProgram:
                 None,
                 timeout,
             )
-            contract_error = self._capture_contract_error(captured)
-            reward_result = self.reward_callable(final_answer, self.prompt)
-            if not isinstance(reward_result, RewardResult):
-                reward_value = float(reward_result)
-                reward_result = RewardResult(reward_value, {"outcome": reward_value})
-            if finish_reason in {"error", "aborted"}:
-                contract_error = (
-                    f"DeepSeek Harness ended with {finish_reason}"
-                    if contract_error is None
-                    else f"{contract_error}; Harness ended with {finish_reason}"
-                )
-            if contract_error is not None:
-                reward_result = RewardResult(
-                    0.0,
-                    {**reward_result.components, "tool_contract": 0.0},
-                    {**reward_result.metadata, "tool_contract_error": contract_error},
-                )
-            elif self.config.get("required_tool_calls") is not None:
-                reward_result = RewardResult(
-                    reward_result.value,
-                    {**reward_result.components, "tool_contract": 1.0},
-                    reward_result.metadata,
-                )
-            return build_deepseek_trajectory(
+            reward_result = self._score_capture(final_answer, finish_reason, captured)
+            return build_harness_call_trajectories(
+                label="DeepSeek",
+                runner_name="deepseek",
+                tool_history_field="messages",
+                status_resolver=_trajectory_status,
                 prompt=self.prompt,
                 policy_version=self.policy_version,
                 sample_index=self.sample_index,
                 completion_records=captured.get("completions", []),
                 reward=reward_result.value,
                 reward_components=reward_result.components,
-                end_of_turn_token_id=self.end_of_turn_token_id,
                 max_episode_tokens=(
                     None
                     if self.config.get("max_episode_tokens") is None
@@ -248,6 +245,7 @@ class DeepSeekAgentProgram:
                     "generation_seconds": time.perf_counter() - started,
                     "final_answer": final_answer,
                     "finish_reason": finish_reason,
+                    "harness_finish_reason": finish_reason,
                     "deepseek_events": events,
                     **dict(reward_result.metadata),
                 },
@@ -261,6 +259,41 @@ class DeepSeekAgentProgram:
                     None,
                     timeout,
                 )
+
+    def _score_capture(
+        self, final_answer: str, finish_reason: str, captured: Mapping[str, Any],
+    ) -> RewardResult:
+        """Validate failure provenance and score captured tool-call evidence."""
+        contract_error = self._capture_contract_error(captured)
+        failure = _validated_failure(captured, finish_reason)
+        if failure:
+            contract_error = f"DeepSeek model failure: {failure['failure_reason']}; {contract_error or ''}"
+        reward_result = self.reward_callable(final_answer, self.prompt)
+        if not isinstance(reward_result, RewardResult):
+            reward_value = float(reward_result)
+            reward_result = RewardResult(reward_value, {"outcome": reward_value})
+        if finish_reason in {"error", "aborted"}:
+            contract_error = (
+                f"DeepSeek Harness ended with {finish_reason}"
+                if contract_error is None
+                else f"{contract_error}; Harness ended with {finish_reason}"
+            )
+        if contract_error is not None:
+            reward_result = RewardResult(
+                0.0,
+                {**reward_result.components, "tool_contract": 0.0},
+                {**reward_result.metadata, "tool_contract_error": contract_error},
+            )
+        elif self.config.get("required_tool_calls") is not None:
+            reward_result = RewardResult(
+                reward_result.value,
+                {**reward_result.components, "tool_contract": 1.0},
+                reward_result.metadata,
+            )
+        return RewardResult(
+            reward_result.value, reward_result.components,
+            {**failure, **dict(reward_result.metadata)},
+        )
 
     def _validate_capture(self, captured: Mapping[str, Any]) -> None:
         """Validate captured policy identity and required tool-call evidence."""

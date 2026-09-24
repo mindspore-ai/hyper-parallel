@@ -365,21 +365,9 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
             payload["seed"] = seed
         return payload
 
-    def _completion_records_from_response(
-        self,
-        prompts: list[list[int]],
-        num_choices: int,
-        settings: Any,
-        result: Mapping[str, Any],
-    ) -> list[tuple[list[int], Optional[list[float]]]]:
-        """Validate one OpenAI response and restore its prompt-major child order."""
-        choices = result.get("choices")
-        expected_choices = len(prompts) * num_choices
-        if not isinstance(choices, list) or len(choices) != expected_choices:
-            raise RuntimeError(
-                "vLLM completion response count mismatch: "
-                f"expected={expected_choices}, received={len(choices) if isinstance(choices, list) else None}"
-            )
+    @staticmethod
+    def _validate_choice_indices(choices: list[Any], expected_choices: int) -> None:
+        """Require unique prompt-major indices before restoring response order."""
         indices = []
         for choice in choices:
             if not isinstance(choice, Mapping):
@@ -393,31 +381,56 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
                 "vLLM completion response choice indices must be a unique contiguous range: "
                 f"expected=0..{expected_choices - 1}, received={indices}"
             )
-        records = []
-        for choice in sorted(choices, key=lambda item: item["index"]):
-            token_ids = choice.get("token_ids")
-            if not isinstance(token_ids, list):
-                raise RuntimeError("vLLM completion response did not include token_ids")
-            token_log_probs = None
-            if settings.collect_log_probs:
-                log_probs = choice.get("logprobs")
-                if not isinstance(log_probs, dict) or not isinstance(log_probs.get("token_logprobs"), list):
-                    raise RuntimeError("vLLM completion response did not include token_logprobs")
-                raw_log_probs = log_probs["token_logprobs"]
-                if len(raw_log_probs) != len(token_ids) or any(value is None for value in raw_log_probs):
-                    raise RuntimeError(
-                        "vLLM completion returned incomplete sampled-token log probabilities: "
-                        f"tokens={len(token_ids)}, log_probs={len(raw_log_probs)}"
-                    )
-                token_log_probs = [float(value) for value in raw_log_probs]
-            records.append(([int(token_id) for token_id in token_ids], token_log_probs))
-        return records
+
+    def _completion_records_from_response(
+        self,
+        prompts: list[list[int]],
+        num_choices: int,
+        settings: Any,
+        result: Mapping[str, Any],
+    ) -> list[tuple[list[int], Optional[list[float]], Optional[str]]]:
+        """Validate one OpenAI response and restore its prompt-major child order."""
+        choices = result.get("choices")
+        expected_choices = len(prompts) * num_choices
+        if not isinstance(choices, list) or len(choices) != expected_choices:
+            raise RuntimeError(
+                "vLLM completion response count mismatch: "
+                f"expected={expected_choices}, received={len(choices) if isinstance(choices, list) else None}"
+            )
+        self._validate_choice_indices(choices, expected_choices)
+        return [self._completion_record(choice, settings.collect_log_probs)
+                for choice in sorted(choices, key=lambda item: item["index"])]
+
+    @staticmethod
+    def _completion_record(
+        choice: Mapping[str, Any], collect_log_probs: bool,
+    ) -> tuple[list[int], Optional[list[float]], Optional[str]]:
+        """Keep one completion's sampled tokens, raw probabilities and stop reason aligned."""
+        token_ids = choice.get("token_ids")
+        if not isinstance(token_ids, list):
+            raise RuntimeError("vLLM completion response did not include token_ids")
+        token_log_probs = None
+        if collect_log_probs:
+            log_probs = choice.get("logprobs")
+            if not isinstance(log_probs, dict) or not isinstance(log_probs.get("token_logprobs"), list):
+                raise RuntimeError("vLLM completion response did not include token_logprobs")
+            raw_log_probs = log_probs["token_logprobs"]
+            if len(raw_log_probs) != len(token_ids) or any(value is None for value in raw_log_probs):
+                raise RuntimeError(
+                    "vLLM completion returned incomplete sampled-token log probabilities: "
+                    f"tokens={len(token_ids)}, log_probs={len(raw_log_probs)}"
+                )
+            token_log_probs = [float(value) for value in raw_log_probs]
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            raise RuntimeError("vLLM completion finish_reason must be a string when provided")
+        return [int(token_id) for token_id in token_ids], token_log_probs, finish_reason
 
     async def _generate_completion_request(
         self,
         request: _CompletionRequest,
         settings: Any,
-    ) -> list[tuple[list[int], Optional[list[float]]]]:
+    ) -> list[tuple[list[int], Optional[list[float]], Optional[str]]]:
         """Execute one admitted completion parent through the persistent pool."""
         payload = self._completion_payload(
             request.prompts,
@@ -501,9 +514,9 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         row_count: int,
         settings: Any,
         child_capacity: int,
-    ) -> list[tuple[list[int], Optional[list[float]]]]:
+    ) -> list[tuple[list[int], Optional[list[float]], Optional[str]]]:
         """Run a child-bounded rolling pool and restore stable output row order."""
-        results: list[Optional[tuple[list[int], Optional[list[float]]]]] = [None] * row_count
+        results: list[Optional[tuple[list[int], Optional[list[float]], Optional[str]]]] = [None] * row_count
         pending = deque(requests)
         active: dict[asyncio.Task, _CompletionRequest] = {}
         inflight_children = 0
@@ -563,7 +576,7 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         child_capacity: int,
         batch_invariant: bool = False,
         row_seeds: Optional[tuple[int, ...]] = None,
-    ) -> list[tuple[list[int], Optional[list[float]]]]:
+    ) -> list[tuple[list[int], Optional[list[float]], Optional[str]]]:
         """Generate ordered records through persistent child-bounded HTTP admission."""
         if child_capacity <= 0:
             raise ValueError(f"vLLM child_capacity must be positive, got {child_capacity}")
@@ -602,36 +615,33 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         try:
             os.killpg(process_group_id, signal.SIGTERM)
         except ProcessLookupError as error:
+            self._process = None
             if runtime_error is not None:
                 raise runtime_error from error
             return
-        if not parent_running:
-            # The process-group leader can exit before its EngineCore descendants.
+        if parent_running:
             try:
-                os.killpg(process_group_id, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            self._wait_process_group_exit(process_group_id)
-            if runtime_error is not None:
-                raise runtime_error
-            return
+                self._process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self._kill_process_group(process_group_id)
+                self._process.wait(timeout=10)
+        # The API leader may exit before its children finish unlinking IPC resources.
         try:
-            self._process.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process_group_id, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            self._process.wait(timeout=10)
-        else:
-            # The API server leader may exit before EngineCore descendants.
-            try:
-                os.killpg(process_group_id, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        self._wait_process_group_exit(process_group_id)
+            self._wait_process_group_exit(process_group_id, timeout=5)
+        except RuntimeError:
+            self._kill_process_group(process_group_id)
+            self._wait_process_group_exit(process_group_id)
+        self._process = None
         if runtime_error is not None:
             raise runtime_error
+
+    @staticmethod
+    def _kill_process_group(process_group_id: int) -> None:
+        """Escalate shutdown only for descendants that ignored graceful termination."""
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     @staticmethod
     def _has_live_process_group_members(process_group_id: int) -> bool:
@@ -855,22 +865,22 @@ class VLLMGenerationEngine:
                     ),
                 )
             )
-        if bool(self._config.get("trust_remote_code", True)):
-            command.append("--trust-remote-code")
-        if bool(self._config.get("enforce_eager", True)):
-            command.append("--enforce-eager")
+        for key, default in (
+            ("trust_remote_code", True),
+            ("enable_expert_parallel", False),
+            ("enforce_eager", True),
+            ("enable_prompt_tokens_details", False),
+            ("skip_mm_profiling", False),
+            ("enable_auto_tool_choice", False),
+        ):
+            if bool(self._config.get(key, default)):
+                command.append(f"--{key.replace('_', '-')}")
         for key, option in (
             ("enable_prefix_caching", "--enable-prefix-caching"),
             ("enable_chunked_prefill", "--enable-chunked-prefill"),
         ):
             if key in self._config:
                 command.append(option if bool(self._config[key]) else f"--no-{option[2:]}")
-        if bool(self._config.get("enable_prompt_tokens_details", False)):
-            command.append("--enable-prompt-tokens-details")
-        if bool(self._config.get("skip_mm_profiling", False)):
-            command.append("--skip-mm-profiling")
-        if bool(self._config.get("enable_auto_tool_choice", False)):
-            command.append("--enable-auto-tool-choice")
         for key, option in (
             ("tool_call_parser", "--tool-call-parser"),
             ("reasoning_parser", "--reasoning-parser"),
@@ -1039,7 +1049,7 @@ class VLLMGenerationEngine:
         prompt_token_ids: list[list[int]],
         settings: Any,
         row_seeds: Optional[tuple[int, ...]] = None,
-    ) -> list[tuple[list[int], Optional[list[float]]]]:
+    ) -> list[tuple[list[int], Optional[list[float]], Optional[str]]]:
         """Generate through an injected in-process vLLM test client."""
         try:
             from vllm import SamplingParams, TokensPrompt  # pylint: disable=C0415
@@ -1084,7 +1094,7 @@ class VLLMGenerationEngine:
                 if settings.collect_log_probs
                 else None
             )
-            records.append((list(completion.token_ids), token_log_probs))
+            records.append((list(completion.token_ids), token_log_probs, getattr(completion, "finish_reason", None)))
         return records
 
     def _completion_records(
@@ -1093,7 +1103,7 @@ class VLLMGenerationEngine:
         prompt_token_ids: list[list[int]],
         settings: Any,
         row_seeds: Optional[tuple[int, ...]] = None,
-    ) -> list[tuple[list[int], Optional[list[float]]]]:
+    ) -> list[tuple[list[int], Optional[list[float]], Optional[str]]]:
         """Generate completions through HTTP or an injected local client."""
         if isinstance(client, _VLLMHTTPClient):
             return client.generate_tokens(
@@ -1144,7 +1154,7 @@ class VLLMGenerationEngine:
     @staticmethod
     def _build_generation_result(
         request: GenerationRequest,
-        completion_records: list[tuple[list[int], Optional[list[float]]]],
+        completion_records: list[tuple[list[int], Optional[list[float]], Optional[str]]],
         elapsed: float,
         worker_policy_version: Optional[int],
     ) -> GenerationResult:
@@ -1163,7 +1173,7 @@ class VLLMGenerationEngine:
                 response_ids.shape,
                 dtype=torch.float32,
             )
-        for row, (completion_token_ids, completion_log_probs) in enumerate(completion_records):
+        for row, (completion_token_ids, completion_log_probs, _) in enumerate(completion_records):
             tokens = completion_token_ids[: settings.max_new_tokens]
             if tokens:
                 response_ids[row, : len(tokens)] = response_ids.new_tensor(tokens)
@@ -1179,6 +1189,7 @@ class VLLMGenerationEngine:
             generation_seconds=elapsed,
             response_mask=response_mask,
             worker_policy_version=worker_policy_version,
+            finish_reasons=tuple(record[2] for record in completion_records),
         )
 
     def _generate_request(
@@ -1271,6 +1282,7 @@ class VLLMGenerationEngine:
             response_mask = result.response_mask
             rollout_log_probs = result.rollout_log_probs
             generation_seconds = result.generation_seconds
+            finish_reasons = result.finish_reasons
         else:
             sequences = request.input_ids.new_empty(sequence_shape)
             response_mask = request.attention_mask.new_empty(
@@ -1286,6 +1298,7 @@ class VLLMGenerationEngine:
                 else None
             )
             generation_seconds = None
+            finish_reasons = None
         if response_mask is None:
             raise RuntimeError("Trainer TP rollout result requires response_mask")
         dist.broadcast(
@@ -1309,7 +1322,8 @@ class VLLMGenerationEngine:
         elapsed: list[Any] = [None] * self._trainer_tp_size
         dist.all_gather_object(
             elapsed,
-            generation_seconds if self.is_request_owner else None,
+            {"generation_seconds": generation_seconds, "finish_reasons": finish_reasons}
+            if self.is_request_owner else None,
             self._trainer_tp_group,
         )
         if elapsed[0] is None or any(value is not None for value in elapsed[1:]):
@@ -1319,9 +1333,10 @@ class VLLMGenerationEngine:
         return GenerationResult(
             sequences=sequences,
             rollout_log_probs=rollout_log_probs,
-            generation_seconds=float(elapsed[0]),
+            generation_seconds=float(elapsed[0]["generation_seconds"]),
             response_mask=response_mask,
             worker_policy_version=worker_version,
+            finish_reasons=elapsed[0]["finish_reasons"],
         )
 
     def _generate_tp_owned(self, request: GenerationRequest) -> GenerationResult:

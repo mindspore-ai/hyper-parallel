@@ -20,9 +20,9 @@
 # pylint: disable=unexpected-keyword-arg,not-callable
 
 import sys
-from types import SimpleNamespace
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -81,6 +81,8 @@ def test_native_and_hyper_qwen3_select_expected_vllm_runtime(
 
     versions = {"vllm": "0.22.1", "vllm-ascend": "0.22.1rc1"}
     hook_modes: list[bool] = []
+    evidence_hook = Mock()
+    monkeypatch.setattr(plugin_module, "install_tool_evidence", evidence_hook)
     monkeypatch.setattr(plugin_module, "package_version", versions.__getitem__)
     monkeypatch.setattr(
         plugin_module,
@@ -90,6 +92,7 @@ def test_native_and_hyper_qwen3_select_expected_vllm_runtime(
     monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(ModelRegistry=FakeRegistry))
 
     plugin_module.register_hyper_models()
+    evidence_hook.assert_called_once_with()
     plugin_module.register_hyper_models()
     diagnostics: list[str] = []
     profiles: list[str] = []

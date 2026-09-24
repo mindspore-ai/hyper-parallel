@@ -26,6 +26,7 @@ import sys
 import pytest
 
 from . import _launch as launch_module
+from . import test_feature_st
 from . import _worker as worker_module
 from .st_evidence import metrics, validate_phase, validate_sessions
 from .st_runtime import CASES, DEFAULT_RESULT_ROOT, ROOT, Case, prepare_config, command
@@ -317,7 +318,7 @@ def test_evaluation_rejects_partial_or_inconsistent_results(tmp_path: Path, eval
 def test_launcher_is_framework_free() -> None:
     """The pytest launcher must remain importable without training backends."""
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).parent.parent) + os.pathsep + str(ROOT))
-    code = ("import sys; import st.test_rl_st; import st._launch; "
+    code = ("import sys; import st.test_rl_st; import st.test_feature_st; import st._launch; "
             "assert not {'torch','torch_npu','hyper_parallel'} & sys.modules.keys()")
     result = subprocess.run([sys.executable, "-c", code], env=env, cwd=ROOT,
                             capture_output=True, text=True, timeout=30, check=False)
@@ -403,3 +404,20 @@ def test_launcher_removes_temporary_rank_logs(
     )
     assert not config.with_suffix("").exists()
     assert "rank output" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("feature", ["moe", "code", "agent"])
+def test_feature_st_requires_explicit_recipe(feature: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A required feature case must not silently skip when no recipe is configured."""
+    monkeypatch.delenv(f"RL_ST_{feature.upper()}_CONFIG", raising=False)
+    monkeypatch.setenv("RL_ST_REQUIRED", "1")
+    with pytest.raises(pytest.fail.Exception, match="Required system test needs"):
+        test_feature_st.test_feature_training(feature, tmp_path, monkeypatch)
+
+
+def test_feature_st_rejects_stale_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A previous successful completion file cannot satisfy a new system test."""
+    monkeypatch.setenv("RL_ST_RESULT_DIR", str(tmp_path))
+    (tmp_path / "completed.json").write_text('{"status":"passed","steps":2}', encoding="utf-8")
+    with pytest.raises(pytest.fail.Exception, match="stale evidence"):
+        test_feature_st.test_agent_dp_padding(tmp_path, monkeypatch)

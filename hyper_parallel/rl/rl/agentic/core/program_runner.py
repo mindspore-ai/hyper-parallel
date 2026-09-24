@@ -20,10 +20,12 @@ import asyncio
 import hashlib
 import importlib
 import json
+import math
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Callable, Optional, Protocol, Sequence
 
 import torch
@@ -31,7 +33,9 @@ import torch.distributed as dist
 
 from rl.dataset.batch_builder import build_experience_batch
 from rl.dataset.contracts import ExperienceBatch, PromptRecord, Trajectory, Turn
+from rl.dataset.episodes import episode_rows
 from rl.roles.rollout.base import GenerationSettings
+from rl.tool_protocol import validate_trainability
 
 _NATURAL_STOPS = frozenset({"stop", "tool_calls", "stop_sequence"})
 StatusResolver = Callable[[Sequence[Mapping[str, Any]], Mapping[str, Any]], tuple[bool, str]]
@@ -44,6 +48,23 @@ def _int_list(value: Any, label: str, field: str) -> list[int]:
         return [int(item) for item in value]
     except (TypeError, ValueError) as error:
         raise ValueError(f"{label} completion {field} must contain integer token IDs") from error
+
+
+def _sampled_logprobs(content, response_ids, label) -> list[float]:
+    """Validate finite sampled probabilities against their captured action token IDs."""
+    if not isinstance(content, list) or len(content) != len(response_ids):
+        raise ValueError(f"{label} completion logprobs must align with response token IDs")
+    sampled_logprobs = []
+    for token_id, item in zip(response_ids, content):
+        if not isinstance(item, Mapping) or item.get("logprob") is None:
+            raise ValueError(f"{label} completion contains an incomplete sampled-token logprob")
+        if item.get("token_id") is not None and int(item["token_id"]) != token_id:
+            raise ValueError(f"{label} completion token ID and logprob token ID differ")
+        value = float(item["logprob"])
+        if not math.isfinite(value):
+            raise ValueError(f"{label} sampled-token logprob must be finite")
+        sampled_logprobs.append(value)
+    return sampled_logprobs
 
 
 def _trace(record: Mapping[str, Any], label: str) -> dict[str, Any]:
@@ -66,15 +87,7 @@ def _trace(record: Mapping[str, Any], label: str) -> dict[str, Any]:
         response_value = [item.get("token_id") if isinstance(item, Mapping) else None for item in content]
     prompt_ids = _int_list(prompt_value, label, "prompt token IDs")
     response_ids = _int_list(response_value, label, "response token IDs")
-    if not isinstance(content, list) or len(content) != len(response_ids):
-        raise ValueError(f"{label} completion logprobs must align with response token IDs")
-    sampled_logprobs = []
-    for token_id, item in zip(response_ids, content):
-        if not isinstance(item, Mapping) or item.get("logprob") is None:
-            raise ValueError(f"{label} completion contains an incomplete sampled-token logprob")
-        if item.get("token_id") is not None and int(item["token_id"]) != token_id:
-            raise ValueError(f"{label} completion token ID and logprob token ID differ")
-        sampled_logprobs.append(float(item["logprob"]))
+    sampled_logprobs = _sampled_logprobs(content, response_ids, label)
     return {
         "prompt_ids": prompt_ids,
         "response_ids": response_ids,
@@ -103,23 +116,12 @@ def _interstitial(
     label: str,
     max_prefix_rewrite: int,
 ) -> list[int]:
-    """Extract observations between completions while validating prefix continuity."""
-    common_prefix = 0
-    for previous_token, next_token in zip(previous_prompt, next_prompt):
-        if previous_token != next_token:
-            break
-        common_prefix += 1
-    if len(previous_prompt) - common_prefix > max_prefix_rewrite:
-        detail = "canonical prompt prefix" if max_prefix_rewrite == 0 else "canonical prompt body"
-        raise ValueError(f"{label} completion history rewrote its {detail}")
-    tail = next_prompt[common_prefix:]
-    try:
-        boundary = tail.index(end_of_turn_token_id)
-    except ValueError as error:
-        raise ValueError(f"{label} completion history omitted the end-of-turn boundary") from error
-    if previous_response and previous_response[-1] == end_of_turn_token_id:
-        return tail[boundary + 1:]
-    return tail[boundary:]
+    """Extract observations only when history preserves the exact sampled action."""
+    del end_of_turn_token_id, max_prefix_rewrite
+    expected = previous_prompt + previous_response
+    if next_prompt[:len(expected)] != expected:
+        raise ValueError(f"{label} completion history rewrote its exact sampled-action prefix")
+    return next_prompt[len(expected):]
 
 
 def _trajectory_turns(
@@ -156,6 +158,18 @@ def _trajectory_turns(
     return tuple(turns)
 
 
+def _ordered_completions(records: Sequence[Mapping[str, Any]], label: str) -> list[Mapping[str, Any]]:
+    """Require complete, unique call ordinals before producing any training row."""
+    if not records:
+        raise ValueError(f"{label} trajectory requires at least one captured completion")
+    ordinals = [record.get("ordinal", 0) for record in records]
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in ordinals):
+        raise ValueError(f"{label} completion ordinals must be integers")
+    if sorted(ordinals) != list(range(len(records))):
+        raise ValueError(f"{label} completion ordinals must be complete and unique starting at zero")
+    return sorted(records, key=lambda record: record.get("ordinal", 0))
+
+
 def build_harness_trajectory(
     *,
     label: str,
@@ -176,7 +190,7 @@ def build_harness_trajectory(
     """Merge one external harness trace without decoding or re-tokenizing."""
     if not completion_records:
         raise ValueError(f"{label} trajectory requires at least one captured completion")
-    ordered = sorted(completion_records, key=lambda record: int(record.get("ordinal", 0)))
+    ordered = _ordered_completions(completion_records, label)
     traces = [_trace(record, label) for record in ordered]
     eot_id = _end_of_turn_id(traces, end_of_turn_token_id, label)
     prompt_ids = list(traces[0]["prompt_ids"])
@@ -237,6 +251,94 @@ def build_harness_trajectory(
         metadata=trajectory_metadata,
         worker_policy_version=policy_version,
     )
+
+
+def _call_status(trace: Mapping[str, Any], episode_status: Optional[tuple[bool, str]]) -> tuple[bool, str]:
+    """Prefer a harness-owned episode outcome over the individual call's stop reason."""
+    if episode_status is not None:
+        return episode_status
+    truncated = trace.get("finish_reason") in {"length", "max_tokens"}
+    return truncated, "max_tokens" if truncated else "completed"
+
+
+def build_harness_call_trajectories(
+    *,
+    label: str,
+    runner_name: str,
+    prompt: PromptRecord,
+    policy_version: int,
+    sample_index: int,
+    completion_records: Sequence[Mapping[str, Any]],
+    reward: float,
+    reward_components: Mapping[str, float],
+    max_episode_tokens: int | None,
+    metadata: Mapping[str, Any] | None,
+    tool_history_field: str = "input",
+    status_resolver: StatusResolver | None = None,
+) -> tuple[Trajectory, ...]:
+    """Train each sampled action under the exact prompt used by its model call.
+
+    The episode remains the reward/GRPO unit; rows are merely independent
+    teacher-forced contexts. No rewritten assistant history is spliced in.
+    """
+    if not completion_records:
+        raise ValueError(f"{label} trajectory requires at least one captured completion")
+    prototype = prompt.metadata.get("input_ids")
+    if prototype is None or not torch.is_tensor(prototype):
+        raise ValueError(f"{label} trajectory requires PromptRecord metadata input_ids")
+    ordered = _ordered_completions(completion_records, label)
+    traces = [_trace(record, label) for record in ordered]
+    episode_id = f"{prompt.prompt_id}:{policy_version}:{sample_index}"
+    episode_metadata = dict(metadata or {})
+    count = len(traces)
+    episode_status = status_resolver(traces, episode_metadata) if status_resolver else None
+    results = []
+    for index, (record, trace) in enumerate(zip(ordered, traces)):
+        prompt_ids = list(trace["prompt_ids"])
+        response_ids = list(trace["response_ids"])
+        token_ids = prompt_ids + response_ids
+        action_mask = [0] * len(prompt_ids) + [1] * len(response_ids)
+        token_logprobs = [None] * len(prompt_ids) + list(trace["response_logprobs"])
+        _validate_harness_tokens(label, token_ids, action_mask, token_logprobs, max_episode_tokens)
+        row_metadata = dict(episode_metadata)
+        row_metadata.update({
+            "runner": runner_name,
+            "episode_id": episode_id,
+            "call_index": index,
+            "call_count": count,
+            f"{runner_name}_completion_count": count,
+            "finish_reason": trace.get("finish_reason"),
+            "tool_history": record.get("original_request", {}).get(tool_history_field, []),
+            "gateway_record": json.loads(json.dumps(record)),
+        })
+        message = record["response"]["choices"][0].get("message", {})
+        action_text = message.get("content") if isinstance(message, Mapping) else None
+        turns = _trajectory_turns(len(prompt_ids), action_mask, 1, label, runner_name)
+        if isinstance(action_text, str):
+            turns = tuple(replace(turn, content=action_text) if turn.trainable else turn for turn in turns)
+        truncated, terminal_reason = _call_status(trace, episode_status)
+        results.append(Trajectory(
+            trajectory_id=f"{episode_id}:call:{index}",
+            prompt_id=prompt.prompt_id,
+            group_id=prompt.prompt_id,
+            policy_version=policy_version,
+            turns=turns,
+            token_ids=prototype.new_tensor(token_ids),
+            attention_mask=prototype.new_ones((len(token_ids),)),
+            action_mask=prototype.new_tensor(action_mask, dtype=torch.bool),
+            rollout_log_probs=prototype.new_tensor(
+                [float(value) if value is not None else 0.0 for value in token_logprobs[1:]],
+                dtype=torch.float32,
+            ),
+            reward=float(reward),
+            reward_components={str(name): float(value) for name, value in reward_components.items()},
+            done=True,
+            truncated=truncated,
+            terminal_reason=terminal_reason,
+            metadata=row_metadata,
+            worker_policy_version=policy_version,
+        ))
+    return tuple(results)
 
 
 def request_gateway_json(
@@ -314,12 +416,15 @@ class HarnessRuntime:
         label: str,
         default_port: int,
         api_prefix: str = "",
+        gateway_options: Mapping[str, Any] | None = None,
     ) -> None:
+        """Bind a protocol gateway to the shared, policy-versioned rollout engine."""
         self.engine = engine
         self.config = dict(config)
         self._gateway_factory = gateway_factory
         self._label = label
         self._default_port = default_port
+        self._gateway_options = dict(gateway_options or {})
         self._gateway: Any | None = None
         self._episode_version: int | None = None
         host = str(self.config.get("gateway_host", "127.0.0.1"))
@@ -343,6 +448,7 @@ class HarnessRuntime:
                     backend_url=backend_url,
                     model_name=model_name,
                     request_timeout=float(self.config.get("request_timeout", 600.0)),
+                    **self._gateway_options,
                 )
                 self._gateway.start()
             except Exception as error:  # pylint: disable=W0718
@@ -387,6 +493,7 @@ class HarnessProgramFactory:
         end_of_turn_token_id: int | None,
         generation_config: Mapping[str, Any],
     ) -> None:
+        """Retain the runtime identity and generation settings for program construction."""
         self.runtime = runtime
         self.end_of_turn_token_id = end_of_turn_token_id
         self.config = {**runtime.config, **dict(generation_config)}
@@ -417,8 +524,8 @@ class HarnessProgramFactory:
 class AgentProgram(Protocol):
     """One user-defined episode, including its own tools and model calls."""
 
-    async def run(self) -> Trajectory:
-        """Execute one user-owned episode and return its trajectory."""
+    async def run(self) -> Trajectory | tuple[Trajectory, ...]:
+        """Execute one episode and return a continuous trajectory or its per-call rows."""
 
 AgentProgramFactory = Callable[[PromptRecord, int, int], AgentProgram]
 
@@ -457,7 +564,33 @@ class ProgramAgentRunner:
             for prompt in prompt_records
             for sample_index in range(self.num_samples)
         ]
-        return tuple(await asyncio.gather(*(program.run() for program in programs)))
+        results = await asyncio.gather(*(program.run() for program in programs), return_exceptions=True)
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            details = [f"{type(error).__name__}: {error}" for error in errors]
+            raise RuntimeError(f"Agent program group failed after draining all samples: {details}")
+        expected_prompts = [prompt.prompt_id for prompt in prompt_records for _ in range(self.num_samples)]
+        trajectories = self._program_rows(results, expected_prompts)
+        self._validate_trajectories(trajectories, prompt_records, policy_version)
+        episode_rows(trajectories)
+        validate_trainability(trajectories)
+        return tuple(trajectories)
+
+    @staticmethod
+    def _program_rows(results, expected_prompts: Sequence[str]) -> tuple[Trajectory, ...]:
+        """Flatten program results only after validating each complete episode."""
+        trajectories = []
+        for result, prompt_id in zip(results, expected_prompts):
+            rows = (result,) if isinstance(result, Trajectory) else result
+            if not isinstance(rows, tuple) or not rows or not all(isinstance(row, Trajectory) for row in rows):
+                raise TypeError("Agent program must return a Trajectory or a nonempty tuple of Trajectories")
+            if any(row.prompt_id != prompt_id for row in rows):
+                raise ValueError("Agent program returned rows for a different submitted prompt")
+            if isinstance(result, tuple):
+                if not all(row.metadata.get("episode_id") for row in rows) or len(episode_rows(rows)) != 1:
+                    raise ValueError("Agent program call rows must describe exactly one complete episode")
+            trajectories.extend(rows)
+        return tuple(trajectories)
 
     def rollout(
         self,
@@ -469,41 +602,66 @@ class ProgramAgentRunner:
             raise ValueError("ProgramAgentRunner requires at least one PromptRecord")
         started = time.perf_counter()
         trajectories = None
+        payload = None
         local_error = None
-        is_owner = bool(getattr(self.engine, "is_request_owner", True))
-        if is_owner:
+        synchronize_payload = getattr(self.engine, "synchronize_agent_payload", None)
+        if bool(getattr(self.engine, "is_request_owner", True)):
             try:
                 trajectories = asyncio.run(self._run(prompt_records, policy_version))
-            except Exception as error:  # pylint: disable=W0718
+                if callable(synchronize_payload):
+                    payload = self._serialize_trajectories(trajectories)
+            except Exception as error:  # pylint: disable=broad-exception-caught
                 local_error = error
-        synchronize_error = getattr(self.engine, "synchronize_error", None)
-        if callable(synchronize_error):
-            # Optional engine hooks are installed dynamically; the callable guard validates them.
-            synchronize_error(local_error, "agent program rollout")  # pylint: disable=not-callable
-        elif local_error is not None:
-            raise local_error
-        synchronize_payload = getattr(self.engine, "synchronize_agent_payload", None)
-        if callable(synchronize_payload):
-            payload = None if trajectories is None else self._serialize_trajectories(trajectories)
-            # Pylint infers the getattr default rather than the dynamically installed callback.
-            payload = synchronize_payload(payload)  # pylint: disable=not-callable
-            trajectories = self._deserialize_trajectories(payload, prompt_records)
-        if trajectories is None:
-            raise RuntimeError("AgentProgram rollout produced no trajectories")
+        self._synchronize_failure(local_error, "agent program rollout and serialization")
+        batch = None
+        local_error = None
+        try:
+            if callable(synchronize_payload):
+                payload = synchronize_payload(payload)  # pylint: disable=not-callable
+                trajectories = self._deserialize_trajectories(payload, prompt_records)
+            if trajectories is None:
+                raise RuntimeError("AgentProgram rollout produced no trajectories")
+            self._validate_trajectories(trajectories, prompt_records, policy_version)
+            episode_rows(trajectories)
+            validate_trainability(trajectories)
+            batch = build_experience_batch(
+                trajectories=trajectories,
+                generation_seconds=time.perf_counter() - started,
+                settings=self.settings,
+                metadata={"runner": "program"},
+            )
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            local_error = error
+        self._synchronize_failure(local_error, "agent program reconstruction and batching")
+        if batch is None:
+            raise RuntimeError("AgentProgram batching produced no experience")
+        return batch
+
+    def _synchronize_failure(self, error: Optional[Exception], operation: str) -> None:
+        """Keep every TP/DP rank on the same error boundary before subsequent collectives."""
+        synchronize = getattr(self.engine, "synchronize_error", None)
+        if callable(synchronize):
+            synchronize(error, operation)  # pylint: disable=not-callable
+        elif error is not None:
+            raise error
+
+    @staticmethod
+    def _validate_trajectories(trajectories, prompt_records, policy_version) -> None:
+        """Validate identity before entering any all-rank synchronization."""
         allowed_prompt_ids = {prompt.prompt_id for prompt in prompt_records}
+        if len({trajectory.trajectory_id for trajectory in trajectories}) != len(trajectories):
+            raise ValueError("Agent programs returned duplicate trajectory IDs")
         for trajectory in trajectories:
+            if trajectory.metadata.get("dp_padding", False):
+                raise ValueError("Agent programs must return real calls, not DP padding")
+            if not math.isfinite(trajectory.reward):
+                raise ValueError("Agent program trajectory reward must be finite")
             if trajectory.prompt_id not in allowed_prompt_ids:
                 raise ValueError("AgentProgram returned a trajectory for an unknown prompt")
             if trajectory.policy_version != policy_version:
                 raise ValueError(
                     "AgentProgram trajectory policy_version does not match the requested snapshot"
                 )
-        return build_experience_batch(
-            trajectories=trajectories,
-            generation_seconds=time.perf_counter() - started,
-            settings=self.settings,
-            metadata={"runner": "program"},
-        )
 
     @staticmethod
     def _serialize_trajectories(trajectories: tuple[Trajectory, ...]) -> list[dict[str, Any]]:

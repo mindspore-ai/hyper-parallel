@@ -668,10 +668,10 @@ def test_gateway_session_state_lifecycle(
             state.register("other", invalid)
 
 
-def test_codex_gateway_reserves_final_completion_for_answer(
+def test_codex_gateway_preserves_tool_choice_with_bounded_calls(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A bounded Codex session keeps its final response free of tool calls."""
+    """A bounded Codex session preserves caller tool choice through its last call."""
     gateway = importlib.import_module("rl.agentic.codex.gateway")
     state = gateway._State("http://backend", "qwen3", 2.0)
     state.register("session", {"policy_version": 0, "artifact_dir": str(tmp_path),
@@ -686,13 +686,13 @@ def test_codex_gateway_reserves_final_completion_for_answer(
 
     monkeypatch.setattr(gateway._Handler, "_bearer_token", lambda _handler: "session")
     monkeypatch.setattr(gateway._Handler, "_backend_request", backend)
-    monkeypatch.setattr(gateway._Handler, "_json", lambda *_args: None)
+    monkeypatch.setattr(gateway._Handler, "_json", lambda *_args, **_kwargs: None)
     handler = object.__new__(gateway._Handler)
     handler.server = SimpleNamespace(state=state)
     request = {"input": "calculate", "tools": [{"type": "local_shell", "description": "shell"}]}
     handler._proxy_responses(request)
     handler._proxy_responses(request)
-    assert [payload["tool_choice"] for payload in requests] == ["auto", "none"]
+    assert [payload["tool_choice"] for payload in requests] == ["auto", "auto"]
     with pytest.raises(ValueError, match="max_completions"):
         handler._proxy_responses(request)
 
@@ -756,9 +756,9 @@ def test_gateway_http_routes_and_lifecycle(gateway_module: str) -> None:
             "generation": generation,
         }
         assert request("POST", "/internal/sessions", registration)[0] == 201
-        assert request("GET", "/internal/sessions/session")[1]["policy_version"] == 2
         proxy_path = "/v1/chat/completions" if is_deepseek else "/v1/responses"
         assert request("POST", proxy_path, {"messages": []} if is_deepseek else {"input": "q"})[0] == 502
+        assert request("GET", "/internal/sessions/session")[1]["policy_version"] == 2
         assert request("DELETE", "/unknown")[0] == 404
         assert request("DELETE", "/internal/sessions/missing")[0] == 404
         assert request("DELETE", "/internal/sessions/session")[0] == 200
@@ -1129,6 +1129,7 @@ def test_codex_program_configuration_and_process(tmp_path: Path, monkeypatch: py
             return next(self.lines, b"")
 
     class Process:
+        pid = 12345
         returncode = 0
         stdout = Stream([b'{"type":"item.completed","item":{"type":"agent_message","text":"2"}}\n'])
         stderr = Stream([b"diagnostic\n"])
@@ -1139,9 +1140,12 @@ def test_codex_program_configuration_and_process(tmp_path: Path, monkeypatch: py
     async def create_process(*_args: Any, **_kwargs: Any) -> Process:
         return Process()
 
+    signals = []
+    monkeypatch.setattr(modules.codex_harness.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
     monkeypatch.setattr(modules.codex_harness.asyncio, "create_subprocess_exec", create_process)
     answer, code, diagnostics = asyncio.run(program._run_codex("session", artifact, workspace, home))
     assert (answer, code, diagnostics) == ("2", 0, [])
+    assert [pid for pid, _ in signals] == [12345, 12345]
     assert (artifact / "codex-events.jsonl").is_file()
 
     version_process = Process()
@@ -1517,14 +1521,13 @@ def test_harness_trajectory_validation_branches(module_name: str, label: str) ->
         [{"response_ids": [2], "finish_reason": "stop"}], None, label
     ) == 2
     max_rewrite = 0 if label == "Codex" else 16
-    with pytest.raises(ValueError, match="end-of-turn boundary"):
+    with pytest.raises(ValueError, match="exact sampled-action prefix"):
         shared._interstitial([1, 3], [1], [2], 2, label, max_rewrite)
     assert shared._interstitial(
         [1, 2, 3], [1], [2], 2, label, max_rewrite
     ) == [3]
-    assert shared._interstitial(
-        [1, 2, 3], [1], [9], 2, label, max_rewrite
-    ) == [2, 3]
+    with pytest.raises(ValueError, match="exact sampled-action prefix"):
+        shared._interstitial([1, 2, 3], [1], [9], 2, label, max_rewrite)
     if label == "Codex":
         with pytest.raises(ValueError, match="rewrote"):
             shared._interstitial([9, 2], [1], [2], 2, label, max_rewrite)
@@ -1594,16 +1597,17 @@ def test_program_run_lifecycle(
 
         monkeypatch.setattr(program, "_validate_version", validate)
         monkeypatch.setattr(program, "_run_codex", execute)
-        monkeypatch.setattr(harness, "build_codex_trajectory", lambda **_kwargs: trajectory)
+        monkeypatch.setattr(harness, "build_codex_call_trajectories", lambda **_kwargs: (trajectory,))
     else:
         program = harness.DeepSeekAgentProgram(
             _prompt(), 2, 0, "http://gateway/v1", "http://gateway", config, 99
         )
         monkeypatch.setattr(program, "_run_harness", lambda *_args: ("2", "completed", []))
         monkeypatch.setattr(program, "_capture_contract_error", lambda _captured: None)
-        monkeypatch.setattr(harness, "build_deepseek_trajectory", lambda **_kwargs: trajectory)
+        monkeypatch.setattr(harness, "build_harness_call_trajectories", lambda **_kwargs: (trajectory,))
 
-    assert asyncio.run(program.run()) is trajectory
+    result = asyncio.run(program.run())
+    assert result == (trajectory,)
     assert [request[0] for request in requests] == ["POST", "GET", "DELETE"]
     if harness_name == "codex_harness":
         requests.clear()
@@ -1614,7 +1618,7 @@ def test_program_run_lifecycle(
         monkeypatch.setattr(program, "_run_codex", fail)
         with pytest.raises(RuntimeError, match="synthetic Codex failure"):
             asyncio.run(program.run())
-        assert [request[0] for request in requests] == ["POST", "DELETE"]
+        assert [request[0] for request in requests] == ["POST", "GET", "DELETE"]
 
 
 def test_program_factories_verify_policy_version(monkeypatch: pytest.MonkeyPatch) -> None:

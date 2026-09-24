@@ -3,10 +3,31 @@
 ## 适用范围
 
 本文定义 Hyper-RL 的 shared vLLM rollout 合同，覆盖 Qwen3 Hyper/Native TP1/TP2、colocated NPU IPC、disjoint HCCL、
-在线权重发布和同步失败语义。当前只保留 Qwen3-4B dense 适配，Agentic 继续通过同一生成与权重发布接口工作。
+在线权重发布和同步失败语义。Qwen3 dense 保留原有路径；Qwen3-30B-A3B 的 MoE 接入范围见下文。
+Agentic 继续通过同一生成与权重发布接口工作。
 
 公共运行时与 family 模型适配分开维护：代码目录及插件加载路径见
-[代码与模型接入](qwen3_master_adaptation.md#5-rl-运行代码改动清单)。目录调整不改变下述运行合同或配置。
+[模型注册与构建](../rl/roles/model_setup.py)。目录职责不改变下述运行合同或配置。
+
+## Qwen3-30B-A3B
+
+MoE 使用公共 HyperAutoModel 和 Qwen3-MoE recipe 构造训练模型，rollout 使用 native vLLM。
+入口示例为 [Qwen3-30B-A3B GSM8K 配置](../examples/gsm8k/configs/qwen3_30b_a3b_gsm8k_vllm.yaml)。
+首批实现限于 GRPO、colocated、consistency-off、EPLB 关闭；不支持 MoE PPO 或 disjoint。
+当前迁移的实际验收结果记录在 [M1 执行记录](moe_code_agent.md#功能与支持边界)，不能沿用其他分支的历史结果。
+
+- `train.accelerator.ep` 控制训练专家并行，`edp_shard` 控制专家数据并行分片。
+  EP 必须整除专家数，EP×EDP 必须整除训练 world size；dense 模型两者均为 1。
+- `rollout.vllm.enable_expert_parallel` 控制推理专家并行；推理设备数仍为 DP×TP，
+  EP 不额外增加设备。示例训练 TP2/EP2/EDP2、推理 DP2/TP2 使用四张卡。
+- `full_gather` 将 GroupedExperts 的 gate/up/down 切片还原为逐专家 checkpoint 权重，
+  通过 native layerwise reload 更新推理存储。接收方持有独立 tensor，避免跨 bucket 引用失效。
+- `direct_reshard` 使用实际 expert map 和物理 worker 路由，直接复制源 EP/EDP 区域与目标专家存储的交集。
+  专家 worker 的回执必须覆盖全部 DP×TP 设备；不能将一个 DP engine 的结果视为全体结果。
+- 两条路径均保留版本确认和失败传播，无隐式回退。dense 的 builder、TP 传输和一致性路径保持独立。
+
+训练前明确选择策略和设备，按当前 checkout 安装主包及 RL 包并核对导入位置。
+该 MoE 路径使用固定统一 Ascend 镜像的专家布局和加载接口，其他 vLLM 版本需重新验证。
 
 ## Ownership
 
@@ -133,12 +154,14 @@ Colocated 与 disjoint 复用同一份配置 schema、`train_rl.py`、rollout co
 
 2026-09-12 的四卡 colocated GRPO 已有 direct-reshard 与 packed full-gather 两步 bit-exact
 验收，具体数据及后续回归统一见[一致性验证记录](qwen3_training_inference_consistency.md)。
-普通模式的 TP1/TP2、Native Agentic、disjoint，以及 PPO 和恢复结果分别见
-[模型接入验证](qwen3_master_adaptation.md)与 [PPO 验证](ppo.md)。
+模型接入及 PPO 目标计算的逻辑覆盖见
+[模型接入测试](../../../tests/ut/rl/trainer/test_qwen3_master.py)与
+[PPO 训练目标测试](../../../tests/ut/rl/trainer/test_ppo_targets.py)；逻辑测试不代替真机闭环证据。
 迁移来源的 disjoint/cache/resume 历史结果不能替代当前版本对应组合的 bit-exact 验收，
 也不提供多节点或性能承诺。目录重组本身不扩大这些验证范围。
 
-当前不开放专家并行：`train.accelerator.ep=1`，`rollout.vllm.enable_expert_parallel=false`，`enable_eplb=false`。
+Dense 模型仍要求 `train.accelerator.ep=1`，推理专家并行关闭。MoE 的 EP/EDP 和验收范围见
+[Qwen3-30B-A3B](#qwen3-30b-a3b)；两类模型均不开放 EPLB。
 
 ## 修改门禁
 

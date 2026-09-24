@@ -10,8 +10,8 @@ Hyper-RL 当前运行时的核心是一个同步训练状态机：每一步只�
 
 本文首先描述**当前同步实现**的组件边界、状态所有权和失败语义；文末单独说明规划中的演进边界。具体配置、已验证拓扑和运行命令分别由 [vLLM Rollout](vllm_rollout.md)、[训练-推理一致性](qwen3_training_inference_consistency.md) 和 [运行镜像](../docker/README.md) 维护。
 
-当前端到端算法包括 GRPO 和部分组合已验收的 PPO，模型适配收敛到 Qwen3-4B；Native/Hyper rollout、学习、发布及拓扑验证范围见 [README](../README.md#支持范围)和 [PPO](ppo.md)。
-Agentic 的内部 runner、Codex 和 DeepSeek Harness 保持现有接口与行为，其他模型属于后续规划。
+当前端到端算法包括 GRPO 和部分组合已验收的 PPO；模型、Native/Hyper rollout、学习、发布及拓扑范围见 [README](../README.md#支持范围)。
+Agentic 的内部 runner 保留环境循环；Codex 与 DeepSeek Harness 使用真实逐调用轨迹和 episode GRPO，见 [Agentic RL](agentic_rl.md)。
 
 ## 系统视图
 
@@ -84,7 +84,7 @@ vLLM 的 `HyperQwen3ForCausalLM` 继续提供 paged attention/KV cache；Native-
 | `ModelRegistration` | Config → Trainer / rollout / weight sync | 模型家族、checkpoint、tokenizer、tied embedding 和 rollout implementation 使用同一身份 |
 | `PromptRecord` | Dataset → AgentRunner | 稳定 prompt ID、messages、ground truth 和原始 token metadata |
 | `GenerationRequest/Result` | AgentRunner ↔ GenerationEngine | backend-neutral 请求；返回 token IDs、response mask、FP32 raw logprobs 和 worker policy version |
-| `Trajectory` | AgentSession / AgentProgram → batch builder | 单轮或多轮 episode 的 token、turn span、action mask、reward 和终止原因 |
+| `Trajectory` | AgentSession / AgentProgram → batch builder | 完整 episode 或其中一次真实模型调用的 token、action mask、共享 episode 奖励和终止原因 |
 | `ExperienceBatch` | batch builder / preparer → Actor / Critic | padding 后的二维 tensor 合同，以及与 next-token position 对齐的训练字段 |
 | `PolicySnapshot` | Actor → publication controller | 单调递增版本、模型身份和待发布 Actor payload |
 
@@ -113,14 +113,15 @@ returns / values     [batch, tokens - 1] when required
 - 驱动 single-turn 或 multi-turn `AgentSession`；
 - 调用环境、工具与 reward；
 - 将 observation/action 映射为 token-aligned turns；
-- 输出统一的 `Trajectory`。
+- 输出一个完整 episode 的 `Trajectory`，或带完整调用身份的逐调用 `Trajectory` 元组。
 
 `ProgramAgentRunner` 已通过内置 Codex / DeepSeek Harness 接入配置驱动的训练入口，复用同一轨迹与 batch 合同。任意自定义 runner 尚不能直接在 YAML 中接入，仍需适配 runtime、factory、manager 与配置校验；程序化路径的交付验收列入 [TODO](TODO.md)。
 
 ### Agentic Harness
 
 `agentic.runner` 选择内部环境循环、Codex CLI 或 DeepSeek Harness。三条路径最终都产出同一个 token-first
-`Trajectory`；模型返回的 token ID 和 sampled-token raw logprob 是训练证据，工具与环境内容只作为非训练上下文。
+`Trajectory` 类型；外部 program 每次调用一行，由 `dataset/episodes.py` 统一校验和分组。
+模型返回的 token ID 和 sampled-token raw logprob 是训练证据，工具与环境内容只作为非训练上下文。
 
 Codex 和 DeepSeek 通过本地协议 gateway 复用共享 vLLM endpoint，不创建第二个 rollout Router。
 Trainer TP 组只有 request-owner rank 执行外部 harness，完整 trajectory 经对象 collective 同步给同组 rank。

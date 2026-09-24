@@ -124,25 +124,8 @@ def shared_endpoint(client: VLLMWeightSyncClientMixin) -> str:
     return str(endpoints[0])
 
 
-def direct_reshard_workers(
-    client: VLLMWeightSyncClientMixin,
-    *,
-    data_parallel_size: int,
-    tensor_parallel_size: int,
-) -> list[Mapping[str, Any]]:
-    """Query and reduce physical worker layouts to one representative DP replica."""
-    expected_world_size = data_parallel_size * tensor_parallel_size
-    actual_world_size = client.get_world_size()
-    if actual_world_size != expected_world_size:
-        raise RuntimeError(
-            "Direct reshard rollout world size differs from configured DP x TP: "
-            f"expected={expected_world_size}, actual={actual_world_size}"
-        )
-    workers = client.collective_rpc("get_direct_reshard_layout")
-    if not workers or not all(isinstance(worker, Mapping) for worker in workers):
-        raise RuntimeError(
-            f"Direct reshard rollout returned invalid layouts: {workers}"
-        )
+def _worker_layout_coordinates(workers, data_parallel_size, tensor_parallel_size):
+    """Validate worker topology and complete TP replicas before selecting routes."""
     by_coordinate = {}
     for worker in workers:
         coordinate = (int(worker["dp_rank"]), int(worker["tp_rank"]))
@@ -167,6 +150,35 @@ def direct_reshard_workers(
             raise RuntimeError(
                 f"Direct reshard DP{dp_rank} returned incomplete TP layouts"
             )
+    return by_coordinate
+
+
+def direct_reshard_workers(
+    client: VLLMWeightSyncClientMixin,
+    *,
+    data_parallel_size: int,
+    tensor_parallel_size: int,
+) -> list[Mapping[str, Any]]:
+    """Query and reduce physical worker layouts to one representative DP replica."""
+    expected_world_size = data_parallel_size * tensor_parallel_size
+    actual_world_size = client.get_world_size()
+    if actual_world_size != expected_world_size:
+        raise RuntimeError(
+            "Direct reshard rollout world size differs from configured DP x TP: "
+            f"expected={expected_world_size}, actual={actual_world_size}"
+        )
+    workers = client.collective_rpc("get_direct_reshard_layout")
+    if not workers or not all(isinstance(worker, Mapping) for worker in workers):
+        raise RuntimeError(
+            f"Direct reshard rollout returned invalid layouts: {workers}"
+        )
+    by_coordinate = _worker_layout_coordinates(workers, data_parallel_size, tensor_parallel_size)
+    dp_ranks = sorted({coordinate[0] for coordinate in by_coordinate})
+    if any(worker.get("model_type") == "qwen3_moe" for worker in workers):
+        if len(by_coordinate) != expected_world_size:
+            raise RuntimeError("Expert parallel layouts require every DP x TP worker")
+        return [dict(worker, worker_rank=dp * tensor_parallel_size + tp)
+                for (dp, tp), worker in sorted(by_coordinate.items())]
     representative_dp_rank = dp_ranks[0]
     representatives = []
     for tp_rank in range(tensor_parallel_size):

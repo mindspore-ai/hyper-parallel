@@ -236,7 +236,7 @@ def test_complete_config_resolves_validates_and_builds_runtime(
 
 @pytest.mark.parametrize(
     ("model_type", "architecture"),
-    [("qwen3_moe", "Qwen3MoeForCausalLM"), ("deepseek_v3", "DeepseekV3ForCausalLM")],
+    [("deepseek_v3", "DeepseekV3ForCausalLM")],
 )
 def test_removed_model_families_fail_before_runtime_construction(
     tmp_path: Path, model_type: str, architecture: str,

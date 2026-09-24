@@ -37,11 +37,14 @@ def test_external_plugin_entry_point_registers_qwen3(monkeypatch: pytest.MonkeyP
     versions = {"vllm": "0.22.1", "vllm-ascend": "0.22.1rc1"}
     monkeypatch.setattr(plugin_module, "package_version", versions.__getitem__)
     monkeypatch.setattr(plugin_module, "install_vllm_weight_sync_hooks", Mock())
+    evidence_hook = Mock()
+    monkeypatch.setattr(plugin_module, "install_tool_evidence", evidence_hook)
     monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(ModelRegistry=registry))
     monkeypatch.delenv("HYPER_RL_CONSISTENCY_PROFILE", raising=False)
     monkeypatch.delenv("HYPER_RL_TEST_QWEN3_RMS_NORM", raising=False)
 
     register_models()
+    evidence_hook.assert_called_once_with()
 
     registry.register_model.assert_called_once_with(
         "HyperQwen3ForCausalLM", "rl.roles.rollout.consistency_models.qwen3.model:HyperQwen3ForCausalLM",

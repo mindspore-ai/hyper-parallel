@@ -254,6 +254,10 @@ class AgentRunner:
             and tuple(result.rollout_log_probs.shape) != tuple(response_ids.shape)
         ):
             raise ValueError("Generation rollout_log_probs must align with response IDs")
+        reasons = getattr(result, "finish_reasons", None)
+        if reasons is not None and (len(reasons) != session_count or any(
+                reason is not None and not isinstance(reason, str) for reason in reasons)):
+            raise ValueError("Generation finish_reasons must align with response rows")
         return response_ids, self._response_mask(response_ids, result.response_mask)
 
     def _decode_actions(
@@ -296,8 +300,10 @@ class AgentRunner:
                 else result.rollout_log_probs[row][token_mask]
             )
             active_sessions.append(session)
+            reasons = getattr(result, "finish_reasons", None)
+            metadata = {} if reasons is None or reasons[row] is None else {"finish_reason": reasons[row]}
             actions.append(
-                Action(action_texts[action_index], action_tokens, action_log_probs)
+                Action(action_texts[action_index], action_tokens, action_log_probs, metadata)
             )
         return active_sessions, actions
 
@@ -309,22 +315,74 @@ class AgentRunner:
         prompt_length: int,
     ) -> None:
         """Validate, decode, and apply one batched generation result."""
-        response_ids, response_mask = self._validate_generation_result(
-            result,
-            len(sessions),
-            prompt_length,
-        )
-        active_sessions, actions = self._decode_actions(
-            sessions,
-            active_before_generation,
-            result,
-            response_ids,
-            response_mask,
-        )
-        await self._gather_session_operations(
-            "session apply",
-            *(session.apply(action) for session, action in zip(active_sessions, actions)),
-        )
+        active_sessions, actions = [], []
+        local_error = None
+        try:
+            response_ids, response_mask = self._validate_generation_result(result, len(sessions), prompt_length)
+            active_sessions, actions = self._decode_actions(
+                sessions, active_before_generation, result, response_ids, response_mask,
+            )
+        except Exception as error:  # pylint: disable=W0718
+            local_error = error
+        self._synchronize_error(local_error, "agent action preparation")
+        await self._run_environment_batch(active_sessions, actions)
+
+    @property
+    def _owns_environments(self) -> bool:
+        """Use the same TP owner as external programs and inference requests."""
+        return bool(getattr(self.engine, "is_request_owner", True))
+
+    async def _run_environment_batch(
+        self, sessions: Sequence[AgentSession], actions: Optional[Sequence[Action]] = None,
+    ) -> None:
+        """Run one owner batch, then replay its ordered results on TP siblings."""
+        values = None
+        payload = None
+        local_error = None
+        synchronize_payload = getattr(self.engine, "synchronize_agent_payload", None)
+        try:
+            if self._owns_environments:
+                operations = (session.start() for session in sessions) if actions is None else (
+                    session.apply(action) for session, action in zip(sessions, actions)
+                )
+                values = await self._gather_session_operations("environment batch", *operations)
+                if callable(synchronize_payload):
+                    payload = []
+                    for session, value in zip(sessions, values):
+                        observation = value if actions is None else value.observation
+                        observation = replace(observation, token_ids=observation.token_ids.detach().cpu().tolist())
+                        result = observation if actions is None else replace(value, observation=observation)
+                        payload.append((session.prompt.prompt_id, session.sample_index, result))
+        except (Exception, asyncio.CancelledError) as error:  # pylint: disable=W0718
+            local_error = error
+        # No collective runs inside any session coroutine: all local work settles first.
+        self._synchronize_error(local_error, "agent environment batch")
+        if callable(synchronize_payload):
+            payload = synchronize_payload(payload)
+        elif not self._owns_environments:
+            raise RuntimeError("TP environment replicas require synchronize_agent_payload")
+        if self._owns_environments:
+            return
+        await self._replay_environment_batch(sessions, actions, payload)
+
+    @staticmethod
+    async def _replay_environment_batch(
+        sessions: Sequence[AgentSession], actions: Optional[Sequence[Action]], payload: Any,
+    ) -> None:
+        """Restore the owner's ordered environment results on a TP sibling."""
+        if not isinstance(payload, list) or len(payload) != len(sessions):
+            raise ValueError("TP environment payload must cover the ordered session batch")
+        for session, action, item in zip(sessions, actions or [None] * len(sessions), payload):
+            prompt_id, sample_index, value = item
+            if (prompt_id, sample_index) != (session.prompt.prompt_id, session.sample_index):
+                raise ValueError("TP environment payload session order differs from local sessions")
+            observation = value if actions is None else value.observation
+            prototype = session.prompt.metadata["input_ids"]
+            observation = replace(observation, token_ids=prototype.new_tensor(observation.token_ids))
+            if actions is None:
+                await session.start(observation)
+            else:
+                await session.apply(action, replace(value, observation=observation))
 
     def _build_batch(
         self,
@@ -352,21 +410,19 @@ class AgentRunner:
             raise local_error
 
     @staticmethod
-    async def _gather_session_operations(operation: str, *coroutines: Any) -> None:
+    async def _gather_session_operations(operation: str, *coroutines: Any) -> list[Any]:
         """Wait for every session coroutine and report all local failures together."""
         results = await asyncio.gather(*coroutines, return_exceptions=True)
         errors = [str(result) for result in results if isinstance(result, BaseException)]
         if errors:
             raise RuntimeError(f"{operation} failed: {errors}")
+        return results
 
     async def _run_session_turns(self, sessions: Sequence[AgentSession]) -> float:
         """Start sessions, execute synchronized turns, and finalize turn limits."""
         local_error = None
         try:
-            await self._gather_session_operations(
-                "session start",
-                *(session.start() for session in sessions),
-            )
+            await self._run_environment_batch(sessions)
         except Exception as error:  # pylint: disable=W0718
             local_error = error
         self._synchronize_error(local_error, "agent session start")
@@ -412,12 +468,11 @@ class AgentRunner:
     ) -> tuple[tuple[Trajectory, ...], float]:
         """Keep reset, every step, and close on one environment event loop."""
         generation_seconds = 0.0
+        primary_error = None
         try:
             generation_seconds = await self._run_session_turns(sessions)
-        except Exception as error:  # pylint: disable=W0718
+        except (Exception, asyncio.CancelledError) as error:  # pylint: disable=W0718
             primary_error = error
-        else:
-            primary_error = None
         finally:
             local_error = None
             try:
@@ -465,7 +520,7 @@ class AgentRunner:
             )
         for prompt in prompt_records:
             for sample_index in range(self.num_samples):
-                observation_encoder = self._build_observation_encoder(prompt)
+                observation_encoder = self._build_observation_encoder(prompt) if self._owns_environments else None
                 episode_context = EpisodeContext(
                     prompt=prompt,
                     policy_version=policy_version,
@@ -478,7 +533,8 @@ class AgentRunner:
                 sessions.append(
                     AgentSession(
                         prompt=prompt,
-                        environment=ENVIRONMENTS.build(self.environment_name, episode_context),
+                        environment=(ENVIRONMENTS.build(self.environment_name, episode_context)
+                                     if self._owns_environments else None),
                         policy_version=policy_version,
                         sample_index=sample_index,
                         max_turns=max_turns,
