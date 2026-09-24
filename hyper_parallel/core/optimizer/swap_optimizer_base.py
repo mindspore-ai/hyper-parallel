@@ -12,24 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Torch optimizer state swap runtime and Adam/AdamW adapters."""
+"""Generic optimizer-state swap runtime, slots and adapter base."""
 # pylint: disable=protected-access
 
 from __future__ import annotations
 
 import contextlib
 import copy
-import inspect
 import itertools
-from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 import torch
 
-STATE_KEYS = ("exp_avg", "exp_avg_sq", "max_exp_avg_sq")
-MASTER_PARAM_KEY = "master_param"
-SUPPORTED_STATE_KEYS = STATE_KEYS + (MASTER_PARAM_KEY,)
+# Logical optimizer-state keys every swap family in this codebase understands.
+# This is the vocabulary ``SwapOptimizerConfig.state_keys`` may name; each
+# adapter still validates that a key belongs to its own optimizer family.
+KNOWN_STATE_KEYS = (
+    "exp_avg",
+    "exp_avg_sq",
+    "max_exp_avg_sq",
+    "momentum_buffer",
+    "master_param",
+)
 _PACKED_ALIGNMENT_BYTES = 512
 _DEVICE_TYPE = "npu"
 
@@ -72,11 +77,26 @@ class SwapSlot:
         return self.cpu_tensor if self.cpu_tensor is not None else self.tensor
 
 
+class SwapUpdateUnit(Protocol):
+    """Minimal contract the pipeline runtime requires of an update unit.
+
+    The runtime only ever reads a unit's swappable slots, so an update unit is
+    free to carry algorithm-specific metadata (a single parameter and gradient,
+    a Muon HSDP assignment, collective ordering, and so on) as long as it
+    exposes ``slots``.
+    """
+
+    slots: List[SwapSlot]
+
+
 @dataclass
 class UpdateUnit:
-    """Per-parameter optimizer update unit used by the pipeline runtime.
+    """Generic per-parameter update unit: parameter, gradient and swap slots.
 
-    ``adapter_index`` identifies the Torch parameter group owning ``param``.
+    Kept as a concrete unit for optimizers whose atomic update is one parameter,
+    and as the runtime's default unit type.  ``adapter_index`` identifies the
+    owning parameter group.  Optimizers with a richer atomic unit (Muon HSDP
+    assignments, for example) define their own unit exposing ``slots``.
     """
 
     adapter_index: int
@@ -940,25 +960,120 @@ class PipelineSwapRuntime:
         return dtype_layouts, self._align_bytes(byte_offset), device
 
 
-class GroupArgs(NamedTuple):
-    """Per-parameter argument lists one functional Adam/AdamW step consumes."""
+@dataclass
+class _PackedBatchRegion:
+    """One dtype-contiguous host range transferred for a pipeline batch."""
 
-    params: List[Any]
-    grads: List[Any]
-    exp_avgs: List[Any]
-    exp_avg_sqs: List[Any]
-    max_exp_avg_sqs: List[Any]
-    state_steps: List[Any]
+    dtype: Any
+    host_offset: int
+    numel: int
+    slots: List[SwapSlot]
 
 
-class OptimizerSwapAdapter:
-    """Common Torch Adam/AdamW adapter logic."""
+@dataclass
+class _PackedBatchPlan:
+    """Packed transfer regions for one optimizer pipeline batch."""
 
-    functional_name = "adam"
+    regions: Dict[Any, _PackedBatchRegion] = field(default_factory=dict)
+
+
+@dataclass
+class _StagingArena:
+    """One raw device allocation and its dtype-specific views."""
+
+    raw_buffer: Any
+    dtype_views: Dict[Any, Any] = field(default_factory=dict)
+    layout_signature: Any = None
+
+
+def _iter_unique_slots(units: Sequence[UpdateUnit]) -> Iterable[SwapSlot]:
+    """Yield slots once by object identity."""
+    slots = itertools.chain.from_iterable(unit.slots for unit in units)
+    return _iter_unique_slot_objects(slots)
+
+
+def _iter_unique_slot_objects(slots: Iterable[SwapSlot]) -> Iterable[SwapSlot]:
+    """Yield slots once by tensor object identity."""
+    unique_slots: Dict[int, SwapSlot] = {}
+    for slot in slots:
+        unique_slots.setdefault(id(slot.tensor), slot)
+    return unique_slots.values()
+
+
+def _iter_unique_events(slots: Iterable[SwapSlot]) -> Iterable[Any]:
+    """Yield non-empty events once by object identity."""
+    seen = set()
+    for slot in slots:
+        event = slot.event
+        if event is None:
+            continue
+        key = id(event)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield event
+
+
+def _slot_tensor(unit: SwapUpdateUnit, key: str, fallback: Any) -> Any:
+    """Return an active swap slot tensor for ``key``, or ``fallback``.
+
+    A slot is authoritative only while it is swappable, still resident on the
+    local device and bound to a live tensor; otherwise the optimizer state entry
+    is the source of truth for this step.
+    """
+    for slot in unit.slots:
+        if slot.name == key and slot.swappable and slot.state == "device" and slot.tensor is not None:
+            return slot.tensor
+    return fallback
+
+
+def validate_state_keys(state_keys: Optional[Sequence[str]]) -> Optional[tuple[str, ...]]:
+    """Validate user-provided optimizer state keys.
+
+    Only lexical validity is checked here: a key must appear in
+    :data:`KNOWN_STATE_KEYS`.  Whether the wrapped optimizer family actually
+    owns that state is decided later by the family adapter, which fails during
+    ``validate()``/wrap time.
+    """
+    if state_keys is None:
+        return None
+    normalized = tuple(state_keys)
+    invalid = sorted(set(normalized) - set(KNOWN_STATE_KEYS))
+    if invalid:
+        raise ValueError(
+            "SwapOptimizerConfig.state_keys only supports optimizer state slots "
+            f"{KNOWN_STATE_KEYS}, but got {invalid}."
+        )
+    return normalized
+
+
+#: Builds the family adapter for a wrapped optimizer.
+AdapterFactory = Callable[[Any, Any, PipelineSwapRuntime], "StateSwapAdapter"]
+
+
+class StateSwapAdapter:
+    """Algorithm-independent optimizer-state swap adapter base.
+
+    Owns the slot map, the configured/default state-key selection framework, the
+    checkpoint strip/export/restore path and packed-state publication.  The
+    numerical update and the per-parameter unit construction belong to the
+    optimizer family subclasses, which implement :meth:`default_state_keys`,
+    :meth:`prepare_step`, :meth:`iter_update_units` and :meth:`step_batch`.
+    """
+
+    #: Optimizer classes this adapter accepts; ``()`` means "decided by subclass".
     supported_cls = ()
-    decoupled_weight_decay = False
-    is_new_adamw = False
-    supports_fused = False
+
+    def default_state_keys(self) -> Tuple[str, ...]:
+        """Return the family's default swap state keys.
+
+        Subclasses must override this; the base class deliberately assumes
+        nothing about an optimizer's state layout, so there is no default.
+
+        Raises:
+            NotImplementedError: Always, unless a subclass overrides it.
+        """
+        raise NotImplementedError
 
     def __init__(self, optimizer: Any, config: Any, runtime: Any) -> None:
         self.optimizer = optimizer
@@ -970,83 +1085,6 @@ class OptimizerSwapAdapter:
     def matches(cls, optimizer: Any) -> bool:
         """Return whether this adapter supports ``optimizer``."""
         return isinstance(optimizer, cls.supported_cls)
-
-    def validate(self) -> None:
-        """Validate unsupported optimizer flags."""
-        for group in self.optimizer.param_groups:
-            if group.get("foreach", False) is True:
-                raise ValueError("Swap optimizer does not support foreach=True.")
-            if group.get("fused", False) is True and not self.supports_fused:
-                raise ValueError("Swap optimizer does not support fused=True.")
-            if group.get("differentiable", False):
-                raise ValueError("Swap optimizer does not support differentiable=True.")
-            if group.get("capturable", False):
-                raise ValueError("Swap optimizer does not support capturable=True.")
-
-    def prepare_step(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Initialize lazy state and collect this step's update units."""
-        if args or kwargs:
-            raise ValueError("Torch swap optimizer step does not support closure or extra arguments.")
-        if self.runtime.packed_enabled:
-            return self._prepare_packed_step()
-
-        units = []
-        for group_index, group in enumerate(self.optimizer.param_groups):
-            if self.is_new_adamw:
-                group["step"] = (group.get("step") or 0) + 1
-            for param in group["params"]:
-                grad = getattr(param, "grad", None)
-                if grad is None:
-                    continue
-                if getattr(grad, "is_sparse", False):
-                    raise ValueError("Swap optimizer only supports dense Adam/AdamW gradients.")
-                state = self.optimizer.state[param]
-                self._init_param_state(param, grad, group)
-                slots = self._build_slots(param, state)
-                units.append(UpdateUnit(
-                    adapter_index=group_index,
-                    param=param,
-                    grad=grad,
-                    slots=slots,
-                ))
-        return {"units": units}
-
-    def _prepare_packed_step(self) -> Dict[str, Any]:
-        """Build a stable packed layout while retaining inactive materialized states."""
-        records = []
-        for group_index, group in enumerate(self.optimizer.param_groups):
-            if self.is_new_adamw:
-                group["step"] = (group.get("step") or 0) + 1
-            for param in group["params"]:
-                grad = getattr(param, "grad", None)
-                state = self.optimizer.state.get(param)
-                if grad is not None:
-                    if getattr(grad, "is_sparse", False):
-                        raise ValueError("Swap optimizer only supports dense Adam/AdamW gradients.")
-                    state = self.optimizer.state[param]
-                    self._init_param_state(param, grad, group)
-                if state:
-                    self._register_present_slots(param, state)
-                has_slots = any((id(param), key) in self._slots for key in self._configured_state_keys())
-                if grad is None and not has_slots:
-                    continue
-                records.append((group_index, param, grad))
-
-        self.runtime.prepare_packed_host(self._ordered_slots())
-        self.publish_packed_state()
-        units = []
-        for group_index, param, grad in records:
-            state = self.optimizer.state[param]
-            slots = self._build_slots(param, state)
-            if grad is None and not any(slot.swappable and slot.packed for slot in slots):
-                continue
-            units.append(UpdateUnit(
-                adapter_index=group_index,
-                param=param,
-                grad=grad,
-                slots=slots,
-            ))
-        return {"units": units}
 
     def iter_update_units(self, step_context: Dict[str, Any]) -> List[UpdateUnit]:
         """Return units collected in ``prepare_step``."""
@@ -1061,153 +1099,6 @@ class OptimizerSwapAdapter:
                 if state:
                     slots.extend(self._build_slots(param, state))
         return tuple(slots)
-
-    def _collect_group_args(
-            self,
-            units: Sequence[UpdateUnit],
-            group: Dict[str, Any],
-    ) -> GroupArgs:
-        """Gather the per-parameter argument lists one optimizer step needs.
-
-        Units without a gradient are skipped.  ``max_exp_avg_sqs`` stays empty
-        unless the group is amsgrad, and ``state_steps`` holds ``None`` for new
-        AdamW, which advances the step counter itself.
-        """
-        args = GroupArgs([], [], [], [], [], [])
-        for unit in units:
-            if unit.grad is None:
-                continue
-            state = self.optimizer.state[unit.param]
-            args.params.append(unit.param)
-            args.grads.append(unit.grad)
-            args.exp_avgs.append(self._slot_tensor(unit, "exp_avg", state["exp_avg"]))
-            args.exp_avg_sqs.append(self._slot_tensor(unit, "exp_avg_sq", state["exp_avg_sq"]))
-            if group.get("amsgrad", False):
-                args.max_exp_avg_sqs.append(
-                    self._slot_tensor(unit, "max_exp_avg_sq", state["max_exp_avg_sq"])
-                )
-            if self.is_new_adamw:
-                args.state_steps.append(None)
-            else:
-                args.state_steps.append(state["step"])
-        return args
-
-    def step_batch(self, batch: List[UpdateUnit], step_context: Dict[str, Any]) -> None:
-        """Run Torch functional Adam/AdamW for one batch."""
-        del step_context
-        by_group: Dict[int, List[UpdateUnit]] = defaultdict(list)
-        for unit in batch:
-            by_group[unit.adapter_index].append(unit)
-        for group_index, units in by_group.items():
-            self._step_group(self.optimizer.param_groups[group_index], units)
-
-    def _step_group(self, group: Dict[str, Any], units: List[UpdateUnit]) -> None:
-        """Run one group's parameters through the matching functional Adam/AdamW."""
-        args = self._collect_group_args(units, group)
-        params = args.params
-
-        if not params:
-            return
-
-        if self.is_new_adamw:
-            self._step_new_adamw(
-                group,
-                args.params,
-                args.grads,
-                args.exp_avgs,
-                args.exp_avg_sqs,
-                args.max_exp_avg_sqs,
-            )
-            return
-
-        func = getattr(torch.optim._functional, self.functional_name)
-        kwargs = {
-            "amsgrad": group["amsgrad"],
-            "beta1": group["betas"][0],
-            "beta2": group["betas"][1],
-            "lr": group["lr"],
-            "weight_decay": group["weight_decay"],
-            "eps": group["eps"],
-            "maximize": group["maximize"],
-            "foreach": False,
-            "capturable": False,
-            "differentiable": False,
-            "fused": bool(group.get("fused", False)),
-            "grad_scale": getattr(self.optimizer, "grad_scale", None),
-            "found_inf": getattr(self.optimizer, "found_inf", None),
-            "has_complex": False,
-        }
-        if self.functional_name == "adam":
-            if "decoupled_weight_decay" in inspect.signature(func).parameters:
-                kwargs["decoupled_weight_decay"] = self._decoupled_weight_decay(group)
-        func(
-            args.params,
-            args.grads,
-            args.exp_avgs,
-            args.exp_avg_sqs,
-            args.max_exp_avg_sqs,
-            args.state_steps,
-            **kwargs,
-        )
-
-    def _decoupled_weight_decay(self, group: Dict[str, Any]) -> bool:
-        """Resolve the decoupled weight decay flag for one parameter group."""
-        return self.decoupled_weight_decay or group.get("decoupled_weight_decay", False)
-
-    def _step_new_adamw(
-            self,
-            group: Dict[str, Any],
-            params: Sequence[Any],
-            grads: Sequence[Any],
-            exp_avgs: Sequence[Any],
-            exp_avg_sqs: Sequence[Any],
-            max_exp_avg_sqs: Sequence[Any],
-    ) -> None:
-        """Run the new AdamW functional for one group."""
-        if params and params[0].device.type == "cpu":
-            # torch.optim._functional.adamw increments tensor state_steps
-            # internally. New AdamW already advanced group["step"] in
-            # prepare_step(), so feed step - 1 to preserve outer-step
-            # semantics for CPU-only tests.
-            step_tensor = torch.tensor(float(group["step"] - 1), dtype=torch.float32)
-            torch.optim._functional.adamw(
-                params,
-                grads,
-                exp_avgs,
-                exp_avg_sqs,
-                max_exp_avg_sqs,
-                [step_tensor] * len(params),
-                amsgrad=group["amsgrad"],
-                beta1=group["betas"][0],
-                beta2=group["betas"][1],
-                lr=group["lr"],
-                weight_decay=group["weight_decay"],
-                eps=group["eps"],
-                maximize=group["maximize"],
-                foreach=False,
-                capturable=False,
-                differentiable=False,
-                fused=False,
-                grad_scale=None,
-                found_inf=None,
-                has_complex=False,
-            )
-            return
-        _new_adamw_func()(
-            params,
-            grads,
-            exp_avgs,
-            exp_avg_sqs,
-            max_exp_avg_sqs,
-            group["step"],
-            amsgrad=group["amsgrad"],
-            beta1=group["betas"][0],
-            beta2=group["betas"][1],
-            lr=group["lr"],
-            weight_decay=group["weight_decay"],
-            eps=group["eps"],
-            maximize=group["maximize"],
-        )
 
     def finish_step(self, step_context: Any) -> Any:
         """Finish one outer optimizer step."""
@@ -1456,42 +1347,34 @@ class OptimizerSwapAdapter:
             state[key] = device_tensor
             self._slots[(id(param), key)] = self._make_slot(key, device_tensor)
 
-    def _init_param_state(self, param: Any, grad: Any, group: Dict[str, Any]) -> None:
-        """Initialize missing Adam state and swap slots for one parameter."""
-        del grad
-        state = self.optimizer.state[param]
-        if not self.is_new_adamw and len(state) == 0:
-            step_device = (
-                param.device
-                if group.get("fused", False)
-                else ("cpu" if self.runtime.packed_enabled else param.device)
-            )
-            state["step"] = torch.zeros((), dtype=torch.float32, device=step_device)
-        state_keys = ["exp_avg", "exp_avg_sq"]
-        if group.get("amsgrad", False):
-            state_keys.append("max_exp_avg_sq")
-        configured_keys = set(self._configured_state_keys())
-        for key in state_keys:
-            if key in state or (id(param), key) in self._slots:
-                continue
-            if (
-                    key in configured_keys
-                    and not self.runtime.packed_enabled
-                    and self.runtime.is_swappable_tensor(param, self.config.min_numel)
-            ):
-                cpu_tensor = self.runtime.make_zero_cpu_tensor_like(param)
-                device_tensor = torch.empty_like(param, memory_format=torch.preserve_format)
-                state[key] = device_tensor
-                slot = self._make_slot(key, device_tensor)
-                slot.cpu_tensor = cpu_tensor
-                slot.state = "host"
-                self._slots[(id(param), key)] = slot
-                self.runtime.release_device_storage(slot)
-                continue
-            if key in configured_keys and self.runtime.is_packable_template(param, self.config.min_numel):
-                self._slots[(id(param), key)] = self._make_slot(key, None, template=param)
-                continue
-            state[key] = torch.zeros_like(param, memory_format=torch.preserve_format)
+    @staticmethod
+    def _cast_state_tensor_like_torch(
+            param: Any,
+            saved_tensor: Any,
+            saved_id: int,
+            saved_groups: List[Dict[str, Any]],
+            key: str,
+    ) -> Any:
+        """Cast a loaded state tensor using PyTorch optimizer load semantics."""
+        if not isinstance(saved_tensor, torch.Tensor):
+            raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
+        process = getattr(torch.optim.Optimizer, "_process_value_according_to_param_policy", None)
+        if process is not None:
+            return process(param, saved_tensor, saved_id, saved_groups, key).detach().clone()
+        if key == "step":
+            return saved_tensor.detach().clone()
+        if param.is_floating_point():
+            return saved_tensor.detach().to(dtype=param.dtype, device=param.device).clone()
+        return saved_tensor.detach().to(device=param.device).clone()
+
+    @staticmethod
+    def _cast_swappable_tensor_to_cpu(param: Any, saved_tensor: Any) -> Any:
+        """Cast swappable state dtype like PyTorch while keeping values on CPU."""
+        if not isinstance(saved_tensor, torch.Tensor):
+            raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
+        if param.is_floating_point():
+            return saved_tensor.detach().to(dtype=param.dtype, device="cpu")
+        return saved_tensor.detach().to(device="cpu")
 
     def _register_present_slots(self, param: Any, state: Dict[str, Any]) -> None:
         """Register configured state tensors that already exist in an optimizer state mapping."""
@@ -1564,24 +1447,9 @@ class OptimizerSwapAdapter:
                 raise ValueError(f"Requested state key '{key}' is not present for parameter.")
         return tuple(result)
 
-    @staticmethod
-    def _is_active_device_slot(slot: SwapSlot, key: str) -> bool:
-        """Return whether ``slot`` holds ``key`` live on the local device."""
-        if slot.name != key or not slot.swappable or slot.state != "device":
-            return False
-        return slot.tensor is not None
-
-    @staticmethod
-    def _slot_tensor(unit: UpdateUnit, key: str, fallback: Any) -> Any:
-        """Return an active swap slot tensor, or the optimizer state fallback."""
-        for slot in unit.slots:
-            if OptimizerSwapAdapter._is_active_device_slot(slot, key):
-                return slot.tensor
-        return fallback
-
     def _configured_state_keys(self) -> Tuple[str, ...]:
         """Return Adam state keys selected for swap by the current config."""
-        keys = self.config.state_keys or self._default_state_keys()
+        keys = self.config.state_keys or self.default_state_keys()
         result = []
         for key in keys:
             if key == "master_param":
@@ -1591,169 +1459,20 @@ class OptimizerSwapAdapter:
             result.append(key)
         return tuple(result)
 
-    @staticmethod
-    def _cast_state_tensor_like_torch(
-            param: Any,
-            saved_tensor: Any,
-            saved_id: int,
-            saved_groups: List[Dict[str, Any]],
-            key: str,
-    ) -> Any:
-        """Cast a loaded state tensor using PyTorch optimizer load semantics."""
-        if not isinstance(saved_tensor, torch.Tensor):
-            raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
-        process = getattr(torch.optim.Optimizer, "_process_value_according_to_param_policy", None)
-        if process is not None:
-            return process(param, saved_tensor, saved_id, saved_groups, key).detach().clone()
-        if key == "step":
-            return saved_tensor.detach().clone()
-        if param.is_floating_point():
-            return saved_tensor.detach().to(dtype=param.dtype, device=param.device).clone()
-        return saved_tensor.detach().to(device=param.device).clone()
-
-    @staticmethod
-    def _cast_swappable_tensor_to_cpu(param: Any, saved_tensor: Any) -> Any:
-        """Cast swappable state dtype like PyTorch while keeping values on CPU."""
-        if not isinstance(saved_tensor, torch.Tensor):
-            raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
-        if param.is_floating_point():
-            return saved_tensor.detach().to(dtype=param.dtype, device="cpu")
-        return saved_tensor.detach().to(device="cpu")
-
-    @staticmethod
-    def _default_state_keys() -> Tuple[str, ...]:
-        return ("exp_avg", "exp_avg_sq", "max_exp_avg_sq")
-
-
-class TorchNativeAdamAdapter(OptimizerSwapAdapter):
-    """Adapter for ``torch.optim.Adam``."""
-
-    functional_name = "adam"
-
-    @classmethod
-    def matches(cls, optimizer: Any) -> bool:
-        # AdamW inherits Adam in PyTorch.  Keep Adam subclasses supported, but
-        # let AdamW select its dedicated adapter (which preserves fused=True).
-        return (
-            isinstance(optimizer, torch.optim.Adam)
-            and not isinstance(optimizer, torch.optim.AdamW)
-        )
-
-
-class TorchNativeAdamWAdapter(OptimizerSwapAdapter):
-    """Adapter for ``torch.optim.AdamW``."""
-
-    functional_name = "adamw"
-    supports_fused = True
-
-    @classmethod
-    def matches(cls, optimizer: Any) -> bool:
-        return isinstance(optimizer, torch.optim.AdamW)
-
-
-class TorchNewAdamWAdapter(OptimizerSwapAdapter):
-    """Adapter for hyper-parallel's fused AdamW."""
-
-    functional_name = "adamw"
-    is_new_adamw = True
-
-    @classmethod
-    def matches(cls, optimizer: Any) -> bool:
-        """Match hyper-parallel's lazily imported AdamW."""
-        return isinstance(optimizer, _new_adamw_cls())
-
-
-@dataclass
-class _PackedBatchRegion:
-    """One dtype-contiguous host range transferred for a pipeline batch."""
-
-    dtype: Any
-    host_offset: int
-    numel: int
-    slots: List[SwapSlot]
-
-
-@dataclass
-class _PackedBatchPlan:
-    """Packed transfer regions for one optimizer pipeline batch."""
-
-    regions: Dict[Any, _PackedBatchRegion] = field(default_factory=dict)
-
-
-@dataclass
-class _StagingArena:
-    """One raw device allocation and its dtype-specific views."""
-
-    raw_buffer: Any
-    dtype_views: Dict[Any, Any] = field(default_factory=dict)
-    layout_signature: Any = None
-
-
-def _iter_unique_slots(units: Sequence[UpdateUnit]) -> Iterable[SwapSlot]:
-    """Yield slots once by object identity."""
-    slots = itertools.chain.from_iterable(unit.slots for unit in units)
-    return _iter_unique_slot_objects(slots)
-
-
-def _iter_unique_slot_objects(slots: Iterable[SwapSlot]) -> Iterable[SwapSlot]:
-    """Yield slots once by tensor object identity."""
-    unique_slots: Dict[int, SwapSlot] = {}
-    for slot in slots:
-        unique_slots.setdefault(id(slot.tensor), slot)
-    return unique_slots.values()
-
-
-def _iter_unique_events(slots: Iterable[SwapSlot]) -> Iterable[Any]:
-    """Yield non-empty events once by object identity."""
-    seen = set()
-    for slot in slots:
-        event = slot.event
-        if event is None:
-            continue
-        key = id(event)
-        if key in seen:
-            continue
-        seen.add(key)
-        yield event
-
-
-def validate_state_keys(state_keys: Optional[Sequence[str]]) -> Optional[tuple[str, ...]]:
-    """Validate user-provided logical state keys."""
-    if state_keys is None:
-        return None
-    normalized = tuple(state_keys)
-    invalid = sorted(set(normalized) - set(SUPPORTED_STATE_KEYS))
-    if invalid:
-        raise ValueError(
-            "SwapOptimizerConfig.state_keys only supports Adam/AdamW logical slots "
-            f"{SUPPORTED_STATE_KEYS}, but got {invalid}."
-        )
-    return normalized
-
-
-def _new_adamw_cls() -> type:
-    """Return hyper-parallel's AdamW class without importing it at module load."""
-    from hyper_parallel.core.optimizer.adamw import (  # pylint: disable=import-outside-toplevel
-        AdamW as new_adamw_cls,
-    )
-    return new_adamw_cls
-
-
-def _new_adamw_func() -> Callable[..., Any]:
-    """Return hyper-parallel's functional AdamW without importing it at module load."""
-    from hyper_parallel.core.optimizer.adamw import (  # pylint: disable=import-outside-toplevel
-        adamw as new_adamw_func,
-    )
-    return new_adamw_func
-
 
 class SwapOptimizer(torch.optim.Optimizer):
-    """Torch optimizer wrapper for Adam/AdamW state swap."""
+    """Torch optimizer wrapper around a family-provided swap adapter.
+
+    The wrapper is algorithm agnostic: it owns the pipeline runtime, exposes the
+    wrapped optimizer's ``param_groups``/``state``/``defaults`` and drives one
+    step as ``prepare_step`` -> ``partition`` -> ``run_pipeline`` ->
+    ``finish_step``.  The concrete adapter is built by the family factory passed
+    as ``adapter_factory`` (see ``swap_adam.py``/``swap_muon.py``).
+    """
 
     _is_swap_optimizer = True
-    _adapters = (TorchNewAdamWAdapter, TorchNativeAdamAdapter, TorchNativeAdamWAdapter)
 
-    def __init__(self, optimizer: Any, config: Any) -> None:
+    def __init__(self, optimizer: Any, config: Any, adapter_factory: AdapterFactory) -> None:
         # Do not call ``torch.optim.Optimizer.__init__``: the wrapped base
         # optimizer already owns param_groups/state/defaults. Inheriting keeps
         # PyTorch LR schedulers and isinstance checks happy while this wrapper
@@ -1761,7 +1480,7 @@ class SwapOptimizer(torch.optim.Optimizer):
         self.optimizer = optimizer
         self.config = config
         self.runtime = PipelineSwapRuntime(config)
-        self.adapter = self._build_adapter()
+        self.adapter = adapter_factory(optimizer, config, self.runtime)
         self.adapter.validate()
         # Torch Adam states are normally lazy, but callers may materialize them
         # before wrapping to avoid first-step initialization in the measured loop.
@@ -1819,16 +1538,6 @@ class SwapOptimizer(torch.optim.Optimizer):
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         """Load optimizer state dict while keeping swappable tensors on CPU mirrors."""
         self.adapter.load_checkpoint_state_dict(state_dict)
-
-    def _build_adapter(self) -> OptimizerSwapAdapter:
-        for adapter_cls in self._adapters:
-            if adapter_cls.matches(self.optimizer):
-                return adapter_cls(self.optimizer, self.config, self.runtime)
-        raise ValueError(
-            "Swap optimizer only supports torch.optim.Adam, torch.optim.AdamW, "
-            "and hyper_parallel.core.optimizer.adamw.AdamW on the Torch backend. "
-            f"Got {type(self.optimizer)!r}."
-        )
 
     @contextlib.contextmanager
     def _no_grad_context(self) -> Iterable[None]:

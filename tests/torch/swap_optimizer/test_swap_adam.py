@@ -16,13 +16,13 @@
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-SWAP_OPTIMIZER = "swap_optimizer.py"
+SWAP_OPTIMIZER = "swap_adam.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_swap_optimizer_1():
     """
-    Feature: parallel run case in swap_optimizer
+    Feature: parallel run case in swap_adam
     Description:
         1. test_fully_shard_adamw_mixed_precision_swap_optimizer_parameter_align
         2. test_fully_shard_optimizer_swap_adamw_4card_parameter_align
@@ -36,7 +36,7 @@ def test_swap_optimizer_1():
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_swap_optimizer_2():
     """
-    Feature: parallel run case in swap_optimizer
+    Feature: parallel run case in swap_adam
     Description:
         1. test_new_adamw_amsgrad_swap_optimizer_parameter_align
         2. test_torch_adam_swap_optimizer_multi_param_group_align

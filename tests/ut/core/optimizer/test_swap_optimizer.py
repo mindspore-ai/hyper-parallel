@@ -24,7 +24,7 @@ os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 import torch
 
 from hyper_parallel.core.optimizer import SwapOptimizerConfig, swap_optimizer
-from hyper_parallel.core.optimizer import swap_optimizer_base
+from hyper_parallel.core.optimizer import swap_adam, swap_optimizer_base
 from hyper_parallel.core.optimizer.adamw import AdamW as NewAdamW
 from hyper_parallel.core.optimizer.swap_optimizer import SwapOptimizer, is_swap_optimizer
 
@@ -53,8 +53,13 @@ class TestSwapOptimizerConfig(unittest.TestCase):
 
         self.assertEqual(config.swap_times, 16)
         self.assertEqual(config.min_numel, 1024)
-        self.assertFalse(config.include_master_params)
         self.assertIsNone(config.state_keys)
+
+    def test_master_param_option_is_not_exposed(self):
+        """Mixed-precision master parameters are not configured by this API."""
+        self.assertFalse(hasattr(SwapOptimizerConfig(), "include_master_params"))
+        with self.assertRaises(TypeError):
+            SwapOptimizerConfig(include_master_params=False)
 
     def test_swap_times_must_be_positive(self):
         """A non-positive partition count is rejected at construction."""
@@ -74,14 +79,25 @@ class TestSwapOptimizerConfig(unittest.TestCase):
 
     def test_reject_invalid_state_key(self):
         """Unknown logical state keys are rejected before any optimizer is wrapped."""
-        with self.assertRaisesRegex(ValueError, "only supports Adam/AdamW logical slots"):
-            SwapOptimizerConfig(state_keys=("exp_avg", "momentum_buffer"))
+        with self.assertRaisesRegex(ValueError, "only supports optimizer state slots"):
+            SwapOptimizerConfig(state_keys=("exp_avg", "not_a_state_key"))
 
-    def test_master_param_key_is_accepted_for_master_copy_optimizers(self):
-        """``master_param`` passes validation even though Adam itself never uses it."""
-        config = SwapOptimizerConfig(include_master_params=True, state_keys=("exp_avg", "master_param"))
+    def test_known_state_keys_cover_every_family(self):
+        """The shared vocabulary names both Adam and Muon state."""
+        config = SwapOptimizerConfig(state_keys=("exp_avg", "momentum_buffer"))
 
-        self.assertEqual(config.state_keys, ("exp_avg", "master_param"))
+        self.assertEqual(config.state_keys, ("exp_avg", "momentum_buffer"))
+
+    def test_family_specific_key_is_rejected_at_wrap_time(self):
+        """A key of another family passes the lexical check but fails on wrap."""
+        param = torch.nn.Parameter(torch.ones(8, 8))
+        from hyper_parallel.core.optimizer import Muon
+
+        with self.assertRaisesRegex(ValueError, "not available for"):
+            swap_optimizer(
+                Muon([param], lr=0.01),
+                SwapOptimizerConfig(state_keys=("exp_avg",), packed_swap=False, min_numel=1),
+            )
 
     def test_config_is_frozen(self):
         """A validated config cannot be mutated after construction."""
@@ -176,7 +192,7 @@ class TestSwapOptimizerFacade(unittest.TestCase):
 
         wrapped = swap_optimizer(torch.optim.AdamW([param], lr=0.01, fused=True), SwapOptimizerConfig())
 
-        self.assertIsInstance(wrapped.adapter, swap_optimizer_base.TorchNativeAdamWAdapter)
+        self.assertIsInstance(wrapped.adapter, swap_adam.TorchNativeAdamWAdapter)
 
     def test_prefetch_batches_is_not_configurable(self):
         """The pipeline shape is fixed, so no prefetch knob is exposed."""
@@ -243,7 +259,7 @@ class TestSwapOptimizerFacade(unittest.TestCase):
         optimizer = torch.optim.AdamW([param], lr=0.01, fused=True)
         runtime = swap_optimizer_base.PipelineSwapRuntime(SwapOptimizerConfig(packed_swap=True, min_numel=1))
         runtime.is_packable_template = mock.Mock(return_value=False)
-        adapter = swap_optimizer_base.TorchNativeAdamWAdapter(optimizer, runtime.config, runtime)
+        adapter = swap_adam.TorchNativeAdamWAdapter(optimizer, runtime.config, runtime)
 
         adapter._init_param_state(param, object(), optimizer.param_groups[0])
 

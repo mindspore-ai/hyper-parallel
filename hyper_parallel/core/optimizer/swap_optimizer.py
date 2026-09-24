@@ -19,23 +19,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
-from hyper_parallel.core.optimizer.swap_optimizer_base import (
-    SwapOptimizer as _SwapOptimizer,
-)
 from hyper_parallel.core.optimizer.swap_optimizer_base import validate_state_keys
 
 
 @dataclass(frozen=True)
 class SwapOptimizerConfig:
-    """Configuration for Adam/AdamW optimizer state swap.
+    """Configuration for optimizer state swap.
 
     The runtime uses a fixed one-batch-ahead prefetch pipeline.
 
     Args:
         swap_times: Number of pipeline partitions.
-        state_keys: Logical state keys to swap. ``None`` uses adapter defaults.
+        state_keys: Logical optimizer state keys to swap. ``None`` uses the
+            defaults of the adapter matching the wrapped optimizer; an explicit
+            value must only name keys that optimizer family actually owns.
         min_numel: Tensor states smaller than this element count are not swapped.
-        include_master_params: Whether optimizer-owned fp32 master params are swapped.
         packed_swap: Whether to use two packed A/B staging buffers. Defaults to
             ``True``; when ``False``, optimizer states are swapped tensor by
             tensor.
@@ -44,7 +42,6 @@ class SwapOptimizerConfig:
     swap_times: int = 16
     state_keys: Optional[Sequence[str]] = None
     min_numel: int = 1024
-    include_master_params: bool = False
     packed_swap: bool = True
 
     def __post_init__(self) -> None:
@@ -63,7 +60,12 @@ class SwapOptimizer:
 
 
 def swap_optimizer(optimizer: Any, config: Optional[SwapOptimizerConfig] = None) -> Any:
-    """Wrap a supported Adam/AdamW optimizer with optimizer-state swap.
+    """Wrap a supported optimizer with optimizer-state swap.
+
+    Public dispatcher: it resolves the optimizer family and defers to that
+    family's factory, which owns adapter selection and the resulting error
+    message.  Optimizer modules are imported lazily so loading this facade does
+    not require every algorithm implementation.
 
     Args:
         optimizer: Base optimizer instance.
@@ -75,9 +77,32 @@ def swap_optimizer(optimizer: Any, config: Optional[SwapOptimizerConfig] = None)
     Raises:
         ValueError: If the optimizer type is unsupported.
     """
-    return _SwapOptimizer(optimizer, config or SwapOptimizerConfig())
+    resolved = config or SwapOptimizerConfig()
+    if is_muon_optimizer(optimizer):
+        from hyper_parallel.core.optimizer.swap_muon import (  # pylint: disable=import-outside-toplevel
+            swap_muon,
+        )
+        return swap_muon(optimizer, resolved)
+
+    from hyper_parallel.core.optimizer.swap_adam import (  # pylint: disable=import-outside-toplevel
+        swap_adam,
+    )
+    return swap_adam(optimizer, resolved)
 
 
 def is_swap_optimizer(optimizer: Any) -> bool:
     """Return whether ``optimizer`` is a swap optimizer wrapper."""
     return bool(getattr(optimizer, "_is_swap_optimizer", False))
+
+
+def is_muon_optimizer(optimizer: Any) -> bool:
+    """Return whether ``optimizer`` is a Muon leaf optimizer.
+
+    The check is by concrete leaf type, never by class name or by inspecting the
+    shape of a ``ChainedOptimizer``: a chain is not itself a Muon optimizer, and
+    its leaves must each be wrapped on their own.
+    """
+    from hyper_parallel.core.optimizer.muon import (  # pylint: disable=import-outside-toplevel
+        Muon,
+    )
+    return isinstance(optimizer, Muon)
