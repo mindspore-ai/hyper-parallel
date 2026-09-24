@@ -434,6 +434,7 @@ class DeviceMesh:
         """Create one process-group family for the named mesh dimension."""
         group_key = None
         split_ranks = set()
+        is_cp_group = dim_name == "cp"
         if not isinstance(dim_name, tuple):
             dim_name = (dim_name,)
         for rank in rank_list:
@@ -443,7 +444,13 @@ class DeviceMesh:
             if rank == dist.get_rank():
                 group_key = str(sorted_rank)
         split_ranks = sorted([list(item) for item in split_ranks])
-        _utils.split_group(split_ranks=split_ranks)
+        if is_cp_group:
+            _utils.split_group(
+                split_ranks=split_ranks,
+                pg_options=_utils.get_cp_hccl_process_group_options(),
+            )
+        else:
+            _utils.split_group(split_ranks=split_ranks)
         return group_key
 
     @staticmethod
@@ -496,11 +503,18 @@ class DeviceMesh:
 
         dim_group_names = []
         for dim, sub_layout in enumerate(layout):
+            dim_name = mesh_dim_names[dim]
             split_ranks, group_key = DeviceMesh._build_dim_split_ranks(sub_layout, rank_map)
             if _should_defer_group_init(sub_layout, backend_override[dim]):
                 dim_group_names.append(None)
                 continue
-            group = _utils.split_group(split_ranks=split_ranks)
+            if dim_name == "cp":
+                group = _utils.split_group(
+                    split_ranks=split_ranks,
+                    pg_options=_utils.get_cp_hccl_process_group_options(),
+                )
+            else:
+                group = _utils.split_group(split_ranks=split_ranks)
             DeviceMesh._cache_group_if_needed(group_key, group)
             dim_group_names.append(group_key)
         return dim_group_names
@@ -1311,8 +1325,15 @@ class DeviceMesh:
         if group_key is not None and group_key in EXISTING_COMM_GROUPS:
             return group_key
 
+        dim_name = self.mesh_dim_names[mesh_dim] if self.mesh_dim_names is not None else None
         split_ranks, group_key = DeviceMesh._build_dim_split_ranks(self._layout[mesh_dim], self._rank_map)
-        group = _utils.split_group(split_ranks=split_ranks)
+        if dim_name == "cp":
+            group = _utils.split_group(
+                split_ranks=split_ranks,
+                pg_options=_utils.get_cp_hccl_process_group_options(),
+            )
+        else:
+            group = _utils.split_group(split_ranks=split_ranks)
         DeviceMesh._cache_group_if_needed(group_key, group)
         self._dim_group_names[mesh_dim] = group_key
         return group_key
