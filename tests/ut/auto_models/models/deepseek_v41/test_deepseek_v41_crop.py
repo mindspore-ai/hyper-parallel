@@ -15,9 +15,11 @@
 """Focused CPU tests for the cropped DeepSeek-V4.1 validation model."""
 # pylint: disable=wrong-import-position
 
+import functools
 import inspect
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -148,6 +150,14 @@ def _write_released_config(directory: str) -> Path:
         "hidden_size": 256,
         "moe_intermediate_size": 128,
         "num_hidden_layers": 40,
+        # Drafter hyper-parameters as published in DeepSeek-V4.1-Flash.
+        "num_nextn_predict_layers": 3,
+        "dspark_block_size": 5,
+        "dspark_noise_token_id": 63,
+        "dspark_target_layer_ids": [37, 38, 39],
+        "dspark_markov_rank": 256,
+        "dspark_n_routed_experts": 128,
+        "dspark_num_experts_per_tok": 3,
         "num_attention_heads": 32,
         "num_key_value_heads": 1,
         "head_dim": 64,
@@ -1218,6 +1228,196 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
             apply_clamped_gate(gate_up), module.experts.down_proj[0]
         )
         torch.testing.assert_close(output, expected)
+
+
+# Leaf parameter names of the released DeepSeek-V4.1-Flash drafter, taken from
+# the mtp.* entries of model.safetensors.index.json (2401 entries, three
+# stages). Stage and expert indices are collapsed to "N".
+_RELEASED_DRAFTER_LEAVES = {
+    "hc_attn_base", "hc_attn_fn", "hc_attn_scale",
+    "hc_ffn_base", "hc_ffn_fn", "hc_ffn_scale",
+    "attn_norm.weight", "ffn_norm.weight",
+    "attn.attn_sink", "attn.kv_norm.weight", "attn.q_norm.weight",
+    "attn.wkv.weight", "attn.wo_a.weight", "attn.wo_b.weight",
+    "attn.wq_a.weight", "attn.wq_b.weight",
+    "ffn.gate.weight", "ffn.gate.bias", "ffn.gate.bias_vl",
+    "ffn.shared_experts.w1.weight", "ffn.shared_experts.w2.weight",
+    "ffn.shared_experts.w3.weight",
+    "ffn.experts.N.w1.weight", "ffn.experts.N.w2.weight", "ffn.experts.N.w3.weight",
+    "main_norm.weight", "main_proj.weight", "norm.weight",
+    "markov_head.embed.weight", "markov_head.head.weight",
+    "confidence_head.proj.weight",
+}
+
+# Released leaf -> our leaf. Only unambiguous correspondences are listed; the
+# rest are recorded as known differences below.
+_DRAFTER_RENAMES = {
+    "hc_attn_base": "stages.N.attn_hc.base",
+    "hc_attn_fn": "stages.N.attn_hc.fn",
+    "hc_attn_scale": "stages.N.attn_hc.scale",
+    "hc_ffn_base": "stages.N.ffn_hc.base",
+    "hc_ffn_fn": "stages.N.ffn_hc.fn",
+    "hc_ffn_scale": "stages.N.ffn_hc.scale",
+    "attn.attn_sink": "stages.N.self_attn.attn_sink",
+    "attn.kv_norm.weight": "stages.N.self_attn.kv_norm.weight",
+    "attn.q_norm.weight": "stages.N.self_attn.q_norm.weight",
+    "attn.wkv.weight": "stages.N.self_attn.wkv.weight",
+    "attn.wo_a.weight": "stages.N.self_attn.wo_a.weight",
+    "attn.wo_b.weight": "stages.N.self_attn.wo_b.weight",
+    "attn.wq_a.weight": "stages.N.self_attn.wq_a.weight",
+    "attn.wq_b.weight": "stages.N.self_attn.wq_b.weight",
+    "ffn.gate.weight": "stages.N.mlp.gate.weight",
+    "ffn.gate.bias": "stages.N.mlp.gate.bias",
+    "ffn.gate.bias_vl": "stages.N.mlp.gate.bias_vl",
+    "ffn.shared_experts.w1.weight": "stages.N.mlp.shared_experts.gate_proj.weight",
+    "ffn.shared_experts.w2.weight": "stages.N.mlp.shared_experts.down_proj.weight",
+    "ffn.shared_experts.w3.weight": "stages.N.mlp.shared_experts.up_proj.weight",
+    "main_norm.weight": "main_norm.weight",
+    "main_proj.weight": "main_proj.weight",
+    "norm.weight": "norm.weight",
+    "markov_head.embed.weight": "markov_head.embed.weight",
+    "markov_head.head.weight": "markov_head.head.weight",
+    "confidence_head.proj.weight": "confidence_head.proj.weight",
+}
+
+# Released names with no 1:1 counterpart here, and why.
+_RELEASED_ONLY = {
+    # The release stores 128 experts per stage separately; the crop MoE packs
+    # them into two grouped tensors.
+    "ffn.experts.N.w1.weight", "ffn.experts.N.w2.weight", "ffn.experts.N.w3.weight",
+    # One RMSNorm per sublayer here lives inside the hyper-connection module,
+    # so the stage exposes two norms the release keeps flat.
+    "attn_norm.weight", "ffn_norm.weight",
+}
+
+# Ours with no counterpart in the released weights, and why.
+_OURS_ONLY = {
+    # Grouped expert tensors, see above.
+    "stages.N.mlp.experts.gate_up_proj", "stages.N.mlp.experts.down_proj",
+    # The hyper-connection sublayer norms and the stage norms.
+    "stages.N.attn_hc.input_norm.weight", "stages.N.ffn_hc.input_norm.weight",
+    "stages.N.input_layernorm.weight", "stages.N.post_attention_layernorm.weight",
+    # The release fills draft slots from the embedding of dspark_noise_token_id;
+    # this implementation learns a dedicated vector instead.
+    "noise_embedding",
+}
+
+
+class TestDrafterMatchesReleasedLayout(unittest.TestCase):
+    """The drafter's parameters correspond to the released mtp.* layout.
+
+    FP8 ``.scale`` companions are out of scope for bf16 training and are
+    excluded; every other released name must map onto a parameter here, and
+    every parameter here must be accounted for.
+    """
+
+    @staticmethod
+    def _drafter_leaves() -> set:
+        """Build the drafter on meta and collapse index positions to "N"."""
+        from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (  # pylint: disable=C0415
+            build_deepseek_v41_validation_config,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = _write_released_config(directory)
+            assets = _write_engram_assets(directory, num_hidden_layers=40, head_dim=8)
+            config = build_deepseek_v41_validation_config(
+                str(config_path.parent), str(assets), dspark_depth=3, enable_vision=True)
+            with init_empty_weights():
+                model = DeepseekV41ForCausalLM(config)
+            return {re.sub(r"\.\d+\.", ".N.", name)
+                    for name, _ in model.dspark.named_parameters()}
+
+    def test_every_released_name_is_accounted_for(self):
+        """No released parameter family is silently missing."""
+        ours = self._drafter_leaves()
+        for released in sorted(_RELEASED_DRAFTER_LEAVES):
+            with self.subTest(released=released):
+                if released in _RELEASED_ONLY:
+                    continue
+                self.assertIn(_DRAFTER_RENAMES[released], ours)
+
+    def test_no_undocumented_parameters_here(self):
+        """Anything we add beyond the released layout stays documented."""
+        ours = self._drafter_leaves()
+        mapped = set(_DRAFTER_RENAMES.values())
+        self.assertEqual(sorted(ours - mapped - _OURS_ONLY), [])
+
+    def test_hyperparameters_match_the_release(self):
+        """Depth, block width, expert counts and the noise token come from the release."""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = _write_released_config(directory)
+            released = json.loads(config_path.read_text(encoding="utf-8"))["text_config"]
+            assets = _write_engram_assets(directory, num_hidden_layers=40, head_dim=8)
+            from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (  # pylint: disable=C0415
+                build_deepseek_v41_validation_config,
+            )
+            config = build_deepseek_v41_validation_config(
+                str(config_path.parent), str(assets), dspark_depth=3)
+        self.assertEqual(config.v41_dspark_block_size, released["dspark_block_size"])
+        self.assertEqual(config.v41_dspark_markov_rank, released["dspark_markov_rank"])
+        self.assertEqual(config.v41_dspark_noise_token_id, released["dspark_noise_token_id"])
+        self.assertEqual(config.v41_dspark_target_layer_ids, released["dspark_target_layer_ids"])
+        self.assertEqual(config.v41_dspark_n_routed_experts,
+                         min(released["dspark_n_routed_experts"], 16))
+
+
+class TestDSparkCropSwitches(unittest.TestCase):
+    """The crop entry carries the DSpark drafter switches into the config."""
+
+    @staticmethod
+    def _build(**kwargs):
+        """Build a validation config from the release-shaped fixtures."""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = _write_released_config(directory)
+            assets = _write_engram_assets(directory, num_hidden_layers=40, head_dim=8)
+            from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (  # pylint: disable=C0415
+                build_deepseek_v41_validation_config,
+            )
+            return build_deepseek_v41_validation_config(
+                str(config_path.parent), str(assets), **kwargs)
+
+    def test_drafter_is_off_by_default(self):
+        """No drafter parameters are requested unless depth is positive."""
+        config = self._build()
+        self.assertEqual(config.v41_dspark_depth, 0)
+        self.assertEqual(config.v41_dspark_target_layer_ids, [])
+
+    def test_depth_populates_the_released_layout(self):
+        """A positive depth targets the last three layers, as released."""
+        config = self._build(dspark_depth=1)
+        self.assertEqual(config.v41_dspark_depth, 1)
+        self.assertEqual(config.v41_dspark_target_layer_ids, [37, 38, 39])
+        self.assertEqual(config.v41_dspark_window, 128)
+        self.assertLessEqual(config.v41_dspark_top_k, config.v41_dspark_n_routed_experts)
+
+    def test_model_builds_the_drafter_only_when_depth_is_positive(self):
+        """The config field must actually reach the model, not just the config.
+
+        A run with the drafter silently absent looks like a run with the
+        drafter present but ineffective, so assert the object exists.
+        """
+        from hyper_parallel.models.deepseek_v41.dspark import (  # pylint: disable=C0415
+            DeepseekV41DSpark,
+        )
+        from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (  # pylint: disable=C0415
+            build_deepseek_v41_validation_config,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = _write_released_config(directory)
+            assets = _write_engram_assets(directory, num_hidden_layers=40, head_dim=8)
+            build = functools.partial(
+                build_deepseek_v41_validation_config, str(config_path.parent), str(assets))
+            with init_empty_weights():
+                off = DeepseekV41ForCausalLM(build())
+                on = DeepseekV41ForCausalLM(build(dspark_depth=1))
+        self.assertIsNone(off.dspark)
+        self.assertIsInstance(on.dspark, DeepseekV41DSpark)
+        self.assertGreater(on.dspark_loss_coeff, 0.0)
+
+    def test_explicit_targets_override_the_default(self):
+        """Callers can point the drafter at other backbone layers."""
+        config = self._build(dspark_depth=1, dspark_target_layer_ids=[10, 11])
+        self.assertEqual(config.v41_dspark_target_layer_ids, [10, 11])
 
 
 if __name__ == "__main__":
