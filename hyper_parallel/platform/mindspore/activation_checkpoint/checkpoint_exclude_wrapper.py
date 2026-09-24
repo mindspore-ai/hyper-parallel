@@ -16,7 +16,7 @@
 from collections import defaultdict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from typing import Any, Callable, Deque, Dict, List, Tuple
 
 import mindspore as ms
@@ -47,6 +47,16 @@ class _TensorMetadata:
     numel: int
     is_contiguous: bool
 
+    @cached_property
+    def storage_key(self) -> Tuple[Any, ...]:
+        """Return the backing-buffer revision that alias matching compares."""
+        return (self.storage_ptr, self.storage_nbytes, self.dtype, self.version)
+
+    @cached_property
+    def layout_key(self) -> Tuple[Any, ...]:
+        """Return the dtype/layout identity used to validate a rebuilt alias."""
+        return (self.dtype, self.shape, self.stride, self.version, self.is_contiguous)
+
 
 @dataclass(frozen=True)
 class _InputInfo:
@@ -69,6 +79,11 @@ class _ViewRecipe:
     base_version: int
     base_is_contiguous: bool
     exact_input: bool
+
+    @cached_property
+    def base_layout_key(self) -> Tuple[Any, ...]:
+        """Return the replay-input layout identity this recipe was built from."""
+        return (self.dtype, self.base_shape, self.base_stride, self.base_version, self.base_is_contiguous)
 
 
 class _RecomputedInputHandle:
@@ -228,12 +243,7 @@ def _is_non_overlapping_and_dense(metadata: _TensorMetadata) -> bool:
 
 def _make_view_recipe(saved: _TensorMetadata, base: _TensorMetadata) -> Any:
     """Return a safe exact-input/view recipe, or ``None`` for a real save."""
-    if (
-        saved.storage_ptr != base.storage_ptr
-        or saved.storage_nbytes != base.storage_nbytes
-        or saved.dtype != base.dtype
-        or saved.version != base.version
-    ):
+    if saved.storage_key != base.storage_key:
         return None
 
     exact_input = _exact_layout(saved, base)
@@ -388,13 +398,7 @@ def _rebuild_saved_alias(tensor: Any, recipe: _ViewRecipe) -> Any:
     metadata = _tensor_metadata(canonical)
     if metadata is None:
         raise RuntimeError("Checkpoint replay input does not expose usable storage metadata")
-    if (
-        metadata.dtype != recipe.dtype
-        or metadata.shape != recipe.base_shape
-        or metadata.stride != recipe.base_stride
-        or metadata.version != recipe.base_version
-        or metadata.is_contiguous != recipe.base_is_contiguous
-    ):
+    if metadata.layout_key != recipe.base_layout_key:
         raise RuntimeError(
             "Checkpoint replay input layout/version changed for a checkpoint-excluded saved tensor"
         )
