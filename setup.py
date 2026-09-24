@@ -68,6 +68,7 @@ def get_platform() -> str:
     Returns:
         str, platform name in lowercase.
     """
+    print("test for ci")
     return f"{platform.system().strip().lower()}_{platform.machine().strip().lower()}"
 
 
