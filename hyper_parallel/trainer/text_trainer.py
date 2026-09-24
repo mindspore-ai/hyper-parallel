@@ -278,6 +278,7 @@ class TextTrainer:
             )
 
         for optimizer in optimizers:
+            # Keep zeros_like dispatched so lazily created optimizer states retain DTensor metadata.
             with SkipDTensorDispatch(no_skip={torch.zeros_like}):
                 optimizer.step()
             optimizer.zero_grad()

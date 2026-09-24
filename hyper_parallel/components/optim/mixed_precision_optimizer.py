@@ -41,24 +41,6 @@ def _copy_tensor(destination: torch.Tensor, source: torch.Tensor) -> None:
     destination_local.copy_(source_local)
 
 
-def _gradient_for_param(
-        optimizer_param: nn.Parameter,
-        gradient: torch.Tensor,
-) -> torch.Tensor:
-    """Return a detached local gradient matching an optimizer parameter."""
-    optimizer_local = to_local_if_dtensor(optimizer_param)
-    gradient_local = to_local_if_dtensor(gradient).detach()
-    if (
-        gradient_local.device != optimizer_local.device
-        or gradient_local.dtype != optimizer_local.dtype
-    ):
-        gradient_local = gradient_local.to(
-            device=optimizer_local.device,
-            dtype=optimizer_local.dtype,
-        )
-    return gradient_local
-
-
 class MixedPrecisionOptimizer:
     """Base composition for an optimizer that owns precision-conversion state."""
 
@@ -176,21 +158,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 model_gradient = model_param.main_grad
                 if model_gradient is None:
                     model_gradient = model_param.grad
-                main_param.grad = (
-                    None
-                    if model_gradient is None
-                    else _gradient_for_param(main_param, model_gradient)
-                )
+                main_param.grad = model_gradient
                 model_param.grad = None
 
         for fp32_group in self.fp32_from_fp32_groups:
             for model_param in fp32_group:
                 model_gradient = model_param.main_grad
                 if model_gradient is not None:
-                    model_param.grad = _gradient_for_param(
-                        model_param,
-                        model_gradient,
-                    )
+                    model_param.grad = model_gradient
 
     @torch.no_grad()
     def _copy_main_params_to_model_params(self) -> None:

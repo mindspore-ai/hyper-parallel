@@ -42,7 +42,7 @@ _LOGGER_ATTR_SNAPSHOT = {
 import torch  # pylint: disable=wrong-import-position
 from torch import nn  # pylint: disable=wrong-import-position
 
-from hyper_parallel import DeviceMesh, DTensor, Replicate
+from hyper_parallel import DeviceMesh, DTensor, Replicate, SkipDTensorDispatch
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
 )
@@ -54,6 +54,7 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
 from hyper_parallel.core.optimizer.adamw import AdamW as CoreAdamW
 from hyper_parallel.core.optimizer.muon import Muon as CoreMuon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
+from hyper_parallel.models._transformers.model_builder import _validate_optimize_dtype
 from hyper_parallel.core.distributed_checkpoint import (
     save as dcp_save,
 )
@@ -162,6 +163,74 @@ def _muon_step_parameters(muon_optimizer: Any) -> list[nn.Parameter]:
     ]
 
 
+def _assert_serialized_adamw_muon_state(
+        test_case: unittest.TestCase,
+        state_dict: dict,
+        expected_adam_config: dict,
+        expected_muon_config: dict,
+) -> dict:
+    """Check serialized optimizer keys and return saved fp32 main parameters."""
+    test_case.assertIn("state.adam_weight.exp_avg", state_dict)
+    test_case.assertIn("state.adam_weight.exp_avg_sq", state_dict)
+    test_case.assertIn("state.muon_weight.momentum_buffer", state_dict)
+    for config_name, expected_value in expected_adam_config.items():
+        with test_case.subTest(optimizer="adamw", config_name=config_name):
+            test_case.assertEqual(
+                state_dict[f"param_groups.adam_weight.{config_name}"],
+                expected_value,
+            )
+    for config_name, expected_value in expected_muon_config.items():
+        with test_case.subTest(optimizer="muon", config_name=config_name):
+            test_case.assertEqual(
+                state_dict[f"param_groups.muon_weight.{config_name}"],
+                expected_value,
+            )
+    test_case.assertNotIn("param_groups.adam_weight.momentum", state_dict)
+    test_case.assertNotIn("param_groups.muon_weight.betas", state_dict)
+    return copy.deepcopy(
+        state_dict["_mixed_precision_optimizer"]["fp32_from_fp16_params"]
+    )
+
+
+def _assert_restored_adamw_muon_state(
+        test_case: unittest.TestCase,
+        model: nn.Module,
+        adam: CoreAdamW,
+        muon: CoreMuon,
+        state_dict: dict,
+        expected_adam_config: dict,
+        expected_muon_config: dict,
+        expected_main_params: dict,
+) -> None:
+    """Check restored moments, optimizer configs, and fp32 main parameters."""
+    test_case.assertTrue(
+        torch.equal(
+            adam.state[model.adam_weight.main_param]["exp_avg"],
+            state_dict["state.adam_weight.exp_avg"],
+        )
+    )
+    test_case.assertTrue(
+        torch.equal(
+            muon.state[model.muon_weight.main_param]["momentum_buffer"],
+            state_dict["state.muon_weight.momentum_buffer"],
+        )
+    )
+    for config_name, expected_value in expected_adam_config.items():
+        with test_case.subTest(loaded_optimizer="adamw", config_name=config_name):
+            test_case.assertEqual(adam.param_groups[0][config_name], expected_value)
+    for config_name, expected_value in expected_muon_config.items():
+        with test_case.subTest(loaded_optimizer="muon", config_name=config_name):
+            test_case.assertEqual(muon.param_groups[0][config_name], expected_value)
+    model_parameters = dict(model.named_parameters())
+    for parameter_fqn, expected_main_param in expected_main_params.items():
+        test_case.assertTrue(
+            torch.equal(
+                model_parameters[parameter_fqn].main_param,
+                expected_main_param,
+            )
+        )
+
+
 class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
     """Cover group routing, gradient movement, copy-back, reset, and DCP state."""
 
@@ -174,13 +243,15 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         Expectation: Required zero state exists without calling either optimizer step.
         """
         model = nn.Module()
-        model.adamw_param = nn.Parameter(torch.tensor([1.0, 2.0]))
-        model.muon_param = nn.Parameter(torch.arange(4.0).reshape(2, 2))
-        adamw = CoreAdamW([model.adamw_param], lr=0.1)
-        muon = CoreMuon([model.muon_param], lr=0.1)
+        adamw_param = nn.Parameter(torch.tensor([1.0, 2.0]))
+        muon_param = nn.Parameter(torch.arange(4.0).reshape(2, 2))
+        model.register_parameter("adamw_param", adamw_param)
+        model.register_parameter("muon_param", muon_param)
+        adamw = CoreAdamW([adamw_param], lr=0.1)
+        muon = CoreMuon([muon_param], lr=0.1)
         optimizer = ChainedOptimizer(model, {"adamw": adamw, "muon": muon})
-        expected_adamw = model.adamw_param.detach().clone()
-        expected_muon = model.muon_param.detach().clone()
+        expected_adamw = torch.clone(adamw_param)
+        expected_muon = torch.clone(muon_param)
 
         with patch.object(adamw, "step", side_effect=AssertionError("AdamW step called")), \
                 patch.object(muon, "step", side_effect=AssertionError("Muon step called")):
@@ -188,12 +259,12 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
 
         self.assertEqual(adamw.param_groups[0]["step"], 0)
         self.assertEqual(muon.param_groups[0]["step"], 0)
-        self.assertEqual(set(adamw.state[model.adamw_param]), {"exp_avg", "exp_avg_sq"})
-        self.assertEqual(set(muon.state[model.muon_param]), {"momentum_buffer"})
-        self.assertTrue(torch.equal(adamw.state[model.adamw_param]["exp_avg"], torch.zeros(2)))
-        self.assertTrue(torch.equal(muon.state[model.muon_param]["momentum_buffer"], torch.zeros(2, 2)))
-        self.assertTrue(torch.equal(model.adamw_param, expected_adamw))
-        self.assertTrue(torch.equal(model.muon_param, expected_muon))
+        self.assertEqual(set(adamw.state[adamw_param]), {"exp_avg", "exp_avg_sq"})
+        self.assertEqual(set(muon.state[muon_param]), {"momentum_buffer"})
+        self.assertTrue(torch.equal(adamw.state[adamw_param]["exp_avg"], torch.zeros(2)))
+        self.assertTrue(torch.equal(muon.state[muon_param]["momentum_buffer"], torch.zeros(2, 2)))
+        self.assertTrue(torch.equal(adamw_param, expected_adamw))
+        self.assertTrue(torch.equal(muon_param, expected_muon))
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_groups_separate_low_precision_and_native_fp32_params(self):
@@ -258,6 +329,67 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertEqual(main_param.model_name, "weight")
         self.assertFalse(hasattr(main_param, "is_muon"))
         self.assertIs(optimizer.param_groups[0]["params"][0], main_param)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
+    def test_adamw_step_preserves_dtensor_grad_and_state(
+            self,
+            mock_get_rank,
+    ):
+        """Keep DTensor gradients and AdamW state through the fp32 main-param step.
+
+        Feature: DTensor state for mixed-precision AdamW.
+        Description: Step AdamW using an FSDP-style DTensor main gradient.
+        Expectation: Main gradients and AdamW moments retain the DTensor layout.
+        """
+        del mock_get_rank
+        mesh = DeviceMesh(
+            "cpu",
+            [0],
+            mesh_dim_names=("dp",),
+            _init_backend=False,
+        )
+        model = nn.Module()
+        parameter = nn.Parameter(
+            DTensor.from_local(
+                torch.ones(2, dtype=torch.bfloat16),
+                mesh,
+                (Replicate(),),
+            )
+        )
+        parameter.model_name = "weight"
+        model.register_parameter("weight", parameter)
+        leaf_optimizer = CoreAdamW([parameter], lr=0.1)
+        optimizer = Float16OptimizerWithFloat16Params(
+            ChainedOptimizer(model, {"adamw": leaf_optimizer}),
+            model,
+        )
+        parameter.main_grad = DTensor.from_local(
+            torch.tensor([0.5, -0.25], dtype=torch.float32),
+            mesh,
+            (Replicate(),),
+        )
+
+        with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+            optimizer.step()
+
+        main_param = optimizer.fp32_from_float16_groups[0][0]
+        self.assertIsInstance(main_param.grad, DTensor)
+        self.assertIs(main_param.grad.device_mesh, mesh)
+        self.assertEqual(tuple(main_param.grad.placements), (Replicate(),))
+        torch.testing.assert_close(
+            main_param.grad.to_local(),
+            torch.tensor([0.5, -0.25], dtype=torch.float32),
+        )
+        for state_name in ("exp_avg", "exp_avg_sq"):
+            with self.subTest(state_name=state_name):
+                state_tensor = leaf_optimizer.state[main_param][state_name]
+                self.assertIsInstance(state_tensor, DTensor)
+                self.assertEqual(
+                    state_tensor.device_mesh.to_hash(),
+                    mesh.to_hash(),
+                )
+                self.assertEqual(tuple(state_tensor.placements), (Replicate(),))
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_prepare_step_copy_back_and_zero_grad(self):
@@ -660,28 +792,11 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         optimizer.step()
         optimizer.zero_grad()
         state_dict = copy.deepcopy(optimizer.state_dict())
-
-        self.assertIn("state.adam_weight.exp_avg", state_dict)
-        self.assertIn("state.adam_weight.exp_avg_sq", state_dict)
-        self.assertIn("state.muon_weight.momentum_buffer", state_dict)
-        for config_name, expected_value in expected_adam_config.items():
-            with self.subTest(optimizer="adamw", config_name=config_name):
-                self.assertEqual(
-                    state_dict[f"param_groups.adam_weight.{config_name}"],
-                    expected_value,
-                )
-        for config_name, expected_value in expected_muon_config.items():
-            with self.subTest(optimizer="muon", config_name=config_name):
-                self.assertEqual(
-                    state_dict[f"param_groups.muon_weight.{config_name}"],
-                    expected_value,
-                )
-        self.assertNotIn("param_groups.adam_weight.momentum", state_dict)
-        self.assertNotIn("param_groups.muon_weight.betas", state_dict)
-        expected_main_params = copy.deepcopy(
-            state_dict["_mixed_precision_optimizer"][
-                "fp32_from_fp16_params"
-            ]
+        expected_main_params = _assert_serialized_adamw_muon_state(
+            self,
+            state_dict,
+            expected_adam_config,
+            expected_muon_config,
         )
         for leaf_optimizer in (adam, muon_state_owner):
             for parameter_state in leaf_optimizer.state.values():
@@ -715,38 +830,42 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
             DistributedCheckpointer().load(checkpoint_path, load_state)
 
         optimizer.load_state_dict(load_state["optimizer"])
+        _assert_restored_adamw_muon_state(
+            self,
+            model,
+            adam,
+            muon_state_owner,
+            state_dict,
+            expected_adam_config,
+            expected_muon_config,
+            expected_main_params,
+        )
 
-        self.assertTrue(
-            torch.equal(
-                adam.state[model.adam_weight.main_param]["exp_avg"],
-                state_dict["state.adam_weight.exp_avg"],
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                muon_state_owner.state[model.muon_weight.main_param][
-                    "momentum_buffer"
-                ],
-                state_dict["state.muon_weight.momentum_buffer"],
-            )
-        )
-        for config_name, expected_value in expected_adam_config.items():
-            with self.subTest(loaded_optimizer="adamw", config_name=config_name):
-                self.assertEqual(
-                    adam.param_groups[0][config_name],
-                    expected_value,
-                )
-        for config_name, expected_value in expected_muon_config.items():
-            with self.subTest(loaded_optimizer="muon", config_name=config_name):
-                self.assertEqual(
-                    muon_state_owner.param_groups[0][config_name],
-                    expected_value,
-                )
-        for parameter_fqn, expected_main_param in expected_main_params.items():
-            model_parameter = dict(model.named_parameters())[parameter_fqn]
-            self.assertTrue(
-                torch.equal(model_parameter.main_param, expected_main_param)
-            )
+
+class TestOptimizerParameterDtypeValidation(unittest.TestCase):
+    """Validate optimizer parameter dtype requirements before optimizer wrapping."""
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_low_precision_parameters_require_fp32_main_params(self):
+        """Reject low-precision parameters without an fp32 main copy."""
+        model = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+
+        with self.assertRaisesRegex(ValueError, "fp32_main_params.*model_init_dtype"):
+            _validate_optimize_dtype(model, fp32_main_params=False)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_fp32_main_params_allows_low_precision_parameters(self):
+        """Allow low-precision parameters when fp32 main params are enabled."""
+        model = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+
+        _validate_optimize_dtype(model, fp32_main_params=True)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_fp32_parameters_are_allowed(self):
+        """Allow optimizer updates when model parameters are already fp32."""
+        model = nn.Linear(4, 4, bias=False)
+
+        _validate_optimize_dtype(model, fp32_main_params=False)
 
 
 class TestMuonMainParamConstruction(unittest.TestCase):

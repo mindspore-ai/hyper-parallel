@@ -70,6 +70,7 @@ from hyper_parallel.trainer.runtime.logging import setup_logging
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
+from hyper_parallel.models._transformers.model_builder import _validate_optimize_dtype
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
@@ -295,6 +296,10 @@ class BaseTrainer(Stateful, ABC):
             # The final dtype is applied inside the atomic build (05 stage-5
             # item 5); the Trainer no longer patches it afterwards.
             model_init_dtype=self.config.model_init_dtype,
+        )
+        _validate_optimize_dtype(
+            self.model,
+            fp32_main_params=self.config.optimizer.fp32_main_params,
         )
         self.model_config = self.model.config
         if self.global_rank == 0:
@@ -713,7 +718,8 @@ class BaseTrainer(Stateful, ABC):
         # Optimizer and scheduler step
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
         for optimizer in optimizers:
-            with SkipDTensorDispatch():
+            # Keep zeros_like dispatched so lazily created optimizer states retain DTensor metadata.
+            with SkipDTensorDispatch(no_skip={torch.zeros_like}):
                 optimizer.step()
             optimizer.zero_grad()
 
