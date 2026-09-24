@@ -243,6 +243,28 @@ class SwapTensor:
         if self.cpu_pool is None:
             self.val_cpu = None
 
+    def _copy_to_host(self):
+        """Copy the device tensor to its host buffer, releasing the pooled buffer on failure."""
+        try:
+            if self.cpu_pool is not None or self.is_slice_tensor:
+                self.val_cpu.copy_(self.val, non_blocking=True)
+            else:
+                self.val_cpu.untyped_storage().copy_(self.val.untyped_storage(), non_blocking=True)
+        except Exception as exc:
+            if self.cpu_pool is not None and self._cpu_pool_buffer is not None:
+                release_event = _backend.new_event()
+                release_event.record(_backend.get_current_stream())
+                self.release_cpu_buffer(release_event)
+            self.val_cpu = None
+            copy_mode = "tensor" if self.cpu_pool is not None or self.is_slice_tensor else "storage"
+            raise RuntimeError(
+                "Failed to offload activation tensor from device to CPU: "
+                f"source={self.funcname!r}, shape={tuple(self.val.shape)}, dtype={self.val.dtype}, "
+                f"device={self.val.device}, copy_mode={copy_mode}, "
+                f"cpu_pool={'enabled' if self.cpu_pool is not None else 'disabled'}. "
+                f"Original error: {exc}"
+            ) from exc
+
     def async_offload(self):
         """async offload tensor from device to host"""
         if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
@@ -287,25 +309,8 @@ class SwapTensor:
                         f"logical_bytes={logical_bytes}, pool_buffer_shape={tuple(pool_buffer.shape)}, "
                         f"pool_buffer_dtype={pool_buffer.dtype}. Original error: {exc}"
                     ) from exc
-        try:
-            if self.cpu_pool is not None or self.is_slice_tensor:
-                self.val_cpu.copy_(self.val, non_blocking=True)
-            else:
-                self.val_cpu.untyped_storage().copy_(self.val.untyped_storage(), non_blocking=True)
-        except Exception as exc:
-            if self.cpu_pool is not None and self._cpu_pool_buffer is not None:
-                release_event = _backend.new_event()
-                release_event.record(_backend.get_current_stream())
-                self.release_cpu_buffer(release_event)
-            self.val_cpu = None
-            copy_mode = "tensor" if self.cpu_pool is not None or self.is_slice_tensor else "storage"
-            raise RuntimeError(
-                "Failed to offload activation tensor from device to CPU: "
-                f"source={self.funcname!r}, shape={tuple(self.val.shape)}, dtype={self.val.dtype}, "
-                f"device={self.val.device}, copy_mode={copy_mode}, "
-                f"cpu_pool={'enabled' if self.cpu_pool is not None else 'disabled'}. "
-                f"Original error: {exc}"
-            ) from exc
+
+        self._copy_to_host()
         self._state = self.STATE_D2H
 
     def wait_offload(self):
