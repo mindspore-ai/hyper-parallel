@@ -34,6 +34,7 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb
 from hyper_parallel.components.modules import RMSNorm, SwiGLUMLP
 from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.core.multicore.modules.mega_moe.spec import _resolve_capacity_factors
 from hyper_parallel.models.qwen3_moe.adapter.attention import (
     run_qwen3_moe_flash_attention,
 )
@@ -49,24 +50,30 @@ class QwenMoeConfig:
     """
 
     vocab_size: int = 32000
-    hidden_size: int = 2048
-    num_layers: int = 8
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 2
-    max_seq_len: int = 1024
+    hidden_size: int = 5120
+    num_layers: int = 2
+    num_attention_heads: int = 40
+    num_key_value_heads: int = 8
+    max_seq_len: int = 4096
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10_000_000.0
-    num_experts: int = 16
+    num_experts: int = 48
     top_k: int = 8
-    intermediate_size: int = 512
-    shared_expert_intermediate_size: int = 512
+    intermediate_size: int = 1792
+    shared_expert_intermediate_size: int = 1792
     routed_scaling_factor: float = 1.0
-    local_num_tokens: int = 1024
-    expert_capacity_factor: float | None = None
+    local_num_tokens: int = 4096
+    initial_capacity_factor: float | None = None
     ep_size: int = 8
+    dispatch_mode: str = "push"
+    capacity_growth_factor: float | None = None
 
     def __post_init__(self) -> None:
         """Validate the fixed optimizer-step topology."""
+        initial, growth = _resolve_capacity_factors(
+            self.dispatch_mode, self.initial_capacity_factor, self.capacity_growth_factor)
+        object.__setattr__(self, "initial_capacity_factor", initial)
+        object.__setattr__(self, "capacity_growth_factor", growth)
         positive = {
             "vocab_size": self.vocab_size,
             "hidden_size": self.hidden_size,
@@ -233,9 +240,11 @@ class QwenMoeBlock(nn.Module):
             intermediate_size=config.intermediate_size,
             num_experts=config.num_experts,
             top_k=config.top_k,
-            expert_capacity_factor=config.expert_capacity_factor,
+            initial_capacity_factor=config.initial_capacity_factor,
             ep_size=config.ep_size,
             ep_group=ep_group,
+            dispatch_mode=config.dispatch_mode,
+            capacity_growth_factor=config.capacity_growth_factor,
         )
         shared_source = nn.Module()
         shared_source.gate_proj = nn.Linear(config.hidden_size, config.shared_expert_intermediate_size, bias=False)

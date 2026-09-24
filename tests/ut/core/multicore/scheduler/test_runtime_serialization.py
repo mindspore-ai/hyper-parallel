@@ -26,6 +26,7 @@ import hyper_parallel
 from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import (
     build_config_for_rank as build_backward_config,
 )
+from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
 )
@@ -36,11 +37,11 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
     build_forward_graph,
 )
 from hyper_parallel.core.multicore.scheduler.config import (
-    MAX_EXPERT_NUM_PER_RANK,
     NUM_WORKERS_CUBE,
     RuntimeConfigC,
     TaskDescC,
     TaskSplitValue,
+    TaskType,
     configure_ready_handshake,
     event_workspace_bytes,
 )
@@ -143,10 +144,49 @@ class TestRuntimeSerialization(unittest.TestCase):
                 graph = graph_builder(values, hidden_size=128, intermediate_size=128, num_cube_cores=20)
                 graph.propagate_splits(values)
                 cfg = config_builder(graph, values, 63, 20)
-                self.assertEqual(len(cfg.all_event_num_triggers), 1088)
-                self.assertEqual(len(cfg.all_events), 1088)
+                self.assertEqual(len(cfg.all_event_num_triggers), 1104)
+                self.assertEqual(len(cfg.all_events), 1104)
                 image = serialize_runtime_config(cfg)
-                self.assertEqual(struct.unpack_from("<I", image, 12)[0], 1088)
+                self.assertEqual(struct.unpack_from("<I", image, 12)[0], 1104)
+
+    def test_expert_scratch_bounds_are_checked_before_allocation_or_copy(self) -> None:
+        """Reject overflow and metadata whose lists exceed the host allocation."""
+        for experts in (-1, True, 1.5, 1 << 32, (1 << 32) - 1):
+            with self.subTest(experts=experts), self.assertRaises(ValueError):
+                allocate_runtime_config(16, local_experts=experts)
+        cfg = allocate_runtime_config(16)
+        cfg.dynamic_data.dynamic_group_size = 17
+        with self.assertRaisesRegex(ValueError, "group-list scratch"):
+            serialize_runtime_config(cfg)
+
+
+    def test_backward_storage_reuse_requires_all_reader_dependencies(self) -> None:
+        """Allow managed plans, but reject changed queues, joins and additional receive readers."""
+        for ep, cores, rank in ((4, 20, 0), (8, 24, 7)):
+            for mutation in (None, "order", "threshold", "dependency", "reader", "mixed"):
+                with self.subTest(ep=ep, cores=cores, mutation=mutation):
+                    values = TaskSplitValue(tp=1, ep=ep, seq_size=4096, all_expert_num=48, top_k=8)
+                    graph = build_backward_graph(values, hidden_size=5120, intermediate_size=1792,
+                                                 num_cube_cores=cores)
+                    graph.propagate_splits(values)
+                    cfg = build_backward_config(graph, values, rank, cores)
+                    if mutation == "order":
+                        cfg.cube_task_indices[0], cfg.cube_task_indices[cores] = (
+                            cfg.cube_task_indices[cores], cfg.cube_task_indices[0])
+                    elif mutation == "threshold":
+                        task = cfg.all_tasks[cfg.cube_task_indices[cores]]
+                        cfg.all_event_num_triggers[task.trigger_event] = cores - 1
+                    elif mutation == "dependency":
+                        task = next(t for t in cfg.all_tasks if t.task_type == TaskType.TASK_SWI_GLU_GRAD)
+                        task.dependent_event = 0
+                    elif mutation == "reader":
+                        task = next(t for t in cfg.all_tasks if t.task_type == TaskType.TASK_GROUPED_MATMUL
+                                    and t.outputs[0].input_position == 18)
+                        task.inputs[0].input_position = 0
+                    elif mutation == "mixed":
+                        cfg.task_index_num[2] = 1
+                    self.assertEqual(can_reuse_backward_dispatch(cfg, values.single_rank_expert_num, cores),
+                                     mutation is None)
 
 
 class TestRuntimeCppReader(unittest.TestCase):
@@ -171,8 +211,11 @@ class TestRuntimeCppReader(unittest.TestCase):
         cls.reader.valid_runtime.restype = ctypes.c_bool
         cls.reader.valid_ready_runtime.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint32]
         cls.reader.valid_ready_runtime.restype = ctypes.c_bool
+        cls.reader.valid_expert_runtime.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
+        cls.reader.valid_expert_runtime.restype = ctypes.c_bool
         cls.reader.read_ready_event.argtypes = [ctypes.c_void_p]
         cls.reader.read_ready_event.restype = ctypes.c_uint32
+        cls.reader.read_protocol_profile.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         cls.reader.read_task.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
         cls.reader.read_layout.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         cls.reader.group_list_offset.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
@@ -220,16 +263,22 @@ class TestRuntimeCppReader(unittest.TestCase):
 
     def test_dense_runtime_round_trip(self) -> None:
         """Decode small, large and event-expanded graphs using one layout."""
-        for tasks, events in ((1, 1024), (17, 1024), (25601, 1024), (17, 2048)):
-            with self.subTest(tasks=tasks, events=events):
-                cfg = allocate_runtime_config(tasks, events)
-                cfg.task_num = tasks
-                self._round_trip(cfg)
+        for experts in (0, 16, 17, 32, 33, 128, 257):
+            for tasks, events in ((1, 1024), (17, 1024), (25601, 1024), (17, 2048)):
+                with self.subTest(experts=experts, tasks=tasks, events=events):
+                    cfg = allocate_runtime_config(tasks, events, experts)
+                    cfg.task_num = tasks
+                    self._round_trip(cfg)
 
     def test_group_lists_own_complete_cache_lines_within_existing_storage(self) -> None:
         """Prevent adjacent workers' full-line writebacks from corrupting expert counts."""
+        for experts in (1, 16, 17, 31, 32, 33, 64, 128, 257):
+            self._check_group_list_isolation(experts)
+
+    def _check_group_list_isolation(self, experts: int) -> None:
+        """Bound every worker's list at both cache-line widths and offset residues."""
         for tasks, events in ((1, 1024), (17, 1024), (25601, 1024), (17, 1040), (17, 2048)):
-            cfg = allocate_runtime_config(tasks, events)
+            cfg = allocate_runtime_config(tasks, events, experts)
             cfg.task_num = tasks
             image = serialize_runtime_config(cfg)
             buffer = ctypes.create_string_buffer(image)
@@ -238,31 +287,35 @@ class TestRuntimeCppReader(unittest.TestCase):
             scratch_begin = layout[7] + 16
             scratch_end = layout[9]
             for line_bytes in (64, 128):
-                with self.subTest(tasks=tasks, events=events, line_bytes=line_bytes):
+                with self.subTest(experts=experts, tasks=tasks, events=events, line_bytes=line_bytes):
                     owned_lines = set()
                     for worker in range(NUM_WORKERS_CUBE):
                         begin = self.reader.group_list_offset(buffer, worker)
-                        end = begin + MAX_EXPERT_NUM_PER_RANK * 8
+                        end = begin + experts * 8
                         self.assertEqual(begin % line_bytes, 0)
                         self.assertGreaterEqual(begin, scratch_begin)
                         self.assertLessEqual(end, scratch_end)
                         lines = set(range(begin // line_bytes, (end + line_bytes - 1) // line_bytes))
                         self.assertTrue(owned_lines.isdisjoint(lines))
                         owned_lines.update(lines)
-            self.assertEqual(len(image), runtime_config_serialized_size(cfg.task_capacity, events))
+            self.assertEqual(len(image), runtime_config_serialized_size(cfg.task_capacity, events, experts))
 
     def test_rejects_invalid_storage_bounds(self) -> None:
         """Reject insufficient storage and invalid capacities/queue counts."""
-        cfg = allocate_runtime_config(25601)
+        cfg = allocate_runtime_config(25601, local_experts=33)
         cfg.task_num = 25601
         good = serialize_runtime_config(cfg)
+        self.assertTrue(self.reader.valid_expert_runtime(ctypes.create_string_buffer(good), len(good), 4096, 33))
+        self.assertFalse(self.reader.valid_expert_runtime(ctypes.create_string_buffer(good), len(good), 4096, 32))
         for size in (0, 8, 15, 16, 31, 63, len(good) - 1):
             with self.subTest(size=size):
                 self.assertFalse(self.reader.valid_runtime(ctypes.create_string_buffer(good), size, 4096))
         counts_offset = RUNTIME_HEADER_BYTES + 1024 * 20 + cfg.task_capacity * TASK_DESC_SIZE
         for offset, value in ((8, 17), (8, 0xFFFFFFF0), (12, 1008), (12, 1025), (12, 0xFFFFFFF0),
                               (0, 0xFFFFFFFF), (counts_offset, 0xFFFFFFFF),
-                              (counts_offset + 4, cfg.task_capacity + 1)):
+                              (counts_offset + 4, cfg.task_capacity + 1),
+                              (type(cfg).dynamic_data.offset + 8, 65),
+                              (type(cfg).dynamic_data.offset + 8, 0xFFFFFFFF)):
             with self.subTest(offset=offset, value=value):
                 invalid = bytearray(good)
                 struct.pack_into("<I", invalid, offset, value)
@@ -274,20 +327,31 @@ class TestRuntimeCppReader(unittest.TestCase):
         cfg = allocate_runtime_config(17)
         cfg.task_num = 17
         data = bytearray(serialize_runtime_config(cfg))
-        data[32:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 32)
+        data[40:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 40)
         self.assertTrue(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
+        struct.pack_into("<I", data, 36, 2)
+        self.assertFalse(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
 
     def test_ready_header_and_persistent_storage_bounds(self) -> None:
         """Read ready metadata without tags and bound the persistent tail."""
-        for ep_size, experts, events in ((2, 4, 1024), (64, 1024, 1088)):
+        for ep_size, experts, events, mode in ((2, 4, 1024, "push"), (2, 4, 1024, "pull"),
+                                                (64, 1024, 1104, "push"), (64, 1024, 1104, "pull")):
             with self.subTest(ep_size=ep_size):
                 cfg = allocate_runtime_config(17, events)
                 cfg.task_num = 17
-                values = TaskSplitValue(tp=1, ep=ep_size, seq_size=128, all_expert_num=experts, top_k=2)
+                values = TaskSplitValue(tp=1, ep=ep_size, seq_size=128, all_expert_num=experts, top_k=2,
+                                       dispatch_mode=mode)
                 configure_ready_handshake(cfg, values)
+                cfg.cycle_profiling_enabled = 1
+                cfg.aic_profile_record_capacity, cfg.aiv_profile_record_capacity = 101, 203
                 data = serialize_runtime_config(cfg)
                 buffer = ctypes.create_string_buffer(data)
                 event_bytes = event_workspace_bytes(ep_size, experts)
+                fields = (ctypes.c_uint32 * 5)()
+                self.reader.read_protocol_profile(buffer, fields)
+                self.assertEqual(list(fields), [cfg.ready_event, cfg.completion_event, 1, 101, 203])
+                self.assertEqual(cfg.protocol_version, int(mode == "pull"))
+                self.assertEqual(cfg.completion_event > 0, mode == "pull")
                 self.assertEqual(self.reader.read_ready_event(buffer), cfg.ready_event)
                 self.assertTrue(self.reader.valid_ready_runtime(buffer, len(data), event_bytes, ep_size))
                 self.assertFalse(self.reader.valid_ready_runtime(buffer, len(data), event_bytes - 1, ep_size))

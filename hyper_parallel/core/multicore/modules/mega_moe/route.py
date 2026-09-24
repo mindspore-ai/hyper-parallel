@@ -23,6 +23,8 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
+from hyper_parallel.core.multicore.torch import ops as multicore_ops
+
 from .spec import MegaMoeSpec
 
 if TYPE_CHECKING:
@@ -52,6 +54,7 @@ class PreparedTopKRoute:
     tokens_per_expert: torch.Tensor
     received_counts: torch.Tensor
     metadata: RouteMetadata
+    maximum_received_slots: int = 0
 
 
 def _validate_topk_inputs(
@@ -141,7 +144,7 @@ def _finish_count_gather(
 def _expert_capacity(
     counts_by_source: torch.Tensor,
     spec: MegaMoeSpec,
-) -> int:
+) -> tuple[int, int]:
     """Validate the global bound and size rank-local computation tensors."""
     destination_loads = counts_by_source.reshape(
         spec.ep_size,
@@ -151,31 +154,9 @@ def _expert_capacity(
     # One host transfer serves both the coordinated overflow check and local
     # allocation; the existing gathered counts require no extra collective.
     loads = destination_loads.tolist()
-    _validate_bounded_capacity(max(loads), spec)
     # Keep a non-null ABI argument on ranks whose experts receive no tokens.
     # Source outputs and symmetric communication buffers retain their own sizes.
-    return max(1, loads[spec.rank_id])
-
-
-def _validate_bounded_capacity(
-    maximum_received_slots: int,
-    spec: MegaMoeSpec,
-) -> None:
-    """Raise a coordinated error when an explicit factor is too small."""
-    if spec.capacity_is_lossless:
-        return
-    if maximum_received_slots <= spec.receive_capacity:
-        return
-    raise RuntimeError(
-        "MegaMoe receive capacity overflow: "
-        f"configured_capacity={spec.receive_capacity}, "
-        f"actual_maximum={maximum_received_slots}, "
-        f"expert_capacity_factor={spec.expert_capacity_factor}, "
-        f"ep_size={spec.ep_size}, local_num_tokens={spec.local_num_tokens}, "
-        f"top_k={spec.top_k}. Set expert_capacity_factor=None for lossless "
-        "capacity or choose a larger factor. In-kernel multi-wave overflow "
-        "execution is not implemented yet."
-    )
+    return max(1, loads[spec.rank_id]), max(loads)
 
 
 def _permute_topk_input(
@@ -191,6 +172,17 @@ def _permute_topk_input(
         routed_tokens,
         unpermute_mapping.reshape(-1).to(torch.int32).contiguous(),
     )
+
+
+def _permute_topk_input_out(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep the inverse mapping owned while writing rows into leased SHMEM."""
+    mapping = torch.empty(topk_ids.numel(), dtype=torch.int32, device=topk_ids.device)
+    multicore_ops.moe_token_permute_out(hidden_states, topk_ids.contiguous(), output, mapping)
+    return output, mapping
 
 
 def _compute_route_metadata(
@@ -221,11 +213,13 @@ def _compute_route_metadata(
     local_start = spec.rank_id * spec.local_experts
     local_end = local_start + spec.local_experts
     return RouteMetadata(
-        dispatch_src_off=source_prefix[spec.rank_id].to(torch.int64),
+        dispatch_src_off=(source_prefix[:, local_start:local_end].reshape(-1).to(torch.int64)
+                          if spec.dispatch_mode == "pull" else source_prefix[spec.rank_id].to(torch.int64)),
         dispatch_target_off=(
-            destination_prefix[:, :, spec.rank_id].reshape(-1).to(torch.int64)
+            local_destination_prefix.T.reshape(-1).to(torch.int64) if spec.dispatch_mode == "pull"
+            else destination_prefix[:, :, spec.rank_id].reshape(-1).to(torch.int64)
         ),
-        dispatch_size=counts_i32,
+        dispatch_size=received_counts.reshape(-1) if spec.dispatch_mode == "pull" else counts_i32,
         combine_src_off=local_destination_prefix.T.reshape(-1).to(torch.int64),
         combine_target_off=(
             source_prefix[:, local_start:local_end].reshape(-1).to(torch.int64)
@@ -254,24 +248,35 @@ def prepare_topk_route(
         topk_weights: Router weights paired with ``topk_ids``.
         spec: Bound shape and expert-parallel specification.
         tokens_per_expert: Optional trusted Router histogram.
-        workspace: Optional lease owner ordered before the count exchange.
+        workspace: Optional workspace ordered before the count exchange. Pull
+            requires an initialized, caller-held lease covering route execution.
 
     Returns:
         Permuted tokens and exact native route metadata.
     """
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
     counts = _resolve_counts(flat_ids, tokens_per_expert, spec)
+    permutation_output = None
     if workspace is not None:
-        workspace.wait_for_reuse()
+        if spec.dispatch_mode == "pull":
+            if not workspace.in_use or workspace.source_buffer is None:
+                raise RuntimeError("Pull permutation requires an initialized, claimed workspace.")
+            permutation_output = workspace.source_buffer
+        else:
+            workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, spec)
-    routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
+    if permutation_output is None:
+        routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
+    else:
+        routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output)
     received_counts = _finish_count_gather(counts_by_source, count_work, spec)
-    expert_capacity = _expert_capacity(counts_by_source, spec)
+    expert_capacity, maximum_received_slots = _expert_capacity(counts_by_source, spec)
     return PreparedTopKRoute(
         routed_tokens=routed_tokens,
         unpermute_mapping=unpermute_mapping,
         tokens_per_expert=counts,
         received_counts=received_counts,
+        maximum_received_slots=maximum_received_slots,
         metadata=_compute_route_metadata(
             counts,
             counts_by_source,

@@ -99,13 +99,16 @@ def parse_args() -> argparse.Namespace:
 
 def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
                           num_cube_cores: int = 24) -> RuntimeConfigC:
-    """Build backward RuntimeConfig for a single rank.
+    """Build RuntimeConfig for a single rank.
 
     Args:
-        graph: Propagated backward compute graph.
-        tsv: Task split values for the target topology.
-        rank_id: Rank-local identifier.
-        num_cube_cores: Available cube-core count.
+        graph: Graph with propagated task splits.
+        tsv: Rank topology and running event offsets.
+        rank_id: Expert-parallel rank whose queues are generated.
+        num_cube_cores: Number of participating Cube workers.
+
+    Returns:
+        Validated runtime image including transport handshakes and profiler metadata.
     """
     cfg = allocate_graph_config(graph, tsv)
     cfg.num_workers    = 2 * num_cube_cores   # NUM_WORKERS_VECTOR = 2 × NUM_WORKERS_CUBE
@@ -131,7 +134,7 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     add_terminate(cfg, tsv,
                   w2_grad_op.task_num + w1_grad_op.task_num
                   + combine_op.task_num // tsv.ep * tsv.ep)
-    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_grad_op.task_num)
+    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_grad_op.task_num, combine_op.task_num)
     revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=num_cube_cores)
     add_dynamic_data(cfg, tsv, dynamic_input_position=19)
 

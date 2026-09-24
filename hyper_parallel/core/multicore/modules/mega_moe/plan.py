@@ -28,6 +28,7 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data im
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
 )
+from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
 from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
     get_act_grad_tiling_bytes,
     get_gate_grad_tiling_bytes,
@@ -71,6 +72,7 @@ class MegaMoePlan:
     w1_grad_tiling: Any
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
+    reuse_backward_dispatch: bool = False
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -113,6 +115,7 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
         seq_size=spec.local_num_tokens,
         all_expert_num=spec.num_experts,
         top_k=spec.top_k,
+        dispatch_mode=spec.dispatch_mode,
     )
 
 
@@ -127,6 +130,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
+        swiglu_limit=spec.swiglu_limit,
     )
     forward_graph.propagate_splits(task_values)
     forward_data = build_forward_config(
@@ -143,6 +147,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
+        swiglu_limit=spec.swiglu_limit,
     )
     backward_graph.propagate_splits(task_values)
     backward_data = build_backward_config(
@@ -205,6 +210,9 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     }
     return MegaMoePlan(
         spec=spec,
+        reuse_backward_dispatch=can_reuse_backward_dispatch(
+            backward_config, spec.local_experts, spec.num_cube_cores,
+        ),
         fwd_runtime=fwd_runtime,
         up_proj_tiling=_tensor_from_bytes(
             get_up_proj_tiling_bytes(forward_graph.get_op("up_proj").split_value, **gmm_options),

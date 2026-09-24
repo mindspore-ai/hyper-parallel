@@ -17,7 +17,12 @@ shmem.acquire()           # None 表示 dist.group.WORLD；首个引用初始化
 shmem.release()           # 释放当前引用；最后一个引用关闭Runtime
 ```
 
-- 仅支持覆盖整个 distributed world 且 rank 顺序一致的 group；`None` 选择 WORLD。
+- `None` selects Torch WORLD. An explicit EP group may be a noncontiguous subgroup;
+  CANN PE coordinates are the group's local ranks, not Torch global ranks.
+- Disjoint PP/DP groups bootstrap independently through group-local CANN unique-ID
+  exchange. Initialization, allocation ordering, reuse barriers and final release
+  involve only that group. One process supports one ordered active membership;
+  equivalent group handles may share it, but overlapping different roots are rejected.
 - 每次成功`acquire()`都必须对应一次`release()`。首个引用解析Root并初始化Native Runtime；后续等价Root
   只增加引用，不重复初始化；非最后一个`release()`只减少引用。
 - 最后一个引用释放前必须完成所有相关backward和设备操作、释放全部对称Allocation，并保持初始化时冻结的
@@ -26,7 +31,30 @@ shmem.release()           # 释放当前引用；最后一个引用关闭Runtime
   Native初始化失败不产生引用，可再次尝试；Native关闭失败会使进程进入不可恢复状态，之后拒绝再次获取。
 - shutdown 时仍有存活分配会导致关闭失败；所有 rank 必须以一致顺序完成关闭，再销毁 HCCL 进程组。
 
+## MegaMoE 受管 heap 重建
+
+MegaMoE 可内部调用 `acquire(root_group, heap_size_bytes=...)` 显式传递本次物理 heap 大小。
+此入口使用独立 unique ID，包括完整 WORLD root；后续共享引用只能请求不超过已有 heap 的大小。
+环境变量仍用于普通 SHMEM 生命周期；MegaMoE 的自动预算不会回写环境变量。
+
+push 超过由 `initial_capacity_factor` 初始化的容量时，按 `capacity_growth_factor` 增长，
+由 root 级协调者管理所有 workspace：核对 owner 和 allocation 清单，
+同步设备与 EP 控制通信，释放对称 buffer，finalize，生成并分发 fresh unique ID，init，然后重建 buffer。
+SDK 的 bootstrap 是全局状态，必须先 finalize 再获取新 ID。
+整个过程中保留逻辑引用计数和 HCCL ProcessGroup，不对无关 WORLD 成员发起 collective。
+内部重建锁与 SHMEM API 提交锁互斥，未知 owner/allocation 会在释放之前阻止重建。
+
+仅干净的预检查失败可继续使用旧 heap。开始释放后的异常会阻止后续 API 提交、acquire/release 和 MegaMoE 执行，
+调用方应退出进程组；vendor collective 卡住或进程退出仍依赖通信及 launcher 超时。
+旧物理 tensor storage 失效，Python workspace 身份保持不变，已保存的独立 autograd 激活可继续反向。
+
 ## 接口契约
+
+In the contracts below, **world** means the acquired CANN SHMEM root group,
+which may be smaller than Torch WORLD. Other PP stages do not participate.
+Expert parameters and forward activations are not symmetric workspace: multiple
+microbatch graphs may remain live while serial calls reuse the same workspace.
+Drain all backward/recompute work before closing experts or destroying groups.
 
 所有操作接口都要求调用方持有一个尚未释放的引用，并且不得与最后一个`release()`并发。Allocation、free、barrier和
 AllGather等collective路径必须由全world按一致顺序调用；单边Put/Get/Signal均为stream入队语义
@@ -107,12 +135,17 @@ Runtime在初始化时冻结当前NPU设备；`empty`、`barrier`、`signal`、`
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `HYPER_PARALLEL_SHMEM_HEAP_SIZE` | 1073741824（1 GiB） | 每进程堆字节数，正整数；生命周期内固定，修改值随下一生命周期首次`acquire()`生效 |
-| `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT` | `tcp://127.0.0.1:8662` | 引导端点；一个生命周期内各 rank 相同，重建生命周期时更换端口 |
+| `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT` | `tcp://127.0.0.1:8662` | 普通 WORLD / 单进程初始化的 endpoint；子组及 MegaMoE 显式 heap 初始化使用独立 unique ID |
+| `SHMEM_UID_SOCK_IFNAME` | CANN automatic selection | Optional host interface for subgroup UID bootstrap; it must be reachable by all group members across nodes |
 | `HYPER_PARALLEL_SHMEM_TIMEOUT_SEC` | 120 | Runtime 超时秒数 |
 | `HYPER_PARALLEL_SHMEM_DATA_ENGINE` | `mte` | 数据搬移引擎，首版仅支持 `mte` |
 | `HYPER_PARALLEL_SHMEM_LOG_LEVEL` | 未设置即 `2` | Runtime 日志级别：`0`=Debug（最详细；`shmem.empty` 额外在 stderr 输出直接调用点，泄漏的 Allocation 可经 `allocation_base` 回溯到代码行）、`1`=Info、`2`=Error（仅错误）；非法值回退 `2` |
 
 ## 安全性
+
+Subgroup UID bootstrap also uses unencrypted host sockets. Do not configure a
+fixed `SHMEM_UID_SESSION_ID` for independent groups, since that bypasses unique
+rendezvous allocation. Managed MegaMoE heaps use this UID bootstrap for WORLD roots as well.
 
 以下为 CANN `aclshmem` 实现层面的事实，部署前需据此评估威胁模型：
 

@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 #include "cann/signal.h"
@@ -32,9 +33,13 @@ struct InitOptions {
   uint32_t timeout_seconds;
   runtime::DataEngine data_engine;
   std::string_view effective_bootstrap_endpoint;
+  std::string_view unique_id{};
 };
 
 namespace host {
+
+/** @brief Create an opaque CANN bootstrap ID for distribution within one framework EP group. */
+runtime::Result<std::string> get_unique_id();
 
 /**
  * @brief Initialize one process-local CANN SHMEM Root WORLD and fixed symmetric Heap.

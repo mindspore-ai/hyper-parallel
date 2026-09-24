@@ -22,7 +22,6 @@
 namespace optiling {
 const uint64_t BLOCK_SIZE = 32;
 const uint64_t BUFFER_NUM = 2;
-constexpr int64_t MAX_EXPERT_NUM_PER_RANK = 16;
 constexpr int64_t MIN_RUNTIME_CONFIG_BYTES = 64;
 constexpr int64_t MAX_RUNTIME_CONFIG_BYTES_EXCLUSIVE = int64_t{1} << 32;
 constexpr int64_t MIN_EVENT_COUNTER_BYTES = 4096;
@@ -75,8 +74,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   const int64_t expertNum = *expertNumAttr;
   const int64_t hiddenSize = *hiddenSizeAttr;
   const int64_t seqSize = *seqSizeAttr;
-  if (rankId < 0 || ep <= 0 || expertNum <= 0 || expertNum % ep != 0 ||
-      expertNum / ep > MAX_EXPERT_NUM_PER_RANK || hiddenSize <= 0 || seqSize <= 0) {
+  if (rankId < 0 || ep <= 0 || expertNum <= 0 || expertNum % ep != 0 || hiddenSize <= 0 || seqSize <= 0) {
     OP_LOGE(context->GetNodeName(),
             "Invalid topology: rankId=%ld, ep=%ld, expertNum=%ld, hiddenSize=%ld, seqSize=%ld.", rankId, ep,
             expertNum, hiddenSize, seqSize);

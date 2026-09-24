@@ -27,7 +27,6 @@ from hyper_parallel.core.multicore.modules.mega_moe import route as route_module
 from hyper_parallel.core.multicore.modules.mega_moe.route import (
     _expert_capacity,
     _resolve_counts,
-    _validate_bounded_capacity,
     prepare_topk_route,
 )
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -41,7 +40,7 @@ class TestMegaMoeRoute(unittest.TestCase):
         *,
         ep_size: int = 1,
         rank_id: int = 0,
-        expert_capacity_factor: float | None = None,
+        initial_capacity_factor: float | None = None,
         receive_capacity: int = 128,
     ) -> MegaMoeSpec:
         """Build a small CPU-only route specification."""
@@ -51,7 +50,7 @@ class TestMegaMoeRoute(unittest.TestCase):
             intermediate_size=2,
             num_experts=4,
             top_k=2,
-            expert_capacity_factor=expert_capacity_factor,
+            initial_capacity_factor=initial_capacity_factor,
             receive_capacity=receive_capacity,
             ep_size=ep_size,
             ep_group=None,
@@ -76,22 +75,6 @@ class TestMegaMoeRoute(unittest.TestCase):
             torch.equal(computed, expected),
             f"computed counts mismatch: expected={expected}, got={computed}",
         )
-
-    def test_capacity_checks_only_explicit_bounded_mode(self) -> None:
-        """Reuse the gathered maximum and reject explicit bounded overflow."""
-        spec = self._spec(ep_size=2, expert_capacity_factor=None)
-        _validate_bounded_capacity(8, spec)
-        bounded_spec = self._spec(
-            ep_size=2,
-            expert_capacity_factor=1.0,
-            receive_capacity=4,
-        )
-
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "configured_capacity=4, actual_maximum=8",
-        ):
-            _validate_bounded_capacity(8, bounded_spec)
 
     def test_async_count_gather_overlaps_permute_and_builds_metadata(self) -> None:
         """Wait after permutation and derive every native offset from counts."""
@@ -178,6 +161,42 @@ class TestMegaMoeRoute(unittest.TestCase):
         self.assertTrue(torch.equal(metadata.combine_size, torch.tensor([3, 4, 7, 8])))
         self.assertTrue(torch.equal(metadata.group_list, torch.tensor([10, 22])))
         self.assertEqual(metadata.expert_capacity, 22)
+        self.assertEqual((spec.dispatch_split, spec.combine_split, spec.swiglu_split), (128, 128, 128))
+        events.clear()
+        workspace.in_use, workspace.source_buffer = True, torch.empty_like(routed_tokens)
+        workspace.wait_for_reuse.reset_mock()
+        pull_spec = replace(spec, dispatch_mode="pull")
+
+        def _permute_out(tokens, indices, output, mapping):
+            self.assertIs(tokens, hidden_states)
+            self.assertIs(output, workspace.source_buffer)
+            self.assertTrue(indices.is_contiguous())
+            self.assertEqual(mapping.dtype, torch.int32)
+            events.append("permute-out")
+            output.copy_(routed_tokens)
+            mapping.copy_(unpermute_mapping)
+
+        with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather_counts) as gather,
+              patch.object(route_module.multicore_ops, "moe_token_permute_out", side_effect=_permute_out),
+              patch.object(route_module, "_permute_topk_input") as allocating):
+            first, pull = [prepare_topk_route(hidden_states, topk_ids.T.contiguous().T, topk_weights,
+                                              pull_spec, supplied_counts, workspace) for _ in range(2)]
+            self.assertIs(pull.routed_tokens, workspace.source_buffer)
+            self.assertNotEqual(first.unpermute_mapping.data_ptr(), pull.unpermute_mapping.data_ptr())
+            torch.testing.assert_close(first.unpermute_mapping, unpermute_mapping)
+            for active, source in ((False, workspace.source_buffer), (True, None)):
+                workspace.in_use, workspace.source_buffer = active, source
+                gather.reset_mock()
+                with self.assertRaisesRegex(RuntimeError, "initialized, claimed workspace"):
+                    prepare_topk_route(hidden_states, topk_ids, topk_weights, pull_spec, supplied_counts, workspace)
+                gather.assert_not_called()
+        allocating.assert_not_called()
+        workspace.wait_for_reuse.assert_not_called()
+        self.assertEqual(events, ["gather", "permute-out", "wait"] * 2)
+        self.assertEqual(pull.metadata.dispatch_src_off.tolist(), [3, 6, 11, 18])
+        self.assertEqual(pull.metadata.dispatch_target_off.tolist(), [0, 10, 3, 14])
+        self.assertEqual(pull.metadata.dispatch_size.tolist(), [3, 4, 7, 8])
+        self.assertEqual(pull.maximum_received_slots, 22)
 
     def test_local_capacity_tracks_routes_below_source_size_and_empty_ranks(self) -> None:
         """Shrink destination intermediates independently of source or SHMEM size."""
@@ -193,20 +212,17 @@ class TestMegaMoeRoute(unittest.TestCase):
                 with self.subTest(counts=counts, rank=rank):
                     rank_spec = replace(spec, rank_id=rank)
                     actual = _expert_capacity(torch.tensor(counts, dtype=torch.int32), rank_spec)
-                    self.assertEqual(actual, expected)
+                    self.assertEqual(actual, (expected, max(capacities)))
                     self.assertEqual(rank_spec.receive_capacity, 256)
                     self.assertEqual(rank_spec.routed_slots, 4)
 
-    def test_overflow_is_rejected_on_every_rank_including_empty_destinations(self) -> None:
-        """A cold rank must report the same hot-rank overflow before execution."""
+    def test_overflow_load_is_reported_on_every_rank_including_empty_destinations(self) -> None:
+        """Both hot and empty ranks report the same maximum so push can grow before execution."""
         counts = torch.tensor([[4, 0, 0, 0], [4, 0, 0, 0]], dtype=torch.int32)
         for rank in range(2):
-            spec = self._spec(ep_size=2, rank_id=rank, expert_capacity_factor=1.0, receive_capacity=4)
-            with (
-                self.subTest(rank=rank),
-                self.assertRaisesRegex(RuntimeError, "configured_capacity=4, actual_maximum=8"),
-            ):
-                _expert_capacity(counts, spec)
+            spec = self._spec(ep_size=2, rank_id=rank, initial_capacity_factor=1.0, receive_capacity=4)
+            with self.subTest(rank=rank):
+                self.assertEqual(_expert_capacity(counts, spec), (8 if rank == 0 else 1, 8))
 
 
 if __name__ == "__main__":

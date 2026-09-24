@@ -26,12 +26,14 @@ forward and therefore reuse one SHMEM runtime/workspace. The benchmark calls
 acquire and release their SHMEM references internally; model code only closes
 `MegaMoeExperts` (through `QwenMoeModel.close()`) and never calls SHMEM directly.
 
-The public `MegaMoeExperts` API and this benchmark default
-`expert_capacity_factor` to `None`, which reserves the maximum lossless receive
-capacity. An explicit factor such as `1.5` keeps the workspace bounded, but a
-route that exceeds that capacity fails before native execution with a clear
-error. Smaller lossless workspaces via in-kernel multi-wave execution are
-future work.
+Select the transport with `--dispatch-mode push|pull` (default: push).
+Push starts with `--initial-capacity-factor 1.25` and grows on overflow using
+`--capacity-growth-factor 1.25`. Both factors are finite numbers of at least one;
+a growth factor of `1.0` allocates only the current demand. Set the initial
+factor to the EP size to reserve the full lossless upper bound at startup.
+Pull accepts neither factor: its SHMEM contains local source/combine rows,
+while received rows use ordinary HBM. Both transports retain all routed tokens.
+The old `--expert-capacity-factor` and `--capacity-policy` options were removed.
 
 ## Workload
 
@@ -39,10 +41,11 @@ future work.
 | --- | --- |
 | Topology | TP1, EP8 |
 | Dtype | BF16 |
-| Batch / sequence per rank | 1 / 1024 |
-| Hidden size / layers | 2048 / 8 |
-| Routed experts / TopK | 16 / 8 |
-| Expert intermediate size | 512 |
+| Batch / sequence per rank | 1 / 4096 |
+| Hidden size / layers | 5120 / 2 |
+| Routed experts / TopK | 48 / 8 |
+| Routed / shared expert intermediate size | 1792 / 1792 |
+| Attention heads / KV heads / head dimension | 40 / 8 / 128 |
 | Optimizer | HyperParallel AdamW, FP32 master / BF16 model |
 | Comparison order | common A, then MegaMoe B |
 | Default timing | 3 warmup + 5 measured optimizer steps |
@@ -77,7 +80,19 @@ bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh
 `NNODES * NPROC_PER_NODE` must equal EP8. This minimal benchmark uses one
 SHMEM communicator over the full Torch world. The launcher sets
 `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT` from `SHMEM_HOST` (defaulting to `MASTER_ADDR`) and
-`SHMEM_PORT`; subgroup endpoint discovery is intentionally outside this PR.
+`SHMEM_PORT`. The public `MegaMoeExperts` API also accepts EP subgroups: each
+subgroup bootstraps with a CANN unique ID broadcast only among its members.
+`SHMEM_UID_SOCK_IFNAME` can select a host interface reachable by all EP members
+for multi-node UID bootstrap. Do not set a fixed `SHMEM_UID_SESSION_ID` for
+independent groups. No TP degree is passed to MegaMoE: the caller supplies
+rank-local tokens and the actual EP group.
+
+PP stages may retain multiple forward graphs while sharing serial execution
+resources; activations needed by delayed backward are owned by each graph.
+Close local experts after the pipeline drains and before destroying EP groups.
+Only one ordered EP membership may own SHMEM in a process at a time; separate
+disjoint PP/DP groups have independent runtimes. This example itself still uses
+one full-world EP group rather than a pipeline schedule.
 
 ## Output
 
@@ -98,3 +113,22 @@ not affect steady-state timing. Timing is plain A/B, not A/B/B/A, and uses the
 rank-maximum complete optimizer-step latency after independent warmup. This
 random-weight benchmark validates integration; it does not establish checkpoint
 convergence.
+
+### 配置 dispatch 与 push 容量
+
+```bash
+bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \
+  --dispatch-mode push --initial-capacity-factor 1.25 --capacity-growth-factor 1.25
+
+bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \
+  --dispatch-mode pull
+```
+
+结果中的 `shape.dispatch_mode`、`shape.initial_capacity_factor` 和 `shape.capacity_growth_factor`
+记录生效配置；pull 的两个因子为 `null`。MegaMoE backend 的 `shmem_heap_bytes` 来自实际 runtime，
+`heap_growth` 记录扩容前后 heap 大小、各 workspace 容量及各重建阶段耗时，计时来自 rank 0。
+容量回落时不缩容；倍数作用于接收行数，而非整个 heap 的字节数。
+
+此 runner 只在首个 optimizer step 比较 common 与 MegaMoE 的数值。
+后续参数更新可能导致路由逐渐分叉，稳态耗时不能直接视为相同通信负载下的后端比较。
+研究容量策略的开销时，应另用固定参数和固定路由，分别报告稳态与扩容步。
