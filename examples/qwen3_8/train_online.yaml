@@ -129,8 +129,8 @@ lr_scheduler:
     min_lr: 1.0e-6
 
 checkpoint:
-  save_ckpt: false
-  save_hf_weights: true
+  save_ckpt: true
+  save_hf_weights: false
   checkpoint_dir: ./outputs/qwen3_8/checkpoints
   save_steps: 10
   save_epochs: 1

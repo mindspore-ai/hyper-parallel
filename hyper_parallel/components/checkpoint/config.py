@@ -41,6 +41,12 @@ class CheckpointingConfig:
     checkpoint_dir: str = "./checkpoints"
     save_steps: int = 0  # save every N optimizer steps (0 = disabled)
     save_epochs: int = 1  # save every N epochs
+    # Save after this many elapsed training minutes, at the next completed
+    # optimizer step. A non-positive value disables time-based saving.
+    save_time_interval_minutes: float = 0.0
+    # Maximum number of completed ``global_step_*`` directories to retain.
+    # None or a non-positive value disables checkpoint rotation.
+    save_total_limit: Optional[int] = None
     is_async: bool = False
     is_peft: bool = False  # persist trainable (adapter) weights only
     save_optimizer: bool = True
