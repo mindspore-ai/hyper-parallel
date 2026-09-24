@@ -1,4 +1,4 @@
-# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Torch-only Multicore APIs, separate from the HyperParallel root exports."""
+"""Backward paths for shifted Single-Pass HyperMegaMhc."""
 
-from hyper_parallel.core.multicore import profiler
-from hyper_parallel.core.multicore.modules.mega_mhc.module import HyperMegaMhc
-from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
+from .function import hyper_mega_mhc_grad
+from .golden import torch_mega_mhc_grad
 
-__all__ = ["HyperMegaMhc", "MegaMoeExperts", "profiler"]
+__all__ = ["hyper_mega_mhc_grad", "torch_mega_mhc_grad"]

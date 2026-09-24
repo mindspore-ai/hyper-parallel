@@ -1,0 +1,143 @@
+diff --git a/norm/rms_norm_grad/op_kernel/rms_norm_grad_split_n_high_precision.h b/norm/rms_norm_grad/op_kernel/rms_norm_grad_split_n_high_precision.h
+index 271a212..59f8ab1 100644
+--- a/norm/rms_norm_grad/op_kernel/rms_norm_grad_split_n_high_precision.h
++++ b/norm/rms_norm_grad/op_kernel/rms_norm_grad_split_n_high_precision.h
+@@ -27,6 +27,28 @@ public:
+     __aicore__ inline void Init(
+         GM_ADDR dy, GM_ADDR x, GM_ADDR rstd, GM_ADDR gamma, GM_ADDR dx, GM_ADDR dgamma,
+         const RmsNormGradTilingData* tiling, GM_ADDR usrWorkspace)
++    {
++        blockIdx_ = GetBlockIdx();
++        InitImpl(dy, x, rstd, gamma, dx, dgamma, tiling, usrWorkspace);
++    }
++
++    __aicore__ inline void InitTask(
++        GM_ADDR dy, GM_ADDR x, GM_ADDR rstd, GM_ADDR gamma, GM_ADDR dx, GM_ADDR dgamma,
++        const RmsNormGradTilingData* tiling, GM_ADDR usrWorkspace)
++    {
++        taskMode_ = true;
++        blockIdx_ = 0;
++        InitImpl(dy, x, rstd, gamma, dx, dgamma, tiling, usrWorkspace);
++    }
++
++    __aicore__ inline void DestroyTaskPipe()
++    {
++        pipe.Destroy();
++    }
++
++    __aicore__ inline void InitImpl(
++        GM_ADDR dy, GM_ADDR x, GM_ADDR rstd, GM_ADDR gamma, GM_ADDR dx, GM_ADDR dgamma,
++        const RmsNormGradTilingData* tiling, GM_ADDR usrWorkspace)
+     {
+         InitVar(tiling);
+         InitInputGmBuffer(dy, x, rstd, gamma, blockDim_, coreCalcTail_);
+@@ -38,7 +55,7 @@ public:
+         if (isDeterministic_ == 1) {
+             InitWorkspace(usrWorkspace);
+             workspaceGmOri_.SetGlobalBuffer((__gm__ float*)usrWorkspace);
+-        } else {
++        } else if (!taskMode_) {
+             SyncAll();
+         }
+ #else
+@@ -49,15 +66,17 @@ public:
+
+         InitGmZero<int32_t>(syncTmpSpaceGm_, outZeroTmpBuf_, syncLen, (uint32_t)0);
+         if (isDeterministic_ != 1) {
+-            if (GetBlockIdx() == 0) {
++            if (!taskMode_ && blockIdx_ == 0) {
+                 InitGmZero<float>(dgammaGm_, outZeroTmpBuf_, colValAlign_, (uint32_t)0);
+             }
+-            LocalTensor<int32_t> workLocal = syncTmpBuf_.Get<int32_t>();
+-            SyncAll(syncTmpSpaceGm_, workLocal);
++            if (!taskMode_) {
++                LocalTensor<int32_t> workLocal = syncTmpBuf_.Get<int32_t>();
++                SyncAll(syncTmpSpaceGm_, workLocal);
++            }
+         } else {
+             workspaceGm_.SetGlobalBuffer(
+-                (__gm__ float*)usrWorkspace + ALIGN_32 * GetBlockNum() + GetBlockIdx() * colVal_);
+-            if (GetBlockIdx() == 0) {
++                (__gm__ float*)usrWorkspace + ALIGN_32 * GetBlockNum() + blockIdx_ * colVal_);
++            if (blockIdx_ == 0) {
+                 InitGmZero<float>(workspaceGm_, outZeroTmpBuf_, colValAlign_, (uint32_t)0);
+             }
+         }
+@@ -66,7 +85,7 @@ public:
+
+     __aicore__ inline void InitWorkspace(GM_ADDR usrWorkspace)
+     {
+-        workspaceGm_.SetGlobalBuffer((__gm__ float*)usrWorkspace + GetBlockIdx() * colValAlign_);
++        workspaceGm_.SetGlobalBuffer((__gm__ float*)usrWorkspace + blockIdx_ * colValAlign_);
+     }
+
+     __aicore__ inline void InitVar(const RmsNormGradTilingData* tiling)
+@@ -94,20 +113,20 @@ public:
+     __aicore__ inline void InitInputGmBuffer(
+         GM_ADDR dy, GM_ADDR x, GM_ADDR rstd, GM_ADDR gamma, uint32_t numBlocks, uint32_t coreCalcTail)
+     {
+-        if (GetBlockIdx() < numBlocks - 1) {
++        if (blockIdx_ < numBlocks - 1) {
+             coreOffset_ = blockFactor_;
+         } else {
+             coreOffset_ = coreCalcTail > 0 ? coreCalcTail : blockFactor_;
+         }
+-        dyGm_.SetGlobalBuffer((__gm__ T_DY*)dy + GetBlockIdx() * blockFactor_ * colVal_, coreOffset_ * colVal_);
+-        xGm_.SetGlobalBuffer((__gm__ T_DY*)x + GetBlockIdx() * blockFactor_ * colVal_, coreOffset_ * colVal_);
+-        rstdGm_.SetGlobalBuffer((__gm__ float*)rstd + GetBlockIdx() * blockFactor_, coreOffset_);
++        dyGm_.SetGlobalBuffer((__gm__ T_DY*)dy + blockIdx_ * blockFactor_ * colVal_, coreOffset_ * colVal_);
++        xGm_.SetGlobalBuffer((__gm__ T_DY*)x + blockIdx_ * blockFactor_ * colVal_, coreOffset_ * colVal_);
++        rstdGm_.SetGlobalBuffer((__gm__ float*)rstd + blockIdx_ * blockFactor_, coreOffset_);
+         gammaGm_.SetGlobalBuffer((__gm__ T_GAMMA*)gamma, colVal_);
+     }
+
+     __aicore__ inline void InitOutputGmBuffer(GM_ADDR dx, GM_ADDR dgamma)
+     {
+-        dxGm_.SetGlobalBuffer((__gm__ T_DY*)dx + GetBlockIdx() * blockFactor_ * colVal_, coreOffset_ * colVal_);
++        dxGm_.SetGlobalBuffer((__gm__ T_DY*)dx + blockIdx_ * blockFactor_ * colVal_, coreOffset_ * colVal_);
+ #if defined(__CCE_AICORE__) && (__CCE_AICORE__ == 200)
+         dgammaGm_.SetGlobalBuffer((__gm__ float*)dgamma, colValAlign_);
+ #else
+@@ -115,7 +134,7 @@ public:
+         if (isDeterministic_ == 1) {
+             return;
+         } else {
+-            if (GetBlockIdx() == 0) {
++            if (!taskMode_ && blockIdx_ == 0) {
+                 InitOutput<float>(dgammaGm_, colVal_, 0);
+             }
+         }
+@@ -164,7 +183,7 @@ public:
+                 SubProcess(ubCalcLoop_ - 1, ubCalcTail_, gammaLocal, dgammaLocal);
+             }
+         } else {
+-            if (GetBlockIdx() < blockDim_ - 1) {
++            if (blockIdx_ < blockDim_ - 1) {
+                 for (uint32_t i = 0; i < (ubCalcTail_ == 0 ? ubCalcLoop_ : ubCalcLoop_ - 1); i++) {
+                     SubProcess(i, ubCalcNum, gammaLocal, dgammaLocal);
+                 }
+@@ -342,7 +361,7 @@ public:
+
+     __aicore__ inline void AddDgamma()
+     {
+-        if (GetBlockIdx() != 0) {
++        if (blockIdx_ != 0) {
+             return;
+         }
+         LocalTensor<float> dgammaLocal = outQueDgamma_.AllocTensor<float>();
+@@ -526,6 +545,8 @@ public:
+     uint32_t bufferLenSize_;
+     int32_t bufferNum_;
+     uint32_t isDeterministic_{0};
++    uint32_t blockIdx_{0};
++    bool taskMode_{false};
+
+     TPipe pipe;
+     GlobalTensor<T_DY> dyGm_, dxGm_, xGm_;
+@@ -540,4 +561,4 @@ public:
+     TBuf<TPosition::VECCALC> outZeroTmpBuf_;
+     TBuf<TPosition::VECCALC> syncTmpBuf_;
+ };
+-#endif // _RMS_NORM_GRAD_SPLIT_N_HIGH_PRECISION_H_
+\ No newline at end of file
++#endif // _RMS_NORM_GRAD_SPLIT_N_HIGH_PRECISION_H_

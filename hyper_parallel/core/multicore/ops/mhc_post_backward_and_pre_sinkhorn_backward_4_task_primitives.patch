@@ -1,0 +1,223 @@
+diff --git a/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h b/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h
+index 93a8f97..b02c6b7 100644
+--- a/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h
++++ b/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h
+@@ -34,6 +34,11 @@ public:
+                                    GM_ADDR h_post, GM_ADDR grad_x, GM_ADDR grad_h_res, GM_ADDR grad_h_out,
+                                    GM_ADDR grad_h_post, const MhcPostBackwardTilingDataArch22 &tilingData,
+                                    TPipe *pipe);
++    __aicore__ inline void InitAddTask(GM_ADDR grad_y, GM_ADDR direct_grad_y, GM_ADDR x, GM_ADDR h_res,
++                                       GM_ADDR h_out, GM_ADDR h_post, GM_ADDR grad_x, GM_ADDR grad_h_res,
++                                       GM_ADDR grad_h_out, GM_ADDR grad_h_post,
++                                       const MhcPostBackwardTilingDataArch22 &tilingData, TPipe *pipe,
++                                       uint64_t task_offset, uint64_t task_count);
+     __aicore__ inline void Process();
+
+ protected:
+@@ -84,6 +89,9 @@ protected:
+     uint64_t hOutSize = 0;
+     uint64_t hPostSize = 0;
+     bool addDirectGrad = false;
++    bool taskMode = false;
++    uint64_t taskOffset = 0;
++    uint64_t taskCount = 0;
+
+     DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
+     DataCopyPadExtParams<float> padParamsFloat{false, 0, 0, 0};
+@@ -163,20 +171,34 @@ __aicore__ inline void KernelMhcPostBackward<T>::InitAdd(
+ }
+
+ template <typename T>
+-__aicore__ inline void KernelMhcPostBackward<T>::Process()
++__aicore__ inline void KernelMhcPostBackward<T>::InitAddTask(
++    GM_ADDR grad_y, GM_ADDR direct_grad_y, GM_ADDR x, GM_ADDR h_res, GM_ADDR h_out, GM_ADDR h_post,
++    GM_ADDR grad_x, GM_ADDR grad_h_res, GM_ADDR grad_h_out, GM_ADDR grad_h_post,
++    const MhcPostBackwardTilingDataArch22 &tilingData, TPipe *pipe, uint64_t task_offset, uint64_t task_count)
+ {
+-    uint32_t coreId = GetBlockIdx();
++    InitAdd(grad_y, direct_grad_y, x, h_res, h_out, h_post, grad_x, grad_h_res, grad_h_out, grad_h_post,
++            tilingData, pipe);
++    this->taskMode = true;
++    this->taskOffset = task_offset;
++    this->taskCount = task_count;
++}
+
+-    if (coreId >= this->coreUsed) {
+-        return;
++template <typename T>
++__aicore__ inline void KernelMhcPostBackward<T>::Process()
++{
++    uint64_t startIdx = this->taskOffset;
++    uint64_t endIdx = startIdx + this->taskCount;
++    if (!this->taskMode) {
++        uint32_t coreId = GetBlockIdx();
++        if (coreId >= this->coreUsed) {
++            return;
++        }
++        startIdx = coreId > this->frontCore ?
++                       (coreId - this->frontCore) * this->tailBS + this->frontCore * this->singleCoreBS :
++                       coreId * this->singleCoreBS;
++        endIdx = startIdx + ((coreId < this->frontCore) ? this->singleCoreBS : this->tailBS);
+     }
+
+-    uint64_t startIdx = coreId > this->frontCore ?
+-                            (coreId - this->frontCore) * this->tailBS + this->frontCore * this->singleCoreBS :
+-                            coreId * this->singleCoreBS;
+-
+-    uint64_t endIdx = startIdx + ((coreId < this->frontCore) ? this->singleCoreBS : this->tailBS);
+-
+     this->dFPostResCastUb = this->dFPostResCastBuf.template Get<T>();
+     this->FOutCastUb = this->FOutCastBuf.template Get<T>();
+     this->HLPostUb = this->HLPostBuf.template Get<float>();
+diff --git a/mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22/mhc_pre_grad_kernel.h b/mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22/mhc_pre_grad_kernel.h
+index 9d5d353..e1070b9 100644
+--- a/mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22/mhc_pre_grad_kernel.h
++++ b/mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22/mhc_pre_grad_kernel.h
+@@ -100,6 +100,22 @@ public:
+         gradPreviousPreGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(grad_previous_pre));
+         useShiftedPre_ = true;
+     }
++    __aicore__ inline void InitShiftedTask(
++        GM_ADDR x, GM_ADDR hc_fn, GM_ADDR previous_pre, GM_ADDR grad_current_pre, GM_ADDR grad_previous_pre,
++        GM_ADDR grad_y, GM_ADDR grad_post, GM_ADDR grad_comb, GM_ADDR hc_scale, GM_ADDR hc_base, GM_ADDR h_hat2,
++        GM_ADDR rsqrt, GM_ADDR sum_out, GM_ADDR norm_out, GM_ADDR grad_x, GM_ADDR grad_hc_fn,
++        GM_ADDR grad_hc_scale, GM_ADDR grad_hc_base, GM_ADDR grad_rsqrt_workspace, GM_ADDR workspace,
++        const MhcPreSinkhornBackwardArch22TilingData *tilingData, TPipe *pipe)
++    {
++        taskMode_ = true;
++        InitShifted(x, hc_fn, previous_pre, grad_current_pre, grad_previous_pre, grad_y, grad_post, grad_comb,
++                    hc_scale, hc_base, h_hat2, rsqrt, sum_out, norm_out, grad_x, grad_hc_fn, grad_hc_scale,
++                    grad_hc_base, workspace, tilingData, pipe);
++        gradRsqrtWorkspaceGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(grad_rsqrt_workspace));
++    }
++    __aicore__ inline void ProcessGradPrepareTask(const int64_t taskOffset, const int32_t tileTaskCount);
++    __aicore__ inline void ProcessPhiRmsTask(const int64_t taskOffset, const int32_t tileTaskCount);
++    __aicore__ inline void ProcessGradPreviousXTask(const int64_t taskOffset, const int32_t tileTaskCount);
+     __aicore__ inline void Process();
+
+ protected:
+@@ -162,8 +178,9 @@ protected:
+     GlobalTensor<T> gradWeightWSGlobal_;
+     GlobalTensor<T> xWorkspaceGlobal_;
+     GlobalTensor<T> gradXCubeGlobal_;
+-    GlobalTensor<T> gradCurrentPreGlobal_, gradPreviousPreGlobal_;
++    GlobalTensor<T> gradCurrentPreGlobal_, gradPreviousPreGlobal_, gradRsqrtWorkspaceGlobal_;
+     bool useShiftedPre_ = false;
++    bool taskMode_ = false;
+
+ private:
+     __aicore__ inline void InitTiling(const MhcPreSinkhornBackwardArch22TilingData *tilingData)
+@@ -250,6 +267,9 @@ private:
+
+             gradHResGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(grad_comb)); // fp32
+             if constexpr (DETERMINISTIC == false) {
++                if (taskMode_) {
++                    return;
++                }
+                 if (blkIdx_ == aivNum_ - 1) {
+                     InitOutput<T>(gradHcBaseGlobal_, (n_ * n_ + PRE_POST_NUM * n_), 0);
+                     InitOutput<T>(gradHcScaleGlobal_, 3, 0);
+@@ -968,7 +988,6 @@ __aicore__ inline void MhcPreGradKernel<TYPE_X, T, DETERMINISTIC>::StorePrevious
+             gradPreviousPreGlobal_[(taskOffset + row) * n_], dPrePostTempLocal_[row * 2 * n_],
+             {static_cast<uint16_t>(1), static_cast<uint32_t>(n_ * sizeof(T)), 0, 0, 0});
+     }
+-
+     event_t eventMte3Mte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
+     SetFlag<HardEvent::MTE3_MTE2>(eventMte3Mte2);
+     WaitFlag<HardEvent::MTE3_MTE2>(eventMte3Mte2);
+@@ -1040,6 +1059,95 @@ __aicore__ inline void MhcPreGradKernel<TYPE_X, T, DETERMINISTIC>::ComputeScaleB
+     n: n == 4
+ */
+
++template <typename TYPE_X, typename T, bool DETERMINISTIC>
++__aicore__ inline void MhcPreGradKernel<TYPE_X, T, DETERMINISTIC>::ProcessGradPrepareTask(
++    const int64_t taskOffset, const int32_t tileTaskCount)
++{
++    if ASCEND_IS_AIV {
++        GetHcScaleAndHcBase();
++        for (int64_t tileOffset = 0; tileOffset < tileTaskCount; tileOffset += tileCoreBS_) {
++            int32_t nativeCount =
++                min(static_cast<int32_t>(tileCoreBS_), static_cast<int32_t>(tileTaskCount - tileOffset));
++            tileRepeatTimes_ = Ops::Base::CeilDiv(static_cast<int64_t>(nativeCount) * 2 * n_,
++                                                  static_cast<int64_t>(ELEMENTS_SIZE_PER_REPEAT));
++            Duplicate(dPrePostTempLocal_, 0.f, tileCoreBS_ * n_ * 2);
++            for (int64_t innerOffset = 0; innerOffset < nativeCount; innerOffset += onceTask_) {
++                int32_t innerCount =
++                    min(static_cast<int32_t>(onceTask_), static_cast<int32_t>(nativeCount - innerOffset));
++                ComputeGradPre(taskOffset + tileOffset + innerOffset, innerCount, innerOffset);
++            }
++            StorePreviousPreAndLoadCurrentPre(taskOffset + tileOffset, nativeCount);
++            ComputeGradHHat2(taskOffset + tileOffset, nativeCount);
++            SetFlag<HardEvent::V_MTE3>(eventIdVToMTE3XCast);
++            WaitFlag<HardEvent::V_MTE3>(eventIdVToMTE3XCast);
++            DataCopyPad(
++                gradRsqrtWorkspaceGlobal_[taskOffset + tileOffset], gradRsqrtLocal_,
++                {static_cast<uint16_t>(1), static_cast<uint32_t>(nativeCount * sizeof(T)), 0, 0, 0});
++        }
++        tileRepeatTimes_ = Ops::Base::CeilDiv(tileCoreBS_ * 2 * n_,
++                                              static_cast<int64_t>(ELEMENTS_SIZE_PER_REPEAT));
++        ComputeScaleBias();
++        GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE3>(eventIdVToMTE3XCast);
++    }
++}
++
++template <typename TYPE_X, typename T, bool DETERMINISTIC>
++__aicore__ inline void MhcPreGradKernel<TYPE_X, T, DETERMINISTIC>::ProcessPhiRmsTask(
++    const int64_t taskOffset, const int32_t tileTaskCount)
++{
++    if ASCEND_IS_AIC {
++        const int32_t nativeCubeTile = 2 * tileCoreBS_;
++        for (int64_t tileOffset = 0; tileOffset < tileTaskCount; tileOffset += nativeCubeTile) {
++            int32_t nativeCount =
++                min(nativeCubeTile, static_cast<int32_t>(tileTaskCount - tileOffset));
++            ProcessMatmul1(taskOffset + tileOffset, nativeCount);
++            ProcessMatmul2(taskOffset + tileOffset, nativeCount);
++        }
++    }
++}
++
++template <typename TYPE_X, typename T, bool DETERMINISTIC>
++__aicore__ inline void MhcPreGradKernel<TYPE_X, T, DETERMINISTIC>::ProcessGradPreviousXTask(
++    const int64_t taskOffset, const int32_t tileTaskCount)
++{
++    if ASCEND_IS_AIV {
++        for (int64_t tileOffset = 0; tileOffset < tileTaskCount; tileOffset += tileCoreBS_) {
++            int32_t nativeCount =
++                min(static_cast<int32_t>(tileCoreBS_), static_cast<int32_t>(tileTaskCount - tileOffset));
++            int32_t brcbAlign = static_cast<int32_t>(Ops::Base::CeilDiv(
++                static_cast<int64_t>(nativeCount) * n_, static_cast<int64_t>(ELEMENTS_SIZE_PER_BLOCK)));
++            auto preLocal = inputGradQueue.AllocTensor<T>();
++            DataCopyPad(
++                preLocal, preGlobal_[(taskOffset + tileOffset) * n_],
++                {static_cast<uint16_t>(1), static_cast<uint32_t>(nativeCount * n_ * sizeof(T)), 0, 0, 0},
++                {false, 0, 0, 0});
++            inputGradQueue.EnQue(preLocal);
++            inputGradQueue.DeQue();
++            Brcb(preBrcbLocal_, preLocal, brcbAlign, {static_cast<uint8_t>(1), static_cast<uint8_t>(8)});
++            inputGradQueue.FreeTensor(preLocal);
++
++            DataCopyPad(
++                gradRsqrtLocal_, gradRsqrtWorkspaceGlobal_[taskOffset + tileOffset],
++                {static_cast<uint16_t>(1), static_cast<uint32_t>(nativeCount * sizeof(T)), 0, 0, 0},
++                {false, 0, 0, 0});
++            event_t eventMte2V = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
++            SetFlag<HardEvent::MTE2_V>(eventMte2V);
++            WaitFlag<HardEvent::MTE2_V>(eventMte2V);
++            brcbAlign = static_cast<int32_t>(Ops::Base::CeilDiv(
++                static_cast<int64_t>(nativeCount), static_cast<int64_t>(ELEMENTS_SIZE_PER_BLOCK)));
++            Brcb(dRsqrtBrcbLocal_, gradRsqrtLocal_, brcbAlign,
++                 {static_cast<uint8_t>(1), static_cast<uint8_t>(8)});
++
++            for (int64_t innerOffset = 0; innerOffset < nativeCount; innerOffset += onceTask_) {
++                int32_t innerCount =
++                    min(static_cast<int32_t>(onceTask_), static_cast<int32_t>(nativeCount - innerOffset));
++                ComputeGradX1(taskOffset + tileOffset + innerOffset, innerCount, innerOffset);
++            }
++        }
++        GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE3>(eventIdVToMTE3XCast);
++    }
++}
++
+ template <typename TYPE_X, typename T, bool DETERMINISTIC>
+ __aicore__ inline void MhcPreGradKernel<TYPE_X, T, DETERMINISTIC>::Process()
+ {

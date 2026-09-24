@@ -22,10 +22,11 @@
  * they belong in each op's worker_kernel.cpp.
  */
 
-#ifndef MULTICORE_SCHEDULER_WORKER_KERNEL_H
-#define MULTICORE_SCHEDULER_WORKER_KERNEL_H
+#ifndef HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_WORKER_KERNEL_H_
+#define HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_WORKER_KERNEL_H_
 
 #include "kernel_operator.h"
+#include "shmem.h"
 #include "runtime_config.hpp"
 #include "cycle_trace_recorder.h"
 
@@ -35,13 +36,24 @@ namespace MulticoreRuntime {
 
 constexpr uint32_t VECTOR_WORKER_STRIDE = 2;
 constexpr int64_t EVENT_REFRESH_TIME_UNIT_CYCLES = 50;
-constexpr int64_t CUBE_EVENT_REFRESH_INTERVAL_UNITS = 50;    // 2,500 system cycles.
+constexpr int64_t CUBE_EVENT_REFRESH_INTERVAL_UNITS = 50;     // 2,500 system cycles.
 constexpr int64_t VECTOR_EVENT_REFRESH_INTERVAL_UNITS = 150;  // 7,500 system cycles.
 // The selected SwiGLU tiling uses baseRowLen=19; smaller dynamic tails must lower it.
 constexpr int64_t SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT = 19;
 constexpr int64_t READY_SIGNAL_RADIX = 2;
 
-template <typename Derived>
+enum class VectorWorkerPolicy : uint32_t {
+  LEGACY_ODD = 0,
+  ALL = 1,
+};
+
+enum class RuntimeStorageBoundsPolicy : uint32_t {
+  NATIVE_TILING = 0,
+  GRAPH_OWNED = 1,
+};
+
+template <typename Derived, VectorWorkerPolicy WorkerPolicy = VectorWorkerPolicy::LEGACY_ODD,
+          RuntimeStorageBoundsPolicy StorageBoundsPolicy = RuntimeStorageBoundsPolicy::NATIVE_TILING>
 class KernelWorkerBase {
  public:
   __aicore__ inline KernelWorkerBase() {}
@@ -54,9 +66,14 @@ class KernelWorkerBase {
     this->worker_id_ = worker_id;
     this->runtimeConfigPtr = runtimeConfigPtr;
 
-    uint64_t runtime_bytes = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 6);
-    uint64_t event_bytes = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 7);
-    uint32_t ep_size = static_cast<uint32_t>(getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1));
+    uint64_t runtime_bytes = (1ULL << 32) - 1;
+    uint64_t event_bytes = getRuntimeEventCapacity(runtimeConfigPtr) * INT32_T_SIZE;
+    uint32_t ep_size = 1;
+    if constexpr (StorageBoundsPolicy == RuntimeStorageBoundsPolicy::NATIVE_TILING) {
+      runtime_bytes = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 6);
+      event_bytes = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 7);
+      ep_size = static_cast<uint32_t>(getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1));
+    }
     if (!isRuntimeStorageValid(runtimeConfigPtr, runtime_bytes, event_bytes, ep_size)) {
       AscendC::Trap();
     }
@@ -64,21 +81,25 @@ class KernelWorkerBase {
     this->runtime_event_capacity = getRuntimeEventCapacity(runtimeConfigPtr);
     all_event_counters.SetGlobalBuffer((__gm__ int32_t *)(input_list[Derived::EVENT_IDX]), runtime_event_capacity);
 
-    all_event_num_triggers.SetGlobalBuffer(
-        (__gm__ int32_t *)(runtimeConfigPtr + getAllEventNumTriggersOffset()), runtime_event_capacity);
+    all_event_num_triggers.SetGlobalBuffer((__gm__ int32_t *)(runtimeConfigPtr + getAllEventNumTriggersOffset()),
+                                           runtime_event_capacity);
     vector_task_indexs.SetGlobalBuffer(
-        (__gm__ int32_t *)(runtimeConfigPtr + getVectorTaskIndexsOffset(runtimeConfigPtr)), runtime_task_capacity);
-    cube_task_indexs.SetGlobalBuffer(
-        (__gm__ int32_t *)(runtimeConfigPtr + getCubeTaskIndexsOffset(runtimeConfigPtr)), runtime_task_capacity);
-    atomic_add_values.SetGlobalBuffer(
-        (__gm__ int32_t *)(runtimeConfigPtr + getAtomicAddValuesOffset(runtimeConfigPtr)), ATOMIC_ADD_VALUE_LEN);
+      (__gm__ int32_t *)(runtimeConfigPtr + getVectorTaskIndexsOffset(runtimeConfigPtr)), runtime_task_capacity);
+    cube_task_indexs.SetGlobalBuffer((__gm__ int32_t *)(runtimeConfigPtr + getCubeTaskIndexsOffset(runtimeConfigPtr)),
+                                     runtime_task_capacity);
+    atomic_add_values.SetGlobalBuffer((__gm__ int32_t *)(runtimeConfigPtr + getAtomicAddValuesOffset(runtimeConfigPtr)),
+                                      ATOMIC_ADD_VALUE_LEN);
 
     this->input_list = input_list;
     this->task_num = getTaskNum(this->runtimeConfigPtr);
     this->vector_task_num = getTaskIndexNumByTaskType(this->runtimeConfigPtr, TaskAiCoreType::TASK_AICORE_VECTOR);
     this->cube_task_num = getTaskIndexNumByTaskType(this->runtimeConfigPtr, TaskAiCoreType::TASK_AICORE_CUBE);
-    this->core_num = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 5);
-    this->vector_num = this->core_num * 2;
+    // RuntimeConfig is operator-independent; native tiling buffers are not.
+    // Reading a fixed native-tiling offset here corrupts the round-robin stride
+    // for operators whose sixth field is not the AIC count (for example mHC).
+    this->vector_num = getNumWorkers(this->runtimeConfigPtr);
+    this->core_num = this->vector_num / 2;
+    this->active_vector_num = WorkerPolicy == VectorWorkerPolicy::ALL ? this->vector_num : this->vector_num / 2;
   }
 
   __aicore__ inline void Process() {
@@ -107,18 +128,17 @@ class KernelWorkerBase {
       block_idx = block_idx + this->core_num;
     } while (1);
 #else
-    if (this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
+    uint32_t block_idx = GetVectorScheduleIndex();
+    if (block_idx == INVALID_VECTOR_SCHEDULE_INDEX) {
       return;
     }
-    uint32_t block_idx = this->worker_id_ / VECTOR_WORKER_STRIDE;
     do {
       if (block_idx >= this->vector_task_num) {
         return;
       }
       TaskId task_index = GetTaskIndex(block_idx);
       ExecuteTaskFast(task_index);
-      uint32_t half_num = this->vector_num / VECTOR_WORKER_STRIDE;
-      block_idx = block_idx + half_num;
+      block_idx = block_idx + this->active_vector_num;
     } while (1);
 #endif
   }
@@ -139,18 +159,17 @@ class KernelWorkerBase {
       block_idx = block_idx + this->core_num;
     } while (1);
 #else
-    if (this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
+    uint32_t block_idx = GetVectorScheduleIndex();
+    if (block_idx == INVALID_VECTOR_SCHEDULE_INDEX) {
       return;
     }
-    uint32_t block_idx = this->worker_id_ / VECTOR_WORKER_STRIDE;
     do {
       if (block_idx >= this->vector_task_num) {
         return;
       }
       TaskId task_index = GetTaskIndex(block_idx);
       ExecuteTaskProfiled(task_index, cycle_trace_recorder);
-      uint32_t half_num = this->vector_num / VECTOR_WORKER_STRIDE;
-      block_idx = block_idx + half_num;
+      block_idx = block_idx + this->active_vector_num;
     } while (1);
 #endif
   }
@@ -165,8 +184,7 @@ class KernelWorkerBase {
     int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
     int64_t rank = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0) % ep;
     constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
-    __gm__ int32_t *ready =
-      (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + runtime_event_capacity;
+    __gm__ int32_t *ready = (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + runtime_event_capacity;
 
     GlobalTensor<int32_t> ready_state;
     ready_state.SetGlobalBuffer(ready, static_cast<uint32_t>((ep + 1) * ready_stride));
@@ -210,6 +228,13 @@ class KernelWorkerBase {
 #else
     return vector_task_indexs.GetValue(task_id);
 #endif
+  }
+
+  __aicore__ inline uint32_t GetVectorScheduleIndex() {
+    if constexpr (WorkerPolicy == VectorWorkerPolicy::ALL) {
+      return this->worker_id_ < this->active_vector_num ? this->worker_id_ : INVALID_VECTOR_SCHEDULE_INDEX;
+    }
+    return this->worker_id_ % 2 == 0 ? INVALID_VECTOR_SCHEDULE_INDEX : this->worker_id_ / 2;
   }
 
   __aicore__ inline void AtomicAddForAllEventCounters(uint32_t event_index) {
@@ -256,7 +281,7 @@ class KernelWorkerBase {
       AscendC::Trap();
     }
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
-      WaitForDependency(task_desc.dependent_event);
+      WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
     }
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
     if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
@@ -277,7 +302,7 @@ class KernelWorkerBase {
     uint32_t owner_id = getTaskProfileOwnerId(this->runtimeConfigPtr, task_id);
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
       uint64_t wait_start_cycle = cycle_trace_recorder.Now();
-      WaitForDependency(task_desc.dependent_event);
+      WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
       uint64_t wait_end_cycle = cycle_trace_recorder.Now();
       cycle_trace_recorder.Record(Derived::PROFILE_DESC_WAIT_DEPENDENCY, task_id, task_desc.task_index, owner_id,
                                   wait_start_cycle, wait_end_cycle);
@@ -300,7 +325,15 @@ class KernelWorkerBase {
     }
   }
 
-  __aicore__ inline void WaitForDependency(uint32_t event_index) {
+  __aicore__ inline void WaitForDependency(uint32_t event_index, uint32_t poll_interval_us = 0) {
+#ifdef __DAV_C220_CUBE__
+    constexpr uint32_t default_poll_interval_us = CUBE_EVENT_REFRESH_INTERVAL_UNITS;
+#else
+    constexpr uint32_t default_poll_interval_us = VECTOR_EVENT_REFRESH_INTERVAL_UNITS;
+#endif
+    if (poll_interval_us == 0) {
+      poll_interval_us = default_poll_interval_us;
+    }
 #ifdef __DAV_C220_CUBE__
     int32_t needed = all_event_num_triggers.GetValue(event_index);
     DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
@@ -316,7 +349,7 @@ class KernelWorkerBase {
       int64_t GetBlockNumCycle = systemCycleAfter - systemCycleBefore;
       int64_t CycleToTimeBase = EVENT_REFRESH_TIME_UNIT_CYCLES;
       int64_t GetBlockNumTime = GetBlockNumCycle / CycleToTimeBase;
-      if (GetBlockNumTime > CUBE_EVENT_REFRESH_INTERVAL_UNITS) {
+      if (GetBlockNumTime > poll_interval_us) {
         DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
           all_event_counters[event_index]);
         current = all_event_counters.GetValue(event_index);
@@ -338,7 +371,7 @@ class KernelWorkerBase {
       int64_t GetBlockNumCycle = systemCycleAfter - systemCycleBefore;
       int64_t CycleToTimeBase = EVENT_REFRESH_TIME_UNIT_CYCLES;
       int64_t GetBlockNumTime = GetBlockNumCycle / CycleToTimeBase;
-      if (GetBlockNumTime > VECTOR_EVENT_REFRESH_INTERVAL_UNITS) {
+      if (GetBlockNumTime > poll_interval_us) {
         DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
           all_event_counters[event_index]);
         current = all_event_counters.GetValue(event_index);
@@ -367,8 +400,10 @@ class KernelWorkerBase {
   GM_ADDR *input_list = nullptr;
   int64_t core_num = 0;
   int64_t vector_num = 0;
+  uint32_t active_vector_num = 0;
+  static constexpr uint32_t INVALID_VECTOR_SCHEDULE_INDEX = 0xFFFFFFFF;
 };
 
 }  // namespace MulticoreRuntime
 
-#endif  // MULTICORE_SCHEDULER_WORKER_KERNEL_H
+#endif  // HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_WORKER_KERNEL_H_

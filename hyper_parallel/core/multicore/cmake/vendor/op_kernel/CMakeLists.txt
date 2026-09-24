@@ -18,8 +18,16 @@ if(ASCEND_COMPUTE_UNIT STREQUAL "ascend910b")
 elseif(ASCEND_COMPUTE_UNIT STREQUAL "ascend910_93")
     set(KERNEL_COMPUTE_UNIT ascend910_9391)
 else()
-    message(FATAL_ERROR "Unsupported HyperMegaMoe compute unit: ${ASCEND_COMPUTE_UNIT}")
+    message(
+        FATAL_ERROR
+        "Unsupported HyperMegaMoe compute unit: ${ASCEND_COMPUTE_UNIT}"
+    )
 endif()
+
+set(CANN_OP_COMMON_INCLUDE ${ASCEND_CANN_PACKAGE_PATH})
+string(APPEND CANN_OP_COMMON_INCLUDE
+    "/${CMAKE_SYSTEM_PROCESSOR}-linux/include/op_common"
+)
 
 npu_op_kernel_library(ascendc_kernels
     SRC_BASE ${HP_MULTICORE_SOURCE_ROOT}
@@ -27,6 +35,7 @@ npu_op_kernel_library(ascendc_kernels
 )
 
 npu_op_kernel_options(ascendc_kernels ALL OPTIONS
+    -I${CANN_OP_COMMON_INCLUDE}
     -I${HP_SHMEM_SDK_ROOT}/include
     -I${HP_SHMEM_SDK_ROOT}/src/device
     -I${HP_MULTICORE_SOURCE_ROOT}/shmem
@@ -41,12 +50,23 @@ npu_op_kernel_sources(ascendc_kernels
     COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
 )
 npu_op_kernel_sources(ascendc_kernels
+    OP_TYPE HyperMegaMhc
+    KERNEL_DIR ./hyper_mega_mhc/op_kernel
+    KERNEL_FILE hyper_mega_mhc.cpp
+    COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
+)
+npu_op_kernel_sources(ascendc_kernels
     OP_TYPE HyperMegaMoeGrad
     KERNEL_DIR ./hyper_mega_moe_grad/op_kernel
     KERNEL_FILE hyper_mega_moe_grad.cpp
     COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
 )
-
+npu_op_kernel_sources(ascendc_kernels
+    OP_TYPE HyperMegaMhcGrad
+    KERNEL_DIR ./hyper_mega_mhc_grad/op_kernel
+    KERNEL_FILE hyper_mega_mhc_grad.cpp
+    COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
+)
 npu_op_package_add(${package_name}
     LIBRARY ascendc_kernels
 )

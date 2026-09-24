@@ -38,6 +38,8 @@ ATOMIC_ADD_VALUE_LEN = 8
 READY_CACHE_LINE_BYTES = 64
 INVALID_PROFILE_DESC_ID  = 0xFFFFFFFF
 INVALID_PROFILE_OWNER_ID = 0xFFFFFFFF
+DEFAULT_DEPENDENCY_POLL_INTERVAL_US = 0
+FAST_DEPENDENCY_POLL_INTERVAL_US = 5
 EVENT_INVALID_ID         = 0xFFFFFFFF
 
 
@@ -80,6 +82,19 @@ class TaskType(IntEnum):
     TASK_GROUPED_MATMUL       = 104
     TASK_SHMEM_PUT_MEM_SIGNAL = 105
     TASK_SWI_GLU_GRAD         = 106
+    TASK_MHC_POST             = 107
+    TASK_MHC_NORM_CAST        = 108
+    TASK_MHC_PROJECTION       = 109
+    TASK_MHC_MAPPING          = 110
+    TASK_RMS_NORM             = 111
+    TASK_MHC_INPUT_MIX        = 112
+    TASK_RMS_NORM_GRAD        = 113
+    TASK_MHC_GRAD_PREV_A              = 114
+    TASK_MHC_GRAD_MAPPING             = 115
+    TASK_MHC_GRAD_PHI_RMS             = 116
+    TASK_MHC_GRAD_PREV_X_AND_POST     = 117
+    TASK_MHC_POST_GRAD                = 118
+    TASK_MHC_GRAD_PREV_A_AND_MAPPING  = 119
 
 
 class EventType(IntEnum):
@@ -314,7 +329,11 @@ class TaskSplitValue:
 
 
 def init_task_split_value(tsv: TaskSplitValue) -> None:
-    """Reset per-rank runtime counters to zero."""
+    """Reset per-rank runtime counters to zero.
+
+    Args:
+        tsv: Task split values whose runtime counters are reset.
+    """
     tsv.pre_pre_event_num   = 0
     tsv.pre_event_num       = 0
     tsv.pre_task_num        = 0
@@ -371,6 +390,27 @@ def _validate_shmem_task(task: TaskDescC, descriptor_index: int, tsv: TaskSplitV
         )
 
 
+def _validate_runtime_task_queues(cfg: RuntimeConfigC, event_capacity: int) -> None:
+    """Validate scheduled task IDs and their event ranges."""
+    queues = (cfg.cube_task_indices, cfg.vector_task_indices, cfg.mix_task_indices)
+    for indices, count in zip(queues, cfg.task_index_num[:3]):
+        if count < 0 or count > len(indices):
+            raise ValueError(f"invalid runtime task-index count {count}")
+        for task_id in indices[:count]:
+            if task_id < 0 or task_id >= len(cfg.all_tasks):
+                raise ValueError(f"invalid runtime task id {task_id}")
+            task = cfg.all_tasks[task_id]
+            dependency_out_of_range = (
+                task.dependent_event != 0xFFFFFFFF
+                and task.dependent_event >= event_capacity
+            )
+            trigger_out_of_range = task.trigger_event + ATOMIC_ADD_VALUE_LEN > event_capacity
+            if dependency_out_of_range or trigger_out_of_range:
+                raise ValueError(
+                    f"task {task_id} references an event outside allocated capacity {event_capacity}"
+                )
+
+
 def validate_runtime_config(
     cfg: RuntimeConfigC,
     tsv: TaskSplitValue,
@@ -399,18 +439,7 @@ def validate_runtime_config(
     if cfg.task_num > len(cfg.all_tasks):
         raise ValueError(f"task_num ({cfg.task_num}) exceeds allocated task capacity ({len(cfg.all_tasks)}).")
     event_capacity = len(cfg.all_event_num_triggers)
-    queues = (cfg.cube_task_indices, cfg.vector_task_indices, cfg.mix_task_indices)
-    for indices, count in zip(queues, cfg.task_index_num[:3]):
-        if count < 0 or count > len(indices):
-            raise ValueError(f"invalid runtime task-index count {count}")
-        for task_id in indices[:count]:
-            if task_id < 0 or task_id >= len(cfg.all_tasks):
-                raise ValueError(f"invalid runtime task id {task_id}")
-            task = cfg.all_tasks[task_id]
-            if (task.dependent_event != 0xFFFFFFFF and task.dependent_event >= event_capacity) or (
-                task.trigger_event + ATOMIC_ADD_VALUE_LEN > event_capacity
-            ):
-                raise ValueError(f"task {task_id} references an event outside allocated capacity {event_capacity}")
+    _validate_runtime_task_queues(cfg, event_capacity)
 
     local_experts = tsv.single_rank_expert_num
     group_size = cfg.dynamic_data.dynamic_group_size

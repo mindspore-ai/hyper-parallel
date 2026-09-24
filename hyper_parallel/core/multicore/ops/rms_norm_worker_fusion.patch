@@ -1,0 +1,28 @@
+diff --git a/norm/rms_norm/op_kernel/rms_norm.h b/norm/rms_norm/op_kernel/rms_norm.h
+index 4ac04fd13..d5f7987e5 100644
+--- a/norm/rms_norm/op_kernel/rms_norm.h
++++ b/norm/rms_norm/op_kernel/rms_norm.h
+@@ -28,10 +28,17 @@ public:
+     {
+-        ASSERT(GetBlockNum() != 0 && "block dim2 can not be zero!");
++        InitTask(x, gamma, y, rstd, tiling, usrWorkspace, GetBlockIdx(), GetBlockNum());
++    }
++
++    __aicore__ inline void InitTask(GM_ADDR x, GM_ADDR gamma, GM_ADDR y, GM_ADDR rstd,
++                                    const RMSNormTilingData* tiling, GM_ADDR usrWorkspace,
++                                    uint32_t logicalBlockIdx, uint32_t logicalBlockNum)
++    {
++        ASSERT(logicalBlockNum != 0 && "logical block dim can not be zero!");
+         InitVar(tiling);
+-
++
+-        blockIdx_ = GetBlockIdx();
+-        if (blockIdx_ < GetBlockNum() - 1) {
++        blockIdx_ = logicalBlockIdx;
++        if (blockIdx_ < logicalBlockNum - 1) {
+             this->row_work = block_factor;
+-        } else if (blockIdx_ == GetBlockNum() - 1) {
+-            this->row_work = num_row - (GetBlockNum() - 1) * block_factor;
++        } else if (blockIdx_ == logicalBlockNum - 1) {
++            this->row_work = num_row - (logicalBlockNum - 1) * block_factor;
+         }

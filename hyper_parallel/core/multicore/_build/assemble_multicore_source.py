@@ -38,8 +38,19 @@ _SHMEM_CCSRC = _REPO_ROOT / "hyper_parallel" / "core" / "multicore" / "shmem" / 
 _OPS_NN_PATHS = (
     "activation/swi_glu/op_kernel",
     "activation/swi_glu_grad/op_kernel",
+    "norm/rms_norm/op_kernel",
+    "norm/rms_norm_grad/op_kernel",
 )
 _OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel",)
+_OPS_TRANSFORMER_MHC_PATHS = (
+    "common/include",
+    "mhc/mhc_post/op_kernel/arch22",
+    "mhc/mhc_post_backward/op_kernel/arch22",
+    "mhc/mhc_pre_sinkhorn/op_kernel",
+    "mhc/mhc_pre_sinkhorn/op_host/op_tiling",
+    "mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22",
+    "mhc/mhc_pre_sinkhorn_backward/op_host/op_tiling",
+)
 _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad")
 
 
@@ -48,6 +59,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ops-nn-source", required=True)
     parser.add_argument("--ops-transformer-source", required=True)
+    parser.add_argument("--ops-transformer-mhc-source", required=True)
     parser.add_argument("--work-dir", required=True)
     return parser.parse_args()
 
@@ -58,8 +70,12 @@ def main() -> int:
     lock = json.loads(_LOCK_PATH.read_text(encoding="utf-8"))["components"]["multicore"]
     ops_nn_source = Path(args.ops_nn_source).resolve()
     ops_transformer_source = Path(args.ops_transformer_source).resolve()
+    ops_transformer_mhc_source = Path(args.ops_transformer_mhc_source).resolve()
     work_dir = Path(args.work_dir).resolve()
-    _validate_new_work_dir(work_dir, (ops_nn_source, ops_transformer_source))
+    _validate_new_work_dir(
+        work_dir,
+        (ops_nn_source, ops_transformer_source, ops_transformer_mhc_source),
+    )
 
     verify_git_dependency(lock["ops_nn"], ops_nn_source, dependency_name="ops_nn")
     verify_git_dependency(
@@ -67,9 +83,15 @@ def main() -> int:
         ops_transformer_source,
         dependency_name="ops_transformer",
     )
+    verify_git_dependency(
+        lock["ops_transformer_mhc"],
+        ops_transformer_mhc_source,
+        dependency_name="ops_transformer_mhc",
+    )
 
     ops_nn_copy = work_dir / "adapter-inputs" / "ops-nn"
     transformer_copy = work_dir / "adapter-inputs" / "ops-transformer"
+    transformer_mhc_copy = work_dir / "adapter-inputs" / "ops-transformer-mhc"
     _export_git_tree(
         ops_nn_source,
         ops_nn_copy,
@@ -82,11 +104,23 @@ def main() -> int:
         lock["ops_transformer"]["commit"],
         _OPS_TRANSFORMER_PATHS,
     )
+    _export_git_tree(
+        ops_transformer_mhc_source,
+        transformer_mhc_copy,
+        lock["ops_transformer_mhc"]["commit"],
+        _OPS_TRANSFORMER_MHC_PATHS,
+    )
     _apply_locked_adapters(ops_nn_copy, lock["ops_nn"])
     _apply_locked_adapters(transformer_copy, lock["ops_transformer"])
+    _apply_locked_adapters(transformer_mhc_copy, lock["ops_transformer_mhc"])
 
     source_root = work_dir / "source"
-    _compose_hyper_parallel_ops(source_root, ops_nn_copy, transformer_copy)
+    _compose_hyper_parallel_ops(
+        source_root,
+        ops_nn_copy,
+        transformer_copy,
+        transformer_mhc_copy,
+    )
     _require_assembled_files(source_root)
     print(json.dumps({"source_root": str(source_root)}, sort_keys=True))
     return 0
@@ -179,6 +213,7 @@ def _compose_hyper_parallel_ops(
     source_root: Path,
     ops_nn_copy: Path,
     transformer_copy: Path,
+    transformer_mhc_copy: Path,
 ) -> None:
     """Compose HP operator code with selected adapted upstream kernel sources."""
     shmem_root = source_root / "shmem"
@@ -189,6 +224,10 @@ def _compose_hyper_parallel_ops(
     (shmem_root / "data_plane").mkdir()
     shutil.copy2(_SHMEM_CCSRC / "data_plane" / "rma.h", shmem_root / "data_plane" / "rma.h")
     shutil.copy2(_SHMEM_CCSRC / "data_plane" / "sync.h", shmem_root / "data_plane" / "sync.h")
+    shutil.copytree(
+        transformer_mhc_copy / "common" / "include",
+        source_root / "ops_transformer_common",
+    )
     for operator_name in _HYPER_OPERATORS:
         operator_root = source_root / operator_name
         shutil.copytree(_MULTICORE_OPS / operator_name, operator_root)
@@ -205,6 +244,45 @@ def _compose_hyper_parallel_ops(
         ops_nn_copy / "activation" / "swi_glu_grad" / "op_kernel",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad",
     )
+    mhc_root = source_root / "hyper_mega_mhc"
+    shutil.copytree(_MULTICORE_OPS / "hyper_mega_mhc", mhc_root)
+    shutil.copytree(_MULTICORE_OPS / "runtime", mhc_root / "op_kernel" / "runtime")
+    shutil.copytree(
+        ops_nn_copy / "norm" / "rms_norm" / "op_kernel",
+        mhc_root / "op_kernel" / "rms_norm",
+    )
+    shutil.copytree(
+        transformer_mhc_copy / "mhc" / "mhc_post" / "op_kernel" / "arch22",
+        mhc_root / "op_kernel" / "mhc_post",
+    )
+    shutil.copytree(
+        transformer_mhc_copy / "mhc" / "mhc_pre_sinkhorn" / "op_kernel",
+        mhc_root / "op_kernel" / "mhc_pre_sinkhorn",
+    )
+    shutil.copytree(
+        transformer_mhc_copy / "mhc" / "mhc_pre_sinkhorn" / "op_host" / "op_tiling",
+        mhc_root / "op_host" / "mhc_pre_sinkhorn_tiling",
+    )
+
+    mhc_grad_root = source_root / "hyper_mega_mhc_grad"
+    shutil.copytree(_MULTICORE_OPS / "hyper_mega_mhc_grad", mhc_grad_root)
+    shutil.copytree(_MULTICORE_OPS / "runtime", mhc_grad_root / "op_kernel" / "runtime")
+    shutil.copytree(
+        ops_nn_copy / "norm" / "rms_norm_grad" / "op_kernel",
+        mhc_grad_root / "op_kernel" / "rms_norm_grad",
+    )
+    shutil.copytree(
+        transformer_mhc_copy / "mhc" / "mhc_post_backward" / "op_kernel" / "arch22",
+        mhc_grad_root / "op_kernel" / "mhc_post_backward",
+    )
+    shutil.copytree(
+        transformer_mhc_copy / "mhc" / "mhc_pre_sinkhorn_backward" / "op_kernel",
+        mhc_grad_root / "op_kernel" / "mhc_pre_sinkhorn_backward",
+    )
+    shutil.copytree(
+        transformer_mhc_copy / "mhc" / "mhc_pre_sinkhorn_backward" / "op_host" / "op_tiling",
+        mhc_grad_root / "op_host" / "mhc_pre_sinkhorn_backward_tiling",
+    )
 
 
 def _require_assembled_files(source_root: Path) -> None:
@@ -219,6 +297,22 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad" / "swi_glu_grad.cpp",
         source_root / "shmem" / "data_plane" / "rma.h",
         source_root / "shmem" / "data_plane" / "sync.h",
+        source_root / "hyper_mega_mhc" / "op_host" / "hyper_mega_mhc_def.cpp",
+        source_root / "hyper_mega_mhc" / "op_kernel" / "hyper_mega_mhc.cpp",
+        source_root / "hyper_mega_mhc" / "op_kernel" / "worker_kernel.cpp",
+        source_root / "hyper_mega_mhc" / "op_kernel" / "mhc_post" / "mhc_post_arch22.h",
+        source_root / "hyper_mega_mhc" / "op_kernel" / "rms_norm" / "rms_norm.h",
+        source_root / "hyper_mega_mhc_grad" / "op_host" / "hyper_mega_mhc_grad_def.cpp",
+        source_root / "hyper_mega_mhc_grad" / "op_kernel" / "hyper_mega_mhc_grad.cpp",
+        source_root / "hyper_mega_mhc_grad" / "op_kernel" / "worker_kernel.cpp",
+        source_root / "hyper_mega_mhc_grad" / "op_kernel" / "rms_norm_grad" / "rms_norm_grad_split_n_high_precision.h",
+        source_root / "hyper_mega_mhc_grad" / "op_kernel" / "mhc_post_backward" / "mhc_post_backward_arch22.h",
+        source_root
+        / "hyper_mega_mhc_grad"
+        / "op_kernel"
+        / "mhc_pre_sinkhorn_backward"
+        / "arch22"
+        / "mhc_pre_grad_kernel.h",
     )
     missing = [str(path) for path in required_paths if not path.is_file()]
     if missing:

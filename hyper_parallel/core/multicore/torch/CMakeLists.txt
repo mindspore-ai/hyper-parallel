@@ -81,6 +81,8 @@ endforeach()
 
 add_library(hyper_parallel_mega_moe_torch SHARED
     csrc/registration.cpp
+    csrc/registration_mhc.cpp
+    csrc/mega_mhc.cpp
     csrc/mega_moe.cpp
     csrc/mega_moe_grad.cpp)
 target_compile_definitions(hyper_parallel_mega_moe_torch PRIVATE

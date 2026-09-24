@@ -21,6 +21,7 @@ from pathlib import Path
 import unittest
 
 import hyper_parallel
+from hyper_parallel.core.multicore.modules.mega_mhc.module import HyperMegaMhc
 from hyper_parallel.core import multicore
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from tests.common.mark_utils import arg_mark
@@ -36,13 +37,14 @@ class TestMulticoreBoundary(unittest.TestCase):
 
         Feature: Multicore public exports.
         Description: Inspect the component and HyperParallel root package symbols.
-        Expectation: MegaMoeExperts and profiler are exported only by the explicit Multicore module.
+        Expectation: Business modules and profiler are exported only by Multicore.
         """
+        self.assertIs(multicore.HyperMegaMhc, HyperMegaMhc)
         self.assertEqual(MegaMoeExperts.__name__, "MegaMoeExperts")
         self.assertIs(multicore.MegaMoeExperts, MegaMoeExperts)
-        self.assertEqual(multicore.__all__, ["MegaMoeExperts", "profiler"])
+        self.assertEqual(multicore.__all__, ["HyperMegaMhc", "MegaMoeExperts", "profiler"])
         self.assertTrue(callable(multicore.profiler.mega_kernel_profile))
-        for name in ("MegaMoeExperts", "MulticoreModule", "mega_moe", "mega_moe_grad"):
+        for name in ("HyperMegaMhc", "MegaMoeExperts", "MulticoreModule", "mega_moe", "mega_moe_grad"):
             self.assertNotIn(name, hyper_parallel.__all__)
             self.assertFalse(hasattr(hyper_parallel, name))
         self.assertFalse(hasattr(multicore, "__getattr__"))
