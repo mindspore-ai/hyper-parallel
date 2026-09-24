@@ -94,6 +94,7 @@ from hyper_parallel.distributed.expert_parallel.routing import (
     MOE_ROUTER_ADAPTERS,
 )
 from hyper_parallel.distributed.expert_parallel.experts import (
+    SHARED_MERGE_MODES,
     bind_local_expert_forward,
     ep_routed_forward,
     require_attrs,
@@ -200,7 +201,7 @@ def routed_only_ep_compute_fn(
         router_fn=MOE_ROUTER_ADAPTERS["default"],
         archetype_key="routed_only_softmax_topk",
         expected_attrs=["gate", "experts"],
-        combine=lambda module, hidden_states, routed: routed,
+        combine=SHARED_MERGE_MODES["none"],
     )
 
 
@@ -265,23 +266,13 @@ def qwen2moe_ep_compute_fn(
     """
     del mesh, tp_mesh, cp_mesh
 
-    def combine(
-        module: Any,
-        hidden_states: torch.Tensor,
-        routed: torch.Tensor,
-    ) -> torch.Tensor:
-        """Merge the routed branch with the gated shared-expert branch."""
-        shared = module.shared_expert(hidden_states)            # nested boundary
-        gate = torch.sigmoid(module.shared_expert_gate(hidden_states))
-        return routed + gate * shared
-
     return build_ep_compute(
         module,
         ep_mesh,
         router_fn=MOE_ROUTER_ADAPTERS["qwen2moe"],
         archetype_key="qwen2moe_shared_expert_gate",
         expected_attrs=["gate", "experts", "shared_expert", "shared_expert_gate"],
-        combine=combine,
+        combine=SHARED_MERGE_MODES["gated"],
     )
 
 
@@ -306,21 +297,13 @@ def deepseekv3_ep_compute_fn(
     """
     del mesh, tp_mesh, cp_mesh
 
-    def combine(
-        module: Any,
-        hidden_states: torch.Tensor,
-        routed: torch.Tensor,
-    ) -> torch.Tensor:
-        """Merge the routed branch with the shared-experts branch."""
-        return routed + module.shared_experts(hidden_states)    # nested boundary
-
     return build_ep_compute(
         module,
         ep_mesh,
         router_fn=MOE_ROUTER_ADAPTERS["deepseekv3"],
         archetype_key="deepseekv3_sigmoid_group_shared",
         expected_attrs=["gate", "experts", "shared_experts"],
-        combine=combine,
+        combine=SHARED_MERGE_MODES["additive"],
     )
 
 

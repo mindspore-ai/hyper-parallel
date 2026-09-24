@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     )
     from hyper_parallel.models._transformers.checkpoint_loader import (
         CheckpointManager,
-        DCPBackend,
         LoadReport,
     )
 
@@ -37,7 +36,6 @@ _LAZY_EXPORTS = {
     "HyperAutoModelForImageTextToText": ".auto_model",
     "HyperAutoModelForSequenceClassification": ".auto_model",
     "CheckpointManager": ".checkpoint_loader",
-    "DCPBackend": ".checkpoint_loader",
     "LoadReport": ".checkpoint_loader",
 }
 
@@ -63,6 +61,5 @@ __all__ = [
     "HyperAutoModelForImageTextToText",
     "HyperAutoModelForSequenceClassification",
     "CheckpointManager",
-    "DCPBackend",
     "LoadReport",
 ]

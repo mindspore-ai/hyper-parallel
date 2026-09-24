@@ -118,3 +118,63 @@
 #     torch.nn.utils.stateless, torch.distributed.device_mesh). These have no
 #     public API, so the raw imports stay.
 "hyper-parallel/hyper_parallel/compile/"                                   "forbidden-backend-import"
+
+# 20. Codegen generated artifacts — machine-written modeling files (upstream
+#     transformers source + emitter patches, byte-verified by the drift check).
+#     Hand edits are overwritten by regeneration, so lint hygiene is the
+#     emitter's concern (follow-up: dedupe rotate_half, wrap long lines).
+"hyper-parallel/examples/training_demo/generated/"                       "line-too-long"
+"hyper-parallel/examples/training_demo/generated/"                       "missing-module-docstring"
+"hyper-parallel/examples/training_demo/generated/"                       "missing-class-docstring"
+"hyper-parallel/examples/training_demo/generated/"                       "missing-function-docstring"
+"hyper-parallel/examples/training_demo/generated/"                       "invalid-name"
+"hyper-parallel/examples/training_demo/generated/"                       "useless-import-alias"
+"hyper-parallel/examples/training_demo/generated/"                       "reimported"
+"hyper-parallel/examples/training_demo/generated/"                       "consider-using-from-import"
+"hyper-parallel/examples/training_demo/generated/"                       "import-outside-toplevel"
+"hyper-parallel/examples/training_demo/generated/"                       "wrong-import-position"
+"hyper-parallel/examples/training_demo/generated/"                       "wrong-import-order"
+"hyper-parallel/examples/training_demo/generated/"                       "ungrouped-imports"
+"hyper-parallel/examples/training_demo/generated/"                       "function-redefined"
+"hyper-parallel/examples/training_demo/generated/"                       "possibly-used-before-assignment"
+"hyper-parallel/examples/training_demo/generated/"                       "unused-argument"
+"hyper-parallel/examples/training_demo/generated/"                       "unused-import"
+"hyper-parallel/examples/training_demo/generated/"                       "protected-access"
+
+# 21. Codegen package — importing hyper_parallel.codegen must not pull
+#     torch/transformers (import-time isolation), so backend imports stay
+#     lazy per the AGENTS.md convention; the runtime deliberately binds
+#     _hp_* attributes on client modules; emitter-facing helpers keep
+#     native signatures (some formals unused by design); rank/config probing
+#     falls back defensively when the environment is not initialized.
+"hyper-parallel/hyper_parallel/codegen/"                                 "import-outside-toplevel"
+"hyper-parallel/hyper_parallel/codegen/"                                 "protected-access"
+"hyper-parallel/hyper_parallel/codegen/"                                 "unused-argument"
+"hyper-parallel/hyper_parallel/codegen/"                                 "broad-exception-caught"
+
+# 22. Codegen integration seams — shared native files touched by the codegen
+#     branch for the same reasons as above (architecture introspection,
+#     native-signature hooks, __dir__ dunder export).
+"hyper-parallel/hyper_parallel/distributed/_builder/applier.py"          "protected-access"
+"hyper-parallel/hyper_parallel/models/_transformers/model_builder.py"    "unused-argument"
+"hyper-parallel/hyper_parallel/components/modules/__init__.py"           "invalid-name"
+#     auto_model.from_pretrained keeps the master-era ``backend`` passthrough
+#     parameter for signature compatibility; the backend is resolved
+#     internally from force_hf/codegen.
+"hyper-parallel/hyper_parallel/models/_transformers/auto_model.py"     "unused-argument"
+
+
+# 23. Codegen tests — contract tests target the _hp_* installation seams on
+#     purpose; fakes keep the native signatures (some formals unused by
+#     design); _-prefixed formals mark intentionally unused arguments;
+#     test-local imports run after monkeypatching or inside fixtures; the
+#     toggle test executes generated source by design.
+"hyper-parallel/tests/codegen/"                                        "protected-access"
+"hyper-parallel/tests/codegen/"                                        "unused-argument"
+"hyper-parallel/tests/codegen/"                                        "import-outside-toplevel"
+"hyper-parallel/tests/codegen/"                                        "invalid-name"
+"hyper-parallel/tests/codegen/"                                        "redefined-outer-name"
+"hyper-parallel/tests/codegen/"                                        "reimported"
+"hyper-parallel/tests/codegen/"                                        "wrong-import-position"
+"hyper-parallel/tests/codegen/"                                        "exec-used"
+"hyper-parallel/tests/codegen/"                                        "consider-using-from-import"
