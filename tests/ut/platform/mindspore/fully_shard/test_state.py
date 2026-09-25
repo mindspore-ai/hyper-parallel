@@ -237,8 +237,8 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         state._queue_compat_all_reduce.assert_not_called()
         replicate_param.apply_reduced_grad.assert_called_once_with(grad, replicate_param.orig_dtype)
 
-    def test_queue_replicate_params_allreduce_applies_local_grad_when_all_reduce_disabled(self):
-        """requires_all_reduce=False should still materialize replicate_params grads locally."""
+    def test_queue_replicate_params_allreduce_defers_grad_when_all_reduce_disabled(self) -> None:
+        """Deferred replica gradients must remain pending until the scheduled all-reduce."""
         state = _make_state()
         state.requires_all_reduce = False
         grad = ms.Tensor(np.full((2,), 4.0, dtype=np.float32))
@@ -253,6 +253,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
             gradient_scaling_factor=None,
             orig_dtype="float32",
             apply_reduced_grad=MagicMock(return_value=False),
+            to_accumulated_grad_if_needed=MagicMock(),
         )
         state.replicate_params = [replicate_param]
         state._queue_compat_all_reduce = MagicMock()
@@ -260,7 +261,94 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         state._queue_replicate_params_allreduce()
 
         state._queue_compat_all_reduce.assert_not_called()
-        replicate_param.apply_reduced_grad.assert_called_once_with(grad, replicate_param.orig_dtype)
+        replicate_param.apply_reduced_grad.assert_not_called()
+        replicate_param.to_accumulated_grad_if_needed.assert_called_once_with()
+
+    def test_deferred_all_reduce_includes_every_micro_batch_once(self) -> None:
+        """Both pure-AR routes reduce all micros once without re-reducing main_grad."""
+        for replicate_param in (False, True):
+            for reduce_op in (ops.ReduceOp.SUM, ops.ReduceOp.AVG):
+                with self.subTest(replicate_param=replicate_param, reduce_op=reduce_op):
+                    self._check_deferred_all_reduce(replicate_param, reduce_op)
+
+    def _check_deferred_all_reduce(self, replicate_param, reduce_op):
+        state = _make_state()
+        state.reduce_op_type = reduce_op
+        state._needs_overlap_post_backward_steps = MagicMock(return_value=False)
+        param = object.__new__(state_mod.MindSporeHSDPParamV2)
+        param._unsharded_param = SimpleNamespace(grad=None)
+        param.sharded_param = SimpleNamespace(requires_grad=True, grad=None, main_grad=None)
+        param.enable_fsdp_shard = not replicate_param
+        param.shard_size = 1
+        param.dp_size = 2
+        param.reduce_dtype = ms.float32
+        param.orig_dtype = ms.float32
+        param.gradient_scaling_factor = 0.5
+        param.unsharded_accumulated_grad = None
+        param.unsharded_group_info = GroupInfo("replica", "replica-group", 2)
+        param.mp_policy = MixedPrecisionPolicy(apply_grad_on_fp32_main_grad=True)
+        param.sharded_size = (2,)
+        param.offload_to_cpu = False
+        param.all_reduce_handle = None
+        param._to_local_unsharded_grad = lambda grad: grad
+        param.to_sharded_dtensor = lambda grad: SimpleNamespace(_local_tensor=grad)
+        if replicate_param:
+            state.replicate_params = [param]
+        else:
+            state.hsdp_params = [param]
+
+        local = np.arange(1, 9, dtype=np.float32).reshape(4, 2)
+        peer = local + 10
+        expected_input = local.sum(axis=0) * 0.5
+        expected_output = (local + peer).sum(axis=0) * 0.5
+        if reduce_op == ops.ReduceOp.AVG:
+            expected_output /= 2
+        handles = []
+
+        def _all_reduce(grad, op, group, async_op):
+            self.assertEqual(op, reduce_op)
+            self.assertEqual(group, "replica-group")
+            self.assertTrue(async_op)
+            np.testing.assert_array_equal(grad.asnumpy(), expected_input)
+            handle = MagicMock()
+            # Materialize the collective result only on wait, as for async HCCL.
+            handle.wait.side_effect = lambda: grad.copy_(ms.Tensor(expected_output))
+            handles.append(handle)
+            return handle
+
+        target = "hyper_parallel.platform.mindspore.fully_shard.param.dist.all_reduce"
+        # Ascend MindSpore wheels do not implement in-place mul reliably on CPU.
+        # Keep numeric scaling in this CPU test, and check its scheduling too.
+        def _scale(grad, factor):
+            grad.copy_(grad * factor)
+
+        with patch(target, side_effect=_all_reduce) as collective, \
+                patch.object(state_mod, "apply_gradient_scaling_factor", side_effect=_scale) as local_scale, \
+                patch("hyper_parallel.platform.mindspore.fully_shard.param.apply_gradient_scaling_factor",
+                      side_effect=_scale) as reduce_scale:
+            # An already reduced contribution must not enter another all-reduce.
+            param.sharded_param.main_grad = SimpleNamespace(_local_tensor=ms.Tensor([7., 9.], ms.float32))
+            for step in range(2):
+                prior = np.array([7., 9.], dtype=np.float32) if step == 0 else np.zeros(2, np.float32)
+                for micro in range(4):
+                    param._unsharded_param.grad = ms.Tensor(local[micro])
+                    state.requires_all_reduce = micro == 3
+                    state.post_backward()
+                    self.assertEqual(collective.call_count, step + int(micro == 3))
+                    if micro < 3:
+                        np.testing.assert_array_equal(
+                            param.unsharded_accumulated_grad.asnumpy(), local[:micro + 1].sum(axis=0)
+                        )
+                state.reduce_params()
+                np.testing.assert_array_equal(param.sharded_param.main_grad._local_tensor.asnumpy(),
+                                              prior + expected_output)
+                self.assertIsNone(param.unsharded_accumulated_grad)
+                self.assertIsNone(param.unsharded_param.grad)
+                handles[-1].wait.assert_called_once_with()
+                param.sharded_param.main_grad = None
+            self.assertEqual(collective.call_count, 2)
+            self.assertEqual(reduce_scale.call_count, 2)
+            local_scale.assert_not_called()
 
     def test_post_backward_uses_sync_reduction_on_layout_driven_sizes(self):
         """post_backward should use layout-driven sizes and waitable sync reductions before applying grads."""
