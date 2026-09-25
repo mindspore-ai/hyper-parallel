@@ -23,6 +23,7 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 """
 # pylint: disable=forbidden-backend-import
 
+import fnmatch
 import logging
 from typing import Any, Dict, Literal, Optional, Union
 
@@ -355,6 +356,52 @@ def _apply_pre_sharding_features(
         logger.warning("FP8 not implemented in stub")
 
 
+def _apply_parameter_freezing(model: nn.Module, freeze_config: Any) -> None:
+    """Freeze the parameters of every module whose FQN matches ``freeze_config``.
+
+    Runs after module replacement and **before** plan/FSDP derivation: FSDP decides
+    which parameters join the gradient reduction from ``requires_grad``, so freeing
+    the tower later would leave it in the all-reduce while its weights never move.
+    A frozen tower also stops autograd at its output, so its backward pass and its
+    saved activations disappear entirely -- which is the point when comparing
+    against a pipeline that freezes the same tower.
+
+    Args:
+        model: The model being built.
+        freeze_config: One module-name glob or a list of them (``fnmatch`` against
+            the fully qualified module name), e.g. ``["model.vision_tower*"]``.
+
+    Raises:
+        ValueError: If no module matches. A silently unfrozen tower would invalidate
+            any A/B built on top of it, so fail loudly instead.
+    """
+    patterns = [freeze_config] if isinstance(freeze_config, str) else list(freeze_config)
+    if not patterns:
+        return
+    matched, frozen_tensors, frozen_numel = [], 0, 0
+    for name, module in model.named_modules():
+        if not name or not any(fnmatch.fnmatch(name, pattern) for pattern in patterns):
+            continue
+        # Track the match itself, not "did we newly freeze something": an already-frozen
+        # tower must not be reported as a misspelled pattern on a second call.
+        matched.append(name)
+        for parameter in module.parameters(recurse=True):
+            if parameter.requires_grad:
+                parameter.requires_grad = False
+                frozen_tensors += 1
+                frozen_numel += parameter.numel()
+    if not matched:
+        raise ValueError(
+            f"freeze_config={patterns!r} matched no parameter in the model; the names are "
+            "matched with fnmatch against each module's fully qualified name "
+            "(e.g. 'model.vision_tower*')"
+        )
+    logger.info(
+        "Froze %d parameter tensors (%.1fM elements) under %d module(s) matching %s",
+        frozen_tensors, frozen_numel / 1e6, len(matched), patterns,
+    )
+
+
 def _apply_materialization_adapter(model: nn.Module) -> None:
     """Let a family adapter declare derived state on native or custom models."""
     config = getattr(model, "config", None)
@@ -492,7 +539,7 @@ def apply_model_infrastructure(
         _apply_materialization_adapter(model)
 
     if freeze_config is not None:
-        logger.warning("Parameter freezing not implemented in stub")
+        _apply_parameter_freezing(model, freeze_config)
 
     # Steps 7-8: plan and apply parameter/activation layouts.
     model, source_shard_info = _plan_and_apply_sharding(
