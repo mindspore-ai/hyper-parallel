@@ -37,6 +37,7 @@ __all__ = [
     "_AsyncA2ALazyBwd",
 ]
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
@@ -44,6 +45,11 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 from torch.nn import Module
 
+from hyper_parallel.core.expert_parallel.static_splits import (
+    get_static_plan,
+    static_plan_key,
+    store_static_plan,
+)
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
     distribute_module,
@@ -573,26 +579,37 @@ class AllToAllTokenDispatcher:
         ep_size = device_mesh.size()
         num_local_experts = num_tokens_per_expert.shape[0] // ep_size
 
-        # --- Step 1: exchange token counts (no gradient needed) ---
-        # Each rank needs to know how many tokens it will receive from every
-        # other rank (for each local expert).  Uses ``async_op=True`` + an
-        # explicit ``handle.wait()`` rather than ``async_op=False`` because
-        # the implicit cross-stream sync is NCCL-only; on HCCL the compute
-        # stream may read ``counts_out`` before the collective write is
-        # visible, producing garbage values that blow up the downstream
-        # ``torch.empty(sum(output_splits), ...)`` allocation.
-        counts_out = exchange_splits_via_all_to_all(num_tokens_per_expert, ep_group)
-        # counts_out shape: [ep_size * num_local_experts]
-        # counts_out[r * num_local_experts + e] = tokens from rank r for expert e
+        # --- Steps 1-2: token counts and the split vectors ---
+        # Under a static routing plan the answer never changes, so it is computed once and
+        # reused: that is what removes the per-layer counts a2a and its two D2H syncs.
+        plan_key = static_plan_key(
+            num_tokens_per_expert.shape[0], ep_size, num_local_experts,
+            device=num_tokens_per_expert.device,
+        )
+        cached_plan = get_static_plan(plan_key)
+        if cached_plan is not None:
+            counts_out, input_splits, output_splits = cached_plan
+        else:
+            # The counts exchange is shared with the other dispatchers (see
+            # ``core.utils.communication``): async with an explicit wait, because the
+            # implicit cross-stream sync is NCCL-only and on HCCL the compute stream
+            # could read ``counts_out`` before the collective write is visible.
+            counts_out = exchange_splits_via_all_to_all(num_tokens_per_expert, ep_group)
+            # counts_out shape: [ep_size * num_local_experts]
+            # counts_out[r * num_local_experts + e] = tokens from rank r for expert e
 
-        # --- Step 2: compute input / output splits ---
-        # input_splits[r] = tokens this rank sends to rank r
-        # output_splits[r] = tokens this rank receives from rank r
-        # Reshape to [ep_size, num_local_experts] and sum per rank on device;
-        # a single ``tolist()`` drains the rank-sum vector to host, replacing
-        # ``2 * ep_size`` scalar ``int()`` D2H syncs with 2.
-        input_splits = num_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1).tolist()
-        output_splits = counts_out.view(ep_size, num_local_experts).sum(dim=1).tolist()
+            # input_splits[r] = tokens this rank sends to rank r
+            # output_splits[r] = tokens this rank receives from rank r
+            # Reshape to [ep_size, num_local_experts] and sum per rank on device;
+            # a single ``tolist()`` drains the rank-sum vector to host, replacing
+            # ``2 * ep_size`` scalar ``int()`` D2H syncs with 2.
+            input_splits = num_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1).tolist()
+            output_splits = counts_out.view(ep_size, num_local_experts).sum(dim=1).tolist()
+            store_static_plan(
+                plan_key, (counts_out, input_splits, output_splits),
+                f"(ep={ep_size}, local_experts={num_local_experts}, "
+                f"tokens/peer={input_splits[0] if input_splits else 0})",
+            )
 
         # --- Step 3a: exchange actual tokens (differentiable) ---
         dispatched = differentiable_all_to_all_single(
@@ -1016,6 +1033,8 @@ class DeredundencyTokenDispatcher:
         """
         return handle.wait()
 
+
+logger = logging.getLogger(__name__)
 
 _TOKEN_DISPATCHERS = {
     "all_to_all": AllToAllTokenDispatcher,

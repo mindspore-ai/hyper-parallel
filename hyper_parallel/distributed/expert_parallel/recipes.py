@@ -86,7 +86,7 @@ The factory must RETURN the compute fn
 tensors inside the local-region skeleton.
 """
 
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -95,6 +95,8 @@ from hyper_parallel.distributed.expert_parallel.routing import (
 )
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
+    ep_routed_dispatch,
+    ep_routed_experts_and_combine,
     ep_routed_forward,
     require_attrs,
 )
@@ -143,6 +145,8 @@ def build_ep_compute(
     expected_attrs,
     combine: Callable,
     use_grouped_gemm: bool = False,
+    capacity_factor: Optional[float] = None,
+    overlap_fn: Optional[Callable] = None,
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
     interface, bind the local expert entry point, and close over the
@@ -151,6 +155,13 @@ def build_ep_compute(
 
     ``combine(module, hidden_states, routed) -> Tensor`` receives the routed
     branch output and returns the MoE block output.
+
+    When ``overlap_fn`` is given the routed branch is split into dispatch and
+    experts+combine, and ``overlap_fn(module, hidden_states)`` runs in between:
+    the token exchange is issued asynchronously there, so the overlapped work
+    (for DeepSeek-V3 style blocks the shared-expert MLP, which depends only on
+    ``hidden_states``) proceeds while it is in flight.  ``combine`` then
+    receives that value as a fourth argument.
 
     Public since M3 (adjust doc §5.4): model adapters (e.g.
     ``models/qwen3_moe/adapter/distributed/expert_parallel.py``) compose
@@ -170,11 +181,25 @@ def build_ep_compute(
         # archetype and for Qwen3 when grouped GEMM is disabled.
         bind_local_expert_forward(module, ep_mesh["ep"].size())
 
-    def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run the routed branch and compose the MoE block output."""
-        routed = ep_routed_forward(
-            module, hidden_states, router_fn=router_fn, ep_group=ep_group)
-        return combine(module, hidden_states, routed)
+    if capacity_factor is not None:
+        # Read back by ``experts._resolve_capacity_factor``; bounds each expert's routed slots
+        # so the busiest rank's buffers cannot blow up under a skewed real router.
+        module.experts.capacity_factor = float(capacity_factor)
+
+    if overlap_fn is None:
+        def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+            """Run the routed branch and compose the MoE block output."""
+            routed = ep_routed_forward(
+                module, hidden_states, router_fn=router_fn, ep_group=ep_group)
+            return combine(module, hidden_states, routed)
+    else:
+        def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+            """Dispatch, run ``overlap_fn`` against the in-flight exchange, then finish."""
+            state = ep_routed_dispatch(
+                module, hidden_states, router_fn=router_fn, ep_group=ep_group)
+            overlapped = overlap_fn(module, hidden_states)
+            routed = ep_routed_experts_and_combine(module, state, ep_group)
+            return combine(module, hidden_states, routed, overlapped)
 
     return compute_fn
 
@@ -293,6 +318,10 @@ def deepseekv3_ep_compute_fn(
     tp_mesh: Any,
     cp_mesh: Any,
     ep_mesh: Any,
+    use_grouped_gemm: bool = False,
+    overlap_shared_expert: bool = False,
+    fix_router: bool = False,
+    capacity_factor: Optional[float] = None,
 ) -> Callable:
     """Archetype ``deepseekv3_sigmoid_group_shared``: sigmoid group-limited
     routing (with e_score_correction_bias / routed_scaling_factor, already
@@ -303,6 +332,23 @@ def deepseekv3_ep_compute_fn(
 
     ``module.shared_experts(...)`` is a planned nested TP boundary — its
     exit already performs the TP reduction (nested-boundary call contract).
+
+    ``use_grouped_gemm=True`` runs the local experts through the packed
+    ``gate_up_proj`` grouped GEMM path (``npu_grouped_swiglu``) instead of
+    the eager per-expert loop; the default keeps the eager path.
+
+    ``overlap_shared_expert=True`` issues the token exchange asynchronously
+    and evaluates ``shared_experts`` while it is in flight — the shared branch
+    reads only ``hidden_states``, so it hides communication instead of
+    serializing behind the routed branch. The math is unchanged either way.
+
+    ``fix_router=True`` swaps the adapter for ``deepseekv3_fixed``, a
+    BENCHMARK-ONLY variant that hands every rank the same token count
+    (round-robin over the K slots by destination rank instead of the gate's
+    top-k) so that per-rank step time stops depending on how the data
+    happened to route. Loss / grad_norm / expert-load metrics are meaningless
+    in that mode and it must not be used to report an efficiency number —
+    see ``routing._balanced_router``. Correctness runs keep it off.
     """
     del mesh, tp_mesh, cp_mesh
 
@@ -310,17 +356,27 @@ def deepseekv3_ep_compute_fn(
         module: Any,
         hidden_states: torch.Tensor,
         routed: torch.Tensor,
+        overlapped: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Merge the routed branch with the shared-experts branch."""
-        return routed + module.shared_experts(hidden_states)    # nested boundary
+        shared = module.shared_experts(hidden_states) if overlapped is None else overlapped
+        return routed + shared    # nested boundary
+
+    def overlap_shared(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Shared-experts branch, evaluated while the dispatch exchange is in flight."""
+        return module.shared_experts(hidden_states)    # nested boundary
 
     return build_ep_compute(
         module,
         ep_mesh,
-        router_fn=MOE_ROUTER_ADAPTERS["deepseekv3"],
+        router_fn=MOE_ROUTER_ADAPTERS[
+            "deepseekv3_fixed" if fix_router else "deepseekv3"],
         archetype_key="deepseekv3_sigmoid_group_shared",
         expected_attrs=["gate", "experts", "shared_experts"],
         combine=combine,
+        use_grouped_gemm=use_grouped_gemm,
+        capacity_factor=capacity_factor,
+        overlap_fn=overlap_shared if overlap_shared_expert else None,
     )
 
 
