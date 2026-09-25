@@ -69,7 +69,16 @@ class VLMTrainer:
         if config.dataset is None:
             raise ValueError("dataset must define a build target")
 
-        processor = config.dataset.model_assets.build()
+        # The model-owned processor is built through the Omni ``model_assets``
+        # target; forward the model's ``trust_remote_code`` flag so a natively
+        # registered architecture such as the Kimi-K2.6 family (``kimi_k26``)
+        # stays on the local implementation unless the config opts into remote
+        # code.
+        processor = config.dataset.model_assets.build(
+            trust_remote_code=bool(
+                getattr(config.model, "trust_remote_code", True)
+            ),
+        )
         tokenizer = getattr(processor, "tokenizer", None)
         if tokenizer is None:
             raise ValueError("dataset.model_assets must build a processor with a tokenizer")
