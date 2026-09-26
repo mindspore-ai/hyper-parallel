@@ -4,6 +4,9 @@ HyperParallel 的 Context Parallel（CP）是面向注意力计算边界的 `Par
 
 CP 不负责切分数据集、token ids 或整层 Transformer 输入。启用 CP 后，调用模型前仍需要让每个 CP rank 只拿到自己的序列切片，并保证 position ids、RoPE 起始位置和 attention mask 与全局序列窗口对齐。
 
+Kimi Delta Attention 的状态递推使用专用入口，P2P、AllGather、Ulysses 及其混合配置见
+[KDA 上下文并行使用指南](./kda_context_parallel.md)。
+
 ## 适用边界
 
 | 接口 | 真实作用 |
