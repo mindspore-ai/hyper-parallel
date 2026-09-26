@@ -16,15 +16,14 @@
 # pylint: disable=wrong-import-position
 
 import inspect
-import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-
+import torch
 from torch import nn
 
 from hyper_parallel.components.modules import KimiDeltaAttention
@@ -32,6 +31,7 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
     _ForwardRewriteRequest,
 )
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
+from hyper_parallel.distributed.context_parallel import kimi_delta_attention_boundary as boundary
 from hyper_parallel.distributed.recipe_spec import (
     CP,
     INNER_WRAPPER,
@@ -80,6 +80,7 @@ class _RecordingExecutor(nn.Module):
         *,
         chunk_size: int,
         backend: str,
+        **execution_options: Any,
     ) -> None:
         """Record the executor construction arguments."""
         super().__init__()
@@ -87,6 +88,7 @@ class _RecordingExecutor(nn.Module):
         self.mesh = mesh
         self.chunk_size = chunk_size
         self.backend = backend
+        self.execution_options = execution_options
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Return inputs so the wrapper remains callable in this metadata test."""
@@ -183,7 +185,11 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_yaml_cp_condition_and_wrapper_arguments(self):
-        """YAML resolution preserves KDA arguments and gates the rule on CP."""
+        """Feature: Unified KDA CP configuration.
+
+        Description: Parse state_cp_method through the unified wrapper.
+        Expectation: The method is preserved without a chunk-size option; CP1 disables the rule.
+        """
         yaml_text = """
 model:
   _target_: torch.nn.Identity
@@ -196,9 +202,9 @@ plan_overrides:
     region_dispatch: false
     inner_target: self
     inner_wrapper:
-      _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_p2p_cp_wrapper
+      _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
       backend: triton
-      chunk_size: 64
+      state_cp_method: allgather
 """
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "kda_cp.yaml"
@@ -211,7 +217,8 @@ plan_overrides:
         self.assertEqual(entry.inner_target, "self")
         self.assertFalse(entry.region_dispatch)
         self.assertEqual(entry.inner_wrapper.backend, "triton")
-        self.assertEqual(entry.inner_wrapper.chunk_size, 64)
+        self.assertEqual(entry.inner_wrapper.state_cp_method, "allgather")
+        self.assertFalse(hasattr(entry.inner_wrapper, "chunk_size"))
         self.assertEqual(entries_to_plan_overrides([entry], cp_size=1), {})
         active = entries_to_plan_overrides([entry], cp_size=4)
         self.assertEqual(set(active), {"*.self_attn"})
@@ -295,6 +302,93 @@ class TestKimiK3CpWrapperContracts(unittest.TestCase):
         target._hp_kda_cp_config = {"mode": "p2p"}
         with self.assertRaisesRegex(RuntimeError, "already been applied"):
             wrapper(target, None, None, _FakeMesh(2), None)
+
+
+class TestKDACombinedAdapter(unittest.TestCase):
+    """Pin the recipe options for all pairwise and three-way combinations."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_all_combinations_record_effective_options(self):
+        """Feature: Unified KDA CP recipe adapter.
+
+        Description: Construct AG and every two/three-way recipe using metadata-only executors.
+        Expectation: The forward rewrite preserves protocol, Ulysses and group-width choices.
+        """
+        parameters = inspect.signature(adapter_context_parallel.kimi_delta_attention_cp_wrapper).parameters
+        self.assertNotIn("chunk_size", parameters)
+        cases = [("allgather", 1, 1), ("p2p", 2, 1), ("allgather", 2, 1),
+                 ("grouped_allgather_p2p", 1, 2), ("grouped_allgather_p2p", 2, 2)]
+        for protocol, ulysses, width in cases:
+            with self.subTest(protocol=protocol, ulysses=ulysses):
+                name = "KimiDeltaAttentionLayerHybridCP" if ulysses > 1 else "KimiDeltaAttentionLayerP2PCP"
+                model = _TinyKimiModel().self_attn
+                with patch.object(adapter_context_parallel, name, _RecordingExecutor):
+                    request = adapter_context_parallel.kimi_delta_attention_cp_wrapper(
+                        model, None, None, _FakeMesh(8), None, state_cp_method=protocol,
+                        ulysses_degree=ulysses, group_size=width)
+                config = request.companion_attrs["_hp_kda_cp_config"]
+                self.assertEqual(config["state_cp_method"], protocol)
+                self.assertEqual(config["group_size"], width)
+                self.assertEqual(config.get("ulysses_degree", 1), ulysses)
+                self.assertEqual(config["backend"], "triton")
+                self.assertEqual(config["chunk_size"], 64)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_invalid_options_rejected_by_real_executors(self):
+        """Feature: Unified KDA CP configuration validation.
+
+        Description: Construct real state and hybrid executors with mocked mesh metadata.
+        Expectation: Invalid protocols and group widths fail without rewriting the model or splitting groups.
+        """
+        cases = [("unknown", 1, "Unknown|supported"),
+                 ("p2p", 2, "only valid"),
+                 ("allgather", 2, "only valid"),
+                 ("grouped_allgather_p2p", 0, "positive integer"),
+                 ("grouped_allgather_p2p", True, "positive integer"),
+                 ("grouped_allgather_p2p", 1.5, "positive integer"),
+                 ("grouped_allgather_p2p", 3, "divid")]
+        for ulysses in (1, 2):
+            for protocol, width, message in cases:
+                with self.subTest(ulysses=ulysses, protocol=protocol, width=width):
+                    mesh = MagicMock()
+                    mesh.ndim = 1
+                    mesh.rank_list = tuple(range(8))
+                    mesh.size.return_value = 8
+                    mesh.get_local_rank.return_value = 0
+                    mesh.get_group.return_value = None
+                    model = KimiDeltaAttention(hidden_size=32, num_heads=4)
+                    original_forward = model.forward
+                    with self.assertRaisesRegex(ValueError, message):
+                        adapter_context_parallel.kimi_delta_attention_cp_wrapper(
+                            model, None, None, mesh, None, state_cp_method=protocol,
+                            ulysses_degree=ulysses, group_size=width)
+                    self.assertFalse(hasattr(model, "_hp_kda_cp_config"))
+                    self.assertEqual(model.forward, original_forward)
+                    mesh._unflatten.assert_not_called()  # pylint: disable=protected-access
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_invalid_contracts_rejected_before_transport(self):
+        """Feature: KDA boundary validation.
+
+        Description: Pass incompatible shapes, dtypes, rank orders and options.
+        Expectation: Invalid calls fail before transport is invoked.
+        """
+        state = torch.zeros(1, 2, 128, 128)
+        protocols = [boundary.AllGatherBoundary(None, 0, 4),
+                     boundary.GroupedAllGatherBoundary(None, None, 0, (0, 2, 4, 6), 2)]
+        with patch.object(boundary, "dist") as transport:
+            for protocol in protocols:
+                with self.assertRaises(ValueError):
+                    protocol.forward(state, state.double())
+                with self.assertRaises(ValueError):
+                    protocol.backward(state, state[..., :64])
+            transport.all_gather_into_tensor.assert_not_called()
+            transport.irecv.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "ordered"):
+            boundary.GroupedAllGatherBoundary(None, None, 0, (2, 0, 6, 4), 2)
 
 
 if __name__ == "__main__":
