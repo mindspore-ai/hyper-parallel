@@ -242,6 +242,33 @@ class RaggedShard(Placement):
         return f"RS({self.dims}, {self.local_units})"
 
 
+class _StridedRaggedShard(RaggedShard):
+    """Private owner marker for one axis in a strided shard chain.
+
+    The placement is only produced by the DeepSeek V4.1 padding-row getitem
+    path and is not interpreted as a general-purpose RaggedShard.
+    """
+
+    def __init__(
+        self,
+        dims: tuple[int, ...],
+        local_units: tuple[int, ...],
+        split_factor: int,
+    ) -> None:
+        """Initialize one strided owner marker."""
+        super().__init__(dims, local_units)
+        self._split_factor = split_factor
+
+    @property
+    def split_factor(self) -> int:
+        """Return the input StridedShard split factor."""
+        return self._split_factor
+
+    def is_ragged_shard(self) -> bool:
+        """Exclude the private marker from generic RaggedShard handling."""
+        return False
+
+
 class Replicate(Placement):
     """
     Placement strategy indicating that the tensor is fully replicated across devices.
