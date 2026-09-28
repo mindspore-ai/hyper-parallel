@@ -78,7 +78,7 @@ def _profile_buffer(
     return buffer
 
 
-def _parse(buffer: bytes, *, detailed_task_names: bool = False) -> dict:
+def _parse(buffer: bytes, *, detailed_task_names: bool = False, aiv_capacity: int = _AIV_CAPACITY) -> dict:
     return _parse_cycle_buffer(
         buffer,
         _CycleTraceConfig(
@@ -93,12 +93,25 @@ def _parse(buffer: bytes, *, detailed_task_names: bool = False) -> dict:
             task_stage_names={9: "GMM1"},
         ),
         aic_record_capacity=_AIC_CAPACITY,
-        aiv_record_capacity=_AIV_CAPACITY,
+        aiv_record_capacity=aiv_capacity,
     )
 
 
 class TestMegaKernelCycleTrace(unittest.TestCase):
     """Validate schema, timing, naming, fallback, and corruption checks."""
+
+    def test_parse_aiv_tail_above_former_limit(self) -> None:
+        """Decode the 257th vector record instead of silently dropping the tail."""
+        buffer = bytearray(_profile_buffer_bytes_for_capacities(16, 272))
+        offset = _slot_offset(2, 0)
+        CORE_HEADER.pack_into(buffer, offset, 100, 257, 0, 2, 0, 272, 0)
+        for index in range(257):
+            PROFILE_RECORD.pack_into(buffer, offset + CORE_HEADER.size + index * PROFILE_RECORD.size,
+                                     110 + index * 2, 111 + index * 2, 0x10002, index, index, INVALID_OWNER_ID)
+        trace = _parse(buffer, aiv_capacity=272)
+        events = [event for event in trace["traceEvents"] if event["ph"] == "X"]
+        self.assertEqual((len(events), events[-1]["args"]["task_id"]), (257, 256))
+        self.assertEqual(trace["megaKernelCycleTrace"]["droppedRecordCount"], 0)
 
     def test_parse_converts_cycles_and_preserves_raw_identifiers(self):
         """Convert 50 MHz cycles to microseconds and keep raw record fields."""
@@ -145,11 +158,11 @@ class TestMegaKernelCycleTrace(unittest.TestCase):
 
     def test_unknown_task_type_uses_generic_fallback(self):
         """Keep a record readable when a concrete Kernel has no stage rule."""
-        trace = _parse(_profile_buffer(desc_id=0x20000 + 107))
+        trace = _parse(_profile_buffer(desc_id=0x20000 + 999))
         event = next(event for event in trace["traceEvents"] if event["ph"] == "X")
 
-        self.assertEqual(event["name"], "TaskType_107")
-        self.assertEqual(event["args"]["task_type"], 107)
+        self.assertEqual(event["name"], "TaskType_999")
+        self.assertEqual(event["args"]["task_type"], 999)
 
     def test_dropped_count_is_reported_without_overwriting_records(self):
         """Surface Device overflow in metadata and warnings."""

@@ -14,6 +14,8 @@
 # ============================================================================
 """Unit tests for MegaKernel Host profiling metadata and buffer planning."""
 
+from __future__ import annotations
+
 import struct
 import unittest
 
@@ -26,12 +28,14 @@ from hyper_parallel.core.multicore.modules.mega_moe.profiling import (
 from hyper_parallel.core.multicore.profiler.profiling import (
     GRAPH_STAGE_DESC_BASE,
     MAX_PROFILE_BUFFER_BYTES,
+    MAX_RECORDS_PER_CORE,
     _ProfileSpec,
     _apply_mega_kernel_profile_graph,
     _calculate_profile_layout,
     _get_mega_kernel_profile_metadata,
     _prepare_mega_kernel_runtime_config,
     _resolve_cycle_frequency_mhz,
+    _round_up_record_capacity,
     _set_mega_kernel_profile_metadata,
 )
 from hyper_parallel.core.multicore.scheduler.config import (
@@ -100,7 +104,8 @@ class TestMegaKernelProfilingMetadata(unittest.TestCase):
         for task_id in range(3):
             runtime_config.all_tasks[task_id].task_index = task_id
 
-        def resolve_owner(_, task_desc, context):
+        def resolve_owner(_: OperatorNode, task_desc: TaskDescC, context: int) -> int:
+            """Resolve each task owner relative to its context."""
             return context + task_desc.task_index
 
         _apply_mega_kernel_profile_graph(
@@ -311,17 +316,23 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         self.assertEqual(layout.buffer_size, 53760)
         self.assertLess(layout.buffer_size, MAX_PROFILE_BUFFER_BYTES)
 
-    def test_layout_caps_each_worker_at_256_records(self):
-        """Bound Device memory when a long schedule needs more records."""
+    def test_layout_preserves_records_above_former_limit(self) -> None:
+        """Keep all 258 records and reject a capacity that overflows the Device ABI."""
         runtime_config = _runtime_config(2048)
         runtime_config.num_workers = 48
         runtime_config.all_tasks[0] = _three_record_task()
         runtime_config.task_index_num[0] = 2041
+        runtime_config.task_index_num[1] = 2041
 
         layout = _calculate_profile_layout(runtime_config)
 
         self.assertEqual(layout.aic_required_records, 258)
-        self.assertEqual(layout.aic_record_capacity, 256)
+        self.assertEqual(layout.aic_record_capacity, 272)
+        self.assertEqual(layout.aiv_required_records, 258)
+        self.assertEqual(layout.aiv_record_capacity, 272)
+        self.assertEqual(_round_up_record_capacity(MAX_RECORDS_PER_CORE), MAX_RECORDS_PER_CORE)
+        with self.assertRaisesRegex(ValueError, "record limit"):
+            _round_up_record_capacity(MAX_RECORDS_PER_CORE + 1)
 
     def test_prepared_runtime_serializes_disabled_config_and_lazily_profiles(self):
         """Keep the normal tensor disabled and create the enabled tensor on demand."""
@@ -329,7 +340,8 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         runtime_config.num_workers = 48
         created_profile_tensors = []
 
-        def profile_tensor_factory(tensor):
+        def profile_tensor_factory(tensor: bytes) -> bytes:
+            """Enable profiling in a copy without changing the normal runtime."""
             enabled = bytearray(tensor)
             struct.pack_into(
                 "<I",

@@ -29,9 +29,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
  public:
   // input_list layout for hyper_mega_moe (forward):
   //   [23] = tiling params  [24] = all_event_counters  [25] = profile_buffer  [16] = gmm_workspace
-  static constexpr uint32_t TILING_IDX   = 23;
-  static constexpr uint32_t EVENT_IDX    = 24;
-  static constexpr uint32_t PROFILE_IDX  = 25;
+  static constexpr uint32_t TILING_IDX = 23;
+  static constexpr uint32_t EVENT_IDX = 24;
+  static constexpr uint32_t PROFILE_IDX = 25;
   static constexpr uint32_t WORKSPACE_IDX = 16;
   static constexpr uint32_t SWIGLU_DYNAMIC_FIELDS_OFFSET =
     static_cast<uint32_t>(offsetof(SwiGluTilingData, rowLen));
@@ -60,12 +60,24 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
         ExecuteShmemPutMem(task_desc);
         break;
+      case TaskType::TASK_SHMEM_GET_MEM:
+        ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc);
+        break;
       default:
         break;
     }
   }
 
  private:
+  __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
+    union {
+      uint32_t bits;
+      float value;
+    } encoded = {};
+    encoded.bits = task_desc.extra_value_0;
+    return encoded.value;
+  }
+
   __aicore__ inline void ExecuteMatmul(const TaskDesc &task_desc) {}
 
   __aicore__ inline void cacheWriteThrough(__gm__ uint8_t *sourceAddr, int64_t length) {
@@ -74,8 +86,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     }
     __gm__ uint8_t *start =
       (__gm__ uint8_t *)((int64_t)sourceAddr / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE);
-    __gm__ uint8_t *end = (__gm__ uint8_t *)(((int64_t)sourceAddr + length - 1) / AscendC::CACHE_LINE_SIZE *
-                                             AscendC::CACHE_LINE_SIZE);
+    __gm__ uint8_t *end =
+      (__gm__ uint8_t *)(((int64_t)sourceAddr + length - 1) / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE);
     AscendC::GlobalTensor<uint8_t> global;
     global.SetGlobalBuffer(start);
     for (uint32_t i = 0; i <= end - start; i += AscendC::CACHE_LINE_SIZE) {
@@ -119,7 +131,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         if (start + current_seq_end <= end) {
           swi_glu(input_list[task_desc.inputs[0].input_position] + input_0_offset,
                   input_list[task_desc.outputs[0].input_position] + output_0_offset, nullptr,
-                  input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
+                  input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
+                  GetSwiGluClampLimit(task_desc));
         } else {
           GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 80 * (AscendC::GetBlockIdx() + 1);
           __gm__ SwiGluTilingData *tilingdata_data = reinterpret_cast<__gm__ SwiGluTilingData *>(tiling_data_addr);
@@ -133,7 +146,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           cacheWriteThrough(tiling_data_addr + SWIGLU_DYNAMIC_FIELDS_OFFSET, SWIGLU_DYNAMIC_FIELDS_BYTES);
           PipeBarrier<PIPE_ALL>();
           swi_glu(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                  input_list[task_desc.outputs[0].input_position] + output_0_offset, nullptr, tiling_data_addr);
+                  input_list[task_desc.outputs[0].input_position] + output_0_offset, nullptr, tiling_data_addr,
+                  GetSwiGluClampLimit(task_desc));
         }
       }
       return;
@@ -142,7 +156,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
               task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type,
             input_list[task_desc.outputs[0].input_position] +
               task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type,
-            nullptr, input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
+            nullptr, input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
+            GetSwiGluClampLimit(task_desc));
   }
 
   __aicore__ inline void ExecuteGroupedMatmul(TaskDesc task_desc) {
@@ -158,8 +173,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         int64_t expert_num_single_rank = expert_num / ep;
         grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
 
-        GM_ADDR grouped_list_real =
-          this->runtimeConfigPtr + getGroupedMatmulGroupListOffsetById(this->runtimeConfigPtr, AscendC::GetBlockIdx());
+        GM_ADDR grouped_list_real = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
         GlobalTensor<int64_t> grouped_list_tensor_real;
         grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
         uint32_t data_index = task_desc.task_index / this->core_num;
@@ -199,11 +213,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                                     ? start * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
                                     : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position],
-                       nullptr, nullptr, nullptr, nullptr, nullptr, grouped_list_real, nullptr,
-                       input_list[task_desc.outputs[0].input_position] + output_0_offset,
-                       input_list[WORKSPACE_IDX],
-                       tiling_data_addr, false, false);
+                       input_list[task_desc.inputs[1].input_position], nullptr, nullptr, nullptr, nullptr, nullptr,
+                       grouped_list_real, nullptr, input_list[task_desc.outputs[0].input_position] + output_0_offset,
+                       input_list[WORKSPACE_IDX], tiling_data_addr, false, false);
       }
       return;
     }
@@ -233,7 +245,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     int32_t start = value * task_desc.task_split_value * hidden_size;
     int32_t end = (value + 1) * task_desc.task_split_value * hidden_size;
     if (start >= size_) {
-      send_data_size_ = 0;
+      aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, 1, ACLSHMEM_SIGNAL_ADD,
+                          target_pe);
+      return;
     } else {
       if (end > size_) {
         send_data_size_ = size_ - start;
@@ -248,15 +262,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                           target_offset_,
                           input_list[task_desc.inputs[1].input_position] +
                             task_desc.inputs[1].base_ptr_offset * task_desc.inputs[1].data_type,
-                          src_offset_,
-                          send_data_size_,
-                          signal,
-                          static_cast<int64_t>(task_desc.trigger_event),
-                          1,
-                          nullptr,
-                          1,
-                          target_pe,
-                          false);
+                          src_offset_, send_data_size_, signal, static_cast<int64_t>(task_desc.trigger_event), 1,
+                          nullptr, 1, target_pe, false);
   }
 };
 

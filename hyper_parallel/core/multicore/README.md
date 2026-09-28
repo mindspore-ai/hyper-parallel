@@ -68,9 +68,15 @@ experts = MegaMoeExperts(
 output = experts(hidden_states, topk_ids, topk_weights)
 ```
 
+`ep_group` may also be a PP/DP-local EP subgroup: pass its size as `ep_size`.
+MegaMoE uses group-local expert ownership and does not take a TP-size argument.
+Subgroups exchange independent CANN bootstrap IDs internally and do not use a
+shared WORLD rendezvous port. See the [SHMEM lifecycle](docs/shmem.md) for
+cross-node interface selection and group-local shutdown requirements.
+
 ### 输入与权重
 
-- EP 必须覆盖整个默认 world；每 rank 的 token 数 `T` 固定且为 128 的倍数，专家数 `E` 可被 EP 整除。
+- EP may be WORLD or a subgroup; per-rank token count `T` is fixed and a multiple of 128, and `E` is divisible by EP.
   执行计划采用静态 tiling，构造后的 `T/H/I/E/K/EP` 固定；其他 shape、芯片及后端需单独验证。
 - `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，
   ID 使用全局专家编号。
@@ -91,20 +97,55 @@ output = experts(
 )
 ```
 
-### 容量
+### 通信模式与容量
 
-`expert_capacity_factor=None` 是默认值，接收容量为 `EP * T * K` 向上对齐到 128，保证 lossless。
-该容量用于各 rank 对称分配的 SHMEM 接收区。计算中间张量和待反向保存的 dispatch、
-up-projection、activation 按本 rank 本次实际接收量分配；无接收时保留一行 ABI 占位。
-源端 permute/combine 输出仍为 `T * K` 行。每次 forward 保存独立的接收数据和容量，支持后续路由变化。
+构造时通过 `dispatch_mode="push"`（默认）或 `dispatch_mode="pull"` 选择 dispatch；
+两种模式的 combine 均使用 PUT。模式必须在所有 EP rank 上一致，运行中不可修改。
+不同模式可以在同一进程中串行使用，但不能共享同一 workspace。
 
-分配前将已交换的各 rank 负载一次读取到 Host，同时用于本地定尺寸和全局溢出检查。
-这也适用于默认 lossless 模式，会增加一次 Device-to-Host 等待，以减少计算和保存区的容量余量。
-SHMEM heap 的预留仍由配置接收容量决定，不会随本次实际接收量缩小。
+push 默认从较小的接收容量开始，在路由溢出时在线扩容；配置只有两个 push 专用因子：
 
-显式设置不小于 1 的有限 factor 时，容量改为 `ceil(T * K * factor)` 再对齐。
-超过容量时，所有 EP rank 在进入 native kernel 前报 `capacity overflow`。
-应根据显存和路由负载选择容量，确保显式容量覆盖实际接收量。
+| 参数 | push 默认值 | 作用 |
+| --- | --- | --- |
+| `initial_capacity_factor` | `1.25` | 初始接收容量相对于本地 `T * K` 路由行数的倍数 |
+| `capacity_growth_factor` | `1.25` | 超限时相对于当前接收容量的增长倍数；`1.0` 表示仅满足当次需求 |
+
+两个因子都要求为有限数且不小于1。省略或传入 `None` 表示采用 push 默认值。
+pull 不需要容量因子，显式传入任一数值都会报错。旧 `expert_capacity_factor` 和 `capacity_policy` 参数已移除。
+
+```python
+# Pass these keywords alongside the model's fixed shape and EP topology.
+push_options = dict(dispatch_mode="push", initial_capacity_factor=1.25, capacity_growth_factor=1.25)
+pull_options = dict(dispatch_mode="pull")
+```
+
+初始容量为 `align128(ceil(initial_capacity_factor * T * K))`，不超过 `EP * T * K` 的保守无损上界。
+需要一次性预留最坏情况时，将 `initial_capacity_factor` 设为 EP 大小。
+当最大目的 rank 接收量 `R_max` 超过当前容量 `C` 时：
+
+```text
+C_new = min(EP * T * K, align128(max(R_max, ceil(capacity_growth_factor * C))))
+```
+
+同一 EP root 的所有 rank 完成在途工作，释放全部受管对称 buffer，finalize 旧 runtime，
+再使用 fresh bootstrap ID 初始化更大的 heap 并重建 workspace，继续本次 forward；回落时不缩容。
+该路径复用已有路由 counts，未溢出的 forward 不增加负载 collective。
+增长倍数作用于接收容量，不是整个 heap；返回区仍固定为 `T * K` 行，总 heap 向上取整到2 MiB。
+
+pull 的 SHMEM 仅包含 `T * K` 行发送区和返回区，接收区位于普通 HBM、按实际接收量分配。
+两种模式的计算中间张量和待反向保存的 dispatch、up-projection、activation 都按本 rank 实际接收量分配；
+零接收保留一行 ABI 占位。通信任务固定为128行。路由不丢 token，热点的普通 HBM 开销仍存在。
+
+共享层、独立的 push/pull workspace 和尚未绑定的层统一计入预算。
+逻辑 workspace 对象保持稳定，因此扩容前的 forward 支持延迟或重复 backward、checkpoint 重算及串行交替 stream。
+每个 root 要求串行执行；push 不支持图捕获，同一 root 下的其他层也不能保留使用旧地址的捕获图。
+外部持有的专家参数不属于 heap，扩容不会移动它们。
+
+若显式设置 `HYPER_PARALLEL_SHMEM_HEAP_SIZE`，物理 heap 直接按此固定预算初始化；push 只在预算内增加逻辑容量。
+当增长余量放不下、而实际需求能放下时，退到最小必要容量。预算不足、未知 owner/allocation 或活动租约
+会在销毁前阻止扩容；开始释放后若重建失败，runtime 不可继续使用，需退出并重启训练进程。
+自动预算不写入环境变量；实际大小读取 `shmem.debug_state()["config"]["heap_size_bytes"]`。
+扩容有一次性同步和初始化开销，可通过增加初始因子或增长因子减少重建次数。
 
 ### 资源共享与关闭
 
@@ -115,7 +156,7 @@ MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in model.la
 ```
 
 共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
-checkpoint/recompute 和 `retain_graph=True` 暂未验证。所有 backward 完成后，各 rank 按相同顺序调用
+两条路径已验证 non-reentrant checkpoint 和 `retain_graph=True`。所有 backward 完成后，各 rank 按相同顺序调用
 每层的幂等 `close()`，并在销毁进程组前完成关闭。
 
 SHMEM Python层以进程级引用计数统一管理Runtime生命周期。每个MegaMoe执行资源组建立时配对调用一次

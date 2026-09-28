@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -22,12 +22,14 @@
  * they belong in each op's worker_kernel.cpp.
  */
 
-#ifndef MULTICORE_SCHEDULER_WORKER_KERNEL_H
-#define MULTICORE_SCHEDULER_WORKER_KERNEL_H
+#ifndef HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_WORKER_KERNEL_H_
+#define HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_WORKER_KERNEL_H_
 
 #include "kernel_operator.h"
 #include "runtime_config.hpp"
 #include "cycle_trace_recorder.h"
+
+#include "get_mem.h"
 
 using namespace AscendC;  // NOLINT(build/namespaces)
 
@@ -57,21 +59,26 @@ class KernelWorkerBase {
     uint64_t runtime_bytes = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 6);
     uint64_t event_bytes = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 7);
     uint32_t ep_size = static_cast<uint32_t>(getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1));
-    if (!isRuntimeStorageValid(runtimeConfigPtr, runtime_bytes, event_bytes, ep_size)) {
+    uint64_t local_experts = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 2) / ep_size;
+    if (!isRuntimeStorageValid(runtimeConfigPtr, runtime_bytes, event_bytes, ep_size, local_experts)) {
       AscendC::Trap();
     }
     this->runtime_task_capacity = getRuntimeTaskCapacity(runtimeConfigPtr);
     this->runtime_event_capacity = getRuntimeEventCapacity(runtimeConfigPtr);
+#ifdef __DAV_C220_CUBE__
+    // The worker's scratch region is fixed for the lifetime of this task graph.
+    this->grouped_matmul_group_list_offset_ = getGroupedMatmulGroupListOffsetById(runtimeConfigPtr, worker_id);
+#endif
     all_event_counters.SetGlobalBuffer((__gm__ int32_t *)(input_list[Derived::EVENT_IDX]), runtime_event_capacity);
 
-    all_event_num_triggers.SetGlobalBuffer(
-        (__gm__ int32_t *)(runtimeConfigPtr + getAllEventNumTriggersOffset()), runtime_event_capacity);
+    all_event_num_triggers.SetGlobalBuffer((__gm__ int32_t *)(runtimeConfigPtr + getAllEventNumTriggersOffset()),
+                                           runtime_event_capacity);
     vector_task_indexs.SetGlobalBuffer(
-        (__gm__ int32_t *)(runtimeConfigPtr + getVectorTaskIndexsOffset(runtimeConfigPtr)), runtime_task_capacity);
-    cube_task_indexs.SetGlobalBuffer(
-        (__gm__ int32_t *)(runtimeConfigPtr + getCubeTaskIndexsOffset(runtimeConfigPtr)), runtime_task_capacity);
-    atomic_add_values.SetGlobalBuffer(
-        (__gm__ int32_t *)(runtimeConfigPtr + getAtomicAddValuesOffset(runtimeConfigPtr)), ATOMIC_ADD_VALUE_LEN);
+      (__gm__ int32_t *)(runtimeConfigPtr + getVectorTaskIndexsOffset(runtimeConfigPtr)), runtime_task_capacity);
+    cube_task_indexs.SetGlobalBuffer((__gm__ int32_t *)(runtimeConfigPtr + getCubeTaskIndexsOffset(runtimeConfigPtr)),
+                                     runtime_task_capacity);
+    atomic_add_values.SetGlobalBuffer((__gm__ int32_t *)(runtimeConfigPtr + getAtomicAddValuesOffset(runtimeConfigPtr)),
+                                      ATOMIC_ADD_VALUE_LEN);
 
     this->input_list = input_list;
     this->task_num = getTaskNum(this->runtimeConfigPtr);
@@ -83,15 +90,20 @@ class KernelWorkerBase {
 
   __aicore__ inline void Process() {
     ReadyHandshakeMeta meta;
-    if (LoadReadyHandshakeMeta(&meta)) {
+    bool has_ready = LoadReadyHandshakeMeta(&meta);
+    pull_protocol_ = meta.completion_event != 0;
+    if (has_ready) {
       WaitForDeviceReady(meta);
     }
     bool profile_enabled = isCycleProfileEnabled(this->runtimeConfigPtr);
     if (profile_enabled) {
       ProcessProfiled();
-      return;
+    } else {
+      ProcessFast();
     }
-    ProcessFast();
+    if (meta.completion_event != 0) {
+      CompleteDeviceReads(meta);
+    }
   }
 
  protected:
@@ -160,20 +172,26 @@ class KernelWorkerBase {
     return meta->ready_event != 0;
   }
 
-  __aicore__ inline void PublishDeviceReady(const ReadyHandshakeMeta &meta) {
+  __aicore__ inline void PublishDeviceReady(const ReadyHandshakeMeta &meta, bool completion = false) {
 #ifndef __DAV_C220_CUBE__
     int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
     int64_t rank = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0) % ep;
     constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
-    __gm__ int32_t *ready =
-      (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + runtime_event_capacity;
+    __gm__ int32_t *ready = (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + runtime_event_capacity;
+    if (completion) {
+      ready += (ep + 1) * ready_stride;
+    }
 
     GlobalTensor<int32_t> ready_state;
     ready_state.SetGlobalBuffer(ready, static_cast<uint32_t>((ep + 1) * ready_stride));
     uint32_t generation_index = static_cast<uint32_t>(ep) * ready_stride;
     DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
       ready_state[generation_index]);
-    int32_t generation = ready_state.GetValue(generation_index) + 1;
+    int32_t previous_generation = ready_state.GetValue(generation_index);
+    if (previous_generation == INT32_MAX) {
+      AscendC::Trap();
+    }
+    int32_t generation = previous_generation + 1;
     ready_state.SetValue(generation_index, generation);
     DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
       ready_state[generation_index]);
@@ -186,8 +204,51 @@ class KernelWorkerBase {
       aclshmemx_signal_op(round_ready, generation, ACLSHMEM_SIGNAL_SET, static_cast<int>(target));
       aclshmem_signal_wait_until(round_ready, ACLSHMEM_CMP_GE, generation);
     }
-    TriggerEvent(meta.ready_event);
+    if (!completion) {
+      TriggerEvent(meta.ready_event);
+    }
 #endif
+  }
+
+  __aicore__ inline void CompleteDeviceReads(const ReadyHandshakeMeta &meta) {
+#ifndef __DAV_C220_CUBE__
+    if (this->worker_id_ % 2 == 0) {
+      return;
+    }
+#endif
+    TriggerEvent(meta.completion_event);
+#ifndef __DAV_C220_CUBE__
+    if (this->worker_id_ == 1) {
+      WaitForDependency(meta.completion_event);
+      if (meta.ready_event != 0) {
+        PublishDeviceReady(meta, true);
+      }
+    }
+#endif
+  }
+
+  template <typename T>
+  __aicore__ inline void ExecuteShmemGetMem(const TaskDesc &task) {
+    int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+    int64_t experts = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 2);
+    int64_t hidden = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 3);
+    int64_t tiles = task.task_split_num / experts;
+    int64_t source_pe = task.task_index / ((experts / ep) * tiles);
+    int64_t size =
+      reinterpret_cast<__gm__ int32_t *>(input_list[task.inputs[3].input_position])[task.inputs[3].base_ptr_offset];
+    int64_t start = (task.task_index % tiles) * static_cast<int64_t>(task.task_split_value) * hidden;
+    if (start >= size) {
+      return;
+    }
+    int64_t tile_elements = static_cast<int64_t>(task.task_split_value) * hidden;
+    int64_t elements = size - start < tile_elements ? size - start : tile_elements;
+    int64_t destination_offset =
+      reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[0].input_position])[task.inputs[0].base_ptr_offset];
+    int64_t source_offset =
+      reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[2].input_position])[task.inputs[2].base_ptr_offset];
+    PullToLocal<T>(input_list[task.outputs[0].input_position] + (destination_offset + start) * sizeof(T),
+                   input_list[task.inputs[1].input_position] + (source_offset + start) * sizeof(T), elements,
+                   source_pe);
   }
 
   __aicore__ inline void WaitForDeviceReady(const ReadyHandshakeMeta &meta) {
@@ -301,56 +362,35 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void WaitForDependency(uint32_t event_index) {
+    // Pull producers signal locally after MTE3 completion. Observe short-lived
+    // GMM/SwiGLU dependencies promptly while retaining a bounded refresh rate.
 #ifdef __DAV_C220_CUBE__
-    int32_t needed = all_event_num_triggers.GetValue(event_index);
-    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
-      all_event_counters[event_index]);
-    int32_t current = all_event_counters.GetValue(event_index);
-    PipeBarrier<PIPE_ALL>();
-    int64_t systemCycleBefore = AscendC::GetSystemCycle();
-    do {
-      if (current >= needed) {
-        break;
-      }
-      int64_t systemCycleAfter = AscendC::GetSystemCycle();
-      int64_t GetBlockNumCycle = systemCycleAfter - systemCycleBefore;
-      int64_t CycleToTimeBase = EVENT_REFRESH_TIME_UNIT_CYCLES;
-      int64_t GetBlockNumTime = GetBlockNumCycle / CycleToTimeBase;
-      if (GetBlockNumTime > CUBE_EVENT_REFRESH_INTERVAL_UNITS) {
-        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
-          all_event_counters[event_index]);
-        current = all_event_counters.GetValue(event_index);
-        systemCycleBefore = AscendC::GetSystemCycle();
-      }
-    } while (1);
+    int64_t poll_interval_us = pull_protocol_ ? 10 : CUBE_EVENT_REFRESH_INTERVAL_UNITS;
 #else
+    int64_t poll_interval_us = pull_protocol_ ? 30 : VECTOR_EVENT_REFRESH_INTERVAL_UNITS;
+#endif
     int32_t needed = all_event_num_triggers.GetValue(event_index);
     DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
       all_event_counters[event_index]);
     int32_t current = all_event_counters.GetValue(event_index);
     PipeBarrier<PIPE_ALL>();
-    int64_t systemCycleBefore = AscendC::GetSystemCycle();
-    do {
-      if (current >= needed) {
-        break;
-      }
-      int64_t systemCycleAfter = AscendC::GetSystemCycle();
-      int64_t GetBlockNumCycle = systemCycleAfter - systemCycleBefore;
-      int64_t CycleToTimeBase = EVENT_REFRESH_TIME_UNIT_CYCLES;
-      int64_t GetBlockNumTime = GetBlockNumCycle / CycleToTimeBase;
-      if (GetBlockNumTime > VECTOR_EVENT_REFRESH_INTERVAL_UNITS) {
+    int64_t previous_cycle = AscendC::GetSystemCycle();
+    while (current < needed) {
+      int64_t elapsed_cycles = AscendC::GetSystemCycle() - previous_cycle;
+      if (elapsed_cycles / EVENT_REFRESH_TIME_UNIT_CYCLES > poll_interval_us) {
         DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
           all_event_counters[event_index]);
         current = all_event_counters.GetValue(event_index);
-        systemCycleBefore = AscendC::GetSystemCycle();
+        previous_cycle = AscendC::GetSystemCycle();
       }
-    } while (1);
-#endif
+    }
   }
 
   __aicore__ inline void TriggerEvent(uint32_t event_index) { AtomicAddForAllEventCounters(event_index); }
 
+  bool pull_protocol_ = false;
   uint32_t worker_id_ = 0;
+  uint32_t grouped_matmul_group_list_offset_ = 0;
   uint32_t task_num = 0;
   uint32_t runtime_task_capacity = 0;
   uint32_t runtime_event_capacity = 0;
@@ -371,4 +411,4 @@ class KernelWorkerBase {
 
 }  // namespace MulticoreRuntime
 
-#endif  // MULTICORE_SCHEDULER_WORKER_KERNEL_H
+#endif  // HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_WORKER_KERNEL_H_

@@ -81,4 +81,10 @@ __aicore__ inline void put_signal(__gm__ void *remote_dst, __gm__ const void *lo
   signal(remote_signal, signal_value, signal_op, target_pe);
 }
 
+/** @brief Complete a double-buffered MTE GET with bursts capped at four KiB. */
+template <typename T>
+__aicore__ inline void get_pipelined(GM_ADDR destination, GM_ADDR source, int64_t elements, int source_pe) {
+  cann::device::get_pipelined<T>(destination, source, elements, source_pe);
+}
+
 }  // namespace hyper_parallel::multicore::shmem::data_plane

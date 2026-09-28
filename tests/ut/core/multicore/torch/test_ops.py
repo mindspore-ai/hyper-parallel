@@ -16,6 +16,7 @@
 """Unit tests for native Torch adapter registration diagnostics."""
 
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -29,6 +30,15 @@ class TestTorchOps(unittest.TestCase):
     def tearDown(self) -> None:
         """Never retain a mocked native-registration cache between tests."""
         ops._load_native.cache_clear()
+
+    @staticmethod
+    def _backward_op(alias: str = "a") -> SimpleNamespace:
+        """Build a real schema for the mutable receive and expert input-gradient slots."""
+        middle = ", ".join(f"Tensor input_{index}" for index in range(1, 12))
+        schema = ops.torch._C.parse_schema(
+            f"mega_moe_grad(Tensor(a!) dispatch, {middle}, Tensor({alias}!) gate_dx) -> ()"
+        )
+        return SimpleNamespace(default=SimpleNamespace(_schema=schema))
 
     def test_adapter_failure_reports_original_cause(self):
         """Preserve the failed library and ABI error in the native diagnostic."""
@@ -46,8 +56,17 @@ class TestTorchOps(unittest.TestCase):
             patch.object(ops, "get_multicore_paths", return_value=(Path("vendor"), Path("good.so"))),
             patch.object(ops, "preload_vendor_library") as preload,
             patch.object(ops.torch.ops, "load_library") as load,
+            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_transport_version",
+                         return_value=1, create=True) as version,
+            patch.object(ops.torch.ops.hyper_parallel, "mega_moe_grad", self._backward_op(), create=True) as backward,
         ):
             ops._load_native()
             ops._load_native()
-        preload.assert_called_once_with(Path("vendor"))
-        load.assert_called_once_with("good.so")
+            preload.assert_called_once_with(Path("vendor"))
+            load.assert_called_once_with("good.so")
+            for protocol, alias, message in ((0, "a", "transport ABI"), (1, "e", "storage reuse")):
+                ops._load_native.cache_clear()
+                version.return_value = protocol
+                backward.default._schema = self._backward_op(alias).default._schema
+                with self.assertRaisesRegex(NativeComponentUnavailableError, message):
+                    ops._load_native()

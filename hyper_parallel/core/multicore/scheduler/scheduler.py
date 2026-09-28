@@ -18,53 +18,41 @@ Task-queue reordering passes applied after the main fill loop.
 revise_task_queue          — RATR: rank-aware tile reorder for dispatch/combine.
 revise_gmm_task_queue_bwd  — Backward GMM1/GMM4 expert interleave in cube_task_indices.
 """
-from hyper_parallel.core.multicore.scheduler.config import RuntimeConfigC
+from __future__ import annotations
+
+from hyper_parallel.core.multicore.scheduler.config import RuntimeConfigC, TaskSplitValue
 
 
-def revise_task_queue(cfg: RuntimeConfigC, tsv,
-                      dispatch_task_num: int, swiglu_task_num: int) -> None:
+def revise_task_queue(cfg: RuntimeConfigC, tsv: TaskSplitValue,
+                      dispatch_task_num: int, swiglu_task_num: int, combine_task_num: int | None = None) -> None:
     """
     Reorder vector_task_indices for dispatch and combine based on rank_id (RATR).
 
-    dispatch_task_num: task_num of the dispatch (A1) operator.
-    swiglu_task_num:   task_num of the swiglu / swiglu_grad operator.
+    Args:
+        cfg: Runtime whose vector queue is reordered in place.
+        tsv: Expert topology and local rank.
+        dispatch_task_num: Number of dispatch tasks.
+        swiglu_task_num: Number of intervening SwiGLU or SwiGLU-grad tasks.
+        combine_task_num: Number of combine tasks, possibly using a different split.
     """
     temp = list(cfg.vector_task_indices)
-
-    single_rank_expert_num = tsv.single_rank_expert_num
-    single_expert_task_num = dispatch_task_num // tsv.all_expert_num
-    ep                     = tsv.ep
-    rank_id                = tsv.rank_id
-    single_rank_task_num   = dispatch_task_num // tsv.ep
-
-    ep_rank = [(i + rank_id) % ep for i in range(ep)]
-
-    # ── dispatch segment ─────────────────────────────────────────────────────
-    start = 0
-    index = 0
-    for j in range(single_rank_expert_num):
-        j_v = j * single_expert_task_num
-        for k in range(single_expert_task_num):
-            k_v = j_v + k
-            for i in ep_rank:
-                i_v = k_v + i * single_rank_task_num
-                cfg.vector_task_indices[start + index] = temp[start + i_v]
-                index += 1
-
-    # ── combine segment ──────────────────────────────────────────────────────
-    start = dispatch_task_num + swiglu_task_num
-    index = 0
-    for j in range(single_rank_expert_num):
-        j_v = j * single_expert_task_num
-        for k in range(single_expert_task_num):
-            k_v = j_v + k
-            for i in ep_rank:
-                i_v = k_v + i * single_rank_task_num
-                cfg.vector_task_indices[start + index] = temp[start + i_v]
-                index += 1
+    ep_rank = [(peer + tsv.rank_id) % tsv.ep for peer in range(tsv.ep)]
+    if combine_task_num is None:
+        combine_task_num = dispatch_task_num
+    segments = ((0, dispatch_task_num), (dispatch_task_num + swiglu_task_num, combine_task_num))
+    for start, task_count in segments:
+        tasks_per_expert = task_count // tsv.all_expert_num
+        tasks_per_peer = task_count // tsv.ep
+        index = 0
+        for expert in range(tsv.single_rank_expert_num):
+            for tile in range(tasks_per_expert):
+                for peer in ep_rank:
+                    source = peer * tasks_per_peer + expert * tasks_per_expert + tile
+                    cfg.vector_task_indices[start + index] = temp[start + source]
+                    index += 1
 
 
-def revise_gmm_task_queue_bwd(cfg: RuntimeConfigC, tsv,
+def revise_gmm_task_queue_bwd(cfg: RuntimeConfigC, tsv: TaskSplitValue,
                                act_grad_task_num: int,
                                num_cube_cores: int = 24) -> None:
     """
@@ -72,6 +60,12 @@ def revise_gmm_task_queue_bwd(cfg: RuntimeConfigC, tsv,
 
     Result pattern: [w2_grad exp0, act_grad exp0, w2_grad exp1, act_grad exp1, ...]
     act_grad start offset = 0; w2_grad start offset = act_grad_task_num.
+
+    Args:
+        cfg: Runtime image with the original Cube queue.
+        tsv: Expert topology.
+        act_grad_task_num: Offset at which weight-gradient tasks begin.
+        num_cube_cores: Number of participating Cube workers.
     """
     temp          = list(cfg.cube_task_indices)
     expert_single = tsv.single_rank_expert_num

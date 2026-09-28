@@ -181,10 +181,18 @@ def _run_acceptance_worker(
     card_mark="allcards",
     essential_mark="unessential",
 )
-def test_mega_moe_local_capacity_lifetime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Preserve all gradients across odd receive tails and two outstanding routes."""
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_mega_moe_local_capacity_lifetime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str,
+) -> None:
+    """Feature: Transport storage lifetime.
+    Description: Run retained backward and profiling through the shared memory worker in both modes.
+    Expectation: Outputs and all gradients agree across hotspots, tails and receive-buffer reuse.
+    """
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
     _run_acceptance_worker(
         monkeypatch, tmp_path, "test_mega_moe_local_capacity_lifetime", 2, "_test_mega_moe_memory.py",
+        heap_bytes=(34 if dispatch_mode == "pull" else 64) * 1024**2,
     )
 
 
@@ -207,8 +215,15 @@ def test_mega_moe_poisoned_buffers(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     card_mark="allcards",
     essential_mark="unessential",
 )
-def test_mega_moe_device_ready_lifecycle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Validate peer readiness under checkpoint replay, rank skew and stream reuse."""
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_mega_moe_device_ready_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str,
+) -> None:
+    """Feature: Device-owned ready generations.
+    Description: Reuse lifecycle scenarios for push and pull through the same worker.
+    Expectation: Replay, streams and capacity-error recovery preserve outputs and gradients.
+    """
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
     _run_acceptance_worker(
         monkeypatch, tmp_path, "test_mega_moe_device_ready_lifecycle", 2, "_test_mega_moe_ready.py",
     )
@@ -270,12 +285,58 @@ def test_mega_moe_large_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     card_mark="allcards",
     essential_mark="unessential",
 )
-def test_mega_moe_group_list_isolation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Feature: Isolated grouped-matmul scratch for up to 16 experts per rank.
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_mega_moe_group_list_isolation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str,
+) -> None:
+    """Feature: Graph-sized grouped-matmul scratch beyond 16 experts per rank.
 
-    Description: Repeat balanced, empty-expert, skew and single-destination routes with 10 to 16 local experts.
+    Description: Repeat balanced, empty-expert, skew and single-destination routes with 10 to 128 local experts.
     Expectation: Forward, all gradients and SGD updates match common MoE over eight steps per shape.
     """
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
+    evidence_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path))) / dispatch_mode
+    monkeypatch.setenv("HP_MEGA_MOE_EVIDENCE_DIR", str(evidence_dir))
     _run_acceptance_worker(
         monkeypatch, tmp_path, "test_mega_moe_group_list_isolation", 2, "_test_mega_moe_runtime.py",
+        heap_bytes=128 * 1024 * 1024,
     )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards",
+          essential_mark="essential")
+@pytest.mark.parametrize("task_queue", ["1", "2"])
+def test_mega_moe_native_permutation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task_queue: str) -> None:
+    """Feature: Native permutation bridges in both task queues.
+
+    Description: Compare caller-owned permutation and both gradient operations on two ranks.
+    Expectation: Exact outputs, stable buffer addresses and valid asynchronous lifetimes.
+    """
+    monkeypatch.setenv("TASK_QUEUE_ENABLE", task_queue)
+    monkeypatch.setenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path / task_queue))
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_native_permutation", 2, "_test_mega_moe.py")
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="unessential")
+def test_mega_moe_subgroups(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Feature: Noncontiguous EP subgroups.
+
+    Description: Run two independent groups with external weights in push and pull modes.
+    Expectation: Outputs and all gradients match an unsharded reference.
+    """
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_subgroups", 4, "_test_mega_moe_runtime.py")
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential",
+)
+@pytest.mark.parametrize("variant", ["single", "shared", "mixed", "checkpoint"])
+def test_mega_moe_heap_growth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, variant: str) -> None:
+    """Feature: Collective push heap growth.
+    Description: Rebuild after one forward while keeping both autograd graphs live.
+    Expectation: Repeated reverse backwards match common EP and the old heap is invalidated.
+    """
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
+    monkeypatch.setenv("HP_MEGA_MOE_GROWTH_CASE", variant)
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_heap_growth", 2, "_test_mega_moe_memory.py")

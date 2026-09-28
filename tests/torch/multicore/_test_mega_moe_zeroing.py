@@ -97,7 +97,7 @@ def test_mega_moe_poisoned_buffers() -> None:
     results = []
     for factor in (None, 1.5):
         start_shmem_lifetime()
-        mega, common = baseline.new_layers(shape, expert_capacity_factor=factor)
+        mega, common = baseline.new_layers(shape, initial_capacity_factor=factor)
         patterns = ["balanced", "tail", "empty_experts", "balanced"]
         if factor is None:
             patterns.extend(["destination0", "destination1", "tail"])

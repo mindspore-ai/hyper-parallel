@@ -16,6 +16,8 @@
 
 from dataclasses import asdict
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -40,6 +42,7 @@ def _new_stack(shape: baseline.MoeShape, layers: int = 3) -> list[MegaMoeExperts
             top_k=shape.top_k,
             ep_size=shape.ep_size,
             ep_group=dist.group.WORLD,
+            dispatch_mode=os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push"),
         ).to(device=baseline.DEVICE, dtype=torch.bfloat16)
         for _ in range(layers)
     ]

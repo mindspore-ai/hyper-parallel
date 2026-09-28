@@ -31,11 +31,12 @@ Forward and backward ACLNN symbols are packaged in one component-owned
 ``hyper_parallel_multicore_nn`` vendor. Source the packaged ``set_env.bash``
 before starting the application or framework Python process so CANN can discover that vendor.
 """
-__all__ = ["mega_moe", "mega_moe_grad"]
+__all__ = ["mega_moe", "mega_moe_grad", "moe_token_permute_grad", "moe_token_permute_out"]
 
 from functools import lru_cache
+
 import torch
-import torch_npu  # pylint: disable=unused-import  # Registers native NPU operators.
+import torch_npu  # noqa: F401  # pylint: disable=unused-import  # Registers native NPU operators.
 
 from hyper_parallel.core.multicore._loader import (
     NativeComponentUnavailableError,
@@ -51,7 +52,14 @@ def _load_native() -> None:
     preload_vendor_library(vendor_root)
     try:
         torch.ops.load_library(str(adapter_path))
-    except (OSError, RuntimeError) as error:
+        if torch.ops.hyper_parallel.mega_moe_transport_version() != 1:
+            raise RuntimeError("adapter transport ABI mismatch; rebuild the Torch adapter")
+        schema = torch.ops.hyper_parallel.mega_moe_grad.default._schema
+        dispatch_alias = schema.arguments[0].alias_info.before_set
+        input_grad_alias = schema.arguments[12].alias_info.before_set
+        if not dispatch_alias or dispatch_alias != input_grad_alias:
+            raise RuntimeError("adapter does not declare backward dispatch storage reuse; rebuild the Torch adapter")
+    except (AttributeError, OSError, RuntimeError) as error:
         raise NativeComponentUnavailableError(
             "[HP-NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED] component=multicore framework=torch "
             f"library={adapter_path} error={error}. "
@@ -64,6 +72,48 @@ def _load_native() -> None:
 
 # Python wrappers — thin pass-through to the registered C++ ops
 # ---------------------------------------------------------------------------
+
+
+def moe_token_permute_out(
+    tokens: torch.Tensor,
+    indices: torch.Tensor,
+    output: torch.Tensor,
+    mapping: torch.Tensor,
+) -> None:
+    """Permute all routed rows directly into caller-owned contiguous storage.
+
+    Args:
+        tokens: Contiguous token states shaped ``[tokens, hidden]``.
+        indices: Contiguous INT32/INT64 expert IDs shaped ``[tokens, top_k]``.
+        output: Output shaped ``[tokens * top_k, hidden]``, matching token dtype.
+        mapping: Independent INT32 inverse mapping shaped ``[tokens * top_k]``.
+    """
+    _load_native()
+    torch.ops.hyper_parallel.moe_token_permute_out(tokens, indices, output, mapping)
+
+
+def mega_moe_unpermute_grad_out(
+    permuted_tokens: torch.Tensor,
+    grad_output: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    probs: torch.Tensor,
+    grad_permuted: torch.Tensor,
+    grad_probs: torch.Tensor,
+) -> None:
+    """Write routing gradients into owned outputs inside a workspace lease.
+
+    Args:
+        permuted_tokens: Independently saved expert-major forward outputs.
+        grad_output: Token-major output gradients.
+        sorted_indices: Flat INT32 inverse mapping from input permutation.
+        probs: Contiguous FP32 top-k probabilities saved by forward.
+        grad_permuted: Contiguous symmetric source receiving expert-major dY.
+        grad_probs: Independent FP32 output matching the probabilities.
+    """
+    _load_native()
+    torch.ops.hyper_parallel.mega_moe_unpermute_grad_out(
+        permuted_tokens, grad_output, sorted_indices, probs, grad_permuted, grad_probs,
+    )
 
 
 def mega_moe(
@@ -432,4 +482,27 @@ def mega_moe_grad_with_profile_buffer(
         expert_num,
         hidden_size,
         seq_size,
+    )
+
+
+def moe_token_permute_grad(
+    grad_permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Reduce dropless permuted gradients without retaining original token values.
+
+    Args:
+        grad_permuted_tokens: Expert-major gradients with shape [T * K, H].
+        sorted_indices: Int32 inverse mapping returned by token permutation.
+        num_tokens: Original token count T.
+        top_k: Number of routes K per token.
+
+    Returns:
+        Owned [T, H] gradients with the input gradient's dtype and device.
+    """
+    _load_native()
+    return torch.ops.hyper_parallel.moe_token_permute_grad(
+        grad_permuted_tokens, sorted_indices, num_tokens, top_k
     )

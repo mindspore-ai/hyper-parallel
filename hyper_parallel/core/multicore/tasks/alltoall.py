@@ -18,8 +18,9 @@ from enum import Enum
 
 from hyper_parallel.core.multicore.scheduler.config import (
     TaskDescC, TensorDescC, RuntimeConfigC,
-    TaskAiCoreType, TaskType,
+    TaskAiCoreType, TaskType, TaskSplitValue,
 )
+from hyper_parallel.core.multicore.scheduler.graph import OperatorNode
 from hyper_parallel.core.multicore.tasks.task_base import FillConfig
 from hyper_parallel.core.multicore.tasks.utils import (
     advance_tsv_vector, advance_tsv_vector_only,
@@ -30,9 +31,9 @@ class AllToAllType(Enum):
     """
     MoE AllToAll semantic type — determines event wiring.
 
-    DISPATCH — scatter tokens from model-parallel ranks to expert-holding ranks.
+    DISPATCH — transfer source tokens into expert storage via configured PUT or GET.
         dependent_event = pre_pre_event_num + 0
-        trigger_event   = pre_event_num + (i // per_g_e_num) + 1
+        trigger_event   = pre_event_num + global_expert + 1
         trigger_count   = task_num * ep // all_expert_num
 
     COMBINE — gather expert results back to the originating rank.
@@ -71,14 +72,25 @@ class AllToAllFillConfig(FillConfig):
     advance:     str          = "vector"   # "vector" | "vector_only"
     event_group: int          = 1          # only used when advance="vector"
 
-    def fill(self, cfg: RuntimeConfigC, op, tsv) -> None:
+    def fill(self, cfg: RuntimeConfigC, op: OperatorNode, tsv: TaskSplitValue) -> None:
+        """Emit configured dispatch and PUT combine tasks with completion events.
+
+        Args:
+            cfg: Runtime receiving task descriptors and event thresholds.
+            op: Communication node with fixed tensor argument positions.
+            tsv: Topology and running graph offsets.
+        """
         task_num    = op.task_num
         per_g_e_num = task_num // tsv.all_expert_num
         param       = op.param_positions
 
         for i in range(task_num):
             task = TaskDescC()
-            task.task_type        = TaskType.TASK_SHMEM_PUT_MEM_SIGNAL
+            task.task_type = (
+                TaskType.TASK_SHMEM_GET_MEM
+                if self.moe_type == AllToAllType.DISPATCH and tsv.dispatch_mode == "pull"
+                else TaskType.TASK_SHMEM_PUT_MEM_SIGNAL
+            )
             task.task_aicore_type = TaskAiCoreType.TASK_AICORE_CUBE
             task.num_inputs       = len(op.inputs)
             task.num_outputs      = len(op.outputs)
@@ -108,7 +120,8 @@ class AllToAllFillConfig(FillConfig):
             task.outputs[0] = out
 
             if self.moe_type == AllToAllType.DISPATCH:
-                res = i // per_g_e_num
+                res = (tsv.rank_id * tsv.single_rank_expert_num + (i // per_g_e_num) % tsv.single_rank_expert_num
+                       if tsv.dispatch_mode == "pull" else i // per_g_e_num)
                 task.dependent_event = tsv.pre_pre_event_num + 0
                 task.trigger_event   = tsv.pre_event_num + res + 1
                 cfg.all_event_num_triggers[task.trigger_event] = (

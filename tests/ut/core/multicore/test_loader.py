@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for unified multicore payload lookup and OPP diagnostics."""
 
+import ctypes
 import os
 import shutil
 import tempfile
@@ -24,7 +25,6 @@ from unittest.mock import patch
 
 from hyper_parallel.core.multicore import _loader
 from hyper_parallel.core.multicore._loader import NativeComponentUnavailableError
-
 
 class TestMulticoreNative(unittest.TestCase):
     """Verify component-owned OPP environment and payload lookup."""
@@ -48,6 +48,21 @@ class TestMulticoreNative(unittest.TestCase):
         adapter.write_bytes(b"adapter")
         self.shmem_root = self.native_root.parent / "shmem" / "lib"
         (self.shmem_root / "shmem").mkdir(parents=True)
+
+    def test_vendor_preload_keeps_dependency_symbols_local(self) -> None:
+        """Load the exact vendor locally and preserve the cause of any load failure."""
+        library = self.vendor_root / "op_api" / "lib" / "libcust_opapi.so"
+        error = OSError("missing dependency")
+        for failure in (None, error):
+            with patch.object(_loader.ctypes, "CDLL", side_effect=failure) as load:
+                if failure is None:
+                    _loader.preload_vendor_library(self.vendor_root)
+                else:
+                    with self.assertRaisesRegex(NativeComponentUnavailableError, "missing dependency") as raised:
+                        _loader.preload_vendor_library(self.vendor_root)
+                    self.assertIs(raised.exception.__cause__, error)
+                    self.assertIn(str(library), str(raised.exception))
+                load.assert_called_once_with(str(library), mode=ctypes.RTLD_LOCAL)
 
     def test_component_paths_accept_sourced_environment_without_modifying_it(self):
         """Lookup accepts the sourced vendor paths without changing the process environment."""
