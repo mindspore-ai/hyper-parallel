@@ -56,12 +56,21 @@ _TEXT_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "moe_intermediate_size": ("moe_intermediate_size",),
     "shared_expert_intermediate_size": ("shared_expert_intermediate_size",),
     "first_k_dense_replace": ("first_k_dense_replace",),
-    "mtp_depth": ("mtp_depth", "num_nextn_predict_layers"),
+    "mtp_depth": ("mtp_depth", "num_nextn_predict_layers", "mtp_num_hidden_layers"),
     "multiple_of": ("multiple_of",),
     "ffn_dim_multiplier": ("ffn_dim_multiplier",),
     "kv_lora_rank": ("kv_lora_rank",),
     "q_lora_rank": ("q_lora_rank",),
     "qk_rope_head_dim": ("qk_rope_head_dim",),
+    "attn_output_gate": ("attn_output_gate",),
+    # A hybrid stack states its layers; without this every layer is costed
+    # as full attention, which is quadratic in the sequence length.
+    "layer_types": ("layer_types",),
+    "linear_num_key_heads": ("linear_num_key_heads",),
+    "linear_key_head_dim": ("linear_key_head_dim",),
+    "linear_num_value_heads": ("linear_num_value_heads",),
+    "linear_value_head_dim": ("linear_value_head_dim",),
+    "linear_conv_kernel_dim": ("linear_conv_kernel_dim",),
 }
 
 # Vision towers use their own spelling for the shared concepts.
@@ -80,6 +89,25 @@ _VISION_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
 _DEFAULT_VISUAL_SEQ_LEN = 1024
 
 
+def _declares_pretrained_path(mapping: Any) -> bool:
+    """Return whether the ``model`` section names a Transformers checkpoint.
+
+    This is the one key only this schema has: the older HyperParallel yamls
+    name a checkpoint as ``model.weights_path``. Recognising it means a
+    config needs no empty ``training``/``accelerator``/``fsdp_config``
+    section just to be identified.
+    """
+    if isinstance(mapping, Mapping):
+        model = mapping.get("model")
+    else:
+        model = getattr(mapping, "model", None)
+    if model is None:
+        return False
+    if isinstance(model, Mapping):
+        return bool(model.get("pretrained_model_name_or_path"))
+    return bool(getattr(model, "pretrained_model_name_or_path", None))
+
+
 def is_auto_models_schema(mapping: Any) -> bool:
     """Return whether *mapping* looks like an AutoModels Trainer config.
 
@@ -87,6 +115,8 @@ def is_auto_models_schema(mapping: Any) -> bool:
     attributes, so the SAPP-ND ``Config`` tree and a parsed YAML dict can be
     tested with the same call.
     """
+    if _declares_pretrained_path(mapping):
+        return True
     if isinstance(mapping, Mapping):
         return any(name in mapping for name in _AUTO_MODELS_SECTIONS)
     holder = getattr(mapping, "__dict__", None)
@@ -137,6 +167,21 @@ def _derive_shared_experts(spec: Dict[str, Any]) -> None:
     shared_inter = int(spec.get("shared_expert_intermediate_size", 0) or 0)
     if moe_inter and shared_inter:
         spec["num_shared_experts"] = max(1, shared_inter // moe_inter)
+
+
+def _derive_dense_ffn_width(spec: Dict[str, Any]) -> None:
+    """Fill the dense feed-forward width for an all-MoE config.
+
+    A model whose every layer is MoE (Qwen3.5-MoE) declares no
+    ``intermediate_size``, but the cost model prices the shared expert at
+    that width, so leaving it absent drops the shared expert entirely.
+    The shared expert's own width is the value meant there.
+    """
+    if spec.get("intermediate_size"):
+        return
+    width = spec.get("shared_expert_intermediate_size") or spec.get("moe_intermediate_size")
+    if width:
+        spec["intermediate_size"] = int(width)
 
 
 def _visual_seq_len(vision_spec: Dict[str, Any], override: Optional[int]) -> int:
@@ -251,6 +296,7 @@ def resolve_hf_model_spec(
 
     spec = _spec_from_aliases(_text_tower(model_config), _TEXT_FIELD_ALIASES)
     _derive_shared_experts(spec)
+    _derive_dense_ffn_width(spec)
     spec["name"] = str(getattr(model_config, "model_type", None) or model_path)
 
     vision_config = getattr(model_config, "vision_config", None)

@@ -54,10 +54,19 @@ class EvalAttn:
     def num_params_attn(ccfg: CostModelConfig, ctx: Context) -> float:
         """Parameters count for Multi-Head/Grouped-Q./Multi-Q. Attention"""
         if ccfg.dc_kv == 0:
-            # Q,O and K,V have distinct shapes
-            return 0.5 * ccfg.n_attMM * (
-                ccfg.h * ccfg.h + ccfg.h
-            ) + 0.5 * ccfg.n_attMM * (ccfg.h * ccfg.n_kv * ccfg.dh + ccfg.h)
+            # Q,O and K,V have distinct shapes. Q and O are h x (a*dh),
+            # which equals h x h only when head_dim = h/a; a fused output
+            # gate (Qwen3.5) doubles the Q projection.
+            d_h = ccfg.dh or (ccfg.h / ccfg.a if ccfg.a else 0)
+            d_q = ccfg.a * d_h
+            q_fact = 2 if ccfg.attn_output_gate else 1
+            return 0.25 * ccfg.n_attMM * (
+                q_fact * ccfg.h * d_q + ccfg.h
+            ) + 0.25 * ccfg.n_attMM * (
+                ccfg.h * d_q + ccfg.h
+            ) + 0.5 * ccfg.n_attMM * (
+                ccfg.h * ccfg.n_kv * d_h + ccfg.h
+            ) + ccfg.attn_extra_p
         return EvalAttn.num_params_mla(ccfg, ctx)
 
     @staticmethod

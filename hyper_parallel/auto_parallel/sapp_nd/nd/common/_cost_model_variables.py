@@ -79,6 +79,21 @@ class _CostModVar:
     dc_q: float = 0
     dhr: float = 0
     k_1st_dense: float = 0
+    # Attention flavour of a layer group, and the extra parameters a flavour
+    # carries that the q/k/v/o formula does not describe (conv, gates).
+    attn_kind: str = "full"
+    attn_extra_p: float = 0
+    lin_n_k: float = 0
+    lin_d_k: float = 0
+    lin_n_v: float = 0
+    lin_d_v: float = 0
+    lin_conv: float = 0
+    # Recurrent-state update and readout, the linear-attention op the
+    # arch hooks have no counterpart for. Zero for every other flavour.
+    n_linrec: float = 0
+    # The attention fields a linear group displaced, kept so a later full
+    # group can put them back when hooks run in place, layer after layer.
+    full_attn: dict = None
     n_mtp: float = 0
     is_mtp_in_offset: bool = True
     multiple_of: float = 0
@@ -140,6 +155,7 @@ class _CostModVar:
     has_grad_shard: bool = False
     freeze: bool = False
     has_fa: bool = False
+    attn_output_gate: bool = False
     # vp_less_mem: bool = False
     has_clip: bool = False
     gmm: bool = False
