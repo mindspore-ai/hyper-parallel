@@ -37,6 +37,12 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
     revert_weight_conversion,
 )
 
+# PEP 604 unions (``str | Path``, ``DCPBackend | None``, ``list[A | B] | None``) are valid on
+# this interpreter, but the checker evaluates them and reports a false
+# ``unsupported-binary-operation`` at every site -- 10 of them, all present on the base
+# revision this file was branched from.
+# pylint: disable=unsupported-binary-operation
+
 from hyper_parallel import DTensor, Partial, distribute_tensor
 
 logger = logging.getLogger(__name__)
@@ -1094,5 +1100,26 @@ def load_pretrained_weights(
     *,
     strict: bool = True,
 ) -> LoadReport:
-    """Backward-compatible functional wrapper around CheckpointManager."""
-    return CheckpointManager(model).load_checkpoint(pretrained_path, strict=strict)
+    """Load Hugging Face pretrained weights into an already-finalized model.
+
+    The model build path (``apply_model_infrastructure``) stages the checkpoint and
+    finalizes it internally; this wrapper is for callers that own a finalized model
+    -- for example a demo builder that constructs with ``from_config`` for a random
+    init and then wants the real weights instead.  Staging alone is not enough:
+    :func:`_finalize_model_loading` performs the deferred copy and marks the loaded
+    tensors initialized, so both steps belong here.
+
+    Args:
+        model: Finalized (sharded and materialized) model to load into.
+        pretrained_path: Local Hugging Face checkpoint directory or file.
+        strict: Raise when an owned model tensor is left unloaded; a partial load
+            is a silently half-random model, so this defaults to ``True``.
+
+    Returns:
+        The load report, after finalization.
+
+    Raises:
+        RuntimeError: If ``strict`` is set and owned tensors are missing.
+    """
+    report = CheckpointManager(model).load_checkpoint(pretrained_path, strict=False)
+    return _finalize_model_loading(model, report, strict=strict)
