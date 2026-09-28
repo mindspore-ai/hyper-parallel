@@ -36,7 +36,10 @@ from hyper_parallel.trainer.config.data import (
     DatasetConfig,
     ModelAssetsConfig,
 )
-from hyper_parallel.trainer.config.optimization import OptimizerConfig
+from hyper_parallel.trainer.config.optimization import (
+    OptimizerConfig,
+    OptimizerSwapConfig,
+)
 from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 
@@ -515,15 +518,6 @@ def _resolve_dataclass(node: object, config_type: type, *, path: str) -> object:
         raise ConfigResolutionError(path, f"could not construct {config_type.__name__}: {exc}") from exc
 
 
-def _target_hints(target: object, *, path: str) -> dict[str, object]:
-    """Resolve annotations for a target function or class constructor."""
-    hint_source = target.__init__ if inspect.isclass(target) else target
-    try:
-        return get_type_hints(hint_source)
-    except (NameError, TypeError) as exc:
-        raise ConfigResolutionError(path, f"could not resolve target type annotations: {exc}") from exc
-
-
 def _resolve_nested_target_nodes(value: object, *, path: str) -> object:
     """Resolve reserved ``_target_`` nodes inside a target argument tree."""
     if isinstance(value, Mapping):
@@ -723,7 +717,7 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
 
 
 def _resolve_optimizer_config(node: object, *, path: str) -> OptimizerConfig:
-    """Resolve an ``OptimizerConfig`` with its FP32 main-parameter policy."""
+    """Resolve an optimizer target with its precision and swap policies."""
     if not isinstance(node, Mapping):
         raise ConfigResolutionError(path, "Optimizer configuration must be a YAML mapping")
 
@@ -733,9 +727,15 @@ def _resolve_optimizer_config(node: object, *, path: str) -> OptimizerConfig:
         bool,
         path=f"{path}.fp32_main_params",
     )
+    swap = normalize_value(
+        target_node.pop("swap", {}),
+        OptimizerSwapConfig,
+        path=f"{path}.swap",
+    )
     return OptimizerConfig(
         target=_resolve_target(target_node, path=path),
         fp32_main_params=fp32_main_params,
+        swap=swap,
     )
 
 

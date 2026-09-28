@@ -229,6 +229,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 "MixedPrecisionConfig",
                 "ModelIntegrationConfig",
                 "OptimizerConfig",
+                "OptimizerSwapConfig",
                 "ProfilingConfig",
                 "Target",
                 "TrainerConfig",
@@ -247,7 +248,7 @@ class TestOptimizerContracts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_wrapper_signatures(self):
         """AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged."""
-        import hyper_parallel.components.optim as optim
+        from hyper_parallel.components import optim
 
         self.assertEqual(
             str(inspect.signature(optim.AdamW.__init__)),
@@ -281,7 +282,7 @@ class TestOptimizerContracts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_module_all(self):
         """optim package and mixed_precision_optimizer ``__all__`` stay unchanged."""
-        import hyper_parallel.components.optim as optim
+        from hyper_parallel.components import optim
         from hyper_parallel.components.optim import mixed_precision_optimizer
 
         self.assertEqual(
