@@ -430,7 +430,9 @@ class TokenizerTemplate(ChatTemplate):
         """Encode messages with the tokenizer chat template and mask non-assistant loss.
 
         Each message is appended incrementally so token boundaries follow the
-        tokenizer's own prefix-stable rendering.
+        tokenizer's own prefix-stable rendering. Leading system messages are
+        first rendered together with the following non-system message because
+        some native templates reject a system-only conversation prefix.
 
         Args:
             messages: Conversation records with ``role``, ``content``, and optional ``loss_mask``.
@@ -441,14 +443,30 @@ class TokenizerTemplate(ChatTemplate):
             Model inputs with input_ids, attention_mask, and labels.
 
         Raises:
-            ValueError: If the template rewrites or shortens an earlier conversation prefix.
+            ValueError: If the template rewrites or shortens an earlier conversation prefix, or if leading
+                system messages cannot be grouped without changing the configured loss mask.
         """
         self._log_first_template(messages, tools)
         input_ids: List[int] = []
         labels: List[int] = []
         previous_length = 0
 
+        has_pending_system_messages = False
         for end, message in enumerate(messages, start=1):
+            loss_mask = message.get("loss_mask", 1 if message["role"] == "assistant" else 0)
+            if previous_length == 0 and message["role"] == "system":
+                if loss_mask == 1:
+                    raise ValueError(
+                        "A leading system message with loss enabled cannot be grouped with the first user message."
+                    )
+                has_pending_system_messages = True
+                continue
+            if has_pending_system_messages and previous_length == 0 and loss_mask == 1:
+                raise ValueError(
+                    "The first message after leading system messages must have loss disabled so their token "
+                    "boundaries can be grouped safely."
+                )
+
             encoded = self._apply_chat_template(
                 messages[:end],
                 tokenize=True,
@@ -464,11 +482,13 @@ class TokenizerTemplate(ChatTemplate):
                 )
 
             self._update_prefix_labels(input_ids, current_ids, labels)
-            loss_mask = message.get("loss_mask", 1 if message["role"] == "assistant" else 0)
             new_ids = current_ids[previous_length:]
             labels.extend(new_ids if loss_mask == 1 else [IGNORE_INDEX] * len(new_ids))
             input_ids = current_ids
             previous_length = current_length
+
+        if has_pending_system_messages and previous_length == 0:
+            raise ValueError("A conversation containing only system messages cannot be rendered for training.")
 
         input_ids = input_ids[-max_seq_len:]
         labels = labels[-max_seq_len:]

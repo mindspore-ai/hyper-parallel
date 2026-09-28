@@ -341,9 +341,57 @@ class TestChatTemplateGoldens(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_tokenizer_template_groups_leading_system_with_user(self):
+        """tokenizer: do not render a system-only prefix when deriving loss boundaries."""
+        class UserRequiredTokenizer(FakeTokenizer):
+            """Reject message prefixes that do not contain a user query."""
+
+            def __init__(self):
+                super().__init__()
+                self.rendered_prefixes = []
+
+            def apply_chat_template(
+                    self,
+                    messages: Any,
+                    tokenize: bool = True,
+                    add_generation_prompt: bool = False,
+                    return_dict: bool = True,
+                    **kwargs: Any,
+            ) -> Any:
+                """Record valid prefixes and emulate a tokenizer requiring a user message."""
+                del kwargs
+                if not any(message["role"] == "user" for message in messages):
+                    raise ValueError("No user query found in messages.")
+                self.rendered_prefixes.append(list(messages))
+                return super().apply_chat_template(
+                    messages,
+                    tokenize=tokenize,
+                    add_generation_prompt=add_generation_prompt,
+                    return_dict=return_dict,
+                )
+
+        messages = [
+            {"role": "system", "content": None, "reasoning_effort": None},
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "Answer"},
+        ]
+        tokenizer = UserRequiredTokenizer()
+        result = chat_template.build_chat_template("tokenizer", tokenizer).encode_messages(messages)
+
+        self.assertEqual([len(prefix) for prefix in tokenizer.rendered_prefixes], [2, 3])
+        user_prefix = _ids("<system>None</system><user>Question</user>")
+        assistant_segment = _ids("<assistant>Answer</assistant>")
+        self.assertEqual(result["input_ids"], user_prefix + assistant_segment)
+        self.assertEqual(result["labels"], [-100] * len(user_prefix) + assistant_segment)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_tokenizer_template_rejects_prefix_rewrite(self):
         """tokenizer: structural prefix rewrites raise ValueError."""
-        messages = [dict(message) for message in _MESSAGES]
+        messages = [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "Answer"},
+        ]
         template = chat_template.build_chat_template(
             "tokenizer", PrefixRewritingTokenizer()
         )
