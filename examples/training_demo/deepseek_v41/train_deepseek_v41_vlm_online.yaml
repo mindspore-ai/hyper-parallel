@@ -69,6 +69,9 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
+  # Optional HyperMegaMhc: change the replacement target below to
+  # hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc.DeepseekV41HyperMegaMhc.
+  # It adopts the original fn/base/scale parameters and requires TP=CP=PP=1.
   # These replacements are optimizations only: the registered architecture is
   # executable before the Trainer applies any of them.
   - match:
