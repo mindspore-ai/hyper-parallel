@@ -320,12 +320,12 @@ class TestDeepseekV41EngramScaling(unittest.TestCase):
 
         self.assertEqual(recipe.activation_checkpoint.selection.layer_count, 0)
         self.assertIsNone(recipe.activation_checkpoint.selection.layer_indices)
-        self.assertIs(  # pylint: disable=protected-access
-            recipe.dataloader._target_,
+        self.assertIs(
+            recipe.dataloader._target_,  # pylint: disable=protected-access
             TokenBatchLoader,
         )
-        self.assertIs(  # pylint: disable=protected-access
-            recipe.dataloader.collate_fn._target_,
+        self.assertIs(
+            recipe.dataloader.collate_fn._target_,  # pylint: disable=protected-access
             build_online_text_collate_fn,
         )
         text_runtime = recipe.dataloader.get_batch.runtime_input_adapter.build()
@@ -334,20 +334,20 @@ class TestDeepseekV41EngramScaling(unittest.TestCase):
         vlm_recipe = parse_training_args([
             str(recipe_path.with_name("train_deepseek_v41_vlm_online.yaml"))
         ])
-        self.assertIs(  # pylint: disable=protected-access
-            vlm_recipe.dataset.data_transform._target_,
+        self.assertIs(
+            vlm_recipe.dataset.data_transform._target_,  # pylint: disable=protected-access
             build_deepseek_v41_omni_transform,
         )
-        self.assertIs(  # pylint: disable=protected-access
-            vlm_recipe.dataloader._target_,
+        self.assertIs(
+            vlm_recipe.dataloader._target_,  # pylint: disable=protected-access
             OmniPackingLoader,
         )
-        self.assertIs(  # pylint: disable=protected-access
-            vlm_recipe.dataloader.get_batch._target_,
+        self.assertIs(
+            vlm_recipe.dataloader.get_batch._target_,  # pylint: disable=protected-access
             OmniParallelBatch,
         )
-        self.assertIs(  # pylint: disable=protected-access
-            vlm_recipe.dataloader.get_batch.runtime_input_adapter._target_,
+        self.assertIs(
+            vlm_recipe.dataloader.get_batch.runtime_input_adapter._target_,  # pylint: disable=protected-access
             DeepseekV41Runtime,
         )
         vlm_runtime = vlm_recipe.dataloader.get_batch.runtime_input_adapter.build()
@@ -456,7 +456,7 @@ class TestDeepseekV41EngramScaling(unittest.TestCase):
         """Preserve model identity across optional module replacements.
 
         Feature: DeepSeek optimization replacements.
-        Description: Compare state, outputs, and gradients before and after replacement.
+        Description: Compare reference replacement state, outputs, and gradients before and after replacement.
         Expectation: Replacement modules preserve all observable model values.
         """
         recipe_path = Path(__file__).resolve().parents[5] / (
@@ -702,8 +702,8 @@ class TestDeepseekV41EngramScaling(unittest.TestCase):
         engram_spec = plan.modules["model.layers.1.engram"]
         self.assertEqual(engram_spec._ep_size, 4)  # pylint: disable=protected-access
         self.assertIsInstance(engram_spec.local_compute_fn, Target)
-        self.assertIs(  # pylint: disable=protected-access
-            engram_spec.local_compute_fn._target_,
+        self.assertIs(
+            engram_spec.local_compute_fn._target_,  # pylint: disable=protected-access
             deepseek_v41_engram_compute_fn,
         )
         self.assertEqual(engram_spec.params["embed.weight"][EP], Shard(0))
@@ -1096,6 +1096,8 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
                 return gate_up
 
         class _TextMoe(nn.Module):
+            """Minimal text MoE exposing the production forward signature."""
+
             def __init__(self) -> None:
                 """Create the text-only MoE signature fixture."""
                 super().__init__()
@@ -1131,6 +1133,8 @@ class TestDeepseekV41ExpertParallel(unittest.TestCase):
                 return 1
 
         class _EpMesh:
+            """Single-rank EP mesh without a distributed process group."""
+
             @staticmethod
             def get_group(name: str) -> None:
                 """Return the local fixture's absent process group."""
