@@ -218,6 +218,8 @@ function validate_multicore_vendor() {
         aclnnHyperMegaMoeGetWorkspaceSize
         aclnnHyperMegaMoeGrad
         aclnnHyperMegaMoeGradGetWorkspaceSize
+        aclnnHyperMegaMhc
+        aclnnHyperMegaMhcGetWorkspaceSize
     )
 
     if [[ -n "${build_log}" ]]; then
@@ -251,7 +253,7 @@ function validate_multicore_vendor() {
 
     IFS=',' read -r -a validation_socs <<< "${soc_list}"
     for soc in "${validation_socs[@]}"; do
-        for op_name in hyper_mega_moe hyper_mega_moe_grad; do
+        for op_name in hyper_mega_moe hyper_mega_moe_grad hyper_mega_mhc hyper_mega_mhc_grad; do
             mapfile -t artifacts < <(
                 find "${vendor_root}/op_impl/ai_core/tbe/kernel/${soc}/${op_name}" \
                     -maxdepth 1 -type f -name '*.o' -print 2>/dev/null
@@ -281,7 +283,7 @@ function validate_multicore_vendor() {
         require_nonempty_artifact \
             "${vendor_root}/op_impl/ai_core/tbe/kernel/config/${soc}/binary_info_config.json" \
             "${soc} binary index"
-        for op_name in hyper_mega_moe hyper_mega_moe_grad; do
+        for op_name in hyper_mega_moe hyper_mega_moe_grad hyper_mega_mhc hyper_mega_mhc_grad; do
             require_nonempty_artifact \
                 "${vendor_root}/op_impl/ai_core/tbe/kernel/config/${soc}/${op_name}.json" \
                 "${soc} ${op_name} binary config"
@@ -358,11 +360,13 @@ check_gcc_version || fail "UNSUPPORTED_GCC" "Host GCC is outside the supported b
 
 OPS_NN_SOURCE_DIR="${NATIVE_ROOT}/deps/ops_nn/src"
 OPS_TRANSFORMER_SOURCE_DIR="${NATIVE_ROOT}/deps/ops_transformer/src"
+OPS_TRANSFORMER_MHC_SOURCE_DIR="${NATIVE_ROOT}/deps/ops_transformer_mhc/src"
 MULTICORE_VENDOR_CMAKE="${PROJECT_ROOT}/hyper_parallel/core/multicore/cmake/vendor"
 
 CURRENT_REASON_CODE="MULTICORE_DEPENDENCY_PREPARATION_FAILED"
 "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_parallel/core/multicore/_build/prepare_dependencies.py" \
     --dependency ops_nn \
+    --dependency ops_transformer_mhc \
     --dependency ops_transformer
 
 CURRENT_REASON_CODE="SHMEM_SDK_HANDOFF_FAILED"
@@ -505,6 +509,7 @@ for cann_soc in "${CANN_SOCS[@]}"; do
     "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_parallel/core/multicore/_build/assemble_multicore_source.py" \
         --ops-nn-source "${OPS_NN_SOURCE_DIR}" \
         --ops-transformer-source "${OPS_TRANSFORMER_SOURCE_DIR}" \
+        --ops-transformer-mhc-source "${OPS_TRANSFORMER_MHC_SOURCE_DIR}" \
         --work-dir "${ASSEMBLY_ROOT}"
 
     echo "INFO: building isolated ${cann_soc} vendor input from ${SOURCE_ROOT}"

@@ -29,7 +29,7 @@ from typing import Any
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _LOCK_PATH = Path(__file__).with_name("dependencies.lock.json")
 _DEFAULT_CACHE = _REPO_ROOT / "build" / "native" / "deps"
-_DEPENDENCIES = ("shmem", "ops_nn", "ops_transformer")
+_DEPENDENCIES = ("shmem", "ops_nn", "ops_transformer", "ops_transformer_mhc")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -116,10 +116,14 @@ def verify_git_dependency(
         dependency_lock["commit"],
         f"{repository_name}-{dependency_lock['version']}/",
     )
-    if archive_hash != dependency_lock["git_archive_tar_sha256"]:
+    expected_archive_hashes = {
+        dependency_lock["git_archive_tar_sha256"],
+        *dependency_lock.get("git_archive_tar_sha256_compat", []),
+    }
+    if archive_hash not in expected_archive_hashes:
         raise ValueError(
             "Dependency archive hash mismatch: "
-            f"expected={dependency_lock['git_archive_tar_sha256']}, actual={archive_hash}"
+            f"expected one of {sorted(expected_archive_hashes)}, actual={archive_hash}"
         )
     return {
         "dependency": dependency_name or repository_name.replace("-", "_"),
