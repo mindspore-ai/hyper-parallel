@@ -1,0 +1,4 @@
+npu_situ_glu:
+  dist_op_name: _npu_situ_glu_dist_op
+  distributed_op_class: NpuSituGluDistributedOp
+  distributed_op_file: parallel_situ_glu
