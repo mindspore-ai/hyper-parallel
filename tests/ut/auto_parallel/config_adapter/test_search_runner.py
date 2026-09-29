@@ -360,6 +360,82 @@ class TestPostFilter(unittest.TestCase):
         self.assertEqual(len(filtered), 1)
 
 
+class TestMemoryBudget(unittest.TestCase):
+    """Tests for _memory_budget_gb and _filter_by_memory."""
+
+    def test_tighter_of_limit_and_device(self):
+        """The user's memory_limit_gb wins when it is below the device size."""
+        config = _make_full_config()
+        self.assertEqual(sr._memory_budget_gb(config), 60.0)
+
+    def test_device_used_when_no_limit(self):
+        """An unset memory_limit_gb falls back to the device memory."""
+        config = _make_full_config()
+        config.constraint["memory_limit_gb"] = 0.0
+        self.assertEqual(sr._memory_budget_gb(config), 64.0)
+
+    def test_unconstrained_when_neither_set(self):
+        """No budget at all reports 0.0, which disables the gate."""
+        config = _make_full_config()
+        config.constraint["memory_limit_gb"] = 0.0
+        config.cluster_spec["device_memory_gb"] = 0.0
+        self.assertEqual(sr._memory_budget_gb(config), 0.0)
+
+    def test_over_budget_entries_dropped(self):
+        """Entries above the budget are removed, entries below are kept."""
+        entries = [_make_scored_entry(mem=50.0 * 1024), _make_scored_entry(mem=61.0 * 1024)]
+        kept = sr._filter_by_memory(entries, 60.0)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0][1], 50.0 * 1024)
+
+    def test_zero_budget_keeps_everything(self):
+        """A zero budget disables the gate rather than rejecting everything."""
+        entries = [_make_scored_entry(mem=99.0 * 1024)]
+        self.assertEqual(len(sr._filter_by_memory(entries, 0.0)), 1)
+
+
+class TestPostFilterMemory(unittest.TestCase):
+    """Tests for the memory gate inside _post_filter."""
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    def test_over_budget_removed(self, _):
+        """A strategy above memory_limit_gb never reaches the caller."""
+        config = _make_full_config()
+        entries = [_make_scored_entry(mem=61.0 * 1024), _make_scored_entry(mem=50.0 * 1024)]
+        filtered = sr._post_filter(entries, config)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0][1], 50.0 * 1024)
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    def test_candidate_fallback_stays_within_budget(self, _):
+        """The no-candidate-match fallback picks a fitting entry, not the first one."""
+        config = _make_full_config()
+        config.search_space["tensor_parallel_degree"] = [16, 32]
+        entries = [
+            _make_scored_entry(tp=2, mem=61.0 * 1024),
+            _make_scored_entry(tp=4, mem=50.0 * 1024),
+        ]
+        filtered = sr._post_filter(entries, config)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0][1], 50.0 * 1024)
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    def test_all_over_budget_returns_empty(self, _):
+        """Every entry over budget yields an empty list for the caller to reject."""
+        config = _make_full_config()
+        entries = [_make_scored_entry(mem=61.0 * 1024)]
+        self.assertEqual(sr._post_filter(entries, config), [])
+
+
 class TestWriteTempHpYaml(unittest.TestCase):
     """Tests for _write_temp_hp_yaml."""
 
@@ -377,6 +453,13 @@ class TestWriteTempHpYaml(unittest.TestCase):
         self.assertIn("model:", data)
         self.assertIn("training:", data)
         os.remove(path)
+
+    def test_max_device_memory_follows_memory_limit(self):
+        """The yaml carries the memory budget, so ND prunes against it."""
+        runner = self._get_runner()
+        config = _make_full_config()
+        hp_yaml = runner._build_hp_yaml_dict(config)
+        self.assertEqual(hp_yaml["context"]["max_device_memory"], "60.0GB")
 
 
 class TestSearchStrategies(unittest.TestCase):
@@ -407,6 +490,30 @@ class TestSearchStrategies(unittest.TestCase):
         self.assertIn("tp", result)
         self.assertIn("dp", result)
         self.assertIn("memory_estimate_mb", result)
+
+    @patch(
+        "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
+        return_value=_make_mock_dim_module(),
+    )
+    @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
+    def test_search_strategies_rejects_over_budget(
+        self, mock_parallelize_cls, mock_get_dim,
+    ):  # pylint: disable=unused-argument
+        """A search whose strategies all exceed the budget raises, never returns one."""
+        mock_dims = MagicMock()
+        mock_dims.dims_val = {
+            _MOCK_DP: 2, _MOCK_TP: 2, _MOCK_PP: 2,
+            _MOCK_CP: 1, _MOCK_EP: 1, _MOCK_MBN: 2,
+        }
+        mock_entry = (mock_dims, 70.0 * 1024, 0.05, [])
+        mock_runner = MagicMock()
+        mock_runner.run_generation_to_ordering.return_value = [mock_entry]
+        mock_parallelize_cls.return_value = mock_runner
+
+        config = _make_full_config()
+        with self.assertRaises(ValueError) as ctx:
+            sr.search_strategies(config)
+        self.assertIn("memory budget", str(ctx.exception))
 
 
 # ── Minimal HyperV2 yaml builder ──────────────────────────────────────────

@@ -20,7 +20,7 @@ Reads Search Config (``search.yaml``) and HyperParallel training config
 
 import logging
 import os
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     import yaml  # type: ignore[import-untyped]  # pylint: disable=C0415
@@ -52,6 +52,11 @@ def _normalize_model_spec(model_spec: Dict[str, Any]) -> Dict[str, Any]:
     for hf_key, internal_key in _HP_TO_INTERNAL.items():
         if hf_key in model_spec and internal_key not in model_spec:
             model_spec[internal_key] = model_spec.pop(hf_key)
+    # A resolved Transformers config states its expert count, never a
+    # moe_enabled flag; the constraint checker and the emitted strategy
+    # both read the flag, so derive it rather than reporting a MoE as dense.
+    if "moe_enabled" not in model_spec:
+        model_spec["moe_enabled"] = int(model_spec.get("num_experts") or 1) > 1
     return model_spec
 
 
@@ -137,7 +142,7 @@ def _load_yaml(path: str) -> Dict[str, Any]:
 
 def _parse_unified_parallelism(
     para_raw: Dict[str, Any],
-) -> Tuple[Dict[str, List[int]], Dict[str, Any]]:
+) -> Tuple[Dict[str, List[int]], Dict[str, Any], Set[str]]:
     """Convert the unified parallelism declaration into search_space + constraint.
 
     Rules:
@@ -148,10 +153,14 @@ def _parse_unified_parallelism(
         (neither fixed nor explicitly enumerated).
 
     Returns:
-        A ``(search_space, constraint)`` tuple.
+        A ``(search_space, constraint, auto)`` tuple, where *auto* names the
+        dimensions the user handed to the searcher. They carry no candidates,
+        so without naming them they are indistinguishable from dimensions the
+        file never mentioned, and a ``train_yaml`` would pin them.
     """
     search_space: Dict[str, List[int]] = {}
     constraint: Dict[str, Any] = {}
+    auto: Set[str] = set()
 
     for short_key, canonical_key in _UNIFIED_DIM_MAP.items():
         if short_key not in para_raw:
@@ -164,9 +173,48 @@ def _parse_unified_parallelism(
         elif isinstance(value, list):
             search_space[canonical_key] = [int(v) for v in value]
         elif isinstance(value, str) and value.strip().lower() == "auto":
-            continue
+            auto.add(canonical_key)
 
-    return search_space, constraint
+    return search_space, constraint, auto
+
+
+# Every unified dimension ND can actually search. ``etp`` is declarable but
+# has no ND dimension behind it, so it is always a fixed input.
+_NOT_SEARCHABLE = frozenset({"etp"})
+
+
+def _describe_parallelism(
+    search_space: Dict[str, List[int]],
+    auto_dims: Any,
+    declared: Dict[str, Any],
+    from_train_yaml: bool,
+) -> str:
+    """Report how every parallelism dimension was resolved.
+
+    A dimension left out of the file is not switched off: it is pinned to the
+    train.yaml value when there is one and searched freely when there is not.
+    Pin a dimension to 1 to take it out of the strategy.
+    """
+    parts = []
+    for short_key, canonical_key in _UNIFIED_DIM_MAP.items():
+        candidates = search_space.get(canonical_key)
+        if short_key in _NOT_SEARCHABLE:
+            fixed = candidates[0] if candidates else "default"
+            state = f"fixed {fixed} (no ND dimension)"
+        elif canonical_key in auto_dims:
+            state = "searched (auto)"
+        elif candidates is None:
+            state = "searched (not declared)"
+        elif len(candidates) == 1:
+            source = (
+                "declared" if short_key in declared
+                else "train.yaml" if from_train_yaml else "default"
+            )
+            state = f"fixed {candidates[0]} ({source})"
+        else:
+            state = f"searched over {candidates}"
+        parts.append(f"{short_key}={state}")
+    return "; ".join(parts)
 
 
 def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
@@ -214,12 +262,14 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
     parallelism_raw = _get_dict(raw, "parallelism")
     constraint_raw = _get_dict(raw, "constraint")
 
-    search_space, parallelism_constraint = _parse_unified_parallelism(parallelism_raw)
+    search_space, parallelism_constraint, auto_dims = _parse_unified_parallelism(
+        parallelism_raw
+    )
 
     # Inherit undeclared dimensions from train.yaml as fixed values.
     if base_config:
         for space_key, candidates in base_config.search_space.items():
-            if space_key not in search_space:
+            if space_key not in search_space and space_key not in auto_dims:
                 search_space[space_key] = candidates
 
         if constraint_raw.get("global_batch_size", 0) is None or constraint_raw.get("global_batch_size", 0) == 0:
@@ -251,11 +301,17 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
         **parallelism_constraint,
     }
 
+    summary = _describe_parallelism(
+        search_space, auto_dims, parallelism_raw, bool(base_config)
+    )
+    logger.info("parallelism resolved: %s", summary)
+
     return NormalizedConfig(
         model_spec=model_spec,
         cluster_spec=cluster_spec,
         search_space=search_space,
         constraint=constraint,
+        parallelism_summary=summary,
         estimator=estimator,
         pp_config=pp_config,
     )
@@ -278,7 +334,7 @@ def read_search_config(path: str) -> NormalizedConfig:
         train_yaml: "./train.yaml"   # load model params from here
         cluster:
           num_nodes: 4
-          cards_per_node: 8
+          cards_per_node: 16   # optional: defaults to the -A device type
         parallelism:
           dp: [1, 2, 4]
           tp: [1, 2, 4, 8]
@@ -337,9 +393,19 @@ def _load_auto_models_model_spec_from_yaml(raw: Dict[str, Any]) -> Dict[str, Any
     model_spec = _load_auto_models_model_spec(
         model_raw, context_raw.get("visual_seq_len"),
     )
-    model_spec["max_position_embeddings"] = data_transform_raw.get(
-        "max_seq_len", model_spec.get("max_position_embeddings", 4096),
-    )
+    # Both spellings the SAPP-ND parser accepts, so the two halves of the
+    # cost model agree on where the training sequence length comes from.
+    seq_len = data_transform_raw.get("max_seq_len") or _get_dict(raw, "data").get("max_seq_len")
+    if seq_len:
+        model_spec["max_position_embeddings"] = seq_len
+    else:
+        logger.warning(
+            "no dataset.data_transform.max_seq_len (nor data.max_seq_len): costing "
+            "the model's context limit of %s tokens, which for a long-context model "
+            "puts every candidate out of memory",
+            model_spec.get("max_position_embeddings", 4096),
+        )
+        model_spec.setdefault("max_position_embeddings", 4096)
     if context_raw.get("device_num") is not None:
         model_spec["device_num"] = int(context_raw["device_num"])
     model_spec["local_batch_size"] = training_raw.get("micro_batch_size", 1)
