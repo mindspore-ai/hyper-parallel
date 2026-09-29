@@ -63,7 +63,8 @@ def build_online_mapping_dataset(
     """Build a finite Online Dataset that produces text RawSamples.
 
     Args:
-        data_path: Optional local JSON/JSONL/Parquet/CSV/Arrow paths.
+        data_path: Optional local JSON/JSONL/CSV/TXT/Parquet/Arrow paths; JSON, CSV,
+            and TXT files may be gzip-compressed.
         data_config: Cache options or ``hf_dataset_name``.
         dataloader_context: DataLoader ownership and synchronization policy.
 
