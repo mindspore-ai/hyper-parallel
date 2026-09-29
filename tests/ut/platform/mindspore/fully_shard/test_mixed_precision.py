@@ -46,7 +46,7 @@ ensure_mindspore_platform_for_fully_shard()
 import mindspore as ms
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState, ShardedState
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
@@ -1235,6 +1235,7 @@ class TestSchedulerBackwardCompatFlow(unittest.TestCase):
         scheduler.cell = MagicMock()
         scheduler._hsdp_backward_pre_hook = MagicMock()
         scheduler._root_backward_hook = MagicMock()
+        scheduler.scheduler_ctx = HSDPSchedulerContext()
         grad = MagicMock()
 
         result = scheduler._backward_pre_hook(grad)
@@ -1256,6 +1257,7 @@ class TestSchedulerBackwardCompatFlow(unittest.TestCase):
         scheduler.cell = MagicMock()
         scheduler._hsdp_backward_pre_hook = MagicMock()
         scheduler._root_backward_hook = MagicMock()
+        scheduler.scheduler_ctx = HSDPSchedulerContext()
         grad = MagicMock()
 
         result = scheduler._backward_pre_hook(grad)
@@ -1323,6 +1325,8 @@ class TestSchedulerBackwardCompatFlow(unittest.TestCase):
         scheduler.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
         scheduler._backward_hook = MagicMock()
         scheduler.hsdp_state = MagicMock()
+        scheduler.scheduler_ctx = HSDPSchedulerContext()
+        scheduler._is_root = True
 
         HSDPSchedulerV2.root_bp_state = True
 
@@ -1332,23 +1336,25 @@ class TestSchedulerBackwardCompatFlow(unittest.TestCase):
         scheduler.hsdp_state.reduce_params.assert_called_once_with()
         self.assertFalse(HSDPSchedulerV2.root_bp_state)
 
-    def test_root_backward_hook_keeps_root_state_for_non_root_callback(self):
+    def test_root_backward_hook_keeps_root_state_for_non_root_owner(self):
         """
         Feature: recompute forward guard
-        Description: Non-root final callbacks should not clear the shared recompute state
-        Expectation: root_bp_state remains set until the outermost callback runs
+        Description: A non-root finalization owner must drain without resetting another root's state
+        Expectation: terminal reduction runs even when local post-backward is already complete
         """
         scheduler = object.__new__(MindSporeHSDPSchedulerV2)
         scheduler.scheduler_state = FSDPSchedulerState.BACKWARD
         scheduler._backward_hook = MagicMock()
         scheduler.hsdp_state = MagicMock()
+        scheduler.scheduler_ctx = HSDPSchedulerContext()
+        scheduler._is_root = False
 
         HSDPSchedulerV2.root_bp_state = True
 
         scheduler._root_backward_hook()
 
         scheduler._backward_hook.assert_called_once_with()
-        scheduler.hsdp_state.reduce_params.assert_not_called()
+        scheduler.hsdp_state.reduce_params.assert_called_once_with()
         self.assertTrue(HSDPSchedulerV2.root_bp_state)
 
 
