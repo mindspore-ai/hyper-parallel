@@ -53,9 +53,16 @@ def _load_sharding_rules():
         ParamRole,
     )
     return [
-        (["q_a_proj", "kv_a_proj_with_mqa"], ParamRole.REPLICATED),
+        (["q_a_proj", "kv_a_proj_with_mqa", "linear_qkv"], ParamRole.REPLICATED),
         (["q_b_proj", "kv_b_proj"], ParamRole.COLWISE),
     ]
+
+
+def _load_context_parallel():
+    """Load the optional dense MLA CP adapter without importing kernels at discovery."""
+    from hyper_parallel.models.deepseek_v3.adapter.distributed import context_parallel  # pylint: disable=C0415
+
+    return context_parallel
 
 
 DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
@@ -63,6 +70,7 @@ DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     model_type="deepseek_v3",
     replacements=_load_replacements,
     sharding_rules=_load_sharding_rules,
+    context_parallel=_load_context_parallel,
 )
 register_model_adapter(DEEPSEEK_V3_ADAPTER_SPEC)
 
