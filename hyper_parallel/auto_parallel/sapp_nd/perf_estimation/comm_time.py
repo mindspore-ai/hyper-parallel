@@ -546,9 +546,9 @@ def estimate_from_mem_comm(*args, **kwargs):
         # path.  The TIME path's estimate_comm_score(overlap=...) call
         # above is zeroed, so this is the single source of overlap for
         # both paths.
-        # Defaults (dp=0.9, tp=0.5) are MindFormers-validated overlap, not
-        # test hacks: they made the model match real MindFormers step times.
-        # Re-validating for the hyper-parallel target is a follow-up.
+        # Defaults (dp=0.9, tp=0.5) are empirical overlap fractions, not test
+        # hacks: raw volume over-counts overlapped communication.
+        # Re-validate against profiled PyTorch step times before changing them.
         # Follow-up: source from hardware, fix estimate_comm_score's dim
         # list and add latency, then fold this into estimate_comm_score.
         comm[Dim.DP] *= (1 - param["cfg"].comm_dp_overlap)

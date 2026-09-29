@@ -21,8 +21,9 @@ It supports a customizable cost model for fast, explainable estimates.
 
 ### Inputs
 
-The main input is an LLM configuration. MindFormers YAML, MindSpeed JSON, and
-HyperParallel TOML formats are supported by parser modules.
+The main input is an LLM configuration. HyperParallel YAML and MindSpeed JSON
+are supported by parser modules. TorchTitan TOML remains as a deprecated
+placeholder.
 
 ### Workflow
 
@@ -155,7 +156,7 @@ The default parser lookup is based on the input suffix:
 
 | Suffix | Parser |
 | --- | --- |
-| `.yaml` | `CostModelParserMindformers` |
+| `.yaml` | `CostModelParserHyperV2` |
 | `.json` | `CostModelParserMindspeed` |
 | `.toml` | `CostModelParserHyperparallel` |
 
