@@ -54,7 +54,7 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedDSAAttention,
     SharedCompressedDSAAttentionBase,
     SharedCompressedDSAIndexer,
-    build_sliding_window_indices as _window_indices,
+    build_sliding_window_indices,
 )
 from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE,
@@ -66,6 +66,8 @@ from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
 )
+
+_window_indices = build_sliding_window_indices
 
 _FULL_MODEL_MODE = "full"
 _VALIDATION_CROP_MODE = "validation_crop"
@@ -636,6 +638,38 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             merged = merged + image_grad_anchor.to(merged.dtype) * 0.0
         return merged
 
+    def _prepare_input_embeddings(
+            self, input_ids, inputs_embeds, token_types, pixel_values, image_patch_offsets,
+            image_vit_grid_hw, image_llm_grid_hw, image_batch_indices, image_token_starts, image_sequence_start,
+    ):
+        """Validate image metadata and inject image features into token embeddings."""
+        image_inputs = (
+            pixel_values,
+            image_patch_offsets,
+            image_vit_grid_hw,
+            image_llm_grid_hw,
+            image_batch_indices,
+            image_token_starts,
+        )
+        if any(value is not None for value in image_inputs):
+            if token_types is None:
+                raise ValueError("token_types are required with V4.1 image inputs")
+            if any(value is None for value in image_inputs):
+                raise ValueError("all V4.1 image metadata fields are required with pixel_values")
+            image_records = self._encode_image_features(
+                pixel_values, image_patch_offsets, image_vit_grid_hw, image_llm_grid_hw,
+                image_batch_indices, image_token_starts,
+            )
+        else:
+            image_records = []
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        if image_records:
+            inputs_embeds = self._merge_image_embeddings(
+                inputs_embeds, token_types, image_records, image_sequence_start,
+            )
+        return inputs_embeds
+
     def forward(
             self,
             input_ids: torch.LongTensor | None = None,
@@ -676,40 +710,16 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         Returns:
             Decoder hidden state and optional cache metadata.
         """
-        # The conditions below enforce one ordered forward contract across text,
-        # vision, Engram, shared-attention, mHC, and gradient-checkpointing paths.
-        #lizard forgives(cyclomatic_complexity)
         if use_cache or past_key_values is not None:
             raise NotImplementedError("the V4.1 validation crop supports training without KV cache")
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("specify exactly one of input_ids or inputs_embeds")
         if input_ids is None:
             raise ValueError("input_ids are required while Engram is enabled")
-        image_inputs = (
-            pixel_values,
-            image_patch_offsets,
-            image_vit_grid_hw,
-            image_llm_grid_hw,
-            image_batch_indices,
-            image_token_starts,
+        inputs_embeds = self._prepare_input_embeddings(
+            input_ids, inputs_embeds, token_types, pixel_values, image_patch_offsets,
+            image_vit_grid_hw, image_llm_grid_hw, image_batch_indices, image_token_starts, image_sequence_start,
         )
-        if any(value is not None for value in image_inputs):
-            if token_types is None:
-                raise ValueError("token_types are required with V4.1 image inputs")
-            if any(value is None for value in image_inputs):
-                raise ValueError("all V4.1 image metadata fields are required with pixel_values")
-            image_records = self._encode_image_features(
-                pixel_values, image_patch_offsets, image_vit_grid_hw, image_llm_grid_hw,
-                image_batch_indices, image_token_starts,
-            )
-        else:
-            image_records = []
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-        if image_records:
-            inputs_embeds = self._merge_image_embeddings(
-                inputs_embeds, token_types, image_records, image_sequence_start,
-            )
         if token_types is not None and token_types.shape != input_ids.shape:
             raise ValueError("token_types must have the same shape as input_ids")
         image_mask = None if token_types is None else token_types >= 0
@@ -728,13 +738,9 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                     "packed_seq_params must be SharedCompressedPackedSequence, "
                     f"got {type(packed_sequence).__name__}"
                 )
-            segment_start_positions = packed_sequence.local_segment_starts(input_ids.device)
-            local_positions = torch.arange(
-                packed_sequence.local_query_start,
-                packed_sequence.local_query_start + packed_sequence.local_query_length,
-                device=input_ids.device,
-            ).unsqueeze(0)
-            segment_start_mask = (local_positions == segment_start_positions).expand_as(input_ids)
+            packed_sequence = packed_sequence.prepare(input_ids.device, tuple(self.config.v41_compress_ratios))
+            kwargs["packed_seq_params"] = packed_sequence
+            segment_start_mask = packed_sequence.segment_start_mask(input_ids.device).expand_as(input_ids)
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
