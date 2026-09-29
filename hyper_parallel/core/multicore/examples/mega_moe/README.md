@@ -21,10 +21,15 @@ The Qwen Router computes `topk_ids`, `topk_weights`, and
 
 Each decoder layer keeps independent expert parameters and optimizer state.
 All serial MegaMoe layers call `share_execution_resources()` before first
-forward and therefore reuse one SHMEM runtime/workspace. The benchmark calls
-`QwenMoeModel.close()` before destroying the process group. Execution resources
-acquire and release their SHMEM references internally; model code only closes
-`MegaMoeExperts` (through `QwenMoeModel.close()`) and never calls SHMEM directly.
+forward and therefore reuse one SHMEM runtime/workspace. The benchmark retains
+`QwenMoeModel.close()` for early release before destroying its owned process group;
+an external process group remains owned by its caller. Communication teardown and
+normal process exit also attempt automatic cleanup if explicit close was omitted.
+Orphan workspaces are reconciled for reuse/eviction at the next collective first binding,
+not on each training step. Existing per-layer `close()` calls remain supported;
+no new lifecycle API or direct SHMEM calls are needed. Automatic cleanup requires
+matching rank order and completed backward graphs; failure/signal exits still rely
+on launcher cleanup and are not guaranteed to complete collective teardown.
 
 The public `MegaMoeExperts` API and this benchmark default
 `expert_capacity_factor` to `None`, which reserves the maximum lossless receive
