@@ -952,11 +952,16 @@ class HSDPParamV2:
         shard_dim: int,
     ) -> None:
         """Rebuild padded communication storage and refresh the DTensor local view."""
+        # A converted parameter may still reference the forward graph through
+        # DTensor's local TensorImpl.  Storage owned by HSDP must be an
+        # off-graph leaf so this reference cannot retain the previous device
+        # allocation after an offload or parameter conversion.
+        local_tensor = local_tensor.detach()
         actual_shard_length = self.sharded_size[shard_dim]
         if self.sharded_size == self.padded_sharded_param_size:
             local_tensor = local_tensor.contiguous()
             self._sharded_param_data = local_tensor.view(-1)
-            local_view = local_tensor.detach()
+            local_view = local_tensor
         else:
             padded_local_tensor = local_tensor.new_zeros(self.padded_sharded_param_size)
             if self.pin_memory:
@@ -972,7 +977,7 @@ class HSDPParamV2:
                 shard_dim,
                 0,
                 actual_shard_length,
-            ).detach()
+            )
         set_requires_grad_if_needed(self.sharded_param, local_view)
         self.sharded_param._local_tensor = local_view
         self._update_shardedparam_storage_forcely()
@@ -981,8 +986,14 @@ class HSDPParamV2:
                 "Expected sharded_param._local_tensor to be contiguous"
             )
 
+    @torch.no_grad()
     def reset_sharded_param(self) -> None:
-        """Reset sharded param after load_state_dict."""
+        """Reset sharded param after load_state_dict.
+
+        This method may replace the DTensor local storage.  It intentionally
+        runs without autograd tracking because the rebuilt storage is the
+        persistent parameter state, not part of a forward computation.
+        """
         new_param = self._resolve_reset_param()
         local_tensor = new_param._local_tensor if isinstance(new_param, DTensor) else new_param
         if local_tensor.is_meta:

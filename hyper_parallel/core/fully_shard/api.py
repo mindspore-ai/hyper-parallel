@@ -129,6 +129,27 @@ class HSDPModule:
         """Initialize HSDPModule."""
         self.hsdp_scheduler = None  # Initialized in hsdp_init()
 
+    def _apply(self, *args: Any, **kwargs: Any) -> Any:
+        """Apply a tensor conversion while preserving HSDP parameter storage.
+
+        ``nn.Module._apply`` can replace the DTensor local storage while an
+        unsharded parameter buffer is still materialized on the device.  HSDP
+        must reshard before delegating to the conversion and rebuild its
+        sharded-parameter bookkeeping afterwards.  The bookkeeping reset is a
+        storage operation and must not become part of an autograd graph.
+        """
+        if not hasattr(self, "hsdp_scheduler") or self.hsdp_scheduler is None:
+            return super()._apply(*args, **kwargs)
+        self.reshard()
+        result = super()._apply(*args, **kwargs)
+        hsdp_state = self.hsdp_scheduler.hsdp_state
+        if hsdp_state is None:
+            return result
+        with torch.no_grad():
+            for hsdp_param in hsdp_state.hsdp_params:
+                hsdp_param.reset_sharded_param()
+        return result
+
     def hsdp_init(self, module, mesh, reshard_after_forward,
                   shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device,
                   comm_fusion, comm_fusion_zero_copy: Optional[bool] = None,
