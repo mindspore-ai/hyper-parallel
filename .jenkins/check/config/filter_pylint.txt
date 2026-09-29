@@ -136,3 +136,6 @@
 # 24. DSA functional exports are resolved lazily by components.functional;
 #     pylint cannot infer that the exported operator proxies are callable.
 "hyper-parallel/hyper_parallel/components/modules/dsa_attention.py"        "not-callable"
+
+# KDA boundary merge loads optional Triton kernels only on the NPU path.
+"hyper-parallel/hyper_parallel/distributed/context_parallel/kimi_delta_attention_boundary.py" "import-outside-toplevel"

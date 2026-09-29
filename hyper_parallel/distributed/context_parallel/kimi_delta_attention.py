@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Ulysses and state-P2P context-parallel execution for KDA."""
+"""KDA context-parallel executors: state CP, Ulysses and their combinations."""
 # pylint: disable=forbidden-backend-import
 from __future__ import annotations
 
 __all__ = [
+    "KimiDeltaAttentionHybridCP",
+    "KimiDeltaAttentionLayerHybridCP",
     "KimiDeltaAttentionLayerP2PCP",
     "KimiDeltaAttentionLayerUlyssesCP",
     "KimiDeltaAttentionP2PCP",
@@ -39,6 +41,10 @@ from hyper_parallel.components.modules.kimi_delta_attention import (
     torch_kda_state_summary,
 )
 from hyper_parallel.core.utils import communication
+from hyper_parallel.distributed.context_parallel.kimi_delta_attention_boundary import (
+    build_kda_boundary,
+    split_kda_mesh,
+)
 
 
 _KDA_BACKENDS = frozenset({"eager", "triton"})
@@ -359,7 +365,15 @@ class _RecvKDAInitialState(torch.autograd.Function):
         prev_rank: int,
         state_shape: tuple[int, ...],
     ) -> torch.Tensor:
-        """Receive the initial recurrent state from the previous CP rank."""
+        """Receive the initial recurrent state from the previous CP rank.
+
+        Args:
+            ctx: Autograd context holding tensors and communication metadata.
+            anchor: Tensor supplying the receive device and autograd dependency.
+            cp_group: Precreated chronological CP process group.
+            prev_rank: Global rank of the preceding sequence partition.
+            state_shape: Shape of the FP32 recurrent state.
+        """
         state = torch.empty(state_shape, device=anchor.device, dtype=torch.float32)
         dist.recv(state, src=prev_rank, group=cp_group)
         ctx.cp_group = cp_group
@@ -371,7 +385,12 @@ class _RecvKDAInitialState(torch.autograd.Function):
         ctx: Any,
         grad_state: Optional[torch.Tensor],
     ) -> tuple[None, None, None, None]:
-        """Send the accumulated initial-state gradient to the previous rank."""
+        """Send the accumulated initial-state gradient to the previous rank.
+
+        Args:
+            ctx: Autograd context holding tensors and communication metadata.
+            grad_state: Gradient of the received initial state.
+        """
         if grad_state is None:
             raise RuntimeError("KDA P2P backward is missing the initial-state gradient.")
         dist.send(grad_state.contiguous(), dst=ctx.prev_rank, group=ctx.cp_group)
@@ -388,7 +407,14 @@ class _SendKDAFinalState(torch.autograd.Function):
         cp_group: Any,
         next_rank: int,
     ) -> torch.Tensor:
-        """Send the final recurrent state to the next CP rank."""
+        """Send the final recurrent state to the next CP rank.
+
+        Args:
+            ctx: Autograd context holding tensors and communication metadata.
+            final_state: Outgoing recurrent state.
+            cp_group: Precreated chronological CP process group.
+            next_rank: Global rank of the following sequence partition.
+        """
         dist.send(final_state.contiguous(), dst=next_rank, group=cp_group)
         ctx.cp_group = cp_group
         ctx.next_rank = next_rank
@@ -401,7 +427,12 @@ class _SendKDAFinalState(torch.autograd.Function):
         ctx: Any,
         grad_token: torch.Tensor,
     ) -> tuple[torch.Tensor, None, None]:
-        """Receive the final-state gradient from the next rank."""
+        """Receive the final-state gradient from the next rank.
+
+        Args:
+            ctx: Autograd context holding tensors and communication metadata.
+            grad_token: Gradient token supplying the receive device.
+        """
         grad_state = torch.empty(
             ctx.state_shape,
             device=grad_token.device,
@@ -637,7 +668,18 @@ class KimiDeltaAttentionUlyssesCP(nn.Module):
         dt_bias: torch.Tensor,
         scale: Optional[float] = None,
     ) -> torch.Tensor:
-        """Run chunkwise KDA using full sequence and local heads."""
+        """Run chunkwise KDA using full sequence and local heads.
+
+        Args:
+            query: Local query tensor [B,T,H,K].
+            key: Matching local key tensor.
+            value: Local value tensor [B,T,HV,V].
+            gate: Per-token gate logits [B,T,HV,K].
+            beta: Per-token beta logits [B,T,HV].
+            a_log: Decay parameter with one value per value head.
+            dt_bias: Learned bias with one value per gate channel.
+            scale: Optional attention scaling factor.
+        """
         self._validate_inputs(query, key, value, gate, beta, a_log, dt_bias)
         num_v_heads = value.shape[2]
         k_head_dim = query.shape[-1]
@@ -686,6 +728,8 @@ class KimiDeltaAttentionP2PCP(nn.Module):
         lower_bound: float = -5.0,
         safe_gate: bool = True,
         backend: str = "eager",
+        state_cp_method: str = "p2p",
+        group_size: int = 1,
     ) -> None:
         """Initialize the KDA state-P2P executor for one 1-D CP mesh."""
         super().__init__()
@@ -701,6 +745,9 @@ class KimiDeltaAttentionP2PCP(nn.Module):
         self.cp_size = self.cp_mesh.size()
         self.cp_rank = self.cp_mesh.get_local_rank()
         self.cp_group = self.cp_mesh.get_group()
+        if backend != "triton" and state_cp_method != "p2p":
+            raise ValueError("KDA AllGather boundaries require backend='triton'.")
+        self.boundary = build_kda_boundary(self.cp_mesh, state_cp_method, group_size)
         self.prev_rank = _global_peer_rank(
             self.cp_mesh,
             max(self.cp_rank - 1, 0),
@@ -726,7 +773,18 @@ class KimiDeltaAttentionP2PCP(nn.Module):
         dt_bias: torch.Tensor,
         scale: Optional[float] = None,
     ) -> torch.Tensor:
-        """Run one local KDA segment and propagate its recurrent state."""
+        """Run one local KDA segment and propagate its recurrent state.
+
+        Args:
+            query: Local query tensor [B,T,H,K].
+            key: Matching local key tensor.
+            value: Local value tensor [B,T,HV,V].
+            gate: Per-token gate logits [B,T,HV,K].
+            beta: Per-token beta logits [B,T,HV].
+            a_log: Decay parameter with one value per value head.
+            dt_bias: Learned bias with one value per gate channel.
+            scale: Optional attention scaling factor.
+        """
         if self.cp_size == 1:
             return _run_local_kda(
                 query,
@@ -781,7 +839,28 @@ class KimiDeltaAttentionP2PCP(nn.Module):
             lower_bound=self.lower_bound,
             chunk_size=self.chunk_size,
             safe_gate=self.safe_gate,
+            boundary=self.boundary,
         )
+
+
+def _validate_layer_short_conv(module: nn.Module, mode: str) -> None:
+    """Check the shared depthwise-convolution contract before building execution."""
+    if _uses_short_conv(module):
+        for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
+            if not hasattr(module, name):
+                raise TypeError(f"Kimi K3 layer is missing {name}.")
+            convolution = getattr(module, name)
+            if convolution.stride != (1,) or convolution.dilation != (1,):
+                raise ValueError(
+                    f"Kimi K3 {mode} CP supports ShortConv stride=1 and "
+                    "dilation=1 only."
+                )
+            if convolution.groups != convolution.in_channels:
+                raise ValueError(f"Kimi K3 {mode} CP expects depthwise ShortConv.")
+            if getattr(convolution, "activation", None) not in ("silu", "swish"):
+                raise ValueError(
+                    f"Kimi K3 {mode} CP expects ShortConv SiLU activation."
+                )
 
 
 class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
@@ -868,22 +947,7 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
                 "Kimi K3 Ulysses CP does not yet support allow_neg_eigval=True."
             )
 
-        if _uses_short_conv(self.module):
-            for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
-                if not hasattr(self.module, name):
-                    raise TypeError(f"Kimi K3 layer is missing {name}.")
-                convolution = getattr(self.module, name)
-                if convolution.stride != (1,) or convolution.dilation != (1,):
-                    raise ValueError(
-                        "Kimi K3 Ulysses CP supports ShortConv stride=1 and "
-                        "dilation=1 only."
-                    )
-                if convolution.groups != convolution.in_channels:
-                    raise ValueError("Kimi K3 Ulysses CP expects depthwise ShortConv.")
-                if getattr(convolution, "activation", None) not in ("silu", "swish"):
-                    raise ValueError(
-                        "Kimi K3 Ulysses CP expects ShortConv SiLU activation."
-                    )
+        _validate_layer_short_conv(self.module, "Ulysses")
 
     def _pack_projected_inputs(
         self,
@@ -947,7 +1011,16 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
         output_attentions: bool = False,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None, None]:
-        """Run the real Kimi layer boundary using KDA and Ulysses CP."""
+        """Run the real Kimi layer boundary using KDA and Ulysses CP.
+
+        Args:
+            hidden_states: Local sequence shard [B,T,hidden_size].
+            attention_mask: Optional dense mask; padding is unsupported.
+            past_key_values: Recurrent inference cache, currently unsupported.
+            use_cache: Must be False for this training adapter.
+            output_attentions: Must be False; KDA does not materialize attention weights.
+            kwargs: Additional model arguments; packed sequences are unsupported.
+        """
         if not self.module.training:
             raise NotImplementedError("Kimi K3 Ulysses CP currently supports training only.")
         if past_key_values is not None or use_cache:
@@ -974,13 +1047,7 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
             _value_head_dim(base),
         )
 
-        query, key, value, gate, beta = self._pack_projected_inputs(
-            query,
-            key,
-            value,
-            gate,
-            beta,
-        )
+        query, key, value, gate, beta = self._pack_projected_inputs(query, key, value, gate, beta)
         if _uses_short_conv(base):
             query = self._local_short_conv(query, base.q_conv1d)
             key = self._local_short_conv(key, base.k_conv1d)
@@ -1046,6 +1113,8 @@ class KimiDeltaAttentionLayerP2PCP(KimiDeltaAttentionP2PCP):
         *,
         chunk_size: int = 64,
         backend: str = "eager",
+        state_cp_method: str = "p2p",
+        group_size: int = 1,
     ) -> None:
         """Initialize the full-layer state-P2P adapter."""
         lower_bound = _gate_lower_bound(module)
@@ -1059,6 +1128,8 @@ class KimiDeltaAttentionLayerP2PCP(KimiDeltaAttentionP2PCP):
             lower_bound=float(lower_bound),
             safe_gate=_uses_safe_gate(module),
             backend=backend,
+            state_cp_method=state_cp_method,
+            group_size=group_size,
         )
         self.module = module
         self._validate_module()
@@ -1103,22 +1174,7 @@ class KimiDeltaAttentionLayerP2PCP(KimiDeltaAttentionP2PCP):
             or all(hasattr(self.module, name) for name in ("g_a_proj", "g_b_proj"))
         ):
             raise TypeError("Kimi K3 layer is missing its output-gate projection.")
-        if _uses_short_conv(self.module):
-            for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
-                if not hasattr(self.module, name):
-                    raise TypeError(f"Kimi K3 layer is missing {name}.")
-                convolution = getattr(self.module, name)
-                if convolution.stride != (1,) or convolution.dilation != (1,):
-                    raise ValueError(
-                        "Kimi K3 P2P CP supports ShortConv stride=1 and "
-                        "dilation=1 only."
-                    )
-                if convolution.groups != convolution.in_channels:
-                    raise ValueError("Kimi K3 P2P CP expects depthwise ShortConv.")
-                if getattr(convolution, "activation", None) not in ("silu", "swish"):
-                    raise ValueError(
-                        "Kimi K3 P2P CP expects ShortConv SiLU activation."
-                    )
+        _validate_layer_short_conv(self.module, "P2P")
 
     def forward(  # pylint: disable=arguments-renamed
         self,
@@ -1129,7 +1185,16 @@ class KimiDeltaAttentionLayerP2PCP(KimiDeltaAttentionP2PCP):
         output_attentions: bool = False,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None, None]:
-        """Run the real Kimi layer boundary with fused state-P2P KDA."""
+        """Run the real Kimi layer boundary with fused state-P2P KDA.
+
+        Args:
+            hidden_states: Local sequence shard [B,T,hidden_size].
+            attention_mask: Optional dense mask; padding is unsupported.
+            past_key_values: Recurrent inference cache, currently unsupported.
+            use_cache: Must be False for this training adapter.
+            output_attentions: Must be False; KDA does not materialize attention weights.
+            kwargs: Additional model arguments; packed sequences are unsupported.
+        """
         if not self.module.training:
             raise NotImplementedError("Kimi K3 P2P CP currently supports training only.")
         if past_key_values is not None or use_cache:
@@ -1232,3 +1297,77 @@ class KimiDeltaAttentionLayerP2PCP(KimiDeltaAttentionP2PCP):
             a_log=a_log,
             dt_bias=dt_bias,
         )
+
+
+class KimiDeltaAttentionHybridCP(KimiDeltaAttentionUlyssesCP):
+    """Exchange token/head shards before invoking P2P or fused AllGather state CP."""
+
+    def __init__(self, device_mesh: DeviceMesh, *, ulysses_degree: int,
+                 chunk_size: int = 64, lower_bound: float = -5.0, safe_gate: bool = True,
+                 backend: str = "triton", **state_options: Any) -> None:
+        """Create both submeshes once, outside forward and checkpoint replay."""
+        protocol = state_options.get("state_cp_method", "p2p")
+        if protocol not in ("p2p", "allgather", "grouped_allgather_p2p"):
+            raise ValueError("Hybrid requires a supported KDA state_cp_method.")
+        if backend.lower() != "triton" and protocol != "p2p":
+            raise ValueError("KDA AllGather boundaries require backend='triton'.")
+        if (not isinstance(ulysses_degree, int) or isinstance(ulysses_degree, bool)
+                or ulysses_degree < 2 or device_mesh.size() % ulysses_degree):
+            raise ValueError("ulysses_degree must be an integer >= 2 dividing the CP size.")
+        width = state_options.get("group_size", 1)
+        if (not isinstance(width, int) or isinstance(width, bool) or width < 1
+                or (device_mesh.size() // ulysses_degree) % width):
+            raise ValueError("group_size must be a positive integer dividing the state CP size.")
+        if protocol != "grouped_allgather_p2p" and width != 1:
+            raise ValueError("group_size is only valid for grouped_allgather_p2p.")
+        hybrid = split_kda_mesh(device_mesh, ulysses_degree, ("kda_state", "kda_ulysses"))
+        super().__init__(hybrid["kda_ulysses"], chunk_size=chunk_size, lower_bound=lower_bound,
+                         safe_gate=safe_gate, backend=backend)
+        self.hybrid_mesh = hybrid
+        self.state = KimiDeltaAttentionP2PCP(hybrid["kda_state"], chunk_size=chunk_size,
+                                            lower_bound=lower_bound, safe_gate=safe_gate,
+                                            backend=backend, **state_options)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                gate: torch.Tensor, beta: torch.Tensor, *, a_log: torch.Tensor,
+                dt_bias: torch.Tensor, scale: float | None = None) -> torch.Tensor:
+        """Keep source-token order within each row and chronological rows in state CP.
+
+        Args:
+            query: Projected query tensor [B,T,H,K].
+            key: Projected key tensor [B,T,H,K].
+            value: Projected value tensor [B,T,H,V].
+            gate: Per-token gate logits [B,T,H,K].
+            beta: Per-token beta logits [B,T,H].
+            a_log: Learned decay parameter with one entry per value head.
+            dt_bias: Learned gate bias with H times K entries.
+            scale: Attention scaling factor; None selects the local default.
+        """
+        self._validate_inputs(query, key, value, gate, beta, a_log, dt_bias)
+        heads, key_dim = value.shape[2], query.shape[-1]
+        inputs = tuple(self._seq_to_head(tensor) for tensor in (query, key, value, gate, beta))
+        local_a = _slice_local_heads(a_log.reshape(heads), self.cp_rank, self.cp_size)
+        local_bias = _slice_local_heads(dt_bias.reshape(heads, key_dim), self.cp_rank, self.cp_size)
+        output = self.state(*inputs, a_log=local_a, dt_bias=local_bias, scale=scale)
+        return self._head_to_seq(output)
+
+
+class KimiDeltaAttentionLayerHybridCP(KimiDeltaAttentionLayerP2PCP):
+    """Reuse full-layer projection/halo handling and replace only the projected core."""
+
+    def __init__(self, module: nn.Module, device_mesh: DeviceMesh, *, ulysses_degree: int,
+                 chunk_size: int = 64, backend: str = "triton", **state_options: Any) -> None:
+        """Retain full-CP neighbors for ShortConv before any Ulysses exchange."""
+        if not isinstance(ulysses_degree, int) or isinstance(ulysses_degree, bool) or ulysses_degree < 2:
+            raise ValueError("Hybrid KDA requires integer ulysses_degree >= 2.")
+        if module.num_heads % ulysses_degree or _num_value_heads(module) % ulysses_degree:
+            raise ValueError("KDA query and value heads must both be divisible by ulysses_degree.")
+        super().__init__(module, device_mesh, chunk_size=chunk_size, backend=backend)
+        self.hybrid_core = KimiDeltaAttentionHybridCP(
+            device_mesh, ulysses_degree=ulysses_degree, chunk_size=chunk_size,
+            lower_bound=self.lower_bound, safe_gate=self.safe_gate, backend=backend, **state_options)
+
+    def _run_local_kda(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                       gate: torch.Tensor, beta: torch.Tensor, *, a_log: torch.Tensor,
+                       dt_bias: torch.Tensor) -> torch.Tensor:
+        return self.hybrid_core(query, key, value, gate, beta, a_log=a_log, dt_bias=dt_bias)
