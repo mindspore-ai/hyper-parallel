@@ -153,8 +153,8 @@ Pick the matching paragraph for the report's last section:
 > Revert before merge. One test was temp-skipped as a confirmed
 > unrelated flake.
 
-- **tests/torch/activation_checkpoint/test_activation_checkpoint.py::test_activation_checkpoint** at
-  `tests/torch/activation_checkpoint/test_activation_checkpoint.py:88`
+- **tests/st/activation_checkpoint/test_activation_checkpoint.py::test_activation_checkpoint** at
+  `tests/st/activation_checkpoint/test_activation_checkpoint.py:88`
   - failed in builds: #2450, #2451
   - triage: Q1=no, Q2=no, Q3=passed-on-master
   - applied in commit: abc1234

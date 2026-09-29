@@ -14,7 +14,7 @@
 # ============================================================================
 """Llama3 demo: tensor parallelism + fully_shard (FSDP2-style) on the Torch backend.
 
-Layout follows ``tests/torch/fully_shard/_test_tp_fully_shard_e2e.py``: a 2-D device mesh
+Layout follows ``tests/st/fully_shard/_test_tp_fully_shard_e2e.py``: a 2-D device mesh
 ``(dp, tp)`` where ``parallelize_llama3`` uses the 1-D ``mesh["tp"]`` slice and
 ``fully_shard`` uses the 1-D ``mesh["dp"]`` slice (FSDP shards parameters across DP ranks;
 TP keeps Colwise/Rowwise/sequence-parallel plans on the TP submesh).

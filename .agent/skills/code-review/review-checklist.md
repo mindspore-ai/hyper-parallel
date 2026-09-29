@@ -168,7 +168,7 @@ When a change introduces new API patterns, evaluate broader implications:
 ### Test Existence
 
 - [ ] **Tests exist** — New functionality has corresponding tests
-- [ ] **Right test location** — UT under `tests/ut/<module>/`; distributed ST under `tests/torch/<module>/`
+- [ ] **Right test location** — UT under `tests/ut/<module>/`; distributed ST under `tests/st/<module>/`
 
 ### Style / Comments (from `code-style.md`)
 

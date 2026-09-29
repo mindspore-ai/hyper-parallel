@@ -149,7 +149,7 @@ body schedule.
    micro-batch runs its transposed forward.
 6. Tests: `tests/ut/core/pipeline_parallel/test_mpipe_transpose.py` (ordering),
    `test_mpipe_transpose_exec.py` (single-process recompute equivalence).
-   Distributed correctness: `tests/torch/pipeline_parallel/_test_mpipe_transpose.py`
+   Distributed correctness: `tests/st/pipeline_parallel/_test_mpipe_transpose.py`
    (gloo on CPU, hccl on Ascend NPU), launched by `test_mpipe_transpose_dist.py`
    via `parallel_run` / `TorchCase`.
 

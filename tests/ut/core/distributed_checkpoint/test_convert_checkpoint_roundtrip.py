@@ -16,7 +16,7 @@
 
 Validates :func:`full_state_dict_to_dcp_format` and :func:`dcp_to_full_state_dict` only.
 Hugging Face I/O, ``convert_full_checkpoint_to_dcp``, and file-based checkpoints are
-covered in ST (see ``tests/torch/distributed_checkpoint/test_offline_convert_st_torch.py``).
+covered in ST (see ``tests/st/distributed_checkpoint/test_offline_convert_st_torch.py``).
 
 Uses plain PyTorch tensors on CPU for this gate (``pytest tests/ut``).
 """

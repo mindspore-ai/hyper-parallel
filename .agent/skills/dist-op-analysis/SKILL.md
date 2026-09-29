@@ -80,7 +80,7 @@ Evaluate in order and explicitly state the choice and rationale in the plan:
 Key requirements:
 
 - **`_validate_input_layouts`**: only required for new classes using three-phase dispatch; defined as `@staticmethod`, called by `infer_layout` after `_check_partial_inputs`. Performs layout validity checks only (sharding constraints, mesh consistency, etc.) — no derivation.
-- **PyTorch ST**: cases use standard `torch.xxx()` APIs. Cases are defined in `tests/torch/shard/ops/cases/case_{op_name}.py` using the declarative `OpShardCase` pattern. See `.agent/rules/distributed-op-testing.md` for the full spec.
+- **PyTorch ST**: cases use standard `torch.xxx()` APIs. Cases are defined in `tests/st/shard/ops/cases/case_{op_name}.py` using the declarative `OpShardCase` pattern. See `.agent/rules/distributed-op-testing.md` for the full spec.
 
 ## Step 5: Output the Plan
 

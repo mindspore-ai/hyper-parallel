@@ -407,18 +407,18 @@ consistent intra-group step`）。走 `new_group` 这两个问题都不存在。
 # 无 NPU 也可验证（CPU + gloo 后端）
 export HYPER_PARALLEL_TEST_DEVICE_TYPE=cpu
 python -m torch.distributed.run --nproc-per-node=4 -m pytest -s \
-    tests/torch/distributed_checkpoint/dcp_async_save.py::test_dcp_async_save_twice_reuses_the_plan_cache
+    tests/st/distributed_checkpoint/dcp_async_save.py::test_dcp_async_save_twice_reuses_the_plan_cache
 ```
 
 | 用例文件 | 覆盖内容 |
 |------|------|
-| `tests/torch/distributed_checkpoint/dcp_save_and_load.py` | DTensor + 普通 Tensor + 标量混合存取、跨切分加载 |
-| `tests/torch/distributed_checkpoint/dcp_async_save.py` | 三种异步协同模式、Plan 缓存复用 |
-| `tests/torch/distributed_checkpoint/dcp_broadcast_load.py` | 副本张量广播加载（预建 / 懒建通信组） |
-| `tests/torch/distributed_checkpoint/dcp_pipeline_load.py` | 读播流水：超出在飞上限、通信组交错、非张量状态、重复加载 |
-| `tests/torch/distributed_checkpoint/dcp_pp_stage_load.py` | PP 下的广播加载（8 卡 `pp=2 × dp=2 × tp=2`）：各 stage 参数不同、某个 stage 无副本分片、两 stage 在分片序中交错、跨 stage 绑定参数 |
-| `tests/torch/distributed_checkpoint/dcp_resharding_api.py` | 多种 mesh 组合下的重切分读取 |
-| `tests/torch/distributed_checkpoint/_test_dcp_tp_dp.py` | `fully_shard` + 优化器状态 + flatten_state_dict |
-| `tests/torch/distributed_checkpoint/dcp_plan_cache_minimal_api.py` | Plan 缓存命中与 model / optimizer 缓存隔离 |
+| `tests/st/distributed_checkpoint/dcp_save_and_load.py` | DTensor + 普通 Tensor + 标量混合存取、跨切分加载 |
+| `tests/st/distributed_checkpoint/dcp_async_save.py` | 三种异步协同模式、Plan 缓存复用 |
+| `tests/st/distributed_checkpoint/dcp_broadcast_load.py` | 副本张量广播加载（预建 / 懒建通信组） |
+| `tests/st/distributed_checkpoint/dcp_pipeline_load.py` | 读播流水：超出在飞上限、通信组交错、非张量状态、重复加载 |
+| `tests/st/distributed_checkpoint/dcp_pp_stage_load.py` | PP 下的广播加载（8 卡 `pp=2 × dp=2 × tp=2`）：各 stage 参数不同、某个 stage 无副本分片、两 stage 在分片序中交错、跨 stage 绑定参数 |
+| `tests/st/distributed_checkpoint/dcp_resharding_api.py` | 多种 mesh 组合下的重切分读取 |
+| `tests/st/distributed_checkpoint/_test_dcp_tp_dp.py` | `fully_shard` + 优化器状态 + flatten_state_dict |
+| `tests/st/distributed_checkpoint/dcp_plan_cache_minimal_api.py` | Plan 缓存命中与 model / optimizer 缓存隔离 |
 
 用例文件本身不带 `test_` 前缀（或以 `_` 开头），由同名的 `test_*.py` 包装器通过 `parallel_run` 拉起多进程执行；直接用 `torch.distributed.run` 跑上表中的文件即可。

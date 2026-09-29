@@ -21,7 +21,7 @@ Layout:
 | Component | Description                                                                                                         | Location Pattern                        |
 | --------- |---------------------------------------------------------------------------------------------------------------------|-----------------------------------------|
 | **Unit Tests** | Conducting independent testing of functions and modules using only the CPU                                          | `tests/ut/<module>/<feature>/test_*.py` |
-| **Integration Tests** | Test interactions between components and modules that require actual distributed communication and GPU/NPU hardware | `tests/torch/<module>/test_*.py`        |
+| **Integration Tests** | Test interactions between components and modules that require actual distributed communication and GPU/NPU hardware | `tests/st/<module>/test_*.py`        |
 
 **Key Principles:**
 

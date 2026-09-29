@@ -280,7 +280,7 @@ MoE 的具体配置与验收见[模型文档](https://atomgit.com/mindspore/hype
 
 ## 系统测试
 
-RL ST 位于 `hyper_parallel/rl/tests/st/`，暂不由主项目 `tests/torch/` 门禁收集。
+RL ST 位于 `hyper_parallel/rl/tests/st/`，暂不由主项目 `tests/st/` 门禁收集。
 保留六个真实 NPU 场景及原有验收条件；主项目门禁通过不代表这些场景已执行。
 共享配方仍位于 `tests/common/rl_st_cases.py`，供 UT 和独立 ST 使用。
 

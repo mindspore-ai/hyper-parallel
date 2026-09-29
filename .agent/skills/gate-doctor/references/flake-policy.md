@@ -102,7 +102,7 @@ touched.
 
 Grep the failing test file and the modules it imports for symbols
 defined in the PR diff. A failing `test_swiglu_*` for a PR that only
-touches `tests/torch/llama3_examples/` shows no overlap —
+touches `tests/st/llama3_examples/` shows no overlap —
 that's a real "no". A failing `test_with_stream.py` for a PR that
 adds a new ops entry in `mindspore/ops/api_def/` may overlap through
 the generated dispatch table — that's a "maybe yes".

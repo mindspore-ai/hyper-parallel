@@ -831,13 +831,13 @@ def _run_pr_st_gate(scope: str, diff_range: Optional[str]) -> None:
     """
     if scope == "full":
         # Distributed ST lives in the per-suite pytest launchers under
-        # tests/torch (tests/ut holds the unit tests and is gated separately).
-        targets = [d for d in ("tests/torch",)
+        # tests/st (tests/ut holds the unit tests and is gated separately).
+        targets = [d for d in ("tests/st",)
                    if (REPO_ROOT / d).is_dir()]
         if not targets:
             raise AutoGitError(
                 "ST gate (full): no ST test directories found "
-                "(looked for tests/torch).\n"
+                "(looked for tests/st).\n"
                 "Re-run with --st skip if this repo has no ST suite."
             )
         print(f"Running ST gate (full) on: {', '.join(targets)}")
