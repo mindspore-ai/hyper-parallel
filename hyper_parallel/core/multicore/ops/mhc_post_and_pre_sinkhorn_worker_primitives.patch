@@ -1,0 +1,368 @@
+diff --git a/mhc/mhc_post/op_kernel/arch22/mhc_post_arch22.h b/mhc/mhc_post/op_kernel/arch22/mhc_post_arch22.h
+index 89168819b..5916694b3 100644
+--- a/mhc/mhc_post/op_kernel/arch22/mhc_post_arch22.h
++++ b/mhc/mhc_post/op_kernel/arch22/mhc_post_arch22.h
+@@ -42,6 +42,8 @@ public:
+           tilingData_(tilingData){};
+     __aicore__ inline void Init(GM_ADDR x, GM_ADDR hRes, GM_ADDR hOut, GM_ADDR hPost, GM_ADDR output,
+                                 GM_ADDR workspace);
++    __aicore__ inline void InitTask(GM_ADDR x, GM_ADDR hRes, GM_ADDR hOut, GM_ADDR hPost, GM_ADDR output,
++                                    GM_ADDR workspace, uint32_t logicalBlockIdx);
+     __aicore__ inline void Process();
+
+ private:
+@@ -87,7 +89,15 @@ TEMPLATE_DECLARE
+ __aicore__ inline void MhcPostKernel<TEMPLATE_ARGS>::Init(GM_ADDR x, GM_ADDR hRes, GM_ADDR hOut, GM_ADDR hPost,
+                                                           GM_ADDR output, GM_ADDR workspace)
+ {
+-    blockIdx_ = GetBlockIdx();
++    InitTask(x, hRes, hOut, hPost, output, workspace, GetBlockIdx());
++}
++
++TEMPLATE_DECLARE
++__aicore__ inline void MhcPostKernel<TEMPLATE_ARGS>::InitTask(GM_ADDR x, GM_ADDR hRes, GM_ADDR hOut,
++                                                              GM_ADDR hPost, GM_ADDR output, GM_ADDR workspace,
++                                                              uint32_t logicalBlockIdx)
++{
++    blockIdx_ = logicalBlockIdx;
+     if (blockIdx_ >= tilingData_->usedCoreNum) {
+         return;
+     }
+diff --git a/mhc/mhc_pre_sinkhorn/op_kernel/mhc_pre_sinkhorn_cube_compute.h b/mhc/mhc_pre_sinkhorn/op_kernel/mhc_pre_sinkhorn_cube_compute.h
+index 87facf9d7..1a74914f3 100644
+--- a/mhc/mhc_pre_sinkhorn/op_kernel/mhc_pre_sinkhorn_cube_compute.h
++++ b/mhc/mhc_pre_sinkhorn/op_kernel/mhc_pre_sinkhorn_cube_compute.h
+@@ -494,6 +494,8 @@ public:
+                                 const GlobalTensor<float> &workspaceGlobalAB, int64_t bs, int64_t n, int64_t c,
+                                 int64_t vecCoreNum);
+     __aicore__ inline void ProcessMatmulXPhi(const int32_t taskOffset, const int32_t mm1M);
++    __aicore__ inline void ProcessMatmulXPhiTask(const int32_t inputOffset, const int32_t outputOffset,
++                                                 const int32_t mm1M);
+
+ public:
+     GlobalTensor<float> xGm_;
+@@ -548,6 +550,22 @@ __aicore__ inline void MHC_PRE_SINKHORN_CUBE_COMPUTE_TEMPLATE_CLASS::ProcessMatm
+     mm1_.End();
+     ping4Cub = 1 - ping4Cub;
+ }
++MHC_PRE_SINKHORN_CUBE_COMPUTE_TEMPLATE_PARAM
++__aicore__ inline void MHC_PRE_SINKHORN_CUBE_COMPUTE_TEMPLATE_CLASS::ProcessMatmulXPhiTask(
++    const int32_t inputOffset, const int32_t outputOffset, const int32_t mm1M)
++{
++    if (mm1M <= 0) {
++        return;
++    }
++    mm1_.SetTensorA(xGm_[inputOffset * mm1K_]);
++    mm1_.SetTensorB(phiGm_, true);
++    mm1_.SetHF32(true, 1);
++    mm1_.SetOrgShape(mm1M, mm1N_, mm1K_);
++    mm1_.SetSingleShape(mm1M, mm1N_, mm1K_);
++    mm1_.template IterateAll<false>(workspaceGlobalAB_[outputOffset * mm1N_]);
++    mm1_.End();
++}
++
+ } // namespace MhcPreSinkhorn
+
+ #endif // MHC_PRE_SINKHORN_CUBE_COMPUTE_H
+diff --git a/mhc/mhc_pre_sinkhorn/op_kernel/mhc_pre_sinkhorn_m_split_core.h b/mhc/mhc_pre_sinkhorn/op_kernel/mhc_pre_sinkhorn_m_split_core.h
+index c63f0fc59..d699df50d 100644
+--- a/mhc/mhc_pre_sinkhorn/op_kernel/mhc_pre_sinkhorn_m_split_core.h
++++ b/mhc/mhc_pre_sinkhorn/op_kernel/mhc_pre_sinkhorn_m_split_core.h
+@@ -33,6 +33,7 @@ public:
+         pipe = pipePtr;
+         tilingData = tilingDataPtr;
+         needGrad_ = tilingData->needGrad;
++        isNormCastTask_ = false;
+
+         // 获取当前核心 ID
+         uint64_t blockIdx = GetBlockIdx();
+@@ -87,6 +88,14 @@ public:
+         }
+     }
+
++    __aicore__ inline void SetNormCastTaskContext(GM_ADDR xCastWorkspace, int32_t tokenOffset, int32_t tokenCount)
++    {
++        isNormCastTask_ = true;
++        normCastTokenOffset_ = tokenOffset;
++        normCastTokenCount_ = tokenCount;
++        xCastWsGm.SetGlobalBuffer((__gm__ float *)xCastWorkspace);
++    }
++
+     __aicore__ inline void Process()
+     {
+         uint64_t blockIdx = GetBlockIdx();
+@@ -94,38 +103,49 @@ public:
+         uint64_t cubeCoreId = blockIdx;
+
+         if ASCEND_IS_AIC {
+-            CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
+-            CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
++            if (!isNormCastTask_) {
++                CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
++                CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
++            }
+         }
+
+         // 循环处理 BS（每轮最多 32 个）
+         // ASCEND_IS_AIC 直接根据总BS数，计算当前处理的BS数
+-        int32_t totalTasksAligned_ = AlignUp(tilingData->bs, tilingData->stage1VecCoreNum * tilingData->stage1BsFactor);
++        int32_t totalTasksAligned_ = isNormCastTask_ ? normCastTokenOffset_ + normCastTokenCount_ :
++            AlignUp(tilingData->bs, tilingData->stage1VecCoreNum * tilingData->stage1BsFactor);
+
+         // Cube Core 流程
+         if ASCEND_IS_AIC {
+-            for (int32_t taskOffset = blockIdx * 2 * tilingData->stage1BsFactor; taskOffset < totalTasksAligned_;
+-                 taskOffset += tilingData->stage1CubeCoreNum * 2 * tilingData->stage1BsFactor) {
+-                int32_t tileTaskCount = min(static_cast<int32_t>(2 * tilingData->stage1BsFactor),
+-                                            static_cast<int32_t>(tilingData->bs - taskOffset));
+-                // 等待 Vector Core 完成 Cast
+-                CrossCoreWaitFlag(SYNC_AIV_TO_AIC_FLAG);
+-                // 执行矩阵乘
+-                if (tileTaskCount > 0) {
+-                    cubeCompute_.ProcessMatmulXPhi(taskOffset, tileTaskCount);
++            if (!isNormCastTask_) {
++                for (int32_t taskOffset = blockIdx * 2 * tilingData->stage1BsFactor; taskOffset < totalTasksAligned_;
++                     taskOffset += tilingData->stage1CubeCoreNum * 2 * tilingData->stage1BsFactor) {
++                    int32_t tileTaskCount = min(static_cast<int32_t>(2 * tilingData->stage1BsFactor),
++                                                static_cast<int32_t>(tilingData->bs - taskOffset));
++                    // 等待 Vector Core 完成 Cast
++                    CrossCoreWaitFlag(SYNC_AIV_TO_AIC_FLAG);
++                    // 执行矩阵乘
++                    if (tileTaskCount > 0) {
++                        cubeCompute_.ProcessMatmulXPhi(taskOffset, tileTaskCount);
++                    }
++                    // 通知 Vector Core 完成
++                    CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
+                 }
+-                // 通知 Vector Core 完成
+-                CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
+             }
+         }
+
+         if ASCEND_IS_AIV {
+             int64_t ncSize = tilingData->hcMult * tilingData->d;
+-            for (int32_t taskOffset = blockIdx * tilingData->stage1BsFactor; taskOffset < totalTasksAligned_;
+-                 taskOffset += tilingData->stage1VecCoreNum * tilingData->stage1BsFactor) {
+-                CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
+-                int32_t curBs = min(static_cast<int32_t>(tilingData->stage1BsFactor),
+-                                    static_cast<int32_t>(tilingData->bs - taskOffset));
++            int32_t firstTaskOffset = isNormCastTask_ ? normCastTokenOffset_ :
++                blockIdx * tilingData->stage1BsFactor;
++            int32_t taskStep = isNormCastTask_ ? tilingData->stage1BsFactor :
++                tilingData->stage1VecCoreNum * tilingData->stage1BsFactor;
++            for (int32_t taskOffset = firstTaskOffset; taskOffset < totalTasksAligned_; taskOffset += taskStep) {
++                if (!isNormCastTask_) {
++                    CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
++                }
++                int32_t remainingBs = isNormCastTask_ ? totalTasksAligned_ - taskOffset :
++                    tilingData->bs - taskOffset;
++                int32_t curBs = min(static_cast<int32_t>(tilingData->stage1BsFactor), remainingBs);
+                 if (curBs > 0) {
+                     int64_t curBsOffset = taskOffset;
+                     // 初始化 sum 为 0
+@@ -155,9 +175,10 @@ public:
+
+                         // 3. CopyOut X_cast to workspace
+                         xCastLocal = xCastQue.DeQue<float>();
+-                        int64_t xCastoffset =
++                        int64_t xCastoffset = isNormCastTask_ ?
++                            (taskOffset - normCastTokenOffset_) * ncSize :
+                             blockIdx * tilingData->stage1BsFactor * ncSize +
+-                            ping4vec * tilingData->stage1VecCoreNum * tilingData->stage1BsFactor * ncSize;
++                                ping4vec * tilingData->stage1VecCoreNum * tilingData->stage1BsFactor * ncSize;
+                         CopyOut(xCastLocal, xCastWsGm[xCastoffset + ncOffset], curBs, curNcSize, ncSize - curNcSize);
+                         xCastQue.FreeTensor(xCastLocal);
+
+@@ -200,10 +221,14 @@ public:
+                     invRmsQue.FreeTensor(invRmsLocal);
+                     ping4vec = 1 - ping4vec;
+                 }
+-                CrossCoreSetFlag<SYNC_MODE2, PIPE_MTE3>(SYNC_AIV_TO_AIC_FLAG);
++                if (!isNormCastTask_) {
++                    CrossCoreSetFlag<SYNC_MODE2, PIPE_MTE3>(SYNC_AIV_TO_AIC_FLAG);
++                }
++            }
++            if (!isNormCastTask_) {
++                CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
++                CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
+             }
+-            CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
+-            CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
+         }
+     }
+
+@@ -233,6 +258,9 @@ public:
+
+     // 标志
+     bool needGrad_ = true;
++    bool isNormCastTask_ = false;
++    int32_t normCastTokenOffset_ = 0;
++    int32_t normCastTokenCount_ = 0;
+     uint64_t ping4vec = 1;
+
+     // 同步标志
+@@ -263,8 +291,8 @@ public:
+         combFragGm.SetGlobalBuffer((__gm__ float *)combFrag);
+         workspaceGm.SetGlobalBuffer((__gm__ float *)workspace);
+
++        hPreGm.SetGlobalBuffer((__gm__ float *)hPre);
+         if (needGrad_) {
+-            hPreGm.SetGlobalBuffer((__gm__ float *)hPre);
+             hcBeforeNormGm.SetGlobalBuffer((__gm__ float *)hcBeforeNorm);
+             invRmsGm.SetGlobalBuffer((__gm__ float *)invRms);
+             sumOutGm.SetGlobalBuffer((__gm__ float *)sumOut);
+@@ -319,9 +347,69 @@ public:
+         combFragBufLocal = combFragBuf.Get<float>();
+     }
+
+-    __aicore__ inline void Process(bool isTailBsLoop = false)
++    __aicore__ inline void SetTaskContext(GM_ADDR previousPre, uint64_t taskIndex, uint64_t taskSplitNum,
++                                          uint64_t taskSplitValue)
++    {
++        stage2BlockIdx_ = taskIndex;
++        taskSplitNum_ = taskSplitNum;
++        taskSplitValue_ = taskSplitValue;
++        previousPreGm.SetGlobalBuffer((__gm__ float *)previousPre);
++    }
++
++    __aicore__ inline void ProcessYTask()
++    {
++        if ASCEND_IS_AIV {
++            int64_t tokenOffset = stage2BlockIdx_ * taskSplitValue_;
++            int64_t tokenCount = stage2BlockIdx_ == taskSplitNum_ - 1 ?
++                tilingData->bs - tokenOffset : taskSplitValue_;
++            int64_t rowFactor = tilingData->stage2RowFactor;
++            int64_t rowOuterLoop = CeilDiv(tokenCount, rowFactor);
++            for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
++                int64_t rowOffset = rowOuterIdx * rowFactor;
++                int64_t curRowFactor = min(rowFactor, tokenCount - rowOffset);
++                int64_t hPreBaseOffset = (tokenOffset + rowOffset) * tilingData->hcMult;
++                LocalTensor<float> previousPreLocal =
++                    mxies01ReduceLocal[tilingData->stage2RowFactor * tilingData->hcMultAlign];
++                for (int64_t row = 0; row < curRowFactor; ++row) {
++                    for (int64_t col = 0; col < tilingData->hcMult; ++col) {
++                        previousPreLocal.SetValue(row * tilingData->hcMultAlign + col,
++                                                  previousPreGm.GetValue(hPreBaseOffset + row * tilingData->hcMult + col));
++                    }
++                }
++                event_t previousPreEvent = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_V));
++                SetFlag<HardEvent::S_V>(previousPreEvent);
++                WaitFlag<HardEvent::S_V>(previousPreEvent);
++
++                int64_t xBaseOffset = (tokenOffset + rowOffset) * tilingData->hcMult * tilingData->d;
++                int64_t yBaseOffset = (tokenOffset + rowOffset) * tilingData->d;
++                for (int64_t dLoopIdx = 0; dLoopIdx < tilingData->dLoop; dLoopIdx++) {
++                    int64_t curDFactor =
++                        (dLoopIdx == tilingData->dLoop - 1) ? tilingData->tailDFactor : tilingData->dFactor;
++                    xLocal = xQue.template AllocTensor<T>();
++                    CopyIn(xGm[xBaseOffset + dLoopIdx * tilingData->dFactor], xLocal,
++                           curRowFactor * tilingData->hcMult, curDFactor, tilingData->d - curDFactor);
++                    xQue.template EnQue(xLocal);
++                    xLocal = xQue.template DeQue<T>();
++                    yLocal = yQue.template AllocTensor<T>();
++                    ProcessY(yLocal, xLocal, previousPreLocal, hcBrcbLocal1, xCastLocal, yCastLocal, curRowFactor,
++                             tilingData->hcMult, curDFactor);
++                    xQue.template FreeTensor(xLocal);
++                    yQue.template EnQue(yLocal);
++                    yLocal = yQue.template DeQue<T>();
++                    CopyOut(yLocal, yGm[yBaseOffset + dLoopIdx * tilingData->dFactor], curRowFactor, curDFactor,
++                            tilingData->d - curDFactor);
++                    yQue.template FreeTensor(yLocal);
++                }
++            }
++            MTE3ToVSync();
++        }
++    }
++
++    __aicore__ inline void Process(bool isTailBsLoop = false, bool synchronizeBefore = true)
+     {
+-        SyncAll();
++        if (synchronizeBefore) {
++            SyncAll();
++        }
+         isTailBsLoop_ = isTailBsLoop;
+
+         int64_t curRowOfFormerBlock = isTailBsLoop ? tilingData->tailBsRowOfFormerBlock : tilingData->rowOfFormerBlock;
+@@ -337,9 +420,19 @@ public:
+             isTailBsLoop ? tilingData->tailBsTailRowFactorOfTailBlock : tilingData->tailRowFactorOfTailBlock;
+         int64_t curML1Size = isTailBsLoop ? tilingData->tailBsML1Size : tilingData->mL1Size;
+
++        int64_t tailTaskRows = tilingData->bs - (taskSplitNum_ - 1) * taskSplitValue_;
++        int64_t rowFactor = tilingData->stage2RowFactor;
++        curRowOfFormerBlock = taskSplitValue_;
++        curRowLoopOfFormerBlock = CeilDiv(taskSplitValue_, rowFactor);
++        curRowLoopOfTailBlock = CeilDiv(tailTaskRows, rowFactor);
++        curSecondUsedCoreNum = taskSplitNum_;
++        curStage2RowFactor = rowFactor;
++        curTailRowFactorOfFormerBlock = taskSplitValue_ % rowFactor == 0 ? rowFactor : taskSplitValue_ % rowFactor;
++        curTailRowFactorOfTailBlock = tailTaskRows % rowFactor == 0 ? rowFactor : tailTaskRows % rowFactor;
++
+         if ASCEND_IS_AIV {
+             int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;
+-            int64_t stage2BlockIdx = GetBlockIdx();
++            int64_t stage2BlockIdx = stage2BlockIdx_;
+             int64_t stage2UsedCoreNum = curSecondUsedCoreNum;
+             if (stage2BlockIdx >= stage2UsedCoreNum) {
+                 return;
+@@ -362,8 +455,6 @@ public:
+                 (stage2BlockIdx == stage2UsedCoreNum - 1) ? curRowLoopOfTailBlock : curRowLoopOfFormerBlock;
+             int64_t tailRowFactor =
+                 (stage2BlockIdx == stage2UsedCoreNum - 1) ? curTailRowFactorOfTailBlock : curTailRowFactorOfFormerBlock;
+-            int64_t xGmBlockBaseOffsetPart2 = stage2BlockIdx * curRowOfFormerBlock * tilingData->hcMult * tilingData->d;
+             uint64_t mixBaseOffset = 0;
+             for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
+-                int64_t xGmBsBaseOffsetPart2 = rowOuterIdx * curStage2RowFactor * tilingData->hcMult * tilingData->d;
+                 int64_t curRowFactor = (rowOuterIdx == rowOuterLoop - 1) ? tailRowFactor : curStage2RowFactor;
+@@ -398,33 +489,9 @@ public:
+-                if (needGrad_) {
+-                    int64_t hPreBaseOffset = stage2BlockIdx * curRowOfFormerBlock * tilingData->hcMult +
+-                                             rowOuterIdx * curStage2RowFactor * tilingData->hcMult;
+-                    VToMTE3Sync();
+-                    CopyOut(mxies01ReduceLocal, hPreGm[hPreBaseOffset], curRowFactor, tilingData->hcMult);
+-                    MTE3ToVSync();
+-                }
++                int64_t hPreBaseOffset = stage2BlockIdx * curRowOfFormerBlock * tilingData->hcMult +
++                                         rowOuterIdx * curStage2RowFactor * tilingData->hcMult;
++                VToMTE3Sync();
++                CopyOut(mxies01ReduceLocal, hPreGm[hPreBaseOffset], curRowFactor, tilingData->hcMult);
++                MTE3ToVSync();
+                 // --- pre --
+-                for (int64_t dLoopIdx = 0; dLoopIdx < tilingData->dLoop; dLoopIdx++) {
+-                    int64_t curDFactor =
+-                        (dLoopIdx == tilingData->dLoop - 1) ? tilingData->tailDFactor : tilingData->dFactor;
+-                    xLocal = xQue.template AllocTensor<T>();
+-                    CopyIn(xGm[xGmBlockBaseOffsetPart2 + xGmBsBaseOffsetPart2 + dLoopIdx * tilingData->dFactor], xLocal,
+-                           curRowFactor * tilingData->hcMult, curDFactor, tilingData->d - curDFactor);
+-                    xQue.template EnQue(xLocal);
+-                    xLocal = xQue.template DeQue<T>();
+-                    yLocal = yQue.template AllocTensor<T>();
+-
+-                    ProcessY(yLocal, xLocal, mxies01ReduceLocal, hcBrcbLocal1, xCastLocal, yCastLocal, curRowFactor,
+-                             tilingData->hcMult, curDFactor);
+-                    xQue.template FreeTensor(xLocal);
+-                    yQue.template EnQue(yLocal);
+-                    yLocal = yQue.template DeQue<T>();
+-
+-                    CopyOut(yLocal,
+-                            yGm[stage2BlockIdx * curRowOfFormerBlock * tilingData->d +
+-                                rowOuterIdx * curStage2RowFactor * tilingData->d + dLoopIdx * tilingData->dFactor],
+-                            curRowFactor, curDFactor, tilingData->d - curDFactor);
+-                    yQue.template FreeTensor(yLocal);
+-                }
+                 // post
+                 postLocal = postQue.AllocTensor<float>();
+                 ProcessPost(postLocal, mxies01Local[curRowFactor * tilingData->hcMultAlign], hcBase1Local,
+@@ -593,8 +660,13 @@ private:
+     GlobalTensor<float> sumOutGm;
+     GlobalTensor<float> normOutGm;
+
++    GlobalTensor<float> previousPreGm;
++
+     bool needGrad_ = false;
+     bool isTailBsLoop_ = false;
++    uint64_t stage2BlockIdx_ = 0;
++    uint64_t taskSplitNum_ = 1;
++    uint64_t taskSplitValue_ = 1;
+
+     TQue<QuePosition::VECIN, 1> mixesQue01;
+     TQue<QuePosition::VECIN, 1> mixesQue2;

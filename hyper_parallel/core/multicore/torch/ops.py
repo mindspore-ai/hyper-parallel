@@ -31,7 +31,14 @@ Forward and backward ACLNN symbols are packaged in one component-owned
 ``hyper_parallel_multicore_nn`` vendor. Source the packaged ``set_env.bash``
 before starting the application or framework Python process so CANN can discover that vendor.
 """
-__all__ = ["mega_moe", "mega_moe_grad"]
+__all__ = [
+    "cann_mhc_pre_sinkhorn",
+    "cann_mhc_pre_sinkhorn_with_cache",
+    "hyper_mega_mhc",
+    "hyper_mega_mhc_grad",
+    "mega_moe",
+    "mega_moe_grad",
+]
 
 from functools import lru_cache
 import torch
@@ -66,6 +73,343 @@ def _load_native() -> None:
 # ---------------------------------------------------------------------------
 
 
+def cann_mhc_pre_sinkhorn(
+    x: torch.Tensor,
+    phi: torch.Tensor,
+    alpha: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    hc_eps: float = 1e-6,
+    norm_eps: float = 1e-6,
+    num_iters: int = 20,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Call CANN MhcPreSinkhorn while retaining mappings needed by shifting.
+
+    Args:
+        x: Token-major residual input.
+        phi: Projection weights.
+        alpha: MhcPre scaling parameters.
+        bias: MhcPre bias parameters.
+        hc_eps: Sinkhorn numerical-stability epsilon.
+        norm_eps: RMS normalization epsilon.
+        num_iters: Sinkhorn iteration count.
+    """
+    _load_native()
+    if x.ndim != 3:
+        raise ValueError(f"x must be token-major [M, 4, H], got {tuple(x.shape)}.")
+    token_count, hc_mult, hidden_size = x.shape
+    hc_mix = hc_mult * hc_mult + 2 * hc_mult
+    x_bsnd = x.unsqueeze(0)
+    hin = torch.empty((1, token_count, hidden_size), dtype=x.dtype, device=x.device)
+    h_post = torch.empty((1, token_count, hc_mult), dtype=torch.float32, device=x.device)
+    h_res = torch.empty((1, token_count, hc_mult * hc_mult), dtype=torch.float32, device=x.device)
+    h_pre = torch.empty((1, token_count, hc_mult), dtype=torch.float32, device=x.device)
+    hc_before_norm = torch.empty((1, token_count, hc_mix), dtype=torch.float32, device=x.device)
+    inv_rms = torch.empty((1, token_count, 1), dtype=torch.float32, device=x.device)
+    sum_out = torch.empty((2 * num_iters, 1, token_count, hc_mult), dtype=torch.float32, device=x.device)
+    norm_out = torch.empty(
+        (2 * num_iters, 1, token_count, hc_mult, hc_mult),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    torch.ops.hyper_parallel.cann_mhc_pre_sinkhorn(
+        x_bsnd,
+        phi,
+        alpha,
+        bias,
+        hin,
+        h_post,
+        h_res,
+        h_pre,
+        hc_before_norm,
+        inv_rms,
+        sum_out,
+        norm_out,
+        hc_eps,
+        norm_eps,
+        num_iters,
+    )
+    return (
+        hin.squeeze(0),
+        h_post.squeeze(0),
+        h_res.squeeze(0).reshape(token_count, hc_mult, hc_mult),
+        h_pre.squeeze(0),
+    )
+
+
+def cann_mhc_pre_sinkhorn_with_cache(
+    x: torch.Tensor,
+    phi: torch.Tensor,
+    alpha: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    hc_eps: float = 1e-6,
+    norm_eps: float = 1e-6,
+    num_iters: int = 20,
+) -> tuple[torch.Tensor, ...]:
+    """Call CANN MhcPreSinkhorn and expose all native backward caches.
+
+    Args:
+        x: Token-major residual input.
+        phi: Projection weights.
+        alpha: MhcPre scaling parameters.
+        bias: MhcPre bias parameters.
+        hc_eps: Sinkhorn numerical-stability epsilon.
+        norm_eps: RMS normalization epsilon.
+        num_iters: Sinkhorn iteration count.
+    """
+    _load_native()
+    if x.ndim != 3:
+        raise ValueError(f"x must be token-major [M, 4, H], got {tuple(x.shape)}.")
+    token_count, hc_mult, hidden_size = x.shape
+    hc_mix = hc_mult * hc_mult + 2 * hc_mult
+    x_bsnd = x.unsqueeze(0)
+    hin = torch.empty((1, token_count, hidden_size), dtype=x.dtype, device=x.device)
+    h_post = torch.empty((1, token_count, hc_mult), dtype=torch.float32, device=x.device)
+    h_res = torch.empty((1, token_count, hc_mult * hc_mult), dtype=torch.float32, device=x.device)
+    h_pre = torch.empty((1, token_count, hc_mult), dtype=torch.float32, device=x.device)
+    hc_before_norm = torch.empty((1, token_count, hc_mix), dtype=torch.float32, device=x.device)
+    inv_rms = torch.empty((1, token_count, 1), dtype=torch.float32, device=x.device)
+    sum_out = torch.empty((2 * num_iters, 1, token_count, hc_mult), dtype=torch.float32, device=x.device)
+    norm_out = torch.empty(
+        (2 * num_iters, 1, token_count, hc_mult, hc_mult), dtype=torch.float32, device=x.device
+    )
+    torch.ops.hyper_parallel.cann_mhc_pre_sinkhorn(
+        x_bsnd,
+        phi,
+        alpha,
+        bias,
+        hin,
+        h_post,
+        h_res,
+        h_pre,
+        hc_before_norm,
+        inv_rms,
+        sum_out,
+        norm_out,
+        hc_eps,
+        norm_eps,
+        num_iters,
+    )
+    return hin, h_post, h_res, h_pre, hc_before_norm, inv_rms, sum_out, norm_out
+
+
+def hyper_mega_mhc(
+    previous_output: torch.Tensor,
+    residual: torch.Tensor,
+    previous_pre_mix: torch.Tensor,
+    previous_post_mix: torch.Tensor,
+    previous_residual_mix: torch.Tensor,
+    phi: torch.Tensor,
+    alpha: torch.Tensor,
+    bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    runtime_config: torch.Tensor,
+    all_event_counters: torch.Tensor,
+    profile_buffer: torch.Tensor,
+    *,
+    hc_eps: float = 1e-6,
+    norm_eps: float = 1e-6,
+    num_iters: int = 20,
+    need_backward: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate outputs and launch the single-kernel shifted mHC implementation.
+
+    Args:
+        previous_output: Previous block output used by MhcPost.
+        residual: Previous block residual state.
+        previous_pre_mix: Previous block pre-mix coefficients.
+        previous_post_mix: Previous block post-mix coefficients.
+        previous_residual_mix: Previous block residual-mix coefficients.
+        phi: Projection weights.
+        alpha: MhcPre scaling parameters.
+        bias: MhcPre bias parameters.
+        norm_weight: Shifted RMSNorm weight.
+        runtime_config: Serialized multicore schedule.
+        all_event_counters: Device event-counter storage.
+        profile_buffer: Device profiling storage.
+        hc_eps: Sinkhorn numerical-stability epsilon.
+        norm_eps: RMS normalization epsilon.
+        num_iters: Sinkhorn iteration count.
+        need_backward: Whether MhcPre should retain backward caches.
+    """
+    _load_native()
+    if residual.ndim != 4:
+        raise ValueError(f"residual must be BSND [B, S, 4, H], got {tuple(residual.shape)}.")
+    batch_size, sequence_length, hc_mult, hidden_size = residual.shape
+    new_residual = torch.empty_like(residual)
+    next_pre_mix = torch.empty(
+        (batch_size, sequence_length, hc_mult),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    next_post_mix = torch.empty_like(next_pre_mix)
+    next_residual_mix = torch.empty(
+        (batch_size, sequence_length, hc_mult * hc_mult),
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    block_input = torch.empty(
+        (batch_size, sequence_length, hidden_size),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    torch.ops.hyper_parallel.mega_mhc(
+        previous_output,
+        residual,
+        previous_pre_mix,
+        previous_post_mix,
+        previous_residual_mix,
+        phi,
+        alpha,
+        bias,
+        norm_weight,
+        runtime_config,
+        all_event_counters,
+        profile_buffer,
+        new_residual,
+        next_pre_mix,
+        next_post_mix,
+        next_residual_mix,
+        block_input,
+        hc_eps,
+        norm_eps,
+        num_iters,
+        need_backward,
+    )
+    return (
+        new_residual,
+        next_pre_mix,
+        next_post_mix,
+        next_residual_mix.reshape(batch_size, sequence_length, hc_mult, hc_mult),
+        block_input,
+    )
+
+
+def _allocate_hyper_mega_mhc_grad_outputs(
+    previous_residual: torch.Tensor,
+    phi: torch.Tensor,
+    alpha: torch.Tensor,
+    bias: torch.Tensor,
+    previous_output: torch.Tensor,
+    previous_pre: torch.Tensor,
+    previous_post: torch.Tensor,
+    previous_residual_mix: torch.Tensor,
+    norm_weight: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """Allocate output gradients required by the native backward ABI."""
+    return (
+        torch.empty_like(previous_residual),
+        torch.empty_like(phi),
+        torch.empty_like(alpha),
+        torch.empty_like(bias),
+        torch.empty_like(previous_output),
+        torch.empty_like(previous_pre),
+        torch.empty_like(previous_post),
+        torch.empty_like(previous_residual_mix),
+        torch.empty(norm_weight.shape, dtype=torch.float32, device=norm_weight.device),
+    )
+
+
+def hyper_mega_mhc_grad(
+    grad_hin_placeholder: torch.Tensor,
+    grad_h_post: torch.Tensor,
+    grad_h_res: torch.Tensor,
+    x: torch.Tensor,
+    phi: torch.Tensor,
+    alpha: torch.Tensor,
+    bias: torch.Tensor,
+    previous_pre: torch.Tensor,
+    hc_before_norm: torch.Tensor,
+    inv_rms: torch.Tensor,
+    sum_out: torch.Tensor,
+    norm_out: torch.Tensor,
+    grad_current_pre: torch.Tensor,
+    mixed_input: torch.Tensor,
+    rms_rstd: torch.Tensor,
+    norm_weight: torch.Tensor,
+    direct_grad_x: torch.Tensor,
+    previous_residual: torch.Tensor,
+    previous_output: torch.Tensor,
+    previous_post: torch.Tensor,
+    previous_residual_mix: torch.Tensor,
+    runtime_config: torch.Tensor,
+    all_event_counters: torch.Tensor,
+    profile_buffer: torch.Tensor,
+    *,
+    hc_eps: float = 1e-6,
+) -> tuple[torch.Tensor, ...]:
+    """Allocate gradients and launch the single-kernel shifted mHC backward.
+
+    Args:
+        grad_hin_placeholder: Placeholder gradient matching native ABI order.
+        grad_h_post: Gradient of current post-mix coefficients.
+        grad_h_res: Gradient of current residual-mix coefficients.
+        x: Forward MhcPre input.
+        phi: Projection weights.
+        alpha: MhcPre scaling parameters.
+        bias: MhcPre bias parameters.
+        previous_pre: Previous pre-mix coefficients.
+        hc_before_norm: Cached pre-normalization coefficients.
+        inv_rms: Cached coefficient inverse RMS.
+        sum_out: Cached Sinkhorn reductions.
+        norm_out: Cached Sinkhorn normalization values.
+        grad_current_pre: Gradient of current pre-mix coefficients.
+        mixed_input: Cached shifted input mix.
+        rms_rstd: Cached shifted RMSNorm reciprocal standard deviation.
+        norm_weight: Shifted RMSNorm weight.
+        direct_grad_x: Direct gradient of the current residual state.
+        previous_residual: Previous residual state.
+        previous_output: Previous block output.
+        previous_post: Previous post-mix coefficients.
+        previous_residual_mix: Previous residual-mix coefficients.
+        runtime_config: Serialized multicore schedule.
+        all_event_counters: Device event-counter storage.
+        profile_buffer: Device profiling storage.
+        hc_eps: Sinkhorn numerical-stability epsilon.
+    """
+    _load_native()
+    grad_outputs = _allocate_hyper_mega_mhc_grad_outputs(
+        previous_residual,
+        phi,
+        alpha,
+        bias,
+        previous_output,
+        previous_pre,
+        previous_post,
+        previous_residual_mix,
+        norm_weight,
+    )
+    return torch.ops.hyper_parallel.mega_mhc_grad(
+        grad_hin_placeholder,
+        grad_h_post,
+        grad_h_res,
+        x,
+        phi,
+        alpha,
+        bias,
+        previous_pre,
+        hc_before_norm,
+        inv_rms,
+        sum_out,
+        norm_out,
+        grad_current_pre,
+        mixed_input,
+        rms_rstd,
+        norm_weight,
+        direct_grad_x,
+        previous_residual,
+        previous_output,
+        previous_post,
+        previous_residual_mix,
+        runtime_config,
+        all_event_counters,
+        profile_buffer,
+        *grad_outputs,
+        hc_eps,
+    )
+
+
 def mega_moe(
     dispatch_target: torch.Tensor,
     dispatch_target_off: torch.Tensor,
@@ -97,6 +441,9 @@ def mega_moe(
 ) -> None:
     """
     MoE-FFN forward operator.
+
+    Args:
+        dispatch_target: First operator tensor; the detailed ABI is documented below.
 
     Writes in-place to: dispatch_target, up_proj_y, swiglu_out, down_proj_y,
                         combine_target.
@@ -281,6 +628,9 @@ def mega_moe_with_profile_buffer(
 ) -> None:
     """
     Launch the internal forward ABI with a profiler-owned ordinary NPU buffer.
+
+    Args:
+        dispatch_target: First operator tensor; the detailed ABI is documented below.
 
     Writes in-place to: dispatch_target, up_proj_y, swiglu_out, down_proj_y,
                         combine_target.

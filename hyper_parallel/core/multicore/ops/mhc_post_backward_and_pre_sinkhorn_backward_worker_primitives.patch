@@ -1,0 +1,243 @@
+diff --git a/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h b/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h
+--- a/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h
++++ b/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h
+@@ -30,6 +30,10 @@ public:
+     __aicore__ inline void Init(GM_ADDR grad_y, GM_ADDR x, GM_ADDR h_res, GM_ADDR h_out, GM_ADDR h_post, GM_ADDR grad_x,
+                                 GM_ADDR grad_h_res, GM_ADDR grad_h_out, GM_ADDR grad_h_post,
+                                 const MhcPostBackwardTilingDataArch22 &tilingData, TPipe *pipe);
++    __aicore__ inline void InitAdd(GM_ADDR grad_y, GM_ADDR direct_grad_y, GM_ADDR x, GM_ADDR h_res, GM_ADDR h_out,
++                                   GM_ADDR h_post, GM_ADDR grad_x, GM_ADDR grad_h_res, GM_ADDR grad_h_out,
++                                   GM_ADDR grad_h_post, const MhcPostBackwardTilingDataArch22 &tilingData,
++                                   TPipe *pipe);
+     __aicore__ inline void Process();
+
+ protected:
+@@ -47,7 +51,7 @@ protected:
+     TBuf<TPosition::VECCALC> dHLResTmpBuf1, dHLResTmpBuf2, dHLResTmpBuf3, dHLResTmpBuf4;
+     TBuf<TPosition::VECCALC> dxLTmpBuf2;
+
+-    GlobalTensor<T> dFPostResGm, FOutGm, xLGm;
++    GlobalTensor<T> dFPostResGm, directGradYGm, FOutGm, xLGm;
+     GlobalTensor<float> HLResGm, HLPostGm;
+
+     GlobalTensor<T> dxLGm, dFOutGm;
+@@ -79,6 +83,7 @@ protected:
+     uint64_t hResSize = 0;
+     uint64_t hOutSize = 0;
+     uint64_t hPostSize = 0;
++    bool addDirectGrad = false;
+
+     DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
+     DataCopyPadExtParams<float> padParamsFloat{false, 0, 0, 0};
+@@ -146,6 +151,17 @@ __aicore__ inline void KernelMhcPostBackward<T>::Init(GM_ADDR grad_y, GM_ADDR x,
+     pipe->InitBuffer(this->dxLTmpBuf2, this->n * this->n * sizeof(float));
+ }
+
++template <typename T>
++__aicore__ inline void KernelMhcPostBackward<T>::InitAdd(
++    GM_ADDR grad_y, GM_ADDR direct_grad_y, GM_ADDR x, GM_ADDR h_res, GM_ADDR h_out, GM_ADDR h_post,
++    GM_ADDR grad_x, GM_ADDR grad_h_res, GM_ADDR grad_h_out, GM_ADDR grad_h_post,
++    const MhcPostBackwardTilingDataArch22 &tilingData, TPipe *pipe)
++{
++    Init(grad_y, x, h_res, h_out, h_post, grad_x, grad_h_res, grad_h_out, grad_h_post, tilingData, pipe);
++    this->directGradYGm.SetGlobalBuffer((__gm__ T *)direct_grad_y, this->dFPostResSize);
++    this->addDirectGrad = true;
++}
++
+ template <typename T>
+ __aicore__ inline void KernelMhcPostBackward<T>::Process()
+ {
+@@ -229,6 +245,21 @@ __aicore__ inline void KernelMhcPostBackward<T>::Process()
+             Cast(this->FOutUb, this->FOutCastUb, RoundMode::CAST_NONE, this->blockChannel);       // bf16--> fp32
+             Cast(this->xLUb, this->xLCastUb, RoundMode::CAST_NONE, this->n * this->blockChannel); // bf16--> fp32
+
++            if (this->addDirectGrad) {
++                SetFlag<HardEvent::V_MTE2>(2);
++                WaitFlag<HardEvent::V_MTE2>(2);
++                DataCopyPad(
++                    this->dFPostResCastUb,
++                    this->directGradYGm[i * this->n * this->channel + j * this->blockChannel],
++                    copyParamsdFPostResUb, this->padParams);
++                SetFlag<HardEvent::MTE2_V>(2);
++                WaitFlag<HardEvent::MTE2_V>(2);
++                Cast(this->dxLUb, this->dFPostResCastUb, RoundMode::CAST_NONE,
++                     this->n * this->blockChannel);
++                PipeBarrier<PIPE_V>();
++                Add(this->dFPostResUb, this->dFPostResUb, this->dxLUb, this->n * this->blockChannel);
++            }
++
+             VecMatmulMknk(this->FOutUb, this->dFPostResUb, this->dHLPostUb, this->dHLResTmp1, this->dHLResTmp3, 1,
+                           this->blockChannel, this->n, this->alignN);
+
+@@ -300,6 +331,20 @@ __aicore__ inline void KernelMhcPostBackward<T>::Process()
+             Cast(this->FOutUb, this->FOutCastUb, RoundMode::CAST_NONE, this->tailC);                     // bf16--> fp32
+             Cast(this->xLUb, this->xLCastUb, RoundMode::CAST_NONE, this->n * this->tailC);               // bf16--> fp32
+
++            if (this->addDirectGrad) {
++                SetFlag<HardEvent::V_MTE2>(2);
++                WaitFlag<HardEvent::V_MTE2>(2);
++                DataCopyPad(
++                    this->dFPostResCastUb,
++                    this->directGradYGm[i * this->n * this->channel + this->loopC * this->blockChannel],
++                    copyParamsdFPostResUb, this->padParams);
++                SetFlag<HardEvent::MTE2_V>(2);
++                WaitFlag<HardEvent::MTE2_V>(2);
++                Cast(this->dxLUb, this->dFPostResCastUb, RoundMode::CAST_NONE, this->n * this->tailC);
++                PipeBarrier<PIPE_V>();
++                Add(this->dFPostResUb, this->dFPostResUb, this->dxLUb, this->n * this->tailC);
++            }
++
+             VecMatmulMknk(this->FOutUb, this->dFPostResUb, this->dHLPostUb, this->dHLResTmp1, this->dHLResTmp3, 1,
+                           this->tailC, this->n, this->alignN);
+
+diff --git a/mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22/mhc_pre_grad_kernel.h b/mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22/mhc_pre_grad_kernel.h
+--- a/mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22/mhc_pre_grad_kernel.h
++++ b/mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22/mhc_pre_grad_kernel.h
+@@ -86,5 +86,18 @@ public:
+         InitGradPreStageBuffer();
+     }
++    __aicore__ inline void InitShifted(
++        GM_ADDR x, GM_ADDR hc_fn, GM_ADDR previous_pre, GM_ADDR grad_current_pre, GM_ADDR grad_previous_pre,
++        GM_ADDR grad_y, GM_ADDR grad_post, GM_ADDR grad_comb, GM_ADDR hc_scale, GM_ADDR hc_base, GM_ADDR h_hat2,
++        GM_ADDR rsqrt, GM_ADDR sum_out, GM_ADDR norm_out, GM_ADDR grad_x, GM_ADDR grad_hc_fn,
++        GM_ADDR grad_hc_scale, GM_ADDR grad_hc_base, GM_ADDR workspace,
++        const MhcPreSinkhornBackwardArch22TilingData *tilingData, TPipe *pipe)
++    {
++        Init(x, hc_fn, previous_pre, grad_y, grad_post, grad_comb, hc_scale, hc_base, h_hat2, rsqrt, sum_out,
++             norm_out, grad_x, grad_hc_fn, grad_hc_scale, grad_hc_base, workspace, tilingData, pipe);
++        gradCurrentPreGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(grad_current_pre));
++        gradPreviousPreGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(grad_previous_pre));
++        useShiftedPre_ = true;
++    }
+     __aicore__ inline void Process();
+
+ protected:
+@@ -145,4 +158,6 @@ protected:
+     GlobalTensor<T> xWorkspaceGlobal_;
+     GlobalTensor<T> gradXCubeGlobal_;
++    GlobalTensor<T> gradCurrentPreGlobal_, gradPreviousPreGlobal_;
++    bool useShiftedPre_ = false;
+
+ private:
+@@ -337,6 +349,7 @@ private:
+     }
+
+     __aicore__ inline void ComputeGradPre(const int64_t taskOffset, const int32_t tileTaskCount, const int32_t innerId);
++    __aicore__ inline void StorePreviousPreAndLoadCurrentPre(const int64_t taskOffset, const int32_t tileTaskCount);
+
+     __aicore__ inline void ComputeGradHHat2(const int64_t taskOffset, const int32_t tileTaskCount);
+     __aicore__ inline void SinkhornGrad(const int64_t taskOffset, const int32_t tileTaskCount);
+@@ -941,6 +954,30 @@ __aicore__ inline void MhcPreGradKernel<TYPE_X, T, DETERMINISTIC>::ComputeGradPre(const int64_t taskOffset,
+     }
+ }
+
++template <typename TYPE_X, typename T, bool DETERMINISTIC>
++__aicore__ inline void MhcPreGradKernel<TYPE_X, T, DETERMINISTIC>::StorePreviousPreAndLoadCurrentPre(
++    const int64_t taskOffset, const int32_t tileTaskCount)
++{
++    SetFlag<HardEvent::V_MTE3>(eventIdVToMTE3XCast);
++    WaitFlag<HardEvent::V_MTE3>(eventIdVToMTE3XCast);
++    for (int32_t row = 0; row < tileTaskCount; ++row) {
++        DataCopyPad(
++            gradPreviousPreGlobal_[(taskOffset + row) * n_], dPrePostTempLocal_[row * 2 * n_],
++            {static_cast<uint16_t>(1), static_cast<uint32_t>(n_ * sizeof(T)), 0, 0, 0});
++    }
++
++    event_t eventMte3Mte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
++    SetFlag<HardEvent::MTE3_MTE2>(eventMte3Mte2);
++    WaitFlag<HardEvent::MTE3_MTE2>(eventMte3Mte2);
++    DataCopyPad(
++        dPrePostTempLocal_, gradCurrentPreGlobal_[taskOffset * n_],
++        {static_cast<uint16_t>(tileTaskCount), static_cast<uint32_t>(n_ * sizeof(T)), 0, 0, 0},
++        {true, 0, static_cast<uint8_t>(ELEMENTS_SIZE_PER_BLOCK - n_), 0});
++    event_t eventMte2V = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
++    SetFlag<HardEvent::MTE2_V>(eventMte2V);
++    WaitFlag<HardEvent::MTE2_V>(eventMte2V);
++}
++
+ template <typename TYPE_X, typename T, bool DETERMINISTIC>
+ __aicore__ inline void MhcPreGradKernel<TYPE_X, T, DETERMINISTIC>::ComputeScaleBias()
+ {
+@@ -1024,6 +1069,9 @@ __aicore__ inline void MhcPreGradKernel<TYPE_X, T, DETERMINISTIC>::Process()
+                     ComputeGradPre(taskOffset + taskOffsetInner, tileTaskCountInner, taskOffsetInner);
+                     innerId++;
+                 }
++                if (useShiftedPre_) {
++                    StorePreviousPreAndLoadCurrentPre(taskOffset, tileTaskCount);
++                }
+                 ComputeGradHHat2(taskOffset, tileTaskCount);
+             }
+             CrossCoreSetFlag<0x2, PIPE_MTE3>(0);
+diff --git a/mhc/mhc_pre_sinkhorn_backward/op_host/op_tiling/arch22/mhc_pre_sinkhorn_backward_arch22_tiling.cpp b/mhc/mhc_pre_sinkhorn_backward/op_host/op_tiling/arch22/mhc_pre_sinkhorn_backward_arch22_tiling.cpp
+--- a/mhc/mhc_pre_sinkhorn_backward/op_host/op_tiling/arch22/mhc_pre_sinkhorn_backward_arch22_tiling.cpp
++++ b/mhc/mhc_pre_sinkhorn_backward/op_host/op_tiling/arch22/mhc_pre_sinkhorn_backward_arch22_tiling.cpp
+@@ -16,8 +16,8 @@
+ #include "tiling/platform/platform_ascendc.h"
+ #include "mhc_pre_sinkhorn_backward_arch22_tiling.h"
+ #include "log/log.h"
+-#include "mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22/mhc_pre_sinkhorn_backward_data_arch22.h"
+-#include "mhc/mhc_pre_sinkhorn_backward/op_kernel/arch22/mhc_pre_sinkhorn_backward_key_arch22.h"
++#include "mhc_pre_sinkhorn_backward/arch22/mhc_pre_sinkhorn_backward_data_arch22.h"
++#include "mhc_pre_sinkhorn_backward/arch22/mhc_pre_sinkhorn_backward_key_arch22.h"
+
+ #define CHECK_NULLPTR(ptr) \
+     if (ptr == nullptr) { \
+@@ -39,10 +39,6 @@ constexpr uint8_t HC_BEFORE_NORM_IDX = 8;
+ constexpr uint8_t INV_RMS_IDX = 9;
+ constexpr uint8_t SUM_OUT_IDX = 10;
+ constexpr uint8_t NORM_OUT_IDX = 11;
+-constexpr uint8_t GRAD_X_IDX = 0;
+-constexpr uint8_t GRAD_PHI_IDX = 1;
+-constexpr uint8_t GRAD_ALPHA_IDX = 2;
+-constexpr uint8_t GRAD_BIAS_IDX = 3;
+ constexpr float DEFAULT_EPS = 1e-6f;
+ constexpr uint8_t BATCH_SIZE_DIM_IDX = 0;
+ constexpr uint8_t SEQ_LENGTH_DIM_IDX = 1;
+@@ -256,7 +252,7 @@ ge::graphStatus ShapeVerify(gert::TilingContext *context, int64_t batchSize, int64_t seqLength, int64_t n, int64_t c)
+                                             normOutShape.GetDim(0), sumOutShape.GetDim(0)),
+                 return ge::GRAPH_FAILED);
+
+-    auto gradXShapePtr = context->GetOutputShape(GRAD_X_IDX);
++    auto gradXShapePtr = context->GetInputShape(INPUT_X_IDX);
+     OP_CHECK_IF(gradXShapePtr == nullptr,
+                 OPS_REPORT_VECTOR_INNER_ERR(opName, "ShapeVerify failed, gradX shape is nullptr"),
+                 return ge::GRAPH_FAILED);
+@@ -274,7 +270,7 @@ ge::graphStatus ShapeVerify(gert::TilingContext *context, int64_t batchSize, int64_t seqLength, int64_t n, int64_t c)
+             gradXShape.GetDim(3)),
+         return ge::GRAPH_FAILED);
+
+-    auto gradPhiShapePtr = context->GetOutputShape(GRAD_PHI_IDX);
++    auto gradPhiShapePtr = context->GetInputShape(PHI_IDX);
+     OP_CHECK_IF(gradPhiShapePtr == nullptr,
+                 OPS_REPORT_VECTOR_INNER_ERR(opName, "ShapeVerify failed, gradPhi shape is nullptr"),
+                 return ge::GRAPH_FAILED);
+@@ -289,7 +285,7 @@ ge::graphStatus ShapeVerify(gert::TilingContext *context, int64_t batchSize, int64_t seqLength, int64_t n, int64_t c)
+                     n * n + 2 * n, n * c, gradPhiShape.GetDim(0), gradPhiShape.GetDim(1)),
+                 return ge::GRAPH_FAILED);
+
+-    auto gradAlphaShapePtr = context->GetOutputShape(GRAD_ALPHA_IDX);
++    auto gradAlphaShapePtr = context->GetInputShape(ALPHA_IDX);
+     OP_CHECK_IF(gradAlphaShapePtr == nullptr,
+                 OPS_REPORT_VECTOR_INNER_ERR(opName, "ShapeVerify failed, gradAlpha shape is nullptr"),
+                 return ge::GRAPH_FAILED);
+@@ -300,7 +296,7 @@ ge::graphStatus ShapeVerify(gert::TilingContext *context, int64_t batchSize, int64_t seqLength, int64_t n, int64_t c)
+                     gradAlphaShape.GetDimNum(), gradAlphaShape.GetDim(0)),
+                 return ge::GRAPH_FAILED);
+
+-    auto gradBiasShapePtr = context->GetOutputShape(GRAD_BIAS_IDX);
++    auto gradBiasShapePtr = context->GetInputShape(BIAS_IDX);
+     OP_CHECK_IF(gradBiasShapePtr == nullptr,
+                 OPS_REPORT_VECTOR_INNER_ERR(opName, "ShapeVerify failed, gradBias shape is nullptr"),
+                 return ge::GRAPH_FAILED);
+diff --git a/mhc/mhc_pre_sinkhorn_backward/op_host/op_tiling/arch22/mhc_pre_sinkhorn_backward_arch22_tiling.h b/mhc/mhc_pre_sinkhorn_backward/op_host/op_tiling/arch22/mhc_pre_sinkhorn_backward_arch22_tiling.h
+--- a/mhc/mhc_pre_sinkhorn_backward/op_host/op_tiling/arch22/mhc_pre_sinkhorn_backward_arch22_tiling.h
++++ b/mhc/mhc_pre_sinkhorn_backward/op_host/op_tiling/arch22/mhc_pre_sinkhorn_backward_arch22_tiling.h
+@@ -16,7 +16,7 @@
+ #ifndef MHC_PRE_SINKHORN_BACKWARD_ARCH22_TILING_H_
+ #define MHC_PRE_SINKHORN_BACKWARD_ARCH22_TILING_H_
+
+-#include "op_host/tiling_base.h"
++#include "exe_graph/runtime/tiling_context.h"
+ #include "register/tilingdata_base.h"
+ #include "tiling/tiling_api.h"
+ #include "err/ops_err.h"

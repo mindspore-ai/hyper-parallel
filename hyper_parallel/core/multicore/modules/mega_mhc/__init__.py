@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Torch-only Multicore APIs, separate from the HyperParallel root exports."""
+"""Single-Pass mHC multicore module and independent reference paths."""
 
-from hyper_parallel.core.multicore import profiler
-from hyper_parallel.core.multicore.modules.mega_mhc.module import HyperMegaMhc
-from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
+from .function import hyper_mega_mhc
+from .golden import cann_mega_mhc, torch_mega_mhc
+from .module import HyperMegaMhc
 
-__all__ = ["HyperMegaMhc", "MegaMoeExperts", "profiler"]
+__all__ = ["HyperMegaMhc", "cann_mega_mhc", "hyper_mega_mhc", "torch_mega_mhc"]

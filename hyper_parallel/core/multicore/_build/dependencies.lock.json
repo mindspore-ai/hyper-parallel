@@ -32,12 +32,25 @@
         "commit": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
         "tree": "52694bc828b50c83f37781b9d4a378466410f671",
         "git_archive_tar_sha256": "20e717c1004de51bc2de594509ffde1a2cf84911a20fc8ab610bb4ec508fe14d",
+        "git_archive_tar_sha256_compat": [
+          "6797add7ec5380727a4d2dd9c86874864a093fdc5d1f6e3aaaacbf729991258d"
+        ],
         "resolution": "exact upstream source tag; the fusion adapter is applied only to an isolated source copy",
         "patches": [
           {
             "path": "hyper_parallel/core/multicore/ops/swi_glu_fusion.patch",
             "sha256": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d",
             "purpose": "expose the selected SwiGLU and SwiGLUGrad kernels as inline HyperMegaMoe building blocks"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/rms_norm_worker_fusion.patch",
+            "sha256": "e8e278434a4dc475477f1ee55d339c307f409e504cbf7dad6e29186d1121200f",
+            "purpose": "add a logical token-block entry point while preserving the native RMSNorm entry behavior"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/rms_norm_grad_worker_fusion.patch",
+              "sha256": "b55856bdaa183684576febdcbf2df01cace97932f00d2a336e54cb7d59ee8964",
+              "purpose": "add a task-local RMSNormGrad entry point and explicit fused-task pipe cleanup"
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
@@ -58,6 +71,37 @@
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+      },
+      "ops_transformer_mhc": {
+        "version": "58b4a6bde",
+        "repository": "https://gitcode.com/cann/ops-transformer.git",
+        "fetch_ref": "58b4a6bdeb29feeb0070dd266106bd4e130bb72b",
+        "tag_object": null,
+        "commit": "58b4a6bdeb29feeb0070dd266106bd4e130bb72b",
+        "tree": "f941884a2f35988711169e77772c9faea4e942f2",
+        "git_archive_tar_sha256": "72cbff27e7e1602c547e17ebccdba013c109e80c331ddd46b896b32628118aa1",
+        "git_archive_tar_sha256_compat": [
+          "f8a1baea0d188fdcff8426e7b7d11bf9d43f3ea3fb26fa4dd270eb88d1566229"
+        ],
+        "resolution": "exact upstream commit providing MhcPost and MhcPreSinkhorn sources; adapters are applied only to an isolated source copy",
+        "patches": [
+          {
+            "path": "hyper_parallel/core/multicore/ops/mhc_post_and_pre_sinkhorn_worker_primitives.patch",
+            "sha256": "9d60a12e1b58fe5b8364b310a5938ac9d8f4b10137a0e697ea3018709d2419b5",
+            "purpose": "expose task-local MhcPost, NormCast, Projection, InputMix, and Mapping/Sinkhorn primitives"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/mhc_post_backward_and_pre_sinkhorn_backward_worker_primitives.patch",
+            "sha256": "20a1ad0d0ff548a12282c4331afb03bbff7aabfd8f391a2b085907b52cf5d260",
+            "purpose": "expose shifted MhcPreSinkhornBackward and additive MhcPostBackward entry points"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/mhc_post_backward_and_pre_sinkhorn_backward_4_task_primitives.patch",
+              "sha256": "12434fae310dca30b53bc285a0a54af49e221275c52b9b3437302d2f851c005e",
+              "purpose": "expose task-local Prepare, PhiRms, and PreviousX worker primitives"
+          }
+        ],
+        "upgrade_policy": "a version change must pass HyperMegaMhc accuracy and performance validation"
       },
       "shmem": {
         "version": "d30702bb55d0",
