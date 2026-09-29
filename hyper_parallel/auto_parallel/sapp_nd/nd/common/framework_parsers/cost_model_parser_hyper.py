@@ -727,8 +727,11 @@ class CostModelParserHyperV2(_CostModelParser):
         else:
             self.ccfg.offset = [0] * self.ccfg.p
 
-    def config_shard_emb(self) -> None:
+    def config_shard_emb(self, ccfg: Any = None) -> None:
         """Configure embedding sharding based on current parallelism.
+
+        Args:
+            ccfg: Cost-model config to update. Defaults to the parser's config.
 
         Mirrors ``CostModelParserMindformers.config_shard_emb`` so that
         ``set_strategy`` recomputes ``shard_embed`` whenever the parallel
@@ -742,14 +745,18 @@ class CostModelParserHyperV2(_CostModelParser):
         ``shard_embed`` value computed in ``_init_shard`` is never refreshed,
         producing an embedding-memory mismatch versus the MF parser.
         """
-        self.ccfg.shard_embed = (
-            self.ccfg.d
-            if (self.ccfg.vocab_emb_dp and self.ccfg.p == 1)
-            else (self.ccfg.t * self.ccfg.d)
+        target_ccfg = self.ccfg if ccfg is None else ccfg
+        target_ccfg.shard_embed = (
+            target_ccfg.d
+            if (target_ccfg.vocab_emb_dp and target_ccfg.p == 1)
+            else (target_ccfg.t * target_ccfg.d)
         )
 
-    def config_shard_recompute(self) -> None:
+    def config_shard_recompute(self, ccfg: Any = None) -> None:
         """Recompute ``shard_recompute_input`` after strategy changes.
+
+        Args:
+            ccfg: Cost-model config to update. Defaults to the parser's config.
 
         When ``recompute_slice_activation`` is ``True``, the recompute input
         is sharded by the current tensor-parallel degree ``t``; otherwise it
@@ -762,8 +769,9 @@ class CostModelParserHyperV2(_CostModelParser):
         YAML), causing memory-estimation errors when the search explores
         strategies with different ``t`` values.
         """
-        self.ccfg.shard_recompute_input = (
-            self.ccfg.t if self._recompute_slice_activation else 1
+        target_ccfg = self.ccfg if ccfg is None else ccfg
+        target_ccfg.shard_recompute_input = (
+            target_ccfg.t if self._recompute_slice_activation else 1
         )
 
     def _init_shard(self):
