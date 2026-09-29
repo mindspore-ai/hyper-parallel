@@ -97,7 +97,13 @@ class MindSporeHSDPStateV2(HSDPState):
         ms.runtime.current_stream().synchronize()
 
     def _apply_pending_unsharded_grad_locally(self, hsdp_param) -> bool:
-        """Materialize pending unsharded grad onto ``sharded_param.grad`` without communication."""
+        """Defer unsynchronized replica grads, or materialize a local-only grad."""
+        if not self.requires_all_reduce and hsdp_param.dp_size > 1:
+            # Keep every micro-batch in the pending buffer until the scheduled
+            # all-reduce. Writing local contributions to main_grad here would
+            # exclude them from that collective and make replicas diverge.
+            hsdp_param.to_accumulated_grad_if_needed()
+            return False
         pending_grad = self._get_pending_unsharded_grad(hsdp_param)
         apply_gradient_scaling_factor(
             pending_grad, hsdp_param.gradient_scaling_factor
@@ -629,9 +635,8 @@ class MindSporeHSDPStateV2(HSDPState):
                     if self._should_run_all_reduce(hsdp_param):
                         self._queue_compat_all_reduce(hsdp_param)
                     else:
-                        # No-communication path (shard_size == 1, no all-reduce):
-                        # this leg owns the scaling since the grad never goes through
-                        # reduce_scatter_grad / all_reduce_grad.
+                        # Defer replica contributions until their all-reduce;
+                        # local-only gradients are scaled and applied here.
                         need_synchronize = self._apply_pending_unsharded_grad_locally(
                             hsdp_param
                         )
