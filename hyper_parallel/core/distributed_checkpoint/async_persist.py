@@ -497,11 +497,13 @@ def resolve_async_persist_result(
         try:
             async_callback()
             StandardSavePlanner.cached_save_result.update(payload[1])
-        except Exception:  # pylint: disable=broad-except
-            persist_future.set_exception(RuntimeError(traceback.format_exc()))
+        except Exception as exc:  # pylint: disable=broad-except
+            persist_future.set_exception(exc)
         else:
             persist_future.set_result(payload[0])
     elif status == AsyncPersistStatus.FAILURE:
+        # The child's exception object cannot cross the process boundary, so what
+        # arrives is its formatted traceback and a RuntimeError carries the text.
         persist_future.set_exception(RuntimeError(payload))
     else:
         persist_future.set_exception(
