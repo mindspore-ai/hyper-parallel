@@ -557,3 +557,128 @@ def npu_sparse_lightning_indexer_kl_loss_grad(
         cu_seq_lens_q, cu_seq_lens_k, seqused_q, seqused_k, cmp_residual_k,
         layout, mask_mode, cmp_ratio,
     )
+
+
+def _validate_chunk_kda_autograd_options(initial_state, disable_recompute, state_v_first):
+    """Validate state options not yet supported by automatic backward."""
+    if initial_state is not None:
+        raise ValueError("initial_state is not supported until backward provides dht/dh0 semantics.")
+    if not disable_recompute:
+        raise ValueError("disable_recompute=False is not supported by the fused backward kernel.")
+    if state_v_first:
+        raise ValueError("state_v_first=True is not supported by the fused backward kernel.")
+
+
+def npu_chunk_kda(
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        g: Tensor,
+        beta: Tensor,
+        scale: float,
+        chunk_size: int = 64,
+        *,
+        layout: str = "BNSD",
+        output_final_state: bool = False,
+        safe_gate: bool = False,
+        lower_bound: float = -5.0,
+        use_gate_in_kernel: bool = False,
+        a_log: Tensor = None,
+        dt_bias: Tensor = None,
+        cu_seqlens=None,
+        chunk_indices=None,
+        initial_state: Tensor = None,
+        disable_recompute: bool = True,
+        state_v_first: bool = False,
+):
+    """Run differentiable dense or packed Chunk KDA.
+
+    Returns ``(attn_out, final_state)``; ``final_state`` is ``None`` unless
+    ``output_final_state=True``. MindSpore automatically invokes the fused
+    backward operator when gradients are requested.
+    """
+    _validate_chunk_kda_autograd_options(initial_state, disable_recompute, state_v_first)
+    return _platform.custom_ops.npu_chunk_kda(
+        q, k, v, g, beta, scale, chunk_size, layout, output_final_state,
+        safe_gate, lower_bound, use_gate_in_kernel, a_log, dt_bias,
+        cu_seqlens, chunk_indices
+    )
+
+
+def npu_chunk_kda_fwd(
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        g: Tensor,
+        beta: Tensor,
+        scale: float,
+        chunk_size: int = 64,
+        *,
+        layout: str = "BNSD",
+        output_final_state: bool = False,
+        safe_gate: bool = False,
+        lower_bound: float = -5.0,
+        use_gate_in_kernel: bool = False,
+        a_log: Tensor = None,
+        dt_bias: Tensor = None,
+        cu_seqlens=None,
+        chunk_indices=None,
+        initial_state: Tensor = None,
+        disable_recompute: bool = True,
+        state_v_first: bool = False,
+        return_intermediates: bool = False,
+):
+    """Run explicit Chunk KDA forward without registering automatic backward.
+
+    Forward-only execution exposes the wider FLA-NPU capability. When
+    ``return_intermediates=True``, arguments must also satisfy the current
+    backward restrictions because the returned tensors are intended for
+    :func:`npu_chunk_kda_bwd`.
+
+    When ``return_intermediates=True``, returns
+    ``(attn_out, final_state, intermediates)``. ``intermediates`` contains
+    ``(gk, aqk, akk, w, qg, kg, v_new, h)`` in the order accepted by
+    :func:`npu_chunk_kda_bwd`. Otherwise returns only
+    ``(attn_out, final_state)``.
+    """
+    return _platform.custom_ops.npu_chunk_kda_fwd(
+        q, k, v, g, beta, scale, chunk_size, layout, output_final_state,
+        safe_gate, lower_bound, use_gate_in_kernel, a_log, dt_bias,
+        cu_seqlens, chunk_indices, initial_state, disable_recompute,
+        state_v_first, return_intermediates
+    )
+
+
+def npu_chunk_kda_bwd(
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        beta: Tensor,
+        gk: Tensor,
+        aqk: Tensor,
+        akk: Tensor,
+        w: Tensor,
+        qg: Tensor,
+        kg: Tensor,
+        v_new: Tensor,
+        h: Tensor,
+        d_o: Tensor,
+        scale: float,
+        chunk_size: int = 64,
+        *,
+        layout: str = "BNSD",
+        raw_g: Tensor = None,
+        a_log: Tensor = None,
+        dt_bias: Tensor = None,
+        cu_seqlens=None,
+        chunk_indices=None,
+        safe_gate: bool = False,
+        use_gate_in_kernel: bool = False,
+        lower_bound: float = -5.0,
+):
+    """Run explicit backward and return ``dq, dk, dv, db, dg, dA, dbias``."""
+    return _platform.custom_ops.npu_chunk_kda_bwd(
+        q, k, v, beta, gk, aqk, akk, w, qg, kg, v_new, h,
+        d_o, scale, chunk_size, layout, raw_g, a_log, dt_bias,
+        cu_seqlens, chunk_indices, safe_gate, use_gate_in_kernel, lower_bound
+    )
