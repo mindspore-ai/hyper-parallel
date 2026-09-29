@@ -230,6 +230,14 @@ class HSDPModule:
                 return _UnshardHandle(hsdp_state=hsdp_state)
         return None
 
+    def wait_for_unshard(self) -> None:
+        """wait for all asynchronously launched unshard communications"""
+        if not self.hsdp_scheduler:
+            raise ValueError("hsdp_scheduler is None")
+        hsdp_state = self.hsdp_scheduler.hsdp_state
+        if hsdp_state:
+            hsdp_state.wait_for_unshard()
+
     def load_state_dict(
         self,
         state_dict: Mapping[str, Any],
