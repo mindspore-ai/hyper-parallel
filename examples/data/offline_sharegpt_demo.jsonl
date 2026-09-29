@@ -1,0 +1,1 @@
+{"conversations":[{"from":"system","value":"Answer concisely."},{"from":"human","value":"What does offline conversion produce?"},{"from":"gpt","value":"It produces tokenizer-indexed .bin and .idx files."}]}

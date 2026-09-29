@@ -45,6 +45,11 @@ class OfflinePreparationConfig:
     data_files: Optional[_DatasetDataFiles] = None
     num_proc: Optional[int] = None
     json_keys: Union[str, List[str]] = field(default_factory=lambda: ["text"])
+    text_template: Optional[str] = None
+    conversation_key: Optional[str] = None
+    role_key: str = "role"
+    content_key: str = "content"
+    role_map: Optional[Dict[str, str]] = None
     tokenizer_use_fast: bool = True
     trust_remote_code: bool = False
     chat_template: Optional[str] = None
@@ -104,6 +109,10 @@ class OfflinePreparationConfig:
             raise ValueError("json_keys must contain one or more column names")
         return keys
 
+    def uses_record_transform(self) -> bool:
+        """Return whether preprocessing needs columns beyond ``json_keys``."""
+        return self.text_template is not None or self.conversation_key is not None
+
     def download_root(self) -> Path:
         """Resolve the root directory for downloaded raw JSONL datasets.
 
@@ -124,16 +133,21 @@ class OfflinePreparationConfig:
             Local JSONL destination path.
         """
         source_path = Path(self.dataset_name_or_path).expanduser()
-        local_suffixes = (".json", ".jsonl", ".json.gz", ".jsonl.gz")
+        direct_json_suffixes = (".json", ".jsonl")
+        local_suffixes = direct_json_suffixes + (
+            ".json.gz", ".jsonl.gz", ".csv", ".csv.gz", ".parquet", ".arrow", ".txt", ".txt.gz",
+        )
         if source_path.is_dir():
-            return source_path.resolve()
+            return self.download_root() / f"{self.dataset_label()}-{self._slug(self.dataset_split)}.jsonl"
         if source_path.name.lower().endswith(local_suffixes):
             resolved_path = source_path.resolve()
             if not resolved_path.is_file():
                 raise FileNotFoundError(
-                    f"Local JSON dataset does not exist: {resolved_path}"
+                    f"Local dataset file does not exist: {resolved_path}"
                 )
-            return resolved_path
+            if resolved_path.name.lower().endswith(direct_json_suffixes):
+                return resolved_path
+            return self.download_root() / f"{self.dataset_label()}-{self._slug(self.dataset_split)}.jsonl"
 
         file_name = f"{self.dataset_label()}-{self._slug(self.dataset_split)}.jsonl"
         return self.download_root() / file_name
@@ -158,6 +172,11 @@ class OfflinePreparationConfig:
             dataset_name_or_path=str(self.resolved_json_path()),
             output_prefix=str(self.resolved_output_prefix()),
             json_keys=self.json_keys_list(),
+            text_template=self.text_template,
+            conversation_key=self.conversation_key,
+            role_key=self.role_key,
+            content_key=self.content_key,
+            role_map=self.role_map,
             tokenizer_name_or_path=self.tokenizer_name_or_path,
             tokenizer_use_fast=self.tokenizer_use_fast,
             trust_remote_code=self.trust_remote_code,
