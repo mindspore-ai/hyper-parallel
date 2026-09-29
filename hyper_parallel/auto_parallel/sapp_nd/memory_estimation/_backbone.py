@@ -558,7 +558,7 @@ class _Backbone:
 
     def __chunk_stage_lay_loops(self, *args):
         """Evaluate every layer in every stage and chunk."""
-        flatten, stages, record_lay_types = args[0], args[1], args[2]
+        stages, record_lay_types = args[1], args[2]
         sm = args[3]
         verbose, compute_ppb, ppb_lay_desc = args[4], args[5], args[6]
         self._ctx.real_lay_ids = []
@@ -579,7 +579,7 @@ class _Backbone:
                     self.__update_evaluator(node, verbose)
                     # Update next layer custom function
                     self.__update_next_layer_custom_function(
-                        flatten,
+                        args[0],
                         verbose,
                         record_lay_types,
                         stage_id,
@@ -591,7 +591,8 @@ class _Backbone:
                     self._ctx.current_chunk_id = chunk_id
                     self._ctx.current_lay_id = lay_id
                     self._ctx.current_node = node
-                    sm["stat"][stage_id][chunk_id][lay_id] = self._inner_static_mem()
+                    static_mem = self._inner_static_mem()
+                    sm["stat"][stage_id][chunk_id][lay_id] = static_mem
                     sm["dyn"][stage_id][chunk_id][lay_id] = sum(
                         self._inner_dynamic_mem()
                     )
