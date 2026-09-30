@@ -15,9 +15,11 @@
 """VLM Trainer assembled from the shared BaseTrainer stages."""
 
 from collections import defaultdict
+from itertools import count, takewhile
 from typing import Any, Dict
 
 from hyper_parallel.data.batching import calculate_num_micro_batches
+from hyper_parallel.data.batching.get_batch import SynchronizedBatchReader
 from hyper_parallel.data.omni import OmniDataTransform
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
@@ -119,6 +121,10 @@ class VLMTrainer:
             data_config=getattr(config.dataset, "data_config", {}),
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
         )
+        if getattr(config.dataset, "source", None) is not None:
+            get_batch = SynchronizedBatchReader(
+                get_batch, num_micro_batches=self.base.num_micro_batches, device=self.base.device,
+            )
         self.base.get_batch = get_batch
 
     @property
@@ -243,8 +249,15 @@ class VLMTrainer:
             self.base.train_epochs,
         )
 
-        # Checkpoint resume restores state.global_step, state.epoch, and the DataLoader cursor.
-        for epoch in range(self.base.state.epoch, self.base.train_epochs):
+        # Dynamic packing makes the number of optimizer steps per source epoch
+        # unknown; source training completes the configured global step budget.
+        source_training = isinstance(self.base.get_batch, SynchronizedBatchReader)
+        start_epoch = self.base.state.epoch
+        epochs = (
+            takewhile(lambda _: self.base.state.global_step < self.base.train_iters, count(start_epoch))
+            if source_training else range(start_epoch, self.base.train_epochs)
+        )
+        for epoch in epochs:
             train_dataloader = self.base.train_dataloader
 
             if hasattr(train_dataloader, "set_epoch"):
@@ -253,8 +266,12 @@ class VLMTrainer:
             self.on_epoch_begin()
             data_iterator = iter(train_dataloader) if train_dataloader is not None else None
 
-            start_step = self.base.state.global_step - epoch * self.base.train_steps
-            train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+            epoch_start_step = self.base.state.global_step
+            start_step = 0 if source_training else epoch_start_step - epoch * self.base.train_steps
+            train_steps = (
+                self.base.train_iters - epoch_start_step if source_training
+                else min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+            )
             for _ in range(start_step, train_steps):
                 try:
                     self.train_step(data_iterator)
@@ -262,6 +279,12 @@ class VLMTrainer:
                     logger.info("epoch:%s Dataloader finished with drop_last %s", epoch, config.dataloader.drop_last)
                     break
 
+            if source_training and self.base.state.global_step == epoch_start_step:
+                if epoch != start_epoch or epoch_start_step == 0:
+                    raise ValueError(
+                        "Explicit source produced no complete optimizer step in an epoch; "
+                        "check sample validity, packing and the global batch size"
+                    )
             self.on_epoch_end()
             self.base.state.epoch = epoch + 1
             print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")

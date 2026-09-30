@@ -30,6 +30,7 @@ from hyper_parallel.data.online import (
     build_online_iterable_source,
     build_online_mapping_source,
 )
+from hyper_parallel.data.online.provider import SampleAdapter, SourceProvider, build_provider_source
 from hyper_parallel.data.parallel import (
     DataLoaderParallelContext,
     create_dataloader_parallel_context,
@@ -81,6 +82,9 @@ def build_online_text_mapping_dataset(
     data_path: OnlineDataPath | None = None,
     transform: Callable[[Any], Any] | None = None,
     training_config: Any = None,
+    source: SourceProvider | None = None,
+    sample_adapter: SampleAdapter | None = None,
+    mesh_context: Any = None,
 ) -> Any:
     """Build an Online Mapping Dataset and apply its text transform.
 
@@ -91,6 +95,9 @@ def build_online_text_mapping_dataset(
             multiple sources.
         transform: Plaintext or conversation sample transform.
         training_config: Training plan providing the random seed and split sizes.
+        source: Optional provider replacing the default file/Hub source loader.
+        sample_adapter: Provider record conversion; requires source.
+        mesh_context: Runtime mesh used only for an explicit provider.
 
     Returns:
         A transformed Online Dataset on each DataLoader-owning rank.
@@ -100,6 +107,16 @@ def build_online_text_mapping_dataset(
     """
     if transform is None:
         raise ValueError("Online Dataset requires a plaintext or conversation data_transform")
+
+    if source is not None:
+        source_dataset = build_provider_source(
+            source, access_mode="mapping", data_path=data_path, data_config=data_config,
+            sample_adapter=sample_adapter, sample_filter=transform.is_valid_sample,
+            training_config=training_config, mesh_context=mesh_context,
+        )
+        return MappingTransformDataset.apply(source_dataset, transform)
+    if sample_adapter is not None:
+        raise ValueError("sample_adapter requires an explicit source")
 
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)
@@ -126,6 +143,8 @@ def build_online_iterable_dataset(
     dataloader_context: DataLoaderParallelContext | None = None,
     mesh_context: Any = None,
     training_config: Any = None,
+    source: SourceProvider | None = None,
+    sample_adapter: SampleAdapter | None = None,
 ) -> Any:
     """Build an Online Iterable Dataset and apply its text transform.
 
@@ -137,6 +156,8 @@ def build_online_iterable_dataset(
         dataloader_context: Optional explicit DataLoader ownership context.
         mesh_context: Runtime mesh used to derive Iterable source ownership.
         training_config: Training plan providing the shuffle seed.
+        source: Optional provider replacing the default file/Hub source loader.
+        sample_adapter: Provider record conversion; requires source.
 
     Returns:
         A transformed Online Iterable Dataset on each DataLoader-owning rank.
@@ -146,6 +167,16 @@ def build_online_iterable_dataset(
     """
     if transform is None:
         raise ValueError("Online Dataset requires a plaintext or conversation data_transform")
+
+    if source is not None:
+        source_dataset = build_provider_source(
+            source, access_mode="iterable", data_path=data_path, data_config=data_config,
+            sample_adapter=sample_adapter, sample_filter=transform.is_valid_sample,
+            training_config=training_config, mesh_context=mesh_context, dataloader_context=dataloader_context,
+        )
+        return IterableTransformDataset.apply(source_dataset, transform)
+    if sample_adapter is not None:
+        raise ValueError("sample_adapter requires an explicit source")
 
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)

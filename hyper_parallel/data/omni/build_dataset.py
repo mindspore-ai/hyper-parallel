@@ -23,11 +23,15 @@ from hyper_parallel.data.constants import ONLINE_SPLIT_COUNT
 from hyper_parallel.data.omni.omni_transform import (
     OmniDataTransform,
     _OmniTransformStrategy,
+    _PreprocessedOmniTransform,
 )
 from hyper_parallel.data.online import (
     MappingTransformDataset,
     OnlineDataPath,
     build_online_mapping_source,
+)
+from hyper_parallel.data.online.provider import (
+    SampleAdapter, SourceProvider, build_provider_source,
 )
 
 
@@ -37,6 +41,10 @@ def build_online_omni_mapping_dataset(
     data_path: OnlineDataPath | None = None,
     transform: OmniDataTransform | None = None,
     training_config: Any = None,
+    source: SourceProvider | None = None,
+    sample_adapter: SampleAdapter | None = None,
+    mesh_context: Any = None,
+    preprocessed: bool = False,
 ) -> Any:
     """Build an Online Mapping source and apply its Omni transform lazily.
 
@@ -46,6 +54,10 @@ def build_online_omni_mapping_dataset(
             train/valid/test path mapping.
         transform: Omni sample transform selected by the Trainer.
         training_config: Training plan providing the random seed.
+        source: Optional provider replacing the default file/Hub source loader.
+        sample_adapter: Provider record conversion; requires source.
+        mesh_context: Runtime mesh used only for an explicit provider.
+        preprocessed: Reuse stored model inputs and labels, retaining encode_batch.
 
     Returns:
         A transformed Online Mapping Dataset or train-valid-test tuple.
@@ -58,6 +70,18 @@ def build_online_omni_mapping_dataset(
         raise ValueError("Online Omni Dataset requires a data_transform")
     if not isinstance(transform, OmniDataTransform):
         raise TypeError("Online Omni Dataset transform must be an OmniDataTransform")
+    if preprocessed:
+        transform = _PreprocessedOmniTransform(transform)
+
+    if source is not None:
+        source_dataset = build_provider_source(
+            source, access_mode="mapping", data_path=data_path, data_config=data_config,
+            sample_adapter=sample_adapter, sample_filter=transform.is_valid_sample,
+            training_config=training_config, mesh_context=mesh_context,
+        )
+        return _OmniMappingDataset.apply(source_dataset, transform)
+    if sample_adapter is not None:
+        raise ValueError("sample_adapter requires an explicit source")
 
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)
