@@ -474,7 +474,11 @@ class FSDPPass(GraphPass):
         )
 
         new_returned = list(returned)
-        num_grads = len(new_returned) - 1  # index 0 is the loss
+        # ``train_fn`` may append the traced ``loss_dict`` outputs AFTER the
+        # gradients (see ``trace_model_graph``); those are not gradients and
+        # must stay outside the reduce_scatter range.
+        num_loss_outputs = len(getattr(graph_module, "loss_dict_keys", []))
+        num_grads = len(new_returned) - 1 - num_loss_outputs  # index 0 is the loss
         if num_grads != len(trainable_state_indices):
             raise ValueError(
                 f"Gradient count ({num_grads}) does not match trainable "
@@ -486,8 +490,9 @@ class FSDPPass(GraphPass):
 
         # Index 0 is the loss; gradients start at index 1. Gradient i+1
         # corresponds to trainable parameter i, whose state_idx is
-        # trainable_state_indices[i].
-        for i in range(1, len(new_returned)):
+        # trainable_state_indices[i]. The trailing loss_dict outputs are
+        # named loss values, not gradients.
+        for i in range(1, len(new_returned) - num_loss_outputs):
             grad_node = new_returned[i]
             if not isinstance(grad_node, fx.Node):
                 continue
