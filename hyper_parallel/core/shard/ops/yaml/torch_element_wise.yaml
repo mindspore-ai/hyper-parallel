@@ -40,6 +40,9 @@ sigmoid:
 silu:
   dist_op_name: _torch_silu_dist_op
 
+softplus:
+  dist_op_name: _torch_softplus_dist_op
+
 cos:
   dist_op_name: _torch_cos_dist_op
 
