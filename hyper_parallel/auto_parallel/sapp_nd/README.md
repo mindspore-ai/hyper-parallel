@@ -14,6 +14,58 @@ Because both estimations are analytic, ND does not require online profiling duri
 - Hardware type and device count.
 - Global batch size and memory budget.
 
+### HyperParallel configurations (`-f hyper_v2`)
+
+A HyperParallel `train.yaml` needs only the checkpoint and the training
+sequence length. The dimensions are read from the Transformers config, so
+nothing about the model is restated here:
+
+```yaml
+model:
+  pretrained_model_name_or_path: /path/to/Qwen3-30B-A3B
+  torch_dtype: bfloat16
+
+dataset:
+  data_transform:
+    max_seq_len: 4096      # or the legacy data.max_seq_len
+```
+
+Without a sequence length ND costs the model's context limit, which for a
+long-context model puts every candidate out of memory; it warns when it
+falls back. `training`, `accelerator`, `fsdp_config`, `activation_checkpoint`
+and `context` are accepted but optional: the search varies those dimensions
+itself, and the device count, batch size and memory budget come from `-d`,
+`-b` and `-M`. Give them only when costing one fixed strategy.
+
+### Search configurations (`-s`)
+
+`-s` adds what the CLI cannot express: a candidate list per dimension, pinned
+degrees, and a `resolved.yaml` written back for the trainer. A search config
+either restates the model itself (see `auto_parallel/examples/*_search.yaml`)
+or points at a train.yaml:
+
+```yaml
+train_yaml: "./train.yaml"
+cluster:
+  num_nodes: 4
+  cards_per_node: 16     # optional: defaults to the -A device type
+  device_memory_gb: 58.0
+parallelism:
+  tp: 4                  # scalar -> fixed
+  pp: [1, 2, 4, 8]       # list   -> search candidates
+  dp: auto               # auto   -> the searcher decides
+constraint:
+  global_batch_size: 128
+  memory_limit_gb: 58.0  # candidates above this are dropped
+recompute: "full"
+```
+
+Both are run the same way:
+
+```bash
+python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd     -y train.yaml -s search.yaml -f hyper_v2     -d 64 -b 128 -A A3 -M 58GB -o out
+```
+
 ## Workflow
 
 1. Construct the model.
@@ -117,6 +169,7 @@ sapp_nd/
 
 ### Framework Configurations
 
+- HyperParallel yaml configurations (`-f hyper_v2`), with or without a search config.
 - MindSpore and MindFormers yaml configurations.
 - Megatron json configurations.
 - TorchTitan toml configurations are planned but not complete in this PR.
@@ -124,6 +177,9 @@ sapp_nd/
 ### Models
 
 - Transformer dense models, including Llama-series and Qwen-series up to Qwen 2.5.
+- Qwen3-series, including MoE variants. Models whose layers are not all the
+  same attention flavour (Qwen3.5's linear/full alternation) are costed as if
+  every layer were full attention.
 - Mixture-of-Experts models, including DeepSeekV3.
 - Multimodal models are in progress.
 

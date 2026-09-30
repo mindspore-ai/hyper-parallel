@@ -185,11 +185,6 @@ class Dimensions:
             )
         if all_dims:
             self.all_dims = all_dims
-        self._reset_all_dims()
-
-    def _reset_all_dims(self):
-        for d in self.all_dims:
-            d.reset_bound()
 
     def __str__(self):
         return str(self.dims_val)

@@ -16,7 +16,8 @@
 
 Converts a :class:`NormalizedConfig` into a temporary HyperParallel
 ``train.yaml``, runs the ND search via :class:`Parallelize`,
-post-filters by user candidate lists, and returns the optimal strategy.
+post-filters by user candidate lists and memory budget, and returns the
+optimal strategy.
 """
 
 import logging
@@ -36,7 +37,10 @@ CONFIG_OVERRIDE_FIELDS = [
     "moe_intermediate_size", "first_k_dense_replace", "mtp_depth",
     "multiple_of", "ffn_dim_multiplier", "kv_lora_rank", "q_lora_rank",
     "qk_rope_head_dim", "v_head_dim", "capacity_factor", "offset",
-    "head_dim", "vision",
+    "head_dim", "vision", "attn_output_gate",
+    "layer_types", "linear_num_key_heads", "linear_key_head_dim",
+    "linear_num_value_heads", "linear_value_head_dim",
+    "linear_conv_kernel_dim",
     "param_init_type", "compute_dtype", "softmax_compute_type",
 ]
 
@@ -133,6 +137,45 @@ def _build_model_dict(model: Dict[str, Any]) -> Dict[str, Any]:
     return model_dict
 
 
+def _memory_budget_gb(config: NormalizedConfig) -> float:
+    """Return the per-device memory budget in GB, or ``0.0`` if unconstrained.
+
+    ``constraint.memory_limit_gb`` is the budget the user asked for and
+    ``cluster_spec.device_memory_gb`` the hardware ceiling, so the search
+    must respect whichever of the two is tighter.
+
+    Args:
+        config: The normalized config carrying constraint and cluster spec.
+
+    Returns:
+        The tighter positive budget in GB, or ``0.0`` when neither is set.
+    """
+    limit = float(config.constraint.get("memory_limit_gb", 0.0) or 0.0)
+    device = float(config.cluster_spec.get("device_memory_gb", 0.0) or 0.0)
+    budgets = [value for value in (limit, device) if value > 0]
+    return min(budgets) if budgets else 0.0
+
+
+def _pinned_or_first(config: NormalizedConfig, constraint_key: str, space_key: str,
+                     default: List[Any]) -> Any:
+    """Return the degree *constraint_key* pins, else the first candidate.
+
+    Args:
+        config: The normalized config carrying constraint and search space.
+        constraint_key: The ``constraint`` entry that pins the degree.
+        space_key: The ``search_space`` entry listing its candidates.
+        default: The candidates when the search space lists none.
+
+    Returns:
+        The pinned degree when it is positive, else the first candidate,
+        a placeholder the search replaces.
+    """
+    pinned = config.constraint.get(constraint_key)
+    if pinned is not None and pinned > 0:
+        return pinned
+    return config.search_space.get(space_key, default)[0]
+
+
 def _build_strategy_dicts(config: NormalizedConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Build the ``accelerator`` and ``fsdp_config`` sections of the HP YAML."""
     accel: Dict[str, Any] = {}
@@ -147,12 +190,14 @@ def _build_strategy_dicts(config: NormalizedConfig) -> Tuple[Dict[str, Any], Dic
         "fixed_etp_degree": ("expert_tensor_parallel_degree", "expert_tensor_parallel_degree", [0]),
     }
     for constraint_key, (accel_key, space_key, default) in fixed_map.items():
-        fixed_val = config.constraint.get(constraint_key)
-        if fixed_val is not None and fixed_val > 0:
-            accel[accel_key] = fixed_val
-        else:
-            candidates = config.search_space.get(space_key, default)
-            accel[accel_key] = candidates[0]
+        accel[accel_key] = _pinned_or_first(config, constraint_key, space_key, default)
+
+    # micro_batch_num has no accelerator entry of its own, so a fixed value
+    # would be dropped and the global-batch-size check would then reject the
+    # only config the user asked for.
+    accel["micro_batch_num"] = int(
+        _pinned_or_first(config, "fixed_micro_batch_num", "micro_batch_num", [1])
+    )
 
     # CP algorithm: propagate to yaml so CostModelParserHyperV2 can read it.
     cp_algo = config.estimator.get("cp_algo")
@@ -166,12 +211,9 @@ def _build_strategy_dicts(config: NormalizedConfig) -> Tuple[Dict[str, Any], Dic
 
     use_sp = config.model_spec.get("use_seq_parallel", True)
     accel.setdefault("sequence_parallel", bool(use_sp))
-    fixed_fsdp = config.constraint.get("fixed_fsdp_degree")
-    fsdp_candidates = config.search_space.get("data_parallel_shard_degree", [1])
     fsdp = {
         "dp_shard_size": int(
-            fixed_fsdp if fixed_fsdp is not None and fixed_fsdp > 0
-            else fsdp_candidates[0]
+            _pinned_or_first(config, "fixed_fsdp_degree", "data_parallel_shard_degree", [1])
         )
     }
     return accel, fsdp
@@ -192,10 +234,12 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     recompute = config.estimator.get("recompute_strategy", "none")
 
     cluster = config.cluster_spec
-    device_mem_gb = cluster.get("device_memory_gb", 0)
     context: Dict[str, Any] = {}
-    if device_mem_gb > 0:
-        context["max_device_memory"] = f"{device_mem_gb}GB"
+    # ND prunes the space against ccfg.device_capacity, which the parser reads
+    # from this field, so the user's memory_limit_gb has to reach it here.
+    budget_gb = _memory_budget_gb(config)
+    if budget_gb > 0:
+        context["max_device_memory"] = f"{budget_gb}GB"
     device_num = cluster.get("num_nodes", 0) * cluster.get("cards_per_node", 0)
     if device_num > 0:
         context["device_num"] = int(device_num)
@@ -285,6 +329,35 @@ def _resolve_search_dimensions(config: NormalizedConfig) -> Tuple[List[Any], Set
     return dims, candidate_dims
 
 
+def _filter_by_memory(scored_space: list, budget_gb: float) -> list:
+    """Drop entries whose peak-memory estimate exceeds *budget_gb*.
+
+    ND already prunes against the device capacity while it generates the
+    space; this is the gate that holds when a strategy is scored under a
+    capacity looser than the budget the caller asked for.
+
+    Args:
+        scored_space: Scored entries ``(strategy, memory_mb, score, ...)``.
+        budget_gb: Per-device budget in GB; ``0`` disables the gate.
+
+    Returns:
+        The entries that fit.  May be empty, which means the budget rules
+        out every strategy the search found.
+    """
+    if budget_gb <= 0:
+        return list(scored_space)
+    budget_mb = budget_gb * 1024.0
+    kept = [entry for entry in scored_space if float(entry[1]) <= budget_mb]
+    if len(kept) < len(scored_space):
+        logger.info(
+            "Memory filter dropped %d of %d strategies above %.1f GB.",
+            len(scored_space) - len(kept),
+            len(scored_space),
+            budget_gb,
+        )
+    return kept
+
+
 def _post_filter(
     scored_space: list,
     config: NormalizedConfig,
@@ -319,8 +392,10 @@ def _post_filter(
         if candidates is not None:
             candidate_map[dim_obj] = candidates
 
+    feasible = _filter_by_memory(scored_space, _memory_budget_gb(config))
+
     filtered = []
-    for entry in scored_space:
+    for entry in feasible:
         dims_val = entry[0].dims_val  # type: ignore[index]
         keep = True
         for dim_obj, allowed in candidate_map.items():
@@ -331,14 +406,32 @@ def _post_filter(
         if keep:
             filtered.append(entry)
 
-    if not filtered and scored_space:
+    if not filtered and feasible:
         logger.warning(
             "Post-filter removed ALL %d candidates; "
             "no strategy matches the user's candidate constraints.",
-            len(scored_space),
+            len(feasible),
         )
-        return scored_space[:1]
+        return feasible[:1]
     return filtered
+
+
+def _pinned_degree(config: NormalizedConfig, constraint_key: str, space_key: str) -> int:
+    """Return the degree of a dimension the search did not vary.
+
+    Args:
+        config: The normalized config carrying constraint and search space.
+        constraint_key: The ``constraint`` entry that pins the degree.
+        space_key: The ``search_space`` entry listing its candidates.
+
+    Returns:
+        The pinned degree, else the only candidate, else 1.
+    """
+    pinned = config.constraint.get(constraint_key)
+    if not pinned:
+        candidates = config.search_space.get(space_key) or []
+        pinned = candidates[0] if len(candidates) == 1 else 1
+    return int(pinned)
 
 
 def _format_result(best_entry: tuple, config: NormalizedConfig) -> Dict[str, Any]:
@@ -361,8 +454,19 @@ def _format_result(best_entry: tuple, config: NormalizedConfig) -> Dict[str, Any
     for dim_obj, key in dim_to_key.items():
         if dim_obj in dims_val:
             result[key] = int(dims_val[dim_obj])
-    result.setdefault("cp", 1)
-    result.setdefault("ep", 1)
+    # A pinned dimension is absent from dims_val, so fill it from what pinned
+    # it: the searcher never varied it, but every consumer still reads it.
+    fixed_from = {
+        "dp": ("fixed_dp_degree", "data_parallel_replicate_degree"),
+        "tp": ("fixed_tp_degree", "tensor_parallel_degree"),
+        "pp": ("fixed_pp_degree", "pipeline_parallel_degree"),
+        "cp": ("fixed_cp_degree", "context_parallel_degree"),
+        "ep": ("fixed_ep_degree", "expert_parallel_degree"),
+        "micro_batch_num": ("fixed_micro_batch_num", "micro_batch_num"),
+    }
+    for key, (constraint_key, space_key) in fixed_from.items():
+        if key not in result:
+            result[key] = _pinned_degree(config, constraint_key, space_key)
     total_dp = result.get("dp", 1)
     if "dp_shard" not in result:
         # OP absent from the searched dimensions: fall back to the declared
@@ -430,6 +534,14 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
         raise ValueError("ND search returned no valid strategies.")
 
     filtered = _post_filter(scored_space, config, candidate_dims)
+    if not filtered:
+        lightest_gb = min(float(entry[1]) for entry in scored_space) / 1024.0
+        raise ValueError(
+            "No strategy fits the memory budget of "
+            f"{_memory_budget_gb(config):.1f} GB; the lightest strategy "
+            f"found needs {lightest_gb:.1f} GB. Raise "
+            "constraint.memory_limit_gb or widen the search space."
+        )
     best = filtered[0]
     result = _format_result(best, config)
 

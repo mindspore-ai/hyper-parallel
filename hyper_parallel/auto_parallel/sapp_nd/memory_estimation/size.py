@@ -163,6 +163,13 @@ class Memory:
             return new_mem
         return new_mem.to(self.unit)
 
+    def set(self, mem: "Memory") -> "Memory":
+        """Take the size of another memory, in place"""
+        if self.__class__ is not mem.__class__:
+            return NotImplemented
+        self.size, self.unit = mem.size, mem.unit
+        return self
+
     def decrease(self, mem):
         """Subtraction of 2 memory sizes"""
         if self.__class__ is not mem.__class__:
