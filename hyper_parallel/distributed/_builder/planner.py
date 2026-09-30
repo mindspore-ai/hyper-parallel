@@ -233,12 +233,6 @@ class ShardingPlanner:
                     spec, group, boundary_fqn, template, mesh_dim_names, arch,
                     ep_extend=ep_extend, mesh=mesh, model=model, param_ndims=param_ndims,
                 )
-            if boundary_type == "linear_attention" and "cp" in mesh_dim_names:
-                boundary_module = model.get_submodule(boundary_fqn)
-                if "GatedDeltaNet" in type(boundary_module).__name__:
-                    spec.inner_target = "self"
-                    spec.inner_wrapper = "gdn_ulysses"
-                    spec.region_dispatch = False
             plan.modules[boundary_fqn] = spec
 
     def _finalize_boundary_specs(

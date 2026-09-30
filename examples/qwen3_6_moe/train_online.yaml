@@ -1,18 +1,16 @@
-# Eight-rank Qwen3.8-27B FSDP + CP training with high-performance fused GDN.
-#
-# The defaults load public Hugging Face assets. Command-line overrides can
-# select local or offline model, tokenizer, and dataset assets.
+# Eight-rank Qwen3.6-35B-A3B online conversation training with FSDP, CP,
+# high-performance fused GDN, and grouped routed experts.
 
 model:
   _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3.8-27B
+  pretrained_model_name_or_path: /home/chaoran/models/Qwen3.6-35B-A3B
   ignore_mismatched_sizes: true
   torch_dtype: bfloat16
   attn_implementation: sdpa
   force_hf: true
 
 training:
-  train_iters: 3
+  train_iters: 100
   train_samples: null
   global_batch_size: 8
   micro_batch_size: 1
@@ -42,12 +40,16 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
-  # Use the high-performance fused GDN forward/backward path.
   - match: "*.linear_attn"
-    module_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet
+    module_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet
     exact_type: true
     replace_module:
       _target_: hyper_parallel.components.modules.TritonGDN
+  - match: "*.mlp.experts"
+    module_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeExperts
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.components.modules.GroupedExperts
   - match: "*.linear_attn"
     when: cp
     inner_target: self
@@ -78,38 +80,40 @@ compile:
 
 dataset:
   model_assets:
-    chat_template: null
+    chat_template: tokenizer
+    chat_template_kwargs:
+      enable_thinking: true
+      reasoning_effort: medium
+    log_first_chat_template: true
     tokenizer:
       _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
-      pretrained_model_name_or_path: Qwen/Qwen3.8-27B
-      tokenizer_type: pretokenized
-      vocab_size: 248320
-      eod_token_id: 248044
-  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
-  data_path: ./outputs/qwen3_8/data/parallel_offline_text_document
+      pretrained_model_name_or_path: /home/chaoran/models/Qwen3.6-35B-A3B
+      local_files_only: true
+      use_fast: true
+      trust_remote_code: false
+  data_transform:
+    _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
+    data_type: conversation
+    text_keys: messages
+    max_seq_len: 4096
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
+  data_path: /home/chaoran/datasets/decif-30k.jsonl
   data_config:
-    seq_length: 4096
-    split: "1, 0, 0"
-    mock_data: false
-    distributed_walk: true
-    is_dataset_from_mr: false
-    simple_blend: "no"
-    data_lazy_load: true
-    skip_data_check: true
-    labels_are_shifted: true
+    dataset_type: mapping
+    hf_dataset_name: null
     create_attention_mask_in_dataloader: false
-    create_ltor_fields_in_dataloader: false
+    labels_are_shifted: true
 
 dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader
   collate_fn:
-    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
   get_batch:
     _target_: hyper_parallel.data.batching.ParallelBatch
-    source_type: indexed
+    source_type: online
     attention_mode: dense
     cp_algorithm: ulysses
-  dataloader_type: single
+  dataloader_type: cyclic
   data_rearrange_map: null
   data_sharding: false
   drop_last: true
@@ -136,8 +140,8 @@ lr_scheduler:
 
 checkpoint:
   save_ckpt: false
-  save_hf_weights: true
-  checkpoint_dir: ./outputs/qwen3_8/checkpoints
+  save_hf_weights: false
+  checkpoint_dir: ./outputs/qwen3_6_moe/checkpoints
   save_steps: 10
   save_epochs: 1
   is_async: false
@@ -156,7 +160,7 @@ profiling:
   enabled: false
   start_step: 3
   end_step: 4
-  trace_dir: ./outputs/qwen3_8/profiling
+  trace_dir: ./outputs/qwen3_6_moe/profiling
   record_shapes: false
   profile_memory: false
   with_stack: false

@@ -89,6 +89,7 @@ _FAMILY_ALIASES: Dict[str, str] = {}
 _FAMILY_DIR_ALIASES = {
     "deepseekv2": "deepseek_v3",
     "qwen35text": "qwen3_5",
+    "qwen35moetext": "qwen3_5_moe",
 }
 
 # normalized family directory name → registration module path; built lazily.

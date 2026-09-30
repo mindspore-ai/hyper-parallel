@@ -45,6 +45,11 @@ plan_overrides:
     exact_type: true
     replace_module:
       _target_: hyper_parallel.components.modules.TritonGDN
+  - match: "*.linear_attn"
+    when: cp
+    inner_target: self
+    inner_wrapper: gdn_ulysses
+    region_dispatch: false
   - match: "*.self_attn"
     when: cp
     inner_target: self
