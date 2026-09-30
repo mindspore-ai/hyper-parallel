@@ -97,12 +97,15 @@ def test_tokenize_padding_collate_and_prompt_record(
     parquet_path.touch()
     frame = data_source.pd.DataFrame(
         [
-            {"prompt": "short prompt", "answer": "1"},
-            {"prompt": "a somewhat longer prompt", "answer": "2"},
+            {"prompt": "short prompt", "answer": "1", "context_json": '{"title":["First"],"sentences":[["A"]]}', "question_id": "q1"},
+            {"prompt": "a somewhat longer prompt", "answer": "2", "context_json": '{"title":["Second"],"sentences":[["B"]]}', "question_id": "q2"},
         ]
     )
     monkeypatch.setattr(data_source.pd, "read_parquet", lambda _path: frame)
-    dataset = PromptDataset(str(parquet_path), _Tokenizer(), max_prompt_length=16)
+    dataset = PromptDataset(
+        str(parquet_path), _Tokenizer(), max_prompt_length=16,
+        metadata_columns=("context_json", "question_id"),
+    )
 
     batch = collate_prompt_samples([dataset[0], dataset[1]], pad_token_id=0)
     records = build_prompt_records(batch, batch["input_ids"], batch["attention_mask"])
@@ -115,6 +118,8 @@ def test_tokenize_padding_collate_and_prompt_record(
     assert [record.ground_truth for record in records] == ["1", "2"]
     assert records[0].metadata["input_ids"].tolist() == [1, 2]
     assert records[1].metadata["input_ids"].tolist() == [1, 2, 3, 4]
+    assert records[0].metadata["question_id"] == "q1"
+    assert records[1].metadata["context_json"] == '{"title":["Second"],"sentences":[["B"]]}'
 
 
 def test_evaluation_partition_pads_only_rows_beyond_the_global_sample_limit() -> None:

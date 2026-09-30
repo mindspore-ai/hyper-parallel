@@ -38,12 +38,12 @@ _RESERVED_TRANSITION_INFO = frozenset(("reward_components", *_TOOL_COUNTER_NAMES
 
 
 class AgentSession:
-    """Own one Environment and accumulate its token-exact trajectory."""
+    """Own or mirror one environment and accumulate its token-exact trajectory."""
 
     def __init__(
         self,
         prompt: PromptRecord,
-        environment: Environment,
+        environment: Optional[Environment],
         policy_version: int,
         sample_index: int,
         max_turns: int,
@@ -157,15 +157,19 @@ class AgentSession:
             return None
         return self.max_episode_tokens - self._token_count
 
-    async def start(self) -> None:
-        """Reset the environment and append its initial observation."""
+    async def start(self, observation: Optional[Observation] = None) -> Observation:
+        """Reset the owned environment or replay its synchronized initial observation."""
         if self._started:
             raise RuntimeError("AgentSession.start() may be called only once")
         self._started = True
-        observation = await self.environment.reset(self.episode_context)
+        if observation is None:
+            if self.environment is None:
+                raise RuntimeError("Replica session requires an owner observation")
+            observation = await self.environment.reset(self.episode_context)
         if observation.token_ids.numel() == 0:
             raise ValueError("The initial environment observation must not be empty")
         self._append_observation(observation, initial=True)
+        return observation
 
     def _prepare_observation_tokens(self, observation: Observation, initial: bool) -> Any:
         """Validate one observation and move it to the trajectory device."""
@@ -343,8 +347,8 @@ class AgentSession:
         elif self.truncated and self.terminal_reason is not TerminationReason.CONTEXT_LIMIT:
             self.terminal_reason = TerminationReason.ENVIRONMENT_TRUNCATED
 
-    async def apply(self, action: Action) -> None:
-        """Apply one action and accumulate its resulting transition."""
+    async def apply(self, action: Action, transition: Optional[Transition] = None) -> Transition:
+        """Apply an owned environment action or replay its synchronized transition."""
         if not self.active:
             raise RuntimeError("Cannot apply an action to an inactive AgentSession")
         if self.turn_count >= self.max_turns:
@@ -353,11 +357,14 @@ class AgentSession:
         self._append_action(action)
         # Environment.step is the round boundary: it turns the latest inference
         # output into reward, terminal state, and possibly the next model input.
-        transition = (
-            await self.environment.step(action, context)
-            if self._step_accepts_context
-            else await self.environment.step(action)
-        )
+        if transition is None:
+            if self.environment is None:
+                raise RuntimeError("Replica session requires an owner transition")
+            transition = (
+                await self.environment.step(action, context)
+                if self._step_accepts_context
+                else await self.environment.step(action)
+            )
         self.turn_results.append(transition)
         self._record_transition(transition)
         self.done = bool(transition.done)
@@ -367,6 +374,7 @@ class AgentSession:
             terminal=self.done or self.truncated,
         )
         self._update_terminal_reason()
+        return transition
 
     def finish_max_turns(self) -> None:
         """Truncate an active session after the configured turn limit."""
@@ -383,7 +391,8 @@ class AgentSession:
     async def close(self) -> None:
         """Close the environment at most once."""
         if not self._closed:
-            await self.environment.close()
+            if self.environment is not None:
+                await self.environment.close()
             self._closed = True
 
     def result(self) -> EpisodeResult:

@@ -211,6 +211,8 @@ class Critic(torch.nn.Module):  # pylint: disable=abstract-method
 
     def update(self, experience: ExperienceBatch) -> CriticUpdateMetrics:
         """Run configured value epochs and optimizer steps."""
+        if experience.metadata.get("reward_status") == "pending":
+            raise ValueError("Pending model rewards cannot be used for Critic optimization")
         if experience.values is None or experience.returns is None:
             raise RuntimeError(
                 "Training experience must include values and returns before Critic update"

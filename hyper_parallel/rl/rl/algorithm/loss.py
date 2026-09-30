@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""MOLT-style loss and algorithm registries with built-in GRPO/PPO recipes."""
+"""Loss and algorithm registries with built-in GRPO, PPO, and GSPO recipes."""
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Protocol
 
@@ -41,17 +42,24 @@ class DataRequirements:
 class AlgorithmRequirements:
     roles: RoleRequirements
     data: DataRequirements
+    loss_aggregation: str = "token-mean"
+
+    def __post_init__(self) -> None:
+        """Reject aggregation modes the Actor cannot normalize."""
+        if self.loss_aggregation not in ("token-mean", "seq-mean-token-mean"):
+            raise ValueError(f"Unsupported loss aggregation: {self.loss_aggregation}")
 
 
 @dataclass(frozen=True)
 class LossOutput:
-    """Unreduced token sums returned to backend-owned optimization code."""
+    """Local loss numerators and token diagnostics, normalized by the Actor."""
     total_loss_sum: Any
     policy_loss_sum: Any
     regularization_loss_sum: Any
     valid_token_count: Any
     old_policy_kl_sum: Any
     clipped_token_count: Any
+    clipped_sequence_count: Optional[Any] = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +125,8 @@ class PolicyObjective(Protocol):
         current_log_probs: Any,
         old_log_probs: Any,
         advantages: Any,
+        *,
+        action_mask: Optional[Any] = None,
     ) -> PolicyObjectiveOutput:
         """Compute per-token policy loss and clipping indicators."""
 PolicyLossBuilder = Callable[..., PolicyObjective]
@@ -146,8 +156,11 @@ class ClippedPolicyObjective:
         current_log_probs: Any,
         old_log_probs: Any,
         advantages: Any,
+        *,
+        action_mask: Optional[Any] = None,
     ) -> PolicyObjectiveOutput:
         """Compute the clipped importance-ratio policy objective."""
+        del action_mask
         log_ratio = current_log_probs - old_log_probs
         ratio = log_ratio.exp()
         unclipped_loss = -advantages * ratio
@@ -166,6 +179,51 @@ class ClippedPolicyObjective:
         return PolicyObjectiveOutput(loss=policy_loss, clipped=clipped)
 
 
+@register_policy_loss("gspo")
+@dataclass(frozen=True)
+class GSPOPolicyObjective:
+    """Sequence importance ratios with token-local first-order gradients."""
+    clip_ratio_low: float = 3.0e-4
+    clip_ratio_high: float = 4.0e-4
+
+    def compute(
+        self,
+        current_log_probs: Any,
+        old_log_probs: Any,
+        advantages: Any,
+        *,
+        action_mask: Optional[Any] = None,
+    ) -> PolicyObjectiveOutput:
+        """Compute masked sequence ratios and the asymmetric clipped objective."""
+        if action_mask is None or action_mask.ndim != 2:
+            raise ValueError("GSPO requires a rank-two action_mask")
+        for name, tensor in (
+            ("current_log_probs", current_log_probs),
+            ("old_log_probs", old_log_probs),
+            ("advantages", advantages),
+        ):
+            if tuple(tensor.shape) != tuple(action_mask.shape):
+                raise ValueError(f"GSPO {name} must align with action_mask")
+        mask = action_mask.bool()
+        current = current_log_probs.float().masked_fill(~mask, 0.0)
+        old = old_log_probs.detach().float().masked_fill(~mask, 0.0)
+        advantage = advantages.detach().float().masked_fill(~mask, 0.0)
+        lengths = mask.sum(dim=-1).clamp_min(1)
+        sequence_log_ratio = (current - old).sum(dim=-1) / lengths
+        # Sequence averaging in the loss supplies the length factor in the gradient.
+        token_log_ratio = current - current.detach() + sequence_log_ratio.detach().unsqueeze(-1)
+        ratio = token_log_ratio.clamp(max=10.0).exp()
+        unclipped = -advantage * ratio
+        clipped = -advantage * ratio.clamp(
+            min=1.0 - self.clip_ratio_low,
+            max=1.0 + self.clip_ratio_high,
+        )
+        return PolicyObjectiveOutput(
+            loss=unclipped.maximum(clipped).masked_fill(~mask, 0.0),
+            clipped=((clipped > unclipped) & mask).float(),
+        )
+
+
 def low_variance_kl(
     current_log_probs: Any,
     target_log_probs: Any,
@@ -177,7 +235,18 @@ def low_variance_kl(
 
 def _masked_sum(values: Any, mask: Any) -> Any:
     """Sum values at valid action positions."""
-    return (values * mask).flatten().sum(dim=0)
+    return values.masked_fill(~mask.bool(), 0.0).flatten().sum(dim=0)
+
+
+def _loss_sum(values: Any, mask: Any, aggregation: str) -> Any:
+    """Build a local loss numerator without dividing by the batch size."""
+    if aggregation == "token-mean":
+        return _masked_sum(values, mask)
+    if aggregation == "seq-mean-token-mean":
+        selected = values.masked_fill(~mask.bool(), 0.0)
+        lengths = mask.sum(dim=-1).clamp_min(1)
+        return (selected.sum(dim=-1) / lengths).sum(dim=0)
+    raise ValueError(f"Unsupported loss aggregation: {aggregation}")
 
 
 def _actor_loss(
@@ -185,6 +254,7 @@ def _actor_loss(
     algorithm_name: str,
     objective: PolicyObjective,
     kl_coefficient: float,
+    requirements: AlgorithmRequirements,
     current_log_probs: Any,
     old_log_probs: Any,
     reference_log_probs: Optional[Any],
@@ -192,22 +262,45 @@ def _actor_loss(
     action_mask: Any,
 ) -> LossOutput:
     """Assemble the shared clipped-policy and reference-KL Actor output."""
-    if reference_log_probs is None:
+    if action_mask.ndim != 2:
+        raise ValueError("Actor loss requires a rank-two action_mask")
+    tensors = {
+        "current_log_probs": current_log_probs,
+        "old_log_probs": old_log_probs,
+        "advantages": advantages,
+    }
+    if requirements.data.reference_log_probs and reference_log_probs is None:
         raise ValueError(
             f"{algorithm_name} requires frozen-reference log-probabilities"
         )
-    policy = objective.compute(current_log_probs, old_log_probs, advantages)
-    reference_kl = low_variance_kl(current_log_probs, reference_log_probs)
+    if requirements.data.reference_log_probs:
+        tensors["reference_log_probs"] = reference_log_probs
+    for name, tensor in tensors.items():
+        if tuple(tensor.shape) != tuple(action_mask.shape):
+            raise ValueError(f"{algorithm_name} {name} must align with action_mask")
+    mask = action_mask.bool()
+    current = current_log_probs.masked_fill(~mask, 0.0)
+    old = old_log_probs.detach().masked_fill(~mask, 0.0)
+    advantage = advantages.detach().masked_fill(~mask, 0.0)
+    policy = objective.compute(current, old, advantage, action_mask=mask)
+    reference_kl = torch.zeros_like(policy.loss)
+    if requirements.data.reference_log_probs:
+        reference = reference_log_probs.detach().masked_fill(~mask, 0.0)
+        reference_kl = low_variance_kl(current.float(), reference.float())
     regularization = kl_coefficient * reference_kl
-    numeric_mask = action_mask.to(dtype=current_log_probs.dtype)
-    old_policy_kl = low_variance_kl(current_log_probs, old_log_probs)
+    old_policy_kl = low_variance_kl(current.detach().float(), old.float())
+    aggregation = requirements.loss_aggregation
+    clipped_sequences = None
+    if aggregation == "seq-mean-token-mean":
+        clipped_sequences = (policy.clipped.bool() & mask).any(dim=-1).float().sum(dim=0).detach()
     return LossOutput(
-        total_loss_sum=_masked_sum(policy.loss + regularization, numeric_mask),
-        policy_loss_sum=_masked_sum(policy.loss, numeric_mask),
-        regularization_loss_sum=_masked_sum(reference_kl, numeric_mask),
-        valid_token_count=numeric_mask.flatten().sum(dim=0).detach(),
-        old_policy_kl_sum=_masked_sum(old_policy_kl, numeric_mask).detach(),
-        clipped_token_count=_masked_sum(policy.clipped, numeric_mask).detach(),
+        total_loss_sum=_loss_sum(policy.loss + regularization, mask, aggregation),
+        policy_loss_sum=_loss_sum(policy.loss, mask, aggregation),
+        regularization_loss_sum=_loss_sum(reference_kl, mask, aggregation),
+        valid_token_count=mask.float().flatten().sum(dim=0).detach(),
+        old_policy_kl_sum=_masked_sum(old_policy_kl, mask).detach(),
+        clipped_token_count=_masked_sum(policy.clipped, mask).detach(),
+        clipped_sequence_count=clipped_sequences,
     )
 
 
@@ -228,21 +321,23 @@ def build_algorithm(config: Mapping[str, Any]) -> RLAlgorithm:
     return ALGORITHMS.build(name, config)
 
 
-GRPO_REQUIREMENTS = AlgorithmRequirements(
-    roles=RoleRequirements(reference=True),
-    data=DataRequirements(
-        reference_log_probs=True,
-        grouped_responses=True,
-    ),
-)
-PPO_REQUIREMENTS = AlgorithmRequirements(
-    roles=RoleRequirements(reference=True, critic=True),
-    data=DataRequirements(
-        reference_log_probs=True,
-        values=True,
-        returns=True,
-    ),
-)
+def _finite_float(value: Any, field: str) -> float:
+    """Read a finite numeric setting without accepting boolean coefficients."""
+    if isinstance(value, bool):
+        raise ValueError(f"algorithm.{field} must be a finite number")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"algorithm.{field} must be a finite number") from error
+    if not math.isfinite(result):
+        raise ValueError(f"algorithm.{field} must be a finite number")
+    return result
+
+
+def _validate_kl_coefficient(value: Any) -> None:
+    """Validate the coefficient controlling Reference ownership."""
+    if _finite_float(value, "kl_coef") < 0:
+        raise ValueError("algorithm.kl_coef must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -254,6 +349,10 @@ class GRPOConfig:
     clip_ratio_c: float = 3.0
     kl_coef: float = 0.001
 
+    def __post_init__(self) -> None:
+        """Validate Reference ownership for direct and mapping construction."""
+        _validate_kl_coefficient(self.kl_coef)
+
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> "GRPOConfig":
         """Validate and build a GRPO configuration from a mapping."""
@@ -264,25 +363,27 @@ class GRPOConfig:
             clip_ratio_low=float(config.get("clip_ratio_low", 0.2)),
             clip_ratio_high=float(config.get("clip_ratio_high", 0.2)),
             clip_ratio_c=float(config.get("clip_ratio_c", 3.0)),
-            kl_coef=float(config.get("kl_coef", 0.001)),
+            kl_coef=_finite_float(config.get("kl_coef", 0.001), "kl_coef"),
         )
         if instance.clip_ratio_low < 0 or instance.clip_ratio_high < 0:
             raise ValueError("GRPO clip ratios must be non-negative")
         if instance.clip_ratio_c <= 1:
             raise ValueError("GRPO dual-clip constant must be greater than one")
-        if instance.kl_coef < 0:
-            raise ValueError("GRPO KL coefficient must be non-negative")
         return instance
 
 
 class GRPOAlgorithm:
     """GRPO math with no optimizer, model, or distributed dependencies."""
     name = "grpo"
-    requirements = GRPO_REQUIREMENTS
 
     def __init__(self, config: GRPOConfig) -> None:
         """Compose the complete GRPO recipe from registered components."""
         self.config = config
+        use_reference = config.kl_coef > 0.0
+        self.requirements = AlgorithmRequirements(
+            roles=RoleRequirements(reference=use_reference),
+            data=DataRequirements(reference_log_probs=use_reference, grouped_responses=True),
+        )
         self._advantage_estimator = get_advantage_estimator(
             "grpo",
             epsilon=config.advantage_epsilon,
@@ -331,6 +432,7 @@ class GRPOAlgorithm:
         """Compute clipped policy and reference-KL loss sums."""
         return _actor_loss(
             algorithm_name="GRPO",
+            requirements=self.requirements,
             objective=self._policy_objective,
             kl_coefficient=self._kl_coefficient,
             current_log_probs=current_log_probs,
@@ -369,6 +471,10 @@ class PPOConfig:
     value_clip_ratio: float = 0.2
     kl_coef: float = 0.001
 
+    def __post_init__(self) -> None:
+        """Validate Reference ownership independently of the Critic role."""
+        _validate_kl_coefficient(self.kl_coef)
+
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> "PPOConfig":
         """Validate and build a PPO configuration from a mapping."""
@@ -381,25 +487,27 @@ class PPOConfig:
             normalize_advantages=bool(config.get("normalize_advantages", True)),
             clip_ratio=float(config.get("clip_ratio", 0.2)),
             value_clip_ratio=float(config.get("value_clip_ratio", 0.2)),
-            kl_coef=float(config.get("kl_coef", 0.001)),
+            kl_coef=_finite_float(config.get("kl_coef", 0.001), "kl_coef"),
         )
         if not 0 <= instance.gamma <= 1 or not 0 <= instance.gae_lambda <= 1:
             raise ValueError("PPO gamma and gae_lambda must be in [0, 1]")
         if instance.clip_ratio < 0 or instance.value_clip_ratio < 0:
             raise ValueError("PPO clip ratios must be non-negative")
-        if instance.kl_coef < 0:
-            raise ValueError("PPO KL coefficient must be non-negative")
         return instance
 
 
 class PPOAlgorithm:
     """PPO recipe composed from registered GAE, clipped objective, and KL."""
     name = "ppo"
-    requirements = PPO_REQUIREMENTS
 
     def __init__(self, config: PPOConfig) -> None:
         """Compose the complete PPO recipe from registered components."""
         self.config = config
+        use_reference = config.kl_coef > 0.0
+        self.requirements = AlgorithmRequirements(
+            roles=RoleRequirements(reference=use_reference, critic=True),
+            data=DataRequirements(reference_log_probs=use_reference, values=True, returns=True),
+        )
         self._advantage_estimator = get_advantage_estimator(
             "gae",
             gamma=config.gamma,
@@ -447,6 +555,7 @@ class PPOAlgorithm:
         """Compute clipped policy and reference-KL loss sums."""
         return _actor_loss(
             algorithm_name="PPO",
+            requirements=self.requirements,
             objective=self._policy_objective,
             kl_coefficient=self._kl_coefficient,
             current_log_probs=current_log_probs,
@@ -482,3 +591,114 @@ class PPOAlgorithm:
 def build_ppo(config: Mapping[str, Any]) -> PPOAlgorithm:
     """Build the registered PPO recipe from user configuration."""
     return PPOAlgorithm(PPOConfig.from_mapping(config))
+
+
+@dataclass(frozen=True)
+class GSPOConfig:
+    """Validated sequence-policy hyperparameters without dual clipping."""
+    advantage_epsilon: float = 1.0e-6
+    clip_ratio_low: float = 3.0e-4
+    clip_ratio_high: float = 4.0e-4
+    kl_coef: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Validate direct construction as well as parsed configuration."""
+        for field in ("advantage_epsilon", "clip_ratio_low", "clip_ratio_high", "kl_coef"):
+            _finite_float(getattr(self, field), field)
+        if self.advantage_epsilon <= 0:
+            raise ValueError("algorithm.advantage_epsilon must be positive")
+        if not 0 <= self.clip_ratio_low < 1:
+            raise ValueError("algorithm.clip_ratio_low must be in [0, 1)")
+        if self.clip_ratio_high < 0:
+            raise ValueError("algorithm.clip_ratio_high must be non-negative")
+        _validate_kl_coefficient(self.kl_coef)
+
+    @classmethod
+    def from_mapping(cls, config: Mapping[str, Any]) -> "GSPOConfig":
+        """Reject incompatible recipe fields before allocating any models."""
+        allowed = {
+            "name", "advantage_epsilon", "clip_ratio_low", "clip_ratio_high",
+            "kl_coef", "kl_type", "loss_aggregation",
+        }
+        unknown = set(config) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported GSPO algorithm fields: {sorted(unknown)}")
+        if config.get("loss_aggregation") != "seq-mean-token-mean":
+            raise ValueError("GSPO requires algorithm.loss_aggregation=seq-mean-token-mean")
+        if config.get("kl_type", "low_var_kl") != "low_var_kl":
+            raise ValueError("GSPO requires algorithm.kl_type=low_var_kl")
+        defaults = cls()
+        return cls(**{
+            field: _finite_float(config.get(field, getattr(defaults, field)), field)
+            for field in ("advantage_epsilon", "clip_ratio_low", "clip_ratio_high", "kl_coef")
+        })
+
+
+class GSPOAlgorithm:
+    """Group-relative targets and sequence-level clipped policy optimization."""
+    name = "gspo"
+
+    def __init__(self, config: GSPOConfig) -> None:
+        """Compose GSPO and declare optional Reference ownership per instance."""
+        self.config = config
+        use_reference = config.kl_coef > 0.0
+        self.requirements = AlgorithmRequirements(
+            roles=RoleRequirements(reference=use_reference),
+            data=DataRequirements(reference_log_probs=use_reference, grouped_responses=True),
+            loss_aggregation="seq-mean-token-mean",
+        )
+        self._advantage_estimator = get_advantage_estimator("grpo", epsilon=config.advantage_epsilon)
+        self._policy_objective = get_policy_loss(
+            "gspo", clip_ratio_low=config.clip_ratio_low, clip_ratio_high=config.clip_ratio_high,
+        )
+
+    def compute_advantages(
+        self, rewards: Any, group_ids: Optional[tuple[Optional[str], ...]] = None,
+    ) -> Any:
+        """Return one group-relative advantage per trajectory."""
+        mask = rewards.new_ones((rewards.shape[0], 1), dtype=torch.bool)
+        return self._advantage_estimator.estimate(rewards, mask, group_ids).advantages[:, 0]
+
+    def build_targets(
+        self,
+        rewards: Any,
+        action_mask: Any,
+        group_ids: Optional[tuple[Optional[str], ...]] = None,
+        values: Optional[Any] = None,
+    ) -> TargetOutput:
+        """Build fixed group advantages before optimization splits the batch."""
+        return self._advantage_estimator.estimate(rewards, action_mask, group_ids, values)
+
+    def compute_actor_loss(
+        self,
+        current_log_probs: Any,
+        old_log_probs: Any,
+        reference_log_probs: Optional[Any],
+        advantages: Any,
+        action_mask: Any,
+    ) -> LossOutput:
+        """Return sequence-averaged loss sums and token-level diagnostics."""
+        return _actor_loss(
+            algorithm_name="GSPO",
+            objective=self._policy_objective,
+            kl_coefficient=self.config.kl_coef,
+            requirements=self.requirements,
+            current_log_probs=current_log_probs,
+            old_log_probs=old_log_probs,
+            reference_log_probs=reference_log_probs,
+            advantages=advantages,
+            action_mask=action_mask,
+        )
+
+    def compute_critic_loss(
+        self, current_values: Any, old_values: Any, returns: Any, action_mask: Any,
+    ) -> CriticLossOutput:
+        """Reject Critic requests because GSPO only optimizes the Actor."""
+        del current_values, old_values, returns, action_mask
+        raise RuntimeError("GSPO does not create or optimize a Critic")
+
+
+@register_algorithm("gspo")
+def build_gspo(config: Mapping[str, Any]) -> GSPOAlgorithm:
+    """Build the complete GSPO recipe through the public algorithm registry."""
+    return GSPOAlgorithm(GSPOConfig.from_mapping(config))

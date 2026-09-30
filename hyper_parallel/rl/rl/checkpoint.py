@@ -27,12 +27,12 @@ import torch
 import torch.distributed as dist
 import yaml
 
-from rl.utils.monitoring.config import sanitize_config
-
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.distributed_checkpoint import load as dcp_load
 from hyper_parallel.core.distributed_checkpoint import save as dcp_save
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
+from rl.reward_model.scoring import scorer_fingerprint
+from rl.utils.monitoring.config import sanitize_config
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +128,10 @@ class RLCheckpointManager:
                 )
             if bool(manifest.get("critic", False)) != (getattr(self.trainer, "critic", None) is not None):
                 raise RuntimeError("Checkpoint Critic ownership does not match the active algorithm")
+            reward_config = self.resolved_config.get("reward_model")
+            expected_scorer = None if reward_config is None else scorer_fingerprint(reward_config)
+            if manifest.get("reward_model_scorer") != expected_scorer:
+                raise RuntimeError("Checkpoint reward model scorer does not match the active configuration")
             rank_state = checkpoint_dir / f"rank_{dist.get_rank()}"
             if not rank_state.is_dir():
                 raise RuntimeError(f"Checkpoint rank-local state is missing: {rank_state}")
@@ -343,7 +347,9 @@ class RLCheckpointManager:
             with temporary.open("w", encoding="utf-8") as handle:
                 json.dump(
                     {"step": step, "world_size": dist.get_world_size(),
-                     "critic": getattr(self.trainer, "critic", None) is not None},
+                     "critic": getattr(self.trainer, "critic", None) is not None,
+                     "reward_model_scorer": (None if "reward_model" not in self.resolved_config
+                                             else scorer_fingerprint(self.resolved_config["reward_model"]))},
                     handle,
                 )
             os.replace(temporary, manifest_path)

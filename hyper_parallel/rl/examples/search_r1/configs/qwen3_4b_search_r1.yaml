@@ -1,0 +1,201 @@
+model:
+  registry_name: qwen3_4b
+  name: qwen3
+  weights_path: /models/Qwen3-4B
+  tokenizer_path: /models/Qwen3-4B
+  config_overrides: null
+
+consistency:
+  enabled: true
+
+data:
+  train_path: /data/hotpotqa/train.parquet
+  test_path: /data/hotpotqa/test.parquet
+  prompt_column: question
+  answer_column: answer
+  metadata_columns:
+    - question_id
+    - question_type
+    - question_level
+    - context_json
+    - supporting_facts_json
+  max_prompt_length: 256
+  max_train_samples: null
+  shuffle: true
+  num_workers: 0
+  prefetch_factor: null
+  pin_memory: true
+
+rollout:
+  engine: vllm
+  num_return_sequences: 4
+  max_new_tokens: 256
+  ignore_eos: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  seed: 20260916
+  vllm:
+    deployment: colocated
+    data_parallel_size: 2
+    port: 8100
+    server_hccl_if_base_port: 62600
+    server_hccl_npu_socket_port_range: 62600-62700
+    model_implementation: hyper
+    tensor_parallel_size: 1
+    weight_sync:
+      strategy: full_gather
+      bucket_size_mb: 128
+    dtype: bfloat16
+    trust_remote_code: false
+    enforce_eager: true
+    batch_invariant: false
+    enable_prefix_caching: true
+    enable_chunked_prefill: true
+    enable_auto_tool_choice: true
+    tool_call_parser: hermes
+    gpu_memory_utilization: 0.35
+    kv_cache_memory_bytes: 8589934592
+    max_model_len: 8192
+    block_size: 128
+    max_num_seqs: 1
+    max_num_batched_tokens: 2048
+    logprobs_mode: raw_logprobs
+    startup_timeout: 600
+    request_timeout: 600
+
+agentic:
+  runner: codex
+  max_turns: 10
+  max_observation_tokens: 384
+  max_episode_tokens: 8192
+  codex:
+    executable: codex
+    version: "0.152.1"
+    model: qwen3
+    reasoning_effort: low
+    enable_thinking: false
+    compact_harness_context: true
+    exec_command_yield_time_ms: 30000
+    system_instructions: >-
+      You are a concise search agent. Follow the user task, call the provided shell tool when required,
+      use only tool evidence, and return the requested final format without plans or commentary.
+    sandbox: danger-full-access
+    gateway_host: 127.0.0.1
+    gateway_public_host: 127.0.0.1
+    gateway_port: 8200
+    timeout_seconds: 1800
+    request_timeout: 600
+    max_inflight_requests: 1
+    session_root: /results/codex-trajectories
+    workspace_callable: examples.search_r1.workspace:build_search_workspace
+    execution_callable: examples.search_r1.container_execution:request_container_execution
+    program_callable: examples.search_r1.agent:SearchR1Program
+    reward_callable: examples.search_r1.reward:score_hotpotqa_answer
+    instruction_template: |-
+      /no_think
+      Answer this multi-hop question using only the local article files in ./articles.
+      Do not write a preamble or plan. Your first response must be an exec_command tool call.
+      Use exec_command with login=false and shell commands such as
+      rg -i -F -m 5 -- "SHORT ENTITY" articles or sed -n '1,30p' 'articles/004.txt'.
+      Search only ./articles. Do not access any other path, network, or external knowledge.
+      Search a short distinctive entity, not the entire question. rg exit code 1 with no output
+      means NO MATCH, not a broken shell. Do not repeat the same failed query or switch shells.
+      On no match, shorten to one distinctive word without punctuation and retry with rg -i -F.
+      Hyphens, en dashes and apostrophes may differ. If still empty, inspect article titles with
+      rg '^TITLE:' articles. Keep the filename in the output.
+      Select a relevant file and read it with sed. Follow entities found in evidence for the next hop.
+      After a match, read the relevant file header and sentences with sed -n '1,30p' articles/FILE;
+      read later ranges if needed. Keep output bounded; do not dump all articles.
+      FILE: gives the real path; TITLE: gives the article title. Never use a title as a path.
+      Each sentence has [REF: Exact Article Title:0], with its original zero-based sentence ID.
+      Before answering, verify each cited sentence exists and supports the answer or a reasoning hop.
+      Copy the complete text inside [REF: ...] verbatim into SOURCES, without brackets or REF:.
+      Never cite a filename, path, rg line number, or a guessed sentence ID.
+      Example: [REF: Example Island:0] must be cited as Example Island:0, NOT 004.txt:3.
+      Stop when evidence is sufficient. Give only the short answer entity/value, not a full explanation.
+      If evidence is still insufficient within the budget, do not guess: use ANSWER: UNKNOWN
+      and SOURCES: NONE when no supporting evidence was found.
+      Return exactly two lines:
+      ANSWER: short answer
+      SOURCES: Title One:sentence_id; Title Two:sentence_id
+
+      Question: {prompt}
+
+evaluation:
+  enabled: true
+  batch_size: 1
+  max_samples: 8
+  max_new_tokens: 256
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  log_samples: 2
+  progress_steps: 0
+
+algorithm:
+  name: grpo
+  advantage_epsilon: 1.0e-6
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.2
+  clip_ratio_c: 3.0
+  kl_coef: 0.001
+  kl_type: low_var_kl
+  loss_aggregation: token-mean
+
+train:
+  max_steps: 50
+  seed: 1234
+  prompt_batch_size: 1
+  micro_batch_size: 1
+  response_mini_batch_size: 4
+  policy_update_epochs: 1
+  init_device: meta
+  comm_backend: hccl
+  learning_gate:
+    enabled: false
+    min_gradient_norm: 0.0
+    require_mixed_rewards: false
+  accelerator:
+    dp_replicate: 1
+    dp_shard: 2
+    tp: 1
+    cp: 1
+    pp: 1
+    reshard_after_forward: true
+    comm_fusion: true
+    cpu_offload: true
+    activation_checkpoint: full
+  mixed_precision:
+    enabled: true
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: null
+  optimizer:
+    lr: 1.0e-6
+    lr_min: 0.0
+    lr_decay_style: constant
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    eps: 1.0e-8
+    betas: [0.9, 0.999]
+    foreach: null
+  checkpoint:
+    output_dir: /results/checkpoints
+    load_path: null
+    save_steps: 50
+    save_final: true
+    verify_reload: true
+
+logging:
+  backends: [console]
+  project_name: hyper-rl
+  experiment_name: qwen3_4b_search_r1
+  log_steps: 1
+  log_samples: 2
+  wandb:
+    mode: disabled
+    entity: null
+    directory: /results/wandb

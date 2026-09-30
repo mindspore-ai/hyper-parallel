@@ -61,7 +61,7 @@ _EXPORTS = {
     "Action": ("rl.agentic.core.types", "Action"),
     "AgentAction": ("rl.agentic.core.types", "AgentAction"),
     "AgentProgram": ("rl.agentic.core.program_runner", "AgentProgram"),
-    "AgentRunner": ("rl.agentic.core.runner", "AgentRunner"),
+    "AgentRunner": ("rl.agentic.core.trajectory_runner", "AgentRunner"),
     "AgentSession": ("rl.agentic.core.session", "AgentSession"),
     "ENVIRONMENTS": ("rl.agentic.envs.environment", "ENVIRONMENTS"),
     "Environment": ("rl.agentic.envs.environment", "Environment"),

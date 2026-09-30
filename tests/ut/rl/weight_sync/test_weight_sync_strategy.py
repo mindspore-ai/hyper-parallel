@@ -16,11 +16,11 @@
 
 import pytest
 
-import rl.roles.weight_sync.transfer as transfer_module
+import rl.weight_sync.transfer as transfer_module
 from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
-from rl.roles import weight_sync
-from rl.roles.weight_sync.config import resolve_weight_sync_config
-from rl.roles.weight_sync.transfer import build_weight_transfer
+from rl import weight_sync
+from rl.weight_sync.config import resolve_weight_sync_config
+from rl.weight_sync.transfer import build_weight_transfer
 
 
 def _rollout_model():

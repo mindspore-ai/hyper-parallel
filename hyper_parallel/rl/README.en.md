@@ -105,7 +105,7 @@ Run all subsequent commands from the repository root. If you already have a chec
 ### 2. Prepare the runtime image
 
 ```bash
-docker pull swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.22.1rc1-unified-arm64
+docker image inspect hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64
 
 npu-smi info
 ```
@@ -152,7 +152,7 @@ export HYPER_QWEN3_TP_MAX_STEPS=1
 **Qwen3-4B + Search-R1, two retrieval-QA steps on two NPUs.** The model uses a local retrieval tool and continues answering from observations; no external agent CLI is required. Prepare `train.parquet` with `prompt` and `answer` columns and `corpus.jsonl` using the [data preparation script](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c631327524ea37b6b2ca328076980a/hyper_parallel/rl/examples/agents/search_R1/prepare_search_r1_data.py).
 
 ```bash
-export HYPER_VLLM_IMAGE=swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.22.1rc1-unified-arm64
+export HYPER_VLLM_IMAGE=hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64
 export HYPER_VLLM_MODEL_ROOT=/absolute/path/to/Qwen3-4B
 export HYPER_VLLM_DATA_ROOT=/absolute/path/to/hotpotqa
 export HYPER_VLLM_RESULT_ROOT=/absolute/path/to/results/search-r1
@@ -213,6 +213,12 @@ def build_environment(context: EpisodeContext) -> GSM8KMultiTurnEnvironment:
 
 In the full training YAML, use the `agentic` settings from the [GSM8K multi-turn configuration](examples/gsm8k/configs/multi_turn.yaml), change `module_path` to `examples.gsm8k.custom_reward`, and set `environment` to `custom_gsm8k`. This replaces only terminal scoring for the multi-turn task; it does not modify the Trainer or weight publication.
 
+GSM8K rule and model scorers both live in [agent.py](examples/gsm8k/agent.py). Omit the top-level `reward_model`
+section for rule rewards. To score with an RM after generation, use the
+[model reward recipe](examples/gsm8k/configs/qwen3_4b_gsm8k_model_reward.yaml) with
+`reward_model.scorer: examples.gsm8k.agent:score_gsm8k_environment_reward`. See the
+[RM contract](docs/reward_model.md) for shared-device transitions and configuration requirements.
+
 ---
 
 <!-- markdownlint-disable-next-line MD033 -->
@@ -227,6 +233,8 @@ Currently validated on **single-node Ascend 910B3**; see the [runtime image](doc
 | Capability | Status | Scope |
 | :--- | :---: | :--- |
 | **Synchronous GRPO** | ✅ | Sampling, learning, publication, evaluation, and recovery; extensible advantage/loss implementations, no Ray required |
+| **GSPO** | 🧪 | Qwen3 dense [recipe](examples/gsm8k/configs/qwen3_4b_gsm8k_gspo.yaml), sequence-normalized Actor loss, and metrics are integrated; real NPU acceptance has not been run |
+| **Colocated Reward Model** | 🧪 | Optional frozen vLLM RM and task-owned [Qwen3 Dense scorer](examples/gsm8k/agent.py) are integrated; real NPU acceptance has not been run. The example Qwen3-4B is a generative judge for flow validation, not a preference-trained RM |
 | **Single-turn and multi-turn tool tasks** | ✅ | Python environments, tools, and rewards share token-first trajectories; environment observations are excluded from loss |
 | **Programmatic agents** | ◐ | Codex / DeepSeek harnesses integrated; custom programs require adaptation. See [Agentic RL](docs/agentic_rl.md) |
 | **Sampling and deployment** | ✅ | Hyper/Native-vLLM; Qwen3 dense supports colocated and disjoint deployment, MoE is colocated only. See [vLLM Rollout](docs/vllm_rollout.md) for DP/TP/EP combinations |
@@ -268,7 +276,7 @@ Each direction requires complete recipes, learning results, and resource-cost co
 
 ## 📌 Current limitations
 
-- **Runtime scope:** Current execution is single-node Ascend synchronous GRPO, limited to the models and topologies in [supported capabilities](#supported-capabilities). MoE does not yet support disjoint deployment or intra-expert TP. PPO / Critic components do not yet provide end-to-end training.
+- **Runtime scope:** Current execution is single-node Ascend synchronous GRPO, limited to the models and topologies in [supported capabilities](#supported-capabilities). Dense GSPO has CPU coverage and an NPU acceptance recipe; real NPU acceptance has not been run. MoE does not yet support disjoint deployment or intra-expert TP. PPO / Critic components do not yet provide end-to-end training.
 - **Validation scope:** Functional success does not establish long-term learning gains. Bit-Exact covers pre-update logprobs only in specified Qwen3 dense + Hyper-vLLM configurations; it does not guarantee gradients, updated parameters, or convergence. See [consistency documentation](docs/qwen3_training_inference_consistency.md).
 - **Recovery and counters:** Checkpoint recovery is implemented, but sample/token consumption counters are not yet incremented during training steps and must not be used to measure actual training volume. See [state and recovery boundaries](docs/architecture.md#状态所有权).
 - **Deployment requirements:** vLLM RLHF/refit development endpoints are intended only for trusted, isolated training networks. See the [runtime image](docker/README.md) for environment and driver requirements.

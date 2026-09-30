@@ -65,6 +65,13 @@ def validate_phase(output: Path, case: Any, phase: int) -> None:
         require(row["train/global_step"] == row.get("policy/version") == step, "Policy version mismatch")
         require("train/total_loss" in row and "train/gradient_norm" in row, "Missing optimizer metrics")
         changed |= row["train/gradient_norm"] > 0
+        _validate_gspo_metrics(row, case.algorithm)
+        if case.name.startswith("reward-model-"):
+            require(row.get("reward/request_count", 0) >= row.get("train/valid_sequences", 1),
+                    "Missing model reward requests")
+            require(row.get("reward/scored_sequences") == row.get("train/valid_sequences"),
+                    "RM scoring duplicated TP samples")
+            require("reward/accuracy" not in row, "Model scores were mislabeled as accuracy")
         if case.algorithm == "ppo":
             require(row.get("critic/valid_tokens", 0) > 0 and row.get("critic/optimizer_steps", 0) > 0,
                     "Missing Critic optimization")
@@ -76,14 +83,51 @@ def validate_phase(output: Path, case: Any, phase: int) -> None:
         if case.strategy == "full_gather":
             _validate_streaming_metrics(row)
     require(changed, "No non-zero learning update: inspect real rewards/advantages; do not relabel rewards")
+    if case.name.startswith("reward-model-"):
+        _validate_reward_service_evidence(output, phase, rows, steps)
     if case.algorithm == "ppo":
         require(critic_changed, "No non-zero Critic update")
     if case.exact:
         require(negative_control, "No post-update change against the old policy")
     if case.name == "dense-tp1-full":
         _validate_evaluation(rows, steps)
-    if case.resume or case.name == "dense-tp1-full":
+    if case.name.startswith("reward-model-"):
+        evaluation = rows[steps[-1]]
+        require(evaluation.get("validation/total") == 8, "Incomplete RM evaluation")
+        require("validation/reward_mean" in evaluation, "Missing RM evaluation reward")
+        require("validation/accuracy" not in evaluation, "RM evaluation was mislabeled as accuracy")
+    if case.resume or case.name == "dense-tp1-full" or case.name.startswith("reward-model-"):
         _validate_checkpoint(output, case, steps)
+
+
+def _validate_reward_service_evidence(output: Path, phase: int, rows: dict, steps: tuple) -> None:
+    """Check real service access and owner-control logs, not only reported counters."""
+    phase_log = (output / f"phase-{phase}.log").read_text()
+    model_log_path = output / f"reward-model-phase-{phase}.log"
+    require(model_log_path.is_file(), "Missing reward model service log")
+    model_log = model_log_path.read_text()
+    evaluation_samples = int(rows[steps[-1]].get("validation/total", 0))
+    expected_cycles = len(steps) + int(evaluation_samples > 0)
+    require(phase_log.count("reward service awake:") == expected_cycles, "Unexpected RM wake cycle count")
+    require(phase_log.count("reward service sleeping:") == expected_cycles,
+            "RM did not sleep after every scoring phase")
+    requests = len(re.findall(r'"POST /v1/chat/completions HTTP/1\.1" \d{3}', model_log))
+    expected_requests = sum(int(rows[step]["reward/request_count"]) for step in steps) + evaluation_samples
+    require(requests == expected_requests, "RM access log shows missing or duplicated scoring requests")
+
+
+def _validate_gspo_metrics(row: dict[str, float], algorithm: str) -> None:
+    """Check sequence normalization and role ownership for the zero-KL GSPO recipe."""
+    if algorithm != "gspo":
+        return
+    sequences = row.get("train/valid_sequences", 0)
+    require(0 < sequences <= row["train/valid_tokens"], "Invalid GSPO sequence denominator")
+    require(sequences == row.get("rollout/sequence_count"),
+            "GSPO single-epoch sequence count differs from rollout; check TP duplication")
+    require(0 <= row.get("train/sequence_clip_fraction", -1) <= 1,
+            "Missing or invalid GSPO sequence clipping metric")
+    require(row.get("train/kl_loss") == 0, "Zero-KL GSPO recipe computed Reference KL")
+    require(not any(key.startswith("critic/") for key in row), "GSPO unexpectedly optimized a Critic")
 
 
 def validate_sessions(root: Path, versions: tuple[int, ...]) -> None:
@@ -176,6 +220,8 @@ def _validate_checkpoint(output, case, steps):
     require(marker["step"] == saved_step and marker["world_size"] == case.world, "Incomplete checkpoint")
     if case.algorithm == "ppo":
         require(marker.get("critic") is True, "Checkpoint does not include Critic")
+    if case.name.startswith("reward-model-"):
+        require(bool(marker.get("reward_model_scorer")), "Checkpoint lacks RM scorer identity")
     require(read_json(checkpoint / "extra_state.json")["global_step"] == saved_step, "Checkpoint step mismatch")
     require(any(checkpoint.glob("*.safetensors")), "Missing model checkpoint tensors")
     for rank in range(case.world):
@@ -199,6 +245,8 @@ def _validate_checkpoint(output, case, steps):
 
 def _phase_steps(case, phase):
     """Return the exact expected step sequence for each resume phase."""
+    if case.name == "reward-model-resume":
+        return (1, 2) if phase == 1 else (3, 4)
     steps = (phase,) if case.resume else (1, 2)
     if case.algorithm == "ppo" and case.resume and phase == 2:
         steps = (2, 3)

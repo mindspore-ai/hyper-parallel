@@ -21,7 +21,7 @@ import unittest
 from contextlib import ExitStack
 from unittest.mock import MagicMock, call, patch, sentinel
 
-from rl import process_cleanup as runtime
+from rl.utils import process_cleanup as runtime
 from rl.trainer import SyncTrainer
 
 from hyper_parallel.core.dtensor import device_mesh

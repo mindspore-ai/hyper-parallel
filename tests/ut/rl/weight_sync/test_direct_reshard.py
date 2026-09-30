@@ -22,15 +22,15 @@ from typing import Any
 import pytest
 import torch
 
-import rl.roles.weight_sync.model_adapter as adapter_module
-from rl.roles.weight_sync.layout import (
+import rl.weight_sync.model_adapter as adapter_module
+from rl.weight_sync.layout import (
     SourceTensorLayout,
     TensorRegion,
-    build_direct_reshard_plan,
     describe_source_tensor,
     resolve_destination_layouts,
     resolve_source_layouts,
 )
+from rl.weight_sync.transfer import DirectReshardStrategy
 def _apply_plan(
     plan,
     source_values: dict[tuple[str, int], torch.Tensor],
@@ -115,7 +115,7 @@ def test_direct_reshard_matches_full_gather_reference() -> None:
                 )
             )
             source_values[(name, source_rank)] = full[row_start : row_start + local_rows]
-    plan = build_direct_reshard_plan(
+    plan = DirectReshardStrategy.build_direct_reshard_plan(
         sources,
         destinations,
         source_world_size=2,
@@ -221,7 +221,7 @@ def test_source_and_destination_metadata_build_complete_reshard_plan() -> None:
 
     sources = resolve_source_layouts(rank_descriptions)
     destinations = resolve_destination_layouts(worker_descriptions, {"weight": (4, 4)})
-    plan = build_direct_reshard_plan(
+    plan = DirectReshardStrategy.build_direct_reshard_plan(
         sources,
         destinations,
         source_world_size=2,

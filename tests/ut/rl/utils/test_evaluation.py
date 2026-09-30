@@ -64,14 +64,15 @@ def test_evaluator_excludes_padding_and_aggregates_rank_zero_results(
         @staticmethod
         def generate(prompt_records: Any, policy_version: int) -> Any:
             assert len(prompt_records) == 2
+            assert all(prompt.metadata["phase"] == "evaluation" for prompt in prompt_records)
             assert policy_version in (7, 8)
             return SimpleNamespace(
                 rewards=torch.tensor([1.0, 999.0]),
                 action_mask=torch.tensor([[False, True, True], [False, True, True]]),
                 responses=("correct", "padding"),
                 trajectories=(
-                    SimpleNamespace(metadata={"extracted_answer": "1"}),
-                    SimpleNamespace(metadata={"extracted_answer": "999"}),
+                    SimpleNamespace(metadata={"extracted_answer": "1"}, reward_components={"success": 1.0}),
+                    SimpleNamespace(metadata={"extracted_answer": "999"}, reward_components={"success": 0.0}),
                 ),
                 generation_seconds=2.0,
             )

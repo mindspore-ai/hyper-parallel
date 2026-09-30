@@ -77,11 +77,13 @@ def test_vllm_completion_preserves_payload_and_choice_order() -> None:
                     "index": 1,
                     "token_ids": [20],
                     "logprobs": {"token_logprobs": [-0.2]},
+                    "finish_reason": "length",
                 },
                 {
                     "index": 0,
                     "token_ids": [10, 2],
                     "logprobs": {"token_logprobs": [-0.1, -0.3]},
+                    "finish_reason": "stop",
                 },
             ]
         },
@@ -93,7 +95,7 @@ def test_vllm_completion_preserves_payload_and_choice_order() -> None:
     assert payload["top_k"] == 5
     assert payload["stop_token_ids"] == [2, 3]
     assert payload["logprobs"] == 1
-    assert records == [([10, 2], [-0.1, -0.3]), ([20], [-0.2])]
+    assert records == [([10, 2], [-0.1, -0.3], "stop"), ([20], [-0.2], "length")]
 
 
 def test_vllm_router_respects_capacity_and_restores_row_order(
@@ -147,7 +149,7 @@ def test_vllm_router_respects_capacity_and_restores_row_order(
         )
     )
 
-    assert records == [([10], None), ([11], None), ([12], None), ([13], None)]
+    assert records == [([10], None, None), ([11], None, None), ([12], None, None), ([13], None, None)]
     assert peak == 2
     assert events.index(("start", 12)) < events.index(("finish", 10))
 
@@ -232,7 +234,7 @@ def test_sync_generate_executes_complete_http_generation_pipeline(
         child_capacity: int,
         batch_invariant: bool,
         row_seeds: tuple[int, ...],
-    ) -> list[tuple[list[int], list[float]]]:
+    ) -> list[tuple[list[int], list[float], str]]:
         captured.update(
             prompts=prompts,
             settings=settings,
@@ -240,7 +242,7 @@ def test_sync_generate_executes_complete_http_generation_pipeline(
             batch_invariant=batch_invariant,
             row_seeds=row_seeds,
         )
-        return [([9, 2], [-0.1, -0.2]), ([8], [-0.3])]
+        return [([9, 2], [-0.1, -0.2], "stop"), ([8], [-0.3], "length")]
 
     monkeypatch.setattr(client, "generate_tokens", generate_tokens)
     engine = VLLMGenerationEngine(
@@ -281,6 +283,7 @@ def test_sync_generate_executes_complete_http_generation_pipeline(
     )
     assert result.generation_seconds == 2.5
     assert result.worker_policy_version == 4
+    assert result.finish_reasons == ("stop", "length")
     assert version_calls == ["version", "version"]
 
 
@@ -295,7 +298,7 @@ def test_tp_owner_generates_once_and_broadcasts_complete_result(
     )
     owner_result = VLLMGenerationEngine._build_generation_result(
         request,
-        [([9, 2], [-0.1, -0.2])],
+        [([9, 2], [-0.1, -0.2], "stop")],
         1.5,
         3,
     )
@@ -314,7 +317,8 @@ def test_tp_owner_generates_once_and_broadcasts_complete_result(
 
     def gather(output: list[Any], value: Any, group: Any) -> None:
         assert group == "tp"
-        output[:] = [value, value] if isinstance(value, tuple) else [1.5, None]
+        output[:] = ([value, value] if isinstance(value, tuple)
+                     else [{"generation_seconds": 1.5, "finish_reasons": ("stop",)}, None])
 
     monkeypatch.setattr(vllm_module.dist, "broadcast", broadcast)
     monkeypatch.setattr(vllm_module.dist, "all_gather_object", gather)
@@ -348,6 +352,7 @@ def test_tp_owner_generates_once_and_broadcasts_complete_result(
     replica = non_owner._generate_tp_owned(request)
 
     assert generation_calls == ["owner"]
+    assert owner_copy.finish_reasons == replica.finish_reasons == ("stop",)
     assert owner.request_owner_generate_count == 1
     assert non_owner.request_owner_generate_count == 0
     torch.testing.assert_close(replica.sequences, owner_copy.sequences)
@@ -515,6 +520,7 @@ def test_engine_computes_child_capacity_and_inprocess_results(
                 completion = SimpleNamespace(
                     token_ids=[token_id],
                     logprobs=[{token_id: candidate}],
+                    finish_reason="stop" if token_id == 7 else "length",
                 )
                 outputs.append(SimpleNamespace(outputs=[completion]))
             return outputs
@@ -547,7 +553,7 @@ def test_engine_computes_child_capacity_and_inprocess_results(
     )
 
     assert capacity == 4
-    assert records == [([7], [-0.5]), ([8], [-0.5])]
+    assert records == [([7], [-0.5], "stop"), ([8], [-0.5], "length")]
     assert [sampling.seed for sampling in local_client.sampling] == [30, 31]
     assert all(sampling.stop_token_ids == [2, 3] for sampling in local_client.sampling)
 
@@ -703,7 +709,7 @@ def test_http_client_retries_readiness_and_completes_bounded_process_cleanup(
     monkeypatch.setattr(
         delayed,
         "_wait_process_group_exit",
-        lambda process_group: events.append(("exit", process_group)),
+        lambda process_group, timeout=30: events.append(("exit", process_group, timeout)),
     )
     monkeypatch.setattr(
         vllm_module.os,
@@ -722,7 +728,7 @@ def test_http_client_retries_readiness_and_completes_bounded_process_cleanup(
     monkeypatch.setattr(
         exited,
         "_wait_process_group_exit",
-        lambda process_group: events.append(("exit", process_group)),
+        lambda process_group, timeout=30: events.append(("exit", process_group, timeout)),
     )
     exited.close()
 
@@ -731,10 +737,9 @@ def test_http_client_retries_readiness_and_completes_bounded_process_cleanup(
         ("wait", 20),
         ("signal", 101, vllm_module.signal.SIGKILL),
         ("wait", 10),
-        ("exit", 101),
+        ("exit", 101, 5),
         ("signal", 102, vllm_module.signal.SIGTERM),
-        ("signal", 102, vllm_module.signal.SIGKILL),
-        ("exit", 102),
+        ("exit", 102, 5),
     ]
 
 

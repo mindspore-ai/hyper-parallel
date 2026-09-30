@@ -13,12 +13,12 @@ HyperParallel 主项目提供分布式模型构建、训练和并行能力；RL 
 | 层次 | 当前职责与边界 | 代码依据 |
 | --- | --- | --- |
 | 主项目 | DTensor、TP、FSDP/HSDP、CP、EP、PP、checkpoint 等基础能力；各模块后端范围分别维护 | `hyper_parallel/core/`、`hyper_parallel/distributed/`、`hyper_parallel/platform/` |
-| RL 运行时 | 同步在线 GRPO/PPO；当前模型注册只接受 Qwen3 dense，公开配方面向单节点 Ascend NPU | `hyper_parallel/rl/rl/trainer.py`、`hyper_parallel/rl/rl/roles/model_setup.py` |
+| RL 运行时 | 同步在线 GRPO/PPO/GSPO；当前模型注册只接受 Qwen3 dense，公开配方面向单节点 Ascend NPU | `hyper_parallel/rl/rl/trainer.py`、`hyper_parallel/rl/rl/roles/model_setup.py` |
 | 训练拓扑 | `dp_replicate=1`、`tp=1` 或 `2`、`cp=pp=ep=1`；`dp_shard` 为正整数 | `hyper_parallel/rl/rl/config.py::_trainer_topology`、`hyper_parallel/rl/rl/config.py::_validate_trainer_ep` |
 | Rollout | 一个共享 vLLM 服务，支持 DP 与 TP；colocated 共用训练设备，disjoint 使用独立设备集；dense 模型拒绝 EP/EPLB | `hyper_parallel/rl/rl/config.py::_validate_vllm`、`hyper_parallel/rl/rl/roles/rollout/topology.py` |
 | 验证范围 | UT 验证合同及局部计算；真实模型、通信与学习效果由明确的 NPU 配方验证 | [功能盘点](../hyper_parallel/rl/docs/current_feature_inventory.md)、[PPO](../hyper_parallel/rl/docs/ppo.md)、[ST](../hyper_parallel/rl/docs/hyper-rl-st.md) |
 
-算法注册支持扩展，但内置算法为 GRPO/PPO。模型层对 Qwen3 家族身份的接受，不代表任意模型规模、设备或拓扑已验收。
+算法注册支持扩展，内置算法为 GRPO/PPO/GSPO；GSPO 的 Qwen3 dense 配方仍待真实 NPU 验收。模型层对 Qwen3 家族身份的接受，不代表任意模型规模、设备或拓扑已验收。
 DeepSeek Harness 是 Agent 程序接入方式，不表示支持 DeepSeek-V3 模型。多节点、MoE、异步/off-policy 等能力
 不应从主项目接口或外部目录中的文档推断为当前 RL 已支持。
 
@@ -34,10 +34,11 @@ DeepSeek Harness 是 Agent 程序接入方式，不表示支持 DeepSeek-V3 模�
 | 高性能模块 | `hyper_parallel/components/` | 模型可组合的函数及模块 |
 | 主项目 Trainer | `hyper_parallel/trainer/` | 通用配置、优化器及训练组件；RL 拥有独立的训练主循环 |
 | RL 配置与编排 | `hyper_parallel/rl/rl/config.py`、`hyper_parallel/rl/rl/trainer.py` | 校验 YAML、构造运行配置、编排 rollout、更新、发布、评估与保存 |
-| RL 退出清理 | `hyper_parallel/rl/rl/process_cleanup.py` | 关闭 tracker、rollout 服务，销毁进程组并清理分布式缓存 |
-| RL 算法与角色 | `hyper_parallel/rl/rl/algorithm/`、`hyper_parallel/rl/rl/roles/policy/` | GRPO/PPO 目标与损失；Actor/Reference/Critic 持有模型和计算职责 |
+| RL 退出清理 | `hyper_parallel/rl/rl/utils/process_cleanup.py` | 关闭 tracker、rollout 服务，销毁进程组并清理分布式缓存 |
+| RL 算法与角色 | `hyper_parallel/rl/rl/algorithm/`、`hyper_parallel/rl/rl/roles/policy/` | GRPO/PPO/GSPO 目标与损失；Actor/Reference/Critic 持有模型和计算职责 |
 | RL 数据与交互 | `hyper_parallel/rl/rl/dataset/`、`hyper_parallel/rl/rl/agentic/` | prompt、trajectory、token mask、经验批次、环境、工具与外部 Agent 程序 |
-| RL 生成与发布 | `hyper_parallel/rl/rl/roles/rollout/`、`hyper_parallel/rl/rl/roles/weight_sync/` | vLLM 服务、模型适配、IPC/HCCL 传输及策略版本提交 |
+| RL 生成与发布 | `hyper_parallel/rl/rl/roles/rollout/`、`hyper_parallel/rl/rl/weight_sync/` | vLLM 服务、模型适配、IPC/HCCL 传输及策略版本提交 |
+| 可选共卡 RM | `hyper_parallel/rl/rl/reward_model/`；业务评分在 `hyper_parallel/rl/examples/` | 冻结模型在 rollout 休眠后评分，默认规则路径保持原样；NPU 待验收 |
 | RL 持久化与观测 | `hyper_parallel/rl/rl/checkpoint.py`、`hyper_parallel/rl/rl/evaluation.py`、`hyper_parallel/rl/rl/utils/monitoring/` | 保存恢复、独立评估、指标及 console/W&B 输出 |
 
 Qwen3 主项目构建使用通用 `HyperAutoModelForCausalLM` 和 `models/qwen3/adapter/`。
@@ -62,8 +63,8 @@ Actor 更新 → PPO Critic 更新 → 发布 Actor 策略 → 提交 policy_ver
 
 - `SyncTrainer._prepare_experience` 按算法需求计算 Reference logprobs、Critic values 和目标；
   Actor 重算用于诊断及可选的一致性门禁，训练的 `old_log_probs` 仍来自 rollout。
-- GRPO 使用分组奖励优势；PPO 已接入价值头、GAE、bootstrap、Actor/Critic 更新与双角色 checkpoint。
-  两者当前都需要 Reference。算法计算目标和损失，角色执行反向与优化器步进。
+- GRPO 与 GSPO 使用分组奖励优势；GSPO 对有效动作 token 求序列均值，再对有效序列等权求均值。PPO 已接入价值头、GAE、bootstrap、Actor/Critic 更新与双角色 checkpoint。
+  三种算法仅在 `kl_coef > 0` 时需要 Reference。算法计算目标和损失，角色执行反向与优化器步进。
 - `SyncTrainer._publish_policy` 发布 Actor 模型。`ActorRolloutWeightSync` 管理训练与生成驻留状态，
   `WeightPublisher` 执行暂停、传输、完成及版本核对；发布异常会向上传播，不自动切换策略。
 - `full_gather` 按完整参数组桶，并把完整参数交给 vLLM 加载；单个大参数可以超过配置的桶大小。

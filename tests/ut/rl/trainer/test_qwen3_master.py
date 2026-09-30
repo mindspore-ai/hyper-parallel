@@ -39,19 +39,16 @@ from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
 from rl.roles.qwen3_builder import Qwen3ShardingPlanner as ShardingPlanner
 from rl.roles.qwen3_builder import get_module_replacements, get_parallel_overrides
 from rl.roles.qwen3_builder import restore_tied_parameter as _replicate_tied_weights
-from rl.roles.weight_sync import packed_weight
-from rl.roles.weight_sync.layout import (
-    build_direct_reshard_plan,
-    pack_direct_bucket,
-    resolve_destination_layouts,
-    resolve_source_layouts,
-)
-from rl.roles.weight_sync.model_adapter import ModelWeightAdapter, rollout_tensor_descriptions
-from rl.roles.weight_sync.packed_weight import (
+from rl.weight_sync import packed_weight
+from rl.weight_sync.layout import resolve_destination_layouts, resolve_source_layouts
+from rl.weight_sync.model_adapter import ModelWeightAdapter, rollout_tensor_descriptions
+from rl.weight_sync.packed_weight import (
     build_packed_weight_buckets,
+    pack_direct_bucket,
     materialize_packed_weight_bucket,
     unpack_packed_weights,
 )
+from rl.weight_sync.transfer import DirectReshardStrategy
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
 
@@ -286,7 +283,7 @@ def test_direct_reshard_fused_sources_match_canonical_destinations(trainer_tp, d
     destinations = resolve_destination_layouts(
         worker_descriptions, {name: tuple(value.shape) for name, value in expected.items()},
     )
-    plan = build_direct_reshard_plan(
+    plan = DirectReshardStrategy.build_direct_reshard_plan(
         sources, destinations, source_world_size=len(states), bucket_size_bytes=128,
     )
     _assert_direct_bucket_copy(plan, states, destination_maps, expected_maps)

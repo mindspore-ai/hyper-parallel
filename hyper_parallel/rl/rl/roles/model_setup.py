@@ -20,6 +20,7 @@ __all__ = [
     "ModelRegistration",
     "NATIVE_MODEL_IMPLEMENTATION",
     "NATIVE_QWEN3_ARCHITECTURE",
+    "NATIVE_QWEN3_MOE_ARCHITECTURE",
     "SUPPORTED_MODEL_IMPLEMENTATIONS",
     "VLLMModelRegistration",
     "architecture_for_implementation",
@@ -50,6 +51,7 @@ SUPPORTED_MODEL_IMPLEMENTATIONS = (
 )
 HYPER_QWEN3_ARCHITECTURE = "HyperQwen3ForCausalLM"
 NATIVE_QWEN3_ARCHITECTURE = "Qwen3ForCausalLM"
+NATIVE_QWEN3_MOE_ARCHITECTURE = "Qwen3MoeForCausalLM"
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,8 @@ class ModelRegistration:
             and self.model_type == "qwen3"
         ):
             return "qwen3"
+        if self.hf_architecture == NATIVE_QWEN3_MOE_ARCHITECTURE and self.model_type == "qwen3_moe":
+            return "qwen3_moe"
         raise ValueError(
             "Unsupported RL model identity: "
             f"architecture={self.hf_architecture!r}, model_type={self.model_type!r}, "
@@ -128,6 +132,7 @@ def architecture_for_implementation(
             NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_ARCHITECTURE,
         },
     }
+    architectures["qwen3_moe"] = {NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_MOE_ARCHITECTURE}
     try:
         return architectures[model_family][normalized]
     except KeyError as error:
