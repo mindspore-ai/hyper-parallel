@@ -61,6 +61,88 @@ class IdentityDataTransform:
 
 
 @dataclass
+class PretokenizedTextTransform:
+    """Turn stored token documents or aligned input/label pairs into Text samples.
+
+    Args:
+        max_seq_len: Maximum output sequence length. Token-only documents are
+            shifted and chunked; samples with labels must already fit this limit.
+
+    Note:
+        Without labels, ``input_ids`` contains the whole document including any
+        desired EOS token. With labels, both fields must already use HP Text's
+        next-token alignment. A binary ``loss_mask`` is folded into labels so
+        HP packing preserves it. Attention masks and positions are configured
+        on the Text batch runtime, not on individual stored records.
+    """
+
+    max_seq_len: int
+
+    def __post_init__(self) -> None:
+        """Reject invalid sequence limits before constructing a Dataset."""
+        if isinstance(self.max_seq_len, bool) or not isinstance(self.max_seq_len, int) or self.max_seq_len <= 0:
+            raise ValueError("max_seq_len must be a positive integer")
+
+    @staticmethod
+    def is_valid_sample(sample: Mapping[str, Any]) -> bool:
+        """Check that a stored document can supply at least one training token."""
+        if "input_ids" not in sample:
+            raise ValueError("Pretokenized text requires input_ids")
+        return len(sample["input_ids"]) >= (1 if "labels" in sample else 2)
+
+    def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Preserve aligned labels, or shift and chunk a stored token document."""
+        input_ids = self._token_tensor(sample["input_ids"], "input_ids")
+        if any(name in sample for name in ("attention_mask", "position_ids")):
+            raise ValueError(
+                "Prepared Text records must omit attention_mask and position_ids; "
+                "HP constructs them from packed sequence boundaries and the Text batch configuration"
+            )
+        if torch.any(input_ids < 0):
+            raise ValueError("Prepared input_ids must contain non-negative token IDs")
+        if "labels" not in sample:
+            if "loss_mask" in sample:
+                raise ValueError("Prepared loss_mask requires explicitly aligned labels")
+            if input_ids.numel() < 2:
+                raise ValueError("A token document must contain at least two tokens")
+            return [
+                {"input_ids": input_ids[start:min(start + self.max_seq_len, input_ids.numel() - 1)],
+                 "labels": input_ids[start + 1:start + self.max_seq_len + 1]}
+                for start in range(0, max(0, input_ids.numel() - 1), self.max_seq_len)
+            ]
+        labels = self._aligned_labels(sample, input_ids)
+        if not torch.any(labels != IGNORE_INDEX):
+            return []
+        return [{"input_ids": input_ids, "labels": labels}]
+
+    def _aligned_labels(self, sample: Mapping[str, Any], input_ids: torch.Tensor) -> torch.Tensor:
+        """Validate stored labels and fold binary loss weights into ignore indices."""
+        labels = self._token_tensor(sample["labels"], "labels")
+        if labels.shape != input_ids.shape or not 0 < input_ids.numel() <= self.max_seq_len:
+            raise ValueError("Prepared input_ids/labels must have equal positive length <= max_seq_len")
+        if torch.any((labels < 0) & (labels != IGNORE_INDEX)):
+            raise ValueError("Prepared labels must contain token IDs or IGNORE_INDEX (-100)")
+        if "loss_mask" in sample:
+            mask = torch.as_tensor(sample["loss_mask"])
+            if mask.device.type != "cpu" or mask.shape != input_ids.shape or mask.is_complex():
+                raise ValueError("Prepared loss_mask must be a CPU array matching input_ids shape")
+            if not torch.all((mask == 0) | (mask == 1)):
+                raise ValueError("Prepared Text loss_mask must contain only 0 or 1")
+            if torch.any(mask == 0):
+                labels = labels.masked_fill(mask == 0, IGNORE_INDEX)
+        return labels
+
+    @staticmethod
+    def _token_tensor(value: Any, name: str) -> torch.Tensor:
+        tensor = torch.as_tensor(value)
+        if tensor.device.type != "cpu":
+            raise ValueError(f"Prepared {name} must be on CPU; the batch runtime owns device transfer")
+        if tensor.ndim != 1 or tensor.is_floating_point() or tensor.is_complex() or tensor.dtype == torch.bool:
+            raise ValueError(f"Prepared {name} must be a one-dimensional integer array")
+        return tensor.to(dtype=torch.long)
+
+
+@dataclass
 class PlaintextTransform:
     """Tokenize plaintext records into one or more model samples."""
 
