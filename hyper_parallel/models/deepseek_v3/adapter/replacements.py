@@ -20,24 +20,20 @@ gate/up/down expert containers; the generic grouped-linear modules live in
 TP=CP=EP=PP=1 and validate the NPU runtime before converting.
 """
 
-__all__ = ["replace_hifloat8_grouped_experts", "replace_mxfp8_grouped_experts"]
-
 from collections.abc import Mapping
 from typing import Any
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.quantization.functional import (
-    validate_hifloat8_gmm_runtime,
-    validate_npu_gmm_runtime,
-)
+from hyper_parallel.components.quantization.functional import build_low_precision_strategy
 from hyper_parallel.components.quantization.modules.hifloat8_grouped_linear import (
     HiFloat8GroupedExperts,
 )
-from hyper_parallel.components.quantization.modules.mxfp8_grouped_linear import (
-    MXFP8GroupedExperts,
+from hyper_parallel.components.quantization.modules.grouped_experts import (
+    GroupedExperts,
 )
+from hyper_parallel.components.quantization.ops import validate_hifloat8_gmm_runtime
 
 
 def _check_ep1_only(context: Mapping[str, Any], factory_name: str) -> None:
@@ -69,21 +65,25 @@ def replace_hifloat8_grouped_experts(
 
 
 @module_replacement
-def replace_mxfp8_grouped_experts(
+def replace_grouped_experts(
     *,
     module: nn.Module,
     module_fqn: str,
     context: Mapping[str, Any],
-) -> MXFP8GroupedExperts:
-    """Replace one EP=1 packed gate/up/down expert container with MXFP8 GMMs."""
+) -> GroupedExperts:
+    """Replace packed experts with the policy-selected grouped-linear strategy."""
 
-    _check_ep1_only(context, "MXFP8 grouped experts")
+    _check_ep1_only(context, "Low-precision grouped experts")
     parameters = tuple(module.parameters(recurse=False))
-    if any(dimension % 32 for parameter in parameters for dimension in parameter.shape[-2:]):
-        shapes = [tuple(parameter.shape) for parameter in parameters]
-        raise ValueError(
-            f"{module_fqn!r} is not MXFP8 tile aligned: {shapes} "
-            "requires matrix dimensions that are multiples of 32."
-        )
-    validate_npu_gmm_runtime()
-    return MXFP8GroupedExperts.from_module(module, fqn=module_fqn)
+    strategy = build_low_precision_strategy(
+        context.get("low_precision"),
+        tile_shapes=tuple(tuple(parameter.shape) for parameter in parameters),
+    )
+    return GroupedExperts.from_module(
+        module,
+        fqn=module_fqn,
+        grouped_linear=strategy,
+    )
+
+
+__all__ = ["replace_grouped_experts", "replace_hifloat8_grouped_experts"]

@@ -24,7 +24,7 @@ from hyper_parallel.components.quantization.functional._saved_quantized import (
     save_quantized_operands,
 )
 
-from hyper_parallel.components.quantization.functional.npu_hifloat8 import (
+from hyper_parallel.components.quantization.ops.npu_hifloat8 import (
     hifloat8_grouped_matmul,
 )
 from hyper_parallel.components.quantization.quantizers.hifloat8 import (

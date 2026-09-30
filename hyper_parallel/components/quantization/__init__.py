@@ -14,20 +14,36 @@
 # ============================================================================
 """Low-precision quantization: config, tensors, quantizers, functions, modules."""
 
-from hyper_parallel.components.quantization.config import LowPrecisionConfig
+from hyper_parallel.components.quantization.config import (
+    LowPrecisionConfig,
+    LowPrecisionDtypeScheme,
+)
 from hyper_parallel.components.quantization.functional import (
+    GroupedLinear,
+    W4A8GroupedLinear,
+    FakeW4A8GroupedLinear,
+    build_low_precision_strategy,
+)
+from hyper_parallel.components.quantization.ops import (
+    FakeW4A8CapabilityError,
+    FakeW4A8NpuOps,
     HiFloat8NpuOps,
     LowPrecisionCapabilityError,
     MXFP8NpuOps,
+    W4A8CapabilityError,
+    W4A8NpuOps,
     hifloat8_grouped_matmul,
     hifloat8_matmul,
     mxfp8_grouped_matmul,
     mxfp8_matmul,
+    transform_grouped_scale,
+    validate_fake_w4a8_gmm_runtime,
+    validate_w4a8_gmm_runtime,
 )
 from hyper_parallel.components.quantization.modules import (
+    GroupedExperts,
     HiFloat8GroupedExperts,
     HiFloat8Linear,
-    MXFP8GroupedExperts,
     MXFP8Linear,
     QuantizedLinearBase,
     replace_hifloat8_linear,
@@ -37,6 +53,8 @@ from hyper_parallel.components.quantization.quantizers import (
     HiFloat8Quantizer,
     MXFP8Quantizer,
     Quantizer,
+    W4A8Quantizer,
+    FakeW4A8Quantizer,
 )
 from hyper_parallel.components.quantization.tensor import (
     HiFloat8Tensor,
@@ -45,6 +63,8 @@ from hyper_parallel.components.quantization.tensor import (
     MXFP8TensorStorage,
     QuantizedTensor,
     QuantizedTensorStorage,
+    W4A8Tensor,
+    W4A8TensorStorage,
 )
 
 __all__ = [
@@ -55,13 +75,26 @@ __all__ = [
     "HiFloat8Tensor",
     "HiFloat8TensorStorage",
     "LowPrecisionConfig",
+    "LowPrecisionDtypeScheme",
     "LowPrecisionCapabilityError",
-    "MXFP8GroupedExperts",
+    "GroupedExperts",
     "MXFP8Linear",
     "MXFP8NpuOps",
     "MXFP8Quantizer",
     "MXFP8Tensor",
     "MXFP8TensorStorage",
+    "W4A8CapabilityError",
+    "W4A8GroupedLinear",
+    "W4A8NpuOps",
+    "W4A8Quantizer",
+    "W4A8Tensor",
+    "W4A8TensorStorage",
+    "FakeW4A8CapabilityError",
+    "FakeW4A8GroupedLinear",
+    "FakeW4A8NpuOps",
+    "FakeW4A8Quantizer",
+    "GroupedLinear",
+    "build_low_precision_strategy",
     "QuantizedLinearBase",
     "QuantizedTensor",
     "QuantizedTensorStorage",
@@ -70,6 +103,9 @@ __all__ = [
     "hifloat8_matmul",
     "mxfp8_grouped_matmul",
     "mxfp8_matmul",
+    "transform_grouped_scale",
+    "validate_w4a8_gmm_runtime",
+    "validate_fake_w4a8_gmm_runtime",
     "replace_hifloat8_linear",
     "replace_mxfp8_linear",
 ]

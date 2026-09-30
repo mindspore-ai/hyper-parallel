@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.components.quantization.functional.npu_hifloat8 import (
+from hyper_parallel.components.quantization.ops.npu_hifloat8 import (
     HiFloat8NpuOps,
     _get_hifloat8_npu_ops,
 )

@@ -206,6 +206,8 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("enabled", "False"),
                 ("format", "'mxfp8_e4m3'"),
                 ("scaling", "'mx_block'"),
+                ("dtype_schemes", "<factory> {}"),
+                ("default_dtype_scheme", "None"),
             ],
         )
 
