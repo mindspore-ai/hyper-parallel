@@ -390,13 +390,19 @@ def _make_selective_checkpoint_policy_fn() -> Callable:
     return selective_checkpointing_policy
 
 
-def make_selective_checkpoint_context_fn() -> Callable[[], tuple[object, object]]:
+def make_selective_checkpoint_context_fn(
+        allow_cache_entry_mutation: bool = False,
+) -> Callable[[], tuple[object, object]]:
     """Create a per-checkpoint-region selective activation policy context.
 
     Expensive operations are saved, ordinary operations are recomputed, and
     matmul operations alternate between the two decisions. A new counter is
     created every time the returned factory is invoked, matching the
     ``context_fn`` contract of non-reentrant checkpointing.
+
+    Args:
+        allow_cache_entry_mutation: Whether to accept deterministic in-place
+            rewrites of cached tensors instead of raising.
 
     Returns:
         A no-argument factory that creates the forward and recompute contexts.
@@ -412,7 +418,8 @@ def make_selective_checkpoint_context_fn() -> Callable[[], tuple[object, object]
             non-reentrant checkpointing ``context_fn`` contract.
         """
         return create_selective_checkpoint_contexts(
-            _make_selective_checkpoint_policy_fn()
+            _make_selective_checkpoint_policy_fn(),
+            allow_cache_entry_mutation=allow_cache_entry_mutation,
         )
 
     return selective_checkpoint_context_fn
@@ -953,6 +960,7 @@ def _apply_selective_checkpointing(
     *,
     enable_compile: bool,
     swap_inputs: bool,
+    allow_cache_entry_mutation: bool = False,
 ) -> int:
     """Wrap every discovered layer for selective recomputation.
 
@@ -967,6 +975,8 @@ def _apply_selective_checkpointing(
         enable_compile: Whether the wrapped regions will be compiled.
         swap_inputs: Whether checkpoint inputs should be offloaded in eager
             execution. Ignored in compile mode.
+        allow_cache_entry_mutation: Whether to accept deterministic in-place
+            rewrites of cached tensors instead of raising.
 
     Returns:
         The number of layers, or submodules in the KV-shared fallback, wrapped.
@@ -1004,7 +1014,8 @@ def _apply_selective_checkpointing(
     return _wrap_layer_containers(
         containers,
         eager_checkpoint_wrapper,
-        context_fn=make_selective_checkpoint_context_fn(),
+        context_fn=make_selective_checkpoint_context_fn(
+            allow_cache_entry_mutation),
     )
 
 
@@ -1074,6 +1085,7 @@ def _apply_activation_checkpointing(
     enable_compile: bool = False,
     swap_inputs: bool = False,
     selection: Optional[Any] = None,
+    allow_cache_entry_mutation: bool = False,
 ) -> nn.Module:
     """Apply full or selective recomputation to discovered transformer layers.
 
@@ -1115,6 +1127,7 @@ def _apply_activation_checkpointing(
             has_kv_sharing,
             enable_compile=enable_compile,
             swap_inputs=swap_inputs,
+            allow_cache_entry_mutation=allow_cache_entry_mutation,
         )
         _warn_if_nothing_wrapped(wrapped_count, activation_checkpoint, containers)
         logger.info(

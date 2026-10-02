@@ -295,6 +295,8 @@ class BaseTrainer(Stateful, ABC):
             activation_checkpoint=self.config.activation_checkpoint.mode,
             activation_checkpoint_selection=self.config.activation_checkpoint.selection,
             swap_inputs=getattr(self.config.activation_checkpoint, "swap_inputs", False),
+            allow_cache_entry_mutation=getattr(
+                self.config.activation_checkpoint, "allow_cache_entry_mutation", False),
             activation_swap=self.config.activation_swap,
             compile_config=self.config.compile,
             # The final dtype is applied inside the atomic build (05 stage-5

@@ -325,7 +325,7 @@ def compressed_causal_topk(
     selected_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
-        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu_()
+        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
@@ -435,7 +435,7 @@ def compressed_causal_candidates(
     candidate_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
-        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu_()
+        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
@@ -505,7 +505,7 @@ def compressed_causal_topk_and_candidates(
     candidate_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
-        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu_()
+        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
@@ -602,7 +602,7 @@ def compressed_candidate_topk(
             "bchd,bckd->bchk",
             query[:, start:end].float(),
             selected_key,
-        ).relu_()
+        ).relu()
         scores = (dots * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
