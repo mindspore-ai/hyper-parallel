@@ -17,7 +17,8 @@ source
 ```text
 data/
 ├── indexed/    # .idx/.bin、Indexed split、sample index、blend
-├── online/     # 原始 Mapping/Iterable source、文件/HF 加载、source blend
+├── online/     # 公共 Mapping/Iterable source、加载与 provider 接入、source blend
+├── nv_meta/    # prepared .nv-meta SQLite/tar reader 与 provider
 ├── text/       # LLM tokenizer、chat template、transform、Dataset 入口
 ├── omni/       # image/video/audio processor transform 生命周期、Omni Dataset 入口
 ├── batching/   # 候选池、packing、collator、DataLoader、get-batch
@@ -27,7 +28,8 @@ data/
 
 | 模块 | 输入 | 输出 | 不负责 |
 | --- | --- | --- | --- |
-| `online` | 文件、目录、glob、Hub Dataset | RawSample source | tokenizer、模型语义 |
+| `online` | 文件、目录、glob、Hub Dataset、显式 provider | RawSample source | tokenizer、模型语义 |
+| `nv_meta` | prepared SQLite metadata + tar | 带来源信息的 bytes 记录 | tokenizer、模型语义 |
 | `text` | RawSample + tokenizer/template | Text ModelSample | 多模态 processor |
 | `omni` | RawSample + processor | Omni planning/ModelSample | source IO、DP 采样 |
 | `batching` | ModelSample | collated batch | 原始文件加载 |
@@ -55,10 +57,313 @@ DeepSeek-V4.1 Online VLM 的样本契约、图片展开、label mask 和 batch �
 | Online Iterable Text | 已支持 | `build_online_iterable_dataset` |
 | Online Mapping Omni | 已支持 | `build_online_omni_mapping_dataset` |
 | Online Iterable Omni | 尚未提供顶层 Dataset 入口 | 可复用 `online` Iterable source seam |
-| Offline Omni metadata | transform 生命周期已预留 | Dataset/provider 尚未落地 |
+| `.nv-meta` Text/Omni | 支持原始记录和预处理张量 | 原有 builder + `NvMetaSource`，内置常用解码 |
 | Omni TP/CP get-batch | 已实现，待多卡训练验证 | `OmniParallelBatch` 仅支持 PP=1 |
 
 当前 Omni 已接入 image/VLM 字段；目录和 transform contract 可继续扩展 video、audio。
+
+## 2.1 在现有 Online 层接入额外来源
+
+`online` 是 Text/Omni 共用的原始数据层，不限定某一种存储格式。已有的
+`MappingTransformDataset`、`IterableTransformDataset` 和 source 混合实现保留在原文件。
+没有配置 `source` 时，既有 Dataset builder 沿用原来的加载、过滤、混合与 transform 路径；
+已有 `data_path`、`data_config`、model assets、DataLoader 和训练示例不需要迁移。
+
+需要其他读取后端时，在现有 Text/Omni builder 上显式配置 `source`：
+
+```yaml
+dataset:
+  _target_: hyper_parallel.data.omni.build_online_omni_mapping_dataset
+  data_config: {}
+  source:
+    _target_: hyper_parallel.data.nv_meta.NvMetaSource
+    data_path: /datasets/webdataset
+  data_transform:
+    _target_: hyper_parallel.data.omni.AutoProcessorTransform
+    max_seq_len: 4096
+```
+
+这是替换已有训练配置的 Dataset 部分；继续保留模型的 `model_assets` 和 DataLoader 配置。
+默认读取每个样本的 JSON 对象，并解析 messages 中指向本样本图片 part 的引用，无需配置 adapter。
+其他常用布局只增加 `source.record_part`：`txt` 返回 `text`，`tokens.npy` 返回 `input_ids`，
+`npz`/`pt` 返回保存的字段字典。该参数指定 tar 内的 part 名称，不是整个数据集的文件格式。
+Text 使用原有 `hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset`；
+流式 Text 使用 `build_online_iterable_dataset`；Omni 沿用
+`build_online_omni_mapping_dataset`。访问方式由所选 builder 决定，不再重复配置一份 mode。
+
+| 配置位置 | 适用范围与职责 |
+| --- | --- |
+| `dataset.data_path`、`dataset.data_config` | 未配置 source 时，保留已有文件/Hub 配置含义 |
+| `dataset.source.data_path` | 显式 source 的唯一单源路径 |
+| `dataset.source.data_config` | source 自己的 split、shuffle、reader 和多源选项 |
+| `dataset.data_config` | 显式 source 时，保留 HP ownership/cache 和 batch 选项 |
+| `dataset.source.record_part` | nv-meta 内置解码的记录 part，默认 `json` |
+| `dataset.sample_adapter` | 特殊样本布局的可选覆盖，须显式配置 source |
+| `dataset.data_transform` | Text/Omni 的原有模型处理过程 |
+
+显式 `source` 与旧 `dataset.data_path`、`dataset.data_config.sources` 互斥；单源和多源配置
+也互斥。nv-meta 不接受 `source.data_config.path`、`source.data_config.data_path` 等路径别名。
+HP 已有嵌套 `_target_` 负责构造 source 描述对象；它的构造器不打开文件。Trainer 的 seed、
+样本目标和分布式上下文由 `online.provider.build_provider_source` 在构建时传入。
+内置 adapter 在 source 构造时确定，不扫描数据猜格式。自定义 `sample_adapter` 使用已有的
+嵌套 `_target_` 构建与序列化机制，并替换内置解码；不与非默认 `source.record_part` 同时配置。
+adapter 不隐式接收 Trainer 运行时参数。tokenizer 和模型编码仍由 `data_transform` 负责。
+
+```text
+现有 Text/Omni Dataset builder
+  -> 未配置 source：原有文件/Hub 加载路径
+  -> 显式配置 source：online provider 接入 -> nv-meta reader
+  -> canonical RawSample -> 原有 Text/Omni 包装 -> packing / DataLoader
+```
+
+新增能力仍属于 `online`，集中在两个文件：`provider.py` 定义来源接口、构建上下文与 ownership
+接入；`source_views.py` 包装有限索引来源，统一 Mapping/Iterable 访问、适配、过滤与恢复，
+并在内部生成索引计划和 metadata 负载分配。Text/Omni 只依赖 provider 接口，不导入访问视图或存储后端。
+`nv_meta` 只实现格式相关
+reader/provider/样本解码；来源不导入 Text/Omni，模型处理层也不判断 nv-meta 格式。
+Omni 沿用 Mapping 的包装类和 preencode/postencode/batch 生命周期；原始媒体和预处理张量
+均通过该入口接入。适配器应输出可直接消费的媒体对象
+或正确解析的媒体引用，不要求 Omni 理解 tar 或 SQLite。
+
+## 2.2 `.nv-meta` prepared WebDataset
+
+`.nv-meta` 是准备阶段生成的 SQLite 样本索引。reader 按 `sample_parts` 的 byte offset 从 tar
+读取所需字段，不扫描或整体解压 shard。`dataset.yaml`、`split.yaml`（或 `split.json`）和
+`.info.json`（或 `.info.yaml`）只作为元数据读取，不执行其中的 `__module__`、`__class__`
+或用户代码。安装可选格式依赖：`pip install PyYAML braceexpand`；远程 tar 另需 fsspec
+及对应协议后端。支持 Energon 的 brace shard 选择器，例如 `shard-{00000..00999}.tar`，
+以及 `val`/`valid`/`validation` split 别名；不存在的 split 不会退回读取全部数据。
+
+`NvMetaSource` 支持 Mapping 和 Iterable。Mapping 保留全局索引，由 HP 原有 BatchSampler
+分配 DP 样本；Iterable 按 DP × worker 直接步进到本 worker 的索引，不逐条遍历其他 worker 的位置。
+有限 Iterable 只丢弃不足一个完整 DP 轮次的尾部，各 rank 再由 worker 分摊；worker 数不改变
+每个 rank 应有的样本数。`repeat` 要求每个 DP rank 至少能分到一条样本。
+reader 保持 prepared 索引顺序，shuffle、重复和访问模式只由公共访问视图处理，不建立全量
+Python shuffle 索引。`NvMetaSource` 是唯一的格式 provider。单源 Iterable 的 replay key
+直接标识物理记录，恢复候选池时不按当前 epoch 或 worker 数重新推导样本。
+游标 checkpoint 则要求 prepared 数据、配置、DP world size 和 worker 数量保持不变；
+`persistent_workers` 在下次迭代开始时读取共享 epoch。不要在一个迭代器仍运行时切换 epoch。
+
+Text/Omni Mapping 入口从 Trainer 的 mesh 派生数据加载归属，训练 YAML 无需配置并行上下文。
+Iterable worker 只保存 DP rank/size，不持有父进程的通信组或同步回调；worker 编号在 worker 内获取。
+
+常规训练只需配置路径；样本布局不同才指定 `record_part`，拆分和访问策略按需选择：
+
+| source 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `data_path` | 无 | 数据根目录或 `.nv-meta` 目录，与 `data_config.sources` 互斥 |
+| `record_part` | `json` | 内置解码的 part 名称，见第 2.3 节 |
+| `data_config.split` | `train` | prepared split 名称 |
+| `data_config.shuffle` | `false` | 显式打开时使用确定性索引顺序 |
+| `data_config.repeat` | `false` | 单源 Iterable 循环读取 |
+| `data_config.sources` | 无 | Mapping 多源列表，每项含 `data_path` 和 `weight` |
+
+以下为按需读取、缓存与大规模调度选项，通常保持默认值即可；nv-meta 只接受
+`split`、`required_parts`，不再提供重复的 `split_name`、`parts` 配置名：
+
+| source 高级配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `data_config.required_parts` | adapter 声明或所有 parts | 只读取需要的扩展名 |
+| `data_config.metadata_cache_size` | `4096` | 每进程 metadata LRU 上限 |
+| `data_config.max_open_shards` | `64` | 每进程 tar/fsspec 文件句柄上限 |
+| `data_config.cache_dir` | 用户缓存目录下 `hyper_parallel/nv_meta` | 只读 mmap 索引缓存；可配置节点本地 SSD |
+| `data_config.cache_timeout` | `600` | 等待同一索引缓存写锁的秒数 |
+| `data_config.read_buffer_size` | `8388608` | 同一样本相邻 parts 合并读取的窗口字节上限 |
+| `data_config.read_balance` | 关闭 | 可选 metadata 读计划 |
+| `data_config.max_balance_group_size` | `262144` | Iterable 自动规划窗口上限 |
+| `data_config.output_index_for_resume` | `false` | 单源 Iterable 的 output-index replay |
+| `data_config.filter_samples` | `false` | 默认访问时校验并报错；开启后丢弃未通过校验的记录 |
+
+首次构建将选定 split 的 SQLite 索引流式编译为只读缓存；之后的 rank/worker 只打开
+manifest 并按需 mmap，同节点由操作系统共享文件页，不通过 pickle 复制全量索引。
+媒体成本也保存在缓存中，读取成本不再为每个 worker 扫描整张 SQLite 表。
+缓存指纹覆盖 metadata、SQLite 路径/大小/修改时间、split 和 part 选择；文件锁串行化同一
+指纹的构建，完整文件写好后原子发布。prepared 数据和 tar 应在训练期间保持不变，
+SQLite WAL 必须先完成 checkpoint；该缓存不是对每次 payload 读取重新校验内容的机制。
+
+adapter 可以声明 `required_parts = ("json", "jpg")`；显式 reader 配置可覆盖这一声明。
+reader 只返回选中的 parts，未声明的图片、视频、音频不会单独读取或解码；合并相邻读取可能包含少量间隙字节。
+默认 JSON adapter 不限制 parts，会读取当前样本的全部 parts；不会自动根据 JSON 引用再按需读取媒体。
+只需查看指定样本的文字和图片时，可直接按索引访问并明确选择 parts：
+
+```python
+from hyper_parallel.data.nv_meta import NvMetaDataset
+
+dataset = NvMetaDataset("/data/prepared", required_parts=["txt", "img1.jpg"])
+try:
+    locations = dataset.index_metadata(123)  # 只查询该样本的位置，不读取媒体内容。
+    sample = dataset[123]  # 只读取第 123 个样本选中的 parts。
+finally:
+    dataset.close()
+```
+
+原始记录直接返回 Mapping，包含 `parts`、`sample_key`、`__key__`、source info 和可选媒体 metadata；
+`NvMetaDataset.index_metadata()` 可只读取位置与代价，返回的 `NvMetaSampleIndex` 使用统一的
+`NvMetaPartLocation` 描述 byte range。
+v8 SQLite 索引可提供媒体成本；缺少真实 part offset 的旧版本会明确报错，不推测 tar 布局。
+
+默认在样本访问时调用 transform 的 `is_valid_sample`，失败时报错，不在构建时扫描 payload。
+显式开启 `filter_samples` 后，Mapping 内容过滤需要读取候选记录建立有效索引；这不能描述为
+零 payload 读取。过滤索引使用紧凑整数数组，过滤后的长训练重复索引使用有界/惰性
+计划。未打乱的单源 Mapping 使用 range；大规模单源重复和 Iterable 默认计划不建立全长 Python
+整数列表。适配与模型处理保持按需执行，构建阶段不额外增加一层逐样本格式分派。
+
+nv-meta 多源配置仅支持 Mapping，位于 `source.data_config.sources`；每个条目指定一个 `data_path`
+和正的有限 `weight`。Text Iterable 使用单个 `source.data_path`；多源 Iterable 配置在打开 reader 前报错。
+nv-meta Mapping blend 先按权重确定精确整数配额，再惰性计算全局与 source-local 索引；
+调度状态内存为 O(K)，K 为来源数，不随训练目标样本数增长。这是新 provider 的混合实现，
+原有文件/Hub Online 混合算法、默认顺序及 checkpoint 格式保持不变。
+单源 Iterable 使用物理样本索引恢复候选池，不保存媒体 payload。
+按索引恢复要求 adapter/transform 确定且处理配置不变；含随机增强时使用 `save_by_idx: false`
+保存完整候选样本。Mapping 恢复还要求使用相同的数据、种子、混合权重与采样配置。
+
+metadata 读计划可以按 `pixels`、`frames`、`duration`、`bytes` 或 `media_bytes` 调度。它适用于
+单源且 `filter_samples: false` 的训练路径；访问时的校验不会改变索引分配。开启过滤时不支持
+该计划。Mapping 仅在相应 global micro-batch 内重排，要求 `sampler_type: single`、
+无 `data_rearrange_map`，并检查 DP/micro-batch 配置与 sampler 一致。
+Mapping 和 Iterable 都按窗口惰性生成 metadata 计划，缓存当前窗口。窗口内使用最小堆维护
+可分配的 rank/worker，保留按负载、slot 编号选择的顺序，避免为每条样本扫描所有 worker。
+显式 `balance_group_size` 也受窗口上限约束；拓扑所需窗口超限时明确报错。
+读成本均衡默认关闭。各 worker 会独立计算同一窗口，超大 worker 拓扑下存在重复规划开销；
+启用前应测量规划耗时与消除数据倾斜的收益，metadata 成本不是模型计算耗时的精确预测。
+
+payload tar 可以使用 fsspec URL，metadata 目录仍需本地可读。reader 合并同一样本中
+相邻的已选 part 范围，受读取窗口上限约束；它不是整 shard 下载或跨样本预取。
+合并读取可能包含少量间隙字节，单个超大 part 仍需完整加载，`read_buffer_size` 不是样本内存上限。
+文件句柄和 metadata LRU 属于各进程，worker 重开 mmap/句柄，不继承可变文件游标。
+远程存储仍需结合请求延迟、节点缓存和 worker 数测量实际吞吐。
+
+直接处理解码后的样本时也可调用 `build_nv_meta_dataset(data_path=..., access_mode="mapping")`，
+其中公共 `access_mode` 默认 Mapping，也支持 Iterable。这个便捷函数只构造适配后的原始来源，
+默认解码 JSON，其他布局同样用 `record_part` 指定；直接读取原始字节使用 `NvMetaDataset`。
+它不绑定模型 transform；训练配置使用上面的 Text/Omni 入口。packing、worker、prefetch、
+`persistent_workers`、`pin_memory` 等仍属于已有 DataLoader 配置。
+
+显式 source 训练在每个 optimizer step 开始前，由 `SynchronizedBatchReader` 预读一个
+完整梯度累积步，并用一次小型 collective 确认所有 rank 就绪。任一 rank 提前结束时，
+所有 rank 在最短完整 step 处结束，舍弃无法组成完整 step 的尾部，避免一部分 rank
+继续进入模型 collective。额外 Host 缓冲最多为一个梯度累积步的 collated batches；
+设备传输沿用原有 runtime：Text 逐 micro-batch 传输，VLM 仍在 step 前准备全部 micro-batch
+的设备输入。因此该协议解决结束一致性，不代表降低了 VLM 峰值显存。保存 checkpoint 必须在完整 step 边界。
+未配置 source 的训练保留原流程。直接自定义训练循环时，也需要使用这个完整 step 协议。
+显式 source 的有限 epoch 耗尽后继续下一 epoch，直到完成配置的 optimizer steps；
+无法提供任何完整 step 的数据会报错，避免空转。评估吞吐时需把 CPU 准备和就绪协调计入端到端耗时，
+不能只比较 step callback 计时。
+
+## 2.3 nv-meta 训练样本与配置
+
+`online` 表示运行时的数据处理路径，不表示联网。本地 tar 同样可以在线 tokenize；
+提前写好 token/张量的 tar 也使用同一个 reader。`.nv-meta` 的 prepare 步骤只建立索引，
+不代表已经完成模型预处理。以下片段用于替换现有训练配置的对应字段，不改变模型、并行、
+优化器及 model assets 配置。模型/分词器资产也应提前准备到本地，才能完全离线运行。
+
+| 已保存内容 | `source.record_part` | 模型处理 |
+| --- | --- | --- |
+| `sample.json` 中的 `text`、`messages` 或训练字段 | 默认 `json`，可省略 | 对应 Text/Omni transform |
+| `sample.txt` 中的 UTF-8 文本 | `txt` | 原有 `PlaintextTransform` |
+| `sample.tokens.npy` 中的一维整数 token 文档 | `tokens.npy` | `PretokenizedTextTransform` |
+| NPZ/PT 中的 `input_ids` 与对齐的 `labels` | `npz` / `pt` | `PretokenizedTextTransform` |
+| NPZ/PT 中的完整多模态单样本张量 | `npz` / `pt` | Omni builder 配置 `preprocessed: true` |
+
+上述约定共用一个内置 decoder；`record_part` 是准确的 part 名称，例如 `record.json`，
+不会搜索任意 JSON 或猜测字段。TXT/NPY/NPZ/PT 自动限制 reader 只读选中的 part。
+JSON 仍可能引用可变媒体字段，因此默认保留当前样本的全部 parts。这里只解析 HP 样本约定，
+不会执行 `.nv-meta/dataset.yaml` 声明的 Energon sample class、field-map 表达式或自定义代码。
+特殊字段重命名、多个 part 合并或模型专用媒体解码，才配置 `dataset.sample_adapter`；
+例如 `NvMetaSampleAdapter(record_part=None, field_map={"text": "caption.txt"})`。
+
+**原始文本**：每个样本包含 UTF-8 `txt` part，tokenizer 沿用 TextTrainer 的 model assets。
+
+```yaml
+dataset:
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_config: {}
+  source:
+    _target_: hyper_parallel.data.nv_meta.NvMetaSource
+    data_path: /datasets/text
+    record_part: txt
+  data_transform:
+    _target_: hyper_parallel.data.text.text_transform.PlaintextTransform
+    max_seq_len: 4096
+```
+
+需要将长文档切分并组 batch 时，沿用 `TokenBatchLoader` 和 `build_online_text_collate_fn`。
+固定样本 DataLoader 要求 transform 每次恰好输出一个样本。Iterable 只需换成原有
+`build_online_iterable_dataset`；流式重复由 `source.data_config.repeat` 控制。
+
+**原始图文**：第 2.1 节的配置使用 `AutoProcessorTransform`，搭配原有 `OmniPackingLoader`、
+`build_omni_collate_fn` 和模型 processor。对应一个样本的 `json` part 示例为：
+
+```json
+{"messages": [
+  {"role": "user", "content": [
+    {"type": "image", "image": "part:jpg"},
+    {"type": "text", "text": "描述这张图片。"}
+  ]},
+  {"role": "assistant", "content": [{"type": "text", "text": "一只猫。"}]}
+]}
+```
+
+tar 中同一样本还须包含 `jpg` part。`part:img1.jpg`、`part:img2.jpg` 可引用多张图。
+adapter 只解码实际引用的图片；`required_parts` 可限制 reader 的 payload I/O。
+内置 adapter 输出 processor 可直接接收的 PIL 图片对象；DeepSeek-V4.1 显式配置
+`sample_adapter: {_target_: hyper_parallel.data.nv_meta.NvMetaSampleAdapter, image_mode: bytes}`，
+输出其原生 `data: bytes` 图片块，保留原模型 transform，不经 base64
+转换或临时文件。样本内重复引用同一 part 只解码一次。外部相对媒体路径以数据根目录为基准。
+
+**预先 tokenize 的文本**：保留 Text builder，选择 token part 和预处理 transform：
+
+```yaml
+source:
+  _target_: hyper_parallel.data.nv_meta.NvMetaSource
+  data_path: /datasets/tokenized-text
+  record_part: tokens.npy
+data_transform:
+  _target_: hyper_parallel.data.text.text_transform.PretokenizedTextTransform
+  max_seq_len: 4096
+```
+
+仅有 `input_ids` 时，将完整 token 文档右移得到 labels，再按长度切分；EOS 应已写入文档。
+已保存 labels 时不再次移位或切分，要求符合 HP Text 的 next-token 对齐、loss mask 约定和长度上限。
+此时可用 `source.record_part: npz` 或 `source.record_part: pt` 读取字段字典。可选二值 `loss_mask`
+会转换为 labels 中的 `-100`，因此经过 HP packing 后仍生效；全无监督的记录不产生训练样本。
+不要保存 `attention_mask`、`position_ids` 到此 Text 输入：HP 根据 packing 边界和 batch
+配置重建它们，transform 会明确拒绝这些字段，避免悄悄丢失自定义语义。
+不会调用 tokenizer；CPU long tensor 在无需掩码或 dtype 转换时直接复用。
+
+**完整预处理的多模态样本**：在现有 Omni builder 配置中选择张量 part 并开启 `preprocessed`，
+model assets 和模型的 `data_transform` 保持原配置：
+
+```yaml
+preprocessed: true
+source:
+  _target_: hyper_parallel.data.nv_meta.NvMetaSource
+  data_path: /datasets/preprocessed-omni
+  record_part: pt
+```
+
+对应 DataLoader 保留 `OmniPackingLoader`，并显式设置 `min_buffered_samples: 1`，
+减少在候选池中滞留已解码媒体张量的数量。该设置不会修改已有 DataLoader 默认值；
+`max_seq_len` 限制 token 数，不限制图片像素、视频帧数或单样本媒体字节数。
+
+每个 `pt` part 保存一个 CPU tensor 字典，包括 `input_ids`、`labels` 及模型所需媒体/位置字段；
+也可以使用 `npz`。要求它等价于该模型在线 `encode_sample` 的输出，保留该模型自己的 label
+对齐规则，不混用 Text 和 Omni 的移位约定。builder 跳过在线样本编码、保留 `encode_batch`，
+所以 DeepSeek-V4.1 等模型的 packing 后字段转换仍执行。字段 dtype、单样本 shape、序列上限
+在 transform 边界校验。token/mask 字段要求一维，位置字段允许模型需要的前置轴，
+但最后一维必须等于 token 长度；通用 packing/CP 不接受预存的 N×N attention mask。
+可变长图文样本不会被自动截断。NPY/NPZ 禁用 pickle；PT 使用
+`weights_only=True` 和 CPU 加载，可以保留 BF16 等张量 dtype。
+
+只离线计算 packing 长度等元数据时，继续使用原有 `preencode_sample` / `postencode_sample`
+契约，**不要**开启 `preprocessed`。完整预处理必须包含实际模型输入，不能只有长度信息。
+
+图片解码由内置 adapter 提供。视频/音频可使用模型 processor 已支持的外部文件引用，或其支持的
+已解码 NPY 数组；tar 中压缩视频/音频需要匹配该 processor 的业务 adapter。完整离线媒体特征
+可随 PT/NPZ 字段直接接入。nv-meta 接入不会新增模型本身尚未支持的模态或并行方式。
+CPU 回归覆盖真实 SQLite/tar、Text/Omni builder、packing、loss/backward 和恢复契约。
+模型本身的模态支持及 Omni `PP=1` 限制仍然适用；大型模型的显存、加速器吞吐和多节点稳定性
+需使用目标模型、数据分布和集群配置验收，不能从 CPU 测试推导。
 
 ## 3. 两类 source
 

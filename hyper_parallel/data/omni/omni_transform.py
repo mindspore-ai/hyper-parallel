@@ -20,9 +20,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 from transformers import AutoProcessor
 
 from hyper_parallel.data.constants import IGNORE_INDEX, OMNI_CP_TOKEN_FIELDS, ONLINE_SOURCE_PATH_KEY
+from hyper_parallel.data.online.provider import SOURCE_INFO_KEY
 
 
 def build_auto_processor(
@@ -270,6 +272,76 @@ class _OmniTransformStrategy:
         prepared_sample = self.prepare_sample(raw_sample)
         prepared_samples = [prepared_sample]
         return prepared_samples
+
+
+class _PreprocessedOmniTransform(OmniDataTransform):
+    """Reuse unbatched CPU model inputs and retain the model's batch encoder.
+
+    Stored labels already follow the selected model's alignment. Token fields
+    are one-dimensional, except positions may retain model-owned leading axes.
+    Modality fields retain their stored dtypes and shapes. The existing Omni
+    pipeline owns packing and device transfer.
+    """
+
+    def __init__(self, transform: OmniDataTransform) -> None:
+        """Retain the original model transform for its batch encoding hook."""
+        self.transform = transform
+        super().__init__(max_seq_len=transform.max_seq_len, processor=transform.processor)
+
+    @staticmethod
+    def is_valid_sample(sample: Mapping[str, Any]) -> bool:
+        """Validate prepared fields without requiring original messages."""
+        if "input_ids" not in sample or "labels" not in sample:
+            raise ValueError("Preprocessed Omni samples require input_ids and labels")
+        return len(sample["input_ids"]) > 0
+
+    def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
+        """Restore CPU tensors without rerunning sample encoding or shifting labels."""
+        self.is_valid_sample(sample)
+        encoded = self._restore_tensors(sample)
+        length = encoded["input_ids"].numel()
+        if not 0 < length <= self.max_seq_len:
+            raise ValueError("Prepared Omni sample length must be between 1 and max_seq_len")
+        for name in OMNI_CP_TOKEN_FIELDS.intersection(encoded):
+            if encoded[name].ndim == 0 or encoded[name].shape[-1] != length:
+                raise ValueError(f"Prepared Omni field {name!r} must align with input_ids")
+            if name not in ("position_ids", "text_position_ids") and encoded[name].ndim != 1:
+                raise ValueError(f"Prepared Omni token field {name!r} must be one-dimensional")
+        labels = encoded["labels"]
+        if torch.any((labels < 0) & (labels != IGNORE_INDEX)):
+            raise ValueError("Prepared Omni labels must contain token IDs or IGNORE_INDEX (-100)")
+        for name in ("loss_mask", "stream_loss_mask"):
+            if name in encoded:
+                mask = encoded[name]
+                if mask.is_complex() or not torch.all(torch.isfinite(mask) & (mask >= 0)):
+                    raise ValueError(f"Prepared Omni {name} must contain finite non-negative weights")
+        return encoded
+
+    @staticmethod
+    def _restore_tensors(sample: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+        """Restore CPU fields, retaining media storage and normalizing token dtypes."""
+        internal_fields = {SOURCE_INFO_KEY, ONLINE_SOURCE_PATH_KEY, "metadata", "sample_key", "__key__"}
+        encoded = {}
+        for name, value in sample.items():
+            if name in internal_fields:
+                continue
+            try:
+                tensor = torch.as_tensor(value)
+            except (TypeError, ValueError, RuntimeError) as error:
+                raise ValueError(f"Prepared Omni field {name!r} must contain a tensor-compatible value") from error
+            if tensor.device.type != "cpu" or tensor.requires_grad:
+                raise ValueError(f"Prepared Omni field {name!r} must be a CPU tensor without gradients")
+            encoded[name] = tensor
+        for name in ("input_ids", "labels"):
+            value = encoded[name]
+            if value.ndim != 1 or value.is_floating_point() or value.is_complex() or value.dtype == torch.bool:
+                raise ValueError(f"Prepared Omni {name} must be a one-dimensional integer array")
+            encoded[name] = value.to(dtype=torch.long)
+        return encoded
+
+    def encode_batch(self, batch: Any) -> Any:
+        """Keep model-specific conversions after packing and collation."""
+        return self.transform.encode_batch(batch)
 
 
 __all__ = [

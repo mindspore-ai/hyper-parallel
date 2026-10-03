@@ -35,6 +35,7 @@ from hyper_parallel.data.batching.dynamic_batch import (
 )
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
+from hyper_parallel.data.online.source_views import validate_indexed_dataloader
 
 logger = get_dataset_logger(__name__)
 
@@ -134,6 +135,12 @@ def build_dataloader(
             continue
 
         batch_sampler = None
+        validate_indexed_dataloader(
+            dataset, sampler_type=getattr(dataloader_target, "sampler_type", "single"),
+            data_rearrange_map=getattr(dataloader_target, "data_rearrange_map", None),
+            dp_world_size=mesh_context.dp_size,
+            micro_batch_size=training_config.micro_batch_size,
+        )
         if not _is_iterable_dataset(dataset):
             batch_sampler = build_dataset_batch_sampler(
                 total_samples=len(dataset),
@@ -186,6 +193,7 @@ class FixedBatchDataLoader(StatefulDataLoader):
             seed: int = 1234,
             pin_memory: bool = False,
             prefetch_factor: int | None = None,
+            persistent_workers: bool = False,
     ) -> None:
         """Initialize the stateful DataLoader."""
         if sampler_type not in ("single", "cyclic"):
@@ -193,12 +201,16 @@ class FixedBatchDataLoader(StatefulDataLoader):
 
         self.drop_last = drop_last
         self.sampler_type = sampler_type
+        self._indexed_dataset = bool(validate_indexed_dataloader(dataset, sampler_type=sampler_type))
         generator = torch.Generator().manual_seed(seed)
         worker_options = {
             "num_workers": num_workers,
             "generator": generator,
             "pin_memory": pin_memory,
         }
+        if persistent_workers and num_workers <= 0:
+            raise ValueError("persistent_workers requires num_workers > 0")
+        worker_options["persistent_workers"] = bool(persistent_workers)
         if num_workers > 0 and prefetch_factor is not None:
             worker_options["prefetch_factor"] = prefetch_factor
         if batch_sampler is None:
@@ -225,7 +237,7 @@ class FixedBatchDataLoader(StatefulDataLoader):
 
         epoch_setter = getattr(self.dataset, "set_epoch", None)
         if callable(epoch_setter):
-            dataset_epoch = epoch if self.sampler_type == "cyclic" else 0
+            dataset_epoch = epoch if self.sampler_type == "cyclic" or self._indexed_dataset else 0
             epoch_setter(dataset_epoch)
 
 
@@ -255,6 +267,7 @@ class _DynamicBatchLoader(ABC):
         seed: Source DataLoader random seed.
         pin_memory: Whether source samples use pinned host memory.
         prefetch_factor: Number of source batches prefetched by each worker.
+        persistent_workers: Keep source workers alive between epochs.
     """
 
     def __init__(
@@ -275,6 +288,7 @@ class _DynamicBatchLoader(ABC):
             seed: int = 1234,
             pin_memory: bool = False,
             prefetch_factor: int | None = None,
+            persistent_workers: bool = False,
     ) -> None:
         """Initialize source reading, token selection, and Online packing."""
         # pylint: disable=too-many-locals
@@ -325,6 +339,7 @@ class _DynamicBatchLoader(ABC):
             seed=seed,
             pin_memory=pin_memory,
             prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
         )
         self.resume_pending = False
 
