@@ -16,10 +16,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
+from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter, RuntimeInputContext
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.indexed.indexed_data_reader import IndexedDataReader
 
@@ -78,3 +81,30 @@ class IndexedSupervisedDataset:
             raise ValueError("Ignored labels must have zero loss weight")
         sample["labels"][mask == 0] = IGNORE_INDEX
         return sample
+
+
+class JTSequenceRuntime(RuntimeInputAdapter):
+    """Pass the public batch's document boundaries to JT without constructing a dense mask."""
+
+    def runtime_input_fields(self) -> tuple[str, ...]:
+        """Declare the model-owned cumulative-length input."""
+        return ("actual_seq_len",)
+
+    def build_runtime_inputs(self, *, batch: Mapping[str, Any],
+                             context: RuntimeInputContext) -> Mapping[str, Any]:
+        """Convert global leading-zero boundaries once at the data/model boundary.
+
+        Args:
+            batch: Local tokens and global cumulative document boundaries.
+            context: Local sequence shape and CP degree from the public data path.
+        """
+        boundaries = batch.get("cu_seq_lens")
+        if boundaries is None:
+            return {}
+        values = tuple(int(value) for value in boundaries.tolist())
+        global_length = context.local_input_shape[1] * context.parallel_sizes["cp"]
+        if (context.local_input_shape[0] != 1 or len(values) < 2 or values[0] != 0
+                or values[-1] != global_length
+                or any(left >= right for left, right in zip(values, values[1:]))):
+            raise ValueError("JT packed boundaries must cover one global batch-one sequence")
+        return {"actual_seq_len": values[1:]}

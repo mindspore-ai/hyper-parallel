@@ -25,11 +25,23 @@ def _load_expert_parallel():
 
     return jt_builder
 
+
+def _load_context_parallel():
+    """Return JT-owned context-parallel adapters lazily."""
+    # Loading the provider also loads the optional JT NPU implementation.
+    from hyper_parallel.models.jt_deepseek_v3.adapter.distributed import (  # pylint: disable=import-outside-toplevel
+        context_parallel,
+    )
+
+    return context_parallel
+
+
 JT_DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="JTDeepseekV3ForCausalLM",
     model_type="jt_deepseek_v3",
     sharding_rules=build_parameter_sharding_rules,
     expert_parallel=_load_expert_parallel,
+    context_parallel=_load_context_parallel,
     fsdp_wrap_modules=lambda model: tuple(
         f"mtp.layers.{index}.transformer_layer" for index in range(len(model.mtp.layers))
     ),

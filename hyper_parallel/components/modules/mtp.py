@@ -104,6 +104,18 @@ class DeepseekV3MTPExecution(nn.Module):
     """
 
     @staticmethod
+    def shift_inputs(input_ids: torch.Tensor, labels: torch.Tensor,
+                     loss_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Shift the three aligned supervision streams through one replaceable boundary.
+
+        Args:
+            input_ids: Unshifted token IDs for this prediction depth.
+            labels: Targets for this prediction depth.
+            loss_mask: Validity of the aligned targets.
+        """
+        return tuple(shift_mtp_sequence(value) for value in (input_ids, labels, loss_mask))
+
+    @staticmethod
     def fuse_inputs(layer: MultiTokenPredictionLayer, hidden: torch.Tensor,
                     embedding: torch.Tensor) -> torch.Tensor:
         """Use the public layer's normalization and hidden-then-embedding fusion.
@@ -147,7 +159,8 @@ class DeepseekV3MTPExecution(nn.Module):
                 loss_factor: float, decoder_kwargs: Mapping[str, Any] | None = None,
                 loss_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
                 auxiliary_loss: torch.Tensor | None = None,
-                auxiliary_fn: Callable[[nn.Module], torch.Tensor] | None = None) -> MultiTokenPredictionOutput:
+                auxiliary_fn: Callable[[nn.Module], torch.Tensor] | None = None,
+                sequence_end_mask: torch.Tensor | None = None) -> MultiTokenPredictionOutput:
         """Shift future targets, run independent depths and accumulate their losses.
 
         Args:
@@ -163,25 +176,31 @@ class DeepseekV3MTPExecution(nn.Module):
             loss_fn: Optional scalar CE reduction; defaults to the V3 objective.
             auxiliary_loss: Existing trunk auxiliary scalar, accumulated in execution order.
             auxiliary_fn: Optional callback extracting each decoder's auxiliary scalar.
+            sequence_end_mask: Local document tails; future tokens must not cross these positions.
 
         Note:
-            Each row must be one independent, unpartitioned sequence. Packed
-            document boundaries and context-parallel token shifts are not implemented.
+            Packed callers supply document tails and decoder attention boundaries.
+            A model adapter may replace shift_inputs to exchange partition boundaries.
             Logits are reduced immediately and are not retained in the return value.
         """
         if input_ids.ndim != 2 or input_ids.numel() == 0:
             raise ValueError("MTP requires nonempty [batch, sequence] global token IDs")
         if labels.shape != input_ids.shape or loss_mask.shape != input_ids.shape:
             raise ValueError("MTP token IDs, pre-shifted labels and loss mask must match")
+        if sequence_end_mask is not None and (sequence_end_mask.shape != input_ids.shape
+                                              or sequence_end_mask.dtype != torch.bool):
+            raise ValueError("MTP sequence_end_mask must be boolean and match the local tokens")
         loss = torch.zeros((), device=hidden.device, dtype=torch.float32)
         auxiliary = torch.zeros_like(loss) if auxiliary_loss is None else auxiliary_loss
         loss_fn = self.token_loss if loss_fn is None else loss_fn
         decoder_kwargs = {} if decoder_kwargs is None else decoder_kwargs
         depth_losses = []
         for layer in layers:
-            input_ids = shift_mtp_sequence(input_ids)
-            labels = shift_mtp_sequence(labels)
-            loss_mask = shift_mtp_sequence(loss_mask)
+            input_ids, labels, loss_mask = self.shift_inputs(input_ids, labels, loss_mask)
+            if sequence_end_mask is not None:
+                input_ids, labels, loss_mask = (
+                    value.masked_fill(sequence_end_mask, 0) for value in (input_ids, labels, loss_mask)
+                )
             combined = self.fuse_inputs(layer, hidden, embedding(input_ids))
             raw_hidden = layer.transformer_layer(layer.eh_proj(combined), **decoder_kwargs)
             prediction_hidden = layer.final_layernorm(raw_hidden)

@@ -64,11 +64,21 @@ plan_overrides:
       kv_b_proj.weight: {tp: "shard(0)"}
       o_proj.weight: {tp: "shard(1)"}
     region_dispatch: false
+  # CP requires num_attention_heads divisible by tp_size * cp_size.
+  - match: "*.self_attn"
+    when: cp
+    inner_target: self
+    inner_wrapper:
+      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel.mla_cp_wrapper
+      strategy: expanded_ulysses  # Or latent_kv_head; both preserve JT's QK statistics.
+  - match: "*.self_attn"
+    when: sequence_parallel
     in_src:
       hidden_states: {tp: "shard(1)"}
     in_dst:
       hidden_states: {tp: "shard(1)"}
   - match: "*.self_attn.*_layernorm"
+    when: sequence_parallel
     in_src:
       hidden_states: {tp: "shard(1)"}
     in_dst:
@@ -76,6 +86,7 @@ plan_overrides:
     out_src: {tp: "shard(1)"}
     out_dst: {tp: replicate}
   - match: "*.self_attn.key_rope_gather"
+    when: sequence_parallel
     in_src:
       input: {tp: "shard(1)"}
     in_dst:
@@ -87,6 +98,8 @@ plan_overrides:
       gate_proj.weight: {tp: replicate}
       up_proj.weight: {tp: replicate}
       down_proj.weight: {tp: replicate}
+  - match: "*.mlp.shared_experts"
+    when: sequence_parallel
     in_src:
       x: {tp: "shard(1)"}
     in_dst:
@@ -96,6 +109,8 @@ plan_overrides:
   - match: "mtp.layers.*.eh_proj"
     params:
       weight: {tp: replicate}
+  - match: "mtp.layers.*.eh_proj"
+    when: sequence_parallel
     in_src:
       input: {tp: "shard(1)"}
     in_dst:
@@ -149,6 +164,10 @@ dataloader:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: indexed
     attention_mode: compressed
+    # Enable both options only for records containing independent packed documents.
+    # reset_position_ids: true
+    # runtime_input_adapter:
+    #   _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_data.JTSequenceRuntime
   sampler_type: single
   drop_last: true
   num_workers: 0

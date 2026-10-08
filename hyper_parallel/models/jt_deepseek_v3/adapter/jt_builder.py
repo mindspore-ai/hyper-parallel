@@ -40,6 +40,7 @@ from hyper_parallel.models._transformers.model_builder import (
     instantiate_infrastructure,
 )
 from hyper_parallel.models.jt_deepseek_v3.configuration_jt_deepseek_v3 import JTDeepseekV3Config
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel import configure_context_parallel
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM,
 )
@@ -184,6 +185,7 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
         is_hf_model=True,
         **infrastructure_options,
     )
+    configure_context_parallel(model, mesh)
     dp_cp_mesh = mesh.dp_cp_mesh
     # QK clipping must use one maximum on every rank that holds the same attention heads.
     model.qk_clip_group = None if dp_cp_mesh is None or dp_cp_mesh.size() == 1 else dp_cp_mesh.get_group()

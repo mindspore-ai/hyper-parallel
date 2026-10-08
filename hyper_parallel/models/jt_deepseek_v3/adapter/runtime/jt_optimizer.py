@@ -25,6 +25,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.components.optim.builders import Muon
+from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import JTDeepseekV3MLAAttention
 
 
@@ -69,6 +70,33 @@ def _replica_maxima(modules: list[JTDeepseekV3MLAAttention], group: Any) -> list
     return [part.view_as(maximum) for part, maximum in zip(parts, maxima)]
 
 
+def _scale_projection(parameter: torch.Tensor, scale: torch.Tensor, nope_dim: int,
+                      extra_dim: int, *, query: bool) -> None:
+    """Apply per-head factors to the matching local rows of FSDP/TP parameters."""
+    width = nope_dim + extra_dim
+    copies = _value_copies(parameter)
+    tensor = copies[0]
+    global_heads = tensor.shape[0] // width
+    if global_heads != scale.numel():
+        if not isinstance(tensor, DTensor) or "tp" not in tensor.device_mesh.mesh_dim_names:
+            raise ValueError("QK clipping statistics do not cover the projection heads")
+        tp_mesh = tensor.device_mesh["tp"]
+        gathered = [torch.empty_like(scale) for _ in range(tp_mesh.size())]
+        dist.all_gather(gathered, scale, group=tp_mesh.get_group())
+        scale = torch.cat(gathered)
+    if global_heads != scale.numel():
+        raise ValueError("QK clipping TP head statistics have an unexpected size")
+    extra = scale if query else torch.ones_like(scale)
+    factors = torch.cat((scale.sqrt()[:, None].expand(-1, nope_dim),
+                         extra[:, None].expand(-1, extra_dim)), dim=-1).reshape(-1, 1)
+    for weight in copies:
+        if isinstance(weight, DTensor):
+            local_factor = distribute_tensor(factors, weight.device_mesh, weight.placements).to_local()
+            weight.to_local().mul_(local_factor)
+        else:
+            weight.mul_(factors)
+
+
 @torch.no_grad()
 def clip_qk(model: torch.nn.Module, threshold: float) -> None:
     """Clip coupled query/key projections after each optimizer update.
@@ -80,13 +108,10 @@ def clip_qk(model: torch.nn.Module, threshold: float) -> None:
     modules = [module for module in model.modules() if isinstance(module, JTDeepseekV3MLAAttention)]
     for module, maximum in zip(modules, _replica_maxima(modules, model.qk_clip_group)):
         scale = threshold / maximum.clamp_min(threshold)
-        for weight in _value_copies(module.q_b_proj.weight):
-            query = weight.view(module.num_heads, module.qk_nope_head_dim + module.qk_rope_head_dim, -1)
-            query[:, :module.qk_nope_head_dim].mul_(scale.sqrt()[:, None, None])
-            query[:, module.qk_nope_head_dim:].mul_(scale[:, None, None])
-        for weight in _value_copies(module.kv_b_proj.weight):
-            key_value = weight.view(module.num_heads, module.qk_nope_head_dim + module.v_head_dim, -1)
-            key_value[:, :module.qk_nope_head_dim].mul_(scale.sqrt()[:, None, None])
+        _scale_projection(module.q_b_proj.weight, scale, module.qk_nope_head_dim,
+                          module.qk_rope_head_dim, query=True)
+        _scale_projection(module.kv_b_proj.weight, scale, module.qk_nope_head_dim,
+                          module.v_head_dim, query=False)
         module.max_logits_val.zero_()
 
 
