@@ -29,6 +29,7 @@ from typing import Dict, Optional
 
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError
+from tests.common.mark_utils import arg_mark
 
 
 def _sample_model(  # pylint: disable=unused-argument
@@ -97,6 +98,25 @@ class TestConfigOverrides(unittest.TestCase):
             config.model.activation, "silu",
             msg=f"case: str_coercion, activation={config.model.activation!r}")
 
+    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
+    def test_profiler_memory_and_model_integration_overrides_coexist(self) -> None:
+        """Resolve profiler sections alongside the current diagnostic configuration.
+
+        Feature: Trainer profiling configuration compatibility.
+        Description: Parse memory and performance profiling with model diagnostics enabled.
+        Expectation: All three sections retain their independent typed overrides.
+        """
+        config = self._parse(
+            "--profiler.enabled=true", "--profiler.stop_step=4", "--profiler.rank_ids=[0, 2]",
+            "--memory.enable=true", "--memory.end_step=3", "--model_integration.mode=runtime",
+        )
+        self.assertTrue(config.profiler.enabled)
+        self.assertEqual(config.profiler.stop_step, 4)
+        self.assertEqual(config.profiler.rank_ids, [0, 2])
+        self.assertTrue(config.memory.enable)
+        self.assertEqual(config.memory.end_step, 3)
+        self.assertEqual(config.model_integration.mode, "runtime")
+
     def test_optimizer_target_argument(self) -> None:
         """``--optimizer.<arg>`` reaches the optimizer target through the shorthand."""
         config = self._parse("--optimizer.learning_rate=0.5")
@@ -117,10 +137,10 @@ class TestConfigOverrides(unittest.TestCase):
         """A misspelled target argument is reported with a suggestion."""
         with self.assertRaisesRegex(
             ConfigResolutionError,
-            r"unknown target argument 'wdith'; did you mean 'width'\?",
+            r"unknown target argument 'widh'; did you mean 'width'\?",
             msg="case: unknown_target_argument_suggests",
         ):
-            self._parse("--model.wdith=8")
+            self._parse("--model.widh=8")
 
     def test_nested_mapping_value(self) -> None:
         """An override below a mapping argument rewrites that key."""

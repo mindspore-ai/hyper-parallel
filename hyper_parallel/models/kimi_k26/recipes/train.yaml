@@ -241,16 +241,19 @@ debug:
   check_nan_inf: true
   check_dataset: null
 
-profiling:
+profiler:
   enabled: false
   start_step: 3
-  end_step: 5
-  trace_dir: ./outputs/profiling
-  record_shapes: false
-  profile_memory: false
+  stop_step: 4
+  start_on_init: false
+  memory: false
+  rank_ids: [0]
+  pipeline_stage_leaders: false
+  output_path: ./outputs/profiling
+  level: 1
   with_stack: false
-  with_modules: false
-  rank: 0
+  data_simplification: false
+  mstx: false
 
 loss_fn:
   # 家族子类：Omni 多模态 batch 只带 raw labels，这里按 next-token 语义推导 shift_labels
