@@ -1,0 +1,106 @@
+# Online Dataset smoke test for ShareGPT conversations.
+
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  force_hf: true
+
+training:
+  train_iters: 2
+  train_samples: null
+  global_batch_size: 2
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 2
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: off
+
+dataset:
+  model_assets:
+    chat_template: tokenizer
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+      use_fast: true
+      trust_remote_code: false
+  data_transform:
+    _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
+    data_type: conversation
+    text_keys: conversations
+    role_key: from
+    content_key: value
+    max_seq_len: 512
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
+  data_path: examples/training_demo/data/sharegpt_demo.jsonl
+  data_config:
+    dataset_type: mapping
+    hf_dataset_name: null
+    labels_are_shifted: true
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.ParallelBatch
+    source_type: online
+    attention_mode: dense
+  dataloader_type: cyclic
+  drop_last: true
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  no_decay_params: [bias, norm, ln_]
+  muon_config:
+    muon_lr: 1.0e-5
+    muon_weight_decay: 0.01
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.95]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-5
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
