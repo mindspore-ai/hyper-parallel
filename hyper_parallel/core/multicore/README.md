@@ -115,12 +115,31 @@ MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in model.la
 ```
 
 共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
-checkpoint/recompute 和 `retain_graph=True` 暂未验证。所有 backward 完成后，各 rank 按相同顺序调用
-每层的幂等 `close()`，并在销毁进程组前完成关闭。
+checkpoint/recompute 和 `retain_graph=True` 暂未验证。默认由运行时托管 workspace，无需显式
+关闭。模块 GC 仅登记使用权释放，不执行 collective；下一个资源组
+首次 forward 时，所有 WORLD rank 一起核对资源表，只复用各 rank 都无成员且无待反向图的兼容
+workspace，其余可回收的孤儿 workspace 当场释放。此协调不在已绑定模型的每步 forward 中执行。
+GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图引用仍会占用内存，固定 SHMEM 堆上限不变。
+
+自动清理适配在首次绑定时安装：拦截 Torch `ProcessGroup.shutdown`（旧版本使用
+`distributed_c10d._shutdown_backend`），在 WORLD 或 SHMEM Root 被关闭前先回收资源。
+因此标准 `dist.destroy_process_group()` 及其提前导入的函数别名无需额外适配；不支持的 Torch
+版本在 native 资源创建前报错。直接调用底层 HCCL/C++ 销毁接口不在此 Python 适配范围内。
+另注册先于 torch_npu 退出钩子的 `atexit` 清理；所有 rank 正常退出时自动尝试回收。
+这些边界仍要求所有 rank 同序进入且没有在途调用/待反向图。异常、Ctrl+C、kill 或通信故障
+不承诺安全或及时退出，不从 signal handler 中执行 collective；SIGKILL 无法执行退出钩子。
+
+需要提前释放时，仍可调用原有 `MegaMoeExperts.close()`，示例中的 `model.close()` 保持逐层关闭；
+共享 workspace 在最后一个成员关闭时才释放，不释放普通模型参数。所有 WORLD rank 须在无在途
+调用及待反向图时同序关闭。关闭失败会保留句柄供安全条件下重试，部分关闭的模块不能再次执行。
+只有所有 rank 均成功后才移除资源记录；对称内存部分释放状态不一致或原生 shutdown 失败须重启。
+自动清理失败会阻止显式通信域销毁继续执行；进程退出时仅记录失败并继续框架退出流程，不能保证释放成功。
 
 SHMEM Python层以进程级引用计数统一管理Runtime生命周期。每个MegaMoe执行资源组建立时配对调用一次
 内部`shmem.acquire()`，关闭时在workspace释放全部对称Tensor后调用一次`shmem.release()`；
-`share_execution_resources`的相同配置层共享同一组及workspace，因此只形成一个SHMEM引用。非最后一个
+`share_execution_resources`的相同配置层共享同一组及workspace，因此只形成一个资源组SHMEM引用。
+资源池另外持有一个Runtime引用，使不同配置的孤儿workspace替换不会触发Runtime反复终结/重建；
+显式关闭全部已绑定资源或自动关停时释放该引用。非最后一个
 `release()`只减少本地计数，进程内最后一个引用才执行跨rank关闭（仅丢弃模块对象不会触发释放）。未来
 MegaMHC、MegaDSA等Multicore特性复用同一SHMEM Runtime时，也通过同一配对接口共享这套进程级计数，
 不在各消费者内重复实现生命周期协调。

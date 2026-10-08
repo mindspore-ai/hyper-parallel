@@ -217,6 +217,24 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertEqual(self.native._initialize.call_count, 2)
         _lifecycle.release()
 
+    def test_peer_shutdown_errors_are_coordinated(self) -> None:
+        """A peer precheck failure blocks the barrier; a peer native failure is terminal."""
+        _lifecycle.acquire()
+        self.dist.barrier.reset_mock()
+        with patch.object(_lifecycle._automatic, "exchange", return_value=[None, "peer busy"]):
+            with self.assertRaisesRegex(RuntimeError, "peer busy"):
+                _lifecycle.release()
+        self.dist.barrier.assert_not_called()
+        self.native._shutdown.assert_not_called()
+        self.assertEqual(_lifecycle._reference_count(), 1)
+        with patch.object(_lifecycle._automatic, "exchange", side_effect=[[None, None], [None, "peer finalize"]]):
+            with self.assertRaisesRegex(RuntimeError, "peer finalize"):
+                _lifecycle.release()
+        self.native._shutdown.assert_called_once_with()
+        self.assertTrue(_lifecycle._shutdown_failed)
+        with self.assertRaisesRegex(RuntimeError, "Native shutdown failure"):
+            _lifecycle.acquire()
+
     def test_native_shutdown_failure_blocks_future_acquire(self) -> None:
         """Clear Root ownership but reject a new lifecycle after Native shutdown fails."""
         _lifecycle.acquire()

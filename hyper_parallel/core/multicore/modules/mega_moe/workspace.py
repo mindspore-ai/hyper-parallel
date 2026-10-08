@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import os
 import threading
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 
-from hyper_parallel.core.multicore import shmem
+from hyper_parallel.core.multicore import _automatic, shmem
 from hyper_parallel.core.multicore.scheduler.config import (
     MIN_EVENT_CAPACITY,
     event_workspace_bytes,
@@ -124,11 +125,33 @@ class MegaMoeWorkspace:
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
     in_use: bool = False
+    closing: bool = False
     used: bool = False
     event_counter_bytes: int = MIN_EVENT_CAPACITY * 4
     forward_ready_initialized: bool = False
     backward_ready_initialized: bool = False
     lock: Any = field(default_factory=threading.Lock, repr=False)
+    graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
+
+    def track_graph(self, context: Any) -> None:
+        """Retain a weak lease while this context can still run backward.
+
+        Args:
+            context: Autograd context that may still access workspace buffers.
+        """
+        self.graphs.add(context)
+
+    def can_close(self) -> bool:
+        """Check active calls and weak graph leases without unpacking saved tensors."""
+        return not self.in_use and not self.graphs
+
+    def release_graph(self, context: Any) -> None:
+        """Retire this context's lease after successful non-retained backward.
+
+        Args:
+            context: Autograd context whose final backward completed.
+        """
+        self.graphs.discard(context)
 
     def ensure(self, spec: MegaMoeSpec, dtype: Any, device: Any) -> None:
         """Allocate the fixed configured route capacity once.
@@ -138,6 +161,8 @@ class MegaMoeWorkspace:
             dtype: Element dtype for symmetric data buffers.
             device: Device that owns local and symmetric buffers.
         """
+        if self.closing:
+            raise RuntimeError("cannot allocate a closing MegaMoe workspace.")
         requested_capacity = spec.receive_capacity
         if self.expert_buffer is not None:
             compatible = (
@@ -227,6 +252,8 @@ class MegaMoeWorkspace:
     def claim(self) -> None:
         """Claim the serial workspace and order it after the previous stream."""
         with self.lock:
+            if self.closing:
+                raise RuntimeError("cannot claim a closing MegaMoe workspace.")
             if self.in_use:
                 raise RuntimeError("MegaMoe execution resources do not support concurrent calls.")
             if self.used:
@@ -244,6 +271,11 @@ class MegaMoeWorkspace:
 
     def _free_symmetric_tensors(self) -> None:
         """Free each unique SHMEM allocation and invalidate its tensor view."""
+        if self.closing:
+            remaining = tuple(tensor is not None for tensor in (
+                self.expert_buffer, self.routed_buffer, self.forward_event_counters, self.backward_event_counters))
+            if any(peer != remaining for peer in _automatic.exchange(remaining)):
+                raise RuntimeError("partial symmetric teardown differs across ranks; restart the process")
         for field_name in (
             "expert_buffer",
             "routed_buffer",
@@ -274,15 +306,28 @@ class MegaMoeWorkspace:
         with self.lock:
             if self.in_use:
                 raise RuntimeError("cannot close MegaMoe workspace during an active call.")
-            if self.expert_buffer is None and self.gmm_workspace is None:
-                return
-        torch.npu.synchronize(self.device)
+            if not self.can_close():
+                raise RuntimeError("cannot close MegaMoe workspace while backward graphs still need its buffers.")
+            empty = all(tensor is None for tensor in (
+                self.expert_buffer,
+                self.routed_buffer,
+                self.forward_event_counters,
+                self.backward_event_counters,
+                self.gmm_workspace,
+                self.swiglu_grad_workspace,
+                self.completion_event,
+            ))
+            self.closing = True
+        # An empty rank must still participate when peers retain buffers after a failure.
+        if all(_automatic.exchange(empty)):
+            return
+        _automatic.collective_call(lambda: None if empty else torch.npu.synchronize(self.device))
         # Workspace teardown requires each collective barrier to complete before
         # the following free or local Tensor release.
         shmem.host_barrier()
-        self._free_symmetric_tensors()
+        _automatic.collective_call(self._free_symmetric_tensors)
         shmem.host_barrier()
-        self._free_local_tensors()
+        _automatic.collective_call(self._free_local_tensors)
         self.dtype = None
         self.device = None
         self.completion_event = None
