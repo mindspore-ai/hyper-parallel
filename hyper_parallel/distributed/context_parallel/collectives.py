@@ -225,6 +225,16 @@ def _prepare_ulysses_send(
     return tensor.contiguous().reshape(split_shape).permute(permutation).contiguous()
 
 
+def _sum_scatter_sequence_gradient(gradient: Tensor, dim: int, size: int, group: Any) -> Tensor:
+    """Return the SUM adjoint of an equal-shard all-gather, in the input layout."""
+    send = _move_dim_to_front(gradient, dim)
+    local_shape = (send.shape[0] // size, *send.shape[1:])
+    output = gradient.new_empty(local_shape)
+    work = dist.reduce_scatter_tensor(output, send, op=dist.ReduceOp.SUM, group=group, async_op=True)
+    work.wait()
+    return _move_dim_from_front(output, dim)
+
+
 class _AsyncAllGatherWait(torch.autograd.Function):
     """Attach a pre-launched all-gather to autograd at its wait point."""
 
@@ -252,13 +262,7 @@ class _AsyncAllGatherWait(torch.autograd.Function):
         grad_output: Tensor,
     ) -> tuple[Tensor, None, None, None, None, None]:
         """Reduce and select this rank's input-gradient sequence shard."""
-        grad = grad_output.contiguous().clone()
-        work = dist.all_reduce(grad, group=ctx.group, async_op=True)
-        work.wait()
-        rank = dist.get_rank(ctx.group)
-        local = torch.chunk(
-            grad, ctx.world_size, dim=ctx.gather_dim
-        )[rank].contiguous()
+        local = _sum_scatter_sequence_gradient(grad_output, ctx.gather_dim, ctx.world_size, ctx.group)
         return (
             local,
             None,
@@ -549,11 +553,7 @@ class _AllGatherAlongDim(torch.autograd.Function):
         grad_output: Tensor,
     ) -> tuple[Tensor, None, None, None]:
         """Sum the gradient across ranks and take this rank's chunk."""
-        # reduce-scatter: sum the gradient across ranks, take this rank's chunk
-        grad = grad_output.contiguous().clone()
-        dist.all_reduce(grad, group=ctx.group)
-        rank = dist.get_rank(ctx.group)
-        local = torch.chunk(grad, ctx.cp_size, dim=ctx.cp_dim)[rank]
+        local = _sum_scatter_sequence_gradient(grad_output, ctx.cp_dim, ctx.cp_size, ctx.group)
         return local.contiguous(), None, None, None
 
 

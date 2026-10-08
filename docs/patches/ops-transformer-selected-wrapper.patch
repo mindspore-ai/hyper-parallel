@@ -1,0 +1,26 @@
+diff --git a/torch_extension/cann_ops_transformer/op_builder/builder.py b/torch_extension/cann_ops_transformer/op_builder/builder.py
+index 07f2b808f..94b1b39d3 100644
+--- a/torch_extension/cann_ops_transformer/op_builder/builder.py
++++ b/torch_extension/cann_ops_transformer/op_builder/builder.py
+@@ -193,7 +193,7 @@ class OpBuilder(ABC):
+             self._remove_stale_torch_lock()
+
+             # Lazy import avoids pulling arg_check into every builder import path.
+-            from cann_ops_transformer.utils.arg_check import wrap_op_module
++            from ..utils.arg_check import wrap_op_module
+
+             op_module = load(
+                 name=self.name,
+diff --git a/torch_extension/setup.py b/torch_extension/setup.py
+index 7d3216c08..26ba5229b 100644
+--- a/torch_extension/setup.py
++++ b/torch_extension/setup.py
+@@ -215,7 +215,7 @@ class BuildPyWithOps(_build_py):
+                 os.makedirs(os.path.dirname(dst), exist_ok=True)
+                 with open(dst, "w") as f:
+                     for sel_op in sel_ops:
+-                        f.write("from .%s import %s\n" % (sel_op, sel_op))
++                        f.write("from .%s import *\n" % sel_op)
+         else:
+             for category, init_src in _op_category_inits.items():
+                 dst = os.path.join(build_pkg, "ops", category, "__init__.py")

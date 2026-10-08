@@ -728,13 +728,11 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                     "packed_seq_params must be SharedCompressedPackedSequence, "
                     f"got {type(packed_sequence).__name__}"
                 )
-            segment_start_positions = packed_sequence.local_segment_starts(input_ids.device)
-            local_positions = torch.arange(
-                packed_sequence.local_query_start,
-                packed_sequence.local_query_start + packed_sequence.local_query_length,
-                device=input_ids.device,
-            ).unsqueeze(0)
-            segment_start_mask = (local_positions == segment_start_positions).expand_as(input_ids)
+            packed_sequence = packed_sequence.prepare(
+                input_ids.device, tuple(self.config.v41_compress_ratios),
+            )
+            kwargs["packed_seq_params"] = packed_sequence
+            segment_start_mask = packed_sequence.segment_start_mask(input_ids.device).expand_as(input_ids)
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0

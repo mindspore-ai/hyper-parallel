@@ -31,11 +31,12 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
 from hyper_parallel.distributed.context_parallel.collectives import (
     async_cp_allgather_launch,
 )
+from hyper_parallel.distributed.context_parallel.halo import async_cp_halo_launch
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 
 
 def _build_shared_attention_cp_context(cp_mesh: Any) -> SharedCompressedAttentionCPContext:
-    """Build V4.1's asynchronous KV-all-gather communication context."""
+    """Build V4.1 raw halo and asynchronous global-bank gather context."""
 
     def _gather_sequence(tensor: torch.Tensor, sequence_dim: int) -> torch.Tensor:
         """All-gather one sequence dimension in CP-rank order."""
@@ -45,11 +46,16 @@ def _build_shared_attention_cp_context(cp_mesh: Any) -> SharedCompressedAttentio
         """Launch a differentiable KV all-gather for projection overlap."""
         return async_cp_allgather_launch(tensor, sequence_dim, cp_mesh)
 
+    def _launch_raw_halo(tensor: torch.Tensor, sequence_dim: int, window_size: int) -> Any:
+        """Exchange only the raw KV needed by the causal sliding window."""
+        return async_cp_halo_launch(tensor, sequence_dim, window_size, cp_mesh)
+
     return SharedCompressedAttentionCPContext(
         size=cp_mesh.size(),
         rank=cp_mesh.get_local_rank(),
         gather_sequence=_gather_sequence,
         launch_sequence=_launch_sequence,
+        launch_raw_halo=_launch_raw_halo,
     )
 
 
@@ -80,8 +86,8 @@ def deepseek_v41_shared_attention_parallel_wrapper(
 ) -> _ForwardRewriteRequest:
     """Install V4.1's explicit TP Indexer and Colossal CP collectives.
 
-    Queries and Top-K indices remain sequence-local; raw KV, compressed KV,
-    and index keys use asynchronous differentiable all-gather. Projection
+    Queries and Top-K indices remain sequence-local. Raw KV uses all-to-all-v
+    halo; compressed KV and index keys use differentiable all-gather. Projection
     GEMMs overlap communication. Indexer Q/merge heads remain TP-local and
     reduce their score and KL-target contributions before global Top-K.
     """
