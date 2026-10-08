@@ -21,6 +21,9 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.quantization.config import LowPrecisionDtypeScheme
+from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import (
+    MXFP8GroupedLinear,
+)
 from hyper_parallel.components.quantization.modules import GroupedExperts
 from hyper_parallel.models.deepseek_v3.adapter.replacements import (
     replace_grouped_experts,
@@ -50,6 +53,12 @@ class _SourceExperts(nn.Module):
         self.act_fn = nn.SiLU()
         self.register_buffer("sentinel", torch.tensor(11), persistent=False)
         self.config = {"name": "source"}
+
+
+def _test_strategy() -> MXFP8GroupedLinear:
+    """Return a real non-module strategy for shell contract tests."""
+
+    return MXFP8GroupedLinear()
 
 
 def _dense_grouped_apply(inputs, weight, group_list, strategy, group_list_type):
@@ -95,7 +104,9 @@ class TestGroupedExpertsConversion(unittest.TestCase):
         source = _SourceExperts()
         source.eval()
         converted = GroupedExperts.from_module(
-            source, fqn="model.layers.0.mlp.experts", grouped_linear=object()
+            source,
+            fqn="model.layers.0.mlp.experts",
+            grouped_linear=_test_strategy(),
         )
 
         self.assertIsNot(converted, source)
@@ -114,7 +125,9 @@ class TestGroupedExpertsConversion(unittest.TestCase):
         torch.manual_seed(23)
         source = _SourceExperts()
         converted = GroupedExperts.from_module(
-            source, fqn="experts", grouped_linear=object()
+            source,
+            fqn="experts",
+            grouped_linear=_test_strategy(),
         )
         hidden = torch.randn(4, 4, requires_grad=True)
         indices = torch.tensor([[0, 1], [1, 0], [0, 1], [1, 0]])
@@ -142,12 +155,12 @@ class TestGroupedExpertsConversion(unittest.TestCase):
         missing = nn.Module()
         missing.register_parameter("gate_up_proj", nn.Parameter(torch.randn(2, 6, 4)))
         with self.assertRaisesRegex(TypeError, "must register packed expert parameters"):
-            GroupedExperts.from_module(missing, fqn="bad")
+            GroupedExperts.from_module(missing, fqn="bad", grouped_linear=_test_strategy())
 
         bad_shape = _SourceExperts()
         bad_shape.down_proj = nn.Parameter(torch.randn(2, 5, 3))
         with self.assertRaisesRegex(ValueError, "incompatible gate/up and down"):
-            GroupedExperts.from_module(bad_shape, fqn="bad")
+            GroupedExperts.from_module(bad_shape, fqn="bad", grouped_linear=_test_strategy())
 
 
 class TestGroupedExpertsFactory(unittest.TestCase):
@@ -160,7 +173,7 @@ class TestGroupedExpertsFactory(unittest.TestCase):
         policy = LowPrecisionDtypeScheme(
             weight_format="mxfp4", act_format="mxfp8"
         )
-        strategy = object()
+        strategy = _test_strategy()
         patch_path = (
             "hyper_parallel.models.deepseek_v3.adapter.replacements."
             "build_low_precision_strategy"

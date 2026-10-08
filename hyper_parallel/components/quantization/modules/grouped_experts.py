@@ -31,9 +31,6 @@ from hyper_parallel.components.quantization.ops.npu_mxfp8 import LowPrecisionCap
 from hyper_parallel.components.quantization.ops.npu_w4a8 import (
     W4A8CapabilityError,
 )
-from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import (
-    MXFP8GroupedLinear,
-)
 
 _EXPERT_PARAMETER_NAMES = ("gate_up_proj", "down_proj")
 
@@ -41,9 +38,9 @@ _EXPERT_PARAMETER_NAMES = ("gate_up_proj", "down_proj")
 class GroupedExperts(nn.Module):
     """Canonical low-precision shell for DeepSeek-V3 grouped experts.
 
-    The bound grouped-linear compute may select MXFP8, native W4A8, or fake
-    W4A8. The shell owns no quantizer; it holds only the ``grouped_linear``
-    instance selected by ``strategy_factory``.
+    The bound grouped-linear compute may select MXFP8, HiFloat8, native W4A8,
+    or fake W4A8. The shell owns no quantizer; it holds only the
+    ``grouped_linear`` instance selected by ``strategy_factory``.
     """
 
     def __init__(
@@ -52,11 +49,12 @@ class GroupedExperts(nn.Module):
         hidden_dim: int,
         intermediate_dim: int,
         *,
+        grouped_linear: GroupedLinear,
         fqn: str = "",
-        grouped_linear: GroupedLinear | None = None,
     ) -> None:
         """Create an unbound packed-expert module."""
 
+        self._validate_grouped_linear(grouped_linear)
         super().__init__()
         self.gate_up_proj = nn.Parameter(
             torch.empty(num_experts, 2 * intermediate_dim, hidden_dim)
@@ -69,11 +67,19 @@ class GroupedExperts(nn.Module):
         self.hidden_dim = hidden_dim
         self.intermediate_dim = intermediate_dim
         self.fqn = fqn
-        self.grouped_linear = (
-            grouped_linear
-            if grouped_linear is not None
-            else MXFP8GroupedLinear()
-        )
+        self.grouped_linear = grouped_linear
+
+    @staticmethod
+    def _validate_grouped_linear(grouped_linear: GroupedLinear) -> None:
+        """Require a plain strategy so module registration stays unchanged."""
+
+        if isinstance(grouped_linear, nn.Module) or not isinstance(
+            grouped_linear,
+            GroupedLinear,
+        ):
+            raise TypeError(
+                "grouped_linear must be a non-Module GroupedLinear instance"
+            )
 
     @classmethod
     def from_module(
@@ -81,10 +87,11 @@ class GroupedExperts(nn.Module):
         source: nn.Module,
         *,
         fqn: str,
-        grouped_linear: GroupedLinear | None = None,
+        grouped_linear: GroupedLinear,
     ) -> "GroupedExperts":
         """Create a no-allocation shell retaining the source registrations."""
 
+        cls._validate_grouped_linear(grouped_linear)
         parameter_names = tuple(source._parameters)  # pylint: disable=protected-access
         if parameter_names != _EXPERT_PARAMETER_NAMES:
             raise TypeError(
@@ -132,11 +139,7 @@ class GroupedExperts(nn.Module):
         converted.hidden_dim = gate_up_proj.shape[2]
         converted.intermediate_dim = gate_up_proj.shape[1] // 2
         converted.fqn = fqn
-        converted.grouped_linear = (
-            grouped_linear
-            if grouped_linear is not None
-            else MXFP8GroupedLinear()
-        )
+        converted.grouped_linear = grouped_linear
         if hasattr(source, "config"):
             converted.config = source.config
         converted.training = source.training
@@ -210,7 +213,9 @@ class GroupedExperts(nn.Module):
         )
         sorted_outputs = self._grouped_forward(sorted_inputs, tokens_per_expert)
         sorted_weights = top_k_weights.reshape(-1)[expert_order]
-        sorted_outputs = sorted_outputs * sorted_weights.unsqueeze(-1)
+        sorted_outputs = (
+            sorted_outputs * sorted_weights.unsqueeze(-1)
+        ).to(hidden_states.dtype)
 
         inverse_order = torch.empty_like(expert_order)
         inverse_order[expert_order] = torch.arange(
