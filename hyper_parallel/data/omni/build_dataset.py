@@ -23,12 +23,15 @@ from hyper_parallel.data.constants import ONLINE_SPLIT_COUNT
 from hyper_parallel.data.omni.omni_transform import (
     OmniDataTransform,
     _OmniTransformStrategy,
+    _PreprocessedOmniTransform,
 )
 from hyper_parallel.data.online import (
     MappingTransformDataset,
     OnlineDataPath,
     build_online_mapping_source,
 )
+from hyper_parallel.data.nv_meta.build_dataset import build_nv_meta_dataset
+from hyper_parallel.data.parallel import create_dataloader_parallel_context
 
 
 def build_online_omni_mapping_dataset(
@@ -37,15 +40,19 @@ def build_online_omni_mapping_dataset(
     data_path: OnlineDataPath | None = None,
     transform: OmniDataTransform | None = None,
     training_config: Any = None,
+    mesh_context: Any = None,
+    preprocessed: bool = False,
 ) -> Any:
     """Build an Online Mapping source and apply its Omni transform lazily.
 
     Args:
-        data_config: Online Mapping source options.
+        data_config: Online Mapping options; format nv_meta selects prepared metadata.
         data_path: Optional local source path, ordered paths, or pre-split
             train/valid/test path mapping.
         transform: Omni sample transform selected by the Trainer.
         training_config: Training plan providing the random seed.
+        mesh_context: Runtime mesh used for nv-meta DataLoader ownership.
+        preprocessed: Reuse stored model inputs and labels, retaining encode_batch.
 
     Returns:
         A transformed Online Mapping Dataset or train-valid-test tuple.
@@ -58,6 +65,30 @@ def build_online_omni_mapping_dataset(
         raise ValueError("Online Omni Dataset requires a data_transform")
     if not isinstance(transform, OmniDataTransform):
         raise TypeError("Online Omni Dataset transform must be an OmniDataTransform")
+    if preprocessed:
+        transform = _PreprocessedOmniTransform(transform)
+
+    if data_config.get("format") == "nv_meta":
+        dataloader_context = None
+        if mesh_context is not None:
+            dataloader_context = create_dataloader_parallel_context(
+                mesh_context,
+                data_index_cache=bool(data_config.get("data_index_cache", False)),
+                shared_storage=not bool(data_config.get("no_shared_storage", False)),
+            )
+        source_dataset = build_nv_meta_dataset(
+            access_mode="mapping",
+            data_path=data_path,
+            data_config=data_config,
+            is_valid_sample=transform.is_valid_sample,
+            training_config=training_config,
+            dataloader_context=dataloader_context,
+        )
+        return _OmniMappingDataset.apply(source_dataset, transform)
+    if data_config.get("format") is not None:
+        raise ValueError("data_config.format only supports nv_meta; omit it for existing file/Hub loading")
+    if data_config.get("sample_adapter") is not None:
+        raise ValueError("data_config.sample_adapter requires data_config.format: nv_meta")
 
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)

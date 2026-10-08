@@ -30,6 +30,7 @@ from hyper_parallel.data.online import (
     build_online_iterable_source,
     build_online_mapping_source,
 )
+from hyper_parallel.data.nv_meta.build_dataset import build_nv_meta_dataset
 from hyper_parallel.data.parallel import (
     DataLoaderParallelContext,
     create_dataloader_parallel_context,
@@ -81,16 +82,18 @@ def build_online_text_mapping_dataset(
     data_path: OnlineDataPath | None = None,
     transform: Callable[[Any], Any] | None = None,
     training_config: Any = None,
+    mesh_context: Any = None,
 ) -> Any:
     """Build an Online Mapping Dataset and apply its text transform.
 
     Args:
-        data_config: Online Mapping source options.
+        data_config: Online Mapping options; format nv_meta selects prepared metadata.
         data_path: Optional local source path, ordered paths, or pre-split
             train/valid/test path mapping. Use ``data_config.sources`` for
             multiple sources.
         transform: Plaintext or conversation sample transform.
         training_config: Training plan providing the random seed and split sizes.
+        mesh_context: Runtime mesh used for nv-meta DataLoader ownership.
 
     Returns:
         A transformed Online Dataset on each DataLoader-owning rank.
@@ -100,6 +103,21 @@ def build_online_text_mapping_dataset(
     """
     if transform is None:
         raise ValueError("Online Dataset requires a plaintext or conversation data_transform")
+
+    if data_config.get("format") == "nv_meta":
+        source_dataset = build_nv_meta_dataset(
+            access_mode="mapping",
+            data_path=data_path,
+            data_config=data_config,
+            is_valid_sample=transform.is_valid_sample,
+            training_config=training_config,
+            dataloader_context=_build_dataloader_context(mesh_context, data_config),
+        )
+        return MappingTransformDataset.apply(source_dataset, transform)
+    if data_config.get("format") is not None:
+        raise ValueError("data_config.format only supports nv_meta; omit it for existing file/Hub loading")
+    if data_config.get("sample_adapter") is not None:
+        raise ValueError("data_config.sample_adapter requires data_config.format: nv_meta")
 
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)
@@ -130,7 +148,7 @@ def build_online_iterable_dataset(
     """Build an Online Iterable Dataset and apply its text transform.
 
     Args:
-        data_config: Online Iterable source options.
+        data_config: Online Iterable options; format nv_meta selects prepared metadata.
         data_path: Optional local source path, ordered paths, or Hub Dataset
             ID. Use ``data_config.sources`` for multiple sources.
         transform: Plaintext or conversation sample transform.
@@ -146,6 +164,23 @@ def build_online_iterable_dataset(
     """
     if transform is None:
         raise ValueError("Online Dataset requires a plaintext or conversation data_transform")
+
+    if data_config.get("format") == "nv_meta":
+        if dataloader_context is None:
+            dataloader_context = _build_dataloader_context(mesh_context, data_config)
+        source_dataset = build_nv_meta_dataset(
+            access_mode="iterable",
+            data_path=data_path,
+            data_config=data_config,
+            is_valid_sample=transform.is_valid_sample,
+            training_config=training_config,
+            dataloader_context=dataloader_context,
+        )
+        return IterableTransformDataset.apply(source_dataset, transform)
+    if data_config.get("format") is not None:
+        raise ValueError("data_config.format only supports nv_meta; omit it for existing file/Hub loading")
+    if data_config.get("sample_adapter") is not None:
+        raise ValueError("data_config.sample_adapter requires data_config.format: nv_meta")
 
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)

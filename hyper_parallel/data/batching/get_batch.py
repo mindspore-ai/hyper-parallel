@@ -17,10 +17,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import operator
+from collections import deque
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from hyper_parallel.data.batching.runtime_input import (
     AttentionRuntime,
@@ -43,6 +46,85 @@ from hyper_parallel.data.parallel import (
 )
 
 logger = get_dataset_logger(__name__)
+
+
+class SynchronizedBatchReader:
+    """Agree on a complete optimizer step before consuming a finite source.
+
+    Explicit source providers can yield different numbers of packed batches on
+    different ranks. Prefetch at most one step on the host and agree on readiness
+    before the wrapped runtime transfers any batch or starts model collectives.
+    All training ranks, including ranks without a DataLoader, must call this
+    reader exactly ``num_micro_batches`` times per completed optimizer step.
+    Checkpoints belong at those step boundaries, where this queue is empty.
+    """
+
+    def __init__(
+        self, get_batch: Callable[..., Any], *, num_micro_batches: int, device: Any,
+    ) -> None:
+        """Wrap an HP batch runtime while retaining its DataLoader ownership."""
+        num_micro_batches = operator.index(num_micro_batches)
+        if num_micro_batches <= 0:
+            raise ValueError("num_micro_batches must be positive")
+        self.get_batch = get_batch
+        self.parallel_context = getattr(get_batch, "parallel_context", None)
+        if self.parallel_context is None:
+            raise ValueError("Explicit source training requires a batch runtime with parallel_context")
+        self.num_micro_batches = num_micro_batches
+        self._pending: deque[Any] = deque()
+        self._remaining = 0
+        self._source_iterator: Any = None
+        self._distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        # Gloo accepts CPU tensors; accelerator backends require their device.
+        status_device = "cpu" if not self._distributed or dist.get_backend() == "gloo" else device
+        self._status = torch.empty((), dtype=torch.int32, device=status_device)
+
+    def __getattr__(self, name: str) -> Any:
+        """Preserve model-integration metadata exposed by the wrapped runtime."""
+        return getattr(object.__getattribute__(self, "get_batch"), name)
+
+    def __call__(self, data_iterator: Any) -> Any:
+        """Delegate one micro-batch after all ranks have a complete step."""
+        self.prepare_step(data_iterator)
+        local_iterator = iter((self._pending.popleft(),)) if self._pending else iter(())
+        result = self.get_batch(local_iterator)
+        self._remaining -= 1
+        if not self._remaining:
+            self._source_iterator = None
+        return result
+
+    def prepare_step(self, data_iterator: Any) -> None:
+        """Check readiness before optimizer-step callbacks or model work begin."""
+        if not self._remaining:
+            self._prefetch_step(data_iterator)
+        elif data_iterator is not self._source_iterator:
+            raise ValueError("Cannot change the data iterator within an optimizer step")
+
+    def _prefetch_step(self, data_iterator: Any) -> None:
+        """Propagate EOF and reader failures before any rank starts a step."""
+        status = 2
+        read_error = None
+        self._pending.clear()
+        if self.parallel_context.build_on_rank():
+            try:
+                for _ in range(self.num_micro_batches):
+                    self._pending.append(next(data_iterator))
+            except StopIteration:
+                status = 1
+            except Exception as error:
+                status = 0
+                read_error = error
+        if self._distributed:
+            self._status.fill_(status)
+            dist.all_reduce(self._status, op=dist.ReduceOp.MIN)
+            status = int(self._status.item())
+        if status < 2:
+            self._pending.clear()
+            if status == 0:
+                raise RuntimeError("A training rank failed while preparing the next optimizer step") from read_error
+            raise StopIteration
+        self._source_iterator = data_iterator
+        self._remaining = self.num_micro_batches
 
 
 class OmniParallelBatch:
