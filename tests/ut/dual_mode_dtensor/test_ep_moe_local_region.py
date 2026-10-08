@@ -31,6 +31,7 @@ from hyper_parallel.distributed.expert_parallel.routing import (
     _topk_router_module,
 )
 from hyper_parallel.distributed.expert_parallel.experts import (
+    _aggregate_ep_outputs,
     _local_swiglu_expert_forward,
     resolve_swiglu_weights,
 )
@@ -1014,7 +1015,11 @@ def test_planner_ep_marking_and_stack(tiny_hf_native_moe, tiny_moe, make_mesh):
 #          test_topk_router_module_adapter, test_sigmoid_group_router_adapter
 # ==========================================================================
 
-def test_router_and_expert_utils(tiny_hf_native_moe, tiny_hf_batched_moe):
+def test_router_and_expert_utils(
+    tiny_hf_native_moe,
+    tiny_hf_batched_moe,
+    monkeypatch,
+):
     """Router adapters (softmax top-k / TopKRouter module / sigmoid group)
     plus SwiGLU weight resolution and local expert forward."""
     # ── case: test_softmax_topk_router ──
@@ -1164,6 +1169,43 @@ def test_router_and_expert_utils(tiny_hf_native_moe, tiny_hf_batched_moe):
     assert torch.equal(idx, ref_idx), "case: sigmoid_group_router_group_filter"
     torch.testing.assert_close(
         w, ref_w.to(w.dtype), msg="case: sigmoid_group_router_group_filter"
+    )
+
+    # ── case: test_ep_output_aggregation_uses_inverse_dispatch_mapping ──
+    # The native unpermute operator consumes the inverse route permutation,
+    # not the expert-major dispatch order itself.
+    dispatch_order = torch.tensor([1, 4, 2, 0, 5, 3], dtype=torch.long)
+    combined_outputs = torch.arange(12, dtype=torch.float32).view(6, 2)
+    expert_weights = torch.tensor([0.2, 0.8, 0.3, 0.7, 0.4, 0.6])
+
+    def fake_moe_token_unpermute(permuted_tokens, unpermute_mapping, probs):
+        expected_mapping = torch.tensor([3, 0, 2, 5, 1, 4], dtype=torch.int32)
+        assert torch.equal(unpermute_mapping, expected_mapping), (
+            f"inverse dispatch mapping mismatch: "
+            f"expected={expected_mapping}, got={unpermute_mapping}"
+        )
+        assert probs.shape == (3, 2), (
+            f"top-k probability shape mismatch: expected={(3, 2)}, got={tuple(probs.shape)}"
+        )
+        token_major = permuted_tokens[unpermute_mapping.long()].view(3, 2, 2)
+        return (token_major * probs.unsqueeze(-1)).sum(dim=1)
+
+    monkeypatch.setattr(
+        "hyper_parallel.distributed.expert_parallel.experts.moe_token_unpermute",
+        fake_moe_token_unpermute,
+    )
+    output = _aggregate_ep_outputs(
+        combined_outputs,
+        expert_weights,
+        dispatch_order,
+        (1, 3, 2),
+    )
+    token_major = combined_outputs[torch.tensor([3, 0, 2, 5, 1, 4])].view(3, 2, 2)
+    expected = (token_major * expert_weights.view(3, 2, 1)).sum(dim=1).view(1, 3, 2)
+    torch.testing.assert_close(
+        output,
+        expected,
+        msg="case: ep_output_aggregation_uses_inverse_dispatch_mapping",
     )
 
 
