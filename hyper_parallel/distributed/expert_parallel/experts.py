@@ -41,6 +41,9 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from hyper_parallel.components.functional.moe_token_unpermute import (
+    moe_token_unpermute,
+)
 from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
 )
@@ -76,7 +79,6 @@ logger = logging.getLogger(__name__)
 class _EPDispatch:
     """Prepared tensors and split sizes for one routed expert exchange."""
 
-    source_indices: torch.Tensor
     expert_weights: torch.Tensor
     dispatch_order: torch.Tensor
     states: torch.Tensor
@@ -499,7 +501,6 @@ def _prepare_ep_dispatch(
             f"tokens/peer={send_counts[0] if send_counts else 0})",
         )
     return _EPDispatch(
-        source_indices=source_indices,
         expert_weights=expert_weights,
         dispatch_order=dispatch_order,
         states=dispatched_states,
@@ -837,19 +838,23 @@ def _dispatch_chunk(
 def _aggregate_ep_outputs(
     combined_outputs: torch.Tensor,
     expert_weights: torch.Tensor,
-    source_indices: torch.Tensor,
     dispatch_order: torch.Tensor,
     output_shape: tuple[int, int, int],
 ) -> torch.Tensor:
     """Undo expert-major routing and aggregate weighted top-k outputs."""
-    weighted_outputs = combined_outputs * expert_weights[dispatch_order].unsqueeze(-1)
-    output = torch.zeros(
-        output_shape[0] * output_shape[1],
-        output_shape[-1],
-        dtype=weighted_outputs.dtype,
-        device=weighted_outputs.device,
+    unpermute_mapping = torch.empty_like(dispatch_order, dtype=torch.int32)
+    unpermute_mapping[dispatch_order] = torch.arange(
+        dispatch_order.numel(),
+        dtype=torch.int32,
+        device=dispatch_order.device,
     )
-    output.index_add_(0, source_indices[dispatch_order], weighted_outputs)
+    token_count = output_shape[0] * output_shape[1]
+    topk_weights = expert_weights.view(token_count, -1)
+    output = moe_token_unpermute(
+        combined_outputs,
+        unpermute_mapping,
+        topk_weights,
+    )
     return output.view(*output_shape)
 
 
@@ -1096,7 +1101,6 @@ def ep_routed_forward(
     return _aggregate_ep_outputs(
         combined_expert_outputs,
         dispatch.expert_weights,
-        dispatch.source_indices,
         dispatch.dispatch_order,
         output_shape,
     )
