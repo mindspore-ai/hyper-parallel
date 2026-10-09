@@ -705,7 +705,7 @@ pytest -v \
 ### 12.2 Torch NPU 测试
 
 ```bash
-pytest -v tests/torch/multicore/test_mega_moe_profiling.py
+pytest -v tests/st/multicore/test_mega_moe_profiling.py
 ```
 
 正式验证至少应检查：

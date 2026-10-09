@@ -71,7 +71,7 @@ Distributed ST helpers: `torchrun_case()` via `tests.common.distributed_launcher
 | **Checkpoint** | `core/distributed_checkpoint/` | Distributed save/load |
 | **Multicore** | `core/multicore/` | Torch-only component with private SHMEM and native build |
 | **Collectives** | `collectives/cc.py` | Process groups |
-| **Tests** | `tests/ut/`, `tests/torch/` | UT + distributed ST |
+| **Tests** | `tests/ut/`, `tests/st/` | UT + distributed ST |
 
 ---
 

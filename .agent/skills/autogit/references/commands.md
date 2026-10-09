@@ -125,7 +125,7 @@ autogit pr --ut full              # run full UT suite instead of changed-scope
    ⚠ Refuse if uncommitted changes exist — commit first
 2. Resolve UT/ST gates (ask one-at-a-time on tty; error on non-tty if undecided)
 3. Run UT gate (changed: only PR-diff test files; full: tests/ut)
-4. Run ST gate when scope != skip (changed: PR-diff ST files; full: tests/torch/st)
+4. Run ST gate when scope != skip (changed: PR-diff ST files; full: tests/st)
 5. Determine branch type
    • feature branch → use directly
    • master/main → create new branch + cherry-pick

@@ -9,7 +9,7 @@
 | 目录 | 说明 | 是否需要分布式环境 |
 |------|------|-------------------|
 | `tests/ut/` | 单元测试 | 不需要 |
-| `tests/torch/` | PyTorch 分布式系统测试 | 需要（torchrun） |
+| `tests/st/` | PyTorch 分布式系统测试 | 需要（torchrun） |
 
 ## 运行测试
 
@@ -22,7 +22,7 @@ pytest tests/ut/
 ### PyTorch 分布式测试
 
 ```bash
-torchrun --nproc_per_node=8 -m pytest tests/torch/
+torchrun --nproc_per_node=8 -m pytest tests/st/
 ```
 
 ### 按模块运行

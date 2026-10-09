@@ -26,7 +26,7 @@ discovery, or swap hooks. Do not invent alternate phase orders.
 - Primary code: `hyper_parallel/integration/llamafactory/activation.py`, `utils.py`
 - Core APIs: `checkpoint_wrapper`, `SwapManager`, `CheckpointPolicy` under
   `core/activation_checkpoint/`
-- Tests: `tests/torch/integration/llamafactory/ut/test_activation.py`
+- Tests: `tests/st/integration/llamafactory/ut/test_activation.py`
 
 ## Hard ordering (must)
 

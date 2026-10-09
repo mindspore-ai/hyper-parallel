@@ -104,7 +104,7 @@ UT 包含 CPU 计算与 mock；真实模型、通信和数值效果需执行对�
 | Dense GSPO | `gspo-tp1-full`、`gspo-tp2-consistency-full`、`gspo-checkpoint-resume` | 序列归一化、训推一致性与恢复；真实 NPU 待运行 |
 | 共卡 RM | `reward-model-tp1`、`reward-model-tp2`、`reward-model-resume` | 服务切换、模型打分、发布与恢复；真实 NPU 待运行 |
 
-真实 RL ST 保留在 RL 子项目中，暂不由主项目 `tests/torch/` 门禁收集；需显式执行并准备模型、数据、镜像和设备。
+真实 RL ST 保留在 RL 子项目中，暂不由主项目 `tests/st/` 门禁收集；需显式执行并准备模型、数据、镜像和设备。
 运行条件见 [ST 说明](../hyper_parallel/rl/README.md#系统测试)，PPO 验证边界见
 [PPO 文档](../hyper_parallel/rl/docs/ppo.md)，bit-exact 的条件见
 [训练推理一致性](../hyper_parallel/rl/docs/qwen3_training_inference_consistency.md)。

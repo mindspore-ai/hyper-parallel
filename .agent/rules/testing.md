@@ -29,7 +29,7 @@ paths:
 ## Test Types
 
 - **Unit tests** (`tests/ut/`): Run without distributed setup, no GPU required for logic tests
-- **Torch distributed ST** (`tests/torch/**` launchers): Spawn workers via `torchrun`
+- **Torch distributed ST** (`tests/st/**` launchers): Spawn workers via `torchrun`
 
 ## ST launcher import rule (mandatory)
 
@@ -42,7 +42,7 @@ Workers still import frameworks normally.
 - Spawn from launchers with:
   - `from tests.common.distributed_launcher import torchrun_case`
   - and/or `from tests.common.parallel_case import parallel_run, TorchCase`
-- Keep `tests/torch/__init__.py` limited to package
+- Keep `tests/st/__init__.py` limited to package
   setup — **never** import `hyper_parallel` there.
 - Put worker bodies in `_test_*.py` (or other non-`test_` modules). Launchers only
   pass file + case name into `torchrun_case` / `TorchCase`.
@@ -54,7 +54,7 @@ Workers still import frameworks normally.
 
 ### Do not
 
-- Import `tests.torch.utils` from a launcher —
+- Import `tests.st.utils` from a launcher —
   that module imports `torch` / `torch_npu`. It is **worker-only**.
 - Import `hyper_parallel` or `torch` at module top of a
   `test_*.py` that only orchestrates `parallel_run` / `torchrun_case`.
@@ -62,7 +62,7 @@ Workers still import frameworks normally.
   without splitting (launcher stays light; in-process goes to another module
   or `_…_impl.py`).
 - Import case packages / backends at suite-planning time when AST metadata
-  scan is enough (see `tests/shard_ops/framework` + `load_case_plan_from_package`).
+  scan is enough (see `tests/st/shard/framework` + `load_case_plan_from_package`).
 
 ### Quick check
 

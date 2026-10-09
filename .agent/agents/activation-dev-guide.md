@@ -26,7 +26,7 @@ This feature adds two activation optimization modes to the LlamaFactory integrat
 - `hyper_parallel/core/activation_memory/api.py` — `swap_wrapper`, swap policy plumbing
 
 ### Tests
-- `tests/torch/integration/llamafactory/ut/test_activation.py` — 25 unit tests (no distributed setup)
+- `tests/st/integration/llamafactory/ut/test_activation.py` — 25 unit tests (no distributed setup)
 
 ## Critical Ordering: Detect Early, Wrap Late
 
