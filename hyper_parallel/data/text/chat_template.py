@@ -363,6 +363,7 @@ class TokenizerTemplate(ChatTemplate):
             *,
             tokenize: bool,
             return_dict: bool,
+            add_generation_prompt: bool = False,
             tools: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> Any:
         """Render messages with one consistent set of native-template arguments."""
@@ -372,7 +373,7 @@ class TokenizerTemplate(ChatTemplate):
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=tokenize,
-            add_generation_prompt=False,
+            add_generation_prompt=add_generation_prompt,
             return_dict=return_dict,
             **template_kwargs,
         )
@@ -465,24 +466,62 @@ class TokenizerTemplate(ChatTemplate):
                     "boundaries can be grouped safely."
                 )
 
-            encoded = self._apply_chat_template(
-                messages[:end],
-                tokenize=True,
-                return_dict=True,
-                tools=tools,
-            )
-            current_ids = encoded["input_ids"]
-            current_length = len(current_ids)
+            if message["role"] == "assistant" and loss_mask == 1:
+                completed_conversation_text = self._apply_chat_template(
+                    messages[:end],
+                    tokenize=False,
+                    return_dict=False,
+                    tools=tools,
+                )
+                # The inference prefix is only a loss-mask boundary probe. Tokenize it separately from the
+                # assistant target so BPE cannot merge a prefilled header token with the first generated token.
+                inference_prefix_text = self._apply_chat_template(
+                    messages[:end - 1],
+                    tokenize=False,
+                    return_dict=False,
+                    add_generation_prompt=True,
+                    tools=tools,
+                )
+                if not completed_conversation_text.startswith(inference_prefix_text):
+                    raise ValueError(
+                        "The tokenizer generation prompt is not a text prefix of the completed assistant message; "
+                        "training and inference assistant headers would be inconsistent."
+                    )
+                assistant_target_text = completed_conversation_text[len(inference_prefix_text):]
+                inference_prefix_ids = self.tokenizer.encode(inference_prefix_text, add_special_tokens=False)
+                assistant_target_ids = self.tokenizer.encode(assistant_target_text, add_special_tokens=False)
+                rendered_conversation_ids = inference_prefix_ids + assistant_target_ids
+            else:
+                encoded = self._apply_chat_template(
+                    messages[:end],
+                    tokenize=True,
+                    return_dict=True,
+                    tools=tools,
+                )
+                rendered_conversation_ids = encoded["input_ids"]
+            current_length = len(rendered_conversation_ids)
             if current_length < previous_length:
                 raise ValueError(
                     "The tokenizer chat template shortened the conversation after adding a message; "
                     "assistant-only loss masking requires monotonic message boundaries."
                 )
 
-            self._update_prefix_labels(input_ids, current_ids, labels)
-            new_ids = current_ids[previous_length:]
-            labels.extend(new_ids if loss_mask == 1 else [IGNORE_INDEX] * len(new_ids))
-            input_ids = current_ids
+            self._update_prefix_labels(input_ids, rendered_conversation_ids, labels)
+            if message["role"] == "assistant" and loss_mask == 1:
+                if (
+                        len(inference_prefix_ids) < previous_length
+                        or inference_prefix_ids[:previous_length] != input_ids
+                ):
+                    raise ValueError(
+                        "The tokenizer generation prompt structurally rewrote the conversation prefix; "
+                        "assistant-header loss masking requires the inference prompt to extend the training history."
+                    )
+                labels.extend([IGNORE_INDEX] * (len(inference_prefix_ids) - previous_length))
+                labels.extend(assistant_target_ids)
+            else:
+                new_ids = rendered_conversation_ids[previous_length:]
+                labels.extend(new_ids if loss_mask == 1 else [IGNORE_INDEX] * len(new_ids))
+            input_ids = rendered_conversation_ids
             previous_length = current_length
 
         if has_pending_system_messages and previous_length == 0:

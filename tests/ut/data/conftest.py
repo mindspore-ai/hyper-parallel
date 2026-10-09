@@ -114,7 +114,8 @@ class PrefixRewritingTokenizer(FakeTokenizer):
             if index == 0 and len(messages) > 1:
                 content = content.upper()
             parts.append(f"<{message['role']}>{content}</{message['role']}>")
-        ids = self.encode("".join(parts), add_special_tokens=False)
+        text = "".join(parts)
+        ids = self.encode(text, add_special_tokens=False) if tokenize else text
         return {"input_ids": ids} if return_dict else ids
 
 
@@ -136,7 +137,8 @@ class GptOssTokenizer(FakeTokenizer):
                 parts.append(f"<assistant>{message['content']}{terminal}")
                 continue
             parts.append(f"<{message['role']}>{message['content']}</{message['role']}>")
-        ids = self.encode("".join(parts), add_special_tokens=False)
+        text = "".join(parts)
+        ids = self.encode(text, add_special_tokens=False) if tokenize else text
         return {"input_ids": ids} if return_dict else ids
 
 

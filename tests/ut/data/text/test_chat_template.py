@@ -113,6 +113,7 @@ class TestChatTemplateGoldens(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.template_kwargs = []
+                self.generation_prompts = []
 
             def apply_chat_template(
                     self,
@@ -124,6 +125,7 @@ class TestChatTemplateGoldens(unittest.TestCase):
             ) -> Any:
                 """Record native-template options before delegating to the fake tokenizer."""
                 self.template_kwargs.append(kwargs)
+                self.generation_prompts.append(add_generation_prompt)
                 return super().apply_chat_template(
                     messages,
                     tokenize=tokenize,
@@ -145,7 +147,9 @@ class TestChatTemplateGoldens(unittest.TestCase):
         self.assertEqual(tokenizer.template_kwargs, [
             {"enable_thinking": True, "reasoning_effort": "medium"},
             {"enable_thinking": True, "reasoning_effort": "medium"},
+            {"enable_thinking": True, "reasoning_effort": "medium"},
         ])
+        self.assertEqual(tokenizer.generation_prompts, [False, False, True])
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -157,6 +161,7 @@ class TestChatTemplateGoldens(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.template_kwargs = []
+                self.generation_prompts = []
 
             def apply_chat_template(
                     self,
@@ -168,6 +173,7 @@ class TestChatTemplateGoldens(unittest.TestCase):
             ) -> Any:
                 """Record native-template options before delegating to the fake tokenizer."""
                 self.template_kwargs.append(kwargs)
+                self.generation_prompts.append(add_generation_prompt)
                 return super().apply_chat_template(
                     messages,
                     tokenize=tokenize,
@@ -193,7 +199,79 @@ class TestChatTemplateGoldens(unittest.TestCase):
         self.assertEqual(tokenizer.template_kwargs, [
             {"enable_thinking": True, "tools": tools},
             {"enable_thinking": True, "tools": tools},
+            {"enable_thinking": True, "tools": tools},
         ])
+        self.assertEqual(tokenizer.generation_prompts, [False, False, True])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_tokenizer_template_masks_native_assistant_generation_prefix(self):
+        """tokenizer: mask the same assistant prefix that inference pre-fills."""
+        class ThinkingTokenizer(FakeTokenizer):
+            """Render a Qwen-style assistant generation prefix with an opening think tag."""
+
+            def __init__(self):
+                super().__init__()
+                self.vocab.update({"\n\n": 6, "\n": 7})
+
+            def apply_chat_template(
+                    self,
+                    messages: Any,
+                    tokenize: bool = True,
+                    add_generation_prompt: bool = False,
+                    return_dict: bool = True,
+                    **kwargs: Any,
+            ) -> Any:
+                """Render a prefix-stable Qwen-style conversation."""
+                del kwargs
+                text = "".join(
+                    f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n"
+                    for message in messages
+                )
+                if add_generation_prompt:
+                    text += "<|im_start|>assistant\n<think>\n"
+                ids = self.encode(text, add_special_tokens=False) if tokenize else text
+                return {"input_ids": ids} if return_dict else ids
+
+        tokenizer = ThinkingTokenizer()
+        messages = [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "<think>\n\nReasoning</think>\nAnswer"},
+        ]
+        result = chat_template.build_chat_template("tokenizer", tokenizer).encode_messages(messages)
+        completed_conversation = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            return_dict=False,
+        )
+        generation_prefix_text = tokenizer.apply_chat_template(
+            messages[:-1],
+            tokenize=False,
+            add_generation_prompt=True,
+            return_dict=False,
+        )
+        generation_prefix = tokenizer.apply_chat_template(
+            messages[:-1],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+        )["input_ids"]
+        assistant_target = tokenizer.encode(
+            completed_conversation[len(generation_prefix_text):],
+            add_special_tokens=False,
+        )
+        whole_conversation_encoding = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=True,
+        )["input_ids"]
+
+        self.assertNotEqual(whole_conversation_encoding, generation_prefix + assistant_target)
+        self.assertEqual(result["input_ids"], generation_prefix + assistant_target)
+        self.assertEqual(result["labels"][:len(generation_prefix)], [-100] * len(generation_prefix))
+        self.assertEqual(result["labels"][len(generation_prefix):], assistant_target)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -377,7 +455,7 @@ class TestChatTemplateGoldens(unittest.TestCase):
         tokenizer = UserRequiredTokenizer()
         result = chat_template.build_chat_template("tokenizer", tokenizer).encode_messages(messages)
 
-        self.assertEqual([len(prefix) for prefix in tokenizer.rendered_prefixes], [2, 3])
+        self.assertEqual([len(prefix) for prefix in tokenizer.rendered_prefixes], [2, 3, 2])
         user_prefix = _ids("<system>None</system><user>Question</user>")
         assistant_segment = _ids("<assistant>Answer</assistant>")
         self.assertEqual(result["input_ids"], user_prefix + assistant_segment)
