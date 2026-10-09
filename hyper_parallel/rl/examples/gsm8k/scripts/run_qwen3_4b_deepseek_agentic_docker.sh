@@ -19,7 +19,7 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../../../.." && pwd)
 
-: "${HYPER_DEEPSEEK_IMAGE:=swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.22.1rc1-unified-arm64}"
+: "${HYPER_DEEPSEEK_IMAGE:=hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64}"
 : "${HYPER_DEEPSEEK_MODEL_ROOT:=/home/mwl/ckpt/qwen3-4b}"
 : "${HYPER_DEEPSEEK_DATA_ROOT:=/home/zjy/dataset/gsm8k}"
 : "${HYPER_DEEPSEEK_RESULT_ROOT:=${repo_root}/hyper_parallel/rl/output/qwen3-4b-gsm8k-deepseek}"
@@ -85,6 +85,8 @@ result_root=$(cd -- "${HYPER_DEEPSEEK_RESULT_ROOT}" && pwd)
 
 docker run --rm --privileged --shm-size=64g --network=host \
     -e "ASCEND_RT_VISIBLE_DEVICES=${HYPER_DEEPSEEK_VISIBLE_DEVICES}" \
+    -e "HYPER_RESULT_UID=$(id -u)" \
+    -e "HYPER_RESULT_GID=$(id -g)" \
     -e HYPER_PARALLEL_PLATFORM=torch \
     -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
     -e VLLM_HOST_IP=127.0.0.1 \
@@ -111,6 +113,7 @@ docker run --rm --privileged --shm-size=64g --network=host \
     -w /workspace/hyper-parallel \
     "${HYPER_DEEPSEEK_IMAGE}" /bin/bash -lc '
         set -euo pipefail
+        trap "chown -R ${HYPER_RESULT_UID}:${HYPER_RESULT_GID} /results" EXIT
         python -c \
             "from importlib.metadata import version; import deepseek_harness; \
 assert version(\"deepseek-harness-sdk\") == \"0.1.1rc1\""

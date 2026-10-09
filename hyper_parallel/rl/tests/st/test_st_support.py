@@ -26,7 +26,9 @@ import sys
 import pytest
 
 from . import _launch as launch_module
+from . import test_feature_st
 from . import _worker as worker_module
+from . import st_evidence
 from .st_evidence import metrics, validate_phase, validate_sessions
 from .st_runtime import CASES, DEFAULT_RESULT_ROOT, ROOT, Case, prepare_config, command
 
@@ -68,8 +70,10 @@ def test_recipe_matches_case(case: Case, tmp_path: Path) -> None:
     )
     if case.resume:
         resumed = prepare_config(case, 2, (8100, 8200), devices)
-        assert resumed["train"]["checkpoint"]["load_path"] == "/results/checkpoints/step_1"
-        assert resumed["train"]["max_steps"] == (3 if case.algorithm == "ppo" else 2)
+        checkpoint_step = 2 if case.name == "reward-model-resume" else 1
+        assert resumed["train"]["checkpoint"]["load_path"] == f"/results/checkpoints/step_{checkpoint_step}"
+        expected_steps = 4 if case.name == "reward-model-resume" else 3 if case.algorithm == "ppo" else 2
+        assert resumed["train"]["max_steps"] == expected_steps
 
 
 def test_default_results_use_rl_output() -> None:
@@ -78,7 +82,7 @@ def test_default_results_use_rl_output() -> None:
 
 
 def test_selected_acceptance_matrix() -> None:
-    """Run only the approved six real-NPU acceptance scenarios."""
+    """Keep the dense and GSPO acceptance scenarios explicit."""
     assert tuple(case.name for case in CASES) == (
         "dense-tp2-consistency-full",
         "dense-tp2-direct",
@@ -86,6 +90,12 @@ def test_selected_acceptance_matrix() -> None:
         "codex-agent",
         "deepseek-agent",
         "ppo-tp1-full",
+        "gspo-tp1-full",
+        "gspo-tp2-consistency-full",
+        "gspo-checkpoint-resume",
+        "reward-model-tp1",
+        "reward-model-tp2",
+        "reward-model-resume",
     )
     exact = next(case for case in CASES if case.exact)
     config = prepare_config(exact, 1, (8100, 8200), list(range(exact.cards)))
@@ -118,9 +128,38 @@ def _evidence(output: Path, case: Case | None = None, phase: int = 1) -> Case:
                "weight_sync/streaming_bucket_count": 2, "weight_sync/streaming_acked_buckets": 2,
                "weight_sync/streaming_released_buckets": 2, "weight_sync/streaming_max_inflight_buckets": 1,
                "weight_sync/streaming_max_gathered_bytes": 128, "weight_sync/streaming_max_packed_bytes": 128}
+        if case.algorithm == "gspo":
+            row = {key: value for key, value in row.items() if not key.startswith("critic/")}
+            row.update({"train/valid_sequences": 1, "rollout/sequence_count": 1,
+                        "train/sequence_clip_fraction": 0.5, "train/kl_loss": 0})
+        if case.name.startswith("reward-model-"):
+            row.update({"reward/request_count": 1, "reward/scored_sequences": 1, "reward/retry_count": 0})
+            if step == steps[-1]:
+                row.update({"validation/total": 8, "validation/reward_mean": 0.5})
         lines.append(f"INFO | step={step} | " + ", ".join(f"{key}={value}" for key, value in row.items()))
     (output / f"phase-{phase}.log").write_text("\n".join(lines))
     return case
+
+
+def test_reward_model_evidence_rejects_missing_scores_and_fake_accuracy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only scored, request-backed RM runs may pass the CPU evidence gate."""
+    case = Case("reward-model-synthetic", strategy="direct_reshard", algorithm="gspo")
+    _evidence(tmp_path, case)
+    monkeypatch.setattr(st_evidence, "_validate_reward_service_evidence", lambda *_args: None)
+    monkeypatch.setattr(st_evidence, "_validate_checkpoint", lambda *_args: None)
+    validate_phase(tmp_path, case, 1)
+    log = tmp_path / "phase-1.log"
+    original = log.read_text()
+    for field, value, error in (
+        ("reward/request_count", 0, "requests"),
+        ("reward/scored_sequences", 0, "duplicated"),
+        ("reward/accuracy", 0.5, "mislabeled"),
+    ):
+        log.write_text(original + f"\nINFO | step=1 | {field}={value}")
+        with pytest.raises(AssertionError, match=error):
+            validate_phase(tmp_path, case, 1)
 
 
 @pytest.mark.parametrize("damage", ["none", "stale-version", "zero-gradient", "wrong-strategy"])
@@ -249,6 +288,16 @@ def test_checkpoint_uses_current_hyperparallel_format(tmp_path: Path, damage: st
         (Case("ppo", strategy="direct_reshard", algorithm="ppo"), "critic/gradient_norm", 0, "Critic update"),
         (Case("ppo", strategy="direct_reshard", algorithm="ppo"), "critic/optimizer_steps", 0, "Critic optimization"),
         (Case("ppo", strategy="direct_reshard", algorithm="ppo"), "critic/valid_tokens", 0, "Critic optimization"),
+        (Case("gspo", strategy="direct_reshard", algorithm="gspo"),
+         "train/valid_sequences", 0, "sequence denominator"),
+        (Case("gspo", strategy="direct_reshard", algorithm="gspo"),
+         "train/valid_sequences", 2, "TP duplication"),
+        (Case("gspo", strategy="direct_reshard", algorithm="gspo"),
+         "train/sequence_clip_fraction", 1.1, "sequence clipping"),
+        (Case("gspo", strategy="direct_reshard", algorithm="gspo"),
+         "train/kl_loss", 0.1, "Reference KL"),
+        (Case("gspo", strategy="direct_reshard", algorithm="gspo"),
+         "critic/optimizer_steps", 1, "Critic"),
         (Case("full"), "weight_sync/streaming_acked_buckets", 1, "Unacknowledged"),
         (Case("full"), "weight_sync/streaming_released_buckets", 1, "Unacknowledged"),
         (Case("full"), "weight_sync/streaming_max_inflight_buckets", 2, "Unbounded"),
@@ -317,7 +366,7 @@ def test_evaluation_rejects_partial_or_inconsistent_results(tmp_path: Path, eval
 def test_launcher_is_framework_free() -> None:
     """The pytest launcher must remain importable without training backends."""
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).parent.parent) + os.pathsep + str(ROOT))
-    code = ("import sys; import st.test_rl_st; import st._launch; "
+    code = ("import sys; import st.test_rl_st; import st.test_feature_st; import st._launch; "
             "assert not {'torch','torch_npu','hyper_parallel'} & sys.modules.keys()")
     result = subprocess.run([sys.executable, "-c", code], env=env, cwd=ROOT,
                             capture_output=True, text=True, timeout=30, check=False)
@@ -403,3 +452,20 @@ def test_launcher_removes_temporary_rank_logs(
     )
     assert not config.with_suffix("").exists()
     assert "rank output" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("feature", ["moe", "code", "agent"])
+def test_feature_st_requires_explicit_recipe(feature: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A required feature case must not silently skip when no recipe is configured."""
+    monkeypatch.delenv(f"RL_ST_{feature.upper()}_CONFIG", raising=False)
+    monkeypatch.setenv("RL_ST_REQUIRED", "1")
+    with pytest.raises(pytest.fail.Exception, match="Required system test needs"):
+        test_feature_st.test_feature_training(feature, tmp_path, monkeypatch)
+
+
+def test_feature_st_rejects_stale_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A previous successful completion file cannot satisfy a new system test."""
+    monkeypatch.setenv("RL_ST_RESULT_DIR", str(tmp_path))
+    (tmp_path / "completed.json").write_text('{"status":"passed","steps":2}', encoding="utf-8")
+    with pytest.raises(pytest.fail.Exception, match="stale evidence"):
+        test_feature_st.test_agent_dp_padding(tmp_path, monkeypatch)

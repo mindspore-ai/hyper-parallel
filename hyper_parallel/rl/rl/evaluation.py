@@ -16,6 +16,7 @@
 
 __all__ = ["Evaluator"]
 
+from dataclasses import replace
 import logging
 from typing import Any, Callable, Optional
 
@@ -26,6 +27,7 @@ from rl.dataset.data_source import (
     build_padded_evaluation_batches,
     build_prompt_records,
 )
+from rl.dataset.episodes import episode_rows
 from rl.roles.rollout.worker import RolloutManager
 from rl.utils.monitoring.metrics import select_round_robin_samples
 
@@ -46,6 +48,10 @@ class Evaluator:
         max_samples: Optional[int],
         log_samples: int,
         progress_steps: int,
+        data_parallel_rank: Optional[int] = None,
+        data_parallel_size: Optional[int] = None,
+        is_request_owner: bool = True,
+        score_batch: Optional[Callable[..., Any]] = None,
     ) -> None:
         """Initialize evaluation data, rollout runtime, and progress settings."""
         self.dataset = dataset
@@ -57,6 +63,10 @@ class Evaluator:
         self.log_samples = log_samples
         self.progress_steps = progress_steps
         self.last_step = -1
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_size = data_parallel_size
+        self.is_request_owner = is_request_owner
+        self.score_batch = score_batch
 
     def run(self, step: int) -> tuple[dict[str, float], list[dict[str, Any]]]:
         """Generate the evaluation split and return rank-zero metrics and samples."""
@@ -64,8 +74,8 @@ class Evaluator:
         world_size = dist.get_world_size()
         batches = build_padded_evaluation_batches(
             dataset_size=len(self.dataset),
-            num_replicas=world_size,
-            rank=rank,
+            num_replicas=world_size if self.data_parallel_size is None else self.data_parallel_size,
+            rank=rank if self.data_parallel_rank is None else self.data_parallel_rank,
             batch_size=self.batch_size,
             max_samples=self.max_samples,
         )
@@ -83,7 +93,7 @@ class Evaluator:
             )
         local = self._collect_local(step, rank, batches)
         gathered: list[Optional[dict[str, Any]]] = [None] * world_size
-        dist.all_gather_object(gathered, local)
+        dist.all_gather_object(gathered, local if self.is_request_owner else None)
         self.last_step = step
         if rank != 0:
             return {}, []
@@ -99,6 +109,8 @@ class Evaluator:
         """Collect rank-local evaluation samples and reward moments."""
         record: dict[str, Any] = {
             "correct": 0.0,
+            "correct_count": 0,
+            "reward_sum": 0.0,
             "total": 0,
             "generated_tokens": 0,
             "response_length": 0,
@@ -114,6 +126,8 @@ class Evaluator:
             )
             for key in (
                 "correct",
+                "correct_count",
+                "reward_sum",
                 "total",
                 "generated_tokens",
                 "response_length",
@@ -144,26 +158,45 @@ class Evaluator:
         batch = self.collate_fn([self.dataset[sample_index] for sample_index, _ in entries])
         input_ids = batch["input_ids"].to(self.device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
-        rollout = self.rollout_manager.generate(
-            prompt_records=build_prompt_records(batch, input_ids, attention_mask),
-            policy_version=step,
+        prompts = tuple(
+            replace(prompt, metadata={**prompt.metadata, "phase": "evaluation"})
+            for prompt in build_prompt_records(batch, input_ids, attention_mask)
         )
+        rollout = self.rollout_manager.generate(prompt_records=prompts, policy_version=step)
+        if self.score_batch is not None:
+            rollout = self.score_batch(prompts, rollout)
+            if rollout.metadata.get("reward_status") != "scored":
+                raise ValueError("Evaluation requires completed model rewards")
         record: dict[str, Any] = {
             "correct": 0.0,
+            "correct_count": 0,
+            "reward_sum": 0.0,
             "total": 0,
             "generated_tokens": 0,
             "response_length": 0,
             "generation_seconds": rollout.generation_seconds,
             "samples": [],
         }
-        for local_index, ((_, valid), response) in enumerate(
-            zip(entries, rollout.responses)
-        ):
+        episodes = episode_rows(rollout.trajectories)
+        if len(episodes) != len(entries):
+            raise ValueError("Evaluation requires exactly one complete episode per input prompt")
+        for local_index, ((_, valid), rows) in enumerate(zip(entries, episodes)):
             if not valid:
                 continue
-            reward = float(rollout.rewards[local_index].item())
-            response_length = int(rollout.action_mask[local_index].sum(dim=0).item())
-            record["correct"] += reward
+            first = rows[0]
+            reward = float(rollout.rewards[first].item())
+            record["reward_sum"] += reward
+            response_length = int(rollout.action_mask[rows].sum(dim=-1).sum(dim=0).item())
+            trajectory = rollout.trajectories[first]
+            response = "\n".join(rollout.responses[row] for row in rows)
+            if self.score_batch is None:
+                record["correct"] += float(trajectory.reward_components.get("success", reward))
+                record["correct_count"] += 1
+            elif "correctness" in trajectory.reward_components or "success" in trajectory.reward_components:
+                record["correct"] += float(trajectory.reward_components.get(
+                    "success", trajectory.reward_components.get("correctness"),
+                ))
+                record["correct_count"] += 1
             record["total"] += 1
             record["generated_tokens"] += response_length
             record["response_length"] += response_length
@@ -174,11 +207,13 @@ class Evaluator:
                         "rank": rank,
                         "prompt": batch["prompts"][local_index],
                         "response": response,
-                        "ground_truth": batch["ground_truths"][local_index],
-                        "extracted_answer": rollout.trajectories[
-                            local_index
-                        ].metadata.get("extracted_answer"),
+                        **({"ground_truth": batch["ground_truths"][local_index]}
+                           if isinstance(batch["ground_truths"][local_index], str) else {}),
+                        "extracted_answer": trajectory.metadata.get("extracted_answer"),
                         "reward": reward,
+                        "reward_components": dict(trajectory.reward_components),
+                        "status": trajectory.metadata.get("status"),
+                        "finish_reason": rollout.trajectories[rows[-1]].metadata.get("finish_reason"),
                     }
                 )
         return record
@@ -190,16 +225,15 @@ class Evaluator:
     ) -> tuple[dict[str, float], list[dict[str, Any]]]:
         """Merge distributed evaluation metrics and bounded samples."""
         correct = sum(float(record["correct"]) for record in records)
+        correct_count = sum(int(record.get("correct_count", record["total"])) for record in records)
+        reward_sum = sum(float(record.get("reward_sum", 0.0)) for record in records)
         total = sum(int(record["total"]) for record in records)
         generated_tokens = sum(int(record["generated_tokens"]) for record in records)
         response_length = sum(int(record["response_length"]) for record in records)
         generation_seconds = max(
             float(record["generation_seconds"]) for record in records
         )
-        accuracy = correct / max(total, 1)
         metrics = {
-            "validation/accuracy": accuracy,
-            "validation/correct": correct,
             "validation/total": float(total),
             "validation/response_length_mean": response_length / max(total, 1),
             "validation/generated_tokens": float(generated_tokens),
@@ -208,11 +242,10 @@ class Evaluator:
                 generated_tokens / max(generation_seconds, 1.0e-9)
             ),
         }
-        logger.info(
-            "step=%d validation completed: accuracy=%.6f (%d/%d)",
-            step,
-            accuracy,
-            int(correct),
-            total,
-        )
+        if self.score_batch is not None:
+            metrics["validation/reward_mean"] = reward_sum / max(total, 1)
+        if correct_count == total:
+            metrics["validation/accuracy"] = correct / max(total, 1)
+            metrics["validation/correct"] = correct
+        logger.info("step=%d validation completed: scored=%d accuracy_samples=%d", step, total, correct_count)
         return metrics, select_round_robin_samples(records, self.log_samples)

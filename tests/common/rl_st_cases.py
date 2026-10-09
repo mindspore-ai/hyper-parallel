@@ -56,6 +56,12 @@ CASES = (
     Case("codex-agent", runner="codex"),
     Case("deepseek-agent", runner="deepseek"),
     Case("ppo-tp1-full", algorithm="ppo"),
+    Case("gspo-tp1-full", algorithm="gspo"),
+    Case("gspo-tp2-consistency-full", algorithm="gspo", tp=2, exact=True),
+    Case("gspo-checkpoint-resume", algorithm="gspo", resume=True),
+    Case("reward-model-tp1", algorithm="gspo", exact=True),
+    Case("reward-model-tp2", algorithm="gspo", tp=2),
+    Case("reward-model-resume", algorithm="gspo", resume=True, exact=True),
 )
 
 AGENT_INSTRUCTIONS = {
@@ -85,6 +91,10 @@ def prepare_config(case: Case, phase: int, ports: tuple[int, int], devices: list
         recipe = EXAMPLES / f"gsm8k/configs/{case.runner}_multi_turn.yaml"
     elif case.algorithm == "ppo":
         recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_ppo.yaml"
+    elif case.name.startswith("reward-model-"):
+        recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_model_reward.yaml"
+    elif case.algorithm == "gspo":
+        recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_gspo.yaml"
     else:
         recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_vllm_production.yaml"
     config = yaml.safe_load(recipe.read_text())
@@ -113,6 +123,8 @@ def prepare_config(case: Case, phase: int, ports: tuple[int, int], devices: list
                  response_mini_batch_size=8)
     if case.algorithm == "ppo" and case.resume and phase == 2:
         train["max_steps"] = 3
+    if case.name == "reward-model-resume":
+        train["max_steps"] = 2 if phase == 1 else 4
     train["accelerator"].update(dp_replicate=1, dp_shard=2, tp=case.tp,
                                  ep=1,
                                  cpu_offload=True, activation_checkpoint="full")
@@ -121,12 +133,20 @@ def prepare_config(case: Case, phase: int, ports: tuple[int, int], devices: list
     train["learning_gate"]["enabled"] = False
     # Production evaluation is scheduled at checkpoint boundaries.
     train["checkpoint"].update(output_dir="/results/checkpoints", save_steps=0,
-                                save_final=case.resume or case.name == "dense-tp1-full", verify_reload=False,
-                                load_path="/results/checkpoints/step_1" if phase == 2 else None)
-    config["evaluation"].update(enabled=case.name == "dense-tp1-full",
+                                save_final=case.resume or case.name == "dense-tp1-full"
+                                or case.name.startswith("reward-model-"), verify_reload=False,
+                                load_path=("/results/checkpoints/step_2" if case.name == "reward-model-resume"
+                                           else "/results/checkpoints/step_1") if phase == 2 else None)
+    config["evaluation"].update(enabled=case.name == "dense-tp1-full"
+                                 or case.name.startswith("reward-model-"),
                                  batch_size=1, max_samples=8, max_new_tokens=512)
     config["logging"].update(backends=["console"], log_steps=1)
     config["logging"]["wandb"]["mode"] = "disabled"
+    if case.name.startswith("reward-model-"):
+        config["reward_model"].update(
+            model_path="/model", tensor_parallel_size=case.tp, data_parallel_size=2,
+            port=ports[1], log_path=f"/results/reward-model-phase-{phase}.log",
+        )
     if case.runner != "internal":
         config["agentic"][case.runner].update(
             gateway_port=ports[1], session_root="/results/sessions",

@@ -36,11 +36,13 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 import torch
+import yaml
 
 from rl.agentic.core.types import InteractionMode
 from rl.agentic.envs.environment import ENVIRONMENTS, load_agentic_module
 from rl.algorithm.loss import RLAlgorithm
 from rl.consistency import CONSISTENCY_PROFILE_OFF, consistency_profile, validate_consistency_model_identity
+from rl.dataset.data_source import validate_row_adapter_config
 from rl.roles.model_setup import (
     ModelRegistration,
     model_trust_remote_code,
@@ -50,11 +52,14 @@ from rl.roles.model_setup import (
     trainer_attention_implementation,
 )
 from rl.roles.policy.critic import build_value_model
+from rl.reward_model.scoring import load_reward_function
 from rl.roles.qwen3_builder import build_causal_lm
 from rl.roles.rollout import ROLLOUT_ENGINES
-from rl.roles.weight_sync.config import resolve_weight_sync_config
+from rl.weight_sync.config import resolve_weight_sync_config
+
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.components.optim import AdamW, MultiLRScheduler
+from hyper_parallel.models import HyperAutoModelForCausalLM, qwen3_moe
 from hyper_parallel.models.build_options import (
     FSDP2Config,
     FSDP2MixedPrecisionConfig,
@@ -64,10 +69,12 @@ from hyper_parallel.trainer.config import (
     ActivationCheckpointConfig,
     MixedPrecisionConfig,
     OptimizerConfig,
+    PlanOverride,
     Target,
     TrainerConfig,
     TrainingConfig,
 )
+from hyper_parallel.trainer.config.resolver import resolve_component
 
 _HCCL_MIN_PORT = 1024
 _HCCL_MAX_PORT = 65520
@@ -82,6 +89,7 @@ _EXPECTED_TOP_LEVEL = frozenset(
         "train",
         "logging",
         "consistency",
+        "reward_model",
     )
 )
 
@@ -430,10 +438,51 @@ def _validate_dense_parallelism(
 
 
 def _validate_trainer_ep(accelerator: Mapping[str, Any]) -> None:
-    """Accept only the inactive expert-parallel setting."""
-    ep_size = accelerator.get("ep", 1)
-    if not isinstance(ep_size, int) or isinstance(ep_size, bool) or ep_size != 1:
-        raise ValueError("Qwen3 dense requires train.accelerator.ep=1")
+    """Accept only inactive expert-parallel dimensions for dense Qwen3."""
+    for name in ("ep", "edp_shard"):
+        size = accelerator.get(name, 1)
+        if not isinstance(size, int) or isinstance(size, bool) or size != 1:
+            raise ValueError(f"Qwen3 dense requires train.accelerator.{name}=1")
+
+
+def _validate_model_scope(config: Mapping[str, Any], model: ModelRegistration) -> None:
+    """Keep MoE rollout within the native colocated GRPO contract."""
+    accelerator = required_mapping(required_mapping(config, "train"), "accelerator")
+    if model.family == "qwen3":
+        _validate_trainer_ep(accelerator)
+        return
+    rollout = required_mapping(config, "rollout")
+    vllm = optional_mapping(rollout, "vllm")
+    if (rollout.get("engine") != "vllm" or vllm.get("deployment") != "colocated"
+            or vllm.get("model_implementation", "native") != "native"):
+        raise ValueError("Qwen3-MoE requires colocated native vLLM rollout")
+    if required_mapping(config, "algorithm").get("name") != "grpo":
+        raise ValueError("Qwen3-MoE currently supports GRPO only")
+    if consistency_profile(config) != CONSISTENCY_PROFILE_OFF:
+        raise ValueError("Qwen3-MoE requires consistency off")
+    for name in ("enable_expert_parallel", "enable_eplb"):
+        if not isinstance(vllm.get(name, False), bool):
+            raise ValueError(f"rollout.vllm.{name} must be a boolean")
+    if vllm.get("enable_eplb", False):
+        raise ValueError("Qwen3-MoE does not support enable_eplb")
+    _validate_moe_parallelism(accelerator, model)
+
+
+def _validate_moe_parallelism(accelerator: Mapping[str, Any], model: ModelRegistration) -> None:
+    """Check expert meshes against the training world and checkpoint experts."""
+    sizes = {name: accelerator.get(name, 1) for name in ("ep", "edp_shard")}
+    for name, size in sizes.items():
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise ValueError(f"train.accelerator.{name} must be a positive integer")
+    if sizes["ep"] == 1 and sizes["edp_shard"] != 1:
+        raise ValueError("train.accelerator.edp_shard requires ep>1")
+    world_size = _trainer_world_size(accelerator)
+    if world_size % (sizes["ep"] * sizes["edp_shard"]):
+        raise ValueError("train.accelerator.ep * edp_shard must divide training world_size")
+    with (Path(model.weights_path) / "config.json").open(encoding="utf-8") as config_file:
+        num_experts = _positive_integer(json.load(config_file), "num_experts", "model config")
+    if num_experts % sizes["ep"]:
+        raise ValueError("train.accelerator.ep must divide num_experts")
 
 
 def _validate_vllm(
@@ -456,7 +505,8 @@ def _validate_vllm(
         model_registration,
         vllm.get("model_implementation", "native"),
     )
-    _validate_dense_parallelism(vllm, accelerator)
+    if model_registration.family == "qwen3":
+        _validate_dense_parallelism(vllm, accelerator)
     resolve_weight_sync_config(
         optional_mapping(vllm, "weight_sync"),
         deployment=deployment,
@@ -474,7 +524,7 @@ def _validate_agentic(agentic: Mapping[str, Any]) -> None:
     if module_path is not None:
         load_agentic_module(module_path)
     environment_name = agentic.get("environment")
-    if environment_name not in ENVIRONMENTS.names:
+    if runner == "internal" and environment_name not in ENVIRONMENTS.names:
         raise ValueError(
             f"Unknown agentic.environment '{environment_name}'; "
             f"available={ENVIRONMENTS.names}"
@@ -524,6 +574,8 @@ def _validate_codex_agentic(agentic: Mapping[str, Any]) -> None:
     if codex["version"] != "0.152.1":
         raise ValueError("The Codex runner protocol is validated only for codex-cli 0.152.1")
     _validate_gateway_config(codex, "agentic.codex")
+    _positive_integer({"max_inflight_requests": codex.get("max_inflight_requests", 1)},
+                      "max_inflight_requests", "agentic.codex")
     if codex.get("sandbox", "danger-full-access") not in {"danger-full-access", "workspace-write"}:
         raise ValueError("agentic.codex.sandbox must be danger-full-access or workspace-write")
     _validate_codex_mcp_servers(codex)
@@ -577,6 +629,8 @@ def _validate_external_agentic_rollout(
     parser = vllm.get("tool_call_parser")
     if not isinstance(parser, str) or not parser:
         raise ValueError(f"The {display_name} runner requires rollout.vllm.tool_call_parser")
+    if parser != "hermes":
+        raise ValueError(f"{display_name} tool evidence currently requires rollout.vllm.tool_call_parser=hermes")
     if int(vllm.get("port", 0)) == int(runner_config["gateway_port"]):
         raise ValueError(f"{display_name} gateway_port must differ from rollout.vllm.port")
 
@@ -659,7 +713,9 @@ def _validate_critic(
     _ = optional_mapping(critic, "optimizer")
     if "weights_path" in critic:
         weights_path = _path_value(critic, "weights_path")
-        resolve_model({**model, "weights_path": weights_path})
+        registration = resolve_model({**model, "weights_path": weights_path})
+        if registration.family != "qwen3":
+            raise ValueError("PPO Critic requires a dense Qwen3 checkpoint")
 
 
 def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
@@ -670,14 +726,19 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     consistency_profile(config)
     model = required_mapping(config, "model")
     data = required_mapping(config, "data")
+    validate_row_adapter_config(data)
     rollout = required_mapping(config, "rollout")
     agentic = required_mapping(config, "agentic")
+    if agentic.get("runner") in {"codex", "deepseek"} and algorithm.name != "grpo":
+        name = {"codex": "Codex", "deepseek": "DeepSeek"}[agentic["runner"]]
+        raise ValueError(f"Segmented {name} agent trajectories currently require GRPO")
     evaluation = required_mapping(config, "evaluation")
     train = required_mapping(config, "train")
     accelerator = required_mapping(train, "accelerator")
     if algorithm.requirements.roles.critic:
         _validate_critic(train, rollout, model)
     model_registration = build_model_registration(config)
+    _validate_model_scope(config, model_registration)
     validate_consistency_model_identity(config, model_registration)
     _validate_model_and_data_paths(model, data, evaluation)
     _validate_training_sizes(train, rollout, data, algorithm)
@@ -687,6 +748,94 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
         _ = _trainer_topology(accelerator)
     _validate_checkpoint(required_mapping(train, "checkpoint"))
     _validate_logging(required_mapping(config, "logging"))
+    if "reward_model" in config:
+        _validate_reward_model(config, model_registration)
+
+
+def _validate_reward_model_topology(config: Mapping[str, Any], reward: Mapping[str, Any]) -> None:
+    """Check reward model device coverage and network port separation."""
+    rollout_vllm = required_mapping(required_mapping(config, "rollout"), "vllm")
+    for field in ("tensor_parallel_size", "data_parallel_size", "port", "server_hccl_if_base_port"):
+        value = reward.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"reward_model.{field} must be a positive integer")
+    tp, dp = reward["tensor_parallel_size"], reward["data_parallel_size"]
+    rollout_world = int(rollout_vllm["tensor_parallel_size"]) * int(rollout_vllm["data_parallel_size"])
+    if tp not in (1, 2) or tp * dp != rollout_world:
+        raise ValueError("RM TP1/TP2 x DP must cover the complete rollout device set")
+    if not 1024 <= reward["port"] <= 65535 or reward["port"] == int(rollout_vllm["port"]):
+        raise ValueError("RM port must be valid and distinct from rollout")
+    base_port = reward["server_hccl_if_base_port"]
+    if not 1024 <= base_port <= 65436:
+        raise ValueError("RM HCCL base port must leave room for its range")
+    try:
+        start, end = map(int, str(reward["server_hccl_npu_socket_port_range"]).split("-"))
+    except (KeyError, ValueError) as error:
+        raise ValueError("RM HCCL socket range must use start-end syntax") from error
+    if not 1024 <= start <= base_port <= end <= 65535:
+        raise ValueError("RM HCCL socket range must contain its base port")
+    actor_base = rollout_vllm.get("server_hccl_if_base_port")
+    if actor_base is not None and start <= int(actor_base) <= end:
+        raise ValueError("RM and Actor rollout HCCL ports overlap")
+
+
+def _validate_reward_model_runtime(reward: Mapping[str, Any]) -> None:
+    """Check reward model dtype and finite runtime limits."""
+    if reward.get("dtype", "bfloat16") != "bfloat16":
+        raise ValueError("Colocated RM currently requires bfloat16")
+    for field in ("startup_timeout", "request_timeout", "gpu_memory_utilization"):
+        value = float(reward.get(field, 0.35 if field == "gpu_memory_utilization" else 600))
+        if not math.isfinite(value) or value <= 0 or (field == "gpu_memory_utilization" and value > 1):
+            raise ValueError(f"reward_model.{field} must be finite and positive")
+    for field in ("max_num_seqs", "max_model_len", "kv_cache_memory_bytes", "max_new_tokens", "max_concurrency"):
+        if field in reward and (not isinstance(reward[field], int) or isinstance(reward[field], bool)
+                                or reward[field] <= 0):
+            raise ValueError(f"reward_model.{field} must be positive")
+    if int(reward.get("max_retries", 2)) < 0:
+        raise ValueError("reward_model.max_retries must be non-negative")
+
+
+def _validate_reward_model(config: Mapping[str, Any], model_registration: ModelRegistration) -> None:
+    """Require a complete single-node, colocated RM before any runtime starts."""
+    reward = required_mapping(config, "reward_model")
+    allowed = {
+        "scorer", "model_path", "scoring", "deployment", "tensor_parallel_size", "data_parallel_size",
+        "port", "dtype", "gpu_memory_utilization", "startup_timeout", "request_timeout", "max_num_seqs",
+        "max_model_len", "kv_cache_memory_bytes", "max_new_tokens", "server_hccl_if_base_port",
+        "server_hccl_npu_socket_port_range", "log_path", "max_retries", "served_model_name",
+        "max_concurrency",
+    }
+    if set(reward) - allowed:
+        raise ValueError(f"Unsupported reward_model fields: {sorted(set(reward) - allowed)}")
+    agentic = required_mapping(config, "agentic")
+    if agentic.get("runner", "internal") != "internal" or agentic.get("environment") != "gsm8k_tools":
+        raise ValueError("Colocated reward_model currently requires the internal GSM8K environment")
+    if required_mapping(config, "algorithm").get("name") not in {"grpo", "gspo"}:
+        raise ValueError("Colocated reward_model currently supports GRPO or GSPO")
+    if model_registration.family != "qwen3":
+        raise ValueError("Colocated reward_model currently requires Qwen3 dense")
+    if reward.get("deployment") != "colocated" or not uses_colocated_vllm(config):
+        raise ValueError("reward_model requires colocated vLLM rollout")
+    train = required_mapping(config, "train")
+    if not required_mapping(train, "accelerator").get("cpu_offload", False):
+        raise ValueError("Colocated reward_model requires train.accelerator.cpu_offload=true")
+    scorer = reward.get("scorer")
+    try:
+        load_reward_function(scorer)
+    except (ImportError, AttributeError, TypeError) as error:
+        raise ValueError(f"Invalid reward_model.scorer: {error}") from error
+    if reward.get("scoring") not in {"generative", "discriminative"}:
+        raise ValueError("reward_model.scoring must be generative or discriminative")
+    path = Path(_path_value(reward, "model_path"))
+    identity_path = path / "config.json"
+    if not identity_path.is_file():
+        raise ValueError(f"Reward model configuration not found: {identity_path}")
+    if reward["scoring"] == "discriminative":
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        if not any("SequenceClassification" in name for name in identity.get("architectures", [])):
+            raise ValueError("Discriminative RM requires a trained sequence-classification checkpoint")
+    _validate_reward_model_topology(config, reward)
+    _validate_reward_model_runtime(reward)
 
 
 def _load_automatic_limit_text_config(model: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -701,11 +850,11 @@ def _load_automatic_limit_text_config(model: Mapping[str, Any]) -> Mapping[str, 
         ) from error
     text_config = model_config.get("text_config", model_config)
     layer_types = text_config.get("layer_types") or []
-    if text_config.get("model_type") != "qwen3" or any(
+    if text_config.get("model_type") not in {"qwen3", "qwen3_moe"} or any(
         layer_type != "full_attention" for layer_type in layer_types
     ):
         raise ValueError(
-            "Automatic max_num_seqs currently supports dense Qwen3 "
+            "Automatic max_num_seqs currently supports Qwen3 "
             "full-attention models only"
         )
     return text_config
@@ -971,16 +1120,27 @@ def _build_model_target(
     *,
     use_consistency: bool = False,
     value_model: bool = False,
+    family: str = "qwen3",
 ) -> Target:
     """Build the pretrained causal-language-model target."""
     attention_implementation = trainer_attention_implementation(model_config)
-    # The existing packed consistency recipe owns a separate HF attention
-    # interface and is intentionally outside the fused Qwen3 training path.
+    if family == "qwen3_moe":
+        builder = HyperAutoModelForCausalLM.from_pretrained
+        target_path = "hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained"
+        builder_options = {}
+    elif value_model:
+        builder = build_value_model
+        target_path = "rl.roles.policy.critic.build_value_model"
+        builder_options = {}
+    else:
+        builder = build_causal_lm
+        target_path = "rl.roles.qwen3_builder.build_causal_lm"
+        # The packed consistency recipe owns a separate HF attention interface.
+        builder_options = {"fused": not use_consistency}
     return Target(
-        build_value_model if value_model else build_causal_lm,
-        target_path=("rl.roles.policy.critic.build_value_model" if value_model
-                     else "rl.roles.qwen3_builder.build_causal_lm"),
-        **({} if value_model else {"fused": not use_consistency}),
+        builder,
+        target_path=target_path,
+        **builder_options,
         pretrained_model_name_or_path=str(model_config["weights_path"]),
         torch_dtype=_normalize_dtype_name(param_dtype_name) if mixed_precision_enabled else "float32",
         attn_implementation=attention_implementation,
@@ -1029,11 +1189,10 @@ def _build_accelerator_config(
     accelerator_config: Mapping[str, Any],
 ) -> AcceleratorConfig:
     """Build the supported parallel-dimension configuration."""
-    _validate_trainer_ep(accelerator_config)
     return AcceleratorConfig(
         tp_size=int(accelerator_config.get("tp", 1)),
         cp_size=int(accelerator_config.get("cp", 1)),
-        ep_size=1,
+        ep_size=int(accelerator_config.get("ep", 1)),
         pp_size=int(accelerator_config.get("pp", 1)),
         sequence_parallel=False,
         loss_parallel=False,
@@ -1049,6 +1208,7 @@ def _build_fsdp_config(
     mixed_precision_enabled = bool(mixed_precision_config.get("enabled", True))
     return FSDP2Config(
         dp_shard_size=dp_shard,
+        edp_shard_size=int(accelerator_config.get("edp_shard", 1)),
         mix_precision=FSDP2MixedPrecisionConfig(
             param_dtype=(
                 _normalize_dtype_name(
@@ -1094,6 +1254,16 @@ def _build_checkpoint_config(
     )
 
 
+def _model_plan_overrides(family: str) -> list[PlanOverride]:
+    """Reuse the public MoE replacement and conditional parallel recipes."""
+    if family != "qwen3_moe":
+        return []
+    recipe_path = Path(qwen3_moe.__file__).parent / "recipes" / "train.yaml"
+    with recipe_path.open(encoding="utf-8") as recipe_file:
+        entries = yaml.safe_load(recipe_file)["plan_overrides"]
+    return resolve_component(entries, annotation=list[PlanOverride], path="plan_overrides")
+
+
 def _runtime_backend(train_config: Mapping[str, Any], accelerator_config: Mapping[str, Any]) -> str:
     """Include CPU communication when optimizer state is offloaded."""
     backend = str(train_config.get("comm_backend") or "hccl")
@@ -1105,6 +1275,10 @@ def _runtime_backend(train_config: Mapping[str, Any], accelerator_config: Mappin
 
 def build_runtime_config(config: Mapping[str, Any], *, critic: bool = False) -> TrainerConfig:
     """Translate Hyper-RL YAML into the HyperAutoModel runtime configuration."""
+    registration = build_model_registration(config)
+    _validate_model_scope(config, registration)
+    if critic and registration.family == "qwen3_moe":
+        raise ValueError("Qwen3-MoE does not support a Critic model")
     model_config = required_mapping(config, "model")
     train_config = required_mapping(config, "train")
     accelerator_config = required_mapping(train_config, "accelerator")
@@ -1130,7 +1304,9 @@ def build_runtime_config(config: Mapping[str, Any], *, critic: bool = False) -> 
             model_config, param_dtype_name, mixed_precision_enabled,
             use_consistency=consistency_profile(config) != CONSISTENCY_PROFILE_OFF,
             value_model=critic,
+            family=registration.family,
         ),
+        plan_overrides=_model_plan_overrides(registration.family),
         optimizer=OptimizerConfig(target=_build_optimizer_target(optimizer_config)),
         lr_scheduler=_build_lr_scheduler_target(optimizer_config),
         training=_build_training_config(
@@ -1150,8 +1326,6 @@ def build_runtime_config(config: Mapping[str, Any], *, critic: bool = False) -> 
         ),
         checkpoint=_build_checkpoint_config(checkpoint_config),
     )
-
-
 
 
 def _validate_vllm_hccl_ports(vllm: Mapping[str, Any]) -> None:

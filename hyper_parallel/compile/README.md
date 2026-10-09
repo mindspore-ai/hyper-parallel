@@ -46,9 +46,14 @@ DeadCodeElimination → CanonicalizeGraph → FSDPPass → AutoOverlapPass
 **FSDPPass**:
 
 - Identifies FSDP parameter placeholders via GraphParallelPlan
-- Inserts `all_gather` after each FSDP parameter (Shard → Replicate)
+- Sinks `all_gather` to each parameter's first forward use (Shard → Replicate)
+- Frees the replicated parameter after its last forward read, then re-gathers
+  it for the backward and rematerializes any saved forward view of it
+  (`reshard_after_forward`), so peak memory tracks the forward working set
 - Inserts `reduce_scatter` on gradient outputs (Replicate → Shard)
 - Physically shards live model parameters (dim 0) so optimizer is FSDP-agnostic
+
+Disable reshard with `PassConfig(fsdp_reshard_after_forward=False)`.
 
 **AutoOverlapPass**:
 

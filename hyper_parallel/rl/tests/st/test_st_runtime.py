@@ -15,6 +15,7 @@
 """CPU checks for ST failure reporting, resume phases, and bounded container cleanup."""
 
 import json
+import os
 from pathlib import Path
 import subprocess
 from unittest.mock import MagicMock
@@ -118,14 +119,16 @@ def test_execute_cleans_only_its_owned_container(
     monkeypatch.setattr(runtime.subprocess, "run", run)
     if outcome == "timeout":
         with pytest.raises(subprocess.TimeoutExpired):
-            runtime.execute(["docker", "run"], tmp_path, 1, "rl-st-owned", 1)
+            runtime.execute(["docker", "run"], tmp_path, 1, "rl-st-owned", 1, "test-image")
     elif outcome == "exit-error":
         with pytest.raises(AssertionError, match="Training exited 1"):
-            runtime.execute(["docker", "run"], tmp_path, 1, "rl-st-owned", 1)
+            runtime.execute(["docker", "run"], tmp_path, 1, "rl-st-owned", 1, "test-image")
     else:
-        runtime.execute(["docker", "run"], tmp_path, 1, "rl-st-owned", 1)
+        runtime.execute(["docker", "run"], tmp_path, 1, "rl-st-owned", 1, "test-image")
     expected = [
         ["docker", "rm", "-f", "rl-st-owned"],
         ["docker", "ps", "-aq", "--filter", "name=^rl-st-owned$"],
+        ["docker", "run", "--rm", "--user", "0:0", "-v", f"{tmp_path.resolve()}:/results",
+         "--entrypoint", "chown", "test-image", "-R", f"{os.getuid()}:{os.getgid()}", "/results"],
     ]
     assert commands == expected, f"Expected scoped cleanup={expected}, got={commands}"

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import time
 import uuid
 from pathlib import Path
@@ -31,6 +32,7 @@ from rl.agentic.codex.gateway import CodexGateway
 from rl.agentic.core.program_runner import (
     HarnessProgramFactory,
     HarnessRuntime,
+    build_harness_call_trajectories,
     build_harness_trajectory,
     harness_generation_settings,
     load_reward_callable,
@@ -40,6 +42,8 @@ from rl.agentic.core.types import RewardResult
 from rl.dataset.contracts import PromptRecord, Trajectory
 DEFAULT_CODEX_VERSION = "0.152.1"
 RewardCallable = Callable[[str, PromptRecord], float | RewardResult]
+WorkspaceCallable = Callable[[PromptRecord, Path], None]
+ExecutionCallable = Callable[[list[str], Path, Path, dict[str, str]], tuple[list[str], Path, dict[str, str]]]
 _MODEL_METADATA_FALLBACK = re.compile(
     r"^Model metadata for `[^`]+` not found\. Defaulting to fallback metadata;"
 )
@@ -73,12 +77,50 @@ def build_codex_trajectory(
     )
 
 
+def build_codex_call_trajectories(
+    *,
+    prompt: PromptRecord,
+    policy_version: int,
+    sample_index: int,
+    completion_records: Sequence[Mapping[str, Any]],
+    reward: float,
+    reward_components: Mapping[str, float],
+    max_episode_tokens: int | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> tuple[Trajectory, ...]:
+    """Keep every Codex action trainable under its real rollout prompt."""
+    return build_harness_call_trajectories(
+        label="Codex",
+        runner_name="codex",
+        prompt=prompt,
+        policy_version=policy_version,
+        sample_index=sample_index,
+        completion_records=completion_records,
+        reward=reward,
+        reward_components=reward_components,
+        max_episode_tokens=max_episode_tokens,
+        metadata=metadata,
+    )
+
+
 def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
 def _load_reward_callable(value: Any) -> RewardCallable:
     return load_reward_callable(value, "agentic.codex.reward_callable", "Codex")
+
+
+def _load_workspace_callable(value: Any) -> WorkspaceCallable | None:
+    if value is None:
+        return None
+    return load_reward_callable(value, "agentic.codex.workspace_callable", "Codex workspace")
+
+
+def _load_execution_callable(value: Any) -> ExecutionCallable | None:
+    if value is None:
+        return None
+    return load_reward_callable(value, "agentic.codex.execution_callable", "Codex execution")
 
 
 def _classify_codex_events(
@@ -133,7 +175,10 @@ class CodexRuntime(HarnessRuntime):
 
     def __init__(self, engine: Any, config: Mapping[str, Any]) -> None:
         """Bind the runtime to the existing shared rollout engine."""
-        super().__init__(engine, config, CodexGateway, "Codex", 8200)
+        super().__init__(
+            engine, config, CodexGateway, "Codex", 8200,
+            gateway_options={"max_inflight_requests": int(config.get("max_inflight_requests", 1))},
+        )
 
 
 class CodexAgentProgram:
@@ -156,8 +201,10 @@ class CodexAgentProgram:
         self.config = dict(config)
         self.end_of_turn_token_id = end_of_turn_token_id
         self.reward_callable = _load_reward_callable(self.config.get("reward_callable"))
+        self.workspace_callable = _load_workspace_callable(self.config.get("workspace_callable"))
+        self.execution_callable = _load_execution_callable(self.config.get("execution_callable"))
 
-    async def run(self) -> Trajectory:
+    async def run(self) -> tuple[Trajectory, ...]:
         """Run Codex, fetch the captured network trace, score it, and convert it."""
         session_id = uuid.uuid4().hex
         artifact_dir, workspace_dir, codex_home = self._prepare_directories(session_id)
@@ -172,6 +219,10 @@ class CodexAgentProgram:
                 "artifact_dir": str(artifact_dir),
                 "max_completions": int(self.config["max_turns"]),
                 "generation": self._generation_settings(),
+                "instructions_override": self.config.get("system_instructions"),
+                "enable_thinking": self.config.get("enable_thinking"),
+                "compact_harness_context": self.config.get("compact_harness_context", False),
+                "exec_command_yield_time_ms": self.config.get("exec_command_yield_time_ms"),
             },
             timeout,
         )
@@ -195,16 +246,21 @@ class CodexAgentProgram:
         workspace_dir: Path,
         codex_home: Path,
         timeout: float,
-    ) -> Trajectory:
+    ) -> tuple[Trajectory, ...]:
         """Execute and materialize one already registered Codex session."""
         self._write_codex_config(codex_home, session_id)
         await self._validate_version()
         started = time.perf_counter()
-        final_answer, return_code, diagnostics = await self._run_codex(
-            session_id, artifact_dir, workspace_dir, codex_home
-        )
-        if return_code != 0:
-            raise RuntimeError(f"Codex exited with status {return_code}; see {artifact_dir}")
+        execution_error = None
+        final_answer, diagnostics = "", []
+        try:
+            final_answer, return_code, diagnostics = await self._run_codex(
+                session_id, artifact_dir, workspace_dir, codex_home
+            )
+            if return_code != 0:
+                raise RuntimeError(f"Codex exited with status {return_code}; see {artifact_dir}")
+        except RuntimeError as error:
+            execution_error = error
         captured = await asyncio.to_thread(
             _http_json,
             "GET",
@@ -214,18 +270,26 @@ class CodexAgentProgram:
         )
         if captured.get("policy_version") != self.policy_version:
             raise RuntimeError("Codex gateway returned a different policy version")
-        reward_result = self.reward_callable(final_answer, self.prompt)
-        if not isinstance(reward_result, RewardResult):
-            reward_value = float(reward_result)
-            reward_result = RewardResult(reward_value, {"outcome": reward_value})
-        return build_codex_trajectory(
+        failure = captured.get("failure")
+        if failure is not None:
+            if (not isinstance(failure, Mapping) or failure.get("failure_origin") != "model"
+                    or failure.get("trainable") is not True):
+                raise RuntimeError(f"Codex gateway reported an untrainable failure: {failure}") from execution_error
+            reward_result = RewardResult(0.0, {"outcome": 0.0}, dict(failure))
+        else:
+            if execution_error is not None:
+                raise execution_error
+            reward_result = self.reward_callable(final_answer, self.prompt)
+            if not isinstance(reward_result, RewardResult):
+                reward_value = float(reward_result)
+                reward_result = RewardResult(reward_value, {"outcome": reward_value})
+        return build_codex_call_trajectories(
             prompt=self.prompt,
             policy_version=self.policy_version,
             sample_index=self.sample_index,
             completion_records=captured.get("completions", []),
             reward=reward_result.value,
             reward_components=reward_result.components,
-            end_of_turn_token_id=self.end_of_turn_token_id,
             max_episode_tokens=(
                 None
                 if self.config.get("max_episode_tokens") is None
@@ -254,7 +318,8 @@ class CodexAgentProgram:
         root = Path(
             str(self.config.get("session_root", "/tmp/hyper-rl-codex"))
         ).expanduser().resolve()
-        artifact_dir = root / f"{self.prompt.prompt_id}-{self.sample_index}-{session_id}"
+        # Logical IDs can contain separators; only generated session IDs enter paths.
+        artifact_dir = root / f"{session_id}-{self.sample_index}"
         workspace_dir = artifact_dir / "workspace"
         codex_home = artifact_dir / ".codex"
         artifact_dir.mkdir(parents=True, exist_ok=False)
@@ -266,6 +331,8 @@ class CodexAgentProgram:
             shutil.copytree(template, workspace_dir)
         else:
             workspace_dir.mkdir()
+        if self.workspace_callable is not None:
+            self.workspace_callable(self.prompt, workspace_dir)
         codex_home.mkdir()
         return artifact_dir, workspace_dir, codex_home
 
@@ -352,8 +419,12 @@ class CodexAgentProgram:
             "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 30.0)
+        finally:
+            await _stop_process_group(process)
         installed = (stdout or stderr).decode("utf-8", errors="replace")
         expected = str(self.config.get("version", DEFAULT_CODEX_VERSION))
         matches = re.search(rf"(?<!\d){re.escape(expected)}(?!\d)", installed)
@@ -376,7 +447,7 @@ class CodexAgentProgram:
         if sandbox == "danger-full-access":
             command.append("--dangerously-bypass-approvals-and-sandbox")
         elif sandbox == "workspace-write":
-            command.extend(("--sandbox", sandbox, "--approve-for-me"))
+            command.extend(("--sandbox", sandbox))
         else:
             raise ValueError(f"Unsupported automated Codex sandbox: {sandbox}")
         command.extend(
@@ -405,13 +476,21 @@ class CodexAgentProgram:
         """Run the configured program with isolated state and bounded execution time."""
         command = self._codex_command()
         environment = _codex_environment(self.gateway_url, codex_home, session_id)
+        environment["HYPER_CODEX_GATEWAY_URL"] = self.gateway_url
+        environment["HYPER_CODEX_MAX_CALLS"] = str(self.config.get("max_turns", 1))
+        cwd = workspace_dir
+        if self.execution_callable is not None:
+            command, cwd, environment = self.execution_callable(
+                command, workspace_dir, codex_home, environment
+            )
         process = await asyncio.create_subprocess_exec(
             *command,
-            cwd=workspace_dir,
+            cwd=cwd,
             env=environment,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         timeout = float(self.config.get("timeout_seconds", 1800.0))
         stdout_lines, stderr_lines = await _collect_codex_output(process, artifact_dir, timeout)
@@ -420,6 +499,30 @@ class CodexAgentProgram:
             stdout_lines, stderr_lines, return_code, artifact_dir,
         )
         return final_answer, return_code, diagnostic_events
+
+
+async def _wait_for_process_exit(process: asyncio.subprocess.Process) -> None:
+    """Observe the harness exit even when a tool descendant still owns its output pipes."""
+    while process.returncode is None:
+        await asyncio.sleep(0.05)
+
+
+async def _stop_process_group(process: asyncio.subprocess.Process) -> None:
+    """Reap the harness and its tool descendants on success, failure or cancellation."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(process.wait(), 5.0)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
 
 
 async def _drain_codex_stream(
@@ -455,19 +558,16 @@ async def _collect_codex_output(
                             normalize_newlines=False)
     )
     try:
-        await asyncio.wait_for(process.wait(), timeout)
+        await asyncio.wait_for(_wait_for_process_exit(process), timeout)
     except asyncio.TimeoutError as error:
-        process.kill()
-        await process.wait()
-        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         raise RuntimeError(f"Codex episode timed out after {timeout} seconds") from error
-    except asyncio.CancelledError:
-        if process.returncode is None:
-            process.kill()
-            await process.wait()
-        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-        raise
-    await asyncio.gather(stdout_task, stderr_task)
+    finally:
+        # Descendants may keep stdout open after the harness exits.
+        await _stop_process_group(process)
+        drain_results = await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+    for result in drain_results:
+        if isinstance(result, BaseException):
+            raise RuntimeError("Codex output capture failed") from result
     return stdout_lines, stderr_lines
 
 
@@ -507,6 +607,16 @@ class CodexProgramFactory(HarnessProgramFactory):
 
     program_type = CodexAgentProgram
     label = "Codex"
+
+    def __init__(
+        self, runtime: CodexRuntime, end_of_turn_token_id: int | None, generation_config: Mapping[str, Any]
+    ) -> None:
+        super().__init__(runtime, end_of_turn_token_id, generation_config)
+        program = self.config.get("program_callable")
+        if program is not None:
+            self.program_type = load_reward_callable(
+                program, "agentic.codex.program_callable", "Codex program"
+            )
 
 
 def _mcp_environment(server):

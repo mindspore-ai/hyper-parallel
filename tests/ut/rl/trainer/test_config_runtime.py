@@ -96,9 +96,38 @@ def test_all_st_recipes_pass_production_validation(
         for phase in range(1, 3 if case.resume else 2):
             config = runtime.prepare_config(case, phase, (8100, 8200), devices)
             config["model"].update(validated_recipe["model"])
+            if "reward_model" in config:
+                config["reward_model"]["model_path"] = validated_recipe["model"]["weights_path"]
             for field in ("train_path", "test_path"):
                 config["data"][field] = validated_recipe["data"][field]
             validate_config(resolve_vllm_automatic_limits(config), build_algorithm(config["algorithm"]))
+
+
+def test_colocated_reward_model_config_rejects_conflicts(
+    validated_recipe: dict, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check RM ownership, scoring callback and service ports before startup."""
+    runtime = importlib.import_module("tests.common.rl_st_cases")
+    case = next(case for case in runtime.CASES if case.name == "reward-model-tp1")
+    devices = list(range(case.cards))
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", ",".join(map(str, devices)))
+    config = runtime.prepare_config(case, 1, (8100, 8200), devices)
+    config["model"].update(validated_recipe["model"])
+    config["reward_model"]["model_path"] = validated_recipe["model"]["weights_path"]
+    for field in ("train_path", "test_path"):
+        config["data"][field] = validated_recipe["data"][field]
+    config = resolve_vllm_automatic_limits(config)
+    validate_config(config, build_algorithm(config["algorithm"]))
+    for field, value, error in (
+        ("port", 8100, "distinct"),
+        ("scorer", "examples.gsm8k.agent:compute_gsm8k_reward", "async"),
+        ("tensor_parallel_size", 3, "TP1/TP2"),
+    ):
+        old = config["reward_model"][field]
+        config["reward_model"][field] = value
+        with pytest.raises(ValueError, match=error):
+            validate_config(config, build_algorithm(config["algorithm"]))
+        config["reward_model"][field] = old
 
 
 def _complete_config(tmp_path: Path) -> dict:
@@ -236,7 +265,7 @@ def test_complete_config_resolves_validates_and_builds_runtime(
 
 @pytest.mark.parametrize(
     ("model_type", "architecture"),
-    [("qwen3_moe", "Qwen3MoeForCausalLM"), ("deepseek_v3", "DeepseekV3ForCausalLM")],
+    [("deepseek_v3", "DeepseekV3ForCausalLM")],
 )
 def test_removed_model_families_fail_before_runtime_construction(
     tmp_path: Path, model_type: str, architecture: str,

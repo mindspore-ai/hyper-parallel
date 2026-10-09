@@ -1,0 +1,398 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Whole-parameter and direct-fragment buckets for weight publication."""
+
+__all__ = [
+    "PackedWeight",
+    "PackedWeightAck",
+    "PackedWeightBucket",
+    "build_packed_weight_buckets",
+    "materialize_packed_weight_bucket",
+    "unpack_packed_weights",
+    "build_direct_reshard_buckets",
+    "pack_direct_bucket",
+]
+
+
+from dataclasses import dataclass, replace
+from itertools import product
+from math import prod
+from typing import Any, Iterable, Mapping, Optional
+
+import torch
+import torch.distributed as dist
+
+from rl.weight_sync.layout import TensorRegion, TransferBucket, TransferEntry, local_tensor
+
+
+@dataclass(frozen=True)
+class PackedWeight:
+    """Describe one complete HF parameter inside a packed byte buffer."""
+
+    name: str
+    dtype_name: str
+    shape: tuple[int, ...]
+    element_size: int
+    buffer_offset: int = 0
+
+    @property
+    def num_bytes(self) -> int:
+        """Return the serialized size of the complete parameter."""
+        return prod(self.shape) * self.element_size
+
+    def at_offset(self, offset: int) -> "PackedWeight":
+        """Return this parameter assigned to one packed-buffer offset."""
+        return replace(self, buffer_offset=int(offset))
+
+    def worker_metadata(self) -> dict[str, Any]:
+        """Serialize the contract needed to reconstruct the parameter view."""
+        return {
+            "name": self.name,
+            "dtype_name": self.dtype_name,
+            "shape": list(self.shape),
+            "buffer_offset": self.buffer_offset,
+            "num_bytes": self.num_bytes,
+        }
+
+
+@dataclass(frozen=True)
+class PackedWeightBucket:
+    """A batch of complete parameters bounded when each parameter fits."""
+
+    entries: tuple[PackedWeight, ...]
+    total_bytes: int
+
+    def worker_metadata(self) -> list[dict[str, Any]]:
+        """Return ordered metadata for vLLM worker reconstruction."""
+        return [entry.worker_metadata() for entry in self.entries]
+
+
+@dataclass(frozen=True)
+class PackedWeightAck:
+    """Confirm that every intended worker loaded one packed bucket."""
+
+    bucket_index: int
+    total_bytes: int
+    worker_count: int
+
+
+def _aligned_offset(offset: int, alignment: int) -> int:
+    return ((offset + alignment - 1) // alignment) * alignment
+
+
+def build_packed_weight_buckets(
+    state_dict: Mapping[str, Any],
+    bucket_size_bytes: int,
+    *,
+    skip_names: frozenset[str] = frozenset(),
+) -> tuple[PackedWeightBucket, ...]:
+    """Group complete parameters without splitting a vLLM load unit."""
+    if bucket_size_bytes <= 0:
+        raise ValueError("Packed weight bucket_size_bytes must be positive")
+    entries = []
+    for name, value in sorted(state_dict.items()):
+        if name in skip_names:
+            continue
+        local_value = local_tensor(value)
+        is_floating_point = getattr(local_value, "is_floating_point", None)
+        if callable(is_floating_point) and not is_floating_point():
+            continue
+        shape = tuple(int(size) for size in value.shape)
+        if not shape or any(size <= 0 for size in shape):
+            raise ValueError(f"Packed weight {name!r} has invalid shape {shape}")
+        entries.append(
+            PackedWeight(
+                name=name,
+                dtype_name=str(value.dtype).rsplit(".", maxsplit=1)[-1],
+                shape=shape,
+                element_size=int(local_value.element_size()),
+            )
+        )
+    if not entries:
+        raise ValueError("Packed weight publication found no parameters")
+
+    buckets = []
+    current = []
+    current_bytes = 0
+    for entry in entries:
+        offset = _aligned_offset(current_bytes, entry.element_size)
+        if current and offset + entry.num_bytes > bucket_size_bytes:
+            buckets.append(PackedWeightBucket(tuple(current), current_bytes))
+            current = []
+            current_bytes = 0
+            offset = 0
+        current.append(entry.at_offset(offset))
+        current_bytes = offset + entry.num_bytes
+        if entry.num_bytes >= bucket_size_bytes:
+            buckets.append(PackedWeightBucket(tuple(current), current_bytes))
+            current = []
+            current_bytes = 0
+    if current:
+        buckets.append(PackedWeightBucket(tuple(current), current_bytes))
+    return tuple(buckets)
+
+
+def materialize_packed_weight_bucket(
+    state_dict: Mapping[str, Any],
+    bucket: PackedWeightBucket,
+    *,
+    producer_rank: int = 0,
+) -> Optional[Any]:
+    """Gather every complete parameter; only producer_rank packs it."""
+
+    rank = dist.get_rank()
+    tensors = []
+    for entry in bucket.entries:
+        value = state_dict.get(entry.name)
+        if value is None:
+            raise ValueError(f"Packed weight source {entry.name!r} is missing")
+        full_tensor = getattr(value, "full_tensor", None)
+        tensor = full_tensor() if callable(full_tensor) else value
+        tensor = tensor.detach()
+        if (
+            tuple(int(size) for size in tensor.shape) != entry.shape
+            or str(tensor.dtype).rsplit(".", maxsplit=1)[-1] != entry.dtype_name
+            or int(tensor.element_size()) != entry.element_size
+        ):
+            raise ValueError(
+                f"Packed weight {entry.name!r} differs from its bucket contract"
+            )
+        if rank == producer_rank:
+            tensors.append(tensor.contiguous())
+        else:
+            del tensor
+    if rank != producer_rank:
+        return None
+    packed = torch.empty(
+        bucket.total_bytes,
+        dtype=torch.uint8,
+        device=tensors[0].device,
+    )
+    for entry, tensor in zip(bucket.entries, tensors):
+        raw = tensor.view(torch.uint8).view(-1)
+        if int(raw.numel()) != entry.num_bytes:
+            raise ValueError(
+                f"Packed weight {entry.name!r} has {raw.numel()} bytes, "
+                f"expected {entry.num_bytes}"
+            )
+        packed.narrow(0, entry.buffer_offset, entry.num_bytes).copy_(raw)
+    return packed
+
+
+def unpack_packed_weights(
+    packed: Any,
+    metadata: list[Mapping[str, Any]],
+) -> list[tuple[str, Any]]:
+    """Reconstruct complete parameter views for model.load_weights()."""
+
+    weights = []
+    for entry in metadata:
+        dtype = getattr(torch, str(entry["dtype_name"]))
+        shape = tuple(int(size) for size in entry["shape"])
+        num_bytes = int(entry["num_bytes"])
+        offset = int(entry["buffer_offset"])
+        if num_bytes != prod(shape) * dtype.itemsize:
+            raise ValueError(f"Packed weight metadata is invalid for {entry['name']!r}")
+        if offset < 0 or offset + num_bytes > int(packed.numel()):
+            raise ValueError(f"Packed weight {entry['name']!r} exceeds its buffer")
+        tensor = packed.narrow(0, offset, num_bytes).view(dtype).view(shape)
+        rows = entry.get("canonical_rows")
+        experts = entry.get("canonical_experts")
+        if experts is not None:
+            weights.extend(_unpack_canonical_experts(tensor, experts))
+        elif rows is None:
+            weights.append((str(entry["name"]), tensor))
+        else:
+            weights.extend(_unpack_canonical_rows(tensor, rows))
+    return weights
+
+
+def _validate_expert_slice(tensor, starts, lengths, name):
+    """Reject malformed or out-of-bounds singleton expert slices."""
+    if len(starts) != 3 or len(lengths) != 3 or lengths[0] != 1:
+        raise ValueError("Canonical expert conversion requires singleton-expert rank-three slices")
+    if any(start < 0 or size <= 0 or start + size > limit
+           for start, size, limit in zip(starts, lengths, tensor.shape)):
+        raise ValueError(f"Canonical expert slice exceeds storage for {name!r}")
+
+
+def _unpack_canonical_experts(tensor: Any, experts: list[Mapping[str, Any]]) -> list[tuple[str, Any]]:
+    """Validate complete, disjoint expert slices and restore HF projection axes."""
+    if tensor.ndim != 3 or not experts:
+        raise ValueError("Canonical expert conversion requires rank-three storage and non-empty slices")
+    weights = []
+    names = set()
+    ends = [0] * tensor.shape[0]
+    for expert in sorted(experts, key=lambda item: tuple(item["starts"])):
+        starts, lengths = expert["starts"], expert["shape"]
+        name = str(expert["name"])
+        _validate_expert_slice(tensor, starts, lengths, name)
+        if (name in names or starts[1] != 0 or lengths[1] != tensor.shape[1]
+                or starts[2] != ends[starts[0]]):
+            raise ValueError("Canonical expert slices must cover storage exactly once with unique names")
+        names.add(name)
+        ends[starts[0]] += lengths[2]
+        region = tensor[tuple(slice(start, start + size) for start, size in zip(starts, lengths))]
+        weights.append((name, region.squeeze(0).transpose(0, 1)))
+    if any(end != tensor.shape[2] for end in ends):
+        raise ValueError("Canonical expert slices do not cover storage")
+    return weights
+
+
+def _unpack_canonical_rows(tensor: Any, rows: list[Mapping[str, Any]]) -> list[tuple[str, Any]]:
+    """Restore canonical matrices from explicit disjoint physical row ranges."""
+    if tensor.ndim != 2 or not rows:
+        raise ValueError("Canonical row conversion requires a matrix and non-empty ranges")
+    grouped = {}
+    source_end = 0
+    for row in sorted(rows, key=lambda item: int(item["source_start"])):
+        start, length = int(row["source_start"]), int(row["length"])
+        if start != source_end or length <= 0 or start + length > tensor.shape[0]:
+            raise ValueError("Canonical row ranges must cover the fused weight exactly once")
+        grouped.setdefault(str(row["name"]), []).append(row)
+        source_end += length
+    if source_end != tensor.shape[0]:
+        raise ValueError("Canonical row ranges do not cover the fused weight")
+    weights = []
+    for name, parts in grouped.items():
+        tensors = []
+        target_end = 0
+        target_rows = int(parts[0]["target_rows"])
+        for part in sorted(parts, key=lambda item: int(item["target_start"])):
+            if int(part["target_start"]) != target_end or int(part["target_rows"]) != target_rows:
+                raise ValueError(f"Canonical row ranges for {name!r} overlap or have gaps")
+            length = int(part["length"])
+            tensors.append(tensor.narrow(0, int(part["source_start"]), length))
+            target_end += length
+        if target_end != target_rows:
+            raise ValueError(f"Canonical row ranges for {name!r} are incomplete")
+        weights.append((name, torch.cat(tensors, dim=0)))
+    return weights
+
+
+
+def _tile_region(
+    region: TensorRegion,
+    *,
+    element_size: int,
+    bucket_size_bytes: int,
+) -> tuple[TensorRegion, ...]:
+    """Tile a rectangle in canonical order, independently of gather/direct routing."""
+    max_numel = bucket_size_bytes // element_size
+    if max_numel <= 0:
+        raise ValueError("Weight-sync bucket is smaller than one tensor element")
+    if region.numel <= max_numel:
+        return (region,)
+    chunks = [1] * len(region.lengths)
+    remaining = max_numel
+    for dim in reversed(range(len(chunks))):
+        chunks[dim] = min(region.lengths[dim], max(1, remaining))
+        remaining = max(1, remaining // chunks[dim])
+    ranges = [range(0, length, chunk) for length, chunk in zip(region.lengths, chunks)]
+    return tuple(
+        TensorRegion(
+            tuple(start + offset for start, offset in zip(region.starts, offsets)),
+            tuple(min(chunk, length - offset) for offset, chunk, length in zip(offsets, chunks, region.lengths)),
+        )
+        for offsets in product(*ranges)
+    )
+
+
+def _bucketize(
+    entries: Iterable[TransferEntry],
+    bucket_size_bytes: int,
+) -> tuple[TransferBucket, ...]:
+    """Assign aligned offsets and group bounded direct entries."""
+    buckets, current = [], []
+    size = 0
+    for entry in entries:
+        if entry.num_bytes > bucket_size_bytes:
+            raise ValueError(f"Weight-sync fragment {entry.name!r} exceeds its bucket")
+        offset = _aligned_offset(size, entry.element_size)
+        if current and offset + entry.num_bytes > bucket_size_bytes:
+            buckets.append(TransferBucket(tuple(current), size))
+            current, offset = [], 0
+        current.append(entry.with_buffer_offset(offset))
+        size = offset + entry.num_bytes
+    if current:
+        buckets.append(TransferBucket(tuple(current), size))
+    return tuple(buckets)
+
+
+def _split_entry(entry: TransferEntry, bucket_size_bytes: int) -> tuple[TransferEntry, ...]:
+    """Apply shared canonical tiles to the source and permuted destination."""
+    region = TensorRegion((0,) * len(entry.lengths), entry.lengths)
+    tiles = _tile_region(
+        region,
+        element_size=entry.element_size,
+        bucket_size_bytes=bucket_size_bytes,
+    )
+    if tiles == (region,):
+        return (entry,)
+    return tuple(
+        replace(
+            entry,
+            source_starts=tuple(start + offset for start, offset in zip(entry.source_starts, tile.starts)),
+            destination_starts=tuple(
+                start + tile.starts[axis] for start, axis in zip(entry.destination_starts, entry.physical_permutation)
+            ),
+            lengths=tile.lengths,
+            buffer_offset=0,
+        )
+        for tile in tiles
+    )
+
+
+def build_direct_reshard_buckets(
+    entries: Iterable[TransferEntry], bucket_size_bytes: int,
+) -> tuple[TransferBucket, ...]:
+    """Split and group ordered direct fragments within the strict byte limit."""
+    return _bucketize(
+        (fragment for entry in entries for fragment in _split_entry(entry, bucket_size_bytes)),
+        bucket_size_bytes,
+    )
+
+
+def pack_direct_bucket(
+    state_dict: Mapping[str, Any],
+    bucket: TransferBucket,
+    device: Any,
+) -> Any:
+    """Pack one direct route into a bounded byte tensor on ``device``."""
+    packed = torch.empty(bucket.total_bytes, dtype=torch.uint8, device=device)
+    for entry in bucket.entries:
+        value = state_dict.get(entry.source_key)
+        if value is None:
+            raise ValueError(
+                f"Direct reshard source parameter {entry.source_key!r} is missing"
+            )
+        source_slice = tuple(
+            slice(start, start + length)
+            for start, length in zip(entry.source_starts, entry.lengths)
+        )
+        fragment = local_tensor(value)[source_slice].detach()
+        if entry.physical_permutation != tuple(range(len(entry.lengths))):
+            fragment = fragment.permute(entry.physical_permutation)
+        fragment = fragment.contiguous()
+        if str(fragment.device) != str(device):
+            fragment = fragment.to(device)
+        raw = fragment.view(torch.uint8).view(-1)
+        if int(raw.numel()) != entry.num_bytes:
+            raise ValueError(
+                f"Direct reshard source fragment {entry.source_key!r} has "
+                f"{raw.numel()} bytes, expected {entry.num_bytes}"
+            )
+        packed.narrow(0, entry.buffer_offset, entry.num_bytes).copy_(raw)
+    return packed

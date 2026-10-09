@@ -42,7 +42,7 @@ prepare_config = rl_st_cases.prepare_config
 
 ROOT = Path(__file__).resolve().parents[4]
 HERE = Path(__file__).resolve().parent
-BASE_IMAGE = "swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.22.1rc1-unified-arm64"
+BASE_IMAGE = "hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64"
 DEFAULT_RESULT_ROOT = ROOT / "hyper_parallel/rl/output"
 
 
@@ -60,6 +60,8 @@ def command(case: Case, model: Path, data: Path, output: Path, image: str,
         "ASCEND_RT_VISIBLE_DEVICES": ",".join(map(str, devices[:case.world])),
         "HYPER_PARALLEL_PLATFORM": "torch",
         "PYTHONDONTWRITEBYTECODE": "1",
+        "HYPER_RESULT_UID": str(os.getuid()),
+        "HYPER_RESULT_GID": str(os.getgid()),
         "PYTEST_ADDOPTS": "-o log_cli=true -o log_cli_level=INFO -p no:cacheprovider",
         "PYTHONPATH": "/repo/hyper_parallel/rl:/repo",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
@@ -92,7 +94,8 @@ def command(case: Case, model: Path, data: Path, output: Path, image: str,
     launch = ["python", "/repo/hyper_parallel/rl/tests/st/_launch.py",
               f"/results/phase-{phase}.yaml", str(case.world)]
     return args + ["-w", "/repo", image, "/bin/bash", "-lc",
-                   "set -e; unset VLLM_PLUGINS; "
+                   "set -e; "
+                   "unset VLLM_PLUGINS; "
                    "bash /repo/hyper_parallel/rl/docker/install_runtime.sh; "
                    "exec " + shlex.join(launch)]
 
@@ -134,7 +137,18 @@ def resources(case: Case) -> tuple[Path, Path, str, list[int]]:
     return model, data, image, devices[:case.cards]
 
 
-def execute(args: list[str], output: Path, phase: int, name: str, timeout: int) -> None:
+def _restore_output_owner(output: Path, image: str) -> None:
+    """Restore host ownership even when the training container was force-killed."""
+    ownership_command = [
+        "docker", "run", "--rm", "--user", "0:0", "-v", f"{output.resolve()}:/results",
+        "--entrypoint", "chown", image, "-R", f"{os.getuid()}:{os.getgid()}", "/results",
+    ]
+    result = subprocess.run(ownership_command, capture_output=True, timeout=120, check=False)
+    if result.returncode:
+        raise RuntimeError(f"Could not restore ownership of {output}: {result.stderr.decode(errors='replace')}")
+
+
+def execute(args: list[str], output: Path, phase: int, name: str, timeout: int, image: str) -> None:
     """Bound a child process and clean up only its uniquely named ST container."""
     with (output / f"phase-{phase}.log").open("w") as log, subprocess.Popen(
         args, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, cwd=ROOT
@@ -157,6 +171,7 @@ def execute(args: list[str], output: Path, phase: int, name: str, timeout: int) 
                                        capture_output=True, timeout=20, check=True)
             if remaining.stdout.strip():
                 raise AssertionError(f"ST container cleanup incomplete: {name}")
+            _restore_output_owner(output, image)
 
 
 def run_case(case: Case) -> Path:
@@ -185,7 +200,7 @@ def run_case(case: Case) -> Path:
             args = command(case, model, data, output, image, devices, phase, name, master_port=ports[2])
             report["phases"].append({"command": args, "ports": ports})
             (output / "result.json").write_text(json.dumps(report, indent=2))
-            execute(args, output, phase, name, timeout)
+            execute(args, output, phase, name, timeout, image)
             validate_phase(output, case, phase)
             for port in ports:
                 with socket.socket() as listener:

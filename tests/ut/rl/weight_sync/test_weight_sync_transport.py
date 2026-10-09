@@ -25,13 +25,13 @@ from typing import Any, Mapping
 import pytest
 import torch
 
-import rl.roles.weight_sync.hccl as hccl_module
-import rl.roles.weight_sync.ipc as ipc_module
-import rl.roles.weight_sync.sync as sync_module
-import rl.roles.weight_sync.vllm_client as client_module
-from rl.roles.weight_sync.hccl import HCCLWeightTransport
-from rl.roles.weight_sync.ipc import PhysicalRolloutWorker
-from rl.roles.weight_sync.layout import DirectReshardPlan, TransferBucket, TransferEntry
+import rl.weight_sync.hccl as hccl_module
+import rl.weight_sync.ipc as ipc_module
+import rl.weight_sync.sync as sync_module
+import rl.weight_sync.vllm_client as client_module
+from rl.weight_sync.hccl import HCCLWeightTransport
+from rl.weight_sync.ipc import PhysicalRolloutWorker
+from rl.weight_sync.layout import DirectReshardPlan, TransferBucket, TransferEntry
 
 
 class _Collectives:

@@ -144,6 +144,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         end: int,
         *,
         global_tokens: int,
+        global_sequences: Optional[int] = None,
     ) -> ActorMicroBatchMetrics:
         """Compute and backpropagate one policy-loss micro-batch."""
         self._require_trainable()
@@ -155,6 +156,11 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             )
         if global_tokens <= 0:
             raise ValueError(f"global_tokens must be positive, got {global_tokens}")
+        normalizer = global_tokens
+        if self.algorithm.requirements.loss_aggregation == "seq-mean-token-mean":
+            if global_sequences is None or global_sequences <= 0 or global_sequences > global_tokens:
+                raise ValueError("Sequence loss requires 0 < global_sequences <= global_tokens")
+            normalizer = global_sequences
         current_log_probs = self.sequence_log_probs(
             experience.sequences[start:end],
             experience.attention_mask[start:end],
@@ -171,33 +177,45 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             advantages=experience.advantages[start:end],
             action_mask=action_mask,
         )
-        scaled_loss = output.total_loss_sum / global_tokens * self._dp_size
-        if not bool(scaled_loss.isfinite().item()):
+        scaled_loss = output.total_loss_sum / normalizer * self._dp_size
+        if self.algorithm.name == "gspo":
+            finite = scaled_loss.detach().isfinite() & current_log_probs.detach().masked_fill(
+                ~action_mask.bool(), 0.0,
+            ).isfinite().all()
+            finite = finite.to(dtype=torch.int32)
+            if self._dp_size > 1:
+                dist.all_reduce(finite, op=dist.ReduceOp.MIN, group=self._dp_group_info.group)
+            is_finite = bool(finite.item())
+        else:
+            is_finite = bool(scaled_loss.isfinite().item())
+        if not is_finite:
             raise RuntimeError(
                 f"Non-finite {self.algorithm.name} loss detected on response slice "
                 f"[{start}:{end}]"
             )
         scaled_loss.backward()
-        numeric_mask = action_mask.to(dtype=current_log_probs.dtype)
         return ActorMicroBatchMetrics(
             total_loss_sum=output.total_loss_sum.detach(),
             policy_loss_sum=output.policy_loss_sum.detach(),
             kl_loss_sum=output.regularization_loss_sum.detach(),
             old_policy_kl_sum=output.old_policy_kl_sum.detach(),
             log_ratio_abs_sum=(
-                (current_log_probs.detach() - old_log_probs).abs() * numeric_mask
+                (current_log_probs.detach() - old_log_probs).abs().masked_fill(~action_mask.bool(), 0.0)
             ).flatten().sum(dim=0),
             clipped_token_count=output.clipped_token_count.detach(),
+            clipped_sequence_count=output.clipped_sequence_count,
         )
 
     def update(self, experience: ExperienceBatch) -> ActorUpdateMetrics:
         """Run policy epochs, optimizer steps, and metric finalization."""
         self._require_trainable()
-        response_count = self._validate_experience(experience)
+        response_count = (self._validate_update_experience(experience)
+                          if self.algorithm.name == "gspo" else self._validate_experience(experience))
         accumulator = ActorMetricAccumulator.create(
             experience.sequences.new_zeros(()),
             dp_group_info=self._dp_group_info,
             dp_size=self._dp_size,
+            loss_aggregation=self.algorithm.requirements.loss_aggregation,
         )
         self.train()
         for _ in range(self._update_epochs):
@@ -206,23 +224,25 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                     mini_start + self._response_mini_batch_size,
                     response_count,
                 )
-                global_tokens = self._global_token_count(
-                    experience.loss_action_mask[mini_start:mini_end]
-                )
+                local_mask = experience.loss_action_mask[mini_start:mini_end]
+                if self.algorithm.name == "gspo":
+                    global_tokens, global_sequences = self._global_batch_counts(local_mask)
+                else:
+                    global_tokens = self._global_token_count(local_mask)
+                    global_sequences = None
                 self.optimizer.zero_grad(set_to_none=True)
                 for start in range(mini_start, mini_end, self._micro_batch_size):
                     end = min(start + self._micro_batch_size, mini_end)
                     self._set_gradient_sync(end == mini_end)
+                    backward_kwargs = {"global_tokens": global_tokens}
+                    if global_sequences is not None:
+                        backward_kwargs["global_sequences"] = global_sequences
                     accumulator.add_micro_batch(
-                        self.forward_backward(
-                            experience,
-                            start,
-                            end,
-                            global_tokens=global_tokens,
-                        )
+                        self.forward_backward(experience, start, end, **backward_kwargs)
                     )
                 accumulator.add_optimizer_step(
                     global_tokens=global_tokens,
+                    global_sequences=global_sequences,
                     gradient_norm=self._optimizer_step(),
                 )
         if self.lr_scheduler is not None:
@@ -238,6 +258,8 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
 
     def _validate_experience(self, experience: ExperienceBatch) -> int:
         """Validate token-aligned fields required by policy optimization."""
+        if experience.metadata.get("reward_status") == "pending":
+            raise ValueError("Pending model rewards cannot be used for Actor optimization")
         sequences = experience.sequences
         old_log_probs = experience.old_log_probs
         advantages = experience.advantages
@@ -285,6 +307,32 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                 )
         return response_count
 
+    def _validate_update_experience(self, experience: ExperienceBatch) -> int:
+        """Make invalid fixed targets visible to every DP rank before backward."""
+        local_error = None
+        response_count = 0
+        try:
+            response_count = self._validate_experience(experience)
+            mask = experience.loss_action_mask.bool()
+            fields = [experience.old_log_probs, experience.advantages]
+            if self.algorithm.requirements.data.reference_log_probs:
+                fields.append(experience.reference_log_probs)
+            finite = torch.stack([
+                value.detach().masked_fill(~mask, 0.0).isfinite().all() for value in fields
+            ]).all() & experience.rewards.isfinite().all()
+            if not bool(finite.item()):
+                raise ValueError("Actor experience contains non-finite rewards or action targets")
+        except (ValueError, RuntimeError) as error:
+            local_error = str(error)
+        if self._dp_size > 1:
+            errors: list[Optional[str]] = [None] * self._dp_size
+            dist.all_gather_object(errors, local_error, group=self._dp_group_info.group)
+            if any(error is not None for error in errors):
+                raise ValueError(f"Actor experience validation failed: {errors}")
+        elif local_error is not None:
+            raise ValueError(local_error)
+        return response_count
+
     def _global_token_count(self, action_mask: torch.Tensor) -> int:
         """All-reduce the valid action-token count used for loss scaling."""
         count = torch.tensor(
@@ -298,6 +346,20 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         if result <= 0:
             raise RuntimeError("Actor update has no valid action tokens on any rank")
         return result
+
+    def _global_batch_counts(self, action_mask: torch.Tensor) -> tuple[int, int]:
+        """Reduce token and nonempty-sequence counts over DP, excluding TP copies."""
+        mask = action_mask.bool()
+        counts = torch.stack((
+            mask.flatten().sum(dim=0, dtype=torch.int64),
+            mask.any(dim=-1).sum(dim=0, dtype=torch.int64),
+        ))
+        if self._dp_size > 1:
+            dist.all_reduce(counts, group=self._dp_group_info.group)
+        tokens, sequences = counts.tolist()
+        if tokens <= 0:
+            raise RuntimeError("Actor update has no valid action tokens on any rank")
+        return tokens, sequences
 
     def _set_gradient_sync(self, is_last_micro_batch: bool) -> None:
         """Enable HSDP gradient synchronization for the final micro-batch."""

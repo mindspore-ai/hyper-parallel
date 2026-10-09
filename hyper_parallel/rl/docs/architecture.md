@@ -10,8 +10,8 @@ Hyper-RL 当前运行时的核心是一个同步训练状态机：每一步只�
 
 本文首先描述**当前同步实现**的组件边界、状态所有权和失败语义；文末单独说明规划中的演进边界。具体配置、已验证拓扑和运行命令分别由 [vLLM Rollout](vllm_rollout.md)、[训练-推理一致性](qwen3_training_inference_consistency.md) 和 [运行镜像](../docker/README.md) 维护。
 
-当前端到端算法包括 GRPO 和部分组合已验收的 PPO，模型适配收敛到 Qwen3-4B；Native/Hyper rollout、学习、发布及拓扑验证范围见 [README](../README.md#支持范围)和 [PPO](ppo.md)。
-Agentic 的内部 runner、Codex 和 DeepSeek Harness 保持现有接口与行为，其他模型属于后续规划。
+当前端到端算法包括 GRPO 和部分组合已验收的 PPO；模型、Native/Hyper rollout、学习、发布及拓扑范围见 [README](../README.md#支持范围)。
+Agentic 的内部 runner 保留环境循环；Codex 与 DeepSeek Harness 使用真实逐调用轨迹和 episode GRPO，见 [Agentic RL](agentic_rl.md)。
 
 ## 系统视图
 
@@ -34,7 +34,7 @@ Agentic 的内部 runner、Codex 和 DeepSeek Harness 保持现有接口与行�
    FSDP/TP、optimizer、gradient clipping 与 checkpoint 复用 master 公共能力。
 3. Rollout registry 构造一个 backend-neutral `GenerationEngine`，当前实现为共享 vLLM deployment。
 
-Trainer 初始化失败或训练退出时调用 `rl/process_cleanup.py::cleanup_processes`，依次关闭 tracker、
+Trainer 初始化失败或训练退出时调用 `rl/utils/process_cleanup.py::cleanup_processes`，依次关闭 tracker、
 rollout manager 和 rollout engine，再调用同文件的 `destroy_process_group` 销毁默认进程组，清理
 mesh、layout、FSDP、P2P 和 redistribution 缓存。P2P 缓存使用 native-core 所在位置，
 销毁失败时仍清理缓存；底层函数抛出的 RuntimeError/ValueError 由总清理入口记录为告警。
@@ -47,8 +47,11 @@ mesh、layout、FSDP、P2P 和 redistribution 缓存。P2P 缓存使用 native-c
 - 如何构建 advantage/return；
 - 如何计算 Actor/Critic loss。
 
-GRPO 和 PPO 共用 SyncTrainer。PPO 创建独立 Critic，固定 old values / returns 后更新两种角色，
+GRPO、PPO 和 GSPO 共用 SyncTrainer。GSPO 在 Qwen3 dense 路径上使用分组优势、序列级重要性比率和等权序列损失；默认零 KL，不创建 Reference 或 Critic。
+三种算法只在 `kl_coef > 0` 时请求 Reference；PPO 仍创建独立 Critic，固定 old values / returns 后更新两种角色，
 仅发布 Actor 权重。PPO 的配置、数据语义和实际验收范围见 [PPO](ppo.md)。
+
+可选共卡 RM 由 `rl/reward_model/` 持有冻结 vLLM 服务；业务评分函数位于 `examples/`。Trainer 仅在内部 Qwen3 Dense 的模型模式下安排 `rollout sleep → RM wake/score/sleep → Actor update`，并在评估、保存恢复和退出时核对服务状态。默认规则环境直接评分，不创建 RM。接口及验收边界见[共卡 RM 合同](reward_model.md)。
 
 ### master 模型接入
 
@@ -84,7 +87,7 @@ vLLM 的 `HyperQwen3ForCausalLM` 继续提供 paged attention/KV cache；Native-
 | `ModelRegistration` | Config → Trainer / rollout / weight sync | 模型家族、checkpoint、tokenizer、tied embedding 和 rollout implementation 使用同一身份 |
 | `PromptRecord` | Dataset → AgentRunner | 稳定 prompt ID、messages、ground truth 和原始 token metadata |
 | `GenerationRequest/Result` | AgentRunner ↔ GenerationEngine | backend-neutral 请求；返回 token IDs、response mask、FP32 raw logprobs 和 worker policy version |
-| `Trajectory` | AgentSession / AgentProgram → batch builder | 单轮或多轮 episode 的 token、turn span、action mask、reward 和终止原因 |
+| `Trajectory` | AgentSession / AgentProgram → batch builder | 完整 episode 或其中一次真实模型调用的 token、action mask、共享 episode 奖励和终止原因 |
 | `ExperienceBatch` | batch builder / preparer → Actor / Critic | padding 后的二维 tensor 合同，以及与 next-token position 对齐的训练字段 |
 | `PolicySnapshot` | Actor → publication controller | 单调递增版本、模型身份和待发布 Actor payload |
 
@@ -113,14 +116,15 @@ returns / values     [batch, tokens - 1] when required
 - 驱动 single-turn 或 multi-turn `AgentSession`；
 - 调用环境、工具与 reward；
 - 将 observation/action 映射为 token-aligned turns；
-- 输出统一的 `Trajectory`。
+- 输出一个完整 episode 的 `Trajectory`，或带完整调用身份的逐调用 `Trajectory` 元组。
 
 `ProgramAgentRunner` 已通过内置 Codex / DeepSeek Harness 接入配置驱动的训练入口，复用同一轨迹与 batch 合同。任意自定义 runner 尚不能直接在 YAML 中接入，仍需适配 runtime、factory、manager 与配置校验；程序化路径的交付验收列入 [TODO](TODO.md)。
 
 ### Agentic Harness
 
 `agentic.runner` 选择内部环境循环、Codex CLI 或 DeepSeek Harness。三条路径最终都产出同一个 token-first
-`Trajectory`；模型返回的 token ID 和 sampled-token raw logprob 是训练证据，工具与环境内容只作为非训练上下文。
+`Trajectory` 类型；外部 program 每次调用一行，由 `dataset/episodes.py` 统一校验和分组。
+模型返回的 token ID 和 sampled-token raw logprob 是训练证据，工具与环境内容只作为非训练上下文。
 
 Codex 和 DeepSeek 通过本地协议 gateway 复用共享 vLLM endpoint，不创建第二个 rollout Router。
 Trainer TP 组只有 request-owner rank 执行外部 harness，完整 trajectory 经对象 collective 同步给同组 rank。
@@ -211,7 +215,7 @@ Disjoint 不需要 training residency 切换，但 publication 期间仍会关�
 
 两种策略共用 Qwen3 dense 的 canonical adapter、DP/TP 布局与事务校验。专家参数布局和 MoE 专用发布分支已移除；Qwen3 的 colocated、disjoint 与适用的 Bit-Exact 路径保留。
 
-共享 Qwen3 的融合 QKV 权重由 RL 的 `roles/weight_sync/model_adapter.py` 描述为标准 HF 权重的行区间。
+共享 Qwen3 的融合 QKV 权重由 RL 的 `weight_sync/model_adapter.py` 描述为标准 HF 权重的行区间。
 full-gather 按物理融合参数合桶，接收方按元数据还原 Q/K/V 后调用 vLLM `load_weights()`；
 不会额外 gather 三次 QKV。direct-reshard 在本地 FSDP/TP 分片与这些行区间之间求交，
 继续使用现有的 fragment 限额、IPC/HCCL 路由和事务提交机制。未融合参数保持原有协议。
@@ -258,7 +262,7 @@ Resume 后，如果 Trainer step 高于 rollout 初始版本，Trainer 会在第
 | 下游 rollout backend 适配 | `RolloutEngineRegistry` + `GenerationEngine` | 返回 authoritative tokens、mask、logprobs 和 policy version |
 | 新环境 | `agentic.module_path` + Environment | 最终输出 `Trajectory` |
 | 程序化 Agent | AgentProgram / ProgramAgentRunner | 内置 Harness 已接入；新增 runner 需适配，边界见 [Agentic RL](agentic_rl.md) |
-| 新 reward | 环境 reward 或 reward registry | reward 与 trajectory/group identity 对齐 |
+| 新 reward | 在任务环境或 `examples/` 的 Agent 中计算 | reward 与 trajectory/group identity 对齐 |
 | 新模型 | `ModelRegistration`、HyperAutoModel 与 rollout adapter | 训练/推理参数语义和 weight layout 必须可映射 |
 
 注册成功只代表组件可构造，不代表具备端到端支持。新能力还需要 shipped recipe、代表测试和对应运行门禁。

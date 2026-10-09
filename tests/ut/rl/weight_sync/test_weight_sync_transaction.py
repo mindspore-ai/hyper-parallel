@@ -22,22 +22,21 @@ import torch
 import torch.distributed as dist
 
 from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
-from rl.roles.weight_sync import vllm_worker
-from rl.roles.weight_sync.layout import pack_direct_bucket
-from rl.roles.weight_sync.packed_weight import PackedWeightAck
-from rl.roles.weight_sync.sync import (
+from rl.weight_sync import vllm_worker
+from rl.weight_sync.packed_weight import PackedWeightAck, pack_direct_bucket
+from rl.weight_sync.sync import (
     ActorRolloutWeightSync,
     PolicySnapshot,
     coordinator_call,
     synchronized_call,
 )
-from rl.roles.weight_sync.transfer import (
+from rl.weight_sync.transfer import (
     DirectReshardStrategy,
     FullGatherStrategy,
     WeightPublisher,
     WeightSource,
 )
-from rl.roles.weight_sync.vllm_client import VLLMWeightSyncClientMixin
+from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
 
 
 def _model():

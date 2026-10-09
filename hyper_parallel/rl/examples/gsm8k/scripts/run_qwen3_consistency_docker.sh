@@ -26,7 +26,7 @@ deployment=${1:-colocated}
     exit 1
 }
 
-image=${HYPER_QWEN3_IMAGE:-swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.22.1rc1-unified-arm64}
+image=${HYPER_QWEN3_IMAGE:-hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64}
 model_root=${HYPER_QWEN3_MODEL_ROOT:-${workspace_root}/models/Qwen3-4B}
 data_root=${HYPER_QWEN3_DATA_ROOT:-${workspace_root}/data/gsm8k}
 result_root=${HYPER_QWEN3_RESULT_ROOT:-${repo_root}/hyper_parallel/rl/output/qwen3-consistency-smoke}
@@ -308,6 +308,8 @@ mkdir -p "${result_root}"
 
 docker run --rm --privileged --shm-size="${shm_size}" --network=host \
     -e "ASCEND_RT_VISIBLE_DEVICES=${visible_devices}" \
+    -e "HYPER_RESULT_UID=$(id -u)" \
+    -e "HYPER_RESULT_GID=$(id -g)" \
     -e HYPER_PARALLEL_PLATFORM=torch \
     -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
     -e VLLM_HOST_IP=127.0.0.1 \
@@ -350,6 +352,7 @@ docker run --rm --privileged --shm-size="${shm_size}" --network=host \
     -w /workspace/hyper-parallel \
     "${image}" /bin/bash -lc '
         set -euo pipefail
+        trap "chown -R ${HYPER_RESULT_UID}:${HYPER_RESULT_GID} /results" EXIT
         unset VLLM_PLUGINS
         export PYTHONPATH=/workspace/hyper-parallel/hyper_parallel/rl:/workspace/hyper-parallel:${PYTHONPATH:-}
         bash /workspace/hyper-parallel/hyper_parallel/rl/docker/install_runtime.sh

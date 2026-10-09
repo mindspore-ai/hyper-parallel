@@ -25,8 +25,8 @@ from typing import Any, Optional
 import pytest
 import torch
 
-import rl.roles.weight_sync.vllm_worker as worker_module
-from rl.roles.weight_sync.vllm_worker import (
+import rl.weight_sync.vllm_worker as worker_module
+from rl.weight_sync.vllm_worker import (
     get_direct_reshard_layout,
     get_policy_version,
     init_direct_reshard_group,
@@ -633,6 +633,10 @@ def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
     class NPUWorker:
         """Record the original worker hooks before installing weight-update adapters."""
         @staticmethod
+        def wake_up(worker: Any, tags: Any = None) -> None:
+            original_calls.append(("worker_wake", worker, tags))
+
+        @staticmethod
         def start_weight_update(worker: Any, is_checkpoint_format: bool = True) -> None:
             original_calls.append(("start", worker, is_checkpoint_format))
 
@@ -663,6 +667,21 @@ def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
         sys.modules,
         "vllm.v1.engine.core",
         SimpleNamespace(EngineCore=EngineCore),
+    )
+    class DPLBAsyncMPClient:
+        """Keep hook installation isolated from the real vLLM engine client."""
+
+        async def collective_rpc_async(
+            self, method: str, timeout: Optional[float] = None, args: tuple = (), kwargs: Optional[dict] = None,
+        ) -> list:
+            """Expose the installed client method without importing vLLM."""
+            del method, timeout, args, kwargs
+            return []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.engine.core_client",
+        SimpleNamespace(DPLBAsyncMPClient=DPLBAsyncMPClient),
     )
     monkeypatch.setattr(worker_module, "_patch_state", worker_module._PatchState())
 

@@ -50,6 +50,16 @@ class PassConfig:
             ``FSDPPass`` itself still early-returns when distributed is not
             initialized or ``world_size == 1``, so single-card runs are a
             no-op regardless.
+        fsdp_reshard_after_forward: Drive the FSDP reshard optimization.
+            When ``True`` (default, matching FSDP's ``reshard_after_forward``)
+            ``FSDPPass`` sinks each param's all_gather to its first forward
+            use, frees the replicated full parameter once its last forward
+            reader is done, and — when the backward still needs it — inserts a
+            fresh all_gather plus a rematerialization of the saved forward
+            views just before the first backward consumer. Peak memory then
+            tracks the forward working set instead of the sum of all
+            replicated parameters. Set ``False`` to keep every gathered
+            parameter resident for the whole joint graph (previous behavior).
         fsdp_degree: Size of the FSDP group. ``None`` (default) means
             "resolve at runtime": the trainer back-fills it from the
             automodel ``MeshContext`` (TP+FSDP hybrid, where the FSDP group
@@ -102,6 +112,7 @@ class PassConfig:
 
     enable_overlap: bool = True
     fsdp_enabled: bool = True
+    fsdp_reshard_after_forward: bool = True
     fsdp_degree: Optional[int] = None
     tp_size: int = 1
     sequence_parallel: bool = False
