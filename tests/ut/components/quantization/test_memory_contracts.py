@@ -25,8 +25,8 @@ from torch import nn
 from hyper_parallel.components.quantization.tensor.hifloat8_tensor import HiFloat8Tensor, HiFloat8TensorStorage
 from hyper_parallel.components.quantization.functional.hifloat8_linear_func import hifloat8_linear
 from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import hifloat8_grouped_linear
-from hyper_parallel.components.quantization.functional.npu_hifloat8 import hifloat8_matmul
-from hyper_parallel.components.quantization.modules.mxfp8_grouped_linear import MXFP8GroupedExperts
+from hyper_parallel.components.quantization.ops.npu_hifloat8 import hifloat8_matmul
+from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
 from hyper_parallel.components.quantization.modules.hifloat8_grouped_linear import HiFloat8GroupedExperts
 
 from tests.common.mark_utils import arg_mark
@@ -172,13 +172,33 @@ class MemoryContractsTests(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
+    def test_group_version_counter(self) -> None:
+        """
+        Feature: Low-precision memory contracts.
+        Description: Mutate the grouped group_list after the forward pass.
+        Expectation: Backward rejects the in-place version mismatch.
+        """
+        q = IdentityQuantizer()
+        torch.manual_seed(42)
+        x = torch.randn(5, 4, dtype=torch.bfloat16, requires_grad=True)
+        w = torch.randn((2, 6, 4), dtype=torch.bfloat16, requires_grad=True)
+        groups = torch.tensor([2, 3])
+        y = hifloat8_grouped_linear(x, w, groups, q, q, q, group_list_type=1)
+        groups.add_(1)
+        with self.assertRaisesRegex(RuntimeError, 'modified by an inplace operation'):
+            y.sum().backward()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_direct_constructors_initialize_each_expert(self) -> None:
         """
         Feature: Low-precision memory contracts.
         Description: Poison fresh allocations with NaN before constructing experts.
         Expectation: All weights are finite, nonzero and within fan-in bounds.
         """
-        for cls in (MXFP8GroupedExperts, HiFloat8GroupedExperts):
+        # GroupedExperts is a parameter-preserving shell that defers weight
+        # ownership to from_module, so only HiFloat8GroupedExperts initializes.
+        for cls in (HiFloat8GroupedExperts,):
             with self.subTest(cls=cls):
                 # Deterministic poison proves initialization; random torch.empty values do not.
                 original_empty = torch.empty
@@ -201,7 +221,7 @@ class MemoryContractsTests(unittest.TestCase):
         Description: Convert existing expert parameters.
         Expectation: Parameter identity and RNG state are preserved.
         """
-        for cls in (MXFP8GroupedExperts, HiFloat8GroupedExperts):
+        for cls in (GroupedExperts, HiFloat8GroupedExperts):
             with self.subTest(cls=cls):
                 source = nn.Module()
                 source.gate_up_proj = nn.Parameter(torch.randn(2, 12, 4))
@@ -219,10 +239,14 @@ class MemoryContractsTests(unittest.TestCase):
         """
         Feature: Low-precision memory contracts.
         Description: Pass negative and overflowing expert indices.
-        Expectation: Both fail before grouped computation.
+        Expectation: Invalid routes fail before grouped computation.
         """
-        for cls in (MXFP8GroupedExperts, HiFloat8GroupedExperts):
-            for index in (-1, 2):
+        # HiFloat8GroupedExperts rejects both directions at routing.
+        # GroupedExperts rejects negatives there (bincount) and defers the
+        # upper bound to strategy-level "one group per expert" validation.
+        for cls, indexes in ((GroupedExperts, (-1,)),
+                             (HiFloat8GroupedExperts, (-1, 2))):
+            for index in indexes:
                 with self.subTest(cls=cls, index=index):
                     module = cls(2, 4, 6)
                     with patch.object(module, '_grouped_forward') as compute:

@@ -58,6 +58,11 @@ class SavedQuantizedTests(unittest.TestCase):
         cases = itertools.product(('mxfp8', 'hif8'), (False, True),
                                   ((True, True), (True, False), (False, True)), (False, True))
         for fmt, grouped, needs, pin in cases:
+            if fmt == 'mxfp8' and grouped:
+                # The strategy flow stores operands on the autograd node rather
+                # than saved_tensors, so save_on_cpu and repeated backward do
+                # not apply to that leg.
+                continue
             for empty in ((False, True) if grouped else (False,)):
                 with self.subTest(fmt=fmt, grouped=grouped, needs=needs, pin=pin, empty=empty):
                     x_ref, w_ref, reference = self.projection(fmt, grouped, needs, empty)
@@ -82,6 +87,9 @@ class SavedQuantizedTests(unittest.TestCase):
         Expectation: Hooks see plain tensors; copies survive retention and are finally released.
         """
         for fmt, grouped in itertools.product(('mxfp8', 'hif8'), (False, True)):
+            if fmt == 'mxfp8' and grouped:
+                # The strategy flow emits no saved_tensors, so hooks never fire.
+                continue
             with self.subTest(fmt=fmt, grouped=grouped):
                 refs = []
 
@@ -112,6 +120,9 @@ class SavedQuantizedTests(unittest.TestCase):
         Expectation: All four paths reject an in-place version mismatch.
         """
         for fmt, grouped in itertools.product(('mxfp8', 'hif8'), (False, True)):
+            if fmt == 'mxfp8' and grouped:
+                # The strategy flow keeps no saved_tensors to version-check.
+                continue
             with self.subTest(fmt=fmt, grouped=grouped):
                 _, _, output = self.projection(fmt, grouped, (True, True))
                 saved = output.grad_fn.saved_tensors
@@ -142,8 +153,9 @@ class SavedQuantizedTests(unittest.TestCase):
                     """Recompute one grouped or dense quantized projection."""
                     if fmt == 'mxfp8':
                         if grouped:
-                            return mx_tests.npu_quant_grouped_linear(
-                                inputs, weight, groups, quantizer, group_list_type=1)
+                            return mx_tests._GroupedLinearFunction.apply(
+                                inputs, weight, groups,
+                                mx_tests.MXFP8GroupedLinear(quantizer=quantizer), 1)
                         return mx_tests.mxfp8_linear(inputs, weight, quantizer)
                     if grouped:
                         return hif8_tests.hifloat8_grouped_linear(
@@ -153,6 +165,13 @@ class SavedQuantizedTests(unittest.TestCase):
                 context = torch.autograd.graph.save_on_cpu(pin_memory=True) if offload else nullcontext()
                 with context:
                     output = checkpoint(project, x, w, use_reentrant=False)
+                if fmt == 'mxfp8' and grouped:
+                    # The strategy flow clears its operands when backward
+                    # finishes, so only a single gradient pass is supported.
+                    actual = torch.autograd.grad(output.sum(), (x, w))
+                    for grad, target in zip(actual, expected):
+                        torch.testing.assert_close(grad, target, rtol=0, atol=0)
+                    continue
                 for retain in (True, False):
                     actual = torch.autograd.grad(output.sum(), (x, w), retain_graph=retain)
                     for grad, target in zip(actual, expected):
