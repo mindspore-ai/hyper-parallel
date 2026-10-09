@@ -23,7 +23,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-from .inputs import get_cp_group, get_cp_rank
+from .inputs import get_cp_rank
 
 
 def _build_cp_shift_labels(
@@ -74,16 +74,6 @@ def _local_per_token_cross_entropy(
     return flat_loss.view_as(local_labels)
 
 
-def _group_loss_for_logging(local_loss_sum: torch.Tensor, cp_num_items: torch.Tensor, cp_group=None) -> torch.Tensor:
-    """Return the CP-group token mean to match per-DP-rank Trainer loss logging."""
-    if not dist.is_available() or not dist.is_initialized():
-        return local_loss_sum / torch.clamp(cp_num_items.to(local_loss_sum.device), min=1)
-
-    group_loss_sum = local_loss_sum.detach().clone()
-    dist.all_reduce(group_loss_sum, group=cp_group)
-    return group_loss_sum / torch.clamp(cp_num_items.to(group_loss_sum.device), min=1)
-
-
 def _should_use_original_loss(
     logits,
     labels,
@@ -98,7 +88,7 @@ def _should_use_original_loss(
     return logits.dim() < 3 or labels.dim() < 2
 
 
-def _wrap_loss_function(original_loss_function, cp_rank: int, cp_size: int, cp_group=None):
+def _wrap_loss_function(original_loss_function, cp_rank: int, cp_size: int):
     """Patch only token alignment/normalization before delegating to the original loss."""
 
     @wraps(original_loss_function)
@@ -135,16 +125,24 @@ def _wrap_loss_function(original_loss_function, cp_rank: int, cp_size: int, cp_g
             )
 
         cp_shift_labels = _build_cp_shift_labels(labels, local_seq_len, cp_rank, ignore_index)
-        # Fully_shard uses a flattened (DP * CP) mesh, so its gradient reduction
-        # averages over CP peers as well. Scale each local token-loss shard by
-        # cp_size to recover the same per-DP-sample gradient as full-sequence CE
-        # without a post-backward CP gradient all-reduce.
-        cp_num_items = _num_items_in_batch(cp_shift_labels, ignore_index, group=cp_group).to(logits.device)
+        # Match Transformers' token-normalized loss contract while counting CP
+        # tokens after sequence sharding, so CP peers do not duplicate the denominator.
+        if num_items_in_batch is not None:
+            global_num_items = num_items_in_batch
+            if torch.is_tensor(global_num_items):
+                global_num_items = global_num_items.to(logits.device)
+            else:
+                global_num_items = torch.tensor(global_num_items, device=logits.device)
+            global_num_items = global_num_items / cp_size
+        else:
+            global_num_items = _num_items_in_batch(cp_shift_labels, ignore_index, group=None).to(logits.device)
         per_token_loss = _local_per_token_cross_entropy(logits, cp_shift_labels, vocab_size, ignore_index)
         local_loss_sum = per_token_loss.sum()
-        backward_loss = local_loss_sum * cp_size / torch.clamp(cp_num_items, min=1)
-        cp_group_token_mean = _group_loss_for_logging(local_loss_sum, cp_num_items, cp_group=cp_group)
-        return backward_loss + (cp_group_token_mean - backward_loss).detach()
+        backward_loss = local_loss_sum / torch.clamp(global_num_items, min=1)
+        if num_items_in_batch is None:
+            world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+            backward_loss = backward_loss * world_size
+        return backward_loss
 
     return _hp_cp_loss_function
 
@@ -155,13 +153,12 @@ def _enable_context_parallel_loss_patch(model: nn.Module, hp_args) -> None:
     if cp_size <= 1:
         return
     cp_rank = get_cp_rank(hp_args)
-    cp_group = get_cp_group(hp_args)
     for module in model.modules():
         if getattr(module, "_hp_cp_loss_enabled", False) or not hasattr(module, "loss_function"):
             continue
         try:
             original_loss_function = module.loss_function
-            module.loss_function = _wrap_loss_function(original_loss_function, cp_rank, cp_size, cp_group=cp_group)
+            module.loss_function = _wrap_loss_function(original_loss_function, cp_rank, cp_size)
         except (AttributeError, TypeError):
             continue
         module._hp_cp_loss_enabled = True  # pylint: disable=protected-access
