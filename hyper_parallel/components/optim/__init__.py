@@ -14,7 +14,7 @@
 # ============================================================================
 """Optimizer and learning-rate scheduler interfaces for AutoModels."""
 
-from hyper_parallel.components.optim.builders import AdamW, Muon
+from hyper_parallel.components.optim.builders import AdamW, ComposedOptimizer, Muon, Sinkhorn
 from hyper_parallel.components.optim.lr_scheduler import MultiLRScheduler
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
@@ -28,9 +28,11 @@ from hyper_parallel.components.optim.parameter_groups import (
 
 __all__ = [
     "AdamW",
+    "ComposedOptimizer",
     "Float16OptimizerWithFloat16Params",
     "MixedPrecisionOptimizer",
     "Muon",
+    "Sinkhorn",
     "MultiLRScheduler",
     "get_adamw_param_groups",
     "get_parameter_names",

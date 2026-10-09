@@ -225,22 +225,42 @@ dataloader:
   pin_memory: false
   prefetch_factor: null
 
+# Optimizer hyperparameters follow DeepSeek-V4.1 §2.5 and §4.2.2.
+# The crop preserves native attention/indexer head widths (512/128).
+# Engram tables use an explicit Sinkhorn parameter group with a 5x learning rate.
 optimizer:
-  _target_: hyper_parallel.components.optim.Muon
+  _target_: hyper_parallel.components.optim.ComposedOptimizer
   fp32_main_params: true
-  no_decay_params: [bias, norm, ln_]
-  muon_config:
-    muon_lr: 3.0e-5
-    muon_weight_decay: 0.0
-    muon_momentum: 0.95
-    muon_nesterov: true
-    muon_ns_steps: 5
-    muon_ns_variant: asym5
-  adamw_config:
-    adamw_lr: 1.0e-5
-    adamw_weight_decay: 0.01
-    adamw_betas: [0.9, 0.999]
-    adamw_eps: 1.0e-8
+  muon:
+    lr: 2.6e-4
+    weight_decay: 0.1
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+    ns_variant: asym5
+    matched_adamw_rms: 0.18
+    head_wise: true
+    head_wise_patterns:
+      '^model\.layers\.[0-9]+\.self_attn\.(q_b_proj|kv_proj)\.weight$': 512
+      '^model\.layers\.[0-9]+\.self_attn\.indexer\.(q_b_proj|wk)\.weight$': 128
+  sinkhorn:
+    lr: 2.6e-4
+    momentum: 0.95
+    nesterov: true
+    steps: 11
+    tau: 1.0e-3
+    eps: 1.0e-20
+    correction: 0.18
+    param_groups:
+      - param_patterns: ['\.engram\.embed\.weight$']
+        lr: 1.3e-3
+  adamw:
+    lr: 2.6e-4
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+    eps: 1.0e-20
+    # Engram's matrix-shaped Q/K RMSNorm scales are not linear weights.
+    param_patterns: ['\.engram\.[qk]_weight$']
 
 lr_scheduler:
   _target_: hyper_parallel.components.optim.MultiLRScheduler

@@ -62,8 +62,8 @@ class ChainedOptimizer:
         self.chained_optimizers = list(optimizers.values())
         self.optimizers_keys = list(optimizers.keys())
         self.model = model
-        self.flatten = flatten  # not flatten adamw, flatten for multi-optimizer
-        self._is_multi_optimizer = flatten
+        self.flatten = flatten or len(optimizers) > 1
+        self._is_multi_optimizer = len(optimizers) > 1
         self.model_param_by_optimizer_param: Dict[
             torch.nn.Parameter, torch.nn.Parameter
         ] = {}
@@ -78,26 +78,27 @@ class ChainedOptimizer:
         return iter(self.chained_optimizers)
 
     def _rebind_param_attrs(self) -> None:
-        """Restore model FQNs and optimizer-family name views."""
-        muon_param_ids: set = set()
-        adamw_param_ids: set = set()
-        self.muon_keys = []
-        self.no_muon_keys = []
-        for _, opt in self.optimizers_dict.items():
-            is_muon = hasattr(opt, "is_muon") and opt.is_muon
-            target = muon_param_ids if is_muon else adamw_param_ids
-            for group in opt.param_groups:
-                for p in group.get("params", []):
-                    target.add(id(p))
+        """Bind model FQNs and validate exclusive ownership by named leaves."""
+        owner_by_id = {}
+        self.param_names_by_optimizer = {name: [] for name in self.optimizers_dict}
+        for name, optimizer in self.optimizers_dict.items():
+            for group in optimizer.param_groups:
+                for param in group["params"]:
+                    if id(param) in owner_by_id:
+                        raise ValueError("A parameter belongs to more than one optimizer group")
+                    owner_by_id[id(param)] = name
 
+        registered_ids = set()
         for param_name, param in self.model.named_parameters():
             optimizer_param = self.optimizer_param_by_model_param.get(param, param)
-            setattr(param, "model_name", param_name)
-            setattr(optimizer_param, "model_name", param_name)
-            if id(optimizer_param) in muon_param_ids:
-                self.muon_keys.append(param_name)
-            elif id(optimizer_param) in adamw_param_ids:
-                self.no_muon_keys.append(param_name)
+            param.model_name = param_name
+            optimizer_param.model_name = param_name
+            registered_ids.add(id(optimizer_param))
+            owner = owner_by_id.get(id(optimizer_param))
+            if owner is not None:
+                self.param_names_by_optimizer[owner].append(param_name)
+        if owner_by_id.keys() - registered_ids:
+            raise ValueError("Optimizer parameters must belong to the registered model")
 
     def reset_optimizer_parameters(
             self,
@@ -289,11 +290,12 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
     Provides fused hierarchical broadcast for parameters and optimizer states.
     """
 
+    state_tensor_keys: Tuple[str, ...] = ()
+
     def __init__(
             self,
             params: Any,
             defaults: Dict[str, Any],
-            is_muon: bool,
             hsdp_replica_count: Optional[int] = None,
     ) -> None:
         """Initialize topology-aware optimizer state and parameter groups.
@@ -301,11 +303,9 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
         Args:
             params: Parameter groups optimized by this instance.
             defaults: Default hyperparameters applied to every group.
-            is_muon: Whether parameters use the Muon update path.
             hsdp_replica_count: Optional optimizer-state replica group size.
         """
         super().__init__(params, defaults)
-        self.is_muon = is_muon
         self.hsdp_replica_count = hsdp_replica_count
         self._param_to_broadcast_info: Dict[
             torch.nn.Parameter, Tuple[Tuple[int, ...], Tuple[dist.ProcessGroup, ...]]
@@ -671,8 +671,11 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
 
     def _broadcast_state_fused_for_ckpt(self) -> None:
         """Broadcast optimizer state before checkpoint save."""
-        state_keys = ["momentum_buffer"] if self.is_muon else ["exp_avg", "exp_avg_sq"]
-        self._broadcast_op_fused(target="state", state_keys=state_keys)
+        self._broadcast_op_fused(target="state", state_keys=list(self.state_tensor_keys))
+
+    def _new_checkpoint_state(self, param: torch.Tensor, _: str) -> torch.Tensor:
+        """Allocate a missing parameter-shaped state; subclasses may override its schema."""
+        return torch.zeros_like(param, dtype=torch.float32)
 
     def _collect_broadcast_tensors(
             self,
@@ -702,7 +705,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
                         state_tensor = param_state[key]
                         local_tensor = to_local_if_dtensor(state_tensor)
                     else:
-                        local_tensor = torch.empty_like(p, dtype=torch.float32)
+                        local_tensor = self._new_checkpoint_state(p, key)
                         param_state[key] = local_tensor
                         local_tensor = to_local_if_dtensor(local_tensor)
 
@@ -978,6 +981,10 @@ class AsyncReplicateBroadcaster:
 
         All ranks must call this at the same point in the execution flow
         to ensure collective communication consistency.
+
+        Args:
+            hsdp_assign: Shard and replica ownership of the broadcast group.
+            records: Optional subset of parameter records to broadcast.
         """
         if not hsdp_assign.is_replicated or not hsdp_assign.replicate_pgs:
             return
@@ -1054,10 +1061,7 @@ class AsyncReplicateBroadcaster:
 
             # Pack: owner rank
             if local_coord == src_coord:
-                for t, offset, actual_numel, padded_numel in batch_tensor_offsets:
-                    batch_buffer[offset:offset + actual_numel].copy_(t.view(-1))
-                    if padded_numel > actual_numel:
-                        batch_buffer[offset + actual_numel:offset + padded_numel].zero_()
+                self._pack_broadcast_batch(batch_buffer, batch_tensor_offsets)
 
             if async_op:
                 handles = BaseDistributedOptimizer._hierarchical_broadcast_buffer_async(
@@ -1084,6 +1088,14 @@ class AsyncReplicateBroadcaster:
             # Sync path: buffer can be freed immediately
             buffer.untyped_storage().resize_(0)
             del buffer
+
+    @staticmethod
+    def _pack_broadcast_batch(batch_buffer, batch_tensor_offsets):
+        """Pack owner values and zero alignment padding before broadcast."""
+        for t, offset, actual_numel, padded_numel in batch_tensor_offsets:
+            batch_buffer[offset:offset + actual_numel].copy_(t.view(-1))
+            if padded_numel > actual_numel:
+                batch_buffer[offset + actual_numel:offset + padded_numel].zero_()
 
     def _wait_and_release_oldest(self) -> None:
         """Wait, unpack, and release the oldest inflight async batch."""
