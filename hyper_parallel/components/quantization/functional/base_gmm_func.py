@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Shared grouped-linear autograd flow for native and fake-QAT strategies.
+"""Shared native grouped-linear autograd flow.
 
-The lifecycle prepares forward operands, executes GMM, retains only the views
-required by backward, prepares ``grad_output``, and executes dgrad/wgrad.
-Format-specific strategies provide quantization, direction-retention, group
-normalization, and backend calls; the shared template contains no format or
-operator dispatch.
+The grouped-linear lifecycle is common to the native formats currently using
+it: prepare the forward operands, execute GMM, retain only the views required
+by backward, prepare ``grad_output``, and execute dgrad/wgrad. Format-specific
+strategies provide operand preparation and backend calls. A future fake
+strategy may reuse this boundary after its tensor-save/release semantics are
+generalized; this module deliberately contains no fake-quantization code.
 """
 
 from abc import ABC, abstractmethod
@@ -29,10 +30,6 @@ import torch  # pylint: disable=forbidden-backend-import
 from hyper_parallel.components.quantization.tensor import (
     QuantizedTensor,
     QuantizedTensorStorage,
-)
-from hyper_parallel.components.quantization.functional._saved_quantized import (
-    restore_quantized_operands,
-    save_quantized_operands,
 )
 
 
@@ -49,24 +46,6 @@ class GroupedLinear(ABC):
 
     FORMAT_NAME: str
 
-    def _validate_inputs(
-        self,
-        inputs: torch.Tensor,
-        weight: torch.Tensor,
-        group_list: torch.Tensor,
-        group_list_type: int,
-    ) -> None:
-        """Validate the common live-weight and group metadata contract."""
-
-        validate_grouped_linear_inputs(
-            inputs,
-            weight,
-            group_list,
-            group_list_type,
-            weight_input_dim=-1,
-            name=self.FORMAT_NAME,
-        )
-
     @abstractmethod
     def normalize_group_list(
         self,
@@ -76,9 +55,9 @@ class GroupedLinear(ABC):
         """Adapt grouped metadata to this backend's fixed contract.
 
         The adapter may hand per-expert token counts (``group_list_type=1``)
-        or cumulative offsets (``group_list_type=0``). MXFP8 and HiFloat8
-        accept either representation; W4A8 strategies normalize counts to
-        cumulative offsets and leave existing offsets unchanged.
+        or cumulative offsets (``group_list_type=0``). MXFP8 accepts either
+        representation; W4A8 normalizes counts to cumulative offsets and
+        leaves existing offsets unchanged.
         """
 
     @abstractmethod
@@ -100,9 +79,10 @@ class GroupedLinear(ABC):
     ) -> None:
         """Release the forward-only weight view after the forward GMM.
 
-        Each strategy keeps the direction consumed by its dgrad operator.
-        Input and gradient views are released inline in the template because
-        their lifecycle does not vary by format.
+        Keeps the direction dgrad consumes: row-wise for MXFP8 (``rowwise``
+        kept), transposed column-wise for W4A8 (``colwise`` kept).  The
+        input/gradient views are released inline in the template instead,
+        because no native format varies them.
         """
 
     @abstractmethod
@@ -165,11 +145,13 @@ class GroupedLinear(ABC):
 
         # 共享校验门禁——live [E,O,K] 几何/group 不变量，
         # 错误前缀取 FORMAT_NAME
-        self._validate_inputs(
+        validate_grouped_linear_inputs(
             inputs,
             weight,
             group_list,
             group_list_type,
+            weight_input_dim=-1,
+            name=self.FORMAT_NAME,
         )
         # hook: group 元数据归一化——W4A8 覆写为 counts→offsets
         effective_group_list, effective_group_list_type = self.normalize_group_list(
@@ -182,12 +164,12 @@ class GroupedLinear(ABC):
         ctx.weight_shape = weight.shape
         ctx.weight_dtype = weight.dtype
         ctx.weight_device = weight.device
+        ctx.group_list = effective_group_list
         ctx.group_list_type = effective_group_list_type
         ctx.strategy = self
         ctx.empty_input = inputs.shape[0] == 0
         if ctx.empty_input:
             # abstract: 给出输出宽 O，空输入也能产出 (0,O)
-            ctx.save_for_backward(effective_group_list)
             return inputs.new_empty((0, self.output_features(weight)))
 
         # The adapter hands live ``[E, O, K]`` weights; transpose once to the
@@ -224,25 +206,12 @@ class GroupedLinear(ABC):
             output_dtype=inputs.dtype,
         )
 
+        ctx.input_quant = input_quant if needs_grad_weight else None
+        ctx.weight_quant = weight_quant if needs_grad_input else None
         # The forward view is spent; keep only the direction backward needs.
         input_quant.update_usage(rowwise=False, colwise=needs_grad_weight)
         # hook: 只保留 dgrad 需要的 weight 方向——W4A8 覆写
         self.retain_weight_backward(weight_quant, needs_grad_input)
-        operands = (
-            input_quant if needs_grad_weight else None,
-            weight_quant if needs_grad_input else None,
-        )
-        ctx.quantized_operands_saved = all(
-            operand is None or isinstance(operand, QuantizedTensor)
-            for operand in operands
-        )
-        if ctx.quantized_operands_saved:
-            save_quantized_operands(ctx, *operands, effective_group_list)
-            ctx.input_quant = None
-            ctx.weight_quant = None
-        else:
-            ctx.save_for_backward(effective_group_list)
-            ctx.input_quant, ctx.weight_quant = operands
         return output
 
     def backward(
@@ -255,7 +224,6 @@ class GroupedLinear(ABC):
         needs_grad_input = ctx.needs_input_grad[0]
         needs_grad_weight = ctx.needs_input_grad[1]
         if ctx.empty_input:
-            (group_list,) = ctx.saved_tensors
             grad_input = (
                 torch.zeros(
                     ctx.input_shape,
@@ -276,18 +244,12 @@ class GroupedLinear(ABC):
             )
             return grad_input, grad_weight
 
-        if ctx.quantized_operands_saved:
-            group_list, input_quant, weight_quant = restore_quantized_operands(ctx)
-        else:
-            (group_list,) = ctx.saved_tensors
-            input_quant = ctx.input_quant
-            weight_quant = ctx.weight_quant
         # abstract: 量化 grad_output，保留 backward 需要的两个方向
         grad_quant = self.quantize_grad_output(
             grad_output,
             rowwise=needs_grad_input,
             colwise=needs_grad_weight,
-            group_list=group_list,
+            group_list=ctx.group_list,
             group_list_type=ctx.group_list_type,
         )
         grad_input = None
@@ -296,9 +258,9 @@ class GroupedLinear(ABC):
             # abstract: dgrad——grad_output × 保留的 weight（NT）
             grad_input = self.grouped_matmul(
                 grad_quant,
-                weight_quant,
+                ctx.weight_quant,
                 layout="NT",
-                group_list=group_list,
+                group_list=ctx.group_list,
                 group_type=0,
                 group_list_type=ctx.group_list_type,
                 output_dtype=ctx.input_dtype,
@@ -306,10 +268,10 @@ class GroupedLinear(ABC):
         if needs_grad_weight:
             # abstract: wgrad——保留的 input × grad_output（TN，得 [E,K,O]）
             grad_weight = self.grouped_matmul(
-                input_quant,
+                ctx.input_quant,
                 grad_quant,
                 layout="TN",
-                group_list=group_list,
+                group_list=ctx.group_list,
                 group_type=2,
                 group_list_type=ctx.group_list_type,
                 output_dtype=ctx.weight_dtype,

@@ -27,9 +27,13 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.quantization.functional import build_low_precision_strategy
+from hyper_parallel.components.quantization.modules.hifloat8_grouped_linear import (
+    HiFloat8GroupedExperts,
+)
 from hyper_parallel.components.quantization.modules.grouped_experts import (
     GroupedExperts,
 )
+from hyper_parallel.components.quantization.ops import validate_hifloat8_gmm_runtime
 
 
 def _check_ep1_only(context: Mapping[str, Any], factory_name: str) -> None:
@@ -44,6 +48,20 @@ def _check_ep1_only(context: Mapping[str, Any], factory_name: str) -> None:
             f"{factory_name} currently require TP=CP=EP=PP=1; "
             f"active axes: {active_model_parallel_axes}."
         )
+
+
+@module_replacement
+def replace_hifloat8_grouped_experts(
+    *,
+    module: nn.Module,
+    module_fqn: str,
+    context: Mapping[str, Any],
+) -> HiFloat8GroupedExperts:
+    """Replace one EP=1 packed expert container with HiFloat8 GMMs."""
+
+    _check_ep1_only(context, "HiFloat8 grouped experts")
+    validate_hifloat8_gmm_runtime()
+    return HiFloat8GroupedExperts.from_module(module, fqn=module_fqn)
 
 
 @module_replacement
@@ -68,4 +86,4 @@ def replace_grouped_experts(
     )
 
 
-__all__ = ["replace_grouped_experts"]
+__all__ = ["replace_grouped_experts", "replace_hifloat8_grouped_experts"]

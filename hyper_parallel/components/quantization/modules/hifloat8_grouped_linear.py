@@ -12,39 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Canonical low-precision adapter for DeepSeek-V3 grouped experts.
+"""Packed-expert module executing its projections in HiFloat8 GMMs."""
 
-``GroupedExperts`` is the single canonical grouped-experts shell: it only
-orchestrates routing, activation, and token ordering.  Gate/up and down
-projections run through the bound ``GroupedLinear``, whose
-instance is picked exclusively in ``strategy_factory``.
-"""
+from typing import Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.components.quantization.functional import (
-    GroupedLinear,
-    _GroupedLinearFunction,
+from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import (
+    hifloat8_grouped_linear,
 )
-from hyper_parallel.components.quantization.ops.npu_mxfp8 import LowPrecisionCapabilityError
-from hyper_parallel.components.quantization.ops.npu_w4a8 import (
-    W4A8CapabilityError,
+from hyper_parallel.components.quantization.quantizers.hifloat8 import (
+    GRADIENT_FORMAT_MAX,
+    INPUT_WEIGHT_FORMAT_MAX,
+    HiFloat8Quantizer,
 )
-from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import (
-    MXFP8GroupedLinear,
-)
+
 
 _EXPERT_PARAMETER_NAMES = ("gate_up_proj", "down_proj")
 
 
-class GroupedExperts(nn.Module):
-    """Canonical low-precision shell for DeepSeek-V3 grouped experts.
-
-    The bound grouped-linear compute may select MXFP8, native W4A8, or fake
-    W4A8. The shell owns no quantizer; it holds only the ``grouped_linear``
-    instance selected by ``strategy_factory``.
-    """
+class HiFloat8GroupedExperts(nn.Module):
+    """Preserve packed expert parameters and execute their projections in HiF8."""
 
     def __init__(
         self,
@@ -53,9 +42,11 @@ class GroupedExperts(nn.Module):
         intermediate_dim: int,
         *,
         fqn: str = "",
-        grouped_linear: GroupedLinear | None = None,
+        input_quantizer: Optional[HiFloat8Quantizer] = None,
+        weight_quantizer: Optional[HiFloat8Quantizer] = None,
+        grad_output_quantizer: Optional[HiFloat8Quantizer] = None,
     ) -> None:
-        """Create an unbound packed-expert module."""
+        """Create packed experts with per-projection Linear-style initialization."""
 
         super().__init__()
         self.gate_up_proj = nn.Parameter(
@@ -69,10 +60,36 @@ class GroupedExperts(nn.Module):
         self.hidden_dim = hidden_dim
         self.intermediate_dim = intermediate_dim
         self.fqn = fqn
-        self.grouped_linear = (
-            grouped_linear
-            if grouped_linear is not None
-            else MXFP8GroupedLinear()
+        self._initialize_quantizers(
+            input_quantizer,
+            weight_quantizer,
+            grad_output_quantizer,
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize each expert using its projection's fan-in, not the expert axis."""
+
+        for weight in (self.gate_up_proj, self.down_proj):
+            bound = weight.shape[-1] ** -0.5
+            nn.init.uniform_(weight, -bound, bound)
+
+    def _initialize_quantizers(
+        self,
+        input_quantizer: Optional[HiFloat8Quantizer],
+        weight_quantizer: Optional[HiFloat8Quantizer],
+        grad_output_quantizer: Optional[HiFloat8Quantizer],
+    ) -> None:
+        """Use supplied quantizers or construct role-specific HiFloat8 defaults."""
+
+        self.input_quantizer = input_quantizer or HiFloat8Quantizer(
+            fp8_max=INPUT_WEIGHT_FORMAT_MAX
+        )
+        self.weight_quantizer = weight_quantizer or HiFloat8Quantizer(
+            fp8_max=INPUT_WEIGHT_FORMAT_MAX
+        )
+        self.grad_output_quantizer = grad_output_quantizer or HiFloat8Quantizer(
+            fp8_max=GRADIENT_FORMAT_MAX
         )
 
     @classmethod
@@ -81,15 +98,28 @@ class GroupedExperts(nn.Module):
         source: nn.Module,
         *,
         fqn: str,
-        grouped_linear: GroupedLinear | None = None,
-    ) -> "GroupedExperts":
-        """Create a no-allocation shell retaining the source registrations."""
+        input_quantizer: Optional[HiFloat8Quantizer] = None,
+        weight_quantizer: Optional[HiFloat8Quantizer] = None,
+        grad_output_quantizer: Optional[HiFloat8Quantizer] = None,
+    ) -> "HiFloat8GroupedExperts":
+        """Create a no-allocation shell retaining source registrations.
+
+        Args:
+            source: Module owning packed gate/up and down expert parameters.
+            fqn: Fully qualified module name for diagnostics.
+            input_quantizer: Optional current-scaling input recipe override.
+            weight_quantizer: Optional current-scaling weight recipe override.
+            grad_output_quantizer: Optional gradient recipe override.
+
+        Returns:
+            Adapter sharing the original parameters without reinitializing them.
+        """
 
         parameter_names = tuple(source._parameters)  # pylint: disable=protected-access
         if parameter_names != _EXPERT_PARAMETER_NAMES:
             raise TypeError(
                 f"{fqn!r} must register packed expert parameters "
-                f"{_EXPERT_PARAMETER_NAMES}, but got {parameter_names}."
+                f"{_EXPERT_PARAMETER_NAMES}, got {parameter_names}."
             )
         gate_up_proj = source._parameters["gate_up_proj"]  # pylint: disable=protected-access
         down_proj = source._parameters["down_proj"]  # pylint: disable=protected-access
@@ -107,7 +137,8 @@ class GroupedExperts(nn.Module):
         if gate_up_proj.shape[1] % 2 or tuple(down_proj.shape) != expected_down_shape:
             raise ValueError(
                 f"{fqn!r} has incompatible gate/up and down expert shapes: "
-                f"gate_up={tuple(gate_up_proj.shape)}, down={tuple(down_proj.shape)}."
+                f"gate_up={tuple(gate_up_proj.shape)}, "
+                f"down={tuple(down_proj.shape)}."
             )
 
         # Create a no-allocation shell: cls.__new__(cls) resolves to
@@ -132,10 +163,10 @@ class GroupedExperts(nn.Module):
         converted.hidden_dim = gate_up_proj.shape[2]
         converted.intermediate_dim = gate_up_proj.shape[1] // 2
         converted.fqn = fqn
-        converted.grouped_linear = (
-            grouped_linear
-            if grouped_linear is not None
-            else MXFP8GroupedLinear()
+        converted._initialize_quantizers(
+            input_quantizer,
+            weight_quantizer,
+            grad_output_quantizer,
         )
         if hasattr(source, "config"):
             converted.config = source.config
@@ -147,30 +178,28 @@ class GroupedExperts(nn.Module):
         sorted_inputs: torch.Tensor,
         tokens_per_expert: torch.Tensor,
     ) -> torch.Tensor:
-        """Run already expert-major tokens through the two low-precision GMMs."""
+        """Run expert-major tokens through gate/up and down HiFloat8 GMMs."""
 
-        try:
-            gate_up = _GroupedLinearFunction.apply(
-                sorted_inputs,
-                self.gate_up_proj,
-                tokens_per_expert,
-                self.grouped_linear,
-                1,
-            )
-            gate, up = gate_up.chunk(2, dim=-1)
-            intermediate = self.act_fn(gate) * up
-            return _GroupedLinearFunction.apply(
-                intermediate,
-                self.down_proj,
-                tokens_per_expert,
-                self.grouped_linear,
-                1,
-            )
-        except (LowPrecisionCapabilityError, W4A8CapabilityError) as exc:
-            target = self.fqn or "<unknown>"
-            raise LowPrecisionCapabilityError(
-                f"Low-precision grouped-expert target {target!r} cannot run: {exc}"
-            ) from exc
+        gate_up = hifloat8_grouped_linear(
+            sorted_inputs,
+            self.gate_up_proj,
+            tokens_per_expert,
+            self.input_quantizer,
+            self.weight_quantizer,
+            self.grad_output_quantizer,
+            group_list_type=1,
+        )
+        gate, up = gate_up.chunk(2, dim=-1)
+        intermediate = self.act_fn(gate) * up
+        return hifloat8_grouped_linear(
+            intermediate,
+            self.down_proj,
+            tokens_per_expert,
+            self.input_quantizer,
+            self.weight_quantizer,
+            self.grad_output_quantizer,
+            group_list_type=1,
+        )
 
     def forward(
         self,
@@ -178,21 +207,31 @@ class GroupedExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Sort routed tokens, execute grouped experts, and restore token order."""
+        """Sort routes, execute packed experts, and restore token order.
+
+        Args:
+            hidden_states: Input matrix in [tokens, hidden_dim] layout.
+            top_k_index: Local expert indices in [tokens, top_k] layout.
+            top_k_weights: Routing weights matching top_k_index.
+
+        Returns:
+            Routing-weighted expert output in the original token order and dtype.
+        """
 
         if hidden_states.ndim != 2:
             raise ValueError(
-                "Grouped experts require two-dimensional hidden_states, "
-                f"but got shape {tuple(hidden_states.shape)}."
+                "Packed HiFloat8 experts require two-dimensional hidden_states, "
+                f"got shape {tuple(hidden_states.shape)}."
             )
         if top_k_index.shape != top_k_weights.shape or top_k_index.ndim != 2:
             raise ValueError(
-                "top_k_index and top_k_weights must have the same two-dimensional shape."
+                "top_k_index and top_k_weights must have the same 2D shape."
             )
         if top_k_index.shape[0] != hidden_states.shape[0]:
             raise ValueError(
                 "The routed token count must match hidden_states: "
-                f"routes={top_k_index.shape[0]}, tokens={hidden_states.shape[0]}."
+                f"routes={top_k_index.shape[0]}, "
+                f"tokens={hidden_states.shape[0]}."
             )
 
         token_count = hidden_states.shape[0]
@@ -208,9 +247,14 @@ class GroupedExperts(nn.Module):
             flattened_expert_indices,
             minlength=self.num_experts,
         )
+        # bincount rejects negative IDs; an extra bin identifies an upper-bound violation.
+        if tokens_per_expert.numel() != self.num_experts:
+            raise ValueError(f"Expert indices must be in [0, {self.num_experts}).")
         sorted_outputs = self._grouped_forward(sorted_inputs, tokens_per_expert)
         sorted_weights = top_k_weights.reshape(-1)[expert_order]
-        sorted_outputs = sorted_outputs * sorted_weights.unsqueeze(-1)
+        sorted_outputs = (
+            sorted_outputs * sorted_weights.unsqueeze(-1)
+        ).to(hidden_states.dtype)
 
         inverse_order = torch.empty_like(expert_order)
         inverse_order[expert_order] = torch.arange(
@@ -224,4 +268,4 @@ class GroupedExperts(nn.Module):
         ).sum(dim=1)
 
 
-__all__ = ["GroupedExperts"]
+__all__ = ["HiFloat8GroupedExperts"]

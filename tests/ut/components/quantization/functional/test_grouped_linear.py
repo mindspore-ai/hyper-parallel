@@ -14,16 +14,12 @@
 # ============================================================================
 """CPU tests for grouped-linear strategy dispatch and shared autograd."""
 
-from typing import Any
 import unittest
 from unittest import mock
 
 import torch
 
 from hyper_parallel.components.quantization.config import LowPrecisionDtypeScheme
-from hyper_parallel.components.quantization.functional import (
-    hifloat8_gmm_func as hifloat8_impl,
-)
 from hyper_parallel.components.quantization.functional.base_gmm_func import (
     GroupedLinear,
     _GroupedLinearFunction,
@@ -31,9 +27,6 @@ from hyper_parallel.components.quantization.functional.base_gmm_func import (
 )
 from hyper_parallel.components.quantization.functional.fake_w4a8_gmm_func import (
     FakeW4A8GroupedLinear,
-)
-from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import (
-    HiFloat8GroupedLinear,
 )
 from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import (
     MXFP8GroupedLinear,
@@ -58,50 +51,14 @@ cpu_test = arg_mark(
 class _DenseStorage:
     """Minimal directional storage carrying high-precision CPU data."""
 
-    def __init__(
-        self,
-        value: torch.Tensor,
-        *,
-        rowwise: bool,
-        colwise: bool,
-    ) -> None:
-        """Store one dense value and its available directional views."""
-
+    def __init__(self, value, *, rowwise, colwise):
         self.value = value
         self.rowwise = rowwise
         self.colwise = colwise
 
-    def update_usage(
-        self,
-        rowwise: bool = True,
-        colwise: bool = True,
-    ) -> None:
-        """Release directional views no longer needed by the lifecycle."""
-
+    def update_usage(self, rowwise=True, colwise=True):
         self.rowwise = self.rowwise and rowwise
         self.colwise = self.colwise and colwise
-
-
-class _RecordingQuantizer:
-    """Dense quantizer double recording role-specific direction requests."""
-
-    def __init__(self) -> None:
-        """Create empty call and storage histories."""
-
-        self.calls: list[tuple[torch.Tensor, dict[str, Any]]] = []
-        self.storages: list[_DenseStorage] = []
-
-    def quantize(self, tensor: torch.Tensor, **kwargs: Any) -> _DenseStorage:
-        """Return dense storage while retaining arguments for assertions."""
-
-        storage = _DenseStorage(
-            tensor,
-            rowwise=kwargs["rowwise"],
-            colwise=kwargs["colwise"],
-        )
-        self.calls.append((tensor.detach().clone(), dict(kwargs)))
-        self.storages.append(storage)
-        return storage
 
 
 class _DenseGroupedLinear(GroupedLinear):
@@ -109,84 +66,35 @@ class _DenseGroupedLinear(GroupedLinear):
 
     FORMAT_NAME = "DenseTest"
 
-    def normalize_group_list(
-        self,
-        group_list: torch.Tensor,
-        group_list_type: int,
-    ) -> tuple[torch.Tensor, int]:
-        """Keep count/offset metadata unchanged."""
-
+    def normalize_group_list(self, group_list, group_list_type):
         return group_list, group_list_type
 
-    def output_features(self, weight: torch.Tensor) -> int:
-        """Read output width from the live weight layout."""
-
+    def output_features(self, weight):
         return weight.shape[-2]
 
-    def weight_quantization_directions(
-        self,
-        needs_grad_input: bool,
-    ) -> tuple[bool, bool]:
-        """Request the same directional views as MXFP8/HiFloat8."""
-
+    def weight_quantization_directions(self, needs_grad_input):
         return needs_grad_input, True
 
-    def retain_weight_backward(
-        self,
-        weight_quant: _DenseStorage,
-        needs_grad_input: bool,
-    ) -> None:
-        """Retain only the view consumed by dense dgrad."""
-
+    def retain_weight_backward(self, weight_quant, needs_grad_input):
         weight_quant.update_usage(rowwise=needs_grad_input, colwise=False)
 
     @staticmethod
-    def _store(
-        value: torch.Tensor,
-        rowwise: bool,
-        colwise: bool,
-    ) -> _DenseStorage:
+    def _store(value, rowwise, colwise):
         return _DenseStorage(value, rowwise=rowwise, colwise=colwise)
 
-    def quantize_input(
-        self,
-        inputs: torch.Tensor,
-        *,
-        rowwise: bool,
-        colwise: bool,
-        **kwargs: Any,
-    ) -> _DenseStorage:
-        """Wrap the dense input without changing its values."""
-
+    def quantize_input(self, inputs, *, rowwise, colwise, **kwargs):
         del kwargs
         return self._store(inputs, rowwise, colwise)
 
-    def quantize_weight(
-        self,
-        weight: torch.Tensor,
-        *,
-        rowwise: bool,
-        colwise: bool,
-    ) -> _DenseStorage:
-        """Wrap the dense weight without changing its values."""
-
+    def quantize_weight(self, weight, *, rowwise, colwise):
         return self._store(weight, rowwise, colwise)
 
-    def quantize_grad_output(
-        self,
-        grad_output: torch.Tensor,
-        *,
-        rowwise: bool,
-        colwise: bool,
-        **kwargs: Any,
-    ) -> _DenseStorage:
-        """Wrap the dense output gradient without changing its values."""
-
+    def quantize_grad_output(self, grad_output, *, rowwise, colwise, **kwargs):
         del kwargs
         return self._store(grad_output, rowwise, colwise)
 
     @staticmethod
-    def _counts(group_list: torch.Tensor, group_list_type: int) -> list[int]:
+    def _counts(group_list, group_list_type):
         if group_list_type == 1:
             return group_list.tolist()
         boundaries = group_list.tolist()
@@ -195,17 +103,15 @@ class _DenseGroupedLinear(GroupedLinear):
 
     def grouped_matmul(
         self,
-        left: _DenseStorage,
-        right: _DenseStorage,
+        left,
+        right,
         *,
-        layout: str,
-        group_list: torch.Tensor,
-        group_type: int,
-        group_list_type: int,
-        output_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Execute grouped dense matmul for the requested layout."""
-
+        layout,
+        group_list,
+        group_type,
+        group_list_type,
+        output_dtype,
+    ):
         del group_type
         counts = self._counts(group_list, group_list_type)
         left_parts = left.value.split(counts, dim=0)
@@ -226,11 +132,7 @@ class _DenseGroupedLinear(GroupedLinear):
         raise AssertionError(f"unexpected layout: {layout}")
 
 
-def _dense_reference(
-    inputs: torch.Tensor,
-    weight: torch.Tensor,
-    counts: torch.Tensor,
-) -> torch.Tensor:
+def _dense_reference(inputs, weight, counts):
     """Reference grouped linear for live [E, O, K] weights."""
     parts = inputs.split(counts.tolist(), dim=0)
     return torch.cat(
@@ -249,21 +151,15 @@ class TestStrategyFactory(unittest.TestCase):
             mock.patch(f"{module}.validate_npu_gmm_runtime"),
             mock.patch(f"{module}.validate_w4a8_gmm_runtime"),
             mock.patch(f"{module}.validate_fake_w4a8_gmm_runtime"),
-            mock.patch(f"{module}.validate_hifloat8_gmm_runtime"),
         )
 
     @cpu_test
-    def test_dispatches_all_supported_grouped_linear_strategies(self):
-        """Every supported policy chooses its independent strategy."""
+    def test_dispatches_w8a8_native_w4a8_and_fake_w4a8(self):
+        """All three supported policies choose their independent strategies."""
         aligned32 = ((2, 64, 32), (2, 32, 64))
         aligned128 = ((2, 256, 128), (2, 128, 256))
-        p_mx, p_native, p_fake, p_hifloat = self._patch_probes()
-        with (
-            p_mx as mx_probe,
-            p_native as native_probe,
-            p_fake as fake_probe,
-            p_hifloat as hifloat_probe,
-        ):
+        p_mx, p_native, p_fake = self._patch_probes()
+        with p_mx as mx_probe, p_native as native_probe, p_fake as fake_probe:
             w8a8 = build_low_precision_strategy(None, tile_shapes=aligned32)
             native = build_low_precision_strategy(
                 LowPrecisionDtypeScheme(
@@ -280,24 +176,14 @@ class TestStrategyFactory(unittest.TestCase):
                 ),
                 tile_shapes=aligned32,
             )
-            hifloat = build_low_precision_strategy(
-                LowPrecisionDtypeScheme(
-                    weight_format="hif8",
-                    act_format="hif8",
-                ),
-                # HiFloat8 current scaling has no MX block-alignment gate.
-                tile_shapes=((2, 63, 31), (2, 31, 63)),
-            )
 
         self.assertIsInstance(w8a8, MXFP8GroupedLinear)
         self.assertIsInstance(native, W4A8GroupedLinear)
         self.assertEqual(native.block_size, 128)
         self.assertIsInstance(fake, FakeW4A8GroupedLinear)
-        self.assertIsInstance(hifloat, HiFloat8GroupedLinear)
         mx_probe.assert_called_once_with()
         native_probe.assert_called_once_with()
         fake_probe.assert_called_once_with()
-        hifloat_probe.assert_called_once_with()
 
     @cpu_test
     def test_alignment_and_unsupported_policies_fail_at_factory(self):
@@ -316,163 +202,10 @@ class TestStrategyFactory(unittest.TestCase):
                 LowPrecisionDtypeScheme(is_fake_quantize=True),
                 tile_shapes=((2, 64, 32), (2, 32, 64)),
             )
-        with self.assertRaisesRegex(NotImplementedError, "hifloat combination"):
+        with self.assertRaisesRegex(NotImplementedError, "only the mxfp family"):
             build_low_precision_strategy(
-                LowPrecisionDtypeScheme(weight_format="hif4", act_format="hif8"),
+                LowPrecisionDtypeScheme(weight_format="hif8", act_format="hif8"),
                 tile_shapes=((2, 64, 32), (2, 32, 64)),
-            )
-        with self.assertRaisesRegex(NotImplementedError, "fake HiFloat QAT"):
-            build_low_precision_strategy(
-                LowPrecisionDtypeScheme(
-                    is_fake_quantize=True,
-                    weight_format="hif8",
-                    act_format="hif8",
-                ),
-                tile_shapes=((2, 64, 32), (2, 32, 64)),
-            )
-
-
-class TestHiFloat8GroupedLinear(unittest.TestCase):
-    """HiFloat8 plugs format hooks into the one shared autograd lifecycle."""
-
-    @cpu_test
-    def test_default_role_quantizers_keep_original_recipes(self):
-        """Input, weight, and gradient recipes stay independent at 15/15/224."""
-        strategy = HiFloat8GroupedLinear()
-
-        self.assertIsInstance(strategy, GroupedLinear)
-        self.assertIsNot(strategy.input_quantizer, strategy.weight_quantizer)
-        self.assertIsNot(strategy.input_quantizer, strategy.grad_output_quantizer)
-        self.assertEqual(strategy.input_quantizer.fp8_max, 15.0)
-        self.assertEqual(strategy.weight_quantizer.fp8_max, 15.0)
-        self.assertEqual(strategy.grad_output_quantizer.fp8_max, 224.0)
-
-    @cpu_test
-    def test_shared_forward_backward_preserves_hifloat8_operator_contract(self):
-        """The merged flow keeps quantization directions and NN/NT/TN calls."""
-        torch.manual_seed(17)
-        input_quantizer = _RecordingQuantizer()
-        weight_quantizer = _RecordingQuantizer()
-        grad_quantizer = _RecordingQuantizer()
-        strategy = HiFloat8GroupedLinear(
-            input_quantizer=input_quantizer,
-            weight_quantizer=weight_quantizer,
-            grad_output_quantizer=grad_quantizer,
-        )
-        counts = torch.tensor([2, 3], dtype=torch.int64)
-        inputs = torch.randn(5, 4, dtype=torch.bfloat16, requires_grad=True)
-        weight = torch.randn(2, 6, 4, dtype=torch.bfloat16, requires_grad=True)
-        grad = torch.randn(5, 6, dtype=torch.bfloat16)
-        operator_calls = []
-        dense_strategy = _DenseGroupedLinear()
-
-        def _dense_hifloat8_gmm(
-            left: _DenseStorage,
-            right: _DenseStorage,
-            **kwargs: Any,
-        ) -> torch.Tensor:
-            """Record and execute one dense stand-in for a HiFloat8 GMM."""
-
-            operator_calls.append(dict(kwargs))
-            return dense_strategy.grouped_matmul(left, right, **kwargs)
-
-        with mock.patch.object(
-            hifloat8_impl,
-            "hifloat8_grouped_matmul",
-            side_effect=_dense_hifloat8_gmm,
-        ):
-            actual = _GroupedLinearFunction.apply(
-                inputs,
-                weight,
-                counts,
-                strategy,
-                1,
-            )
-            actual_grads = torch.autograd.grad(actual, (inputs, weight), grad)
-
-        ref_inputs = inputs.detach().clone().requires_grad_(True)
-        ref_weight = weight.detach().clone().requires_grad_(True)
-        expected = _dense_reference(ref_inputs, ref_weight, counts)
-        expected_grads = torch.autograd.grad(expected, (ref_inputs, ref_weight), grad)
-
-        torch.testing.assert_close(actual, expected)
-        torch.testing.assert_close(actual_grads[0], expected_grads[0])
-        torch.testing.assert_close(actual_grads[1], expected_grads[1])
-        self.assertEqual(
-            [(call["layout"], call["group_type"]) for call in operator_calls],
-            [("NN", 0), ("NT", 0), ("TN", 2)],
-        )
-        self.assertTrue(
-            all(call["group_list_type"] == 1 for call in operator_calls)
-        )
-        self.assertTrue(
-            all(call["output_dtype"] == torch.bfloat16 for call in operator_calls)
-        )
-        self.assertEqual(
-            (input_quantizer.calls[0][1]["rowwise"],
-             input_quantizer.calls[0][1]["colwise"]),
-            (True, True),
-        )
-        self.assertEqual(
-            (weight_quantizer.calls[0][1]["rowwise"],
-             weight_quantizer.calls[0][1]["colwise"]),
-            (True, True),
-        )
-        self.assertEqual(
-            (grad_quantizer.calls[0][1]["rowwise"],
-             grad_quantizer.calls[0][1]["colwise"]),
-            (True, True),
-        )
-        torch.testing.assert_close(
-            weight_quantizer.calls[0][0],
-            weight.detach().transpose(-2, -1).contiguous(),
-        )
-        self.assertEqual(
-            (input_quantizer.storages[0].rowwise,
-             input_quantizer.storages[0].colwise),
-            (False, True),
-        )
-        self.assertEqual(
-            (weight_quantizer.storages[0].rowwise,
-             weight_quantizer.storages[0].colwise),
-            (True, False),
-        )
-        self.assertEqual(
-            (grad_quantizer.storages[0].rowwise,
-             grad_quantizer.storages[0].colwise),
-            (False, False),
-        )
-
-    @cpu_test
-    def test_hifloat8_specific_validation_is_retained(self):
-        """The shared bridge still rejects invalid HiFloat8 dtype and groups."""
-        quantizer = _RecordingQuantizer()
-        strategy = HiFloat8GroupedLinear(quantizer, quantizer, quantizer)
-        weight = torch.randn(2, 6, 4, dtype=torch.bfloat16)
-
-        with self.assertRaisesRegex(TypeError, "float16 or bfloat16"):
-            _GroupedLinearFunction.apply(
-                torch.randn(3, 4),
-                weight,
-                torch.tensor([1, 2], dtype=torch.int64),
-                strategy,
-                1,
-            )
-        with self.assertRaisesRegex(TypeError, "torch.int64"):
-            _GroupedLinearFunction.apply(
-                torch.randn(3, 4, dtype=torch.bfloat16),
-                weight,
-                torch.tensor([1, 2], dtype=torch.int32),
-                strategy,
-                1,
-            )
-        with self.assertRaisesRegex(ValueError, "all-zero group_list"):
-            _GroupedLinearFunction.apply(
-                torch.empty(0, 4, dtype=torch.bfloat16),
-                weight,
-                torch.tensor([0, 1], dtype=torch.int64),
-                strategy,
-                1,
             )
 
 

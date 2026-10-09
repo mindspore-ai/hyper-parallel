@@ -12,26 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Canonical shell and single replacement for low-precision Dense Linear."""
+"""Common parameter-preserving base for low-precision Linear adapters."""
 
-from collections.abc import Mapping
-from typing import Any
+from abc import ABC, abstractmethod
+from typing import TypeVar
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.components.quantization.functional.base_linear_func import (
-    LinearStrategy,
-    _LinearFunction,
-)
-from hyper_parallel.components.quantization.functional.linear_strategy_factory import (
-    build_linear_strategy,
-)
-from hyper_parallel.models.replacement import module_replacement
+_LinearType = TypeVar("_LinearType", bound="QuantizedLinearBase")
 
 
-class LowPrecisionLinear(nn.Linear):
-    """Preserve Linear state while delegating compute to one bound strategy."""
+class QuantizedLinearBase(nn.Linear, ABC):
+    """Preserve Linear parameters while delegating format-specific compute."""
 
     _hp_linear_compute_kind = "npu_quant"
 
@@ -39,80 +32,49 @@ class LowPrecisionLinear(nn.Linear):
         self,
         in_features: int,
         out_features: int,
-        bias: bool = True,
-        *,
-        strategy: LinearStrategy,
     ) -> None:
-        """Create a low-precision Linear with newly allocated Parameters."""
+        """Create a format-specific low-precision Linear."""
 
-        self._validate_strategy(strategy)
-        super().__init__(in_features, out_features, bias=bias)
-        self.strategy = strategy
-
-    @staticmethod
-    def _validate_strategy(strategy: LinearStrategy) -> None:
-        """Require a plain strategy so module registration stays unchanged."""
-
-        if isinstance(strategy, nn.Module) or not isinstance(strategy, LinearStrategy):
-            raise TypeError("strategy must be a non-Module LinearStrategy instance")
+        super().__init__(in_features, out_features, bias=True)
+        self._initialize_format()
 
     @classmethod
     def from_linear(
-        cls,
+        cls: type[_LinearType],
         linear: nn.Linear,
-        *,
-        strategy: LinearStrategy,
-    ) -> "LowPrecisionLinear":
-        """Create a no-allocation shell retaining the source Parameters."""
+    ) -> _LinearType:
+        """Create a no-allocation shell while retaining Parameter objects."""
 
-        cls._validate_strategy(strategy)
+        # Do not call nn.Linear.__init__: it allocates and initializes a full
+        # temporary weight before we replace it. This remains safe for large
+        # model conversion and meta-device construction.
         converted = cls.__new__(cls)
+        # Deliberately invoke nn.Module.__init__ directly to skip
+        # nn.Linear.__init__'s allocation; super() cannot express this.
         nn.Module.__init__(converted)  # pylint: disable=unnecessary-dunder-call
         converted.in_features = linear.in_features
         converted.out_features = linear.out_features
         converted.register_parameter("weight", linear.weight)
         converted.register_parameter("bias", linear.bias)
-        converted.strategy = strategy
         converted.training = linear.training
+        converted._initialize_format()
         return converted
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
-        """Apply the selected low-precision compute and high-precision bias."""
+    @abstractmethod
+    def _initialize_format(self) -> None:
+        """Create format-specific quantizers and state."""
 
-        output = _LinearFunction.apply(input, self.weight, self.strategy)
+    @abstractmethod
+    def _apply_low_precision(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Execute one format-specific bias-free Dense operation."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
+        """Apply low-precision compute and preserve the high-precision bias."""
+
+        output = self._apply_low_precision(input)
         if self.bias is not None:
             output = output + self.bias
         return output
 
 
-@module_replacement
-def replace_linear(
-    *,
-    module: nn.Module,
-    module_fqn: str,
-    context: Mapping[str, Any],
-) -> LowPrecisionLinear:
-    """Replace one exact Dense Linear using the selected dtype policy."""
-
-    if type(module) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
-        raise TypeError(
-            f"{module_fqn!r} must be exact nn.Linear, got {type(module).__name__}"
-        )
-    if context.get("pp"):
-        raise NotImplementedError(
-            "Low-precision Linear training is not yet supported with pipeline parallelism."
-        )
-    try:
-        strategy = build_linear_strategy(
-            context.get("low_precision"),
-            in_features=module.in_features,
-            out_features=module.out_features,
-        )
-    except ValueError as error:
-        raise ValueError(
-            f"Low-precision Linear target {module_fqn!r} is invalid: {error}"
-        ) from error
-    return LowPrecisionLinear.from_linear(module, strategy=strategy)
-
-
-__all__ = ["LowPrecisionLinear", "replace_linear"]
+__all__ = ["QuantizedLinearBase"]
