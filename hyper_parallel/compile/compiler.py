@@ -41,6 +41,7 @@ from torch.distributed.distributed_c10d import _register_process_group
 from .pass_config import PassConfig
 from .graph_parallel_plan import GraphParallelPlan
 from .passes.pipeline import PassPipeline
+from .tracer.dynamic_shapes import DynamicArgDims, normalize_dynamic_arg_dims
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
 
 _LOG = logging.getLogger(__name__)
@@ -63,6 +64,8 @@ class GraphCompiler:
         parallel_plan: Optional[GraphParallelPlan] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
+        dynamic: bool = False,
+        dynamic_arg_dims: Optional[DynamicArgDims] = None,
     ) -> None:
         """
         Args:
@@ -79,7 +82,13 @@ class GraphCompiler:
                 only the FSDP shard sub-mesh is registered under ``"fsdp"``.
                 Use this to feed an automodel TP-sharded model into the
                 graph-mode FSDP pass.
+            dynamic: Symbolize user input dimensions (default False).
+            dynamic_arg_dims: Dotted input paths to dynamic dimensions; overrides automatic selection.
         """
+        self.dynamic = dynamic
+        if not isinstance(self.dynamic, bool):
+            raise ValueError("dynamic must be a bool")
+        self.dynamic_arg_dims = normalize_dynamic_arg_dims(dynamic_arg_dims)
         self.model = model
         self.train_fn = train_fn
         self.pass_config = pass_config
@@ -111,6 +120,10 @@ class GraphCompiler:
             **inputs: Model inputs, forwarded to ``train_fn`` as keyword
                 arguments and used to trace the joint graph
         """
+        if (self.dynamic or self.dynamic_arg_dims is not None) and self.pass_config.pp_enabled:
+            raise ValueError(
+                "Dynamic shapes with pipeline parallel are not supported yet; disable PP or dynamic shapes"
+            )
         if self.pass_config.fsdp_enabled and dist.is_initialized():
             # Only build the FSDP mesh when distributed is actually up.
             # ``FSDPPass`` early-returns when ``world_size == 1``, so a
@@ -118,8 +131,10 @@ class GraphCompiler:
             # runs as plain graph mode without sharding.
             self._init_device_mesh(self._mesh_context)
 
-        joint_graph = trace_model_graph(self.model, self.train_fn, inputs)
-
+        trace_kwargs = {}
+        if self.dynamic or self.dynamic_arg_dims is not None:
+            trace_kwargs = {"dynamic": self.dynamic, "dynamic_arg_dims": self.dynamic_arg_dims}
+        joint_graph = trace_model_graph(self.model, self.train_fn, inputs, **trace_kwargs)
         pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
         pass_kwargs = self._build_pass_kwargs()
@@ -128,6 +143,8 @@ class GraphCompiler:
         # transformed graph lives on ``joint_graph`` for ``forward_backward``.
         pipeline.run(joint_graph.graph_module, **pass_kwargs)
 
+        if joint_graph.input_guards is not None:
+            joint_graph.input_guards.refresh()
         self._joint_graph = joint_graph
 
     def forward_backward(self, **inputs: Any) -> Any:
@@ -155,7 +172,14 @@ class GraphCompiler:
         return loss
 
     def to(self, device: torch.device) -> "GraphCompiler":
-        """Move the model to ``device`` and remember it for graph execution."""
+        """Move the model and subsequent graph execution to the requested device.
+
+        Args:
+            device: Target device for model state and graph execution.
+
+        Returns:
+            This compiler, for chained configuration.
+        """
         self.device = torch.device(device)
         self.model = self.model.to(self.device)
         return self

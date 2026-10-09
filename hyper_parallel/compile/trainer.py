@@ -34,6 +34,7 @@ import torch
 import torch.distributed as dist
 
 from .compiler import GraphCompiler
+from .tracer.dynamic_shapes import DynamicArgDims
 from .pass_config import PassConfig
 from .graph_parallel_plan import GraphParallelPlan
 
@@ -60,6 +61,8 @@ class GraphTrainer:
         optimizer_config: Optional[dict] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
+        dynamic: bool = False,
+        dynamic_arg_dims: Optional[DynamicArgDims] = None,
     ) -> None:
         """
         Args:
@@ -77,6 +80,8 @@ class GraphTrainer:
                 already hold the group object) and only the FSDP shard
                 sub-mesh is registered under ``"fsdp"``. Use this to feed an
                 automodel TP-sharded model into the graph-mode FSDP pass.
+            dynamic: Enable symbolic user input dimensions (forwarded to GraphCompiler).
+            dynamic_arg_dims: Optional input paths to dynamic dimensions (forwarded to GraphCompiler).
         """
         # The compiler owns the model, device, config, and the compiled
         # graph; the trainer keeps only the optimizer / loop policy.
@@ -87,6 +92,8 @@ class GraphTrainer:
             parallel_plan=parallel_plan,
             device=device,
             mesh_context=mesh_context,
+            dynamic=dynamic,
+            dynamic_arg_dims=dynamic_arg_dims,
         )
         self.optimizer_config = optimizer_config or {}
         self.optimizer = None
