@@ -16,13 +16,14 @@
 """data: dataset building, batching, and parallel batch primitives.
 
 Stage 6 (05 §15.10) final layout: ``text`` (LLM builders/transforms/chat
-templates and online sources), ``indexed`` (``.idx``/``.bin`` datasets and
-the native helpers), ``batching`` (collators, dataloaders, get-batch),
-``parallel`` (DP samplers, CP/TP batch distribution, build barrier),
-``vlm`` (transitional vision-language boundary with its own facade), and
+templates), ``online`` (mapping/iterable raw sources), ``indexed``
+(``.idx``/``.bin`` datasets and the native helpers), ``batching``
+(collators, dataloaders, get-batch),
+``parallel`` (DP samplers and CP/TP batch distribution),
+``omni`` (image/video/audio data with its own facade), and
 ``tools`` (offline preparation). Shared constants live in
 ``data.constants``; dataset logging in ``data.dataset_logging``.
 
 The package root deliberately has no flat re-exports — import the owning
-subpackage (VLM symbols only via ``hyper_parallel.data.vlm``).
+subpackage (multimodal symbols only via ``hyper_parallel.data.omni``).
 """

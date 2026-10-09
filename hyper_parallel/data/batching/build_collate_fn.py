@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -24,7 +23,7 @@ from typing import Any
 import torch
 from torch.utils.data import default_collate
 
-from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.data.constants import IGNORE_INDEX, OMNI_CONCAT_FIELDS
 
 
 def _get_sequence_parallel_size(mesh_context: Any | None) -> int:
@@ -41,25 +40,8 @@ def _get_sequence_parallel_size(mesh_context: Any | None) -> int:
     return cp_size * (tp_size if sequence_parallel else 1)
 
 
-class DataCollator(ABC):
-    """Convert Dataset samples into one forward-backward micro-batch."""
-
-    @abstractmethod
-    def __call__(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
-        """Collate one sequence of model samples.
-
-        Args:
-            model_samples: Samples selected for one forward-backward step by the
-                fixed or dynamic batching policy.
-
-        Returns:
-            A collated batch mapping.
-        """
-        raise NotImplementedError
-
-
 @dataclass
-class TextPackingCollator(DataCollator):
+class TextPackingCollator:
     """Pack unpadded Online text samples and emit ``cu_seq_lens``.
 
     Only ``input_ids`` and pre-shifted ``labels`` are packed here. Unified
@@ -118,25 +100,35 @@ class TextPackingCollator(DataCollator):
         return packed_batch
 
 
-@dataclass
-class MainCollator(DataCollator):
-    """Apply modality packing after fixed or dynamic sample selection.
-
-    Args:
-        packing_collator: Text or multimodal packing implementation.
-    """
-
-    packing_collator: DataCollator
+class OmniCollator:
+    """Batch already prepared Omni samples without performing sequence packing."""
 
     def __call__(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
-        """Pack selected samples and retain compact sequence boundaries."""
-        packed_batch = self.packing_collator(model_samples)
+        """Stack token fields and concatenate variable-length modality fields."""
+        if not model_samples:
+            raise ValueError("model_samples must contain at least one Omni sample")
 
-        return packed_batch
+        sample_fields = set()
+        for model_sample in model_samples:
+            sample_fields.update(model_sample)
+
+        batch = {}
+        for field in sample_fields:
+            values = []
+            for model_sample in model_samples:
+                if field in model_sample:
+                    values.append(model_sample[field])
+
+            if field in OMNI_CONCAT_FIELDS:
+                batch[field] = torch.cat(values, dim=0)
+            else:
+                batch[field] = default_collate(values)
+
+        return batch
 
 
-def build_indexed_collate_fn() -> Callable[[list[Any]], Any]:
-    """Build default collation for fixed-length Indexed samples.
+def build_default_collate_fn() -> Callable[[list[Any]], Any]:
+    """Build ordinary PyTorch collation for already prepared samples.
 
     Returns:
         PyTorch default collation.
@@ -146,7 +138,17 @@ def build_indexed_collate_fn() -> Callable[[list[Any]], Any]:
     return collate_fn
 
 
-def build_online_text_collate_fn(mesh_context: Any | None = None) -> DataCollator:
+# Indexed samples are already prepared and use the same ordinary collation.
+build_indexed_collate_fn = build_default_collate_fn
+
+
+def build_omni_collate_fn() -> OmniCollator:
+    """Build ordinary collation for encoded or finally packed Omni samples."""
+    collate_fn = OmniCollator()
+    return collate_fn
+
+
+def build_online_text_collate_fn(mesh_context: Any | None = None) -> TextPackingCollator:
     """Build Online text collation shared by fixed N and dynamic K batching.
 
     Packing concatenates ``input_ids`` and ``labels`` and emits ``cu_seq_lens``.
@@ -163,7 +165,6 @@ def build_online_text_collate_fn(mesh_context: Any | None = None) -> DataCollato
         A collator producing one forward-backward batch.
     """
     sequence_parallel_size = _get_sequence_parallel_size(mesh_context)
-    packing_collator = TextPackingCollator(sequence_parallel_size=sequence_parallel_size)
-    collate_fn = MainCollator(packing_collator=packing_collator)
+    collate_fn = TextPackingCollator(sequence_parallel_size=sequence_parallel_size)
 
     return collate_fn

@@ -30,6 +30,9 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     MixedPrecisionOptimizer,
 )
+from hyper_parallel.models._transformers.model_builder import (
+    validate_model_init_dtype,
+)
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import empty_cache
 from hyper_parallel.trainer.runtime.device import (
@@ -105,6 +108,7 @@ class CheckpointerCallback(Callback):
         self._restore_from = ckpt_cfg.restore_from
         self._restore_optimizer = ckpt_cfg.restore_optimizer
         self._restore_train_state = ckpt_cfg.restore_train_state
+        self._restore_dataloader_state = ckpt_cfg.restore_dataloader_state
 
         self._last_saved_step: int = -1
         self.checkpointer = build_checkpointer(
@@ -267,6 +271,14 @@ class CheckpointerCallback(Callback):
         if self._save_train_state:
             checkpoint_state["extra_state"] = self._collect_extra_state(state)
 
+        model_integration = getattr(self.trainer, "model_integration", None)
+        if model_integration is not None:
+            model_integration.capture_checkpoint_payload(
+                "before_save",
+                save_dir,
+                checkpoint_state,
+            )
+
         self.checkpointer.save(
             save_dir,
             checkpoint_state,
@@ -347,11 +359,18 @@ class CheckpointerCallback(Callback):
             strict_model=not self._is_peft,
             extra_state_skeleton=extra_state_skeleton,
         )
+        model_integration = getattr(self.trainer, "model_integration", None)
+        if model_integration is not None:
+            model_integration.capture_checkpoint_payload(
+                "after_load",
+                restore_path,
+                checkpoint_state,
+            )
 
         self.trainer.model.load_state_dict(
             checkpoint_state["model"], strict=not self._is_peft
         )
-        apply_model_init_dtype(
+        validate_model_init_dtype(
             self.trainer.model,
             self.trainer.config.model_init_dtype,
         )
@@ -394,7 +413,8 @@ class CheckpointerCallback(Callback):
         """Restore progress, scheduler, dataloader position and RNG state."""
         trainer = self.trainer
         trainer.state.global_step = extra["global_step"]
-        trainer.state.epoch = extra.get("epoch", 0)
+        persisted_epoch = extra.get("epoch", 0)
+        trainer.state.epoch = persisted_epoch
 
         # The restored step is already on disk. Without this, resuming a run that
         # had nothing left to do would have ``on_train_end`` rewrite the very
@@ -419,7 +439,12 @@ class CheckpointerCallback(Callback):
                 scheduler.load_state_dict(scheduler_sd)
 
         dataloader_sd = extra.get("train_dataloader")
-        if dataloader_sd and hasattr(trainer.train_dataloader, "load_state_dict"):
+        if dataloader_sd and not self._restore_dataloader_state:
+            logger.info(
+                "restore_dataloader_state=False: retaining the configured "
+                "dataloader start instead of restoring its checkpoint cursor."
+            )
+        elif dataloader_sd and hasattr(trainer.train_dataloader, "load_state_dict"):
             trainer.train_dataloader.load_state_dict(dataloader_sd)
         elif dataloader_sd:
             logger.warning(
@@ -436,3 +461,4 @@ class CheckpointerCallback(Callback):
         python_rng = rng_state.get("python")
         if python_rng is not None:
             random.setstate(python_rng)
+

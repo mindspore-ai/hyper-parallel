@@ -2183,5 +2183,211 @@ class TestPermutedProbsDispatch(unittest.TestCase):
         )
 
 
+class TestStaticSplitsFastPath(unittest.TestCase):
+    """Pin ``HP_EP_STATIC_SPLITS``: one routing plan, no per-layer counts exchange.
+
+    The dispatch must hand ``all_to_all_single`` Python split lists, so every MoE layer pays
+    a counts a2a plus two ``.tolist()`` D2H drains -- and a drain waits for every op already
+    enqueued, which serialises the layer and shows up as 8.8 s of ``aclrtSynchronizeStream``
+    in the 2-SN host profile.  Under a static router (``fix_router: true``) the counts are
+    constant, so the plan is computed once and reused.  These tests pin that the exchange
+    really is skipped, that the reused plan produces the identical dispatch, and that the
+    switch defaults to off.
+    """
+
+    def setUp(self) -> None:
+        """Build the same mocked dispatch as ``TestExpertParallelDispatch``."""
+        from hyper_parallel.core.expert_parallel import static_splits
+
+        self.static_splits = static_splits
+        self.ep = ExpertParallel()
+        self.ep_size = 2
+        self.num_local_experts = 2
+        self.dim = 8
+        self.counts_out = torch.tensor([3, 2, 1, 4])
+        self.num_tokens_per_expert_in = torch.tensor([3, 2, 1, 4])
+        self.routed_input = torch.randn(int(self.counts_out.sum()), self.dim)
+        self.mock_mesh = _make_mock_device_mesh(self.ep_size)
+        self.module = _make_mock_module()
+
+        saved_enabled = static_splits._ENABLED  # pylint: disable=protected-access
+
+        def restore():
+            static_splits._ENABLED = saved_enabled  # pylint: disable=protected-access
+            static_splits.clear_static_plans()
+
+        self.addCleanup(restore)
+
+    def _configure(self, mock_exchange, mock_a2a):
+        """Point the counts exchange and the token exchange at deterministic values."""
+        mock_exchange.side_effect = lambda _tensor, _group: self.counts_out
+        mock_a2a.side_effect = lambda inp, *_args, **_kw: inp
+
+    def _dispatch(self):
+        """Dispatch once through ``ExpertParallel._token_dispatch``."""
+        return self.ep._token_dispatch(
+            module=self.module,
+            inputs=(self.routed_input, self.num_tokens_per_expert_in),
+            device_mesh=self.mock_mesh,
+        )
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.differentiable_all_to_all_single")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.exchange_splits_via_all_to_all")
+    def test_counts_exchange_runs_once_per_plan(self, mock_exchange, mock_a2a):
+        """Two layers with the same plan exchange counts once when the switch is on."""
+        self.static_splits._ENABLED = True  # pylint: disable=protected-access
+        self.static_splits.clear_static_plans()
+        self._configure(mock_exchange, mock_a2a)
+
+        first = self._dispatch()
+        second = self._dispatch()
+        self.assertEqual(mock_exchange.call_count, 1)
+        # Reusing the plan must reproduce the dispatch exactly, not approximately.
+        self.assertTrue(torch.equal(first[0], second[0]))
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.differentiable_all_to_all_single")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.exchange_splits_via_all_to_all")
+    def test_counts_exchange_runs_per_layer_when_off(self, mock_exchange, mock_a2a):
+        """The default keeps the original behaviour: one exchange per dispatch."""
+        self.static_splits._ENABLED = False  # pylint: disable=protected-access
+        self._configure(mock_exchange, mock_a2a)
+
+        self._dispatch()
+        self._dispatch()
+        self.assertEqual(mock_exchange.call_count, 2)
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.differentiable_all_to_all_single")
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.exchange_splits_via_all_to_all")
+    def test_cache_is_keyed_by_plan_shape(self, mock_exchange, mock_a2a):
+        """A different expert layout must not reuse the previous plan."""
+        self.static_splits._ENABLED = True  # pylint: disable=protected-access
+        self.static_splits.clear_static_plans()
+        self._configure(mock_exchange, mock_a2a)
+
+        self._dispatch()
+        other = torch.tensor([2, 2, 2, 2, 2, 2, 2, 2])
+        mock_exchange.side_effect = lambda _tensor, _group: other
+        self.ep._token_dispatch(
+            module=self.module,
+            inputs=(torch.randn(int(other.sum()), self.dim), other),
+            device_mesh=_make_mock_device_mesh(2),
+        )
+        self.assertEqual(mock_exchange.call_count, 2)
+
+    def test_switch_defaults_to_off(self):
+        """The env is opt-in: with it unset the fast path must not be active."""
+
+        if os.environ.get("HP_EP_STATIC_SPLITS", "0") == "1":
+            self.skipTest("HP_EP_STATIC_SPLITS is set in this environment")
+        self.assertFalse(self.static_splits.static_splits_enabled())
+
+
+class TestRealDispatchStaticPlan(unittest.TestCase):
+    """Pin the fast path in the dispatch that the training run actually calls.
+
+    ``hyper_parallel/distributed/expert_parallel/experts.py::_prepare_ep_dispatch`` is the
+    implementation used by the 2-SN arms, and it has its own counts exchange (this one
+    synchronous) plus two ``.tolist()`` drains.  The first version of this optimisation was
+    applied to the ``core`` twin, which the run never enters -- the arm's step times came
+    back bit-identical to the control and no log line fired.  These tests therefore cover
+    the distributed implementation directly.
+    """
+
+    def setUp(self) -> None:
+        """Enable the switch and clear the plan cache, restoring both afterwards."""
+        from hyper_parallel.core.expert_parallel import static_splits
+
+        self.static_splits = static_splits
+        saved_enabled = static_splits._ENABLED  # pylint: disable=protected-access
+        static_splits._ENABLED = True  # pylint: disable=protected-access
+        static_splits.clear_static_plans()
+
+        def restore():
+            static_splits._ENABLED = saved_enabled  # pylint: disable=protected-access
+            static_splits.clear_static_plans()
+
+        self.addCleanup(restore)
+        self.dim = 8
+        self.ep_size = 2
+        self.local_expert_count = 2
+        self.global_expert_count = 4
+        self.token_count = 4
+        self.topk = 2
+
+    def _dispatch(self, mock_dist):
+        """Run the real ``_prepare_ep_dispatch`` with a stubbed collective."""
+        from hyper_parallel.distributed.expert_parallel.experts import _prepare_ep_dispatch
+
+        hidden = torch.randn(self.token_count, self.dim)
+        # Top-k indices spread over both ranks' experts so the plan is non-trivial.
+        topk_indices = torch.tensor([[0, 1], [2, 3], [1, 2], [3, 0]])
+        topk_weights = torch.rand(self.token_count, self.topk)
+        return _prepare_ep_dispatch(
+            hidden, topk_indices, topk_weights,
+            local_expert_count=self.local_expert_count,
+            global_expert_count=self.global_expert_count,
+            ep_size=self.ep_size,
+            ep_group=None,
+        )
+
+    @patch("hyper_parallel.distributed.expert_parallel.experts.dist")
+    def test_counts_exchange_runs_once_for_a_static_plan(self, mock_dist):
+        """Two layers with the same plan exchange counts once, and agree exactly."""
+        mock_dist.all_to_all_single.side_effect = lambda out, _inp, **_kw: None
+        first = self._dispatch(mock_dist)
+        second = self._dispatch(mock_dist)
+        self.assertEqual(mock_dist.all_to_all_single.call_count, 1)
+        self.assertEqual(
+            (first.send_counts, first.receive_counts),
+            (second.send_counts, second.receive_counts),
+            "split lists must be reused verbatim",
+        )
+
+    @patch("hyper_parallel.distributed.expert_parallel.experts.dist")
+    def test_counts_exchange_runs_per_layer_when_disabled(self, mock_dist):
+        """With the switch off the original behaviour is untouched."""
+        self.static_splits._ENABLED = False  # pylint: disable=protected-access
+        mock_dist.all_to_all_single.side_effect = lambda out, _inp, **_kw: None
+        self._dispatch(mock_dist)
+        self._dispatch(mock_dist)
+        self.assertEqual(mock_dist.all_to_all_single.call_count, 2)
+
+
+class TestStaticSplitsProbe(unittest.TestCase):
+    """Pin the bisect modes that attribute the static-plan OOM.
+
+    The fast path removes the counts all-to-all and the two D2H drains together, and the
+    2-SN config OOMs 4/4 with it on, so the halves have to be separable to name the cause.
+    """
+
+    def _mode(self, value):
+        """Return ``probe_mode()`` for one env value, restoring the environment."""
+        from hyper_parallel.core.expert_parallel import static_splits
+
+        previous = os.environ.get("HP_EP_STATIC_SPLITS_PROBE")
+        if value is None:
+            os.environ.pop("HP_EP_STATIC_SPLITS_PROBE", None)
+        else:
+            os.environ["HP_EP_STATIC_SPLITS_PROBE"] = value
+        try:
+            return static_splits.probe_mode()
+        finally:
+            if previous is None:
+                os.environ.pop("HP_EP_STATIC_SPLITS_PROBE", None)
+            else:
+                os.environ["HP_EP_STATIC_SPLITS_PROBE"] = previous
+
+    def test_modes_are_recognised(self):
+        """The two half-probes are parsed, in any casing and with padding."""
+        self.assertEqual(self._mode("a2a"), "a2a")
+        self.assertEqual(self._mode(" DRAINS "), "drains")
+
+    def test_unknown_or_absent_is_the_normal_path(self):
+        """Anything else must fall back to the normal fast path, never to a probe."""
+        self.assertEqual(self._mode(None), "")
+        self.assertEqual(self._mode(""), "")
+        self.assertEqual(self._mode("both"), "")
+
+
 if __name__ == "__main__":
     unittest.main()

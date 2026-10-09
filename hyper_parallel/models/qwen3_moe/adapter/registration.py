@@ -12,14 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""registration: architecture ID / capability contract for Qwen3-MoE.
+"""Register the Qwen3-MoE adapter capabilities.
 
-Registers the family's ``ModelAdapterSpec`` with the shared
-``models/registry.py`` (adjust doc §7.2). The replacements/attention
-providers are wired by M2, the context_parallel/expert_parallel providers
-by M3. This module never imports Trainer/Data or the legacy
-``components/models`` god files, and the providers stay lazy so registry
-discovery keeps working on CPU-only checkouts.
+Providers remain lazy so registry discovery does not import model
+implementations, trainer/data modules, or backend dependencies.
 """
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
@@ -28,15 +24,15 @@ from hyper_parallel.models.registry import register_model_adapter
 
 def _load_replacements():
     """Return the family's replacement-factory module (lazy provider)."""
-    from hyper_parallel.models.qwen3_moe.adapter import (  # pylint: disable=C0415
-        replacements,
+    from hyper_parallel.models.qwen3_moe.adapter.conversion import (  # pylint: disable=C0415
+        module_replacement,
     )
-    return replacements
+    return module_replacement
 
 
 def _load_attention():
     """Return the family's attention-contract module (lazy provider)."""
-    from hyper_parallel.models.qwen3_moe.adapter import (  # pylint: disable=C0415
+    from hyper_parallel.models.qwen3_moe.adapter.runtime import (  # pylint: disable=C0415
         attention,
     )
     return attention
@@ -60,10 +56,10 @@ def _load_expert_parallel():
 
 def _load_loss():
     """Return the family's model-integrated output-loss adapter."""
-    from hyper_parallel.models.qwen3_moe.adapter import (  # pylint: disable=C0415
-        chunk_loss,
+    from hyper_parallel.models.qwen3_moe.adapter.runtime import (  # pylint: disable=C0415
+        chunked_loss,
     )
-    return chunk_loss
+    return chunked_loss
 
 
 QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(

@@ -18,7 +18,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
@@ -278,6 +278,34 @@ class TestCheckpointerCallbackAsyncFailure(unittest.TestCase):
             str(ctx.exception),
             f"the async failure must reach the training loop, got={ctx.exception!r}",
         )
+
+    @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.set_device_rng_state")
+    def test_train_state_restore_can_replay_from_configured_data_start(
+            self,
+            mock_set_device_rng_state: MagicMock,
+    ) -> None:
+        """Warm-start restore keeps progress and RNG without loading the cursor."""
+        dataloader = MagicMock()
+        callback = CheckpointerCallback.__new__(CheckpointerCallback)
+        callback._restore_dataloader_state = False
+        callback.trainer = SimpleNamespace(
+            state=TrainerState(),
+            train_dataloader=dataloader,
+            train_steps=4,
+            lr_scheduler=None,
+        )
+
+        callback._apply_extra_state({
+            "global_step": 1,
+            "epoch": 0,
+            "lr_scheduler": None,
+            "train_dataloader": {"cursor": 7},
+            "rng_state": {},
+        })
+
+        self.assertEqual(callback.trainer.state.global_step, 1)
+        dataloader.load_state_dict.assert_not_called()
+        mock_set_device_rng_state.assert_called_once_with(None)
 
 
 if __name__ == "__main__":

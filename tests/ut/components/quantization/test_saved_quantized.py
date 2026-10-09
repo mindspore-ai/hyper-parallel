@@ -55,7 +55,11 @@ class SavedQuantizedTests(unittest.TestCase):
         Description: Offload all four projections with both pinning modes and gradient subsets.
         Expectation: Outputs and repeated gradients match the non-offloaded reference.
         """
-        cases = itertools.product(('mxfp8', 'hif8'), (False, True),
+        # The grouped MXFP8 strategy flow keeps quantized wrappers on the
+        # autograd context instead of physical saved tensors, so offload and
+        # hook contracts cover the Dense MXFP8 path and both HiFloat8 paths.
+        fmt_grouped = (('mxfp8', False), ('hif8', False), ('hif8', True))
+        cases = itertools.product(fmt_grouped,
                                   ((True, True), (True, False), (False, True)), (False, True))
         for fmt, grouped, needs, pin in cases:
             if fmt == 'mxfp8' and grouped:
@@ -138,7 +142,8 @@ class SavedQuantizedTests(unittest.TestCase):
         Description: Recompute all four projections, optionally inside pinned-memory saving.
         Expectation: Repeated first-order gradients match the uncheckpointed reference.
         """
-        for fmt, grouped, offload in itertools.product(('mxfp8', 'hif8'), (False, True), (False, True)):
+        fmt_grouped = (('mxfp8', False), ('hif8', False), ('hif8', True))
+        for (fmt, grouped), offload in itertools.product(fmt_grouped, (False, True)):
             with self.subTest(fmt=fmt, grouped=grouped, offload=offload):
                 x, w, reference = self.projection(fmt, grouped, (True, True))
                 expected = torch.autograd.grad(reference.sum(), (x, w))

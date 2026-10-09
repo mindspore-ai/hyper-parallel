@@ -15,14 +15,19 @@
 """Architecture and lazy provider registration for DeepSeek-V3.2."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.deepseek_v32.adapter.policies.sharding import (
+    build_parameter_sharding_rules,
+)
 from hyper_parallel.models.registry import register_model_adapter
 
 
 def _load_replacements():
     """Return the family's replacement factories without importing NPU ops."""
-    from hyper_parallel.models.deepseek_v32.adapter import replacements  # pylint: disable=C0415
+    from hyper_parallel.models.deepseek_v32.adapter.conversion import (  # pylint: disable=C0415
+        module_replacement,
+    )
 
-    return replacements
+    return module_replacement
 
 
 def _load_context_parallel():
@@ -34,36 +39,11 @@ def _load_context_parallel():
     return context_parallel
 
 
-def _load_sharding_rules():
-    """Return the DSA/MLA tensor-parallel naming-rule overrides.
-
-    The fused latent projection and DSA indexer stay replicated.  Main MLA
-    up-projections are sharded by attention head; the generic rule keeps the
-    output projection rowwise and reduces its output across TP ranks.
-    """
-    from hyper_parallel.distributed.tensor_parallel.param_role import (  # pylint: disable=C0415
-        ParamRole,
-    )
-
-    return [
-        (["linear_qkv"], ParamRole.REPLICATED),
-        (["q_b_proj", "kv_b_proj"], ParamRole.COLWISE),
-        (
-            [
-                "indexer.wq_b",
-                "indexer.wk",
-                "indexer.weights_proj",
-            ],
-            ParamRole.REPLICATED,
-        ),
-    ]
-
-
 DEEPSEEK_V32_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV32ForCausalLM",
     model_type="deepseek_v32",
     replacements=_load_replacements,
     context_parallel=_load_context_parallel,
-    sharding_rules=_load_sharding_rules,
+    sharding_rules=build_parameter_sharding_rules,
 )
 register_model_adapter(DEEPSEEK_V32_ADAPTER_SPEC)

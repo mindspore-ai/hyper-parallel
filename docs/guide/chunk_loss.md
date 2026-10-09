@@ -8,7 +8,7 @@ Chunk Loss 用于降低大词表语言模型在输出投影和交叉熵阶段的
 
 - `components/losses/chunked_cross_entropy.py`：与模型无关的分块线性交叉熵；
 - `ChunkedCausalLMLoss` 和 Trainer 接线：负责标签交接、局部归一化与模型绑定；
-- `models/qwen3_moe/adapter/chunk_loss.py`：Qwen3-MoE 在完整 LM Head 之前的专用适配。
+- `models/qwen3_moe/adapter/runtime/chunked_loss.py`：Qwen3-MoE 在完整 LM Head 之前的专用适配。
 
 ## 1. 为什么必须在模型 forward 内接入
 
@@ -107,7 +107,7 @@ loss_fn:
 
 每个 micro-batch 的 Trainer 流程是：
 
-1. batch adapter 返回独立的 `model_inputs` 与 `loss_inputs`；
+1. get-batch runtime 返回独立的 `model_inputs` 与 `loss_inputs`；
 2. `ChunkedCausalLMLoss.prepare_model_inputs()` 从 loss 输入读取预先生成的 `shift_labels` 和 loss mask；
 3. 从模型输入移除普通 `labels`、`shift_labels`，避免 Qwen 自己计算 eager loss；
 4. 增加显式的 `chunk_loss_*` 参数并调用模型；

@@ -58,7 +58,7 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     ulysses_head_to_seq,
 )
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
-from hyper_parallel.models.qwen3_moe.adapter.attention import (
+from hyper_parallel.models.qwen3_moe.adapter.runtime.attention import (
     run_qwen3_moe_flash_attention,
 )
 

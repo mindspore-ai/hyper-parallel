@@ -1,0 +1,172 @@
+# Validation-manifest schema understood by hyper_parallel.tools.model_integration.
+schema_version: 1
+
+model:
+  # ModelAdapterSpec identity. It selects model-owned structure, parity, and
+  # recompute contracts; model construction remains in launcher.config.
+  adapter: deepseek_v41
+  # Replace these local paths before inspect/check. A Hugging Face URL alone is
+  # first cloned with GIT_LFS_SKIP_SMUDGE=1; validation never fetches weights.
+  id_or_path: /local/path/to/DeepSeek-V4.1-Flash
+  builder:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
+    config_path: /local/path/to/DeepSeek-V4.1-Flash
+    engram_assets_path: /local/path/to/engram_depth_preserving_d8.json
+    # Keep all 40 decoder layers and native role indices. Scale parameter
+    # dimensions and expert count to fit the 16-device validation host.
+    text_parameter_divisor: 8
+    num_routed_experts: 16
+    exercise_post_training_indexer: true
+    indexer_loss_coeff: 0.001
+    torch_dtype: bfloat16
+    validate_placement: false
+
+reference:
+  source_path: /local/path/to/DeepSeek-V4.1-Flash
+  revision: REPLACE_WITH_PINNED_COMMIT
+
+# Architecture, data, precision, and model assets belong to the Trainer recipe.
+# The shell owns the runtime environment; --output-dir selects evidence storage.
+launcher:
+  # Python module launched by torchrun for every generated matrix case.
+  module: examples.training_demo.train_text
+  # Trainer recipe, resolved relative to this validation manifest.
+  config: train_deepseek_v41_online.yaml
+  # Per-process-group launch timeout in seconds.
+  timeout_seconds: 7200
+
+matrix:
+  # Number of processes passed to torchrun --nproc_per_node.
+  devices: 16
+  # Optimizer steps executed by every ordinary validation case.
+  steps: 10
+  # Resume cases save here, then restore and continue until matrix.steps.
+  resume_split_step: 5
+  # Initial steps excluded from throughput and memory summaries.
+  performance_warmup_steps: 2
+  # The initialize launch saves a common step-1 warm-start DCP. Every measured
+  # case restores the same model/optimizer/scheduler/RNG state, then replays
+  # from the configured data start; real resume cases still restore the cursor.
+  shared_initial_checkpoint: true
+
+  # Reference topology. Every axis case changes one dimension from this case.
+  baseline:
+    # Tensor-, context-, and expert-parallel group sizes.
+    tp: 1
+    cp: 1
+    ep: 1
+    # FSDP data-parallel shard group size.
+    fsdp: 16
+    # Whether TP also shards sequence activations.
+    sequence_parallel: false
+    # Adapter-owned activation-checkpoint layer selection.
+    recompute: {layer_count: 0}
+
+  # Generate one-factor-at-a-time cases. Values equal to the baseline are
+  # de-duplicated, so this entry adds the EP16 comparison.
+  axes:
+    ep: [1, 16]
+
+  # Explicit topology bundles. CP can be isolated with EP disabled. TP is
+  # exercised together with EP because the fused routed-expert gate/up layout
+  # is not a valid TP-only shard; TP2 also changes the FSDP degree and enables
+  # its production SP policy. Each mapping overrides only baseline fields.
+  combined:
+    - tp: 1
+      cp: 2
+      ep: 1
+      fsdp: 16
+      sequence_parallel: false
+    - tp: 2
+      cp: 1
+      ep: 16
+      fsdp: 8
+      sequence_parallel: true
+    - tp: 1
+      cp: 2
+      ep: 16
+      fsdp: 16
+      sequence_parallel: false
+
+  # Generate exact count-based and index-based safe-region recompute cases.
+  recompute_selections:
+    - {layer_count: 0}
+    - {layer_count: 2}
+    - {layer_indices: [0, 1, 2, 3]}
+  # Fixed topology used while only the recompute selection changes. This deliberately
+  # uses EP16 instead of the EP1 baseline, so these cases use cross_topology limits.
+  recompute_topology:
+    tp: 1
+    cp: 1
+    ep: 16
+    fsdp: 16
+    sequence_parallel: false
+
+  # Save and restore using the baseline topology.
+  same_topology_resume: true
+  # Save with the baseline topology, then restore under this target topology.
+  cross_topology_resume:
+    tp: 2
+    cp: 1
+    ep: 16
+    fsdp: 8
+    sequence_parallel: true
+
+acceptance:
+  # Maximum absolute loss/norm drift when TP/CP/EP/FSDP/SP match the baseline.
+  # It also covers recompute or Production/Validate cases whose parallel fields
+  # remain unchanged, plus same-topology resume.
+  same_topology:
+    loss_max_abs: 0.0005
+    # Independent BF16 launches can produce a single scale-proportional loss
+    # deviation even before a checkpoint boundary. Keep the absolute bound and
+    # accept only a relative deviation below 0.01% when it is exceeded.
+    loss_max_rel: 0.0001
+    loss_combination: any
+    norm_max_abs: 0.002
+    # Independent BF16 launches can differ slightly even before a checkpoint
+    # boundary. Accept an absolute or scale-aware norm bound; loss remains on
+    # its strict absolute bound because no loss-relative limit is declared.
+    norm_max_rel: 0.005
+    norm_combination: any
+  # Looser drift limits whenever TP/CP/EP/FSDP/SP differ from the baseline,
+  # including cross-topology resume.
+  cross_topology:
+    loss_max_abs: 0.005
+    # BF16 topology changes may produce scale-proportional drift. Absolute or
+    # relative agreement is sufficient for each scalar, while loss and norm
+    # must still both pass.
+    loss_max_rel: 0.005
+    norm_max_abs: 0.125
+    norm_max_rel: 0.005
+    combination: any
+  # Strict base limits are used by native module parity and same-topology cases.
+  parameters:
+    max_abs: 1.0e-6
+    relative_l2: 1.0e-6
+    combination: all
+    summary:
+      l2_norm_relative: 1.0e-6
+    # Fresh-process BF16 execution is not bitwise deterministic even with an
+    # identical topology. Keep this profile stricter than cross-topology while
+    # avoiding unstable relative errors for values and gradients near zero.
+    same_topology:
+      max_abs: 5.0e-4
+      relative_l2: 2.0e-2
+      combination: any
+      summary:
+        l2_norm_max_abs: 2.0e-3
+        l2_norm_relative: 2.0e-2
+        combination: any
+    # BF16 topology changes use a separately declared scale-aware policy.
+    cross_topology:
+      max_abs: 1.0e-3
+      relative_l2: 2.0e-2
+      combination: any
+      summary:
+        # Aggregate evidence cannot establish element-wise max_abs or tensor
+        # relative L2. Compare the scalar L2 norm with absolute-or-relative
+        # bounds so near-zero gradients do not fail only from denominator noise.
+        l2_norm_max_abs: 2.0e-3
+        l2_norm_relative: 2.0e-2
+        combination: any

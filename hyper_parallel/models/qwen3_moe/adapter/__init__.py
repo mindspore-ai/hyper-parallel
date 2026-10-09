@@ -12,20 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""qwen3_moe.adapter: public handwritten extension surface for Qwen3-MoE.
+"""Public Qwen3-MoE adapter surface.
 
-Only the supported extension contract is exported here; underscore-named
-functions/classes/modules remain internal implementation details (adjust
-doc §7.1). M2 provides the structure replacements onto the generic
-``modules`` entries; the attention mask/cache contract lives in
-``attention.py`` and the CP/EP distributed rules in ``distributed/``
-(M3).
+Module conversion lives in ``conversion/``, model-forward and loss contracts
+in ``runtime/``, and CP/EP implementations in ``distributed/``.
 """
 
 from hyper_parallel.models.qwen3_moe.adapter.registration import (
     QWEN3_MOE_ADAPTER_SPEC,
 )
-from hyper_parallel.models.qwen3_moe.adapter.replacements import (
+from hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement import (
     replace_qwen3_moe_flash_attention,
     replace_qwen3_moe_grouped_experts,
     replace_qwen3_moe_rms_norm,

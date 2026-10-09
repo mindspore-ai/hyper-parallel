@@ -36,9 +36,16 @@ from hyper_parallel.trainer.config.data import (
     DatasetConfig,
     ModelAssetsConfig,
 )
-from hyper_parallel.trainer.config.optimization import OptimizerConfig
+from hyper_parallel.trainer.config.optimization import (
+    OptimizerConfig,
+    OptimizerSwapConfig,
+)
 from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.config.trainer import TrainerConfig
+
+
+_NONE_TYPE = types.NoneType  # pylint: disable=no-member
+_UNION_TYPE = types.UnionType  # pylint: disable=no-member
 
 
 class ConfigResolutionError(ValueError):
@@ -101,7 +108,7 @@ def import_target(target_path: str, *, location: str) -> object:
 
 def _is_union(annotation: object) -> bool:
     """Return whether the annotation is a ``Union`` or a PEP 604 union."""
-    return get_origin(annotation) in (Union, types.UnionType)
+    return get_origin(annotation) in (Union, _UNION_TYPE)
 
 
 def _annotation_name(annotation: object) -> str:
@@ -160,8 +167,8 @@ def _normalize_sequence(
 
 def _require_none_allowed(annotation: object, *, path: str) -> None:
     """Accept ``None`` only when the annotation permits it."""
-    if annotation is types.NoneType or (
-        _is_union(annotation) and types.NoneType in get_args(annotation)
+    if annotation is _NONE_TYPE or (
+        _is_union(annotation) and _NONE_TYPE in get_args(annotation)
     ):
         return None
     raise ConfigResolutionError(path, f"expected {_annotation_name(annotation)}, got None")
@@ -170,7 +177,7 @@ def _require_none_allowed(annotation: object, *, path: str) -> None:
 def _normalize_union(value: object, annotation: object, *, path: str) -> object:
     """Normalize a value against the first compatible union member."""
     members = get_args(annotation)
-    non_none_members = tuple(member for member in members if member is not types.NoneType)
+    non_none_members = tuple(member for member in members if member is not _NONE_TYPE)
     if len(non_none_members) == 1 and len(non_none_members) != len(members):
         return normalize_value(value, non_none_members[0], path=path)
 
@@ -297,6 +304,11 @@ def normalize_value(value: object, annotation: object, *, path: str) -> object:
         ConfigResolutionError: The value does not match the annotation or the
             annotation is unsupported.
     """
+    # A nested target is a deferred instance of the annotated runtime type.
+    # Its constructor arguments are validated when its own node is resolved;
+    # the parent Target materializes it immediately before invocation.
+    if isinstance(value, Target):
+        return value
     if annotation in (Any, object):
         return value
     if isinstance(annotation, dataclasses.InitVar):
@@ -448,7 +460,7 @@ def replace_override_path(config: object, parts: list[str], value: object, *, pa
 def _resolve_union(node: object, annotation: object, *, path: str) -> object:
     """Resolve a YAML value against a compatible non-``None`` union member."""
     non_none_members = [
-        member for member in get_args(annotation) if member is not types.NoneType
+        member for member in get_args(annotation) if member is not _NONE_TYPE
     ]
     if len(non_none_members) == 1:
         # Single-member union (e.g. Optional[Target]): resolve directly so the
@@ -506,6 +518,28 @@ def _resolve_dataclass(node: object, config_type: type, *, path: str) -> object:
         raise ConfigResolutionError(path, f"could not construct {config_type.__name__}: {exc}") from exc
 
 
+def _resolve_nested_target_nodes(value: object, *, path: str) -> object:
+    """Resolve reserved ``_target_`` nodes inside a target argument tree."""
+    if isinstance(value, Mapping):
+        if "_target_" in value:
+            return _resolve_target(value, path=path)
+        return {
+            key: _resolve_nested_target_nodes(item, path=f"{path}.{key}")
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _resolve_nested_target_nodes(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _resolve_nested_target_nodes(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        )
+    return value
+
+
 def _resolve_target_args(
     raw_args: Mapping[str, object],
     signature: inspect.Signature,
@@ -526,6 +560,7 @@ def _resolve_target_args(
     normalized = {}
     for name, value in raw_args.items():
         parameter = signature.parameters.get(name)
+        value = _resolve_nested_target_nodes(value, path=f"{path}.{name}")
         if parameter is None:
             normalized[name] = value
             continue
@@ -591,23 +626,37 @@ def _resolve_target(node: object, *, path: str) -> Target[Any]:
 
 
 def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
-    """Resolve a ``DataLoaderConfig`` with its collator and batch adapter."""
+    """Resolve a DataLoader target with nested collator and batch runtime."""
     if not isinstance(node, Mapping):
         raise ConfigResolutionError(path, "DataLoader configuration must be a YAML mapping")
 
     target_node = dict(node)
+    if "dataloader_type" in target_node:
+        raise _fail(f"{path}.dataloader_type", "renamed to sampler_type")
+    if "batch_adapter" in target_node:
+        raise _fail(
+            f"{path}.batch_adapter",
+            "removed by the Omni data lifecycle; use dataset.data_transform for "
+            "sample/batch encoding and dataloader.get_batch.runtime_input_adapter "
+            "for model-owned forward metadata",
+        )
     collate_node = target_node.pop("collate_fn", None)
     get_batch_node = target_node.pop("get_batch", None)
-    dataloader_type = normalize_value(
-        target_node.pop("dataloader_type", "single"),
+    sampler_type = normalize_value(
+        target_node.pop("sampler_type", "single"),
         Literal["single", "cyclic"],
-        path=f"{path}.dataloader_type",
+        path=f"{path}.sampler_type",
     )
     data_rearrange_map = target_node.pop("data_rearrange_map", None)
     data_sharding = normalize_value(
         target_node.pop("data_sharding", False),
         bool,
         path=f"{path}.data_sharding",
+    )
+    use_background_prefetcher = normalize_value(
+        target_node.pop("use_background_prefetcher", False),
+        bool,
+        path=f"{path}.use_background_prefetcher",
     )
     target = _resolve_target(target_node, path=path)
     collate_fn = (
@@ -624,9 +673,10 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         target=target,
         collate_fn=collate_fn,
         get_batch=get_batch,
-        dataloader_type=dataloader_type,
+        sampler_type=sampler_type,
         data_rearrange_map=data_rearrange_map,
         data_sharding=data_sharding,
+        use_background_prefetcher=use_background_prefetcher,
     )
 
 
@@ -639,11 +689,17 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
     model_assets_node = target_node.pop("model_assets", {})
     data_transform_node = target_node.pop("data_transform", None)
     target = _resolve_target(target_node, path=path)
-    model_assets = resolve_component(
-        model_assets_node,
-        annotation=ModelAssetsConfig,
-        path=f"{path}.model_assets",
-    )
+    if isinstance(model_assets_node, Mapping) and "_target_" in model_assets_node:
+        model_assets = _resolve_target(
+            model_assets_node,
+            path=f"{path}.model_assets",
+        )
+    else:
+        model_assets = resolve_component(
+            model_assets_node,
+            annotation=ModelAssetsConfig,
+            path=f"{path}.model_assets",
+        )
     data_transform = (
         None
         if data_transform_node is None
@@ -652,15 +708,16 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
             path=f"{path}.data_transform",
         )
     )
-    return DatasetConfig(
+    dataset_config = DatasetConfig(
         target=target,
         model_assets=model_assets,
         data_transform=data_transform,
     )
+    return dataset_config
 
 
 def _resolve_optimizer_config(node: object, *, path: str) -> OptimizerConfig:
-    """Resolve an ``OptimizerConfig`` with its FP32 main-parameter policy."""
+    """Resolve an optimizer target with its precision and swap policies."""
     if not isinstance(node, Mapping):
         raise ConfigResolutionError(path, "Optimizer configuration must be a YAML mapping")
 
@@ -670,9 +727,15 @@ def _resolve_optimizer_config(node: object, *, path: str) -> OptimizerConfig:
         bool,
         path=f"{path}.fp32_main_params",
     )
+    swap = normalize_value(
+        target_node.pop("swap", {}),
+        OptimizerSwapConfig,
+        path=f"{path}.swap",
+    )
     return OptimizerConfig(
         target=_resolve_target(target_node, path=path),
         fp32_main_params=fp32_main_params,
+        swap=swap,
     )
 
 
@@ -705,6 +768,8 @@ def resolve_component(node: object, *, annotation: object, path: str) -> object:
         return _resolve_dataloader_config(node, path=path)
     if annotation is OptimizerConfig:
         return _resolve_optimizer_config(node, path=path)
+    if isinstance(node, Mapping) and "_target_" in node:
+        return _resolve_target(node, path=path)
     if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
         return _resolve_dataclass(node, annotation, path=path)
     return normalize_value(node, annotation, path=path)

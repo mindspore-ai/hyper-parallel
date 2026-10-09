@@ -1,0 +1,93 @@
+# VLM Trainer smoke config — tiny Qwen2-VL with self-made synthetic data.
+# AutoProcessorTransform applies the processor chat template to each sample.
+
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /path/to/vlm/model
+  torch_dtype: bfloat16
+  attn_implementation: eager
+  force_hf: true
+
+training:
+  train_iters: 10
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+  reshard_after_forward: true
+  requires_grad_sync: true
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: "off"
+
+dataset:
+  model_assets:
+    _target_: hyper_parallel.data.omni.build_auto_processor
+    pretrained_model_name_or_path: /path/to/vlm/model
+    local_files_only: true
+  data_transform:
+    _target_: hyper_parallel.data.omni.AutoProcessorTransform
+    max_seq_len: 512
+  _target_: hyper_parallel.data.omni.build_online_omni_mapping_dataset
+  data_path: /path/to/vlm/data.json
+  data_config: {}
+
+dataloader:
+  _target_: hyper_parallel.data.batching.OmniPackingLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_omni_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.OmniParallelBatch
+    encoder_dp: false
+  sampler_type: single
+  token_budget: 128
+  min_buffered_samples: 1
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  restore_from: null
+  checkpoint_dir: ./outputs/training_demo/vlm/checkpoints
+
+debug:
+  check_nan_inf: false
+  check_dataset: null

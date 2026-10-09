@@ -84,4 +84,10 @@ def mhc_post(
     """
     x_shape = x.size()
     residual = residual.reshape(x_shape[0], x_shape[1], num_stream, -1)
-    return _MhcPost.apply(residual, h_res, x, h_post).flatten(2)
+    if x.device.type == "npu" and omni_training_custom_ops is not None:
+        return _MhcPost.apply(residual, h_res, x, h_post).flatten(2)
+    output = h_post.unsqueeze(-1) * x.unsqueeze(-2)
+    output = output + torch.sum(
+        h_res.unsqueeze(-1) * residual.unsqueeze(-2), dim=2
+    )
+    return output.flatten(2).to(x.dtype)

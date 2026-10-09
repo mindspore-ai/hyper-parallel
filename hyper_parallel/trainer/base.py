@@ -43,13 +43,14 @@ import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import Dataset
-from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
+from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase
 from transformers.modeling_outputs import ModelOutput
 
 from hyper_parallel import HSDPModule, SkipDTensorDispatch
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.trainer.config import (
+    OptimizerSwapConfig,
     TrainerConfig,
     normalize_distributed_setup_overrides,
     save_configs,
@@ -71,10 +72,17 @@ from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
+from hyper_parallel.core.optimizer import (
+    ChainedOptimizer,
+    SwapOptimizerConfig,
+    swap_optimizer,
+)
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
+    MixedPrecisionOptimizer,
 )
 from hyper_parallel.trainer.runtime import fsdp as fsdp_runtime
+from hyper_parallel.trainer.runtime import model_integration as model_integration_runtime
 from hyper_parallel.trainer.runtime.data_iterator import HyperIter
 from hyper_parallel.trainer.runtime.logging import enable_third_party_logging
 from hyper_parallel.trainer.runtime.memory import empty_cache, print_device_mem_info
@@ -100,6 +108,59 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hyper_parallel.data.text.chat_template import ChatTemplate
+
+
+def _to_swap_optimizer_config(config: OptimizerSwapConfig) -> SwapOptimizerConfig:
+    """Translate the trainer-facing swap section into the core swap config.
+
+    Args:
+        config: Resolved ``optimizer.swap`` configuration section.
+
+    Returns:
+        The backend-neutral swap configuration consumed by ``swap_optimizer``.
+    """
+    return SwapOptimizerConfig(
+        swap_times=config.swap_times,
+        state_keys=config.state_keys,
+        min_numel=config.min_numel,
+        include_master_params=config.include_master_params,
+        # ``None`` means "leave it to the backend default", not "off": the core
+        # config declares ``packed_swap: bool = True``, so pass that default
+        # through rather than letting ``None`` read as a hard False.
+        packed_swap=True if config.packed_swap is None else config.packed_swap,
+    )
+
+
+def _attach_optimizer_swap(optimizer: Any, config: OptimizerSwapConfig) -> Any:
+    """Attach optimizer-state swap to every Adam/AdamW leaf of ``optimizer``.
+
+    Every YAML optimizer target returns a ``ChainedOptimizer`` of leaf
+    optimizers -- also for a single AdamW -- and the fp32 main-parameter wrapper
+    keeps the same leaf containers. The swap runtime wraps one concrete
+    Adam/AdamW and delegates everything else, so it is attached to the leaves
+    and the outer object keeps dispatching.
+
+    Args:
+        optimizer: Optimizer built by the configured target, optionally already
+            wrapped for fp32 main parameters.
+        config: Resolved ``optimizer.swap`` configuration section.
+
+    Returns:
+        The optimizer carrying swap-wrapped leaves. A leaf the swap runtime does
+        not support fails here, before the first training step.
+    """
+    swap_config = _to_swap_optimizer_config(config)
+    chained = optimizer.optimizer if isinstance(optimizer, MixedPrecisionOptimizer) else optimizer
+    if not isinstance(chained, ChainedOptimizer):
+        return swap_optimizer(optimizer, swap_config)
+
+    names = list(chained.optimizers_dict)
+    leaves = [swap_optimizer(chained.optimizers_dict[name], swap_config) for name in names]
+    # In place: the fp32 main-parameter wrapper aliases both containers.
+    chained.chained_optimizers[:] = leaves
+    for name, leaf in zip(names, leaves):
+        chained.optimizers_dict[name] = leaf
+    return optimizer
 
 
 class BaseTrainer(Stateful, ABC):
@@ -132,6 +193,13 @@ class BaseTrainer(Stateful, ABC):
     # Core configs
     config: TrainerConfig
     device: torch.device
+    # Attached at runtime by the model-integration pipeline (the Omni dataset builder sets
+    # ``data_transform``, the integration adapter attaches ``get_batch`` and
+    # ``num_micro_batches``): bare annotations, which assign nothing, so runtime behaviour is
+    # unchanged -- they exist so the type checker sees the contract this class reads.
+    data_transform: Any
+    get_batch: Any
+    num_micro_batches: int
 
     # AutoModel distributed setup.
     # These objects have one owner: ``../build_options.py`` and
@@ -152,9 +220,11 @@ class BaseTrainer(Stateful, ABC):
     model: PreTrainedModel = None
     model_parts: Optional[List[torch.nn.Module]] = None
     hsdp_model_parts: List[torch.nn.Module] = []
+    fsdp_runtime_diagnostics: Optional[fsdp_runtime.FSDPRuntimeDiagnostics] = None
+    model_integration: Optional[model_integration_runtime.ModelIntegrationSession] = None
     model_config: PretrainedConfig = PretrainedConfig()
     tokenizer: PreTrainedTokenizerBase = None
-    processor: ProcessorMixin = None
+    processor: Any = None
     chat_template: Optional[ChatTemplate] = None
     model_assets: List[Any] = []
 
@@ -224,6 +294,7 @@ class BaseTrainer(Stateful, ABC):
         self._compute_train_iters()
 
         self._build_optimizer()
+        self.model_integration.attach_optimizer(self.optimizer)
         self._build_lr_scheduler()
         self._build_training_context()
         self._init_callbacks()
@@ -289,6 +360,7 @@ class BaseTrainer(Stateful, ABC):
             distributed_setup=self.distributed_setup,
             peft_config=self.peft_config,
             activation_checkpoint=self.config.activation_checkpoint.mode,
+            activation_checkpoint_selection=self.config.activation_checkpoint.selection,
             swap_inputs=getattr(self.config.activation_checkpoint, "swap_inputs", False),
             activation_swap=self.config.activation_swap,
             compile_config=self.config.compile,
@@ -311,6 +383,17 @@ class BaseTrainer(Stateful, ABC):
             for model_part in self.model_parts
             if isinstance(model_part, HSDPModule)
         ]
+        self.model_integration = model_integration_runtime.build_model_integration_session(
+            self.model,
+            self.config,
+            self.global_rank,
+            self.mesh,
+        )
+        self.fsdp_runtime_diagnostics = (
+            fsdp_runtime.build_fsdp_runtime_diagnostics(self.hsdp_model_parts)
+            if getattr(self.config.debug, "check_fsdp_runtime", False)
+            else None
+        )
 
     def _build_loss(self) -> None:
         """Build the configured loss module or use the model-output default."""
@@ -373,6 +456,14 @@ class BaseTrainer(Stateful, ABC):
             setattr(self, f"{split_name}_dataloader", dataloader)
             setattr(self, f"{split_name}_batch_sampler", batch_sampler)
 
+    def attach_model_integration_data_pipeline(self) -> None:
+        """Attach the final data pipeline through one shared Trainer path."""
+        self.model_integration.attach_data_pipeline(
+            runtime_adapter=getattr(self.get_batch, "runtime_input_adapter", None),
+            get_batch=self.get_batch,
+            model_assets=tuple(self.model_assets),
+        )
+
     def _compute_train_iters(self) -> None:
         """Resolve the run limit and the optimizer steps available per Dataset epoch."""
         training_config = self.config.training
@@ -416,12 +507,20 @@ class BaseTrainer(Stateful, ABC):
             if config.optimizer.fp32_main_params
             else optimizer
         )
+        # Swap is attached after the fp32 main-parameter wrap: that wrapper owns
+        # the master parameters ``include_master_params`` swaps, and the lr
+        # scheduler built right after reads ``self.optimizer.param_groups``.
+        if config.optimizer.swap.enabled:
+            self.optimizer = _attach_optimizer_swap(self.optimizer, config.optimizer.swap)
 
     def _build_lr_scheduler(self):
         config: TrainerConfig = self.config
+        scheduler_iters = config.training.lr_scheduler_iters or self.train_iters
+        if scheduler_iters <= 0:
+            raise ValueError("training.lr_scheduler_iters must be positive when configured")
         lr_scheduler = config.lr_scheduler.build(
             optimizer=self.optimizer,
-            train_iters=self.train_iters,
+            train_iters=scheduler_iters,
         )
         self.lr_scheduler = lr_scheduler.get_lr_scheduler()
 
@@ -572,7 +671,7 @@ class BaseTrainer(Stateful, ABC):
 
         Args:
             micro_batch: Inputs forwarded to the model.
-            loss_inputs: Loss-only labels and masks from the batch adapter. If
+            loss_inputs: Loss-only labels and masks from the get-batch runtime. If
                 omitted, the legacy single-dictionary path is preserved.
 
         Returns:
@@ -609,6 +708,7 @@ class BaseTrainer(Stateful, ABC):
                 micro_batch = prepare_model_inputs(micro_batch, loss_inputs)
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
+            self.model_integration.record_batch(micro_batch, loss_inputs)
 
             model_fwd_context = (
                 self.model_fwd_context()
@@ -662,13 +762,56 @@ class BaseTrainer(Stateful, ABC):
         """
         self._configure_fsdp_gradient_sync(micro_step, num_micro_steps)
 
+    def begin_fsdp_runtime_diagnostics(self, micro_step: int) -> None:
+        """Begin observing one FSDP forward/backward micro-step when enabled."""
+        if self.fsdp_runtime_diagnostics is not None:
+            self.fsdp_runtime_diagnostics.begin_micro_step(
+                self.state.global_step,
+                micro_step,
+            )
+
+    def validate_fsdp_runtime_before_optimizer(self) -> None:
+        """Fail before optimizer updates when FSDP prefetch state is unsafe."""
+        if self.fsdp_runtime_diagnostics is not None:
+            self.model_integration.record_fsdp_trace(
+                self.fsdp_runtime_diagnostics.trace_evidence()
+            )
+            self.fsdp_runtime_diagnostics.validate_before_optimizer_step()
+
+    def prepare_optimizer_step(self) -> Any:
+        """Run pre-optimizer diagnostics and clipping in their required order."""
+        self.model_integration.after_backward_before_clip()
+        self.validate_fsdp_runtime_before_optimizer()
+        max_grad_norm = self.config.training.max_grad_norm
+        grad_norm: Any = 0.0
+        post_clip_norm = None
+        if max_grad_norm > 0:
+            grad_norm = clip_grad_norm_(self.model, max_grad_norm)
+            if self.model_integration.runtime_enabled:
+                grad_norm_value = (
+                    float(grad_norm.item())
+                    if isinstance(grad_norm, torch.Tensor)
+                    else float(grad_norm)
+                )
+                clip_coefficient = min(
+                    float(max_grad_norm) / (grad_norm_value + 1.0e-6),
+                    1.0,
+                )
+                post_clip_norm = grad_norm_value * clip_coefficient
+        elif self.model_integration.runtime_enabled:
+            grad_norm = clip_grad_norm_(self.model, float("inf"))
+            post_clip_norm = grad_norm
+        self.model_integration.after_clip(post_clip_norm)
+        return grad_norm
+
     def step_optimizers_and_schedulers(self) -> None:
-        """Step optimizers and schedulers after gradient accumulation."""
+        """Step every optimizer and scheduler, then expose the final state."""
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
         for optimizer in optimizers:
-            with SkipDTensorDispatch():
+            with SkipDTensorDispatch(no_skip={torch.zeros_like}):
                 optimizer.step()
             optimizer.zero_grad()
+        self.model_integration.after_optimizer()
 
         schedulers = (
             self.lr_scheduler
@@ -678,24 +821,43 @@ class BaseTrainer(Stateful, ABC):
         for scheduler in schedulers:
             scheduler.step()
 
+    def _end_model_integration_step(self, metrics: Dict[str, Any]) -> None:
+        """Persist structured step metrics and global input identity."""
+        if not self.model_integration.runtime_enabled:
+            return
+        resolved_metrics = dict(metrics)
+        optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
+        learning_rates = []
+        for optimizer in optimizers:
+            inner = getattr(optimizer, "optimizer", optimizer)
+            leaves = getattr(inner, "chained_optimizers", (inner,))
+            for leaf in leaves:
+                learning_rates.extend(
+                    group.get("lr")
+                    for group in getattr(leaf, "param_groups", ())
+                    if group.get("lr") is not None
+                )
+        if learning_rates:
+            resolved_metrics["lr"] = float(learning_rates[0])
+        token_counts = getattr(self, "step_token_counts", {})
+        token_values = []
+        for value in token_counts.values():
+            token_values.append(float(value.item() if torch.is_tensor(value) else value))
+        if token_values:
+            resolved_metrics["tokens"] = sum(token_values)
+        resolved_metrics["samples"] = self.config.training.global_batch_size
+        self.model_integration.end_step(resolved_metrics)
+
     def train_step(
-            self,
-            data_iterator: Any,
+        self,
+        data_iterator: Any,
     ) -> Dict[str, float]:
-        """Execute one optimizer update from the next dataloader batch.
-
-        Args:
-            data_iterator: Iterator providing the next optimizer-step batch.
-
-        Returns:
-            Aggregated loss and gradient norm for the completed step.
-        """
-        config = self.config
-
+        """Execute one optimizer update from the next dataloader batch."""
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self.state.global_step += 1
 
         self.on_step_begin(micro_batches=micro_batches)
+        self.model_integration.begin_step(self.state.global_step)
 
         # Forward and backward for each micro batch
         synchronize()
@@ -710,6 +872,7 @@ class BaseTrainer(Stateful, ABC):
         for micro_step, micro_batch in enumerate(micro_batches):
             self.model_reshard(micro_step, num_micro_steps)
             self._configure_fsdp_gradient_sync(micro_step, num_micro_steps)
+            self.begin_fsdp_runtime_diagnostics(micro_step)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
@@ -720,16 +883,11 @@ class BaseTrainer(Stateful, ABC):
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        # Gradient clipping (reads FSDP/EP groups from current ParallelState)
-        grad_norm = clip_grad_norm_(
-            self.model,
-            config.training.max_grad_norm,
-        )
-
-        # Optimizer and scheduler step
+        grad_norm = self.prepare_optimizer_step()
         self.step_optimizers_and_schedulers()
 
         grad_norm_value = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+        self._end_model_integration_step({"loss": total_loss, "grad_norm": grad_norm_value})
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm_value)
         return {
             "loss": total_loss,

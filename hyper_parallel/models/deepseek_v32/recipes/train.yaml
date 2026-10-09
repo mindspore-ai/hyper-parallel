@@ -39,15 +39,18 @@ plan_overrides:
       - model.norm
     module_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32RMSNorm
     replace_module:
-      _target_: hyper_parallel.models.deepseek_v32.adapter.replacements.replace_deepseek_v32_rms_norm
+      _target_: >-
+        hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_rms_norm
   - match: "*.self_attn"
     module_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32Attention
     replace_module:
-      _target_: hyper_parallel.models.deepseek_v32.adapter.replacements.replace_deepseek_v32_dsa_attention
+      _target_: >-
+        hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
   - match: "*.mlp.experts"
     module_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32Experts
     replace_module:
-      _target_: hyper_parallel.models.deepseek_v32.adapter.replacements.replace_deepseek_v32_grouped_experts
+      _target_: >-
+        hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_grouped_experts
   - match: "*.self_attn"
     when: cp
     region_dispatch: false
@@ -81,31 +84,29 @@ dataset:
       use_fast: true
       trust_remote_code: true
   data_transform:
-    _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
     data_type: plaintext
     text_keys: text
     max_seq_len: 4096
   data_config:
-    dataset_type: mapping
-    hf_dataset_name: Salesforce/wikitext
-    hf_config_name: wikitext-2-raw-v1
+    config_name: wikitext-2-raw-v1
     cache_dir: null
     labels_are_shifted: true
     create_attention_mask_in_dataloader: true
     create_ltor_fields_in_dataloader: false
-  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
-  data_path: null
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_path: Salesforce/wikitext
 
 dataloader:
-  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
   min_buffered_samples: 200
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
   get_batch:
-    _target_: hyper_parallel.data.batching.ParallelBatch
+    _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
     attention_mode: dense
-  dataloader_type: single
+  sampler_type: single
   data_rearrange_map: null
   data_sharding: false
   drop_last: true

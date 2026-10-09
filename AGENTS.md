@@ -146,6 +146,8 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **gate-doctor** | GitCode PR gate diagnose → autofix to green | 门禁 / autofix / `/retest` |
 | **parallel-strategy-analyzer** | DP/FSDP/TP/PP/EP/CP strategy + cost estimate | `/parallel-strategy-analyzer` |
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
+| **hf-model-integration** | Integrate HF-native or HF-component custom models through model-owned adapters | model onboarding / functional bring-up |
+| **hf-model-precision-validation** | Validate module parity and distributed numerical self-consistency | model numerical acceptance / diagnosis |
 
 ### Commands
 

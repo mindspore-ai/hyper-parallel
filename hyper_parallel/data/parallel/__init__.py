@@ -16,9 +16,7 @@
 
 Stage 4e contributed ``shard_batch_for_cp``; stage 6 (05 §11.2) adds the
 DataLoader-side CP/TP batch distribution, DP samplers and parallel
-dataloader construction from ``components/datasets/parallel``, plus the
-``OnlineDatasetBarrier`` build synchronization primitive (05 §15.10
-step 3).
+dataloader construction from ``components/datasets/parallel``.
 """
 
 from hyper_parallel.data.parallel.batch_parallel import (
@@ -27,7 +25,6 @@ from hyper_parallel.data.parallel.batch_parallel import (
     shard_batch_for_cp,
 )
 from hyper_parallel.data.parallel.batch_sampler import build_dataset_batch_sampler
-from hyper_parallel.data.parallel.build_barrier import OnlineDatasetBarrier
 from hyper_parallel.data.parallel.dataloader_parallel import (
     DataLoaderParallelContext,
     build_dataset_for_dataloader,
@@ -38,7 +35,6 @@ from hyper_parallel.data.parallel.dataloader_parallel import (
 __all__ = [
     "CPBatchSharder",
     "DataLoaderParallelContext",
-    "OnlineDatasetBarrier",
     "TPBatchBroadcaster",
     "build_dataset_batch_sampler",
     "build_dataset_for_dataloader",

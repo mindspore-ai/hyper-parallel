@@ -357,9 +357,12 @@ FORBIDDEN = ("auto_models.recipes", "_transformers", "hyper_parallel.models",
 # Sanctioned edges into the top-level ``hyper_parallel.models`` package
 # (top-level split, migration plan §3): ``build_options`` is a leaf DTO
 # module (stdlib/torch/components only, no back-edge) imported at module
-# level; ``registry`` is the planner's function-level adapter lookup. Both
-# stay acyclic; every other ``hyper_parallel.models.*`` edge is forbidden.
+# level; ``adapter_spec`` is a pure-stdlib leaf DTO module (dataclasses /
+# typing only) consumed by activation checkpointing; ``registry`` is the
+# planner's function-level adapter lookup. All stay acyclic; every other
+# ``hyper_parallel.models.*`` edge is forbidden.
 ALLOWED_MODELS_EDGES = ("hyper_parallel.models.build_options",
+                        "hyper_parallel.models.adapter_spec",
                         "hyper_parallel.models.registry")
 
 

@@ -15,20 +15,13 @@
 """Unit tests for trainer lifecycle cleanup."""
 
 import importlib
-import sys
 import unittest
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from tests.common.mark_utils import arg_mark
 
-_BATCHING_MODULE = ModuleType("hyper_parallel.data.batching")
-_BATCHING_MODULE.build_dataloader = MagicMock()
-
-# This module tests the training lifecycle, not dataloader construction. Stub
-# that boundary so collecting the UT does not require the optional torchdata.
-with patch.dict(sys.modules, {"hyper_parallel.data.batching": _BATCHING_MODULE}):
-    base_module = importlib.import_module("hyper_parallel.trainer.base")
+base_module = importlib.import_module("hyper_parallel.trainer.base")
 
 
 class TestBaseTrainerCleanup(unittest.TestCase):

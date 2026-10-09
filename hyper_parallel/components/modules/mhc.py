@@ -20,10 +20,12 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
+import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.functional.mhc_post import mhc_post
 from hyper_parallel.components.functional.mhc_pre import mhc_pre
+from hyper_parallel.components.functional.sinkhorn import sinkhorn, sinkhorn_knopps
 from hyper_parallel.models.replacement import module_replacement
 
 
@@ -190,3 +192,81 @@ class MhcPostModule(nn.Module):
             h_res,
             self.num_stream,
         )
+
+
+@module_replacement
+class PipelinedMhcModule(nn.Module):
+    """Coefficient module for cross-sublayer pipelined mHC."""
+
+    def __init__(
+        self,
+        *,
+        module: nn.Module,
+        module_fqn: str = "",
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Reuse the source module's ``fn/base/scale`` parameter layout."""
+        super().__init__()
+        del module_fqn, context
+        required = ("input_norm", "fn", "base", "scale", "hc_mult")
+        missing = [name for name in required if not hasattr(module, name)]
+        if missing:
+            raise TypeError(f"pipelined MHC source is missing required attributes: {missing}")
+        self.input_norm = module.input_norm
+        self.fn = module.fn
+        self.base = module.base
+        self.scale = module.scale
+        self.hc_mult = int(module.hc_mult)
+        self.hc_sinkhorn_iters = int(module.hc_sinkhorn_iters)
+        self.hc_eps = float(module.hc_eps)
+        expected_mix = (self.hc_mult + 2) * self.hc_mult
+        if tuple(self.fn.shape)[0] != expected_mix or self.base.numel() != expected_mix:
+            raise ValueError("pipelined MHC fn/base shapes do not match hc_mult")
+        if self.scale.numel() != 3:
+            raise ValueError("pipelined MHC scale must contain three values")
+        self.train(module.training)
+
+    def forward(
+        self,
+        hidden_streams: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Produce the coefficients consumed by the following sublayer."""
+        flattened = self.input_norm(hidden_streams.flatten(start_dim=2).float())
+        mix = F.linear(  # pylint: disable=not-callable
+            flattened, self.fn.float()
+        )
+        num_stream = self.hc_mult
+        pre, post, residual = mix.split(
+            [num_stream, num_stream, num_stream * num_stream], dim=-1
+        )
+        pre_bias, post_bias, residual_bias = self.base.split(
+            [num_stream, num_stream, num_stream * num_stream]
+        )
+        pre_scale, post_scale, residual_scale = self.scale.unbind(0)
+        pre = torch.sigmoid(pre * pre_scale + pre_bias) + self.hc_eps
+        post = 2 * torch.sigmoid(post * post_scale + post_bias)
+        residual = residual.view(*residual.shape[:-1], num_stream, num_stream)
+        residual = residual * residual_scale + residual_bias.view(num_stream, num_stream)
+        if hidden_streams.device.type == "npu" and hasattr(torch.ops.custom, "npu_sinkhorn"):
+            residual = sinkhorn(residual, self.hc_sinkhorn_iters, self.hc_eps)
+        else:
+            residual = sinkhorn_knopps(residual, self.hc_sinkhorn_iters, self.hc_eps)
+        return pre, post, residual
+
+
+def pipelined_mhc_post(
+    sublayer_output: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    combine: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the shared high-performance mHC post path to 4-D streams."""
+    num_stream = residual.shape[-2]
+    flattened = mhc_post(
+        sublayer_output,
+        residual.flatten(start_dim=2),
+        post,
+        combine,
+        num_stream,
+    )
+    return flattened.unflatten(-1, (num_stream, residual.shape[-1]))

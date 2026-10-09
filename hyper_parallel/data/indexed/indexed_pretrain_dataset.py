@@ -28,12 +28,12 @@ from typing import Any
 import numpy as np
 from numpy.random import RandomState
 
+from hyper_parallel.data.constants import PAD_TOKEN_ID
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.indexed.indexed_data_config import GPTDatasetConfig
 from hyper_parallel.data.indexed.indexed_data_reader import IndexedDataReader
 
 logger = get_dataset_logger(__name__)
-_PAD_TOKEN_ID = -1
 
 
 def _build_document_index(
@@ -105,9 +105,9 @@ class _IndexedPretrainDataset(ABC):
         # Handle pad token id provided by the tokenizer.
         try:
             pad_token_id = self.config.tokenizer.pad
-            self._pad_token_id = _PAD_TOKEN_ID if pad_token_id is None else int(pad_token_id)
+            self._pad_token_id = PAD_TOKEN_ID if pad_token_id is None else int(pad_token_id)
         except (AttributeError, NotImplementedError):
-            self._pad_token_id = _PAD_TOKEN_ID
+            self._pad_token_id = PAD_TOKEN_ID
 
         try:
             special_token_ids = [
@@ -131,7 +131,7 @@ class _IndexedPretrainDataset(ABC):
                     "masked as padding"
                 )
             else:
-                self._pad_token_id = _PAD_TOKEN_ID
+                self._pad_token_id = PAD_TOKEN_ID
                 logger.warning(
                     "The tokenizer PAD ID collides with another special token ID; using an internal padding sentinel"
                 )

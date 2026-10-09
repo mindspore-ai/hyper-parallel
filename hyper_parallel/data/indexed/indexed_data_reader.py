@@ -24,21 +24,10 @@ from typing import ClassVar
 
 import numpy as np
 
+from hyper_parallel.data.constants import INDEX_DTYPE_CODES, INDEX_HEADER, INDEX_VERSION
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-logger = get_dataset_logger(__name__)
 
-_INDEX_HEADER = b"MMIDIDX\x00\x00"
-_INDEX_VERSION = 1
-_DTYPES = {
-    1: np.uint8,
-    2: np.int8,
-    3: np.int16,
-    4: np.int32,
-    5: np.int64,
-    6: np.float64,
-    7: np.float32,
-    8: np.uint16,
-}
+logger = get_dataset_logger(__name__)
 
 
 class _IndexReader:
@@ -48,16 +37,16 @@ class _IndexReader:
         """Parse and memory-map one index metadata file."""
         # Read the fixed-size header, which describes how the following index arrays are decoded.
         with open(idx_path, "rb") as stream:
-            header = stream.read(len(_INDEX_HEADER))
-            if header != _INDEX_HEADER:
+            header = stream.read(len(INDEX_HEADER))
+            if header != INDEX_HEADER:
                 raise ValueError(f"Invalid indexed Dataset header in {idx_path!r}")
 
             version = struct.unpack("<Q", stream.read(8))[0]
-            if version != _INDEX_VERSION:
-                raise ValueError(f"Unsupported indexed Dataset version {version}; expected {_INDEX_VERSION}")
+            if version != INDEX_VERSION:
+                raise ValueError(f"Unsupported indexed Dataset version {version}; expected {INDEX_VERSION}")
 
             dtype_code = struct.unpack("<B", stream.read(1))[0]
-            self.dtype = np.dtype(_DTYPES[dtype_code])
+            self.dtype = np.dtype(INDEX_DTYPE_CODES[dtype_code])
             self.dtype_size = self.dtype.itemsize
 
             self.sequence_count = struct.unpack("<Q", stream.read(8))[0]

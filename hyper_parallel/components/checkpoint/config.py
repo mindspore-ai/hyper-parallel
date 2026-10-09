@@ -62,6 +62,12 @@ class CheckpointingConfig:
     restore_from: Optional[str] = None  # "LATEST" or specific path
     restore_optimizer: bool = True
     restore_train_state: bool = True  # step/epoch, lr_scheduler, dataloader, RNG
+    # Restore progress/scheduler/RNG while deliberately replaying data from the
+    # loader's configured start. This is useful for a validation warm start in
+    # which every topology must consume the same fixed replay, including when
+    # the loader cannot reshard a saved cursor across DP world sizes. Keep this
+    # enabled for ordinary K-to-K+N training continuation.
+    restore_dataloader_state: bool = True
 
     model_save_format: str = "safetensors"
     # Whether to additionally export merged HF weights: "none" (never) |

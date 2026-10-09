@@ -18,11 +18,12 @@ Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5).
 ``PlanOverride`` stays the YAML DTO that desugars to
 ``auto_models.distributed.recipe_spec.ModuleShardingSpec``.
 """
+# pylint: disable=unused-import
 
 import importlib
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, List, Literal, Optional, Union
 
@@ -56,6 +57,70 @@ class AcceleratorConfig:
 
 
 @dataclass
+class ActivationCheckpointSelection:
+    """Select adapter-declared safe recompute regions and exact layer coverage.
+
+    ``layer_count`` selects the contiguous prefix ``[0, layer_count)`` from
+    the flattened layer-container order. ``layer_indices`` selects explicit
+    zero-based entries from that same order.
+    """
+
+    source: Literal["default", "model_adapter_safe_regions"] = "default"
+    layer_count: Optional[int] = None
+    layer_indices: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        """Validate the mutually exclusive layer-count and layer-index selectors."""
+        if self.source not in ("default", "model_adapter_safe_regions"):
+            raise ValueError(
+                "activation_checkpoint.selection.source must be default or "
+                "model_adapter_safe_regions"
+            )
+        selectors = (self.layer_count is not None, self.layer_indices is not None)
+        if self.source == "default" and any(selectors):
+            raise ValueError(
+                "activation_checkpoint.selection.layer_count and layer_indices "
+                "are only valid when "
+                "selection.source=model_adapter_safe_regions"
+            )
+        if self.source == "model_adapter_safe_regions" and sum(selectors) != 1:
+            raise ValueError(
+                "activation_checkpoint.selection requires exactly one of "
+                "layer_count or layer_indices when "
+                "selection.source=model_adapter_safe_regions"
+            )
+        if self.layer_count is not None and (
+            isinstance(self.layer_count, bool)
+            or not isinstance(self.layer_count, int)
+            or self.layer_count < 0
+        ):
+            raise ValueError(
+                "activation_checkpoint.selection.layer_count must be a "
+                "non-negative integer"
+            )
+        if self.layer_indices is None:
+            return
+        if not isinstance(self.layer_indices, list) or not self.layer_indices:
+            raise ValueError(
+                "activation_checkpoint.selection.layer_indices must be a "
+                "non-empty list of non-negative integers"
+            )
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in self.layer_indices
+        ):
+            raise ValueError(
+                "activation_checkpoint.selection.layer_indices must contain "
+                "only non-negative integers"
+            )
+        if len(set(self.layer_indices)) != len(self.layer_indices):
+            raise ValueError(
+                "activation_checkpoint.selection.layer_indices must not "
+                "contain duplicates"
+            )
+
+
+@dataclass
 class ActivationCheckpointConfig:
     """Activation-checkpoint options exposed by the initial YAML schema.
 
@@ -65,6 +130,9 @@ class ActivationCheckpointConfig:
 
     mode: Optional[Literal["off", "full", "selective"]] = "off"
     swap_inputs: bool = False
+    selection: ActivationCheckpointSelection = field(
+        default_factory=ActivationCheckpointSelection
+    )
 
     def __post_init__(self) -> None:
         """Reject ambiguous values for activation input swapping."""
@@ -93,14 +161,19 @@ class PlanOverride:
             It receives ``module``, ``module_fqn``, and a read-only context,
             and must return a structure-preserving replacement. A list
             ``match`` is supported only for replacement-only entries.
-        match: fqn or fqn glob matched (fnmatchcase) against the plan's
-            boundary FQNs — ``*`` spans dots, so ``"*.self_attn"`` hits
+        match: fqn or fqn glob. Globs first merge matching planner boundaries;
+            a glob with a concrete params/I/O contract also expands against
+            the final model's ``named_modules`` and creates missing boundaries.
+            A merge-only glob fails if it matches a real module that has no
+            planner boundary, with a suggested contract skeleton.
+            ``*`` spans dots, so ``"*.self_attn"`` hits
             ``model.layers.0.self_attn``.
         when: optional activation condition. Sharding actions accept ``"cp"``
-            (active when cp_size>1), ``"ep"`` (ep_size>1), or
-            ``"low_precision"`` (active when online low precision is
-            enabled). A replacement action accepts only ``"low_precision"``;
-            module replacement must not depend on the parallel topology.
+            (active when cp_size>1), ``"ep"`` (ep_size>1),
+            ``"sequence_parallel"``, or ``"low_precision"`` (active when
+            online low precision is enabled). A replacement action accepts
+            only ``"low_precision"``; module replacement must not depend on
+            the parallel topology.
         low_precision_dtype_scheme: a named ``training.low_precision.
             dtype_schemes`` entry bound to this match. Only valid on
             ``when="low_precision"`` replacement entries; the resolved scheme
@@ -165,8 +238,11 @@ class PlanOverride:
             YAML form ``{name: {axis: placement_str}}`` (out_* also accept
             the scalar shorthand ``{axis: placement_str}``), or the sentinels
             ``"auto"`` / ``"none"``. Merge mode (match hits a derived
-            boundary): usually omitted — empty inherits the derived contract;
-            insert mode (misses every boundary): all must be fully declared.
+            boundary): an omitted field inherits and an explicit ``{}``
+            clears. Insert mode (misses every boundary): nothing can inherit;
+            at least one concrete parameter/I/O field must declare the new
+            boundary, and all fields required by that module's contract must
+            be written explicitly.
         tp_divide_attrs: optional module-instance integer attributes divided
             exactly by the active TP size when the module forward runs on
             local tensors. Omit for no user adjustment; an explicit empty
@@ -174,7 +250,9 @@ class PlanOverride:
     """
 
     match: Union[str, List[str]]
-    when: Optional[Literal["cp", "ep", "low_precision"]] = None
+    when: Optional[Literal[
+        "cp", "ep", "sequence_parallel", "low_precision"
+    ]] = None
     low_precision_dtype_scheme: Optional[str] = None
     module_type: Optional[str] = None
     exact_type: bool = False
@@ -314,7 +392,7 @@ class PlanOverride:
         }
 
 
-_WHEN_CONDITIONS = ("cp", "ep", "low_precision")
+_WHEN_CONDITIONS = ("cp", "ep", "sequence_parallel", "low_precision")
 
 
 def _import_module_type(path: str) -> type:
@@ -460,6 +538,7 @@ def _validate_when(entry: PlanOverride) -> None:
 
 def entries_to_plan_overrides(
         entries: "List[PlanOverride]", *, cp_size: int = 1, ep_size: int = 1,
+        sequence_parallel: bool = False,
         low_precision_enabled: bool = False,
 ) -> "dict[str, Any]":
     """Desugar PlanOverride entries into a ``plan_overrides`` dict.
@@ -496,6 +575,7 @@ def entries_to_plan_overrides(
             active = {
                 "cp": cp_size > 1,
                 "ep": ep_size > 1,
+                "sequence_parallel": sequence_parallel,
                 "low_precision": low_precision_enabled,
             }[entry.when]
             if not active:
@@ -561,6 +641,7 @@ def normalize_distributed_setup_overrides(
             entries,
             cp_size=getattr(mesh_context, "cp_size", 1),
             ep_size=getattr(mesh_context, "ep_size", 1),
+            sequence_parallel=getattr(mesh_context, "sequence_parallel", False),
             low_precision_enabled=low_precision_enabled,
         )
         if entries

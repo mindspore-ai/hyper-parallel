@@ -84,7 +84,13 @@ class Target(Generic[_T]):
         return self._target_
 
     def build(self, **runtime_kwargs: Any) -> _T:
-        """Invoke the target with configured and applicable runtime arguments."""
+        """Invoke the target with configured and applicable runtime arguments.
+
+        Nested :class:`Target` values are built immediately before their
+        parent. This lets configuration inject a model-owned adapter into a
+        generic framework target without introducing a model-specific wrapper
+        factory.
+        """
         signature = inspect.signature(self._target_)
         if not any(
                 parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -97,6 +103,10 @@ class Target(Generic[_T]):
             }
 
         kwargs = {**self._kwargs, **runtime_kwargs}
+        kwargs = {
+            name: _build_nested_targets(value)
+            for name, value in kwargs.items()
+        }
         return self._target_(**kwargs)
 
     def replace(self, **changes: Any) -> "Target[_T]":
@@ -118,3 +128,19 @@ class Target(Generic[_T]):
                 for name, value in self._kwargs.items()
             },
         }
+
+
+def _build_nested_targets(value: Any) -> Any:
+    """Materialize deferred targets inside one configured argument tree."""
+    if isinstance(value, Target):
+        return value.build()
+    if isinstance(value, dict):
+        return {
+            key: _build_nested_targets(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_build_nested_targets(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_build_nested_targets(item) for item in value)
+    return value

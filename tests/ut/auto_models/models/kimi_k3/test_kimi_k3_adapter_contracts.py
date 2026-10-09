@@ -42,6 +42,7 @@ from hyper_parallel.distributed.tensor_parallel.param_role import (
     ParamRole,
     ParameterClassifier,
 )
+from hyper_parallel.models.kimi_k3.adapter import load_context_parallel
 from hyper_parallel.models.kimi_k3.adapter.distributed import (
     context_parallel as adapter_context_parallel,
 )
@@ -122,6 +123,8 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
         text_spec = get_model_adapter("KimiLinearForCausalLM")
         self.assertIsNotNone(top_spec)
         self.assertIsNotNone(text_spec)
+        self.assertIs(top_spec.context_parallel, load_context_parallel)
+        self.assertIs(text_spec.context_parallel, load_context_parallel)
         self.assertIs(
             top_spec.context_parallel(),
             adapter_context_parallel,

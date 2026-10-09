@@ -30,6 +30,7 @@ class TrainingConfig:
 
     train_iters: Optional[int] = None
     train_samples: Optional[int] = None
+    lr_scheduler_iters: Optional[int] = None
     eval_iters: int = 0
 
     global_batch_size: int = 8
@@ -56,6 +57,28 @@ class DebugConfig:
 
     check_dataset: Optional[Literal["debug", "info", "warn"]] = None
     check_nan_inf: bool = False
+    check_fsdp_runtime: bool = False
+
+
+@dataclass
+class ModelIntegrationConfig:
+    """Enable model-integration checks at one well-defined lifecycle scope.
+
+    ``build`` validates the final module tree, sharding ownership, data
+    contract, optimizer layout, and checkpoint coverage. ``runtime`` includes
+    those checks and records one-step input, gradient, shared-state, and layout
+    evidence. Output location and probe selection are framework policy rather
+    than user-tunable training semantics.
+    """
+
+    mode: Literal["off", "build", "runtime"] = "off"
+
+    def __post_init__(self) -> None:
+        """Reject ambiguous validation scopes at the configuration boundary."""
+        if self.mode not in ("off", "build", "runtime"):
+            raise ValueError(
+                "model_integration.mode must be one of: off, build, runtime"
+            )
 
 
 @dataclass

@@ -19,9 +19,8 @@ __all__ = ["VLMTrainer"]
 from collections import defaultdict
 from typing import Any, Dict
 
-from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data.batching import calculate_num_micro_batches
-from hyper_parallel.data.vlm import build_processor, build_vlm_get_batch
+from hyper_parallel.data.omni import OmniDataTransform
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
@@ -57,45 +56,53 @@ class VLMTrainer:
 
         # get_batch
         self._build_get_batch()
+        self.base.attach_model_integration_data_pipeline()
         self.base._compute_train_iters()
 
         self.base._build_optimizer()
+        self.base.model_integration.attach_optimizer(self.base.optimizer)
         self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks()
 
     def _build_model_assets(self) -> None:
-        """Build processor-backed assets for VLM training."""
+        """Build and publish the processor consumed by the Omni transform."""
         config: TrainerConfig = self.base.config
         if config.dataset is None:
             raise ValueError("dataset must define a build target")
 
-        processor_path = (
-            getattr(config.model, "tokenizer_path", None)
-            or getattr(config.model, "pretrained_model_name_or_path", None)
+        # The model-owned processor is built through the Omni ``model_assets``
+        # target; forward the model's ``trust_remote_code`` flag so a natively
+        # registered architecture such as the Kimi-K2.6 family (``kimi_k26``)
+        # stays on the local implementation unless the config opts into remote
+        # code.
+        processor = config.dataset.model_assets.build(
+            trust_remote_code=bool(
+                getattr(config.model, "trust_remote_code", True)
+            ),
         )
-        if processor_path is None:
-            self.base.processor = None
-        else:
-            self.base.processor = build_processor(processor_path)
-        self.base.tokenizer = getattr(self.base.processor, "tokenizer", None)
-        self.base.chat_template = None
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None:
+            raise ValueError("dataset.model_assets must build a processor with a tokenizer")
 
-        self.base.model_assets = [self.base.model_config]
-        if self.base.processor is not None:
-            self.base.model_assets.append(self.base.processor)
+        self.base.processor = processor
+        self.base.tokenizer = tokenizer
+        self.base.chat_template = getattr(processor, "chat_template", None)
+        self.base.model_assets = [self.base.model_config, processor]
 
     def _build_data_transform(self) -> None:
-        """Build the configured multimodal sample transform."""
+        """Build the Omni encoding lifecycle from the prebuilt processor."""
         dataset_config = self.base.config.dataset
         if dataset_config is None:
             raise ValueError("dataset must define a build target")
         if dataset_config.data_transform is None:
-            self.base.data_transform = None
-            return
-        self.base.data_transform = dataset_config.data_transform.build(
+            raise ValueError("dataset.data_transform must define an Omni transform build target")
+        data_transform = dataset_config.data_transform.build(
             processor=self.base.processor,
         )
+        if not isinstance(data_transform, OmniDataTransform):
+            raise TypeError("dataset.data_transform must build an OmniDataTransform")
+        self.base.data_transform = data_transform
 
     def _build_collate_fn(self) -> None:
         """Build the VLM collator and gradient-accumulation batch count."""
@@ -108,21 +115,22 @@ class VLMTrainer:
             micro_batch_size=training_config.micro_batch_size,
             dp_world_size=self.base.mesh.dp_size,
         )
-        self.base.collate_fn = dataloader_config.collate_fn.build()
+        self.base.collate_fn = dataloader_config.collate_fn.build(
+            mesh_context=self.base.mesh,
+        )
 
     def _build_get_batch(self) -> None:
-        """Build the DataLoader-to-VLM batch adapter."""
+        """Build the DataLoader-to-LLM batch runtime."""
         config = self.base.config
-        get_batch_builder = (
-            config.dataloader.get_batch.build
-            if config.dataloader.get_batch
-            else build_vlm_get_batch
-        )
-        self.base.get_batch = get_batch_builder(
+        if config.dataloader.get_batch is None:
+            raise ValueError("dataloader.get_batch must define a batching runtime target")
+        get_batch = config.dataloader.get_batch.build(
             mesh_context=self.base.mesh,
             device=self.base.device,
+            data_config=getattr(config.dataset, "data_config", {}),
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
         )
+        self.base.get_batch = get_batch
 
     @property
     def distributed_setup(self) -> Any:
@@ -188,12 +196,13 @@ class VLMTrainer:
                 micro_step,
                 num_micro_steps,
             )
+            self.base.begin_fsdp_runtime_diagnostics(micro_step)
             self.base.current_token_counts = count_loss_token(loss_inputs)
             self.base.step_token_counts = {
                 name: token_count * num_micro_steps
                 for name, token_count in self.base.current_token_counts.items()
             }
-            loss, loss_dict = self.base.forward_backward_step(model_inputs)
+            loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
 
             # Release each device batch as soon as its backward pass completes;
             # prefetching all micro-batches must not pin them until step end.
@@ -207,7 +216,6 @@ class VLMTrainer:
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         """Execute one VLM training step."""
-        config = self.base.config
         first_training_batch = self.base.get_batch(data_iterator)
         num_micro_steps = self.base.num_micro_batches
         training_batches = [first_training_batch]
@@ -217,6 +225,7 @@ class VLMTrainer:
         self.on_step_begin(
             micro_batches=[model_inputs for model_inputs, _ in training_batches]
         )
+        self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
         total_loss, total_loss_dict = self._forward_backward_micro_batches(
@@ -224,26 +233,28 @@ class VLMTrainer:
             num_micro_steps,
         )
 
-        grad_norm = clip_grad_norm_(
-            self.base.model,
-            config.training.max_grad_norm,
-        )
-
+        grad_norm = self.base.prepare_optimizer_step()
         self.base.step_optimizers_and_schedulers()
 
+        # Checkpoint and logging callbacks observe completed optimizer updates.
+        self.base.state.global_step += 1
         grad_norm_value = float(grad_norm)
+        # The base trainer owns this integration hook and the VLM subclass only
+        # mirrors the base step order, so reaching the private method is intended.
+        self.base._end_model_integration_step(  # pylint: disable=protected-access
+            {"loss": total_loss, "grad_norm": grad_norm_value}
+        )
         self.on_step_end(
             loss=total_loss,
             loss_dict=total_loss_dict,
             grad_norm=grad_norm_value,
         )
 
-        self.base.state.global_step += 1
-
-        return {
+        step_metrics = {
             "loss": total_loss,
             "grad_norm": grad_norm_value,
         }
+        return step_metrics
 
     def train(self) -> None:
         """Run the VLM training loop."""
