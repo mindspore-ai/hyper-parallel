@@ -63,6 +63,10 @@ class GraphTrainer:
         mesh_context: Optional[Any] = None,
         dynamic: bool = False,
         dynamic_arg_dims: Optional[DynamicArgDims] = None,
+        compile_sizes: Optional[List[int]] = None,
+        compile_size_input: Optional[str] = None,
+        compile_size_dim: int = -1,
+        max_specializations: int = 8,
     ) -> None:
         """
         Args:
@@ -82,6 +86,10 @@ class GraphTrainer:
                 automodel TP-sharded model into the graph-mode FSDP pass.
             dynamic: Enable symbolic user input dimensions (forwarded to GraphCompiler).
             dynamic_arg_dims: Optional input paths to dynamic dimensions (forwarded to GraphCompiler).
+            compile_sizes: Sizes for lazy specialization (forwarded to GraphCompiler).
+            compile_size_input: Dotted tensor path for size selection.
+            compile_size_dim: Axis for an explicit dispatch path (default -1).
+            max_specializations: Maximum cached input signatures (default 8).
         """
         # The compiler owns the model, device, config, and the compiled
         # graph; the trainer keeps only the optimizer / loop policy.
@@ -94,6 +102,10 @@ class GraphTrainer:
             mesh_context=mesh_context,
             dynamic=dynamic,
             dynamic_arg_dims=dynamic_arg_dims,
+            compile_sizes=compile_sizes,
+            compile_size_input=compile_size_input,
+            compile_size_dim=compile_size_dim,
+            max_specializations=max_specializations,
         )
         self.optimizer_config = optimizer_config or {}
         self.optimizer = None
@@ -131,6 +143,11 @@ class GraphTrainer:
             self.compile(**inputs)
 
         return self._compiler.forward_backward(**inputs)
+
+    @property
+    def specialization_stats(self) -> dict[str, Any]:
+        """Expose the compiler's lazy specialization counters for training audits."""
+        return self._compiler.specialization_stats
 
     def to(self, device: torch.device) -> "GraphTrainer":
         """Move the model to ``device`` and remember it for batch placement.

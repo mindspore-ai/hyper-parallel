@@ -31,12 +31,14 @@ def _loss(model, x, y):
 
 @pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("reshard", [False, True])
-def test_dynamic_fsdp(overlap: bool, reshard: bool) -> None:
+@pytest.mark.parametrize("specialize", [False, True])
+def test_dynamic_fsdp(overlap: bool, reshard: bool, specialize: bool) -> None:
     """Compare losses, reduced gradient shards and optimizer updates with eager.
 
     Args:
         overlap: Whether to overlap communication and computation.
         reshard: Whether to release full parameters after the forward.
+        specialize: Whether to lazily generate configured concrete-size variants.
     """
     dist.init_process_group("gloo", timeout=timedelta(seconds=60))
     try:
@@ -48,6 +50,8 @@ def test_dynamic_fsdp(overlap: bool, reshard: bool) -> None:
             model, _loss, device=torch.device("cpu"),
             pass_config=PassConfig(fsdp_enabled=True, enable_overlap=overlap, fsdp_reshard_after_forward=reshard),
             dynamic_arg_dims={"x": [0, 1], "y": [0, 1]},
+            compile_sizes=[7, 8] if specialize else None,
+            compile_size_input="x", compile_size_dim=1,
         )
         optimizer = torch.optim.SGD(model.parameters(), lr=1e-2, foreach=False)
         ref_optimizer = torch.optim.SGD(reference.parameters(), lr=1e-2, foreach=False)
@@ -75,6 +79,11 @@ def test_dynamic_fsdp(overlap: bool, reshard: bool) -> None:
                 torch.testing.assert_close(parameter, ref_parameter.chunk(world_size, dim=0)[rank])
             optimizer.zero_grad()
             ref_optimizer.zero_grad()
+        if specialize:
+            stats = compiler.specialization_stats
+            assert stats["compilations"] == 1, f"Expected one specialization, got {stats}"
+            assert stats["cache_hits"] == 1, f"Expected one cache hit, got {stats}"
+            assert stats["general_calls"] == 2, f"Expected two general calls, got {stats}"
         dist.barrier()
     finally:
         dist.destroy_process_group()

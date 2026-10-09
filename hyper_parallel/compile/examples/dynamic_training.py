@@ -25,6 +25,7 @@ import importlib
 import json
 import os
 from datetime import timedelta
+from typing import Optional
 from unittest.mock import patch
 
 import torch
@@ -80,7 +81,10 @@ def _check_gradients(model: nn.Module, reference: nn.Module, rank: int, world_si
         torch.testing.assert_close(parameter.grad, expected_grad)
 
 
-def run_training(device: torch.device, steps: int = 12, dtype: torch.dtype = torch.float32) -> dict:
+def run_training(
+    device: torch.device, steps: int = 12, dtype: torch.dtype = torch.float32,
+    compile_sizes: Optional[list[int]] = None,
+) -> dict:
     """Check graph loss, reduced gradient shards and optimizer updates against eager.
 
     A process group is optional. FSDP uses SUM reduce-scatter, so the eager
@@ -91,6 +95,7 @@ def run_training(device: torch.device, steps: int = 12, dtype: torch.dtype = tor
         device: Device for model state and generated token batches.
         steps: Number of optimizer steps, at least four.
         dtype: Floating-point parameter dtype.
+        compile_sizes: Optional sequence lengths eligible for lazy specialization.
 
     Returns:
         Training audit containing shapes, losses and capture count.
@@ -106,6 +111,7 @@ def run_training(device: torch.device, steps: int = 12, dtype: torch.dtype = tor
     trainer = GraphTrainer(
         model, causal_loss, pass_config=PassConfig(fsdp_enabled=world_size > 1), device=device,
         dynamic_arg_dims={"input_ids": [0, 1], "labels": [0, 1]},
+        compile_sizes=compile_sizes, compile_size_input="input_ids", compile_size_dim=1,
         optimizer_config={"lr": 1e-2},
     )
     optimizer = torch.optim.Adam(reference.parameters(), lr=1e-2, foreach=False)
@@ -141,6 +147,7 @@ def run_training(device: torch.device, steps: int = 12, dtype: torch.dtype = tor
         "rank": rank, "world_size": world_size, "device": str(device), "dtype": str(dtype),
         "optimizer_steps": steps, "captures": captures, "unique_shapes": sorted({tuple(shape) for shape in shapes}),
         "losses": losses, "eager_loss_gradients_and_weights_match": True,
+        "specialization": trainer.specialization_stats,
     }
     print(json.dumps(audit))
     return audit
@@ -152,6 +159,7 @@ def main() -> None:
     parser.add_argument("--device", choices=("cpu", "cuda", "npu"), default="cpu")
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="float32")
     parser.add_argument("--steps", type=int, default=12)
+    parser.add_argument("--compile-sizes", type=int, nargs="*", default=None)
     args = parser.parse_args()
     if args.device == "npu":
         # torch_npu is optional for CPU/CUDA users and registers the NPU backend.
@@ -165,7 +173,7 @@ def main() -> None:
         backend = {"cpu": "gloo", "cuda": "nccl", "npu": "hccl"}[args.device]
         dist.init_process_group(backend, timeout=timedelta(seconds=120))
     try:
-        run_training(device, args.steps, getattr(torch, args.dtype))
+        run_training(device, args.steps, getattr(torch, args.dtype), args.compile_sizes)
     finally:
         if distributed:
             dist.destroy_process_group()

@@ -41,6 +41,7 @@ from torch.distributed.distributed_c10d import _register_process_group
 from .pass_config import PassConfig
 from .graph_parallel_plan import GraphParallelPlan
 from .passes.pipeline import PassPipeline
+from .size_specialization import SizeSpecializationDispatcher, validate_compile_sizes
 from .tracer.dynamic_shapes import DynamicArgDims, normalize_dynamic_arg_dims
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
 
@@ -66,6 +67,10 @@ class GraphCompiler:
         mesh_context: Optional[Any] = None,
         dynamic: bool = False,
         dynamic_arg_dims: Optional[DynamicArgDims] = None,
+        compile_sizes: Optional[List[int]] = None,
+        compile_size_input: Optional[str] = None,
+        compile_size_dim: int = -1,
+        max_specializations: int = 8,
     ) -> None:
         """
         Args:
@@ -84,11 +89,21 @@ class GraphCompiler:
                 graph-mode FSDP pass.
             dynamic: Symbolize user input dimensions (default False).
             dynamic_arg_dims: Dotted input paths to dynamic dimensions; overrides automatic selection.
+            compile_sizes: Sizes for lazy FX specialization (disabled by default).
+            compile_size_input: Dotted tensor path for dispatch; defaults to the first symbolic input axis.
+            compile_size_dim: Dispatch axis for an explicit path (default -1).
+            max_specializations: Maximum cached full input signatures (default 8).
         """
         self.dynamic = dynamic
         if not isinstance(self.dynamic, bool):
             raise ValueError("dynamic must be a bool")
         self.dynamic_arg_dims = normalize_dynamic_arg_dims(dynamic_arg_dims)
+        self.compile_size_input = compile_size_input
+        self.compile_size_dim = compile_size_dim
+        self.max_specializations = max_specializations
+        self.compile_sizes = validate_compile_sizes(compile_sizes, self.max_specializations)
+        if self.compile_sizes and not (self.dynamic or self.dynamic_arg_dims is not None):
+            raise ValueError("compile_sizes requires dynamic=True or dynamic_arg_dims")
         self.model = model
         self.train_fn = train_fn
         self.pass_config = pass_config
@@ -103,11 +118,17 @@ class GraphCompiler:
         pass_config.validate()
 
         self._joint_graph = None
+        self._size_dispatcher = None
 
     @property
     def is_compiled(self) -> bool:
         """Whether a joint graph has already been compiled."""
         return self._joint_graph is not None
+
+    @property
+    def specialization_stats(self) -> dict[str, Any]:
+        """Return lazy size-specialization counters, or an empty mapping when disabled."""
+        return self._size_dispatcher.stats if self._size_dispatcher is not None else {}
 
     def compile(self, **inputs: Any) -> None:
         """
@@ -135,6 +156,13 @@ class GraphCompiler:
         if self.dynamic or self.dynamic_arg_dims is not None:
             trace_kwargs = {"dynamic": self.dynamic, "dynamic_arg_dims": self.dynamic_arg_dims}
         joint_graph = trace_model_graph(self.model, self.train_fn, inputs, **trace_kwargs)
+        # Validate selection before a parallel pass mutates the live model.
+        size_dispatcher = None
+        if self.compile_sizes:
+            size_dispatcher = SizeSpecializationDispatcher(
+                joint_graph, inputs, self.compile_sizes, self.compile_size_input,
+                self.compile_size_dim, self.max_specializations,
+            )
         pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
         pass_kwargs = self._build_pass_kwargs()
@@ -146,6 +174,7 @@ class GraphCompiler:
         if joint_graph.input_guards is not None:
             joint_graph.input_guards.refresh()
         self._joint_graph = joint_graph
+        self._size_dispatcher = size_dispatcher
 
     def forward_backward(self, **inputs: Any) -> Any:
         """
@@ -262,6 +291,7 @@ class GraphCompiler:
             self._joint_graph,
             self.model,
             inputs,
+            **({"graph_dispatcher": self._size_dispatcher} if self._size_dispatcher is not None else {}),
         )
 
     def _accumulate_grads(self, grads: List[torch.Tensor]) -> None:

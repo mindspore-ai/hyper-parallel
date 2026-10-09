@@ -608,6 +608,8 @@ def run_traced_graph(
     joint_graph: JointGraph,
     model: torch.nn.Module,
     inputs: Dict[str, Any],
+    *,
+    graph_dispatcher: Optional[Callable] = None,
 ) -> tuple:
     """
     Execute a traced joint graph against the live model state.
@@ -627,6 +629,8 @@ def run_traced_graph(
         joint_graph: Captured and transformed joint forward/backward graph.
         model: Live model supplying current parameters and buffers.
         inputs: Keyword inputs with the same pytree structure as the capture.
+        graph_dispatcher: Optional callable selecting a variant after guard validation;
+            it must preserve the general graph's flat input/output contract.
 
     Returns:
         tuple: (loss, grads) where ``grads`` aligns with the model's
@@ -658,7 +662,8 @@ def run_traced_graph(
     flat_inputs = list(state_flat) + list(user_flat)
 
     with torch.no_grad():
-        outputs = joint_graph.graph_module(*flat_inputs)
+        runnable = joint_graph.graph_module if graph_dispatcher is None else graph_dispatcher
+        outputs = runnable(*flat_inputs)
 
     if isinstance(outputs, (list, tuple)):
         loss, grads = outputs[0], list(outputs[1:])

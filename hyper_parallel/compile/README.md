@@ -170,6 +170,61 @@ The implementation uses `ShapeEnv` and `make_fx` directly and has no runtime
 MagiCompiler dependency. Execution reuses symbolic FX code; it does not add a
 compiled-kernel backend or NPU graph capture.
 
+## Lazy size specialization
+
+Configure hot sequence lengths directly on `GraphCompiler` or `GraphTrainer`:
+
+```python
+compiler = GraphCompiler(
+    model, train_fn, pass_config=PassConfig(fsdp_enabled=False),
+    dynamic_arg_dims={"x": [0, 1], "y": [0, 1]},
+    compile_sizes=[5, 7], compile_size_input="x", compile_size_dim=1,
+    max_specializations=8,
+)
+```
+
+The first call executes the general symbolic graph. Later configured sizes
+lazily generate concrete-shape FX variants; repeated input signatures hit the
+cache, and unconfigured sizes use the general graph. Capacity is bounded:
+new signatures at capacity fall back to the general graph.
+
+The selector uses a dotted tensor path and axis (negative axes are supported).
+Without an explicit path, it uses the first symbolic user input axis. The cache
+key includes every user tensor's shape, stride, storage offset and metadata,
+so another batch dimension at the same sequence length needs its own variant.
+Tensor values and model weights stay live. General input guards run before
+all dispatches, including cache hits.
+
+Specialization folds pure symbolic shape queries and integer arithmetic in the
+already transformed graph. It does not execute tensor or communication
+operations while generating a variant, repeat model capture or run the FSDP
+sharding pass again. This is FX code specialization; no acceleration is promised.
+`compile_sizes=None` or `[]` disables it. `specialization_stats` on either the
+compiler or trainer exposes generation, hit, fallback and folded-node counters.
+
+```bash
+python -m hyper_parallel.compile.examples.size_specialization
+python -m hyper_parallel.compile.examples.dynamic_training \
+  --device npu --compile-sizes 7 11
+```
+
+The training entry also supports FSDP2 with lengths differing between ranks:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  -m hyper_parallel.compile.examples.dynamic_training \
+  --device npu --compile-sizes 7 8 11 12
+```
+
+When another job shares the same NPUs, HCCL sockets can use automatically
+assigned ports via `HCCL_NPU_SOCKET_PORT_RANGE=auto` and
+`HCCL_HOST_SOCKET_PORT_RANGE=auto`; see the
+[HCCL environment reference](https://www.hiascend.com/document/detail/zh/canncommercial/850/commlib/hcclug/hcclug_000092.html).
+
+Run [the cache regression tests](../../tests/ut/compile/test_size_specialization.py)
+with `python -m pytest tests/ut/compile/test_size_specialization.py -q`.
+
 ## Key Design Decisions
 
 1. **Static Inputs**: Parameters are graph inputs, not `get_attr`. This allows passes to split the graph by reshaping placeholders.
