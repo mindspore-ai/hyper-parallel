@@ -86,6 +86,7 @@ from hyper_parallel.trainer.runtime import model_integration as model_integratio
 from hyper_parallel.trainer.runtime.data_iterator import HyperIter
 from hyper_parallel.trainer.runtime.logging import enable_third_party_logging
 from hyper_parallel.trainer.runtime.memory import empty_cache, print_device_mem_info
+from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
 from hyper_parallel.trainer.runtime.random import enable_high_precision_for_bf16, set_seed
 from hyper_parallel.trainer.runtime.device import (  # pylint: disable=syntax-error
     get_device_type,
@@ -98,7 +99,7 @@ from hyper_parallel.trainer.callbacks import (
     EvaluateCallback,
     GarbageCollectionCallback,
     LoggingCallback,
-    ProfilingCallback,
+    ProfilerCallback,
     TqdmCallback,
     CheckpointerCallback,
     TrainerState,
@@ -269,35 +270,45 @@ class BaseTrainer(Stateful, ABC):
         # ``_build_distributed_setup`` remains a reserved backend hook; the
         # trainer only defines its contract here.
         self._setup()
+        try:
+            memory_profiler.reset(
+                self.config.memory,
+                global_rank=self.global_rank,
+                tp_rank=self.mesh.tp_rank,
+                dp_rank=self.mesh.dp_rank,
+            )
 
-        # Reserved atomic model-build interface.
-        #
-        # Owner:
-        #   - ``../_transformers/auto_model.py::HyperAutoModel*.from_pretrained``
-        #   - ``../_transformers/model_builder.py`` for materialization,
-        #     checkpoint loading, PEFT/quantization, and parallelize.
-        #
-        # Contract:
-        #   - consume the ``DistributedSetup`` created above;
-        #   - set ``model`` and the resolved checkpoint ``model_config``;
-        #   - return a materialized, weight-loaded, already-parallelized model;
-        #   - never call a second trainer-side ``build_parallelize_model``.
-        self._build_model()
-        self._build_loss()
+            # Reserved atomic model-build interface.
+            #
+            # Owner:
+            #   - ``../_transformers/auto_model.py::HyperAutoModel*.from_pretrained``
+            #   - ``../_transformers/model_builder.py`` for materialization,
+            #     checkpoint loading, PEFT/quantization, and parallelize.
+            #
+            # Contract:
+            #   - consume the ``DistributedSetup`` created above;
+            #   - set ``model`` and the resolved checkpoint ``model_config``;
+            #   - return a materialized, weight-loaded, already-parallelized model;
+            #   - never call a second trainer-side ``build_parallelize_model``.
+            self._build_model()
+            self._build_loss()
 
-        # Build trainer-owned data components after the model finalizes parameters and sharding.
-        self._build_model_assets()
-        self._build_data_transform()
-        self._build_dataset()
-        self._build_collate_fn()
-        self._build_dataloader()
-        self._compute_train_iters()
+            # Build trainer-owned data components after the model finalizes parameters and sharding.
+            self._build_model_assets()
+            self._build_data_transform()
+            self._build_dataset()
+            self._build_collate_fn()
+            self._build_dataloader()
+            self._compute_train_iters()
 
-        self._build_optimizer()
-        self.model_integration.attach_optimizer(self.optimizer)
-        self._build_lr_scheduler()
-        self._build_training_context()
-        self._init_callbacks()
+            self._build_optimizer()
+            self.model_integration.attach_optimizer(self.optimizer)
+            self._build_lr_scheduler()
+            self._build_training_context()
+            self._init_callbacks()
+        except BaseException:
+            self.abort_profilers()
+            raise
 
     def _setup(self):
         """Initialize logging, distributed state, and the local device."""
@@ -541,14 +552,14 @@ class BaseTrainer(Stateful, ABC):
         self.logging_callback = LoggingCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.garbage_collection_callback = GarbageCollectionCallback(self)
-        self.profiling_callback = ProfilingCallback(self)
+        self.profiler_callback = ProfilerCallback(self)
         self._callbacks = [
             self.environ_meter_callback,
             self.logging_callback,
             self.tqdm_callback,
             self.evaluate_callback,
             self.garbage_collection_callback,
-            self.profiling_callback,
+            self.profiler_callback,
         ]
         # Registered to save, to restore, or both --- the two are independent, so
         # a run that only loads an existing checkpoint still needs the callback.
@@ -852,7 +863,15 @@ class BaseTrainer(Stateful, ABC):
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        """Execute one optimizer update from the next dataloader batch."""
+        """Execute one optimizer update from the next dataloader batch.
+
+        Args:
+            data_iterator: Iterator providing the next micro-batches.
+
+        Returns:
+            Aggregated loss and gradient norm.
+        """
+        memory_profiler.step()
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self.state.global_step += 1
 
@@ -894,6 +913,16 @@ class BaseTrainer(Stateful, ABC):
             "grad_norm": grad_norm_value,
         }
 
+    def abort_profilers(self) -> None:
+        """Release process-local profiling resources while preserving a training error."""
+        memory_profiler.abort()
+        profiler_callback = getattr(self, "profiler_callback", None)
+        if profiler_callback is not None:
+            try:
+                profiler_callback.close()
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.exception("Failed to stop performance profiling while aborting training.")
+
     def destroy_distributed(self) -> None:
         """Synchronize all ranks and tear down the distributed process group."""
         if not dist.is_available() or not dist.is_initialized():
@@ -907,53 +936,59 @@ class BaseTrainer(Stateful, ABC):
 
     def train(self) -> None:
         """Run the configured training loop."""
-        config: TrainerConfig = self.config
-        self.on_train_begin()
-        self.data_iterator = HyperIter(
-            self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
-        )
-        logger.info(
-            "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
-            self.local_rank, self.state.global_step, self.train_iters, self.state.epoch, self.train_epochs,
-        )
-
         try:
-            start_epoch = self.state.epoch
-            for epoch in range(start_epoch, self.train_epochs):
-                if epoch != start_epoch:
-                    self.train_dataloader.set_epoch(epoch)
-                    self.data_iterator = HyperIter(
-                        self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
-                    )
-                self.state.epoch = epoch
+            config: TrainerConfig = self.config
+            self.on_train_begin()
+            self.data_iterator = HyperIter(
+                self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
+            )
+            logger.info(
+                "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
+                self.local_rank, self.state.global_step, self.train_iters, self.state.epoch, self.train_epochs,
+            )
 
-                self.on_epoch_begin()
-
-                start_step = self.state.global_step - epoch * self.train_steps
-                train_steps = min(self.train_steps, self.train_iters - epoch * self.train_steps)
-                for _ in range(start_step, train_steps):
-                    try:
-                        self.train_step(self.data_iterator)
-                    except StopIteration:
-                        logger.info(
-                            "epoch:%s Dataloader finished with drop_last %s",
-                            epoch,
-                            config.dataloader.drop_last,
+            try:
+                start_epoch = self.state.epoch
+                for epoch in range(start_epoch, self.train_epochs):
+                    if epoch != start_epoch:
+                        self.train_dataloader.set_epoch(epoch)
+                        self.data_iterator = HyperIter(
+                            self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
                         )
-                        break
+                    self.state.epoch = epoch
 
-                self.on_epoch_end()
-                self.state.epoch = epoch + 1
+                    self.on_epoch_begin()
 
-                print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+                    start_step = self.state.global_step - epoch * self.train_steps
+                    train_steps = min(self.train_steps, self.train_iters - epoch * self.train_steps)
+                    for _ in range(start_step, train_steps):
+                        try:
+                            self.train_step(self.data_iterator)
+                        except StopIteration:
+                            logger.info(
+                                "epoch:%s Dataloader finished with drop_last %s",
+                                epoch,
+                                config.dataloader.drop_last,
+                            )
+                            break
 
+                    self.on_epoch_end()
+                    self.state.epoch = epoch + 1
+
+                    print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+
+                    if config.dataloader.use_background_prefetcher:
+                        self.data_iterator.stop()
+
+                memory_profiler.stop()
+                self.on_train_end()
+            finally:
                 if config.dataloader.use_background_prefetcher:
                     self.data_iterator.stop()
 
-            self.on_train_end()
-        finally:
-            if config.dataloader.use_background_prefetcher:
-                self.data_iterator.stop()
+        except BaseException:
+            self.abort_profilers()
+            raise
 
         synchronize()
 

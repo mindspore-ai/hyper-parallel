@@ -150,13 +150,11 @@ debug:
   check_nan_inf: false
   check_dataset: null
 
-profiling:
+profiler:
   enabled: false
   start_step: 3
-  end_step: 4
-  trace_dir: ./outputs/deepseek_v32/profiling
-  record_shapes: false
-  profile_memory: false
+  stop_step: 3
+  output_path: ./outputs/deepseek_v32/profiling
+  memory: false
   with_stack: false
-  with_modules: false
-  rank: 0
+  rank_ids: [0]
