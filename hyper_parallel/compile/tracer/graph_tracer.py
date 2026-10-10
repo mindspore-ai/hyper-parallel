@@ -59,15 +59,18 @@ from collections.abc import Callable, Generator
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import nn
+from torch._decomp import get_decompositions
 from torch._guards import tracing, TracingContext
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.traceback import preserve_node_meta
 from torch.nn.utils import stateless
+
+from .dynamic_shapes import DynamicArgDims, InputGuards, build_symbolic_inputs
 
 # Older torch's make_fx predates record_stack_traces / record_module_stack
 # and rejects unknown kwargs; forward only the kwargs this torch supports.
@@ -172,10 +175,18 @@ class JointGraph:
     # runtime parameter state into the graph.
     state_fqns: List[str]
     example_inputs: tuple
+    input_guards: Optional[InputGuards] = None
 
 
 def extract_module_state(mod: nn.Module) -> Dict[str, torch.Tensor]:
-    """Return a merged dict of the module's named parameters and buffers."""
+    """Return a merged mapping of named parameters and buffers.
+
+    Args:
+        mod: Module whose live state tensors are extracted.
+
+    Returns:
+        Mapping from fully qualified state names to live tensors.
+    """
     return {
         **dict(mod.named_parameters(remove_duplicate=False)),
         **dict(mod.named_buffers(remove_duplicate=False)),
@@ -395,50 +406,9 @@ def _input_meta(x: Any) -> Any:
     return x
 
 
-def trace_model_graph(  # pylint: disable=too-many-locals
-    model: torch.nn.Module,
-    train_fn: Callable,
-    inputs: Dict[str, Any],
-) -> JointGraph:
-    """
-    Trace model to generate complete forward + backward graph
-
-    Args:
-        model: Model (no parallel wrapping)
-        train_fn: Training function signature:
-            ``train_fn(model, **inputs) -> loss``
-        inputs: Model inputs, forwarded to ``train_fn`` as keyword arguments
-
-    Returns:
-        JointGraph: Joint forward-backward computation graph
-
-    Note:
-        Tracing is STATIC-SHAPE: no ``ShapeEnv`` is installed, so the graph
-        bakes the sample tensors' concrete shapes (symbolic ``sym_size``
-        nodes would make per-stage placement ambiguous in ``PpPass``).
-        This contract is shared by ALL graph-mode users, FSDP included — a
-        batch whose shape differs from the compile sample must be
-        re-compiled.
-    """
-    # Extract module state (parameters/buffers) into flat tensors threaded
-    # through the graph as static inputs (leading placeholders).
-    model_state = extract_module_state(model)
-    state_fqns = list(model_state.keys())
-    # Which leading state inputs are parameters (vs buffers). FSDP shards
-    # parameters only: buffers -- e.g. the non-persistent RoPE ``cache`` --
-    # are full-rank by nature and must flow through as plain inputs, never
-    # all-gathered. ``state_is_param`` is indexed by state position, aligned
-    # with ``state_fqns``.
-    param_fqns = set(dict(model.named_parameters(remove_duplicate=False)).keys())
-    state_is_param = [fqn in param_fqns for fqn in state_fqns]
-    state_flat, _ = torch.utils._pytree.tree_flatten({"model": model_state})
-
-    # user_inputs is a plain dict so the traced closure unpacks it back into
-    # train_fn's keyword arguments.
-    user_inputs = inputs
-    user_inputs_flat, user_inputs_spec = torch.utils._pytree.tree_flatten(user_inputs)
-
-    for leaf in [*state_flat, *user_inputs_flat]:
+def _validate_trace_leaves(leaves: List[Any]) -> None:
+    """Reject implicit modules and unsupported objects before fake tensor tracing."""
+    for leaf in leaves:
         if isinstance(leaf, nn.Module):
             raise ValueError(
                 "trace_model_graph requires explicit tensor state, not "
@@ -451,18 +421,13 @@ def trace_model_graph(  # pylint: disable=too-many-locals
                 f"got {type(leaf).__name__}."
             )
 
-    full_args = list(state_flat) + list(user_inputs_flat)
 
-    # Static shapes: no ShapeEnv -> no symbolic sizes -> the traced graph
-    # carries no aten.sym_size scalar nodes (their CSE-across-phases aliasing
-    # makes per-stage placement ambiguous). The trainer compiles per fixed
-    # batch shape, so static tracing loses nothing here.
-    fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
-    fake_args = tuple(
-        _fakeify_input(fake_mode, a) if isinstance(a, torch.Tensor) else a
-        for a in full_args
-    )
-    num_state_inputs = len(state_flat)
+def _make_fwd_bwd_fn(
+    model: nn.Module, train_fn: Callable, state_fqns: List[str],
+    state_is_param: List[bool], state_spec: Any, user_inputs_spec: Any,
+) -> Callable:
+    """Build a callable that emits loss and gradients from explicit state inputs."""
+    num_state_inputs = len(state_fqns)
 
     def _fwd_bwd_fn(*plain_args):
         state_wrapped = plain_args[:num_state_inputs]
@@ -499,6 +464,72 @@ def trace_model_graph(  # pylint: disable=too-many-locals
 
         return [loss] + processed_grads
 
+    return _fwd_bwd_fn
+
+
+def trace_model_graph(  # pylint: disable=too-many-locals
+    model: torch.nn.Module,
+    train_fn: Callable,
+    inputs: Dict[str, Any],
+    *,
+    dynamic: bool = False,
+    dynamic_arg_dims: Optional[DynamicArgDims] = None,
+) -> JointGraph:
+    """
+    Trace model to generate complete forward + backward graph
+
+    Args:
+        model: Model (no parallel wrapping)
+        train_fn: Training function signature:
+            ``train_fn(model, **inputs) -> loss``
+        inputs: Model inputs, forwarded to ``train_fn`` as keyword arguments
+        dynamic: Symbolize all user tensor dimensions when no explicit mapping is supplied.
+        dynamic_arg_dims: Dotted input paths to dynamic dimensions (supports negative indices).
+            Providing a mapping enables selective symbolic tracing, even when dynamic is False.
+            Parameters and buffers always remain static.
+
+    Returns:
+        JointGraph: Joint forward-backward computation graph
+
+    Note:
+        Static tracing remains the default. Dynamic traces retain shape guards;
+        incompatible shapes or shape-dependent branches raise before execution.
+    """
+    # Extract module state (parameters/buffers) into flat tensors threaded
+    # through the graph as static inputs (leading placeholders).
+    model_state = extract_module_state(model)
+    state_fqns = list(model_state.keys())
+    # Which leading state inputs are parameters (vs buffers). FSDP shards
+    # parameters only: buffers -- e.g. the non-persistent RoPE ``cache`` --
+    # are full-rank by nature and must flow through as plain inputs, never
+    # all-gathered. ``state_is_param`` is indexed by state position, aligned
+    # with ``state_fqns``.
+    param_fqns = set(dict(model.named_parameters(remove_duplicate=False)).keys())
+    state_is_param = [fqn in param_fqns for fqn in state_fqns]
+    state_flat, state_spec = torch.utils._pytree.tree_flatten({"model": model_state})
+
+    # user_inputs is a plain dict so the traced closure unpacks it back into
+    # train_fn's keyword arguments.
+    user_inputs = inputs
+    user_inputs_flat, user_inputs_spec = torch.utils._pytree.tree_flatten(user_inputs)
+
+    full_args = list(state_flat) + list(user_inputs_flat)
+    _validate_trace_leaves(full_args)
+
+    if not isinstance(dynamic, bool):
+        raise ValueError("dynamic must be a bool")
+    symbolic = dynamic or dynamic_arg_dims is not None
+    if symbolic:
+        fake_mode, fake_args = build_symbolic_inputs(state_flat, inputs, dynamic_arg_dims)
+    else:
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+        fake_args = tuple(_fakeify_input(fake_mode, value) for value in full_args)
+    num_state_inputs = len(state_flat)
+
+    _fwd_bwd_fn = _make_fwd_bwd_fn(
+        model, train_fn, state_fqns, state_is_param, state_spec, user_inputs_spec
+    )
+
     # make_fx only records ``nn_module_stack`` when the traced callable
     # carries ``_orig_mod``: its ``_init_modes_from_inputs`` then installs a
     # ``_ModuleStackTracer`` that captures which module's ``forward`` was
@@ -507,10 +538,6 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     # to its pipeline stage. Backward nodes are annotated separately (see
     # ``_annotate_autograd_backward``), after tracing.
     _fwd_bwd_fn._orig_mod = model  # type: ignore[attr-defined]
-
-    # The pytree spec of the combined state tree is captured here so the
-    # traced closure can unflatten the leading state placeholders.
-    _, state_spec = torch.utils._pytree.tree_flatten({"model": model_state})
 
     ctx = TracingContext(fake_mode)
     with (
@@ -521,7 +548,12 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         torch.autograd.set_multithreading_enabled(False),
         _non_strict_tracing_context(),
     ):
-        traced_graph = make_fx(_fwd_bwd_fn, **_MAKE_FX_KWARGS)(*fake_args)
+        # Native constant padding can specialize SymInt sizes (notably on
+        # NPU). Its upstream decomposition preserves causal-LM label lengths.
+        decompositions = get_decompositions([torch.ops.aten.constant_pad_nd.default]) if symbolic else None
+        traced_graph = make_fx(
+            _fwd_bwd_fn, decomposition_table=decompositions, **_MAKE_FX_KWARGS
+        )(*fake_args)
 
     # Stock torch's make_fx does not tag backward nodes (no torchtitan
     # ``_patch_engine_backward`` hook), so the joint graph splits into
@@ -565,6 +597,10 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         num_layers=num_layers,
         state_fqns=state_fqns,
         example_inputs=fake_args,
+        input_guards=(
+            InputGuards(user_inputs_flat, fake_args[num_state_inputs:], fake_mode.shape_env)
+            if symbolic else None
+        ),
     )
 
 
@@ -572,6 +608,8 @@ def run_traced_graph(
     joint_graph: JointGraph,
     model: torch.nn.Module,
     inputs: Dict[str, Any],
+    *,
+    graph_dispatcher: Optional[Callable] = None,
 ) -> tuple:
     """
     Execute a traced joint graph against the live model state.
@@ -579,13 +617,20 @@ def run_traced_graph(
     Parameters/buffers are sampled from ``model`` at call time and fed to the
     graph as static inputs (in ``joint_graph.state_fqns`` order). ``inputs``
     is flattened with the same pytree structure used at trace time (checked
-    against the stored spec) and appended after the state. Runs under
-    ``torch.no_grad()`` because the graph already contains the explicit
-    backward ops traced by ``torch.autograd.grad``.
+    against the stored spec) and appended after the state. Execution uses
+    disabled gradient recording because it already contains explicitly traced
+    backward operations.
 
     FSDP is invisible here: FSDPPass shards ``model``'s parameters in place,
     so ``model.parameters()`` yields the shards the graph expects as its
     leading static inputs (the graph re-gathers them via AllGather each step).
+
+    Args:
+        joint_graph: Captured and transformed joint forward/backward graph.
+        model: Live model supplying current parameters and buffers.
+        inputs: Keyword inputs with the same pytree structure as the capture.
+        graph_dispatcher: Optional callable selecting a variant after guard validation;
+            it must preserve the general graph's flat input/output contract.
 
     Returns:
         tuple: (loss, grads) where ``grads`` aligns with the model's
@@ -611,10 +656,14 @@ def run_traced_graph(
 
     state_flat, _ = torch.utils._pytree.tree_flatten({"model": model_state})
 
+    if joint_graph.input_guards is not None:
+        joint_graph.input_guards.validate(user_flat)
+
     flat_inputs = list(state_flat) + list(user_flat)
 
     with torch.no_grad():
-        outputs = joint_graph.graph_module(*flat_inputs)
+        runnable = joint_graph.graph_module if graph_dispatcher is None else graph_dispatcher
+        outputs = runnable(*flat_inputs)
 
     if isinstance(outputs, (list, tuple)):
         loss, grads = outputs[0], list(outputs[1:])
