@@ -73,6 +73,7 @@ class TestShardingConfigContracts(unittest.TestCase):
                 ("_tp_local_attr_plan", "None"),
                 ("_deferred_bias_params", "()"),
                 ("is_boundary", "True"),
+                ("skip_source_lowering", "None"),
                 ("region_dispatch", "None"),
                 ("inner_target", "None"),
                 ("inner_wrapper", "None"),

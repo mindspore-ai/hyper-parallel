@@ -113,4 +113,24 @@ def parse_training_args(argv: Sequence[str] | None = None) -> TrainerConfig:
     parser = argparse.ArgumentParser(description="HyperParallel training config")
     parser.add_argument("config_file", help="Path to the YAML training config")
     args, overrides = parser.parse_known_args(argv)
-    return _load_training_config(args.config_file, overrides)
+    return load_training_config(args.config_file, overrides)
+
+
+def load_training_config(
+    config_file: str | Path,
+    cli_overrides: Sequence[str] = (),
+) -> TrainerConfig:
+    """Load a training YAML into ``TrainerConfig``.
+
+    Args:
+        config_file: Path to the YAML training config.
+        cli_overrides: Canonical ``--field=value`` dotted overrides.
+
+    Returns:
+        Resolved training configuration, carrying the resolved YAML path for
+        callers that need the source of the configuration (codegen artifact
+        layout, signature).
+    """
+    config = _load_training_config(config_file, cli_overrides)
+    config._yaml_path = str(Path(config_file).resolve())  # pylint: disable=protected-access
+    return config

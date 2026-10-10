@@ -309,6 +309,9 @@ def build_deepseek_v41_validation_config(
     )
     _apply_v41_vision_fields(config, source, enable_vision, vision_parameter_divisor)
     config._attn_implementation = "eager"  # pylint: disable=protected-access
+    # Record the source identity the way AutoConfig.from_pretrained does; the
+    # codegen from_config path resolves the modeling source from it.
+    config._name_or_path = str(Path(config_path).expanduser().resolve())  # pylint: disable=protected-access
     return config
 
 
@@ -328,8 +331,11 @@ def build_cropped_deepseek_v41(
         compile_config: CompileConfig | dict[str, Any] | None = None,
         activation_checkpoint: str | None = None,
         activation_checkpoint_selection: Any | None = None,
+        swap_inputs: bool = False,
         activation_swap: str = "none",
         model_init_dtype: str = "float32",
+        codegen: bool = False,
+        codegen_config: Any | None = None,
 ) -> PreTrainedModel:
     """Build and parallelize the depth-preserving V4.1 parameter crop.
 
@@ -350,8 +356,11 @@ def build_cropped_deepseek_v41(
         compile_config: Optional compilation configuration.
         activation_checkpoint: Activation-checkpoint mode.
         activation_checkpoint_selection: Optional adapter-safe region selection.
+        swap_inputs: Trainer-injected activation-swap input flag.
         activation_swap: Activation-swap mode.
         model_init_dtype: Final parameter initialization dtype.
+        codegen: Select the codegen ``gen`` backend for this build.
+        codegen_config: Optional codegen backend configuration.
 
     Returns:
         Parallelized, randomly initialized V4.1 validation model.
@@ -376,8 +385,11 @@ def build_cropped_deepseek_v41(
         compile_config=compile_config,
         activation_checkpoint=activation_checkpoint,
         activation_checkpoint_selection=activation_checkpoint_selection,
+        swap_inputs=swap_inputs,
         activation_swap=activation_swap,
         model_init_dtype=model_init_dtype,
+        codegen=codegen,
+        codegen_config=codegen_config,
     )
 
 
