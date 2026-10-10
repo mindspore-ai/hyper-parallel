@@ -22,7 +22,6 @@ Test IDs:
   LB-M05: MoEMonitorCallback stores mean aux_loss in last_mean_aux_loss
   LB-M06: MoEMonitorCallback handles multi-layer with different num_experts
 """
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -44,6 +43,8 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
     def _make_moe_mock(self, tokens: list) -> MagicMock:
         """Create a mock MoE module with given tokens_per_expert values."""
         moe = MagicMock()
+        del moe.expert_bias_update_groups
+        del moe.expert_bias_update_rate
         moe.tokens_per_expert = torch.tensor(tokens, dtype=torch.float32)
         moe.update_expert_bias = MagicMock()
         return moe

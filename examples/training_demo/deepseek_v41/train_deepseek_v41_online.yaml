@@ -18,6 +18,9 @@ model:
   # Validation-only value: the V4.1 report does not publish the production
   # coefficient. This activates PanGu-style sparse-stage Indexer KL training.
   indexer_loss_coeff: 0.001
+  # Optional MoE regularization; this is not the auxiliary-loss-free bias update.
+  router_aux_loss_coeff: 0.0001
+  router_bias_update_rate: 0.001
   torch_dtype: bfloat16
   validate_placement: false
 
@@ -141,6 +144,12 @@ plan_overrides:
     local_compute_fn:
       _target_: >-
         hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
+  - match: "*.mlp"
+    inner_target: self
+    region_dispatch: false
+    inner_wrapper:
+      _target_: >-
+        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_router_aux_loss_wrapper
   - match: "*.mlp"
     when: ep
     region_dispatch: false

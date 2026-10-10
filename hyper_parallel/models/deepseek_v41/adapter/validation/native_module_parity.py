@@ -38,8 +38,8 @@ from typing import Any
 
 import numpy as np
 import torch  # pylint: disable=forbidden-backend-import
-import torch.nn.functional as functional  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
+from torch.nn import functional  # pylint: disable=forbidden-backend-import
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts, DeepseekV4MLP
 
@@ -67,6 +67,11 @@ class HyperParallelMoE(nn.Module):
     """Minimal owner that invokes the adapter's real sparse-MoE forward."""
 
     def __init__(self, config: DeepseekV4Config) -> None:
+        """Construct matching gate, routed experts and shared expert weights.
+
+        Args:
+            config: Cropped V4 configuration used for the native comparison.
+        """
         super().__init__()
         self.gate = DeepseekV41TopKRouter(config)
         self.experts = DeepseekV4Experts(config)
@@ -121,7 +126,8 @@ def _load_native_modules(native_repo: Path) -> tuple[Any, Any]:
     kernel.hc_split_sinkhorn = _unsupported_kernel
     kernel.sparse_attn = _eager_sparse_attention
     sys.modules["kernel"] = kernel
-    sys.path.insert(0, str(inference_dir))
+    # The downloaded native model imports its sibling inference modules.
+    sys.path.insert(0, str(inference_dir))  # pylint: disable=sys-path-mutation
     try:
         model_spec = importlib.util.spec_from_file_location("deepseek_v41_native_model", model_path)
         if model_spec is None or model_spec.loader is None:
@@ -201,7 +207,7 @@ def _metrics(reference: torch.Tensor, actual: torch.Tensor) -> dict[str, float]:
     flat_actual = actual_fp32.flatten()
     cosine = 1.0
     if flat_reference.numel() and flat_reference.norm() and flat_actual.norm():
-        cosine = float(functional.cosine_similarity(flat_reference, flat_actual, dim=0))
+        cosine = float(functional.cosine_similarity(flat_reference, flat_actual, dim=0))  # pylint: disable=not-callable
     return {
         "max_abs": float(difference.max()) if difference.numel() else 0.0,
         "mean_abs": float(difference.mean()) if difference.numel() else 0.0,
@@ -365,7 +371,7 @@ def _run_engram(
 
 def _moe_config() -> DeepseekV4Config:
     """Build the small released-shape-invariant MoE configuration."""
-    config = DeepseekV4Config(
+    config = DeepseekV4Config(  # pylint: disable=unexpected-keyword-arg
         vocab_size=32,
         hidden_size=16,
         moe_intermediate_size=24,
@@ -391,6 +397,8 @@ def _moe_config() -> DeepseekV4Config:
         index_topk=2,
         partial_rotary_factor=0.5,
     )
+    config.router_aux_loss_coef = 0.0
+    config.router_bias_update_rate = 0.0
     config.v41_vision_enabled = True
     return config
 
@@ -458,9 +466,11 @@ def _run_moe(
     hp_input = source.to(device=target_device, dtype=dtype).detach().requires_grad_(True)
     native_weights, native_indices = native.gate(native_input.flatten(0, 1), image_mask.flatten())
     hp_logits, hp_weights, hp_indices = hp.gate(hp_input, image_mask=image_mask.to(target_device))
-    native_logits = functional.linear(native_input.flatten(0, 1).float(), native.gate.weight.float())
-    native_scores = functional.softplus(native_logits).sqrt()
-    hp_scores = functional.softplus(hp_logits).sqrt()
+    native_logits = functional.linear(  # pylint: disable=not-callable
+        native_input.flatten(0, 1).float(), native.gate.weight.float(),
+    )
+    native_scores = functional.softplus(native_logits).sqrt()  # pylint: disable=not-callable
+    hp_scores = functional.softplus(hp_logits).sqrt()  # pylint: disable=not-callable
     native_score_grad = torch.autograd.grad(native_scores.sum(), native_logits, retain_graph=True)[0]
     hp_score_grad = torch.autograd.grad(hp_scores.sum(), hp_logits, retain_graph=True)[0]
     if hp_scores.device != target_device or hp_score_grad.device != target_device:
@@ -494,7 +504,7 @@ def _attention_config(
 ) -> DeepseekV4Config:
     """Build a shape-compatible V4.1 attention-only configuration."""
     layer_count = len(ratios)
-    config = DeepseekV4Config(
+    config = DeepseekV4Config(  # pylint: disable=unexpected-keyword-arg
         vocab_size=32,
         hidden_size=512,
         moe_intermediate_size=128,

@@ -70,6 +70,8 @@ from hyper_parallel.trainer.runtime.distributed import (
 from hyper_parallel.trainer.runtime.logging import setup_logging
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
+from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
+from hyper_parallel.core.utils.moe_utils import MoEMonitorCallback
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
 from hyper_parallel.models._transformers.model_builder import _validate_optimize_dtype
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
@@ -540,6 +542,12 @@ class BaseTrainer(Stateful, ABC):
 
     def _init_callbacks(self):
         """Initialize callbacks."""
+        dp_cp_mesh = self.mesh.dp_cp_mesh
+        self.moe_monitor = MoEMonitorCallback(
+            self.model,
+            dp_group=dp_cp_mesh.get_group() if dp_cp_mesh is not None else None,
+            tp_group=self.device_mesh["tp"].get_group() if self.mesh.sequence_parallel else None,
+        )
         self.state = TrainerState()
         self.environ_meter_callback = EnvironMeterCallback(self)
         self.tqdm_callback = TqdmCallback(self)
@@ -658,6 +666,9 @@ class BaseTrainer(Stateful, ABC):
             Backward loss and named globally aggregated loss values.
         """
         local_loss = self.loss_fn(model_output=outputs, labels=labels)
+        foundation_loss = local_loss.get("foundation_loss") if isinstance(local_loss, dict) else local_loss
+        if foundation_loss is not None:
+            bind_aux_loss_scale(foundation_loss)
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             local_loss,
             self.current_token_counts,
@@ -688,7 +699,7 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None
             else nullcontext()
         )
-        with micro_step_context:
+        with micro_step_context, aux_loss_scale_context():
             micro_batch = self.preforward(micro_batch)
             # TextTrainer passes loss-only fields separately. Keep the legacy
             # BaseTrainer/VLM one-dictionary call contract working as well.
@@ -817,6 +828,9 @@ class BaseTrainer(Stateful, ABC):
             with SkipDTensorDispatch(no_skip={torch.zeros_like}):
                 optimizer.step()
             optimizer.zero_grad()
+        moe_monitor = getattr(self, "moe_monitor", None)
+        if moe_monitor is not None:
+            moe_monitor.on_step_end()
         self.model_integration.after_optimizer()
 
         schedulers = (

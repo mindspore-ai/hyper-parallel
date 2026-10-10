@@ -25,6 +25,7 @@ assets exercise only ``v41_model_mode="validation_crop"``.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -43,6 +44,12 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     apply_rotary_pos_emb,
 )
 
+from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
+from hyper_parallel.models.deepseek_v41.aux_loss import (
+    accumulate_router_load,
+    sequence_load_balancing_loss,
+    update_modality_bias,
+)
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
@@ -66,6 +73,7 @@ from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
 )
+from hyper_parallel.models.materialization import register_rebuildable_buffer
 
 _FULL_MODEL_MODE = "full"
 _VALIDATION_CROP_MODE = "validation_crop"
@@ -169,10 +177,23 @@ class DeepseekV41TopKRouter(nn.Module):
         self.top_k = int(config.num_experts_per_tok)
         self.scoring_func = str(config.scoring_func)
         self.routed_scaling_factor = float(config.routed_scaling_factor)
+        self.aux_loss_coeff = float(getattr(config, "router_aux_loss_coef", 0.0))
+        if not math.isfinite(self.aux_loss_coeff) or self.aux_loss_coeff < 0:
+            raise ValueError("router_aux_loss_coef must be finite and nonnegative")
+        self.last_aux_loss: torch.Tensor | None = None
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
-        self.bias = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32))
+        self.expert_bias_update_rate = float(getattr(config, "router_bias_update_rate", 0.001))
+        if not math.isfinite(self.expert_bias_update_rate) or self.expert_bias_update_rate < 0:
+            raise ValueError("router_bias_update_rate must be finite and nonnegative")
+        self.enable_expert_bias = self.expert_bias_update_rate > 0
+        self.expert_bias_update_groups: tuple[Any, ...] | None = None
+        self.register_buffer("tokens_per_expert", torch.zeros(2, self.num_experts, dtype=torch.long), persistent=False)
+        register_rebuildable_buffer(
+            self, "tokens_per_expert", value=torch.zeros(2, self.num_experts, dtype=torch.long, device="cpu"),
+        )
+        self.bias = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32), requires_grad=False)
         if bool(getattr(config, "v41_vision_enabled", False)):
-            self.bias_vl = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32))
+            self.bias_vl = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32), requires_grad=False)
         else:
             self.register_parameter("bias_vl", None)
 
@@ -180,11 +201,30 @@ class DeepseekV41TopKRouter(nn.Module):
             self,
             hidden_states: torch.Tensor,
             image_mask: torch.Tensor | None = None,
+            token_mask: torch.Tensor | None = None,
+            sequence_partition_groups: tuple[Any, ...] = (),
+            sequence_ids: torch.Tensor | None = None,
+            num_sequences: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return raw logits, routing weights, and selected experts.
 
         ``bias`` and ``bias_vl`` select experts only; the gathered routing
         weights intentionally use the unbiased scores, matching V4.1.
+
+        Args:
+            hidden_states: Token activations ending in the hidden dimension.
+            image_mask: Optional boolean [batch, sequence] image-token mask.
+            token_mask: Optional boolean mask matching the token dimensions;
+                true tokens contribute to auxiliary statistics.
+            sequence_partition_groups: Independent CP/TP groups partitioning
+                one microbatch's token stream, supplied by the parallel adapter.
+            sequence_ids: Optional logical sample IDs matching the token dimensions.
+            num_sequences: Total logical samples, including samples absent on this rank.
+
+        Returns:
+            Flattened logits, scaled top-k weights, and expert indices. During
+            training with a positive coefficient, weights carry the auxiliary
+            gradient and ``last_aux_loss`` stores its unweighted detached value.
         """
         flattened = hidden_states.reshape(-1, self.hidden_size)
         logits = functional.linear(  # pylint: disable=not-callable
@@ -200,8 +240,8 @@ class DeepseekV41TopKRouter(nn.Module):
             raise ValueError(f"Unsupported V4.1 router scoring function: {self.scoring_func!r}")
         correction_bias = self.bias
         if image_mask is not None:
-            if image_mask.shape != hidden_states.shape[:2]:
-                raise ValueError("image_mask must have shape [batch, sequence]")
+            if image_mask.shape != hidden_states.shape[:-1] or image_mask.dtype != torch.bool:
+                raise ValueError("image_mask must be boolean and match the hidden-state token dimensions")
             if self.bias_vl is not None:
                 correction_bias = torch.where(
                     image_mask.reshape(-1, 1),
@@ -212,7 +252,47 @@ class DeepseekV41TopKRouter(nn.Module):
         weights = scores.gather(1, indices)
         if self.top_k > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1.0e-20)
-        return logits, weights * self.routed_scaling_factor, indices
+        weights = weights * self.routed_scaling_factor
+        if token_mask is not None:
+            if token_mask.shape != hidden_states.shape[:-1] or token_mask.dtype != torch.bool:
+                raise ValueError("token_mask must be boolean and match the hidden-state token dimensions")
+            token_mask = token_mask.reshape(-1)
+        self.last_aux_loss = None
+        if self.training and self.aux_loss_coeff:
+            if sequence_ids is None:
+                num_sequences = hidden_states.shape[0] if hidden_states.ndim == 3 else 1
+                sequence_ids = torch.arange(num_sequences, device=scores.device).repeat_interleave(
+                    hidden_states.shape[-2],
+                )
+            elif sequence_ids.shape != hidden_states.shape[:-1] or num_sequences is None:
+                raise ValueError("sequence_ids must match token dimensions and specify num_sequences")
+            aux_loss = sequence_load_balancing_loss(
+                scores, indices, sequence_ids.reshape(-1), num_sequences, token_mask, sequence_partition_groups,
+            )
+            self.last_aux_loss = aux_loss.detach()
+            weights = aux_loss_auto_scale(weights, aux_loss * self.aux_loss_coeff)
+        if self.training and self.enable_expert_bias:
+            weights = accumulate_router_load(weights, indices, image_mask, token_mask, self.tokens_per_expert)
+        return logits, weights, indices
+
+    @torch.no_grad()
+    def update_expert_bias(self, lr: float | None = None, num_recomputations: int = 1) -> None:
+        """Update text/image selection biases once after the optimizer step.
+
+        The shared monitor synchronizes counts first. Backward counts each
+        microbatch once, so checkpoint recomputation needs no correction.
+
+        Args:
+            lr: Optional step size, defaulting to this router's configured rate.
+            num_recomputations: Shared monitor compatibility argument; unused.
+        """
+        del num_recomputations
+        if lr is None:
+            lr = self.expert_bias_update_rate
+        update_modality_bias(self.bias, self.tokens_per_expert[0], lr)
+        if self.bias_vl is not None:
+            update_modality_bias(self.bias_vl, self.tokens_per_expert[1], lr)
+        self.tokens_per_expert.zero_()
 
 
 def _v41_sparse_moe_forward(
@@ -220,11 +300,17 @@ def _v41_sparse_moe_forward(
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        router_token_mask: torch.Tensor | None = None,
+        router_sequence_ids: torch.Tensor | None = None,
+        router_num_sequences: int | None = None,
 ) -> torch.Tensor:
-    """Run the HF expert container with V4.1's visual router correction."""
+    """Run V4.1 text/image routing with optional auxiliary token masking."""
     del input_ids
     batch_size, sequence_length, hidden_size = hidden_states.shape
-    _, weights, indices = self.gate(hidden_states, image_mask=image_mask)
+    _, weights, indices = self.gate(
+        hidden_states, image_mask=image_mask, token_mask=router_token_mask,
+        sequence_ids=router_sequence_ids, num_sequences=router_num_sequences,
+    )
     routed = self.experts(hidden_states.view(-1, hidden_size), indices, weights)
     return routed.view(batch_size, sequence_length, hidden_size) + self.shared_experts(hidden_states)
 
@@ -386,6 +472,7 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
         module.k_weight.fill_(1.0)
     elif isinstance(module, DeepseekV41TopKRouter):
         nn.init.normal_(module.weight, mean=0.0, std=std)
+        module.tokens_per_expert.zero_()
         module.bias.zero_()
         if module.bias_vl is not None:
             module.bias_vl.zero_()
@@ -425,6 +512,9 @@ def _v41_decoder_layer_forward(
         segment_starts: torch.Tensor | None,
         engram_token_mask: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        router_token_mask: torch.Tensor | None = None,
+        router_sequence_ids: torch.Tensor | None = None,
+        router_num_sequences: int | None = None,
         **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one V4.1 block while preserving the decoder module call boundary."""
@@ -452,10 +542,10 @@ def _v41_decoder_layer_forward(
     residual = hidden_states
     ffn_pre, ffn_post, ffn_comb = self.ffn_hc(hidden_states)
     ffn_input = self.post_attention_layernorm(_hc_pre(hidden_states, attention_pre))
-    if image_mask is None:
-        ffn_output = self.mlp(ffn_input, input_ids=input_ids)
-    else:
-        ffn_output = self.mlp(ffn_input, input_ids=input_ids, image_mask=image_mask)
+    ffn_output = self.mlp(
+        ffn_input, input_ids=input_ids, image_mask=image_mask, router_token_mask=router_token_mask,
+        router_sequence_ids=router_sequence_ids, router_num_sequences=router_num_sequences,
+    )
     hidden_states = _hc_post(ffn_output, residual, ffn_post, ffn_comb)
     return hidden_states, ffn_pre
 
@@ -498,8 +588,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             layer.self_attn = DeepseekV41Attention(config, layer_idx)
             layer.forward = MethodType(_v41_decoder_layer_forward, layer)
             layer.mlp.gate = DeepseekV41TopKRouter(config)
-            if bool(getattr(config, "v41_vision_enabled", False)):
-                layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)
+            layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)
         for layer_id in assets["layer_ids"]:
             self.layers[layer_id].engram = DeepseekV41Engram(config, layer_id, assets)
         self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -749,6 +838,16 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
         }
         segment_start_mask = self._build_segment_start_mask(kwargs.get("packed_seq_params"), input_ids)
+        packed_sequence = kwargs.get("packed_seq_params")
+        if packed_sequence is not None:
+            boundaries = packed_sequence.cu_seq_lens.to(device=input_ids.device, dtype=torch.long)
+            positions = torch.arange(
+                packed_sequence.local_query_start,
+                packed_sequence.local_query_start + packed_sequence.local_query_length,
+                device=input_ids.device,
+            )
+            kwargs["router_sequence_ids"] = torch.bucketize(positions, boundaries[1:], right=True).unsqueeze(0)
+            kwargs["router_num_sequences"] = boundaries.numel() - 1
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0

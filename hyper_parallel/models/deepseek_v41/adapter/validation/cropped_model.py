@@ -260,6 +260,8 @@ def build_deepseek_v41_validation_config(
         num_routed_experts: int = 16,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        router_aux_loss_coeff: float = 1.0e-4,
+        router_bias_update_rate: float = 1.0e-3,
 ) -> DeepseekV4Config:
     """Translate the released config into a depth-preserving parameter crop.
 
@@ -282,6 +284,8 @@ def build_deepseek_v41_validation_config(
             exercises candidate selection before the released Reindex layers.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient. The released
             report does not disclose its production value.
+        router_aux_loss_coeff: Sequence balancing coefficient; zero disables it.
+        router_bias_update_rate: Per-step text/image correction-bias update speed; zero disables it.
 
     Returns:
         A Transformers DeepSeek-V4 config carrying V4.1 extension fields.
@@ -307,6 +311,8 @@ def build_deepseek_v41_validation_config(
         exercise_post_training_indexer,
         indexer_loss_coeff,
     )
+    config.router_aux_loss_coef = float(router_aux_loss_coeff)
+    config.router_bias_update_rate = float(router_bias_update_rate)
     _apply_v41_vision_fields(config, source, enable_vision, vision_parameter_divisor)
     config._attn_implementation = "eager"  # pylint: disable=protected-access
     return config
@@ -330,6 +336,8 @@ def build_cropped_deepseek_v41(
         activation_checkpoint_selection: Any | None = None,
         activation_swap: str = "none",
         model_init_dtype: str = "float32",
+        router_aux_loss_coeff: float = 1.0e-4,
+        router_bias_update_rate: float = 1.0e-3,
 ) -> PreTrainedModel:
     """Build and parallelize the depth-preserving V4.1 parameter crop.
 
@@ -343,6 +351,8 @@ def build_cropped_deepseek_v41(
         exercise_post_training_indexer: Exercise the released Full/Reindex
             hierarchy at its native layer indices.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
+        router_aux_loss_coeff: Sequence balancing coefficient; zero disables it.
+        router_bias_update_rate: Per-step text/image correction-bias update speed; zero disables it.
         torch_dtype: Forward dtype accepted by the model builder.
         validate_placement: Enable DTensor placement validation.
         distributed_setup: Trainer-provided parallel topology.
@@ -365,6 +375,8 @@ def build_cropped_deepseek_v41(
         num_routed_experts=num_routed_experts,
         exercise_post_training_indexer=exercise_post_training_indexer,
         indexer_loss_coeff=indexer_loss_coeff,
+        router_aux_loss_coeff=router_aux_loss_coeff,
+        router_bias_update_rate=router_bias_update_rate,
     )
     return HyperAutoModelForCausalLM.from_config(
         config,

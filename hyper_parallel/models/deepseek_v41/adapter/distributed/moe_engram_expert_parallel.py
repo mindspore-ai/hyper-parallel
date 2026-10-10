@@ -16,50 +16,116 @@
 
 from __future__ import annotations
 
-import inspect
+from functools import wraps
 from typing import Any, Callable
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
     ep_routed_forward,
     require_attrs,
 )
-from hyper_parallel.distributed.recipe_spec import local_compute
+from hyper_parallel.distributed.recipe_spec import inner_wrapper, local_compute
+
+
+def _local_router_metadata(tensor: torch.Tensor | None, states: torch.Tensor, tp_mesh: Any) -> torch.Tensor | None:
+    """Slice CP-local metadata when an EP router keeps the TP sequence shard."""
+    if tensor is None or tensor.shape == states.shape[:-1]:
+        return tensor
+    local_length = states.shape[-2]
+    if tp_mesh is None or tensor.shape[-1] != local_length * tp_mesh.size():
+        raise ValueError("router metadata must match the local or TP-gathered token dimensions")
+    return tensor.narrow(-1, tp_mesh.get_local_rank() * local_length, local_length)
+
+
+@inner_wrapper
+def deepseek_v41_router_aux_loss_wrapper(
+        target_module: torch.nn.Module,
+        mesh: Any,
+        tp_mesh: Any,
+        cp_mesh: Any,
+        ep_mesh: Any,
+) -> list[_ForwardRewriteRequest]:
+    """Reduce router statistics over token partitions inside the MLP boundary.
+
+    CP always partitions tokens. TP does so only with EP; the non-EP MLP
+    gathers TP sequence shards. EP may span distinct DP samples, so it is
+    never a statistics group.
+
+    Args:
+        target_module: V4.1 MLP containing the learned gate.
+        mesh: Full mesh, including independent DP axes.
+        tp_mesh: Optional tensor-parallel mesh.
+        cp_mesh: Optional context-parallel mesh.
+        ep_mesh: Optional expert-dispatch mesh.
+    """
+    groups = tuple(
+        axis.get_group() for axis in (cp_mesh, tp_mesh if ep_mesh is not None else None)
+        if axis is not None and axis.size() > 1
+    )
+    gate = target_module.gate
+    original_forward = gate.forward
+    dp_groups = tuple(
+        mesh[name].get_group() for name in (mesh.mesh_dim_names if mesh is not None else ())
+        if name in ("dp", "dp_replicate", "dp_shard") and mesh[name].size() > 1
+    )
+
+    @wraps(original_forward)
+    def router_forward(
+            hidden_states: torch.Tensor,
+            image_mask: torch.Tensor | None = None,
+            token_mask: torch.Tensor | None = None,
+            sequence_partition_groups: tuple[Any, ...] = (),
+            sequence_ids: torch.Tensor | None = None,
+            num_sequences: int | None = None,
+    ) -> Any:
+        """Align sample/modality metadata with the router's token partitions.
+
+        Args:
+            hidden_states: Gate-local token activations.
+            image_mask: Optional image-token mask.
+            token_mask: Optional valid-token mask.
+            sequence_partition_groups: Must be empty; owned by this wrapper.
+            sequence_ids: Optional packed logical sample IDs.
+            num_sequences: Global sample count within this microbatch.
+        """
+        if sequence_partition_groups:
+            raise ValueError("sequence partition groups are owned by the parallel wrapper")
+        local_tp_mesh = tp_mesh if ep_mesh is not None else None
+        return original_forward(
+            hidden_states,
+            image_mask=_local_router_metadata(image_mask, hidden_states, local_tp_mesh),
+            token_mask=_local_router_metadata(token_mask, hidden_states, local_tp_mesh),
+            sequence_ids=_local_router_metadata(sequence_ids, hidden_states, local_tp_mesh),
+            num_sequences=num_sequences,
+            sequence_partition_groups=groups,
+        )
+
+    return [
+        _ForwardRewriteRequest(target_module, target_module.forward),
+        _ForwardRewriteRequest(gate, router_forward, companion_attrs={"expert_bias_update_groups": dp_groups + groups}),
+    ]
 
 
 def _router(
         module: Any,
         hidden_states: torch.Tensor,
         image_mask: torch.Tensor | None = None,
+        router_token_mask: torch.Tensor | None = None,
+        router_sequence_ids: torch.Tensor | None = None,
+        router_num_sequences: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return the V4.1 learned router's selected experts and weights."""
-    output = (
-        module.gate(hidden_states)
-        if image_mask is None
-        else module.gate(hidden_states, image_mask=image_mask)
+    output = module.gate(
+        hidden_states, image_mask=image_mask, token_mask=router_token_mask,
+        sequence_ids=router_sequence_ids, num_sequences=router_num_sequences,
     )
     if not isinstance(output, (tuple, list)) or len(output) != 3:
         raise TypeError("DeepSeek-V4.1 gate must return logits, weights, and indices")
     _, weights, indices = output
     return indices, weights
-
-
-def _routed_and_shared_forward(
-        module: Any,
-        hidden_states: torch.Tensor,
-        image_mask: torch.Tensor | None,
-        ep_group: Any,
-) -> torch.Tensor:
-    """Dispatch routed experts and add the V4.1 shared expert branch."""
-    routed = ep_routed_forward(
-        module,
-        hidden_states,
-        router_fn=lambda target_module, target_states: _router(target_module, target_states, image_mask),
-        ep_group=ep_group,
-    )
-    return routed + module.shared_experts(hidden_states)
 
 
 @local_compute
@@ -88,29 +154,38 @@ def deepseek_v41_ep_compute_fn(
         apply_gate=module.experts._apply_gate,  # pylint: disable=protected-access
     )
 
-    if "image_mask" not in inspect.signature(module.forward).parameters:
-        def text_compute_fn(
-                module: Any,
-                hidden_states: torch.Tensor,
-                input_ids: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            """Run the text-only source contract without visual routing state."""
-            del input_ids
-            return _routed_and_shared_forward(module, hidden_states, None, ep_group)
-
-        return text_compute_fn
-
-    def multimodal_compute_fn(
+    def compute_fn(
             module: Any,
             hidden_states: torch.Tensor,
             input_ids: torch.Tensor | None = None,
             image_mask: torch.Tensor | None = None,
+            router_token_mask: torch.Tensor | None = None,
+            router_sequence_ids: torch.Tensor | None = None,
+            router_num_sequences: int | None = None,
     ) -> torch.Tensor:
-        """Run the multimodal source contract with optional visual routing state."""
-        del input_ids
-        return _routed_and_shared_forward(module, hidden_states, image_mask, ep_group)
+        """Run text and image routing through the same dispatch/combine path.
 
-    return multimodal_compute_fn
+        Args:
+            module: MLP owning routed and shared experts.
+            hidden_states: Token activations before expert dispatch.
+            input_ids: Unused by learned routing.
+            image_mask: Optional image-token mask.
+            router_token_mask: Optional valid-token mask.
+            router_sequence_ids: Optional packed logical sample IDs.
+            router_num_sequences: Global sample count within this microbatch.
+        """
+        del input_ids
+        routed = ep_routed_forward(
+            module,
+            hidden_states,
+            router_fn=lambda target, states: _router(
+                target, states, image_mask, router_token_mask, router_sequence_ids, router_num_sequences,
+            ),
+            ep_group=ep_group,
+        )
+        return routed + module.shared_experts(hidden_states)
+
+    return compute_fn
 
 
 @local_compute
@@ -168,4 +243,4 @@ def deepseek_v41_engram_compute_fn(
     return compute_fn
 
 
-__all__ = ["deepseek_v41_engram_compute_fn", "deepseek_v41_ep_compute_fn"]
+__all__ = ["deepseek_v41_engram_compute_fn", "deepseek_v41_ep_compute_fn", "deepseek_v41_router_aux_loss_wrapper"]

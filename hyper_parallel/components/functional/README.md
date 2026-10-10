@@ -46,4 +46,7 @@ weights and computation; routing, expert-parallel communication, and shared expe
 
 ## Auxiliary-loss functions
 
-`hyper_parallel.components.functional` also exports `aux_loss_auto_scale` and `set_aux_loss_scale` for auxiliary-loss gradient injection.
+`hyper_parallel.components.functional` exports `aux_loss_auto_scale` and `set_aux_loss_scale` for auxiliary-loss gradient injection.
+`aux_loss_scale_context` plus `bind_aux_loss_scale` makes injected gradients follow the scalar task loss's actual backward multiplier, including gradient accumulation.
+Model-specific objectives live with their models; DeepSeek-V4.1's balancing loss is defined in
+[`models/deepseek_v41/aux_loss.py`](../../models/deepseek_v41/aux_loss.py).

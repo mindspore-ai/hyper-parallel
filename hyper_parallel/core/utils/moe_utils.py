@@ -16,8 +16,8 @@
 
 from typing import TYPE_CHECKING, Optional, Any
 
-import torch.distributed as dist
-from torch import nn
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+from torch import nn  # pylint: disable=forbidden-backend-import
 
 if TYPE_CHECKING:
     from hyper_parallel.components.modules.moe import MoE
@@ -77,12 +77,20 @@ def sync_and_update_expert_bias(
     Note:
         Reference implementation: Megatron-LM megatron/core/transformer/moe/moe_utils.py
         uses TP×CP×DP group synchronization for global batch statistics.
+        Model adapters may provide ``expert_bias_update_groups`` and
+        ``expert_bias_update_rate`` to override generic groups and update speed.
     """
-    for group in (tp_group, cp_group, dp_group):
+    groups = getattr(moe, "expert_bias_update_groups", None)
+    if groups is None:
+        groups = (tp_group, cp_group, dp_group)
+    for group in groups:
         if group is not None:
             dist.all_reduce(moe.tokens_per_expert, group=getattr(group, "group", group))
 
-    moe.update_expert_bias(lr=lr, num_recomputations=num_recomputations)
+    moe.update_expert_bias(
+        lr=getattr(moe, "expert_bias_update_rate", lr),
+        num_recomputations=num_recomputations,
+    )
 
 
 def _get_moe_layers(model: "nn.Module") -> list:
