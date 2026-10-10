@@ -67,6 +67,7 @@ def get_adamw_param_groups(
         no_decay_params: Optional[Sequence[str]] = None,
         param_groups: Optional[Sequence[Dict[str, Any]]] = None,
         allowed_param_ids: Optional[Sequence[int]] = None,
+        excluded_param_ids: Optional[Sequence[int]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Split model parameters into decaying and non-decaying groups.
 
@@ -90,11 +91,12 @@ def get_adamw_param_groups(
     if param_groups is None:
         decay_param_names = set(get_parameter_names(model, no_decay_params))
         allowed_ids = set(allowed_param_ids) if allowed_param_ids is not None else None
+        excluded_ids = set(excluded_param_ids or ())
         decay_parameters = []
         no_decay_parameters = []
         no_decay_parameter_names = []
         for n, p in model.named_parameters():
-            if not p.requires_grad or (allowed_ids is not None and id(p) not in allowed_ids):
+            if not p.requires_grad or id(p) in excluded_ids or (allowed_ids is not None and id(p) not in allowed_ids):
                 continue
             setattr(p, "model_name", n)
             adamw_names.append(n)
@@ -117,6 +119,7 @@ def get_adamw_param_groups(
 def split_muon_adamw_params(
         model: nn.Module,
         extra_adamw_name_keywords: Sequence[str] = (),
+        excluded_param_ids: Optional[Sequence[int]] = None,
 ) -> Tuple[List[nn.Parameter], List[nn.Parameter], List[str], List[str]]:
     """Route matrix parameters to Muon and remaining parameters to AdamW.
 
@@ -133,10 +136,11 @@ def split_muon_adamw_params(
     adamw_keywords = tuple(adamw_keywords)
     muon_params, adamw_params = [], []
     muon_names, adamw_names = [], []
+    excluded_ids = set(excluded_param_ids or ())
 
     for name, parameter in model.named_parameters():
         setattr(parameter, "model_name", name)
-        if not parameter.requires_grad:
+        if not parameter.requires_grad or id(parameter) in excluded_ids:
             continue
 
         is_matrix = parameter.ndim >= 2

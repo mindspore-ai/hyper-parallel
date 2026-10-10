@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Declare parameter sharding and FSDP wrapping policies."""
+# pylint: disable=unsupported-binary-operation
 
 from typing import Any
 
@@ -59,18 +60,31 @@ def _get_visual_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
 
 
 def get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
-    """Return visual units and homogeneous-mesh Engram child units."""
+    """Return visual units and homogeneous-mesh Engram child units.
+
+    Args:
+        model: Model being built or inspected.
+    """
+    from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import (  # pylint: disable=C0415
+        HostEngramTable,
+    )
     module_by_fqn = dict(model.named_modules())
     engram_units = tuple(
         module_fqn
         for module_fqn in module_by_fqn
-        if module_fqn.endswith(".engram.embed") or module_fqn.endswith(".engram.wkv")
+        if module_fqn.endswith(".engram.wkv")
+        or (module_fqn.endswith(".engram.embed")
+            and not isinstance(module_by_fqn[module_fqn], HostEngramTable))
     )
     return _get_visual_fsdp_wrap_modules(model) + engram_units
 
 
 def get_fsdp_excluded_subtrees(model: Any) -> tuple[str, ...]:
-    """Keep the ViT hierarchy out of HF decoder-container discovery."""
+    """Keep the ViT hierarchy out of HF decoder-container discovery.
+
+    Args:
+        model: Model being built or inspected.
+    """
     module_by_fqn = dict(model.named_modules())
     return ("model.vision",) if module_by_fqn.get("model.vision") is not None else ()
 
@@ -79,7 +93,12 @@ def get_fsdp_execution_order(
         model: Any,
         module_fqns: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """Return visual and per-decoder child units in V4.1 forward order."""
+    """Return visual and per-decoder child units in V4.1 forward order.
+
+    Args:
+        model: Model being built or inspected.
+        module_fqns: Fully qualified module names in execution order.
+    """
     visual_fqns = _get_visual_fsdp_wrap_modules(model)
     selected_fqns = set(module_fqns)
     execution_order = [

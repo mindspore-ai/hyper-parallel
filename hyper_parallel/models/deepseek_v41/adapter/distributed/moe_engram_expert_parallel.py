@@ -94,7 +94,13 @@ def deepseek_v41_ep_compute_fn(
                 hidden_states: torch.Tensor,
                 input_ids: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            """Run the text-only source contract without visual routing state."""
+            """Run the text-only source contract without visual routing state.
+
+            Args:
+                module: Module being executed or inspected.
+                hidden_states: Current hidden-state tensor.
+                input_ids: Input token IDs.
+            """
             del input_ids
             return _routed_and_shared_forward(module, hidden_states, None, ep_group)
 
@@ -106,7 +112,14 @@ def deepseek_v41_ep_compute_fn(
             input_ids: torch.Tensor | None = None,
             image_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the multimodal source contract with optional visual routing state."""
+        """Run the multimodal source contract with optional visual routing state.
+
+        Args:
+            module: Module being executed or inspected.
+            hidden_states: Current hidden-state tensor.
+            input_ids: Input token IDs.
+            image_mask: Image-token mask.
+        """
         del input_ids
         return _routed_and_shared_forward(module, hidden_states, image_mask, ep_group)
 
@@ -149,7 +162,31 @@ def deepseek_v41_engram_compute_fn(
             segment_starts: torch.Tensor | None = None,
             token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Route hash-row requests and run the exact V4.1 fusion."""
+        """Route hash-row requests and run the exact V4.1 fusion.
+
+        Args:
+            module: Module being executed or inspected.
+            hidden_states: Current hidden-state tensor.
+            input_ids: Input token IDs.
+            segment_starts: Segment boundary flags.
+            token_mask: Token validity mask.
+        """
+        from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import (  # pylint: disable=C0415
+            HostEngramTable,
+        )
+        if isinstance(module.embed, HostEngramTable):
+            ids = module._aligned_hash_ids(
+                hidden_states, input_ids, segment_starts, token_mask,
+                cp_group=cp_group, cp_rank=cp_rank, cp_size=cp_size,
+                tp_rank=tp_rank, tp_size=tp_size,
+            )
+            fused = module._fuse(hidden_states, module.embed(ids))
+            if token_mask is None:
+                return fused
+            return torch.where(
+                token_mask.to(torch.bool).unsqueeze(-1).unsqueeze(-1),
+                fused, hidden_states,
+            )
         return module.parallel_forward(
             hidden_states,
             input_ids,

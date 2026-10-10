@@ -92,8 +92,9 @@ Test at least these explicit selections:
 - Production and strict Validate for one representative recomputation topology.
 
 Use the same checkpoint, data hashes, global batch, routing seeds, and optimizer
-state. Require aligned loss and global norm for multiple optimizer steps, not just
-the first forward. Read back the resolved selection and record exact wrapper
+state. Require aligned loss and global norm for at least ten consecutive paired
+optimizer steps in formal end-to-end self-consistency, not just the first forward.
+Read back the resolved selection and record exact wrapper
 count/FQNs, step time, peak memory, and whether
 shared-state producers were retained or replayed.
 

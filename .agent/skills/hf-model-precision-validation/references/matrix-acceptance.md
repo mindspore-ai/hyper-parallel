@@ -20,9 +20,12 @@ valid:
 | Explicit `layer_count`/`layer_indices` selections | Validate checkpointed activation and shared-state paths |
 | Online full/cropped pipeline | Smoke by default; formal only with replay/hash proof |
 
-Run each numerical case long enough to expose update divergence; ten optimizer
-steps is the default unless the user selects another count. Recompute and memory
-reuse checks require at least two steps because a second-step peak may differ.
+Run every formal end-to-end self-consistency comparison for at least ten
+consecutive, paired optimizer steps; users may request more, but fewer steps
+remain smoke evidence. Count compared steps after any shared warm start, not just
+the manifest's total length. For K-to-K+N resume, require `N >= 10` and set
+`matrix.steps - matrix.resume_split_step >= 10`. Recomputation and memory reuse
+smokes may run two steps, but they cannot replace the ten-step precision gate.
 
 ## Mandatory Coverage Ledger
 
@@ -116,6 +119,12 @@ Record each optimizer step's:
 - representative parameter/main-gradient/optimizer-state logical and local shapes,
   including an empty uneven shard when one exists.
 
+For every formal comparison, retain at least ten consecutive aligned rows with
+both reference and candidate loss, global pre-clip norm, per-metric deltas,
+global input hash, learning rate, and pass/fail status. Report post-clip norm as
+well when both sides emit it. Missing rows or missing norm cannot be replaced by
+an average or a maximum over fewer steps.
+
 `max_grad_norm=1` does not imply a logged pre-clip norm below one. Compare the
 same norm definition between cases.
 
@@ -139,7 +148,7 @@ in the manifest and report.
 
 A case passes only when:
 
-- all required steps complete;
+- at least ten consecutive paired optimizer steps complete after any warm start;
 - loss and norm both meet their tolerances;
 - LR and data identity match;
 - errors remain centered without systematic drift;

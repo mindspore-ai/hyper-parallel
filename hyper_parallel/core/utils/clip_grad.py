@@ -36,11 +36,12 @@ Note: PP does not use DTensor layout for gradients today.  Cross-stage
 norm aggregation will require an additional manual all-reduce and is
 left for future work.
 """
+# pylint: disable=forbidden-backend-import,not-callable
 import functools
 import math
 import warnings
 from collections import defaultdict, namedtuple
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -59,6 +60,165 @@ except ImportError:
     _has_foreach_support = None  # type: ignore[assignment]
 
 __all__: list[str] = ["clip_grad_norm_"]
+
+
+def _norm_coverage(param: torch.nn.Parameter) -> tuple[tuple[int, ...], tuple[tuple[int, int], ...]]:
+    """Describe the exact global rectangle represented by a local parameter."""
+    global_shape = tuple(param.shape)
+    layout = getattr(param, "layout", None) if _is_dtensor(param) else None
+    if layout is None:
+        area = tuple((0, size) for size in global_shape)
+    else:
+        from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout  # pylint: disable=C0415
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank not in layout.rank_list:
+            raise ValueError("Norm layout does not contain the current global rank")
+        area = infer_slice_area_by_layout(
+            layout, layout.rank_list.index(rank), global_shape,
+        )
+        local = param._local_tensor if _is_dtensor(param) else param  # pylint: disable=W0212
+        if tuple(end - start for start, end in area) != tuple(local.shape):
+            raise ValueError("Norm layout cannot describe the exact local parameter coverage")
+    return global_shape, tuple((int(start), int(end)) for start, end in area)
+
+
+def _norm_representative(fqn: str, shape: tuple[int, ...],
+                         stage_data: dict[int, dict], rank: int,
+                         local_area: tuple) -> bool:
+    """Validate disjoint shard coverage and choose one copy of this area."""
+    representatives = {}
+    for member, data in stage_data.items():
+        if data[fqn][0] != shape:
+            raise ValueError(f"Norm shard global shape mismatch: {fqn}")
+        area = data[fqn][1]
+        representatives.setdefault(area, []).append(member)
+    nonempty = [area for area in representatives if all(end > start for start, end in area)]
+    volume = sum(math.prod(end - start for start, end in area) for area in nonempty)
+    if volume != math.prod(shape):
+        raise ValueError(f"Norm shard coverage is incomplete or duplicated: {fqn}")
+    for index, left in enumerate(nonempty):
+        for right in nonempty[index + 1:]:
+            if all(max(a[0], b[0]) < min(a[1], b[1]) for a, b in zip(left, right)):
+                raise ValueError(f"Norm shard rectangles overlap: {fqn}")
+    return rank == min(representatives[local_area])
+
+
+def build_norm_shard_plan(model: torch.nn.Module, excluded_params: Iterable[torch.nn.Parameter],
+                          mesh_context: Any) -> tuple:
+    """Choose one rank per identical global shard and verify full coverage.
+
+    Args:
+        model: Model with final FSDP parameter layouts.
+        excluded_params: Parameters managed by an external optimizer.
+        mesh_context: Stage-local mesh and topology metadata.
+    """
+    excluded_ids = {id(param) for param in excluded_params}
+    local = {
+        fqn: _norm_coverage(param)
+        for fqn, param in model.named_parameters()
+        if param.requires_grad and id(param) not in excluded_ids
+    }
+    if dist.is_initialized():
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, local)
+        rank = dist.get_rank()
+    else:
+        gathered = [local]
+        rank = 0
+    mesh = getattr(mesh_context, "device_mesh", None)
+    stage_ranks = (tuple(mesh.rank_list) if mesh is not None and hasattr(mesh, "rank_list")
+                   else tuple(range(len(gathered))))
+    stage_data = {member: gathered[member] for member in stage_ranks}
+    reference_names = set(local)
+    if any(set(data) != reference_names for data in stage_data.values()):
+        raise ValueError("Norm shard plan has different dense FQNs within one PP stage")
+    representatives = {
+        fqn: _norm_representative(fqn, local[fqn][0], stage_data, rank, local[fqn][1])
+        for fqn in sorted(reference_names)
+    }
+    return local, representatives, stage_ranks, stage_data
+
+
+def _effective_dense_grads(parameters: list[tuple[str, torch.nn.Parameter]]) -> tuple[list, dict]:
+    """Collect local gradients and reduce partial placements once."""
+    infos = []
+    mesh_cache = {}
+    for _, param in parameters:
+        mesh, shard_dims, partial_info = _get_param_mesh_info(param)
+        if mesh is not None:
+            mesh_cache[id(mesh)] = mesh
+        infos.append((param, _get_local_grad(param), mesh, partial_info,
+                      (id(mesh) if mesh is not None else None, shard_dims)))
+    return infos, _coalesce_partial_reduce(infos, mesh_cache)
+
+
+def _check_dense_grad_presence(present: dict[str, bool], descriptors: dict,
+                               stage_ranks: tuple[int, ...], stage_data: dict) -> None:
+    """Reject mismatched gradient presence on copies of the same shard."""
+    if not dist.is_initialized():
+        return
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, present)
+    for fqn in descriptors:
+        copies = [gathered[member][fqn] for member in stage_ranks
+                  if stage_data[member][fqn] == descriptors[fqn]]
+        if copies and any(value != copies[0] for value in copies):
+            raise ValueError(f"Norm shard gradient presence differs across replicas: {fqn}")
+
+
+def dense_grad_norm_sq_and_refs(model: torch.nn.Module,
+                                excluded_params: Iterable[torch.nn.Parameter],
+                                norm_shard_plan: tuple,
+                                mesh_context: Any) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Sum each dense global shard once and return mutable effective gradients.
+
+    Args:
+        model: Model with final FSDP parameter layouts.
+        excluded_params: Parameters managed by an external optimizer.
+        norm_shard_plan: Validated coverage and one representative per shard.
+        mesh_context: Stage-local mesh and topology metadata.
+    """
+    excluded_ids = {id(param) for param in excluded_params}
+    parameters = [
+        (fqn, param) for fqn, param in model.named_parameters()
+        if param.requires_grad and id(param) not in excluded_ids
+    ]
+    descriptors, representatives, stage_ranks, stage_data = norm_shard_plan
+    device = next(((_param_device(param)) for _, param in parameters), None)
+    if device is None:
+        mesh = getattr(mesh_context, "device_mesh", None)
+        device = torch.device(getattr(mesh, "device_type", "cpu"))
+    infos, reduced = _effective_dense_grads(parameters)
+    refs = []
+    local_sq = torch.zeros((), device=device, dtype=torch.float32)
+    present = {}
+    for index, (fqn, _) in enumerate(parameters):
+        grad = infos[index][1]
+        present[fqn] = grad is not None
+        if grad is None:
+            continue
+        refs.append(grad)
+        if representatives[fqn]:
+            view = reduced.get(index, grad)
+            local_sq.add_(view.float().square().sum().to(device))
+    _check_dense_grad_presence(present, descriptors, stage_ranks, stage_data)
+    for name in getattr(getattr(mesh_context, "device_mesh", None), "mesh_dim_names", ()) or ():
+        axis = mesh_context.device_mesh[name]
+        if axis.size() > 1:
+            dist.all_reduce(local_sq, op=dist.ReduceOp.SUM, group=axis.get_group())
+    return local_sq, refs
+
+
+def scale_grad_refs_(refs: Iterable[torch.Tensor], coefficient: torch.Tensor) -> None:
+    """Scale the exact dense gradients that the optimizer will consume.
+
+    Args:
+        refs: Mutable dense effective gradients.
+        coefficient: Shared clipping coefficient.
+    """
+    for grad in refs:
+        grad.mul_(coefficient)
 
 
 # (id(mesh) or None, shard_dims) -> list of local grads for norm computation

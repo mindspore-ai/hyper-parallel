@@ -26,6 +26,7 @@ on every source (non-FSDP) mesh axis, together with the source sub-mesh.
 final sharded parameter carries the full distributed layout (FSDP dims +
 source dims) for downstream consumers such as distributed checkpointing.
 """
+# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 
@@ -341,6 +342,7 @@ def _build_managed_source_shard_info(
     manager,
     owner: ModuleClass,
     metadata_by_parameter: SourceShardInfoByParam | None,
+    ignored_params: set[ParameterClass] | None = None,
 ) -> SourceShardInfoByParam | None:
     """Select and complete metadata for parameters managed by one wrap call.
 
@@ -360,7 +362,7 @@ def _build_managed_source_shard_info(
     ):
         default_source_shard_info = _get_default_source_shard_info(manager)
     managed_source_shard_info = {}
-    for parameter in get_managed_modules_parameters((owner,)):
+    for parameter in get_managed_modules_parameters((owner,), ignored_params):
         source_shard_info = metadata_by_parameter.get(parameter)
         if source_shard_info is None:
             if default_source_shard_info is None:

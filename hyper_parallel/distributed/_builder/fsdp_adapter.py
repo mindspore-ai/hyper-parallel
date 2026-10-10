@@ -21,6 +21,7 @@ Trainer step runtime); ``FSDP2Manager`` / ``_instantiate_fsdp2`` and the
 (FQN/DTensor source-shard resolution) merged into
 ``distributed/_builder/source_shard.py`` (05 row 406).
 """
+# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 
@@ -233,7 +234,11 @@ class FSDP2Manager:
         excluded_subtree_module_fqns = excluded_subtree_module_fqns or set()
 
         def is_inside_declared_subtree(module_fqn: str) -> bool:
-            """Whether one module is inside an automatic-discovery exclusion."""
+            """Whether one module is inside an automatic-discovery exclusion.
+
+            Args:
+                module_fqn: Fully qualified name of the module.
+            """
             return any(
                 module_fqn == declared_fqn
                 or module_fqn.startswith(f"{declared_fqn}.")
@@ -481,6 +486,7 @@ class FSDP2Manager:
         owner: ModuleClass,
         owner_by_parameter: Mapping[ParameterClass, ModuleClass],
         replicate_params: set[ParameterClass] | None,
+        ignored_params: set[ParameterClass] | None = None,
     ) -> set[ParameterClass] | None:
         """Select configured replicate parameters owned by one FSDP module."""
         if replicate_params is None:
@@ -489,6 +495,7 @@ class FSDP2Manager:
             parameter
             for parameter, parameter_owner in owner_by_parameter.items()
             if parameter_owner is owner and parameter in replicate_params
+            and parameter not in (ignored_params or ())
         }
 
     def _configure_source_layout_gradient_scaling(
@@ -599,6 +606,7 @@ class FSDP2Manager:
         metadata_by_parameter,
         replicate_params,
         dense_fsdp_kwargs: dict[str, Any],
+        ignored_params: set[ParameterClass] | None = None,
     ) -> int:
         """Apply FSDP to child units and return the gradient-scaled count."""
         gradient_scaled_units = 0
@@ -610,6 +618,7 @@ class FSDP2Manager:
                 self,
                 wrap_module.module,
                 metadata_by_parameter,
+                ignored_params,
             )
             fsdp_sublayer_kwargs = dense_fsdp_kwargs
             if self._uses_expert_mesh(managed_source_info):
@@ -622,8 +631,9 @@ class FSDP2Manager:
                 wrap_module.module,
                 source_shard_infos=_source_infos_for_fully_shard(managed_source_info),
                 replicate_params=self._build_managed_replicate_params(
-                    wrap_module.module, owner_by_parameter, replicate_params
+                    wrap_module.module, owner_by_parameter, replicate_params, ignored_params
                 ),
+                ignored_params=ignored_params,
                 **fsdp_sublayer_kwargs,
             )
             if self._configure_source_layout_gradient_scaling(wrap_module.module, managed_source_info):
@@ -637,12 +647,14 @@ class FSDP2Manager:
         metadata_by_parameter,
         replicate_params,
         dense_root_kwargs: dict[str, Any],
+        ignored_params: set[ParameterClass] | None = None,
     ) -> int:
         """Apply root FSDP and report whether gradient scaling was configured."""
         root_source_info = _build_managed_source_shard_info(
             self,
             model,
             metadata_by_parameter,
+            ignored_params,
         )
         if self._uses_expert_mesh(root_source_info):
             raise ValueError("Routed expert parameters must belong to a nested experts FSDP unit")
@@ -650,8 +662,9 @@ class FSDP2Manager:
             model,
             source_shard_infos=_source_infos_for_fully_shard(root_source_info),
             replicate_params=self._build_managed_replicate_params(
-                model, owner_by_parameter, replicate_params
+                model, owner_by_parameter, replicate_params, ignored_params
             ),
+            ignored_params=ignored_params,
             **dense_root_kwargs,
         )
         return int(self._configure_source_layout_gradient_scaling(model, root_source_info))
@@ -680,6 +693,7 @@ class FSDP2Manager:
         self,
         model: ModuleClass,
         source_shard_info: SourceShardInfoByFQN | None = None,
+        ignored_params: set[ParameterClass] | None = None,
     ) -> ModuleClass:
         """Apply configured child FSDP units, root FSDP, and prefetch links.
 
@@ -715,6 +729,7 @@ class FSDP2Manager:
             metadata_by_parameter,
             replicate_params,
             dense_fsdp_kwargs,
+            ignored_params,
         )
         gradient_scaled_units += self._parallelize_root(
             model,
@@ -722,6 +737,7 @@ class FSDP2Manager:
             metadata_by_parameter,
             replicate_params,
             dense_root_kwargs,
+            ignored_params,
         )
         self._log_gradient_scaling(gradient_scaled_units)
         ordered_wrap_modules = self._order_wrap_modules(model, wrap_modules)
@@ -757,6 +773,7 @@ def _apply_fsdp2(
     model: "nn.Module",
     fsdp2_manager: Any,
     source_shard_info: Any,
+    ignored_params: set[ParameterClass] | None = None,
 ) -> "nn.Module":
     """Apply FSDP2; Torch scheduler hooks remain outside Dynamo by design.
 
@@ -771,6 +788,7 @@ def _apply_fsdp2(
     model = fsdp2_manager.parallelize(
         model,
         source_shard_info=source_shard_info,
+        ignored_params=ignored_params,
     )
     logger.info("FSDP2 wrap applied")
     return model

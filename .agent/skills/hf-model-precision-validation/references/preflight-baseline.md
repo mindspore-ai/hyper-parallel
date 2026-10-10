@@ -130,9 +130,10 @@ When the model is too large and no initial checkpoint is loaded:
    assuming an early prefix exercises them.
 2. Fix initialization, data, routing, and sampler seeds.
 3. Build the required FP32-initialized/main-parameter route.
-4. Run an uninterrupted K+N reference and save at K.
-5. Restore every candidate from the exact K checkpoint and compare the next N
-   optimizer steps with the uninterrupted reference.
+4. Choose `N >= 10`, run an uninterrupted K+N reference, and save at K.
+5. Restore every candidate from the exact K checkpoint and compare all next N
+   consecutive optimizer steps with the uninterrupted reference, checking both
+   loss and global pre-clip gradient norm at every step.
 
 The checkpoint must include model, optimizer moments, distinct FP32 main
 parameters when present, scheduler, global step/train state, per-rank RNG, and

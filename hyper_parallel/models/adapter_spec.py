@@ -102,6 +102,7 @@ class ModelAdapterSpec:
     attention: Optional[Callable[..., Any]] = None
     checkpoint: Optional[Callable[..., Any]] = None
     materialization: Optional[Callable[..., Any]] = None
+    external_state: Optional[Callable[..., Any]] = None
     context_parallel: Optional[Callable[..., Any]] = None
     expert_parallel: Optional[Callable[..., Any]] = None
     sharding_rules: Optional[Callable[..., Any]] = None
