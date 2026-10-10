@@ -25,12 +25,18 @@ _WORKER = str(Path(__file__).resolve().parent / "_test_fsdp_accuracy.py")
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level1",
+    level_mark="level0",
     card_mark="allcards",
     essential_mark="essential",
 )
 def test_qwen2_tp_cp_ep_fsdp_global_accuracy() -> None:
-    """Compare Qwen2-MoE fp32 main_param training on DP(2)+CP(2)+TP(2)+EP(8)."""
+    """Verify Qwen2-MoE mixed-parallel training accuracy.
+
+    Feature: Qwen2-MoE FSDP fp32 main parameters.
+    Description: Compare 20 training steps on DP(2)+CP(2)+TP(2)+EP(8)
+        against an unsharded model, including loss, gradients and updates.
+    Expectation: Distributed results match the reference within tolerance.
+    """
     torchrun_case(
         _WORKER,
         "test_qwen2_tp_cp_ep_fsdp_global_accuracy",
