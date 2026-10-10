@@ -22,6 +22,7 @@ from torch import Tensor, nn
 
 
 from hyper_parallel.core.activation_memory.wrapper import ckpt_wrapper as _checkpoint_wrapper
+from hyper_parallel.core.activation_memory.wrapper import CheckpointExcludeWrapper
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
     _find_transformer_block_modules,
@@ -30,6 +31,7 @@ from hyper_parallel.distributed.activation_checkpoint import (
     _wrap_layer_containers,
     apply_submodule_checkpointing,
 )
+from hyper_parallel.models.adapter_spec import RecomputePolicy
 
 
 _ACTIVATION_CHECKPOINT_MODULE = (
@@ -232,6 +234,128 @@ class TestTransformerBlockDiscovery(unittest.TestCase):
         for block in model.decoder.values():
             self.assertIsInstance(block.self_attn, nn.Linear)
             self.assertTrue(hasattr(block.mlp, "_wrapped_module"))
+
+
+class TestModelAdapterRecomputeRegions(unittest.TestCase):
+    """Tests for adapter-declared recompute regions and their exclusions."""
+
+    @staticmethod
+    def _selection(**overrides):
+        """Return one model-adapter selection for the safe-region source."""
+        values = {
+            "source": "model_adapter_safe_regions",
+            "layer_count": 4,
+            "layer_indices": None,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def _model(policy):
+        """Return a discovery fixture carrying one fake adapter policy."""
+        model = _DiscoveryModel()
+        model.config = SimpleNamespace(model_type="fixture")
+        for tower in (model.text_tower, model.image_tower):
+            tower.decoder["2"] = _CheckpointableSubmodules()
+            tower.decoder["7"] = _CheckpointableSubmodules()
+        return model, SimpleNamespace(recompute=lambda: policy)
+
+    @staticmethod
+    def _apply(model, adapter, selection):
+        """Apply the layer-region mode against the fake adapter."""
+        with (
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.get_model_adapter", return_value=adapter),
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.checkpoint_wrapper", new=_checkpoint_wrapper),
+        ):
+            _apply_activation_checkpointing(model, "selective", selection=selection)
+
+    def test_layer_region_wraps_layer_and_excludes_no_replay_module(self):
+        """One region per layer; the named descendant stays outside replay."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            exclude_patterns=("*decoder.*.self_attn",),
+        )
+        model, adapter = self._model(policy)
+
+        self._apply(model, adapter, self._selection())
+
+        blocks = [
+            block for tower in (model.text_tower, model.image_tower)
+            for block in tower.decoder.values()
+        ]
+        self.assertEqual(len(blocks), 4)
+        for block in blocks:
+            self.assertTrue(hasattr(block, "_wrapped_module"))
+            self.assertIsInstance(block.self_attn, CheckpointExcludeWrapper)
+            self.assertIsInstance(block.mlp, nn.Linear)
+            self.assertIsInstance(block.input_layernorm, nn.LayerNorm)
+
+    def test_layer_region_calls_model_owned_hook_once(self):
+        """The model-owned hook runs after the regions are installed."""
+        applied = []
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            exclude_patterns=("*decoder.*.self_attn",),
+            on_applied=applied.append,
+        )
+        model, adapter = self._model(policy)
+
+        self._apply(model, adapter, self._selection())
+
+        self.assertEqual(applied, [model])
+
+    def test_layer_region_requires_region_patterns(self):
+        """A policy without region patterns cannot be applied."""
+        policy = RecomputePolicy(
+            region_patterns=(),
+            exclude_patterns=("*decoder.*.self_attn",),
+        )
+        model, adapter = self._model(policy)
+
+        with self.assertRaisesRegex(ValueError, "requires RecomputePolicy.region_patterns"):
+            self._apply(model, adapter, self._selection(layer_count=1))
+
+    def test_region_requires_one_excluded_module(self):
+        """An exclude pattern that matches nothing inside the regions is rejected."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            exclude_patterns=("*image_tower.*.self_attn",),
+        )
+        model, adapter = self._model(policy)
+
+        with self.assertRaisesRegex(ValueError, "exclude patterns matched no module"):
+            self._apply(model, adapter, self._selection(layer_count=2))
+
+    def test_leaf_region_patterns_keep_one_region_per_submodule(self):
+        """Leaf patterns keep the submodule-region shape without exclusions."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*.mlp", "*decoder.*.input_layernorm"),
+        )
+        model, adapter = self._model(policy)
+
+        self._apply(model, adapter, self._selection())
+
+        blocks = [
+            block for tower in (model.text_tower, model.image_tower)
+            for block in tower.decoder.values()
+        ]
+        for block in blocks:
+            self.assertTrue(hasattr(block.mlp, "_wrapped_module"))
+            self.assertTrue(hasattr(block.input_layernorm, "_wrapped_module"))
+            self.assertIsInstance(block.post_attention_layernorm, nn.LayerNorm)
+            self.assertIsInstance(block.self_attn, nn.Linear)
+        self.assertFalse(hasattr(blocks[0], "_wrapped_module"))
+
+    def test_region_root_cannot_be_excluded(self):
+        """A module declared as both a region root and an exclusion is rejected."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*.self_attn",),
+            exclude_patterns=("*decoder.*.self_attn",),
+        )
+        model, adapter = self._model(policy)
+
+        with self.assertRaisesRegex(ValueError, "HP-STATE-002"):
+            self._apply(model, adapter, self._selection(layer_count=1))
 
 
 class TestActivationCheckpointSwapInputs(unittest.TestCase):

@@ -33,6 +33,9 @@ from torch import nn
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionState,
 )
+from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
+    build_shared_state_release_plan,
+)
 from hyper_parallel.models.deepseek_v41.adapter.validation import (
     shared_state_trace as shared_state_trace_module,
 )
@@ -308,6 +311,8 @@ class TestModelIntegrationContracts(unittest.TestCase):
             ).layer_indices,
             [0, 2],
         )
+        with self.assertRaisesRegex(ValueError, "must be default or"):
+            ActivationCheckpointSelection(source="model_adapter_layer_regions")
 
     def test_manifest_is_local_only_and_command_validated(self) -> None:
         """Reject implicit remote model sources before command execution."""
@@ -643,9 +648,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 "recompute_selections": [{"layer_count": 2}],
                 "cross_topology_resume": {"tp": 2, "ep": 16, "fsdp": 8},
             },
-            RecomputePolicy(
-                safe_module_patterns=("model.layers.*.mlp",),
-            ),
+            RecomputePolicy(region_patterns=("model.layers.*.mlp",)),
         )
         by_name = {case.name: case for case in cases}
 
@@ -719,9 +722,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
                     {"layer_indices": [0, 2]},
                 ],
             },
-            RecomputePolicy(
-                safe_module_patterns=("model.layers.*.mlp",),
-            ),
+            RecomputePolicy(region_patterns=("model.layers.*.mlp",)),
         )
 
         self.assertEqual(
@@ -1335,6 +1336,63 @@ class TestModelIntegrationContracts(unittest.TestCase):
                     state.require_compressed_kv(1, 2)
         finally:
             finish_shared_state_trace(token)
+
+    @staticmethod
+    def _released_topology_config() -> SimpleNamespace:
+        """Return the released CSA2 layer topology used by the release plan."""
+        return SimpleNamespace(
+            num_hidden_layers=40,
+            v41_compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
+            v41_kv_source_layer_ids=[2, 8, 14, 20],
+            v41_index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36],
+            v41_candidate_source_layer_id=20,
+        )
+
+    def test_shared_state_release_plan_follows_released_topology(self) -> None:
+        """Release every published entry once its last consumer has run."""
+        plan = build_shared_state_release_plan(self._released_topology_config())
+
+        # An encoder Full layer publishes indexer K that no Reindex layer reads,
+        # so it is dead when its producer returns.
+        self.assertEqual(plan[2], (("index_key", 2),))
+        # Compressed K=V and Top-K live until the end of their Reuse group.
+        self.assertEqual(plan[7], (("compressed_kv", 2), ("topk", 2)))
+        self.assertEqual(plan[19], (("compressed_kv", 14), ("topk", 14)))
+        # The decoder shares layer 20's K=V across all five groups.
+        self.assertEqual(plan[23], (("topk", 20),))
+        self.assertEqual(plan[36], (("index_key", 20),))
+        self.assertEqual(
+            plan[39],
+            (("candidate", 20), ("compressed_kv", 20), ("topk", 36)),
+        )
+        self.assertNotIn(20, plan)
+
+    def test_shared_state_release_is_opt_in(self) -> None:
+        """Without a plan the published entries survive every consumer."""
+        state = SharedCompressedAttentionState()
+
+        state.publish_topk_indices(2, torch.ones(1, dtype=torch.int32))
+        state.release_consumed(7)
+
+        self.assertIn(2, state.topk_indices_by_source)
+
+    def test_release_consumed_drops_only_the_planned_entries(self) -> None:
+        """One consumer releases its own entries and keeps later groups intact."""
+        state = SharedCompressedAttentionState(
+            release_plan=build_shared_state_release_plan(self._released_topology_config())
+        )
+        for source in (2, 8, 20):
+            state.publish_compressed_kv(source, torch.ones(1))
+            state.publish_topk_indices(source, torch.ones(1, dtype=torch.int32))
+        state.publish_index_key(20, torch.ones(1))
+
+        state.release_consumed(7)
+
+        self.assertNotIn(2, state.compressed_kv_by_source)
+        self.assertNotIn(2, state.topk_indices_by_source)
+        self.assertIn(8, state.compressed_kv_by_source)
+        self.assertIn(20, state.compressed_kv_by_source)
+        self.assertIn(20, state.index_key_by_source)
 
     def test_trainer_reuses_clip_result_for_runtime_diagnostics(self) -> None:
         """Derive the post-clip norm without a second full-model reduction."""

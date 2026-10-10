@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
@@ -65,12 +65,35 @@ class SharedCompressedAttentionState:
     which has several Full/Reindex groups, and makes a consumer's dependency
     explicit when activation recomputation revisits modules out of forward
     order.
+
+    ``release_plan`` maps a consumer layer to the published entries whose last
+    consumer it is. Tensors that only the plan holds (the integer Top-K and
+    candidate-block selections) are freed as soon as that consumer's forward
+    returns, instead of living until the whole forward finishes. It must stay
+    empty when any CSA2 layer can be replayed, because a replayed consumer would
+    then ask for state that no longer exists.
     """
 
     compressed_kv_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     index_key_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     topk_indices_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     candidate_blocks_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
+    release_plan: dict[int, tuple[tuple[str, int], ...]] = field(default_factory=dict)
+
+    _REGISTRIES: ClassVar[dict[str, str]] = {
+        "compressed_kv": "compressed_kv_by_source",
+        "index_key": "index_key_by_source",
+        "topk": "topk_indices_by_source",
+        "candidate": "candidate_blocks_by_source",
+    }
+
+    def release_consumed(self, consumer_layer: int) -> None:
+        """Drop the published entries whose final consumer just finished."""
+        dependencies = self.release_plan.get(consumer_layer)
+        if not dependencies:
+            return
+        for kind, source_layer in dependencies:
+            getattr(self, self._REGISTRIES[kind]).pop(source_layer, None)
 
     @staticmethod
     def _require(
@@ -1528,6 +1551,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query, combined_key_value, sparse_indices, hidden_states.device
         )
         output = self._project_output(attention_output, cos, sin, batch_size, sequence_length)
+        shared_state.release_consumed(self.layer_idx)
         return output, None
 
 

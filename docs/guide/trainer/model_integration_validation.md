@@ -417,22 +417,22 @@ case = ModuleParityCase(
 
 ### 3.4 安全重计算区域
 
-共享 KV、Indexer 状态或其他跨层状态的 producer 不应被整层 replay。模型 adapter 应声明可重计算子模块：
+共享 KV、Indexer 状态或其他跨层状态的 producer/consumer 不应被 replay。模型 adapter 用一份声明同时描述"哪些模块成为区域"和"哪些后代必须留在重放之外"：
 
 ```python
 from hyper_parallel.models.adapter_spec import RecomputePolicy
 
 
 def build_recompute_policy():
+    """整层一个区域，CSA2 attention 排除在重放之外。"""
     return RecomputePolicy(
-        safe_module_patterns=(
-            "model.layers.*.input_layernorm",
-            "model.layers.*.post_attention_layernorm",
-            "model.layers.*.mlp",
-        ),
-        no_replay_module_patterns=("model.layers.*.self_attn",),
+        region_patterns=("model.layers.*",),
+        exclude_patterns=("model.layers.*.self_attn",),
+        on_applied=enable_early_release,
     )
 ```
+
+`region_patterns` 取**最外层匹配**作为区域根：写成整层模式时一个区域只保存一份层输入，写成 `model.layers.*.mlp` 这类叶子模块模式时则每个模块各自成区域（此时 `exclude_patterns` 一般留空）。`exclude_patterns` 必须命中区域根的后代，否则直接报错；同一个模块也不能既是区域根又被排除（`HP-STATE-002`）。`on_applied` 是区域装好后的模型自有钩子，用于开启只在"排除项不参与重放"时才安全的运行时行为（例如共享状态读完后立即释放）。
 
 Trainer recipe 通过通用配置选择该策略：
 
@@ -761,7 +761,7 @@ DeepSeek adapter 的验证声明包括：
 - `compressed_kv`、`index_key`、`topk_indices`、`candidate_blocks` 跨层 publish/consume 检查；
 - packed runtime 字段、视觉输入字段及 vision/aligner 梯度检查；
 - 独立进程中的原生 Engram/MoE/CSA2 前向与反向比较；
-- attention 不 replay，只对 norm/MLP/MoE 安全区域做分层重计算。
+- attention 不 replay：整层作为一个区域重算，CSA2 attention 通过 `exclude_patterns` 排出重放之外。
 
 DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相替代的：
 
