@@ -149,6 +149,7 @@
 ## 生态集成
 
 - [x] LlamaFactory 集成（activation recompute & swap + HSDP）
+- [x] DeepSeek 与 TorchTitan-NPU Ascend 高性能算子可选适配
 
 ## 工具
 

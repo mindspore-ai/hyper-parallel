@@ -27,6 +27,8 @@ from typing import Any
 
 _EXPORT_TO_MODULE = {
     "DeepseekV32DSAAttention": "dsa_attention",
+    "DeepseekV41SparseDecodeAttention": "deepseek_sparse_attention",
+    "DeepseekV41SparsePrefillAttention": "deepseek_sparse_attention",
     "DSAAttention": "dsa_attention",
     "GQAAttention": "gqa_attention",
     "GatedGQAAttention": "gqa_attention",

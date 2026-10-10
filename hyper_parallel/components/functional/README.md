@@ -47,3 +47,17 @@ weights and computation; routing, expert-parallel communication, and shared expe
 ## Auxiliary-loss functions
 
 `hyper_parallel.components.functional` also exports `aux_loss_auto_scale` and `set_aux_loss_scale` for auxiliary-loss gradient injection.
+
+## Optional DeepSeek and TorchTitan-NPU Ascend operators
+
+DeepGEMM-Ascend, DeepSelect, FlashMLA, and TileKernels are available through
+lazy optional adapters. They are not imported by a plain HyperParallel import
+and must be built separately for the active PyTorch, torch-npu, and CANN
+environment. See the [DeepSeek Ascend operator guide](../../../docs/guide/deepseek_ascend_ops.md).
+
+The same guide documents the lazy `torchtitan_*` adapters for TorchTitan-NPU's public AscendC, TileLang, and
+Triton production operators. Installing TorchTitan-NPU is optional and is only required when one of these adapters is called.
+
+Common GEMM, quantization, SwiGLU, MoE routing, RoPE, and Engram paths have
+explicit public functions. Generic dispatch remains available for additional
+public production operators as upstream packages evolve.

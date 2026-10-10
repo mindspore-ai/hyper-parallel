@@ -7,12 +7,17 @@ Python or declaratively replace existing model modules through Trainer YAML.
 
 | Category | Modules |
 | --- | --- |
-| Attention | `GQAAttention`, `GatedGQAAttention`, `MLAAttention`, `DSAAttention`, `DeepseekV32DSAAttention` |
+| Attention | `GQAAttention`, `GatedGQAAttention`, `MLAAttention`, `DSAAttention`, `DeepseekV32DSAAttention`, `DeepseekV41SparsePrefillAttention`, `DeepseekV41SparseDecodeAttention` |
 | MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP` |
 | Normalization | `RMSNorm`, `OffsetRMSNorm` |
 | MHC | `MhcPreModule`, `MhcPostModule` |
 
 Reusable high-performance functions are provided separately in [`hyper_parallel.components.functional`](../functional/README.md).
+
+The two DeepSeek V4.1 sparse-attention modules are optional adapters over FlashMLA's Ascend backend. FlashMLA must be built
+separately in the active PyTorch, torch-npu, and CANN environment. See the
+[DeepSeek Ascend operator guide](../../../docs/guide/deepseek_ascend_ops.md) for the supported surface, upstream requirements,
+build commands, scheduler lifecycle, and validation procedure.
 
 Modules can also be constructed directly:
 
