@@ -188,3 +188,4 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **unit-test** | `tests/ut/**` — hard constraints; how-to → skill `add-unit-test` |
 | **hyper-rl** | `hyper_parallel/rl/**`, RL docs and agent rules — sole RL entry; also consult it for migrated RL tests |
 | **distributed-op-dev** / **distributed-op-testing** / **test-assertion-style** | Op impl & tests (scoped) |
+| **precision-acceptance** | `docs/design/**`, precision tools & skill — 1000-step acceptance 口径 |
