@@ -149,6 +149,43 @@ plan_overrides:
         hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
       use_grouped_gemm: false
 
+  # DSpark drafter (enabled via --model.dspark_depth>0): small coefficient,
+  # attention, and draft-MoE parameters stay TP-replicated; FSDP owns sharding.
+  - match: "dspark"
+    params:
+      main_proj.weight: {tp: replicate}
+      noise_embedding: {tp: replicate}
+      markov_head.embed.weight: {tp: replicate}
+      markov_head.head.weight: {tp: replicate}
+      confidence_head.proj.weight: {tp: replicate}
+  - match: "dspark.stages.0.attn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "dspark.stages.0.ffn_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "dspark.stages.0.self_attn"
+    params:
+      attn_sink: {tp: replicate}
+      wq_a.weight: {tp: replicate}
+      wq_b.weight: {tp: replicate}
+      wkv.weight: {tp: replicate}
+      wo_a.weight: {tp: replicate}
+      wo_b.weight: {tp: replicate}
+  - match: "dspark.stages.0.mlp"
+    params:
+      gate.weight: {tp: replicate}
+      gate.bias: {tp: replicate}
+      experts.gate_up_proj: {tp: replicate}
+      experts.down_proj: {tp: replicate}
+      shared_experts.gate_proj.weight: {tp: replicate}
+      shared_experts.up_proj.weight: {tp: replicate}
+      shared_experts.down_proj.weight: {tp: replicate}
+
 mixed_precision:
   enabled: false
 
