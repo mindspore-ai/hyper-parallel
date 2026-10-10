@@ -298,7 +298,7 @@ def compressed_causal_topk(
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
     if query_chunk_size <= 0:
         raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
-    batch_size, sequence_length, num_heads, head_dim = query.shape
+    batch_size, sequence_length, _, head_dim = query.shape
     if key.ndim != 3 or key.shape[0] != batch_size or key.shape[2] != head_dim:
         raise ValueError(
             "compressed index key must have shape [batch, compressed_sequence, head_dim]"
@@ -325,7 +325,7 @@ def compressed_causal_topk(
     selected_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
-        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu_()
+        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
@@ -435,7 +435,7 @@ def compressed_causal_candidates(
     candidate_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
-        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu_()
+        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
@@ -505,7 +505,7 @@ def compressed_causal_topk_and_candidates(
     candidate_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
-        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu_()
+        scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
@@ -602,7 +602,7 @@ def compressed_candidate_topk(
             "bchd,bckd->bchk",
             query[:, start:end].float(),
             selected_key,
-        ).relu_()
+        ).relu()
         scores = (dots * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)

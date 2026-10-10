@@ -430,6 +430,7 @@ def _apply_activation_features(
     mesh: Optional[MeshContext],
     swap_inputs: bool = False,
     selection: Optional[Any] = None,
+    allow_cache_entry_mutation: bool = False,
 ) -> nn.Module:
     """Apply activation checkpointing and attention swap in execution order."""
     if activation_checkpoint not in (None, "off"):
@@ -439,6 +440,7 @@ def _apply_activation_features(
             enable_compile=compile_for_execution,
             swap_inputs=swap_inputs,
             selection=selection,
+            allow_cache_entry_mutation=allow_cache_entry_mutation,
         )
     validate_attention_swap(
         activation_swap,
@@ -497,6 +499,7 @@ def apply_model_infrastructure(
     activation_checkpoint_selection: Optional[Any] = None,
     activation_swap: str = "none",
     swap_inputs: bool = False,
+    allow_cache_entry_mutation: bool = False,
     is_meta_device: bool = False,
     is_hf_model: bool = False,
     device: Optional[torch.device] = None,
@@ -554,6 +557,7 @@ def apply_model_infrastructure(
         mesh,
         swap_inputs=swap_inputs,
         selection=activation_checkpoint_selection,
+        allow_cache_entry_mutation=allow_cache_entry_mutation,
     )
     # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
     # as DTensors, and FSDP derives their source layouts directly.
