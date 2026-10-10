@@ -145,11 +145,11 @@ class TestMegaKernelCycleTrace(unittest.TestCase):
 
     def test_unknown_task_type_uses_generic_fallback(self):
         """Keep a record readable when a concrete Kernel has no stage rule."""
-        trace = _parse(_profile_buffer(desc_id=0x20000 + 107))
+        trace = _parse(_profile_buffer(desc_id=0x20000 + 255))
         event = next(event for event in trace["traceEvents"] if event["ph"] == "X")
 
-        self.assertEqual(event["name"], "TaskType_107")
-        self.assertEqual(event["args"]["task_type"], 107)
+        self.assertEqual(event["name"], "TaskType_255")
+        self.assertEqual(event["args"]["task_type"], 255)
 
     def test_dropped_count_is_reported_without_overwriting_records(self):
         """Surface Device overflow in metadata and warnings."""
@@ -195,7 +195,6 @@ class TestMegaKernelCycleTrace(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "contains no records"):
             _parse(empty)
-
 
 if __name__ == "__main__":
     unittest.main()

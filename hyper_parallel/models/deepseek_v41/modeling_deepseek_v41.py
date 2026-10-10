@@ -44,6 +44,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 )
 
 from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
+from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
@@ -394,7 +395,7 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
     if isinstance(module, (DeepseekV41Engram, EngramModule)):
         module.q_weight.fill_(1.0)
         module.k_weight.fill_(1.0)
-    elif isinstance(module, DeepseekV41TopKRouter):
+    elif isinstance(module, (DeepseekV41TopKRouter, MegaGate)):
         nn.init.normal_(module.weight, mean=0.0, std=std)
         module.bias.zero_()
         if module.bias_vl is not None:

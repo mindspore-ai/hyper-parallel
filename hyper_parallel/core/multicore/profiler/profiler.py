@@ -377,15 +377,38 @@ class TorchMegaKernelProfiler:
         if len(self._pending) >= self._max_pending_calls:
             self._drain(keep=self._action is not ProfilerAction.WARMUP)
         invocation_id = self._next_invocation_id
-        profile_buffer, profile_buffer_key = self._take_profile_buffer(
-            runtime,
-            event_counters,
-        )
+        profile_buffer, profile_buffer_key = self._take_profile_buffer(runtime)
         self._next_invocation_id += 1
         call = _MegaKernelCall(
             runtime_config=runtime.profile_tensor,
             event_counters=event_counters,
             clear_event_counters=event_counters,
+            profiler=self,
+            profile_buffer=profile_buffer,
+            runtime=runtime,
+            direction=direction,
+            step=self._step,
+            profile_buffer_key=profile_buffer_key,
+            invocation_id=invocation_id,
+        )
+        self._pending.append(call)
+        return call
+
+    def acquire_eventless_call(
+        self,
+        runtime: _PreparedMegaKernelRuntime,
+        direction: str,
+    ) -> _MegaKernelCall:
+        """Reserve profiling state for a MegaKernel without scheduler events."""
+        if len(self._pending) >= self._max_pending_calls:
+            self._drain(keep=self._action is not ProfilerAction.WARMUP)
+        invocation_id = self._next_invocation_id
+        profile_buffer, profile_buffer_key = self._take_profile_buffer(runtime)
+        self._next_invocation_id += 1
+        call = _MegaKernelCall(
+            runtime_config=runtime.profile_tensor,
+            event_counters=None,
+            clear_event_counters=None,
             profiler=self,
             profile_buffer=profile_buffer,
             runtime=runtime,
@@ -409,7 +432,6 @@ class TorchMegaKernelProfiler:
     def _take_profile_buffer(
         self,
         runtime: _PreparedMegaKernelRuntime,
-        event_counters: Any,
     ) -> tuple[Any, tuple[int, int]]:
         """Take one ordinary NPU buffer that is private to the next invocation."""
         profile_buffer_key = (runtime.device_id, runtime.buffer_size)
@@ -420,7 +442,7 @@ class TorchMegaKernelProfiler:
             profile_buffer = torch.empty(
                 (runtime.buffer_size,),
                 dtype=torch.uint8,
-                device=event_counters.device,
+                device=runtime.device,
             )
         profile_buffer.zero_()
         return profile_buffer, profile_buffer_key
@@ -599,6 +621,26 @@ def prepare_mega_kernel_call(
     return profiler.acquire_call(
         runtime,
         fallback_event_counters,
+        direction,
+    )
+
+
+def prepare_eventless_mega_kernel_call(
+    runtime: _PreparedMegaKernelRuntime,
+    *,
+    direction: str,
+) -> _MegaKernelCall | None:
+    """Prepare eventless profiling resources only while capture is active.
+
+    Normal launches return ``None`` so latency-sensitive callers can use the
+    prepared normal RuntimeConfig directly without allocating a call object.
+    """
+    with _ACTIVE_LOCK:
+        profiler = _ACTIVE_PROFILER
+    if profiler is None or not profiler.is_capture_enabled():
+        return None
+    return profiler.acquire_eventless_call(
+        runtime,
         direction,
     )
 

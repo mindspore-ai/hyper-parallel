@@ -218,6 +218,10 @@ function validate_multicore_vendor() {
         aclnnHyperMegaMoeGetWorkspaceSize
         aclnnHyperMegaMoeGrad
         aclnnHyperMegaMoeGradGetWorkspaceSize
+        aclnnHyperMegaGateRoute
+        aclnnHyperMegaGateRouteGetWorkspaceSize
+        aclnnHyperMegaGateRouteGrad
+        aclnnHyperMegaGateRouteGradGetWorkspaceSize
     )
 
     if [[ -n "${build_log}" ]]; then
@@ -251,7 +255,7 @@ function validate_multicore_vendor() {
 
     IFS=',' read -r -a validation_socs <<< "${soc_list}"
     for soc in "${validation_socs[@]}"; do
-        for op_name in hyper_mega_moe hyper_mega_moe_grad; do
+        for op_name in hyper_mega_moe hyper_mega_moe_grad hyper_mega_gate_route hyper_mega_gate_route_grad; do
             mapfile -t artifacts < <(
                 find "${vendor_root}/op_impl/ai_core/tbe/kernel/${soc}/${op_name}" \
                     -maxdepth 1 -type f -name '*.o' -print 2>/dev/null
@@ -281,7 +285,7 @@ function validate_multicore_vendor() {
         require_nonempty_artifact \
             "${vendor_root}/op_impl/ai_core/tbe/kernel/config/${soc}/binary_info_config.json" \
             "${soc} binary index"
-        for op_name in hyper_mega_moe hyper_mega_moe_grad; do
+        for op_name in hyper_mega_moe hyper_mega_moe_grad hyper_mega_gate_route hyper_mega_gate_route_grad; do
             require_nonempty_artifact \
                 "${vendor_root}/op_impl/ai_core/tbe/kernel/config/${soc}/${op_name}.json" \
                 "${soc} ${op_name} binary config"
@@ -595,6 +599,11 @@ cmake --install "${TORCH_BUILD}"
 if [[ ! -s "${TORCH_OUTPUT}/libhyper_parallel_mega_moe_torch.so" ]]; then
     fail "TORCH_ADAPTER_ARTIFACT_MISSING" \
         "PyTorch multicore adapter was not installed under ${TORCH_OUTPUT}." 13
+fi
+
+if [[ ! -s "${TORCH_OUTPUT}/libhyper_parallel_mega_gate_torch.so" ]]; then
+    fail "TORCH_ADAPTER_ARTIFACT_MISSING" \
+        "Missing MegaGate Torch adapter: ${TORCH_OUTPUT}/libhyper_parallel_mega_gate_torch.so" 12
 fi
 
 CURRENT_REASON_CODE="HOST_ELF_VALIDATION_FAILED"

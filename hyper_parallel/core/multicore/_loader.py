@@ -63,10 +63,17 @@ def require_multicore_environment() -> Path:
     return vendor_root.resolve()
 
 
-def get_multicore_paths() -> tuple[Path, Path]:
-    """Return the unified vendor root and Torch adapter."""
+def get_multicore_adapter_path(adapter_name: str) -> tuple[Path, Path]:
+    """Return the unified vendor root and one named Torch adapter.
+
+    Args:
+        adapter_name: Component-owned adapter basename without ``lib`` or ``.so``.
+
+    Returns:
+        Unified vendor root and resolved adapter path.
+    """
     vendor_root = require_multicore_environment()
-    adapter = _component_root() / "framework" / "torch" / "libhyper_parallel_mega_moe_torch.so"
+    adapter = _component_root() / "framework" / "torch" / f"lib{adapter_name}.so"
     vendor_library = vendor_root / "op_api" / "lib" / "libcust_opapi.so"
     if not vendor_library.is_file() or not adapter.is_file():
         raise NativeComponentUnavailableError(
@@ -75,6 +82,11 @@ def get_multicore_paths() -> tuple[Path, Path]:
             "framework; rebuild with --multicore on and inspect the build log."
         )
     return vendor_root, adapter.resolve()
+
+
+def get_multicore_paths() -> tuple[Path, Path]:
+    """Return the unified vendor root and legacy MegaMoe Torch adapter."""
+    return get_multicore_adapter_path("hyper_parallel_mega_moe_torch")
 
 
 def preload_vendor_library(vendor_root: Path) -> None:

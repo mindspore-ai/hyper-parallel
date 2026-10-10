@@ -98,4 +98,22 @@ target_link_libraries(hyper_parallel_mega_moe_torch PRIVATE
     ${TORCH_LINK_LIBRARIES})
 hp_enable_elf_hardening(hyper_parallel_mega_moe_torch)
 
-install(TARGETS hyper_parallel_mega_moe_torch DESTINATION .)
+add_library(hyper_parallel_mega_gate_torch SHARED
+    csrc/mega_gate_registration.cpp
+    csrc/mega_gate.cpp)
+target_compile_definitions(hyper_parallel_mega_gate_torch PRIVATE
+    _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI})
+target_include_directories(hyper_parallel_mega_gate_torch PRIVATE
+    ${Python3_INCLUDE_DIRS}
+    ${TORCH_INCLUDE_ROOT}
+    ${TORCH_INCLUDE_ROOT}/torch/csrc/api/include
+    ${TORCH_NPU_INCLUDE_ROOT}
+    ${TORCH_NPU_INCLUDE_ROOT}/third_party/acl/inc
+    ${OP_PLUGIN_ROOT}
+    ${OP_PLUGIN_ROOT}/op_plugin/include
+    ${HP_MULTICORE_VENDOR_ROOT}/op_api/include)
+target_link_libraries(hyper_parallel_mega_gate_torch PRIVATE
+    ${TORCH_LINK_LIBRARIES})
+hp_enable_elf_hardening(hyper_parallel_mega_gate_torch)
+
+install(TARGETS hyper_parallel_mega_moe_torch hyper_parallel_mega_gate_torch DESTINATION .)

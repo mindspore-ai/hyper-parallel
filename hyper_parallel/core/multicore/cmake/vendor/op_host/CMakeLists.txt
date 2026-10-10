@@ -15,6 +15,8 @@
 
 set(FWD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe/op_host)
 set(BWD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_grad/op_host)
+set(GATE_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_gate/op_host)
+set(GATE_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_gate_grad/op_host)
 set(CANN_OP_COMMON_INCLUDE
     ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/op_common
 )
@@ -34,10 +36,16 @@ set(OP_SCHEMA_SOURCES
     ${FWD_HOST}/hyper_mega_moe_infershape.cpp
     ${BWD_HOST}/hyper_mega_moe_grad_def.cpp
     ${BWD_HOST}/hyper_mega_moe_grad_infershape.cpp
+    ${GATE_HOST}/hyper_mega_gate_route_def.cpp
+    ${GATE_HOST}/hyper_mega_gate_route_infershape.cpp
+    ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_def.cpp
+    ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_infershape.cpp
 )
 set(OP_TILING_SOURCES
     ${FWD_HOST}/hyper_mega_moe_tiling.cpp
     ${BWD_HOST}/hyper_mega_moe_grad_tiling.cpp
+    ${GATE_HOST}/hyper_mega_gate_route_tiling.cpp
+    ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_tiling.cpp
 )
 
 npu_op_code_gen(
@@ -55,19 +63,28 @@ set(ACLNN_SOURCES
     ${FWD_HOST}/op_api/hyper_mega_moe.cpp
     ${BWD_HOST}/op_api/aclnn_hyper_mega_moe_grad.cpp
     ${BWD_HOST}/op_api/hyper_mega_moe_grad.cpp
+    ${GATE_HOST}/op_api/hyper_mega_gate_route.cpp
+    ${GATE_HOST}/op_api/aclnn_hyper_mega_gate_route.cpp
+    ${GATE_GRAD_HOST}/op_api/aclnn_hyper_mega_gate_route_grad.cpp
+    ${GATE_GRAD_HOST}/op_api/hyper_mega_gate_route_grad.cpp
+    ${GATE_GRAD_HOST}/op_api/hyper_mega_gate_route_grad_post.cpp
+    ${GATE_GRAD_HOST}/op_api/linear_index/linear_index.cpp
 )
 npu_op_library(cust_opapi ACLNN ${ACLNN_SOURCES})
 target_compile_options(cust_opapi PRIVATE -fvisibility=hidden)
 target_include_directories(cust_opapi PRIVATE
     ${FWD_HOST}/op_api
     ${BWD_HOST}/op_api
+    ${GATE_HOST}/op_api
+    ${GATE_GRAD_HOST}/op_api
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
     ${CANN_ACLNN_INCLUDE}
     ${CANN_ACLNN_OP_INCLUDE}
 )
 target_link_directories(cust_opapi PRIVATE ${CANN_ARCH_LIBRARY})
-target_link_libraries(cust_opapi PRIVATE opapi_math)
+target_link_libraries(cust_opapi PRIVATE opapi_math -Wl,--no-as-needed opapi_nn -Wl,--as-needed)
+
 hp_enable_elf_hardening(cust_opapi)
 
 file(GLOB GROUP_PROTO_SOURCES ${ASCEND_AUTOGEN_PATH}/group_op_proto/*.cc)
@@ -82,9 +99,12 @@ target_compile_options(cust_op_proto PRIVATE -fvisibility=hidden)
 target_include_directories(cust_op_proto PRIVATE
     ${FWD_HOST}
     ${BWD_HOST}
+    ${GATE_HOST}
+    ${GATE_GRAD_HOST}
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
 )
+
 hp_enable_elf_hardening(cust_op_proto)
 
 file(GLOB FALLBACK_SOURCES ${ASCEND_AUTOGEN_PATH}/fallback_*.cpp)
@@ -98,6 +118,8 @@ target_compile_options(cust_optiling PRIVATE -fvisibility=hidden)
 target_include_directories(cust_optiling PRIVATE
     ${FWD_HOST}
     ${BWD_HOST}
+    ${GATE_HOST}
+    ${GATE_GRAD_HOST}
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
 )
@@ -113,4 +135,6 @@ npu_op_package_add(${package_name}
     FILES
         ${FWD_HOST}/op_api/aclnn_hyper_mega_moe.h
         ${BWD_HOST}/op_api/aclnn_hyper_mega_moe_grad.h
+        ${GATE_HOST}/op_api/aclnn_hyper_mega_gate_route.h
+        ${GATE_GRAD_HOST}/op_api/aclnn_hyper_mega_gate_route_grad.h
 )

@@ -2,7 +2,7 @@
 
 Multicore 是独立的 Torch-only 组件，提供芯片内多核 MPMD 并行能力，结合核级内存语义单边通信，增强 MoE 通算掩盖和 MAC 利用率。
 
-用户从独立组件 `hyper_parallel.core.multicore` 显式导入 `MegaMoeExperts`。
+用户从独立组件 `hyper_parallel.core.multicore` 显式导入 `MegaGate` 或 `MegaMoeExperts`。
 SHMEM 由 Multicore 在内部管理，不提供独立用户接口。
 
 - [构建与交付](docs/build.md)
@@ -43,6 +43,37 @@ Torch adapter 是通过 `torch.ops.load_library()` 加载的普通共享库。
 ---
 
 ## Torch managed API
+
+### MegaGate
+
+`MegaGate`提供可独立构造的Gate参数和返回值。NPU上的`sqrtsoftplus`路径使用native Route/RouteGrad，
+投影MatMul由Torch和CANN选型；其他评分函数及非NPU环境使用Torch实现。使用native路径前须以
+`--multicore on`构建并激活生成的multicore payload。
+
+```python
+import torch
+
+from hyper_parallel.core.multicore import MegaGate
+
+gate = MegaGate(
+    hidden_size=5120,
+    num_experts=384,
+    top_k=6,
+    scoring_func="sqrtsoftplus",
+    routed_scaling_factor=1.0,
+    vision_enabled=True,
+).to(device="npu", dtype=torch.bfloat16)
+
+logits, routing_weights, expert_indices = gate(hidden_states, image_mask=image_mask)
+```
+
+`weight`默认使用标准差为0.02的Normal分布初始化，可通过`initializer_range`调整；文本和视觉correction
+bias初始化为零。`hidden_states`形状为
+`[batch, sequence, H]`。返回的`logits`、`routing_weights`分别为FP32，专家索引为INT64。
+传入`image_mask`时，mask形状须为`[batch, sequence]`；启用视觉bias时还须是同一NPU上的连续BOOL Tensor。
+当前native Route要求FP32 logits，不支持外层BF16 autocast改变投影输出类型。
+
+### MegaMoeExperts
 
 Torch 模型通过 `MegaMoeExperts` 执行 Router 选出的专家，当前支持 Ascend NPU 上的 Torch BF16 训练。
 先按[构建与交付](docs/build.md)选择 `--multicore on`，激活 CANN 和 native payload，

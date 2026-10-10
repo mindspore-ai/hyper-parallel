@@ -11,6 +11,8 @@
 #ifndef MULTICORE_SCHEDULER_RUNTIME_CONFIG_HPP
 #define MULTICORE_SCHEDULER_RUNTIME_CONFIG_HPP
 
+#include <cstddef>
+
 namespace MulticoreRuntime {
 
 constexpr uint32_t MAX_TENSOR_DIMS = 4;
@@ -65,6 +67,27 @@ enum class TaskType : uint32_t {
   TASK_GROUPED_MATMUL = 104,
   TASK_SHMEM_PUT_MEM_SIGNAL = 105,
   TASK_SWI_GLU_GRAD = 106,
+  TASK_GATE_SOFTPLUS = 107,
+  TASK_GATE_SQRT = 108,
+  TASK_GATE_ADD_BIAS = 109,
+  TASK_GATE_TOPK = 110,
+  TASK_GATE_GATHER = 111,
+  TASK_GATE_REDUCE_SUM = 112,
+  TASK_GATE_ADD_EPSILON = 113,
+  TASK_GATE_DIV = 114,
+  TASK_GATE_MUL_SCALE = 115,
+  TASK_GATE_CAST_INDEX = 116,
+  TASK_GATE_GRAD_MULS_SCALE = 117,
+  TASK_GATE_GRAD_BROADCAST_DENOMINATOR = 118,
+  TASK_GATE_GRAD_NEG = 119,
+  TASK_GATE_GRAD_DIV_SELECTED = 120,
+  TASK_GATE_GRAD_DIV_SELECTED_RATIO = 121,
+  TASK_GATE_GRAD_MUL_CROSS = 122,
+  TASK_GATE_GRAD_DIV_DIRECT = 123,
+  TASK_GATE_GRAD_REDUCE_SUM = 124,
+  TASK_GATE_GRAD_BROADCAST_ROW_SUM = 125,
+  TASK_GATE_GRAD_ADD_SELECTED = 126,
+  TASK_GATE_GRAD_ZEROS = 127,
 };
 
 enum class EventType : uint32_t {
@@ -282,6 +305,20 @@ __aicore__ inline uint32_t getTaskProfileOwnerId(__gm__ uint8_t *tiling, uint32_
                             MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
   uint32_t size = getAllTasksOffset(tiling) + (index_size + 1) * task_desc_size - UINT32_T_SIZE;
   return (*(__gm__ uint32_t *)(tiling + size));
+}
+
+__aicore__ inline uint32_t getRuntimeWorkerCount(__gm__ uint8_t *tiling) {
+  return *reinterpret_cast<__gm__ uint32_t *>(tiling + UINT32_T_SIZE);
+}
+
+__aicore__ inline TaskType getTaskType(__gm__ uint8_t *tiling, uint32_t task_id) {
+  return *reinterpret_cast<__gm__ TaskType *>(tiling + getAllTasksOffset(tiling) + task_id * sizeof(TaskDesc));
+}
+
+__aicore__ inline uint32_t getTaskTilingDataOffset(__gm__ uint8_t *tiling, uint32_t task_id) {
+  constexpr uint32_t field_offset = offsetof(TaskDesc, tiling_data_offset);
+  return *reinterpret_cast<__gm__ uint32_t *>(tiling + getAllTasksOffset(tiling) + task_id * sizeof(TaskDesc) +
+                                              field_offset);
 }
 
 __aicore__ inline void getEventDesc(__gm__ uint8_t *tiling, EventDesc *tilingData, uint32_t index_size) {

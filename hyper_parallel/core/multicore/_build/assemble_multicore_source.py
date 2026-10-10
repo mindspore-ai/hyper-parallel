@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Assemble the isolated HyperMegaMoe source closure from pinned kernel sources."""
+"""Assemble the isolated Multicore operator closure from pinned sources."""
 
 from __future__ import annotations
 
@@ -38,9 +38,17 @@ _SHMEM_CCSRC = _REPO_ROOT / "hyper_parallel" / "core" / "multicore" / "shmem" / 
 _OPS_NN_PATHS = (
     "activation/swi_glu/op_kernel",
     "activation/swi_glu_grad/op_kernel",
+    "index/linear_index/op_host/op_api",
 )
-_OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel",)
-_HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad")
+_OPS_TRANSFORMER_PATHS = (
+    "gmm/grouped_matmul/op_kernel",
+)
+_HYPER_OPERATORS = (
+    "hyper_mega_moe",
+    "hyper_mega_moe_grad",
+    "hyper_mega_gate",
+    "hyper_mega_gate_grad",
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -192,6 +200,16 @@ def _compose_hyper_parallel_ops(
     for operator_name in _HYPER_OPERATORS:
         operator_root = source_root / operator_name
         shutil.copytree(_MULTICORE_OPS / operator_name, operator_root)
+        if operator_name == "hyper_mega_gate":
+            shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
+            continue
+        if operator_name == "hyper_mega_gate_grad":
+            shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
+            shutil.copytree(
+                ops_nn_copy / "index" / "linear_index" / "op_host" / "op_api",
+                operator_root / "op_host" / "op_api" / "linear_index",
+            )
+            continue
         shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
         shutil.copytree(
             ops_nn_copy / "activation" / "swi_glu" / "op_kernel",
@@ -217,12 +235,21 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_moe_grad" / "op_host" / "hyper_mega_moe_grad_def.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "hyper_mega_moe_grad.cpp",
         source_root / "hyper_mega_moe_grad" / "op_kernel" / "swi_glu_grad" / "swi_glu_grad.cpp",
+        source_root / "hyper_mega_gate" / "op_kernel" / "route_pipeline.h",
+        source_root / "hyper_mega_gate" / "op_kernel" / "runtime" / "aiv_pipeline_worker.h",
+        source_root / "hyper_mega_gate" / "op_host" / "hyper_mega_gate_route_def.cpp",
+        source_root / "hyper_mega_gate" / "op_kernel" / "hyper_mega_gate_route.cpp",
+        source_root / "hyper_mega_gate_grad" / "op_kernel" / "route_grad_pipeline.h",
+        source_root / "hyper_mega_gate_grad" / "op_kernel" / "runtime" / "aiv_pipeline_worker.h",
+        source_root / "hyper_mega_gate_grad" / "op_host" / "hyper_mega_gate_route_grad_def.cpp",
+        source_root / "hyper_mega_gate_grad" / "op_host" / "op_api" / "linear_index" / "linear_index.cpp",
+        source_root / "hyper_mega_gate_grad" / "op_kernel" / "hyper_mega_gate_route_grad.cpp",
         source_root / "shmem" / "data_plane" / "rma.h",
         source_root / "shmem" / "data_plane" / "sync.h",
     )
     missing = [str(path) for path in required_paths if not path.is_file()]
     if missing:
-        raise ValueError(f"Incomplete HyperMegaMoe source closure: {missing}")
+        raise ValueError(f"Incomplete Multicore operator source closure: {missing}")
 
 
 def _validate_archive_names(names: Any) -> None:

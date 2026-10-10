@@ -80,6 +80,27 @@ class TaskType(IntEnum):
     TASK_GROUPED_MATMUL       = 104
     TASK_SHMEM_PUT_MEM_SIGNAL = 105
     TASK_SWI_GLU_GRAD         = 106
+    TASK_GATE_SOFTPLUS                    = 107
+    TASK_GATE_SQRT                        = 108
+    TASK_GATE_ADD_BIAS                    = 109
+    TASK_GATE_TOPK                        = 110
+    TASK_GATE_GATHER                      = 111
+    TASK_GATE_REDUCE_SUM                  = 112
+    TASK_GATE_ADD_EPSILON                 = 113
+    TASK_GATE_DIV                         = 114
+    TASK_GATE_MUL_SCALE                   = 115
+    TASK_GATE_CAST_INDEX                  = 116
+    TASK_GATE_GRAD_MULS_SCALE             = 117
+    TASK_GATE_GRAD_BROADCAST_DENOMINATOR  = 118
+    TASK_GATE_GRAD_NEG                    = 119
+    TASK_GATE_GRAD_DIV_SELECTED           = 120
+    TASK_GATE_GRAD_DIV_SELECTED_RATIO     = 121
+    TASK_GATE_GRAD_MUL_CROSS              = 122
+    TASK_GATE_GRAD_DIV_DIRECT             = 123
+    TASK_GATE_GRAD_REDUCE_SUM             = 124
+    TASK_GATE_GRAD_BROADCAST_ROW_SUM      = 125
+    TASK_GATE_GRAD_ADD_SELECTED           = 126
+    TASK_GATE_GRAD_ZEROS                  = 127
 
 
 class EventType(IntEnum):

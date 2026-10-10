@@ -46,6 +46,18 @@ npu_op_kernel_sources(ascendc_kernels
     KERNEL_FILE hyper_mega_moe_grad.cpp
     COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
 )
+npu_op_kernel_sources(ascendc_kernels
+    OP_TYPE HyperMegaGateRoute
+    KERNEL_DIR ./hyper_mega_gate/op_kernel
+    KERNEL_FILE hyper_mega_gate_route.cpp
+    COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
+)
+npu_op_kernel_sources(ascendc_kernels
+    OP_TYPE HyperMegaGateRouteGrad
+    KERNEL_DIR ./hyper_mega_gate_grad/op_kernel
+    KERNEL_FILE hyper_mega_gate_route_grad.cpp
+    COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
+)
 
 npu_op_package_add(${package_name}
     LIBRARY ascendc_kernels

@@ -25,8 +25,10 @@ set(HP_SHMEM_SDK_ROOT "" CACHE PATH "Installed SHMEM SDK root")
 set(HP_VENDOR_STAGE_ROOT "${CMAKE_BINARY_DIR}/stage" CACHE PATH "CANN vendor stage root")
 
 if(NOT HP_MULTICORE_SOURCE_ROOT
-        OR NOT EXISTS "${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe/op_host/hyper_mega_moe_def.cpp")
-    message(FATAL_ERROR "HP_MULTICORE_SOURCE_ROOT must identify an assembled HyperMegaMoe source tree")
+        OR NOT EXISTS "${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe/op_host/hyper_mega_moe_def.cpp"
+        OR NOT EXISTS "${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_gate/op_host/hyper_mega_gate_route_def.cpp"
+        OR NOT EXISTS "${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_gate_grad/op_host/hyper_mega_gate_route_grad_def.cpp")
+    message(FATAL_ERROR "HP_MULTICORE_SOURCE_ROOT must identify an assembled Multicore source tree")
 endif()
 if(NOT HP_SHMEM_SDK_ROOT OR NOT EXISTS "${HP_SHMEM_SDK_ROOT}/include/shmem.h")
     message(FATAL_ERROR "HP_SHMEM_SDK_ROOT must identify an installed SHMEM SDK")

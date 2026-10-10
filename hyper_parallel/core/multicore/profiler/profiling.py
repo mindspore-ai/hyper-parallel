@@ -20,11 +20,10 @@ __all__ = []
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import Enum
 import struct
 from threading import Lock
 from typing import Any
-
-import torch_npu
 
 from hyper_parallel.core.multicore.scheduler.config import (
     EVENT_INVALID_ID,
@@ -80,6 +79,21 @@ CORE_TYPE_NAMES = {
 }
 
 
+class _TaskExecutionMode(Enum):
+    """Describe how Device workers execute scheduled task descriptors.
+
+    ``EVENT_DRIVEN`` assigns a prebuilt task graph across AIC and AIV worker
+    queues. Device events enforce graph dependencies, allowing independent
+    Cube and Vector tasks to overlap.
+
+    ``AIV_PIPELINE`` makes every active AIV worker execute the same ordered
+    stage sequence on its own data shard without scheduler events.
+    """
+
+    EVENT_DRIVEN = "event_driven"
+    AIV_PIPELINE = "aiv_pipeline"
+
+
 @dataclass(frozen=True)
 class _ProfileMetadata:
     """Host-only display metadata selected by a concrete MegaKernel builder."""
@@ -88,6 +102,7 @@ class _ProfileMetadata:
     owner_label: str
     stage_names: Mapping[int, str]
     task_stage_names: Mapping[int, str]
+    execution_mode: _TaskExecutionMode
 
 
 @dataclass(frozen=True)
@@ -134,6 +149,9 @@ class _CycleTraceConfig:
 
 def _get_soc_name(device_id: int | None) -> str:
     """Return and validate the current Ascend SoC name through Torch NPU."""
+    # Metadata construction and CPU/meta modules must not import an optional backend.
+    import torch_npu  # pylint: disable=import-outside-toplevel
+
     get_device_name = torch_npu.npu.get_device_name
     try:
         soc_name = get_device_name(device_id)
@@ -213,9 +231,38 @@ def _max_worker_record_count(
     return max(worker_record_counts)
 
 
-def _calculate_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
-    """Reproduce Device task distribution and size AIC/AIV slots from the busiest worker."""
-    _validate_runtime_config(runtime_config)
+def _calculate_aiv_pipeline_profile_layout(
+    runtime_config: RuntimeConfigC,
+) -> _ProfileLayout:
+    """Size AIV slots for workers that each execute the complete stage sequence."""
+    worker_capacity = int(runtime_config.num_workers)
+    if not 0 < worker_capacity <= VECTOR_SLOT_COUNT:
+        raise ValueError(
+            "AIV pipeline worker capacity must be in "
+            f"[1, {VECTOR_SLOT_COUNT}], got {worker_capacity}"
+        )
+    scheduled_task_count = int(runtime_config.task_index_num[1])
+    if not 0 <= scheduled_task_count <= len(runtime_config.vector_task_indices):
+        raise ValueError(f"scheduled task count is outside RuntimeConfig capacity: {scheduled_task_count}")
+    required_records = 0
+    for schedule_index in range(scheduled_task_count):
+        task_id = int(runtime_config.vector_task_indices[schedule_index])
+        if not 0 <= task_id < len(runtime_config.all_tasks):
+            raise ValueError(f"scheduled task ID is outside RuntimeConfig capacity: {task_id}")
+        task = runtime_config.all_tasks[task_id]
+        if task.dependent_event != EVENT_INVALID_ID or task.trigger_event != EVENT_INVALID_ID:
+            raise ValueError("AIV pipelines cannot contain scheduler events")
+        required_records += 1
+    return _ProfileLayout(
+        aic_required_records=0,
+        aiv_required_records=required_records,
+        aic_record_capacity=0,
+        aiv_record_capacity=_round_up_record_capacity(required_records),
+    )
+
+
+def _calculate_event_driven_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
+    """Size AIC/AIV slots for event-driven task queues using the busiest worker."""
     num_workers = int(runtime_config.num_workers)
     if num_workers < 0 or num_workers % 2 != 0 or num_workers > VECTOR_SLOT_COUNT:
         raise ValueError(
@@ -240,6 +287,17 @@ def _calculate_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
         aic_record_capacity=_round_up_record_capacity(aic_required_records),
         aiv_record_capacity=_round_up_record_capacity(aiv_required_records),
     )
+
+
+def _calculate_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
+    """Select the profile layout algorithm for the configured task execution mode."""
+    _validate_runtime_config(runtime_config)
+    metadata = _get_mega_kernel_profile_metadata(runtime_config)
+    if metadata.execution_mode is _TaskExecutionMode.AIV_PIPELINE:
+        return _calculate_aiv_pipeline_profile_layout(runtime_config)
+    if metadata.execution_mode is _TaskExecutionMode.EVENT_DRIVEN:
+        return _calculate_event_driven_profile_layout(runtime_config)
+    raise ValueError(f"unsupported task execution mode: {metadata.execution_mode!r}")
 
 
 def _configure_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
@@ -271,6 +329,7 @@ def _set_mega_kernel_profile_metadata(
     owner_label: str,
     stage_names: Mapping[int, str],
     task_stage_names: Mapping[int, str] | None = None,
+    execution_mode: _TaskExecutionMode = _TaskExecutionMode.EVENT_DRIVEN,
 ) -> None:
     """Attach concrete-kernel display metadata without changing serialized RuntimeConfig."""
     _validate_runtime_config(runtime_config)
@@ -278,11 +337,14 @@ def _set_mega_kernel_profile_metadata(
         raise ValueError(f"kernel_name must be a non-empty string, got {kernel_name!r}")
     if not isinstance(owner_label, str) or not owner_label.strip():
         raise ValueError(f"owner_label must be a non-empty string, got {owner_label!r}")
+    if not isinstance(execution_mode, _TaskExecutionMode):
+        raise TypeError(f"execution_mode must be _TaskExecutionMode, got {type(execution_mode).__name__}")
     metadata = _ProfileMetadata(
         kernel_name=kernel_name.strip(),
         owner_label=owner_label.strip(),
         stage_names=_resolve_stage_names(stage_names),
         task_stage_names=dict(task_stage_names or {}),
+        execution_mode=execution_mode,
     )
     setattr(runtime_config, _PROFILE_METADATA_ATTRIBUTE, metadata)
 
@@ -438,6 +500,7 @@ def _get_mega_kernel_profile_metadata(
         owner_label="Owner",
         stage_names=_resolve_stage_names(None),
         task_stage_names={},
+        execution_mode=_TaskExecutionMode.EVENT_DRIVEN,
     )
 
 
@@ -451,6 +514,7 @@ class _PreparedMegaKernelRuntime:
         tensor_factory: Callable[[bytes], Any],
         profile_tensor_factory: Callable[[Any], Any],
         rank: int,
+        device: Any,
         device_id: int,
     ) -> None:
         """Prepare immutable metadata and the default disabled Device tensor."""
@@ -461,6 +525,7 @@ class _PreparedMegaKernelRuntime:
             raise TypeError("profile_tensor_factory must be callable")
         self._profile_tensor_factory = profile_tensor_factory
         self._rank = rank
+        self._device = device
         self._device_id = device_id
         self._metadata = _get_mega_kernel_profile_metadata(runtime_config)
         self._layout = _configure_profile_layout(runtime_config)
@@ -493,6 +558,11 @@ class _PreparedMegaKernelRuntime:
     def rank(self) -> int:
         """Return the distributed rank that owns this runtime."""
         return self._rank
+
+    @property
+    def device(self) -> Any:
+        """Return the device used to allocate runtime-owned tensors."""
+        return self._device
 
     @property
     def device_id(self) -> int:
@@ -536,6 +606,7 @@ def _prepare_mega_kernel_runtime_config(
     tensor_factory: Callable[[bytes], Any],
     profile_tensor_factory: Callable[[Any], Any],
     rank: int,
+    device: Any,
     device_id: int,
 ) -> _PreparedMegaKernelRuntime:
     """Prepare fast/profiled RuntimeConfig variants without exposing ABI details."""
@@ -544,6 +615,7 @@ def _prepare_mega_kernel_runtime_config(
         tensor_factory=tensor_factory,
         profile_tensor_factory=profile_tensor_factory,
         rank=rank,
+        device=device,
         device_id=device_id,
     )
 

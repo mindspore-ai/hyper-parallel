@@ -30,9 +30,11 @@ class _FakeStorage:
 
     def __init__(self):
         self.released = False
+        self.resize_calls = 0
 
     def resize_(self, size):
         """Record whether the storage was resized to zero."""
+        self.resize_calls += 1
         self.released = size == 0
 
 
@@ -93,6 +95,7 @@ class _FakeRuntime:
     rank = 2
     normal_tensor = "disabled-config"
     profile_tensor = "enabled-config"
+    device = "runtime-device"
     device_id = 0
     kernel_name = "FakeMegaKernel"
     buffer_size = 4
@@ -203,6 +206,84 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         self.assertEqual(call.clear_event_counters, event_counters)
         self.assertEqual(event_counters.requested_slices, [])
         mock_empty.assert_not_called()
+
+    def test_inactive_eventless_call_does_not_allocate_profile_storage(self):
+        """Keep MegaGate free of profile allocation when capture is off."""
+        runtime = _FakeRuntime()
+
+        with patch.object(torch_profiler.torch, "empty") as mock_empty:
+            call = torch_profiler.prepare_eventless_mega_kernel_call(
+                runtime,
+                direction="forward",
+            )
+
+        self.assertIsNone(call)
+        mock_empty.assert_not_called()
+
+    def test_active_eventless_call_allocates_only_a_profile_buffer(self):
+        """Capture MegaGate without creating or clearing an event-counter tensor."""
+        runtime = _FakeRuntime()
+        profile_buffer = _FakeProfileBuffer(b"1000")
+        profiler = torch_profiler.TorchMegaKernelProfiler(
+            schedule=None,
+            on_trace_ready=None,
+            detailed_task_names=False,
+            max_pending_calls=4,
+        )
+
+        with patch.object(torch_profiler.torch, "empty", return_value=profile_buffer) as mock_empty:
+            with profiler:
+                call = torch_profiler.prepare_eventless_mega_kernel_call(
+                    runtime,
+                    direction="forward",
+                )
+                self.assertEqual(call.runtime_config, runtime.profile_tensor)
+                self.assertIsNone(call.event_counters)
+                self.assertIsNone(call.clear_event_counters)
+                self.assertIs(call.profile_buffer, profile_buffer)
+                self.assertEqual(mock_empty.call_args.kwargs["device"], runtime.device)
+                call.cancel()
+
+    def test_eventless_cancel_releases_buffer_once(self):
+        """Make repeated cancellation release one eventless call buffer once."""
+        runtime = _FakeRuntime()
+        profile_buffer = _FakeProfileBuffer(b"1000")
+        profiler = torch_profiler.TorchMegaKernelProfiler(
+            schedule=None,
+            on_trace_ready=None,
+            detailed_task_names=False,
+            max_pending_calls=4,
+        )
+
+        with patch.object(torch_profiler.torch, "empty", return_value=profile_buffer):
+            with profiler:
+                call = torch_profiler.prepare_eventless_mega_kernel_call(
+                    runtime,
+                    direction="forward",
+                )
+                call.cancel()
+                call.cancel()
+
+        self.assertEqual(profile_buffer.storage.resize_calls, 1)
+
+    def test_eventless_allocation_failure_does_not_register_call(self):
+        """Leave no pending call when profile-buffer allocation fails."""
+        runtime = _FakeRuntime()
+        profiler = torch_profiler.TorchMegaKernelProfiler(
+            schedule=None,
+            on_trace_ready=None,
+            detailed_task_names=False,
+            max_pending_calls=4,
+        )
+
+        with patch.object(torch_profiler.torch, "empty", side_effect=RuntimeError("allocation failed")):
+            with profiler:
+                with self.assertRaisesRegex(RuntimeError, "allocation failed"):
+                    torch_profiler.prepare_eventless_mega_kernel_call(
+                        runtime,
+                        direction="forward",
+                    )
+                self.assertEqual(profiler._pending, [])  # pylint: disable=protected-access
 
     def test_active_window_exports_internal_trace_at_step_boundary(self):
         """Export retained active-window calls when the step closes the window."""
@@ -319,6 +400,9 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
                     runtime, direction="forward", fallback_event_counters=event_counters
                 )
                 self.assertIsNot(first.profile_buffer, second.profile_buffer)
+                self.assertTrue(
+                    all(call.kwargs["device"] == runtime.device for call in mock_empty.call_args_list)
+                )
                 first.complete()
                 second.complete()
 

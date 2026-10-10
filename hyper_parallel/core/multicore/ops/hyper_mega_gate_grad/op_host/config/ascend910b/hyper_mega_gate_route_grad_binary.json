@@ -1,0 +1,26 @@
+{
+  "op_type": "HyperMegaGateRouteGrad",
+  "dynamicParamMode": "folded_with_desc",
+  "op_list": [
+    {
+      "bin_filename": "HyperMegaGateRouteGrad_aiv_fp32",
+      "inputs": [
+        {"dtype": "float", "paramType": "required", "index": 0, "name": "selected_scores", "shape": [-2], "format": "ND"},
+        {"dtype": "float", "paramType": "required", "index": 1, "name": "normalization_denominator", "shape": [-2], "format": "ND"},
+        {"dtype": "float", "paramType": "required", "index": 2, "name": "grad_routing_weights", "shape": [-2], "format": "ND"},
+        {"dtype": "float", "paramType": "required", "index": 3, "name": "route_scores", "shape": [-2], "format": "ND"},
+        {"dtype": "int64", "paramType": "required", "index": 4, "name": "expert_indices", "shape": [-2], "format": "ND"},
+        {"dtype": "uint8", "paramType": "required", "index": 5, "name": "runtime_config", "shape": [-2], "format": "ND"},
+        {"dtype": "uint8", "paramType": "required", "index": 6, "name": "profile_buffer", "shape": [-2], "format": "ND"}
+      ],
+      "outputs": [
+        {"dtype": "float", "paramType": "required", "index": 0, "name": "selected_score_grad", "shape": [-2], "format": "ND"},
+        {"dtype": "float", "paramType": "required", "index": 1, "name": "zero_score_grad", "shape": [-2], "format": "ND"}
+      ],
+      "attrs": [
+        {"value": 6, "dtype": "int", "name": "top_k"},
+        {"value": 1.5, "dtype": "float", "name": "routed_scaling_factor"}
+      ]
+    }
+  ]
+}

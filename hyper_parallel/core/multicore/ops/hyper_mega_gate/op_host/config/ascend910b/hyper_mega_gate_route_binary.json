@@ -1,0 +1,29 @@
+{
+  "op_type": "HyperMegaGateRoute",
+  "dynamicParamMode": "folded_with_desc",
+  "op_list": [
+    {
+      "bin_filename": "HyperMegaGateRoute_aiv_fp32",
+      "inputs": [
+        {"name": "logits", "index": 0, "dtype": "float", "format": "ND", "paramType": "required", "shape": [-2]},
+        {"name": "text_bias", "index": 1, "dtype": "float", "format": "ND", "paramType": "required", "shape": [-2]},
+        {"name": "vision_bias", "index": 2, "dtype": "float", "format": "ND", "paramType": "required", "shape": [-2]},
+        {"name": "image_mask", "index": 3, "dtype": "bool", "format": "ND", "paramType": "required", "shape": [-2]},
+        {"name": "runtime_config", "index": 4, "dtype": "uint8", "format": "ND", "paramType": "required", "shape": [-2]},
+        {"name": "profile_buffer", "index": 5, "dtype": "uint8", "format": "ND", "paramType": "required", "shape": [-2]}
+      ],
+      "outputs": [
+        {"name": "routing_weights", "index": 0, "dtype": "float", "format": "ND", "paramType": "required", "shape": [-2]},
+        {"name": "expert_indices", "index": 1, "dtype": "int64", "format": "ND", "paramType": "required", "shape": [-2]},
+        {"name": "route_scores", "index": 2, "dtype": "float", "format": "ND", "paramType": "required", "shape": [-2]},
+        {"name": "selected_scores", "index": 3, "dtype": "float", "format": "ND", "paramType": "required", "shape": [-2]},
+        {"name": "normalization_denominator", "index": 4, "dtype": "float", "format": "ND", "paramType": "required", "shape": [-2]}
+      ],
+      "attrs": [
+        {"name": "top_k", "dtype": "int", "value": 6},
+        {"name": "routed_scaling_factor", "dtype": "float", "value": 1.5},
+        {"name": "use_vision_bias", "dtype": "bool", "value": false}
+      ]
+    }
+  ]
+}
