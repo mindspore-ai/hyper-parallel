@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>性能拆解报告</title>
+<style>
+  body { font-family: Consolas, "Courier New", monospace; margin: 24px; color: #171c23; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 16px; margin-top: 24px; }
+  table { border-collapse: collapse; margin: 8px 0; }
+  th, td { border: 1px solid #b9c0c8; padding: 4px 12px; text-align: left; }
+  th { background: #edf3fa; }
+  .note { color: #555e68; font-size: 13px; }
+  .todo { color: #a5322e; }
+</style>
+</head>
+<body>
+<h1>性能拆解报告</h1>
+<p class="note">来源 profiling 目录：<code><!--SOURCE--></code></p>
+<p class="note">规则版本：breakdown-dimensions v1。占比为相对值，采集开销不计入真实步时。</p>
+
+<h2>一、计算维度（Cube / Vector / FA / AI_CPU 回退）</h2>
+<table>
+  <tr><th>类别</th><th>耗时(us)</th><th>占比</th></tr>
+  <!--COMPUTE_ROWS-->
+</table>
+<p class="note">AI_CPU 行为回退热点（如整型 ArgSort、scatter_reduce 回退），优先交 perf-playbook 选手段。</p>
+
+<h2>二、步时四维（计算 / 通信未掩盖 / Free / 优化器）</h2>
+<table>
+  <tr><th>维度</th><th>占比</th><th>说明</th></tr>
+  <tr><td>计算</td><td class="todo">[待解析]</td><td>见上表合计</td></tr>
+  <tr><td>通信（未掩盖）</td><td class="todo">[待解析]</td><td>需 step_trace + 通信域→轴映射</td></tr>
+  <tr><td>Free</td><td class="todo">[待解析]</td><td>下发气泡 / 等待</td></tr>
+  <tr><td>优化器更新</td><td class="todo">[待解析]</td><td>优化器段</td></tr>
+</table>
+<p class="note">四维切分需 step_trace 与并行配置；通信域→并行轴映射见 breakdown-dimensions（部分 [待对齐]）。</p>
+
+<h2>三、视角汇总</h2>
+<p class="note">算子视角由上表 Top-N 给出；Module / Layer 视角需 profiler 带 module 标记后补填。</p>
+
+<h2>四、瓶颈与下一步</h2>
+<p>最大可动项（AI_CPU 回退 / 未掩盖通信 / Free 气泡）：<span class="todo">[FILL]</span></p>
+<p class="note">拆解只定位瓶颈；选手段见 perf-playbook skill。</p>
+</body>
+</html>
