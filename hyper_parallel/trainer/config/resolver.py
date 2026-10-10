@@ -632,9 +632,9 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
 
     target_node = dict(node)
     if "dataloader_type" in target_node:
-        raise _fail(f"{path}.dataloader_type", "renamed to sampler_type")
+        raise ConfigResolutionError(f"{path}.dataloader_type", "renamed to sampler_type")
     if "batch_adapter" in target_node:
-        raise _fail(
+        raise ConfigResolutionError(
             f"{path}.batch_adapter",
             "removed by the Omni data lifecycle; use dataset.data_transform for "
             "sample/batch encoding and dataloader.get_batch.runtime_input_adapter "

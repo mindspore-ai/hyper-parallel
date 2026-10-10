@@ -464,6 +464,11 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     )
     num_state_inputs = len(state_flat)
 
+    # ``_fwd_bwd_fn`` communicates the traced ``loss_dict`` key order to the
+    # enclosing scope through this box (plain closure writes cannot escape
+    # the nested ``def``); the keys are attached to the GraphModule below.
+    loss_dict_keys_box: list[str] = []
+
     def _fwd_bwd_fn(*plain_args):
         state_wrapped = plain_args[:num_state_inputs]
         user_wrapped = plain_args[num_state_inputs:]
@@ -476,7 +481,25 @@ def trace_model_graph(  # pylint: disable=too-many-locals
             _reparametrize_train_state(model, state_t["model"]),
             _patch_engine_backward(),
         ):
-            loss = train_fn(model, **user_args)
+            out = train_fn(model, **user_args)
+
+            # ``train_fn`` may return either a bare loss tensor or the
+            # ``(loss, loss_dict)`` pair produced by the trainer's
+            # ``postforward``. The named loss_dict values are emitted as
+            # graph outputs AFTER the gradients so passes that assume
+            # ``output[0] == loss`` and ``output[1:] == grads`` keep working
+            # once they trim the trailing loss_dict outputs.
+            if (
+                isinstance(out, tuple)
+                and len(out) == 2
+                and isinstance(out[1], dict)
+            ):
+                loss, loss_dict = out
+                loss_dict_keys = list(loss_dict.keys())
+                loss_dict_keys_box.extend(loss_dict_keys)
+                loss_dict_values = [loss_dict[key] for key in loss_dict_keys]
+            else:
+                loss, loss_dict_keys, loss_dict_values = out, [], []
 
             # Read params from state_t["model"] so the exact trace-time
             # tensors (not the live module's) drive autograd.grad.
@@ -497,7 +520,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
             else:
                 processed_grads.append(grad)
 
-        return [loss] + processed_grads
+        return [loss] + processed_grads + loss_dict_values
 
     # make_fx only records ``nn_module_stack`` when the traced callable
     # carries ``_orig_mod``: its ``_init_modes_from_inputs`` then installs a
@@ -546,6 +569,11 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     # Kept for ``run_traced_graph`` to validate the runtime inputs' pytree
     # structure against the traced one.
     traced_graph.user_inputs_spec = user_inputs_spec
+    # Key order of the traced ``loss_dict``: its values are emitted as
+    # graph outputs AFTER the gradients, so ``run_traced_graph`` can split
+    # (loss, grads, loss_dict) and passes can trim the trailing loss_dict
+    # outputs off the gradient range.
+    traced_graph.loss_dict_keys = list(loss_dict_keys_box)
 
     param_names = [name for name, _ in model.named_parameters() if _.requires_grad]
     param_shapes = {
@@ -588,8 +616,10 @@ def run_traced_graph(
     leading static inputs (the graph re-gathers them via AllGather each step).
 
     Returns:
-        tuple: (loss, grads) where ``grads`` aligns with the model's
-        trainable parameter list.
+        tuple: (loss, grads, loss_dict) where ``grads`` aligns with the
+        model's trainable parameter list and ``loss_dict`` maps the traced
+        loss names to their graph outputs (empty when ``train_fn`` returned
+        a bare loss tensor).
     """
     model_state = extract_module_state(model)
     if list(model_state.keys()) != joint_graph.state_fqns:
@@ -616,8 +646,20 @@ def run_traced_graph(
     with torch.no_grad():
         outputs = joint_graph.graph_module(*flat_inputs)
 
+    loss_dict_keys = getattr(joint_graph.graph_module, "loss_dict_keys", [])
+    num_loss_outputs = len(loss_dict_keys)
     if isinstance(outputs, (list, tuple)):
-        loss, grads = outputs[0], list(outputs[1:])
+        loss = outputs[0]
+        loss_dict = (
+            dict(zip(loss_dict_keys, outputs[len(outputs) - num_loss_outputs:]))
+            if num_loss_outputs
+            else {}
+        )
+        grads = (
+            list(outputs[1:len(outputs) - num_loss_outputs])
+            if num_loss_outputs
+            else list(outputs[1:])
+        )
     else:
-        loss, grads = outputs, []
-    return loss, grads
+        loss, grads, loss_dict = outputs, [], {}
+    return loss, grads, loss_dict

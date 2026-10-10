@@ -65,6 +65,7 @@ class TextTrainer:
         self.base.model_integration.attach_optimizer(self.base.optimizer)
         self.base._build_lr_scheduler()
         self.base._build_training_context()
+        self.base._build_graph_compiler()
         self.base._init_callbacks()
 
     def _build_model_assets(self) -> None:
@@ -279,7 +280,7 @@ class TextTrainer:
         # optimizer updates.
         self.base.state.global_step += 1
         grad_norm_value = float(grad_norm)
-        self.base._end_model_integration_step(
+        self.base._end_model_integration_step(  # pylint: disable=protected-access
             {"loss": total_loss, "grad_norm": grad_norm_value}
         )
         self.on_step_end(

@@ -86,13 +86,15 @@ class TestGraphTrainerCompile(unittest.TestCase):
             device=torch.device("cpu"),
         )
 
-        loss = tr.train_step(x=torch.randn(2, 4), y=torch.randn(2, 4))
+        loss, loss_dict = tr.train_step(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
         self.assertIsNotNone(
             tr._compiler._joint_graph, "compile should populate the joint graph"
         )
         self.assertIsNotNone(tr.optimizer)
         self.assertIsInstance(loss, torch.Tensor)
+        # A bare-loss ``train_fn`` emits no named loss_dict outputs.
+        self.assertEqual(loss_dict, {})
         # A real forward/backward ran: the model now holds a non-zero grad.
         self.assertIsNotNone(model.weight.grad)
         self.assertGreater(float(model.weight.grad.abs().sum()), 0.0)
