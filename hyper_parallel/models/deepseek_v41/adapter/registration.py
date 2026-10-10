@@ -18,6 +18,9 @@ from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping import (
     register_deepseek_v41_checkpoint_mapping,
 )
+from hyper_parallel.models.deepseek_v41.adapter.ops.fused_lightning_indexer import (
+    register_fused_indexer,
+)
 from hyper_parallel.models.deepseek_v41.adapter.policies.activation_checkpointing import (
     build_recompute_policy,
 )
@@ -80,6 +83,10 @@ DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
     validation=_load_validation_spec,
 )
 register_model_adapter(DEEPSEEK_V41_ADAPTER_SPEC)
+
+# The CSA selection chains live in the shared module; this installs the V4.1
+# fused-operator provider they consult when it is available.
+register_fused_indexer()
 
 
 __all__ = ["DEEPSEEK_V41_ADAPTER_SPEC"]
