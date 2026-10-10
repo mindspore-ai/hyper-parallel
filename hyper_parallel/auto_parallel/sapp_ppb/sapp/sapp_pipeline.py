@@ -158,7 +158,7 @@ class SappPipeline:
         return [[layer_count] * self.num_of_stage_ for _ in range(num_of_interleave)]
 
     def print_yaml_results(self) -> None:
-        """Log the solver output in the MindFormers YAML schema."""
+        """Log the solver output in the pipeline YAML schema."""
 
         for layer in self.layers_sorted_[Layer.type_enum.BODY]:
             nass = self.naive_layer_per_stage(layer.nb_layer_,
