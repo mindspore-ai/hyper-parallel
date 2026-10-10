@@ -102,6 +102,20 @@ bash examples/qwen3_8/launch_1node_8dies.sh \
   --training.train_iters=100
 ```
 
+训练前可按同一 tokenizer、chat template、assistant loss mask 和因果移位口径统计 Decif 长度分布：
+
+```bash
+python examples/qwen3_8/tools/analyze_decif_lengths.py \
+  --data-path "$ONLINE_JSONL" \
+  --tokenizer-path "$MODEL_DIR" \
+  --max-seq-len 32768 \
+  --output-dir ./outputs/decif_length_stats
+```
+
+脚本生成 `decif_length_distribution.png`、逐样本 CSV 和汇总 JSON。`--max-seq-len` 必须与实际训练
+覆盖值一致；默认使用 `enable_thinking=true` 和 `reasoning_effort=medium`。绘图环境缺少 Matplotlib 时，
+先执行 `python -m pip install matplotlib`。
+
 脚本默认使用 8 张 NPU、`MASTER_ADDR=127.0.0.1`、`MASTER_PORT=29500`；可用同名环境变量覆盖。
 它还设置 `HYPER_PARALLEL_PLATFORM=torch`、`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`
 以及 HCCL 超时变量；均可在启动前用环境变量覆盖。YAML 中 FSDP shard size=8、CP=2、TP=1、
