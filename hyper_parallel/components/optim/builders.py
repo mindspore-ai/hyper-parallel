@@ -44,6 +44,7 @@ class AdamW:
             adamw_config: dict,
             model: nn.Module,
             no_decay_params: Optional[List[str]] = None,
+            excluded_param_ids: Optional[Sequence[int]] = None,
     ) -> None:
         """Initialize AdamW optimizer configuration.
 
@@ -59,6 +60,7 @@ class AdamW:
             self.model,
             weight_decay=adamw_config.get("adamw_weight_decay", 1e-2),
             no_decay_params=no_decay_params,
+            excluded_param_ids=excluded_param_ids,
         )
         if not adamw_groups:
             raise ValueError("AdamW requires at least one trainable parameter")
@@ -77,6 +79,7 @@ class AdamW:
             no_decay_params: Optional[Sequence[str]] = None,
             param_groups: Optional[Sequence[Dict[str, Any]]] = None,
             allowed_param_ids: Optional[Sequence[int]] = None,
+            excluded_param_ids: Optional[Sequence[int]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[str]]:
         """Split model parameters into decaying and non-decaying groups.
 
@@ -100,6 +103,7 @@ class AdamW:
             no_decay_params=no_decay_params,
             param_groups=param_groups,
             allowed_param_ids=allowed_param_ids,
+            excluded_param_ids=excluded_param_ids,
         )
 
     def get_optimizer(self) -> Any:
@@ -119,6 +123,7 @@ class Muon:
             model: nn.Module,
             extra_adamw_name_keywords: Optional[List[str]] = None,
             no_decay_params: Optional[List[str]] = None,
+            excluded_param_ids: Optional[Sequence[int]] = None,
     ) -> None:
         """Build a mixed Muon and fallback AdamW runtime for ``model``.
 
@@ -136,6 +141,7 @@ class Muon:
         muon_params, adamw_params, muon_names, adamw_names = self.split_muon_adamw_params(
             model,
             extra_adamw_name_keywords=extra_adamw_name_keywords or (),
+            excluded_param_ids=excluded_param_ids,
         )
         if not muon_params:
             raise ValueError("Muon requires at least one eligible matrix parameter")
@@ -145,6 +151,7 @@ class Muon:
             weight_decay=adamw_config.get("adamw_weight_decay", 1e-2),
             no_decay_params=no_decay_params,
             allowed_param_ids=[id(parameter) for parameter in adamw_params],
+            excluded_param_ids=excluded_param_ids,
         )
 
         logger.info_rank0(
@@ -167,6 +174,7 @@ class Muon:
     def split_muon_adamw_params(
             model: nn.Module,
             extra_adamw_name_keywords: Sequence[str] = (),
+            excluded_param_ids: Optional[Sequence[int]] = None,
     ) -> Tuple[List[nn.Parameter], List[nn.Parameter], List[str], List[str]]:
         """Route matrix parameters to Muon and remaining parameters to AdamW.
 
@@ -184,6 +192,7 @@ class Muon:
         return split_muon_adamw_params(
             model,
             extra_adamw_name_keywords=extra_adamw_name_keywords,
+            excluded_param_ids=excluded_param_ids,
         )
 
     def get_optimizer(self) -> Any:

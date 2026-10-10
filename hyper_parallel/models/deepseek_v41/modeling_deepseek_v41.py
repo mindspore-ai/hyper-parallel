@@ -62,6 +62,7 @@ from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE_NEW_LINE,
     IMAGE_START,
 )
+from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
 from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTower,
@@ -107,6 +108,13 @@ class DeepseekV41Engram(nn.Module):
         """Create the scaled table and the V4.1 gated residual projection."""
         super().__init__()
         self.layer_id = layer_id
+        backend = getattr(config, "engram_storage_backend", "device")
+        if backend not in ("device", "host"):
+            raise ValueError("engram_storage_backend must be 'device' or 'host'")
+        if getattr(config, "engram_host_lookup_impl", None) is not None:
+            raise ValueError("Engram Host lookup implementation selection is unsupported")
+        self.engram_max_pending_entries = int(getattr(config, "engram_max_pending_entries", 1000000))
+        self.engram_max_sparse_rows_per_step = int(getattr(config, "engram_max_sparse_rows_per_step", 1000000))
         self.hidden_size = config.hidden_size
         self.hc_mult = config.hc_mult
         self.eps = config.rms_norm_eps
@@ -139,7 +147,14 @@ class DeepseekV41Engram(nn.Module):
             segment_starts: torch.Tensor | None = None,
             token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply the released hash lookup and gated residual update."""
+        """Apply the released hash lookup and gated residual update.
+
+        Args:
+            hidden_states: Current hidden-state tensor.
+            input_ids: Input token IDs.
+            segment_starts: Segment boundary flags.
+            token_mask: Token validity mask.
+        """
         hash_ids = self.hash_mapping(input_ids, segment_starts, token_mask)
         embeddings = self.embed(hash_ids)
         key_value = self.wkv(embeddings.flatten(start_dim=-2))
@@ -195,6 +210,10 @@ class DeepseekV41TopKRouter(nn.Module):
 
         ``bias`` and ``bias_vl`` select experts only; the gathered routing
         weights intentionally use the unbiased scores, matching V4.1.
+
+        Args:
+            hidden_states: Current hidden-state tensor.
+            image_mask: Image-token mask.
         """
         flattened = hidden_states.reshape(-1, self.hidden_size)
         logits = functional.linear(  # pylint: disable=not-callable
@@ -258,7 +277,12 @@ class DeepseekV41Compressor(nn.Module):
             hidden_states: torch.Tensor,
             compress_position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return unrotated and RoPE-rotated compressed KV tensors."""
+        """Return unrotated and RoPE-rotated compressed KV tensors.
+
+        Args:
+            hidden_states: Current hidden-state tensor.
+            compress_position_embeddings: Compressed positional embeddings.
+        """
         batch_size, sequence_length, _ = hidden_states.shape
         if self.compress_ratio == 1:
             latent = self.norm(self.wkv(hidden_states))
@@ -369,7 +393,11 @@ class DeepseekV41PipelinedHyperConnection(nn.Module):
             self,
             hidden_streams: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute V4.1 pre, post, and residual mixing coefficients."""
+        """Compute V4.1 pre, post, and residual mixing coefficients.
+
+        Args:
+            hidden_streams: Current parallel hidden streams.
+        """
         flattened = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         mix = functional.linear(flattened, self.fn.float())  # pylint: disable=not-callable
         num_stream = self.hc_mult
@@ -528,6 +556,8 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
     @torch.no_grad()
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize backbone state after FSDP has established local shards."""
+        if isinstance(module, HostEngramTable):
+            return
         if isinstance(module, nn.Embedding):
             _initialize_embedding_shard_safe(module, self.config.initializer_range)
             return
@@ -799,6 +829,8 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
     @torch.no_grad()
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize V4.1-only state in addition to the inherited V4 modules."""
+        if isinstance(module, HostEngramTable):
+            return
         if isinstance(module, nn.Embedding):
             _initialize_embedding_shard_safe(module, self.config.initializer_range)
             return
@@ -807,7 +839,11 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
 
     @classmethod
     def from_config(cls, config: Any, **kwargs: Any) -> "DeepseekV41ForCausalLM":
-        """Construct the model from its translated V4.1 configuration."""
+        """Construct the model from its translated V4.1 configuration.
+
+        Args:
+            config: Model configuration.
+        """
         del kwargs
         return cls(config)
 

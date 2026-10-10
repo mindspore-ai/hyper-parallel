@@ -15,6 +15,9 @@
 """Register the DeepSeek-V4.1 model and adapter providers."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import (
+    build_deepseek_v41_external_state,
+)
 from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping import (
     register_deepseek_v41_checkpoint_mapping,
 )
@@ -72,6 +75,7 @@ DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
     model_type="deepseek_v41",
     context_parallel=_load_context_parallel,
     expert_parallel=_load_expert_parallel,
+    external_state=build_deepseek_v41_external_state,
     sharding_rules=build_parameter_sharding_rules,
     fsdp_wrap_modules=get_fsdp_wrap_modules,
     fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,

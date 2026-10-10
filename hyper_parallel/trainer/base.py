@@ -71,6 +71,7 @@ from hyper_parallel.trainer.runtime.logging import setup_logging
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
+from hyper_parallel.models.external_state import get_model_external_state
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
 from hyper_parallel.core.optimizer import (
     ChainedOptimizer,
@@ -501,6 +502,24 @@ class BaseTrainer(Stateful, ABC):
     def _build_optimizer(self) -> None:
         """Build the configured optimizer with the runtime model context."""
         config: TrainerConfig = self.config
+        external = get_model_external_state(self.model)
+        if external is not None:
+            def wrap_dense(dense_raw: Any) -> Any:
+                """Wrap dense parameters in FP32 main and optional state swap.
+
+                Args:
+                    dense_raw: Constructed dense optimizer.
+                """
+                dense = (
+                    Float16OptimizerWithFloat16Params(dense_raw, self.model)
+                    if config.optimizer.fp32_main_params else dense_raw
+                )
+                if config.optimizer.swap.enabled:
+                    dense = _attach_optimizer_swap(dense, config.optimizer.swap)
+                return dense
+
+            self.optimizer = external.build_optimizer(config.optimizer, wrap_dense=wrap_dense)
+            return
         optimizer = config.optimizer.target.build(model=self.model).get_optimizer()
         self.optimizer = (
             Float16OptimizerWithFloat16Params(optimizer, self.model)
@@ -763,7 +782,11 @@ class BaseTrainer(Stateful, ABC):
         self._configure_fsdp_gradient_sync(micro_step, num_micro_steps)
 
     def begin_fsdp_runtime_diagnostics(self, micro_step: int) -> None:
-        """Begin observing one FSDP forward/backward micro-step when enabled."""
+        """Begin observing one FSDP forward/backward micro-step when enabled.
+
+        Args:
+            micro_step: Microbatch index.
+        """
         if self.fsdp_runtime_diagnostics is not None:
             self.fsdp_runtime_diagnostics.begin_micro_step(
                 self.state.global_step,
@@ -783,6 +806,11 @@ class BaseTrainer(Stateful, ABC):
         self.model_integration.after_backward_before_clip()
         self.validate_fsdp_runtime_before_optimizer()
         max_grad_norm = self.config.training.max_grad_norm
+        external = get_model_external_state(self.model)
+        if external is not None:
+            preparation = external.prepare_optimizer_step(max_norm=max_grad_norm)
+            self.model_integration.after_clip(preparation.post_clip_norm)
+            return preparation.global_norm
         grad_norm: Any = 0.0
         post_clip_norm = None
         if max_grad_norm > 0:
@@ -852,7 +880,11 @@ class BaseTrainer(Stateful, ABC):
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        """Execute one optimizer update from the next dataloader batch."""
+        """Execute one optimizer update from the next dataloader batch.
+
+        Args:
+            data_iterator: Training data iterator.
+        """
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self.state.global_step += 1
 

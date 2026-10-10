@@ -190,12 +190,17 @@ probes, memory observations, and checkpoint evidence below `cases/<case>/`.
 `summary.md` is the detailed English report and `summary.zh-CN.md` is its detailed
 Chinese counterpart. Both must state `PASS`, `FAIL`, or `BLOCKED` on line one;
 report disjoint coverage counts; list every case, category, topology, threshold,
-and compared step count; show maximum loss, pre-clip norm, and post-clip norm
-differences; prove input/LR/checkpoint identity; summarize parameter probes and
+and compared step count; identify at least ten consecutive per-step loss and
+pre-clip norm comparisons plus their maxima, and post-clip norm differences when
+recorded; prove input/LR/checkpoint identity; summarize parameter probes and
 optimizer-state comparison policy; distinguish formal deterministic evidence from
 non-replayable Online smoke; include module-parity and exact operator-support
 results; compare performance/memory after warm-up; and document exclusions plus
 diagnostic-only changes.
+
+If the renderer omits the stepwise table, preserve its generated reports and
+write an adjacent evidence appendix linked to the raw `metrics.jsonl` and
+`comparison.json` rows.
 
 Before rendering, require evidence dependency closure: a split-run handoff must
 make its structure findings, module parity, and checkpoint coverage available in
