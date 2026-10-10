@@ -422,6 +422,23 @@ def _hc_post(
     return pipelined_mhc_post(sublayer_output, residual, post, comb)
 
 
+def _identity_residual_mix(reference: torch.Tensor) -> torch.Tensor:
+    """Build a batch-broadcast identity mapping for shifted mHC state."""
+    num_stream = reference.shape[-1]
+    identity = torch.eye(num_stream, dtype=reference.dtype, device=reference.device)
+    view_shape = (1,) * (reference.ndim - 1) + (num_stream, num_stream)
+    return identity.view(view_shape).expand(*reference.shape[:-1], num_stream, num_stream)
+
+
+def _uses_shifted_mhc(layer: nn.Module) -> bool:
+    """Validate and report whether both layer boundaries use the shifted protocol."""
+    attention_shifted = callable(getattr(layer.attn_hc, "advance", None))
+    ffn_shifted = callable(getattr(layer.ffn_hc, "advance", None))
+    if attention_shifted != ffn_shifted:
+        raise RuntimeError("attention and FFN mHC replacements must use the same protocol")
+    return attention_shifted
+
+
 def _v41_decoder_layer_forward(
         self: nn.Module,
         hidden_states: torch.Tensor,
@@ -435,9 +452,63 @@ def _v41_decoder_layer_forward(
         segment_starts: torch.Tensor | None,
         engram_token_mask: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        previous_output: torch.Tensor | None = None,
+        previous_post_mix: torch.Tensor | None = None,
+        previous_residual_mix: torch.Tensor | None = None,
         **kwargs: Any,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     """Run one V4.1 block while preserving the decoder module call boundary."""
+    if _uses_shifted_mhc(self):
+        if previous_output is None or previous_post_mix is None or previous_residual_mix is None:
+            raise ValueError("shifted mHC decoder state is incomplete")
+        if hasattr(self, "engram"):
+            hidden_states = _hc_post(
+                previous_output,
+                hidden_states,
+                previous_post_mix,
+                previous_residual_mix,
+            )
+            hidden_states = self.engram(
+                hidden_states,
+                input_ids,
+                segment_starts,
+                token_mask=engram_token_mask,
+            )
+            previous_output = torch.zeros_like(previous_output)
+            previous_post_mix = torch.zeros_like(previous_post_mix)
+            previous_residual_mix = _identity_residual_mix(pre_mix)
+
+        residual, attention_pre, attention_post, attention_comb, attention_input = self.attn_hc.advance(
+            previous_output,
+            hidden_states,
+            pre_mix,
+            previous_post_mix,
+            previous_residual_mix,
+            self.input_layernorm.weight,
+        )
+        attention_output, _ = self.self_attn(
+            attention_input,
+            position_embeddings=position_embeddings,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            shared_attention_state=shared_attention_state,
+            **kwargs,
+        )
+        residual, ffn_pre, ffn_post, ffn_comb, ffn_input = self.ffn_hc.advance(
+            attention_output,
+            residual,
+            attention_pre,
+            attention_post,
+            attention_comb,
+            self.post_attention_layernorm.weight,
+        )
+        if image_mask is None:
+            ffn_output = self.mlp(ffn_input, input_ids=input_ids)
+        else:
+            ffn_output = self.mlp(ffn_input, input_ids=input_ids, image_mask=image_mask)
+        return ffn_output, residual, ffn_pre, ffn_post, ffn_comb
+
     if hasattr(self, "engram"):
         hidden_states = self.engram(
             hidden_states,
@@ -510,7 +581,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             layer.mlp.gate = DeepseekV41TopKRouter(config)
             if bool(getattr(config, "v41_vision_enabled", False)):
                 layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)
-        for layer_id in assets["layer_ids"]:
+        for layer_id in config.v41_engram_layer_ids:
             self.layers[layer_id].engram = DeepseekV41Engram(config, layer_id, assets)
         self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
@@ -763,20 +834,46 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
         shared_state = SharedAttentionState()
-        for layer in self.layers:
-            hidden_states, pre_mix = layer(
-                hidden_states,
-                pre_mix=pre_mix,
-                input_ids=input_ids,
-                position_embeddings=position_embeddings,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                shared_attention_state=shared_state,
-                segment_starts=segment_start_mask,
-                engram_token_mask=engram_token_mask,
-                image_mask=image_mask,
-                **kwargs,
-            )
+        shifted_mhc_layers = [_uses_shifted_mhc(layer) for layer in self.layers]
+        if any(shifted_mhc_layers) and not all(shifted_mhc_layers):
+            raise RuntimeError("shifted mHC must replace every retained V4.1 boundary")
+        if all(shifted_mhc_layers):
+            previous_output = torch.zeros_like(inputs_embeds)
+            post_mix = torch.zeros_like(pre_mix)
+            residual_mix = _identity_residual_mix(pre_mix)
+            for layer in self.layers:
+                previous_output, hidden_states, pre_mix, post_mix, residual_mix = layer(
+                    hidden_states,
+                    pre_mix=pre_mix,
+                    previous_output=previous_output,
+                    previous_post_mix=post_mix,
+                    previous_residual_mix=residual_mix,
+                    input_ids=input_ids,
+                    position_embeddings=position_embeddings,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    shared_attention_state=shared_state,
+                    segment_starts=segment_start_mask,
+                    engram_token_mask=engram_token_mask,
+                    image_mask=image_mask,
+                    **kwargs,
+                )
+            hidden_states = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
+        else:
+            for layer in self.layers:
+                hidden_states, pre_mix = layer(
+                    hidden_states,
+                    pre_mix=pre_mix,
+                    input_ids=input_ids,
+                    position_embeddings=position_embeddings,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    shared_attention_state=shared_state,
+                    segment_starts=segment_start_mask,
+                    engram_token_mask=engram_token_mask,
+                    image_mask=image_mask,
+                    **kwargs,
+                )
         hidden_states = self.norm(_hc_pre(hidden_states, pre_mix))
         return MoeModelOutputWithPast(last_hidden_state=hidden_states)
 

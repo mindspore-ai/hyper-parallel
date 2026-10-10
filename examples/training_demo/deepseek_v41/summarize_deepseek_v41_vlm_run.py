@@ -62,8 +62,8 @@ def _validate_metrics(rows: list[dict[str, Any]], expected_steps: int | None) ->
     """Require a contiguous, finite training curve."""
     if not rows:
         raise ValueError("the log contains no complete training-step metrics")
-    expected_indices = list(range(len(rows)))
     actual_indices = [int(row["step"]) for row in rows]
+    expected_indices = list(range(actual_indices[0], actual_indices[0] + len(rows)))
     if actual_indices != expected_indices:
         raise ValueError(f"training steps are not contiguous: {actual_indices[:5]} ... {actual_indices[-5:]}")
     if expected_steps is not None and len(rows) != expected_steps:
@@ -130,7 +130,8 @@ def _write_svg(rows: list[dict[str, Any]], output_path: Path) -> None:
         )
     x_labels = []
     for index in range(5):
-        step = round(index * (len(rows) - 1) / 4)
+        row_index = round(index * (len(rows) - 1) / 4)
+        step = int(rows[row_index]["step"])
         x = margin + index * (width - 2 * margin) / 4
         x_labels.append(
             f'<text x="{x:.2f}" y="{height - margin + 28}" text-anchor="middle" '

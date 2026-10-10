@@ -21,7 +21,7 @@ automatically computes task_num / split_dim for every node from their SplitSpec.
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 
@@ -31,6 +31,13 @@ class OpType(Enum):
     GMM         = "gmm"
     SWIGLU      = "swiglu"
     SWIGLU_GRAD = "swiglu_grad"
+    MHC_POST    = "mhc_post"
+    MHC_NORM_CAST = "mhc_norm_cast"
+    MHC_PROJECTION = "mhc_projection"
+    MHC_MAPPING = "mhc_mapping"
+    MHC_INPUT_MIX = "mhc_input_mix"
+    MHC_PIPELINE = "mhc_pipeline"
+    RMS_NORM = "rms_norm"
 
 
 @dataclass
@@ -93,18 +100,30 @@ class OperatorNode:
 class ComputeGraph:
     """Directed acyclic graph describing operator execution order."""
 
-    def __init__(self):
-        self._nodes: dict = {}
-        self._insertion_order: list = []
+    def __init__(self) -> None:
+        """Initialize an empty compute graph."""
+        self._nodes: dict[str, OperatorNode] = {}
+        self._insertion_order: list[str] = []
 
     def add_op(self, op: OperatorNode) -> 'ComputeGraph':
-        """Add an operator node to the graph."""
+        """Add an operator node to the graph.
+
+        Args:
+            op: Operator node to append.
+        """
         self._nodes[op.name] = op
         self._insertion_order.append(op.name)
         return self
 
-    def add_edge(self, src, dst) -> 'ComputeGraph':
-        """src / dst can be an OperatorNode or a name string."""
+    def add_edge(
+        self, src: Union[OperatorNode, str], dst: Union[OperatorNode, str]
+    ) -> 'ComputeGraph':
+        """Connect two operator nodes.
+
+        Args:
+            src: Source node or its registered name.
+            dst: Destination node or its registered name.
+        """
         s = src if isinstance(src, OperatorNode) else self._nodes[src]
         d = dst if isinstance(dst, OperatorNode) else self._nodes[dst]
         s.successors.append(d)
@@ -112,7 +131,11 @@ class ComputeGraph:
         return self
 
     def get_op(self, name: str) -> OperatorNode:
-        """Retrieve an operator node by name."""
+        """Retrieve an operator node by name.
+
+        Args:
+            name: Registered operator name.
+        """
         return self._nodes[name]
 
     def topological_sort(self) -> List[OperatorNode]:
@@ -137,6 +160,9 @@ class ComputeGraph:
 
         Must be called once after graph construction and before any fill loop.
         Resets all TensorSpec split annotations before traversal.
+
+        Args:
+            tsv: Topology values used to resolve split counts.
         """
         for op in self._nodes.values():
             for t in op.inputs + op.outputs:

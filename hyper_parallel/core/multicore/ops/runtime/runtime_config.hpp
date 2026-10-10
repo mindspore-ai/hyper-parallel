@@ -8,8 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef MULTICORE_SCHEDULER_RUNTIME_CONFIG_HPP
-#define MULTICORE_SCHEDULER_RUNTIME_CONFIG_HPP
+#ifndef HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_RUNTIME_CONFIG_HPP_
+#define HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_RUNTIME_CONFIG_HPP_
 
 namespace MulticoreRuntime {
 
@@ -27,8 +27,8 @@ constexpr uint32_t ATOMIC_ADD_VALUE_LEN = 8;
 constexpr uint32_t GROUP_LIST_CACHE_LINE_BYTES = 128;
 static_assert(MAX_EXPERT_NUM_PER_RANK * sizeof(int64_t) % GROUP_LIST_CACHE_LINE_BYTES == 0,
               "Grouped-list worker stride must preserve cache-line alignment.");
-static_assert((GROUP_LIST_CACHE_LINE_BYTES - 1) +
-                  NUM_WORKERS_CUBE * MAX_EXPERT_NUM_PER_RANK * sizeof(int64_t) <= MAX_GROUP_LIST * sizeof(int64_t),
+static_assert((GROUP_LIST_CACHE_LINE_BYTES - 1) + NUM_WORKERS_CUBE * MAX_EXPERT_NUM_PER_RANK * sizeof(int64_t) <=
+                MAX_GROUP_LIST * sizeof(int64_t),
               "Grouped-list scratch slots exceed the runtime-config buffer.");
 
 constexpr uint32_t UB_32B_ALIGN = 32;
@@ -65,6 +65,19 @@ enum class TaskType : uint32_t {
   TASK_GROUPED_MATMUL = 104,
   TASK_SHMEM_PUT_MEM_SIGNAL = 105,
   TASK_SWI_GLU_GRAD = 106,
+  TASK_MHC_POST = 107,
+  TASK_MHC_NORM_CAST = 108,
+  TASK_MHC_PROJECTION = 109,
+  TASK_MHC_MAPPING = 110,
+  TASK_RMS_NORM = 111,
+  TASK_MHC_INPUT_MIX = 112,
+  TASK_RMS_NORM_GRAD = 113,
+  TASK_MHC_GRAD_PREV_A = 114,
+  TASK_MHC_GRAD_MAPPING = 115,
+  TASK_MHC_GRAD_PHI_RMS = 116,
+  TASK_MHC_GRAD_PREV_X_AND_POST = 117,
+  TASK_MHC_POST_GRAD = 118,
+  TASK_MHC_GRAD_PREV_A_AND_MAPPING = 119,
 };
 
 enum class EventType : uint32_t {
@@ -153,6 +166,10 @@ static_assert(sizeof(TensorDesc) == 64);
 static_assert(sizeof(TaskDesc) == 576);
 
 __aicore__ inline uint32_t getTaskNum(__gm__ uint8_t *tiling) { return (*(__gm__ uint32_t *)(tiling)); }
+
+__aicore__ inline uint32_t getNumWorkers(__gm__ uint8_t *tiling) {
+  return (*(__gm__ uint32_t *)(tiling + UINT32_T_SIZE));
+}
 
 __aicore__ inline uint32_t getRuntimeTaskCapacity(__gm__ uint8_t *tiling) {
   return (*(__gm__ uint32_t *)(tiling + 2 * UINT32_T_SIZE));
@@ -339,7 +356,7 @@ __aicore__ inline uint32_t getGroupedMatmulGroupListOffset(__gm__ uint8_t *tilin
 __aicore__ inline uint32_t getGroupedMatmulGroupListOffsetById(__gm__ uint8_t *tiling, uint32_t worker_id) {
   // Each worker must own complete cache lines when publishing its group list.
   const uint32_t aligned_offset = (getGroupedMatmulGroupListOffset(tiling) + GROUP_LIST_CACHE_LINE_BYTES - 1) /
-                                 GROUP_LIST_CACHE_LINE_BYTES * GROUP_LIST_CACHE_LINE_BYTES;
+                                  GROUP_LIST_CACHE_LINE_BYTES * GROUP_LIST_CACHE_LINE_BYTES;
   return aligned_offset + MAX_EXPERT_NUM_PER_RANK * INT64_T_SIZE * worker_id;
 }
 
@@ -390,8 +407,8 @@ __aicore__ inline bool areTaskIndexCountsValid(__gm__ uint8_t *tiling, uint64_t 
 }
 
 // Check byte and index bounds before reading variable-sized arrays.
-__aicore__ inline bool isRuntimeStorageValid(__gm__ uint8_t *tiling, uint64_t runtime_bytes,
-                                             uint64_t event_bytes, uint32_t ep_size = 1) {
+__aicore__ inline bool isRuntimeStorageValid(__gm__ uint8_t *tiling, uint64_t runtime_bytes, uint64_t event_bytes,
+                                             uint32_t ep_size = 1) {
   if (runtime_bytes < sizeof(RuntimeHeader) || runtime_bytes >= RUNTIME_ADDRESS_SPACE_BYTES) {
     return false;
   }
@@ -402,9 +419,8 @@ __aicore__ inline bool isRuntimeStorageValid(__gm__ uint8_t *tiling, uint64_t ru
     return false;
   }
   uint64_t required = sizeof(RuntimeHeader) + events * (INT32_T_SIZE + sizeof(EventDesc)) +
-                      capacity * (sizeof(TaskDesc) + TASK_AICORE_INDEX_TYPE_COUNT * INT32_T_SIZE) +
-                      4 * INT32_T_SIZE + sizeof(DynamicData) + MAX_GROUP_LIST * INT64_T_SIZE +
-                      ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
+                      capacity * (sizeof(TaskDesc) + TASK_AICORE_INDEX_TYPE_COUNT * INT32_T_SIZE) + 4 * INT32_T_SIZE +
+                      sizeof(DynamicData) + MAX_GROUP_LIST * INT64_T_SIZE + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
   return required < RUNTIME_ADDRESS_SPACE_BYTES && runtime_bytes >= required &&
          areTaskIndexCountsValid(tiling, capacity);
 }
@@ -418,4 +434,4 @@ __aicore__ inline void SyncFunc() {
 
 }  // namespace MulticoreRuntime
 
-#endif  // MULTICORE_SCHEDULER_RUNTIME_CONFIG_HPP
+#endif  // HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_RUNTIME_CONFIG_HPP_

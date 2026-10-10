@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from hyper_parallel.data.constants import ONLINE_SPLIT_COUNT
+from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.omni.omni_transform import (
     OmniDataTransform,
     _OmniTransformStrategy,
@@ -29,6 +30,29 @@ from hyper_parallel.data.online import (
     OnlineDataPath,
     build_online_mapping_source,
 )
+
+logger = get_dataset_logger(__name__)
+
+
+def _get_train_valid_test_num_samples(training_config: Any) -> tuple[int, int, int]:
+    """Calculate train, validation, and test sizes from the training plan."""
+    if training_config is None:
+        raise ValueError("Dataset sample planning requires a training configuration")
+
+    global_batch_size = training_config.global_batch_size
+    if training_config.train_iters is not None:
+        train_iters = training_config.train_iters
+    elif training_config.train_samples:
+        train_iters = training_config.train_samples // global_batch_size
+    else:
+        raise ValueError("training.train_iters and training.train_samples cannot both be None")
+
+    train_samples = training_config.train_samples or train_iters * global_batch_size
+    eval_iters = training_config.eval_iters
+    valid_iters = (train_iters // eval_iters + 1) * eval_iters if eval_iters else 0
+    split_sizes = (train_samples, valid_iters * global_batch_size, eval_iters * global_batch_size)
+    logger.debug("Dataset target sizes: train=%d, validation=%d, test=%d", *split_sizes)
+    return split_sizes
 
 
 def build_online_omni_mapping_dataset(
@@ -45,7 +69,7 @@ def build_online_omni_mapping_dataset(
         data_path: Optional local source path, ordered paths, or pre-split
             train/valid/test path mapping.
         transform: Omni sample transform selected by the Trainer.
-        training_config: Training plan providing the random seed.
+        training_config: Training plan providing the random seed and split sizes.
 
     Returns:
         A transformed Online Mapping Dataset or train-valid-test tuple.
@@ -62,12 +86,16 @@ def build_online_omni_mapping_dataset(
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
+    train_valid_test_num_samples = None
+    if training_config is not None:
+        train_valid_test_num_samples = _get_train_valid_test_num_samples(training_config)
 
     sample_filter = transform.is_valid_sample
     source_dataset = build_online_mapping_source(
         data_path=data_path,
         data_config=dataset_config,
         sample_filter=sample_filter,
+        train_valid_test_num_samples=train_valid_test_num_samples,
     )
     transformed_dataset = _OmniMappingDataset.apply(source_dataset, transform)
     return transformed_dataset
