@@ -14,6 +14,8 @@
 # ============================================================================
 """Per-step structured terminal logging callback."""
 
+from __future__ import annotations
+
 import logging
 from typing import Any
 
@@ -48,9 +50,13 @@ class LoggingCallback(Callback):
             return str(value)
 
     @classmethod
-    def _format_message(cls, state: TrainerState, metrics: dict[str, Any]) -> str:
+    def _format_message(cls, state: TrainerState, metrics: dict[str, Any],
+                        total_steps: int | None = None) -> str:
         """Build a deterministic, complete metric line for one optimizer step."""
-        fields = [f"step={state.global_step}", f"epoch={state.epoch}"]
+        fields = [f"step={state.global_step}"]
+        if total_steps is not None:
+            fields.append(f"total_steps={total_steps}")
+        fields.append(f"epoch={state.epoch}")
         fields.extend(
             f"{name}={cls._format_value(value)}"
             for name, value in sorted(metrics.items())
@@ -87,5 +93,5 @@ class LoggingCallback(Callback):
         metrics = getattr(self.trainer, "step_env_metrics", {})
         if not metrics:
             return
-        self._write(self._format_message(state, metrics))
+        self._write(self._format_message(state, metrics, getattr(self.trainer, "train_iters", None)))
         self._last_logged_step = state.global_step

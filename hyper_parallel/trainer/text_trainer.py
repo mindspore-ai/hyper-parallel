@@ -251,7 +251,6 @@ class TextTrainer:
 
         self.on_step_begin()
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
-        synchronize()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
