@@ -29,6 +29,12 @@ from hyper_parallel.components.quantization.functional.w4a8_gmm_func import W4A8
 from hyper_parallel.components.quantization.functional.fake_w4a8_gmm_func import (
     FakeW4A8GroupedLinear,
 )
+from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import (
+    HiFloat8GroupedLinear,
+)
+from hyper_parallel.components.quantization.ops.npu_hifloat8 import (
+    validate_hifloat8_gmm_runtime,
+)
 from hyper_parallel.components.quantization.ops.npu_mxfp8 import validate_npu_gmm_runtime
 from hyper_parallel.components.quantization.ops.npu_w4a8 import validate_w4a8_gmm_runtime
 from hyper_parallel.components.quantization.ops.npu_fake_w4a8 import (
@@ -46,10 +52,9 @@ def build_low_precision_strategy(
     ``config`` is the already-validated dtype scheme (``None`` = default native
     ``mxfp8``/``mxfp8``, i.e. W8A8). Discriminators run in priority order: the
     explicit fake-QAT flag selects the independent fake W4A8 strategy, then
-    format family (only ``mxfp`` is unified; hifloat keeps its original
-    adapter), then the weight/activation bit-width profile derived from
-    ``weight_format``/``act_format``, with its NPU runtime probe and the
-    real-weight tile-alignment check.
+    format family and the weight/activation profile select MXFP8, HiFloat8,
+    or native W4A8 with the corresponding runtime probe. MX strategies also
+    enforce their real-weight tile-alignment contract.
     """
 
     # Replacement factories historically receive the global ``LowPrecisionConfig``
@@ -95,11 +100,24 @@ def build_low_precision_strategy(
                 f"{weight_format!r}/act_format={act_format!r} is not "
                 "implemented; supported: mxfp8/mxfp8 (w8a8), mxfp4/mxfp8 (w4a8)."
             )
+    elif family == "hifloat":
+        if config is not None and config.is_fake_quantize:
+            raise NotImplementedError(
+                "fake HiFloat QAT is not implemented; "
+                f"got weight_format={weight_format!r}/act_format={act_format!r}."
+            )
+        if weight_format == "hif8" and act_format == "hif8":
+            validate_hifloat8_gmm_runtime()
+            return HiFloat8GroupedLinear()
+        raise NotImplementedError(
+            "hifloat combination weight_format="
+            f"{weight_format!r}/act_format={act_format!r} is not implemented; "
+            "supported: hif8/hif8."
+        )
     else:
         raise NotImplementedError(
-            "only the mxfp family is migrated to the unified grouped-linear "
-            f"flow; got weight_format={weight_format!r}/"
-            f"act_format={act_format!r}."
+            "grouped-linear format family is not implemented: "
+            f"weight_format={weight_format!r}/act_format={act_format!r}."
         )
     return strategy
 

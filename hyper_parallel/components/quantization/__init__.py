@@ -20,6 +20,7 @@ from hyper_parallel.components.quantization.config import (
 )
 from hyper_parallel.components.quantization.functional import (
     GroupedLinear,
+    LinearStrategy,
     W4A8GroupedLinear,
     FakeW4A8GroupedLinear,
     build_low_precision_strategy,
@@ -42,12 +43,7 @@ from hyper_parallel.components.quantization.ops import (
 )
 from hyper_parallel.components.quantization.modules import (
     GroupedExperts,
-    HiFloat8GroupedExperts,
-    HiFloat8Linear,
-    MXFP8Linear,
-    QuantizedLinearBase,
-    replace_hifloat8_linear,
-    replace_mxfp8_linear,
+    LowPrecisionLinear,
 )
 from hyper_parallel.components.quantization.quantizers import (
     HiFloat8Quantizer,
@@ -68,8 +64,6 @@ from hyper_parallel.components.quantization.tensor import (
 )
 
 __all__ = [
-    "HiFloat8GroupedExperts",
-    "HiFloat8Linear",
     "HiFloat8NpuOps",
     "HiFloat8Quantizer",
     "HiFloat8Tensor",
@@ -77,8 +71,8 @@ __all__ = [
     "LowPrecisionConfig",
     "LowPrecisionDtypeScheme",
     "LowPrecisionCapabilityError",
+    "LinearStrategy",
     "GroupedExperts",
-    "MXFP8Linear",
     "MXFP8NpuOps",
     "MXFP8Quantizer",
     "MXFP8Tensor",
@@ -95,7 +89,7 @@ __all__ = [
     "FakeW4A8Quantizer",
     "GroupedLinear",
     "build_low_precision_strategy",
-    "QuantizedLinearBase",
+    "LowPrecisionLinear",
     "QuantizedTensor",
     "QuantizedTensorStorage",
     "Quantizer",
@@ -106,6 +100,4 @@ __all__ = [
     "transform_grouped_scale",
     "validate_w4a8_gmm_runtime",
     "validate_fake_w4a8_gmm_runtime",
-    "replace_hifloat8_linear",
-    "replace_mxfp8_linear",
 ]
