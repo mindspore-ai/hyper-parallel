@@ -86,6 +86,10 @@ plan_overrides:
     replace_module:
       _target_: >-
         hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+      # This recipe exercises post-training candidate pools, which the fused
+      # path does not support. Enable only for ordinary causal r1/r2 training
+      # with supported head dimensions/counts (see the replacement docstring).
+      use_fused_ops: false
   - match: "*.self_attn"
     tp_divide_attrs: [num_groups]
   - match: "*.self_attn"
