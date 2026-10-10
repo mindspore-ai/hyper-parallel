@@ -22,12 +22,24 @@ Model hyperparameters are resolved with the same Transformers
 ``AutoConfig.from_pretrained`` path used by AutoModels. Legacy
 ``model.config_overrides`` remains supported for standalone search configs.
 
-Expected YAML structure::
+Expected YAML structure.  Only two things are required: the checkpoint to
+read the dimensions from, and the training sequence length::
 
     model:
       _target_: hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained
       pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
-      torch_dtype: bfloat16
+      torch_dtype: bfloat16          # optional, default bfloat16
+
+    dataset:
+      data_transform:
+        max_seq_len: 4096            # or the legacy data.max_seq_len
+                                     # absent: the model's CONTEXT LIMIT is
+                                     # costed, which is rarely what you meant
+
+Everything below is optional, and on the search path it is ignored: the
+search varies these dimensions itself, and the device count, the batch size
+and the memory budget come from ``-d``, ``-b`` and ``-M`` (or from the
+search config).  Give them only to cost one fixed strategy::
 
     training:
       global_batch_size: 4
@@ -42,6 +54,13 @@ Expected YAML structure::
 
     activation_checkpoint:
       mode: full
+
+    context:
+      max_device_memory: "64GB"
+      device_num: 64
+
+``model.config_overrides`` stays supported for standalone search configs,
+and wins over anything read from the checkpoint.
 """
 # pylint: disable=too-many-locals,too-many-statements,too-many-branches
 import logging
@@ -50,6 +69,7 @@ from typing import Any, Dict
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
     CWrap,
     check_and_apply_custom_hook,
@@ -62,6 +82,31 @@ from hyper_parallel.auto_parallel._hf_model_spec import (
 
 logger = logging.getLogger(__name__)
 
+# Every field a linear-attention group sets. A full-attention group restores
+# them, because the memory and communication estimates apply layer hooks in
+# place, one layer after another, rather than on a copy per group.
+_LINEAR_ATTN_FIELDS = (
+    "a", "dh", "n_kv", "attn_output_gate", "n_attBMM", "n_softmax",
+    "n_headCast", "n_linrec", "attn_extra_p",
+    "lin_n_k", "lin_d_k", "lin_n_v", "lin_d_v", "lin_conv",
+)
+
+
+def _declared(ccfg: Any, name: str) -> Any:
+    """Return *name* as set on *ccfg*, else its class default, else 0.
+
+    Reading through ``CostModelConfig.__getattr__`` would return the same 0
+    for an unset field, but with a warning for every layer.
+    """
+    held = vars(ccfg)
+    return held[name] if name in held else getattr(type(ccfg), name, 0)
+
+
+def _restore_full_attention(ccfg: Any) -> None:
+    """Put back the attention fields a linear group displaced, if any."""
+    ccfg.attn_kind = "full"
+    for name, value in (getattr(ccfg, "full_attn", None) or {}).items():
+        setattr(ccfg, name, value)
 
 
 def custom_vision_tower(ccfg: Any) -> None:
@@ -136,7 +181,7 @@ class CostModelParserHyperV2(_CostModelParser):
         self.config_optimizer_shard(self.ccfg)
         self.config_comm_flag(self.ccfg)
         self._init_shard()
-        self.ccfg.layer_custom_config = [(self.ccfg.n_lay + self.ccfg.n_mtp, None)]
+        self._init_layer_stack()
         self._init_offset()
         self.ccfg.overwrite_eval_functions = {}
 
@@ -156,6 +201,14 @@ class CostModelParserHyperV2(_CostModelParser):
             self._model_section(), self._visual_seq_len_override()
         )
         self._vision_spec = spec.pop("vision", None)
+        self._layer_types = spec.get("layer_types") or []
+        self._linear_attn = {
+            "n_k": self._spec_int(spec, "linear_num_key_heads"),
+            "d_k": self._spec_int(spec, "linear_key_head_dim"),
+            "n_v": self._spec_int(spec, "linear_num_value_heads"),
+            "d_v": self._spec_int(spec, "linear_value_head_dim"),
+            "conv": self._spec_int(spec, "linear_conv_kernel_dim"),
+        }
         self._apply_spec(self.ccfg, spec)
         self._resolve_device_capacity()
 
@@ -207,6 +260,8 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.dc_kv = self._spec_int(spec, "kv_lora_rank")
         ccfg.dc_q = self._spec_int(spec, "q_lora_rank")
         ccfg.dhr = self._spec_int(spec, "qk_rope_head_dim")
+        # Qwen3.5 fuses the output gate into q_proj, doubling its width.
+        ccfg.attn_output_gate = bool(spec.get("attn_output_gate", False))
 
     def _apply_moe_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
         """Map dense defaults and optional MoE fields."""
@@ -245,6 +300,94 @@ class CostModelParserHyperV2(_CostModelParser):
         ccfg.is_mtp_in_offset = bool(ccfg.n_mtp)
         ccfg.multiple_of = self._spec_int(spec, "multiple_of", 256)
         ccfg.fdm = float(spec.get("ffn_dim_multiplier", 1.0) or 1.0)
+
+    # -- Layer stack ----------------------------------------------------
+
+    def _init_layer_stack(self, ccfg: Any = None) -> None:
+        """Group the body layers by attention flavour.
+
+        A hybrid model (Qwen3.5) states its stack in ``layer_types``. Without
+        it every layer is priced as full attention, which charges the
+        quadratic score term on layers that have no score matrix at all.
+        The MTP layers inherit the flavour of the last body group.
+        """
+        ccfg = ccfg if ccfg is not None else self.ccfg
+        total = int(ccfg.n_lay + ccfg.n_mtp)
+        kinds = [str(k) for k in self._layer_types[: int(ccfg.n_lay)]]
+        if not kinds or len(set(kinds)) <= 1 and "linear" not in "".join(kinds):
+            ccfg.layer_custom_config = [(total, None)]
+            return
+
+        groups = []
+        for kind in kinds:
+            if groups and groups[-1][0] == kind:
+                groups[-1][1] += 1
+            else:
+                groups.append([kind, 1])
+        groups[-1][1] += int(ccfg.n_mtp)
+
+        ccfg.layer_custom_config = [
+            (count, self._layer_hook(kind)) for kind, count in groups
+        ]
+        logger.info(
+            "layer stack: %s",
+            ", ".join(f"{count}x{kind}" for kind, count in groups),
+        )
+
+    def _layer_hook(self, kind: str):
+        """Return the hook that gives one layer group its attention flavour.
+
+        Same contract as the arch hooks: the memory backbone calls it with an
+        evaluator, the performance path with a bare config.
+        """
+        linear = dict(self._linear_attn)
+
+        def apply(lccfg: Any) -> None:
+            """Give *lccfg* this group's attention flavour."""
+            if "linear" not in kind:
+                _restore_full_attention(lccfg)
+                return
+            if not (linear["n_v"] and linear["d_v"] and linear["d_k"]):
+                logger.warning(
+                    "layer_types declares %s but the config carries no linear "
+                    "attention dimensions; costing it as full attention", kind,
+                )
+                _restore_full_attention(lccfg)
+                return
+            if getattr(lccfg, "full_attn", None) is None:
+                lccfg.full_attn = {
+                    name: _declared(lccfg, name) for name in _LINEAR_ATTN_FIELDS
+                }
+            lccfg.attn_kind = "linear"
+            for name, value in linear.items():
+                setattr(lccfg, "lin_" + name, value)
+            # Map the flavour onto the q/k/v/o formula: the value heads carry
+            # the q-side width, the key heads the kv-side, and the gate
+            # projection is exactly a second q-wide tensor.
+            lccfg.a = linear["n_v"]
+            lccfg.dh = linear["d_v"]
+            lccfg.n_kv = linear["n_k"] * linear["d_k"] / linear["d_v"]
+            lccfg.attn_output_gate = True
+            # A recurrent layer keeps no score matrix, so none of the terms
+            # that scale with s^2 exist on it.
+            lccfg.n_attBMM = 0
+            lccfg.n_softmax = 0
+            lccfg.n_headCast = 0
+            lccfg.n_linrec = 1
+            # Short convolution over the projected stream, plus the two
+            # per-head gates the delta rule needs.
+            qkv_width = 2 * linear["n_k"] * linear["d_k"] + linear["n_v"] * linear["d_v"]
+            lccfg.attn_extra_p = linear["conv"] * qkv_width + 2 * lccfg.h * linear["n_v"]
+
+        def hook(e: Any) -> None:
+            """Apply the flavour through an evaluator or a bare config."""
+            # A bare config has to be wrapped; hasattr cannot tell, because a
+            # missing attribute on a Config resolves to 0 rather than raising.
+            if isinstance(e, CostModelConfig):
+                e = CWrap(e)
+            e.set_ccfg(apply)
+
+        return hook
 
     # -- Multimodal ----------------------------------------------------
 
@@ -300,7 +443,7 @@ class CostModelParserHyperV2(_CostModelParser):
         cc.model_name = name
         cc.rec_op = Config(dict(self.ccfg.rec_op.__dict__))
         cc.overwrite_eval_functions = dict(self.ccfg.overwrite_eval_functions)
-        cc.layer_custom_config = [(cc.n_lay + cc.n_mtp, None)]
+        self._init_layer_stack(cc)
         cc.offset = self._even_offset()
         return cc
 

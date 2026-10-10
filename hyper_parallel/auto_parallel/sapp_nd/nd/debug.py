@@ -21,6 +21,7 @@ from enum import Enum, auto
 from pathlib import Path
 from functools import partial
 from math import isnan, sqrt
+from typing import Optional
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -30,6 +31,27 @@ from scipy.stats import pearsonr
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
+
+
+# Where the CSVs and the plots go. Defaults to a directory beside this file,
+# which is unwritable in an installed package and mixes consecutive runs
+# together, so ``run_nd -o`` overrides it.
+_OUTPUT_DIR = None
+
+
+def set_output_dir(path: Optional[str]) -> None:
+    """Send the debug artifacts to *path* instead of the package directory."""
+    global _OUTPUT_DIR  # pylint: disable=global-statement
+    _OUTPUT_DIR = str(path) if path else None
+    if _OUTPUT_DIR:
+        os.makedirs(_OUTPUT_DIR, exist_ok=True)
+
+
+def output_dir() -> str:
+    """Return the directory the debug artifacts are written to."""
+    if _OUTPUT_DIR:
+        return _OUTPUT_DIR
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
 
 class PerfParts(Enum):
@@ -115,11 +137,7 @@ class Debug:
         if self.enable:
             self.parallel_dimensions = parallel_dimensions
             self.info = {p: 0 for p in info_type}
-            self.output_file = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "output",
-                output_file,
-            )
+            self.output_file = os.path.join(output_dir(), output_file)
 
     def is_enabled(self):
         """Check whether debugging is enabled"""
