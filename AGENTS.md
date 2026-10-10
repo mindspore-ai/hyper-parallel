@@ -148,6 +148,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
 | **hf-model-integration** | Integrate HF-native or HF-component custom models through model-owned adapters | model onboarding / functional bring-up |
 | **hf-model-precision-validation** | Validate module parity and distributed numerical self-consistency | model numerical acceptance / diagnosis |
+| **cluster-debug** | Read-only multi-rank failure diagnosis: per-rank logs/plog/py-spy, first real error, fault classes | 集群调试 / HCCL 超时 / 多卡挂死 |
 
 ### Commands
 
