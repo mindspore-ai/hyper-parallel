@@ -175,10 +175,19 @@ class JointGraph:
 
 
 def extract_module_state(mod: nn.Module) -> Dict[str, torch.Tensor]:
-    """Return a merged dict of the module's named parameters and buffers."""
+    """Return a merged dict of the module's named parameters and buffers.
+
+    Tied tensors (e.g. an ``lm_head.weight`` sharing storage with
+    ``embed_tokens.weight``) are DEDUPLICATED to a single entry: the graph
+    threads each unique tensor as one static input, so emitting one entry per
+    alias would double the placeholder count, duplicate every FSDP collective,
+    and make ``torch.autograd.grad`` return (and the compiler add) the same
+    gradient once per alias. The missing aliases are re-materialized only for
+    tracing, via ``_reparametrize_train_state``'s ``tie_weights=True``.
+    """
     return {
-        **dict(mod.named_parameters(remove_duplicate=False)),
-        **dict(mod.named_buffers(remove_duplicate=False)),
+        **dict(mod.named_parameters(remove_duplicate=True)),
+        **dict(mod.named_buffers(remove_duplicate=True)),
     }
 
 
@@ -191,9 +200,17 @@ def _reparametrize_train_state(
 
     Inside the traced function this swaps in the fake/static tensors so every
     parameter access in the model goes through the graph's static inputs.
+
+    ``tie_weights=True`` re-adds, for the duration of the trace, the alias
+    keys that ``extract_module_state`` deduplicated — mapping each alias to
+    the SAME static tensor. Both tied uses then reference one ``fx.Node``, so
+    the traced graph keeps a single placeholder (and a single gradient) for
+    the shared tensor instead of a baked-in ``get_attr`` constant.
     """
     with contextlib.ExitStack() as stack:
-        stack.enter_context(stateless._reparametrize_module(module, model_state))
+        stack.enter_context(
+            stateless._reparametrize_module(module, model_state, tie_weights=True)
+        )
         yield
 
 

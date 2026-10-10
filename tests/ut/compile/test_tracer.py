@@ -23,7 +23,11 @@ Covers the tracer end-to-end, which the pass-level tests bypass:
    ``torch.autograd.grad`` on the live model.
 3. Buffers are marked non-param (``state_is_param[i] is False``) so FSDP never
    all-gathers them -- the property the FSDP pass depends on.
-4. ``extract_module_state`` merges parameters and buffers.
+4. ``extract_module_state`` merges parameters and buffers, deduplicating tensors
+   tied across several FQNs to a single entry.
+5. Tied weights (an alias shared by two modules) trace to ONE placeholder and
+   ONE gradient — never a baked-in ``get_attr`` constant, and never a
+   doubled gradient — because the alias is re-materialized only for tracing.
 
 Running under stock torch (no ``torch.compiler._patch_engine_backward``) still
 captures the joint graph; the patcher warning is suppressed during the trace.
@@ -160,6 +164,58 @@ class TestRunTracedGraph(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             run_traced_graph(joint, model, {"x": x, "y": y})
         self.assertIn("different parameter/buffer names", str(ctx.exception))
+
+
+class _TiedEmbedding(nn.Module):
+    """Embedding whose weight is tied to the output projection's weight."""
+
+    def __init__(self) -> None:
+        """Tie ``lm.weight`` to ``emb.weight`` (one shared tensor)."""
+        super().__init__()
+        self.emb = nn.Embedding(10, 4)
+        self.lm = nn.Linear(4, 10, bias=False)
+        self.lm.weight = self.emb.weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Embed then project back to vocab logits using the shared weight."""
+        return self.lm(self.emb(x))
+
+
+class TestTiedWeights(unittest.TestCase):
+    """Tied parameters trace to one placeholder and one undoubled gradient."""
+
+    def test_tied_weight_one_placeholder_and_full_gradient(self):
+        """Test the deduped alias is one static input with the full gradient.
+
+        Without dedup the same tensor is flattened once per FQN, so the graph
+        carries two placeholders and FSDP later inserts two collectives; and a
+        naive ``remove_duplicate=True`` (without ``tie_weights``) would bake the
+        second use in as a ``get_attr`` constant instead. The tracer must land
+        in the middle: one placeholder, no ``get_attr``, and the shared weight's
+        gradient equal to autograd's full (not doubled) gradient.
+        """
+        torch.manual_seed(0)
+        model = _TiedEmbedding()
+        x = torch.randint(0, 10, (2, 3))
+        y = torch.randn(2, 3, 10)
+
+        joint, loss, grads = _trace_and_run(
+            model, lambda m, x, y: ((m(x) - y) ** 2).mean(), x, y
+        )
+        gm = joint.graph_module
+        self.assertEqual(joint.state_fqns, ["emb.weight"])
+        self.assertEqual(gm.num_state_inputs, 1)
+        self.assertEqual(
+            [n for n in gm.graph.nodes if n.op == "get_attr"],
+            [],
+            "the tied alias must not be baked in as a get_attr constant",
+        )
+        self.assertEqual(len(grads), 1, "one shared weight -> one gradient")
+
+        ref_loss = ((model(x) - y) ** 2).mean()
+        ref_grad = torch.autograd.grad(ref_loss, [model.emb.weight])[0]
+        self.assertTrue(torch.isclose(loss, ref_loss, atol=1e-5).item())
+        self.assertTrue(torch.allclose(grads[0], ref_grad, atol=1e-5))
 
 
 class TestExtractModuleState(unittest.TestCase):
