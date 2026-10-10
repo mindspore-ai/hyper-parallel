@@ -251,10 +251,10 @@ class FSDP2Manager:
                 child_fqn = f"{container_fqn}.{child_name}" if container_fqn else child_name
                 if is_inside_declared_subtree(child_fqn):
                     continue
-                blocks = list(child.children())
-                if not blocks:
+                blocks = list(child.named_children())
+                if len(blocks) < 2 or len({type(block) for _, block in blocks}) != 1:
                     continue
-                for block_index, block in enumerate(blocks):
+                for block_name, block in blocks:
                     if id(block) in wrapped_module_ids:
                         continue
                     wrapped_module_ids.add(id(block))
@@ -263,9 +263,7 @@ class FSDP2Manager:
                         # The wrapper and its direct child represent one logical
                         # transformer block during module-tree traversal.
                         wrapped_module_ids.add(id(wrapped_module))
-                    wrap_modules.append(
-                        _WrapModuleInfo(f"{child_fqn}.{block_index}", block)
-                    )
+                    wrap_modules.append(_WrapModuleInfo(f"{child_fqn}.{block_name}", block))
         return wrap_modules, wrapped_module_ids
 
     def _find_expert_wrap_modules(

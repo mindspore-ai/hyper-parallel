@@ -80,6 +80,20 @@ class _EPDispatch:
     receive_counts: list[int]
 
 
+@dataclass(frozen=True)
+class _NpuTokenDispatch:
+    """Prepared tensors and split metadata for NPU token dispatch."""
+
+    states: torch.Tensor
+    unpermute_indices: torch.Tensor
+    send_counts: list[int]
+    receive_counts: list[int]
+    local_expert_counts: torch.Tensor
+    received_chunk_sizes: list[int]
+    source_to_expert_order: list[int]
+    expert_to_source_order: list[int]
+
+
 def resolve_swiglu_weights(
     experts: Any,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
@@ -285,6 +299,17 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
     return output
 
 
+def _local_expert_major_forward(experts, dispatched_states, local_expert_counts):
+    """Run grouped experts for an already expert-major token stream."""
+    grouped_forward = getattr(experts, "forward_expert_major", None)
+    if not callable(grouped_forward):
+        raise TypeError(
+            f"{type(experts).__name__}: NPU token dispatch requires "
+            "experts.forward_expert_major"
+        )
+    return grouped_forward(dispatched_states, local_expert_counts)
+
+
 def _get_global_expert_count(module):
     """Return the model-level routed expert count for an MoE module."""
     if hasattr(module.experts, "num_experts"):
@@ -305,6 +330,7 @@ def bind_local_expert_forward(
     ep_size: int,
     use_grouped_gemm: bool = False,
     apply_gate: Optional[Callable] = None,
+    use_npu_moe_token_dispatch: bool = False,
 ) -> None:
     """Install the local expert compute entry used by TP-extend-EP.
 
@@ -314,6 +340,8 @@ def bind_local_expert_forward(
     point) so nested FSDP hooks unshard/reshard around the local SwiGLU
     computation. ``apply_gate`` supplies model-specific fused gate/up
     semantics when the default activation-times-up rule is insufficient.
+    ``use_npu_moe_token_dispatch`` selects expert-major grouped computation
+    for the NPU token permute/unpermute path.
     """
     global_expert_count = _get_global_expert_count(module)
     if global_expert_count % ep_size != 0:
@@ -337,6 +365,15 @@ def bind_local_expert_forward(
             )
     if apply_gate is not None and use_grouped_gemm:
         raise ValueError("custom expert gate activation is not supported by grouped GEMM")
+    if use_npu_moe_token_dispatch and not use_grouped_gemm:
+        raise ValueError("NPU token dispatch requires grouped GEMM")
+    if use_npu_moe_token_dispatch and not callable(
+        getattr(module.experts, "forward_expert_major", None)
+    ):
+        raise TypeError(
+            f"{type(module.experts).__name__}: NPU token dispatch requires "
+            "experts.forward_expert_major"
+        )
     # ``_ep_*`` is the contract the local compute path reads back off the module's
     # experts child; setting them here is the point of the binder.
     # pylint: disable=protected-access
@@ -346,7 +383,158 @@ def bind_local_expert_forward(
     # The forward write itself lives in the forward rewriter (05 §15.2.3:
     # the single MethodType/assignment site); this binder only sets the
     # companion attributes above.
-    _install_bound_forward(module.experts, _local_swiglu_expert_forward)
+    local_forward = (
+        _local_expert_major_forward
+        if use_npu_moe_token_dispatch
+        else _local_swiglu_expert_forward
+    )
+    _install_bound_forward(module.experts, local_forward)
+
+
+def _npu_moe_token_permute(
+    tokens: torch.Tensor,
+    indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load the optional NPU fused permutation only when requested."""
+    from hyper_parallel.components.functional.moe_token_permute import (  # pylint: disable=C0415
+        moe_token_permute,
+    )
+
+    return moe_token_permute(tokens, indices)
+
+
+def _npu_moe_token_unpermute(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    probabilities: torch.Tensor,
+) -> torch.Tensor:
+    """Load the optional NPU fused unpermutation only when requested."""
+    from hyper_parallel.components.functional.moe_token_unpermute import (  # pylint: disable=C0415
+        moe_token_unpermute,
+    )
+
+    return moe_token_unpermute(permuted_tokens, sorted_indices, probabilities)
+
+
+def _reorder_variable_chunks(
+    tensor: torch.Tensor,
+    chunk_sizes: list[int],
+    order: list[int],
+) -> torch.Tensor:
+    """Reorder variable-length chunks without changing rows within a chunk."""
+    chunks = tensor.split(chunk_sizes, dim=0)
+    return torch.cat([chunks[index] for index in order], dim=0)
+
+
+def _prepare_npu_token_dispatch(
+    hidden_states: torch.Tensor,
+    topk_indices: torch.Tensor,
+    *,
+    local_expert_count: int,
+    global_expert_count: int,
+    ep_size: int,
+    ep_rank: int,
+    ep_group: Any,
+) -> _NpuTokenDispatch:
+    """Permute tokens with the NPU fused op and prepare EP split metadata."""
+    flattened_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    local_counts = _expert_token_counts(topk_indices, global_expert_count)
+    global_counts = torch.empty(
+        (ep_size, global_expert_count),
+        dtype=local_counts.dtype,
+        device=local_counts.device,
+    )
+    dist.all_gather_into_tensor(global_counts, local_counts, group=ep_group)
+
+    expert_start = ep_rank * local_expert_count
+    expert_end = expert_start + local_expert_count
+    received_counts_by_source = global_counts[:, expert_start:expert_end]
+    send_counts = local_counts.reshape(ep_size, local_expert_count).sum(dim=1).tolist()
+    receive_counts = received_counts_by_source.sum(dim=1).tolist()
+    local_expert_counts = received_counts_by_source.sum(dim=0)
+    received_chunk_sizes = received_counts_by_source.reshape(-1).tolist()
+    source_to_expert_order = [
+        source * local_expert_count + expert
+        for expert in range(local_expert_count)
+        for source in range(ep_size)
+    ]
+    expert_to_source_order = [
+        expert * ep_size + source
+        for source in range(ep_size)
+        for expert in range(local_expert_count)
+    ]
+    permuted_states, unpermute_indices = _npu_moe_token_permute(
+        flattened_states,
+        topk_indices.to(torch.int32),
+    )
+    return _NpuTokenDispatch(
+        states=permuted_states,
+        unpermute_indices=unpermute_indices,
+        send_counts=send_counts,
+        receive_counts=receive_counts,
+        local_expert_counts=local_expert_counts,
+        received_chunk_sizes=received_chunk_sizes,
+        source_to_expert_order=source_to_expert_order,
+        expert_to_source_order=expert_to_source_order,
+    )
+
+
+def _npu_token_dispatch_forward(
+    module: Any,
+    hidden_states: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    ep_group: Any,
+) -> torch.Tensor:
+    """Run NPU fused token permutation around EP all-to-all and experts."""
+    ep_size = ep_group.size()
+    ep_rank = dist.get_rank(group=ep_group)
+    local_expert_count = module.experts.local_expert_count
+    global_expert_count = local_expert_count * ep_size
+    dispatch = _prepare_npu_token_dispatch(
+        hidden_states,
+        topk_indices,
+        local_expert_count=local_expert_count,
+        global_expert_count=global_expert_count,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        ep_group=ep_group,
+    )
+    received_states = ep_all_to_all(
+        dispatch.states,
+        dispatch.send_counts,
+        dispatch.receive_counts,
+        ep_group,
+    )
+    expert_major_states = _reorder_variable_chunks(
+        received_states,
+        dispatch.received_chunk_sizes,
+        dispatch.source_to_expert_order,
+    )
+    expert_major_outputs = module.experts(
+        expert_major_states,
+        dispatch.local_expert_counts,
+    )
+    source_major_outputs = _reorder_variable_chunks(
+        expert_major_outputs,
+        [
+            dispatch.received_chunk_sizes[index]
+            for index in dispatch.source_to_expert_order
+        ],
+        dispatch.expert_to_source_order,
+    )
+    combined_outputs = ep_all_to_all(
+        source_major_outputs.contiguous(),
+        dispatch.receive_counts,
+        dispatch.send_counts,
+        ep_group,
+    )
+    output = _npu_moe_token_unpermute(
+        combined_outputs,
+        dispatch.unpermute_indices,
+        topk_weights.to(combined_outputs.dtype),
+    )
+    return output.view_as(hidden_states)
 
 
 def _resolve_capacity_factor(module: Any) -> Optional[float]:
@@ -1000,12 +1188,35 @@ def _chunked_ep_forward(
     )
 
 
+def _run_npu_token_dispatch(
+    module: Any,
+    hidden_states: torch.Tensor,
+    routing: tuple[torch.Tensor, torch.Tensor],
+    ep_group: Any,
+    chunk_count: int,
+) -> torch.Tensor:
+    """Validate and run the optional NPU token dispatcher."""
+    if chunk_count > 1:
+        raise ValueError("NPU token dispatch does not support HP_EP_DISPATCH_CHUNKS > 1")
+    if _resolve_capacity_factor(module) is not None:
+        raise ValueError("NPU token dispatch does not support expert capacity limits")
+    topk_indices, topk_weights = routing
+    return _npu_token_dispatch_forward(
+        module,
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        ep_group,
+    )
+
+
 def ep_routed_forward(
     module: Any,
     hidden_states: torch.Tensor,
     *,
     router_fn: Callable,
     ep_group: Any,
+    use_npu_moe_token_dispatch: bool = False,
 ) -> torch.Tensor:
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
@@ -1016,17 +1227,10 @@ def ep_routed_forward(
     accuracy_fix_plan.md §3). There is no ``tp_group`` parameter: if the
     caller invokes a nested-boundary submodule (e.g. ``module.shared_expert``),
     that submodule's own boundary performs its TP communication — the
-    **nested-boundary call contract**:
-
-    1. the input is the parent local region's current logical local layout;
-    2. the nested boundary exclusively owns its parameter layout and its TP
-       communication (entry/exit via its own PrecompiledBoundary);
-    3. the return value is already the nested boundary's out_dst logical
-       layout (e.g. under SP: the complete per-token values of the local
-       sequence chunk);
-    4. the caller MUST NOT repeat any compensating collective
-       (all-reduce / reduce-scatter / all-gather) on the returned value
-       over the nested boundary's mesh.
+    **nested-boundary call contract**: the nested boundary receives the
+    parent's local layout, exclusively owns its parameter layout and TP
+    communication, and returns its declared out_dst layout. The caller MUST
+    NOT repeat a compensating collective over the nested boundary's mesh.
 
     Communication flow (isomorphic to Megatron token_dispatcher.py
     MoEAlltoAllTokenDispatcher):
@@ -1048,6 +1252,10 @@ def ep_routed_forward(
     collective of the step with no independent work to hide behind -- gets the
     chunk GEMMs to overlap with.  Default 1 keeps the unchunked schedule.
 
+    ``use_npu_moe_token_dispatch`` replaces the generic sort/index-add routing
+    with NPU token permute/unpermute. It requires grouped GEMM and currently
+    excludes chunked dispatch and expert capacity limits.
+
     Extended EP group = the ep axis of the derived expert mesh (flatten
     ep_size consecutive ranks: first span the TP group, then extend to
     adjacent dp/cp ranks; MindSpeed TP-extend-EP / Megatron etp=1 + ep
@@ -1065,7 +1273,10 @@ def ep_routed_forward(
     chunk_count = _resolve_dispatch_chunks(ep_size)
 
     output_shape = tuple(hidden_states.shape)
-    topk_indices, topk_weights = router_fn(module, hidden_states)  # [T, K]
+    routing = router_fn(module, hidden_states)  # pair of [T, K] tensors
+    if use_npu_moe_token_dispatch:
+        return _run_npu_token_dispatch(module, hidden_states, routing, ep_group, chunk_count)
+    topk_indices, topk_weights = routing
     dispatch = _prepare_ep_dispatch(
         hidden_states,
         topk_indices,
