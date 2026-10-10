@@ -19,7 +19,7 @@ from tests.common.parallel_case import parallel_run, TorchCase
 _TEST_CP_SD = "_test_cp_optim_state_dict.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_cp_optim_state_dict_group1():
     """
@@ -35,7 +35,7 @@ def test_cp_optim_state_dict_group1():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_cp_optim_state_dict_group2():
     """
