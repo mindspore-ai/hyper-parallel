@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>显存拆解报告</title>
+<style>
+  body { font-family: Consolas, "Courier New", monospace; margin: 24px; color: #171c23; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 16px; margin-top: 24px; }
+  table { border-collapse: collapse; margin: 8px 0; }
+  th, td { border: 1px solid #b9c0c8; padding: 4px 12px; text-align: left; }
+  th { background: #edf3fa; }
+  .note { color: #555e68; font-size: 13px; }
+  .todo { color: #a5322e; }
+</style>
+</head>
+<body>
+<h1>显存拆解报告</h1>
+<p class="note">来源快照：<code><!--SOURCE--></code></p>
+<p class="note">规则版本：breakdown-dimensions v1。</p>
+
+<h2>一、总量与碎片</h2>
+<table>
+  <tr><th>项</th><th>MiB</th></tr>
+  <tr><td>Reserved（保留）</td><td><!--RESERVED--></td></tr>
+  <tr><td>Active（已分配）</td><td><!--ACTIVE--></td></tr>
+  <tr><td>碎片（Reserved − Active）</td><td><!--FRAG--></td></tr>
+</table>
+<p class="note">碎片远大于 0 且 inactive 块多而碎 → 碎片严重，考虑分配器策略 / 预热分配。</p>
+
+<h2>二、峰值构成（Top 常驻块，Tensor 粒度）</h2>
+<table>
+  <tr><th>大小(MiB)</th><th>归因（调用点 / module）</th></tr>
+  <!--TOP_BLOCKS-->
+</table>
+<p class="note">按 size 降序；归因来自分配调用栈。"unclassified" 表示快照未带调用栈或未解析。</p>
+
+<h2>三、静/动态 × 阶段</h2>
+<table>
+  <tr><th>维度</th><th>MiB</th><th>说明</th></tr>
+  <tr><td>静态（参数/优化器/常驻）</td><td class="todo">[待解析]</td><td>需调用栈归类</td></tr>
+  <tr><td>动态（激活/临时）</td><td class="todo">[待解析]</td><td>前向分配反向释放</td></tr>
+  <tr><td>峰值阶段</td><td class="todo">[待解析]</td><td>前向末/反向初常见</td></tr>
+</table>
+<p class="note">静/动态与阶段切分需带调用栈的快照；部分口径 [待对齐]。</p>
+
+<h2>四、激活按 module 与重算收益</h2>
+<p class="note">每 module 激活占用 + 细粒度重算可省显存排序：<span class="todo">[待解析]</span>（需 module 归类）。选是否重算交 perf-playbook。</p>
+
+<h2>五、结论</h2>
+<p>峰值 / 碎片 / 泄露：<span class="todo">[FILL]</span></p>
+<p class="note">本报告定位显存问题；选手段（重算/swap/offload）见 perf-playbook skill。</p>
+</body>
+</html>
