@@ -53,6 +53,7 @@ class TrainerConfig:
 
     lr_scheduler: Optional[Target[Any]] = None
     loss_fn: Optional[Target[Any]] = None
+    flops_estimator: Optional[Target[Any]] = None
     # Final floating-point dtype after model weights are loaded or initialized
     # from scratch. None preserves the dtype produced by the initialization path.
     model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None
