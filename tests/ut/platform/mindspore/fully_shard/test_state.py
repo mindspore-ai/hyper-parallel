@@ -272,6 +272,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
                     self._check_deferred_all_reduce(replicate_param, reduce_op)
 
     def _check_deferred_all_reduce(self, replicate_param, reduce_op):
+        """Reduce four micro-batches per step and assert one all-reduce per step."""
         state = _make_state()
         state.reduce_op_type = reduce_op
         state._needs_overlap_post_backward_steps = MagicMock(return_value=False)
@@ -915,6 +916,102 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         state.reduce_op_type = ops.ReduceOp.AVG
         state.set_reduce_op_type("sum")
         self.assertEqual(state._resolve_reduce_op(), ops.ReduceOp.SUM)
+
+
+class _FakeMesh:
+    def __init__(self, names):
+        self.mesh_dim_names = tuple(names)
+
+    def to_hash(self):
+        return (self.mesh_dim_names,)
+
+
+def _make_owned_state(mesh_names):
+    state = _make_state()
+    state._pending_owner_key = _FakeMesh(mesh_names).to_hash()
+    state._drain_any_owner = False
+    return state
+
+
+def _make_meshed_param(fqn, mesh_names):
+    param = MagicMock()
+    param._param_fqn = fqn
+    param.mesh_info = SimpleNamespace(mesh=_FakeMesh(mesh_names))
+    param.all_reduce_output.return_value = MagicMock()
+    param.reduce_scatter_output.return_value = MagicMock()
+    param.apply_reduced_grad.return_value = False
+    return param
+
+
+class TestPendingQueueOwnership(MindSporeFullyShardUnitTest):
+    """Pending reductions are drained by the unit on the same communication domain."""
+
+    def test_drain_skips_pending_of_a_foreign_mesh(self):
+        """
+        Feature: owner-filtered gradient drain
+        Description: A nested unit on another mesh must not drain the layer's pending work
+        Expectation: only same-mesh entries are consumed, the rest stay queued in order
+        """
+        HSDPState.pre_all_reduce_params.clear()
+        state = _make_owned_state(("dp_replicate", "fsdp"))
+        mine = _make_meshed_param("layers.1.alpha_pre", ("dp_replicate", "fsdp"))
+        foreign = _make_meshed_param("layers.2.alpha_pre", ("edp_replicate", "efsdp"))
+        HSDPState.pre_all_reduce_params.extend([(mine, ms.float32), (foreign, ms.float32)])
+
+        state.reduce_params()
+
+        mine.all_reduce_output.assert_called_once_with()
+        mine.apply_reduced_grad.assert_called_once()
+        foreign.all_reduce_output.assert_not_called()
+        self.assertEqual(HSDPState.pre_all_reduce_params, [(foreign, ms.float32)])
+        HSDPState.pre_all_reduce_params.clear()
+
+    def test_drain_all_owners_sweeps_the_tail_of_nested_chains(self):
+        """
+        Feature: end-of-backward sweep
+        Description: The last unit of a nested chain has no same-mesh successor
+        Expectation: drain_all_owners() still consumes it so no gradient is lost
+        """
+        HSDPState.pre_all_reduce_params.clear()
+        state = _make_owned_state(("dp_replicate", "fsdp"))
+        tail = _make_meshed_param("layers.0.mlp.experts.alpha_pre", ("edp_replicate", "efsdp"))
+        HSDPState.pre_all_reduce_params.append((tail, ms.float32))
+
+        with state_mod.drain_all_owners(state):
+            state.reduce_params()
+
+        tail.all_reduce_output.assert_called_once_with()
+        self.assertEqual(HSDPState.pre_all_reduce_params, [])
+
+    def test_fused_group_is_owner_tagged_and_filtered(self):
+        """
+        Feature: owner-filtered fused all-reduce groups
+        Description: Groups carry the communication domain of their creating unit
+        Expectation: a group from another mesh is left for its own domain to drain
+        """
+        HSDPState.pre_reduce_scatter_params.clear()
+        MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
+        state = _make_owned_state(("dp_replicate", "fsdp"))
+        mine = SimpleNamespace(owner_key=state._pending_owner_key, hsdp_params=[])
+        foreign = SimpleNamespace(
+            owner_key=_FakeMesh(("edp_replicate", "efsdp")).to_hash(), hsdp_params=[])
+        MindSporeHSDPStateV2.pre_all_reduce_groups.extend([mine, foreign])
+
+        self.assertEqual(state._wait_prev_reduce_scatter(), [mine])
+        self.assertEqual(MindSporeHSDPStateV2.pre_all_reduce_groups, [foreign])
+        MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
+
+    def test_stable_split_keeps_relative_order(self):
+        """
+        Feature: ordered queue partition
+        Description: Filtering must not rotate the shared queue
+        Expectation: both partitions keep the original relative order
+        """
+        queue = [("a", 1), ("b", 2), ("a", 3), ("c", 4), ("a", 5)]
+        owned = state_mod._take_owned_entries(queue, lambda entry: entry[0] == "a")
+        self.assertEqual(owned, [("a", 1), ("a", 3), ("a", 5)])
+        self.assertEqual(queue, [("b", 2), ("c", 4)])
+
 
 if __name__ == "__main__":
     unittest.main()
