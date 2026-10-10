@@ -58,11 +58,17 @@ class AcceleratorConfig:
 
 @dataclass
 class ActivationCheckpointSelection:
-    """Select adapter-declared safe recompute regions and exact layer coverage.
+    """Select adapter-declared recompute regions and exact layer coverage.
 
     ``layer_count`` selects the contiguous prefix ``[0, layer_count)`` from
     the flattened layer-container order. ``layer_indices`` selects explicit
     zero-based entries from that same order.
+
+    ``model_adapter_safe_regions`` wraps the outermost module matching the
+    adapter's ``region_patterns`` inside every selected layer and keeps every
+    ``exclude_patterns`` descendant outside the replay. Which shape that
+    produces is the model's declaration, not the Trainer's: leaf patterns give
+    one region per submodule, a layer pattern gives one region per layer.
     """
 
     source: Literal["default", "model_adapter_safe_regions"] = "default"

@@ -37,14 +37,30 @@ from typing import Any, Callable, Optional
 class RecomputePolicy:
     """Model-owned activation-checkpoint regions used by normal training.
 
-    Cross-layer state producers must be excluded from whole-module replay.
-    The adapter therefore declares checkpoint-safe submodules independently
-    from optional model-integration validation metadata. Layer coverage is
-    selected independently through the Trainer's activation-checkpoint config.
+    One declaration covers both region shapes a model may need:
+
+    * ``region_patterns`` names the modules that become checkpoint regions. The
+      outermost match inside every selected layer is used, so a pattern set of
+      leaf submodules keeps one region per submodule while a layer pattern wraps
+      the whole layer and saves a single copy of the layer input.
+    * ``exclude_patterns`` names descendants that must stay outside the replay.
+      This is the only supported way to keep a cross-layer state producer or
+      consumer inside a checkpointed region, because replaying it would publish
+      state twice and re-issue collectives.
+
+    A module may not be a region root and an excluded descendant at the same
+    time, and an excluded module may not contain a region root. Layer coverage
+    is selected independently through the Trainer's activation-checkpoint
+    config.
+
+    ``on_applied`` lets a model enable runtime behaviour that is only valid once
+    its excluded descendants stay outside replay, for example releasing
+    cross-layer state as soon as its last consumer has read it.
     """
 
-    safe_module_patterns: tuple[str, ...]
-    no_replay_module_patterns: tuple[str, ...] = ()
+    region_patterns: tuple[str, ...]
+    exclude_patterns: tuple[str, ...] = ()
+    on_applied: Optional[Callable[[Any], None]] = None
 
 
 @dataclass(frozen=True)

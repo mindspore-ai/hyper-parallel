@@ -56,6 +56,9 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedDSAIndexer,
     build_sliding_window_indices as _window_indices,
 )
+from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
+    build_shared_state_release_plan,
+)
 from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE,
     IMAGE_END,
@@ -687,6 +690,23 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         ).unsqueeze(0)
         return (local_positions == segment_start_positions).expand_as(input_ids)
 
+    def _shared_state_release_plan(self) -> dict:
+        """Return the cached cross-layer state release schedule for this config.
+
+        The schedule is only derived when the trainer enabled it, which happens
+        when CSA2 attention is excluded from replay. A replayed consumer would
+        otherwise ask for state that has already been released.
+        """
+        plan = getattr(self, "_cached_state_release_plan", None)
+        if plan is None:
+            plan = (
+                build_shared_state_release_plan(self.config)
+                if getattr(self.config, "v41_release_consumed_shared_state", False)
+                else {}
+            )
+            self._cached_state_release_plan = plan
+        return plan
+
     def forward(
             self,
             input_ids: torch.LongTensor | None = None,
@@ -762,7 +782,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
-        shared_state = SharedAttentionState()
+        shared_state = SharedAttentionState(release_plan=self._shared_state_release_plan())
         for layer in self.layers:
             hidden_states, pre_mix = layer(
                 hidden_states,
