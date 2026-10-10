@@ -222,6 +222,17 @@ lazily created optimizer state expose one consistent logical global layout.
    plan so the precision stage can run the declared replacement, CP, and EP A/B
    experiments.
 
+## Deliverables and Report
+
+Beyond the adapter itself, a migration ships what lets someone else run it:
+checkpoint conversion, the training recipe, launch and test scripts, and the
+migration report. Requirements and check points for each are in
+[references/migration-deliverables.md](references/migration-deliverables.md);
+the report is written from `templates/migration-report.md`. Precision
+numbers follow `rules/precision-acceptance.md`; performance and memory
+breakdowns come from the `profiling` and `memory-analysis` skills and are
+cited rather than re-derived.
+
 ## Completion Gate
 
 The integration is complete only when model construction and registration remain
