@@ -223,10 +223,12 @@ class VLMTrainer:
             training_batches.append(self.base.get_batch(data_iterator))
 
         self.on_step_begin(
-            micro_batches=[model_inputs for model_inputs, _ in training_batches]
+            micro_batches=[
+                {**model_inputs, "token_count": count_loss_token(loss_inputs)["foundation_tokens"]}
+                for model_inputs, loss_inputs in training_batches
+            ]
         )
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
-        synchronize()
 
         total_loss, total_loss_dict = self._forward_backward_micro_batches(
             training_batches,

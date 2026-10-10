@@ -464,6 +464,9 @@ class TextParallelBatch:
             "labels": parallel_batch["labels"],
             "loss_mask": parallel_batch["loss_mask"],
         }
+        if self.attention_runtime.reset_mask:
+            # Packed geometry belongs to accounting, not the model forward signature.
+            loss_inputs["cu_seq_lens"] = parallel_batch["cu_seq_lens"]
         if self.labels_are_shifted:
             loss_inputs["shift_labels"] = parallel_batch["labels"]
 
