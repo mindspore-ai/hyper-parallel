@@ -59,7 +59,14 @@ logger = logging.getLogger(__name__)
 
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
-IS_NPU_AVAILABLE = torch_npu is not None and torch.npu.is_available()
+# ``torch_npu`` can be importable yet leave ``torch.npu`` unregistered
+# (an x86 CI host with the wheel installed but no CANN runtime), so probe
+# the attribute before touching it.
+IS_NPU_AVAILABLE = (
+    torch_npu is not None
+    and getattr(torch, "npu", None) is not None
+    and torch.npu.is_available()
+)
 
 if IS_NPU_AVAILABLE:
     torch.npu.config.allow_internal_format = False

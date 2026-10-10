@@ -136,3 +136,81 @@
 # 24. DSA functional exports are resolved lazily by components.functional;
 #     pylint cannot infer that the exported operator proxies are callable.
 "hyper-parallel/hyper_parallel/components/modules/dsa_attention.py"        "not-callable"
+
+# 25. Codegen package — importing hyper_parallel.codegen must not pull
+#     torch/transformers (import-time isolation), so backend imports stay
+#     lazy per the AGENTS.md convention; the runtime deliberately binds
+#     _hp_* attributes on client modules; emitter-facing helpers keep
+#     native signatures (some formals unused by design); rank/config probing
+#     falls back defensively when the environment is not initialized.
+"hyper-parallel/hyper_parallel/codegen/"                                 "import-outside-toplevel"
+"hyper-parallel/hyper_parallel/codegen/"                                 "protected-access"
+"hyper-parallel/hyper_parallel/codegen/"                                 "unused-argument"
+"hyper-parallel/hyper_parallel/codegen/"                                 "broad-exception-caught"
+
+# 26. Codegen integration seams — shared native files touched by the codegen
+#     branch for the same reasons as above (architecture introspection,
+#     native-signature hooks, __dir__ dunder export).
+"hyper-parallel/hyper_parallel/distributed/_builder/applier.py"          "protected-access"
+"hyper-parallel/hyper_parallel/models/_transformers/model_builder.py"    "unused-argument"
+"hyper-parallel/hyper_parallel/components/modules/__init__.py"           "invalid-name"
+#     auto_model.from_pretrained keeps the master-era ``backend`` passthrough
+#     parameter for signature compatibility; the backend is resolved
+#     internally from force_hf/codegen.
+"hyper-parallel/hyper_parallel/models/_transformers/auto_model.py"     "unused-argument"
+
+# 27. Codegen tests — contract tests target the _hp_* installation seams on
+#     purpose; fakes keep the native signatures (some formals unused by
+#     design); _-prefixed formals mark intentionally unused arguments;
+#     test-local imports run after monkeypatching or inside fixtures; the
+#     toggle test executes generated source by design.
+"hyper-parallel/tests/codegen/"                                        "protected-access"
+"hyper-parallel/tests/codegen/"                                        "unused-argument"
+"hyper-parallel/tests/codegen/"                                        "import-outside-toplevel"
+"hyper-parallel/tests/codegen/"                                        "invalid-name"
+"hyper-parallel/tests/codegen/"                                        "redefined-outer-name"
+"hyper-parallel/tests/codegen/"                                        "reimported"
+"hyper-parallel/tests/codegen/"                                        "wrong-import-position"
+"hyper-parallel/tests/codegen/"                                        "exec-used"
+"hyper-parallel/tests/codegen/"                                        "consider-using-from-import"
+
+# 28. Codegen reference artifacts — machine-generated modeling bundles
+#     committed as generation examples (header banner + the verbatim
+#     copied upstream source + the inline parallel patches).  The copied
+#     source keeps the upstream module name, docstrings, import layout
+#     and line lengths; hand edits would break the sha256 recorded in
+#     codegen_meta.json, so the gate filter is the seam for these.
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "line-too-long"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "invalid-name"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "unused-import"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "missing-module-docstring"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "missing-class-docstring"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "missing-function-docstring"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "useless-import-alias"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "reimported"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "consider-using-from-import"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "import-outside-toplevel"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "wrong-import-position"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "wrong-import-order"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "ungrouped-imports"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "function-redefined"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "unused-argument"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "protected-access"
+"hyper-parallel/examples/training_demo/qwen3_moe/generated/" "possibly-used-before-assignment"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "line-too-long"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "invalid-name"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "unused-import"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "missing-module-docstring"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "missing-class-docstring"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "missing-function-docstring"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "useless-import-alias"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "reimported"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "consider-using-from-import"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "import-outside-toplevel"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "wrong-import-position"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "wrong-import-order"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "ungrouped-imports"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "function-redefined"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "unused-argument"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "protected-access"
+"hyper-parallel/examples/training_demo/deepseek_v41/generated/" "possibly-used-before-assignment"

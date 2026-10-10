@@ -22,3 +22,12 @@ hyper-parallel/hyper_parallel/components/functional/kimi_delta_attention.py:forw
 hyper-parallel/hyper_parallel/components/functional/kimi_delta_attention.py:backward
 hyper-parallel/hyper_parallel/components/functional/_triton/kimi_delta_attention/state_summary.py:kda_split_state_summary_kernel
 hyper-parallel/hyper_parallel/components/functional/_triton/kimi_delta_attention/state_summary.py:kda_state_grad_ext_kernel
+hyper-parallel/hyper_parallel/codegen/check/preflight.py:verify_boundary_forms
+hyper-parallel/hyper_parallel/codegen/emit/modeling.py:rewrite_relative_imports
+hyper-parallel/hyper_parallel/codegen/inline/meta_plan.py:_strip_ep_sub_boundaries
+hyper-parallel/hyper_parallel/codegen/meta.py:validate_meta_schema
+hyper-parallel/hyper_parallel/codegen/plan/boundary_forms.py:classify_boundary_form
+hyper-parallel/hyper_parallel/codegen/runtime.py:hp_install_boundaries
+hyper-parallel/hyper_parallel/distributed/expert_parallel/structure.py:detect_router_kind
+hyper-parallel/hyper_parallel/models/_transformers/auto_model.py:_build_model
+hyper-parallel/hyper_parallel/models/_transformers/model_builder.py:_init_model

@@ -181,6 +181,15 @@ class ModuleShardingSpec:
     # ── Boundary flag ──
     is_boundary: bool = True
 
+    # Codegen source-lowering opt-out: set by meta normalization (NOT the
+    # planner) after freeze, when the boundary's class is shared with a
+    # non-boundary instance — a class-level forward rewrite would leak the
+    # boundary body into instances that never receive ``_hp_boundary``.
+    # The runtime per-instance wrapper executes the same boundary contract
+    # instead.  ``None`` (absent) is the only unmarked state; only an
+    # explicit ``True`` crosses the meta boundary (int_truthy freeze kind).
+    skip_source_lowering: Optional[bool] = None
+
     # ── Structural flags (user-configurable) ──
     # ┌─────────────────────────────────────────────────────────────────┐
     # │ The user extension-point interfaces: region_dispatch /           │

@@ -40,7 +40,14 @@ class CroppedQwen3MoeOptions:
         peft_config: Optional Trainer-provided PEFT configuration.
         compile_config: Optional Trainer-provided compile configuration.
         activation_checkpoint: Activation checkpoint mode.
+        activation_checkpoint_selection: Trainer-injected selection of
+            checkpoint-safe submodules; forwarded to the build pipeline.
+        swap_inputs: Trainer-injected activation-swap input flag.
+        model_init_dtype: Trainer-injected parameter initialization dtype.
         activation_swap: Activation swap mode.
+        codegen: Select the codegen ``gen`` backend for this build.
+        codegen_config: Trainer config carrying the codegen settings; forwarded
+            so the artifact bundle can be prepared from the config identity.
     """
 
     num_hidden_layers: int = 4
@@ -52,7 +59,12 @@ class CroppedQwen3MoeOptions:
     peft_config: Any | None = None
     compile_config: CompileConfig | dict[str, Any] | None = None
     activation_checkpoint: str | None = None
+    activation_checkpoint_selection: Any | None = None
+    swap_inputs: bool = False
+    model_init_dtype: str | None = None
     activation_swap: str = "none"
+    codegen: bool = False
+    codegen_config: Any | None = None
 
 
 def _resolve_build_options(
@@ -142,5 +154,10 @@ def build_cropped_qwen3_moe(
         validate_placement=options.validate_placement,
         compile_config=options.compile_config,
         activation_checkpoint=options.activation_checkpoint,
+        activation_checkpoint_selection=options.activation_checkpoint_selection,
+        swap_inputs=options.swap_inputs,
         activation_swap=options.activation_swap,
+        model_init_dtype=options.model_init_dtype,
+        codegen=options.codegen,
+        codegen_config=options.codegen_config,
     )

@@ -595,6 +595,44 @@ def _rewrap_local_outputs(output, spec, mesh, mesh_dim_names, module_name):
     return items[0]
 
 
+def rewrap_declared_outputs(output, entries, mesh, *, label):
+    """Re-wrap declared local-region outputs with their ``out_src`` layout.
+
+    The codegen-runtime counterpart of :func:`_rewrap_local_outputs`:
+    ``InstalledBoundary.rewrap_outputs`` calls this with placements it
+    pre-resolved from the frozen plan at install time, so the forward-path
+    work is a plain replay.  ``None`` and already-DTensor items pass through.
+    """
+    is_sequence = isinstance(output, (tuple, list))
+    items = list(output) if is_sequence else [output]
+    for index, out_name, placements in entries:
+        if index >= len(items):
+            raise ValueError(
+                f"{label}: out_src maps output {out_name!r} to index "
+                f"{index}, but forward returned only {len(items)} output(s)"
+            )
+        item = items[index]
+        if item is None or isinstance(item, DTensor):
+            continue
+        if not isinstance(item, torch.Tensor):
+            raise TypeError(
+                f"{label}: declared output {out_name!r} at index "
+                f"{index} must be a Tensor or None, got {type(item).__name__}"
+            )
+        items[index] = DTensor.from_local(item, mesh, tuple(placements))
+
+    if isinstance(output, tuple):
+        return tuple(items)
+    if isinstance(output, list):
+        return items
+    if len(items) != 1:
+        raise ValueError(
+            f"{label}: scalar forward output cannot satisfy "
+            f"{len(entries)} declared out_src entries"
+        )
+    return items[0]
+
+
 def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
                                *, validate_mode=False, compute_fn=None,
                                exclude_subtrees=()):
@@ -1068,9 +1106,18 @@ def _wrap_vocab_parallel_embedding(module, tp_mesh):
     interval [lo, hi) are zeroed and indices are shifted by the offset, so the
     output is naturally a Partial contribution and the boundary exit's
     Partial->Shard(1) reduction is unchanged.
+
+    The interval must come from the *local* vocab shard. The applier reaches
+    this after the Phase C one-shot ``_local_params_context`` unwrap (plain
+    local parameter), but a caller may install the boundary while the weight
+    is still a DTensor -- ``DTensor.shape`` is the global shape and would give
+    a wrong interval -- so the local shard is read explicitly.
     """
     original_forward = module.forward
-    v_local = module.weight.shape[0]
+    weight = module.weight
+    to_local = getattr(weight, "to_local", None)
+    local_weight = to_local() if callable(to_local) else weight
+    v_local = local_weight.shape[0]
     lo = tp_mesh.get_local_rank() * v_local
     hi = lo + v_local
 
