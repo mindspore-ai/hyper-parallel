@@ -148,6 +148,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
 | **hf-model-integration** | Integrate HF-native or HF-component custom models through model-owned adapters | model onboarding / functional bring-up |
 | **hf-model-precision-validation** | Validate module parity and distributed numerical self-consistency | model numerical acceptance / diagnosis |
+| **knowledge-retrieval** | Answer from the repo: search rules/docs/code/tests, rank by authority, cite the source | 知识检索 / 查文档 / 这个报错是什么 |
 
 ### Commands
 
