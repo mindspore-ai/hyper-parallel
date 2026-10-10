@@ -21,13 +21,16 @@ import textwrap
 import unittest
 
 
+
 import hyper_parallel.core.optimizer as opt
+from tests.common.mark_utils import arg_mark
 
 
-_LAZY_NAMES = ("AdamW", "Muon", "ChainedOptimizer", "detect_dtensor_backend")
+_LAZY_NAMES = ("AdamW", "Muon", "Sinkhorn", "ChainedOptimizer", "detect_dtensor_backend")
 _TORCH_ONLY_MODULES = (
     "hyper_parallel.core.optimizer.adamw",
     "hyper_parallel.core.optimizer.muon",
+    "hyper_parallel.core.optimizer.sinkhorn",
     "hyper_parallel.core.optimizer.optimizer",
     "hyper_parallel.core.optimizer.dtensor_compat",
     "hyper_parallel.core.optimizer.utils",
@@ -56,6 +59,8 @@ def _run_isolated(script: str) -> subprocess.CompletedProcess:
 class TestLazyOptimizerExports(unittest.TestCase):
     """Torch-only optimizer symbols stay off the eager import path until accessed."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_lazy_names_are_mapped(self):
         """
         Feature: optimizer lazy export map
@@ -65,6 +70,8 @@ class TestLazyOptimizerExports(unittest.TestCase):
         for name in _LAZY_NAMES:
             self.assertIn(name, opt._LAZY_EXPORTS)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_swap_api_stays_eager(self):
         """
         Feature: SwapOptimizer eager export
@@ -76,6 +83,8 @@ class TestLazyOptimizerExports(unittest.TestCase):
             self.assertNotIn(name, opt._LAZY_EXPORTS)
             self.assertIsNotNone(getattr(opt, name))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_unknown_attribute_still_raises(self):
         """
         Feature: optimizer ``__getattr__`` unknown name
@@ -85,6 +94,8 @@ class TestLazyOptimizerExports(unittest.TestCase):
         with self.assertRaises(AttributeError):
             getattr(opt, "NotAnOptimizerSymbol")
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_getattr_resolves_and_caches_torch_symbols(self):
         """
         Feature: optimizer lazy getattr identity
@@ -101,6 +112,8 @@ class TestLazyOptimizerExports(unittest.TestCase):
         self.assertIs(Muon, DirectMuon)
         self.assertIs(ChainedOptimizer, DirectChained)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_importing_package_does_not_load_torch_optimizer_modules(self):
         """
         Feature: optimizer package import without torch-only modules
@@ -127,6 +140,8 @@ class TestLazyOptimizerExports(unittest.TestCase):
         result = _run_isolated(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr + result.stdout)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_accessing_adamw_loads_torch_optimizer_modules(self):
         """
         Feature: optimizer AdamW lazy load

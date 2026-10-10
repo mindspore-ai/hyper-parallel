@@ -283,7 +283,7 @@ class TestOptimizerContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_module_all(self):
-        """optim package and mixed_precision_optimizer ``__all__`` stay unchanged."""
+        """Optimizer exports include the composed and Sinkhorn builders."""
         from hyper_parallel.components import optim
         from hyper_parallel.components.optim import mixed_precision_optimizer
 
@@ -291,9 +291,11 @@ class TestOptimizerContracts(unittest.TestCase):
             optim.__all__,
             [
                 "AdamW",
+                "ComposedOptimizer",
                 "Float16OptimizerWithFloat16Params",
                 "MixedPrecisionOptimizer",
                 "Muon",
+                "Sinkhorn",
                 "MultiLRScheduler",
                 "get_adamw_param_groups",
                 "get_parameter_names",

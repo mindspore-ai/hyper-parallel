@@ -16,6 +16,7 @@
 """Muon optimizer with HSDP shard-group-aware communication."""
 
 import math
+import re
 from collections.abc import Callable, Iterable
 from collections import defaultdict
 from dataclasses import dataclass
@@ -123,7 +124,18 @@ def zeropower_via_newtonschulz5(
         epsilon: float = 1e-10,
         ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
 ) -> torch.Tensor:
-    """Newton-Schulz orthogonalization with preallocated matmul buffers."""
+    """Newton-Schulz orthogonalization with preallocated matmul buffers.
+
+    Args:
+        ns_inputs: Matrix or batch of matrices to orthogonalize.
+        steps: Number of polynomial iterations.
+        ns_variant: Polynomial coefficient schedule.
+        epsilon: Stabilizer for input normalization.
+        ns_coefficients: Explicit coefficients for the custom schedule.
+
+    Returns:
+        Orthogonalized matrices with the original shape.
+    """
     mat_x = ns_inputs
     transposed = ns_inputs.size(-2) > ns_inputs.size(-1)
     if transposed:
@@ -176,7 +188,16 @@ def compute_muon_slice_scale(
         matched_adamw_rms: float,
         zero_rms_scale_mode: str = "zero",
 ) -> float:
-    """Compute Muon scale from the logical matrix dims of a reshaped slice."""
+    """Compute Muon scale from the logical matrix dims of a reshaped slice.
+
+    Args:
+        slice_tensor: Orthogonalized matrix or matrix batch.
+        matched_adamw_rms: Target update RMS coefficient.
+        zero_rms_scale_mode: Behavior when the RMS coefficient is zero.
+
+    Returns:
+        Scale applied before the learning rate.
+    """
     if not matched_adamw_rms:
         return 1.0 if zero_rms_scale_mode == "use_lr" else 0.0
     shape = tuple(slice_tensor.shape)
@@ -195,6 +216,7 @@ class Muon(BaseDistributedOptimizer):
     sharded parameters.
     """
 
+    state_tensor_keys = ("momentum_buffer",)
     ADDITIONAL_CONFIG_KEYS = set(_MUON_ADVANCED_DEFAULTS)
 
     def __init__(
@@ -208,6 +230,9 @@ class Muon(BaseDistributedOptimizer):
             ns_steps: int = 5,
             ns_variant: str = "asym5",
             hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
+            head_wise: bool = False,
+            head_dim: Optional[int] = None,
+            head_wise_patterns: Optional[Dict[str, int]] = None,
             **advanced_options: Any,
     ) -> None:
         """Initialize Muon and build parameter-identity runtime caches.
@@ -231,8 +256,19 @@ class Muon(BaseDistributedOptimizer):
             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
             apply_lr_in_update: Whether the update callback applies the learning rate.
             hsdp_replica_count: Optional optimizer-state replica group size.
+            head_wise: Split selected independent Q/K matrices by output head.
+            head_dim: Output channels per head for default Q/K name selection.
+            head_wise_patterns: Optional regex-to-head-dimension mapping replacing default selection.
         """
         advanced = _resolve_muon_advanced_options(advanced_options)
+        self.head_wise = head_wise
+        self.head_dim = head_dim
+        self.head_wise_patterns = head_wise_patterns
+        self._head_wise_dims: Dict[torch.nn.Parameter, int] = {}
+        if head_wise and (advanced.reshape_fn is not None or advanced.ns_transform_fn is not None):
+            raise ValueError("head_wise cannot be combined with reshape_fn or ns_transform_fn")
+        if head_wise_patterns is not None and not head_wise:
+            raise ValueError("head_wise_patterns requires head_wise=True")
         if ns_variant not in ("legacy", "asym5", "custom"):
             raise ValueError(
                 f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
@@ -264,7 +300,7 @@ class Muon(BaseDistributedOptimizer):
             "zero_rms_scale_mode": advanced.zero_rms_scale_mode,
             "apply_lr_in_update": advanced.apply_lr_in_update,
         }
-        super().__init__(params, defaults, is_muon=True, hsdp_replica_count=hsdp_replica_count)
+        super().__init__(params, defaults, hsdp_replica_count=hsdp_replica_count)
         self.reshape_fn = advanced.reshape_fn
         self.zeropower_fn = advanced.zeropower_fn
         self.momentum_update_fn = advanced.momentum_update_fn
@@ -274,6 +310,7 @@ class Muon(BaseDistributedOptimizer):
 
     def reset_optimizer_parameters(self) -> None:
         """Rebuild all parameter-identity caches from current param groups."""
+        self._configure_head_wise()
         self._group_dtensor_by_mesh()
         self._build_param_shard_metadata()
         deduced_count = self._auto_deduce_replica_count()
@@ -285,6 +322,43 @@ class Muon(BaseDistributedOptimizer):
         self._build_hsdp_batch()
         self._build_param_broadcast_info()
         self._classify_parameters_for_step()
+
+    def _new_checkpoint_state(self, param: torch.Tensor, _: str) -> torch.Tensor:
+        """Muon momentum follows the parameter/gradient precision."""
+        return torch.zeros_like(param)
+
+    def _configure_head_wise(self) -> None:
+        """Resolve head dimensions once, including after main-parameter replacement."""
+        self._head_wise_dims = {}
+        if not self.head_wise:
+            return
+        patterns = self.head_wise_patterns
+        if patterns is None:
+            patterns = {r"(?:^|\.)(?:q_proj|k_proj|q_b_proj|wq|wk)\.weight$": self.head_dim}
+        compiled = [(re.compile(pattern), dim) for pattern, dim in patterns.items()]
+        for group in self.param_groups:
+            for param in group["params"]:
+                dim = self._resolve_head_dim(param, compiled)
+                if dim is not None:
+                    self._head_wise_dims[param] = dim
+
+    @staticmethod
+    def _resolve_head_dim(param, compiled):
+        """Validate the selected matrix's name and output-head geometry."""
+        name = getattr(param, "model_name", None)
+        if name is None:
+            raise ValueError("head_wise requires model_name; use get_hyper_optimizer to bind names")
+        dims = [dim for pattern, dim in compiled if pattern.search(name)]
+        if not dims:
+            return None
+        if len(dims) != 1:
+            raise ValueError(f"Overlapping head_wise_patterns for {name}")
+        dim = dims[0]
+        if not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0:
+            raise ValueError(f"A positive integer head_dim is required for {name}")
+        if param.ndim != 2 or param.shape[0] % dim:
+            raise ValueError(f"{name} must be a 2D matrix with rows divisible by head_dim={dim}")
+        return dim
 
     @staticmethod
     def _validate_ns_coefficients(
@@ -350,24 +424,7 @@ class Muon(BaseDistributedOptimizer):
         for group in self.param_groups:
             group['step'] = (group.get('step') or 0) + 1
 
-        # Compute momentum only for no-comm params upfront.
-        no_comm_ns: Dict[int, Dict] = {}
-        for group_idx in range(num_groups):
-            info = self._hsdp_assignment_batches.get(group_idx)
-            if not info:
-                # No HSDP info — all params are no_comm.
-                unshard_params = self.unshard_params_by_group.get(group_idx, [])
-                no_comm_ns[group_idx] = self._update_muon_momentum(
-                    self.param_groups[group_idx], unshard_params
-                )
-            else:
-                no_comm_params = info.get("no_comm", [])
-                if no_comm_params:
-                    no_comm_ns[group_idx] = self._update_muon_momentum(
-                        self.param_groups[group_idx], no_comm_params
-                    )
-                else:
-                    no_comm_ns[group_idx] = {}
+        no_comm_ns = self._prepare_no_comm_momentum(num_groups)
 
         # Process no-comm params.
         for group_idx in range(num_groups):
@@ -377,17 +434,7 @@ class Muon(BaseDistributedOptimizer):
                 if self.post_update_fn is not None:
                     self._run_post_update_fn(group, no_comm_ns[group_idx].keys())
 
-        # Flatten nested batch into a linear schedule.
-        group_linear_batches: Dict[int, List[HSDPGroupAssignment]] = {}
-        max_num_batches = 0
-        for group_idx in range(num_groups):
-            info = self._hsdp_assignment_batches.get(group_idx)
-            linear_batches = []
-            if info:
-                for bg in info.get("batch_groups", []):
-                    linear_batches.extend(bg.get("sub_batches", []))
-            group_linear_batches[group_idx] = linear_batches
-            max_num_batches = max(max_num_batches, len(linear_batches))
+        group_linear_batches, max_num_batches = self._linear_batch_schedule(num_groups)
 
         # Process batches: compute momentum per-batch for owned params only (HSDP de-duplication).
         for batch_idx in range(max_num_batches):
@@ -417,6 +464,45 @@ class Muon(BaseDistributedOptimizer):
 
         broadcaster.wait_all()
         return loss
+
+    def _linear_batch_schedule(self, num_groups):
+        """Flatten ownership batches without changing their collective order."""
+        # Flatten nested batch into a linear schedule.
+        group_linear_batches: Dict[int, List[HSDPGroupAssignment]] = {}
+        max_num_batches = 0
+        for group_idx in range(num_groups):
+            info = self._hsdp_assignment_batches.get(group_idx)
+            linear_batches = []
+            if info:
+                for bg in info.get("batch_groups", []):
+                    linear_batches.extend(bg.get("sub_batches", []))
+            group_linear_batches[group_idx] = linear_batches
+            max_num_batches = max(max_num_batches, len(linear_batches))
+
+        return group_linear_batches, max_num_batches
+
+    def _prepare_no_comm_momentum(self, num_groups):
+        """Prepare momentum for parameters that need no shard communication."""
+        # Compute momentum only for no-comm params upfront.
+        no_comm_ns: Dict[int, Dict] = {}
+        for group_idx in range(num_groups):
+            info = self._hsdp_assignment_batches.get(group_idx)
+            if not info:
+                # No HSDP info — all params are no_comm.
+                unshard_params = self.unshard_params_by_group.get(group_idx, [])
+                no_comm_ns[group_idx] = self._update_muon_momentum(
+                    self.param_groups[group_idx], unshard_params
+                )
+            else:
+                no_comm_params = info.get("no_comm", [])
+                if no_comm_params:
+                    no_comm_ns[group_idx] = self._update_muon_momentum(
+                        self.param_groups[group_idx], no_comm_params
+                    )
+                else:
+                    no_comm_ns[group_idx] = {}
+
+        return no_comm_ns
 
     def _run_post_update_fn(
             self,
@@ -743,6 +829,10 @@ class Muon(BaseDistributedOptimizer):
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """Return the contiguous NS input and any reshape views used for NS."""
         working_input = ns_input if ns_input.is_contiguous() else ns_input.contiguous()
+        head_dim = getattr(self, "_head_wise_dims", {}).get(param)
+        if head_dim is not None:
+            # A leading singleton batch axis avoids the legacy [rows, 1, cols] Conv1d convention.
+            return working_input, [working_input.view(1, -1, head_dim, working_input.shape[-1])]
         if self.reshape_fn is None:
             return working_input, [working_input]
 
@@ -785,7 +875,12 @@ class Muon(BaseDistributedOptimizer):
         _, reshaped_inputs = self._reshape_ns_input(param, working_input)
 
         def restore_view_updates(updates: List[torch.Tensor], output: torch.Tensor) -> None:
-            """Write reshaped NS updates back into the views and the working input."""
+            """Write reshaped NS updates back into the views and the working input.
+
+            Args:
+                updates: Orthogonalized slices in transform order.
+                output: Destination for the restored parameter-shaped update.
+            """
             for reshaped_input, update in zip(reshaped_inputs, updates):
                 reshaped_input.copy_(update.contiguous().view_as(reshaped_input))
             if output.untyped_storage().data_ptr() != working_input.untyped_storage().data_ptr():
