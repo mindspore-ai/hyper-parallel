@@ -147,7 +147,7 @@ plan_overrides:
     local_compute_fn:
       _target_: >-
         hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
-      use_grouped_gemm: false
+      use_grouped_gemm: true
 
 mixed_precision:
   enabled: false

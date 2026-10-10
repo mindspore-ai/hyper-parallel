@@ -54,7 +54,6 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedDSAAttention,
     SharedCompressedDSAAttentionBase,
     SharedCompressedDSAIndexer,
-    build_sliding_window_indices as _window_indices,
 )
 from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE,
@@ -223,6 +222,43 @@ class DeepseekV41TopKRouter(nn.Module):
         if self.top_k > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1.0e-20)
         return logits, weights * self.routed_scaling_factor, indices
+
+
+def deepseek_v41_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
+    """Apply native FP32 clamp and SwiGLU to separate expert projections.
+
+    Args:
+        gate: Gate projection output, either dense or expert-major.
+        up: Up projection output with the same shape as ``gate``.
+        limit: ``swiglu_limit``; nonpositive values disable clamping.
+
+    Returns:
+        FP32 activation. The caller restores its projection input dtype before
+        the down projection, keeping this math shared by routed and shared experts.
+    """
+    gate = gate.float()
+    up = up.float()
+    if limit > 0:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    return functional.silu(gate) * up
+
+
+def _v41_shared_expert_forward(module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Use native activation math without replacing the HF projection modules."""
+    intermediate = deepseek_v41_swiglu(
+        module.gate_proj(hidden_states), module.up_proj(hidden_states), module.limit,
+    )
+    return module.down_proj(intermediate.to(hidden_states.dtype))
+
+
+def bind_shared_expert_forward(shared_expert: nn.Module) -> None:
+    """Bind native shared-expert math while preserving HF state and module hooks.
+
+    Args:
+        shared_expert: HF shared MLP whose ``limit`` comes from ``swiglu_limit``.
+    """
+    shared_expert.forward = MethodType(_v41_shared_expert_forward, shared_expert)
 
 
 def _v41_sparse_moe_forward(
@@ -508,6 +544,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             layer.self_attn = DeepseekV41Attention(config, layer_idx)
             layer.forward = MethodType(_v41_decoder_layer_forward, layer)
             layer.mlp.gate = DeepseekV41TopKRouter(config)
+            bind_shared_expert_forward(layer.mlp.shared_experts)
             if bool(getattr(config, "v41_vision_enabled", False)):
                 layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)
         for layer_id in assets["layer_ids"]:

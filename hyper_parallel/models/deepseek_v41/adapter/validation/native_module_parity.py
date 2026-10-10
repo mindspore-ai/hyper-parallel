@@ -38,8 +38,8 @@ from typing import Any
 
 import numpy as np
 import torch  # pylint: disable=forbidden-backend-import
-import torch.nn.functional as functional  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
+from torch.nn import functional  # pylint: disable=forbidden-backend-import
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts, DeepseekV4MLP
 
@@ -52,6 +52,7 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41Engram,
     DeepseekV41TopKRouter,
     _v41_sparse_moe_forward,
+    bind_shared_expert_forward,
 )
 
 
@@ -71,6 +72,7 @@ class HyperParallelMoE(nn.Module):
         self.gate = DeepseekV41TopKRouter(config)
         self.experts = DeepseekV4Experts(config)
         self.shared_experts = DeepseekV4MLP(config)
+        bind_shared_expert_forward(self.shared_experts)
         self.forward = MethodType(_v41_sparse_moe_forward, self)
 
 
@@ -282,7 +284,7 @@ def _native_hash_state(native_engram: Any, assets: dict[str, Any]) -> nn.Module:
         head_dim=assets["head_dim"],
     )
     state = native_engram.NgramHashState.__new__(native_engram.NgramHashState)
-    nn.Module.__init__(state)
+    super(native_engram.NgramHashState, state).__init__()
     state.layout = layout
     state.pad_id = assets["token_map"][assets["pad_token_id"]]
     flattened = [value for row in assets["primes"][0] for value in row]

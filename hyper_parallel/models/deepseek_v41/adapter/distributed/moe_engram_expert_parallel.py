@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import inspect
+from types import MethodType
 from typing import Any, Callable
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -27,6 +28,53 @@ from hyper_parallel.distributed.expert_parallel.experts import (
     require_attrs,
 )
 from hyper_parallel.distributed.recipe_spec import local_compute
+from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import deepseek_v41_swiglu
+
+
+def _deepseek_v41_unclamped_gate(gate_up: torch.Tensor) -> torch.Tensor:
+    """Apply native FP32 SwiGLU when a nonpositive limit disables clamping."""
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    return deepseek_v41_swiglu(gate, up, 0.0).to(gate_up.dtype)
+
+
+def _deepseek_v41_grouped_expert_forward(
+        experts: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+) -> torch.Tensor:
+    """Run FP32 clamped SwiGLU between two grouped GEMMs.
+
+    The generic EP path has already sorted ``hidden_states`` into expert-major
+    order. Routed and shared experts reuse the native FP32 clamp and SwiGLU
+    implementation. Nonpositive limits disable clamping; the down projection
+    still receives the original hidden-state dtype.
+    """
+    # The shared primitive imports optional torch_npu; keep CPU/GPU imports lazy.
+    from hyper_parallel.components.functional import grouped_matmul  # pylint: disable=C0415
+
+    group_list = torch.cumsum(
+        tokens_per_expert.to(device=hidden_states.device, dtype=torch.int64),
+        dim=0,
+    )
+    gate_up = grouped_matmul(  # pylint: disable=not-callable
+        hidden_states,
+        experts.gate_up_proj.transpose(1, 2),
+        bias=None,
+        group_list=group_list,
+        group_type=0,
+        group_list_type=0,
+    )
+    # Cast the packed projections once; the shared helper's casts are then no-ops.
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    intermediate = deepseek_v41_swiglu(gate, up, experts.limit)
+    return grouped_matmul(  # pylint: disable=not-callable
+        intermediate.to(hidden_states.dtype),
+        experts.down_proj.transpose(1, 2),
+        bias=None,
+        group_list=group_list,
+        group_type=0,
+        group_list_type=0,
+    )
 
 
 def _router(
@@ -79,13 +127,21 @@ def deepseek_v41_ep_compute_fn(
         raise ValueError("DeepSeek-V4.1 EP forward requires an active ep_mesh")
     if module.is_hash:
         raise ValueError("DeepSeek-V4.1 validation layers must use learned routing")
+    apply_gate = (
+        module.experts._apply_gate  # pylint: disable=protected-access
+        if module.experts.limit > 0 else _deepseek_v41_unclamped_gate
+    )
     if use_grouped_gemm:
-        raise ValueError("DeepSeek-V4.1 clamp semantics currently require use_grouped_gemm=false")
+        module.experts.forward_expert_major = MethodType(
+            _deepseek_v41_grouped_expert_forward,
+            module.experts,
+        )
     ep_group = ep_mesh.get_group("ep")
     bind_local_expert_forward(
         module,
         ep_mesh["ep"].size(),
-        apply_gate=module.experts._apply_gate,  # pylint: disable=protected-access
+        use_grouped_gemm=use_grouped_gemm,
+        apply_gate=None if use_grouped_gemm else apply_gate,
     )
 
     if "image_mask" not in inspect.signature(module.forward).parameters:
