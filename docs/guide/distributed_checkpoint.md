@@ -2,6 +2,39 @@
 
 HyperParallel 提供 DCP（Distributed Checkpoint）能力：每个 rank 只保存自己持有的分片，配合一份描述"谁存了哪一块"的全局元数据；加载时按目标切分策略重新计算需要读哪些片段，因此**并行策略变化后无需离线转换**。此外支持异步落盘、副本张量读一次 + 广播、Plan 缓存，以及与 Hugging Face safetensors 格式的离线互转。
 
+## 在 Trainer 中保存与恢复
+
+使用 `TextTrainer` 或 `VLMTrainer` 时，在训练 YAML 的 `checkpoint` 节点配置保存与恢复，
+由 Trainer 管理检查点生命周期。例如，每 100 个优化器更新步保存一次模型、优化器和训练状态：
+
+```yaml
+checkpoint:
+  save_ckpt: true
+  checkpoint_dir: ./checkpoints
+  save_steps: 100
+  save_epochs: 0
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: true
+```
+
+继续训练时，在同一训练命令中附加 `--checkpoint.restore_from=LATEST`，从
+`checkpoint_dir` 读取最新检查点；也可将该字段设为具体检查点目录。
+`training.train_iters` 表示训练的总目标步数，需大于已保存的 `global_step`。
+`LATEST` 未找到检查点时会记录警告并从头训练；需要恢复指定状态时应使用具体目录。
+
+`restore_optimizer` 和 `restore_train_state` 默认开启，分别控制优化器状态和训练状态的恢复。
+训练状态包括训练进度、学习率调度器、随机数状态及数据读取位置。
+数据位置恢复还要求 DataLoader 提供相应的状态保存与加载接口。
+`save_ckpt` 只控制写入；设置 `restore_from` 后，即使关闭保存也会执行恢复。
+
+加载 Hugging Face 预训练权重用于初始化模型；恢复完整训练状态应使用上述 Trainer 检查点。
+跨并行拓扑续训时，还需检查数据读取状态是否支持对应的恢复方式，
+并使用相同输入比较连续训练与保存后恢复训练的结果。
+完整字段见 [`CheckpointingConfig`](../../hyper_parallel/components/checkpoint/config.py)。
+其中 `model_save_format`、`save_consolidated`、`staging_dir` 和 `best_metric_key` 当前为预留字段，
+Trainer 尚未据此执行合并权重导出；Hugging Face 格式互转见本文 [离线格式转换](#离线格式转换hugging-face--dcp)。
+
 ## 核心概念
 
 | 概念 | 说明 |
