@@ -7,6 +7,9 @@
 | 文档                                       | 说明 |
 |------------------------------------------|------|
 | [安装指南](./installation.md)                | 源码构建、依赖安装、环境配置 |
+| [模型训练](../hyper_parallel/models/README.md) | Hugging Face 与自有模型训练入口、模型配方及配置导航 |
+| [YAML Trainer 配置结构](./guide/trainer/yaml_config.md) | YAML 字段、Target 与命令行覆盖 |
+| [二次开发指南](./guide/trainer/custom_component.md) | 自有模型、数据、Loss、Optimizer 与任务 Trainer 扩展 |
 
 ## 特性使用指南
 
@@ -20,7 +23,7 @@
 | [Activation Checkpoint / Swap](./guide/activation_checkpoint.md) | checkpoint_wrapper、swap_wrapper、swap_tensor_wrapper、协同配置 |
 | [Optimizer](./guide/optimizer.md) | AdamW、Muon、ChainedOptimizer、学习率调度器 |
 | [Chunk Loss](./guide/chunk_loss.md) | 大词表输出投影与交叉熵分块、Trainer 和 Qwen3-MoE 接入 |
-| [DCP 分布式检查点](./guide/distributed_checkpoint.md) | 检查点保存/加载、异步 staging、离线转换 |
+| [DCP 分布式检查点](./guide/distributed_checkpoint.md) | Trainer 保存与恢复配置、DCP 接口、异步 staging、离线转换 |
 | [自动并行](./guide/auto_parallel.md) | SAPP-ND、SAPP-PPB |
 | [LlamaFactory + HyperParallel SFT 训练](./guide/llama_factory_hyperparallel_sft_guide.md) | 基于 LlamaFactory 和 HyperParallel 的 SFT 配置、启动、精度与性能验证 |
 
