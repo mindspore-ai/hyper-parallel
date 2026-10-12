@@ -232,7 +232,7 @@ class TestTiedWeights(unittest.TestCase):
         x = torch.randint(0, 10, (2, 3))
         y = torch.randn(2, 3, 10)
 
-        joint, loss, grads = _trace_and_run(
+        joint, loss, grads, _ = _trace_and_run(
             model, lambda m, x, y: ((m(x) - y) ** 2).mean(), x, y
         )
         gm = joint.graph_module
