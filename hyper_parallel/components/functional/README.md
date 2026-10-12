@@ -248,3 +248,14 @@ These protocols share the same local KDA stages and can be combined with Ulysses
 Forward exchanges use S/M, while backward produces fresh G/N instead of caching M.
 See [KDA context parallelism](../../../docs/guide/kda_context_parallel.md)
 for configurations, supported shapes and the state-buffer lifetime contract.
+
+## Optional DeepSeek Ascend operators
+
+DeepGEMM-Ascend, DeepEP-Ascend, DeepSelect, FlashMLA, and TileKernels are available through
+lazy optional adapters. They are not imported by a plain HyperParallel import
+and must be built separately for the active PyTorch, torch-npu, and CANN
+environment. See the [DeepSeek Ascend operator guide](../../../docs/guide/deepseek_ascend_ops.md).
+
+Common GEMM, quantization, SwiGLU, MoE routing, RoPE, and Engram paths have
+explicit public functions. Generic dispatch remains available for additional
+public production operators as upstream packages evolve.

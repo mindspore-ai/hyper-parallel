@@ -227,3 +227,6 @@
 
 "hyper-parallel/hyper_parallel/components/functional/kimi_delta_attention_ascendc.py" "forbidden-backend-import"
 "hyper-parallel/hyper_parallel/components/functional/gated_delta_net_ascendc.py" "forbidden-backend-import"
+
+# Router replacement adopts source state without allocating new native parameters.
+"hyper-parallel/hyper_parallel/components/modules/tile_kernels.py" "non-parent-init-called"

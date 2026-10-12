@@ -220,7 +220,7 @@ class PipelinedMhcModule(nn.Module):
         self.hc_sinkhorn_iters = int(module.hc_sinkhorn_iters)
         self.hc_eps = float(module.hc_eps)
         expected_mix = (self.hc_mult + 2) * self.hc_mult
-        if tuple(self.fn.shape)[0] != expected_mix or self.base.numel() != expected_mix:
+        if self.fn.shape[0] != expected_mix or self.base.numel() != expected_mix:
             raise ValueError("pipelined MHC fn/base shapes do not match hc_mult")
         if self.scale.numel() != 3:
             raise ValueError("pipelined MHC scale must contain three values")
@@ -229,8 +229,9 @@ class PipelinedMhcModule(nn.Module):
     def forward(
         self,
         hidden_streams: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Produce the coefficients consumed by the following sublayer."""
+        pre_mix: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Produce coefficients and optionally collapse with the incoming mix."""
         flattened = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         mix = F.linear(  # pylint: disable=not-callable
             flattened, self.fn.float()
@@ -251,7 +252,20 @@ class PipelinedMhcModule(nn.Module):
             residual = sinkhorn(residual, self.hc_sinkhorn_iters, self.hc_eps)
         else:
             residual = sinkhorn_knopps(residual, self.hc_sinkhorn_iters, self.hc_eps)
-        return pre, post, residual
+        if pre_mix is None:
+            return pre, post, residual
+        collapsed = (pre_mix.unsqueeze(-1) * hidden_streams.float()).sum(dim=2)
+        return collapsed.to(hidden_streams.dtype), pre, post, residual
+
+    @staticmethod
+    def post(
+        sublayer_output: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        combine: torch.Tensor,
+    ) -> torch.Tensor:
+        """Combine a sublayer result with the residual streams."""
+        return pipelined_mhc_post(sublayer_output, residual, post, combine)
 
 
 def pipelined_mhc_post(

@@ -7,12 +7,39 @@ Python or declaratively replace existing model modules through Trainer YAML.
 
 | Category | Modules |
 | --- | --- |
-| Attention | `GQAAttention`, `GatedGQAAttention`, `MLAAttention`, `DSAAttention`, `DeepseekV32DSAAttention` |
-| MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP` |
+| Attention | `GQAAttention`, `GatedGQAAttention`, `MLAAttention`, `DSAAttention`, `DeepseekV32DSAAttention`, `FlashMLASparsePrefill`, `FlashMLASparseDecode`, `DeepSelectCompressedSparseAttention2`, `FlashMLACompressedSparseAttention2` |
+| MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP`, `TileKernelsV41TopKRouter` |
 | Normalization | `RMSNorm`, `OffsetRMSNorm` |
-| MHC | `MhcPreModule`, `MhcPostModule` |
+| MHC | `MhcPreModule`, `MhcPostModule`, `TileKernelsPipelinedMHCCoefficients` |
+| Engram | `TileKernelsEngram` |
 
 Reusable high-performance functions are provided separately in [`hyper_parallel.components.functional`](../functional/README.md).
+
+`FlashMLASparsePrefill` and `FlashMLASparseDecode` wrap FlashMLA's Ascend sparse-attention kernels, not full model layers.
+They do not own projection weights or convert checkpoints. Prefill is stateless; decode caches scheduling metadata.
+FlashMLA must be built
+separately in the active PyTorch, torch-npu, and CANN environment. See the
+[DeepSeek Ascend installation guide](../../../docs/guide/deepseek_ascend_ops.md) for dependency requirements,
+installation commands, and supported operators.
+
+The TileKernels replacements preserve the V4.1 parameter layout and training contracts.
+`DeepSelectCompressedSparseAttention2` replaces only Indexer Top-K; attention and Indexer KL use PyTorch.
+`FlashMLACompressedSparseAttention2` uses FlashMLA prefill and requires inference without autograd.
+
+### Compatible names
+
+The previous names remain aliases of the same classes. Existing replacement targets and parameter keys are unchanged.
+
+| Previous name | Canonical name |
+| --- | --- |
+| `DeepseekV41SparsePrefillAttention` | `FlashMLASparsePrefill` |
+| `DeepseekV41SparseDecodeAttention` | `FlashMLASparseDecode` |
+| `DeepSelectSharedCompressedDSAAttention` | `DeepSelectCompressedSparseAttention2` |
+| `FlashMLASharedCompressedDSAAttention` | `FlashMLACompressedSparseAttention2` |
+| `TileKernelsEngramModule` | `TileKernelsEngram` |
+| `TileKernelsV41MhcModule` | `TileKernelsPipelinedMHCCoefficients` |
+
+FlashMLA wrappers are implemented in `flash_mla.py`; `deepseek_sparse_attention.py` retains their previous import names.
 
 Modules can also be constructed directly:
 
