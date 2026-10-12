@@ -43,9 +43,11 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions  # noqa: E4
 from hyper_parallel import (  # noqa: E402
     ContextParallel,
     SkipDTensorDispatch,
-    get_optim_state_dict,
     init_device_mesh,
     parallelize_module,
+)
+from hyper_parallel.core.distributed_checkpoint import (
+    get_optim_state_dict,
     set_optim_state_dict,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402

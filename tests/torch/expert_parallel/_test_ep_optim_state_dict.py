@@ -44,8 +44,10 @@ import torch_npu  # noqa: F401,E402  # pylint: disable=unused-import
 from torch.distributed.checkpoint.state_dict import StateDictOptions  # noqa: E402
 
 from hyper_parallel import (  # noqa: E402
-    get_optim_state_dict,
     init_device_mesh,
+)
+from hyper_parallel.core.distributed_checkpoint import (
+    get_optim_state_dict,
     set_optim_state_dict,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402

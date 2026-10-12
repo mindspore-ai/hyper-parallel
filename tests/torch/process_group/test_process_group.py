@@ -22,7 +22,7 @@ from tests.common.parallel_case import parallel_run, TorchCase
 PROCESS_GROUP = os.path.join(os.path.dirname(__file__), "process_group.py")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_process_group():
     """
     Feature: parallel run case in process_group

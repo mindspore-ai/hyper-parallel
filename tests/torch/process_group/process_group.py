@@ -29,7 +29,7 @@ def test_process_group():
     Finally, destroy the sub process group and process group.
     """
     # init process group
-    init_process_group()
+    init_process_group(backend="hccl")
     world_size = dist.get_world_size()
     # pylint: disable=C0415
     rank_list = get_process_group_ranks()

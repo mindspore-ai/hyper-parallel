@@ -19,7 +19,7 @@ from tests.common.parallel_case import parallel_run, TorchCase
 _TEST_OPTIM_SD = "_test_optim_state_dict.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_optim_state_dict_group1():
     """
@@ -35,7 +35,7 @@ def test_optim_state_dict_group1():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_optim_state_dict_group2():
     """
@@ -51,7 +51,7 @@ def test_optim_state_dict_group2():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_optim_state_dict_group3():
     """
@@ -65,11 +65,13 @@ def test_optim_state_dict_group3():
     parallel_run([
         TorchCase(_TEST_OPTIM_SD, "test_o5_optim_state_dict_strict_false", 12414, 4),
         TorchCase(_TEST_OPTIM_SD, "test_o9_hsdp_local_shape_correctness", 12415, 4),
+    ])
+    parallel_run([
         TorchCase(_TEST_OPTIM_SD, "test_o10_full_cpu_restore_to_device", 12416, 4),
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_optim_state_dict_group4():
     """
@@ -85,7 +87,7 @@ def test_optim_state_dict_group4():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_optim_state_dict_group5():
     """
@@ -99,7 +101,7 @@ def test_optim_state_dict_group5():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_optim_state_dict_group6():
     """
@@ -113,7 +115,7 @@ def test_optim_state_dict_group6():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_optim_state_dict_group7():
     """

@@ -19,7 +19,7 @@ from tests.common.parallel_case import parallel_run, TorchCase
 _TEST_FSDP_SD = "_test_fsdp_optim_state_dict.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_fsdp_optim_state_dict_group1():
     """
@@ -35,7 +35,7 @@ def test_fsdp_optim_state_dict_group1():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_fsdp_optim_state_dict_group2():
     """
@@ -51,7 +51,7 @@ def test_fsdp_optim_state_dict_group2():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_fsdp_optim_state_dict_group3():
     """
@@ -65,11 +65,13 @@ def test_fsdp_optim_state_dict_group3():
     parallel_run([
         TorchCase(_TEST_FSDP_SD, "test_f5_fsdp_optim_state_dict_strict_false", 13414, 4),
         TorchCase(_TEST_FSDP_SD, "test_f8_fsdp_local_shape_correctness", 13415, 4),
+    ])
+    parallel_run([
         TorchCase(_TEST_FSDP_SD, "test_f9_fsdp_full_cpu_restore_to_device", 13416, 4),
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_fsdp_optim_state_dict_group4():
     """
