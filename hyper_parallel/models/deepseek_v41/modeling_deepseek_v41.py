@@ -247,9 +247,24 @@ def _apply_router_training_state(
 class DeepseekV41TopKRouter(nn.Module):
     """V4.1 learned router with independent text and image correction biases."""
 
-    def __init__(self, config: Any) -> None:
-        """Create the released noaux_tc routing parameter layout."""
+    def __init__(self, config: Any = None, *, module: DeepseekV41TopKRouter | None = None) -> None:
+        """Create routing state from configuration or adopt an existing router.
+
+        Args:
+            config: Model configuration for new routing parameters.
+            module: Existing router whose parameters, counters and training
+                policy are reused without allocating replacement parameters.
+
+        Raises:
+            ValueError: Exactly one of ``config`` or ``module`` must be provided.
+            TypeError: ``module`` is not a DeepSeek V4.1 router.
+        """
         super().__init__()
+        if (config is None) == (module is None):
+            raise ValueError("Router construction requires exactly one of config or module")
+        if module is not None:
+            self._adopt_router_state(module)
+            return
         self.hidden_size = int(config.hidden_size)
         self.num_experts = int(config.num_local_experts)
         self.top_k = int(config.num_experts_per_tok)
@@ -274,6 +289,29 @@ class DeepseekV41TopKRouter(nn.Module):
             self.bias_vl = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32), requires_grad=False)
         else:
             self.register_parameter("bias_vl", None)
+
+    def _adopt_router_state(self, module: DeepseekV41TopKRouter) -> None:
+        """Bind existing routing state while keeping the source outside the module tree."""
+        if not isinstance(module, DeepseekV41TopKRouter):
+            raise TypeError("Router adoption requires DeepseekV41TopKRouter")
+        self.hidden_size = module.hidden_size
+        self.num_experts = module.num_experts
+        self.top_k = module.top_k
+        self.scoring_func = module.scoring_func
+        self.routed_scaling_factor = module.routed_scaling_factor
+        self.aux_loss_coeff = module.aux_loss_coeff
+        self.last_aux_loss = module.last_aux_loss
+        self.expert_bias_update_rate = module.expert_bias_update_rate
+        self.enable_expert_bias = module.enable_expert_bias
+        self.expert_bias_update_groups = module.expert_bias_update_groups
+        self.register_parameter("weight", module.weight)
+        self.register_parameter("bias", module.bias)
+        self.register_parameter("bias_vl", module.bias_vl)
+        self.register_buffer("tokens_per_expert", module.tokens_per_expert, persistent=False)
+        register_rebuildable_buffer(
+            self, "tokens_per_expert", value=torch.zeros(2, self.num_experts, dtype=torch.long, device="cpu"),
+        )
+        self.train(module.training)
 
     def forward(
             self,
@@ -319,7 +357,7 @@ class DeepseekV41TopKRouter(nn.Module):
                     self.bias_vl.unsqueeze(0),
                     self.bias.unsqueeze(0),
                 )
-        indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
+        indices = self._select_experts(scores + correction_bias)
         weights = scores.gather(1, indices)
         if self.top_k > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1.0e-20)
@@ -337,6 +375,10 @@ class DeepseekV41TopKRouter(nn.Module):
             num_sequences,
         )
         return logits, weights, indices
+
+    def _select_experts(self, scores: torch.Tensor) -> torch.Tensor:
+        """Select experts while allowing replacements to share router training semantics."""
+        return torch.topk(scores, self.top_k, dim=-1, sorted=False).indices
 
     @torch.no_grad()
     def update_expert_bias(self, lr: float | None = None, num_recomputations: int = 1) -> None:
@@ -564,11 +606,13 @@ class DeepseekV41PipelinedHyperConnection(nn.Module):
     def forward(
             self,
             hidden_streams: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute V4.1 pre, post, and residual mixing coefficients.
+            pre_mix: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Compute coefficients and optionally collapse residual streams.
 
         Args:
             hidden_streams: Hyper-connection streams entering the mixer.
+            pre_mix: Optional coefficients for collapsing the incoming streams.
         """
         flattened = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         mix = functional.linear(flattened, self.fn.float())  # pylint: disable=not-callable
@@ -586,7 +630,24 @@ class DeepseekV41PipelinedHyperConnection(nn.Module):
         residual = residual.view(*residual.shape[:-1], num_stream, num_stream)
         residual = residual * residual_scale + residual_bias.view(num_stream, num_stream)
         residual = sinkhorn_knopps(residual, self.hc_sinkhorn_iters, self.hc_eps)
-        return pre, post, residual
+        if pre_mix is None:
+            return pre, post, residual
+        collapsed = (pre_mix.unsqueeze(-1) * hidden_streams.float()).sum(dim=2)
+        return collapsed.to(hidden_streams.dtype), pre, post, residual
+
+    @staticmethod
+    def post(
+            sublayer_output: torch.Tensor,
+            residual: torch.Tensor,
+            post: torch.Tensor,
+            combine: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the independent reference post arithmetic."""
+        output = post.unsqueeze(-1) * sublayer_output.unsqueeze(-2)
+        output = output + torch.sum(
+            combine.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3
+        )
+        return output.to(sublayer_output.dtype)
 
 
 def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
@@ -602,7 +663,7 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
         module.bias.zero_()
         if module.bias_vl is not None:
             module.bias_vl.zero_()
-    elif isinstance(module, (DeepseekV41Attention, SharedCompressedDSAAttention)):
+    elif isinstance(module, (DeepseekV41Attention, SharedCompressedDSAAttentionBase)):
         module.sinks.zero_()
     elif isinstance(module, (DeepseekV41PipelinedHyperConnection, PipelinedMhcModule)):
         nn.init.normal_(module.fn, mean=0.0, std=std)
@@ -773,8 +834,10 @@ def _v41_decoder_layer_forward(
             token_mask=engram_token_mask,
         )
     residual = hidden_states
-    attention_pre, attention_post, attention_comb = self.attn_hc(hidden_states)
-    attention_input = self.input_layernorm(_hc_pre(hidden_states, pre_mix))
+    attention_input, attention_pre, attention_post, attention_comb = self.attn_hc(
+        hidden_states, pre_mix
+    )
+    attention_input = self.input_layernorm(attention_input)
     attention_output, _ = self.self_attn(
         attention_input,
         position_embeddings=position_embeddings,
@@ -784,16 +847,18 @@ def _v41_decoder_layer_forward(
         shared_attention_state=shared_attention_state,
         **kwargs,
     )
-    hidden_states = _hc_post(attention_output, residual, attention_post, attention_comb)
+    hidden_states = self.attn_hc.post(
+        attention_output, residual, attention_post, attention_comb
+    )
 
     residual = hidden_states
-    ffn_pre, ffn_post, ffn_comb = self.ffn_hc(hidden_states)
-    ffn_input = self.post_attention_layernorm(_hc_pre(hidden_states, attention_pre))
+    ffn_input, ffn_pre, ffn_post, ffn_comb = self.ffn_hc(hidden_states, attention_pre)
+    ffn_input = self.post_attention_layernorm(ffn_input)
     ffn_output = self.mlp(
         ffn_input, input_ids=input_ids, image_mask=image_mask, router_token_mask=router_token_mask,
         router_sequence_ids=router_sequence_ids, router_num_sequences=router_num_sequences,
     )
-    hidden_states = _hc_post(ffn_output, residual, ffn_post, ffn_comb)
+    hidden_states = self.ffn_hc.post(ffn_output, residual, ffn_post, ffn_comb)
     return hidden_states, ffn_pre
 
 

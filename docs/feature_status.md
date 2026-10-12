@@ -151,6 +151,7 @@ This document records HyperParallel's supported and planned model and system cap
 ## Ecosystem Integration
 
 - [x] LlamaFactory integration (activation recomputation and swap + HSDP)
+- [x] Optional DeepSeek Ascend operator adapters
 
 ## Tools
 

@@ -248,3 +248,73 @@ These protocols share the same local KDA stages and can be combined with Ulysses
 Forward exchanges use S/M, while backward produces fresh G/N instead of caching M.
 See [KDA context parallelism](../../../docs/guide/kda_context_parallel.md)
 for configurations, supported shapes and the state-buffer lifetime contract.
+
+## Optional DeepSeek Ascend operators
+
+DeepGEMM-Ascend, DeepEP-Ascend, DeepSelect, FlashMLA, and TileKernels are available through
+lazy optional adapters. They are not imported by a plain HyperParallel import
+and must be built separately for the active PyTorch, torch-npu, and CANN
+environment. See the [DeepSeek Ascend operator guide](../../../docs/guide/deepseek_ascend_ops.md).
+
+Common GEMM, quantization, SwiGLU, MoE routing, RoPE, and Engram paths have
+explicit public functions. Generic dispatch remains available for additional
+public production operators as upstream packages evolve.
+
+These functions operate on caller-provided tensors and resources.
+FlashMLA's operator-level `nn.Module` wrappers are described in the [Module guide](../modules/README.md).
+
+### Names and upstream contracts
+
+DeepGEMM direct calls retain upstream precision and layout names:
+`bf16_gemm_nt`, `fp8_gemm_nn`, `fp8_fp4_gemm_tn`, and their supported
+`nt`/`nn`/`tn`/`tt` counterparts. Grouped calls retain names such as
+`m_grouped_bf16_gemm_nt_contiguous` and `k_grouped_fp8_gemm_tn_contiguous`.
+Arguments and return values pass through unchanged; there is no separate layout selector.
+The same rule applies to `einsum`, `fp8_einsum`, `fp8_fp4_mqa_logits`,
+`fp8_fp4_paged_mqa_logits`, `get_paged_mqa_logits_metadata`,
+`transform_sf_into_required_layout`, `transform_k_grouped_sf_into_required_layout`,
+`fp8_fp4_mega_moe`, `transform_weights_for_mega_moe`, and `tf32_hc_prenorm_gemm`.
+
+```python
+from hyper_parallel.components.functional import bf16_gemm_nt
+
+bf16_gemm_nt(a, b, out)
+```
+
+TileKernels calls retain upstream operator names where applicable:
+`per_token_cast`, `per_block_cast`, `cast_back`, `swiglu_forward`,
+`swiglu_backward`, `topk_gate`, `moe_topk_gate`, `moe_topk_gate_backward`,
+`normalize_weight`, `apply_rotary`, `engram_hash`, and `engram_gate`.
+Some wrappers use descriptive argument names: `apply_rotary.sequence_offset`
+maps to upstream `seqlen_offset`, `engram_gate` forwards RMSNorm weights and
+numerical constants positionally, and `moe_topk_gate_backward.score_sum_gradient`
+maps to `grad_scores_sum`. Matching operator names do not imply identical Python signatures.
+
+Adapters with additional contracts are named separately:
+
+| Interface | Upstream entry | Adaptation |
+| --- | --- | --- |
+| `deep_select_topk` | `deep_select.topk` | Maps output-buffer and out-of-bounds option names |
+| `deep_select_get_stride_requirement` | `deep_select.get_stride_requirement` | Source-qualified name; result unchanged |
+| `get_mla_metadata` | `flash_mla.get_mla_metadata` | Arguments and result unchanged |
+| `flash_mla_sparse_prefill` | `flash_mla.flash_mla_sparse_fwd` | Maps dimension/sink options and rejects differentiable inputs |
+| `flash_mla_sparse_decode` | `flash_mla.flash_mla_with_kvcache` | Adapts sparse-cache arguments and rejects differentiable inputs |
+| `create_ep_buffer` | `deep_ep.EPBuffer` | Lazy factory; returns the upstream buffer, not an `nn.Module` |
+| `deep_ep_dispatch` | `EPBuffer.dispatch` | Requires expanded dispatch and disables handle copying |
+| `deep_ep_combine`, `deep_ep_wait`, `deep_ep_destroy` | Buffer/event methods | Explicit communication and resource lifecycle |
+| `mhc_split_mixes`, `mhc_sinkhorn`, `mhc_pre_apply`, `tile_kernels_mhc_post` | TileKernels mHC forward/backward kernels | Shape adaptation and autograd; not raw native signatures |
+
+`tile_kernels_mhc_post` is distinct from the existing `mhc_post` interface.
+`call_deep_gemm` and `call_tile_kernel` provide explicit dispatch by upstream operator name.
+`is_operator_backend_available` checks package discoverability, not device or ABI compatibility.
+
+### Compatibility
+
+The previous `deepseek_*` names remain available. Renamed functions are aliases
+of the same callable, not additional wrapper layers. Legacy selector helpers
+`deepseek_bf16_gemm`, `deepseek_fp8_gemm`, `deepseek_fp8_fp4_gemm`,
+`deepseek_grouped_bf16_gemm`, `deepseek_grouped_fp8_gemm`,
+`deepseek_grouped_fp8_fp4_gemm`, `deepseek_einsum`, `deepseek_mqa_logits`,
+and `deepseek_transform_scaling_factors` retain their existing selector arguments.
+Use the explicit upstream-named entries above in new code.
+`is_deepseek_backend_available` remains an alias of `is_operator_backend_available`.
