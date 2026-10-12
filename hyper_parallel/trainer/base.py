@@ -725,6 +725,7 @@ class BaseTrainer(Stateful, ABC):
 
             # with use_parallel_state("base"):
             loss, loss_dict = self.postforward(outputs, labels)
+            self.environ_meter_callback.record_loss_metrics(outputs)
             # The loss graph owns everything required for backward. Releasing
             # the model output here avoids retaining large vocabulary logits
             # until the whole backward pass finishes.
@@ -864,9 +865,6 @@ class BaseTrainer(Stateful, ABC):
 
         self.on_step_begin(micro_batches=micro_batches)
         self.model_integration.begin_step(self.state.global_step)
-
-        # Forward and backward for each micro batch
-        synchronize()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
