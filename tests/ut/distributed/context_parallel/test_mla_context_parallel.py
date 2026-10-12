@@ -26,7 +26,7 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
     _prepare_fusion_attention_context, resolve_packed_sequence_lengths,
 )
 from hyper_parallel.distributed.context_parallel.mla_context_parallel import (
-    MLADimensions, MLACPPlan,
+    MLADimensions, MLACPPlan, _partition_causal_kv, _run_attention,
 )
 from hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel import mla_cp_wrapper
 from tests.common.mla_cp_utils import (
@@ -115,6 +115,14 @@ class TestMLAContextParallel(unittest.TestCase):
             module(inputs, actual_seq_len=(0, 12))
         with self.assertRaisesRegex(ValueError, "batch_size=1"):
             module(inputs.expand(2, -1, -1), actual_seq_len=(24,))
+        query_partition = make_mla()
+        mesh = unittest.mock.Mock(ndim=1, size=lambda: 8, get_local_rank=lambda: 0)
+        install_mla_cp(query_partition, mesh, "latent_kv_head", "sdpa", ulysses_degree=1)
+        with patch("hyper_parallel.distributed.context_parallel.mla_context_parallel.mla_all_gather") as collective:
+            for options in ({"is_causal": False}, {"attention_mask": torch.ones(96, 96, dtype=torch.bool)}):
+                with self.assertRaisesRegex(ValueError, "causal attention without an explicit mask"):
+                    query_partition(inputs, **options)
+            collective.assert_not_called()
 
     def test_plan_and_wrapper_fail_fast(self) -> None:
         """
@@ -128,6 +136,13 @@ class TestMLAContextParallel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "divisible"):
             MLACPPlan(dims, 2, tp_degree=4)
         self.assertEqual(MLACPPlan(dims, 2, tp_degree=2).compute_heads, 1)
+        self.assertEqual(MLACPPlan(dims, 8, ulysses_degree=1).compute_heads, 4)
+        self.assertEqual(MLACPPlan(dims, 8, ulysses_degree=2).all_gather_degree, 4)
+        for degree in (0, 3, 16, True, 1.5):
+            with self.assertRaisesRegex(ValueError, "ulysses_degree"):
+                MLACPPlan(dims, 8, ulysses_degree=degree)
+        with self.assertRaisesRegex(ValueError, "TP1"):
+            MLACPPlan(dims, 4, tp_degree=2, ulysses_degree=1)
         module = make_mla()
         self.assertFalse(hasattr(module, "mla_cp_runtime"))
         mesh = TestCPMesh(singleton=True)
@@ -140,6 +155,38 @@ class TestMLAContextParallel(unittest.TestCase):
         install_mla_cp(module, mesh, "expanded_ulysses", "sdpa")
         with self.assertRaisesRegex(ValueError, "already configured"):
             mla_cp_wrapper(module, None, None, mesh, None)
+
+    def test_causal_query_partitions_match_global_attention(self) -> None:
+        """Feature: Causal KV prefixes for AllGather and hybrid MLA.
+
+        Description: Compare single/packed rectangular SDPA and independent batch samples with a global block mask.
+        Expectation: Outputs and Q/K/V gradients agree for every query partition degree.
+        """
+        torch.manual_seed(19)
+        for batch, ends in ((1, [16]), (1, [1, 7, 8, 13, 16]), (2, [16]), (4, [16])):
+            query = torch.randn(batch, 2, 16, 4, dtype=torch.float64, requires_grad=True)
+            key = torch.randn_like(query, requires_grad=True)
+            value = torch.randn(batch, 2, 16, 3, dtype=torch.float64, requires_grad=True)
+            allowed = torch.zeros(16, 16, dtype=torch.bool)
+            for begin, end in zip([0] + ends[:-1], ends):
+                allowed[begin:end, begin:end] = torch.ones(end - begin, end - begin, dtype=torch.bool).tril()
+            scores = query @ key.transpose(-1, -2)
+            expected = (scores.masked_fill(~allowed, -torch.inf).softmax(-1) @ value).transpose(1, 2)
+            upstream = torch.randn_like(expected)
+            expected_grads = torch.autograd.grad(expected, (query, key, value), upstream, retain_graph=True)
+            for degree in (1, 2, 4):
+                pieces = []
+                for rank, local_query in enumerate(query.chunk(degree, dim=2)):
+                    local_key, local_value, query_ends, key_ends = _partition_causal_kv(
+                        local_query, key, value, ends, rank)
+                    pieces.append(_run_attention(
+                        SimpleNamespace(scaling=1.0), local_query, local_key, local_value, backend="sdpa",
+                        lengths=query_ends, key_lengths=key_ends, causal=True, attention_mask=None))
+                actual = torch.cat(pieces, dim=1)
+                torch.testing.assert_close(actual, expected)
+                actual_grads = torch.autograd.grad(actual, (query, key, value), upstream, retain_graph=True)
+                for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+                    torch.testing.assert_close(actual_grad, expected_grad)
 
 
 class TestMLAModel(unittest.TestCase):

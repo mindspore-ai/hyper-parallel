@@ -16,8 +16,10 @@ plan_overrides:
     inner_target: self
     inner_wrapper:
       _target_: hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel.mla_cp_wrapper
-      strategy: expanded_ulysses
+      strategy: expanded_ulysses  # Or latent_kv_head; representation is independent of the Ulysses degree.
       backend: npu
+      # At TP1: 1 selects KV AllGather, intermediate CP divisors select Ulysses x AllGather.
+      # ulysses_degree: 1
 
 fsdp_config:
   dp_shard_size: 4

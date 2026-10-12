@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Dense MLA Ulysses with expanded QKV or shared latent-KV communication."""
+"""Dense MLA Ulysses, KV AllGather and hybrid CP with expanded or latent KV."""
 
 from __future__ import annotations
 
@@ -26,7 +26,9 @@ import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.distributed.context_parallel.collectives import ulysses_head_to_seq, ulysses_seq_to_head
+from hyper_parallel.distributed.context_parallel.collectives import (
+    _build_hybrid_cp_submeshes, ulysses_head_to_seq, ulysses_seq_to_head,
+)
 from hyper_parallel.components.functional.npu_fusion_attention import (
     PACKED_SEQUENCE_ARGUMENTS, npu_fusion_attention_forward, resolve_packed_sequence_lengths,
 )
@@ -79,18 +81,25 @@ class MLACPPlan:
     strategy: MLACPStrategy = "expanded_ulysses"
     backend: Literal["npu", "sdpa"] = "npu"
     tp_degree: int = 1
+    ulysses_degree: int | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.cp_degree, int) or isinstance(self.cp_degree, bool) or self.cp_degree < 1:
-            raise ValueError("cp_degree must be a positive integer")
+        if self.ulysses_degree is None:
+            object.__setattr__(self, "ulysses_degree", self.cp_degree)
+        for name in ("cp_degree", "tp_degree", "ulysses_degree"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
         if self.strategy not in MLA_CP_STRATEGIES:
             raise ValueError(f"Unknown MLA CP strategy: {self.strategy}")
         if self.backend not in ("npu", "sdpa"):
             raise ValueError(f"Unknown MLA CP backend: {self.backend}")
-        if not isinstance(self.tp_degree, int) or isinstance(self.tp_degree, bool) or self.tp_degree < 1:
-            raise ValueError("tp_degree must be a positive integer")
-        if self.dimensions.heads % (self.tp_degree * self.cp_degree):
-            raise ValueError("MLA heads must be divisible by TP degree times CP degree")
+        if self.cp_degree % self.ulysses_degree:
+            raise ValueError("ulysses_degree must divide cp_degree")
+        if self.dimensions.heads % (self.tp_degree * self.ulysses_degree):
+            raise ValueError("MLA heads must be divisible by TP degree times Ulysses degree")
+        if self.tp_degree > 1 and self.all_gather_degree > 1:
+            raise ValueError("MLA KV AllGather and hybrid CP currently require TP1")
 
     @property
     def local_heads(self) -> int:
@@ -99,8 +108,13 @@ class MLACPPlan:
 
     @property
     def compute_heads(self) -> int:
-        """Heads used by this rank's full-sequence attention kernel."""
-        return self.local_heads // self.cp_degree
+        """Heads used by this rank's query-partition attention kernel."""
+        return self.local_heads // self.ulysses_degree
+
+    @property
+    def all_gather_degree(self) -> int:
+        """Number of query owners for each Ulysses head partition."""
+        return self.cp_degree // self.ulysses_degree
 
     def validate_scale(self, scale: float) -> None:
         """Reject invalid scales without replacing an explicit YaRN scale.
@@ -164,12 +178,12 @@ def _apply_mla_rope(
     return tuple(outputs)
 
 
-def _run_attention(module, query, key, value, *, backend, lengths, causal, attention_mask):
-    """Use the shared FA interface after CP has restored full Q/K token order."""
+def _run_attention(module, query, key, value, *, backend, lengths, key_lengths, causal, attention_mask):
+    """Run shared FA with distinct query and KV document ends after redistribution."""
     if backend == "npu":
         return npu_fusion_attention_forward(
             module, query, key, value, attention_mask, scaling=module.scaling,
-            is_causal=causal, actual_seq_len=lengths,
+            is_causal=causal, actual_seq_qlen=lengths, actual_seq_kvlen=key_lengths,
             pre_tokens=2147483647, next_tokens=0 if causal else 2147483647,
         )[0]
     allowed = attention_mask
@@ -180,14 +194,59 @@ def _run_attention(module, query, key, value, *, backend, lengths, causal, atten
             query, key, value, attn_mask=allowed, dropout_p=0.0,
             is_causal=causal and allowed is None, scale=module.scaling,
         ).transpose(1, 2)
-    outputs = [
-        F.scaled_dot_product_attention(  # pylint: disable=not-callable
-            query[:, :, begin:end], key[:, :, begin:end], value[:, :, begin:end],
-            dropout_p=0.0, is_causal=causal, scale=module.scaling,
-        ).transpose(1, 2)
-        for begin, end in zip([0] + lengths[:-1], lengths)
-    ]
-    return torch.cat(outputs, dim=1)
+    batch, sequence = query.shape[0], query.shape[2]
+    # Match the NPU TND batch-major token order before applying document ends.
+    query, key, value = (tensor.transpose(0, 1).flatten(1, 2).unsqueeze(0) for tensor in (query, key, value))
+    outputs = []
+    query_begin = key_begin = 0
+    for query_end, key_end in zip(lengths, key_lengths):
+        query_part = query[:, :, query_begin:query_end]
+        key_part = key[:, :, key_begin:key_end]
+        value_part = value[:, :, key_begin:key_end]
+        # CPU SDPA uses upper-left causality; rectangular CP segments need right alignment.
+        rectangular = causal and query_part.shape[2] != key_part.shape[2]
+        mask = None
+        if rectangular:
+            mask = torch.ones(query_part.shape[2], key_part.shape[2], dtype=torch.bool, device=query.device)
+            mask = mask.tril(diagonal=key_part.shape[2] - query_part.shape[2])
+        outputs.append(F.scaled_dot_product_attention(  # pylint: disable=not-callable
+            query_part, key_part, value_part, attn_mask=mask,
+            dropout_p=0.0, is_causal=causal and not rectangular, scale=module.scaling,
+        ).transpose(1, 2))
+        query_begin, key_begin = query_end, key_end
+    return torch.cat(outputs, dim=1).reshape(batch, sequence, query.shape[1], value.shape[-1])
+
+
+def _validate_query_partition(causal, attention_mask):
+    """Reject query-partition modes whose FA metadata contract is not implemented."""
+    if not causal or attention_mask is not None:
+        raise ValueError("MLA KV AllGather and hybrid CP require causal attention without an explicit mask")
+
+
+def _partition_causal_kv(query, key, value, lengths, query_rank):
+    """Match local queries to document prefixes for right-aligned causal FA."""
+    query_begin = query_rank * query.shape[2]
+    query_end = query_begin + query.shape[2]
+    key_parts, value_parts, query_ends, key_ends = [], [], [], []
+    query_count = key_count = document_begin = 0
+    for document_end in lengths or [key.shape[2]]:
+        begin, end = max(document_begin, query_begin), min(document_end, query_end)
+        if begin < end:
+            key_parts.append(key[:, :, document_begin:end])
+            value_parts.append(value[:, :, document_begin:end])
+            query_count += end - begin
+            key_count += end - document_begin
+            query_ends.append(query_count)
+            key_ends.append(key_count)
+        document_begin = document_end
+    if query_count != query.shape[2]:
+        raise ValueError("MLA document boundaries do not cover the query partition")
+    key = key_parts[0] if len(key_parts) == 1 else torch.cat(key_parts, dim=2)
+    value = value_parts[0] if len(value_parts) == 1 else torch.cat(value_parts, dim=2)
+    # TND flattens samples in batch-major order; each sample needs independent causal segments.
+    query_ends = [end + index * query_count for index in range(query.shape[0]) for end in query_ends]
+    key_ends = [end + index * key_count for index in range(query.shape[0]) for end in key_ends]
+    return key, value, query_ends, key_ends
 
 
 def _positions(
@@ -315,6 +374,12 @@ class MLAContextParallel:
             raise ValueError("MLACPPlan degree must match the CP mesh")
         self.plan = plan
         self.cp_mesh = cp_mesh
+        rank = 0 if cp_mesh is None else cp_mesh.get_local_rank()
+        self.query_rank, self.head_rank = divmod(rank, plan.ulysses_degree)
+        self.ulysses_mesh = self.all_gather_mesh = cp_mesh
+        if 1 < plan.ulysses_degree < plan.cp_degree:
+            # Group construction and caching follow the existing generic hybrid CP path.
+            self.ulysses_mesh, self.all_gather_mesh = _build_hybrid_cp_submeshes(cp_mesh, plan.ulysses_degree)
 
     def __call__(
         self,
@@ -343,23 +408,27 @@ class MLAContextParallel:
         if lengths is not None and batch != 1:
             raise ValueError("packed MLA CP currently requires batch_size=1")
         if lengths != key_lengths:
-            raise ValueError("MLA Ulysses requires matching global query and key document boundaries")
+            raise ValueError("MLA CP requires matching global query and key document boundaries")
         causal = getattr(module, "is_causal", True) if is_causal is None else is_causal
         if not isinstance(causal, bool):
             raise ValueError("is_causal must be bool")
         _validate_mask(attention_mask, lengths, batch, sequence * degree, query_latent.device)
+        if self.plan.all_gather_degree > 1:
+            _validate_query_partition(causal, attention_mask)
         positions = _positions(position_embeddings, state, dimensions.rope_dim)
         query, rotated_key = _query_and_key_rope(module, state, positions, self.plan.local_heads)
         if self.plan.strategy == "expanded_ulysses" or degree == 1:
             query, key, value = self._expanded(module, state, query, rotated_key)
         else:
             query, key, value = self._latent(module, state, query, rotated_key)
+        if self.plan.all_gather_degree > 1:
+            key, value, lengths, key_lengths = _partition_causal_kv(query, key, value, lengths, self.query_rank)
         output = _run_attention(
-            module, query, key, value, backend=self.plan.backend, lengths=lengths,
+            module, query, key, value, backend=self.plan.backend, lengths=lengths, key_lengths=key_lengths,
             causal=causal, attention_mask=attention_mask,
         )
-        if degree > 1:
-            output = ulysses_head_to_seq(output, 1, 2, self.cp_mesh)
+        if self.plan.ulysses_degree > 1:
+            output = ulysses_head_to_seq(output, 1, 2, self.ulysses_mesh)
         expected = (batch, sequence, self.plan.local_heads, dimensions.value_dim)
         if tuple(output.shape) != expected:
             raise RuntimeError(f"MLA CP output has shape {tuple(output.shape)}, expected {expected}")
@@ -368,23 +437,26 @@ class MLAContextParallel:
     def _expanded(self, module, state, query, key_rope):
         """Pack unequal-width QKV into one sequence-to-head exchange."""
         key, value = _key_value(module, state.kv_latent, key_rope, self.plan.local_heads, None)
-        if self.plan.cp_degree == 1:
-            return query, key, value
-        widths = (query.shape[-1], key.shape[-1], value.shape[-1])
-        # Keep projection outputs in BSND while packing to reduce layout copies.
-        # Source-rank/sequence reconstruction is also a view when B=1.
-        payload = torch.cat(tuple(tensor.transpose(1, 2) for tensor in (query, key, value)), dim=-1)
-        payload = ulysses_seq_to_head(payload, 1, 2, self.cp_mesh)
-        return tuple(tensor.transpose(1, 2) for tensor in payload.split(widths, dim=-1))
+        if self.plan.ulysses_degree > 1:
+            widths = (query.shape[-1], key.shape[-1], value.shape[-1])
+            payload = torch.cat(tuple(tensor.transpose(1, 2) for tensor in (query, key, value)), dim=-1)
+            payload = ulysses_seq_to_head(payload, 1, 2, self.ulysses_mesh)
+            query, key, value = (tensor.transpose(1, 2) for tensor in payload.split(widths, dim=-1))
+        if self.plan.all_gather_degree > 1:
+            widths = (key.shape[-1], value.shape[-1])
+            payload = torch.cat((key.transpose(1, 2), value.transpose(1, 2)), dim=-1)
+            payload = mla_all_gather(payload, 1, self.all_gather_mesh)
+            key, value = (tensor.transpose(1, 2) for tensor in payload.split(widths, dim=-1))
+        return query, key, value
 
     def _latent(self, module, state, query, key_rope):
         """Exchange Q heads, gather shared KV latents, then expand only owned heads."""
         dimensions = self.plan.dimensions
         heads = self.plan.compute_heads
-        rank = 0 if self.cp_mesh is None else self.cp_mesh.get_local_rank()
-        start = rank * heads
-        if self.plan.cp_degree > 1:
-            query = ulysses_seq_to_head(query, 2, 1, self.cp_mesh)
+        start = self.head_rank * heads
+        if self.plan.ulysses_degree > 1:
+            query = ulysses_seq_to_head(query, 2, 1, self.ulysses_mesh)
+        # Latents have not traversed Ulysses, so all CP token owners must contribute.
         payload = mla_all_gather(torch.cat((state.kv_latent, key_rope), dim=-1), 1, self.cp_mesh)
         kv_latent, key_rope = payload.split((dimensions.kv_rank, dimensions.rope_dim), dim=-1)
         # A contiguous latent preserves the native Linear bias-fusion path after payload splitting.

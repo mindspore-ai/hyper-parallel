@@ -94,6 +94,7 @@ def mla_cp_wrapper(
     *,
     strategy: MLACPStrategy = "expanded_ulysses",
     backend: Literal["npu", "sdpa"] = "npu",
+    ulysses_degree: int | None = None,
 ) -> list[_ForwardRewriteRequest]:
     """Install dense MLA CP after replacement and TP sharding, before FSDP.
 
@@ -110,6 +111,8 @@ def mla_cp_wrapper(
         ep_mesh: Unused expert axis supplied by the recipe rewriter.
         strategy: Expanded QKV Ulysses or expanded Q with latent KV AllGather.
         backend: Native unequal-dimension NPU FA or CPU SDPA.
+        ulysses_degree: Defaults to CP size. At TP1, one selects KV AllGather;
+            intermediate CP divisors select Ulysses x AllGather.
 
     Returns:
         Atomic forward rewrites preserving projection parameters and hooks.
@@ -131,7 +134,7 @@ def mla_cp_wrapper(
         kv_rank=target_module.kv_lora_rank, nope_dim=target_module.qk_nope_head_dim,
         rope_dim=target_module.qk_rope_head_dim, value_dim=target_module.v_head_dim,
     )
-    plan = MLACPPlan(dimensions, cp_degree, strategy, backend, tp_degree)
+    plan = MLACPPlan(dimensions, cp_degree, strategy, backend, tp_degree, ulysses_degree)
     plan.validate_scale(target_module.scaling)
     _validate_up_projections(target_module, plan)
     original = target_module.forward

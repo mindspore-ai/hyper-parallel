@@ -26,8 +26,8 @@ _WORKER = str(Path(__file__).with_name("_test_mla_cp.py"))
           card_mark="allcards", essential_mark="essential")
 def test_mla_npu_8_cards() -> None:
     """
-    Feature: MLA Ulysses CP8 on NPU.
-    Description: Run both strategies with BF16 native FA, packed sequences and explicit masks.
+    Feature: MLA Ulysses, KV AllGather and hybrid CP8 on NPU.
+    Description: Run both representations with causal/packed FA and retain Ulysses explicit-mask coverage.
     Expectation: Outputs and gradients match the native non-CP reference within the existing BF16 tolerances.
     """
     torchrun_case(_WORKER, "test_mla_npu_bfloat16", num_proc=8)

@@ -77,7 +77,7 @@ def _compare(actual: torch.Tensor, expected: torch.Tensor, dtype: torch.dtype, l
 def test_mla_npu_bfloat16() -> None:
     """
     Feature: BF16 MLA context parallelism with native QK192/V128 attention.
-    Description: Execute CP8 expanded and latent-KV strategies against the original non-CP module.
+    Description: Execute CP8 Ulysses, KV AllGather and hybrid strategies against the original non-CP module.
     Expectation: Outputs, loss, input gradients and parameter gradients satisfy the existing BF16 tolerances.
     """
     _tp_suite(_npu_device(), torch.bfloat16, ((1, int(os.environ["WORLD_SIZE"]), False),), "npu")
@@ -215,7 +215,7 @@ def _sync_tp_cp_gradients(parallel, reference, tp_mesh, cp_mesh, tp, tp_rank, dt
     return relative
 
 
-def _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, backend):
+def _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, backend, ulysses_degree=None):
     """Apply the production plan and assert the physical TP layout before training."""
     tp_rank = mesh["tp"].get_local_rank() if tp > 1 else 0
     torch.manual_seed(409)
@@ -231,7 +231,7 @@ def _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, backend)
         inner_wrapper=Target(
             mla_cp_wrapper,
             target_path="hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel.mla_cp_wrapper",
-            strategy=strategy, backend=backend,
+            strategy=strategy, backend=backend, ulysses_degree=ulysses_degree,
         ),
     )
     plan = ShardingPlanner(plan_overrides={"self_attn": spec}).plan(
@@ -241,26 +241,28 @@ def _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, backend)
     if tp > 1:
         assert source_info, "TP parameter shards must retain source layouts for the reducer"
     assert parallel.self_attn.num_heads == dimensions.heads // tp
-    assert parallel.self_attn.mla_cp_runtime.plan.compute_heads == dimensions.heads // (tp * cp)
+    assert parallel.self_attn.mla_cp_runtime.plan.compute_heads == dimensions.heads // (tp * (ulysses_degree or cp))
     for name, parameter in parallel.named_parameters():
         _compare(parameter, _tp_shard(reference.get_parameter(name), name, tp, tp_rank), dtype, f"TP layout {name}")
     return reference, parallel, dimensions
 
 
 def _gradient_composition(mesh, tp: int, cp: int, strategy: str, metadata: dict,
-                       device: torch.device, dtype: torch.dtype, backend: str) -> None:
+                       device: torch.device, dtype: torch.dtype, backend: str,
+                       ulysses_degree: int | None = None, batch_size: int = 2) -> None:
     """Compare recomputed TP/CP outputs and accumulated gradients to the unsharded reference."""
     tp_mesh = mesh["tp"] if tp > 1 else None
     cp_mesh = mesh["cp"] if cp > 1 else None
     tp_rank = tp_mesh.get_local_rank() if tp_mesh is not None else 0
     cp_rank = cp_mesh.get_local_rank() if cp_mesh is not None else 0
-    reference, parallel, dimensions = _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, backend)
+    reference, parallel, dimensions = _build_composition(
+        mesh, tp, cp, strategy, metadata, device, dtype, backend, ulysses_degree)
     lengths = metadata.get("actual_seq_len")
     sequence = lengths[-1] if lengths else (64 if device.type == "npu" else 16)
     begin, end = cp_rank * sequence // cp, (cp_rank + 1) * sequence // cp
     positions = position_embeddings(sequence, dimensions.rope_dim, metadata, dtype=dtype, device=device)
     local_positions = tuple(part[:, begin:end].contiguous() for part in positions)
-    batch = 2 if tp == 1 and lengths is None else 1
+    batch = batch_size if (tp, lengths) == (1, None) else 1
     relative = None
     parallel.zero_grad(set_to_none=True)
     reference.zero_grad(set_to_none=True)
@@ -307,6 +309,7 @@ def _gradient_composition(mesh, tp: int, cp: int, strategy: str, metadata: dict,
     relative = _sync_tp_cp_gradients(parallel, reference, tp_mesh, cp_mesh, tp, tp_rank, dtype)
     if dist.get_rank() == 0:
         print(json.dumps({"tp": tp, "cp": cp, "mesh_axes": mesh.mesh_dim_names, "strategy": strategy,
+                          "ulysses_degree": ulysses_degree or cp, "batch_size": batch,
                           "backend": backend, "dtype": str(dtype), "packed": metadata.get("actual_seq_len"),
                           "causal": metadata.get("is_causal", True),
                           "gradient_relative_l2": relative.item(), "backward_passes": 2}), flush=True)
@@ -332,6 +335,11 @@ def _tp_suite(device: torch.device, dtype: torch.dtype, configurations: tuple, b
             for strategy in MLA_CP_STRATEGIES:
                 for metadata in cases:
                     _gradient_composition(mesh, tp, cp, strategy, metadata, device, dtype, backend)
+                if tp == 1:
+                    for degree in (1, 2, 4):
+                        if degree < cp and cp % degree == 0:
+                            for metadata in cases[:2]:
+                                _gradient_composition(mesh, tp, cp, strategy, metadata, device, dtype, backend, degree)
     finally:
         dist.destroy_process_group()
 
