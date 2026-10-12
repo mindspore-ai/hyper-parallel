@@ -146,8 +146,8 @@ checkpoint:
   save_steps: 10
   save_epochs: 1
   is_async: false
-  save_optimizer: false
-  save_train_state: false
+  save_optimizer: true
+  save_train_state: true
   save_extra_state_per_rank: false
   restore_from: null
   restore_optimizer: true
