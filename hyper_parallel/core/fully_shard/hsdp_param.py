@@ -961,7 +961,13 @@ class HSDPParamV2:
         if self.sharded_size == self.padded_sharded_param_size:
             local_tensor = local_tensor.contiguous()
             self._sharded_param_data = local_tensor.view(-1)
-            local_view = local_tensor
+            # `contiguous()` returns the same object when the tensor already is,
+            # so `local_view` would alias the storage `_sharded_param_data`
+            # views. `requires_grad` propagates from a base to its existing
+            # views, so the `set_requires_grad_if_needed` below would then flip
+            # the HSDP-owned storage back on-graph. Detach to keep the view a
+            # distinct tensor with its own flag.
+            local_view = local_tensor.detach()
         else:
             padded_local_tensor = local_tensor.new_zeros(self.padded_sharded_param_size)
             if self.pin_memory:
@@ -977,7 +983,7 @@ class HSDPParamV2:
                 shard_dim,
                 0,
                 actual_shard_length,
-            )
+            ).detach()
         set_requires_grad_if_needed(self.sharded_param, local_view)
         self.sharded_param._local_tensor = local_view
         self._update_shardedparam_storage_forcely()
