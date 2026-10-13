@@ -27,8 +27,10 @@ follows the same contract: intent here, runtime guard in ``PpPass``.
 
 __all__ = ["PassConfig", "PP_SCHEDULES", "DP_MODES", "normalize_dp_mode"]
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
+
+from .recompute_config import RecomputeConfig
 
 
 # Pipeline schedule names accepted by ``pp_schedule``. Kept torch-free here so
@@ -67,6 +69,7 @@ class PassConfig:
     """Parallel configuration for graph-mode FSDP (+ optional TP / SP / PP) training.
 
     Attributes:
+        recompute: Activation recompute policy; disabled by default.
         enable_overlap: Drive ``AutoOverlapPass`` to move ``wait_tensor`` for
             communication/compute overlap.
         fsdp_enabled: Drive ``FSDPPass`` (data-parallel partitioning: parameter
@@ -161,6 +164,7 @@ class PassConfig:
     pp_degree: Optional[int] = None
     pp_microbatch_size: int = 1
     pp_schedule: str = "gpipe"
+    recompute: RecomputeConfig = field(default_factory=RecomputeConfig)
 
     def __post_init__(self) -> None:
         self.dp_mode = normalize_dp_mode(self.dp_mode)
@@ -175,6 +179,11 @@ class PassConfig:
                 ``pp_microbatch_size``, an unknown ``pp_schedule`` /
                 ``dp_mode``, or a non-positive ``dp_replicate_degree``.
         """
+        if not isinstance(self.recompute, RecomputeConfig):
+            raise ValueError("recompute must be a RecomputeConfig")
+        self.recompute.validate()
+        if self.pp_enabled and self.recompute.mode != "none":
+            raise ValueError("Graph recompute with pipeline parallelism is not supported in this release")
         if self.tp_size < 1:
             raise ValueError(f"tp_size must be >= 1, got {self.tp_size}")
         if self.fsdp_degree is not None and self.fsdp_degree < 1:
@@ -221,6 +230,11 @@ def build_pass_config_from_trainer_config(
     trainer package.
     """
     accelerator = config.accelerator
+    recompute_options = getattr(getattr(config, "compile", None), "recompute", None)
+    recompute = RecomputeConfig(**(recompute_options or {}))
+    recompute.validate()
+    if recompute.mode != "none" and getattr(accelerator, "pp_size", 1) > 1:
+        raise ValueError("Graph recompute with pipeline parallelism is not supported in this release")
     if fsdp_enabled is None:
         fsdp_enabled = (
             config.fsdp_config.dp_shard_size > 1
@@ -228,6 +242,7 @@ def build_pass_config_from_trainer_config(
         )
     fsdp_degree = config.fsdp_config.dp_shard_size if fsdp_enabled else None
     return PassConfig(
+        recompute=recompute,
         enable_overlap=enable_overlap,
         fsdp_enabled=fsdp_enabled,
         fsdp_degree=fsdp_degree,

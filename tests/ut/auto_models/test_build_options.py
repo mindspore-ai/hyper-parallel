@@ -60,6 +60,7 @@ class TestBuildOptionsFields(unittest.TestCase):
                 ("backend", "None"),
                 ("options", "None"),
                 ("dynamo_cache_size_limit", "256"),
+                ("recompute", "None"),
             ],
         )
 

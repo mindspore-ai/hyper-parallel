@@ -156,3 +156,9 @@ trainer.train(dataloader, max_steps=1000)
 - **Requires torch with a patched autograd engine** for joint-graph capture.
   On stock torch the backward half is annotated structurally instead (see
   `_annotate_autograd_backward` in `tracer/graph_tracer.py`).
+
+
+## Activation recomputation
+
+GraphCompiler supports optional full/selective activation recomputation.
+See [the runnable example and limitations](examples/recompute/README.md).

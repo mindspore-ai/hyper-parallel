@@ -32,6 +32,7 @@ from hyper_parallel.models._transformers.model_builder import instantiate_infras
 from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config import (
+    ActivationCheckpointConfig,
     AcceleratorConfig,
     OptimizerConfig,
     Target,
@@ -66,6 +67,46 @@ def _make_kw_model() -> torch.nn.Module:
 
 class TestGraphModeIntegration(unittest.TestCase):
     """Test graph-mode selection without the old target-wrapping bridge."""
+
+    def test_recompute_configuration_projection(self):
+        """YAML lists and graph policy options reach PassConfig unchanged."""
+        config = SimpleNamespace(
+            compile=CompileConfig(enabled=True, use_joint_graph=True, recompute={
+                "mode": "selective", "module_patterns": ["model.layers.*"],
+                "selective_policy": "save_compute", "exclude_module_patterns": ["model.layers.0"],
+                "save_ops": ["aten.sin.default"]}),
+            accelerator=SimpleNamespace(tp_size=2, pp_size=1, sequence_parallel=False, loss_parallel=False),
+            fsdp_config=SimpleNamespace(dp_shard_size=2, edp_shard_size=1))
+        result = build_pass_config_from_trainer_config(config)
+        self.assertEqual(result.recompute.mode, "selective")
+        self.assertEqual(result.recompute.module_patterns, ["model.layers.*"])
+        self.assertEqual(result.recompute.selective_policy, "save_compute")
+        self.assertEqual(result.recompute.exclude_module_patterns, ["model.layers.0"])
+        self.assertEqual(result.recompute.save_ops, ["aten.sin.default"])
+        self.assertEqual((result.tp_size, result.fsdp_degree), (2, 2))
+        config.compile.recompute = {"mode": "invalid"}
+        with self.assertRaisesRegex(ValueError, "recompute.mode"):
+            build_pass_config_from_trainer_config(config)
+        config.compile.recompute = {"typo": True}
+        with self.assertRaises(TypeError):
+            build_pass_config_from_trainer_config(config)
+
+    def test_recompute_requires_joint_graph_and_excludes_eager_wrappers(self):
+        """Reject silently ignored options and nested eager checkpoint wrappers."""
+        with self.assertRaisesRegex(TypeError, "mapping"):
+            CompileConfig(enabled=True, use_joint_graph=True, recompute="full")
+        with self.assertRaisesRegex(ValueError, "use_joint_graph"):
+            CompileConfig(enabled=True, recompute={"mode": "full"})
+        for mode in ("full", "selective"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "eager"):
+                TrainerConfig(
+                    model=Target(_target_=_build_model,
+                                 target_path="tests.ut.compile.test_graphtrainer_config._build_model"),
+                    optimizer=OptimizerConfig(target=Target(
+                        _target_=_build_optimizer,
+                        target_path="tests.ut.compile.test_graphtrainer_config._build_optimizer")),
+                    compile=CompileConfig(enabled=True, use_joint_graph=True, recompute={"mode": "full"}),
+                    activation_checkpoint=ActivationCheckpointConfig(mode=mode))
 
     def test_basetrainer_builds_graph_compiler_only_for_joint_graph(self):
         """BaseTrainer should own compiler creation without affecting eager mode."""

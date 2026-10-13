@@ -112,7 +112,11 @@ from hyper_parallel.components.quantization.config import (  # pylint: disable=C
 
 @dataclass
 class CompileConfig:
-    """Decoder-layer ``torch.compile`` options exposed by the Trainer."""
+    """Trainer compilation options for decoder layers or a joint training graph.
+
+    ``recompute`` accepts graph ``RecomputeConfig`` fields as a YAML mapping.
+    It is available only with ``enabled=True`` and ``use_joint_graph=True``.
+    """
 
     enabled: bool = False
     use_joint_graph: bool = False
@@ -122,6 +126,8 @@ class CompileConfig:
     backend: Optional[str] = None
     options: Optional[dict[str, Any]] = None
     dynamo_cache_size_limit: int = 256
+    # Joint-graph RecomputeConfig fields; separate from torch.compile options.
+    recompute: Optional[dict[str, Any]] = None
 
     def selects_graph_compiler(self) -> bool:
         """Return whether this config selects the graph-compiler trainer path."""
@@ -140,6 +146,11 @@ class CompileConfig:
             raise ValueError("compile.backend must be None or a non-empty string")
         if self.options is not None and not isinstance(self.options, dict):
             raise TypeError("compile.options must be a mapping or None")
+        if self.recompute is not None:
+            if not isinstance(self.recompute, dict):
+                raise TypeError("compile.recompute must be a mapping or None")
+            if not self.selects_graph_compiler():
+                raise ValueError("compile.recompute requires enabled=true and use_joint_graph=true")
         if self.options and self.mode != "default" and not self.selects_graph_compiler():
             raise ValueError(
                 "compile.options cannot be combined with a non-default compile.mode"

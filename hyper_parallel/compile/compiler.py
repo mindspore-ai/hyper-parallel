@@ -30,6 +30,7 @@ class and owns them.
 
 __all__ = ["GraphCompiler"]
 
+import copy
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -122,6 +123,13 @@ class GraphCompiler:
     def is_compiled(self) -> bool:
         """Whether a joint graph has already been compiled."""
         return self._joint_graph is not None
+
+    @property
+    def recompute_report(self) -> Optional[dict]:
+        """Return a copy of recompute diagnostics after compilation, or None."""
+        if self._joint_graph is None:
+            return None
+        return copy.deepcopy(self._joint_graph.graph_module.meta.get("recompute_report"))
 
     def compile(self, **inputs: Any) -> None:
         """

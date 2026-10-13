@@ -95,6 +95,11 @@ class TrainerConfig:
             and self.accelerator.pp_size > 1
         ):
             raise ValueError("compile is not supported together with pipeline parallelism")
+        if self.compile.recompute and self.compile.recompute.get("mode", "none") != "none":
+            if self.activation_checkpoint.mode not in (None, "off") or self.activation_swap != "none":
+                raise ValueError("compile.recompute cannot be combined with eager activation checkpoint or swap")
+            if self.accelerator.pp_size > 1:
+                raise ValueError("Graph recompute with pipeline parallelism is not supported in this release")
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
         if self.optimizer.fp32_main_params and reduce_dtype != "float32":
             raise ValueError(

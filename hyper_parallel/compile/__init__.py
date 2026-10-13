@@ -62,6 +62,7 @@ from .graph_parallel_plan import (
 )
 
 from .pass_config import PassConfig
+from .recompute_config import RecomputeConfig
 
 from .trainer import GraphTrainer
 
@@ -72,6 +73,7 @@ __all__ = [
     "create_all_fsdp_plan",
     # Config
     "PassConfig",
+    "RecomputeConfig",
     # Compiler (compile + forward_backward only)
     "GraphCompiler",
     # Trainer

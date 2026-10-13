@@ -25,13 +25,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HYPER_PARALLEL_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 REPO_ROOT="$(cd "${HYPER_PARALLEL_ROOT}/.." && pwd)"
 
-CONFIG="${SCRIPT_DIR}/train_lm_graph_fixed_tp2_fsdp2.yaml"
+CONFIG="${SCRIPT_DIR}/train_lm_graph_tp2_fsdp2.yaml"
 NPROC_PER_NODE=4
 NNODES=1
 NODE_RANK=0
 MASTER_ADDR="127.0.0.1"
 MASTER_PORT=29683
-LABEL="train_lm_graph_fixed_tp2_fsdp2"
+LABEL="train_lm_graph_tp2_fsdp2"
 OUTPUT_DIR="${SCRIPT_DIR}/output"
 TRAIN_ENTRY="${REPO_ROOT}/scripts/train_lm.py"
 
@@ -56,7 +56,7 @@ torchrun \
     --master_port="${MASTER_PORT}" \
     --tee=3 \
     --local-ranks-filter=0 \
-    "${TRAIN_ENTRY}" "${CONFIG}" \
+    "${TRAIN_ENTRY}" "${CONFIG}" "$@" \
     2>&1 | tee "${OUTPUT_DIR}/run_${LABEL}.log"
 
 echo "=========================================================="

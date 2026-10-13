@@ -19,7 +19,8 @@ Automatically builds Pass execution order based on parallel configuration.
 
 Execution Order:
 1. Basic optimization: DeadCodeElimination, CanonicalizeGraph
-2. Execution layer:
+2. Activation recomputation (optional), before parameter lifetime planning.
+3. Execution layer:
    - FSDPPass (FSDP)
    - PpPass (pipeline-parallel stage split) — runs AFTER FSDPPass: the FSDP
      collectives are value-level FX nodes that follow the data flow, so the
@@ -27,7 +28,7 @@ Execution Order:
      while foreign stages' collectives are simply never copied. Splitting
      first would hand FSDPPass two subgraphs and a loss-less output list,
      breaking its grad-index contract.
-3. Communication-compute overlap: AutoOverlapPass (a no-op under PP — the
+4. Communication-compute overlap: AutoOverlapPass (a no-op under PP — the
    stage stub carries no wait_tensor nodes; the GPipe schedule overlaps
    comm/compute at the Python level)
 
@@ -41,6 +42,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 from ..pass_config import PassConfig
 from .base import GraphPass
+from .recompute import RecomputePass
 from .overlap.schedule import AutoOverlapPass
 from .parallel.fsdp_pass import FSDPPass
 from .parallel.pp_pass import PpPass
@@ -78,7 +80,11 @@ class PassPipeline:
         self.passes.append(DeadCodeEliminationPass())
         self.passes.append(CanonicalizeGraphPass())
 
-        # 2. Execution layer: Parallel dimension partitioning
+        # Recompute must precede parameter release / backward re-gather planning.
+        if self.config.recompute.mode != "none":
+            self.passes.append(RecomputePass())
+
+        # Execution layer: parallel dimension partitioning
         if getattr(self.config, "fsdp_enabled", False):
             self.passes.append(FSDPPass(parallel_plan=self.parallel_plan))
         if getattr(self.config, "pp_enabled", False):
