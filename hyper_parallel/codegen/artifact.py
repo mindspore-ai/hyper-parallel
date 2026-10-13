@@ -16,20 +16,29 @@
 
 The artifact bundle lives in a ``generated/`` directory and holds the
 generated modeling file, its diff against the original, and
-``codegen_meta.json``.  CLI workflows can anchor it beside a YAML file; model
-construction workflows can use the current working directory or an explicit
-artifact directory.  The bundle is written as one atomic unit: every file is first staged into a
-temporary *sibling* directory, then the whole directory is swapped into place,
-so a half-written bundle can never be imported.
+``codegen_meta.json``.  Three layout anchors exist: the model-anchored
+default (``hyper_parallel/models/<model_type>/generated``, one bundle per
+model type), the YAML-anchored layout (``<yaml_dir>/generated``, used only
+when no model identity resolves), and the working-directory /
+explicit-directory layout for model-construction workflows.  The bundle is
+written as one atomic unit: every file is first staged into a temporary
+*sibling* directory, then the whole directory is swapped into place, so a
+half-written bundle can never be imported.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+# Bundle directory name shared by every layout constructor.
+_GENERATED_DIR = "generated"
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -51,7 +60,7 @@ class ArtifactLayout:
         contain one Codegen YAML, so another per-YAML directory is redundant.
         """
         yaml_path = os.path.abspath(yaml_path)
-        artifact_dir = os.path.join(os.path.dirname(yaml_path), "generated")
+        artifact_dir = os.path.join(os.path.dirname(yaml_path), _GENERATED_DIR)
         modeling_name = _default_modeling_name(model_name)
         return cls(
             yaml_path=yaml_path,
@@ -75,7 +84,7 @@ class ArtifactLayout:
         signature is computed from the resolved config projection, not from a
         YAML file path.
         """
-        resolved_dir = os.path.abspath(artifact_dir or os.path.join(os.getcwd(), "generated"))
+        resolved_dir = os.path.abspath(artifact_dir or os.path.join(os.getcwd(), _GENERATED_DIR))
         modeling_name = _default_modeling_name(model_name)
         return cls(
             yaml_path="",
@@ -84,6 +93,49 @@ class ArtifactLayout:
             diff_path=os.path.join(resolved_dir, modeling_name + ".diff"),
             meta_path=os.path.join(resolved_dir, "codegen_meta.json"),
             init_path=os.path.join(resolved_dir, "__init__.py"),
+        )
+
+    @classmethod
+    def build_model_anchored(
+        cls,
+        model_type: str,
+        model_name: str | None = None,
+        yaml_path: str | None = None,
+    ) -> "ArtifactLayout":
+        """Create the model-anchored layout for one model type.
+
+        ``artifact_dir`` is ``hyper_parallel/models/<model_type>/generated``
+        — exactly one bundle per model type, colocated with the model's
+        adapter code.  When ``models/<model_type>/`` does not exist yet, a
+        warning is emitted and the directory is created on demand, so a
+        model without a family directory still gets its own bundle home
+        instead of silently falling back to another location.
+        ``yaml_path`` records the originating training YAML in
+        ``codegen_meta.json`` (provenance only — the signature never reads
+        it); it is empty when no YAML anchors the run.
+        """
+        # ``artifact.py`` lives in ``hyper_parallel/codegen/``; the models
+        # tree is its sibling — package-relative, never cwd-dependent.
+        models_root = Path(__file__).resolve().parents[1] / "models"
+        family_root = models_root / model_type
+        if not family_root.is_dir():
+            _LOGGER.warning(
+                "codegen: model type %r has no directory under "
+                "hyper_parallel/models yet; the bundle will be created at "
+                "%s (add an adapter package there to colocate it with the "
+                "model's conversion code)",
+                model_type,
+                os.path.join(str(family_root), _GENERATED_DIR),
+            )
+        artifact_dir = os.path.join(str(family_root), _GENERATED_DIR)
+        modeling_name = _default_modeling_name(model_name)
+        return cls(
+            yaml_path=os.path.abspath(yaml_path) if yaml_path else "",
+            artifact_dir=artifact_dir,
+            modeling_path=os.path.join(artifact_dir, modeling_name),
+            diff_path=os.path.join(artifact_dir, modeling_name + ".diff"),
+            meta_path=os.path.join(artifact_dir, "codegen_meta.json"),
+            init_path=os.path.join(artifact_dir, "__init__.py"),
         )
 
 
@@ -109,9 +161,40 @@ def resolve_default_artifact_layout(
     return ArtifactLayout.build_default(artifact_dir, model_name)
 
 
+def resolve_model_artifact_layout(
+    model_type: str,
+    model_name: str | None = None,
+    yaml_path: str | None = None,
+) -> "ArtifactLayout":
+    """Resolve the model-anchored layout for ``model_type``.
+
+    The bundle directory is always ``hyper_parallel/models/<model_type>/
+    generated`` — a strict one-to-one mapping keyed by the model type, with
+    no aliasing between model types.  When ``models/<model_type>/`` does not
+    exist yet, ``ArtifactLayout.build_model_anchored`` warns and the directory is
+    created on demand by :func:`ensure_artifact_dir`.
+    """
+    return ArtifactLayout.build_model_anchored(
+        model_type, model_name=model_name, yaml_path=yaml_path
+    )
+
+
 def ensure_artifact_dir(layout: ArtifactLayout) -> None:
-    """Create the artifact directory (recursive, no-op if present)."""
-    Path(layout.artifact_dir).mkdir(parents=True, exist_ok=True)
+    """Create the artifact directory (recursive, no-op if present).
+
+    Raises a readable error when the directory cannot be created: the
+    model-anchored default lives inside the installed ``hyper_parallel``
+    package, which is read-only under a non-editable install.
+    """
+    try:
+        Path(layout.artifact_dir).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"codegen: cannot create artifact directory {layout.artifact_dir}: {exc}. "
+            "The default bundle location lives inside the hyper_parallel package; "
+            "for a non-editable install either reinstall with 'pip install -e .' "
+            "or point 'model.codegen_artifact_dir' at a writable directory in the YAML."
+        ) from exc
 
 
 def write_bundle_atomic(
@@ -264,6 +347,7 @@ __all__ = [
     "clean_temp_artifacts",
     "ensure_artifact_dir",
     "resolve_default_artifact_layout",
+    "resolve_model_artifact_layout",
     "resolve_artifact_layout",
     "write_bundle_atomic",
 ]

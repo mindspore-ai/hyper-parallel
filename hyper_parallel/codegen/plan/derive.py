@@ -1,4 +1,4 @@
-﻿# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 # Licensed under the Apache License, Version 2.0
 # ============================================================================
 """Derive the sharding plan for a model without a live process group.
@@ -63,6 +63,7 @@ def build_meta_model(
     *,
     config_overrides: Optional[dict[str, Any]] = None,
     hf_config: Any = None,
+    trust_remote_code: bool = False,
 ) -> Any:
     """Construct an empty meta-device model for the spec's source.
 
@@ -70,6 +71,10 @@ def build_meta_model(
     tree with no weights and no network; wrapping it in
     ``components.utils.model_utils.init_empty_weights`` keeps the parameters
     on the meta device so a CPU-only host never allocates the model's memory.
+
+    ``trust_remote_code`` is forwarded from the YAML ``model:`` block so
+    remote-code checkpoints (``auto_map`` + ``modeling_*.py``) can be built
+    exactly like the trainer's HF backend loads them.
 
     Returns ``None`` only when the spec carries no model identity (the caller
     then skips plan derivation entirely).  A model that *is* configured but
@@ -99,9 +104,15 @@ def build_meta_model(
 
         from transformers import AutoConfig, AutoModelForCausalLM
 
-        config = AutoConfig.from_pretrained(model_id, **dict(config_overrides or {}))
+        config = AutoConfig.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code,
+            **dict(config_overrides or {}),
+        )
         with init_empty_weights():
-            return AutoModelForCausalLM.from_config(config)
+            return AutoModelForCausalLM.from_config(
+                config, trust_remote_code=trust_remote_code
+            )
     except Exception as exc:  # noqa: BLE001 - fail fast: an unbuildable source must not yield a plan-less artifact
         logger.error(
             "codegen: cannot build meta model for %r (%s: %s)",
