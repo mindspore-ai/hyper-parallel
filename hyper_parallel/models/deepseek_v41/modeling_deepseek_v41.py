@@ -427,6 +427,8 @@ class DeepseekV41Compressor(nn.Module):
             self,
             hidden_states: torch.Tensor,
             compress_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+            block_plan: Any = None,
+            cp_context: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return unrotated and RoPE-rotated compressed KV tensors.
 
@@ -440,6 +442,13 @@ class DeepseekV41Compressor(nn.Module):
             cos, sin = compress_position_embeddings
             rotated = apply_rotary_pos_emb(latent.unsqueeze(1), cos, sin).squeeze(1)
             return latent, rotated
+
+        if block_plan is not None:
+            latent = self.norm(block_plan.pool(self.wkv(hidden_states), self.wgate(hidden_states), cp_context))
+            cos, sin = compress_position_embeddings
+            return latent, apply_rotary_pos_emb(
+                latent.unsqueeze(1), cos, sin,
+            ).squeeze(1)
 
         usable = sequence_length - sequence_length % self.compress_ratio
         key_value = self.wkv(hidden_states[:, :usable])
