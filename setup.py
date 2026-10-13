@@ -252,7 +252,13 @@ if __name__ == '__main__':
             'hyper_parallel.components.functional._triton.gated_delta_net': ['GDN_LICENSE'],
             'hyper_parallel.components.functional._triton.kimi_delta_attention': ['KDA_README.md'],
             'hyper_parallel.core.multicore': ['README.md', 'docs/**/*', 'examples/**/*', 'set_env.bash'],
-            'hyper_parallel.models.qwen3_moe': ['recipes/*.yaml'],
+            # Model adapter recipes + committed codegen reference bundles.
+            'hyper_parallel.models.qwen3_moe': [
+                'recipes/*.yaml', 'generated/*.json', 'generated/*.diff',
+            ],
+            'hyper_parallel.models.deepseek_v41': [
+                'generated/*.json', 'generated/*.diff',
+            ],
             'hyper_parallel.auto_parallel': ['op_profiles/*.yaml', 'op_records.yaml'],
             'hyper_parallel.auto_parallel.sapp_nd.memory_estimation': [
                 'configs_eval/default.yaml',

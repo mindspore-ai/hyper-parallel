@@ -20,12 +20,19 @@ import logging
 import os
 from typing import Any, Optional
 
-from hyper_parallel.codegen.artifact import resolve_artifact_layout
+from hyper_parallel.codegen.artifact import (
+    resolve_artifact_layout,
+    resolve_default_artifact_layout,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def verify_drift_intact(meta: Any, yaml_path: str) -> list[str]:
+def verify_drift_intact(
+    meta: Any,
+    yaml_path: str,
+    artifact_dir: Optional[str] = None,
+) -> list[str]:
     """Regenerate the bundle from ``meta`` and compare with the on-disk files.
 
     Returns a list of drift descriptions (empty = intact).  Raises
@@ -33,8 +40,15 @@ def verify_drift_intact(meta: Any, yaml_path: str) -> list[str]:
     the original modeling source file can no longer be read (e.g. a remote-code
     cache was evicted), drift is *reported*, not silently skipped: the artifact
     cannot be re-validated against its origin.
+
+    ``artifact_dir`` optionally pins the bundle location (the layout the
+    caller resolved — model-anchored by default); when omitted the
+    YAML-anchored layout is derived from ``yaml_path`` as before.
     """
-    layout = resolve_artifact_layout(yaml_path, model_name=_model_name(meta))
+    if artifact_dir is not None:
+        layout = resolve_default_artifact_layout(artifact_dir, model_name=_model_name(meta))
+    else:
+        layout = resolve_artifact_layout(yaml_path, model_name=_model_name(meta))
     if not os.path.isdir(layout.artifact_dir):
         raise FileNotFoundError(f"codegen drift: bundle missing at {layout.artifact_dir}")
 

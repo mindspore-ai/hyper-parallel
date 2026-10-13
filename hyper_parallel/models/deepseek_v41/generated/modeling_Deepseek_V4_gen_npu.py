@@ -367,7 +367,7 @@ class DeepseekV41Attention(SharedCompressedDSAAttentionBase):
         super().__init__(
             _DeepseekV41AttentionState(config, layer_idx),
             replace_indexer=False,
-            use_optimized_sparse_attention=False,
+            use_fused_ops=False,
         )
 
 

@@ -33,6 +33,7 @@ from hyper_parallel.codegen.artifact import (
     clean_temp_artifacts,
     ensure_artifact_dir,
     resolve_default_artifact_layout,
+    resolve_model_artifact_layout,
     resolve_artifact_layout,
     write_bundle_atomic,
 )
@@ -272,6 +273,18 @@ def _model_name(config: Any, hf_config: Any = None) -> Optional[str]:
     return getattr(config, "model_name", None)
 
 
+def _model_type(config: Any, hf_config: Any = None) -> Optional[str]:
+    """The HF ``model_type`` of the target model, for the model-anchored layout.
+
+    Shares the best-effort config lookup with :func:`_model_name` (including
+    the ``from_config`` ``config_path`` spelling), so the CLI generation and
+    the trainer anchor the bundle to the same family directory.
+    """
+    if hf_config is None:
+        hf_config = _resolve_hf_config_for_layout(config)
+    return getattr(hf_config, "model_type", None)
+
+
 def _model_type_to_modeling_token(model_type: str) -> str:
     """Convert HF ``model_type`` into the generated modeling file token."""
     parts = [part for part in model_type.replace("-", "_").split("_") if part]
@@ -328,7 +341,15 @@ def _resolve_layout(
     *,
     hf_config: Any = None,
 ) -> ArtifactLayout:
-    """Resolve either YAML-anchored or model-construction artifact layout."""
+    """Resolve the artifact layout for one codegen run.
+
+    Priority: an explicit ``artifact_dir``, then the YAML's
+    ``model.codegen_artifact_dir`` override, then the model-anchored default
+    (``hyper_parallel/models/<model_type>/generated`` — one bundle per model
+    type; a missing ``models/<model_type>/`` directory warns and is created
+    on demand), then the YAML-anchored layout (``<yaml_dir>/generated``) for
+    configs that carry no model identity, and finally ``cwd/generated``.
+    """
     model_name = _model_name(config, hf_config)
     if artifact_dir is not None:
         return resolve_default_artifact_layout(artifact_dir, model_name=model_name)
@@ -336,6 +357,14 @@ def _resolve_layout(
     configured_dir = getattr(model, "codegen_artifact_dir", None)
     if configured_dir:
         return resolve_default_artifact_layout(str(configured_dir), model_name=model_name)
+    model_type = _model_type(config, hf_config)
+    if model_type:
+        source_yaml = yaml_path or getattr(config, "_yaml_path", None)
+        return resolve_model_artifact_layout(
+            str(model_type),
+            model_name=model_name,
+            yaml_path=str(source_yaml) if source_yaml else None,
+        )
     if yaml_path is not None:
         return resolve_artifact_layout(str(yaml_path), model_name=model_name)
     configured_yaml_path = getattr(config, "_yaml_path", None)
@@ -344,14 +373,32 @@ def _resolve_layout(
     return resolve_default_artifact_layout(model_name=model_name)
 
 
+def resolve_layout_for_config(
+    config: Any,
+    yaml_path: str | None = None,
+    *,
+    artifact_dir: str | None = None,
+    hf_config: Any = None,
+) -> ArtifactLayout:
+    """Public layout resolution shared by the CLI and the drift check."""
+    return _resolve_layout(config, yaml_path, artifact_dir, hf_config=hf_config)
+
+
 def _resolve_hf_config_for_layout(config: Any) -> Any:
-    """Best-effort HF config lookup used only for artifact naming/layout."""
+    """Best-effort HF config lookup used only for artifact naming/layout.
+
+    Covers both model spellings: ``from_pretrained`` (``pretrained_model_name_or_path``)
+    and ``from_config`` (``config_path``), so the CLI chain anchors bundles
+    exactly like the trainer chain.
+    """
     model = getattr(config, "model", None)
     if model is None:
         return None
     path = getattr(model, "pretrained_model_name_or_path", None)
     if path is None:
         path = getattr(model, "model_name_or_path", None)
+    if path is None:
+        path = getattr(model, "config_path", None)
     if path is None:
         return None
     kwargs = _hf_config_kwargs(model)
@@ -608,10 +655,16 @@ def _fill_plan_fields(
         derive_sharding_plan,
     )
     from hyper_parallel.codegen.plan.freeze import freeze_plan
+    from hyper_parallel.codegen.source.resolver import _trust_remote_code
     from hyper_parallel.codegen.spec.project import project_codegen_spec
 
     spec = project_codegen_spec(config, layout=layout)
-    model = build_meta_model(spec, config_overrides=_config_overrides(config), hf_config=hf_config)
+    model = build_meta_model(
+        spec,
+        config_overrides=_config_overrides(config),
+        hf_config=hf_config,
+        trust_remote_code=_trust_remote_code(config),
+    )
     if model is None:
         raise RuntimeError(
             "codegen: cannot derive a sharding plan — the spec carries no "
