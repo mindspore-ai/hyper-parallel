@@ -57,9 +57,11 @@ class CSATNDPlan:
         """Pack a [1,Q,...] tensor in the plan's document order."""
         return pack_ranges(tensor.squeeze(0), self.q_ranges)
 
-    def key(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Pack complete visible document prefixes from a [1,K,...] bank."""
-        return pack_ranges(tensor.squeeze(0), self.k_ranges)
+    def key(self, tensor: torch.Tensor, key_offset: int = 0) -> torch.Tensor:
+        """Pack global document prefixes using the physical origin of a [1,K,...] bank."""
+        ranges = self.k_ranges if not key_offset else tuple((start-key_offset, end-key_offset)
+                                                           for start, end in self.k_ranges)
+        return pack_ranges(tensor.squeeze(0), ranges)
 
     def lengths(self, device: torch.device) -> tuple:
         """Reuse device length tensors, including across inference and recomputation."""
@@ -227,17 +229,18 @@ def _bsnd_sparse_flash_mla(
         query: torch.Tensor, raw_key: torch.Tensor, main_key: torch.Tensor | None,
         indices: torch.Tensor | None, sinks: torch.Tensor, scale: float, ratio: int,
         window: int, query_offset: int,
-        segment: tuple[int, int, int, int, int],
+        segment: tuple[int, int, int, int, int], raw_key_offset: int = 0, main_key_offset: int = 0,
+        raw_document_starts: tuple = (),
 ) -> torch.Tensor:
-    """Run one document segment per batch item using the original all-gather banks.
+    """Run one document segment per batch item with independently routed KV banks.
 
     The operator owns Q tiling within this BSND call. Multiple packed
     documents use the TND entry with cumulative document lengths.
 
     Args:
         query: Local attention Q in [B, H, Q, D].
-        raw_key: Global raw KV in [B, 1, K, D].
-        main_key: Global compressed KV in [B, Kc, D], or None for SWA only.
+        raw_key: Full or halo raw KV in [B, 1, K, D].
+        main_key: Full or prefix compressed KV in [B, Kc, D], or None for SWA only.
         indices: Global compressed selection [B, Q, topk], invalid slots -1.
         sinks: One scalar logit per head.
         scale: Attention dot-product scale.
@@ -253,14 +256,14 @@ def _bsnd_sparse_flash_mla(
     if query.dtype != torch.bfloat16 or query.shape[-1] != 512 or window != 128:
         raise ValueError("V4 attention requires BF16, head_dim=512, and window=128")
     start, end, key_start, key_end, residual = segment
-    document_start = key_start * max(ratio, 1)
+    document_start = dict(raw_document_starts).get(start, key_start * max(ratio, 1))
     raw_left = max(document_start, query_offset + start - window + 1)
     raw_right = query_offset + end
-    raw = raw_key[:, :, raw_left:raw_right].transpose(1, 2).contiguous()
+    raw = raw_key[:, :, raw_left-raw_key_offset:raw_right-raw_key_offset].transpose(1, 2).contiguous()
     main = None
     selected = None
     if ratio and key_end > key_start:
-        main = main_key[:, key_start:key_end].unsqueeze(2).contiguous()
+        main = main_key[:, key_start-main_key_offset:key_end-main_key_offset].unsqueeze(2).contiguous()
         original = indices[:, start:end]
         selected = torch.where(original >= 0, original-key_start, -1).int()
         # Backward infers the active count from this width and causality; only KL requires 512 slots.
@@ -335,14 +338,15 @@ class _SparseFlashMlaTND(torch.autograd.Function):
 def sparse_flash_mla(
         query: torch.Tensor, raw_key: torch.Tensor, main_key: torch.Tensor | None,
         indices: torch.Tensor | None, sinks: torch.Tensor, scale: float, ratio: int,
-        window: int, query_offset: int, segments: tuple,
+        window: int, query_offset: int, segments: tuple, raw_key_offset: int = 0, main_key_offset: int = 0,
+        raw_document_starts: tuple = (),
 ) -> torch.Tensor:
-    """Batch packed documents in native TND while preserving the all-gather banks.
+    """Batch packed documents in native TND with independently routed KV banks.
 
     Args:
         query: Local attention Q [batch, heads, queries, 512].
-        raw_key: Global raw KV [batch, 1, keys, 512].
-        main_key: Global compressed KV [batch, compressed keys, 512], or None.
+        raw_key: Full or halo raw KV [batch, 1, keys, 512].
+        main_key: Full or document-prefix compressed KV [batch, compressed keys, 512], or None.
         indices: Sorted global compressed key IDs, invalid slots -1.
         sinks: Per-head scalar sink logits.
         scale: Attention dot-product scale.
@@ -350,6 +354,9 @@ def sparse_flash_mla(
         window: Raw sliding-window size, including the current token.
         query_offset: Global position of the first local query.
         segments: Local Q start/end, compressed document start/prefix end and residual.
+        raw_key_offset: Global position of the first row in the compact raw KV bank.
+        main_key_offset: Global compressed ID represented by row zero of main_key.
+        raw_document_starts: Explicit (local Q start, raw document start) pairs for natural lengths.
 
     Returns:
         Attention output [batch, queries, heads, 512]. A single document or
@@ -359,22 +366,25 @@ def sparse_flash_mla(
     if len(segments) == 1:
         return _bsnd_sparse_flash_mla(
             query, raw_key, main_key, indices, sinks, scale, ratio, window, query_offset, segments[0],
+            raw_key_offset, main_key_offset, raw_document_starts,
         )
     if query.shape[0] != 1:
         raise ValueError("Packed Sparse Flash MLA requires batch size one")
     if query.dtype != torch.bfloat16 or query.shape[-1] != 512 or window != 128:
         raise ValueError("V4 attention requires BF16, head_dim=512, and window=128")
+    document_starts = dict(raw_document_starts)
     output = None
     for has_keys in (True, False):
         plan = csa_tnd_plan(segments, ratio, has_keys)
         if plan is None:
             continue
         raw_ranges = tuple(
-            (max(ks * max(ratio, 1), query_offset+s-window+1), query_offset+e)
+            (max(document_starts.get(s, ks * max(ratio, 1)), query_offset+s-window+1)-raw_key_offset,
+             query_offset+e-raw_key_offset)
             for s, e, ks, _, _ in plan.segments
         )
         raw = pack_ranges(raw_key.squeeze(0).squeeze(0), raw_ranges).unsqueeze(1)
-        main = plan.key(main_key).unsqueeze(1) if has_keys else None
+        main = plan.key(main_key, main_key_offset).unsqueeze(1) if has_keys else None
         selected = plan.local_indices(indices) if has_keys else None
         part = _SparseFlashMlaTND.apply(
             plan.query(query.transpose(1, 2)), raw, main, selected, sinks.float(),

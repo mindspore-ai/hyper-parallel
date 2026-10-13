@@ -60,6 +60,8 @@ def validate_fused_kl_inputs(
         key: Indexer K [batch, keys, dimension].
         weights: Per-query Indexer head weights.
         indices: Ordinary causal selections, before optional width padding.
+            Compact CP banks can retain the global selection width; slots beyond
+            the physical bank are invalid padding, up to the native width of 512.
 
     Raises:
         ValueError: Tensor relationships or logical selection width are invalid.
@@ -68,8 +70,8 @@ def validate_fused_kl_inputs(
     validate_indexer_tensors(query, key, weights)
     if indices.ndim != 3 or indices.shape[:2] != query.shape[:2]:
         raise ValueError("Fused KL indices must have shape [B, Q, TopK] matching Indexer Q")
-    if key.shape[1] == 0 or indices.shape[-1] != min(512, key.shape[1]):
-        raise ValueError(f"Fused KL requires ordinary TopK512 selections from a nonempty bank; "
+    if key.shape[1] == 0 or not min(512, key.shape[1]) <= indices.shape[-1] <= 512:
+        raise ValueError(f"Fused KL requires ordinary TopK512 selections, allowing padding for a compact bank; "
                          f"got K={key.shape[1]}, TopK={indices.shape[-1]}")
     if indices.device != query.device:
         raise ValueError(f"Fused KL indices must share Indexer Q's device, got {indices.device} and {query.device}")
