@@ -431,7 +431,13 @@ def swap_wrapper(
     return SwapWrapper(module, policy_fn, group_swap, cpu_pool)
 
 
-def swap_tensor_wrapper(target, tag: Optional[str] = None, group_swap: bool = False, cpu_pool=None):
+def swap_tensor_wrapper(
+        target,
+        tag: Optional[str] = None,
+        group_swap: bool = False,
+        cpu_pool=None,
+        warn_missing_group: bool = True,
+):
     """Register selected tensors into the current swap group.
 
     This helper is intended to be used inside a forward path that already
@@ -443,6 +449,10 @@ def swap_tensor_wrapper(target, tag: Optional[str] = None, group_swap: bool = Fa
         tag: Optional debug tag.
         group_swap: Whether tensors participate in group copy fusion.
         cpu_pool: Optional pinned host memory pool for swapped tensors.
+        warn_missing_group: Whether to warn when no swap group is active. Set
+            this to ``False`` for callers whose registration is optional, so a
+            run without swap scheduling stays silent instead of warning once
+            per registered tensor.
 
     Returns:
         The registered tensor structure.
@@ -451,9 +461,10 @@ def swap_tensor_wrapper(target, tag: Optional[str] = None, group_swap: bool = Fa
     swap_manager = SwapManager()
     group_name = swap_manager.get_current_group_name()
     if not group_name:
-        warnings.warn(
-            f"Tensor {tag} cannot be swapped, for its group is unregistered."
-        )
+        if warn_missing_group:
+            warnings.warn(
+                f"Tensor {tag} cannot be swapped, for its group is unregistered."
+            )
         return target
     if swap_manager.is_last_group(group_name):
         return target

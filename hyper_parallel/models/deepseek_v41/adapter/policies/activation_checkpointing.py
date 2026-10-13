@@ -12,20 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Declare activation-checkpoint-safe DeepSeek-V4.1 regions."""
+"""Declare the DeepSeek-V4.1 recompute regions used by normal training."""
 
 from hyper_parallel.models.adapter_spec import RecomputePolicy
+from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
+    configure_shared_state,
+)
 
 
 def build_recompute_policy() -> RecomputePolicy:
-    """Return V4.1 checkpoint-safe regions used by normal training."""
+    """Return the V4.1 recompute regions used by normal training.
+
+    Every decoder layer is one region and every CSA2 layer replays. The
+    model-owned hook then pins each replayed index source's discrete selection as
+    an exclusion region, so a replay neither chooses a different key set nor
+    publishes its state twice; published cross-layer entries simply stay alive
+    until the graph drops the state in backward.
+    """
     return RecomputePolicy(
-        safe_module_patterns=(
-            "model.layers.*.input_layernorm",
-            "model.layers.*.post_attention_layernorm",
-            "model.layers.*.mlp",
-        ),
-        no_replay_module_patterns=("model.layers.*.self_attn",),
+        region_patterns=("model.layers.*",),
+        on_applied=configure_shared_state,
     )
 
 

@@ -68,7 +68,7 @@ class TrainerConfig:
     activation_checkpoint: ActivationCheckpointConfig = field(
         default_factory=ActivationCheckpointConfig
     )
-    activation_swap: Literal["none", "attention"] = "none"
+    activation_swap: Literal["none", "attention", "csa2_state"] = "none"
     compile: CompileConfig = field(default_factory=CompileConfig)
 
     # codegen
@@ -95,6 +95,16 @@ class TrainerConfig:
             and self.accelerator.pp_size > 1
         ):
             raise ValueError("compile is not supported together with pipeline parallelism")
+        checkpoint_swap = self.activation_checkpoint
+        if self.activation_swap != "csa2_state" and (
+            checkpoint_swap.state_swap_scope != "encoder"
+            or checkpoint_swap.state_swap_prefetch_layers != 1
+            or checkpoint_swap.state_swap_host_mb != 0
+        ):
+            raise ValueError(
+                "activation_checkpoint.state_swap_* options require "
+                "activation_swap='csa2_state'"
+            )
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
         if self.optimizer.fp32_main_params and reduce_dtype != "float32":
             raise ValueError(

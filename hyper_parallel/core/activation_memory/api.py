@@ -144,7 +144,7 @@ def swap_wrapper(module, policy_fn=None, group_swap=False, cpu_pool=None):
     return _swap_wrapper(module, policy_fn=policy_fn, group_swap=group_swap, **kwargs)
 
 
-def swap_tensor_wrapper(target, tag=None, group_swap=False, cpu_pool=None):
+def swap_tensor_wrapper(target, tag=None, group_swap=False, cpu_pool=None, warn_missing_group=True):
     """Wrap a single tensor or callable for activation swap.
 
     Args:
@@ -153,6 +153,8 @@ def swap_tensor_wrapper(target, tag=None, group_swap=False, cpu_pool=None):
         group_swap: Whether tensors participate in group copy fusion.
         cpu_pool: Optional pinned host memory pool for the swapped tensors.
             Only supported by the Torch backend, so it is forwarded only when set.
+        warn_missing_group: Whether to warn when no swap group is active.
+            Default: ``True``.
 
     Returns:
         The registered tensor structure.
@@ -162,7 +164,13 @@ def swap_tensor_wrapper(target, tag=None, group_swap=False, cpu_pool=None):
     kwargs = {}
     if cpu_pool is not None:
         kwargs["cpu_pool"] = cpu_pool
-    return _swap_tensor_wrapper(target, tag=tag, group_swap=group_swap, **kwargs)
+    return _swap_tensor_wrapper(
+        target,
+        tag=tag,
+        group_swap=group_swap,
+        warn_missing_group=warn_missing_group,
+        **kwargs,
+    )
 
 
 def get_class_activation_wrapper():

@@ -512,8 +512,19 @@ def _apply_activation_features(
     mesh: Optional[MeshContext],
     swap_inputs: bool = False,
     selection: Optional[Any] = None,
+    state_swap_scope: str = "encoder",
+    state_swap_prefetch_layers: int = 1,
+    state_swap_host_mb: int = 0,
 ) -> nn.Module:
     """Apply activation checkpointing and attention swap in execution order."""
+    validate_attention_swap(
+        activation_swap,
+        activation_checkpoint=activation_checkpoint,
+        enable_compile=compile_for_execution,
+        pp_size=getattr(mesh, "pp_size", 1),
+        selection_source=getattr(selection, "source", None),
+    )
+    state_swap = activation_swap == "csa2_state"
     if activation_checkpoint not in (None, "off"):
         model = _apply_activation_checkpointing(
             model,
@@ -521,13 +532,15 @@ def _apply_activation_features(
             enable_compile=compile_for_execution,
             swap_inputs=swap_inputs,
             selection=selection,
+            state_swap=state_swap,
+            state_swap_scope=state_swap_scope,
+            state_swap_prefetch_layers=state_swap_prefetch_layers,
+            state_swap_host_mb=state_swap_host_mb,
         )
-    validate_attention_swap(
-        activation_swap,
-        activation_checkpoint=activation_checkpoint,
-        enable_compile=compile_for_execution,
-        pp_size=getattr(mesh, "pp_size", 1),
-    )
+    if state_swap:
+        # The state swap is installed by the region path, which wrapped the
+        # layers and wired the prefetch chain; there is no module to swap here.
+        return model
     return apply_attention_swap(model, activation_swap) if activation_swap != "none" else model
 
 
@@ -579,6 +592,9 @@ def apply_model_infrastructure(
     activation_checkpoint_selection: Optional[Any] = None,
     activation_swap: str = "none",
     swap_inputs: bool = False,
+    state_swap_scope: str = "encoder",
+    state_swap_prefetch_layers: int = 1,
+    state_swap_host_mb: int = 0,
     is_meta_device: bool = False,
     is_hf_model: bool = False,
     device: Optional[torch.device] = None,
@@ -650,6 +666,9 @@ def apply_model_infrastructure(
         mesh,
         swap_inputs=swap_inputs,
         selection=activation_checkpoint_selection,
+        state_swap_scope=state_swap_scope,
+        state_swap_prefetch_layers=state_swap_prefetch_layers,
+        state_swap_host_mb=state_swap_host_mb,
     )
     # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
     # as DTensors, and FSDP derives their source layouts directly.

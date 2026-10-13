@@ -333,6 +333,9 @@ def build_cropped_deepseek_v41(
         activation_checkpoint_selection: Any | None = None,
         swap_inputs: bool = False,
         activation_swap: str = "none",
+        state_swap_scope: str = "encoder",
+        state_swap_prefetch_layers: int = 1,
+        state_swap_host_mb: int = 0,
         model_init_dtype: str = "float32",
         codegen: bool = False,
         codegen_config: Any | None = None,
@@ -358,6 +361,12 @@ def build_cropped_deepseek_v41(
         activation_checkpoint_selection: Optional adapter-safe region selection.
         swap_inputs: Trainer-injected activation-swap input flag.
         activation_swap: Activation-swap mode.
+        state_swap_scope: Cross-layer state swap scope for
+            ``activation_swap="csa2_state"``.
+        state_swap_prefetch_layers: Layers of load prefetch ahead for the state
+            swap.
+        state_swap_host_mb: Optional pinned-host budget in MiB for the state
+            swap; ``0`` means unlimited.
         model_init_dtype: Final parameter initialization dtype.
         codegen: Select the codegen ``gen`` backend for this build.
         codegen_config: Optional codegen backend configuration.
@@ -387,6 +396,9 @@ def build_cropped_deepseek_v41(
         activation_checkpoint_selection=activation_checkpoint_selection,
         swap_inputs=swap_inputs,
         activation_swap=activation_swap,
+        state_swap_scope=state_swap_scope,
+        state_swap_prefetch_layers=state_swap_prefetch_layers,
+        state_swap_host_mb=state_swap_host_mb,
         model_init_dtype=model_init_dtype,
         codegen=codegen,
         codegen_config=codegen_config,

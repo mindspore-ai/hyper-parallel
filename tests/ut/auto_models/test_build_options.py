@@ -140,8 +140,9 @@ class TestBuildOptionsFields(unittest.TestCase):
             [name for name, _ in _field_snapshot(ModelBuildOptions)],
             [
                 "device", "model_init_dtype", "activation_checkpoint",
-                "activation_swap", "swap_inputs", "compile",
-                "validate_placement", "low_precision",
+                "activation_swap", "state_swap_scope",
+                "state_swap_prefetch_layers", "state_swap_host_mb",
+                "swap_inputs", "compile", "validate_placement", "low_precision",
             ],
         )
         options = ModelBuildOptions()
@@ -149,6 +150,9 @@ class TestBuildOptionsFields(unittest.TestCase):
         self.assertIsNone(options.model_init_dtype)
         self.assertIsNone(options.activation_checkpoint)
         self.assertEqual(options.activation_swap, "none")
+        self.assertEqual(options.state_swap_scope, "encoder")
+        self.assertEqual(options.state_swap_prefetch_layers, 1)
+        self.assertEqual(options.state_swap_host_mb, 0)
         self.assertFalse(options.swap_inputs)
         self.assertIsInstance(options.compile, CompileConfig)
         self.assertFalse(options.validate_placement)
@@ -207,6 +211,12 @@ class TestModelBuildOptionsNormalization(unittest.TestCase):
             ModelBuildOptions(activation_checkpoint="aggressive")
         with self.assertRaisesRegex(ValueError, "activation_swap"):
             ModelBuildOptions(activation_swap="all")
+        with self.assertRaisesRegex(ValueError, "state_swap_scope"):
+            ModelBuildOptions(state_swap_scope="decoder")
+        with self.assertRaisesRegex(ValueError, "state_swap_prefetch_layers"):
+            ModelBuildOptions(state_swap_prefetch_layers=0)
+        with self.assertRaisesRegex(ValueError, "state_swap_host_mb"):
+            ModelBuildOptions(state_swap_host_mb=-1)
         with self.assertRaisesRegex(TypeError, "swap_inputs must be a bool"):
             ModelBuildOptions(swap_inputs=1)
         with self.assertRaisesRegex(TypeError, "validate_placement must be a bool"):

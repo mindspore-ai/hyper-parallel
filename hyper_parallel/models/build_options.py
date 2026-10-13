@@ -200,7 +200,57 @@ class FSDP2Config:
 
 _MODEL_INIT_DTYPES = ("float16", "bfloat16", "float32")
 _ACTIVATION_CHECKPOINT_MODES = ("off", "full", "selective")
-_ACTIVATION_SWAP_MODES = ("none", "attention")
+_ACTIVATION_SWAP_MODES = ("none", "attention", "csa2_state")
+_STATE_SWAP_SCOPES = ("encoder", "all")
+
+
+def _validate_state_swap(scope: Any, prefetch_layers: Any, host_mb: Any) -> None:
+    """Reject malformed cross-layer state swap tuning values."""
+    if scope not in _STATE_SWAP_SCOPES:
+        raise ValueError(
+            f"state_swap_scope must be one of {', '.join(_STATE_SWAP_SCOPES)}; got {scope!r}"
+        )
+    for name, value, minimum in (
+        ("state_swap_prefetch_layers", prefetch_layers, 1),
+        ("state_swap_host_mb", host_mb, 0),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"{name} must be an int >= {minimum}; got {value!r}")
+
+
+def _validate_enum_modes(
+        model_init_dtype: Any,
+        activation_checkpoint: Any,
+        activation_swap: Any,
+) -> None:
+    """Reject unknown dtype, recomputation, and swap mode names."""
+    if model_init_dtype is not None and model_init_dtype not in _MODEL_INIT_DTYPES:
+        raise ValueError(
+            "model_init_dtype must be one of float16, bfloat16, float32, "
+            f"or null; got {model_init_dtype!r}"
+        )
+    if activation_checkpoint is not None and activation_checkpoint not in _ACTIVATION_CHECKPOINT_MODES:
+        raise ValueError(
+            "activation_checkpoint must be one of off, full, selective, "
+            f"or null; got {activation_checkpoint!r}"
+        )
+    if activation_swap not in _ACTIVATION_SWAP_MODES:
+        raise ValueError(
+            "activation_swap must be one of none, attention, csa2_state; "
+            f"got {activation_swap!r}"
+        )
+
+
+def _normalize_compile(compile_config: Any) -> Any:
+    """Return a CompileConfig, accepting a mapping for programmatic callers."""
+    if isinstance(compile_config, Mapping):
+        return CompileConfig(**dict(compile_config))
+    if not isinstance(compile_config, CompileConfig):
+        raise TypeError(
+            "ModelBuildOptions.compile must be a CompileConfig or a "
+            f"mapping; got {type(compile_config).__name__}"
+        )
+    return compile_config
 
 
 @dataclass
@@ -218,7 +268,11 @@ class ModelBuildOptions:
     # from scratch; None preserves the initialization-path dtype.
     model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None
     activation_checkpoint: Optional[Literal["off", "full", "selective"]] = None
-    activation_swap: Literal["none", "attention"] = "none"
+    activation_swap: Literal["none", "attention", "csa2_state"] = "none"
+    # Tuning for activation_swap="csa2_state"; inert for the other modes.
+    state_swap_scope: Literal["encoder", "all"] = "encoder"
+    state_swap_prefetch_layers: int = 1
+    state_swap_host_mb: int = 0
     swap_inputs: bool = False
     compile: CompileConfig = field(default_factory=CompileConfig)
     # Validate DTensor placements (skip compile) instead of a production build.
@@ -234,36 +288,20 @@ class ModelBuildOptions:
                 "ModelBuildOptions.device must be a torch.device, a device "
                 f"string, or None; got {type(self.device).__name__}"
             )
-        if (
-            self.model_init_dtype is not None
-            and self.model_init_dtype not in _MODEL_INIT_DTYPES
-        ):
-            raise ValueError(
-                "model_init_dtype must be one of float16, bfloat16, float32, "
-                f"or null; got {self.model_init_dtype!r}"
-            )
-        if self.activation_checkpoint is not None and (
-            self.activation_checkpoint not in _ACTIVATION_CHECKPOINT_MODES
-        ):
-            raise ValueError(
-                "activation_checkpoint must be one of off, full, selective, "
-                f"or null; got {self.activation_checkpoint!r}"
-            )
-        if self.activation_swap not in _ACTIVATION_SWAP_MODES:
-            raise ValueError(
-                "activation_swap must be one of none, attention; "
-                f"got {self.activation_swap!r}"
-            )
+        _validate_state_swap(
+            self.state_swap_scope,
+            self.state_swap_prefetch_layers,
+            self.state_swap_host_mb,
+        )
+        _validate_enum_modes(
+            self.model_init_dtype,
+            self.activation_checkpoint,
+            self.activation_swap,
+        )
         for name in ("swap_inputs", "validate_placement"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"ModelBuildOptions.{name} must be a bool")
-        if isinstance(self.compile, Mapping):
-            self.compile = CompileConfig(**dict(self.compile))
-        elif not isinstance(self.compile, CompileConfig):
-            raise TypeError(
-                "ModelBuildOptions.compile must be a CompileConfig or a "
-                f"mapping; got {type(self.compile).__name__}"
-            )
+        self.compile = _normalize_compile(self.compile)
         if isinstance(self.low_precision, Mapping):
             self.low_precision = LowPrecisionConfig(**dict(self.low_precision))
         elif self.low_precision is not None and not isinstance(

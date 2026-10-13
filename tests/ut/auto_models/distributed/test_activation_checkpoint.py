@@ -22,6 +22,7 @@ from torch import Tensor, nn
 
 
 from hyper_parallel.core.activation_memory.wrapper import ckpt_wrapper as _checkpoint_wrapper
+from hyper_parallel.core.activation_memory.wrapper import CheckpointExcludeWrapper
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
     _find_transformer_block_modules,
@@ -30,6 +31,8 @@ from hyper_parallel.distributed.activation_checkpoint import (
     _wrap_layer_containers,
     apply_submodule_checkpointing,
 )
+from hyper_parallel.models.adapter_spec import RecomputePolicy
+from hyper_parallel.distributed.attention_swap import validate_attention_swap
 
 
 _ACTIVATION_CHECKPOINT_MODULE = (
@@ -232,6 +235,232 @@ class TestTransformerBlockDiscovery(unittest.TestCase):
         for block in model.decoder.values():
             self.assertIsInstance(block.self_attn, nn.Linear)
             self.assertTrue(hasattr(block.mlp, "_wrapped_module"))
+
+
+class TestModelAdapterRecomputeRegions(unittest.TestCase):
+    """Tests for adapter-declared recompute regions and their exclusions."""
+
+    @staticmethod
+    def _selection(**overrides):
+        """Return one model-adapter selection for the safe-region source."""
+        values = {
+            "source": "model_adapter_safe_regions",
+            "layer_count": 4,
+            "layer_indices": None,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def _model(policy):
+        """Return a discovery fixture carrying one fake adapter policy."""
+        model = _DiscoveryModel()
+        model.config = SimpleNamespace(model_type="fixture")
+        for tower in (model.text_tower, model.image_tower):
+            tower.decoder["2"] = _CheckpointableSubmodules()
+            tower.decoder["7"] = _CheckpointableSubmodules()
+        return model, SimpleNamespace(recompute=lambda: policy)
+
+    @staticmethod
+    def _apply(model, adapter, selection):
+        """Apply the layer-region mode against the fake adapter."""
+        with (
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.get_model_adapter", return_value=adapter),
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.checkpoint_wrapper", new=_checkpoint_wrapper),
+        ):
+            _apply_activation_checkpointing(model, "selective", selection=selection)
+
+    def test_layer_region_wraps_layer_and_excludes_no_replay_module(self):
+        """One region per layer; the named descendant stays outside replay."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            exclude_patterns=("*decoder.*.self_attn",),
+        )
+        model, adapter = self._model(policy)
+
+        self._apply(model, adapter, self._selection())
+
+        blocks = [
+            block for tower in (model.text_tower, model.image_tower)
+            for block in tower.decoder.values()
+        ]
+        self.assertEqual(len(blocks), 4)
+        for block in blocks:
+            self.assertTrue(hasattr(block, "_wrapped_module"))
+            self.assertIsInstance(block.self_attn, CheckpointExcludeWrapper)
+            self.assertIsInstance(block.mlp, nn.Linear)
+            self.assertIsInstance(block.input_layernorm, nn.LayerNorm)
+
+    def test_layer_region_calls_model_owned_hook_once(self):
+        """The model-owned hook runs after the regions are installed."""
+        applied = []
+
+        def _record(model, context):
+            applied.append((model, context))
+
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            exclude_patterns=("*decoder.*.self_attn",),
+            on_applied=_record,
+        )
+        model, adapter = self._model(policy)
+
+        self._apply(model, adapter, self._selection())
+
+        self.assertEqual(len(applied), 1)
+        self.assertIs(applied[0][0], model)
+        self.assertFalse(applied[0][1].state_swap)
+        self.assertTrue(applied[0][1].region_fqns)
+
+    def test_state_swap_installs_the_chain_and_reports_it(self):
+        """A state-swap request wires the chain and reaches the model hook."""
+        applied = []
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            on_applied=lambda model, context: applied.append(context),
+        )
+        model, adapter = self._model(policy)
+
+        with (
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.get_model_adapter", return_value=adapter),
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.checkpoint_wrapper", new=_checkpoint_wrapper),
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}._register_forward_prefetch_layers") as register,
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.SwapManager") as manager,
+        ):
+            _apply_activation_checkpointing(
+                model,
+                "selective",
+                selection=self._selection(),
+                state_swap=True,
+                state_swap_scope="all",
+                state_swap_prefetch_layers=3,
+                state_swap_host_mb=512,
+            )
+
+        register.assert_called_once()
+        manager.return_value.set_prefetch_depth.assert_called_once_with(3)
+        self.assertEqual(len(applied), 1)
+        self.assertTrue(applied[0].state_swap)
+        self.assertEqual(applied[0].state_swap_scope, "all")
+        self.assertEqual(applied[0].state_swap_prefetch_layers, 3)
+        self.assertEqual(applied[0].state_swap_host_mb, 512)
+
+    def test_layer_region_requires_region_patterns(self):
+        """A policy without region patterns cannot be applied."""
+        policy = RecomputePolicy(
+            region_patterns=(),
+            exclude_patterns=("*decoder.*.self_attn",),
+        )
+        model, adapter = self._model(policy)
+
+        with self.assertRaisesRegex(ValueError, "requires RecomputePolicy.region_patterns"):
+            self._apply(model, adapter, self._selection(layer_count=1))
+
+    def test_region_requires_one_excluded_module(self):
+        """An exclude pattern that matches nothing inside the regions is rejected."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            exclude_patterns=("*image_tower.*.self_attn",),
+        )
+        model, adapter = self._model(policy)
+
+        with self.assertRaisesRegex(ValueError, "exclusions matched no module"):
+            self._apply(model, adapter, self._selection(layer_count=2))
+
+    def test_leaf_region_patterns_keep_one_region_per_submodule(self):
+        """Leaf patterns keep the submodule-region shape without exclusions."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*.mlp", "*decoder.*.input_layernorm"),
+        )
+        model, adapter = self._model(policy)
+
+        self._apply(model, adapter, self._selection())
+
+        blocks = [
+            block for tower in (model.text_tower, model.image_tower)
+            for block in tower.decoder.values()
+        ]
+        for block in blocks:
+            self.assertTrue(hasattr(block.mlp, "_wrapped_module"))
+            self.assertTrue(hasattr(block.input_layernorm, "_wrapped_module"))
+            self.assertIsInstance(block.post_attention_layernorm, nn.LayerNorm)
+            self.assertIsInstance(block.self_attn, nn.Linear)
+        self.assertFalse(hasattr(blocks[0], "_wrapped_module"))
+
+    def test_region_root_cannot_be_excluded(self):
+        """A module declared as both a region root and an exclusion is rejected."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*.self_attn",),
+            exclude_patterns=("*decoder.*.self_attn",),
+        )
+        model, adapter = self._model(policy)
+
+        with self.assertRaisesRegex(ValueError, "HP-STATE-002"):
+            self._apply(model, adapter, self._selection(layer_count=1))
+
+    def test_exclude_predicate_keeps_named_modules_out_of_replay(self):
+        """An attribute rule can express exclusions that a path cannot."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            exclude_predicate=lambda fqn, module: bool(getattr(module, "keeps_state", False)),
+        )
+        model, adapter = self._model(policy)
+        for tower in (model.text_tower, model.image_tower):
+            for block in tower.decoder.values():
+                block.self_attn.keeps_state = True
+
+        self._apply(model, adapter, self._selection())
+
+        for tower in (model.text_tower, model.image_tower):
+            for block in tower.decoder.values():
+                self.assertIsInstance(block.self_attn, CheckpointExcludeWrapper)
+                self.assertTrue(hasattr(block, "_wrapped_module"))
+
+
+class TestStateSwapValidation(unittest.TestCase):
+    """Guards for the cross-layer state swap mode."""
+
+    def test_state_swap_requires_the_region_path(self):
+        """The mode needs selective recomputation over adapter regions."""
+        validate_attention_swap(
+            "csa2_state",
+            activation_checkpoint="selective",
+            selection_source="model_adapter_safe_regions",
+        )
+        with self.assertRaisesRegex(ValueError, "mode='selective'"):
+            validate_attention_swap(
+                "csa2_state",
+                activation_checkpoint="full",
+                selection_source="model_adapter_safe_regions",
+            )
+        with self.assertRaisesRegex(ValueError, "selection.source"):
+            validate_attention_swap(
+                "csa2_state",
+                activation_checkpoint="selective",
+                selection_source="default",
+            )
+
+    def test_state_swap_rejects_compile_and_pipeline_parallel(self):
+        """Compile and pipeline parallelism break the chain's ordering."""
+        with self.assertRaisesRegex(ValueError, "torch.compile"):
+            validate_attention_swap(
+                "csa2_state",
+                activation_checkpoint="selective",
+                selection_source="model_adapter_safe_regions",
+                enable_compile=True,
+            )
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+            validate_attention_swap(
+                "csa2_state",
+                activation_checkpoint="selective",
+                selection_source="model_adapter_safe_regions",
+                pp_size=2,
+            )
+
+    def test_unknown_mode_is_rejected_with_the_full_list(self):
+        """An unknown mode names every supported value."""
+        with self.assertRaisesRegex(ValueError, "csa2_state"):
+            validate_attention_swap("all")
 
 
 class TestActivationCheckpointSwapInputs(unittest.TestCase):

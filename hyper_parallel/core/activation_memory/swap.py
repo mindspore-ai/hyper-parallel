@@ -22,7 +22,7 @@ import warnings
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from . import _backend
@@ -491,9 +491,16 @@ class SwapGroup:
     def __init__(self, group_name: str):
         self.group_name = group_name
         self.is_last_group: bool = False
+        # Neighbour in the prefetch chain, recorded by set_forward_prefetch_layer.
+        # ``prev_name`` is walked to prefetch several groups ahead of backward.
+        self.prev_name: Optional[str] = None
         self._storages: List[Storage] = []
         self._load_event: Optional[Any] = None
         self._offload_event: Optional[Any] = None
+        # Whether this step/micro-batch has already been offloaded.  Loads of a
+        # group with nothing offloaded are no-ops rather than "invalid state"
+        # warnings, which matters when several layers prefetch ahead.
+        self._offload_launched = False
         # Group-level contiguous buffers for non-slice tensors.
         self._packed_tensor_info: List = []   # [(SwapTensor, bucket_key, element_offset), ...]
         self._packed_buckets: Dict[str, Dict[str, Any]] = {}
@@ -746,6 +753,7 @@ class SwapGroup:
             # Group-managed tensors are already STATE_D2H so async_offload is a no-op.
             for storage in self._storages:
                 storage.launch_offload()
+            self._offload_launched = True
             self._offload_event.record(copy_stream)
 
     def wait_offload(self):
@@ -770,7 +778,13 @@ class SwapGroup:
         Non-slice tensors are loaded from pinned CPU memory into bounded
         contiguous device buffers, then copied device-to-device into their
         original storages.  Slice tensors use the existing per-tensor path.
+
+        Idempotent within one offload cycle: a group that several later layers
+        prefetch (see ``SwapManager.set_prefetch_depth``) starts exactly one
+        load, and a group that was never offloaded stays untouched.
         """
+        if self._load_event is not None or not self._offload_launched:
+            return
         # Restore original storages before scheduling copies. Keeping the same
         # storage object is required for autograd-saved views of packed tensors.
         with _backend.no_grad():
@@ -863,6 +877,7 @@ class SwapGroup:
         self._packed_buckets = {}
         self._packed_by_bucket = {}
         self._seen_dedup_keys = set()
+        self._offload_launched = False
 
 
 class SwapManager:
@@ -887,6 +902,9 @@ class SwapManager:
         self._layer_count: int = 0
         self._copy_stream: Optional[Any] = None
         self._missing_group_warned: bool = False
+        # How many layers ahead of a group's own backward its load is issued.
+        # 1 keeps the historic behaviour (the next layer prefetches it).
+        self._prefetch_depth: int = 1
 
     def __new__(cls):
         if cls._instance is None:
@@ -1010,6 +1028,52 @@ class SwapManager:
             return False
         return group.is_last_group
 
+    def set_prefetch_depth(self, depth: int) -> int:
+        """Set how many layers ahead of backward a group's load is issued.
+
+        A depth of ``1`` is the historic layer-chain behaviour: the layer right
+        after a group in backward order starts that group's load. Larger depths
+        issue the load earlier, which hides a bigger host-to-device transfer
+        behind more backward compute at the cost of bringing the data back to
+        the device sooner.
+
+        Args:
+            depth: Positive number of layers to prefetch ahead.
+
+        Returns:
+            The previous depth.
+        """
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth < 1:
+            raise ValueError(f"prefetch depth must be a positive int, got {depth!r}")
+        previous = self._prefetch_depth
+        self._prefetch_depth = depth
+        return previous
+
+    @property
+    def prefetch_depth(self) -> int:
+        """Return the number of layers a group load is prefetched ahead."""
+        return self._prefetch_depth
+
+    def prefetch_targets(self, group_name: Optional[str]) -> Tuple[str, ...]:
+        """Return the groups whose loads one backward step starts.
+
+        The returned names are the ``prefetch_depth`` nearest predecessors of
+        ``group_name`` in the forward chain, nearest first. The load is
+        idempotent per offload cycle, so a group reached from several layers is
+        still loaded exactly once.
+        """
+        if not group_name:
+            return ()
+        targets = []
+        current = group_name
+        for _ in range(self._prefetch_depth):
+            group = self._groups.get(current)
+            if group is None or group.prev_name is None:
+                break
+            current = group.prev_name
+            targets.append(current)
+        return tuple(targets)
+
     def unregister_forward_prefetch_hooks(self, module: Any) -> int:
         """Remove hooks installed by :meth:`set_forward_prefetch_layer`.
 
@@ -1102,6 +1166,8 @@ class SwapManager:
 
         self._groups[first_name].is_last_group = first_layer._swap_group_order["next"] is None
         self._groups[second_name].is_last_group = second_layer._swap_group_order["next"] is None
+        if self._groups[second_name].prev_name is None:
+            self._groups[second_name].prev_name = first_name
 
         def _forward_pre_hook(group_name, module, _):  # pylint: disable=W0613
             if getattr(module, "_swap_state", None) == "pre_backward":
@@ -1171,8 +1237,11 @@ class SwapManager:
 
             Swap rules:
             1. At the beginning of backward for the current layer:
-            - If a previous layer exists in backward order, asynchronously
-                prefetch its activations (launch_load).
+            - If previous layers exist in backward order, asynchronously
+                prefetch their activations (launch_load). ``SwapManager``
+                prefetches ``prefetch_depth`` groups ahead, so a larger
+                transfer can be hidden behind several layers; each group still
+                starts exactly one load per offload cycle.
 
             Example:
             - At pre-backward of L2, prefetch activations of L1.
@@ -1189,14 +1258,14 @@ class SwapManager:
             from issuing offload operations during backward phase.
             """
             module._swap_state = "pre_backward"
-            prev_name = module._swap_group_order.get('prev', None)
-            if prev_name:
-                SwapManager().launch_load(prev_name)
+            manager = SwapManager()
+            for target_name in manager.prefetch_targets(group_name):
+                manager.launch_load(target_name)
 
             next_name = module._swap_group_order.get('next', None)
             if next_name:
-                SwapManager().wait_load(group_name)
-            SwapManager().release_group_storage(group_name)
+                manager.wait_load(group_name)
+            manager.release_group_storage(group_name)
 
         def _backward_hook(group_name, module, grad_input, grad_output):  # pylint: disable=W0613
             module._swap_state = "backward"

@@ -417,22 +417,26 @@ case = ModuleParityCase(
 
 ### 3.4 安全重计算区域
 
-共享 KV、Indexer 状态或其他跨层状态的 producer 不应被整层 replay。模型 adapter 应声明可重计算子模块：
+共享跨层状态的 producer/consumer 可以参与重放，但重放路径上有两类动作必须先处理掉：**只需执行一次的副作用**（写跨层状态）和**离散且不可复现的选择**（Top-K / 候选池）。模型 adapter 用一份声明同时描述"哪些模块成为区域"和"哪些后代必须留在重放之外"，并用 `on_applied` 安装依赖最终区域形状的运行期行为（例如给会被重放的层 pin 选区）：
 
 ```python
 from hyper_parallel.models.adapter_spec import RecomputePolicy
+from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
+    configure_shared_state,
+)
 
 
 def build_recompute_policy():
+    """整层一个区域，区域内不做模块级排除。"""
     return RecomputePolicy(
-        safe_module_patterns=(
-            "model.layers.*.input_layernorm",
-            "model.layers.*.post_attention_layernorm",
-            "model.layers.*.mlp",
-        ),
-        no_replay_module_patterns=("model.layers.*.self_attn",),
+        region_patterns=("model.layers.*",),
+        on_applied=configure_shared_state,
     )
 ```
+
+DeepSeek-V4.1 的 `configure_shared_state` 把 indexer 的离散选择 pin 成 exclude 区域：重放复用正向选出的集合，也避免"跳过一段可微代码"破坏 checkpoint 的张量数不变量。跨层状态本身不需要调度——它作为重算区域的输入被 checkpoint 持有，发布出去的条目随它活到反向结束，而 `publish_*` 由 `is_recomputing()` 分相挡住，重放不会写第二次。生产 producer 段（compressor、indexer 投影）**不需要** pin：实测把这段留在区域外只多占激活（4096-token crop 上 +0.21 GB）而不带来收益。
+
+`region_patterns` 取**最外层匹配**作为区域根：写成整层模式时一个区域只保存一份层输入，写成 `model.layers.*.mlp` 这类叶子模块模式时则每个模块各自成区域（此时 `exclude_patterns` 一般留空）。`exclude_patterns` 必须命中区域根的后代，否则直接报错；同一个模块也不能既是区域根又被排除（`HP-STATE-002`）。`on_applied` 是区域装好后的模型自有钩子，用于开启依赖最终区域形状的运行时行为（例如 DeepSeek-V4.1 用它给会被重放的层安装选区 pin）。
 
 Trainer recipe 通过通用配置选择该策略：
 
@@ -455,6 +459,20 @@ activation_checkpoint:
 ```
 
 `layer_indices` 从 `0` 开始，必须非空、非负且不重复。`source: default` 不接受这两个字段。
+
+#### 跨层 state 的异步卸载（`activation_swap: csa2_state`）
+
+整层重算之后，跨层 state 成为唯一随序列长度线性累积的激活：producer 发布后一直驻留到最后一个消费者的反向结束。`activation_swap: csa2_state` 把它交给同一套层链——条目由**最后一个读者**注册进自己所在层的 swap group，于是该层 forward 结束后异步卸载（copy stream 上 D2H）、在它的反向前第 N 层发起预取（`state_swap_prefetch_layers`，默认 1）、并在该层重放前完成回填，正好落在"没人读"的那段窗口里。注册只发生在 forward（`is_recomputing()` 挡住重放），条目对象本身不变，因此数值与不开 swap 逐位一致。
+
+```yaml
+activation_swap: csa2_state       # 只允许配 mode=selective + selection.source=model_adapter_safe_regions
+activation_checkpoint:
+  state_swap_scope: encoder       # encoder（默认）| all
+  state_swap_prefetch_layers: 1   # 预取提前量（层），越大越能掩盖更大的 H2D 拷贝
+  state_swap_host_mb: 0           # 钉住内存预算（MiB），0 = 不限；超出预算的条目留在设备上
+```
+
+模型侧的名单由 `configure_shared_state` 在区域装好后计算：按 `kv_source_layer_idx` / `index_source_layer_idx` / `candidate_source_layer_idx` 推导每个条目的读者集合与最后一个读者，只把"读者非空、全部落在 scope 内、最后一个读者是被重放的区域且不是末组"的条目交给 swap 链；其余条目（末组的 `compressed_kv`、无读者的 `index_key`、scope 外的 reindex 组）逐条打日志说明原因。钉住内存峰值等于被换出的字节数，可用 `state_swap_host_mb` 设上限。
 
 ## 4. 编写验证清单
 
@@ -761,7 +779,7 @@ DeepSeek adapter 的验证声明包括：
 - `compressed_kv`、`index_key`、`topk_indices`、`candidate_blocks` 跨层 publish/consume 检查；
 - packed runtime 字段、视觉输入字段及 vision/aligner 梯度检查；
 - 独立进程中的原生 Engram/MoE/CSA2 前向与反向比较；
-- attention 不 replay，只对 norm/MLP/MoE 安全区域做分层重计算。
+- 整层作为一个区域重算（含 CSA2 attention）：状态写入用 `is_recomputing()` 分相，离散选择 pin 成 exclude 区域；跨层条目由 autograd 图持有到反向结束。
 
 DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相替代的：
 
@@ -787,7 +805,7 @@ DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相
 | `HP-CKPT-001/002` | checkpoint key 未覆盖或转换不可逆 | 增加 mapping/transform/reverse transform 或显式合法排除 |
 | `HP-DATA-001/002` | forward 字段所有权冲突、字段缺失、label shift/模态梯度不符 | 修正 Omni dataset transform、get-batch 或 runtime input adapter 声明 |
 | `HP-PREC-001` | required probe 未匹配最终参数 | 使用替换后的最终 FQN 更新 adapter 声明 |
-| `HP-STATE-001/002/003` | 跨层状态缺 producer/consumer、producer replay 或 trace 超限 | 缩小重计算边界，修正共享状态来源和 forward 生命周期 |
+| `HP-STATE-001/002/003` | 跨层状态缺 producer/consumer、producer replay 或 trace 超限 | 重放路径上把副作用分相（`is_recomputing()`）、把离散选择 pin 成 exclude 区域，或缩小重计算边界 |
 | Online dataloader 拒绝跨 DP world-size cursor，或跳过 cursor 后 input hash 仍不同 | DCP 能重分片模型/优化器，不代表 loader 能重建全局样本位置；从同一配置起点也不保证 DP-invariant packing | warm-start 可用 `restore_dataloader_state=false` 请求 replay，但必须检查 global input hash；正式跨拓扑精度改用固定 Offline replay，真正续训改用支持全局 cursor 重建的 loader，否则标为 `BLOCKED` |
 | `BLOCKED` | 证据、设备、资产或独立 oracle 不可用 | 补齐前置条件；不要放宽阈值或静默缩小实验 |
 

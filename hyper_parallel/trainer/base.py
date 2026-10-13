@@ -365,6 +365,9 @@ class BaseTrainer(Stateful, ABC):
             activation_checkpoint_selection=self.config.activation_checkpoint.selection,
             swap_inputs=getattr(self.config.activation_checkpoint, "swap_inputs", False),
             activation_swap=self.config.activation_swap,
+            state_swap_scope=self.config.activation_checkpoint.state_swap_scope,
+            state_swap_prefetch_layers=self.config.activation_checkpoint.state_swap_prefetch_layers,
+            state_swap_host_mb=self.config.activation_checkpoint.state_swap_host_mb,
             compile_config=self.config.compile,
             codegen=self.config.codegen,
             # The final dtype is applied inside the atomic build (05 stage-5

@@ -58,11 +58,17 @@ class AcceleratorConfig:
 
 @dataclass
 class ActivationCheckpointSelection:
-    """Select adapter-declared safe recompute regions and exact layer coverage.
+    """Select adapter-declared recompute regions and exact layer coverage.
 
     ``layer_count`` selects the contiguous prefix ``[0, layer_count)`` from
     the flattened layer-container order. ``layer_indices`` selects explicit
     zero-based entries from that same order.
+
+    ``model_adapter_safe_regions`` wraps the outermost module matching the
+    adapter's ``region_patterns`` inside every selected layer and keeps every
+    ``exclude_patterns`` descendant outside the replay. Which shape that
+    produces is the model's declaration, not the Trainer's: leaf patterns give
+    one region per submodule, a layer pattern gives one region per layer.
     """
 
     source: Literal["default", "model_adapter_safe_regions"] = "default"
@@ -126,10 +132,20 @@ class ActivationCheckpointConfig:
 
     ``swap_inputs`` is consumed only when ``mode`` is ``"full"`` or
     ``"selective"``.
+
+    ``state_swap_*`` tune the optional host offload of cross-layer state that
+    ``activation_swap: csa2_state`` enables; they are inert while that mode is
+    off. ``state_swap_scope`` selects which published entries a model may hand
+    to the swap chain: ``"encoder"`` keeps only the entries whose readers all
+    live before the first ``compress_ratio == 1`` layer, ``"all"`` covers every
+    entry that has an offload window.
     """
 
     mode: Optional[Literal["off", "full", "selective"]] = "off"
     swap_inputs: bool = False
+    state_swap_scope: Literal["encoder", "all"] = "encoder"
+    state_swap_prefetch_layers: int = 1
+    state_swap_host_mb: int = 0
     selection: ActivationCheckpointSelection = field(
         default_factory=ActivationCheckpointSelection
     )
@@ -138,6 +154,29 @@ class ActivationCheckpointConfig:
         """Reject ambiguous values for activation input swapping."""
         if not isinstance(self.swap_inputs, bool):
             raise TypeError("activation_checkpoint.swap_inputs must be a bool")
+        if self.state_swap_scope not in ("encoder", "all"):
+            raise ValueError(
+                "activation_checkpoint.state_swap_scope must be one of "
+                f"encoder, all; got {self.state_swap_scope!r}"
+            )
+        if (
+            isinstance(self.state_swap_prefetch_layers, bool)
+            or not isinstance(self.state_swap_prefetch_layers, int)
+            or self.state_swap_prefetch_layers < 1
+        ):
+            raise ValueError(
+                "activation_checkpoint.state_swap_prefetch_layers must be a "
+                f"positive int; got {self.state_swap_prefetch_layers!r}"
+            )
+        if (
+            isinstance(self.state_swap_host_mb, bool)
+            or not isinstance(self.state_swap_host_mb, int)
+            or self.state_swap_host_mb < 0
+        ):
+            raise ValueError(
+                "activation_checkpoint.state_swap_host_mb must be a "
+                f"non-negative int; got {self.state_swap_host_mb!r}"
+            )
 
 
 @dataclass

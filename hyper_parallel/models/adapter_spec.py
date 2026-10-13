@@ -34,17 +34,68 @@ from typing import Any, Callable, Optional
 
 
 @dataclass(frozen=True)
+class RecomputeContext:
+    """Runtime facts the region installer resolves before ``on_applied`` runs.
+
+    Attributes:
+        region_fqns: The installed region roots in model order. A model-owned
+            hook uses it to tell whether a module it cares about is replayed and
+            whether it is the last region in the chain.
+        state_swap: Whether cross-layer state of replayed regions is offloaded
+            to host memory through the swap prefetch chain.
+        state_swap_scope: Which entries the model may register, as declared by
+            the Trainer (``"encoder"`` or ``"all"``).
+        state_swap_prefetch_layers: How many layers ahead of a group's backward
+            its host-to-device load starts.
+        state_swap_host_mb: Optional pinned-host budget in MiB; ``0`` means no
+            budget, and entries beyond it stay on the device.
+    """
+
+    region_fqns: tuple[str, ...]
+    state_swap: bool = False
+    state_swap_scope: str = "encoder"
+    state_swap_prefetch_layers: int = 1
+    state_swap_host_mb: int = 0
+
+
+@dataclass(frozen=True)
 class RecomputePolicy:
     """Model-owned activation-checkpoint regions used by normal training.
 
-    Cross-layer state producers must be excluded from whole-module replay.
-    The adapter therefore declares checkpoint-safe submodules independently
-    from optional model-integration validation metadata. Layer coverage is
-    selected independently through the Trainer's activation-checkpoint config.
+    One declaration covers both region shapes a model may need:
+
+    * ``region_patterns`` names the modules that become checkpoint regions. The
+      outermost match inside every selected layer is used, so a pattern set of
+      leaf submodules keeps one region per submodule while a layer pattern wraps
+      the whole layer and saves a single copy of the layer input.
+    * ``exclude_patterns`` names descendants that must stay outside the replay,
+      for a submodule whose forward may not run a second time at all. A
+      cross-layer state producer or consumer does not need an exclusion: a model
+      may instead phase its state writes (``is_recomputing()``) and pin the
+      discrete results a replay has to reuse, as DeepSeek-V4.1 does for its
+      indexer selection.
+
+    A module may not be a region root and an excluded descendant at the same
+    time, and an excluded module may not contain a region root. Layer coverage
+    is selected independently through the Trainer's activation-checkpoint
+    config.
+
+    ``on_applied`` lets a model enable runtime behaviour that depends on the
+    region shape finally installed — it receives the model plus the
+    :class:`RecomputeContext` — for example pinning the discrete selection of
+    every layer that will be replayed, or planning which cross-layer state
+    entries the swap chain offloads.
+
+    ``exclude_predicate`` complements the patterns with an attribute rule that a
+    path cannot express, such as "exclude every module that publishes state".
+    It receives ``(module_fqn, module)`` and is evaluated together with
+    ``exclude_patterns``.
     """
 
-    safe_module_patterns: tuple[str, ...]
-    no_replay_module_patterns: tuple[str, ...] = ()
+    region_patterns: tuple[str, ...]
+    exclude_patterns: tuple[str, ...] = ()
+    exclude_predicate: Optional[Callable[[str, Any], bool]] = None
+    on_applied: Optional[Callable[[Any, RecomputeContext], None]] = None
 
 
 @dataclass(frozen=True)

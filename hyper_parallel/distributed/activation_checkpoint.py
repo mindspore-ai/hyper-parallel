@@ -27,6 +27,7 @@ from torch import nn
 
 from hyper_parallel.core.activation_memory.api import (
     CheckpointPolicy,
+    checkpoint_exclude_wrapper,
     checkpoint_wrapper,
     create_selective_checkpoint_contexts,
     ignore_sac_ops as _ignore_sac_ops,
@@ -35,7 +36,7 @@ from hyper_parallel.core.activation_memory.swap import (
     SwapManager,
     _teardown_wired_swap_layers,
 )
-from hyper_parallel.models.adapter_spec import RecomputePolicy
+from hyper_parallel.models.adapter_spec import RecomputeContext, RecomputePolicy
 from hyper_parallel.models.registry import get_model_adapter
 
 logger = logging.getLogger(__name__)
@@ -861,80 +862,109 @@ def _selected_checkpoint_layer_fqns(
     return {blocks[index].fqn for index in range(layer_count)}
 
 
-def _select_safe_checkpoint_targets(
+def _select_layer_region_roots(
     model: nn.Module,
     selected_layer_fqns: set[str],
     recompute_spec: Any,
-) -> tuple[dict, list]:
-    """Collect adapter-safe modules inside the selected layers."""
-    module_by_fqn = dict(model.named_modules())
+) -> list:
+    """Return the outermost checkpoint region roots inside the selected layers."""
+    matched = [
+        (module_fqn, module)
+        for module_fqn, module in model.named_modules()
+        if module_fqn
+        and any(
+            fnmatch.fnmatchcase(module_fqn, pattern)
+            for pattern in recompute_spec.region_patterns
+        )
+    ]
+    outermost = [
+        (module_fqn, module)
+        for module_fqn, module in matched
+        if not any(
+            module_fqn != other_fqn and module_fqn.startswith(f"{other_fqn}.")
+            for other_fqn, _ in matched
+        )
+    ]
+    return [
+        (module_fqn, module)
+        for module_fqn, module in outermost
+        if any(
+            module_fqn == layer_fqn or module_fqn.startswith(f"{layer_fqn}.")
+            for layer_fqn in selected_layer_fqns
+        )
+    ]
+
+
+def _matches_exclusion(module_fqn: str, module: nn.Module, recompute_spec: Any) -> bool:
+    """Return whether one module is declared to stay outside the replay."""
+    if any(
+        fnmatch.fnmatchcase(module_fqn, pattern)
+        for pattern in recompute_spec.exclude_patterns
+    ):
+        return True
+    predicate = recompute_spec.exclude_predicate
+    return bool(predicate is not None and predicate(module_fqn, module))
+
+
+def _select_excluded_targets(
+    module_by_fqn: dict,
+    region_roots: list,
+    recompute_spec: Any,
+) -> list:
+    """Collect the declared descendants that must stay outside the replay."""
+    root_fqns = tuple(root_fqn for root_fqn, _ in region_roots)
     selected_targets = []
     for module_fqn, module in module_by_fqn.items():
         if not any(
-            module_fqn.startswith(f"{layer_fqn}.")
-            for layer_fqn in selected_layer_fqns
+            module_fqn == root_fqn or module_fqn.startswith(f"{root_fqn}.")
+            for root_fqn in root_fqns
         ):
             continue
-        if not any(
-            fnmatch.fnmatchcase(module_fqn, pattern)
-            for pattern in recompute_spec.safe_module_patterns
-        ):
-            continue
-        if any(
-            fnmatch.fnmatchcase(module_fqn, pattern)
-            for pattern in recompute_spec.no_replay_module_patterns
-        ):
-            raise ValueError(
-                f"[HP-STATE-002] safe recompute target {module_fqn!r} is also a no-replay producer"
-            )
-        selected_targets.append((module_fqn, module))
-    if not selected_targets:
-        raise ValueError(
-            "model adapter safe recompute patterns matched no module in the selected layers"
-        )
-    return module_by_fqn, selected_targets
+        if _matches_exclusion(module_fqn, module, recompute_spec):
+            selected_targets.append((module_fqn, module))
+    return selected_targets
 
 
-def _check_no_nested_checkpoint_targets(selected_targets: list) -> None:
-    """Reject overlapping safe-region selections."""
-    selected_ids = {id(module) for _, module in selected_targets}
-    for module_fqn, module in selected_targets:
-        if any(
-            child is not module and id(child) in selected_ids
-            for child in module.modules()
-        ):
-            raise ValueError(
-                "model adapter safe recompute patterns selected nested targets: "
-                f"{module_fqn}"
-            )
-
-
-def _wrap_safe_checkpoint_targets(
-    model: nn.Module,
-    module_by_fqn: dict,
-    selected_targets: list,
-    checkpoint_kwargs: dict,
-) -> int:
-    """Install checkpoint wrappers deepest-first; return the wrapped count."""
+def _wrap_excluded_targets(module_by_fqn: dict, exclude_targets: list) -> int:
+    """Install exclusion wrappers deepest-first; return the wrapped count."""
     wrapped_count = 0
     for module_fqn, module in sorted(
-        selected_targets,
+        exclude_targets,
         key=lambda item: item[0].count("."),
         reverse=True,
     ):
-        if "." in module_fqn:
-            parent_fqn, child_name = module_fqn.rsplit(".", 1)
-            parent = module_by_fqn[parent_fqn]
-        else:
-            parent, child_name = model, module_fqn
         if _is_checkpoint_wrapped(module):
             continue
-        setattr(parent, child_name, checkpoint_wrapper(module, **checkpoint_kwargs))
+        parent_fqn, child_name = module_fqn.rsplit(".", 1)
+        setattr(
+            module_by_fqn[parent_fqn],
+            child_name,
+            checkpoint_exclude_wrapper(module),
+        )
         wrapped_count += 1
     return wrapped_count
 
 
-def _apply_model_adapter_safe_checkpointing(
+def _validate_region_exclusions(roots: list, exclude_targets: list) -> None:
+    """Reject region shapes that would replay an excluded module or swallow it."""
+    root_fqns = {root_fqn for root_fqn, _ in roots}
+    for module_fqn, _ in exclude_targets:
+        if module_fqn in root_fqns:
+            raise ValueError(
+                f"[HP-STATE-002] recompute region root {module_fqn!r} is also excluded from replay"
+            )
+    root_ids = {id(module) for _, module in roots}
+    for module_fqn, module in exclude_targets:
+        if any(
+            child is not module and id(child) in root_ids
+            for child in module.modules()
+        ):
+            raise ValueError(
+                f"excluded recompute region {module_fqn!r} contains a recompute region root"
+            )
+
+
+def _apply_model_adapter_regions_checkpointing(
     model: nn.Module,
     containers: list[_LayerContainerInfo],
     ac_layers: list[nn.Module],
@@ -942,32 +972,102 @@ def _apply_model_adapter_safe_checkpointing(
     *,
     enable_compile: bool,
     swap_inputs: bool,
+    state_swap: bool = False,
+    state_swap_scope: str = "encoder",
+    state_swap_prefetch_layers: int = 1,
+    state_swap_host_mb: int = 0,
 ) -> nn.Module:
-    """Wrap only model-adapter-declared safe regions in the selected layers."""
+    """Wrap the adapter-declared recompute regions of the selected layers.
+
+    The outermost pattern match inside every selected layer becomes one
+    checkpoint region, so a layer pattern keeps a single saved copy of the layer
+    input. Declared exclusions stay outside the replay, which is what lets a
+    cross-layer state producer or consumer live inside a checkpointed layer.
+    """
     recompute_spec = _adapter_recompute_spec(model)
+    if not recompute_spec.region_patterns:
+        raise ValueError(
+            "activation_checkpoint.selection.source=model_adapter_safe_regions "
+            "requires RecomputePolicy.region_patterns"
+        )
     selected_layer_fqns = _selected_checkpoint_layer_fqns(containers, selection)
     if not selected_layer_fqns:
-        logger.info("Model-adapter safe recompute selected zero layers")
+        logger.info("Model-adapter recompute selected zero layers")
         return model
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
     checkpoint_kwargs = {"swap_inputs": swap_inputs} if not enable_compile else {}
-    module_by_fqn, selected_targets = _select_safe_checkpoint_targets(
-        model, selected_layer_fqns, recompute_spec
-    )
-    _check_no_nested_checkpoint_targets(selected_targets)
-    wrapped_count = _wrap_safe_checkpoint_targets(
-        model, module_by_fqn, selected_targets, checkpoint_kwargs
-    )
-    if swap_inputs and not enable_compile:
+
+    module_by_fqn = dict(model.named_modules())
+    roots = _select_layer_region_roots(model, selected_layer_fqns, recompute_spec)
+    if not roots:
+        raise ValueError(
+            "model adapter recompute patterns matched no region in the selected layers"
+        )
+    excluded_count = _wrap_declared_exclusions(module_by_fqn, roots, recompute_spec)
+    wrapped_count = _wrap_region_roots(model, module_by_fqn, roots, checkpoint_kwargs)
+    if (swap_inputs or state_swap) and not enable_compile:
         _register_forward_prefetch_layers(containers)
+    if state_swap:
+        # Every group's load is issued this many layers ahead of its own
+        # backward, which is what lets a large state entry stay off device
+        # through the peak and still be back before its reader replays.
+        SwapManager().set_prefetch_depth(state_swap_prefetch_layers)
+    if recompute_spec.on_applied is not None:
+        recompute_spec.on_applied(
+            model,
+            RecomputeContext(
+                region_fqns=tuple(root_fqn for root_fqn, _ in roots),
+                state_swap=state_swap,
+                state_swap_scope=state_swap_scope,
+                state_swap_prefetch_layers=state_swap_prefetch_layers,
+                state_swap_host_mb=state_swap_host_mb,
+            ),
+        )
     logger.info(
-        "Model-adapter safe recompute wrapped %d region(s) across %d/%d layers",
+        "Model-adapter recompute wrapped %d region(s) and excluded %d region(s) "
+        "across %d/%d discovered layers%s",
         wrapped_count,
+        excluded_count,
         len(selected_layer_fqns),
         len(ac_layers),
+        " with cross-layer state swap" if state_swap else "",
     )
     return model
+
+
+def _wrap_declared_exclusions(module_by_fqn: dict, roots: list, recompute_spec: Any) -> int:
+    """Validate the declared exclusions of the selected regions and wrap them."""
+    exclude_targets = _select_excluded_targets(module_by_fqn, roots, recompute_spec)
+    declared_exclusions = bool(
+        recompute_spec.exclude_patterns or recompute_spec.exclude_predicate is not None
+    )
+    if declared_exclusions and not exclude_targets:
+        raise ValueError(
+            "model adapter recompute exclusions matched no module "
+            "inside the selected regions"
+        )
+    _validate_region_exclusions(roots, exclude_targets)
+    return _wrap_excluded_targets(module_by_fqn, exclude_targets)
+
+
+def _wrap_region_roots(model: nn.Module, module_by_fqn: dict, roots: list, checkpoint_kwargs: dict) -> int:
+    """Wrap every selected region root, deepest first, and return the count."""
+    wrapped_count = 0
+    for module_fqn, module in sorted(
+        roots,
+        key=lambda item: item[0].count("."),
+        reverse=True,
+    ):
+        if _is_checkpoint_wrapped(module):
+            continue
+        parent_fqn, child_name = module_fqn.rsplit(".", 1)
+        parent = module_by_fqn[parent_fqn] if parent_fqn else model
+        setattr(parent, child_name, checkpoint_wrapper(module, **checkpoint_kwargs))
+        wrapped_count += 1
+    if wrapped_count == 0:
+        raise ValueError("model adapter recompute matched no region to wrap")
+    return wrapped_count
 
 
 def _resolve_activation_checkpoint_containers(
@@ -1121,13 +1221,18 @@ def _apply_activation_checkpointing(
     enable_compile: bool = False,
     swap_inputs: bool = False,
     selection: Optional[Any] = None,
+    state_swap: bool = False,
+    state_swap_scope: str = "encoder",
+    state_swap_prefetch_layers: int = 1,
+    state_swap_host_mb: int = 0,
 ) -> nn.Module:
     """Apply full or selective recomputation to discovered transformer layers.
 
     Validates the requested options, discovers the repeated-block containers that
     advertise HuggingFace checkpointing support, then delegates to the
     mode-specific wrapper. Swap prefetch chains are registered afterwards for
-    every configuration that wrapped the layers itself.
+    every configuration that wrapped the layers itself: activation-input swap
+    and cross-layer state swap share the same per-region chain.
     """
     _validate_activation_checkpoint_config(
         activation_checkpoint,
@@ -1140,13 +1245,17 @@ def _apply_activation_checkpointing(
 
     selection_source = getattr(selection, "source", "default")
     if selection_source == "model_adapter_safe_regions":
-        return _apply_model_adapter_safe_checkpointing(
+        return _apply_model_adapter_regions_checkpointing(
             model,
             containers,
             ac_layers,
             selection,
             enable_compile=enable_compile,
             swap_inputs=swap_inputs,
+            state_swap=state_swap,
+            state_swap_scope=state_swap_scope,
+            state_swap_prefetch_layers=state_swap_prefetch_layers,
+            state_swap_host_mb=state_swap_host_mb,
         )
 
     if hasattr(model, "gradient_checkpointing_disable"):

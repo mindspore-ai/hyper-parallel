@@ -899,11 +899,14 @@ Swap 分组管理器（单例）。
 ```python
 class SwapManager:
     def set_forward_prefetch_layer(self, first_layer, second_layer) -> None
+    def set_prefetch_depth(self, depth: int) -> int
     def launch_offload(self, group_name: str, copy_stream=None) -> None
     def wait_offload(self, group_name: str) -> None
     def launch_load(self, group_name: str, copy_stream=None) -> None
     def wait_load(self, group_name: str) -> None
 ```
+
+`set_prefetch_depth` 设置一个组的 load 提前几层发起（默认 1，即由反向顺序里的下一层预取）；值越大越能掩盖更大的 H2D 拷贝，但数据也会更早回到设备。
 
 ---
 

@@ -33,6 +33,8 @@ import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
+from hyper_parallel.core.activation_memory.wrapper import checkpoint_exclude_wrapper
+from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.models.replacement import module_replacement
 
 
@@ -65,6 +67,13 @@ class SharedCompressedAttentionState:
     which has several Full/Reindex groups, and makes a consumer's dependency
     explicit when activation recomputation revisits modules out of forward
     order.
+
+    Nothing drops an entry early. The state travels into every layer as one of
+    the checkpoint region's inputs, so the graph keeps it alive from the forward
+    pass to the end of backward, and a layer whose forward is replayed reads its
+    entries a second time there. A published entry therefore has to stay
+    readable until backward is done with every consumer, which is also why the
+    publishers skip their write while replaying.
     """
 
     compressed_kv_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
@@ -771,6 +780,11 @@ def shared_compressed_indexer_kl_loss(
 class SharedCompressedDSAIndexer(nn.Module):
     """Reusable V4.1 compressed Lightning Indexer semantics."""
 
+    # Installed by :meth:`enable_selection_exclude` for a replayed layer. The
+    # wrapper sits in a plain container attribute, not in the module tree, so the
+    # exclusion region stays out of ``modules()`` and the state dict.
+    _selection_region: dict[str, Callable[..., Any]] | None = None
+
     def __init__(self, module: nn.Module) -> None:
         """Transfer the source projections without changing checkpoint names."""
         super().__init__()
@@ -832,7 +846,14 @@ class SharedCompressedDSAIndexer(nn.Module):
             query_offset: int = 0,
             minimum_key_indices: torch.Tensor | None = None,
     ) -> SharedCompressedIndexerOutput:
-        """Project local queries and score them against global compressed keys."""
+        """Project local queries and score them against global compressed keys.
+
+        When the enclosing layer is replayed, :meth:`enable_selection_exclude`
+        makes the discrete selection a checkpoint exclusion region: it runs in
+        the original forward and its cached result is reused during the replay,
+        so the chosen key set can never drift and the checkpoint keeps seeing
+        the same saved tensors in both phases.
+        """
         batch_size, sequence_length, _ = hidden_states.shape
         cos, sin = compress_position_embeddings
 
@@ -856,6 +877,71 @@ class SharedCompressedDSAIndexer(nn.Module):
         reduce_sum = None if tp_context is None else tp_context.reduce_sum
         if key_handle is not None:
             key = key_handle.wait()
+        topk_indices, candidate_blocks = self._run_selection(
+            query,
+            key,
+            merge_weight,
+            candidate_blocks=candidate_blocks,
+            query_offset=query_offset,
+            minimum_key_indices=minimum_key_indices,
+            reduce_sum=reduce_sum,
+        )
+        return SharedCompressedIndexerOutput(
+            topk_indices=topk_indices,
+            index_key=key,
+            candidate_blocks=candidate_blocks,
+            index_query=query,
+            merge_weight=merge_weight,
+        )
+
+    def enable_selection_exclude(self) -> None:
+        """Run the discrete selection once and reuse it while the layer replays.
+
+        This is the layer's only pinned region: a recompute must not pick a
+        different Top-K set, and the selection contains differentiable ops, so
+        skipping it would also change how many tensors the checkpoint saves in
+        each phase. Everything else in the forward is either recomputed
+        unchanged or guarded by :func:`is_recomputing`, so a replay reads the
+        shared entries the forward pass published instead of writing its own.
+        """
+        self._selection_region = {"wrapper": checkpoint_exclude_wrapper(self._select_tokens)}
+
+    def _run_selection(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            merge_weight: torch.Tensor,
+            *,
+            candidate_blocks: torch.Tensor | None,
+            query_offset: int,
+            minimum_key_indices: torch.Tensor | None,
+            reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Select Top-K tokens directly, or through the exclusion region."""
+        region = self._selection_region
+        selection = self._select_tokens if region is None else region["wrapper"]
+        return selection(
+            query,
+            key,
+            merge_weight,
+            candidate_blocks=candidate_blocks,
+            query_offset=query_offset,
+            minimum_key_indices=minimum_key_indices,
+            reduce_sum=reduce_sum,
+        )
+
+    def _select_tokens(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            merge_weight: torch.Tensor,
+            *,
+            candidate_blocks: torch.Tensor | None,
+            query_offset: int,
+            minimum_key_indices: torch.Tensor | None,
+            reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Choose the Top-K positions and, for the candidate source, the pool."""
         if self.is_candidate_source:
             topk_indices, candidate_blocks = compressed_causal_topk_and_candidates(
                 query,
@@ -899,13 +985,7 @@ class SharedCompressedDSAIndexer(nn.Module):
                 reduce_sum=reduce_sum,
                 minimum_key_indices=minimum_key_indices,
             )
-        return SharedCompressedIndexerOutput(
-            topk_indices=topk_indices,
-            index_key=key,
-            candidate_blocks=candidate_blocks,
-            index_query=query,
-            merge_weight=merge_weight,
-        )
+        return topk_indices, candidate_blocks
 
 
 def _reference_sparse_attention(
@@ -1093,6 +1173,17 @@ def npu_sparse_attention_with_scalar_sink(
 class SharedCompressedDSAAttentionBase(nn.Module):
     """Shared V4.1 attention semantics with selectable reference execution."""
 
+    # Entry kind -> the attribute naming the layer that published it.
+    _STATE_SWAP_SOURCES = {
+        "compressed_kv": "kv_source_layer_idx",
+        "index_key": "kv_source_layer_idx",
+        "topk": "index_source_layer_idx",
+        "candidate": "candidate_source_layer_idx",
+    }
+    # Installed by the model-owned recompute hook when the swap chain offloads
+    # cross-layer state; ``None`` keeps every entry on device.
+    _state_swap_plan: Any | None = None
+
     def __init__(
             self,
             module: nn.Module,
@@ -1275,16 +1366,40 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             shared_state: "SharedCompressedAttentionState",
             cp_context: "SharedCompressedAttentionCPContext | None",
     ) -> tuple[torch.Tensor | None, "SequenceGatherHandle | None"]:
-        """Compress local hidden states and publish or launch the compressed KV."""
+        """Compress local hidden states and publish or launch the compressed KV.
+
+        The compressed K=V reaches its consumers - the producing Full layer
+        included - through the shared state, so only the publish (or the CP
+        gather handle that feeds it) leaves this call.
+        """
         latent = None
         compressed_handle = None
         if self.is_kv_source:
             latent, compressed = self.compressor(hidden_states, position_embeddings["compress"])
             if cp_context is None:
-                shared_state.publish_compressed_kv(self.layer_idx, compressed)
+                if not is_recomputing():
+                    shared_state.publish_compressed_kv(self.layer_idx, compressed)
             else:
                 compressed_handle = cp_context.launch(compressed, 1)
         return latent, compressed_handle
+
+    def _maybe_swap_state_entry(self, kind: str, entry: Any, state: Any) -> None:
+        """Hand one published entry to the swap chain if this layer reads it last.
+
+        The entry stays where it is: the swap group of this layer is what
+        offloads it once this forward finishes, and what loads it back before
+        this layer's backward replays the consumer. A replay must not register
+        anything, and a run without swap scheduling has no active group, so both
+        are silent no-ops.
+        """
+        plan = self._state_swap_plan
+        if plan is None or entry is None or is_recomputing():
+            return
+        source_attr = self._STATE_SWAP_SOURCES[kind]
+        source_layer = getattr(self, source_attr, None)
+        if source_layer is None:
+            return
+        plan.register(self.layer_idx, kind, int(source_layer), entry, state)
 
     def _run_indexer(
             self,
@@ -1298,7 +1413,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_offset: int,
             minimum_key_indices: torch.Tensor | None,
     ) -> Any | None:
-        """Run the indexer on index-source layers and publish its outputs."""
+        """Run the indexer on index-source layers and publish its forward outputs."""
         if not self.is_index_source:
             return None
         index_key = (
@@ -1306,6 +1421,8 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             if self.indexer.owns_key
             else shared_state.require_index_key(self.kv_source_layer_idx, self.layer_idx)
         )
+        if index_key is not None:
+            self._maybe_swap_state_entry("index_key", index_key, shared_state)
         candidate_blocks = (
             shared_state.require_candidate_blocks(
                 self.candidate_source_layer_idx,
@@ -1313,6 +1430,8 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             )
             if self.indexer.uses_candidates else None
         )
+        if candidate_blocks is not None:
+            self._maybe_swap_state_entry("candidate", candidate_blocks, shared_state)
         indexer_output = self.indexer(
             hidden_states,
             query_residual,
@@ -1325,6 +1444,11 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_offset=query_offset,
             minimum_key_indices=minimum_key_indices,
         )
+        if is_recomputing():
+            # A replay must not republish: its consumers read the entries the
+            # forward pass wrote, and a second write would break the
+            # single-publisher contract (HP-STATE-002).
+            return indexer_output
         if self.indexer.owns_key:
             shared_state.publish_index_key(self.layer_idx, indexer_output.index_key)
         shared_state.publish_topk_indices(self.layer_idx, indexer_output.topk_indices)
@@ -1364,10 +1488,12 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             self.kv_source_layer_idx,
             self.layer_idx,
         )
+        self._maybe_swap_state_entry("compressed_kv", compressed_kv, shared_state)
         topk_indices = shared_state.require_topk_indices(
             self.index_source_layer_idx,
             self.layer_idx,
         )
+        self._maybe_swap_state_entry("topk", topk_indices, shared_state)
         combined_key_value = torch.cat((key_value, compressed_kv.unsqueeze(1)), dim=2)
         compressed_indices = topk_indices.long() + global_sequence_length
         compressed_indices.masked_fill_(topk_indices < 0, -1)
@@ -1509,7 +1635,9 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         if raw_kv_handle is not None:
             key_value = raw_kv_handle.wait()
         if compressed_handle is not None:
-            shared_state.publish_compressed_kv(self.layer_idx, compressed_handle.wait())
+            compressed = compressed_handle.wait()
+            if not is_recomputing():
+                shared_state.publish_compressed_kv(self.layer_idx, compressed)
         if key_value is None:
             raise RuntimeError("raw KV all-gather did not produce a tensor")
 

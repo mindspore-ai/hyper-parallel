@@ -69,6 +69,7 @@ def validate_attention_swap(
     activation_checkpoint: Optional[str] = None,
     enable_compile: bool = False,
     pp_size: int = 1,
+    selection_source: Optional[str] = None,
 ) -> None:
     """Validate attention swap mode and incompatible model-build features.
 
@@ -77,19 +78,45 @@ def validate_attention_swap(
         activation_checkpoint: Activation recomputation mode.
         enable_compile: Whether graph compilation is enabled.
         pp_size: Configured pipeline-parallel world size.
+        selection_source: Activation-checkpoint selection source, used by the
+            cross-layer state swap mode which only works with model-declared
+            regions.
 
     Raises:
         ValueError: If the mode is invalid or an unsupported combination is enabled.
     """
-    if activation_swap not in ("none", "attention"):
+    if activation_swap not in ("none", "attention", "csa2_state"):
         raise ValueError(
-            "activation_swap must be one of ('none', 'attention'), "
+            "activation_swap must be one of ('none', 'attention', 'csa2_state'), "
             f"got {activation_swap!r}"
         )
     if activation_swap == "none":
         return
     if enable_compile:
-        raise ValueError("activation_swap='attention' is incompatible with torch.compile")
+        raise ValueError(
+            f"activation_swap={activation_swap!r} is incompatible with torch.compile"
+        )
+    if activation_swap == "csa2_state":
+        # Cross-layer state swap rides the region chain: it needs the adapter's
+        # whole-layer regions (one group per replayed layer) plus a single
+        # backward order, so it is only valid with the model-adapter region
+        # selection.
+        if activation_checkpoint != "selective":
+            raise ValueError(
+                "activation_swap='csa2_state' requires "
+                "activation_checkpoint.mode='selective'"
+            )
+        if selection_source != "model_adapter_safe_regions":
+            raise ValueError(
+                "activation_swap='csa2_state' requires "
+                "activation_checkpoint.selection.source='model_adapter_safe_regions', "
+                f"got {selection_source!r}"
+            )
+        if pp_size != 1:
+            raise ValueError(
+                "activation_swap='csa2_state' does not support pipeline parallelism"
+            )
+        return
     if activation_checkpoint not in (None, "off"):
         raise ValueError("activation_swap='attention' is incompatible with activation checkpointing")
     if pp_size != 1:
@@ -151,8 +178,9 @@ def apply_attention_swap(model: nn.Module, activation_swap: str) -> nn.Module:
     """
     if activation_swap != "attention":
         raise ValueError(
-            "activation_swap must be one of ('none', 'attention'), "
-            f"got {activation_swap!r}"
+            "apply_attention_swap only installs activation_swap='attention'; "
+            f"got {activation_swap!r} (the 'csa2_state' mode is installed by "
+            "the activation-checkpoint region path)"
         )
     attention_targets = _find_attention_targets(model)
     wrapped_attentions: list[nn.Module] = []

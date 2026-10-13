@@ -89,6 +89,9 @@ output = swap(model.layer, x, policy_fn=swap_policy)
 
 # 使用 swap 功能时，需要注册层间的 offload / prefetch 关系（可以不是相邻层）
 SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
+
+# 可选：一个组的 load 提前几层发起（默认 1，即反向顺序里的下一层预取）
+SwapManager().set_prefetch_depth(2)
 ```
 
 ### 3. 声明式接口

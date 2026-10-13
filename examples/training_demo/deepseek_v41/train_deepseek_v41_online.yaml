@@ -157,7 +157,14 @@ activation_checkpoint:
   selection:
     source: model_adapter_safe_regions
     layer_count: 0
+  # Consumed by activation_swap: csa2_state, which offloads the cross-layer
+  # shared state of replayed layers to pinned host memory.
+  state_swap_scope: encoder
+  state_swap_prefetch_layers: 1
+  state_swap_host_mb: 0
 
+# none | attention | csa2_state (the latter needs mode=selective plus the
+# model-adapter region selection above)
 activation_swap: none
 
 compile:
