@@ -22,7 +22,7 @@ model's family says, from its op profile: :func:`derive_family`.
 """
 import logging
 import math
-from typing import Any, Callable, Dict, Mapping, Union
+from typing import Any, Dict, Mapping, Union
 
 from hyper_parallel.auto_parallel._exec_spec import RECOMPUTE_OPS
 from hyper_parallel.auto_parallel._op_profiles import VISION_ARCH, family_profile
@@ -146,7 +146,7 @@ def param_cp(ccfg: Any) -> float:
     spans the DP x CP domain, its dense FSDP mesh being
     ``(dp_replicate, dp_shard, tp)`` over ``dp * cp`` ranks
     (``MeshContext.build_meshs``), and the table it gathers is whole: so 1
-    there (``shard_spans_cp``), CP elsewhere (C1).
+    there (``shard_spans_cp``), CP elsewhere.
     """
     return 1 if getattr(ccfg, "shard_spans_cp", False) else ccfg.cp
 
@@ -269,7 +269,7 @@ def derive_comm_flags(ccfg: Any) -> None:
     )  # data parallel comm factor
     # Whether another rank holds the same slice of a routed expert, as a
     # shard or a copy, so that its gradient is reduced: d_exp left CP's
-    # ranks out and read 1 where they reduce it (X3).
+    # ranks out and read 1 where they reduce it.
     ccfg.comm_d_exp = (
         0
         if ((expert_dp_ranks(ccfg) == 1) or not ccfg.has_op)
@@ -520,44 +520,18 @@ def derive_head_dim(ccfg: Any) -> None:
         ccfg.dh = getattr(ccfg, "v_head_dim", None) or width
 
 
-def cm_layer_fields(ccfg: Any) -> Dict[str, Any]:
-    """Return what every layer of a cm model takes on top of its kind's fields.
-
-    Each layer shards its expert states as the model shards its partial
-    ones, its other states over the common divisor of the expert count and
-    their sharding, and its embedding over TP.
-    """
-    return {
-        "shard_p_os_exp": ccfg.shard_p_os_exp_partial,
-        "shard_p_os_non_exp_partial": math.gcd(ccfg.n_exp, ccfg.shard_p_os_non_exp),
-        "shard_embed": ccfg.t,
-    }
-
-
-# The fields a family gives every layer, by family: a rule in code, where the
-# family's op profile cannot say it.
-LAYER_FIELD_RULES: Dict[str, Callable[[Any], Dict[str, Any]]] = {"cm": cm_layer_fields}
-
-
-def derive_layer_fields(ccfg: Any) -> None:
-    """Set the fields the family gives every layer, ``layer_fields``, or none."""
-    rule = LAYER_FIELD_RULES.get(getattr(ccfg, "arch", None))
-    ccfg.layer_fields = rule(ccfg) if rule is not None else None
-
-
 def derive_family(ccfg: Any) -> None:
     """Set what the config's family decides where its producer states nothing.
 
     The byte widths, the resharding and the activation sharding, from the
-    run facts the config states and else its family's (:func:`family_run`); an MLA
-    family's head width; and the fields cm gives every layer.
+    run facts the config states and else its family's (:func:`family_run`),
+    and an MLA family's head width.
     """
     run = family_run(ccfg)
     derive_byte_widths(ccfg, run)
     derive_resharding(ccfg, run)
     derive_activation_sharding(ccfg, run)
     derive_head_dim(ccfg)
-    derive_layer_fields(ccfg)
 
 
 def derive(ccfg: Any, strict: bool = True) -> None:

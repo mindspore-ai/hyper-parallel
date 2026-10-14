@@ -152,7 +152,7 @@ class TestMultimodalCostModel(unittest.TestCase):
             model alone, since a stage holds the tower beside it: the stage
             has to fit the moment the language model's first layer runs its
             backward, with every activation the tower keeps still held, not
-            the moment the tower's own first layer ends the backward (F54).
+            the moment the tower's own first layer ends the backward.
             The layers the candidate reads are the language model's.
         """
         runner = self._build()

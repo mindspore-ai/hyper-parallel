@@ -87,7 +87,7 @@ def read_activation_checkpoint_mode(stated: Any, where: str) -> str:
     is not one of :data:`RECOMPUTE_MODES` is refused, True included: ND used
     to price a mode it did not know as no recompute, so a typo of ``full``
     was costed at the off memory, and a False fell through to the legacy
-    default (I13).
+    default.
 
     Args:
         stated: The mode as the yaml states it.

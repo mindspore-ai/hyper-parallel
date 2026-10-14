@@ -91,7 +91,7 @@ MODEL_DEFAULT_KEYS = ("v_head_dim",)
 # and the order they are listed in decides nothing.
 _NAME_PREFIXES = {
     "llama2": "llama2", "mixtral": "mixtral", "t5": "t5", "pangualpha": "pangualpha",
-    "deepseek": "deepseek", "qwen3_5": "qwen3_5", "qwen3.5": "qwen3_5", "qwen": "qwen", "cm": "cm",
+    "deepseek": "deepseek", "qwen3_5": "qwen3_5", "qwen3.5": "qwen3_5", "qwen": "qwen",
 }
 # The names the default profile was taken for, each said once a process.
 _DEFAULTED_NAMES = set()
@@ -267,10 +267,9 @@ def infer_arch(name: Any) -> str:
     The family the lower-cased name opens with, the longest first, else the
     default profile, said once a name.  Matched anywhere in the name, in a
     fixed order, as the cost model matched names before the family became
-    data, ``cm`` took any name holding those two letters and a family listed
-    earlier won over the one the name opens with (I8).  Only a producer with
-    no better source should use it; a spec that declares ``arch`` never gets
-    here.
+    data, a family listed earlier won over the one the name opens with.
+    Only a producer with no better source should use it; a spec that
+    declares ``arch`` never gets here.
     """
     lowered = str(name).lower()
     for prefix in sorted(_NAME_PREFIXES, key=len, reverse=True):

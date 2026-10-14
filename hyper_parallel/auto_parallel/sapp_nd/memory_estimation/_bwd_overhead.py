@@ -80,7 +80,7 @@ class _BackwardOverhead:
         run last, and their working set is the smaller of the two; but the
         moment the language model's own first layer runs its backward, every
         activation of the tower is still held, and that is the moment the
-        stage has to fit (F2, F54).  A stage of one module, or one holding
+        stage has to fit.  A stage of one module, or one holding
         no layer of the main module, keeps its own first layers.
         """
         regular = [lay_id for lay_id, node in enumerate(stages[stage_id][0])

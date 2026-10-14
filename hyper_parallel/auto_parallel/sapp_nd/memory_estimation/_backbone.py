@@ -93,7 +93,7 @@ class _Backbone:
                 raise AttributeError("missing config")
         self.evaluator_instances = None
         # The submodule a multimodal model's stages are fitted on, by name,
-        # or None for a model of one module (F54).
+        # or None for a model of one module.
         self.main_module = None
         self.ppb = None
         # Each stage's dynamic memory, in MB, at the two points of the last
@@ -754,7 +754,7 @@ class _Backbone:
         A multimodal model's stages hold its submodules' layers together, and
         a micro-batch's backward ends on the first of them; the moment the
         main submodule's own first layer runs its backward is the one a stage
-        has to fit (F54).
+        has to fit.
         """
         if not ccfg.multimodal:
             self.main_module = None
@@ -771,7 +771,7 @@ class _Backbone:
         the moment the language model's first layer runs its backward, every
         activation the tower kept is still held: that is the moment the
         stage has to fit, so what the tower keeps of this micro-batch counts
-        beside the other micro-batches' (F54).
+        beside the other micro-batches'.
         """
         if self.main_module is None:
             return 0

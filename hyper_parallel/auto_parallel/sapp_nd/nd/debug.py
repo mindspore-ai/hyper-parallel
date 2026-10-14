@@ -20,15 +20,16 @@ import csv
 from contextlib import contextmanager
 from enum import Enum, auto
 from pathlib import Path
-from functools import partial
 from math import isnan, sqrt
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mc
 from matplotlib.font_manager import FontProperties
+from matplotlib.backends.backend_pdf import PdfPages
 from scipy.stats import pearsonr
+import yaml
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
@@ -37,6 +38,13 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.recompute_dimension import read_rec
 # The column a configuration's activation checkpoint mode goes in, written by a
 # search with a recompute dimension and read from a measured CSV that states it.
 RECOMPUTE_COLUMN = "recompute"
+
+# The results table's recompute rows: the activation checkpoint mode a
+# configuration runs, and the plan per layer that names the exceptions to it.
+MODE_ROW = "RMOD"
+LAYER_ROW = "RLAYER"
+# Rows whose cells hold text, which carries no shading and no largest value.
+_TEXT_ROWS = (MODE_ROW, LAYER_ROW)
 
 
 def _recompute_of(row: dict) -> Optional[str]:
@@ -59,14 +67,29 @@ def _has_recompute(entries: list) -> bool:
 # which is unwritable in an installed package and mixes consecutive runs
 # together, so ``run_nd -o`` overrides it.
 _OUTPUT_DIR = None
+# The CSVs Debug.write appends a row a candidate to.
+DEBUG_CSVS = ("debug.csv", "debug_mem.csv")
 
 
-def set_output_dir(path: Optional[str]) -> None:
-    """Send the debug artifacts to *path* instead of the package directory."""
+def set_output_dir(path: Optional[str], fresh: bool = False) -> None:
+    """Send the debug artifacts to *path* instead of the package directory.
+
+    Args:
+        path: the run's output folder, or None for the package's own.
+        fresh: remove the debug CSVs an earlier run left there. ``Debug.write`` appends and writes the column
+            titles only into a new file, so a run into a folder another run wrote would add its rows under that
+            run's. The process that starts a run passes True; the pool's workers, which append to the files
+            the run started, do not.
+    """
     global _OUTPUT_DIR  # pylint: disable=global-statement
     _OUTPUT_DIR = str(path) if path else None
     if _OUTPUT_DIR:
         os.makedirs(_OUTPUT_DIR, exist_ok=True)
+    if fresh:
+        for name in DEBUG_CSVS:
+            stale = os.path.join(output_dir(), name)
+            if os.path.isfile(stale):
+                os.remove(stale)
 
 
 def output_dir() -> str:
@@ -431,9 +454,16 @@ class Plot:
         self.data = []
 
     def make_table(self):
-        """Make table below plot with each parallelism degree"""
+        """Make the table below the plot with each parallelism degree and the recompute rows.
+
+        A recompute row holds text rather than a degree, so it keeps one
+        shade and its cells grow with the lines its plan takes.
+        """
         self.cell_text = list(map(list, zip(*self.cell_text)))  # transpose
-        max_rows = list(map(max, map(partial(map, _cell_number), self.cell_text)))
+        max_rows = [
+            None if title in _TEXT_ROWS else max(map(_cell_number, cells))
+            for title, cells in zip(self.row_title, self.cell_text)
+        ]
         the_table = plt.table(
             cellText=self.cell_text,
             rowLabels=self.row_title,
@@ -443,31 +473,50 @@ class Plot:
         )
         row_colors = list(map(dim_color, self.row_title))
         for row in range(len(self.row_title)):
+            lines = max(str(text).count("\n") + 1 for text in self.cell_text[row])
             cell = the_table[row + 1, -1]
             cell.set_edgecolor("none")
             cell.get_text().set_color(row_colors[row])
             cell.set_text_props(fontproperties=FontProperties(weight="bold"))
+            cell.set_height(cell.get_height() * lines)
             for col in range(len(self.cell_text[0])):
-                cell = the_table[row + 1, col]
-                value = _cell_number(str(cell.get_text().get_text()))
-                try:
-                    ratio = 1 - (value / max_rows[row])
-                except ZeroDivisionError:
-                    ratio = 0
-                logger.debug(
-                    "tmax = %s, ratio = %f, col=%s, newcolor=%s",
-                    str(max_rows[row]),
-                    ratio,
-                    str(mc.to_rgb(row_colors[row])),
-                    str(near_white(row_colors[row], ratio)),
-                )
-                cell.set_facecolor(near_white(pastel(row_colors[row]), ratio))
-                cell.set_edgecolor("none")
+                self._shade_cell(the_table[row + 1, col], row, max_rows[row], lines, row_colors[row])
 
         for col in range(len(self.cell_text[0])):
             the_table[0, col].set_edgecolor("none")
 
         the_table.scale(xscale=1, yscale=1.2)  # +len(rows)/5)
+
+    def _shade_cell(self, cell: Any, row: int, largest: Optional[float], lines: int, color: Any) -> None:
+        """Shade one cell of the table by its value against the row's largest.
+
+        Args:
+            cell: The cell to shade.
+            row: Its row, which names the degree or the recompute setting.
+            largest: The largest value the row holds; ``None`` for a row of
+                text, which keeps the row's lightest shade.
+            lines: The lines the row's tallest cell takes.
+            color: The row's colour.
+        """
+        cell.set_height(cell.get_height() * lines)
+        if largest is None:
+            ratio = 1
+        else:
+            try:
+                ratio = 1 - (_cell_number(str(cell.get_text().get_text())) / largest)
+            except ZeroDivisionError:
+                ratio = 0
+        if self.row_title[row] == LAYER_ROW:
+            cell.set_text_props(ha="center", fontfamily="monospace")
+        logger.debug(
+            "tmax = %s, ratio = %f, col=%s, newcolor=%s",
+            str(largest),
+            ratio,
+            str(mc.to_rgb(color)),
+            str(near_white(color, ratio)),
+        )
+        cell.set_facecolor(near_white(pastel(color), ratio))
+        cell.set_edgecolor("none")
 
     def close(self, output_path, filename):
         """Plot closing statements"""
@@ -490,10 +539,11 @@ class Plot:
         real_data = kwargs.get("real_data", None)
         plot_idle = kwargs.get("plot_idle", False)
         include_all = kwargs.get("include_all", False)
+        recompute_plans = kwargs.get("recompute_plans")
         min_e = configs_estimated[0][2]
         i = 0
         for index, cfg_e in enumerate(configs_estimated):
-            cells = cfg_e[0].values() + [cfg_e[1]]
+            cells = cfg_e[0].values() + self._recompute_cells(cfg_e[0], recompute_plans) + [cfg_e[1]]
             if self.row_title[0] == "TOP":
                 cells.insert(0, cfg_e[0].rank or index + 1)
             self.cell_text.append(cells)
@@ -514,6 +564,29 @@ class Plot:
                     break
                 self.data.append(tuple([cfg_e[0], score] + cfg_e[3]))
                 i += 1
+
+    def _recompute_cells(self, config: Any, recompute_plans: Optional[dict]) -> list:
+        """The recompute cells of one configuration's column, empty where the table has no such row.
+
+        Args:
+            config: The configuration the column states.
+            recompute_plans: ``{configuration: (mode, layers)}`` from a
+                choice among named modes per layer; ``None`` where the search
+                made none.
+
+        Returns:
+            The mode alone, the mode and its plan per layer, or nothing.
+        """
+        if MODE_ROW not in self.row_title:
+            return []
+        mode, layers = (recompute_plans or {}).get(config, (getattr(config, "recompute", None), None))
+        cells = [mode.upper() if mode else "-"]
+        if LAYER_ROW in self.row_title:
+            cells.append(
+                yaml.safe_dump(layers, default_flow_style=False, sort_keys=False).strip()
+                if layers is not None else "-"
+            )
+        return cells
 
 
 def top_plot_configs(configs_estimated: list, max_num: Optional[int] = None) -> list:
@@ -540,8 +613,9 @@ def plot_nd(
     max_num: Optional[int] = None,
     include_all: bool = False,
     top_result_count: Optional[int] = None,
+    recompute_plans: Optional[dict] = None,
 ) -> None:
-    """Plot estimation with a divider before any additional configurations.
+    """Plot estimation with optional recompute rows and a divider before additions.
 
     Args:
         configs_estimated: Ranked configurations with memory, score and its parts.
@@ -553,12 +627,20 @@ def plot_nd(
         max_num: Maximum number of configurations in the normal plot.
         include_all: Include every supplied configuration without normal plot limits.
         top_result_count: Number of normal results preceding the additions.
+        recompute_plans: ``{configuration: (mode, layers)}``, the activation
+            checkpoint mode and the plan per layer a choice among named modes
+            made. ``None`` omits the plan row; a configuration that states a
+            mode of its own still shows it.
     """
     plot = Plot(
         title, configs_estimated[0][0].keys(), debug_parts,
         top=max_num, show_top=True,
     )
-    plot.parse_data(configs_estimated, include_all=include_all)
+    if _has_recompute(configs_estimated) or recompute_plans is not None:
+        plot.row_title.insert(-1, MODE_ROW)
+    if recompute_plans is not None:
+        plot.row_title.insert(-1, LAYER_ROW)
+    plot.parse_data(configs_estimated, include_all=include_all, recompute_plans=recompute_plans)
 
     data_frame = pd.DataFrame(
         plot.data, columns=(["config", "estim"] + plot.dbg_cols)
@@ -573,6 +655,172 @@ def plot_nd(
 
     plot.make_table()
     plot.close(output_path, "results")
+
+
+def plot_recompute(
+    groups: list,
+    output_path: str,
+    debug_parts: list,
+    filename: str,
+    title: Optional[str] = None,
+    columns_per_page: int = 12,
+) -> None:
+    """Write a summary of every selected recompute plan, then a detail page per strategy.
+
+    Each bar is the cost model's estimate of the step under that plan, split
+    into its parts, so the step between two bars is what the cost model
+    expects the extra recomputed layer to cost.
+
+    Args:
+        groups: The ranked parallel configurations and the records of their
+            selected plans, as ``recompute_plot_data`` prepares them.
+        output_path: Directory in which to save the PDF.
+        debug_parts: The performance components in each record's parts.
+        filename: The PDF's basename, without its extension.
+        title: Optional description of the model and the selection.
+        columns_per_page: The most plans on one detail page. The summary
+            holds every selected plan, with a divider between strategies.
+
+    Raises:
+        ValueError: The page size is not positive, or a record's score parts
+            do not cover every component.
+    """
+    if columns_per_page <= 0:
+        raise ValueError("columns_per_page must be positive")
+    if not groups:
+        return
+    os.makedirs(output_path, exist_ok=True)
+    heading = title or "ND recompute"
+    with PdfPages(os.path.join(output_path, filename + ".pdf")) as document:
+        _save_page(document, _recompute_summary(groups, debug_parts, heading))
+        for config, records in groups:
+            _save_detail_pages(document, config, records, debug_parts, heading, columns_per_page)
+
+
+def _save_page(document: Any, figure: Any) -> None:
+    """Add one figure to the PDF and release it."""
+    document.savefig(figure, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _recompute_summary(groups: list, debug_parts: list, heading: str) -> Any:
+    """The page that holds every selected plan, the strategies it covers named where it has none."""
+    plans = [(config, record) for config, records in groups for record in records]
+    labels = [f"{config.rank}.{index + 1}" for config, records in groups for index in range(len(records))]
+    page_title = f"{heading}\nSummary | {len(plans)} plans across {len(groups)} configurations"
+    if not plans:
+        return _empty_recompute_page([config for config, _ in groups], page_title)
+    figure = _recompute_page(plans, debug_parts, page_title, labels)
+    empty = [str(config.rank) for config, records in groups if not records]
+    if empty:
+        figure.text(0.5, 0.01, "No qualifying plans for TOP " + ", ".join(empty), ha="center", fontsize=8)
+    return figure
+
+
+def _save_detail_pages(
+    document: Any, config: Any, records: list, debug_parts: list, heading: str, columns_per_page: int
+) -> None:
+    """Add one strategy's plans to the PDF, paginated, or a page saying it has none."""
+    if not records:
+        _save_page(document, _empty_recompute_page([config], f"{heading}\nTOP {config.rank}"))
+        return
+    for start in range(0, len(records), columns_per_page):
+        page = records[start:start + columns_per_page]
+        page_title = (
+            f"{heading}\n"
+            f"TOP {config.rank} | plans {start + 1}-{start + len(page)} of {len(records)}"
+        )
+        labels = [str(start + index + 1) for index in range(len(page))]
+        _save_page(document, _recompute_page([(config, record) for record in page], debug_parts, page_title, labels))
+
+
+def _empty_recompute_page(configs: list, title: str) -> Any:
+    """Say that a selection is empty, and name the strategies it covers."""
+    figure = plt.figure(figsize=(12, max(5, 3 + 0.3 * len(configs))))
+    figure.text(0.5, 0.8, title, ha="center", fontsize=12)
+    figure.text(0.5, 0.6, "No recompute plan satisfies the selection for these configurations.", ha="center")
+    descriptions = [
+        f"TOP {config.rank}: " + "  ".join(f"{dim}={value}" for dim, value in config.dims_val.items())
+        for config in configs
+    ]
+    figure.text(0.5, 0.45, "\n".join(descriptions), ha="center", va="top")
+    return figure
+
+
+def _recompute_page(plans: list, debug_parts: list, title: str, labels: list) -> Any:
+    """Draw one page of plans, with a layer table under the chart and a divider between strategies."""
+    if any(len(record["parts"]) != len(debug_parts) for _, record in plans):
+        raise ValueError("recompute plot records must include every performance component")
+    rows = ["TOP"] + plans[0][0].keys() + ["RFULL", MODE_ROW, LAYER_ROW, "MEM", "SCORE"]
+    cells = list(map(list, zip(*[_recompute_column(config, record) for config, record in plans])))
+    lines = [max(str(text).count("\n") + 1 for text in row) for row in cells]
+    heights = [0.20] + [0.18 * count + 0.06 for count in lines]
+    table_height = sum(heights)
+    figure = plt.figure(figsize=(max(12, 1.3 * len(plans) + 3), 4.5 + table_height))
+    grid = figure.add_gridspec(2, 1, height_ratios=[3.5, table_height], hspace=0.10)
+    axis = _recompute_chart(figure.add_subplot(grid[0]), plans, debug_parts, title, labels)
+    table_axis = figure.add_subplot(grid[1])
+    _recompute_table(table_axis, rows, cells, labels, heights)
+    for index in range(1, len(plans)):
+        if plans[index][0] != plans[index - 1][0]:
+            axis.axvline(index - 0.5, color="black", linewidth=1.5)
+            table_axis.axvline(index / len(plans), color="black", linewidth=1.5, zorder=10)
+    figure.subplots_adjust(left=0.09, right=0.84, top=0.88, bottom=0.035)
+    return figure
+
+
+def _recompute_column(config: Any, record: dict) -> list:
+    """One plan's column: its strategy, how many layers it fully recomputes, its plan, memory and estimate."""
+    layers = record["layers"]
+    return [str(config.rank)] + config.values() + [
+        str(record["full_layers"]) if record["full_layers"] is not None else "-",
+        record["mode"].upper() if record["mode"] else "-",
+        yaml.safe_dump(layers, default_flow_style=False, sort_keys=False).strip() if layers is not None else "-",
+        f"{record['memory']:.0f} MB",
+        f"{record['score']:.6g}",
+    ]
+
+
+def _recompute_chart(axis: Any, plans: list, debug_parts: list, title: str, labels: list) -> Any:
+    """Stack each plan's estimated parts on one bar, and return the axis."""
+    parts = list(map(str, debug_parts))
+    frame = pd.DataFrame([record["parts"] for _, record in plans], columns=parts, index=labels)
+    frame.plot.bar(ax=axis, stacked=True, color=gen_colors(parts), width=0.65, rot=0)
+    axis.set_xlim(-0.5, len(plans) - 0.5)
+    axis.set_ylim(
+        min(0, float(frame.clip(upper=0).sum(axis=1).min()) * 1.05),
+        max(1, float(frame.clip(lower=0).sum(axis=1).max()) * 1.05),
+    )
+    axis.set_ylabel("Estimated step (lower is better)")
+    axis.set_xlabel("")
+    axis.legend(loc="upper left", bbox_to_anchor=(1, 1), fontsize=8)
+    axis.set_title(title, fontsize=11)
+    return axis
+
+
+def _recompute_table(table_axis: Any, rows: list, cells: list, labels: list, heights: list) -> None:
+    """Draw the table of plans under the chart, each row shaded like its dimension."""
+    table_height = sum(heights)
+    table_axis.axis("off")
+    table = table_axis.table(cellText=cells, rowLabels=list(map(str, rows)), colLabels=labels,
+                             cellLoc="center", loc="center", bbox=[0, 0, 1, 1])
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    for (row, column), cell in table.get_celld().items():
+        cell.set_height(heights[row] / table_height)
+        cell.set_edgecolor("white")
+        if row == 0:
+            cell.set_facecolor("#eeeeee")
+            continue
+        row_title = rows[row - 1]
+        if column == -1:
+            cell.get_text().set_color(dim_color(row_title))
+            cell.get_text().set_fontweight("bold")
+        else:
+            cell.set_facecolor(near_white(pastel(dim_color(row_title)), 0.9))
+            if row_title == LAYER_ROW:
+                cell.get_text().set_fontfamily("monospace")
+                cell.get_text().set_ha("center" if cells[row - 1][column] == "{}" else "left")
 
 
 def _score_parts() -> list:

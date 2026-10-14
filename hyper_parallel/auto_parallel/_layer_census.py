@@ -57,7 +57,7 @@ host cannot call, so they run under the kernels' shape contracts
 a library the host lacks leaves the census with a layer the run does not
 build, which it refuses (:exc:`CensusUnavailable`): Transformers' own
 modules keep other bytes, and under the selective policy a DeepSeek-V3.2
-layer's eager indexer keeps 2.3 times what the layer keeps plain (F53).  The FLOP census
+layer's eager indexer keeps 2.3 times what the layer keeps plain.  The FLOP census
 (:func:`census_flops`) and the shares of matmul FLOPs a selective layer
 recomputes (:func:`census_recomputed`) stay on Transformers' own modules:
 both count the arithmetic the time model prices, which fusing a module
@@ -407,7 +407,7 @@ def _measure(params: Sequence[torch.Tensor], inputs: Iterable[torch.Tensor],
         # output's grad_fn, a cycle no collector sees, which kept every graph
         # a forward drops alive into the backward.  On the DeepSeek-V4.1 crop
         # at 4096 tokens that was the Indexer selection's scores, 8.9 GiB a
-        # rank a run frees as soon as the indices are taken (D16).
+        # rank a run frees as soon as the indices are taken.
         return tensor.detach()
 
     live = _LiveBytes()
@@ -718,8 +718,7 @@ def _replaced(holder: _Holder, specs: Sequence[Any]) -> None:
             layer nobody runs: a DeepSeek-V3.2 layer whose indexer runs eager
             keeps, under the selective policy, 1192192 bytes a token against
             the 516368 it keeps plain, its scores an fp32 tensor of one
-            sequence by another that the policy holds and no backward takes
-            (F53).
+            sequence by another that the policy holds and no backward takes.
     """
     from hyper_parallel.models.replacement import (  # pylint: disable=C0415
         apply_module_replacements,
@@ -780,10 +779,10 @@ def _family_contracts(config: Any) -> Iterator[None]:
 
     DeepSeek-V4.1's sparse attention is chosen on the device the tensors are
     on, so a census, whose tensors are fake and on none, would take the
-    reference beside the kernel and measure a layer no run builds (F53): the
+    reference beside the kernel and measure a layer no run builds: the
     attention's contract stands in.  The Indexer's selection keeps nothing a
     backward reads on either path, fused or reference, since a run frees its
-    scores' graph as soon as the indices are taken (D16); its contract runs
+    scores' graph as soon as the indices are taken; its contract runs
     the selection without recording that graph, and the census measures the
     same bytes with it as without.
 

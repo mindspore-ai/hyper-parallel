@@ -51,11 +51,16 @@ venv/
 *.lai
 *.a
 *.lib
+# the solver writes one of these per problem into the folder a test runs from
+*.lp
 
 # --- IDE & System ---
 .idea/
 .vscode/
 .trae/
+# where a coding assistant reads skills from, which install.py may link into
+.claude/
+.agents/
 .DS_Store
 *.swp
 

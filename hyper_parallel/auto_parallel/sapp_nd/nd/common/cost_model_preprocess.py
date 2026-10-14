@@ -95,7 +95,7 @@ def compute_kv_dim(ccfg: Any) -> float:
 # that read it. The config hands such a field over as 0, so a model feature
 # nobody parsed costs nothing unless its reader has a fallback of its own, and
 # the estimate stays plausible; a search says which were read, under its
-# ranking (I9). A reader with a fallback, such as _flavour_tables' three
+# ranking. A reader with a fallback, such as _flavour_tables' three
 # feed-forward matmuls, is named too: the record cannot tell it apart.
 UNSET_READS: DefaultDict[str, Counter] = defaultdict(Counter)
 # The fields whose absence means there is nothing to price: a submodule

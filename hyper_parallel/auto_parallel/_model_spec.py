@@ -52,7 +52,7 @@ _FLAGS = ("attn_output_gate", "tie_word_embeddings", "qk_norm", "qkv_bias", "o_b
 
 # The legacy keys that state a run's precision.  Refused as model facts like
 # any unknown key, but named with the keys a run reads instead: a description
-# stating one among its facts was once priced at the default width (D17).
+# stating one among its facts was once priced at the default width.
 _RUN_PRECISION_KEYS = ("compute_dtype", "param_init_type")
 
 

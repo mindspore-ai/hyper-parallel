@@ -192,6 +192,7 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
     [-o OUTPUT_DIR]
     [--real_csv REAL_CSV]
     [--ranking_csv RANKING_CSV]
+    [-rp | --recompute_potentials]
 ```
 
 - `-y`, `--yaml_config`: path to the framework yaml configuration file.
@@ -246,6 +247,37 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd
   the score. Scores keep full precision, so configurations ND cannot tell
   apart show as ties. This is what a sweep reads to profile ND's best
   configurations.
+- `-rp`, `--recompute_potentials`: also report what the cost model estimates
+  each further recomputed layer would cost, see below. Needs `-ar` with the
+  modes each layer chooses among, and a verbosity of at least `2`. Off by
+  default, and the search does none of that work without it.
+
+### Recompute potentials
+
+With `-ar` and the modes each layer chooses among (`--recompute`, or a
+hyper_v2 yaml's `context.recompute`), `-rp` extends every configuration that
+fits memory: keeping its degrees and its memory budget, it fully recomputes
+one more layer, takes the fastest plan the cost model offers, and repeats
+while a plan is left. Layers of one kind, pipeline stage, micro-batches in
+flight and peak boundary are interchangeable, so turning up any one of them
+counts as one plan.
+
+It writes three files beside `results.pdf` in `-o`, `--output-dir`:
+
+| File | Contents |
+| --- | --- |
+| `recompute_potentials.csv` | A row per step of each configuration's sequence: rank, step, degrees, the layer the step turned up, how many layers the plan fully recomputes, peak memory in MB, the score, the plan as the trainer's `activation_checkpoint` reads it, and how wide the plan is |
+| `result_recompute_inc.pdf` | The retained sequences, a bar per plan split into the parts of the score, with the plan's layer table under it |
+| `result_recompute_full_next.pdf` | Per configuration, the plans the cost model scores below the next strategy, plus the first plan at or above it |
+
+Every figure is the cost model's estimate of the step, the same estimate the
+search ranks strategies with. A measured run can disagree with it, so read a
+step between two plans as what the cost model expects the extra recomputed
+layer to cost, not as a measured or guaranteed saving.
+
+The report prices far more plans than the search itself, so it costs a good
+deal more time than a plain search: that is why it is opt-in. It applies to
+the standard ND search, not to `--real_csv`, `--search-config` or `--verify`.
 
 ### Exhaustive plot selection
 

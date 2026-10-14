@@ -1,0 +1,13 @@
+{
+  "a3": {
+    "device": "A3",
+    "dies_per_node": 16,
+    "ratios": "a3.json",
+    "budget": "58GB",
+    "remeasure_spread_pct": 0.79,
+    "usable_gib": 59.39,
+    "reserve_at_full_gib": 8.76,
+    "about": "Ascend A3, 16 dies a node, 64 GB a die. The budget leaves the runtime its own reserve. The ratios turn ND's score into a step time in ms; they were fitted on five launches of 30 September 2026 (see a3.json). The spread is how far the same layout's step time moved between two rounds on different node sets (six layouts, 0.013 to 0.790%): two layouts closer than that cannot be told apart by one round.",
+    "reserve_note": "A die leaves a rank 59.39 GiB, 61.27 less 1.88 held by CANN and HCCL. On 1 October the default allocator reserved 8.76 GiB beyond what was allocated, at EP2 OP32 with full recompute (34.38 reserved, 25.63 allocated): a per-layer plan is priced against 59.39 less that, measured at one layout only. Under expandable segments the reserve behaves otherwise."
+  }
+}

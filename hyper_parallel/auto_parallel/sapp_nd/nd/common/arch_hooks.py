@@ -24,9 +24,7 @@ its default kind.
 The layer stack is data too (``ccfg.layer_stack``).  The estimators read each
 layer's kind from :func:`layer_groups`, and :func:`apply_layer_kind` gives a
 layer its kind from the fields :func:`bind_layer_stack` recorded when the
-family was applied.  A family whose layers take some fields per layer rather
-than on the model, cm's sharding, leaves them in ``ccfg.layer_fields`` for
-every kind to assign.
+family was applied.
 """
 from typing import Any, Dict, List, Optional, Tuple
 from hyper_parallel.auto_parallel._layer_stack import LayerStack, LinearAttentionDims
@@ -174,9 +172,8 @@ def _kind_fields(snapshot: Any, stack: LayerStack, kind: LayerKind) -> Dict[str,
     """The fields *kind* assigns beyond its op counts, from the bound config.
 
     For every flavour some kind of the stack states, the fields it assigns,
-    with the kind's values or the model's; then the fields the family gives
-    every layer, and the kind's census record, None where the spec states
-    none.
+    with the kind's values or the model's; then the kind's census record,
+    None where the spec states none.
     """
     kinds = stack.distinct_kinds()
     fields: Dict[str, Any] = {}
@@ -187,7 +184,6 @@ def _kind_fields(snapshot: Any, stack: LayerStack, kind: LayerKind) -> Dict[str,
             fields.update({name: getattr(snapshot, name) for name in _ATTENTION_FIELDS})
     if any(other.ffn is not None for other in kinds):
         fields.update(_feed_forward(snapshot, kind.ffn))
-    fields.update(getattr(snapshot, "layer_fields", None) or {})
     fields["kind_activations"] = (getattr(snapshot, "census", None) or {}).get(kind.name)
     return fields
 
@@ -267,7 +263,7 @@ def apply_family(ccfg: Any) -> None:
     counts it carries from its language model.  Each layer of a stack takes
     its own kind's counts; the default kind's are the ones the model's
     config prices its embedding and output layer with, so t5 names its
-    encoder (I15).  A family that names none gives the model no counts.
+    encoder.  A family that names none gives the model no counts.
     """
     derive_family(ccfg)
     arch = getattr(ccfg, "arch", None)

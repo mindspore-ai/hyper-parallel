@@ -119,7 +119,7 @@ class TestReadRecomputeModes(unittest.TestCase):
 
 
 class TestReadActivationCheckpointMode(unittest.TestCase):
-    """A train.yaml's one mode, read as the trainer reads it (I13)."""
+    """A train.yaml's one mode, read as the trainer reads it."""
 
     def test_the_modes_the_trainer_runs(self):
         """

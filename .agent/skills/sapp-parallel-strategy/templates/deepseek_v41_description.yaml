@@ -1,0 +1,98 @@
+# The DeepSeek-V4.1 crop described by hand, which scripts/ask.py prices in a checkout without the V4.1
+# model, by formulas alone; deepseek_v41.yaml is the template. context.moe_dispatch is stated 0, as
+# there, because this crop's compute does not grow with the expert degree.
+#
+# DeepSeek-V4.1, the validation crop the timed runs of 8 October 2026 trained. It states torch_dtype,
+# which ND reads in place of compute_dtype, and recompute "off", quoted, as every one of those runs. scripts/ask.py fills what a request
+# states and leaves the parallel degrees to ND. ND's order on this model is not validated:
+# references/trust.json says what an answer may claim. The original header follows.
+#
+# The DeepSeek-V4.1 validation crop as the ND cost model reads it.
+#
+# Transformers does not know the deepseek_v41 model type, so ND cannot resolve
+# the released checkpoint and every fact it prices is stated here by hand. The
+# model section is what nd_describe_deepseek_v41.py emits from the released
+# config.json at text_parameter_divisor 8 and num_routed_experts 16; the rest
+# mirrors train_deepseek_v41_online.yaml, so ND prices the run that launches.
+#
+#   describe:  python nd_describe_deepseek_v41.py spec <model dir>
+#   check:     python nd_describe_deepseek_v41.py verify <model dir> \
+#                  --assets <engram assets> --spec-yaml <this file>
+#   rank:      python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd \
+#                  -y <this file> -f hyper_v2 -d 16 -A A3 -b 16 -t 8 -mppb
+#
+# Blocks no ND field carries, so priced at zero: the output projection's low
+# rank and groups, the Lightning Indexer, the compressed and sparse attention,
+# mHC, Engram and the candidate pool. Together they are 2.7% of the crop's
+# parameters, and the attention block ND does price is overstated: see the
+# verify command's table. num_nextn_predict_layers and the dspark_* fields are
+# left out because the crop builds neither an MTP nor a DSpark layer.
+model:
+  name: deepseek_v41_crop
+  config_overrides:
+    hidden_size: 640
+    num_hidden_layers: 40
+    num_attention_heads: 8
+    num_key_value_heads: 1
+    head_dim: 512
+    qk_rope_head_dim: 64
+    q_lora_rank: 160
+    vocab_size: 129280
+    intermediate_size: 288
+    moe_intermediate_size: 288
+    num_experts: 16
+    num_experts_per_tok: 6
+    num_shared_experts: 1
+    torch_dtype: bfloat16
+
+training:
+  train_iters: 6
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 16
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 16
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 16
+  edp_shard_size: 1
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: "off"
+
+dataset:
+  data_config:
+    seq_length: 4096
+
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+
+context:
+  moe_dispatch: 0
+  # The routed experts are sharded over each strategy's whole expert
+  # data-parallel group, which is what the trainer does and what one fixed
+  # edp_shard_size cannot state as EP varies.
+  expert_shard: group
+  device_num: 16

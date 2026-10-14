@@ -70,6 +70,14 @@ ND 的输出会给出满足内存约束的候选配置和排序结果，并生�
 
 这些参数用于标准 ND 搜索，非零值不能与 `--real_csv`、`--search-config` 或 `--verify` 同时使用。完整的优先级、计数示例和输出说明见 [ND 参数文档](../../hyper_parallel/auto_parallel/sapp_nd/README.md#exhaustive-plot-selection)。
 
+使用 `-ar` 并给出每层可选的重计算模式时，可加 `-rp` / `--recompute_potentials`：
+
+| 参数 | 行为 |
+| --- | --- |
+| `-rp` / `--recompute_potentials` | 对每个满足内存约束的配置，保持其并行度和内存预算不变，依次多全量重计算一层，给出代价模型对每一步的估计 |
+
+该选项默认关闭，不指定时搜索不做这部分计算；指定时在 `-o` 目录下额外写出 `recompute_potentials.csv` 以及 `result_recompute_inc.pdf` 和 `result_recompute_full_next.pdf`。其中每个数值都是代价模型对单步耗时的估计，与搜索排序用的估计一致，实测结果可能与之不符，因此两个计划之间的差值应理解为代价模型预期多重计算一层的代价，而不是实测或保证的收益。该选项用于标准 ND 搜索，不能与 `--real_csv`、`--search-config` 或 `--verify` 同时使用，详见 [ND 参数文档](../../hyper_parallel/auto_parallel/sapp_nd/README.md#recompute-potentials)。
+
 ---
 
 ## SAPP-PPB：Pipeline Parallelism Balancing

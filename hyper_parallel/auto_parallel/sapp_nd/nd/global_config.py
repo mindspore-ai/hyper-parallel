@@ -157,12 +157,12 @@ class GlobalConfig:
         (``MeshContext._build_expert_parallel_mesh``), the domain its FSDP
         shard spans as well (``shard_spans_cp``).  Bounded by DP x TP, a
         strategy under CP could not spread its experts over CP's ranks,
-        though the runtime does (F3).
+        though the runtime does.
         """
         return dp * tp * (cp if getattr(self.ccfg, "shard_spans_cp", False) else 1)
 
     def ep_constraints_valid(self, parallel_config):
-        """Check EP-specific divisibility constraints (C1, C2).
+        """Check EP-specific divisibility constraints.
 
         Runs only for MoE models (n_exp > 1).  C1 ensures experts can be
         evenly partitioned across EP ranks; C2 ensures the expert FFN hidden
@@ -221,7 +221,7 @@ class GlobalConfig:
         # The micro-batch count is the search's own, the global batch over DP
         # and MBS, whatever -l names. Kept from the yaml where -l left it out,
         # every DP but the yaml's own made another batch, so the search
-        # refused every candidate or kept a single DP (M6).
+        # refused every candidate or kept a single DP.
         if Dim.MBN not in self.dimensions:
             dims.append((Dim.MBN, kwargs.get(Dim.MBN.lname())))
             self.dimensions.append(Dim.MBN)

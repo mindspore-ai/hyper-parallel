@@ -359,7 +359,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
 
     def test_a_length_nobody_stated_is_recorded(self):
         """
-        Feature: CostModelParserHyperV2 seq_len resolution, the record of a substitution (I11).
+        Feature: CostModelParserHyperV2 seq_len resolution, the record of a substitution.
         Description: The dense model with its data.max_seq_len of 2048, then
             with no training length anywhere and a context limit of 32768.
         Expectation: The first is stated; the second is costed at the
@@ -573,7 +573,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
 
     def test_the_run_keeps_the_mode_it_trains_with(self):
         """
-        Feature: _parse_recompute, the run's own mode (H1).
+        Feature: _parse_recompute, the run's own mode.
         Description: A run stating selective, one stating nothing, and one
             whose model section states the recompute lists MindFormers takes.
         Expectation: The config keeps the mode the run trains with, the
@@ -693,7 +693,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
 
     def test_a_config_without_an_optimizer_says_what_it_is_priced_as(self):
         """
-        Feature: _CostModelParser.state_optimizer, in both parsers (M3, M5).
+        Feature: _CostModelParser.state_optimizer, in both parsers.
         Description: A HyperParallel config stating no optimizer and one
             stating Muon; the MindFormers DeepSeek yaml without its
             optimizer section and with Muon as its type.
@@ -1050,7 +1050,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_cp_shards_no_parameter_state_beyond_the_stated_shard(self, mock_hf):
         """
-        Feature: param_cp, a parameter's state under CP (C1).
+        Feature: param_cp, a parameter's state under CP.
         Description: An AutoModels run on 64 devices at CP 2 sharding over 16
             ranks; then the rule on a config of the legacy schemas.
         Expectation: HyperParallel's dp_shard_size spans CP's ranks, so the
@@ -1070,7 +1070,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_an_unstated_dtype_is_the_checkpoints(self, mock_hf):
         """
-        Feature: the model's dtype where the config states none (I12).
+        Feature: the model's dtype where the config states none.
         Description: An AutoModels config with no FSDP precision, stating no
             torch_dtype, then auto, then float32, over a checkpoint saved in
             bfloat16; then no dtype anywhere, the checkpoint stating none.
@@ -1099,7 +1099,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_the_compute_width_is_the_one_the_trainer_computes_in(self, mock_hf):
         """
-        Feature: the width an AutoModels run computes in (D17).
+        Feature: the width an AutoModels run computes in.
         Description: Over a checkpoint saved in bfloat16: float32 weights
             FSDP gathers in bfloat16; bfloat16 weights model_init_dtype
             casts to float32, with no FSDP precision; a model section stating
@@ -1157,7 +1157,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_an_mtp_depth_the_trainer_does_not_build_is_said(self, mock_hf):
         """
-        Feature: an MTP depth the AutoModels trainer drops (I2).
+        Feature: an MTP depth the AutoModels trainer drops.
         Description: A checkpoint declaring 3 MTP layers, then one declaring
             none.
         Expectation: ND prices no MTP layer either way; for the three it
@@ -1493,7 +1493,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
     @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_missing_device_num_takes_the_callers_device_count(self, mock_hf):
         """
-        Feature: cluster size fallback, the device count a caller states (M6).
+        Feature: cluster size fallback, the device count a caller states.
         Description: The same AutoModels config, dp_shard_size 4 at TP 4 and
             PP 2 with a global batch of 64 and micro-batches of 2, parsed for
             a caller that states 64 devices, as run_nd -d does; then 60.
@@ -1608,7 +1608,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(ccfg.shard_recompute_input, 1)
 
         # bytes: no dtype stated and no checkpoint to read one from, so the
-        # weights are bfloat16, as they compute (I12)
+        # weights are bfloat16, as they compute
         self.assertEqual(ccfg.bytes_p, 2)
         self.assertEqual(ccfg.bytes_compute, 2)
         self.assertEqual(ccfg.bytes_softmax, 4)

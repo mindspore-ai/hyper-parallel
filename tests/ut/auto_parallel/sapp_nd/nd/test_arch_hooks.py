@@ -18,7 +18,6 @@ How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/nd/test_arch_hooks.py -v
 """
 import copy
-import math
 import os
 import unittest
 from types import SimpleNamespace
@@ -56,7 +55,7 @@ _OPS = ("attMM", "attBMM", "ffMM", "softmax", "dropout", "normOp", "gather")
 # The literal op counts each arch hook assigned before the counts became
 # profiles, in _OPS order, except that mixtral's three expert projections
 # were counted as batched matmuls and now count as the matmuls they are, and
-# its softmaxes and norms are those its Transformers layers run (F51).
+# its softmaxes and norms are those its Transformers layers run.
 # headCast and ffAct were pinned to 1 by the estimator for every family.
 _LEGACY_OPS = {
     "default": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
@@ -65,7 +64,6 @@ _LEGACY_OPS = {
     # Qwen3.5 was priced with the qwen hook; its full-attention kind keeps those counts.
     "qwen3_5": {"full_attention": (4, 2, 3, 1, 0, 2, 4)},
     "deepseek": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
-    "cm": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
     "mixtral": {"decoder": (4, 2, 3, 1, 0, 2, 4)},
     "pangualpha": {"decoder": (4, 1, 2, 2, 5, 4, 4)},
     "t5": {"encoder": (4, 1, 2, 2, 5, 2, 4), "decoder": (8, 2, 2, 4, 7, 3, 6)},
@@ -75,7 +73,7 @@ _LEGACY_OPS = {
 # The byte widths the same hooks set: (bytes_grad at p > 1, at p == 1, bytes_dropout).
 _LEGACY_BYTES = {
     "default": (4, 0, 0), "llama2": (2, 2, 0), "qwen": (4, 0, 0), "qwen3_5": (4, 0, 0),
-    "deepseek": (4, 0, 0), "cm": (4, 0, 0), "mixtral": (2, 0, 0),
+    "deepseek": (4, 0, 0), "mixtral": (2, 0, 0),
     "pangualpha": (4, 0, 1), "t5": (4, 0, 1), "vision": (4, 0, 0),
 }
 
@@ -535,7 +533,7 @@ def _deepseek(name: str = "deepseek_v3") -> CostModelConfig:
 
 
 class TestDenseThenMoE(unittest.TestCase):
-    """DeepSeek's dense and MoE layers, cm's and t5's halves are kinds of the stack."""
+    """DeepSeek's dense and MoE layers and t5's halves are kinds of the stack."""
 
     _FFN = ("hff", "n_chosen_exp", "n_exp", "n_shared_exp", "ep")
 
@@ -606,23 +604,6 @@ class TestDenseThenMoE(unittest.TestCase):
         self.assertEqual(evaluator.ccfg.ep, 1)
         apply_layer_kind(evaluator, moe)
         self.assertEqual(evaluator.ccfg.ep, 2)
-
-    def test_cm_shards_every_layer_as_its_hook_says(self):
-        """
-        Feature: fields the family gives every layer.
-        Description: cm runs DeepSeek's stack with its own optimizer and
-            embedding sharding on each layer.
-        Expectation: Both kinds assign the sharding cm's hook derived.
-        """
-        ccfg = _deepseek("cm_llama_moe")
-        self.assertEqual(ccfg.arch, "cm")
-        check_and_apply_custom_hook(ccfg)
-        expected = (ccfg.shard_p_os_exp_partial, math.gcd(ccfg.n_exp, ccfg.shard_p_os_non_exp), ccfg.t)
-        for kind in ccfg.layer_stack.distinct_kinds():
-            layer = copy.deepcopy(ccfg)
-            apply_layer_kind(layer, kind)
-            self.assertEqual((layer.shard_p_os_exp, layer.shard_p_os_non_exp_partial, layer.shard_embed),
-                             expected, kind.name)
 
     def test_t5_prices_each_half_as_its_kind(self):
         """

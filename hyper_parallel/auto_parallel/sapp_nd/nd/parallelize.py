@@ -15,6 +15,7 @@
 """find parallelization"""
 
 from collections import Counter
+from dataclasses import replace
 import time
 import copy
 import json
@@ -27,6 +28,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import E
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import LayerTimes, estimate_performance
 from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
     MODES,
+    RecomputeAnalysis,
     RecomputeChoice,
     choose_recompute,
     describe,
@@ -34,6 +36,14 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.candidate import (
     trainer_plan,
     trainer_runs_layer_plans,
     whole_modes,
+)
+from hyper_parallel.auto_parallel.sapp_nd.recompute.potential import (
+    DEFAULT_TOP,
+    keep_recompute_potential,
+    recompute_next_plot_groups,
+    recompute_plot_data,
+    sort_recompute_results,
+    write_recompute_csv,
 )
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.global_config import GlobalConfig
@@ -67,7 +77,7 @@ POOL_FROM = 2000
 
 
 def state_machine_links(ccfg: Any, device: Any) -> None:
-    """Give a config, and each submodule's, its machine's ranks a node and link bandwidths (B5).
+    """Give a config, and each submodule's, its machine's ranks a node and link bandwidths.
 
     The CP check, its topology penalty and the CP cost read them off the
     config, where nothing assigned them, so they held the config's defaults,
@@ -137,6 +147,10 @@ class ParallelizeLayer:
         state_machine_links(self.mem_eval._ccfg, getattr(machine, "device", None))
         # The options chosen for each configuration the ordering scored.
         self.recompute_choices = {}
+        # With the potentials report asked for: the plans retained for each
+        # configuration, and every alternative the analysis scored for it.
+        self.recompute_potentials = {}
+        self.recompute_results = {}
 
         self.model_name = self.mem_eval._ccfg.model_name
         logger.debug("model is %s", self.model_name)
@@ -201,7 +215,7 @@ class ParallelizeLayer:
             )
         # Choose every layer's recompute option for each candidate, rather
         # than score it fully recomputed. A multimodal model, whose
-        # candidates are priced on every submodule (F2), gets one mode for
+        # candidates are priced on every submodule, gets one mode for
         # every layer, priced whole, and no option per layer: the options are
         # built for one submodule's layers, whose budgets would leave the
         # others out.
@@ -381,7 +395,7 @@ class ParallelizeLayer:
         The search drives one submodule's strategy (:class:`GlobalConfig`
         gives the others the same degrees), and a candidate is priced on the
         model the run trains: a vision tower's parameters, activations and
-        compute count toward the stage that holds them (F2).
+        compute count toward the stage that holds them.
         """
         return self.mem_eval.ccfg
 
@@ -741,6 +755,119 @@ class ParallelizeLayer:
             self.recompute_choices[parallel_config] = choice
         return choice
 
+    def recompute_potential_sequence(
+        self,
+        parallel_config: Any,
+        base_score: Optional[float] = None,
+        base_memory: Optional[float] = None,
+        cache_file: Any = None,
+        base_parts: Optional[Tuple[float, ...]] = None,
+    ) -> list:
+        """What the cost model expects each further recomputed layer to cost, at fixed degrees.
+
+        The configuration's own plan comes first, then the fastest plan that
+        fully recomputes one more layer, and so on while one is left. The
+        degrees and the memory budget do not move. Every figure is the cost
+        model's estimate of the step, the same estimate the search ranks
+        with; a measured run can disagree with it.
+
+        Args:
+            parallel_config: One configuration that fits memory, whose
+                degrees are kept.
+            base_score: Its score, already computed, reused where given.
+            base_memory: Its peak memory, used where it has no plan.
+            cache_file: Optional cache of ratios for the estimate.
+            base_parts: Its score components, already computed, reused for
+                the plot.
+
+        Returns:
+            The retained plans in order, the configuration's own first. A
+            plan for the whole model, or one that offloads, is retained
+            without extensions.
+
+        Raises:
+            ValueError: The search did not choose among named modes per layer.
+        """
+        if not self.auto_recompute or not self.recompute_mode_per_layer:
+            raise ValueError("recompute potentials need auto_recompute and a mode per layer among recompute_modes")
+        self.config.set_parallel_config(parallel_config)
+        choice = self._potential_baseline(parallel_config, base_memory)
+        dimensions = tuple((str(dim), self.config.dim_val(dim, parallel_config)) for dim in Dim.ALL_DIMS)
+        score, parts = self._baseline_estimate(parallel_config, choice, base_score, base_parts, cache_file)
+        kept = [replace(choice, score=score, dimensions=dimensions, score_parts=tuple(parts))]
+        every = list(kept)
+        if self._extends(choice):
+            self._extend_potentials(kept, every, dimensions, cache_file)
+        self.recompute_potentials[parallel_config] = kept
+        self.recompute_results[parallel_config] = sort_recompute_results(every)
+        return kept
+
+    def _potential_baseline(self, parallel_config: Any, base_memory: Optional[float]) -> RecomputeChoice:
+        """The configuration's own plan; a plan-less choice of its peak memory where the optimizer made none."""
+        choice = self.recompute_choices.get(parallel_config)
+        if choice is None:
+            choice = self.choose_recompute(parallel_config)
+        if choice is None:
+            memory = self.memory_estim() if base_memory is None else base_memory
+            choice = RecomputeChoice((), (float(memory),), ())
+        return choice
+
+    def _baseline_estimate(
+        self,
+        parallel_config: Any,
+        choice: RecomputeChoice,
+        base_score: Optional[float],
+        base_parts: Optional[Tuple[float, ...]],
+        cache_file: Any,
+    ) -> Tuple[float, Tuple[float, ...]]:
+        """The configuration's own score and its parts, priced here only where the search did not keep them."""
+        if base_score is None:
+            base_score = choice.score
+        if base_score is not None and base_parts is not None:
+            return base_score, tuple(base_parts)
+        debugger = Debug.Debug(parallel_config, info_type=Debug.PerfParts, enable=True)
+        priced = self.priced_with_mode(choice.mode) if choice.mode is not None else self.priced()
+        estimated = estimate_performance(
+            priced, device_type=self.machine.device, memory=int(round(choice.memory)),
+            stage_savings=choice.stage_savings or None, cache_file=cache_file, debugger=debugger,
+        )
+        parts = tuple(debugger.info[part] for part in Debug.PerfParts
+                      if part not in {Debug.PerfParts.TOTAL, Debug.PerfParts.MEMORY})
+        return (estimated if base_score is None else base_score), (parts if base_parts is None else tuple(base_parts))
+
+    def _extends(self, choice: RecomputeChoice) -> bool:
+        """Whether a plan can have a layer turned up: stated per layer, without offload, with full to turn up to."""
+        return bool(
+            choice.mode is None and choice.ranges and "full" in (self.recompute_modes or ())
+            and not any(item.option.link_bandwidth for item in choice.ranges)
+        )
+
+    def _extend_potentials(self, kept: list, every: list, dimensions: tuple, cache_file: Any) -> None:
+        """Retain one further fully recomputed layer at a time, while the cost model offers a plan that fits."""
+        self.mem_eval.set_config(self.config.ccfg)
+        analysis = RecomputeAnalysis(
+            self.mem_eval, self.machine.device, self.recompute_modes,
+            selective=self.recompute_selective, dimensions=dimensions,
+        )
+        while True:
+            results = [self._score_potential(analysis, result, cache_file)
+                       for result in analysis.alternatives(kept[-1])]
+            every.extend(results)
+            if keep_recompute_potential(kept[-1], kept, results) is None:
+                return
+
+    def _score_potential(self, analysis: RecomputeAnalysis, result: RecomputeChoice, cache_file: Any) -> \
+            RecomputeChoice:
+        """The cost model's estimate of the step under one alternative, with the parts a plot draws."""
+        debugger = Debug.Debug(None, Debug.PerfParts, enable=True)
+        score = estimate_performance(
+            analysis.config, device_type=self.machine.device, memory=int(round(result.memory)),
+            stage_savings=result.stage_savings, cache_file=cache_file, debugger=debugger,
+        )
+        parts = tuple(debugger.info[part] for part in Debug.PerfParts
+                      if part not in {Debug.PerfParts.TOTAL, Debug.PerfParts.MEMORY})
+        return replace(result, score=score, score_parts=parts)
+
     def _one_mode_whole(self) -> Optional[RecomputeChoice]:
         """The fastest mode that fits, for every layer, each mode priced on the whole model.
 
@@ -1002,7 +1129,7 @@ class ParallelizeLayer:
                 and stated_mode not in (None, "full")):
             # The balancing gives every candidate full recompute without
             # -mppb, whatever the run's mode, which cost an hour twice
-            # because nothing said so (H1).
+            # because nothing said so.
             logger.output(
                 "The run's activation checkpoint mode is %s, and every candidate above is priced fully "
                 "recomputed: pass --recompute %s, or -mppb, to price the run's own",
@@ -1021,6 +1148,7 @@ class ParallelizeLayer:
         force_exhaustive: int = 0,
         fforce_exhaustive: int = 0,
         dimensions: Optional[list] = None,
+        recompute_potentials: bool = False,
     ) -> Any:
         """Search, order and print the configurations that fit memory.
 
@@ -1034,6 +1162,12 @@ class ParallelizeLayer:
         ``fforce_exhaustive`` takes precedence and reserves distinct additions
         for each requested dimension.  The workers run_nd started for the
         search stop when it ends.
+
+        ``recompute_potentials`` adds the recompute potentials report, which
+        the search does none of the work for when it is left out: for every
+        configuration that fits, the cost model's estimate of what each
+        further recomputed layer would cost, written to a CSV and to two
+        comparison PDFs.
         """
         scored_space, dbg, generation, ordering = self._ranked_search(
             yaml_folder, threads_num, cache_file, ranking_csv
@@ -1070,6 +1204,8 @@ class ParallelizeLayer:
         )
         if self.enable_debug:
             output_path = Debug.output_dir()
+            if recompute_potentials:
+                self._report_recompute_potentials(scored_space, dbg, top_num, output_path, cache_file)
             if plot_space:
                 Debug.plot_nd(
                     plot_space,
@@ -1084,8 +1220,77 @@ class ParallelizeLayer:
                         len(plot_space) - len(exhaustive_additions)
                         if exhaustive_additions else None
                     ),
+                    recompute_plans=self._plotted_plans(plot_space),
                 )
         return scored_space
+
+    def _report_recompute_potentials(
+        self, scored_space: list, debug_parts: list, top_num: Optional[int], folder: str, cache_file: Any
+    ) -> None:
+        """Write the recompute potentials report: one sequence per configuration, as a CSV and two PDFs.
+
+        Args:
+            scored_space: Every configuration that fits, in the search's order.
+            debug_parts: The performance components each estimate splits into.
+            top_num: How many configurations the plots show.
+            folder: Where the CSV and the PDFs go.
+            cache_file: Optional cache of ratios for the estimate.
+        """
+        if not self.recompute_mode_per_layer:
+            logger.warning("the recompute potentials report extends a plan per layer, and this search chose none: "
+                           "it needs -ar/--auto_recompute with the modes each layer chooses among")
+            return
+        self.recompute_potentials = {}
+        self.recompute_results = {}
+        for config, memory, score, parts in scored_space:
+            self.recompute_potential_sequence(
+                config, base_score=score, base_memory=memory, cache_file=cache_file, base_parts=tuple(parts),
+            )
+        path = os.path.join(folder, "recompute_potentials.csv")
+        write_recompute_csv(self.recompute_potentials, path)
+        logger.output(
+            "%d retained recompute plans for %d of %d configurations written to %s; every figure is the cost "
+            "model's estimate of the step, not a measured one",
+            sum(len(choices) for choices in self.recompute_potentials.values()),
+            len(self.recompute_potentials), len(scored_space), path,
+        )
+        self._plot_recompute_results(scored_space, debug_parts, top_num, folder)
+
+    def _plot_recompute_results(
+        self, scored_space: list, debug_parts: list, top_num: Optional[int], folder: str
+    ) -> None:
+        """Plot the retained sequence, and the plans the cost model scores below the next strategy."""
+        top = scored_space[:max(0, DEFAULT_TOP if top_num is None else top_num)]
+        retained = [(entry[0], self.recompute_potentials[entry[0]]) for entry in top]
+        following = recompute_next_plot_groups(scored_space, self.recompute_results, top_num)
+        for groups, filename, description in (
+            (retained, "result_recompute_inc",
+             "Retained recompute sequence at the same memory budget, as the cost model estimates it"),
+            (following, "result_recompute_full_next",
+             "Recompute plans the cost model scores below the next strategy, plus the next best"),
+        ):
+            if groups:
+                Debug.plot_recompute(
+                    recompute_plot_data(groups), folder, debug_parts, filename,
+                    title=f"{self.plot_title()}\n{description}",
+                )
+                logger.output("Recompute plot written to %s", os.path.join(folder, filename + ".pdf"))
+
+    def _plotted_plans(self, plot_space: list) -> Optional[dict]:
+        """The plan per layer of each plotted configuration, as the trainer states it.
+
+        Returns:
+            ``{configuration: (mode, layers)}`` where the search chose among
+            named modes per layer; ``None`` where it chose no such plan, so
+            the plot leaves the plan row out.
+        """
+        if not getattr(self, "recompute_mode_per_layer", False):
+            return None
+        return {
+            entry[0]: trainer_plan(self.recompute_choices[entry[0]])
+            for entry in plot_space
+            if entry[0] in self.recompute_choices
+        }
 
     def _log_recompute(self, scored_space: Any) -> None:
         """Log how the recompute was chosen, and the best configuration's, as the trainer states it where it can.
@@ -1376,14 +1581,14 @@ def _log_priced_caveats(priced: Any) -> None:
     """Log what qualifies every number of the table: the length it prices, MTP layers unpriced, fields never set."""
     if not getattr(priced, "seq_len_stated", True):
         # A warning at parse time scrolls past a search's lines; this one
-        # sits under the table it qualifies (I11).
+        # sits under the table it qualifies.
         logger.output(
             "Every number above is priced at %d tokens, the model's context limit: the config states no "
             "training sequence length (dataset.data_transform.max_seq_len or dataset.data_config.seq_length)",
             priced.s,
         )
     if getattr(priced, "mtp_unpriced", 0):
-        # A stated MTP depth looked priced and was not (I2).
+        # A stated MTP depth looked priced and was not.
         logger.output(
             "The model states %d MTP layer(s), which the AutoModels trainer does not build: no number above "
             "prices them",
