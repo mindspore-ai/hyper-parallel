@@ -27,6 +27,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
     mega_moe_event_capacity,
 )
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph
+from hyper_parallel.core.multicore.scheduler.mix_task import validate_mix_task_schedule
 from hyper_parallel.core.multicore.scheduler.runtime import allocate_runtime_config
 
 
@@ -69,5 +70,6 @@ def build_runtime_config(graph: ComputeGraph, tsv: TaskSplitValue,
         op.fill_config.fill(cfg, op, tsv)
 
     cfg.task_num = sum(op.task_num for op in graph.topological_sort())
+    validate_mix_task_schedule(cfg)
     cfg.atomic_add_values[0] = 1
     return cfg

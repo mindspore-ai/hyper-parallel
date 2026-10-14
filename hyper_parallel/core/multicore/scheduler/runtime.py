@@ -27,6 +27,8 @@ from hyper_parallel.core.multicore.scheduler.config import (
     RuntimeConfigC,
     TaskDescC,
 )
+from hyper_parallel.core.multicore.scheduler.mix_task import validate_mix_task_schedule
+
 
 RUNTIME_HEADER_BYTES = ctypes.sizeof(RuntimeConfigC)
 TASK_DESC_SIZE = ctypes.sizeof(TaskDescC)
@@ -141,6 +143,7 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
     Returns:
         Bytes for a matching native runtime reader.
     """
+    validate_mix_task_schedule(cfg)
     capacity = runtime_config_task_capacity(cfg)
     event_capacity = len(cfg.all_event_num_triggers)
     if len(cfg.all_events) != event_capacity:

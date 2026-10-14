@@ -222,6 +222,11 @@ def _calculate_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
             f"RuntimeConfig.num_workers must be an even value in [0, {VECTOR_SLOT_COUNT}], got {num_workers}"
         )
     active_worker_count = num_workers // 2
+    mix_required_records = _max_worker_record_count(
+        runtime_config, runtime_config.mix_task_indices, int(runtime_config.task_index_num[2]), 1,
+    )
+    if mix_required_records and active_worker_count == 0:
+        raise ValueError("RuntimeConfig.num_workers must identify at least one AIC/AIV worker")
     aic_required_records = _max_worker_record_count(
         runtime_config,
         runtime_config.cube_task_indices,
@@ -234,6 +239,8 @@ def _calculate_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
         int(runtime_config.task_index_num[1]),
         active_worker_count,
     )
+    aic_required_records += mix_required_records
+    aiv_required_records += mix_required_records
     return _ProfileLayout(
         aic_required_records=aic_required_records,
         aiv_required_records=aiv_required_records,

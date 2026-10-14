@@ -303,9 +303,10 @@ __aicore__ inline int32_t getTaskIndexNumByTaskType(__gm__ uint8_t *tiling, Task
     return (*(__gm__ int32_t *)(tiling + size + INT32_T_SIZE));
   } else if (task_aicore_type == TaskAiCoreType::TASK_AICORE_CUBE) {
     return (*(__gm__ int32_t *)(tiling + size));
-  } else {
+  } else if (task_aicore_type == TaskAiCoreType::TASK_AICORE_MIX) {
     return (*(__gm__ int32_t *)(tiling + size + INT32_T_SIZE * 2));
   }
+  return 0;
 }
 
 __aicore__ inline uint32_t getCubeTaskIndexsOffset(__gm__ uint8_t *tiling) {

@@ -70,6 +70,8 @@ class KernelWorkerBase {
         (__gm__ int32_t *)(runtimeConfigPtr + getVectorTaskIndexsOffset(runtimeConfigPtr)), runtime_task_capacity);
     cube_task_indexs.SetGlobalBuffer(
         (__gm__ int32_t *)(runtimeConfigPtr + getCubeTaskIndexsOffset(runtimeConfigPtr)), runtime_task_capacity);
+    mix_task_indexs.SetGlobalBuffer(
+        (__gm__ int32_t *)(runtimeConfigPtr + getMixTaskIndexsOffset(runtimeConfigPtr)), runtime_task_capacity);
     atomic_add_values.SetGlobalBuffer(
         (__gm__ int32_t *)(runtimeConfigPtr + getAtomicAddValuesOffset(runtimeConfigPtr)), ATOMIC_ADD_VALUE_LEN);
 
@@ -77,8 +79,14 @@ class KernelWorkerBase {
     this->task_num = getTaskNum(this->runtimeConfigPtr);
     this->vector_task_num = getTaskIndexNumByTaskType(this->runtimeConfigPtr, TaskAiCoreType::TASK_AICORE_VECTOR);
     this->cube_task_num = getTaskIndexNumByTaskType(this->runtimeConfigPtr, TaskAiCoreType::TASK_AICORE_CUBE);
+    this->mix_task_num = getTaskIndexNumByTaskType(this->runtimeConfigPtr, TaskAiCoreType::TASK_AICORE_MIX);
     this->core_num = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 5);
     this->vector_num = this->core_num * 2;
+    if (this->mix_task_num != 0 &&
+        (this->core_num <= 0 || this->vector_num > NUM_WORKERS_VECTOR ||
+         reinterpret_cast<__gm__ RuntimeHeader *>(runtimeConfigPtr)->num_workers != this->vector_num)) {
+      AscendC::Trap();
+    }
   }
 
   __aicore__ inline void Process() {
@@ -96,6 +104,14 @@ class KernelWorkerBase {
 
  protected:
   __aicore__ inline void ProcessFast() {
+    if (this->mix_task_num != 0) {
+      ProcessFastWithMix();
+      return;
+    }
+    ProcessFastCoreTasks();
+  }
+
+  __aicore__ inline void ProcessFastCoreTasks() {
 #ifdef __DAV_C220_CUBE__
     uint32_t block_idx = this->worker_id_;
     do {
@@ -128,6 +144,14 @@ class KernelWorkerBase {
     cycle_trace_recorder.Init(this->worker_id_, this->input_list[Derived::PROFILE_IDX],
                               getAicProfileRecordCapacity(this->runtimeConfigPtr),
                               getAivProfileRecordCapacity(this->runtimeConfigPtr));
+    if (this->mix_task_num != 0) {
+      ProcessProfiledWithMix(cycle_trace_recorder);
+      return;
+    }
+    ProcessProfiledCoreTasks(cycle_trace_recorder);
+  }
+
+  __aicore__ inline void ProcessProfiledCoreTasks(CycleTraceRecorder &cycle_trace_recorder) {
 #ifdef __DAV_C220_CUBE__
     uint32_t block_idx = this->worker_id_;
     do {
@@ -153,6 +177,88 @@ class KernelWorkerBase {
       block_idx = block_idx + half_num;
     } while (1);
 #endif
+  }
+
+  __aicore__ inline bool HandlesCoreTasks() const {
+#ifdef __DAV_C220_CUBE__
+    return true;
+#else
+    return this->worker_id_ % VECTOR_WORKER_STRIDE != 0;
+#endif
+  }
+
+  __aicore__ inline uint32_t GetCoreTaskStartIndex() const {
+#ifdef __DAV_C220_CUBE__
+    return this->worker_id_;
+#else
+    return this->worker_id_ / VECTOR_WORKER_STRIDE;
+#endif
+  }
+
+  __aicore__ inline uint32_t GetCoreTaskStride() const {
+#ifdef __DAV_C220_CUBE__
+    return this->core_num;
+#else
+    return this->vector_num / VECTOR_WORKER_STRIDE;
+#endif
+  }
+
+  __aicore__ inline int32_t GetCoreTaskNum() const {
+#ifdef __DAV_C220_CUBE__
+    return this->cube_task_num;
+#else
+    return this->vector_task_num;
+#endif
+  }
+
+  __aicore__ inline void ProcessFastWithMix() {
+    bool handles_core_tasks = HandlesCoreTasks();
+    uint32_t core_task_index = GetCoreTaskStartIndex();
+    uint32_t core_task_stride = GetCoreTaskStride();
+    int32_t core_task_num = GetCoreTaskNum();
+
+    for (int32_t mix_index = 0; mix_index < this->mix_task_num; ++mix_index) {
+      TaskId mix_task_id = mix_task_indexs.GetValue(mix_index);
+      while (handles_core_tasks && core_task_index < core_task_num) {
+        TaskId core_task_id = GetTaskIndex(core_task_index);
+        if (core_task_id >= mix_task_id) {
+          break;
+        }
+        ExecuteTaskFast(core_task_id);
+        core_task_index += core_task_stride;
+      }
+      ExecuteTaskFast<true>(mix_task_id);
+    }
+
+    while (handles_core_tasks && core_task_index < core_task_num) {
+      ExecuteTaskFast(GetTaskIndex(core_task_index));
+      core_task_index += core_task_stride;
+    }
+  }
+
+  __aicore__ inline void ProcessProfiledWithMix(CycleTraceRecorder &cycle_trace_recorder) {
+    bool handles_core_tasks = HandlesCoreTasks();
+    uint32_t core_task_index = GetCoreTaskStartIndex();
+    uint32_t core_task_stride = GetCoreTaskStride();
+    int32_t core_task_num = GetCoreTaskNum();
+
+    for (int32_t mix_index = 0; mix_index < this->mix_task_num; ++mix_index) {
+      TaskId mix_task_id = mix_task_indexs.GetValue(mix_index);
+      while (handles_core_tasks && core_task_index < core_task_num) {
+        TaskId core_task_id = GetTaskIndex(core_task_index);
+        if (core_task_id >= mix_task_id) {
+          break;
+        }
+        ExecuteTaskProfiled(core_task_id, cycle_trace_recorder);
+        core_task_index += core_task_stride;
+      }
+      ExecuteTaskProfiled<true>(mix_task_id, cycle_trace_recorder);
+    }
+
+    while (handles_core_tasks && core_task_index < core_task_num) {
+      ExecuteTaskProfiled(GetTaskIndex(core_task_index), cycle_trace_recorder);
+      core_task_index += core_task_stride;
+    }
   }
 
   __aicore__ inline bool LoadReadyHandshakeMeta(ReadyHandshakeMeta *meta) {
@@ -245,6 +351,7 @@ class KernelWorkerBase {
     eventPipe.Destroy();
   }
 
+  template <bool is_mix = false>
   __aicore__ inline void ExecuteTaskFast(TaskId task_id) {
     if (task_id >= runtime_task_capacity) {
       AscendC::Trap();
@@ -258,12 +365,20 @@ class KernelWorkerBase {
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
       WaitForDependency(task_desc.dependent_event);
     }
+    if constexpr (is_mix) {
+      // SyncAll defaults to AIV-only; MIX tasks need the AIC participants too.
+      SyncAll<false>();
+    }
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
+    if constexpr (is_mix) {
+      SyncAll<false>();
+    }
     if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
       TriggerEvent(task_desc.trigger_event);
     }
   }
 
+  template <bool is_mix = false>
   __aicore__ inline void ExecuteTaskProfiled(TaskId task_id, CycleTraceRecorder &cycle_trace_recorder) {
     if (task_id >= runtime_task_capacity) {
       AscendC::Trap();
@@ -286,11 +401,18 @@ class KernelWorkerBase {
     if (profile_desc_id == PROFILE_DESC_INVALID_ID) {
       profile_desc_id = PROFILE_DESC_TASK_TYPE_BASE + static_cast<uint32_t>(task_desc.task_type);
     }
+    if constexpr (is_mix) {
+      // SyncAll defaults to AIV-only; MIX tasks need the AIC participants too.
+      SyncAll<false>();
+    }
     uint64_t compute_start_cycle = cycle_trace_recorder.Now();
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
     uint64_t compute_end_cycle = cycle_trace_recorder.Now();
     cycle_trace_recorder.Record(profile_desc_id, task_id, task_desc.task_index, owner_id, compute_start_cycle,
                                 compute_end_cycle);
+    if constexpr (is_mix) {
+      SyncAll<false>();
+    }
     if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
       uint64_t trigger_start_cycle = cycle_trace_recorder.Now();
       TriggerEvent(task_desc.trigger_event);
@@ -356,12 +478,14 @@ class KernelWorkerBase {
   uint32_t runtime_event_capacity = 0;
   int32_t vector_task_num = 0;
   int32_t cube_task_num = 0;
+  int32_t mix_task_num = 0;
 
   GlobalTensor<int32_t> all_event_counters;
   GlobalTensor<int32_t> all_event_num_triggers;
   GlobalTensor<int32_t> atomic_add_values;
   GlobalTensor<int32_t> vector_task_indexs;
   GlobalTensor<int32_t> cube_task_indexs;
+  GlobalTensor<int32_t> mix_task_indexs;
 
   __gm__ uint8_t *runtimeConfigPtr;
   GM_ADDR *input_list = nullptr;

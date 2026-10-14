@@ -29,20 +29,24 @@ from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime, write_ev
 
 @contextmanager
 def poison_overwritten_buffers(value: float) -> Iterator[None]:
-    """Fill candidate outputs before their producers, preserving required dW zeros."""
+    """Fill candidate outputs before their producers, preserving required dW zeros.
+
+    Args:
+        value: Poison value written before each activation or communication producer.
+    """
     allocate_forward = function_module._allocate_forward_intermediates  # pylint: disable=protected-access
     allocate_backward = function_module._allocate_backward_intermediates  # pylint: disable=protected-access
     claim = MegaMoeWorkspace.claim
 
     def _forward(*args):
         tensors = allocate_forward(*args)
-        for tensor in tensors:
+        for tensor in (tensors.up_proj, tensors.activation, tensors.down_proj):
             tensor.fill_(value)
         return tensors
 
     def _backward(*args):
         tensors = allocate_backward(*args)
-        for tensor in tensors[2:]:
+        for tensor in (tensors.act_grad, tensors.swiglu_grad, tensors.gate_dx):
             tensor.fill_(value)
         return tensors
 
