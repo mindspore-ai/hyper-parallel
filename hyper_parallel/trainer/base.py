@@ -559,8 +559,9 @@ class BaseTrainer(Stateful, ABC):
             model: torch.nn.Module,
             model_inputs: Dict[str, Any],
             labels: Optional[torch.Tensor],
+            token_counts: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Wrap the BaseTrainer forward/loss logic for joint-graph capture."""
+        """Capture forward/loss with explicit runtime token counts when provided."""
         model_fwd_context = (
             self.model_fwd_context()
             if callable(self.model_fwd_context)
@@ -568,13 +569,12 @@ class BaseTrainer(Stateful, ABC):
         )
         with model_fwd_context:
             outputs = model(**model_inputs, use_cache=False)
-        # postforward adds the token-weighted global aggregation used by the
-        # eager path; it embeds .item()/all_reduce, which the tracer must be
-        # able to capture for this to compile. Both the backward loss and the
-        # named per-key losses are returned: the tracer emits the loss_dict
-        # values as extra graph outputs (after the gradients), so
-        # multi-key losses keep per-key logging parity with the eager path.
-        loss, loss_dict = self.postforward(outputs, labels)
+        # Counts must be graph inputs: packed lengths and ignored-label counts
+        # can vary even when tensor shapes happen to match the first batch.
+        if token_counts is None:
+            loss, loss_dict = self.postforward(outputs, labels)
+        else:
+            loss, loss_dict = self.postforward(outputs, labels, token_counts=token_counts)
         return loss, loss_dict
 
     def _init_callbacks(self):
@@ -685,22 +685,27 @@ class BaseTrainer(Stateful, ABC):
         return micro_batch
 
     def postforward(
-            self, outputs: ModelOutput, labels: Optional[torch.Tensor]
+            self, outputs: ModelOutput, labels: Optional[torch.Tensor],
+            *, token_counts: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass.
 
         Args:
             outputs: Model outputs consumed by the configured loss.
             labels: Labels associated with the current micro-batch.
+            token_counts: Explicit current/step token counts for joint-graph
+                execution. Eager callers use the trainer's live counts.
 
         Returns:
             Backward loss and named globally aggregated loss values.
         """
         local_loss = self.loss_fn(model_output=outputs, labels=labels)
+        current_counts = self.current_token_counts if token_counts is None else token_counts["current"]
+        step_counts = self.step_token_counts if token_counts is None else token_counts["step"]
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             local_loss,
-            self.current_token_counts,
-            self.step_token_counts,
+            current_counts,
+            step_counts,
             device_mesh=self.mesh,
         )
         loss = torch.stack(list(loss_dict.values())).sum()
@@ -774,9 +779,16 @@ class BaseTrainer(Stateful, ABC):
                 # The traced ``loss_dict`` values flow back as extra graph
                 # outputs (emitted after the gradients), so the logging
                 # metrics keep per-key parity with the eager path.
+                graph_kwargs = {}
+                if hasattr(self, "current_token_counts") and hasattr(self, "step_token_counts"):
+                    graph_kwargs["token_counts"] = {
+                        "current": self.current_token_counts,
+                        "step": self.step_token_counts,
+                    }
                 loss, loss_dict = self.graph_compiler.forward_backward(
                     model_inputs=micro_batch,
                     labels=labels,
+                    **graph_kwargs,
                 )
             else:
                 model_fwd_context = (

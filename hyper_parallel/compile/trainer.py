@@ -34,6 +34,7 @@ import torch
 import torch.distributed as dist
 
 from .compiler import GraphCompiler
+from .tracer.dynamic_shapes import DynamicArgDims
 from .pass_config import PassConfig
 from .graph_parallel_plan import GraphParallelPlan
 
@@ -61,6 +62,12 @@ class GraphTrainer:
         optimizer_config: Optional[dict] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
+        dynamic: Optional[bool] = None,
+        dynamic_arg_dims: DynamicArgDims | None = None,
+        compile_sizes: Optional[list[int]] = None,
+        compile_size_input: Optional[str] = None,
+        compile_size_dim: Optional[int] = None,
+        max_specializations: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -84,6 +91,12 @@ class GraphTrainer:
                 already hold the group object) and only the FSDP shard
                 sub-mesh is registered under ``"fsdp"``. Use this to feed an
                 automodel TP-sharded model into the graph-mode FSDP pass.
+            dynamic: Enable symbolic user input dimensions (forwarded to GraphCompiler).
+            dynamic_arg_dims: Optional input paths to dynamic dimensions (forwarded to GraphCompiler).
+            compile_sizes: Sizes to lazily specialize (forwarded to GraphCompiler).
+            compile_size_input: Optional dispatch tensor path (forwarded to GraphCompiler).
+            compile_size_dim: Dispatch axis for an explicit path (forwarded to GraphCompiler).
+            max_specializations: Cache capacity (forwarded to GraphCompiler).
         """
         # The compiler owns the model, device, config, and the compiled
         # graph; the trainer keeps only the optimizer / loop policy.
@@ -95,6 +108,12 @@ class GraphTrainer:
             trainer_config=trainer_config,
             device=device,
             mesh_context=mesh_context,
+            dynamic=dynamic,
+            dynamic_arg_dims=dynamic_arg_dims,
+            compile_sizes=compile_sizes,
+            compile_size_input=compile_size_input,
+            compile_size_dim=compile_size_dim,
+            max_specializations=max_specializations,
         )
         self.optimizer_config = optimizer_config or {}
         self.optimizer = None

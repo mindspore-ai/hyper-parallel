@@ -42,6 +42,8 @@ from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from .pass_config import PassConfig, normalize_dp_mode, build_pass_config_from_trainer_config
 from .graph_parallel_plan import GraphParallelPlan
 from .passes.pipeline import PassPipeline
+from .size_specialization import SizeSpecializationDispatcher, validate_compile_sizes
+from .tracer.dynamic_shapes import DynamicArgDims, normalize_dynamic_arg_dims
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
 
 _LOG = logging.getLogger(__name__)
@@ -65,6 +67,12 @@ class GraphCompiler:
         trainer_config: Optional[Any] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
+        dynamic: Optional[bool] = None,
+        dynamic_arg_dims: DynamicArgDims | None = None,
+        compile_sizes: Optional[List[int]] = None,
+        compile_size_input: Optional[str] = None,
+        compile_size_dim: Optional[int] = None,
+        max_specializations: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -85,7 +93,35 @@ class GraphCompiler:
                 only the FSDP shard sub-mesh is registered under ``"fsdp"``.
                 Use this to feed an automodel TP-sharded model into the
                 graph-mode FSDP pass.
+            dynamic: Symbolize user input dimensions; inherits trainer_config.compile.dynamic when omitted.
+            dynamic_arg_dims: Optional dotted input paths to dynamic dimensions, e.g. {"x": [0, 1]}.
+                Overrides automatic dimension selection and inherits trainer configuration when omitted.
+            compile_sizes: Opt-in sizes for lazy FX specialization; inherits trainer configuration.
+            compile_size_input: Dotted tensor path for dispatch; defaults to the first symbolic input axis.
+            compile_size_dim: Dispatch axis for an explicit path (default -1).
+            max_specializations: Maximum cached full input signatures (default 8).
         """
+        compile_config = getattr(trainer_config, "compile", None)
+        self.dynamic = getattr(compile_config, "dynamic", False) if dynamic is None else dynamic
+        if not isinstance(self.dynamic, bool):
+            raise ValueError("dynamic must be a bool")
+        if dynamic_arg_dims is None:
+            dynamic_arg_dims = getattr(compile_config, "dynamic_arg_dims", None)
+        self.dynamic_arg_dims = normalize_dynamic_arg_dims(dynamic_arg_dims)
+        if compile_sizes is None:
+            compile_sizes = getattr(compile_config, "compile_sizes", None)
+        self.compile_size_input = (
+            getattr(compile_config, "compile_size_input", None) if compile_size_input is None else compile_size_input
+        )
+        self.compile_size_dim = (
+            getattr(compile_config, "compile_size_dim", -1) if compile_size_dim is None else compile_size_dim
+        )
+        self.max_specializations = (
+            getattr(compile_config, "max_specializations", 8) if max_specializations is None else max_specializations
+        )
+        self.compile_sizes = validate_compile_sizes(compile_sizes, self.max_specializations)
+        if self.compile_sizes and not (self.dynamic or self.dynamic_arg_dims is not None):
+            raise ValueError("compile_sizes requires dynamic=True or dynamic_arg_dims")
         self.model = model
         self.train_fn = train_fn
         self.parallel_plan = parallel_plan
@@ -103,6 +139,7 @@ class GraphCompiler:
         self.pass_config.validate()
 
         self._joint_graph = None
+        self._size_dispatcher = None
         self._pytree_pre_hook: Optional[Callable[[], None]] = None
 
     @staticmethod
@@ -123,6 +160,11 @@ class GraphCompiler:
         """Whether a joint graph has already been compiled."""
         return self._joint_graph is not None
 
+    @property
+    def specialization_stats(self) -> dict[str, Any]:
+        """Return lazy size-specialization counters, or an empty mapping when disabled."""
+        return self._size_dispatcher.stats if self._size_dispatcher is not None else {}
+
     def compile(self, **inputs: Any) -> None:
         """
         Compile model into parallel graph
@@ -134,6 +176,10 @@ class GraphCompiler:
             **inputs: Model inputs, forwarded to ``train_fn`` as keyword
                 arguments and used to trace the joint graph
         """
+        if (self.dynamic or self.dynamic_arg_dims is not None) and self.pass_config.pp_enabled:
+            raise ValueError(
+                "Dynamic shapes with pipeline parallel are not supported yet; disable PP or dynamic shapes"
+            )
         if self._pytree_pre_hook is not None:
             self._pytree_pre_hook()
 
@@ -144,7 +190,17 @@ class GraphCompiler:
             # runs as plain graph mode without sharding.
             self._init_device_mesh(self._mesh_context)
 
-        joint_graph = trace_model_graph(self.model, self.train_fn, inputs)
+        trace_kwargs = {}
+        if self.dynamic or self.dynamic_arg_dims is not None:
+            trace_kwargs = {"dynamic": self.dynamic, "dynamic_arg_dims": self.dynamic_arg_dims}
+        joint_graph = trace_model_graph(self.model, self.train_fn, inputs, **trace_kwargs)
+        # Validate selection before a parallel pass mutates the live model.
+        size_dispatcher = None
+        if self.compile_sizes:
+            size_dispatcher = SizeSpecializationDispatcher(
+                joint_graph, inputs, self.compile_sizes, self.compile_size_input,
+                self.compile_size_dim, self.max_specializations,
+            )
 
         pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
@@ -154,7 +210,10 @@ class GraphCompiler:
         # transformed graph lives on ``joint_graph`` for ``forward_backward``.
         pipeline.run(joint_graph.graph_module, **pass_kwargs)
 
+        if joint_graph.input_guards is not None:
+            joint_graph.input_guards.refresh()
         self._joint_graph = joint_graph
+        self._size_dispatcher = size_dispatcher
 
     def forward_backward(self, **inputs: Any) -> Any:
         """
@@ -461,6 +520,7 @@ class GraphCompiler:
             self._joint_graph,
             self.model,
             inputs,
+            **({"graph_dispatcher": self._size_dispatcher} if self._size_dispatcher is not None else {}),
         )
 
     def _accumulate_grads(self, grads: List[torch.Tensor]) -> None:

@@ -46,6 +46,7 @@ from hyper_parallel.compile.tracer.graph_tracer import (
     run_traced_graph,
     trace_model_graph,
 )
+from tests.common.mark_utils import arg_mark
 
 
 class _LinearWithBuffer(nn.Module):
@@ -217,15 +218,17 @@ class _TiedEmbedding(nn.Module):
 class TestTiedWeights(unittest.TestCase):
     """Tied parameters trace to one placeholder and one undoubled gradient."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_tied_weight_one_placeholder_and_full_gradient(self):
-        """Test the deduped alias is one static input with the full gradient.
+        """
+        Feature: Shared parameters in joint graphs.
+        Description: Trace tied embedding/projection weights as one static input.
+        Expectation: The shared gradient matches eager without get_attr constants.
 
-        Without dedup the same tensor is flattened once per FQN, so the graph
-        carries two placeholders and FSDP later inserts two collectives; and a
-        naive ``remove_duplicate=True`` (without ``tie_weights``) would bake the
-        second use in as a ``get_attr`` constant instead. The tracer must land
-        in the middle: one placeholder, no ``get_attr``, and the shared weight's
-        gradient equal to autograd's full (not doubled) gradient.
+        Flattening aliases twice inserts duplicate placeholders and collectives.
+        Deduplication with tie_weights preserves both uses of the same input and
+        yields one gradient containing the full contribution of both modules.
         """
         torch.manual_seed(0)
         model = _TiedEmbedding()

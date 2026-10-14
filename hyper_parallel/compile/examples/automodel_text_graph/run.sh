@@ -14,10 +14,10 @@
 # limitations under the License.
 # ============================================================================
 
-# GraphTextTrainer text demo launcher — default fixed-shape TP2 + FSDP2 case.
+# TextTrainer joint-graph launcher (TP2 + FSDP2 by default).
 #
 # Usage:
-#   bash run.sh
+#   bash run.sh [config.yaml] [--config.key=value ...]
 #
 set -euo pipefail
 
@@ -25,15 +25,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HYPER_PARALLEL_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 REPO_ROOT="$(cd "${HYPER_PARALLEL_ROOT}/.." && pwd)"
 
-CONFIG="${SCRIPT_DIR}/train_lm_graph_fixed_tp2_fsdp2.yaml"
-NPROC_PER_NODE=4
-NNODES=1
-NODE_RANK=0
-MASTER_ADDR="127.0.0.1"
-MASTER_PORT=29683
-LABEL="train_lm_graph_fixed_tp2_fsdp2"
-OUTPUT_DIR="${SCRIPT_DIR}/output"
-TRAIN_ENTRY="${REPO_ROOT}/scripts/train_lm.py"
+CONFIG="${1:-${CONFIG:-${SCRIPT_DIR}/train_lm_graph_tp2_fsdp2.yaml}}"
+if [[ $# -gt 0 ]]; then shift; fi
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+MASTER_PORT="${MASTER_PORT:-29683}"
+LABEL="$(basename "${CONFIG}" .yaml)"
+OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/output}"
+TRAIN_ENTRY="${TRAIN_ENTRY:-${REPO_ROOT}/scripts/train_lm.py}"
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -48,7 +49,7 @@ echo "master     : ${MASTER_ADDR}:${MASTER_PORT}"
 echo "output_dir : ${OUTPUT_DIR}"
 echo "=========================================================="
 
-torchrun \
+"${PYTHON:-python}" -m torch.distributed.run \
     --nproc_per_node="${NPROC_PER_NODE}" \
     --nnodes="${NNODES}" \
     --node_rank="${NODE_RANK}" \
@@ -56,7 +57,7 @@ torchrun \
     --master_port="${MASTER_PORT}" \
     --tee=3 \
     --local-ranks-filter=0 \
-    "${TRAIN_ENTRY}" "${CONFIG}" \
+    "${TRAIN_ENTRY}" "${CONFIG}" "$@" \
     2>&1 | tee "${OUTPUT_DIR}/run_${LABEL}.log"
 
 echo "=========================================================="

@@ -112,7 +112,12 @@ from hyper_parallel.components.quantization.config import (  # pylint: disable=C
 
 @dataclass
 class CompileConfig:
-    """Decoder-layer ``torch.compile`` options exposed by the Trainer."""
+    """Decoder-layer and joint-graph compile options exposed by the Trainer.
+
+    In joint-graph mode, ``dynamic`` symbolizes user tensor dimensions.
+    ``dynamic_arg_dims`` optionally selects dimensions by dotted input path;
+    a mapping enables dynamic tracing and takes precedence over ``dynamic``.
+    """
 
     enabled: bool = False
     use_joint_graph: bool = False
@@ -122,6 +127,12 @@ class CompileConfig:
     backend: Optional[str] = None
     options: Optional[dict[str, Any]] = None
     dynamo_cache_size_limit: int = 256
+    # Joint-graph input paths, e.g. model_inputs.input_ids: [0, 1].
+    dynamic_arg_dims: Optional[dict[str, int | list[int]]] = None
+    compile_sizes: Optional[list[int]] = None
+    compile_size_input: Optional[str] = None
+    compile_size_dim: int = -1
+    max_specializations: int = 8
 
     def selects_graph_compiler(self) -> bool:
         """Return whether this config selects the graph-compiler trainer path."""
@@ -132,6 +143,8 @@ class CompileConfig:
         for name in ("enabled", "use_joint_graph", "fullgraph", "dynamic"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"compile.{name} must be a bool")
+        if self.dynamic_arg_dims is not None and not isinstance(self.dynamic_arg_dims, dict):
+            raise ValueError("compile.dynamic_arg_dims must be a mapping or None")
         if not isinstance(self.mode, str) or not self.mode.strip():
             raise ValueError("compile.mode must be a non-empty string")
         if self.backend is not None and (

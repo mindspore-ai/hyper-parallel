@@ -1,0 +1,80 @@
+# Online dynamic packing: generate data with prepare_dynamic_text.py, then pass the model path to run.sh.
+# Graph FSDP shards on first capture; use fp32 parameters without separate optimizer master copies.
+model_init_dtype: float32
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  # Random initialization keeps this functional smoke test independent of weight loading.
+  load_base_model: false
+  torch_dtype: float32
+  attn_implementation: sdpa
+  force_hf: true
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  adamw_config:
+    lr: 0.0001
+    adamw_weight_decay: 0.0
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 0.0001
+    lr_warmup_steps: 0
+training:
+  train_iters: 6
+  global_batch_size: 4
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  logging_steps: 1
+  seed: 42
+  enable_full_determinism: false
+accelerator:
+  tp_size: 2
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+fsdp_config:
+  dp_shard_size: 2
+compile:
+  enabled: true
+  use_joint_graph: true
+  dynamic: true
+  # Optional lazy FX specialization (uncomment all three to enable):
+  # compile_sizes: [116, 120, 127]
+  # compile_size_input: model_inputs.input_ids
+  # compile_size_dim: 1
+dataset:
+  # Streaming avoids truncating raw records before dynamic token packing.
+  _target_: hyper_parallel.data.text.build_dataset.build_online_iterable_dataset
+  data_path: ./output/automodel_text_graph/dynamic_text.jsonl
+  model_assets:
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      use_fast: true
+      trust_remote_code: true
+  data_transform:
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 128
+  data_config:
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: true
+dataloader:
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
+  min_buffered_samples: 8
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    attention_mode: dense
+checkpoint:
+  save_ckpt: false

@@ -183,6 +183,16 @@ class TestConfigOverrides(unittest.TestCase):
         ):
             self._parse("--model.width=[unclosed")
 
+    def test_dynamic_joint_graph_mapping(self) -> None:
+        """Typed configuration accepts nested tensor paths and both dimension forms."""
+        config = self._parse(
+            "--compile.enabled=true",
+            "--compile.use_joint_graph=true",
+            "--compile.dynamic_arg_dims={model_inputs.input_ids: [0, 1], labels: 0}",
+        )
+        self.assertTrue(config.compile.selects_graph_compiler())
+        self.assertEqual(config.compile.dynamic_arg_dims, {"model_inputs.input_ids": [0, 1], "labels": 0})
+
 
 if __name__ == "__main__":
     unittest.main()

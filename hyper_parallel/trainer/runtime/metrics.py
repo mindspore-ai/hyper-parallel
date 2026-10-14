@@ -107,8 +107,8 @@ def mean_global_loss(
             # expressed with tensor collectives so the static-shape tracer can
             # capture it (no ``.item()``, no data-dependent zero-token guard).
             # ``differentiable_all_reduce`` dispatches to functional collectives
-            # under tracing; the token-count tensors are baked as trace-time
-            # constants, matching the tracer's fixed-shape contract.
+            # under tracing. BaseTrainer passes token-count tensors as explicit
+            # graph inputs so packed/ignored-token counts remain live.
             step_len = differentiable_all_reduce(
                 step_token_counts[f"{loss_name}_tokens"], "sum", dp_cp_group
             )
