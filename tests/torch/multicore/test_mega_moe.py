@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -26,11 +28,13 @@ import pytest
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import TorchCase, parallel_run
 from tests.common.port_utils import allocate_port
+from tests.common.shmem_loader_evidence import loader_evidence_session
 from tests.torch.multicore._test_env import (
     multicore_adapter_is_available,
     prepare_multicore_test_environment,
     without_inherited_rank_environment,
 )
+
 
 _WORKER = str(Path(__file__).resolve().parent / "_test_mega_moe.py")
 _PRECISION_WORLD_SIZE = 2
@@ -53,7 +57,9 @@ def _run_precision_worker(monkeypatch) -> None:
     monkeypatch.setenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", str(64 * 1024 * 1024))
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
     monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
-    with without_inherited_rank_environment():
+    with loader_evidence_session(
+        monkeypatch, export_on_success=True, worker_source=_WORKER, launcher_source=__file__,
+    ), without_inherited_rank_environment():
         parallel_run(
             [
                 TorchCase(
@@ -64,6 +70,30 @@ def _run_precision_worker(monkeypatch) -> None:
             ],
             global_num_proc=_PRECISION_WORLD_SIZE,
         )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_mega_moe_launcher_import_boundary() -> None:
+    """Feature: lightweight ST collection.
+    Description: Import this launcher in a fresh interpreter with the ST package available.
+    Expectation: Leave Torch, Torch-NPU and HyperParallel unloaded.
+    """
+    launcher_path = str(Path(__file__).resolve())
+    script = (
+        "import importlib.util, sys; "
+        f"spec = importlib.util.spec_from_file_location('hp_mega_moe_launcher', {launcher_path!r}); "
+        "module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); "
+        "assert not {'torch', 'torch_npu', 'hyper_parallel'} & sys.modules.keys()"
+    )
+    subprocess.run(
+        [sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[3],
+        check=True, capture_output=True, text=True,
+    )
 
 
 @arg_mark(
