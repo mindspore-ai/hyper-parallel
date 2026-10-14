@@ -43,11 +43,11 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     apply_rotary_pos_emb,
 )
 
+from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
-# pylint: disable=unused-import
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionCPContext as SharedAttentionCPContext,
     SharedCompressedPackedSequence as SharedPackedSequence,
@@ -83,11 +83,21 @@ def _resolve_v41_model_mode(config: Any) -> str:
 
 
 def _initialize_embedding_shard_safe(module: nn.Embedding, std: float) -> None:
-    """Initialize an embedding and clear its global padding row through DTensor."""
+    """Initialize an embedding and clear its global padding row shard-safely."""
     nn.init.normal_(module.weight, mean=0.0, std=std)
     if module.padding_idx is None:
         return
-    module.weight[module.padding_idx].zero_()
+    weight = module.weight
+    layout = getattr(weight, "layout", None)
+    to_local = getattr(weight, "to_local", None)
+    if layout is None or not callable(to_local):
+        weight[module.padding_idx].zero_()
+        return
+    inner_rank = layout.rank_list.index(layout.mesh.rank)
+    slice_area = infer_slice_area_by_layout(layout, inner_rank, weight.shape)
+    row_start, row_end = slice_area[0]
+    if row_start <= module.padding_idx < row_end:
+        to_local()[module.padding_idx - row_start].zero_()
 
 
 class DeepseekV41Engram(nn.Module):
