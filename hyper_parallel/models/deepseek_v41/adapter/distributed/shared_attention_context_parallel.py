@@ -21,6 +21,7 @@ import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
+    DeepSelectSharedCompressedDSAAttention,
     SharedCompressedAttentionCPContext,
     SharedCompressedAttentionTPContext,
     SharedCompressedDSAAttention,
@@ -87,9 +88,10 @@ def deepseek_v41_shared_attention_parallel_wrapper(
     """
     del mesh, ep_mesh
     wrapper_name = "deepseek_v41_shared_attention_parallel_wrapper"
-    if not isinstance(target_module, SharedCompressedDSAAttention):
+    if not isinstance(target_module, (SharedCompressedDSAAttention, DeepSelectSharedCompressedDSAAttention)):
         raise TypeError(
-            f"{wrapper_name} requires SharedCompressedDSAAttention after "
+            f"{wrapper_name} requires SharedCompressedDSAAttention or "
+            "DeepSelectSharedCompressedDSAAttention after "
             f"module replacement, got {type(target_module).__name__}"
         )
 

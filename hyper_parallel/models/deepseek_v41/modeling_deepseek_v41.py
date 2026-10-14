@@ -46,13 +46,13 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
-from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
+from hyper_parallel.components.modules.mhc import PipelinedMhcModule
+from hyper_parallel.components.modules.tile_kernels import TileKernelsV41TopKRouter
 # pylint: disable=unused-import
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionCPContext as SharedAttentionCPContext,
     SharedCompressedPackedSequence as SharedPackedSequence,
     SharedCompressedAttentionState as SharedAttentionState,
-    SharedCompressedDSAAttention,
     SharedCompressedDSAAttentionBase,
     SharedCompressedDSAIndexer,
 )
@@ -411,11 +411,13 @@ class DeepseekV41PipelinedHyperConnection(nn.Module):
     def forward(
             self,
             hidden_streams: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute V4.1 pre, post, and residual mixing coefficients.
+            pre_mix: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Compute coefficients and optionally collapse residual streams.
 
         Args:
             hidden_streams: Hyper-connection streams entering the mixer.
+            pre_mix: Optional coefficients for collapsing the incoming streams.
         """
         flattened = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         mix = functional.linear(flattened, self.fn.float())  # pylint: disable=not-callable
@@ -433,7 +435,24 @@ class DeepseekV41PipelinedHyperConnection(nn.Module):
         residual = residual.view(*residual.shape[:-1], num_stream, num_stream)
         residual = residual * residual_scale + residual_bias.view(num_stream, num_stream)
         residual = sinkhorn_knopps(residual, self.hc_sinkhorn_iters, self.hc_eps)
-        return pre, post, residual
+        if pre_mix is None:
+            return pre, post, residual
+        collapsed = (pre_mix.unsqueeze(-1) * hidden_streams.float()).sum(dim=2)
+        return collapsed.to(hidden_streams.dtype), pre, post, residual
+
+    @staticmethod
+    def post(
+            sublayer_output: torch.Tensor,
+            residual: torch.Tensor,
+            post: torch.Tensor,
+            combine: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the independent reference post arithmetic."""
+        output = post.unsqueeze(-1) * sublayer_output.unsqueeze(-2)
+        output = output + torch.sum(
+            combine.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3
+        )
+        return output.to(sublayer_output.dtype)
 
 
 def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
@@ -441,12 +460,12 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
     if isinstance(module, (DeepseekV41Engram, EngramModule)):
         module.q_weight.fill_(1.0)
         module.k_weight.fill_(1.0)
-    elif isinstance(module, DeepseekV41TopKRouter):
+    elif isinstance(module, (DeepseekV41TopKRouter, TileKernelsV41TopKRouter)):
         nn.init.normal_(module.weight, mean=0.0, std=std)
         module.bias.zero_()
         if module.bias_vl is not None:
             module.bias_vl.zero_()
-    elif isinstance(module, (DeepseekV41Attention, SharedCompressedDSAAttention)):
+    elif isinstance(module, (DeepseekV41Attention, SharedCompressedDSAAttentionBase)):
         module.sinks.zero_()
     elif isinstance(module, (DeepseekV41PipelinedHyperConnection, PipelinedMhcModule)):
         nn.init.normal_(module.fn, mean=0.0, std=std)
@@ -459,16 +478,6 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
 def _hc_pre(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     """Collapse the parallel residual streams."""
     return (pre_mix.unsqueeze(-1) * hidden_states.float()).sum(dim=2).to(hidden_states.dtype)
-
-
-def _hc_post(
-        sublayer_output: torch.Tensor,
-        residual: torch.Tensor,
-        post: torch.Tensor,
-        comb: torch.Tensor,
-) -> torch.Tensor:
-    """Expand a sublayer result through the reusable high-performance path."""
-    return pipelined_mhc_post(sublayer_output, residual, post, comb)
 
 
 def _v41_decoder_layer_forward(
@@ -495,8 +504,10 @@ def _v41_decoder_layer_forward(
             token_mask=engram_token_mask,
         )
     residual = hidden_states
-    attention_pre, attention_post, attention_comb = self.attn_hc(hidden_states)
-    attention_input = self.input_layernorm(_hc_pre(hidden_states, pre_mix))
+    attention_input, attention_pre, attention_post, attention_comb = self.attn_hc(
+        hidden_states, pre_mix
+    )
+    attention_input = self.input_layernorm(attention_input)
     attention_output, _ = self.self_attn(
         attention_input,
         position_embeddings=position_embeddings,
@@ -506,16 +517,18 @@ def _v41_decoder_layer_forward(
         shared_attention_state=shared_attention_state,
         **kwargs,
     )
-    hidden_states = _hc_post(attention_output, residual, attention_post, attention_comb)
+    hidden_states = self.attn_hc.post(
+        attention_output, residual, attention_post, attention_comb
+    )
 
     residual = hidden_states
-    ffn_pre, ffn_post, ffn_comb = self.ffn_hc(hidden_states)
-    ffn_input = self.post_attention_layernorm(_hc_pre(hidden_states, attention_pre))
+    ffn_input, ffn_pre, ffn_post, ffn_comb = self.ffn_hc(hidden_states, attention_pre)
+    ffn_input = self.post_attention_layernorm(ffn_input)
     if image_mask is None:
         ffn_output = self.mlp(ffn_input, input_ids=input_ids)
     else:
         ffn_output = self.mlp(ffn_input, input_ids=input_ids, image_mask=image_mask)
-    hidden_states = _hc_post(ffn_output, residual, ffn_post, ffn_comb)
+    hidden_states = self.ffn_hc.post(ffn_output, residual, ffn_post, ffn_comb)
     return hidden_states, ffn_pre
 
 

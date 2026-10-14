@@ -117,13 +117,17 @@ plan_overrides:
       scale: {tp: replicate}
     in_src:
       hidden_streams: {tp: replicate, cp: "shard(1)", ep: replicate}
+      pre_mix: {tp: replicate, cp: "shard(1)", ep: replicate}
     in_dst:
       hidden_streams: {tp: replicate, cp: "shard(1)", ep: replicate}
+      pre_mix: {tp: replicate, cp: "shard(1)", ep: replicate}
     out_src:
+      collapsed: {tp: replicate, cp: "shard(1)", ep: replicate}
       pre: {tp: replicate, cp: "shard(1)", ep: replicate}
       post: {tp: replicate, cp: "shard(1)", ep: replicate}
       residual: {tp: replicate, cp: "shard(1)", ep: replicate}
     out_dst:
+      collapsed: {tp: replicate, cp: "shard(1)", ep: replicate}
       pre: {tp: replicate, cp: "shard(1)", ep: replicate}
       post: {tp: replicate, cp: "shard(1)", ep: replicate}
       residual: {tp: replicate, cp: "shard(1)", ep: replicate}
@@ -131,13 +135,17 @@ plan_overrides:
     when: sequence_parallel
     in_src:
       hidden_streams: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+      pre_mix: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
     in_dst:
       hidden_streams: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
+      pre_mix: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
     out_src:
+      collapsed: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
       pre: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
       post: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
       residual: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
     out_dst:
+      collapsed: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
       pre: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
       post: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
       residual: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
