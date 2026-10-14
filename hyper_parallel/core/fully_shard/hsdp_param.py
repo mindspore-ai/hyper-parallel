@@ -136,11 +136,11 @@ class HSDPParamV2:
         module_info: ParamModuleInfo,
         mesh_info: DataParallelMeshInfo,
         shard_placement_fn: Optional[Callable[[nn.Parameter], Optional[Shard]]] = None,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
+        mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
         offload_policy: Optional[OffloadPolicy] = None,
         device: Optional[torch.device] = None,
         source_shard_info: Optional[SourceShardMetaInfo] = None,
-    ):
+    ) -> None:
         """
         Initialize HSDPParamV2 and shard the parameter.
 
@@ -163,7 +163,7 @@ class HSDPParamV2:
         """
         self._module_info: ParamModuleInfo = module_info
         self.mesh_info = mesh_info
-        self.mp_policy = mp_policy
+        self._src_parameter_id = id(param)
         self.device = device
         self.orig_dtype = None
         self.param_dtype = None
@@ -472,7 +472,7 @@ class HSDPParamV2:
             Whether the current stream must synchronize for CPU offload.
         """
         sharded_grad = None
-        if not self.mp_policy.apply_grad_on_fp32_main_grad:
+        if not self.apply_grad_on_fp32_main_grad:
             sharded_grad = self.sharded_param.grad
         else:
             if not hasattr(self.sharded_param, "main_grad"):
@@ -484,7 +484,7 @@ class HSDPParamV2:
             .view(self.sharded_size)
         )
         if (
-            not self.mp_policy.apply_grad_on_fp32_main_grad
+            not self.apply_grad_on_fp32_main_grad
             and reduced_grad.dtype != self.orig_dtype
         ):
             reduced_grad = reduced_grad.to(self.orig_dtype)
@@ -497,13 +497,13 @@ class HSDPParamV2:
             )
             need_synchronize = True
         if sharded_grad is None:
-            if not self.mp_policy.apply_grad_on_fp32_main_grad:
+            if not self.apply_grad_on_fp32_main_grad:
                 self.sharded_param.grad = self.to_sharded_dtensor(reduced_grad)
             else:
                 self.sharded_param.main_grad = self.to_sharded_dtensor(reduced_grad)
                 self.sharded_param.grad = None
         else:
-            if not self.mp_policy.apply_grad_on_fp32_main_grad:
+            if not self.apply_grad_on_fp32_main_grad:
                 self.sharded_param.grad._local_tensor += reduced_grad
             else:
                 self.sharded_param.main_grad._local_tensor += reduced_grad
@@ -664,8 +664,10 @@ class HSDPParamV2:
         self.reduce_dtype = None
 
     def init_dtype_attrs(self, mp_policy: MixedPrecisionPolicy) -> None:
-        """Initialize param_dtype and reduce_dtype from the mixed precision policy."""
-        param_dtype, reduce_dtype = (mp_policy.param_dtype, mp_policy.reduce_dtype)
+        """Initialize dtype attributes, applying source-parameter overrides before policy defaults."""
+        custom_dtypes = (mp_policy.custom_params or {}).get(self._src_parameter_id, {})
+        param_dtype = custom_dtypes.get("param_dtype", mp_policy.param_dtype)
+        reduce_dtype = custom_dtypes.get("reduce_dtype", mp_policy.reduce_dtype)
         self.orig_dtype = self.sharded_param.dtype
         if reduce_dtype == param_dtype:
             reduce_dtype = None
@@ -673,6 +675,7 @@ class HSDPParamV2:
             param_dtype = None
         self.param_dtype = param_dtype
         self.reduce_dtype = reduce_dtype
+        self.apply_grad_on_fp32_main_grad = mp_policy.apply_grad_on_fp32_main_grad
 
     def init_unsharded_param_buffers(
         self,

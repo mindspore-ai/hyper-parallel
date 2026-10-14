@@ -68,7 +68,7 @@ def _new_param():
     )
     hsdp_param._unsharded_param = SimpleNamespace(grad=None)
     hsdp_param.unsharded_accumulated_grad = None
-    hsdp_param.mp_policy = MixedPrecisionPolicy()
+    hsdp_param.apply_grad_on_fp32_main_grad = False
     hsdp_param.orig_dtype = torch.float32
     hsdp_param.reduce_dtype = None
     hsdp_param.gradient_scaling_factor = None
@@ -442,7 +442,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
     def test_apply_reduced_grad_uses_main_grad(self):
         """Reduced gradients should accumulate into fp32 main grad when enabled."""
         hsdp_param = _new_param()
-        hsdp_param.mp_policy = MixedPrecisionPolicy(apply_grad_on_fp32_main_grad=True)
+        hsdp_param.apply_grad_on_fp32_main_grad = True
         hsdp_param.sharded_param.main_grad = SimpleNamespace(_local_tensor=torch.ones(2))
         hsdp_param.to_sharded_dtensor = MagicMock(
             side_effect=lambda tensor: SimpleNamespace(_local_tensor=tensor.clone())

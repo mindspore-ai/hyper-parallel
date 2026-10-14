@@ -29,11 +29,12 @@ import torch
 
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
-from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, DDPMeshInfo, HSDPMeshInfo
+from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, DDPMeshInfo, HSDPMeshInfo, MixedPrecisionPolicy
 from hyper_parallel.core.fully_shard.api import HSDPModule, _extend_module_with_hsdp_interface
 from hyper_parallel.core.fully_shard import hsdp_state as state_mod
 from hyper_parallel.core.fully_shard.param_group import AllReduceParamGroup
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPStateV2, _to_dtype_if_needed
+from tests.common.mark_utils import arg_mark
 
 
 class _FakeGroup:
@@ -346,16 +347,22 @@ class TestHSDPStateV2(unittest.TestCase):
         self.assertFalse(state.requires_all_reduce)
         self.assertFalse(state.param_group.requires_all_reduce)
 
-    def test_init_mp_dtypes_initializes_each_param_independently(self):
-        """Mixed-precision dtype init should not require state-wide uniform dtypes."""
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_init_mp_dtypes_initializes_each_param_independently(self) -> None:
+        """Feature: Shared precision policy initialization.
+        Description: Initialize two parameters independently from their state's policy.
+        Expectation: Each parameter receives the state policy without state-wide dtype constraints.
+        """
         first = _FakeHSDPParam()
         second = _FakeHSDPParam()
         state = _new_state([first, second])
+        state.mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
         HSDPStateV2._init_mp_dtypes(state)
 
-        first.init_dtype_attrs.assert_called_once_with(None)
-        second.init_dtype_attrs.assert_called_once_with(None)
+        first.init_dtype_attrs.assert_called_once_with(state.mp_policy)
+        second.init_dtype_attrs.assert_called_once_with(state.mp_policy)
         self.assertFalse(hasattr(state, "_orig_dtype"))
         self.assertFalse(hasattr(state, "_reduce_dtype"))
 
