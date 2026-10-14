@@ -17,7 +17,7 @@
 # ============================================================================
 """HSDP parameter"""
 # pylint: disable=W0212
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, List, Optional, cast
 
 import torch
@@ -140,7 +140,7 @@ class HSDPParamV2:
         offload_policy: Optional[OffloadPolicy] = None,
         device: Optional[torch.device] = None,
         source_shard_info: Optional[SourceShardMetaInfo] = None,
-    ):
+    ) -> None:
         """
         Initialize HSDPParamV2 and shard the parameter.
 
@@ -163,7 +163,7 @@ class HSDPParamV2:
         """
         self._module_info: ParamModuleInfo = module_info
         self.mesh_info = mesh_info
-        self.mp_policy = mp_policy
+        self.mp_policy = mp_policy if mp_policy is not None else MixedPrecisionPolicy()
         self.device = device
         self.orig_dtype = None
         self.param_dtype = None
@@ -197,6 +197,9 @@ class HSDPParamV2:
         self._spmd_shard_mesh_dim = self.mesh_info.shard_mesh_dim
         self._spmd_replicate_mesh_dim = self.mesh_info.replicate_mesh_dim
         self._init_sharded_param(param, shard_placement_fn)
+        # Resolve weak-keyed overrides while the original Parameter is still
+        # alive; lazy initialization later refreshes only the stored dtype.
+        self.init_dtype_attrs(self.mp_policy, param)
         self.unsharded_accumulated_grad = None
         self._param_fqn: Optional[str] = None
         self.unsharded_param_buffers: List[torch.Tensor] = []
@@ -663,9 +666,35 @@ class HSDPParamV2:
         self.param_dtype = None
         self.reduce_dtype = None
 
-    def init_dtype_attrs(self, mp_policy: MixedPrecisionPolicy) -> None:
-        """Initialize param_dtype and reduce_dtype from the mixed precision policy."""
-        param_dtype, reduce_dtype = (mp_policy.param_dtype, mp_policy.reduce_dtype)
+    def init_dtype_attrs(
+        self,
+        mp_policy: MixedPrecisionPolicy,
+        original_param: Optional[nn.Parameter] = None,
+    ) -> None:
+        """Resolve the parameter's precision policy and refresh effective dtype attributes.
+
+        Args:
+            mp_policy: Policy whose defaults apply to fields without overrides.
+                Later refreshes pass this parameter's resolved ``mp_policy``.
+            original_param: Original Parameter used to resolve weak-keyed overrides
+                during construction. It is not retained by the parameter state.
+
+        Note:
+            Overrides are resolved before the original Parameter can be released.
+            Its effective policy retains the requested dtypes, so meta materialization
+            or storage conversion can normalize casts again without an override cache.
+        """
+        if original_param is not None and mp_policy.custom_params is not None:
+            custom_dtypes = mp_policy.custom_params.get(original_param)
+            if custom_dtypes:
+                mp_policy = replace(
+                    mp_policy,
+                    param_dtype=custom_dtypes.get("param_dtype", mp_policy.param_dtype),
+                    reduce_dtype=custom_dtypes.get("reduce_dtype", mp_policy.reduce_dtype),
+                    custom_params=None,
+                )
+        self.mp_policy = mp_policy
+        param_dtype, reduce_dtype = mp_policy.param_dtype, mp_policy.reduce_dtype
         self.orig_dtype = self.sharded_param.dtype
         if reduce_dtype == param_dtype:
             reduce_dtype = None
