@@ -26,9 +26,14 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 
 
+from tests.common.shmem_loader_evidence import capture_loader_snapshot
+
+capture_loader_snapshot("before_framework_imports")
+
 # The launcher activates CANN and the multicore payload before importing this
 # worker. Framework imports stay out of the ``test_mega_moe.py`` launcher.
-# pylint: disable=wrong-import-position
+# The passive snapshot must precede framework imports to observe their loading effects.
+# pylint: disable=wrong-import-position,wrong-import-order
 import torch
 import torch.distributed as dist
 import torch_npu
@@ -39,7 +44,7 @@ from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.components.modules.moe import GroupedExperts
 
-# pylint: enable=wrong-import-position
+# pylint: enable=wrong-import-position,wrong-import-order
 
 _RTOL = 2e-2
 _ATOL = 2e-3
@@ -96,6 +101,7 @@ def _init_dist() -> tuple[int, torch.device]:
 
 
 RANK, DEVICE = _init_dist()
+capture_loader_snapshot("after_hccl_init")
 
 
 def make_balanced_route(
@@ -274,10 +280,17 @@ def forward_layer(
 ) -> torch.Tensor:
     """Run either backend with the same route and weight expert outputs once."""
     if isinstance(layer, MegaMoeExperts):
-        return layer(
-            hidden_states, topk_ids, topk_weights,
-            tokens_per_expert=tokens_per_expert,
-        )
+        capture_loader_snapshot("before_first_mega_moe")
+        try:
+            output = layer(
+                hidden_states, topk_ids, topk_weights,
+                tokens_per_expert=tokens_per_expert,
+            )
+        except Exception:
+            capture_loader_snapshot("mega_moe_exception")
+            raise
+        capture_loader_snapshot("after_first_mega_moe")
+        return output
     if tokens_per_expert is None:
         tokens_per_expert = torch.bincount(
             topk_ids.reshape(-1).to(torch.int64), minlength=layer.num_experts,
@@ -540,7 +553,10 @@ def _run_precision_case() -> None:
 
 def test_mega_moe_level0_balanced() -> None:
     """Compare routed-expert training results with the reference implementation."""
-    _run_precision_case()
+    try:
+        _run_precision_case()
+    finally:
+        capture_loader_snapshot("precision_end")
 
 
 def performance_shape() -> MoeShape:
