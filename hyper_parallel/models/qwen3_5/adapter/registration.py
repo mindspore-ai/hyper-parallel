@@ -29,6 +29,12 @@ def _load_context_parallel():
     return context_parallel
 
 
+def _load_loss():
+    """Load the optional text-only output-loss adapter lazily."""
+    from hyper_parallel.models.qwen3_5.adapter import chunk_loss  # pylint: disable=C0415
+    return chunk_loss
+
+
 QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5ForConditionalGeneration",
     model_type="qwen3_5",
@@ -39,6 +45,7 @@ QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
 QWEN3_5_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5ForCausalLM",
     model_type="qwen3_5_text",
+    loss=_load_loss,
     context_parallel=_load_context_parallel,
     sharding_rules=build_parameter_sharding_rules,
 )
