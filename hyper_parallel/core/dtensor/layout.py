@@ -316,12 +316,17 @@ class Layout:
         return self._process_alias_layout(obj, alias_tensor_map)
 
     def __deepcopy__(self, memo):
-        """Deep copy layout without rebuilding the underlying device mesh."""
+        """Deep copy layout without rebuilding the underlying device mesh.
+
+        ``_mesh`` is shared by identity: a DeviceMesh is process-wide topology
+        (created once, never mutated in place) and deep-copying it would clone
+        its mesh tensor and process-group bookkeeping on every layout copy.
+        """
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
         for k, v in self.__dict__.items():
-            setattr(result, k, copy.deepcopy(v, memo))
+            setattr(result, k, v if k == "_mesh" else copy.deepcopy(v, memo))
         return result
 
     @staticmethod
