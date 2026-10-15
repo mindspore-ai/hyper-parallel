@@ -207,15 +207,19 @@ class SharedCompressedPackedSequence:
     def local_segment_starts(self, device: torch.device) -> torch.Tensor:
         """Return each local query's global packed-sample start position."""
         boundaries = self.cu_seq_lens.to(device=device, dtype=torch.long)
-        if boundaries.ndim != 1 or boundaries.numel() < 2 or int(boundaries[0]) != 0:
-            raise ValueError("packed cu_seq_lens must be one-dimensional and start with zero")
-        if int(boundaries[-1]) != self.global_sequence_length:
-            raise ValueError(
-                "packed cu_seq_lens must cover global_sequence_length: "
-                f"{int(boundaries[-1])} versus {self.global_sequence_length}"
-            )
-        if torch.any(boundaries[1:] <= boundaries[:-1]):
-            raise ValueError("packed cu_seq_lens must be strictly increasing")
+        if not hasattr(boundaries, "fake_mode"):
+            # These are pure input validations. Dry-run feeds value-free
+            # FakeTensor boundaries, so their host-side scalar reads are
+            # skipped rather than mocked.
+            if boundaries.ndim != 1 or boundaries.numel() < 2 or int(boundaries[0]) != 0:
+                raise ValueError("packed cu_seq_lens must be one-dimensional and start with zero")
+            if int(boundaries[-1]) != self.global_sequence_length:
+                raise ValueError(
+                    "packed cu_seq_lens must cover global_sequence_length: "
+                    f"{int(boundaries[-1])} versus {self.global_sequence_length}"
+                )
+            if torch.any(boundaries[1:] <= boundaries[:-1]):
+                raise ValueError("packed cu_seq_lens must be strictly increasing")
         query_positions = torch.arange(
             self.local_query_start,
             self.local_query_start + self.local_query_length,
@@ -227,6 +231,10 @@ class SharedCompressedPackedSequence:
     def validate_compression_alignment(self, compress_ratio: int) -> None:
         """Reject packed samples whose compressor groups would cross boundaries."""
         if compress_ratio <= 1:
+            return
+        if hasattr(self.cu_seq_lens, "fake_mode"):
+            # Validation-only: the boolean mask index below has a
+            # data-dependent output shape that FakeTensor cannot capture.
             return
         boundaries = self.cu_seq_lens.to(dtype=torch.long)
         misaligned = boundaries[boundaries.remainder(compress_ratio) != 0]
@@ -657,7 +665,11 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                 selected = topk_indices[:, start:end]
                 valid = selected >= 0
                 valid_rows = valid.any(dim=-1)
-                if not torch.any(valid_rows):
+                if not hasattr(valid_rows, "fake_mode") and not torch.any(valid_rows):
+                    # Dry-run replays value-free Top-K indices; the "all rows
+                    # invalid" short-circuit is the only host-visible branch
+                    # and is skipped so every chunk keeps its representative
+                    # activation and saved-tensor footprint.
                     continue
                 safe_indices = selected.clamp_min(0).long()
                 batch_indices = torch.arange(batch_size, device=index_query.device).view(-1, 1, 1)
@@ -695,7 +707,12 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                 log_prediction = index_scores.log_softmax(dim=-1)
                 target_log = target.clamp_min(torch.finfo(torch.float32).tiny).log()
                 row_loss = (target * (target_log - log_prediction)).sum(dim=-1)
-                total_loss.add_(row_loss[valid_rows].sum() * (loss_coeff / denominator))
+                if hasattr(valid_rows, "fake_mode"):
+                    # Value-free Top-K replay keeps every row valid, so the
+                    # boolean gather reduces to the full row tensor.
+                    total_loss.add_(row_loss.sum() * (loss_coeff / denominator))
+                else:
+                    total_loss.add_(row_loss[valid_rows].sum() * (loss_coeff / denominator))
 
                 grad_scores = (log_prediction.exp() - target) * (loss_coeff / denominator)
                 grad_scores.masked_fill_(~valid, 0.0)
@@ -1233,7 +1250,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 f"compress_ratio={compress_ratio}, got {sequence_length}"
             )
         query_offset = cp_context.rank * sequence_length
-        if not torch.all(position_ids[..., 0] == query_offset):
+        if not hasattr(position_ids, "fake_mode") and not torch.all(position_ids[..., 0] == query_offset):
             raise ValueError(
                 "shared compressed attention CP requires contiguous global position_ids; "
                 f"rank {cp_context.rank} expected first position {query_offset}"

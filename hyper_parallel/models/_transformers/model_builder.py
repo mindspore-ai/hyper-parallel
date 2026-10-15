@@ -25,6 +25,9 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 
 import fnmatch
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterator
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
@@ -69,6 +72,23 @@ from hyper_parallel.models.registry import _resolve_custom_model_cls, get_model_
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
 
 logger = logging.getLogger(__name__)
+
+_DEFER_MODEL_MATERIALIZATION: ContextVar[bool] = ContextVar("defer_model_materialization", default=False)
+
+
+@contextmanager
+def model_build_context() -> Iterator[None]:
+    """Build and parallelize a model without materializing or loading its weights."""
+    token = _DEFER_MODEL_MATERIALIZATION.set(True)
+    try:
+        yield
+    finally:
+        _DEFER_MODEL_MATERIALIZATION.reset(token)
+
+
+def is_model_materialization_deferred() -> bool:
+    """Report whether the current model build is shape-only."""
+    return _DEFER_MODEL_MATERIALIZATION.get()
 
 
 def instantiate_infrastructure(
@@ -548,6 +568,8 @@ def _materialize_and_load_model(
     weights_mapping: Any,
 ) -> nn.Module:
     """Materialize model storage and load or initialize meta-device weights."""
+    if is_model_materialization_deferred():
+        return model
     model = _move_model_to_device(model, is_meta_device, device)
     if not is_meta_device:
         return model

@@ -1,0 +1,138 @@
+# Supply local model, Engram asset, tokenizer and data paths via CLI overrides.
+model:
+  _target_: examples.dryrun.deepseek_v41.build_text_model
+  config_path: /path/to/DeepSeek-V4.1-Flash
+  engram_assets_path: /path/to/engram.json
+  torch_dtype: bfloat16
+  text_parameter_divisor: 1
+  num_routed_experts: 384
+  loss_chunks: 8
+  recompute_tier: all
+  validate_placement: false
+model_init_dtype: float32
+training: {train_iters: 1, global_batch_size: 16, micro_batch_size: 1,
+           backend: hccl, init_device: meta, loss_aggregation: token_weighted,
+           max_grad_norm: 1.0, seed: 42}
+accelerator: {tp_size: 2, cp_size: 4, ep_size: 128, pp_size: 1,
+              sequence_parallel: false, loss_parallel: false}
+fsdp_config:
+  dp_shard_size: 64
+  edp_shard_size: 1
+  mix_precision: {param_dtype: bfloat16, reduce_dtype: float32, cast_forward_inputs: false}
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 0
+  backward_prefetch_depth: 0
+  comm_fusion: false
+plan_overrides:
+  - match: [model.layers.*.attn_hc, model.layers.*.ffn_hc]
+    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection
+    replace_module:
+      _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+  - match: model.layers.*.engram
+    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Engram
+    replace_module:
+      _target_: hyper_parallel.components.modules.engram.EngramModule
+  - match: model.layers.*.self_attn
+    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
+    replace_module:
+      _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+  - match: '*.self_attn'
+    tp_divide_attrs: [num_groups]
+  - match: '*.self_attn'
+    region_dispatch: false
+    inner_target: self
+    inner_wrapper:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
+  - match: model.layers.*.*_hc
+    region_dispatch: false
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+    in_src:
+      hidden_streams: {tp: replicate, cp: 'shard(1)', ep: replicate}
+    in_dst:
+      hidden_streams: {tp: replicate, cp: 'shard(1)', ep: replicate}
+    out_src:
+      pre: {tp: replicate, cp: 'shard(1)', ep: replicate}
+      post: {tp: replicate, cp: 'shard(1)', ep: replicate}
+      residual: {tp: replicate, cp: 'shard(1)', ep: replicate}
+    out_dst:
+      pre: {tp: replicate, cp: 'shard(1)', ep: replicate}
+      post: {tp: replicate, cp: 'shard(1)', ep: replicate}
+      residual: {tp: replicate, cp: 'shard(1)', ep: replicate}
+  - match: model.layers.*.engram
+    params:
+      q_weight: {tp: replicate}
+      k_weight: {tp: replicate}
+      embed.weight: {ep: 'shard(0)'}
+      wkv.weight: {tp: replicate}
+  - match: model.layers.*.engram
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
+  - match: '*.mlp'
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+      use_grouped_gemm: false
+activation_checkpoint:
+  mode: selective
+  selection: {source: model_adapter_safe_regions, layer_count: 40}
+dataset:
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_path: /path/to/online_4k.jsonl
+  data_config: {create_attention_mask_in_dataloader: true, labels_are_shifted: true}
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /path/to/DeepSeek-V4.1-Flash
+      local_files_only: true
+      use_fast: true
+      trust_remote_code: false
+  data_transform:
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 4096
+dataloader:
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
+  min_buffered_samples: 1
+  collate_fn: {_target_: hyper_parallel.data.batching.build_online_text_collate_fn}
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    attention_mode: compressed
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
+      include_position_ids: false
+      include_image_sequence_start: false
+  sampler_type: single
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  fp32_main_params: true
+  no_decay_params: [bias, norm, ln_]
+  muon_config: {muon_lr: 3.0e-05, muon_weight_decay: 0.0, muon_momentum: 0.95,
+                muon_nesterov: true, muon_ns_steps: 5, muon_ns_variant: asym5}
+  adamw_config: {adamw_lr: 1.0e-05, adamw_weight_decay: 0.01,
+                 adamw_betas: [0.9, 0.999], adamw_eps: 1.0e-08}
+checkpoint: {save_ckpt: false, checkpoint_dir: outputs/dryrun/deepseek_v41/checkpoints}
+dry_run:
+  enabled: true
+  target_device: npu
+  virtual_world_size: 128
+  output_dir: outputs/dryrun/deepseek_v41
+  value_dependencies:
+    rules:
+      - {match: '*.mlp', handler: moe_routing, path: balanced, inputs: {}}
+      - {match: deepseek_v41, handler: deepseek_v41, path: balanced, inputs: {}}

@@ -36,6 +36,7 @@ from hyper_parallel.models._transformers.model_builder import (
     _init_model,
     apply_model_infrastructure,
     instantiate_infrastructure,
+    is_model_materialization_deferred,
 )
 from hyper_parallel.models._transformers.config_resolver import get_hf_config, get_is_hf_model
 from hyper_parallel.distributed.mesh import DistributedSetup
@@ -437,6 +438,7 @@ class _BaseHyperAutoModelClass:
         # across versions (hence the ImportError fallback).
         # pylint: disable=import-outside-toplevel
         from contextlib import nullcontext
+        from torch._subclasses.fake_tensor import unset_fake_temporarily  # pylint: disable=forbidden-backend-import
         from transformers.modeling_utils import ContextManagers
         try:
             from transformers.modeling_utils import no_init_weights
@@ -448,12 +450,16 @@ class _BaseHyperAutoModelClass:
         # Step 1: Determine meta device (inline world-size probe: auto_models
         # must not import the trainer runtime).
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        deferred = is_model_materialization_deferred()
         is_meta_device = (
-            world_size > 1 or not is_hf_model
+            world_size > 1 or not is_hf_model or deferred
         ) and kwargs.get("quantization_config") is None
 
         init_ctx = (
-            ContextManagers([no_init_weights(), init_empty_weights()])
+            ContextManagers(
+                ([unset_fake_temporarily()] if deferred else []) +
+                [no_init_weights(), init_empty_weights()]
+            )
             if is_meta_device
             else nullcontext()
         )
