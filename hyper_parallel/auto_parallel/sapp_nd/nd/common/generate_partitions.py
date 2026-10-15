@@ -14,6 +14,11 @@
 # ============================================================================
 """generate pipeline partitions"""
 from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_order import (
+    get_model_order,
+    layer_recompute_types,
+    stated_recompute,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
 
@@ -36,6 +41,14 @@ class PartitionGenerator(_CostModVar):
                 combined_stages += [combined_chunks]
             combined += [combined_stages]
         return combined
+
+    def __place_recompute_ranges(self, partitions):
+        """Give each layer the option its recompute range states, in model order."""
+        options = layer_recompute_types(stated_recompute(self), self.n_lay + self.n_mtp)
+        for index, (stage_id, chunk_id, lay_id) in enumerate(get_model_order(self, partitions)):
+            partitions[stage_id][chunk_id][lay_id] = (
+                options[index] if index < len(options) else LayerType.NOT_REC_LAYER
+            )
 
     def generate_partitions_vpp(self):
         """infer layers arrangement"""
@@ -248,6 +261,8 @@ class PartitionGenerator(_CostModVar):
                 lay -= num_assigned
 
         partitions = self.insert_emb_out_partitions(partitions)
+        if stated_recompute(self) is not None:
+            self.__place_recompute_ranges(partitions)
         return partitions
 
     def insert_emb_out_partitions(self, partitions):

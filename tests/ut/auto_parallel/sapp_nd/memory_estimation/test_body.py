@@ -33,8 +33,14 @@ import unittest
 from unittest.mock import MagicMock, PropertyMock
 
 
+from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalFFn, EvalAttn, EvalNorm
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import (
+    HYPER_SELECTIVE_REC_OP, derive_comm_flags, derive_expert_degrees, derive_optimizer_sharding,
+)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
 
 def _make_ccfg(
@@ -65,9 +71,10 @@ def _make_ccfg(
     ccfg.ep = ep
     ccfg.etp = etp
     ccfg.n_ffMM = 1
-    ccfg.n_ffBMM = 0
     ccfg.bytes_p = bytes_p
     ccfg.bytes_os = bytes_os
+    # AdamW's two states and no copy of the parameters, as derive gives them.
+    ccfg.bytes_optim = 2 * bytes_os
     ccfg.bytes_grad = bytes_grad
     ccfg.shard_p_os_non_exp_partial = shard_p_os_non_exp_partial
     ccfg.shard_p_os_exp = shard_p_os_exp
@@ -75,11 +82,14 @@ def _make_ccfg(
     ccfg.shard_grad_non_exp = shard_grad_non_exp
     ccfg.shard_grad_exp = shard_grad_exp
     ccfg.shard_grad_exp_partial = shard_grad_exp_partial
+    # No bias or norm stated: the parameter formulas count their own.
+    for name in ("qkv_bias", "o_bias", "mlp_bias", "norm_bias", "layer_norms", "shared_expert_gate"):
+        setattr(ccfg, name, None)
     return ccfg
 
 
 def _make_ctx(ccfg, attn_p=100.0, norm_p=50.0, ffn_p=200.0,
-              routed_p=300.0, shared_p=100.0, swap_os=False):
+              routed_p=300.0, shared_p=100.0, swap_os=False, router_p=0.0):
     """Create a mock Context for body tests.
 
     The ctx.eval.num_p(ccfg, ctx) must return the 3-tuple that
@@ -99,6 +109,7 @@ def _make_ctx(ccfg, attn_p=100.0, norm_p=50.0, ffn_p=200.0,
     ctx.ffn_shared_num_p = EvalFFn.num_params_shared_expert if shared_p == "real" else (
         lambda c, x: shared_p
     )
+    ctx.ffn_router_num_p = EvalFFn.num_params_router if router_p == "real" else (lambda c, x: router_p)
 
     # ctx.eval.num_p returns the tuple from EvalBody.num_params_layer
     ctx.eval = MagicMock()
@@ -130,6 +141,13 @@ class TestNumParamsLayer(unittest.TestCase):
         self.assertAlmostEqual(non_exp, 150.0)  # 100 + 50, no dense FFN
         self.assertAlmostEqual(routed, 300.0)
         self.assertAlmostEqual(shared, 100.0)
+
+    def test_a_moe_layers_router_is_a_non_expert_part(self):
+        """BD-N02b: a MoE layer's router, a weight per expert over the hidden width, is among its non-expert parts."""
+        ccfg = _make_ccfg(n_exp=8, n_shared_exp=1, h=4096)
+        ctx = _make_ctx(ccfg, attn_p=100.0, norm_p=50.0, routed_p=300.0, shared_p=100.0, router_p="real")
+        non_exp, routed, shared = EvalBody.num_params_layer(ccfg, ctx)
+        self.assertEqual((non_exp, routed, shared), (150.0 + 4096 * 8, 300.0, 100.0))
 
     def test_moe_no_shared_expert(self):
         """BD-N03: MoE without shared expert returns shared=0."""
@@ -298,6 +316,32 @@ class TestStatGradLayer(unittest.TestCase):
         self.assertAlmostEqual(result, expected, places=4)
 
 
+class TestReducedGradLayer(unittest.TestCase):
+    """Test EvalBody.reduced_grad_layer, the gradients FSDP reduce-scatters."""
+
+    def test_fsdp_reduces_what_it_shards(self):
+        """BD-G04: whole and sharded gradients of the parts a data-parallel rank shards.
+
+        Experts under EP 4 kept whole on each rank (no expert shard) are not
+        reduce-scattered; the other parts, sharded over 4, are.
+        """
+        ccfg = _make_ccfg(
+            n_exp=8,
+            n_shared_exp=1,
+            ep=4,
+            bytes_grad=2,
+            shard_grad_non_exp=4.0,
+            shard_grad_exp=1.0,
+            shard_grad_exp_partial=4.0,
+        )
+        ccfg.t, ccfg.t_exp = 1, 1
+        ctx = _make_ctx(ccfg, attn_p=100.0, norm_p=50.0, routed_p=400.0, shared_p=200.0)
+        whole, sharded = EvalBody.reduced_grad_layer(ccfg, ctx)
+        # non_exp: 150 * 2 whole, / 4 sharded; shared: 200 * 2 whole, / 4 sharded
+        self.assertAlmostEqual(whole, (150.0 + 200.0) * 2, places=4)
+        self.assertAlmostEqual(sharded, (150.0 + 200.0) * 2 / 4, places=4)
+
+
 class TestNumParamsRoutedExpert(unittest.TestCase):
     """Test EvalFFn.num_params_routed_expert with ETP correction."""
 
@@ -305,7 +349,7 @@ class TestNumParamsRoutedExpert(unittest.TestCase):
         """BD-R01: routed expert params with etp=1 (no TP slicing)."""
         ccfg = _make_ccfg(n_exp=8, h=4096, hff_exp=2048, etp=1)
         result = EvalFFn.num_params_routed_expert(ccfg, None)
-        # n_exp * max(n_ffMM, n_ffBMM) * (hff_exp * h + hff_exp) = 8 * 1 * (2048*4096 + 2048)
+        # n_exp * n_ffMM * (hff_exp * h + hff_exp) = 8 * 1 * (2048*4096 + 2048)
         expected = 8 * 1 * (2048 * 4096 + 2048)
         self.assertAlmostEqual(result, expected, places=0)
 
@@ -327,21 +371,18 @@ class TestNumParamsRoutedExpert(unittest.TestCase):
 
 
 class TestNumParamsSharedExpert(unittest.TestCase):
-    """Test EvalFFn.num_params_shared_expert uses hff (not hff_exp)."""
+    """Test EvalFFn.num_params_shared_expert prices each shared expert at the routed width."""
 
-    def test_shared_uses_hff_not_hff_exp(self):
-        """BD-S01: shared expert uses ccfg.hff, NOT ccfg.hff_exp.
+    def test_shared_uses_hff_exp_not_hff(self):
+        """BD-S01: each shared expert is hff_exp wide, whatever the dense layers' hff.
 
-        DeepSeek-V3 has hff_exp=2048 (routed) but hff=18432 (shared).
-        Using hff_exp for shared would severely underestimate.
+        DeepSeek-V3's dense layers are 18432 wide and its one shared expert
+        2048, as wide as a routed one; Qwen2-57B-A14B states its 20480 wide
+        shared expert as eight of 2560.
         """
         ccfg = _make_ccfg(n_exp=256, n_shared_exp=1, h=7168, hff=18432, hff_exp=2048)
         result = EvalFFn.num_params_shared_expert(ccfg, None)
-        # Should use hff=18432, not hff_exp=2048
-        expected_with_hff = 1 * 1 * (18432 * 7168 + 18432)
-        wrong_with_hff_exp = 1 * 1 * (2048 * 7168 + 2048)
-        self.assertAlmostEqual(result, expected_with_hff, places=0)
-        self.assertNotAlmostEqual(result, wrong_with_hff_exp, places=0)
+        self.assertAlmostEqual(result, 1 * 1 * (2048 * 7168 + 2048), places=0)
 
     def test_shared_no_etp(self):
         """BD-S02: shared expert is NOT affected by etp (no TP slicing)."""
@@ -389,6 +430,91 @@ class TestLayerActiv(unittest.TestCase):
         result = EvalBody.layer_activ(ccfg, ctx)
         expected = (10 + 20 + 30) + 200 + 5
         self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestCensusActiv(unittest.TestCase):
+    """Test EvalBody.layer_activ on a layer whose kind has a census record."""
+
+    RECORD = KindActivations(saved=100.0, saved_tp=300.0, working=150.0, working_tp=330.0, seq_length=4096)
+
+    @staticmethod
+    def _ccfg(record, sp=2, cp=1):
+        """A MoE layer at TP 2, micro-batch 2 of 4096 tokens, priced with *record*."""
+        ccfg = _make_ccfg(n_exp=8)
+        ccfg.kind_activations = record
+        ccfg.s, ccfg.b, ccfg.t, ccfg.sp, ccfg.cp = 4096, 2, 2, sp, cp
+        return ccfg
+
+    @staticmethod
+    def _ctx(node=LayerType.NOT_REC_LAYER):
+        """A layer of *node* at micro factor 3, between its passes."""
+        ctx = MagicMock()
+        ctx.current_node, ctx.micro_factor = node, 3
+        ctx.working_set, ctx.working_on_saved = 0, False
+        return ctx
+
+    def test_a_layer_keeps_what_its_census_states(self):
+        """
+        Feature: EvalBody.census_activ, between a layer's passes.
+        Description: The layer with sequence parallelism, without it, and
+            at CP 2.
+        Expectation: The census's bytes per token for the micro-batches in
+            flight: TP splits one part, sequence parallelism the other, and
+            CP the tokens.
+        """
+        tokens = 3 * 4096 * 2
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(self.RECORD), self._ctx()), tokens * (50 + 150))
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(self.RECORD, sp=1), self._ctx()), tokens * (100 + 150))
+        self.assertEqual(EvalBody.layer_activ(self._ccfg(self.RECORD, cp=2), self._ctx()), tokens / 2 * (50 + 150))
+
+    def test_gathered_keys_and_values_stay_whole(self):
+        """
+        Feature: EvalBody.census_activ under context parallelism.
+        Description: The layer at CP 2 under colossalai CP, with 2 key heads
+            64 wide.
+        Expectation: A census counts a rank's share of the sequence;
+            colossalai CP keeps the other half's keys and values too, split
+            over TP.
+        """
+        ccfg = self._ccfg(self.RECORD, cp=2)
+        ccfg.cp_algo, ccfg.n_linrec, ccfg.n_kv, ccfg.dh, ccfg.bytes_compute = "colossalai_cp", 0, 2, 64, 2
+        kept = 100 / 2 + 300 / 2 + 2 * 2 * 64 * 2 / 2
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx()), 3 * 4096 * 2 / 2 * kept)
+
+    def test_a_selective_layer_keeps_what_hyperparallels_policy_saves(self):
+        """
+        Feature: EvalBody.census_activ for a selective layer.
+        Description: A selective layer whose kind's record states what it
+            keeps under HyperParallel's selective checkpointing, with that
+            policy's switches.
+        Expectation: The record's selective bytes, split as the rest.
+        """
+        ccfg = self._ccfg(KindActivations(100.0, 300.0, 150.0, 330.0, 4096, selective=20.0, selective_tp=60.0))
+        ccfg.rec_op = Config(dict(HYPER_SELECTIVE_REC_OP))
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(LayerType.SEL_REC_LAYER)), 3 * 4096 * 2 * (10 + 30))
+
+    # A record per op: the ops' bytes sum to what the plain layer keeps.
+    BY_OP = KindActivations(100.0, 300.0, 150.0, 330.0, 4096,
+                            ops={"attMM": 40.0, "normOp": 30.0, "other": 30.0},
+                            ops_tp={"attMM": 100.0, "attBMM": 60.0, "normOp": 80.0, "ffAct": 60.0})
+
+    @staticmethod
+    def _switches(**recompute):
+        """Every switch keeping its op, but those *recompute* sets."""
+        return Config(dict(dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1), **recompute))
+
+    def test_a_selective_layer_keeps_the_ops_its_switches_keep(self):
+        """
+        Feature: EvalBody.census_kept, a census's records per op.
+        Description: A selective layer of a kind whose record states what
+            it keeps for each op, recomputing the norms and the activation.
+        Expectation: What the record states for the ops the switches keep,
+            split as the plain layer's, the ops no switch names and the
+            census's other always kept.
+        """
+        ccfg = self._ccfg(self.BY_OP)
+        ccfg.rec_op = self._switches(normOp=0, ffAct=0)
+        self.assertEqual(EvalBody.layer_activ(ccfg, self._ctx(LayerType.SEL_REC_LAYER)), 3 * 4096 * 2 * (35 + 80))
 
 
 class TestFullrecLayerActiv(unittest.TestCase):
@@ -521,7 +647,7 @@ class TestActCpLayer(unittest.TestCase):
     """Test EvalBody.act_cp_layer (CP activation memory breakdown)."""
 
     def _make_ccfg_cp(self, a=32, t=1, cp=2, s=1024, b=4,
-                       kv_lora_rank=0, n_kv=32, dh=128,
+                       dc_kv=0, n_kv=32, dh=128, dhr=0,
                        cp_algo="colossalai_cp", device_per_node=8,
                        h=4096):
         """Create a mock CostModelConfig for CP activation tests."""
@@ -531,9 +657,10 @@ class TestActCpLayer(unittest.TestCase):
         ccfg.cp = cp
         ccfg.s = s
         ccfg.b = b
-        ccfg.kv_lora_rank = kv_lora_rank
+        ccfg.dc_kv = dc_kv
         ccfg.n_kv = n_kv
         ccfg.dh = dh
+        ccfg.dhr = dhr
         ccfg.h = h
         ccfg.cp_algo = cp_algo
         ccfg.device_per_node = device_per_node
@@ -593,18 +720,21 @@ class TestActCpLayer(unittest.TestCase):
         with self.assertRaises(ValueError):
             EvalBody.act_cp_layer(ccfg, ctx)
 
-    def test_mla_uses_kv_lora_rank(self):
-        """BD-CP07: MLA (kv_lora_rank > 0) uses kv_lora_rank for kv_dim."""
-        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, kv_lora_rank=512,
-                                   n_kv=32, dh=128, cp_algo="colossalai_cp")
+    def test_mla_keeps_every_heads_keys_and_values(self):
+        """BD-CP07: MLA (dc_kv > 0) keeps its heads' K and V, not the latent.
+
+        Each head's key is 128 wide plus the 64-wide rotary part and its
+        value 128 wide, so each of K and V is 32 * (2 * 128 + 64) / 2 wide.
+        """
+        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, dc_kv=512, n_kv=32, dh=128, dhr=64,
+                                   cp_algo="colossalai_cp")
         ctx = self._make_ctx_cp()
         result = EvalBody.act_cp_layer(ccfg, ctx)
-        # kv_dim = kv_lora_rank = 512 for MLA
-        self.assertGreater(result.kv_cache_memory, 0)
+        self.assertEqual(result.kv_cache_memory, 2 * 2 * (1024 / 2) * 4 * 32 * (2 * 128 + 64) / 2)
 
     def test_gqa_kv_dim(self):
         """BD-CP08: GQA (n_kv < a) uses n_kv * dh / t for kv_dim."""
-        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, kv_lora_rank=0,
+        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, dc_kv=0,
                                    n_kv=8, dh=128, cp_algo="colossalai_cp")
         ctx = self._make_ctx_cp()
         result = EvalBody.act_cp_layer(ccfg, ctx)
@@ -613,7 +743,7 @@ class TestActCpLayer(unittest.TestCase):
 
 
 class TestConfigOptimizerShard(unittest.TestCase):
-    """Test config_optimizer_shard has_op guard on shard_p_os_exp.
+    """Test derive_optimizer_sharding's has_op guard on shard_p_os_exp.
 
     Verifies that when has_op=False, d_exp is NOT used as a sharding factor
     for expert optimizer state, preventing memory underestimation.
@@ -622,26 +752,39 @@ class TestConfigOptimizerShard(unittest.TestCase):
     @staticmethod
     def _make_parser_ccfg(
         n_exp=8, d_exp=4, cp=1, t_exp=1, ep=2,
-        has_op=True, has_grad_shard=True, os_max_shard=1,
+        has_op=True, has_grad_shard=True, os_max_shard=1, d=4, t=1,
+        edp_group=None,
     ):
-        """Create a mock _CostModVar for parser-level shard tests."""
+        """Create a mock _CostModVar for parser-level shard tests.
+
+        A strategy's config carries the expert data-parallel group the runtime
+        forms.  Left out here, it is the older reconstruction from ``d_exp``,
+        which agrees with the group wherever EP divides DP.
+        """
         from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
         ccfg = MagicMock(spec=_CostModVar)
+        ccfg.d = d
+        ccfg.t = t
         ccfg.n_exp = n_exp
         ccfg.d_exp = d_exp
         ccfg.cp = cp
         ccfg.t_exp = t_exp
         ccfg.ep = ep
+        ccfg.edp_group = d_exp * cp * t_exp if edp_group is None else edp_group
         ccfg.has_op = has_op
         ccfg.has_grad_shard = has_grad_shard
         ccfg.os_max_shard = os_max_shard
+        ccfg.expert_shard = None
+        ccfg.expert_shard_group = False
+        # The legacy schemas' rule, CP sharding parameter state on top of the
+        # optimizer's ranks; HyperParallel's states True (param_cp).
+        ccfg.shard_spans_cp = False
         return ccfg
 
     def test_has_op_true_uses_d_exp(self):
         """BD-H01: has_op=True => shard_p_os_exp = d_exp * cp * t_exp."""
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
         ccfg = self._make_parser_ccfg(d_exp=4, cp=2, t_exp=1, has_op=True)
-        _CostModelParser.config_optimizer_shard(None, ccfg)
+        derive_optimizer_sharding(ccfg)
         expected = 4 * 2 * 1  # d_exp * cp * t_exp
         self.assertEqual(ccfg.shard_p_os_exp, expected)
 
@@ -651,9 +794,8 @@ class TestConfigOptimizerShard(unittest.TestCase):
         Without the guard, d_exp=4 would produce shard_p_os_exp=8, causing
         expert param/OS/grad memory to be underestimated by 4x.
         """
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
         ccfg = self._make_parser_ccfg(d_exp=4, cp=2, t_exp=1, has_op=False)
-        _CostModelParser.config_optimizer_shard(None, ccfg)
+        derive_optimizer_sharding(ccfg)
         expected = 1 * 2 * 1  # (d_exp if has_op else 1) * cp * t_exp
         self.assertEqual(ccfg.shard_p_os_exp, expected)
 
@@ -664,15 +806,66 @@ class TestConfigOptimizerShard(unittest.TestCase):
         Expert:  shard_p_os_exp     = (d_exp if has_op else 1) * cp * t_exp
         Both bypass the DP sharding factor when has_op=False.
         """
-        from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
         ccfg = self._make_parser_ccfg(d_exp=4, cp=2, t_exp=1, has_op=False)
         ccfg.d = 4
         ccfg.t = 1
-        _CostModelParser.config_optimizer_shard(None, ccfg)
+        derive_optimizer_sharding(ccfg)
         # Non-exp: (d if has_op else 1) * cp * t = 1 * 2 * 1 = 2
         # Expert:  (d_exp if has_op else 1) * cp * t_exp = 1 * 2 * 1 = 2
         self.assertEqual(ccfg.shard_p_os_non_exp, 2)
         self.assertEqual(ccfg.shard_p_os_exp, 2)
+
+
+class TestExpertDataParallelGroup(unittest.TestCase):
+    """The ranks that hold the same experts, as the runtime's expert mesh spans them."""
+
+    @staticmethod
+    def _ccfg(d, t, cp, ep, n_exp=8, hff_exp=1408):
+        """A config a strategy has just been laid over."""
+        from hyper_parallel.auto_parallel.sapp_nd.nd.common._cost_model_variables import _CostModVar
+        ccfg = MagicMock(spec=_CostModVar)
+        ccfg.d, ccfg.t, ccfg.cp, ccfg.ep, ccfg.etp = d, t, cp, ep, 0
+        ccfg.n_exp, ccfg.hff_exp = n_exp, hff_exp
+        ccfg.t_exp, ccfg.d_exp, ccfg.edp_group = t, 0, 0
+        return ccfg
+
+    def test_context_parallelism_does_not_change_the_group(self):
+        """CP takes its ranks from DP, so the group a strategy keeps is the same.
+
+        On 64 ranks at EP 16, 4 ranks hold the same experts whatever CP takes,
+        since the runtime spreads its experts over the stage's whole dp * cp *
+        tp domain; the older reconstruction read 0 at CP 8.
+        """
+        got = {}
+        for cp in (1, 2, 4, 8):
+            ccfg = self._ccfg(d=64 // cp, t=1, cp=cp, ep=16)
+            derive_expert_degrees(ccfg)
+            got[cp] = ccfg.edp_group
+        self.assertEqual(got, {1: 4, 2: 4, 4: 4, 8: 4})
+
+    def test_a_stage_narrower_than_its_experts_is_refused(self):
+        """A strategy spreading experts over more ranks than the stage holds."""
+        ccfg = self._ccfg(d=2, t=1, cp=1, ep=16)
+        with self.assertRaises(TypeError):
+            derive_expert_degrees(ccfg)
+
+    def test_context_parallel_ranks_reduce_an_experts_gradient(self):
+        """An expert's gradient is reduced over CP's ranks too (X3).
+
+        On 64 ranks with an optimizer shard: at CP 2, DP 32 and EP 32 leave
+        one DP rank over EP, but the two CP ranks hold the same experts and
+        reduce their gradients, so the expert's DP communication is priced,
+        where it read 0; at CP 1 and EP 64 no other rank holds them; at TP 2
+        without EP the TP ranks hold different slices and reduce nothing.
+        """
+        got = []
+        for d, t, cp, ep in ((32, 1, 2, 32), (64, 1, 1, 64), (1, 2, 1, 1)):
+            ccfg = self._ccfg(d=d, t=t, cp=cp, ep=ep)
+            ccfg.has_op, ccfg.has_grad_shard = True, False
+            derive_expert_degrees(ccfg)
+            derive_comm_flags(ccfg)
+            got.append(ccfg.comm_d_exp)
+        self.assertEqual(got, [2, 0, 0])
 
 
 if __name__ == "__main__":

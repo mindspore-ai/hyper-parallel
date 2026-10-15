@@ -73,6 +73,55 @@ class EvalLayerComm:
         return non_exp + exp
 
     @staticmethod
+    def fsdp_layer_parts(ccfg: CostModelConfig, ctx: Context) -> tuple:
+        """A layer's parameters as FSDP holds them, for :meth:`fsdp_traffic`.
+
+        The non-expert parameters, the routed and the shared experts, each as
+        its count, the ranks the layer computes it over, the ranks that shard
+        it and the ranks that hold it, a shard or a copy.
+        """
+        non_exp, routed, shared = ctx.eval.num_p(ccfg, ctx)
+        return (
+            (non_exp, ccfg.t, ccfg.shard_p_os_non_exp_partial, ccfg.d * ccfg.cp * ccfg.t),
+            (routed / ccfg.ep, ccfg.t_exp, ccfg.shard_p_os_exp, max(1, int(ccfg.edp_group))),
+            (shared, ccfg.t_exp, ccfg.shard_p_os_exp_partial, ccfg.d * ccfg.cp * ccfg.t_exp),
+        )
+
+    @staticmethod
+    def fsdp_traffic(ccfg: CostModelConfig, parts: tuple, gathers: float, reduces: float) -> float:
+        """The bytes a rank moves in one micro-batch for a module FSDP shards.
+
+        Each ring collective over a part's n shards moves (n - 1) / n of the
+        part a rank.  FSDP gathers a part's parameters *gathers* times a
+        micro-batch and reduce-scatters its gradient once, and the ranks
+        holding copies of a shard all-reduce it *reduces* times a micro-batch.
+        """
+        total = 0.0
+        for size, computed, kept, group in parts:
+            whole = size / max(1, computed)
+            shards = max(1.0, kept / max(1, computed))
+            copies = max(1.0, group / max(1, kept))
+            total += (shards - 1) / shards * whole * (gathers * ccfg.bytes_p + ccfg.bytes_grad)
+            total += 2 * (copies - 1) / copies * whole / shards * ccfg.bytes_grad * reduces
+        return total
+
+    @staticmethod
+    def fsdp_reduce_traffic(ccfg: CostModelConfig, parts: tuple, reduces: float) -> float:
+        """The all-reduce in :meth:`fsdp_traffic`: the bytes the copies of a shard move reducing it.
+
+        HSDP's replicas all-reduce each gradient shard once a step, and a run
+        whose FSDP shards nothing all-reduces every gradient; the rest of
+        :meth:`fsdp_traffic` is FSDP's own gathers and reduce-scatters.
+        """
+        total = 0.0
+        for size, computed, kept, group in parts:
+            whole = size / max(1, computed)
+            shards = max(1.0, kept / max(1, computed))
+            copies = max(1.0, group / max(1, kept))
+            total += 2 * (copies - 1) / copies * whole / shards * ccfg.bytes_grad * reduces
+        return total
+
+    @staticmethod
     def tp_comm_non_exp(ccfg: CostModelConfig, ctx: Context, mb: int) -> float:
         """TP comm for non-expert parameters"""
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
@@ -88,7 +137,7 @@ class EvalLayerComm:
                 * ccfg.n_attMM
             )
         res = (
-            EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.gather)
+            EvalUtils.rec_coeff(rec_layer, EvalUtils.switch(ccfg, ctx, "gather"))
             * ccfg.comm_t
             * tp_comm_non_exp
             / ccfg.cp
@@ -102,9 +151,9 @@ class EvalLayerComm:
         tp_comm_exp = 0.25 * ccfg.n_gather
         tp_comm_exp *= ccfg.s * ccfg.b * ccfg.hff * mb
         if ccfg.n_exp > 1:
-            # Routed experts use hff_exp, shared experts use hff
+            # Routed and shared experts, each hff_exp wide
             routed_comm = ccfg.n_exp / ccfg.ep * ccfg.hff_exp
-            shared_comm = ccfg.n_shared_exp * ccfg.hff
+            shared_comm = ccfg.n_shared_exp * ccfg.hff_exp
             tp_comm_exp = (
                 0.25
                 * ccfg.n_gather
@@ -114,7 +163,7 @@ class EvalLayerComm:
                 * (routed_comm + shared_comm)
             )
         res = (
-            EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.gather)
+            EvalUtils.rec_coeff(rec_layer, EvalUtils.switch(ccfg, ctx, "gather"))
             * ccfg.comm_t
             * tp_comm_exp
             / ccfg.cp
@@ -132,7 +181,7 @@ class EvalLayerComm:
     def cp_comm_non_exp(ccfg: CostModelConfig, ctx: Context) -> float:
         """CP comm for non-expert parameters"""
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
-        rec_factor = EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.gather) * int(
+        rec_factor = EvalUtils.rec_coeff(rec_layer, EvalUtils.switch(ccfg, ctx, "gather")) * int(
             ccfg.p == 1
         )  # [HYPOTHESIS]
         # hybird_cp is a known typo for hybrid_cp kept for backward compat

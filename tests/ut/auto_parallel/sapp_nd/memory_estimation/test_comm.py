@@ -29,7 +29,7 @@ Test IDs:
   CM-E07: ep_comm_layer_imbalanced falls back to balanced when n_exp not divisible by ep
   CM-E08: ep_comm_layer_imbalanced falls back to balanced when tokens_per_expert empty
   CM-E09: ep_comm_layer_imbalanced reduces to balanced under uniform distribution
-  CM-T01: tp_comm_exp MoE formula uses hff_exp for routed, hff for shared
+  CM-T01: tp_comm_exp MoE formula uses hff_exp for routed and shared experts
   CM-T02: tp_comm_exp dense formula uses s*b*hff*mb
   CM-C01: Ring CP p=1 comm is 3x p>1 (rec_factor gate by int(ccfg.p == 1))
   CM-C02: Ulysses CP p=1 comm is 2x p>1 (rec_factor gate by int(ccfg.p == 1))
@@ -73,7 +73,6 @@ def _make_ccfg(
     n_gather=2,
     n_attMM=2,  # pylint: disable=invalid-name
     n_ffMM=1,  # pylint: disable=invalid-name
-    n_ffBMM=0,  # pylint: disable=invalid-name
     rec_op=None,
     cp_algo="colossalai_cp",
     tokens_per_expert=None,
@@ -102,7 +101,6 @@ def _make_ccfg(
     ccfg.n_gather = n_gather
     ccfg.n_attMM = n_attMM
     ccfg.n_ffMM = n_ffMM
-    ccfg.n_ffBMM = n_ffBMM
     ccfg.cp_algo = cp_algo
     ccfg.comm_cp = comm_cp
     ccfg.tokens_per_expert = tokens_per_expert
@@ -411,7 +409,7 @@ class TestTpCommExp(unittest.TestCase):
     """Test tp_comm_exp MoE vs dense formula branching."""
 
     def test_moe_formula(self):
-        """CM-T01: MoE TP comm uses hff_exp for routed, hff for shared."""
+        """CM-T01: MoE TP comm uses hff_exp for routed and shared experts."""
         ccfg = _make_ccfg(
             n_exp=8, n_shared_exp=1, ep=2,
             h=4096, hff=14336, hff_exp=2048, bytes_compute=2,
@@ -421,9 +419,9 @@ class TestTpCommExp(unittest.TestCase):
         mb = 1
         result = EvalLayerComm.tp_comm_exp(ccfg, ctx, mb)
         # Routed: n_exp/ep * hff_exp = 4 * 2048 = 8192
-        # Shared: n_shared_exp * hff = 1 * 14336 = 14336
+        # Shared: n_shared_exp * hff_exp = 1 * 2048 = 2048, whatever hff
         routed_comm = 8 / 2 * 2048
-        shared_comm = 1 * 14336
+        shared_comm = 1 * 2048
         inner = 0.25 * 2 * 4096 * 2 * 1 * (routed_comm + shared_comm)
         rec_layer = ctx.current_node == MagicMock()  # False
         rec_factor = int(not rec_layer) | False  # 1
@@ -743,7 +741,7 @@ class TestCpCommBuffer(unittest.TestCase):
     """Test cp_comm_buffer (CP communication buffer memory estimation)."""
 
     def _make_ccfg_buffer(self, cp=2, s=1024, b=4, t=1, a=32,
-                          n_kv=32, dh=128, kv_lora_rank=0, h=4096,
+                          n_kv=32, dh=128, dc_kv=0, dhr=0, h=4096,
                           device_per_node=8, cp_algo="colossalai_cp"):
         """Create a mock CostModelConfig for CP comm buffer tests."""
         ccfg = MagicMock()
@@ -754,7 +752,8 @@ class TestCpCommBuffer(unittest.TestCase):
         ccfg.a = a
         ccfg.n_kv = n_kv
         ccfg.dh = dh
-        ccfg.kv_lora_rank = kv_lora_rank
+        ccfg.dc_kv = dc_kv
+        ccfg.dhr = dhr
         ccfg.h = h
         ccfg.device_per_node = device_per_node
         ccfg.cp_algo = cp_algo
@@ -822,18 +821,22 @@ class TestCpCommBuffer(unittest.TestCase):
         self.assertAlmostEqual(result, expected, places=0)
 
     def test_mla_kv_dim(self):
-        """CM-CB06: MLA uses kv_lora_rank for kv_dim (not h/t)."""
-        ccfg_ring = self._make_ccfg_buffer(
+        """CM-CB06: MLA exchanges its heads' K and V, not its latent.
+
+        Each head's key is 128 wide plus the 64-wide rotary part and its
+        value 128 wide: 32 * (2 * 128 + 64) / 2 each, where MHA's is h / t.
+        """
+        ccfg_mla = self._make_ccfg_buffer(
             cp=2, device_per_node=8, cp_algo="colossalai_cp",
-            kv_lora_rank=512, n_kv=32, dh=128)
+            dc_kv=512, n_kv=32, dh=128, dhr=64)
         ccfg_mha = self._make_ccfg_buffer(
             cp=2, device_per_node=8, cp_algo="colossalai_cp",
-            kv_lora_rank=0, n_kv=32, dh=128)
+            dc_kv=0, n_kv=32, dh=128)
         ctx = MagicMock()
-        r_mla = EvalLayerComm.cp_comm_buffer(ccfg_ring, ctx)
+        r_mla = EvalLayerComm.cp_comm_buffer(ccfg_mla, ctx)
         r_mha = EvalLayerComm.cp_comm_buffer(ccfg_mha, ctx)
-        # MLA kv_dim=512, MHA kv_dim=4096 → different buffer sizes
-        self.assertNotAlmostEqual(r_mla, r_mha, places=0)
+        # One extra chunk of s / cp tokens at two 2-byte tensors each.
+        self.assertEqual((r_mla, r_mha), ((1024 / 2) * 4 * 32 * (2 * 128 + 64) / 2 * 4, (1024 / 2) * 4 * 4096 * 4))
 
 
 class TestNodeCommEvalRepr(unittest.TestCase):

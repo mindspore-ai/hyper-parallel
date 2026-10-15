@@ -12,10 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Custom variables per model (expert knowledge)"""
-import math
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+"""A model's family, applied to its config, and its layer kinds.
+
+A family is data: its op profile in ``auto_parallel/op_profiles``, or the op
+counts its model spec declares, chosen by ``ccfg.arch``, which the parser
+settles, never by matching the model name.  :func:`check_and_apply_custom_hook`
+applies it where the estimators price a config: what the family decides
+where the run states nothing (:func:`derive_family`), then the op counts of
+its default kind.
+
+The layer stack is data too (``ccfg.layer_stack``).  The estimators read each
+layer's kind from :func:`layer_groups`, and :func:`apply_layer_kind` gives a
+layer its kind from the fields :func:`bind_layer_stack` recorded when the
+family was applied.  A family whose layers take some fields per layer rather
+than on the model, cm's sharding, leaves them in ``ccfg.layer_fields`` for
+every kind to assign.
+"""
+from typing import Any, Dict, List, Optional, Tuple
+from hyper_parallel.auto_parallel._layer_stack import LayerStack, LinearAttentionDims
+from hyper_parallel.auto_parallel._model_spec import ModelSpecError, OpCounts
+from hyper_parallel.auto_parallel._op_profiles import (
+    VISION_ARCH, LayerKind, family_profile, known_archs, load_op_profile,
+)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.apply_exec import apply_layer_strategy
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import derive_family
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 
 
@@ -51,252 +72,227 @@ class CWrap:
         return self.ccfg.get_strategy()
 
 
-def custom_default_transformer(ccfg):
-    """base"""
-    ccfg.n_attMM = 4  # num attention matmul
-    ccfg.n_attBMM = 2  # num attention batch matmul
-    ccfg.n_attParamCast = (
-        ccfg.n_attMM if not ccfg.has_op else 0
-    )  # num attention parameters cast
-    ccfg.n_ffMM = 3  # num feedforward matmul
-    ccfg.n_ffBMM = 0  # num feedforward batch matmul
-    ccfg.n_ffParamCast = (
-        ccfg.n_ffMM if not ccfg.has_op else 0
-    )  # num feedforward parameters cast
-    ccfg.n_softmax = 1  # num softmax
-    ccfg.n_dropout = 0  # num dropout
-    ccfg.n_normOp = 2  # num normalization
-    ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 4 if ccfg.p > 1 else 0  # gradients
-    ccfg.bytes_os = 4  # optimizer states
-    ccfg.bytes_dropout = 0  # dropout mask
-    ccfg.bytes_norm = 4  # normalization input
+def layer_op_counts(ccfg: Any, arch: str, kind: str) -> OpCounts:
+    """Return the op counts of one layer kind.
+
+    The counts the parser recorded from the model spec when there are any,
+    else the family's own profile, which is what a config assembled without
+    a parser gets.
+
+    Raises:
+        ModelSpecError: If the recorded counts have no such kind.
+    """
+    table = getattr(ccfg, "op_counts", None)
+    if not table:
+        return load_op_profile(arch).counts(kind)
+    if kind not in table:
+        raise ModelSpecError(
+            f"{ccfg.model_name}: no op counts for layer kind {kind!r}, "
+            f"the spec declares {sorted(table)}"
+        )
+    return table[kind]
 
 
-def custom_llama2(ccfg):
-    """llama2"""
-    custom_default_transformer(ccfg)
-    ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 2  # gradients
+def apply_op_counts(ccfg: Any, counts: OpCounts) -> None:
+    """Set one layer kind's op counts on *ccfg*, each as ``n_<op>``."""
+    for name, count in counts.to_dict().items():
+        setattr(ccfg, "n_" + name, count)
+    # A layer keeps a cast beside each matmul where the run says it does,
+    # derive's keeps_param_casts; a config derive has not seen, where the
+    # optimizer does not shard.
+    casts = getattr(ccfg, "keeps_param_casts", None)
+    if casts is None:
+        casts = not ccfg.has_op
+    ccfg.n_attParamCast = ccfg.n_attMM if casts else 0
+    ccfg.n_ffParamCast = ccfg.n_ffMM if casts else 0
 
 
-def custom_mixtral(ccfg):
-    """mixtral"""
-    ccfg.n_attMM = 4  # num attention matmul
-    ccfg.n_attBMM = 2  # num attention batch matmul
-    ccfg.n_attParamCast = (
-        ccfg.n_attMM if not ccfg.has_op else 0
-    )  # num attention parameters cast
-    ccfg.n_ffMM = 0  # num feedforward matmul
-    ccfg.n_ffBMM = 3  # num feedforward batch matmul
-    ccfg.n_ffParamCast = (
-        ccfg.n_ffMM if not ccfg.has_op else 0
-    )  # num feedforward parameters cast
-    ccfg.n_softmax = 2  # num softmax
-    ccfg.n_dropout = 0  # num dropout
-    ccfg.n_normOp = 5  # num normalization
-    ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 2 if ccfg.p > 1 else 0  # gradients
-    ccfg.bytes_os = 4  # optimizer states
-    ccfg.bytes_dropout = 0  # dropout mask
-    ccfg.bytes_norm = 4  # normalization input
-    ccfg.hff = ccfg.hff_exp
+# The fields an attention flavour assigns.  Every kind of a stack whose kinds
+# differ in attention writes all of them, so applying kinds in place, one
+# layer after another and in any order, leaves each layer the same config.
+_ATTENTION_FIELDS = (
+    "attn_kind", "a", "dh", "n_kv", "attn_output_gate", "attn_extra_p", "n_qknorm",
+    "lin_n_k", "lin_d_k", "lin_n_v", "lin_d_v", "lin_conv",
+)
+
+# The fields a feed-forward flavour assigns, likewise.
+_FFN_FIELDS = ("hff", "n_chosen_exp", "n_exp", "n_shared_exp", "ep")
+
+# Strategy a kind still sets.  The guard refuses a strategy write through
+# set_ccfg, so the applier gives them through apply_layer_strategy.
+_STRATEGY_FIELDS = ("ep",)
 
 
-def custom_t5(ccfg):
-    """t5"""
+def _linear_attention(snapshot: Any, linear: LinearAttentionDims) -> Dict[str, Any]:
+    """The attention fields of a gated-DeltaNet layer.
 
-    # Encoder + Decoder
-    def encode(c):
-        c.n_attMM = 4  # num attention matmul
-        c.n_attBMM = 1  # num attention batch matmul
-        c.n_attParamCast = (
-            c.n_attMM if not c.has_op else 0
-        )  # num attention parameters cast
-        c.n_ffMM = 2  # num feedforward matmul
-        c.n_ffBMM = 0  # num feedforward batch matmul
-        c.n_ffParamCast = (
-            c.n_ffMM if not c.has_op else 0
-        )  # num feedforward parameters cast
-        c.n_softmax = 2  # num softmax
-        c.n_dropout = 5  # num dropout
-        c.n_normOp = 2  # num normalization
-        c.n_gather = 4  # num gather (TP)
-        c.bytes_grad = 4 if c.p > 1 else 0  # gradients
-        c.bytes_os = 4  # optimizer states
-        c.bytes_dropout = 1  # dropout mask
-        c.bytes_norm = 4  # normalization input
-
-    def decode(c):
-        c.n_attMM = 8  # num attention matmul
-        c.n_attBMM = 2  # num attention batch matmul
-        c.n_attParamCast = (
-            c.n_attMM if not c.has_op else 0
-        )  # num attention parameters cast
-        c.n_ffMM = 2  # num feedforward matmul
-        c.n_ffBMM = 0  # num feedforward batch matmul
-        c.n_ffParamCast = (
-            c.n_ffMM if not c.has_op else 0
-        )  # num feedforward parameters cast
-        c.n_softmax = 4  # num softmax
-        c.n_dropout = 7  # num dropout
-        c.n_normOp = 3  # num normalization
-        c.n_gather = 6  # num gather (TP)
-        c.bytes_grad = 4 if c.p > 1 else 0  # gradients
-        c.bytes_os = 4  # optimizer states
-        c.bytes_dropout = 1  # dropout mask
-        c.bytes_norm = 4  # normalization input
-
-    def hook_encode(e):
-        if isinstance(e, CostModelConfig):
-            e = CWrap(e)
-        e.set_ccfg(encode)
-
-    def hook_decode(e):
-        if isinstance(e, CostModelConfig):
-            e = CWrap(e)
-        e.set_ccfg(decode)
-
-    ccfg.layer_custom_config = [
-        (ccfg.n_lay // 2, hook_encode),
-        (ccfg.n_lay // 2, hook_decode),
-    ]
+    The flavour maps onto the q/k/v/o formula: the value heads carry the
+    q-side width, the key heads the kv-side, and the output gate is a second
+    q-wide tensor.  What the formula does not describe is stated apart: the
+    short convolution over the projected stream, the two per-head gates'
+    projections, each head's decay and time-step bias and the gated output
+    norm's weight as extra parameters, the recurrent state update as the
+    ``linrec`` op.
+    """
+    n_k, d_k = linear.num_key_heads, linear.key_head_dim
+    n_v, d_v = linear.num_value_heads, linear.value_head_dim
+    qkv_width = 2 * n_k * d_k + n_v * d_v
+    return {
+        "attn_kind": "linear",
+        "a": n_v,
+        "dh": d_v,
+        "n_kv": n_k * d_k / d_v,
+        "attn_output_gate": True,
+        "attn_extra_p": linear.conv_kernel_dim * qkv_width + 2 * snapshot.h * n_v + 2 * n_v + d_v,
+        # The kernel normalizes its queries and keys itself, with no weights.
+        "n_qknorm": 0,
+        "lin_n_k": n_k,
+        "lin_d_k": d_k,
+        "lin_n_v": n_v,
+        "lin_d_v": d_v,
+        "lin_conv": linear.conv_kernel_dim,
+    }
 
 
-def custom_pangualpha(ccfg):
-    """pangualpha"""
-    ccfg.n_attMM = 4  # num attention matmul
-    ccfg.n_attBMM = 1  # num attention batch matmul
-    ccfg.n_attParamCast = (
-        ccfg.n_attMM if not ccfg.has_op else 0
-    )  # num attention parameters cast
-    ccfg.n_ffMM = 2  # num feedforward matmul
-    ccfg.n_ffBMM = 0  # num feedforward batch matmul
-    ccfg.n_ffParamCast = (
-        ccfg.n_ffMM if not ccfg.has_op else 0
-    )  # num feedforward parameters cast
-    ccfg.n_softmax = 2  # num softmax
-    ccfg.n_dropout = 5  # num dropout
-    ccfg.n_normOp = 4  # num normalization
-    ccfg.n_gather = 4  # num gather (TP)
-    ccfg.bytes_grad = 4 if ccfg.p > 1 else 0  # gradients
-    ccfg.bytes_os = 4  # optimizer states
-    ccfg.bytes_dropout = 1  # dropout mask
-    ccfg.bytes_norm = 4  # normalization input
+def _feed_forward(snapshot: Any, flavour: Optional[str]) -> Dict[str, Any]:
+    """The feed-forward fields of a layer of *flavour*, from the bound config.
+
+    A MoE layer runs the routed experts at their width.  A dense layer runs
+    one expert at the model's feed-forward width, the parser's ``hff``, with
+    no shared expert and no expert parallelism.  A kind without a flavour
+    keeps the model's own.
+    """
+    if flavour == "dense":
+        return {"hff": snapshot.hff, "n_chosen_exp": 1, "n_exp": 1, "n_shared_exp": 0, "ep": 1}
+    fields = {name: getattr(snapshot, name) for name in _FFN_FIELDS}
+    if flavour == "moe":
+        fields["hff"] = snapshot.hff_exp
+    return fields
 
 
-def custom_deepseek3(ccfg):
-    """deepseekv3"""
-    saved = Config({})
-    if ccfg.config_format == "yaml":
-        saved.hff = int(ccfg.hff)
-    elif ccfg.config_format == "json":
-        saved.hff = ccfg.ffn_hidden_size
-    else:
-        saved.hff = ccfg.specs.inter_dim
-        if not saved.hff:
-            saved.hff = ccfg.specs.hidden_dim
-        if not saved.hff:
-            saved.hff = ccfg.h
-    saved.n_chosen_exp = ccfg.n_chosen_exp
-    saved.n_exp = ccfg.n_exp
-    saved.n_shared_exp = ccfg.n_shared_exp
-    saved.ep = ccfg.ep
-    custom_default_transformer(ccfg)
-    ccfg.dh = 128
+def _kind_fields(snapshot: Any, stack: LayerStack, kind: LayerKind) -> Dict[str, Any]:
+    """The fields *kind* assigns beyond its op counts, from the bound config.
 
-    def dense(c):
-        c.hff = saved.hff
-        c.n_chosen_exp = 1
-        c.n_exp = 1
-        c.n_shared_exp = 0
-
-    def moe(c):
-        c.hff = c.hff_exp
-        c.n_chosen_exp = saved.n_chosen_exp
-        c.n_exp = saved.n_exp
-        c.n_shared_exp = saved.n_shared_exp
-
-    def hook_dense(e):
-        if isinstance(e, CostModelConfig):
-            e = CWrap(e)
-        # e.ccfg.ep = 1
-        e.set_ccfg(dense)
-        e.ccfg.ep = 1
-        # e.set_strategy(ep=1)
-
-    def hook_moe(e):
-        if isinstance(e, CostModelConfig):
-            e = CWrap(e)
-        # e.ccfg.ep = saved.ep
-        e.set_ccfg(moe)
-        e.ccfg.ep = saved.ep
-        # e.set_strategy(ep=saved.ep)
-
-    n_moe = ccfg.n_lay - ccfg.k_1st_dense
-    ccfg.layer_custom_config = [
-        (ccfg.k_1st_dense, hook_dense),
-        (n_moe, hook_moe),
-        (ccfg.n_mtp, hook_moe if n_moe > 0 else hook_dense),
-    ]
+    For every flavour some kind of the stack states, the fields it assigns,
+    with the kind's values or the model's; then the fields the family gives
+    every layer, and the kind's census record, None where the spec states
+    none.
+    """
+    kinds = stack.distinct_kinds()
+    fields: Dict[str, Any] = {}
+    if any(other.attention != "full" for other in kinds):
+        if kind.attention == "linear":
+            fields.update(_linear_attention(snapshot, stack.linear))
+        else:
+            fields.update({name: getattr(snapshot, name) for name in _ATTENTION_FIELDS})
+    if any(other.ffn is not None for other in kinds):
+        fields.update(_feed_forward(snapshot, kind.ffn))
+    fields.update(getattr(snapshot, "layer_fields", None) or {})
+    fields["kind_activations"] = (getattr(snapshot, "census", None) or {}).get(kind.name)
+    return fields
 
 
-def custom_qwen(ccfg):
-    """qwen2"""
-    custom_default_transformer(ccfg)
-    # if "72b" in ccfg.model_name :
-    #     ccfg.s = ccfg.s * 3/4
-    ccfg.shard_recompute_input = ccfg.t
-    ccfg.shard_output_activ = ccfg.t
-    # ccfg.bytes_grad = 4
+def bind_layer_stack(ccfg: Any) -> None:
+    """Record, per kind of the config's stack, the fields it assigns.
+
+    Called where the family is applied, per search candidate and per
+    estimate, so the values a kind restores are the model's own, as
+    applying its family left them.  A config without a stack gets no
+    binding.
+    """
+    stack = getattr(ccfg, "layer_stack", None)
+    if stack is None:
+        ccfg.layer_binding = None
+        return
+    ccfg.layer_binding = {
+        kind.name: _kind_fields(ccfg, stack, kind) for kind in stack.distinct_kinds()
+    }
 
 
-def custom_cm(ccfg):
-    """llama moe"""
-    shard_p_os_exp = ccfg.shard_p_os_exp_partial
-    shard_p_os_non_exp_partial = math.gcd(ccfg.n_exp, ccfg.shard_p_os_non_exp)
-    shard_embed = ccfg.t
-    custom_deepseek3(ccfg)
+def apply_layer_kind(e: Any, kind: LayerKind) -> None:
+    """Make the layer about to be priced one of *kind*.
 
-    def custom_shard(c):
-        c.shard_p_os_exp = shard_p_os_exp
-        c.shard_p_os_non_exp_partial = shard_p_os_non_exp_partial
-        c.shard_embed = shard_embed
-
-    for idx, f in enumerate(ccfg.layer_custom_config):
-
-        def wrap_hook(e, f=f):
-            if isinstance(e, CostModelConfig):
-                e = CWrap(e)
-            f[1](e)
-            e.set_ccfg(custom_shard)
-
-        ccfg.layer_custom_config[idx] = (f[0], wrap_hook)
-
-    def num_params_norm_cm(c, _):
-        return c.n_normOp * 2 * c.h + 0.5 * c.n_attMM * c.dh
-
-    ccfg.overwrite_eval_functions["num_params_norm"] = num_params_norm_cm
-
-
-def check_and_apply_custom_hook(e):
-    """routing hooks"""
+    The memory backbone calls it with an evaluator, the performance path
+    with a bare config.  A config without a stack gives the kind its op
+    counts only.
+    """
     if isinstance(e, CostModelConfig):
         e = CWrap(e)
-    map_modelname_custom = {
-        "llama2": custom_llama2,
-        "mixtral": custom_mixtral,
-        "t5": custom_t5,
-        "pangualpha": custom_pangualpha,
-        "deepseek": custom_deepseek3,
-        "qwen": custom_qwen,
-        "cm": custom_cm,
-    }
-    for k, v in map_modelname_custom.items():
-        if k in e.get_model_name().lower():
-            e.set_ccfg(v)
-            return
-    logger.warning(
-        "Hook not defined for: %s. Default one is chosen", e.get_model_name()
-    )
-    e.set_ccfg(custom_default_transformer)
+    if getattr(e.ccfg, "layer_binding", None) is None:
+        bind_layer_stack(e.ccfg)
+    binding = e.ccfg.layer_binding
+    fields = binding[kind.name] if binding is not None else {}
+
+    def assign(c: Any) -> None:
+        """Give config *c* the kind's counts, then its model fields."""
+        apply_op_counts(c, kind.ops)
+        for name, value in fields.items():
+            if name not in _STRATEGY_FIELDS:
+                setattr(c, name, value)
+
+    e.set_ccfg(assign)
+    apply_layer_strategy(e.ccfg, {name: fields[name] for name in _STRATEGY_FIELDS if name in fields})
+
+
+def _needs_kinds(stack: LayerStack) -> bool:
+    """Whether a stack's layers differ from the config applying its family leaves."""
+    kinds = stack.distinct_kinds()
+    return len(kinds) > 1 or any(kind.attention != "full" or kind.ffn is not None for kind in kinds)
+
+
+def layer_groups(ccfg: Any) -> List[Tuple[Optional[LayerKind], int]]:
+    """Return the groups of layers the estimators price alike, in model order.
+
+    Returns:
+        ``(kind, count)`` per group of the config's stack.  A config without
+        a stack, or whose stack's one kind is the config applying its family
+        leaves, is one group of all its layers, MTP included, with no kind:
+        they are priced on the config as it stands.
+    """
+    stack = getattr(ccfg, "layer_stack", None)
+    if stack is None or not _needs_kinds(stack):
+        return [(None, int(ccfg.n_lay + ccfg.n_mtp))]
+    return [(group.kind, group.count) for group in stack.groups]
+
+
+def layer_kinds(ccfg: Any) -> List[Optional[LayerKind]]:
+    """Return the kind of every layer in model order, as :func:`layer_groups` groups them."""
+    return [kind for kind, count in layer_groups(ccfg) for _ in range(count)]
+
+
+def apply_family(ccfg: Any) -> None:
+    """Give *ccfg* what its family decides, and the op counts of its default kind.
+
+    A vision tower takes the vision profile's encoder counts, whatever
+    counts it carries from its language model.  Each layer of a stack takes
+    its own kind's counts; the default kind's are the ones the model's
+    config prices its embedding and output layer with, so t5 names its
+    encoder (I15).  A family that names none gives the model no counts.
+    """
+    derive_family(ccfg)
+    arch = getattr(ccfg, "arch", None)
+    if arch == VISION_ARCH:
+        apply_op_counts(ccfg, load_op_profile(VISION_ARCH).counts("encoder"))
+        return
+    profile = family_profile(arch)
+    if profile.default is not None:
+        apply_op_counts(ccfg, layer_op_counts(ccfg, profile.arch, profile.default))
+
+
+def check_and_apply_custom_hook(e: Any) -> None:
+    """Apply the family the config declares in ``ccfg.arch``, :func:`apply_family`.
+
+    A config whose arch names no profile is priced as the default family.
+    Then bind the config's layer stack, so each kind restores the values
+    applying the family left.
+    """
+    if isinstance(e, CostModelConfig):
+        e = CWrap(e)
+    arch = getattr(e.ccfg, "arch", None)
+    if arch not in known_archs():
+        logger.warning(
+            "No op profile for: %s (arch %r). The default one is chosen",
+            e.get_model_name(), arch,
+        )
+    e.set_ccfg(apply_family)
+    bind_layer_stack(e.ccfg)

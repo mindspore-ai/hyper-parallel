@@ -17,12 +17,17 @@
 How to run this:
     pytest tests/ut/auto_parallel/test_hf_model_spec.py -v
 """
+import json
+import os
 import sys
+import tempfile
 import types
 import unittest
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
+
+import torch
 
 from hyper_parallel.auto_parallel import _hf_model_spec as spec_mod
 from hyper_parallel.auto_parallel._hf_model_spec import (
@@ -112,6 +117,46 @@ class TestSharedExpertDerivation(unittest.TestCase):
             result = resolve_hf_model_spec({"pretrained_model_name_or_path": "x"})
         self.assertEqual(result["num_shared_experts"], 1)
 
+    def test_a_model_stated_by_hand_is_derived_as_a_resolved_one(self) -> None:
+        """
+        Feature: resolve_hf_model_spec on a model its section states by hand (I1).
+        Description: An all-MoE model, experts 256 wide and one shared
+            expert 512 wide, stated in config_overrides with no checkpoint,
+            and the same model whose checkpoint cannot be resolved.
+        Expectation: Both counts the shared expert as two of the routed
+            width and give the model the shared expert's width as its dense
+            one, as the resolved path does; without that, intermediate_size
+            stayed unstated and the shared expert was priced at nothing.
+        """
+        overrides = {
+            "hidden_size": 1024, "num_hidden_layers": 4, "num_attention_heads": 8, "vocab_size": 32000,
+            "num_experts": 16, "num_experts_per_tok": 4, "moe_intermediate_size": 256,
+            "shared_expert_intermediate_size": 512,
+        }
+        stated = resolve_hf_model_spec({"name": "qwen3_5_moe", "config_overrides": dict(overrides)})
+        with patch.object(spec_mod, "_get_hf_config", side_effect=OSError("offline")):
+            fallback = resolve_hf_model_spec({"pretrained_model_name_or_path": "x",
+                                              "config_overrides": dict(overrides)})
+        for spec in (stated, fallback):
+            self.assertEqual((spec["num_shared_experts"], spec["intermediate_size"]), (2, 512))
+
+    def test_the_checkpoints_dtype_is_read_by_name(self) -> None:
+        """
+        Feature: resolve_hf_model_spec, the checkpoint's dtype (I12).
+        Description: A checkpoint whose config holds its dtype as torch's
+            bfloat16, as newer Transformers state it under dtype, resolved
+            with no torch_dtype in the section, with auto, and with float32.
+        Expectation: bfloat16 by name for the first two, auto stating
+            nothing over the checkpoint; the section's float32 for the last.
+        """
+        recorder = _Recorder(SimpleNamespace(model_type="llama", hidden_size=1024, num_hidden_layers=4,
+                                             num_attention_heads=8, vocab_size=32000, dtype=torch.bfloat16))
+        got = []
+        for stated in ({}, {"torch_dtype": "auto"}, {"torch_dtype": "float32"}):
+            with _stub_registry(recorder):
+                got.append(resolve_hf_model_spec({"pretrained_model_name_or_path": "x", **stated})["torch_dtype"])
+        self.assertEqual(got, ["bfloat16", "bfloat16", "float32"])
+
 
 class TestVisualSequenceLength(unittest.TestCase):
     """The encoder sequence length is derived, overridden or defaulted."""
@@ -138,6 +183,7 @@ class TestVisualSequenceLength(unittest.TestCase):
         with _stub_registry(recorder):
             result = resolve_hf_model_spec({"pretrained_model_name_or_path": "x"})
         self.assertEqual(result["vision"]["max_position_embeddings"], 576)
+        self.assertEqual(result["vision"]["layers"], [{"kind": "encoder", "count": 27}])
 
     def test_override_wins(self) -> None:
         """context.visual_seq_len replaces the derived bound."""
@@ -201,6 +247,84 @@ class TestTransformersEntryPoint(unittest.TestCase):
             })
         self.assertEqual(result["num_hidden_layers"], 4)
         self.assertEqual(result["hidden_size"], 2048)
+
+
+class TestFromConfigRecipe(unittest.TestCase):
+    """A from_config recipe names its model directory and its own shape."""
+
+    def test_the_recipe_states_its_directory_and_its_crop(self) -> None:
+        """
+        Feature: resolve_hf_model_spec on a recipe whose factory builds its model.
+        Description: The released Qwen3.5-MoE shape under config_path, cropped by the
+            factory's arguments, then with config_overrides restating a count.
+        Expectation: config_path names the directory the config is read from; the counts
+            the recipe builds beat the released ones, and what it does not restate is the
+            released config's; config_overrides stay the last word.
+        """
+        recorder = _Recorder(SimpleNamespace(
+            model_type="qwen3_5_moe", hidden_size=2048, num_hidden_layers=40,
+            num_attention_heads=16, num_key_value_heads=2, head_dim=256,
+            num_experts=256, num_experts_per_tok=8, moe_intermediate_size=512,
+            vocab_size=248320, max_position_embeddings=262144,
+        ))
+        recipe = {"_target_": "examples.training_demo.cropped_qwen3_5_moe.build_cropped_qwen3_5_moe",
+                  "config_path": "/home/tt/models/Qwen3.5-35B-A3B-Base", "num_hidden_layers": 8, "num_experts": 64}
+        with _stub_registry(recorder):
+            cropped = resolve_hf_model_spec(recipe)
+            overridden = resolve_hf_model_spec(dict(recipe, config_overrides={"num_hidden_layers": 2}))
+        self.assertEqual(recorder.calls[0][0], "/home/tt/models/Qwen3.5-35B-A3B-Base")
+        self.assertEqual([cropped[key] for key in ("num_hidden_layers", "num_experts", "hidden_size")], [8, 64, 2048])
+        self.assertEqual(overridden["num_hidden_layers"], 2)
+
+
+class TestKeptCensus(unittest.TestCase):
+    """A census is kept on disk and read back while nothing it ran on has changed."""
+
+    _LAYERS = ({"kind": "decoder", "count": 2},)
+
+    def setUp(self) -> None:
+        """An empty census folder of the test's own, and no census run in this process yet."""
+        folder = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        self.addCleanup(folder.cleanup)
+        self.folder = folder.name
+        for patcher in (patch.dict(os.environ, {"ND_CENSUS_CACHE": self.folder}),
+                        patch.dict(spec_mod._CENSUSES, clear=True)):  # pylint: disable=protected-access
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.config = SimpleNamespace(to_json_string=lambda: '{"hidden_size": 64}')
+
+    def _run(self, saved: float = 1.0) -> tuple:
+        """The spec's census as a new process gets it, the census itself stubbed, and how often it ran."""
+        spec_mod._CENSUSES.clear()  # pylint: disable=protected-access
+        record = SimpleNamespace(to_dict=lambda: {"saved": saved, "seq_length": 256})
+        with patch.object(spec_mod, "census_activations", return_value={"decoder": record}) as kinds:
+            with patch.object(spec_mod, "census_output_activations", return_value=record):
+                census = spec_mod._census(self.config, self._LAYERS, 256)  # pylint: disable=protected-access
+        return census, kinds.call_count
+
+    def test_a_later_run_reads_the_kept_census_until_its_code_changes(self) -> None:
+        """
+        Feature: the kept census.
+        Description: Run the census of one model twice, as two runs of a search do; then
+            change the digest the kept file holds of the census's own code, as an edit to
+            that file would, and run it twice more.
+        Expectation: The first run measures and keeps it, the second reads it back without
+            measuring; after the change the next run measures again and keeps the new
+            census, which the run after reads back.
+        """
+        first, measured = self._run()
+        self.assertEqual((measured, first["activations"]["decoder"]["saved"]), (1, 1.0))
+        self.assertEqual(self._run(saved=2.0), (first, 0))
+        name, = os.listdir(self.folder)
+        path = os.path.join(self.folder, name)
+        with open(path, encoding="utf-8") as handle:
+            kept = json.load(handle)
+        kept["sources"]["auto_parallel/_layer_census.py"] = "0" * 64
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(kept, handle)
+        census, measured = self._run(saved=2.0)
+        self.assertEqual((measured, census["activations"]["decoder"]["saved"]), (1, 2.0))
+        self.assertEqual(self._run(saved=3.0), (census, 0))
 
 
 if __name__ == "__main__":

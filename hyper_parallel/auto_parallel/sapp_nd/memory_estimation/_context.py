@@ -152,8 +152,25 @@ class Context:
         self.attn_score_activ, self.attn_proj_activ = None, None
         self.ffn_num_p, self.ffn_activ, self.ffn_moe_activ = None, None, None
         self.ffn_routed_num_p, self.ffn_shared_num_p = None, None
+        self.ffn_router_num_p = None
         self.norm_num_p, self.norm_activ = None, None
         self.pp_micro_eval = {}
+        # How many chunks the schedule splits a micro-batch's sequence into,
+        # as the micro factor of the node being evaluated counts them.
+        self.seq_chunks = 1
+        # How many layers' gathered parameters the node evaluated holds as
+        # its working set in its backward, 0 when it is what it keeps
+        # between its passes.
+        self.working_set = 0
+        # Whether the stage's dynamic memory counts what the node keeps for
+        # the backward whose working set it is.
+        self.working_on_saved = False
+        # The recompute switches of the layer evaluated, where they are not
+        # its config's rec_op: a layer priced under other switches.  None:
+        # the config's.
+        self.switches = None
+        # The gradient bytes of the node evaluated last.
+        self.node_grad = 0
         self.head_node, self.tail_node = None, None
         self.current_node = None
         self.current_stage_id, self.current_chunk_id = -1, -1

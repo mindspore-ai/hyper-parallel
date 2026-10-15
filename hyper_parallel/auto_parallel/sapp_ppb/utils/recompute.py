@@ -59,7 +59,7 @@ JSON_TIME_NAME = {
     TYPE.COMM: "select_comm_time",
     TYPE.BOTH: "both_comm_select_time",
     TYPE.SLCT: "select_rec_time",
-    TYPE.FULL: "recompute_time ",
+    TYPE.FULL: "recompute_time",
 }
 
 JSON_COEF_NAME = {

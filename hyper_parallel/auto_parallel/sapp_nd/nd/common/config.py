@@ -18,7 +18,10 @@ import os
 import copy
 import json
 import yaml
-import toml
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10, where tomllib is not in the standard library
+    tomllib = None
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 
@@ -83,6 +86,25 @@ class YamlObject:
             yaml.dump(self.to_dict(), outfile, default_flow_style=False)
 
 
+def _load_toml(handle):
+    """Parse a TOML file opened in text mode.
+
+    Only TorchTitan configurations are TOML, so the third-party ``toml`` package
+    is imported on use rather than at module scope: it is not a declared
+    dependency, and from Python 3.11 the standard library covers this anyway.
+
+    Args:
+        handle: File object opened in text mode.
+
+    Returns:
+        The parsed document.
+    """
+    if tomllib is not None:
+        return tomllib.loads(handle.read())
+    import toml  # pylint: disable=import-outside-toplevel
+    return toml.load(handle)
+
+
 class Config(YamlObject):
     """Yaml config"""
 
@@ -98,7 +120,7 @@ class Config(YamlObject):
                 elif input_config.endswith("json"):
                     super().__init__(json.load(f))
                 elif input_config.endswith("toml"):
-                    super().__init__(toml.load(f))
+                    super().__init__(_load_toml(f))
                 else:
                     logger.warning("Current handled file formats: YAML, JSON")
         elif isinstance(input_config, Config):

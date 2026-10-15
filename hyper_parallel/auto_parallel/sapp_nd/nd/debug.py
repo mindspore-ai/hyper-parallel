@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,10 +17,12 @@
 import os
 import colorsys
 import csv
+from contextlib import contextmanager
 from enum import Enum, auto
 from pathlib import Path
 from functools import partial
 from math import isnan, sqrt
+from typing import Iterator, Optional
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -31,6 +33,26 @@ from scipy.stats import pearsonr
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 
+# Where the CSVs and the plots go. Defaults to a directory beside this file,
+# which is unwritable in an installed package and mixes consecutive runs
+# together, so ``run_nd -o`` overrides it.
+_OUTPUT_DIR = None
+
+
+def set_output_dir(path: Optional[str]) -> None:
+    """Send the debug artifacts to *path* instead of the package directory."""
+    global _OUTPUT_DIR  # pylint: disable=global-statement
+    _OUTPUT_DIR = str(path) if path else None
+    if _OUTPUT_DIR:
+        os.makedirs(_OUTPUT_DIR, exist_ok=True)
+
+
+def output_dir() -> str:
+    """Return the directory the debug artifacts are written to."""
+    if _OUTPUT_DIR:
+        return _OUTPUT_DIR
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+
 
 class PerfParts(Enum):
     """decomposition of performance"""
@@ -38,7 +60,11 @@ class PerfParts(Enum):
     FW_COMPUTE = auto()
     BW_COMPUTE = auto()
     RECOMPUTE = auto()
+    # FSDP's gathers and reduce-scatters, and a run's other DP traffic.
     DP_COMM = auto()
+    # The all-reduce among the copies of an FSDP shard: HSDP's once a step,
+    # every gradient's where FSDP shards nothing.
+    DP_REDUCE = auto()
     MP_COMM = auto()
     EP_COMM = auto()
     CP_COMM = auto()
@@ -61,6 +87,8 @@ class PerfParts(Enum):
             name = "Rec"
         elif self == self.DP_COMM:
             name = "DP"
+        elif self == self.DP_REDUCE:
+            name = "AR"
         elif self == self.MP_COMM:
             name = "MP"
         elif self == self.EP_COMM:
@@ -115,11 +143,7 @@ class Debug:
         if self.enable:
             self.parallel_dimensions = parallel_dimensions
             self.info = {p: 0 for p in info_type}
-            self.output_file = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "output",
-                output_file,
-            )
+            self.output_file = os.path.join(output_dir(), output_file)
 
     def is_enabled(self):
         """Check whether debugging is enabled"""
@@ -138,15 +162,60 @@ class Debug:
         return ",".join(str_dims + str_score) + "\n"
 
     def write(self):
-        """Parameters to debug"""
+        """Append this row to the CSV, under the column titles where the file is new.
+
+        Inside :func:`holding_open` the file stays open for the next row.
+        """
         if self.enable:
+            logger.info("debug written")
+            held = _HELD.files.get(self.output_file)
+            if held is not None:
+                held.write(self.values())
+                return
             os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
             is_new = not os.path.exists(self.output_file)
-            logger.info("debug written")
-            with open(self.output_file, "a", encoding="utf-8") as outfile:
+            outfile = open(self.output_file, "a", encoding="utf-8")  # pylint: disable=consider-using-with
+            if _HELD.depth:
+                _HELD.files[self.output_file] = outfile
+            try:
                 if is_new:
                     outfile.write(self.column_titles())
                 outfile.write(self.values())
+            finally:
+                if not _HELD.depth:
+                    outfile.close()
+
+
+class _HeldFiles:
+    """The debug CSVs a search holds open while it writes them, by path."""
+
+    def __init__(self) -> None:
+        """No block open and no file held."""
+        self.depth = 0
+        self.files = {}
+
+
+_HELD = _HeldFiles()
+
+
+@contextmanager
+def holding_open() -> Iterator[None]:
+    """Keep each debug CSV written inside the block open until the block ends.
+
+    A search writes a row a candidate, and opening and closing the file for
+    each row cost 3.3 s of the Qwen3.5 example's 14507 rows in a temporary
+    folder and 6.5 s inside OneDrive.  The files are closed, so whole on
+    disk, when the outermost block ends; a row written outside any block
+    still opens and closes its file.
+    """
+    _HELD.depth += 1
+    try:
+        yield
+    finally:
+        _HELD.depth -= 1
+        if not _HELD.depth:
+            while _HELD.files:
+                _HELD.files.popitem()[1].close()
 
 
 def pastel(color, l_delta=0.0, lbl=None, sat=None):
@@ -212,6 +281,7 @@ def gen_colors(categories):
         str(PerfParts.BW_COMPUTE): pastel(compute_color, -0.1),
         str(PerfParts.RECOMPUTE): pastel(compute_color),
         str(PerfParts.DP_COMM): pastel(dim_color(Dim.DP)),
+        str(PerfParts.DP_REDUCE): pastel(dim_color(Dim.DP), -0.15),
         str(PerfParts.MP_COMM): pastel(dim_color(Dim.TP), -0.1),
         str(PerfParts.EP_COMM): pastel(dim_color(Dim.EP)),
         str(PerfParts.CP_COMM): pastel(dim_color(Dim.CP)),
@@ -238,11 +308,13 @@ def set_twin_handles(ax1, data_frame, dbg_cols):
     )
 
     handle2, label2 = ax2.get_legend_handles_labels()  # type: ignore
-    for handle in handle2:
-        if handle not in handle1:
-            handle1.append(handle)
-    for lbl in label2:
+    # Patches compare by identity, so testing the handle admitted every one of
+    # them while the labels deduplicated by name: the legend then drew more
+    # swatches than it had names and mislabelled every entry past the first
+    # shared one. Deduplicate on the label and keep its handle in step.
+    for handle, lbl in zip(handle2, label2):
         if lbl not in label1:
+            handle1.append(handle)
             label1.append(lbl)
     handles = handle1
     labels = label1
@@ -250,6 +322,51 @@ def set_twin_handles(ax1, data_frame, dbg_cols):
     leg = ax2.get_legend()
     pp_color = gen_colors(["PP_COMM"])[0]
     leg.legend_handles[-1].set_facecolor(pp_color)  # type: ignore
+
+
+# The measured parts of the comparison plot, named by the ND part each is set
+# against: FSDP waits count as DP and sequence-parallel waits as MP, as they
+# do in the correlations.
+MEASURED_BARS = ("COMPUTATION", "DP_COMM", "MP_COMM", "EP_COMM", "CP_COMM", "BUBBLE")
+
+
+def measured_bars(waits: dict, plot_idle: bool = False) -> list:
+    """Return one configuration's measured parts in ``MEASURED_BARS`` order.
+
+    Every wait column of the classified CSV lands in one bar, ``op_wait`` in
+    DP's and ``sp_wait`` in MP's as ``real_in_parts`` counts them, so with idle
+    the stack adds up to the measured step. A part the CSV lacks is zero.
+
+    Args:
+        waits: A configuration's measured parts, as ``get_comm_classified_data`` reads them.
+        plot_idle: Whether to append the idle remainder.
+    """
+    def part(name: str) -> float:
+        """The measured part *name*, zero when the CSV does not have it."""
+        return waits.get(name) or 0.0
+
+    bars = [
+        part("comp"),
+        part("dp_wait") + part("op_wait"),
+        part("mp_wait") + part("sp_wait"),
+        part("ep_wait"),
+        part("cp_wait"),
+        part("BUBBLE"),
+    ]
+    if plot_idle:
+        bars.append(part("IDLE"))
+    return bars
+
+
+def _cell_number(text):
+    """Read one cell of the degree table as a number.
+
+    A boolean dimension such as SP prints as True or False, which float()
+    refuses, so every search that varied SP failed as its plot was drawn.
+    """
+    if text in ("True", "False"):
+        return float(text == "True")
+    return float(text)
 
 
 class Plot:
@@ -263,10 +380,20 @@ class Plot:
     dbg_cols: list[str]
     top: int
 
-    def __init__(self, title, rows, debug_parts, top=None):
+    def __init__(
+        self,
+        title: Optional[str],
+        rows: list,
+        debug_parts: list,
+        top: Optional[int] = None,
+        show_top: bool = False,
+    ) -> None:
+        """Initialize the plot table, optionally displaying each configuration's rank."""
         self.title = title
         self.top = top if top is not None else 20
         self.row_title = rows + ["MEM"]
+        if show_top:
+            self.row_title.insert(0, "TOP")
         self.dbg_cols = list(map(str, debug_parts))
         self.col_title = []
         self.cell_text = []
@@ -275,7 +402,7 @@ class Plot:
     def make_table(self):
         """Make table below plot with each parallelism degree"""
         self.cell_text = list(map(list, zip(*self.cell_text)))  # transpose
-        max_rows = list(map(max, map(partial(map, float), self.cell_text)))
+        max_rows = list(map(max, map(partial(map, _cell_number), self.cell_text)))
         the_table = plt.table(
             cellText=self.cell_text,
             rowLabels=self.row_title,
@@ -291,7 +418,7 @@ class Plot:
             cell.set_text_props(fontproperties=FontProperties(weight="bold"))
             for col in range(len(self.cell_text[0])):
                 cell = the_table[row + 1, col]
-                value = float(str(cell.get_text().get_text()))
+                value = _cell_number(str(cell.get_text().get_text()))
                 try:
                     ratio = 1 - (value / max_rows[row])
                 except ZeroDivisionError:
@@ -333,26 +460,19 @@ class Plot:
         plot_idle = kwargs.get("plot_idle", False)
         min_e = configs_estimated[0][2]
         i = 0
-        for cfg_e in configs_estimated:
-            self.cell_text.append(cfg_e[0].values() + [cfg_e[1]])
+        for index, cfg_e in enumerate(configs_estimated):
+            cells = cfg_e[0].values() + [cfg_e[1]]
+            if self.row_title[0] == "TOP":
+                cells.insert(0, cfg_e[0].rank or index + 1)
+            self.cell_text.append(cells)
             self.col_title.append("")
             try:
                 self.data.append(
                     tuple([cfg_e[0], cfg_e[2], cfg_e[3]] + cfg_e[4])
                 )
                 if real_data is not None:
-                    waits = cfg_e[5]
-                    logger.info(waits)
-                    wait_list = [
-                        waits["comp"],
-                        waits["dp_wait"],
-                        waits["mp_wait"],
-                        waits["ep_wait"],
-                        waits["BUBBLE"],
-                    ]
-                    if plot_idle:
-                        wait_list.append(waits["IDLE"])
-                    real_data.append(tuple(wait_list))
+                    logger.info(cfg_e[5])
+                    real_data.append(tuple(measured_bars(cfg_e[5], plot_idle)))
             except IndexError:
                 score = cfg_e[2]
                 if i >= self.top or (min_e is not None and score > min_e * 20):
@@ -363,11 +483,26 @@ class Plot:
 
 
 def plot_nd(
-    configs_estimated, output_path, debug_parts, title=None, max_num=None
-):
-    """Plot estimation"""
+    configs_estimated: list,
+    output_path: str,
+    debug_parts: list,
+    title: Optional[str] = None,
+    max_num: Optional[int] = None,
+) -> None:
+    """Plot estimation.
+
+    Args:
+        configs_estimated: Ranked configurations with memory, score and its parts.
+            TOP uses the rank stored on each configuration, falling back to its
+            position in the supplied list when it has not been ranked.
+        output_path: Directory in which to save results.pdf.
+        debug_parts: Performance components to plot.
+        title: Optional plot title.
+        max_num: Maximum number of configurations in the plot.
+    """
     plot = Plot(
-        title, configs_estimated[0][0].keys(), debug_parts, top=max_num
+        title, configs_estimated[0][0].keys(), debug_parts,
+        top=max_num, show_top=True,
     )
     plot.parse_data(configs_estimated)
 
@@ -382,6 +517,43 @@ def plot_nd(
 
     plot.make_table()
     plot.close(output_path, "results")
+
+
+def _score_parts() -> list:
+    """The parts a score splits into, in the order the debugger fills them."""
+    return [part for part in PerfParts if part not in {PerfParts.TOTAL, PerfParts.MEMORY}]
+
+
+def _make_parent(path: str) -> None:
+    """Create the directory *path* is to be written in, when it is missing."""
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+
+def write_ranking_csv(scored_space: list, path: str) -> None:
+    """Write a search's configurations in ND's order, best first.
+
+    One row per configuration that fits memory: its rank, its degrees, the
+    peak memory in MB, the score and the parts the score splits into,
+    which are blank when the search ran without debug output. Scores keep
+    full precision so that a reader can tell a tie from a near miss.
+
+    Args:
+        scored_space: ``(config, memory, score, parts)`` entries, as
+            ``ParallelizeLayer.order_search_space`` sorts them. Stored ranks
+            are preserved; unranked configurations use their input positions.
+        path: CSV file to write; its directory is created when missing.
+    """
+    parts = _score_parts()
+    _make_parent(path)
+    dims = [str(dim) for dim in scored_space[0][0].keys()] if scored_space else []
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["rank"] + dims + ["memory_mb", "score"] + [str(part) for part in parts])
+        for rank, (config, memory, score, values) in enumerate(scored_space, start=1):
+            split = [repr(float(value)) for value in values] if values else [""] * len(parts)
+            writer.writerow([config.rank or rank] + config.values() + [memory, repr(float(score))] + split)
 
 
 def plot_vs_real(
@@ -410,9 +582,15 @@ def plot_vs_real_comm_classified(
     debug_parts,
     **kwargs,
 ):
-    """Plot estimation vs real detailed time"""
+    """Plot estimation vs real detailed time.
+
+    Written to ``<csv stem><suffix>.pdf`` in *output_path*: ``plot_idle`` adds
+    the measured idle remainder to the measured bars, and ``suffix`` (empty
+    by default) tells apart several plots of one CSV.
+    """
     plot_idle = kwargs.get("plot_idle", False)
     title = kwargs.get("title", None)
+    suffix = kwargs.get("suffix", "")
     real_data = []
 
     plot = Plot(title, configs_estimated[0][0].keys(), debug_parts)
@@ -425,13 +603,7 @@ def plot_vs_real_comm_classified(
     data_frame = pd.DataFrame(
         plot.data, columns=(["config", "real", "estim"] + plot.dbg_cols)
     )
-    real_cols = [
-        "COMPUTATION",
-        "DP_COMM",
-        "MP_COMM",
-        "EP_COMM",
-        "BUBBLE",
-    ]
+    real_cols = list(MEASURED_BARS)
     if plot_idle:
         real_cols.append("IDLE")
     real_df = pd.DataFrame(real_data, columns=real_cols)
@@ -451,7 +623,7 @@ def plot_vs_real_comm_classified(
     plot.make_table()
     plot.close(
         output_path,
-        Path(os.path.basename(csv_f)).stem,
+        Path(os.path.basename(csv_f)).stem + suffix,
     )
 
 
@@ -574,6 +746,7 @@ def estimation_in_real_parts(
     )
     estimations_in_real_components[RealParts.DP_WAIT].append(
         estimations[PerfParts.DP_COMM.value - 1]
+        + estimations[PerfParts.DP_REDUCE.value - 1]
     )
     estimations_in_real_components[RealParts.MP_WAIT].append(
         estimations[PerfParts.MP_COMM.value - 1]
@@ -615,7 +788,7 @@ def real_in_parts(parts, real, time):
     return parts
 
 
-def correlation_with_classified_comms(configs_estimated):
+def correlation_with_classified_comms(configs_estimated: list) -> tuple:
     """Computes correlation and distance between components time & estimation."""
     score_classified = {}
     time_classified = {}
@@ -658,7 +831,7 @@ def correlation_with_classified_comms(configs_estimated):
                 )
                 square_distances_sum += distance * distance
                 distances[wait].append(abs(distance))
-        distances[RealParts.TOTAL] = sqrt(square_distances_sum)
+        distances[RealParts.TOTAL].append(sqrt(square_distances_sum))
 
     correls = {}
     for wait in RealParts:
@@ -705,11 +878,9 @@ def print_diff(case, prev, new, **kwargs):
     logger.output(msg.expandtabs(tabsize))
 
 
-def get_distance_i(part, data_i):
+def get_distance_i(part: RealParts, data_i: tuple) -> float:
     """get the average distance of a given part"""
     _, distance, _, _ = data_i
-    if part is RealParts.TOTAL:
-        return distance[part]
     return sum(distance[part]) / len(distance[part])
 
 

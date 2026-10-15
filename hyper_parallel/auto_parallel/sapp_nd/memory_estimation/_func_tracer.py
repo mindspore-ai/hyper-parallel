@@ -187,16 +187,17 @@ class _FuncTracer:
         """Wrapper"""
 
         def tracked_fun(*args, **kwargs):
-            """Wrapper"""
+            """Run *fun* traced, then print the trace it left."""
+            print("Tracing...")
+            # Trace the call alone: a print traced with it walks the stream's
+            # and the codec's code, whose lines the expression parser rejects.
             sys.settrace(self.line_tracer)
             try:
-                print("Tracing...")
                 res = fun(*args, **kwargs)
-                print(self.trace_str)
-                self.trace_str = ""
-                return res
             finally:
                 sys.settrace(None)
+            print(self.trace_str)
+            self.trace_str = ""
             return res
 
         return tracked_fun

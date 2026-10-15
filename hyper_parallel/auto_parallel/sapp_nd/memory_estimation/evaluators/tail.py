@@ -15,7 +15,10 @@
 """Tail submodule"""
 from __future__ import annotations
 from typing import TYPE_CHECKING
+from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import param_cp
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
@@ -55,7 +58,7 @@ class EvalMTP:
         if not ccfg.n_mtp or ctx.swap_os:
             return 0
         extra_param_size = EvalMTP.num_params_mtp(ccfg, ctx)
-        b_os = 2 * ccfg.bytes_os
+        b_os = ccfg.bytes_optim
         if ccfg.is_shard_mtp_param:
             b_os /= ccfg.shard_p_os_non_exp_partial
         extra = ccfg.n_mtp * extra_param_size * b_os
@@ -92,7 +95,8 @@ class EvalMTP:
             return 0
         micro_factor = ctx.micro_factor
         res = micro_factor * ccfg.n_mtp * ccfg.bytes_compute
-        res *= ccfg.s * ccfg.b * 3 * ccfg.h
+        # A CP rank runs the layer on its own chunk of the sequence.
+        res *= ccfg.s * ccfg.b * 3 * ccfg.h / max(1, ccfg.cp)
         # Shared Head
         ctx.current_node = LayerType.EMBEDDING_LAYER
         res += ccfg.n_mtp * ctx.eval.dyn.activation(ccfg, ctx)
@@ -109,20 +113,20 @@ class EvalMTP:
         mtp_dp_comm_size = 0
         param_size = EvalMTP.num_params_mtp(ccfg, ctx)
         mtp_dp_comm_size += (
-            ccfg.comm_d_non_exp * ccfg.n_mtp * param_size / (ccfg.t * ccfg.cp)
+            ccfg.comm_d_non_exp * ccfg.n_mtp * param_size / (ccfg.t * param_cp(ccfg))
         )
         # Shared Head
         ctx.current_node = LayerType.EMBEDDING_LAYER
         param_size = ctx.eval.num_p(ccfg, ctx)
         mtp_dp_comm_size += (
-            ccfg.comm_d_non_exp * ccfg.n_mtp * param_size / (ccfg.t * ccfg.cp)
+            ccfg.comm_d_non_exp * ccfg.n_mtp * param_size / (ccfg.t * param_cp(ccfg))
         )
         mtp_dp_comm_size += ccfg.n_mtp * ctx.eval.dyn.comm.dp(ccfg, ctx)
         # Shared Tail
         ctx.current_node = LayerType.OUTPUT_LAYER
         param_size = ctx.eval.num_p(ccfg, ctx)
         mtp_dp_comm_size += (
-            ccfg.comm_d_non_exp * ccfg.n_mtp * param_size / (ccfg.t * ccfg.cp)
+            ccfg.comm_d_non_exp * ccfg.n_mtp * param_size / (ccfg.t * param_cp(ccfg))
         )
         mtp_dp_comm_size += ccfg.n_mtp * EvalTailSingle.comm_out_single(
             ccfg, ctx
@@ -147,7 +151,7 @@ class EvalTailSingle:
         if ctx.swap_os:
             return 0
         param_size = ctx.eval.num_p(ccfg, ctx)
-        b_os = 2 * ccfg.bytes_os
+        b_os = ccfg.bytes_optim_table
         b_os /= ccfg.shard_p_os_non_exp_partial
         return param_size * b_os
 
@@ -162,12 +166,34 @@ class EvalTailSingle:
     @staticmethod
     def activ_out_single(ccfg: CostModelConfig, ctx: Context) -> float:
         """activation mem (lmhead)"""
+        census = getattr(ccfg, "output_census", None)
+        if isinstance(census, KindActivations):
+            return EvalTailSingle.census_out_single(ccfg, ctx, census)
         micro_factor = ctx.micro_factor
         last_norm = ccfg.s * ccfg.b * ccfg.bytes_norm * ccfg.h
         lm_head = ccfg.s * ccfg.b * ccfg.bytes_compute * ccfg.v
         activ_size = last_norm + lm_head
-        activ_size /= ccfg.shard_output_activ
+        # A CP rank computes the logits of its own chunk of the sequence: the
+        # output layer gathers none across CP.
+        activ_size /= ccfg.shard_output_activ * max(1, ccfg.cp)
         return micro_factor * activ_size
+
+    @staticmethod
+    def census_out_single(ccfg: CostModelConfig, ctx: Context, census: KindActivations) -> float:
+        """The output layer's activations, as its census measured them (lmhead).
+
+        What the layer keeps between its passes, or its backward's working
+        set (:meth:`EvalUtils.census_bytes`), per token of a CP rank's share
+        of the sequence.  Sequence parallelism splits the part the
+        vocabulary does not scale, and TP the part it does where the loss
+        runs on logits sharded over it (``shards_logits``); otherwise every
+        TP rank holds them whole.
+        """
+        tokens = ctx.micro_factor * ccfg.s * ccfg.b / max(1, ccfg.cp)
+        vocab_shards = max(1, ccfg.t) if ccfg.shards_logits else 1
+        kept = census.saved / max(1, ccfg.sp) + census.saved_tp / vocab_shards
+        held = census.working / max(1, ccfg.sp) + census.working_tp / vocab_shards
+        return EvalUtils.census_bytes(ctx, tokens, kept, held)
 
     @staticmethod
     def comm_out_single(ccfg: CostModelConfig, ctx: Context) -> float:
@@ -175,8 +201,13 @@ class EvalTailSingle:
         return (
             ccfg.comm_d_non_exp
             * ctx.eval.num_p(ccfg, ctx)
-            / (ccfg.t * ccfg.cp)
+            / (ccfg.t * param_cp(ccfg))
         )
+
+    @staticmethod
+    def reduced_grad_out_single(ccfg: CostModelConfig, ctx: Context) -> tuple:
+        """The output table's gradient FSDP reduce-scatters, whole and sharded (lmhead)."""
+        return EvalUtils.reduced_grads(ccfg, ((ctx.eval.num_p(ccfg, ctx), ccfg.t, ccfg.shard_grad_non_exp),))
 
 
 class EvalTail:
@@ -184,8 +215,14 @@ class EvalTail:
 
     @staticmethod
     def num_params_output(ccfg: CostModelConfig, _) -> float:
-        """Parameters count (lmhead)"""
-        return ccfg.h * ccfg.v + ccfg.v
+        """Parameters count: the output table, and the final norm of a model that states its norms.
+
+        One that does not is counted a bias per vocabulary entry instead,
+        the formulas' convention.
+        """
+        if getattr(ccfg, "layer_norms", None) is None:
+            return ccfg.h * ccfg.v + ccfg.v
+        return ccfg.h * ccfg.v + (2 if getattr(ccfg, "norm_bias", None) else 1) * ccfg.h
 
     @staticmethod
     def stat_output_p(ccfg: CostModelConfig, ctx: Context) -> float:

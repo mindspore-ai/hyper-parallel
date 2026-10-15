@@ -1,0 +1,34 @@
+# Qwen3.5: a hybrid stack of gated-DeltaNet linear-attention layers and
+# full-attention layers, named by the values of the model's layer_types.  A
+# linear layer keeps no score matrix, so it runs none of the ops that scale
+# with the square of the sequence, and adds the delta rule's state update.
+# Its run shards activations as Qwen's does.
+run:
+  shard_activations: true
+default: full_attention
+kinds:
+  full_attention:
+    ops:
+      attMM: 4
+      attBMM: 2
+      ffMM: 3
+      softmax: 1
+      dropout: 0
+      normOp: 2
+      gather: 4
+      headCast: 1
+      ffAct: 1
+      linrec: 0
+  linear_attention:
+    attention: linear
+    ops:
+      attMM: 4
+      attBMM: 0
+      ffMM: 3
+      softmax: 0
+      dropout: 0
+      normOp: 2
+      gather: 4
+      headCast: 0
+      ffAct: 1
+      linrec: 1

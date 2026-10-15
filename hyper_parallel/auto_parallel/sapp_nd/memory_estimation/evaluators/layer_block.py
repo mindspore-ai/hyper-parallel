@@ -14,8 +14,10 @@
 # ============================================================================
 """Layer's blocks submodule"""
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Mapping, Optional
+from hyper_parallel.auto_parallel._op_records import load_op_records
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import CPAlgo, _resolve_cp_algo
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 
 if TYPE_CHECKING:
@@ -25,139 +27,122 @@ if TYPE_CHECKING:
 mb = EvalUtils.mb
 
 
+def _bias(ccfg: CostModelConfig, stated: str, width: float) -> float:
+    """A projection's bias: *width* where the model states one, none where it states none.
+
+    Where the model states neither, as a parser that reads no bias does,
+    each projection is counted a bias of the hidden width, the formulas'
+    convention.
+    """
+    has_bias = getattr(ccfg, stated, None)
+    if has_bias is None:
+        return ccfg.h
+    return width if has_bias else 0
+
+
+def _mlp_biases(ccfg: CostModelConfig, width: float) -> float:
+    """The biases of one feed-forward of *width*, or one expert's, as :func:`_bias` counts a projection's.
+
+    Stated, each projection into the width has one of it and the last,
+    back to the hidden width, one of that; unstated, each projection one of
+    the width.
+    """
+    has_bias = getattr(ccfg, "mlp_bias", None)
+    if has_bias is None:
+        return ccfg.n_ffMM * width
+    return (ccfg.n_ffMM - 1) * width + ccfg.h if has_bias else 0
+
+
 class EvalAttn:
     """Attention formulas class"""
 
     @staticmethod
     def num_params_mla(ccfg: CostModelConfig, _) -> float:
-        """Parameters count for Multi-Head Latent Attention"""
-        # W_up_q = ccfg.dc_q * ccfg.dh * ccfg.a
-        # W_up_k = ccfg.dc_kv * ccfg.dh * ccfg.n_kv
-        # W_up_v = ccfg.dc_kv * ccfg.dh * ccfg.n_kv
-        # W_down_q = ccfg.dc_q * ccfg.h
-        # W_down_kv = ccfg.dc_kv * ccfg.h
-        # W_q_rope = ccfg.a * ccfg.dhr * ccfg.dc_q
-        # W_k_rope = ccfg.dhr * ccfg.h
-        # Wo = ccfg.h * ccfg.a * ccfg.dh
+        """Parameters count for Multi-Head Latent Attention.
 
-        c_kv_fact = ccfg.dc_kv * (ccfg.n_kv * ccfg.dh + ccfg.h)
-        c_q_fact = ccfg.dc_q * (ccfg.a * ccfg.dh + ccfg.h + ccfg.a * ccfg.dhr)
-        rest_fact = (ccfg.h * ccfg.a * ccfg.dh) + (ccfg.h * ccfg.dhr)
-        res = (
-            0.5 * ccfg.n_attMM * c_kv_fact
-            + 0.25 * ccfg.n_attMM * c_q_fact
-            + 0.25 * ccfg.n_attMM * rest_fact
-        )
-        return res
+        The queries: a down-projection to their latent, its norm and an
+        up-projection to every head's non-rotary and rotary part, or one
+        projection where the model has no query latent.  The keys and
+        values: one down-projection to their shared latent beside the
+        rotary key, its norm, and an up-projection to every head's
+        non-rotary key and value.  The output projection from the values.
+        Each head's non-rotary key is ``qk_nope_head_dim`` wide, ``dh``,
+        its value head's width, unless the model states it.
+        """
+        d_qk = getattr(ccfg, "qk_nope_head_dim", None) or ccfg.dh
+        heads_q = ccfg.a * (d_qk + ccfg.dhr)
+        if ccfg.dc_q:
+            query = ccfg.h * ccfg.dc_q + ccfg.dc_q + ccfg.dc_q * heads_q
+        else:
+            query = ccfg.h * heads_q
+        key_value = (ccfg.h * (ccfg.dc_kv + ccfg.dhr) + ccfg.dc_kv
+                     + ccfg.dc_kv * ccfg.n_kv * (d_qk + ccfg.dh))
+        output = ccfg.a * ccfg.dh * ccfg.h
+        return 0.25 * ccfg.n_attMM * (query + key_value + output)
 
     @staticmethod
     def num_params_attn(ccfg: CostModelConfig, ctx: Context) -> float:
         """Parameters count for Multi-Head/Grouped-Q./Multi-Q. Attention"""
         if ccfg.dc_kv == 0:
-            # Q,O and K,V have distinct shapes
-            return 0.5 * ccfg.n_attMM * (
-                ccfg.h * ccfg.h + ccfg.h
-            ) + 0.5 * ccfg.n_attMM * (ccfg.h * ccfg.n_kv * ccfg.dh + ccfg.h)
+            # Q,O and K,V have distinct shapes. Q and O are h x (a*dh),
+            # which equals h x h only when head_dim = h/a; a fused output
+            # gate (Qwen3.5) doubles the Q projection.
+            d_h = ccfg.dh or (ccfg.h / ccfg.a if ccfg.a else 0)
+            d_q = ccfg.a * d_h
+            q_fact = 2 if ccfg.attn_output_gate else 1
+            return 0.25 * ccfg.n_attMM * (
+                q_fact * ccfg.h * d_q + _bias(ccfg, "qkv_bias", q_fact * d_q)
+            ) + 0.25 * ccfg.n_attMM * (
+                ccfg.h * d_q + _bias(ccfg, "o_bias", ccfg.h)
+            ) + 0.5 * ccfg.n_attMM * (
+                ccfg.h * ccfg.n_kv * d_h + _bias(ccfg, "qkv_bias", ccfg.n_kv * d_h)
+            ) + ccfg.attn_extra_p
         return EvalAttn.num_params_mla(ccfg, ctx)
 
     @staticmethod
+    def kv_shards(ccfg: CostModelConfig) -> float:
+        """Over how many CP ranks a layer's keys and values are split.
+
+        Colossal-AI and hybrid CP all-gather the keys and values, and the
+        attention kernel keeps them whole for the backward: none.  Ulysses
+        CP gives each rank its heads' share, and a linear-attention layer
+        passes its state rather than gathering them: all of CP.
+        """
+        if _resolve_cp_algo(ccfg) == CPAlgo.ULYSSES_CP or getattr(ccfg, "n_linrec", 0):
+            return ccfg.cp
+        return 1
+
+    @staticmethod
+    def gathered_kv_bytes(ccfg: CostModelConfig) -> float:
+        """The bytes per token of a rank's share of the sequence it keeps of the other ranks' keys and values.
+
+        Where CP gathers the keys and values (:meth:`kv_shards`), the
+        attention keeps the whole sequence's, the rank's own share and
+        ``cp - 1`` others, each split over TP.
+        """
+        if ccfg.cp <= 1 or EvalAttn.kv_shards(ccfg) > 1:
+            return 0
+        return (ccfg.cp - 1) * 2 * ccfg.n_kv * ccfg.dh * ccfg.bytes_compute / max(1, ccfg.t)
+
+    @staticmethod
     def attn_qkv_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """QKV linear Activations"""
-        rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
-        att_qkv_size = 0
-        if ccfg.dc_kv == 0:
-            n_op = ccfg.n_attMM + ccfg.n_attParamCast
-            att_qkv_size = (
-                ccfg.s
-                * ccfg.b
-                * ccfg.bytes_compute
-                * (
-                    0.25 * n_op * ccfg.h
-                    + 0.5 * n_op * ccfg.dh * ccfg.n_kv
-                    + EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.attBMM)
-                    * ccfg.n_attBMM
-                    * ccfg.dh
-                )
-            )
-        else:
-            q_size = (
-                0.25
-                * (ccfg.n_attMM + ccfg.n_attParamCast)
-                * (ccfg.dc_q + 2 * ccfg.a * (ccfg.dh + ccfg.dhr))
-            )
-            k_size = (
-                0.25
-                * (ccfg.n_attMM + ccfg.n_attParamCast)
-                * (ccfg.dhr + ccfg.n_kv * (2 * ccfg.dh + ccfg.dhr))
-            )
-            v_size = (
-                0.25
-                * (ccfg.n_attMM + ccfg.n_attParamCast)
-                * (ccfg.n_kv * ccfg.dh + ccfg.dc_kv)
-            )
-            att_qkv_size = (
-                ccfg.s
-                * ccfg.b
-                * ccfg.bytes_compute
-                * (
-                    q_size
-                    + k_size
-                    + v_size
-                    + EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.attBMM)
-                    * ccfg.n_attBMM
-                    * ccfg.dh
-                )
-            )
-        micro_factor = ctx.micro_factor
-        return micro_factor * att_qkv_size / (ccfg.t * ccfg.cp)
+        """QKV linear Activations: the op records' ``qkv`` slot"""
+        return EvalRecords.slot_bytes(ccfg, ctx, "qkv")
 
     @staticmethod
     def attn_score_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """Score/Softmax Activations"""
-        rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
-        att_score = (
-            ccfg.s_fa
-            * ccfg.b
-            * ccfg.a
-            * ccfg.s
-            * (
-                ccfg.n_softmax
-                * (
-                    ccfg.rec_op.softmax * ccfg.bytes_softmax
-                    + EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.dropout)
-                    * ccfg.bytes_dropout
-                    + EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.headCast)
-                    * ccfg.bytes_compute
-                )
-            )
-        )
-        micro_factor = ctx.micro_factor
-        # cp_sq_div=1: Ring CP shards Q along seq and all-gathers KV, so the S²
-        # score tensor has only one S dim divided → B·H·S²/cp (slope -1).
-        # Only an unimplemented blockwise-ring path (shard both Q and KV along
-        # seq → (s/cp)² scores) would need cp_sq_div=cp; do not re-add the
-        # conditional for the current Ring/Ulysses algorithms.
-        cp_sq_div = 1
-        return micro_factor * att_score / (ccfg.t * ccfg.cp * cp_sq_div)
+        """Score/Softmax Activations: the op records' ``score`` slot.
+
+        Ring CP shards the queries along the sequence and gathers the keys and
+        values, so the score tensor has one sequence dimension divided, B H S^2
+        / cp; only a blockwise ring, which shards both, would divide it again.
+        """
+        return EvalRecords.slot_bytes(ccfg, ctx, "score")
 
     @staticmethod
     def attn_proj_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """Output projection Activations"""
-        rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
-        att_proj = (
-            ccfg.s
-            * ccfg.b
-            * ccfg.h
-            * ccfg.bytes_compute
-            * (
-                0.25 * (ccfg.n_attMM + ccfg.n_attParamCast)
-                + EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.dropout)
-                * ccfg.n_dropout
-                * ccfg.bytes_dropout
-            )
-        )
-        micro_factor = ctx.micro_factor
-        return micro_factor * att_proj / max(ccfg.sp, ccfg.cp)
+        """Output projection Activations: the op records' ``proj`` slot"""
+        return EvalRecords.slot_bytes(ccfg, ctx, "proj")
 
 
 class EvalFFn:
@@ -166,73 +151,53 @@ class EvalFFn:
     @staticmethod
     def num_params_ffn(ccfg: CostModelConfig, _) -> float:
         """Parameters count"""
-        experts_param_size = (
-            (ccfg.n_exp + ccfg.n_shared_exp)
-            * max(ccfg.n_ffMM, ccfg.n_ffBMM)
-            * (ccfg.hff * ccfg.h + ccfg.hff)
-        )
-        return experts_param_size
+        return (ccfg.n_exp + ccfg.n_shared_exp) * (
+            ccfg.n_ffMM * ccfg.hff * ccfg.h + _mlp_biases(ccfg, ccfg.hff))
 
     @staticmethod
     def num_params_routed_expert(ccfg: CostModelConfig, _) -> float:
         """Routed expert parameters count (with ETP correction)"""
         hff_sliced = ccfg.hff_exp / max(ccfg.etp, 1)
-        return ccfg.n_exp * max(ccfg.n_ffMM, ccfg.n_ffBMM) * (hff_sliced * ccfg.h + hff_sliced)
+        return ccfg.n_exp * (ccfg.n_ffMM * hff_sliced * ccfg.h + _mlp_biases(ccfg, hff_sliced))
+
+    @staticmethod
+    def num_params_router(ccfg: CostModelConfig, _: Any) -> float:
+        """The router's parameters: a weight per routed expert, the hidden width wide, where the layer routes."""
+        return ccfg.h * ccfg.n_exp if ccfg.n_exp > 1 else 0
 
     @staticmethod
     def num_params_shared_expert(ccfg: CostModelConfig, _) -> float:
-        """Shared expert parameters count"""
-        return ccfg.n_shared_exp * max(ccfg.n_ffMM, ccfg.n_ffBMM) * (ccfg.hff * ccfg.h + ccfg.hff)
+        """Shared expert parameters count, and the weight that gates its output where the model has one.
+
+        Every producer states the shared experts as a count of experts of
+        the routed ones' width, ``hff_exp``: one wide shared expert as that
+        many.
+        """
+        gate = ccfg.h if ccfg.n_shared_exp and getattr(ccfg, "shared_expert_gate", None) else 0
+        width = ccfg.hff_exp
+        return ccfg.n_shared_exp * (ccfg.n_ffMM * width * ccfg.h + _mlp_biases(ccfg, width)) + gate
 
     @staticmethod
-    def ffn_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """ "Activations count"""
-        rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
-        tok_size = ccfg.s * ccfg.b
-        n_mm = max(ccfg.n_ffMM, ccfg.n_ffBMM)
-        if n_mm % 2 == 0:
-            matmul = 0.5 * ccfg.h + 0.5 * ccfg.hff
-        else:
-            matmul = 1 / 3 * ccfg.h + 2 / 3 * ccfg.hff
-        matmul *= ccfg.bytes_compute * n_mm
-        activ_fun = ccfg.bytes_compute * ccfg.hff
-        activ_fun *= EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.ffAct)
-        pcast = ccfg.bytes_compute * ccfg.hff * ccfg.n_ffParamCast
-        activ_size = matmul + pcast + activ_fun
-        micro_factor = ctx.micro_factor
-        return micro_factor * tok_size * activ_size / (ccfg.t * ccfg.cp)
+    def ffn_activations(ccfg: CostModelConfig, ctx: Context, width: Optional[float] = None) -> float:
+        """Activations of a feed-forward *width* wide, the model's dense width unless given: the ``ffn`` slot"""
+        return EvalRecords.slot_bytes(ccfg, ctx, "ffn", overrides=None if width is None else {"hff": width})
 
     @staticmethod
     def ffn_router_and_concat_activations(
         ccfg: CostModelConfig, ctx: Context
     ) -> float:
-        """MoE router and output activations"""
-        # Router activations (logits, probs, mask)
-        r = ccfg.s * ccfg.b * ccfg.bytes_compute
-        r *= 2 * ccfg.n_exp + ccfg.n_chosen_exp
-        # Concat all exp output
-        c = ccfg.s * ccfg.b * ccfg.bytes_compute * ccfg.h
-        micro_factor = ctx.micro_factor
-        return micro_factor * (r + c) / (ccfg.t * ccfg.cp)
+        """MoE router and output activations: the ``router`` slot"""
+        return EvalRecords.slot_bytes(ccfg, ctx, "router")
 
     @staticmethod
     def shared_exp_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """Shared expert activations"""
-        return ccfg.n_shared_exp * EvalFFn.ffn_activations(ccfg, ctx)
+        """Shared expert activations, each shared expert of the routed ones' width: the ``shared`` slot"""
+        return EvalRecords.slot_bytes(ccfg, ctx, "shared")
 
     @staticmethod
     def routed_exp_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """MoE topK activations"""
-        tok_size = ccfg.s * ccfg.b
-        activ_size = EvalFFn.ffn_activations(ccfg, ctx) / tok_size
-        avg_num_toks = tok_size * ccfg.n_chosen_exp / ccfg.n_exp
-        if not ccfg.gmm:  # Capacity mode
-            expert_capacity = avg_num_toks * ccfg.cap_fact * ccfg.n_exp
-            routed_activ = activ_size * expert_capacity
-        else:  # Dropless mode
-            load = avg_num_toks * ccfg.n_exp * ctx.dropless_tok_factor
-            routed_activ = load * activ_size
-        return routed_activ
+        """MoE topK activations, each expert at its width: the ``routed`` slot"""
+        return EvalRecords.slot_bytes(ccfg, ctx, "routed")
 
     @staticmethod
     def ffn_moe_activations(ccfg: CostModelConfig, ctx: Context) -> float:
@@ -248,21 +213,87 @@ class EvalNorm:
     """Normalization formulas class"""
 
     @staticmethod
+    def head_dim(ccfg: CostModelConfig) -> float:
+        """The width a QK-norm normalizes over: one attention head's"""
+        return ccfg.dh or (ccfg.h / ccfg.a if ccfg.a else 0)
+
+    @staticmethod
     def num_params_norm(ccfg: CostModelConfig, _) -> float:
-        """Parameters count"""
-        return ccfg.n_normOp * 2 * ccfg.h
+        """Parameters count: the layer's norms, and a QK-norm's query and key weights.
+
+        A model that states its norms holds a weight in each, and a bias
+        beside it in a LayerNorm; one that does not is counted two vectors
+        per norm op.
+        """
+        layer_norms = getattr(ccfg, "layer_norms", None)
+        if layer_norms is None:
+            vectors = ccfg.n_normOp * 2
+        else:
+            vectors = layer_norms * (2 if getattr(ccfg, "norm_bias", None) else 1)
+        return vectors * ccfg.h + getattr(ccfg, "n_qknorm", 0) * 2 * EvalNorm.head_dim(ccfg)
 
     @staticmethod
     def norm_activations(ccfg: CostModelConfig, ctx: Context) -> float:
-        """Activations"""
+        """Activations: the norms' inputs, a QK-norm's every head's queries and keys: the ``norm`` slot"""
+        return EvalRecords.slot_bytes(ccfg, ctx, "norm")
+
+
+class EvalRecords:
+    """The op records (shared decision S1), priced on a layer config.
+
+    The activation formulas of :class:`EvalAttn`, :class:`EvalFFn` and
+    :class:`EvalNorm` are the records' slots, so a caller prices a layer
+    under any setting of the recompute switches, or one op alone, without
+    setting anything on its config.
+    """
+
+    @staticmethod
+    def slot_bytes(ccfg: CostModelConfig, ctx: Context, slot: str,
+                   switches: Optional[Mapping[str, Any]] = None,
+                   overrides: Optional[Mapping[str, Any]] = None, only: Optional[str] = None) -> float:
+        """The bytes a layer of *ccfg* keeps in *slot*, one rank's share of a micro-batch.
+
+        Args:
+            ccfg: The layer's config.
+            ctx: The evaluation: its micro factor, and its node, a selective
+                layer's (``SEL_REC_LAYER``) dropping what its switches drop.
+            slot: The slot.
+            switches: A selective layer's switches, 1 to keep an op's
+                activations and 0 to drop them; where omitted, those the
+                context carries, else the config's own.
+            overrides: Values that stand for the config's fields.
+            only: An op to price alone, its parts with it, or a part, whatever
+                the switches say.
+        """
+        records = load_op_records()
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
-        norm = (
-            ccfg.s
-            * ccfg.b
-            * ccfg.bytes_norm
-            * ccfg.h
-            * ccfg.n_normOp
-            * EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.normOp)
-        )
-        micro_factor = ctx.micro_factor
-        return micro_factor * norm / (ccfg.t * ccfg.cp)
+        stated = EvalUtils.switches(ccfg, ctx) if switches is None else switches
+
+        def keep(op: str) -> Any:
+            """Whether this layer keeps *op*'s activation: 1 keeps it, 0 recomputes it."""
+            switch = records.record(op).switch
+            if switch is None:
+                return 1
+            return EvalUtils.rec_coeff(rec_layer, EvalUtils.state(stated, switch))
+
+        return records.evaluate(slot, EvalRecords.values(ccfg, ctx, overrides), keep, only)
+
+    @staticmethod
+    def values(ccfg: CostModelConfig, ctx: Context, overrides: Optional[Mapping[str, Any]] = None) -> Any:
+        """The value of each name a record reads: an override, the evaluation's, or the config's field."""
+        records = load_op_records()
+        overrides = overrides or {}
+
+        def value(name: str) -> Any:
+            """The value of *name*: an override, the evaluation's, a record's default or the config's field."""
+            if name in overrides:
+                return overrides[name]
+            if name in ("micro_factor", "dropless_tok_factor"):
+                return getattr(ctx, name)
+            if name == "kv_shards":
+                return EvalAttn.kv_shards(ccfg)
+            if name in records.defaults:
+                return getattr(ccfg, name, records.defaults[name])
+            return getattr(ccfg, name)
+
+        return value

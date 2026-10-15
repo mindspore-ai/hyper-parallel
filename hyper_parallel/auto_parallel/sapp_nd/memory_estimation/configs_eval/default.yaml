@@ -78,6 +78,7 @@ base_arch_mem_comp :
     num_param_fun : num_params_ffn
     routed_num_fun : num_params_routed_expert
     shared_num_fun : num_params_shared_expert
+    router_num_fun : num_params_router
     activation : ffn_activations
     moe_activ : ffn_moe_activations
   norm : 
