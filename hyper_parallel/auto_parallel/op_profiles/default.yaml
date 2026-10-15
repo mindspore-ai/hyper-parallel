@@ -1,0 +1,38 @@
+# Op counts of a decoder-only transformer with a gated feed-forward.
+# The profile for any model that declares no arch and whose name matches no
+# other profile.
+#
+# Each layer kind declares how many times one layer runs every op the cost
+# model prices; the estimators multiply these counts by per-op costs.  A layer
+# that does not run an op declares 0: an op left out is an error, not a zero.
+# A kind may also state its flavours: attention (full or linear) and ffn
+# (dense or moe).  A profile with several kinds may name a default, the kind
+# a layer takes when nothing says otherwise.
+#
+# A profile may also state, under run, what a model of the family runs with
+# when its producer does not say: grad_bytes, optimizer_state_bytes,
+# norm_bytes and dropout_bytes (4, 4, 4 and 0 otherwise), optimizer_states
+# and main_param_bytes (2 and 0 otherwise), grad_accumulation,
+# whether gradients take memory without pipeline parallelism (false),
+# reshard_params, whether FSDP frees a layer's gathered parameters once it
+# has run (false), deferred_grad_accumulation, whether it holds each
+# layer's reduce-scatter output until the backward ends (false),
+# overlapped_grad_reduce, whether it holds a layer's whole gradients while
+# the next layer's backward runs and the root's until the backward ends
+# (false), shard_activations, whether tensor parallelism shards the activations
+# between layers and the output layer's (false), and loss_parallel, whether the
+# loss runs on logits sharded over the vocabulary (true).  Under model, an MLA
+# family states the v_head_dim a model that declares none has.
+kinds:
+  decoder:
+    ops:
+      attMM: 4      # q, k, v and o projections
+      attBMM: 2     # QK^T and AV
+      ffMM: 3       # gate, up and down projections
+      softmax: 1
+      dropout: 0
+      normOp: 2
+      gather: 4     # tensor-parallel gathers
+      headCast: 1   # casts of the per-head score tensor
+      ffAct: 1      # feed-forward activation
+      linrec: 0     # linear-attention state updates

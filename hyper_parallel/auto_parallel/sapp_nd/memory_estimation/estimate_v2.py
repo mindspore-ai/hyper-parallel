@@ -31,7 +31,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._hook_manager import
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 
 if TYPE_CHECKING:
-    from typing import Any, Dict, Union
+    from typing import Any, Callable, Dict, Optional, Union
     from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook
 
 
@@ -55,6 +55,23 @@ class EvaluatorV2(_Utils, _HookManager):
             hook = list(self._ccfg.hooks_dict.values())[0]
             hook(self)
 
+    def _estimate_on_copy(self, *args) -> Any:
+        """Run the backbone on a copy of the config, leaving the caller's intact.
+
+        The backbone applies each layer's hook in place, one layer after the
+        next. Run on the caller's config, it would leave the last layer's
+        state behind for whatever reads that config next, which in a search
+        is the next candidate.
+        """
+        caller = self._ccfg
+        self._ccfg = copy.deepcopy(caller)
+        self._overhead_obj._ccfg = self._ccfg
+        try:
+            return self._estimate_backbone(*args)
+        finally:
+            self._ccfg = caller
+            self._overhead_obj._ccfg = caller
+
     def estimate_peak(
         self,
         stages: list = None,
@@ -63,13 +80,9 @@ class EvaluatorV2(_Utils, _HookManager):
         plot: bool = False,
     ) -> float:
         """Peak stage memory estimation"""
-        original_ccfg = copy.deepcopy(self._ccfg)
-        res = self._estimate_backbone(
+        res = self._estimate_on_copy(
             stages, verbose, False, spec_stage_id, plot
         )
-        self._ccfg = original_ccfg
-        self._ccfg.parser.ccfg = self._ccfg
-        self._overhead_obj._ccfg = self._ccfg
         insights, _ = res
         stage_mems = [i["Static"] + i["Dynamic"] for i in insights]
         peak_mem = max(stage_mems)
@@ -85,25 +98,15 @@ class EvaluatorV2(_Utils, _HookManager):
 
     def estimate_peak_insight(self, stages: list = None) -> list:
         """subcomponents' proportion estimation"""
-        original_ccfg = copy.deepcopy(self._ccfg)
-        insights, _ = self._estimate_backbone(stages, False, False, -1, False)
-        self._ccfg = original_ccfg
-        self._ccfg.parser.ccfg = self._ccfg
-        self._overhead_obj._ccfg = self._ccfg
+        insights, _ = self._estimate_on_copy(stages, False, False, -1, False)
         return insights
 
-    def estimate_layer_memory(
-        self, stages: list = None, ppb_format=1, device_type=Hard.Device_A2
-    ) -> Dict:
+    def estimate_layer_memory(self, stages: list = None, device_type=Hard.Device_A2) -> Dict:
         """PPB's input"""
         logger.info(device_type)
         if self.ppb:
             return self.ppb
-        original_ccfg = copy.deepcopy(self._ccfg)
-        res = self._estimate_backbone(stages, False, ppb_format, -1, False)
-        self._ccfg = original_ccfg
-        self._ccfg.parser.ccfg = self._ccfg
-        self._overhead_obj._ccfg = self._ccfg
+        res = self._estimate_on_copy(stages, False, True, -1, False)
         _, ppb = res
         self.ppb = ppb
         return ppb
@@ -251,11 +254,6 @@ def main():
         help="Generate pipeline balancing layers description",
     )
     parser.add_argument(
-        "--ppb-new",
-        action="store_true",
-        help="Generate pipeline balancing layers description (New format)",
-    )
-    parser.add_argument(
         "--ctx", action="store_true", help="Show ctx variables"
     )
     parser.add_argument(
@@ -286,9 +284,6 @@ def main():
         e.print_ccfg()
     if args.ppb:
         ppb = e.estimate_layer_memory()
-        print(json.dumps(ppb, indent=2))
-    elif args.ppb_new:
-        ppb = e.estimate_layer_memory(ppb_format=2)
         print(json.dumps(ppb, indent=2))
     else:
         peak_mem = e.estimate_peak(

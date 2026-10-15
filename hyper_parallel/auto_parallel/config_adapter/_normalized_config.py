@@ -17,6 +17,8 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Literal
 
+from hyper_parallel.auto_parallel._model_spec import ModelSpec, model_fields
+
 
 @dataclass
 class NormalizedConfig:
@@ -24,31 +26,16 @@ class NormalizedConfig:
 
     Holds all configuration sections as plain dicts for maximum
     compatibility with PR631's Config class (sapp_nd.nd.common.config).
-    The ``model_spec`` field names follow the HuggingFace-style
-    ``config_overrides`` convention (e.g. ``hidden_size``,
-    ``num_hidden_layers``), matching the HP ``train.yaml`` format.
-
-    **Required model_spec fields**: ``num_hidden_layers``, ``hidden_size``,
-    ``num_attention_heads``, ``vocab_size``.
-
-    **Optional model_spec fields**: ``intermediate_size``,
-    ``num_key_value_heads``, ``max_position_embeddings``,
-    ``local_batch_size``, ``compute_dtype``,
-    ``softmax_compute_type``, ``moe_enabled``, ``num_experts``,
-    ``num_experts_per_tok``, ``num_shared_experts``, ``moe_intermediate_size``,
-    ``use_flash_attention``, ``use_seq_parallel``,
-    ``optimizer_weight_shard_size``,
-    ``enable_parallel_optimizer``,
-    ``multiple_of``, ``ffn_dim_multiplier``,
-    ``mtp_depth``, ``first_k_dense_replace``, ``kv_lora_rank``,
-    ``q_lora_rank``, ``qk_rope_head_dim``, ``v_head_dim``,
-    ``capacity_factor``, ``offset``,
-    ``param_init_type``, ``recompute_slice_activation``.
+    ``model_spec`` holds the model IR in its mapping form: the fields of
+    :class:`~hyper_parallel.auto_parallel._model_spec.ModelSpec`, which owns
+    the list of them and what each one requires. Call :meth:`model` for the
+    typed, validated object. Keys the IR does not declare are carried
+    through untouched for the adapter's own use, such as the micro-batch
+    size; how the run loads, computes and optimizes the model is ``run``'s.
 
     Args:
-        model_spec: Model architecture parameters. Must contain at least
-            ``num_hidden_layers``, ``hidden_size``, ``num_attention_heads``,
-            ``vocab_size``.
+        model_spec: Model architecture parameters, in the shape
+            :class:`ModelSpec` defines.
         cluster_spec: Hardware cluster description.
         search_space: Parallel dimension candidate values, e.g.
             ``{"dp": [1,2,4], "tp": [1,2,4,8], "pp": [1,2], "cp": [1], "ep": [1]}``.
@@ -58,6 +45,14 @@ class NormalizedConfig:
             ``cp_algo`` (``"colossalai_cp"`` | ``"ulysses_cp"`` | ``"hybrid_cp"``,
             default ``"colossalai_cp"``).
         pp_config: Pipeline-parallel specific configuration.
+        run: What the train.yaml states about the run, in its own sections
+            and names: the model's dtypes, FSDP's precision and resharding,
+            the optimizer, gradient clipping and the accelerator's settings.
+            The search runner lays the strategy it searches over it, so the
+            rest reaches the cost model as the train.yaml states it.
+        parallelism_summary: One line naming what every parallelism
+            dimension resolved to, so a dimension that was silently pinned
+            or silently freed is visible.
         resolved_strategy: Final resolved strategy, populated after search.
     """
 
@@ -67,7 +62,21 @@ class NormalizedConfig:
     constraint: Dict[str, Any] = field(default_factory=dict)
     estimator: Dict[str, Any] = field(default_factory=dict)
     pp_config: Dict[str, Any] = field(default_factory=dict)
+    run: Dict[str, Any] = field(default_factory=dict)
+    parallelism_summary: str = ""
     resolved_strategy: Optional[Dict[str, Any]] = None
+
+    def model(self) -> ModelSpec:
+        """Return ``model_spec`` as the typed, validated model IR.
+
+        Returns:
+            The parsed spec.
+
+        Raises:
+            ModelSpecError: If a required field is missing or the declared
+                fields contradict each other.
+        """
+        return ModelSpec.from_dict(model_fields(self.model_spec))
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize all config sections to a nested dictionary."""
@@ -78,6 +87,7 @@ class NormalizedConfig:
             "constraint": dict(self.constraint),
             "estimator": dict(self.estimator),
             "pp_config": dict(self.pp_config),
+            "run": dict(self.run),
         }
         if self.resolved_strategy is not None:
             result["resolved_strategy"] = dict(self.resolved_strategy)

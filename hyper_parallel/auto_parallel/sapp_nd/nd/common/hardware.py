@@ -93,9 +93,7 @@ class Type:
 
 # Device_A2 = Machine(devices_per_node=8, inter_node_bw=10, intra_node_bw=50)
 Device_A2 = Type(name="A2", bounds=[8, None], bandwidths=[50, 10])
-Device_A3 = Type(
-    name="A3", bounds=[16, 24, None], bandwidths=[200, 25, 10]
-)
+Device_A3 = Type(name="A3", bounds=[16, 24, None], bandwidths=[200, 25, 10])
 device_map = {
     "A2": Device_A2,
     "A3": Device_A3,

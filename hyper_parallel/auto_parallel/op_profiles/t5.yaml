@@ -1,0 +1,34 @@
+# T5: an encoder stack then a decoder stack of the same depth.  A decoder
+# layer adds cross-attention, so it runs twice the attention projections.
+# Both keep a one-byte dropout mask.
+run:
+  dropout_bytes: 1
+# The model's own config takes its default kind's counts, and the
+# communication walk prices the embedding and the output layer on it: with
+# no default, their 4 TP gathers read 0 (I15).
+default: encoder
+kinds:
+  encoder:
+    ops:
+      attMM: 4
+      attBMM: 1
+      ffMM: 2
+      softmax: 2
+      dropout: 5
+      normOp: 2
+      gather: 4
+      headCast: 1
+      ffAct: 1
+      linrec: 0
+  decoder:
+    ops:
+      attMM: 8
+      attBMM: 2
+      ffMM: 2
+      softmax: 4
+      dropout: 7
+      normOp: 3
+      gather: 6
+      headCast: 1
+      ffAct: 1
+      linrec: 0

@@ -114,8 +114,9 @@ class EvalExpertCompute:
 
         Shared experts process ALL tokens (not dispatched via EP),
         so their compute is the same regardless of EP degree.
-        Shared experts use hff (not hff_exp) for their hidden dimension.
-          FLOPs = 2 * n_ffMM * s * b * h * hff * n_shared_exp / (t_exp * cp)
+        Each shared expert is as wide as the routed ones, hff_exp, the
+        count every producer states them as.
+          FLOPs = 2 * n_ffMM * s * b * h * hff_exp * n_shared_exp / (t_exp * cp)
 
         Factor t_exp because shared expert is TP/ETP-sharded (not EP-sharded).
         t_exp = etp if etp > 1 else tp (alternative, not multiplicative).
@@ -125,7 +126,7 @@ class EvalExpertCompute:
         t_exp = ccfg.etp if ccfg.etp > 1 else ccfg.t
         n_ff = max(getattr(ccfg, "n_ffMM", 1), 1)
         return (
-            2 * n_ff * ccfg.s * ccfg.b * ccfg.h * ccfg.hff
+            2 * n_ff * ccfg.s * ccfg.b * ccfg.h * ccfg.hff_exp
             * ccfg.n_shared_exp / (max(t_exp, 1) * ccfg.cp)
         )
 

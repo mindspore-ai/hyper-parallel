@@ -50,13 +50,6 @@ class _Utils(_Backbone):
             for m in self._ccfg.mm_order
         ]
 
-    def set_layer_custom(self, lc=None) -> None:
-        """setting ccfg.layer_custom_config (inner call only)"""
-        if not lc:
-            self._ccfg.layer_custom_config = [(self._ccfg.n_lay, None)]
-        elif isinstance(lc, list):
-            self._ccfg.layer_custom_config = lc
-
     def set_config(self, config) -> None:
         """Explicitly Assign a new config ccfg"""
         self._ccfg = config

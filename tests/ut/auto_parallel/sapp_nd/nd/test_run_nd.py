@@ -18,6 +18,8 @@ How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/nd/test_run_nd.py
 """
 import copy
+import csv
+import io
 import json
 import os
 import runpy
@@ -28,6 +30,10 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import yaml
+
+from hyper_parallel.auto_parallel._layer_stack import derive_layers, resolve_layers
+from hyper_parallel.auto_parallel._op_profiles import load_op_profile
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd import debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd import dimensions as Dim
@@ -37,9 +43,8 @@ from hyper_parallel.auto_parallel.sapp_nd.nd import global_config as GC
 from hyper_parallel.auto_parallel.sapp_nd.nd.common import arch_hooks as ArchHooks
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
-    _CostModelParser,
-)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common import cost_model_preprocess as PreProcess
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import HYPER_SELECTIVE_REC_OP, derive_comm_flags
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyperparallel import (
     CostModelParserHyperparallel,
 )
@@ -262,7 +267,6 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
         "comm_ep": 1.0,
         "comm_dp_overlap": 0.9,
         "comm_tp_overlap": 0.5,
-        "layer_custom_config": [(2, None)],
         "n_lay": 2,
         "n_mtp": 1,
         "gbs": 8,
@@ -273,7 +277,6 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
         "n_attMM": 1,
         "n_ffMM": 1,
         "n_attBMM": 1,
-        "n_ffBMM": 1,
         "n_softmax": 1,
         "n_headCast": 1,
         "n_gather": 1,
@@ -284,7 +287,6 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
             attMM=1,
             ffMM=1,
             attBMM=1,
-            ffBMM=1,
             softmax=1,
             headCast=1,
             gather=1,
@@ -298,7 +300,7 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
 
 
 def _make_arch_cfg(**kwargs: Any) -> SimpleNamespace:
-    """Build a tiny config for arch hook functions."""
+    """Build a tiny config to apply a family to."""
     defaults = {
         "model_name": "deepseek-unit",
         "has_op": False,
@@ -697,6 +699,7 @@ class TestSappNDRunND(unittest.TestCase):
         global_config.ccfg = fake_ccfg
         global_config.dimensions = Dim.ALL_DIMS.copy()
         global_config.balancing = _FakeBalancing()
+        global_config.siblings = []
         parallel_config = global_config.make_parallel_config(
             (2, 2, 2, 1),
             (4, 2),
@@ -704,6 +707,14 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertEqual(global_config.dim_val(Dim.DP, parallel_config), 2)
         self.assertEqual(global_config.global_batch_size(parallel_config), 16)
+        no_pipeline = global_config.make_parallel_config((2, 2, 1, 1), (4, 2), (1, 1, 2, False))
+        self.assertEqual(global_config.global_batch_size(no_pipeline), 8)
+        self.assertFalse(no_pipeline.is_valid())
+        fake_ccfg.accumulates_grads = True
+        accumulating = global_config.make_parallel_config((2, 2, 1, 1), (4, 2), (1, 1, 2, False))
+        self.assertEqual(global_config.global_batch_size(accumulating), 16)
+        self.assertTrue(accumulating.is_valid())
+        fake_ccfg.accumulates_grads = False
         self.assertEqual(global_config.layer_num_for_offset(), 4)
         self.assertEqual(global_config.total_layer_num(), 5)
         self.assertEqual(global_config.adapt_config(2, 1), ([0, 0], [0, 0]))
@@ -713,6 +724,14 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(global_config.range_space(Dim.PP, 3), range(1, 4))
         self.assertEqual(global_config.bool_space(Dim.SP), [False, True])
         self.assertEqual(global_config.max_op(dp=4, tp=2, ep=1), 4)
+        # HyperParallel's shard spans DP x CP, so under CP it reaches that
+        # domain; a legacy schema's stays within DP (C1).
+        got = []
+        for spans in (True, False):
+            fake_ccfg.shard_spans_cp = spans
+            got.append(global_config.max_op(dp=4, tp=2, ep=1, cp=2))
+        fake_ccfg.shard_spans_cp = False
+        self.assertEqual(got, [8, 4])
 
         Dim.TP.set_bound(2)
         try:
@@ -720,10 +739,16 @@ class TestSappNDRunND(unittest.TestCase):
         finally:
             Dim.TP.reset_bound()
 
+        # Muon does not narrow the optimizer shard: with an expert count and
+        # MLA widths sharing only a factor of 2 with DP, the cap that came in
+        # with the original search import returned 2 of the 4 available ranks.
         fake_ccfg.optimizer = "muon"
         fake_ccfg.dc_kv = 2
         fake_ccfg.dhr = 2
+        experts = fake_ccfg.n_exp
+        fake_ccfg.n_exp = 6
         self.assertEqual(global_config.max_op(dp=4, tp=2, ep=1), 4)
+        fake_ccfg.n_exp = experts
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             global_config.write(tmp_dir, parallel_config)
@@ -741,6 +766,28 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertIsNone(wrapper.unknown_method())
         ArchHooks.check_and_apply_custom_hook(wrapper)
         self.assertEqual(getattr(wrapped_cfg, "n_attMM"), 4)
+
+    def test_hyperparallel_spreads_experts_over_dp_cp_and_tp(self) -> None:
+        """
+        Feature: GlobalConfig.max_ep and moe_valid (F3 of Nelson's review).
+        Description: 64 experts at DP 4, TP 2 and CP 2 with EP 16, wider than
+            DP x TP: under HyperParallel, whose expert mesh spans DP x CP x TP,
+            then under a legacy schema.
+        Expectation: HyperParallel's bound is that domain's 16 ranks, so EP 16
+            is generated and valid, where the search stopped at DP x TP's 8
+            and refused it; a legacy schema keeps DP x TP.
+        """
+        ccfg = _FakeCostModelConfig()
+        ccfg.n_exp = 64
+        global_config = object.__new__(GC.GlobalConfig)
+        global_config.ccfg = ccfg
+        global_config.dimensions = Dim.ALL_DIMS.copy()
+        parallel_config = global_config.make_parallel_config((4, 2, 1, 2), (1, 1), (16, 1, 1, False))
+        got = []
+        for spans in (True, False):
+            ccfg.shard_spans_cp = spans
+            got.append((global_config.max_ep(dp=4, tp=2, cp=2), global_config.moe_valid(parallel_config)))
+        self.assertEqual(got, [(16, True), (8, False)])
 
     def test_ep_constraints_valid_in_global_config(self) -> None:
         """
@@ -766,6 +813,7 @@ class TestSappNDRunND(unittest.TestCase):
             gc.ccfg = ccfg
             gc.dimensions = Dim.ALL_DIMS.copy()
             gc.balancing = _FakeBalancing()
+            gc.siblings = []
             return gc
 
         # Dense model (n_exp=1) — fast-path, always True regardless of ep.
@@ -781,6 +829,18 @@ class TestSappNDRunND(unittest.TestCase):
             (2, 2, 1, 1), (4, 1), (4, 1, 2, False)
         )
         self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
+
+        # C4: DP 2 x TP 2 over EP 4 leaves one rank per expert group, which
+        # an expert shard of 2 cannot divide; a shard of 1 always does.
+        gc_ok.ccfg.expert_shard = 2
+        self.assertFalse(gc_ok.ep_constraints_valid(pc_ok))
+        gc_ok.ccfg.expert_shard = 1
+        self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
+        # A run that shards over each strategy's whole group fits any group.
+        gc_ok.ccfg.expert_shard = 2
+        gc_ok.ccfg.expert_shard_group = True
+        self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
+        gc_ok.ccfg.expert_shard_group = False
 
         # MoE model, C1 fail: n_exp=8, ep=3 (8 % 3 != 0).
         gc_c1 = _make_gc(n_exp=8, ep=3, hff_exp=14336, etp=0, tp=2)
@@ -1179,8 +1239,59 @@ class TestSappNDRunND(unittest.TestCase):
                             run_name="__main__",
                         )
                 self.assertEqual(exc_info.exception.code, 0)
+                self.assertEqual(cluster_spec["device_type"], "A2")
+                with patch.object(sys, "argv", argv + ["-A", "A3"]):
+                    with self.assertRaises(SystemExit) as exc_info:
+                        runpy.run_module(
+                            "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                            run_name="__main__",
+                        )
+                self.assertEqual(exc_info.exception.code, 0)
             self.assertEqual(cluster_spec["num_nodes"], 8)
-            mock_search.assert_called_once()
+            self.assertEqual(cluster_spec["device_type"], "A3")
+            self.assertEqual(mock_search.call_count, 2)
+
+    def test_run_nd_cli_hyper_v2_d_refuses_part_of_a_node(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: ``-f hyper_v2 -s search.yaml`` with a ``-d`` that is not a whole number of
+                     nodes: 8 cards on A3, whose node holds 16, and 12 where the config states 8.
+        Expectation: The run stops with a usage error before any search: the search config counts
+                     whole nodes and would price 16 devices for either.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            train_yaml = os.path.join(tmp_dir, "train.yaml")
+            search_yaml = os.path.join(tmp_dir, "search.yaml")
+            with open(train_yaml, "w", encoding="utf-8") as fh:
+                fh.write("model:\n  name: test\n")
+            with open(search_yaml, "w", encoding="utf-8") as fh:
+                fh.write("parallelism:\n  dp: [1, 2]\n")
+
+            for flags, cluster_spec, node in (
+                    (["-A", "A3", "-d", "8"], {"num_nodes": 4, "device_type": "A2"}, 16),
+                    (["-d", "12"], {"num_nodes": 4, "cards_per_node": 8, "device_type": "A2"}, 8),
+            ):
+                fake_config = SimpleNamespace(resolved_strategy=None, constraint={}, cluster_spec=cluster_spec)
+                argv = ["run_nd.py", "-f", "hyper_v2", "-y", train_yaml, "-s", search_yaml, "-v", "0"] + flags
+                with patch(
+                    "hyper_parallel.auto_parallel.config_adapter.read_search_config",
+                    return_value=fake_config,
+                ), \
+                        patch("hyper_parallel.auto_parallel.config_adapter.validate", return_value=[]), \
+                        patch(
+                            "hyper_parallel.auto_parallel.config_adapter.search_strategies",
+                        ) as mock_search, \
+                        patch("hyper_parallel.auto_parallel.config_adapter.write_resolved_yaml"), \
+                        patch.object(sys, "argv", argv), \
+                        patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                    with self.assertRaises(SystemExit) as exc_info:
+                        runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                self.assertEqual(exc_info.exception.code, 2, f"{flags}: exit code {exc_info.exception.code}")
+                self.assertIn(f"not a whole number of nodes of {node} cards", stderr.getvalue(),
+                              f"{flags}: stderr was {stderr.getvalue()!r}")
+                mock_search.assert_not_called()
+                self.assertEqual(cluster_spec["num_nodes"], 4, f"{flags}: num_nodes {cluster_spec['num_nodes']}")
 
     def test_debug_csv_and_correlation_helpers(self) -> None:
         """
@@ -1270,46 +1381,141 @@ class TestSappNDRunND(unittest.TestCase):
                 plot_idle=True,
             )
 
+    def test_the_ranking_keeps_nd_order_and_every_digit(self) -> None:
+        """
+        Feature: the CSV of a search's configurations in ND's order.
+        Description: Two configurations, one with its score split into parts and
+            one without, with and without ranks from the full search.
+        Expectation: Rows keep stored global ranks or fall back to their input
+            positions, scores keep full precision, and missing parts are blank.
+        """
+        first = Dim.Dimensions([(Dim.DP, 8), (Dim.SP, False), (Dim.OP, 4)],
+                               all_dims=[Dim.DP, Dim.SP, Dim.OP])
+        second = Dim.Dimensions([(Dim.DP, 4), (Dim.SP, True), (Dim.OP, 2)],
+                                all_dims=[Dim.DP, Dim.SP, Dim.OP])
+        parts = [str(part) for part in Debug.PerfParts][:-2]
+        for ranks, expected in (((None, None), ("1", "2")), ((4, 7), ("4", "7"))):
+            first.rank, second.rank = ranks
+            with self.subTest(ranks=ranks), tempfile.TemporaryDirectory() as tmp_dir:
+                path = os.path.join(tmp_dir, "nested", "ranking.csv")
+                Debug.write_ranking_csv(
+                    [(first, 100, 91599458344632.31, [1.5] * len(parts)), (second, 120, 1e14, [])], path)
+                with open(path, newline="", encoding="utf-8") as handle:
+                    rows = list(csv.reader(handle))
+            self.assertEqual(rows[0], ["rank", "DP", "SP", "OP", "memory_mb", "score"] + parts)
+            self.assertEqual(rows[1][:6], [expected[0], "8", "False", "4", "100", "91599458344632.31"])
+            self.assertEqual(float(rows[1][5]), 91599458344632.31)
+            self.assertEqual(rows[1][6:], ["1.5"] * len(parts))
+            self.assertEqual(rows[2][:6], [expected[1], "4", "True", "2", "120", "100000000000000.0"])
+            self.assertEqual(rows[2][6:], [""] * len(parts))
+
+    def test_a_field_no_parser_set_is_reported_or_refused(self) -> None:
+        """
+        Feature: CostModelConfig.__getattr__, unset_reads_report and run_nd --strict (I9).
+        Description: A config no parser filled, read directly for an op count
+            twice and for its hooks, then through getattr with a default, with
+            and without the strict mode run_nd --strict sets.
+        Expectation: By default each read is 0 and the op count is recorded
+            with its reader and reported once, in one line, the hooks being
+            exempt; under --strict the direct read is refused by name and
+            reader, while getattr gets its stated default; run_nd sets the
+            mode from its flag.
+        """
+        ccfg = object.__new__(CostModelConfig)
+        with patch.object(PreProcess, "UNSET_READS", PreProcess.defaultdict(PreProcess.Counter)), \
+                patch.dict(PreProcess._STRICT, {"on": False}):  # pylint: disable=protected-access
+            self.assertEqual((ccfg.n_gather, ccfg.n_gather, ccfg.hooks_dict), (0, 0, 0))
+            lines = PreProcess.unset_reads_report()
+            self.assertEqual(len(lines), 1)
+            self.assertIn("1 config field(s)", lines[0])
+            self.assertIn("n_gather by test_run_nd.py:test_a_field_no_parser_set_is_reported_or_refused", lines[0])
+            self.assertEqual(PreProcess.unset_reads_report(), [])
+            PreProcess.set_strict(True)
+            with self.assertRaisesRegex(AttributeError, "reads n_gather, which no parser set"):
+                _ = ccfg.n_gather
+            self.assertEqual(getattr(ccfg, "n_gather", 5), 5)
+            for flag, strict in (([], False), (["--strict"], True)):
+                with tempfile.TemporaryDirectory() as tmp_dir, patch.object(Par, "Parallelize", _FakeParallelize), \
+                        patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}), \
+                        patch.object(sys, "argv", ["run_nd.py", "-y", config_path, "-d", "8", "-v", "0"] + flag):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                self.assertEqual(PreProcess._STRICT["on"], strict)  # pylint: disable=protected-access
+
     def test_arch_hook_variants(self) -> None:
         """
         Feature: TestSappNDRunND.
-        Description: Cover predefined architecture hooks using tiny fake configs.
-        Expectation: Hooks update model-specific attributes and layer custom hooks.
+        Description: Apply each family to tiny fake configs.
+        Expectation: Each family's profile sets its fields, and each stack kind applies per layer.
         """
-        cfg = _make_arch_cfg(model_name="llama2")
-        ArchHooks.custom_default_transformer(cfg)
+        cfg = _make_arch_cfg(arch="default")
+        ArchHooks.apply_family(cfg)
         self.assertEqual(cfg.n_attMM, 4)
-        ArchHooks.custom_llama2(cfg)
+        cfg.arch = "llama2"
+        ArchHooks.apply_family(cfg)
         self.assertEqual(cfg.bytes_grad, 2)
-        ArchHooks.custom_mixtral(cfg)
-        self.assertEqual(cfg.hff, cfg.hff_exp)
-        ArchHooks.custom_pangualpha(cfg)
-        self.assertEqual(cfg.n_normOp, 4)
-        ArchHooks.custom_qwen(cfg)
-        self.assertEqual(cfg.shard_recompute_input, cfg.t)
+        cfg.arch = "mixtral"
+        ArchHooks.apply_family(cfg)
+        self.assertEqual((cfg.bytes_grad, cfg.hff), (2, 32))
+        cfg.arch = "pangualpha"
+        ArchHooks.apply_family(cfg)
+        self.assertEqual((cfg.n_normOp, cfg.bytes_dropout), (4, 1))
+        cfg.arch = "qwen"
+        ArchHooks.apply_family(cfg)
+        self.assertEqual((cfg.shard_recompute_input, cfg.shard_output_activ), (cfg.t, cfg.t))
 
-        t5_cfg = _make_arch_cfg(model_name="t5", n_lay=4, n_mtp=0)
-        ArchHooks.custom_t5(t5_cfg)
-        self.assertEqual(len(t5_cfg.layer_custom_config), 2)
+        t5_cfg = _make_arch_cfg(arch="t5", n_lay=4, n_mtp=0)
+        t5_cfg.layer_stack = resolve_layers("t5", derive_layers(load_op_profile("t5"), 4))
+        ArchHooks.apply_family(t5_cfg)
+        ArchHooks.bind_layer_stack(t5_cfg)
+        t5_groups = ArchHooks.layer_groups(t5_cfg)
+        self.assertEqual(len(t5_groups), 2)
         t5_wrap = ArchHooks.CWrap(t5_cfg)
-        t5_cfg.layer_custom_config[0][1](t5_wrap)
+        ArchHooks.apply_layer_kind(t5_wrap, t5_groups[0][0])
         self.assertEqual(t5_cfg.n_attBMM, 1)
-        t5_cfg.layer_custom_config[1][1](t5_wrap)
+        ArchHooks.apply_layer_kind(t5_wrap, t5_groups[1][0])
         self.assertEqual(t5_cfg.n_attMM, 8)
 
-        deepseek_cfg = _make_arch_cfg(model_name="deepseek")
-        ArchHooks.custom_deepseek3(deepseek_cfg)
-        self.assertEqual(len(deepseek_cfg.layer_custom_config), 3)
+        deepseek_cfg = _make_arch_cfg(arch="deepseek")
+        deepseek_cfg.layer_stack = resolve_layers(
+            "deepseek", derive_layers(load_op_profile("deepseek"), 4, 1, first_k_dense=2)
+        )
+        ArchHooks.apply_family(deepseek_cfg)
+        self.assertEqual(deepseek_cfg.dh, 128)
+        ArchHooks.bind_layer_stack(deepseek_cfg)
+        deepseek_groups = ArchHooks.layer_groups(deepseek_cfg)
+        self.assertEqual(len(deepseek_groups), 3)
         deepseek_wrap = ArchHooks.CWrap(deepseek_cfg)
-        deepseek_cfg.layer_custom_config[0][1](deepseek_wrap)
+        ArchHooks.apply_layer_kind(deepseek_wrap, deepseek_groups[0][0])
         self.assertEqual(deepseek_cfg.n_exp, 1)
-        deepseek_cfg.layer_custom_config[1][1](deepseek_wrap)
+        ArchHooks.apply_layer_kind(deepseek_wrap, deepseek_groups[1][0])
         self.assertEqual(deepseek_cfg.n_exp, 4)
 
-        cm_cfg = _make_arch_cfg(model_name="cm")
-        ArchHooks.custom_cm(cm_cfg)
-        self.assertIn("num_params_norm", cm_cfg.overwrite_eval_functions)
-        self.assertGreater(cm_cfg.overwrite_eval_functions["num_params_norm"](cm_cfg, None), 0)
+        cm_cfg = _make_arch_cfg(arch="cm")
+        ArchHooks.apply_family(cm_cfg)
+        self.assertEqual(cm_cfg.layer_fields,
+                         {"shard_p_os_exp": 2, "shard_p_os_non_exp_partial": 2, "shard_embed": 2})
+
+    def test_t5_states_the_tp_gathers_its_embedding_and_output_run(self) -> None:
+        """
+        Feature: apply_family on t5, the model's own config (I15).
+        Description: A T5 config through its family, then each kind of its
+            stack applied in turn.
+        Expectation: The model states the 4 TP gathers of its default kind,
+            the encoder, which the communication walk prices the embedding
+            and the output layer with, where it stated none and they read 0;
+            the encoder's and the decoder's layers keep their 4 and 6.
+        """
+        t5_cfg = _make_arch_cfg(arch="t5", n_lay=4, n_mtp=0)
+        t5_cfg.layer_stack = resolve_layers("t5", derive_layers(load_op_profile("t5"), 4))
+        ArchHooks.apply_family(t5_cfg)
+        ArchHooks.bind_layer_stack(t5_cfg)
+        self.assertEqual(vars(t5_cfg).get("n_gather"), 4)
+        wrap = ArchHooks.CWrap(t5_cfg)
+        gathers = []
+        for kind, _ in ArchHooks.layer_groups(t5_cfg):
+            ArchHooks.apply_layer_kind(wrap, kind)
+            gathers.append(t5_cfg.n_gather)
+        self.assertEqual(gathers, [4, 6])
 
     def test_performance_formula_helpers(self) -> None:
         """
@@ -1367,9 +1573,16 @@ class TestSappNDRunND(unittest.TestCase):
         debugger.info.update({part: 1.0 for part in Debug.PerfParts})
         self.assertGreater(PerfEstimate.apply_regression_coefficients(coeffs, debugger, 10.0), 0)
 
+        def walk(per_stage: list) -> Any:
+            """A walk giving *per_stage*, plain and recomputed alike; both from one walk with ``both``."""
+            def priced(*_: Any, both: bool = False, **__: Any) -> Any:
+                """The walk's sums, plain then recomputed with ``both``."""
+                return (list(per_stage), list(per_stage)) if both else list(per_stage)
+            return priced
+
         with tempfile.TemporaryDirectory() as tmp_dir, \
-                patch.object(PerfEstimate, "estimate_comp", return_value=[10.0, 20.0]), \
-                patch.object(PerfEstimate, "estimate_comm", return_value=[1.0, 2.0]):
+                patch.object(PerfEstimate, "estimate_comp", side_effect=walk([10.0, 20.0])), \
+                patch.object(PerfEstimate, "estimate_comm", side_effect=walk([1.0, 2.0])):
             cfg_for_perf = object.__new__(PerfEstimate.CostModelConfig)
             cfg_for_perf.__dict__.update(vars(cfg))
             perf_debugger = Debug.Debug(
@@ -1472,17 +1685,13 @@ class TestSappNDRunND(unittest.TestCase):
         Feature: TestSappNDRunND.
         Description: Verify the transitional comm overlap fields
             (comm_dp_overlap, comm_tp_overlap) are populated by the real
-            framework parsers via config_comm_flag — the mechanism that
+            framework parsers through derive, which is what
             estimate_from_mem_comm reads on the search (FLOP) path.
         Expectation: After parsing, both overlap fields hold the documented
-            defaults (0.9 and 0.5).  CostModelParserHyperparallel and
-            CostModelParserMindformers both call the base config_comm_flag,
-            so the hyperparallel path covers both.  CostModelParserMindspeed
-            has an inline copy (see cost_model_parser_mindspeed.py:293-294)
-            but is not tested here per project priority.
+            defaults (0.9 and 0.5).  Every parser calls derive, so the
+            hyperparallel path covers them all.
         """
-        # --- Hyperparallel path: calls base config_comm_flag ---
-        # (same base method is also called by CostModelParserMindformers)
+        # --- Hyperparallel path: calls derive ---
         with tempfile.TemporaryDirectory() as tmp_dir:
             source_path = os.path.join(tmp_dir, "__init__.py")
             with open(source_path, "w", encoding="utf-8") as source_file:
@@ -1522,8 +1731,7 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(hp_ccfg.comm_dp_overlap, 0.9)
             self.assertEqual(hp_ccfg.comm_tp_overlap, 0.5)
 
-        # --- Direct test of base _CostModelParser.config_comm_flag ---
-        # Covers the shared method used by mindformers and hyper parsers.
+        # --- Direct test of derive_comm_flags ---
         ccfg_direct = _ParserCostModelConfig()
         ccfg_direct.d = 2
         ccfg_direct.t = 2
@@ -1532,14 +1740,7 @@ class TestSappNDRunND(unittest.TestCase):
         ccfg_direct.has_op = True
         ccfg_direct.has_grad_shard = True
         ccfg_direct.n_exp = 1
-
-        class _ConcreteParser(_CostModelParser):
-            """Concrete subclass for testing the abstract base."""
-
-            def parse(self) -> None:
-                """No-op parse; only config_comm_flag is under test."""
-                return None
-        _ConcreteParser(ccfg_direct).config_comm_flag(ccfg_direct)
+        derive_comm_flags(ccfg_direct)
         self.assertEqual(ccfg_direct.comm_dp_overlap, 0.9)
         self.assertEqual(ccfg_direct.comm_tp_overlap, 0.5)
 
@@ -1575,9 +1776,8 @@ class TestSappNDRunND(unittest.TestCase):
         Description: Cover the TIME performance-type branch and the
             ``cp > 1`` CP debugger info block in ``estimate_from_mem_comm``.
         Expectation: With ``ttype=PerformanceType.TIME`` and ``cp > 1``,
-            the debugger receives both the standard comm keys and the
-            CP-specific detail keys (CP_KV_VOLUME, CP_EXPOSED_TIME,
-            CP_TOPOLOGY, CP_BANDWIDTH).
+            the debugger receives the standard comm keys and nothing but
+            ``PerfParts`` keys, so the debug CSV row stays numeric.
         """
         cfg = _make_perf_cfg(cp=2, n_exp=2)
         stages = [[[LayerType.NOT_REC_LAYER, LayerType.OUTPUT_LAYER]],
@@ -1600,10 +1800,8 @@ class TestSappNDRunND(unittest.TestCase):
             )
         self.assertEqual(len(comm), 2)
         self.assertGreater(comm[0], 0)
-        self.assertIn("CP_KV_VOLUME", debugger.info)
-        self.assertIn("CP_EXPOSED_TIME", debugger.info)
-        self.assertIn("CP_TOPOLOGY", debugger.info)
-        self.assertIn("CP_BANDWIDTH", debugger.info)
+        self.assertIn(Debug.PerfParts.CP_COMM, debugger.info)
+        self.assertTrue(all(isinstance(part, Debug.PerfParts) for part in debugger.info))
 
     def test_framework_parsers_with_synthetic_configs(self) -> None:
         """
@@ -1649,7 +1847,16 @@ class TestSappNDRunND(unittest.TestCase):
             CostModelParserHyperparallel(hp_ccfg).parse()
             self.assertEqual(hp_ccfg.model_name, "llama-unit")
             self.assertEqual(hp_ccfg.vp, 2)
-            self.assertEqual(hp_ccfg.layer_custom_config, [(2, None)])
+            self.assertEqual(ArchHooks.layer_groups(hp_ccfg), [(None, 2)])
+            self.assertEqual(vars(hp_ccfg.rec_op), dict.fromkeys(HYPER_SELECTIVE_REC_OP, 1))
+
+            hp_config.activation_checkpoint.mode = "selective"
+            sel_ccfg = _ParserCostModelConfig()
+            sel_ccfg.config = hp_config
+            sel_ccfg.source_code = source_path
+            CostModelParserHyperparallel(sel_ccfg).parse()
+            self.assertTrue(sel_ccfg.sel_rec)
+            self.assertEqual(vars(sel_ccfg.rec_op), HYPER_SELECTIVE_REC_OP)
 
         ms_mod = {
             "model_id": "vision",
@@ -1690,23 +1897,19 @@ class TestSappNDRunND(unittest.TestCase):
         ms_ccfg = _ParserCostModelConfig()
         ms_ccfg.config = ms_config
         CostModelParserMindspeed(ms_ccfg).parse()
-        self.assertEqual(ms_ccfg.model_name, "multi-unit")
+        # A config of one module is that module.
+        self.assertEqual(ms_ccfg.model_name, "vision")
         self.assertFalse(ms_ccfg.multimodal)
-        self.assertEqual(ms_ccfg.n_lay, 0)
+        self.assertEqual(ms_ccfg.n_lay, 2)
 
     def test_cost_model_config_strategy_helpers(self) -> None:
         """
         Feature: TestSappNDRunND.
-        Description: Cover cost-model copying, validation and strategy mutation with fake parser hooks.
-        Expectation: Strategy fields update consistently without parsing a model config.
+        Description: Cover cost-model copying, validation and strategy mutation without a parser.
+        Expectation: Strategy fields update consistently without parsing a model config, and the
+            fields derived from them follow.
         """
-        parser_calls = []
-        parser = SimpleNamespace(
-            config_shard_emb=lambda: parser_calls.append("embed"),
-            config_dp_tp_exp=lambda cfg: parser_calls.append(("dp_tp", cfg.d, cfg.t)),
-            config_optimizer_shard=lambda cfg: parser_calls.append(("optimizer", cfg.os_max_shard)),
-            config_comm_flag=lambda cfg: parser_calls.append(("comm", cfg.sp)),
-        )
+        parser = SimpleNamespace()
         cost_cfg = object.__new__(CostModelConfig)
         cost_cfg.__dict__.update(
             model_name="unit",
@@ -1737,7 +1940,8 @@ class TestSappNDRunND(unittest.TestCase):
             shard_embed=1,
             shard_output_activ=1,
             shard_recompute_input=1,
-            layer_custom_config=[],
+            n_exp=1,
+            hff_exp=8,
         )
 
         self.assertIn("model_name", str(cost_cfg))
@@ -1774,7 +1978,7 @@ class TestSappNDRunND(unittest.TestCase):
         )
         self.assertEqual(cost_cfg.get_strategy()["dp"], 4)
         self.assertEqual(cost_cfg.gbs, 8)
-        self.assertIn("embed", parser_calls)
+        self.assertEqual(cost_cfg.shard_embed, 8, f"shard_embed={cost_cfg.shard_embed}, want d * t = 8")
 
         cost_cfg.offset = []
         with self.assertRaises(AttributeError):
@@ -1783,24 +1987,47 @@ class TestSappNDRunND(unittest.TestCase):
 
         self._test_multimodal_strategy(cost_cfg)
 
-        hook_calls = []
+    def test_the_search_states_its_machines_links(self) -> None:
+        """
+        Feature: state_machine_links (B5).
+        Description: A config and a multimodal one with a submodule, given
+            the A3 machine, then a config given no machine.
+        Expectation: Each config takes A3's 16 ranks a node and its 200 and
+            25 GB/s links, where every config kept 8, 400 and 25 whatever
+            the machine; without a machine nothing is stated.
+        """
+        plain, child = SimpleNamespace(), SimpleNamespace()
+        multimodal = SimpleNamespace(mm_ccfgs={"vision": child})
+        for cfg in (plain, multimodal):
+            Par.state_machine_links(cfg, Hard.Device_A3)
+        got = [(cfg.device_per_node, cfg.bw_intra, cfg.bw_inter) for cfg in (plain, multimodal, child)]
+        self.assertEqual(got, [(16, 200, 25)] * 3)
+        untouched = SimpleNamespace()
+        Par.state_machine_links(untouched, None)
+        self.assertEqual(vars(untouched), {})
 
-        def original_hook(target: Any) -> None:
-            """Record execution of the original layer hook."""
-            hook_calls.append(("original", target))
-
-        def custom_hook(target: Any) -> None:
-            """Record execution of the injected cost-model hook."""
-            hook_calls.append(("custom", target))
-
-        cost_cfg.layer_custom_config = [(1, original_hook)]
-        cost_cfg.layer_custom_config_callback(custom_hook)
-        wrapped_hook = cost_cfg.layer_custom_config[0][1]
-        wrapped_hook(cost_cfg)
-        evaluator = SimpleNamespace(set_ccfg=lambda hook: hook_calls.append(("set_ccfg", hook)))
-        wrapped_hook(evaluator)
-        self.assertEqual(wrapped_hook.__name__, "original_hook_custom_hook")
-        self.assertTrue(any(call[0] == "set_ccfg" for call in hook_calls))
+    def test_a_strategy_keeps_the_runs_sequence_parallelism(self) -> None:
+        """
+        Feature: CostModelConfig.set_strategy, the sequence-parallel divisor (T1).
+        Description: The DeepSeek MindFormers yaml at TP 4 without sequence
+            parallelism and with it, each moved to TP 2; then a searched
+            candidate at TP 2 stating SP off and on.
+        Expectation: The divisor follows the run's choice at the new TP, 1
+            without and 2 with, where the strategy setter set it to TP for
+            every candidate; a candidate that states SP decides it.
+        """
+        with open(config_path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+        got = []
+        for use_sp in (False, True):
+            data["parallel_config"]["use_seq_parallel"] = use_sp
+            cfg = CostModelConfig(copy.deepcopy(data))
+            cfg.set_strategy(mp=2)
+            got.append(cfg.sp)
+            for stated in (False, True):
+                cfg.set_strategy(mp=2, sp=stated)
+                got.append(cfg.sp)
+        self.assertEqual(got, [1, 1, 2, 2, 1, 2])
 
     def _test_multimodal_strategy(self, cost_cfg: CostModelConfig) -> None:
         """Exercise set_strategy via model_name routing and error handling."""
@@ -1818,6 +2045,7 @@ class TestSappNDRunND(unittest.TestCase):
         multimodal.print_parallelism()
         with self.assertRaises(TypeError):
             multimodal.set_strategy(model_name="missing", dp=1)
+
     def test_parallelize_layer_control_flow_without_estimators(self) -> None:
         """
         Feature: TestSappNDRunND.
@@ -1834,6 +2062,7 @@ class TestSappNDRunND(unittest.TestCase):
             write=lambda folder, config: writes.append((folder, config)),
         )
         runner.config = config_state
+        runner.priced = lambda: config_state.ccfg
         runner.machine = SimpleNamespace(number=16, device=Hard.Device_A2)
         runner.global_batch_size = 8
         runner.model_name = "unit"
@@ -1841,6 +2070,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.mem_eval = SimpleNamespace(
             mem_fit=lambda peak: peak < 100,
             get_strategy=lambda: {},
+            get_max_device_memory=lambda: 100.0,
         )
 
         class _ParallelConfig:
@@ -1872,8 +2102,13 @@ class TestSappNDRunND(unittest.TestCase):
         config_state.global_batch_size = lambda config: 8
 
         runner.device_loops = lambda space, pool: ({"fit": 10, "large": 200}, 2)
-        self.assertEqual(runner.generate_search_space("out", threads_num=None), [("fit", 10)])
+        with patch.object(Par.logger, "output") as output:
+            self.assertEqual(runner.generate_search_space("out", threads_num=None), [("fit", 10)])
         self.assertEqual(writes, [("out", "fit")])
+        said = [call.args for call in output.call_args_list]
+        self.assertEqual([args[1:] for args in said if "dropped:" in args[0]], [("large", 200, 100.0, 100.0)])
+        self.assertIn((2, 0, "", 2), [args[1:] for args in said])
+        self.assertIn((1, 1), [args[1:] for args in said])
 
         runner.memory_estim = lambda debugger=None: 12
         config_state.make_parallel_config = lambda *dims: "inside"
@@ -1892,6 +2127,7 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(debug_parts, [])
         self.assertEqual(runner.order_search_space([], None, None), ([], []))
 
+        runner.batch_reachable = lambda: True
         runner.generate_search_space = lambda folder, threads_num: [(_ParallelConfig(), 10)]
         runner.order_search_space = (
             lambda space, threads_num, cache_file: ([(space[0][0], 10, 2.0, [])], [])
@@ -1906,11 +2142,146 @@ class TestSappNDRunND(unittest.TestCase):
         wrapper.instance = SimpleNamespace(marker="delegated")
         self.assertEqual(wrapper.marker, "delegated")
 
-        with patch.object(Par, "EvaluatorV2") as evaluator_cls:
-            evaluator_cls.return_value.estimate_peak.return_value = 7
-            self.assertEqual(Par.pool_estimate_memory("config"), 7)
-        with patch.object(Par, "estimate_performance", return_value=9):
-            self.assertEqual(Par.pool_estimate_performance("config", Hard.Device_A2), 9)
+    def test_a_candidate_carries_the_searchs_micro_batch_count(self) -> None:
+        """
+        Feature: GlobalConfig.make_parallel_config, the micro-batch count (M6).
+        Description: A config at DP 2, PP 2, micro-batches of 4 and two of
+            them, searched over EP and OP alone, so -l names neither MB nor PP,
+            given a candidate whose loop counted four micro-batches.
+        Expectation: The candidate carries the loop's four and its batch is
+            DP x MB x MBS with them, 32; kept from the config, the two made
+            another batch, 16.
+        """
+        fake_ccfg = _FakeCostModelConfig()
+        global_config = object.__new__(GC.GlobalConfig)
+        global_config.ccfg = fake_ccfg
+        global_config.dimensions = [Dim.EP, Dim.OP]
+        candidate = global_config.make_parallel_config((2, 2, 2, 1), (4, 4), (1, 1, 2, False))
+        self.assertEqual(candidate.val(Dim.MBN), 4)
+        self.assertEqual(global_config.global_batch_size(candidate), 32)
+        self.assertIn(Dim.MBN, global_config.dimensions)
+
+    def test_a_search_no_candidate_of_which_makes_the_batch_stops_with_one_line(self) -> None:
+        """
+        Feature: ParallelizeLayer.batch_reachable (M6).
+        Description: 64 devices searched over EP and OP alone, so every
+            candidate is DP 64 with micro-batches of 1, for a batch of 16, then
+            of 128.
+        Expectation: No candidate makes 16, so the search stops before
+            building one, with one error naming the batch, the yaml's and DP x
+            MBS, 64; 128 is two micro-batches of it, and nothing is said.
+        """
+        for dim in Dim.ALL_DIMS:
+            dim.reset_bound()
+        fake_ccfg = _FakeCostModelConfig()
+        fake_ccfg.d, fake_ccfg.t, fake_ccfg.p, fake_ccfg.b, fake_ccfg.m = 64, 1, 1, 1, 1
+        fake_ccfg.accumulates_grads = True
+        fake_ccfg.gbs = 16
+        global_config = object.__new__(GC.GlobalConfig)
+        global_config.ccfg = fake_ccfg
+        global_config.dimensions = [Dim.EP, Dim.OP]
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.config = global_config
+        runner.machine = SimpleNamespace(number=64)
+        for batch, reachable in ((16, False), (128, True)):
+            with self.subTest(batch=batch), patch.object(Par.logger, "error") as error:
+                runner.global_batch_size = batch
+                self.assertEqual(runner.batch_reachable(), reachable)
+                self.assertEqual(error.call_count, 0 if reachable else 1)
+                if not reachable:
+                    self.assertEqual(error.call_args.args[1:4], (16, 16, "64"))
+
+    def test_a_ranking_priced_at_a_length_nobody_stated_says_so_under_its_table(self) -> None:
+        """
+        Feature: ParallelizeLayer.run_generation_to_ordering, the sequence length (I11).
+        Description: A search over one configuration of a model whose config
+            states no training length, so the parser costed its context
+            limit of 32768; then the same model with a stated length.
+        Expectation: The line under the table names the 32768 tokens and why;
+            with a stated length nothing is said.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP])
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=False), dimensions=[Dim.DP])
+        runner.batch_reachable = lambda: True
+        runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
+        runner.order_search_space = lambda space, threads_num, cache_file: ([(dims, 100, 2.5, [])], [])
+        for stated, said in ((False, 1), (True, 0)):
+            with self.subTest(stated=stated), patch.object(Par.logger, "output") as output:
+                runner.priced = lambda stated=stated: SimpleNamespace(seq_len_stated=stated, s=32768)
+                runner.run_generation_to_ordering(None)
+                lines = [call.args[0] % call.args[1:] for call in output.call_args_list
+                         if "context limit" in call.args[0]]
+                self.assertEqual(len(lines), said)
+                if said:
+                    self.assertIn("priced at 32768 tokens", lines[0])
+        # A field the estimate read unset is named under the table too (I9).
+        reads = PreProcess.defaultdict(PreProcess.Counter, {"n_gather": PreProcess.Counter({"comm.py:tp": 2})})
+        with patch.object(PreProcess, "UNSET_READS", reads), patch.object(Par.logger, "output") as output:
+            runner.run_generation_to_ordering(None)
+        self.assertTrue(any("n_gather by comm.py:tp" in call.args[0] for call in output.call_args_list))
+
+    def test_a_ranking_says_when_it_prices_another_recompute_than_the_runs(self) -> None:
+        """
+        Feature: ParallelizeLayer.run_generation_to_ordering, the run's recompute (H1).
+        Description: A search whose balancing gives every candidate full
+            recompute, for a run training selective, off and full; then the
+            selective run searched with -mppb.
+        Expectation: The line under the table names selective and off, the
+            two modes the search did not price; it says nothing for full, or
+            under -mppb, which prices the run's own.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP])
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.batch_reachable = lambda: True
+        runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
+        runner.order_search_space = lambda space, threads_num, cache_file: (
+            [(Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP]), 100, 2.5, [])], [])
+        said = []
+        for mode, from_config in (("selective", False), ("off", False), ("full", False), ("selective", True)):
+            runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=from_config), dimensions=[Dim.DP])
+            runner.priced = lambda mode=mode: SimpleNamespace(stated_ac_mode=mode)
+            with patch.object(Par.logger, "output") as output:
+                runner.run_generation_to_ordering(None)
+            said.append([call.args[1] for call in output.call_args_list if "checkpoint mode is" in call.args[0]])
+        self.assertEqual(said, [["selective"], ["off"], [], []])
+
+    def test_a_ranking_names_the_mtp_layers_it_does_not_price(self) -> None:
+        """
+        Feature: ParallelizeLayer.run_generation_to_ordering, a dropped MTP depth (I2).
+        Description: A search over one configuration of a model stating 3 MTP
+            layers the AutoModels trainer does not build, then of one stating
+            none.
+        Expectation: The line under the table names the 3 layers; with none,
+            nothing is said.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8)], all_dims=[Dim.DP])
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.config = SimpleNamespace(balancing=SimpleNamespace(from_config=False), dimensions=[Dim.DP])
+        runner.batch_reachable = lambda: True
+        runner.generate_search_space = lambda folder, threads_num: [(dims, 100)]
+        runner.order_search_space = lambda space, threads_num, cache_file: ([(dims, 100, 2.5, [])], [])
+        for dropped, said in ((3, 1), (0, 0)):
+            with self.subTest(dropped=dropped), patch.object(Par.logger, "output") as output:
+                runner.priced = lambda dropped=dropped: SimpleNamespace(mtp_unpriced=dropped)
+                runner.run_generation_to_ordering(None)
+                lines = [call.args[0] % call.args[1:] for call in output.call_args_list
+                         if "MTP layer(s)" in call.args[0]]
+                self.assertEqual(len(lines), said)
+                if said:
+                    self.assertIn("states 3 MTP layer(s)", lines[0])
 
     def test_parallelize_profile_ordering_without_estimators(self) -> None:
         """
@@ -1929,7 +2300,8 @@ class TestSappNDRunND(unittest.TestCase):
             set_parallel_config=lambda config: True,
         )
         runner.mem_eval = SimpleNamespace(get_strategy=lambda: {"dp": 2})
-        runner.memory_estim = lambda: 32
+        runner.priced = lambda: runner.config.ccfg
+        runner.memory_estim = lambda debugger=None: 32
 
         class _FakeDebug:
             """Debug facade with stable accounting entries."""
@@ -1961,7 +2333,8 @@ class TestSappNDRunND(unittest.TestCase):
         with patch.object(Par.Debug, "get_real_data", return_value=([("cfg", 10)], 1)), \
                 patch.object(Par.Debug, "plot_vs_real") as plot_vs_real, \
                 patch.object(Par.Debug, "correlation_topk", return_value=(0.9, 1)), \
-                patch.object(Par.Debug, "get_comm_classified_data", return_value=[("cfg", 10, 2)]), \
+                patch.object(Par.Debug, "get_comm_classified_data",
+                             return_value=[("cfg", 1, 10, 2.0, [], {"IDLE": 3.0})]), \
                 patch.object(Par.Debug, "plot_vs_real_comm_classified") as plot_vs_real_comm, \
                 patch.object(Par.Debug, "correlation_with_classified_comms", return_value=0.8):
             self.assertEqual(runner.test_from_csv("profile.csv", "out"), (0.9, 1, 1))

@@ -187,4 +187,5 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **testing** | `tests/**` |
 | **unit-test** | `tests/ut/**` — hard constraints; how-to → skill `add-unit-test` |
 | **hyper-rl** | `hyper_parallel/rl/**`, RL docs and agent rules — sole RL entry; also consult it for migrated RL tests |
+| **nd-cost-model** | `hyper_parallel/auto_parallel/**`, `tests/ut/auto_parallel/**`: golden before and after, measured figures (B12) |
 | **distributed-op-dev** / **distributed-op-testing** / **test-assertion-style** | Op impl & tests (scoped) |

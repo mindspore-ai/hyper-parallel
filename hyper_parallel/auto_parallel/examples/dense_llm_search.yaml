@@ -28,8 +28,6 @@ cluster:
   cards_per_node: 8
   device_memory_gb: 64.0
   device_type: "A2"
-  intra_node_bandwidth_gbps: 200.0
-  inter_node_bandwidth_gbps: 100.0
 
 parallelism:
   dp: [1, 2, 4, 8]

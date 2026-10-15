@@ -13,14 +13,15 @@
 # limitations under the License.
 # ============================================================================
 """Experimental : Comm time"""
-from copy import deepcopy
-from typing import NamedTuple
+from copy import copy, deepcopy
+from typing import Any, NamedTuple
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.nd.debug import PerfParts
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import NodeEval, Context
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.head import EvalHead
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail
@@ -32,7 +33,9 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_blo
 )
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.utils_classes import NetworkLevel, PerformanceType
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
-    get_layer_custom_configs,
+    get_layer_group_configs,
+    get_layer_switches_by_position,
+    get_model_order,
     get_table_quantity,
 )
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
@@ -40,6 +43,8 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
     CPAlgo,
     _resolve_cp_algo,
 )
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import apply_layer_kind, layer_kinds
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import param_cp
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
     detect_attention_type,
     AttentionType,
@@ -82,7 +87,11 @@ def _cp_comm_zero(ccfg):
 
 
 class _CPVolumes(NamedTuple):
-    """Algorithm-specific CP communication volumes of one layer."""
+    """Algorithm-specific CP communication volumes of one layer.
+
+    ``comm_volume`` is what :func:`cp_traffic` moves, the only field a score
+    reads; the others are logged.
+    """
 
     kv_volume_per_step: float
     total_kv_volume: float
@@ -113,50 +122,50 @@ def _cp_comm_cost_common(ccfg, volumes, attention_type, kv_dim, cp_algo,
     )
 
 
-def _cp_rec_factor(ccfg, ctx):
-    """Recompute coefficient, matching the old cp_comm_non_exp."""
-    rec_layer = (ctx.current_node == LayerType.SEL_REC_LAYER) if ctx else False
-    rec_op_gather = getattr(getattr(ccfg, 'rec_op', None), 'gather', 0)
-    return (int(not rec_layer) | rec_op_gather) * int(ccfg.p == 1)
-
-
-def _ulysses_cp_volumes(ccfg, rec_factor):
+def _ulysses_cp_volumes(ccfg):
     """Ulysses CP volumes: two All2All over (cp-1)/cp of the local shard."""
     s, b = ccfg.s, ccfg.b
     cp = ccfg.cp
     t = max(1, ccfg.t)
     local_qkv = s * b * (ccfg.a / t) * ccfg.dh * 2
     a2a_vol = local_qkv * (cp - 1) / cp
-    # comm_volume: same weighted-unit as dp/tp/ep
-    # Ulysses attention coeff = 0.5*rec_factor + 0.5
-    ulysses_attn_coeff = 0.5 * rec_factor + 0.5
-    comm_vol = (
-        ccfg.comm_cp * 2 * s * b
-        * (ulysses_attn_coeff * ccfg.n_attMM * ccfg.h
-           + ccfg.n_ffMM * ccfg.hff)
-        / t
-    )
-    return _CPVolumes(a2a_vol, a2a_vol * 2, comm_vol, 0, 2)
+    return _CPVolumes(a2a_vol, a2a_vol * 2, cp_traffic(ccfg, CPAlgo.ULYSSES_CP), 0, 2)
 
 
-def _ring_cp_volumes(ccfg, rec_factor, kv_dim):
+def _ring_cp_volumes(ccfg, kv_dim, cp_algo):
     """Ring CP volumes: cp-1 P2P steps of s/cp tokens of KV, both directions."""
     s, b = ccfg.s, ccfg.b
     cp = ccfg.cp
-    t = max(1, ccfg.t)
     kv_bytes = 4
     kv_vol_step = (s / cp) * b * kv_dim * kv_bytes
     total_kv = kv_vol_step * (cp - 1) * 2
-    # comm_volume: same weighted-unit as dp/tp/ep
-    # Ring attention coeff = 2*0.5*rec_factor + 0.5 (extra /cp from (s/cp)^2)
-    ring_attn_coeff = 2 * 0.5 * rec_factor + 0.5
-    comm_vol = (
-        ccfg.comm_cp * 2 * s * b
-        * (ring_attn_coeff * ccfg.n_attMM * ccfg.h
-           + ccfg.n_ffMM * ccfg.hff)
-        / t
-    )
-    return _CPVolumes(kv_vol_step, total_kv, comm_vol, int(cp - 1), 2)
+    return _CPVolumes(kv_vol_step, total_kv, cp_traffic(ccfg, cp_algo), int(cp - 1), 2)
+
+
+def cp_traffic(ccfg: CostModelConfig, cp_algo: CPAlgo) -> float:
+    """The bytes a rank moves a micro-batch for one layer's context parallelism.
+
+    Attention exchanges its keys and values, the MLP nothing.  colossalai
+    and hybrid CP all-gather K and V over the sequence in the forward and
+    reduce-scatter their gradients in the backward, as HyperParallel runs
+    them (a ring passes the same chunks), each moving (cp - 1) / cp of the
+    sequence a rank.  Ulysses all-to-alls the local query, key, value and
+    output between sequence and heads, forward and backward.  A
+    linear-attention layer passes its recurrent state to the next rank,
+    and its gradient back, unless it all-to-alls as Ulysses does.
+    """
+    cp, t = ccfg.cp, max(1, ccfg.t)
+    ring = (cp - 1) / cp
+    head = ccfg.dh or ccfg.h / max(1, ccfg.a)
+    kv_width = compute_kv_dim(ccfg)
+    if cp_algo == CPAlgo.ULYSSES_CP:
+        rope = ccfg.dhr if detect_attention_type(ccfg) == AttentionType.MLA else 0
+        widths = ccfg.a * (head + rope) / t + 2 * kv_width + ccfg.a * head / t
+        return 2 * ring * ccfg.s / cp * ccfg.b * widths * ccfg.bytes_compute
+    if ccfg.n_linrec:
+        state_bytes = 4
+        return 2 * ccfg.a / t * head * head * state_bytes
+    return 2 * ring * ccfg.s * ccfg.b * 2 * kv_width * ccfg.bytes_compute
 
 
 def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPCommunicationCost:
@@ -173,7 +182,11 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
         and receives the rest from other ranks.
         Per-All2All volume = s * b * (a/t) * bytes * (cp-1)/cp (head dims).
         Total volume = 2 * per-All2All volume.
+
+    *ctx* is not read: the exchange a recompute sends again is priced by
+    the walk that recomputes it (``_recomputed_comm``).
     """
+    del ctx
     if ccfg.cp <= 1:
         return _cp_comm_zero(ccfg)
 
@@ -185,12 +198,11 @@ def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPComm
     cp_algo = _resolve_cp_algo(ccfg)
     topology, effective_bandwidth = _cp_resolve_topology(
         ccfg.cp, ccfg.device_per_node, ccfg.bw_intra, ccfg.bw_inter)
-    rec_factor = _cp_rec_factor(ccfg, ctx)
 
     if cp_algo == CPAlgo.ULYSSES_CP:
-        volumes = _ulysses_cp_volumes(ccfg, rec_factor)
+        volumes = _ulysses_cp_volumes(ccfg)
     else:
-        volumes = _ring_cp_volumes(ccfg, rec_factor, kv_dim)
+        volumes = _ring_cp_volumes(ccfg, kv_dim, cp_algo)
     return _cp_comm_cost_common(
         ccfg, volumes, attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
 
@@ -328,7 +340,7 @@ def estimate_op_bulk_comm(*args, **kwargs):
     fill_tp_table(param["cfg"], param["tables"])
     fill_ep_table(param["cfg"], param["tables"], param["device_type"])
 
-    lccfgs = get_layer_custom_configs(param["cfg"])
+    lccfgs = get_layer_group_configs(param["cfg"])
     logger.info(lccfgs)
     param["layer_count"] = 0
     param["idx_lccfg"] = 0
@@ -454,6 +466,10 @@ def prepare_context():
     ctx = Context()
     ctx.attn_num_p = EvalAttn.num_params_attn
     ctx.ffn_num_p = EvalFFn.num_params_ffn
+    # A MoE layer's experts, counted as the memory path's eval config counts them.
+    ctx.ffn_routed_num_p = EvalFFn.num_params_routed_expert
+    ctx.ffn_shared_num_p = EvalFFn.num_params_shared_expert
+    ctx.ffn_router_num_p = EvalFFn.num_params_router
     ctx.norm_num_p = EvalNorm.num_params_norm
 
     ctx.node_eval[LayerType.EMBEDDING_LAYER] = NodeEval(
@@ -469,42 +485,197 @@ def prepare_context():
     return ctx
 
 
-def _accumulate_stage_comm(param, stage):
-    """Sum the per-layer DP, TP, EP and CP communication volumes of one stage."""
+def _recomputed_comm(cfg, ctx, layer):
+    """TP, EP and CP volume a recomputed layer transfers again.
+
+    It is the communication whose buffers the layer's memory no longer keeps:
+    all of it for a fully recomputed layer, and for a selective one what its
+    switches drop, which the memory model's own terms give as the plain
+    volume less the selective one. Parameter traffic is not recomputed. Of
+    CP's traffic, a recompute runs the forward's exchange again, the half
+    the gather switch keeps in a selective layer.
+    """
+    def _volumes(node):
+        ctx.current_node = node
+        kept = EvalUtils.rec_coeff(node == LayerType.SEL_REC_LAYER, EvalUtils.switch(cfg, ctx, "gather"))
+        return (
+            EvalLayerComm.tp_comm_layer(cfg, ctx, 1),
+            EvalLayerComm.ep_comm_layer(cfg, ctx, 1),
+            cp_comm_layer_detailed(cfg, ctx).comm_volume / 2 * kept,
+        )
+
+    kept = ctx.current_node
+    try:
+        plain = _volumes(LayerType.NOT_REC_LAYER)
+        if layer == LayerType.FULL_REC_LAYER:
+            return plain
+        selective = _volumes(LayerType.SEL_REC_LAYER)
+        return tuple(whole - left for whole, left in zip(plain, selective))
+    finally:
+        ctx.current_node = kept
+
+
+def fsdp_root_parts(cfg: Any, layer: Any) -> tuple:
+    """The root's table, the embedding's or the output layer's, as FSDP holds it.
+
+    The parts are as :meth:`EvalLayerComm.fsdp_layer_parts` gives a layer's;
+    a table the output layer shares is its.
+    """
+    if layer == LayerType.EMBEDDING_LAYER:
+        if EvalHead.shares_output_table(cfg):
+            return ()
+        tp = cfg.shard_embed / max(1, cfg.gather_embed or 1)
+        return ((EvalHead.num_params_embed(cfg, None), tp, cfg.shard_embed, cfg.d * tp),)
+    return ((EvalTail.num_params_output(cfg, None), cfg.t, cfg.shard_p_os_non_exp_partial, cfg.d * cfg.cp * cfg.t),)
+
+
+def _fsdp_rounds(cfg) -> tuple:
+    """How many times a micro-batch FSDP gathers a layer's and the root's parameters, and all-reduces.
+
+    Resharded after its forward and its backward, a layer is gathered for
+    both, and the root, kept through its backward, once; kept gathered, each
+    is gathered once a step.  The copies of a shard all-reduce once a step,
+    after the reduce-scatters, where an FSDP group shards the parameters,
+    and every micro-batch where none does.
+    """
+    micro = max(1, cfg.m)
+    reshards = bool(getattr(cfg, "reshards", False))
+    # Sharded beyond TP and whatever CP adds to the width (param_cp): with
+    # TP times CP, a HyperParallel shard no wider than CP read as none.
+    shards = cfg.shard_p_os_non_exp_partial > cfg.t * param_cp(cfg)
+    return (2 if reshards else 1 / micro), (1 if reshards else 1 / micro), (1 / micro if shards else 1)
+
+
+def _accumulate_stage_comm(param, stage, stage_id):
+    """Sum the per-layer DP, TP, EP and CP communication volumes of one stage.
+
+    With ``param["with_recomp"]`` or ``param["both"]``, the walk also keeps
+    the same sums with the volume each recomputed layer's recompute transfers
+    again added, the way the compute estimate counts a recomputed op twice.
+    Both sums take every term in the same order as a walk keeping one of
+    them, so each comes out as that walk's would.
+
+    A body layer is priced on the walk's config, in its own kind; the
+    embedding and the output layer on the model's config, as its family left
+    it, whichever layer the walk reached last.  Under FSDP (grad_shard_as_params),
+    a layer's DP volume, and the root's, is the traffic its collectives
+    move a micro-batch (:meth:`EvalLayerComm.fsdp_traffic`).
+
+    Returns:
+        ``(comm, again, reduced)``: the volumes by dimension; the same with
+        each recomputed layer's traffic added again, or ``None`` where the
+        walk keeps no such sums; and the part of the DP volume the copies of
+        a shard all-reduce (:meth:`EvalLayerComm.fsdp_reduce_traffic`).
+    """
     comm = {Dim.DP: 0.0, Dim.TP: 0.0, Dim.EP: 0.0, Dim.CP: 0.0}
-    for chunk in stage:
-        for layer in chunk:
+    again = dict(comm) if param["with_recomp"] or param["both"] else None
+    sums = (comm,) if again is None else (comm, again)
+    reduced = 0.0
+    fsdp = bool(getattr(param["cfg"], "grad_shard_as_params", False))
+    layer_gathers, root_gathers, reduces = _fsdp_rounds(param["cfg"]) if fsdp else (0, 0, 0)
+    for chunk_id, chunk in enumerate(stage):
+        for lay_id, layer in enumerate(chunk):
             param["ctx"].current_node = layer
-            if (
-                layer
-                not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
-                and param["flatten"]
-            ):
-                custom_fun = param["flatten"].pop(0)
-                if custom_fun:
-                    custom_fun(param["cfg"])
-                logger.info("is layer moe ? %s", param["cfg"].n_exp > 1)
+            position = (stage_id, chunk_id, lay_id)
+            is_body = layer not in [LayerType.EMBEDDING_LAYER, LayerType.OUTPUT_LAYER]
+            cfg = param["walk"] if is_body else param["cfg"]
+            # A layer's own recompute switches, where the config states several.
+            param["ctx"].switches = param["switches"].get(position) if is_body else None
+            if is_body and position in param["kinds"]:
+                kind = param["kinds"][position]
+                if kind is not None:
+                    apply_layer_kind(cfg, kind)
+                logger.info("is layer moe ? %s", cfg.n_exp > 1)
                 param["ctx"].current_node = LayerType.NOT_REC_LAYER
                 logger.info("param ctx %s", param["ctx"])
-                comm[Dim.DP] += EvalLayerComm.dp_comm_layer(param["cfg"], param["ctx"])
+                if fsdp:
+                    parts = EvalLayerComm.fsdp_layer_parts(cfg, param["ctx"])
+                    _add(sums, Dim.DP, EvalLayerComm.fsdp_traffic(cfg, parts, layer_gathers, reduces))
+                    reduced += EvalLayerComm.fsdp_reduce_traffic(cfg, parts, reduces)
+                else:
+                    _add(sums, Dim.DP, EvalLayerComm.dp_comm_layer(cfg, param["ctx"]))
+            elif fsdp and not is_body:
+                parts = fsdp_root_parts(cfg, layer)
+                _add(sums, Dim.DP, EvalLayerComm.fsdp_traffic(cfg, parts, root_gathers, reduces))
+                reduced += EvalLayerComm.fsdp_reduce_traffic(cfg, parts, reduces)
 
-            comm[Dim.TP] += EvalLayerComm.tp_comm_layer(
-                param["cfg"], param["ctx"], 1
-            )  # / 4 #* (param["cfg"].t - 1)
-            comm[Dim.EP] += EvalLayerComm.ep_comm_layer(
-                param["cfg"], param["ctx"], 1
-            )  # * param["cfg"].ep
-            comm[Dim.CP] += cp_comm_layer_detailed(
-                param["cfg"], param["ctx"]
-            ).comm_volume
+            _add(sums, Dim.TP, EvalLayerComm.tp_comm_layer(
+                cfg, param["ctx"], 1
+            ))  # / 4 #* (param["cfg"].t - 1)
+            _add(sums, Dim.EP, EvalLayerComm.ep_comm_layer(
+                cfg, param["ctx"], 1
+            ))  # * param["cfg"].ep
+            if is_body:
+                _add(sums, Dim.CP, cp_comm_layer_detailed(
+                    cfg, param["ctx"]
+                ).comm_volume)
             # min(device_type.level_bound_number[0], param["cfg"].ep)
-            # comm_cp += EvalLayerComm.cp_comm_layer
-            # (param["cfg"], param["ctx"])
-    return comm
+            if again is not None and layer in (LayerType.FULL_REC_LAYER, LayerType.SEL_REC_LAYER):
+                tp_again, ep_again, cp_again = _recomputed_comm(cfg, param["ctx"], layer)
+                again[Dim.TP] += tp_again
+                again[Dim.EP] += ep_again
+                again[Dim.CP] += cp_again
+    return comm, again, reduced
+
+
+def _add(sums, dim, volume):
+    """Add *volume* to dimension *dim* of each of *sums*."""
+    for comm in sums:
+        comm[dim] += volume
+
+
+def _stage_comm_time(param, comm):
+    """Turn one stage's volumes into the walk's units, in place: the time model, the nodes, the overlap, A3."""
+    if param["ccfg"].ttype == PerformanceType.TIME:
+        for dim, ov in zip([Dim.DP, Dim.TP, Dim.CP], [0.0, 0.0, 0.0]):
+            comm[dim] = estimate_comm_score(
+                param["cfg"],
+                comm[dim],
+                dim,
+                overlap=ov,
+                device=param["device_type"],
+            )
+
+    dev_per_node = param["device_type"].level_bound_number[0]
+    comm[Dim.TP] *= max(1, param["cfg"].t // dev_per_node)
+    comm[Dim.EP] *= max(1, param["cfg"].ep // dev_per_node)
+    comm[Dim.CP] *= max(1, param["cfg"].cp // dev_per_node)
+
+    # Transitional overlap correction.
+    # The search runs the FLOP path, which has no other overlap
+    # modeling; these factors are the only overlap correction on that
+    # path.  The TIME path's estimate_comm_score(overlap=...) call
+    # above is zeroed, so this is the single source of overlap for
+    # both paths.
+    # Defaults (dp=0.9, tp=0.5) are MindFormers-validated overlap, not
+    # test hacks: they made the model match real MindFormers step times.
+    # Re-validating for the hyper-parallel target is a follow-up.
+    # Follow-up: source from hardware, fix estimate_comm_score's dim
+    # list and add latency, then fold this into estimate_comm_score.
+    comm[Dim.DP] *= (1 - param["cfg"].comm_dp_overlap)
+    comm[Dim.TP] *= (1 - param["cfg"].comm_tp_overlap)
+
+    if param["device_type"].name == "A3":
+        logger.info("A3 ratio")
+        comm[Dim.DP] /= 2
+        comm[Dim.TP] /= 2
+        comm[Dim.EP] /= 2
+        comm[Dim.CP] /= 2
+
+
+def _stage_totals(comms):
+    """Each stage's volume over the four dimensions, from per-dimension lists."""
+    return [c + comms[Dim.DP][i] + comms[Dim.EP][i] + comms[Dim.CP][i] for i, c in enumerate(comms[Dim.TP])]
 
 
 def estimate_from_mem_comm(*args, **kwargs):
-    """For memory estimation"""
+    """Each stage's communication, from the memory model's volumes.
+
+    With ``both``, one walk returns ``(plain, recomputed)``: each stage's
+    communication, then the same with each recomputed layer's traffic added
+    again, which ``with_recomp`` alone returns.  The debugger records the
+    plain parts.
+    """
 
     param = {
         "cfg": args[0],
@@ -515,56 +686,37 @@ def estimate_from_mem_comm(*args, **kwargs):
     param["debugger"] = kwargs.get(
         "debugger", args[5] if len(args) > 5 else None
     )
-    param["ctx"] = prepare_context()
-
-    # For layer type
-    param["flatten"] = sum(
-        [[f[1]] * f[0] for f in param["cfg"].layer_custom_config], []
+    param["with_recomp"] = kwargs.get(
+        "with_recomp", args[4] if len(args) > 4 else False
     )
+    param["both"] = kwargs.get("both", False)
+    param["ctx"] = prepare_context()
+    # The layers' kinds go on a copy: the model's config leaves the walk as
+    # it entered it, for the next walk and every read after.
+    param["walk"] = copy(param["cfg"])
+
+    # Each layer's kind, in model order; layers past the stack get no entry,
+    # so no kind and no DP term.
+    param["kinds"] = dict(zip(get_model_order(param["cfg"], param["stages"]), layer_kinds(param["cfg"])))
+    param["switches"] = get_layer_switches_by_position(param["cfg"], param["stages"])
     comms = {Dim.DP: [], Dim.TP: [], Dim.EP: [], Dim.CP: []}
-    for stage in param["stages"]:
-        comm = _accumulate_stage_comm(param, stage)
+    recomms = {Dim.DP: [], Dim.TP: [], Dim.EP: [], Dim.CP: []}
+    # Each stage's all-reduce, the share of its DP time the copies of a shard
+    # spend reducing it: estimate_pipeline takes it out of DP_COMM.
+    reduces = []
+    for stage_id, stage in enumerate(param["stages"]):
+        plain, again, reduced = _accumulate_stage_comm(param, stage, stage_id)
+        comm = again if param["with_recomp"] and not param["both"] else plain
+        reduce_share = reduced / comm[Dim.DP] if comm[Dim.DP] else 0.0
 
-        if param["ccfg"].ttype == PerformanceType.TIME:
-            for dim, ov in zip([Dim.DP, Dim.TP, Dim.CP], [0.0, 0.0, 0.0]):
-                comm[dim] = estimate_comm_score(
-                    param["cfg"],
-                    comm[dim],
-                    dim,
-                    overlap=ov,
-                    device=param["device_type"],
-                )
-
-        dev_per_node = param["device_type"].level_bound_number[0]
-        comm[Dim.TP] *= max(1, param["cfg"].t // dev_per_node)
-        comm[Dim.EP] *= max(1, param["cfg"].ep // dev_per_node)
-        comm[Dim.CP] *= max(1, param["cfg"].cp // dev_per_node)
-
-        # Transitional overlap correction.
-        # The search runs the FLOP path, which has no other overlap
-        # modeling; these factors are the only overlap correction on that
-        # path.  The TIME path's estimate_comm_score(overlap=...) call
-        # above is zeroed, so this is the single source of overlap for
-        # both paths.
-        # Defaults (dp=0.9, tp=0.5) are MindFormers-validated overlap, not
-        # test hacks: they made the model match real MindFormers step times.
-        # Re-validating for the hyper-parallel target is a follow-up.
-        # Follow-up: source from hardware, fix estimate_comm_score's dim
-        # list and add latency, then fold this into estimate_comm_score.
-        comm[Dim.DP] *= (1 - param["cfg"].comm_dp_overlap)
-        comm[Dim.TP] *= (1 - param["cfg"].comm_tp_overlap)
-
-        if param["device_type"].name == "A3":
-            logger.info("A3 ratio")
-            comm[Dim.DP] /= 2
-            comm[Dim.TP] /= 2
-            comm[Dim.EP] /= 2
-            comm[Dim.CP] /= 2
-
-        comms[Dim.DP].append(comm[Dim.DP])
-        comms[Dim.TP].append(comm[Dim.TP])
-        comms[Dim.EP].append(comm[Dim.EP])
-        comms[Dim.CP].append(comm[Dim.CP])
+        _stage_comm_time(param, comm)
+        for dim, values in comms.items():
+            values.append(comm[dim])
+        reduces.append(comm[Dim.DP] * reduce_share)
+        if param["both"]:
+            _stage_comm_time(param, again)
+            for dim, values in recomms.items():
+                values.append(again[dim])
 
     if param["debugger"] and param["debugger"].is_enabled():
         logger.info("DP_COMM = %s", comms[Dim.DP])
@@ -572,25 +724,26 @@ def estimate_from_mem_comm(*args, **kwargs):
         logger.info("EP_COMM = %s", comms[Dim.EP])
         logger.info("CP_COMM = %s", comms[Dim.CP])
         param["debugger"].info[PerfParts.DP_COMM] = comms[Dim.DP]
+        param["debugger"].info[PerfParts.DP_REDUCE] = reduces
         param["debugger"].info[PerfParts.MP_COMM] = comms[Dim.TP]
         param["debugger"].info[PerfParts.EP_COMM] = comms[Dim.EP]
         param["debugger"].info[PerfParts.CP_COMM] = comms[Dim.CP]
         if param["cfg"].cp > 1:
+            # Logged, not stored: debugger.info must hold only numeric PerfParts,
+            # which the debug CSV and the score table are built from.
             cp_comm_details = cp_comm_layer_detailed(param["cfg"], param["ctx"])
-            param["debugger"].info["CP_KV_VOLUME"] = cp_comm_details.total_kv_volume
-            param["debugger"].info["CP_EXPOSED_TIME"] = cp_comm_details.exposed_comm_time
-            param["debugger"].info["CP_TOPOLOGY"] = cp_comm_details.topology
-            param["debugger"].info["CP_BANDWIDTH"] = cp_comm_details.effective_bandwidth
+            logger.info("CP_KV_VOLUME = %s", cp_comm_details.total_kv_volume)
+            logger.info("CP_EXPOSED_TIME = %s", cp_comm_details.exposed_comm_time)
+            logger.info("CP_TOPOLOGY = %s", cp_comm_details.topology)
+            logger.info("CP_BANDWIDTH = %s", cp_comm_details.effective_bandwidth)
 
-    res = []
-    for i, c in enumerate(comms[Dim.TP]):
-        res += [c + comms[Dim.DP][i] + comms[Dim.EP][i] + comms[Dim.CP][i]]
-
-    return res
+    if param["both"]:
+        return _stage_totals(comms), _stage_totals(recomms)
+    return _stage_totals(comms)
 
 
 def estimate_comm(*args, **kwargs):
-    """wrapper"""
+    """wrapper; with ``both``, the plain and the recomputed communication from one walk"""
     cfg, ccfg, stages, device_type = args[0], args[1], args[2], args[3]
     with_recomp = kwargs.get(
         "with_recomp", args[4] if len(args) > 4 else False
@@ -606,6 +759,7 @@ def estimate_comm(*args, **kwargs):
         device_type,
         with_recomp=with_recomp,
         debugger=debugger,
+        both=kwargs.get("both", False),
     )
 
 

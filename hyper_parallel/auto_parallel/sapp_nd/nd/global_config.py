@@ -15,7 +15,7 @@
 """One configuration interface for parallelization"""
 
 import copy
-from math import gcd
+from typing import Any, Dict
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import CWrap, check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
@@ -27,10 +27,14 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.balancing_adapter as BA
 class GlobalConfig:
     """Union of cost model & parallel config"""
 
-    def __init__(self, config, dimensions=None, mppb=False):
+    def __init__(self, config, dimensions=None, mppb=False, parent=None):
 
         self.wrap = CWrap(config)
         self.ccfg = self.wrap.ccfg
+        # The other submodules of a multimodal model, which run on the same
+        # stages as the one the search drives: each takes the candidate's
+        # degrees, with its own layers placed and its own recompute adapted.
+        self.siblings = self._pipeline_siblings(config, parent, mppb)
 
         if dimensions is not None:
             logger.debug("dimensions = %s", str(dimensions))
@@ -54,13 +58,21 @@ class GlobalConfig:
             return parallel_config.val(dim)
         return dim.from_config(self.ccfg)
 
+    def accumulates_grads(self) -> bool:
+        """Whether the run accumulates gradients over micro-batches without pipeline parallelism."""
+        return bool(getattr(self.ccfg, "accumulates_grads", False))
+
     def global_batch_size(self, parallel_config):
-        """Compute global batch size from hyperparameters"""
+        """Compute global batch size from hyperparameters.
+
+        Micro-batches multiply it under pipeline parallelism, and without it
+        in a run that accumulates gradients over them.
+        """
         dp = self.dim_val(Dim.DP, parallel_config)
         pp = self.dim_val(Dim.PP, parallel_config)
         mb = self.dim_val(Dim.MBN, parallel_config)
         bs = self.dim_val(Dim.MBS, parallel_config)
-        if pp > 1:
+        if pp > 1 or self.accumulates_grads():
             logger.info("GBS = %dDP * %dMB * %dBS", dp, mb, bs)
             return dp * mb * bs
         logger.info("GBS = %dDP * %dBS", dp, bs)
@@ -104,22 +116,38 @@ class GlobalConfig:
             self.ccfg.config.dump(file_name, folder)
 
     def moe_valid(self, parallel_config):
-        """Check whether  the model is MoE"""
+        """Whether a MoE model's EP fits its experts and the ranks they spread over (:meth:`max_ep`)."""
         expert_num = self.ccfg.n_exp
         if expert_num > 1:
             ep = self.dim_val(Dim.EP, parallel_config)
             dp = self.dim_val(Dim.DP, parallel_config)
             mp = self.dim_val(Dim.TP, parallel_config)
+            cp = self.dim_val(Dim.CP, parallel_config)
             logger.debug(
-                "moe valid ? EP %d <= E %d & EP %d <= DP %d * MP %d",
+                "moe valid ? EP %d <= E %d & EP %d <= %d, DP %d MP %d CP %d",
                 ep,
                 expert_num,
                 ep,
+                self.max_ep(dp, mp, cp),
                 dp,
                 mp,
+                cp,
             )
-            return ep <= min(expert_num, dp * mp)
+            return ep <= min(expert_num, self.max_ep(dp, mp, cp))
         return True
+
+    def max_ep(self, dp: int, tp: int, cp: int = 1) -> int:
+        """Compute bound for dimension EP: the ranks a stage spreads its experts over.
+
+        They are its DP x TP ranks, and under HyperParallel its DP x CP x TP
+        ranks: it builds its expert mesh ``(edp_replicate, edp_shard, ep)``
+        over the whole ``(dp, cp, tp)`` device mesh
+        (``MeshContext._build_expert_parallel_mesh``), the domain its FSDP
+        shard spans as well (``shard_spans_cp``).  Bounded by DP x TP, a
+        strategy under CP could not spread its experts over CP's ranks,
+        though the runtime does (F3).
+        """
+        return dp * tp * (cp if getattr(self.ccfg, "shard_spans_cp", False) else 1)
 
     def ep_constraints_valid(self, parallel_config):
         """Check EP-specific divisibility constraints (C1, C2).
@@ -158,6 +186,15 @@ class GlobalConfig:
         if not r2:
             logger.warning("EP constraint C2 failed: %s", r2.message)
             return False
+        # C4: an expert shard the run states divides its expert data-parallel
+        # group, the stage's ranks over EP, as HyperParallel requires.  A run
+        # that shards over the whole group takes each strategy's own.
+        shard = getattr(self.ccfg, "expert_shard", None) or 1
+        if ep > 1 and shard > 1 and not getattr(self.ccfg, "expert_shard_group", False):
+            group = self.dim_val(Dim.DP, parallel_config) * self.dim_val(Dim.CP, parallel_config) * tp // ep
+            if group % shard:
+                logger.warning("EP constraint C4 failed: an expert shard of %d in a group of %d", shard, group)
+                return False
         return True
 
     def make_parallel_config_args(self, **kwargs):
@@ -169,13 +206,14 @@ class GlobalConfig:
         for dim in self.dimensions:
             dims.append((dim, kwargs.get(dim.lname())))
 
-        has_mbn_not_in = Dim.MBN not in self.dimensions
-        has_pp_in = Dim.PP in self.dimensions
-        has_dp_or_mbs_in = Dim.DP in self.dimensions or Dim.MBS in self.dimensions
-        if has_mbn_not_in and has_pp_in and has_dp_or_mbs_in:
+        # The micro-batch count is the search's own, the global batch over DP
+        # and MBS, whatever -l names. Kept from the yaml where -l left it out,
+        # every DP but the yaml's own made another batch, so the search
+        # refused every candidate or kept a single DP (M6).
+        if Dim.MBN not in self.dimensions:
             dims.append((Dim.MBN, kwargs.get(Dim.MBN.lname())))
             self.dimensions.append(Dim.MBN)
-        return Dim.Dimensions(dims, all_dims=self.dimensions)
+        return Dim.Dimensions(dims, all_dims=self.dimensions, accumulates=self.accumulates_grads())
 
     def make_parallel_config(self, dtpc_p, mbsn, evos_p):
         """Create a parallel config from parallel values"""
@@ -210,6 +248,7 @@ class GlobalConfig:
             kwargs[dim.name.lower()] = value
 
         self.ccfg.set_strategy(**kwargs)
+        self.siblings_take(kwargs)
         if not self.ccfg.multimodal:
             if not self.ccfg.hooks_dict:
                 logger.info(
@@ -223,6 +262,47 @@ class GlobalConfig:
                 hook(self.wrap)
 
         return ok
+
+    @staticmethod
+    def _pipeline_siblings(config, parent, mppb):
+        """Every other config of *config*'s pipeline: a multimodal parent's other submodules, and the parent.
+
+        Each submodule comes with the balancing of its own layers, which
+        adapts its recompute to a candidate's pipeline; the parent has no
+        layers of its own and takes the degrees alone.
+        """
+        if parent is None or not parent.multimodal:
+            return []
+        siblings = []
+        for name in parent.mm_order:
+            sub = parent.mm_ccfgs[name]
+            if sub is not config:
+                siblings.append((sub, BA.BalancingAdapter(
+                    sub.n_lay + sub.n_mtp,
+                    copy.deepcopy(sub.offset),
+                    copy.deepcopy(sub.full_rec),
+                    mppb,
+                )))
+        return siblings + [(parent, None)]
+
+    def siblings_take(self, kwargs: Dict[str, Any]) -> None:
+        """Give every other config of a shared pipeline the degrees of *kwargs*.
+
+        A vision tower is trained on the same devices as the language model
+        the search drives, so it takes the candidate's degrees; its layers
+        stay on the first stages, where the parser places them, and its
+        recompute is adapted to the candidate's pipeline rather than the
+        language model's, which counts other layers.  The parent, which
+        holds the strategy its submodules share and combines their
+        partitions, takes the degrees and no layer of its own.
+        """
+        degrees = {key: value for key, value in kwargs.items() if key not in ("offset", "full_rec")}
+        for sibling, balancing in self.siblings:
+            pipeline = (degrees.get("pp", sibling.p), degrees.get("vpp", sibling.vp))
+            stated = {"offset": BA.front_loaded_offset(balancing.layers if balancing else 0, *pipeline)}
+            if balancing is not None:
+                stated["full_rec"] = balancing.treat_recompute(*pipeline)
+            sibling.set_shared_strategy(**degrees, **stated)
 
     def space(self, dim, divide, reverse=False):
         """Generate the space for a given dimension"""
@@ -265,22 +345,31 @@ class GlobalConfig:
             return [False, True]
         return [dim.from_config(self.ccfg)]
 
-    def max_op(self, dp, tp, ep):
-        """Compute bound for dimension OP"""
-        if (
-            isinstance(self.ccfg.optimizer, str)
-            and "muon" not in self.ccfg.optimizer.lower()
-        ):
-            return dp
-        if self.ccfg.n_exp and self.ccfg.n_exp > 1:
-            exp_gcd = gcd(dp * tp // max(tp, ep), self.ccfg.n_exp)
-        else:
-            exp_gcd = dp
+    def max_op(self, dp, tp, ep, cp=1):
+        """Compute bound for dimension OP.
 
-        dc_kv_valid = self.ccfg.dc_kv and self.ccfg.dc_kv > 1
-        dhr_valid = self.ccfg.dhr and self.ccfg.dhr > 1
-        if dc_kv_valid and dhr_valid:
-            att_gcd = gcd(self.ccfg.h, self.ccfg.dc_kv + self.ccfg.dhr)
-        else:
-            att_gcd = self.ccfg.h
-        return gcd(exp_gcd, att_gcd)
+        OP is the runtime's ``dp_shard_size``, and all the runtime asks of it
+        is that the data-parallel group divide into a replicate axis and a
+        shard axis (``distributed/mesh.py``, ``MeshContext.build_meshs``), so
+        every divisor of DP is reachable.  HyperParallel's group is DP times
+        CP, its FSDP domain, where a shard spans CP's ranks
+        (``shard_spans_cp``): bounded by DP alone, a strategy under CP could
+        not be sharded wider than DP, though the runtime shards it over the
+        whole domain.
+
+        Under Muon this used to narrow to a greatest common divisor over the
+        expert count and the attention widths.  Nothing in the runtime asks
+        for that: Newton-Schulz runs on a matrix's last two dimensions and the
+        optimizer all-gathers them whenever the shard falls there, running
+        locally when it does not (``core/optimizer/muon.py``,
+        ``_classify_parameters_for_step``; ``core/optimizer/
+        sharding_category.py``, ``is_last2d_sharded``), and a width that does
+        not divide a parameter is only logged, never refused.  The cap came in
+        with the original search import and cost the strategies engineers run:
+        at 64 devices with EP 16 it allowed no shard wider than 4, and at 16
+        devices with EP 16 none at all.  What Muon does change, one momentum
+        per matrix in place of two moments, the parser carries as
+        ``optimizer_states``.
+        """
+        del tp, ep  # the shard is bounded by the data-parallel group alone
+        return dp * cp if getattr(self.ccfg, "shard_spans_cp", False) else dp

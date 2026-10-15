@@ -14,10 +14,8 @@
 # ============================================================================
 """find parallelization"""
 
-from contextlib import nullcontext
+from collections import Counter
 import time
-import copy
-import multiprocessing as proc
 import json
 import os
 import logging
@@ -25,7 +23,6 @@ from typing import Any, Optional, Tuple
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_performance
-
 from hyper_parallel.auto_parallel.sapp_nd.nd.global_config import GlobalConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
@@ -33,12 +30,35 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd.dimensions import validate_cp_constraints
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
-    CostModelConfig,
+    arm_strategy_guard,
     detect_attention_type,
+    unset_reads_report,
 )
 
 # logger = proc.log_to_stderr()
 # logger.setLevel(proc.SUBDEBUG)
+
+def state_machine_links(ccfg: Any, device: Any) -> None:
+    """Give a config, and each submodule's, its machine's ranks a node and link bandwidths (B5).
+
+    The CP check, its topology penalty and the CP cost read them off the
+    config, where nothing assigned them, so they held the config's defaults,
+    8 ranks a node, 400 and 25 GB/s, whatever machine was chosen.  The node
+    is the device's first level and its links the first two levels'
+    bandwidths, the second level's falling back to the first's.
+
+    Args:
+        ccfg: The config the search prices; a multimodal one's submodules
+            take the same machine.
+        device: The machine's ``Hard.Type``; nothing is stated without one.
+    """
+    levels = list(getattr(device, "level_bandwidth", None) or [])
+    if device is None or not levels:
+        return
+    for cfg in [ccfg, *(getattr(ccfg, "mm_ccfgs", None) or {}).values()]:
+        cfg.device_per_node = device.intra_node_num()
+        cfg.bw_intra = levels[0]
+        cfg.bw_inter = levels[1] if len(levels) > 1 else levels[0]
 
 
 class ParallelizeLayer:
@@ -61,18 +81,21 @@ class ParallelizeLayer:
             manual_ppb = False
 
         self.mem_eval = evaluator
+        state_machine_links(self.mem_eval._ccfg, getattr(machine, "device", None))
 
         self.model_name = self.mem_eval._ccfg.model_name
         logger.debug("model is %s", self.model_name)
 
-        if "mem_for_ppb" in extra_config:
-            reserve_mem = extra_config.pop("mem_for_ppb")
-            self.mem_eval._ccfg.device_capacity.decrease(reserve_mem)
-
+        # The cap replaces the device's capacity, and the reserve comes out
+        # of whichever capacity holds.
         if "max_mem" in extra_config:
             max_mem = extra_config.pop("max_mem")
             if max_mem is not None:
                 self.mem_eval._ccfg.device_capacity.set(max_mem)
+
+        if "mem_for_ppb" in extra_config:
+            reserve_mem = extra_config.pop("mem_for_ppb")
+            self.mem_eval._ccfg.device_capacity.decrease(reserve_mem)
 
         logger.debug("before global config init")
 
@@ -83,6 +106,7 @@ class ParallelizeLayer:
                     self.mem_eval._ccfg.mm_ccfgs[sub_model],
                     dimensions,
                     mppb=manual_ppb,
+                    parent=self.mem_eval._ccfg,
                 )
             else:
                 self.config = GlobalConfig(
@@ -105,9 +129,16 @@ class ParallelizeLayer:
             self.global_batch_size = self.config.ccfg.gbs
 
         self.bound_space()
+        # From here on the configs this search owns take a strategy only
+        # through set_strategy; an estimator's copy of one starts unarmed.
+        arm_strategy_guard(self.mem_eval.ccfg)
 
     def bound_space(self) -> None:
         """Set bounds for parallel dimensions"""
+        # Bounds live on the module-level dimensions: start each search from
+        # none, or it keeps the tightest bound any earlier search set.
+        for dim in Dim.ALL_DIMS:
+            dim.reset_bound()
         vpp = (
             1
             if Dim.VPP in self.config.dimensions
@@ -146,6 +177,24 @@ class ParallelizeLayer:
             Dim.TP.set_bound(
                 Hard.highest_power_of_2_divisor(self.config.ccfg.a)
             )
+        self._report_bounds(vpp)
+
+    def _report_bounds(self, vpp: int) -> None:
+        """Name the bound each searched dimension takes, and why.
+
+        A degree over its bound is never generated, so no check refuses it
+        and no estimate drops it: this line is the only trace it leaves.
+        """
+        heads = "KV heads" if self.config.ccfg.n_kv else "attention heads' largest power of two"
+        bounds = (
+            (Dim.PP, f"the machine's {self.machine.pipeline_bound()}, {self.config.total_layer_num()} layers "
+                     f"over VPP {vpp}, a batch of {self.global_batch_size}"),
+            (Dim.EP, "the model's experts"),
+            (Dim.TP, f"the model's {heads}"),
+        )
+        named = [f"{dim} up to {dim.get_bound()} ({why})" for dim, why in bounds if dim in self.config.dimensions]
+        if named:
+            logger.output("The search bounds %s", "; ".join(named))
 
     @staticmethod
     def filtered_out(_: Any) -> bool:
@@ -155,20 +204,25 @@ class ParallelizeLayer:
         #         return True
         return False
 
+    def _refuse(self, reason: str) -> bool:
+        """Count a candidate refused for *reason*, for the search's summary, and return False."""
+        self.__dict__.setdefault("refused", Counter())[reason] += 1
+        return False
+
     def is_valid(self, parallel_config: Any) -> bool:
         """Check configuration validity"""
         if not parallel_config.is_valid():
             logger.warning("configuration %s not valid", str(parallel_config))
-            return False
+            return self._refuse("a degree out of bounds")
         if not self.config.moe_valid(parallel_config):
             logger.warning("expert parallel is higher than expert number")
-            return False
+            return self._refuse("EP over the experts or the ranks they spread over")
         if hasattr(self.config, 'ep_constraints_valid') and not self.config.ep_constraints_valid(parallel_config):
             logger.warning("EP divisibility constraints not satisfied")
-            return False
+            return self._refuse("EP divisibility")
         if self.filtered_out(parallel_config):
             logger.warning("Config manually filtered out")
-            return False
+            return self._refuse("filtered out")
 
         if hasattr(parallel_config, 'dims_val') and Dim.CP in parallel_config.dims_val:
             cp_degree = parallel_config.dims_val[Dim.CP]
@@ -204,7 +258,7 @@ class ParallelizeLayer:
 
                 if not cp_result.is_valid:
                     logger.warning("CP constraints violated: %s", cp_result.error_message)
-                    return False
+                    return self._refuse("CP constraints")
 
                 if cp_result.warning_message:
                     logger.info("CP warning: %s", cp_result.warning_message)
@@ -216,16 +270,26 @@ class ParallelizeLayer:
                 gbs,
                 self.global_batch_size,
             )
-            return False
+            return self._refuse("global batch")
         return True
+
+    def priced(self) -> Any:
+        """The config a candidate is priced on: the whole model, every submodule of it.
+
+        The search drives one submodule's strategy (:class:`GlobalConfig`
+        gives the others the same degrees), and a candidate is priced on the
+        model the run trains: a vision tower's parameters, activations and
+        compute count toward the stage that holds them (F2).
+        """
+        return self.mem_eval.ccfg
 
     def memory_estim(self, debugger: Any = None) -> Any:
         """Whether the config fits memory"""
         logger.debug("estimate_peak")
         verbose = logger.level < logging.INFO
-        self.mem_eval.set_config(self.config.ccfg)  # = self.config.ccfg
+        self.mem_eval.set_config(self.priced())
         # self.mem_eval = EvaluatorV2(self.config)
-        logger.debug("ccfg = %s", str(self.config.ccfg))
+        logger.debug("ccfg = %s", self.config.ccfg)
         peak = self.mem_eval.estimate_peak(
             verbose=verbose
         )  # (logger.level>2))
@@ -234,50 +298,58 @@ class ParallelizeLayer:
             debugger.info[Debug.MemParts.TOTAL] = peak
         return peak
 
-    def generate_search_space(self, folder: Any, threads_num: Any) -> Any:
-        """Return a search space computed with memory estimation"""
-        # With a pool the accumulator holds AsyncResult, which the direct
-        # branch's float values hide from static inference.
-        # pylint: disable=no-member
-        space = ({}, 0)
+    def _drop(self, config: Any, peak: float) -> None:
+        """Say that the memory budget drops *config*, and by how much its peak misses it."""
+        budget = self.mem_eval.get_max_device_memory()
+        logger.output(
+            "%s dropped: its peak of %.0f MB is over the %.0f MB budget by %.0f MB",
+            config,
+            peak,
+            budget,
+            peak - budget,
+        )
+
+    def _summarise_search(self, size: int, priced: int, fitting: int) -> None:
+        """The search's two counts: what was tested, refused and priced, and what fits."""
+        refused = self.__dict__.get("refused", Counter())
+        reasons = ", ".join(f"{reason} {count}" for reason, count in refused.most_common())
+        logger.output(
+            "%d configurations tested: %d refused%s, %d priced for memory",
+            size,
+            sum(refused.values()),
+            f" ({reasons})" if reasons else "",
+            priced,
+        )
+        logger.output(
+            "%d configuration fitting memory to order, %d dropped over the memory budget",
+            fitting,
+            priced - fitting,
+        )
+
+    def generate_search_space(self, folder: Any, threads_num: Any) -> Any:  # pylint: disable=unused-argument
+        """Return a search space computed with memory estimation.
+
+        A candidate the memory budget drops is named with its peak, and the
+        summary counts the candidates the checks refused apart from those the
+        budget dropped, each check by name.  *threads_num* is unused: the
+        candidates are priced in this process.
+        """
         configs = []
-        results = {}
-        if threads_num:
-            with proc.Pool(processes=threads_num) as pool:
-                logger.debug("before loops")
-                results, size = self.device_loops(space, pool)
-                logger.debug("%d results", len(results))
-                for config, result in results.items():
-                    logger.debug("result = %s", str(result))
-                    logger.debug(
-                        "before get: is ready ? %s", str(result.ready())
-                    )
-                    peak_mem = result.get()
-                    logger.debug(
-                        "after get: is ready ? %s", str(result.ready())
-                    )
-                    logger.debug(
-                        "after get: is successful ? %s",
-                        str(result.successful()),
-                    )
-                    logger.debug("peak_mem = %s", str(peak_mem))
-                    if self.mem_eval.mem_fit(peak_mem):
-                        configs.append((config, peak_mem))
-                pool.close()
-                pool.join()
-        else:
-            results, size = self.device_loops(space, None)
-            for config, peak_mem in results.items():
-                if self.mem_eval.mem_fit(peak_mem):
-                    configs.append((config, peak_mem))
-                    if folder:
-                        self.config.write(folder, config)
-        logger.output("%d valid configurations generated", size)
-        logger.output("%d configuration fitting memory to order", len(configs))
+        self.refused = Counter()
+        with Debug.holding_open():
+            results, size = self.device_loops(({}, 0), None)
+        for config, peak_mem in results.items():
+            if self.mem_eval.mem_fit(peak_mem):
+                configs.append((config, peak_mem))
+                if folder:
+                    self.config.write(folder, config)
+            else:
+                self._drop(config, peak_mem)
+        self._summarise_search(size, len(results), len(configs))
 
         return configs
 
-    def device_loops(self, space: Any, pool: Any) -> Tuple[dict, int]:
+    def device_loops(self, space: Any, collect: Optional[list]) -> Tuple[dict, int]:
         """Exploration loop nest level 0: parallel dimensions dividing devices"""
         for tp in self.config.space(Dim.TP, self.machine.number):
             for pp in self.config.space(Dim.PP, self.machine.number // tp):
@@ -294,10 +366,43 @@ class ParallelizeLayer:
                     dp = self.machine.number // tp // cp // pp
                     if dp < 1:
                         break
-                    space = self.batch_loops(space, pool, (dp, tp, pp, cp))
+                    space = self.batch_loops(space, collect, (dp, tp, pp, cp))
         return space
 
-    def batch_loops(self, space: Any, pool: Any, dtpc_p: Any) -> Tuple[dict, int]:
+    def batch_reachable(self) -> bool:
+        """Whether any candidate the loops build makes the global batch; one line says so where none does.
+
+        Each candidate's batch is its DP x MB x MBS, MB the batch over DP and
+        MBS, so a batch that is no whole number of micro-batches of any DP x
+        MBS the loops reach is refused in every candidate, each with an error.
+        The search stops before building one, with this line instead.
+        """
+        number = self.machine.number
+        reached = set()
+        for tp in self.config.space(Dim.TP, number):
+            for pp in self.config.space(Dim.PP, number // tp):
+                for cp in self.config.space(Dim.CP, number // tp // pp):
+                    dp = number // tp // cp // pp
+                    if dp < 1:
+                        break
+                    for mbs in self.config.space(Dim.MBS, self.global_batch_size // pp // dp):
+                        mbn = self.global_batch_size // dp // mbs
+                        candidate = self.config.make_parallel_config((dp, tp, pp, cp), (mbs, mbn), (1, 1, 1, False))
+                        if self.config.global_batch_size(candidate) == self.global_batch_size:
+                            return True
+                        reached.add(self.config.dim_val(Dim.DP, candidate) * mbs)
+        logger.error(
+            "No candidate makes a global batch of %d (the yaml states %d): the candidates the search builds "
+            "have DP x MBS of %s, and %d is no whole number of micro-batches of any. State -b as a multiple "
+            "of one of them, or let DP shrink by naming PP, CP or MP in -l.",
+            self.global_batch_size,
+            self.config.ccfg.gbs,
+            ", ".join(str(batch) for batch in sorted(reached)),
+            self.global_batch_size,
+        )
+        return False
+
+    def batch_loops(self, space: Any, collect: Optional[list], dtpc_p: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 1: dimensions dividing batch (except already processed DP)"""
         dp, _, pp, _ = dtpc_p
         # if pp > 1:
@@ -306,164 +411,138 @@ class ParallelizeLayer:
         ):
             logger.debug("mbn= %d / %d / %d", self.global_batch_size, dp, mbs)
             mbn = self.global_batch_size // dp // mbs
-            space = self.parallel_loops(space, pool, (dtpc_p, (mbs, mbn)))
+            space = self.parallel_loops(space, collect, (dtpc_p, (mbs, mbn)))
         # else:
         #     logger.debug("no pipeline so mbn = 1")
         #     mbs = self.global_batch_size // dp
         #     space = self.parallel_loops(space, pool, (dtpc_p, (mbs, 1)))
         return space
 
-    def parallel_loops(self, space: Any, pool: Any, dims: Any) -> Tuple[dict, int]:
+    def parallel_loops(self, space: Any, collect: Optional[list], dims: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 2: dimensions dependent on others"""
         dtpc_p, mbsn = dims
-        dp, tp, pp, _ = dtpc_p
-        for ep in self.config.space(Dim.EP, dp * tp):
+        dp, tp, pp, cp = dtpc_p
+        for ep in self.config.space(Dim.EP, self.config.max_ep(dp, tp, cp)):
             for vpp in self.config.range_space(
                 Dim.VPP, min(4, pp, self.config.total_layer_num() // pp)
             ):
                 for op in self.config.space(
-                    Dim.OP, self.config.max_op(dp, tp, ep)
+                    Dim.OP, self.config.max_op(dp, tp, ep, cp)
                 ):
                     for sp in self.config.bool_space(Dim.SP):
                         space = self.inside_loop_nest(
                             space,
-                            pool,
+                            collect,
                             (dtpc_p, mbsn, (ep, vpp, op, sp)),
                         )
         return space
 
-    def inside_loop_nest(self, space: Any, pool: Any, dims: Any) -> Tuple[dict, int]:
-        """Exploration loop nest statements"""
+    def inside_loop_nest(self, space: Any, collect: Optional[list], dims: Any) -> Tuple[dict, int]:
+        """Exploration loop nest statements: price a candidate that passes the checks, or collect it.
+
+        With *collect*, a list, the candidate and its loop degrees are
+        appended instead of priced, after the same checks and the same
+        setting of the config as here.
+        """
         dtpc_p, mbsn, evos_p = dims
         configs, size = space
         parallel_config = self.config.make_parallel_config(
             dtpc_p, mbsn, evos_p
         )
-        logger.info("test config %d : %s", size, str(parallel_config))
+        logger.info("test config %d : %s", size, parallel_config)
         size += 1
 
         if self.is_valid(parallel_config) and self.config.set_parallel_config(
             parallel_config
         ):
-            if pool is None:
-                if self.enable_debug:
-                    mem_debugger = Debug.Debug(
-                        parallel_config,
-                        info_type=Debug.MemParts,
-                        enable=self.enable_debug,
-                        output_file="debug_mem.csv",
-                    )
-                    # try:
-                    peak = self.memory_estim(mem_debugger)
-                    mem_debugger.write()
-                else:
-                    peak = self.memory_estim()
-                # except:
-                # logger.error()
-                # return (configs, size)
-            else:
-                # logger.debug("before evaluator copy")
-                # evaluator = copy.deepcopy(self.mem_eval)
-                logger.debug("before apply_async")
-                peak = pool.apply_async(
-                    pool_estimate_memory,
-                    args=(copy.deepcopy(self.config.ccfg),),
-                    # args=(evaluator,),
-                    # self.memory_estim,
+            if collect is not None:
+                collect.append((parallel_config, dims))
+                return (configs, size)
+            if self.enable_debug:
+                mem_debugger = Debug.Debug(
+                    parallel_config,
+                    info_type=Debug.MemParts,
+                    enable=self.enable_debug,
+                    output_file="debug_mem.csv",
                 )
-                logger.debug("after apply_async")
+                peak = self.memory_estim(mem_debugger)
+                mem_debugger.write()
+            else:
+                peak = self.memory_estim()
             configs[parallel_config] = peak
 
         return (configs, size)
 
-    def order_search_space(self, space: Any, threads_num: Any, cache_file: Any) -> Any:
-        """Sort the search space computed with performance estimation"""
+    def order_search_space(self, space: Any, threads_num: Any,  # pylint: disable=unused-argument
+                           cache_file: Any) -> Any:
+        """Sort the search space computed with performance estimation.
+
+        *threads_num* is unused: the candidates are priced in this process.
+        """
         if not space:
             return ([], [])
-        multiproc = False
-        if threads_num and threads_num > 5 * len(space):
-            multiproc = True
         scored_space = []
         debug_parts = []
-        with (
-            proc.Pool(processes=threads_num)
-            if multiproc
-            else nullcontext()
-        ) as pool:
-            for config, mem in space:
+        with Debug.holding_open():
+            for config, peak in space:
                 self.config.set_parallel_config(config)
                 values = []
-                if multiproc:
-                    score = pool.apply_async(
-                        pool_estimate_performance,
-                        args=(
-                            copy.deepcopy(self.config.ccfg),
-                            self.machine.device,
-                            mem,
-                            cache_file,
-                        ),
+                priced = self.priced()
+                if self.enable_debug:
+                    debugger = Debug.Debug(
+                        config,
+                        info_type=Debug.PerfParts,
+                        enable=self.enable_debug,
                     )
+                    score = estimate_performance(
+                        priced,
+                        debugger=debugger,
+                        device_type=self.machine.device,
+                        memory=peak,
+                        cache_file=cache_file,
+                    )
+                    debugger.write()
+                    debug_parts = list(debugger.info.keys())
+                    values = list(debugger.info.values())
+                    del values[-2:]
+                    del debug_parts[-2:]
                 else:
-                    if self.enable_debug:
-                        debugger = Debug.Debug(
-                            config,
-                            info_type=Debug.PerfParts,
-                            enable=self.enable_debug,
-                        )
-                        score = estimate_performance(
-                            self.config.ccfg,
-                            debugger=debugger,
-                            device_type=self.machine.device,
-                            memory=mem,
-                            cache_file=cache_file,
-                        )
-                        debugger.write()
-                        debug_parts = list(debugger.info.keys())
-                        values = list(debugger.info.values())
-                        del values[-2:]
-                        del debug_parts[-2:]
-                    else:
-                        score = estimate_performance(
-                            self.config.ccfg,
-                            device_type=self.machine.device,
-                            memory=mem,
-                        )
-                scored_space.append((config, mem, score, values))
-
-                if not multiproc:
-                    logger.info("config %s has score %f", str(config), score)
-
-            if multiproc:
-                new_scored_space = []
-                for config, mem, score, values in scored_space:
-                    score_value = score.get()
-                    logger.info(
-                        "config %s has score %f", str(config), score_value
+                    score = estimate_performance(
+                        priced,
+                        device_type=self.machine.device,
+                        memory=peak,
+                        cache_file=cache_file,
                     )
-                    new_scored_space.append(
-                        (config, mem, score_value, values)
-                    )
-            else:
-                new_scored_space = scored_space
-        return (sorted(new_scored_space, key=lambda x: x[2]), debug_parts)
+                scored_space.append((config, peak, score, values))
+                logger.info("config %s has score %f", config, score)
+        return (sorted(scored_space, key=lambda x: x[2]), debug_parts)
 
     def order_space_test_comm_classified(self, space: Any, order_by: Any = 2) -> Any:
-        """Order the given space with performance estimation"""
+        """Order the given space with performance estimation.
+
+        A measured configuration the cost model cannot represent, such as
+        expert parallelism wider than its stage, is left out and named, so
+        that it does not end the comparison of every other one.
+        """
         scored_space = []
         debug_parts = []
         for config, real_time, real_comm_wait in space:
-            debugger = Debug.Debug(
-                config, info_type=Debug.PerfParts, enable=self.enable_debug
-            )
-            self.config.set_parallel_config(config)
-            peak_mem = self.memory_estim()
-            score = estimate_performance(
-                self.config.ccfg,
-                debugger=debugger,
-                device_type=self.machine.device,
-                stage_focused=0,
-            )  # , memory = mem)
-            debugger.write()
+            # The comparison needs the per-part split at any verbosity; debug.csv stays opt-in.
+            debugger = Debug.Debug(config, info_type=Debug.PerfParts, enable=True)
+            try:
+                self.config.set_parallel_config(config)
+                peak_mem = self.memory_estim()
+                score = estimate_performance(
+                    self.priced(),
+                    debugger=debugger,
+                    device_type=self.machine.device,
+                    stage_focused=0,
+                )  # , memory = mem)
+            except (TypeError, ValueError, ZeroDivisionError) as exc:
+                logger.output("ND cannot cost %s, left out of the comparison: %s", config, exc)
+                continue
+            if self.enable_debug:
+                debugger.write()
             debug_parts = list(debugger.info.keys())
             values = list(debugger.info.values())
             del values[-2:]
@@ -488,7 +567,7 @@ class ParallelizeLayer:
             logger.debug(self.mem_eval.get_strategy())
             peak_mem = self.memory_estim()
             score = estimate_performance(
-                self.config.ccfg,
+                self.priced(),
                 debugger=debugger,
                 device_type=self.machine.device,
             )  # , memory = mem)
@@ -509,33 +588,87 @@ class ParallelizeLayer:
             + f" {self.machine.device} with {self.global_batch_size} GBS"
         )
 
+    def _search_and_order(self, yaml_folder: Any, threads_num: Any, cache_file: Any) -> Tuple[list, list, float, float]:
+        """Generate and order the space.
+
+        Returns:
+            The ordered entries, the parts of their scores, and the seconds
+            generation and ordering took.
+        """
+        if not self.batch_reachable():
+            return [], [], 0.0, 0.0
+        start = time.time()
+        space = self.generate_search_space(yaml_folder, threads_num)
+        generated = time.time()
+        scored_space, dbg = self.order_search_space(space, threads_num, cache_file=cache_file)
+        return scored_space, dbg, generated - start, time.time() - generated
+
+    def _ranked_search(self, yaml_folder: Any, threads_num: Any, cache_file: Any,
+                       ranking_csv: Optional[str]) -> Tuple[list, list, float, float]:
+        """Search and order the space, rank its entries and write the ranking.
+
+        Returns:
+            What :meth:`_search_and_order` returns, each entry's
+            configuration given its rank.
+        """
+        scored_space, dbg, generation, ordering = self._search_and_order(yaml_folder, threads_num, cache_file)
+        for rank, entry in enumerate(scored_space, start=1):
+            entry[0].rank = rank
+        if ranking_csv:
+            Debug.write_ranking_csv(scored_space, ranking_csv)
+            logger.output(
+                "ND's order of %d configuration(s) written to %s",
+                len(scored_space),
+                ranking_csv,
+            )
+        return scored_space, dbg, generation, ordering
+
+    def _log_recompute_source(self, priced: Any) -> None:
+        """Log where the offsets and the recompute came from, and a stated mode the candidates were not priced in."""
+        is_not = " NOT" if not self.config.balancing.from_config else ""
+        logger.output(
+            "Offset & Recompute were%s computed from config info", is_not
+        )
+        stated_mode = getattr(priced, "stated_ac_mode", None)
+        if not self.config.balancing.from_config and stated_mode not in (None, "full"):
+            # The balancing gives every candidate full recompute without
+            # -mppb, whatever the run's mode, which cost an hour twice
+            # because nothing said so (H1).
+            logger.output(
+                "The run's activation checkpoint mode is %s, and every candidate above is priced fully "
+                "recomputed: pass -mppb to price the run's own",
+                stated_mode,
+            )
+
     def run_generation_to_ordering(
         self,
         yaml_folder: Any,
         threads_num: Any = None,
         top_num: Any = None,
         cache_file: Any = None,
+        ranking_csv: Optional[str] = None,
     ) -> Any:
-        """Test some functions"""
-        start = time.time()
-        space = self.generate_search_space(yaml_folder, threads_num)
-        generation = time.time()
-        scored_space, dbg = self.order_search_space(
-            space, threads_num, cache_file=cache_file
+        """Search, order and print the configurations that fit memory.
+
+        ``ranking_csv``, when given, receives every one of them in ND's order.
+        It is written before anything is plotted, so a plot that fails cannot
+        take the ranking with it.
+        """
+        scored_space, dbg, generation, ordering = self._ranked_search(
+            yaml_folder, threads_num, cache_file, ranking_csv
         )
-        ordering = time.time()
+
         logger.output(
             space_to_string(scored_space, max_num=top_num, debug_parts=dbg)
         )
+        priced = self.priced()
+        _log_priced_caveats(priced)
         logger.output(
             "Space generation took %.2fs and ordering took %.2fs",
-            generation - start,
-            ordering - generation,
+            generation,
+            ordering,
         )
-        is_not = " NOT" if not self.config.balancing.from_config else ""
-        logger.output(
-            "Offset & Recompute were%s computed from config info", is_not
-        )
+        self._log_recompute_source(priced)
         logger.output(
             "Device number is %d, global batch size is %d, dimensions are %s",
             self.machine.number,
@@ -543,8 +676,7 @@ class ParallelizeLayer:
             str(self.config.dimensions),
         )
         if self.enable_debug:
-            file_path = os.path.dirname(os.path.realpath(__file__))
-            output_path = os.path.join(file_path, "output")
+            output_path = Debug.output_dir()
             if scored_space:
                 Debug.plot_nd(
                     scored_space,
@@ -555,43 +687,40 @@ class ParallelizeLayer:
                 )
         return scored_space
 
-    def to_ppb(self, scored_space: Any, k: Any, cfg_name: Any) -> None:
-        """Create an input file for pipeline balancing"""
+    def to_ppb(self, scored_space: Any, k: Any, cfg_name: Any, folder: Optional[str] = None) -> str:
+        """Write the pipeline balancer's layer description of the k-th configuration.
+
+        Args:
+            scored_space: The ordered search space.
+            k: Rank of the configuration to describe.
+            cfg_name: Prefix of the model name the balancer is given.
+            folder: Where to write; ND's output directory by default.
+
+        Returns:
+            The path of the file written.
+        """
         parallel_config = scored_space[k][0]
         self.config.set_parallel_config(parallel_config)
-        self.mem_eval.update_config(self.config)
-        m = cfg_name + "_nd_to_ppb_" + str(k)
-        s = self.config.dim_val(Dim.PP, parallel_config)
-        mb = self.config.dim_val(Dim.MBN, parallel_config)
-        i = self.config.dim_val(Dim.VPP, parallel_config)
-        mem = str(self.config.ccfg.device_capacity.to_mb)
-        filename = (
-            os.path.dirname(os.path.realpath(__file__))
-            + "/../pipeline_balance/layers/"
-            + m
-            + ".json"
-        )
-        with open(filename, "w+", encoding="utf-8") as fp:
-            json.dump(
-                self.mem_eval.estimate_layer_memory(
-                    device_type=self.machine.device
-                ),
-                fp,
-                indent=4,
-            )
+        self.mem_eval.set_config(self.config.ccfg)
+        name = f"{cfg_name}_nd_to_ppb_{k}"
+        folder = os.path.abspath(folder or Debug.output_dir())
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, name + ".json")
+        description = self.mem_eval.estimate_layer_memory(device_type=self.machine.device)
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(description, fp, indent=4)
         logger.output(
             "To run pipeline balancing on configuration %s:"
-            "\npython run_pipeline_balance.py "
-            "-m %d -s %d -mb %d -i %d -mem %d",
+            "\npython run_pipeline_balance.py -lf %s -m %s -s %s -mb %s -i %s -mem %s",
             parallel_config,
-            m,
-            s,
-            mb,
-            i,
-            mem,
+            folder,
+            name,
+            self.config.dim_val(Dim.PP, parallel_config),
+            self.config.dim_val(Dim.MBN, parallel_config),
+            self.config.dim_val(Dim.VPP, parallel_config),
+            int(self.config.ccfg.device_capacity.to_mb().size),
         )
-        logger.output("Warning: currently select_recompute_memory \
-                should be removed & layer time need to be added")
+        return path
 
     def test_from_csv(self, csv_f, output_path=None):
         """Run estimation tests against a real run profiling in csv format"""
@@ -703,9 +832,37 @@ class Parallelize:  # pylint: disable=R0903
         return self.instance.__getattribute__(name)
 
 
+def _log_priced_caveats(priced: Any) -> None:
+    """Log what qualifies every number of the table: the length it prices, MTP layers unpriced, fields never set."""
+    if not getattr(priced, "seq_len_stated", True):
+        # A warning at parse time scrolls past a search's lines; this one
+        # sits under the table it qualifies (I11).
+        logger.output(
+            "Every number above is priced at %d tokens, the model's context limit: the config states no "
+            "training sequence length (dataset.data_transform.max_seq_len or dataset.data_config.seq_length)",
+            priced.s,
+        )
+    if getattr(priced, "mtp_unpriced", 0):
+        # A stated MTP depth looked priced and was not (I2).
+        logger.output(
+            "The model states %d MTP layer(s), which the AutoModels trainer does not build: no number above "
+            "prices them",
+            priced.mtp_unpriced,
+        )
+    for line in unset_reads_report():
+        logger.output(line)
+
+
 def space_to_string(space: Any, max_num: Any = None, debug_parts: Any = None) -> str:
-    """Space printer"""
-    i = 0
+    """Format ranked configurations for CLI output.
+
+    Args:
+        space: Configurations with memory, performance score and score components.
+            TOP uses the rank stored on each configuration, falling back to its
+            position in the supplied list when it has not been ranked.
+        max_num: Maximum number of configurations to print.
+        debug_parts: Performance components to name in the header.
+    """
     s = ""
     if max_num is not None:
         s += "Top " + str(max_num) + " configurations:\n"
@@ -713,7 +870,7 @@ def space_to_string(space: Any, max_num: Any = None, debug_parts: Any = None) ->
         s += "\n"
     if len(space) == 0:
         return s
-    s += "\t"
+    s += "\tTOP   "
     for d in space[0][0].all_dims:
         s += str(d) + " " * (6 - len(str(d)))
     s += "Memory    Performance score  "
@@ -721,10 +878,10 @@ def space_to_string(space: Any, max_num: Any = None, debug_parts: Any = None) ->
         for dbg_part in debug_parts:
             s += "\t" + dbg_part.short_name()
     s += "\n"
-    for config in space:
+    for i, config in enumerate(space):
         if max_num is not None and max_num == i:
             break
-        s += "\t"
+        s += f"\t{config[0].rank or i + 1:<6}"
         for v in config[0].values():
             s += v + " " * (6 - len(v))
         s += str(config[1]) + " MB  "  # + str(config[2])
@@ -732,34 +889,4 @@ def space_to_string(space: Any, max_num: Any = None, debug_parts: Any = None) ->
         for v in config[3]:
             s += f"\t{(100*v/config[2]):.2f}%"
         s += "\n"
-        i += 1
     return s
-
-
-def pool_estimate_memory(config: CostModelConfig) -> float:
-    """Calls memory estimation for multiprocessing"""
-    logger.debug("estimate_peak")
-    # print("estimate_peak")
-    e = EvaluatorV2(None, ccfg=config)
-    return e.estimate_peak()
-
-
-# def pool_estimate_memory(evaluator):
-#     """Calls memory estimation for multiprocessing"""
-#     logger.debug("estimate_peak")
-#     return evaluator.estimate_peak()
-
-
-def pool_estimate_performance(
-    config: CostModelConfig,
-    device: Hard.Type,
-    memory: Optional[float] = None,
-    cache_file: Optional[str] = None,
-) -> float:
-    """Calls performance estimation for multiprocessing"""
-    return estimate_performance(
-        config,
-        device_type=device,
-        memory=memory,
-        cache_file=cache_file,
-    )

@@ -14,9 +14,10 @@
 # ============================================================================
 """Utility submodule"""
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Mapping
 import operator
 import ast
+import functools
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 
 if TYPE_CHECKING:
@@ -40,8 +41,44 @@ OPS_MAP = {
 }
 
 
+@functools.lru_cache(maxsize=256)
+def _parsed_expr(expr: str) -> ast.AST:
+    """The expression a communication formula sums, parsed once rather than once a layer and candidate.
+
+    The evaluation only reads the tree, so every call can share it.
+    """
+    return ast.parse(expr).body[0].value
+
+
 class EvalUtils:
     """Utility methods class, PP Microbatch factor formulas"""
+
+    @staticmethod
+    def reduced_grads(ccfg: CostModelConfig, parts: tuple) -> tuple:
+        """What the gradients FSDP reduce-scatters weigh, whole and sharded.
+
+        Each part is its parameter count, the ranks the backward computes
+        its gradient over and the ranks the gradient is kept over.  A part
+        no other rank shards is not reduce-scattered: the gradient the
+        backward computes is the one it keeps.
+        """
+        reduced = [(size, computed, kept) for size, computed, kept in parts if kept > computed]
+        whole = sum(size / computed for size, computed, _ in reduced)
+        sharded = sum(size / kept for size, _, kept in reduced)
+        return whole * ccfg.bytes_grad, sharded * ccfg.bytes_grad
+
+    @staticmethod
+    def census_bytes(ctx: Context, tokens: float, kept: float, held: float) -> float:
+        """What a census states for *tokens*: what a layer keeps, *kept* bytes per token, or its working set.
+
+        As its backward's working set, the most that backward holds, *held*
+        per token; less what the layer keeps, and never below it, where the
+        stage's dynamic memory counts that already, as for a layer that
+        does not recompute.
+        """
+        if not ctx.working_set:
+            return tokens * kept
+        return tokens * (max(0.0, held - kept) if ctx.working_on_saved else held)
 
     @staticmethod
     def mb(x: Union[float, dict, tuple]) -> int:
@@ -65,13 +102,31 @@ class EvalUtils:
         """Masking coefficient for select recompute"""
         return int(not rec_layer) | rec_op
 
+    @staticmethod
+    def switches(ccfg: CostModelConfig, ctx: Context) -> Any:
+        """The switches of the layer *ctx* evaluates: the context's where it states them, else its config's."""
+        stated = getattr(ctx, "switches", None)
+        return stated if isinstance(stated, Mapping) else ccfg.rec_op
+
+    @staticmethod
+    def switch(ccfg: CostModelConfig, ctx: Context, name: str) -> Any:
+        """One recompute switch of the layer *ctx* evaluates, 1 to keep the op's activation and 0 to recompute it."""
+        return EvalUtils.state(EvalUtils.switches(ccfg, ctx), name)
+
+    @staticmethod
+    def state(stated: Any, name: str) -> Any:
+        """Switch *name* in *stated*, a mapping or a config's ``rec_op``: a switch it leaves out keeps its op.
+
+        Read from ``vars``, since a ``Config`` answers 0, recompute, for any
+        attribute it lacks.
+        """
+        values = stated if isinstance(stated, Mapping) else vars(stated) if stated is not None else {}
+        return values.get(name, 1)
+
     @classmethod
     def eval_expr_insight(cls, **kwargs):
         """compute and categorize math expression"""
-        nodes = ast.parse(kwargs.get("expr"))
-        # print(ast.dump(nodes, indent=1))
-        # print(kwargs["expr"])
-        return cls.__eval_ast_mem(nodes.body[0].value, 0, **kwargs)[0]
+        return cls.__eval_ast_mem(_parsed_expr(kwargs.get("expr")), 0, **kwargs)[0]
 
     @staticmethod
     def __log_ast_mem(ctx, cat, mem):
@@ -214,11 +269,16 @@ class EvalUtils:
 
     @staticmethod
     def pp_seq1f1b_micro_factor(ccfg: CostModelConfig, ctx: Context) -> int:
-        """Seq1F1B Warm-up microbatches count"""
+        """Seq1F1B Warm-up microbatches count, in sequence chunks.
+
+        Each chunk holds ``n_s_split``'th of a micro-batch's sequence: the
+        count goes to ``ctx.seq_chunks``, and the backbone evaluates the node
+        at that length.
+        """
         stage_id, chunk_id = ctx.current_stage_id, ctx.current_chunk_id
         # Warm_up micros num compute
         micro_factor = 1
-        ccfg.s /= ccfg.n_s_split  # Splitting seq length
+        ctx.seq_chunks = max(1, ccfg.n_s_split)
         base_micro = min(ccfg.p, ccfg.m)
         if ccfg.vp == 1:
             micro_factor = base_micro - stage_id + ccfg.n_s_split - 1

@@ -31,6 +31,7 @@ Test IDs:
   CT-S02: shared_expert_compute_cost uses etp when etp>1
   CT-S03: shared_expert_compute_cost falls back to tp when etp<=1
   CT-S04: etp=1 falls back to tp (etp=1 means "off", same as etp=0)
+  CT-S05: each shared expert is hff_exp wide, whatever the dense hff
   CT-L01: expert_layer_compute returns 0 when n_exp=1 (dense)
   CT-L02: expert_layer_compute dispatches to balanced when tokens=None
   CT-L03: expert_layer_compute dispatches to imbalanced when tokens set
@@ -280,6 +281,16 @@ class TestSharedExpertCompute(unittest.TestCase):
         ctx = MagicMock()
         n_ff = ccfg.n_ffMM
         expected = 2 * n_ff * 1024 * 4 * 4096 * 14336 * 1 / 2
+        self.assertAlmostEqual(
+            EvalExpertCompute.shared_expert_compute_cost(ccfg, ctx), expected
+        )
+
+    def test_shared_at_expert_width(self):
+        """CT-S05: each shared expert is as wide as a routed one, whatever the dense hff."""
+        ccfg = _make_ccfg(s=1024, b=4, h=4096, hff=18432, hff_exp=2048, n_shared_exp=1,
+                          tp=1, etp=0, cp=1)
+        ctx = MagicMock()
+        expected = 2 * ccfg.n_ffMM * 1024 * 4 * 4096 * 2048 * 1 / 1
         self.assertAlmostEqual(
             EvalExpertCompute.shared_expert_compute_cost(ccfg, ctx), expected
         )

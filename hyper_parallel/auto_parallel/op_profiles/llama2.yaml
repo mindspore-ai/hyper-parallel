@@ -1,0 +1,18 @@
+# Llama 2: the default decoder.  The family differs only in its gradients,
+# which are two bytes wide and take memory without pipeline parallelism too.
+run:
+  grad_bytes: 2
+  grad_accumulation: true
+kinds:
+  decoder:
+    ops:
+      attMM: 4
+      attBMM: 2
+      ffMM: 3
+      softmax: 1
+      dropout: 0
+      normOp: 2
+      gather: 4
+      headCast: 1
+      ffAct: 1
+      linrec: 0
