@@ -200,7 +200,7 @@ class FSDP2Manager:
         self,
         fsdp_mesh: DeviceMesh,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Build shared sublayer kwargs and the root-specialized copy."""
+        """Build child and root kwargs with the same configured reshard policy."""
         mp_policy = self._build_mixed_precision_policy()
         offload_policy = self._build_offload_policy()
 
@@ -213,7 +213,6 @@ class FSDP2Manager:
             "comm_fusion_zero_copy": self.config.comm_fusion_zero_copy,
         }
         fsdp_root_kwargs = fsdp_sublayer_kwargs.copy()
-        fsdp_root_kwargs["reshard_after_forward"] = False
         return fsdp_sublayer_kwargs, fsdp_root_kwargs
 
     @staticmethod
@@ -401,6 +400,38 @@ class FSDP2Manager:
                 )
         return set(excluded_fqns)
 
+    def _find_root_wrap_modules(
+        self,
+        model: ModuleClass,
+        wrapped_module_ids: set[int],
+    ) -> list[_WrapModuleInfo]:
+        """Resolve explicit child units without splitting shared-parameter owners."""
+        if not self.config.root_wrap_modules:
+            return []
+        modules_by_fqn = dict(model.named_modules(remove_duplicate=False))
+        aliases_by_parameter = defaultdict(list)
+        for name, parameter in model.named_parameters(remove_duplicate=False):
+            aliases_by_parameter[parameter].append(name)
+        extra_modules = []
+        for module_fqn in self.config.root_wrap_modules:
+            module = modules_by_fqn.get(module_fqn)
+            if module is None or module is model:
+                raise ValueError(f"root_wrap_modules contains unknown or root module FQN: {module_fqn}")
+            parameters = list(module.parameters())
+            if not parameters:
+                raise ValueError(f"root_wrap_modules module has no parameters: {module_fqn}")
+            # Separate units cannot own one tied parameter across both forwards.
+            # Reject rather than let the first wrapped module capture shared storage.
+            if any(
+                not name.startswith(f"{module_fqn}.")
+                for parameter in parameters for name in aliases_by_parameter[parameter]
+            ):
+                raise ValueError(f"root_wrap_modules module shares parameters outside its subtree: {module_fqn}")
+            if id(module) not in wrapped_module_ids:
+                wrapped_module_ids.add(id(module))
+                extra_modules.append(_WrapModuleInfo(module_fqn, module))
+        return extra_modules
+
     def _find_wrap_modules(
         self,
         model: ModuleClass,
@@ -439,6 +470,7 @@ class FSDP2Manager:
                 "wrap_policy='transformer_block' found no decoder, expert, or "
                 "adapter-declared FSDP child unit"
             )
+        wrap_modules.extend(self._find_root_wrap_modules(model, wrapped_module_ids))
         return wrap_modules
 
     @staticmethod

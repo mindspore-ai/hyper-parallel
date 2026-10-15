@@ -35,6 +35,9 @@ fsdp_config:
     reduce_dtype: float32
     output_dtype: bfloat16
   replicate_params: []
+  root_wrap_modules:
+    - model.embed_tokens
+    - lm_head
   reshard_after_forward: true
   reshard_after_backward: true
   requires_grad_sync: true
