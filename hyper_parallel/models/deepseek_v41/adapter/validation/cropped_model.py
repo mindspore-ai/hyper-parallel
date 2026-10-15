@@ -371,6 +371,7 @@ def build_deepseek_v41_validation_config(
         dspark_target_layer_ids: list[int] | None = None,
         dspark_loss_coeff: float = 1.0,
         dspark_confidence_coeff: float = 0.1,
+        fused_indexer: bool = True,
 ) -> DeepseekV4Config:
     """Translate the released config into a configurable validation crop.
 
@@ -401,6 +402,9 @@ def build_deepseek_v41_validation_config(
             to the last three, matching the released layout.
         dspark_loss_coeff: Drafter objective weight.
         dspark_confidence_coeff: Confidence-head BCE weight.
+        fused_indexer: Prefer the fused Lightning-Indexer operator; the torch
+            path runs whenever its head-count gate is unmet (see
+            ``adapter.ops.fused_lightning_indexer``).
 
     Returns:
         A Transformers DeepSeek-V4 config carrying V4.1 extension fields.
@@ -443,6 +447,7 @@ def build_deepseek_v41_validation_config(
         dspark_loss_coeff,
         dspark_confidence_coeff,
     )
+    config.v41_fused_indexer = bool(fused_indexer)
     config._attn_implementation = "eager"  # pylint: disable=protected-access
     # Record the source identity the way AutoConfig.from_pretrained does; the
     # codegen from_config path resolves the modeling source from it.
@@ -465,6 +470,7 @@ def build_cropped_deepseek_v41(
         dspark_target_layer_ids: list[int] | None = None,
         dspark_loss_coeff: float = 1.0,
         dspark_confidence_coeff: float = 0.1,
+        fused_indexer: bool = True,
         torch_dtype: str = "bfloat16",
         validate_placement: bool = False,
         distributed_setup: DistributedSetup | None = None,
@@ -497,6 +503,9 @@ def build_cropped_deepseek_v41(
             to the last three, matching the released layout.
         dspark_loss_coeff: Drafter objective weight.
         dspark_confidence_coeff: Confidence-head BCE weight.
+        fused_indexer: Prefer the fused Lightning-Indexer operator; the torch
+            path runs whenever its head-count gate is unmet (see
+            ``adapter.ops.fused_lightning_indexer``).
         torch_dtype: Forward dtype accepted by the model builder.
         validate_placement: Enable DTensor placement validation.
         distributed_setup: Trainer-provided parallel topology.
@@ -528,6 +537,7 @@ def build_cropped_deepseek_v41(
         dspark_target_layer_ids=dspark_target_layer_ids,
         dspark_loss_coeff=dspark_loss_coeff,
         dspark_confidence_coeff=dspark_confidence_coeff,
+        fused_indexer=fused_indexer,
     )
     return HyperAutoModelForCausalLM.from_config(
         config,
