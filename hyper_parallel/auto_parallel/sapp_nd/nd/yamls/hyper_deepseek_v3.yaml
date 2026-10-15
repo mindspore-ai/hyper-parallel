@@ -1,11 +1,10 @@
 # ============================================================================
 # HyperParallel Auto Parallel Strategy Search — DeepSeek V3 Demo
 # ============================================================================
-# HyperParallel YAML equivalent of ``deepseek.yaml`` (MindFormers).
-# Model parameters are identical so that users can compare outputs side‑by‑side:
+# PyTorch HyperParallel YAML for DeepSeek V3 strategy search.
 #
-#   MF:  python run_nd.py -f mindformers -y nd/yamls/deepseek.yaml ...
-#   HP:  python run_nd.py -f hyper_v2     -y nd/yamls/hyper_deepseek_v3.yaml ...
+#   python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd \
+#       -f hyper_v2 -y nd/yamls/hyper_deepseek_v3.yaml ...
 #
 # Model: DeepSeek V3 (61 MoE layers, dim=7168, 256 experts, MLA attention).
 # Intended for large‑scale clusters with 58 GB device memory.

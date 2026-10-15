@@ -161,16 +161,18 @@ class TestDryunGuide:
         training_file.write_text(
             """
 model:
-  model_config:
-    num_heads: 8
+  config_overrides:
+    num_attention_heads: 8
     hidden_size: 1024
-    seq_length: 2048
+    max_position_embeddings: 2048
     vocab_size: 32000
-parallel_config:
-  data_parallel: 2
-  model_parallel: 4
-runner_config:
-  batch_size: 16
+data:
+  max_seq_len: 2048
+train:
+  micro_batch_size: 16
+  accelerator:
+    dp_replicate: 2
+    tp_degree: 4
 """,
             encoding="utf-8",
         )

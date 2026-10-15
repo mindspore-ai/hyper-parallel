@@ -40,7 +40,7 @@ Run the ND entrypoint as a Python module from the repository root:
 
 ```bash
 python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd \
-    -y <mindformers_yaml> \
+    -y <hyperparallel_yaml> \
     -l DP MP PP EP MB MBS \
     -d 1024 \
     -b 2048 \
@@ -117,9 +117,9 @@ sapp_nd/
 
 ### Framework Configurations
 
-- MindSpore and MindFormers yaml configurations.
-- Megatron json configurations.
-- TorchTitan toml configurations are planned but not complete in this PR.
+- HyperParallel YAML configurations (PyTorch, default).
+- MindSpeed JSON configurations (PyTorch / Megatron).
+- TorchTitan TOML configurations are a deprecated placeholder. Use ``hyper_v2``.
 
 ### Models
 

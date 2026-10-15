@@ -237,11 +237,8 @@ class CostModelParserHyperV2(_CostModelParser):
     def _apply_scaling_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
         """Map MTP and feed-forward scaling fields."""
         ccfg.n_mtp = self._spec_int(spec, "mtp_depth")
-        # Match the MF parser: when the model declares MTP layers they
-        # participate in pipeline offset balancing (default True); when there
-        # is none they are excluded, mirroring the MF parser's
-        # ``num_nextn_predict_layers`` fallback which sets
-        # ``is_mtp_in_offset = False``.
+        # MTP layers participate in pipeline offset balancing only when the
+        # model declares them. A depth of zero excludes them.
         ccfg.is_mtp_in_offset = bool(ccfg.n_mtp)
         ccfg.multiple_of = self._spec_int(spec, "multiple_of", 256)
         ccfg.fdm = float(spec.get("ffn_dim_multiplier", 1.0) or 1.0)
@@ -579,8 +576,7 @@ class CostModelParserHyperV2(_CostModelParser):
                     "to 'ulysses_cp' if Ulysses CP is intended."
                 )
         # Optimizer type — used by GlobalConfig.max_op to detect muon-based
-        # optimizers.  Matches the MF parser's
-        # ``self.ccfg.optimizer = self.config.optimizer.type``.
+        # optimizers.
         opt_type = (
             self._get_cfg_attr(optimizer, "_target_", None)
             or self._get_cfg_attr(optimizer, "type", None)
@@ -595,11 +591,9 @@ class CostModelParserHyperV2(_CostModelParser):
 
         Reads ``activation_checkpoint.mode`` from the AutoModels schema, with
         the legacy ``train.gradient_checkpointing`` path as a fallback. When
-        ``config_overrides`` supplies ``full_rec`` or ``sel_rec`` (matching
-        the MF parser's ``recompute_config.recompute`` /
-        ``recompute_config.select_recompute`` fields), those values take
-        precedence so that Hyper YAML demo files can express per-stage
-        recompute lists for side-by-side comparisons with MindFormers.
+        ``config_overrides`` supplies ``full_rec`` or ``sel_rec``, those
+        values take precedence so HyperParallel YAML files can express
+        per-stage recompute lists.
         """
         model_raw = self._get_cfg_attr(self.config, "model", Config({}))
         overrides = self._get_cfg_attr(model_raw, "config_overrides", Config({}))
@@ -670,8 +664,7 @@ class CostModelParserHyperV2(_CostModelParser):
         """Initialize MoE strategy variables via base helper.
 
         For MoE models (``n_exp > 1``), ``etp`` defaults to 1 when
-        absent from the YAML, matching the MF parser's
-        ``expert_model_parallel`` default.  For dense models the
+        absent from the YAML.  For dense models the
         existing ``etp=0`` path continues to produce ``t_exp = t,
         d_exp = d``.
 
@@ -698,18 +691,15 @@ class CostModelParserHyperV2(_CostModelParser):
     def _init_offset(self):
         """Initialize the pipeline offset.
 
-        The MF parser reads ``model.model_config.offset`` directly from the
-        YAML.  When it is a list (e.g. ``[1, 1, ..., -1]``),
+        When the offset is a list (e.g. ``[1, 1, ..., -1]``),
         ``CostModelConfig.is_consistent_pp_config`` requires
         ``len(offset) == pp``, so strategies whose pipeline degree differs
         are rejected until ``GlobalConfig.adapt_config`` regenerates a
         matching offset.  A scalar ``0`` is always accepted.
 
-        To match the MF parser's *list*-based filtering behaviour (used by
-        DeepSeek-V3 and other models that declare an explicit offset), this
-        parser emits a list offset of length ``pp`` (all zeros = even
-        balancing) by default.  An explicit offset supplied via
-        ``config_overrides.offset`` overrides this — a list is used as-is,
+        The default is a list of length ``pp`` (all zeros = even balancing)
+        so models that declare an explicit offset keep that filtering.
+        ``config_overrides.offset`` overrides this: a list is used as-is,
         and a non-zero int is broadcast to ``[int] * pp``.
         """
         model_raw = self._get_cfg_attr(self.config, "model", Config({}))
@@ -730,7 +720,6 @@ class CostModelParserHyperV2(_CostModelParser):
     def config_shard_emb(self) -> None:
         """Configure embedding sharding based on current parallelism.
 
-        Mirrors ``CostModelParserMindformers.config_shard_emb`` so that
         ``set_strategy`` recomputes ``shard_embed`` whenever the parallel
         configuration changes.  When ``vocab_emb_dp`` is enabled and pipeline
         parallelism is disabled (``p == 1``), the embedding is sharded only
@@ -739,8 +728,7 @@ class CostModelParserHyperV2(_CostModelParser):
 
         Without this method, ``CostModelConfig.set_strategy`` skips the
         ``config_shard_emb`` call (guarded by ``hasattr``) and the initial
-        ``shard_embed`` value computed in ``_init_shard`` is never refreshed,
-        producing an embedding-memory mismatch versus the MF parser.
+        ``shard_embed`` value computed in ``_init_shard`` is never refreshed.
         """
         self.ccfg.shard_embed = (
             self.ccfg.d
@@ -772,14 +760,12 @@ class CostModelParserHyperV2(_CostModelParser):
         ``shard_embed`` is computed via :meth:`config_shard_emb` so the
         initial value follows the same rule used on subsequent
         ``set_strategy`` calls.  ``shard_output_activ`` defaults to 1 (no
-        sharding), matching the MF parser's default; the ``custom_qwen``
-        arch hook overrides it to ``ccfg.t`` for Qwen-family models via
-        ``check_and_apply_custom_hook``.
+        sharding); the ``custom_qwen`` arch hook overrides it to ``ccfg.t``
+        for Qwen-family models via ``check_and_apply_custom_hook``.
 
-        ``shard_recompute_input`` mirrors the MF parser's
-        ``recompute_config.recompute_slice_activation`` flag: when the flag
-        is ``True`` (DeepSeek-V3), activations are sharded by ``ccfg.t``;
-        when ``False`` (Qwen), they are not sharded.  The flag is stored
+        ``shard_recompute_input`` follows ``recompute_slice_activation``:
+        when the flag is ``True``, activations are sharded by ``ccfg.t``;
+        when ``False``, they are not sharded.  The flag is stored
         as ``self._recompute_slice_activation`` so that
         :meth:`config_shard_recompute` can recompute the value after
         ``set_strategy`` changes ``t``.  Per-model arch hooks

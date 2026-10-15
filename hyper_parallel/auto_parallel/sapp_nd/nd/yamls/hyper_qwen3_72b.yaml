@@ -1,11 +1,10 @@
 # ============================================================================
 # HyperParallel Auto Parallel Strategy Search — Qwen3 72B Demo
 # ============================================================================
-# HyperParallel YAML equivalent of ``pretrain_qwen3_72b.yaml`` (MindFormers).
-# Model parameters are identical so that users can compare outputs side‑by‑side:
+# PyTorch HyperParallel YAML for Qwen3 72B strategy search.
 #
-#   MF:  python run_nd.py -f mindformers -y nd/yamls/pretrain_qwen3_72b.yaml ...
-#   HP:  python run_nd.py -f hyper_v2     -y nd/yamls/hyper_qwen3_72b.yaml ...
+#   python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd \
+#       -f hyper_v2 -y nd/yamls/hyper_qwen3_72b.yaml ...
 #
 # Model hyperparameters match Qwen3 72B (80 layers, dim=8192, 64 heads).
 # Intended for 128‑card clusters with 54 GB device memory.

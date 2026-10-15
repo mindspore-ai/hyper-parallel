@@ -554,27 +554,38 @@ def generate_solvable_config(
 
 
 def parse_training_config(yaml_path: str) -> Optional[Dict[str, Any]]:
-    """Extract the training-YAML fields needed to compute operator shapes for seqpp."""
+    """Extract operator-shape fields from a HyperParallel training YAML."""
     try:
         with open(yaml_path, "r", encoding="utf-8") as file:
             config = yaml.safe_load(file)
 
-        # Extract the requested values
-        model_config = config["model"]["model_config"]
-        parallel_config = config["parallel_config"]
-        runner_config = config["runner_config"]
+        model = config["model"]
+        overrides = model.get("config_overrides") or {}
+        train = config.get("train") or config.get("training") or {}
+        accelerator = train.get("accelerator") or config.get("accelerator") or {}
+        data = config.get("data") or {}
 
-        # Create a dictionary with the requested parameters
+        num_heads = int(overrides["num_attention_heads"])
+        hidden_size = int(overrides["hidden_size"])
+        seq_length = int(
+            data.get("max_seq_len")
+            or overrides.get("max_position_embeddings")
+            or overrides["seq_length"]
+        )
+        dp_replicate = int(accelerator.get("dp_replicate", 1) or 1)
+        dp_shard = int(accelerator.get("dp_shard", accelerator.get("dp_shard_size", 1)) or 1)
         extracted_params = {
-            "num_heads": model_config["num_heads"],
-            "hidden_size": model_config["hidden_size"],
-            "head_dim": int(model_config["hidden_size"] / model_config["num_heads"]),
-            "seq_length": model_config["seq_length"],
-            "batch_size": runner_config["batch_size"],
-            "vocab_size": model_config["vocab_size"],
-            "data_parallel": parallel_config.get("data_parallel", 1),
-            "model_parallel": parallel_config.get("model_parallel", 1),
-            "context_parallel": parallel_config.get("context_parallel", 1),
+            "num_heads": num_heads,
+            "hidden_size": hidden_size,
+            "head_dim": int(hidden_size / num_heads),
+            "seq_length": seq_length,
+            "batch_size": int(train.get("micro_batch_size", 1) or 1),
+            "vocab_size": int(overrides["vocab_size"]),
+            "data_parallel": dp_replicate * dp_shard,
+            "model_parallel": int(accelerator.get("tp_degree", accelerator.get("tp_size", 1)) or 1),
+            "context_parallel": int(
+                accelerator.get("context_parallel_degree", accelerator.get("cp_size", 1)) or 1
+            ),
         }
         logger.output("Extracted training parameters:")
         for key, value in extracted_params.items():

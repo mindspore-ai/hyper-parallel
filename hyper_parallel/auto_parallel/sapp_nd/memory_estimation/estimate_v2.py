@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -204,7 +204,7 @@ def main():
     parser.add_argument(
         "model_config_path",
         nargs=1,
-        help="Model config file (MindFormer YAML or MindSpeed JSON)",
+        help="Model config file (HyperParallel YAML or MindSpeed JSON)",
     )
 
     parser.add_argument(
