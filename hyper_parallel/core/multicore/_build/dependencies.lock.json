@@ -110,14 +110,17 @@
         "upgrade_policy": "a version change must pass HyperMegaMhc accuracy and performance validation"
       },
       "shmem": {
-        "version": "d30702bb55d0",
+        "version": "v1.7.0",
         "repository": "https://gitcode.com/cann/shmem.git",
-        "fetch_ref": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
-        "tag_object": null,
-        "commit": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
-        "tree": "dec6d50ff39113fe892cdc3d52d35e56b24cd0c0",
-        "git_archive_tar_sha256": "c3f207178b6a4f020bc1f98187ca703814e4876064b83e7416010f2f379385f9",
-        "resolution": "exact upstream commit supporting CANN 9.1 and 9.2 native builds",
+        "fetch_ref": null,
+        "tag_object": "9912aa1aaa231a0c6d2e9b80593d4a1a8e654148",
+        "commit": "ecea088d28c057e67181a313cf8abfa1dc777d8a",
+        "tree": "703e460a43ae870d2ddc22ad9f8f038266dd747c",
+        "git_archive_tar_sha256": "72a06b157b5c077a1c8dc9f63c352a68f960cdbdc0d2a5a1df697052540fd74a",
+        "git_archive_tar_sha256_compat": [
+          "6c19650b7f97e435e5e4b2feadb4b0004146ea5d7ecb7ceca21853a58b917c77"
+        ],
+        "resolution": "exact upstream v1.7.0 source tag selected for CANN 9.2 compatibility validation",
         "patches": [],
         "packaging_policy": {
           "upstream_source_modified": false,
@@ -131,7 +134,7 @@
     }
   },
   "current_repository_baseline": {
-    "shmem": "d30702bb55d0",
+    "shmem": "v1.7.0",
     "ops_nn": "v9.1.0.pre",
     "ops_transformer": "v9.1.0.pre",
     "multicore_input": "locked ops-nn and ops-transformer kernel source plus the selected installed CANN >=9.1.0 toolchain"

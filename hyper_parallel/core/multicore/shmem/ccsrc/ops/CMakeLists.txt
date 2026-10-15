@@ -98,6 +98,7 @@ set_target_properties(all_gather_kernel PROPERTIES
 target_compile_options(all_gather_kernel PRIVATE ${CMAKE_CCE_COMPILE_OPTIONS} --cce-aicore-arch=dav-c220-vec)
 target_include_directories(all_gather_kernel PRIVATE
     ${SHMEM_HOME_PATH}/shmem/include
+    ${SHMEM_SOURCE_DIR}/src
     ${SHMEM_SOURCE_DIR}/src/device
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
