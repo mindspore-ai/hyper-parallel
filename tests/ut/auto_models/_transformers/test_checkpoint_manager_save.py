@@ -15,6 +15,7 @@
 """Unit tests for Hugging Face checkpoint export sources."""
 
 import unittest
+from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -22,14 +23,117 @@ import torch
 from hyper_parallel.core.distributed_checkpoint import (
     BytesStorageMetadata,
     Metadata,
+    StandardSavePlanner,
     TensorProperties,
     TensorStorageMetadata,
+    save,
 )
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
 
 
 class TestCheckpointManagerSave(unittest.TestCase):
     """Verify DCP-backed export does not read live training parameters."""
+
+    @staticmethod
+    def _expert_export_model(hidden_size: int = 4, intermediate_size: int = 2) -> torch.nn.Module:
+        """Create an HF-shaped meta model without Transformers or device allocation."""
+        model = torch.nn.Module()
+        model.experts = torch.nn.Module()
+        model.experts.gate_up_proj = torch.nn.Parameter(
+            torch.empty(2, 2 * intermediate_size, hidden_size, device="meta")
+        )
+        model.experts.down_proj = torch.nn.Parameter(
+            torch.empty(2, hidden_size, intermediate_size, device="meta")
+        )
+        return model
+
+    def test_dcp_grouped_experts_restore_values_including_square_projection(self) -> None:
+        """One non-square projection identifies the layout of the square projection too."""
+        model = self._expert_export_model()
+        original = {
+            name: torch.arange(tensor.numel()).reshape(tensor.shape)
+            for name, tensor in model.state_dict().items()
+        }
+        training = {name: tensor.transpose(-2, -1).contiguous() for name, tensor in original.items()}
+        manager = CheckpointManager(model)
+
+        restored = manager._normalize_dcp_export_layout(training, "auto")  # pylint: disable=W0212
+
+        for name, tensor in original.items():
+            torch.testing.assert_close(restored[name], tensor)
+            torch.testing.assert_close(training[name], tensor.transpose(-2, -1))
+
+    def test_dcp_hf_layout_is_preserved(self) -> None:
+        """Native HF experts must not be transposed a second time."""
+        model = self._expert_export_model()
+        original = {name: torch.randn(tensor.shape) for name, tensor in model.state_dict().items()}
+
+        restored = CheckpointManager(model)._normalize_dcp_export_layout(  # pylint: disable=W0212
+            original, "auto"
+        )
+
+        for name, tensor in original.items():
+            self.assertIs(restored[name], tensor)
+
+    def test_dcp_wrong_model_config_is_rejected(self) -> None:
+        """An expert-count mismatch cannot be repaired by transposition."""
+        model = self._expert_export_model()
+        wrong = {name: torch.empty(3, *tensor.shape[1:]) for name, tensor in model.state_dict().items()}
+
+        with self.assertRaisesRegex(ValueError, "expert shapes"):
+            CheckpointManager(model)._normalize_dcp_export_layout(wrong, "auto")  # pylint: disable=W0212
+
+    def test_dcp_dense_shape_mismatch_is_rejected(self) -> None:
+        """Configuration validation also covers non-expert parameters."""
+        model = torch.nn.Linear(4, 2, bias=False, device="meta")
+
+        with self.assertRaisesRegex(ValueError, "weight.*HF expects"):
+            CheckpointManager(model)._normalize_dcp_export_layout(  # pylint: disable=W0212
+                {"weight": torch.empty(4, 2)}, "auto"
+            )
+
+    @patch.object(CheckpointManager, "_is_main_process", return_value=True)
+    def test_offline_save_passes_restored_experts_to_hf(self, _is_main: MagicMock) -> None:
+        """Read a real DCP snapshot and pass restored expert values to HF saving."""
+        model = self._expert_export_model()
+        model.save_pretrained = MagicMock()
+        original = {name: torch.randn(tensor.shape) for name, tensor in model.state_dict().items()}
+        training = {name: tensor.transpose(-2, -1).contiguous() for name, tensor in original.items()}
+
+        with (
+            TemporaryDirectory() as checkpoint_dir,
+            patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0),
+            patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1),
+            patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier"),
+        ):
+            save(
+                {"model": training},
+                checkpoint_id=checkpoint_dir,
+                planner=StandardSavePlanner(enable_plan_caching=False),
+            )
+            CheckpointManager(model).save_pretrained(
+                "/tmp/hf", dcp_checkpoint=checkpoint_dir, dcp_expert_layout="auto"
+            )
+
+        saved = model.save_pretrained.call_args.kwargs["state_dict"]
+        for name, tensor in original.items():
+            torch.testing.assert_close(saved[name], tensor)
+
+    def test_ambiguous_experts_require_explicit_layout(self) -> None:
+        """Square weights require the caller to specify their orientation."""
+        model = torch.nn.Module()
+        model.experts = torch.nn.Module()
+        model.experts.down_proj = torch.nn.Parameter(torch.empty(2, 3, 3, device="meta"))
+        weight = torch.arange(18).reshape(2, 3, 3)
+        manager = CheckpointManager(model)
+        state_dict = {"experts.down_proj": weight}
+
+        with self.assertRaisesRegex(ValueError, "Ambiguous expert layout"):
+            manager._normalize_dcp_export_layout(state_dict, "auto")  # pylint: disable=W0212
+        restored = manager._normalize_dcp_export_layout(state_dict, "grouped_gemm")  # pylint: disable=W0212
+        torch.testing.assert_close(restored["experts.down_proj"], weight.transpose(-2, -1))
+        restored = manager._normalize_dcp_export_layout(state_dict, "hf")  # pylint: disable=W0212
+        self.assertIs(restored["experts.down_proj"], weight)
 
     @patch.object(CheckpointManager, "_is_main_process", return_value=True)
     @patch.object(CheckpointManager, "_load_model_state_dict_from_dcp")

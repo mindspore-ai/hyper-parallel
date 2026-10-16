@@ -29,7 +29,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -77,6 +77,7 @@ class CheckpointManager:
         save_directory: str | Path,
         *,
         dcp_checkpoint: str | Path | None = None,
+        dcp_expert_layout: Optional[str] = None,
         max_shard_size: int | str = "5GB",
         save_original_format: bool = True,
         **kwargs: Any,
@@ -93,6 +94,9 @@ class CheckpointManager:
             save_directory: Destination Hugging Face checkpoint directory.
             dcp_checkpoint: Optional completed DCP directory containing the
                 model shards to export.
+            dcp_expert_layout: For an unreplaced HF model, normalize DCP expert
+                weights using ``auto``, ``hf``, or ``grouped_gemm`` layout.
+                None preserves the live model's registered conversions.
             max_shard_size: Maximum size of each Hugging Face weight shard.
             save_original_format: Whether to reverse registered weight
                 conversions before saving.
@@ -102,6 +106,8 @@ class CheckpointManager:
             True on the writing rank and False on all other ranks.
         """
         save_method = getattr(self.model, "save_pretrained", None)
+        if dcp_expert_layout is not None and dcp_checkpoint is None:
+            raise ValueError("dcp_expert_layout requires a DCP checkpoint")
         if not callable(save_method):
             raise TypeError("CheckpointManager.save_pretrained requires a Transformers model")
         is_main_process = self._is_main_process()
@@ -109,6 +115,8 @@ class CheckpointManager:
             if not is_main_process:
                 return False
             state_dict = self._load_model_state_dict_from_dcp(dcp_checkpoint)
+            if dcp_expert_layout is not None:
+                state_dict = self._normalize_dcp_export_layout(state_dict, dcp_expert_layout)
         else:
             state_dict = self._gather_full_state_dict(keep_state_dict=is_main_process)
         if not is_main_process:
@@ -139,6 +147,57 @@ class CheckpointManager:
             **kwargs,
         )
         return True
+
+    def _normalize_dcp_export_layout(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        layout: str,
+    ) -> dict[str, torch.Tensor]:
+        """Restore batched expert layout against an unreplaced HF model."""
+        if layout not in ("auto", "hf", "grouped_gemm"):
+            raise ValueError(f"Unsupported DCP expert layout: {layout}")
+        if getattr(self.model, "_hp_used_replacement_weight_conversions", None):
+            raise ValueError("DCP layout normalization requires an unreplaced Hugging Face model")
+        expected = self.model.state_dict()
+        result = dict(state_dict)
+        expert_groups: dict[str, list[str]] = defaultdict(list)
+        for name in state_dict:
+            if re.search(r"(?:^|\.)experts\.(?:gate_up_proj|up_proj|down_proj)$", name):
+                expert_groups[name.rsplit(".", 1)[0]].append(name)
+        for prefix, names in expert_groups.items():
+            if any(name not in expected or state_dict[name].ndim != 3 for name in names):
+                raise ValueError(f"Unsupported DCP expert parameters under {prefix}; expected batched HF weights")
+            hf_matches = all(state_dict[name].shape == expected[name].shape for name in names)
+            transposed_matches = all(
+                state_dict[name].transpose(-2, -1).shape == expected[name].shape for name in names
+            )
+            if layout == "auto" and hf_matches and transposed_matches:
+                raise ValueError(
+                    f"Ambiguous expert layout under {prefix}; explicitly select hf or grouped_gemm"
+                )
+            transpose = layout == "grouped_gemm" or (layout == "auto" and not hf_matches)
+            if transpose and not transposed_matches:
+                raise ValueError(
+                    f"DCP expert shapes under {prefix} do not match the requested HF layout: "
+                    + ", ".join(
+                        f"{name}: DCP {tuple(state_dict[name].shape)}, HF {tuple(expected[name].shape)}"
+                        for name in names
+                    )
+                )
+            if transpose:
+                for name in names:
+                    result[name] = state_dict[name].transpose(-2, -1).contiguous()
+                logger.info("Restored HF expert layout for %s", prefix)
+        for name, tensor in result.items():
+            target = expected.get(name)
+            if target is None:
+                raise ValueError(f"DCP parameter {name!r} is absent from the HF model; check --model-dir")
+            if tensor.shape != target.shape:
+                raise ValueError(
+                    f"DCP parameter {name!r} has shape {tuple(tensor.shape)}, "
+                    f"but HF expects {tuple(target.shape)}; check model config and expert layout"
+                )
+        return result
 
     @staticmethod
     def _model_key_from_dcp(

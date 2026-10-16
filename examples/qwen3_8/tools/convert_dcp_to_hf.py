@@ -57,6 +57,15 @@ def parse_args() -> argparse.Namespace:
         help="Empty destination directory for the Transformers checkpoint.",
     )
     parser.add_argument(
+        "--expert-weight-layout",
+        choices=("auto", "hf", "grouped_gemm"),
+        default="auto",
+        help=(
+            "DCP batched expert layout. Auto restores transposed GroupedExperts weights "
+            "by comparing with the HF model; use an explicit layout for ambiguous shapes."
+        ),
+    )
+    parser.add_argument(
         "--tokenizer-dir",
         type=Path,
         default=None,
@@ -120,6 +129,7 @@ def main() -> None:
     CheckpointManager(model).save_pretrained(
         output_dir,
         dcp_checkpoint=checkpoint_dir,
+        dcp_expert_layout=args.expert_weight_layout,
         max_shard_size=args.max_shard_size,
     )
     tokenizer = AutoTokenizer.from_pretrained(
