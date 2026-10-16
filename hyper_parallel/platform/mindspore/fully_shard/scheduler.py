@@ -22,7 +22,10 @@ from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2, FSDP
 from hyper_parallel.core.fully_shard.hsdp_utils import get_dtensor_managed_mesh
 from hyper_parallel.platform.mindspore.fully_shard.hook_function import PostBackwardFunction
 from hyper_parallel.platform.mindspore.fully_shard.param_group import get_comm_ctx
-from hyper_parallel.platform.mindspore.fully_shard.state import MindSporeHSDPStateV2
+from hyper_parallel.platform.mindspore.fully_shard.state import (
+    MindSporeHSDPStateV2,
+    drain_all_owners,
+)
 from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, HSDPMeshInfo, DDPMeshInfo
 from hyper_parallel.platform import get_platform
 
@@ -167,27 +170,34 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         self.wait_for_pending_reductions()
 
     def wait_for_pending_reductions(self) -> None:
-        """Drain every asynchronous gradient reduction queued by this backend."""
-        comm_ctx = get_comm_ctx()
-        if comm_ctx.all_reduce_param_group is not None:
-            comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
-            comm_ctx.all_reduce_param_group = None
-        if comm_ctx.pre_param_group is not None:
-            comm_ctx.pre_param_group.apply_fusion_reduced_grad()
-            comm_ctx.pre_param_group = None
-        # Step 1: Wait for previous reduce-scatter groups and get them for all-reduce
-        prev_groups = self.hsdp_state._wait_prev_reduce_scatter()
-        # Step 2: Accumulate and issue async all-reduce for previous groups
-        for group in prev_groups:
-            group.accumulate_existing_grads_to_buffer()
-            group.issue_async_allreduce()
-            MindSporeHSDPStateV2.pending_all_reduce_groups.append(group)
-        # Step 3: Wait/apply any remaining reduce-scatter for pure FSDP params
-        self.hsdp_state.reduce_scattered_params()
-        # Step 4: Wait for pending all-reduce groups and apply grads
-        MindSporeHSDPStateV2.delay_apply_reduce_grads()
-        # Step 5: Process any remaining all-reduce params (without fusion)
-        self.hsdp_state.reduce_params()
+        """Drain every asynchronous gradient reduction queued by this backend.
+
+        This is the end-of-backward path, so the drain deliberately ignores the
+        per-unit communication-domain filter (see ``state.drain_all_owners``): a
+        nested chain whose last unit already ran -- the routed-experts unit, for
+        instance -- has no same-mesh successor left that could drain it.
+        """
+        with drain_all_owners(self.hsdp_state):
+            comm_ctx = get_comm_ctx()
+            if comm_ctx.all_reduce_param_group is not None:
+                comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
+                comm_ctx.all_reduce_param_group = None
+            if comm_ctx.pre_param_group is not None:
+                comm_ctx.pre_param_group.apply_fusion_reduced_grad()
+                comm_ctx.pre_param_group = None
+            # Step 1: Wait for previous reduce-scatter groups and get them for all-reduce
+            prev_groups = self.hsdp_state._wait_prev_reduce_scatter()
+            # Step 2: Accumulate and issue async all-reduce for previous groups
+            for group in prev_groups:
+                group.accumulate_existing_grads_to_buffer()
+                group.issue_async_allreduce()
+                MindSporeHSDPStateV2.pending_all_reduce_groups.append(group)
+            # Step 3: Wait/apply any remaining reduce-scatter for pure FSDP params
+            self.hsdp_state.reduce_scattered_params()
+            # Step 4: Wait for pending all-reduce groups and apply grads
+            MindSporeHSDPStateV2.delay_apply_reduce_grads()
+            # Step 5: Process any remaining all-reduce params (without fusion)
+            self.hsdp_state.reduce_params()
 
     def _backward_hook(self):
         """Execute backward hook."""
