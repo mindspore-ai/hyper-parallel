@@ -125,11 +125,18 @@ def main() -> None:
             trust_remote_code=args.trust_remote_code,
         )
 
+    # A model built from config has no source conversion history. Keep fused
+    # experts intact instead of letting HF's default reverse mapping split them.
+    has_fused_moe = any(
+        parameter.ndim == 3 and name.endswith((".experts.gate_up_proj", ".experts.down_proj"))
+        for name, parameter in model.named_parameters()
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     CheckpointManager(model).save_pretrained(
         output_dir,
         dcp_checkpoint=checkpoint_dir,
         dcp_expert_layout=args.expert_weight_layout,
+        save_original_format=not has_fused_moe,
         max_shard_size=args.max_shard_size,
     )
     tokenizer = AutoTokenizer.from_pretrained(
