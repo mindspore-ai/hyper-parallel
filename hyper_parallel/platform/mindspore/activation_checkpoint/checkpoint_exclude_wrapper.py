@@ -17,13 +17,14 @@ from collections import defaultdict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
-from typing import Any, Callable, Deque, Dict, List, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import mindspore as ms
 from mindspore.common._grad_function import _Function
 
 from hyper_parallel.core.activation_checkpoint.recompute_state import get_recompute_state
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.shard.local_op_context import LOCAL_OP_EXECUTOR
 from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import ActivationWrapper
 
 
@@ -492,20 +493,40 @@ def _apply_recompute_boundary(output: Any, input_bindings: List[_InputBinding]) 
 class CheckpointExcludeWrapper(ActivationWrapper):
     """Exclude a callable region from checkpoint recomputation."""
 
-    def __init__(self, module: Callable[..., Any], *, preserve_inputs: bool = False) -> None:
+    def __init__(
+        self, module: Callable[..., Any], *, preserve_inputs: bool = False,
+        exclude_single_op: Optional[bool] = None,
+    ) -> None:
         """Initialize a checkpoint exclusion wrapper for a MindSpore Cell or function."""
         if not callable(module):
             raise ValueError("module must be a MindSpore Cell or callable")
         if not isinstance(preserve_inputs, bool):
             raise ValueError("preserve_inputs must be a bool")
+        if exclude_single_op is not None and not isinstance(exclude_single_op, bool):
+            raise ValueError("exclude_single_op must be a bool or None")
         super().__init__(module, track_overlaps=False)
         self.preserve_inputs = preserve_inputs
+        self.exclude_single_op = not isinstance(module, ms.nn.Cell) if exclude_single_op is None else exclude_single_op
 
     def construct(self, *args: Any, **kwargs: Any) -> Any:
         """Execute normally outside recompute and return the cached output in recompute."""
         state = get_recompute_state()
         if state is None:
             return self._ckpt_wrapped_module(*args, **kwargs)
+        if self.exclude_single_op and any(
+            isinstance(tensor, DTensor) for _, tensor in _collect_tensor_inputs(args, kwargs)
+        ):
+            token = LOCAL_OP_EXECUTOR.set(self._run_excluded)
+            try:
+                output = self._ckpt_wrapped_module(*args, **kwargs)
+            finally:
+                LOCAL_OP_EXECUTOR.reset(token)
+            return output
+        return self._run_excluded(self._ckpt_wrapped_module, *args, **kwargs)
+
+    def _run_excluded(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Cache one local call, retaining its replayable input aliases as handles."""
+        state = get_recompute_state()
         cache = state.get_resource(_EXCLUDE_CACHE_KEY, _ExcludeCache)
         if state.is_recomputing:
             entry = cache.pop(id(self))
@@ -518,7 +539,7 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         pack_token = _ACTIVE_PACK_STATE.set(_PackState(input_infos, input_bindings))
         try:
             with _saved_tensors_context():
-                output = self._ckpt_wrapped_module(*args, **kwargs)
+                output = function(*args, **kwargs)
         finally:
             _ACTIVE_PACK_STATE.reset(pack_token)
         cache.save(id(self), _ExcludeCacheEntry(output, input_bindings))
@@ -526,7 +547,7 @@ class CheckpointExcludeWrapper(ActivationWrapper):
 
 
 def checkpoint_exclude_wrapper(
-    module: Callable[..., Any], *, preserve_inputs: bool = False
+    module: Callable[..., Any], *, preserve_inputs: bool = False, exclude_single_op: Optional[bool] = None
 ) -> CheckpointExcludeWrapper:
     """Wrap a MindSpore Cell or function so its region is not recomputed.
 
@@ -535,12 +556,19 @@ def checkpoint_exclude_wrapper(
             checkpoint forward pass.
         preserve_inputs: Keep real saved inputs for early backward. Defaults to
             False, which rebuilds saved input aliases during checkpoint replay.
+        exclude_single_op: Exclude local kernels after DTensor expansion when True,
+            or the entire callable region when False. None defaults to False for
+            Cells and True for other callables. Plain Tensor calls retain the
+            callable region because they do not enter DTensor dispatch.
 
     Returns:
         A wrapper that saves the callable's autograd tensors and reuses its
         forward output while replaying a non-reentrant checkpoint.
 
     Note:
+        In local-op mode the callable and its expansion helpers run during replay;
+        only local kernel calls are cached. preserve_inputs controls saved input
+        retention independently of the exclusion scope.
         This feature requires MindSpore PyNative mode and a surrounding
         HyperParallel checkpoint configured with ``use_reentrant=False``.
         Nested checkpoint exclusion wrappers are not supported.
@@ -548,4 +576,4 @@ def checkpoint_exclude_wrapper(
         backward-compatibility layer may deliberately preserve version counters,
         so not every in-place write can be detected from ``Tensor._version``.
     """
-    return CheckpointExcludeWrapper(module, preserve_inputs=preserve_inputs)
+    return CheckpointExcludeWrapper(module, preserve_inputs=preserve_inputs, exclude_single_op=exclude_single_op)

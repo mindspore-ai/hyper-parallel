@@ -1394,12 +1394,16 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement checkpoint_wrapper")
 
     @staticmethod
-    def checkpoint_exclude_wrapper(module: Any, *, preserve_inputs: bool = False) -> Any:
+    def checkpoint_exclude_wrapper(
+        module: Any, *, preserve_inputs: bool = False, exclude_single_op: Optional[bool] = None
+    ) -> Any:
         """Wrap a callable whose activations should be saved instead of recomputed.
 
         Args:
             module: The module or callable to exclude from activation recomputation.
             preserve_inputs: Retain saved inputs for backward without outer replay.
+            exclude_single_op: True for local kernels, False for the entire region.
+                None selects the backend default for the callable type.
 
         Returns:
             The wrapped module or callable.

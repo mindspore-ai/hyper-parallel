@@ -20,12 +20,14 @@ import os
 import sys
 import warnings
 from contextvars import ContextVar
+from functools import partial
 from itertools import chain
 from typing import Any, Dict, FrozenSet, List, Optional
 
 import yaml
 
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
+from hyper_parallel.core.shard.local_op_context import LOCAL_OP_EXECUTOR
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.random import OffsetBasedRNGTracker, is_rng_supported_mesh
 from hyper_parallel.platform import get_platform
@@ -814,6 +816,21 @@ class OpDispatcher:
     def _dispatch_layout_infer(
         self, op_name: str, op_call: callable, args: tuple, kwargs: dict
     ):
+        """Consume the local-op scope once and restore it after dispatch."""
+        executor = LOCAL_OP_EXECUTOR.get()
+        if executor is None:
+            return self._execute_layout_infer(op_name, op_call, args, kwargs, None)
+
+        # Expansion helpers must not inherit the kernel's execution policy.
+        token = LOCAL_OP_EXECUTOR.set(None)
+        try:
+            return self._execute_layout_infer(op_name, op_call, args, kwargs, executor)
+        finally:
+            LOCAL_OP_EXECUTOR.reset(token)
+
+    def _execute_layout_infer(
+        self, op_name: str, op_call: callable, args: tuple, kwargs: dict, executor
+    ):
         """Standard dispatch through layout-inference: preprocess → infer → execute → wrap.
 
         Args:
@@ -821,6 +838,7 @@ class OpDispatcher:
             op_call: The raw operator callable.
             args: Positional arguments for op_call.
             kwargs: Keyword arguments for op_call.
+            executor: Local operator executor consumed from the dynamic scope.
 
         Returns:
             DTensor: Dispatched result wrapped as DTensor.
@@ -829,6 +847,8 @@ class OpDispatcher:
             RuntimeError: If op_name is not registered, or preprocess returns None.
         """
         if op_name not in self.layout_infer_ops:
+            if executor is not None:
+                raise ValueError(f"Local-op execution requires a registered distributed operator: {op_name}")
             return self._handle_unregistered_op(op_name, op_call, args, kwargs)
 
         cache_manager = LayoutCacheManager.get_instance()
@@ -857,7 +877,15 @@ class OpDispatcher:
             op_call, op_name, cache_key, cache_values, distribute_op, cache_manager
         )
 
-        op_impl = op_call if op_impl is None else op_impl
+        if executor is not None:
+            # Bind only for this invocation: layout caches are shared by layers
+            # with different execution policies. Expansion helpers stay outside
+            # the executor, which wraps only calls to the original local kernel.
+            local_op = partial(executor, op_call)
+            op_impl = distribute_op.get_expand_impl(local_op, infer_result, cache_values)
+            op_impl = local_op if op_impl is None else op_impl
+        else:
+            op_impl = op_call if op_impl is None else op_impl
         py_output = OpDispatcher._call_op_impl(op_impl, packed_call, local_args, local_kwargs)
         return distribute_op.wrap_output(py_output, infer_result[0])
 

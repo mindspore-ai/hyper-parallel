@@ -182,18 +182,27 @@ def swap(function, *args, policy_fn=None, group_swap=False, **kwargs):
         return function(*args, **kwargs)
 
 
-def checkpoint_exclude_wrapper(module: Any, *, preserve_inputs: bool = False) -> Any:
-    """Wrap a callable whose region is excluded from activation recomputation.
+def checkpoint_exclude_wrapper(
+    module: Any, *, preserve_inputs: bool = False, exclude_single_op: Optional[bool] = None
+) -> Any:
+    """Exclude local operator calls from activation recomputation.
+
+    On MindSpore, local-op mode retains local kernel outputs after DTensor
+    expansion; region mode retains the entire callable.
 
     Args:
         module: The module or callable to exclude from recomputation.
         preserve_inputs: Keep saved inputs instead of rebuilding them from outer
             replay, for excluded graphs back-propagated before their trunk.
+        exclude_single_op: True for local kernels, False for the entire region.
+            None defaults to False for Cells and True for other callables.
 
     Returns:
         The platform-specific checkpoint exclusion wrapper.
     """
-    return plat.checkpoint_exclude_wrapper(module, preserve_inputs=preserve_inputs)
+    return plat.checkpoint_exclude_wrapper(
+        module, preserve_inputs=preserve_inputs, exclude_single_op=exclude_single_op
+    )
 
 
 checkpoint_wrapper = plat.checkpoint_wrapper
