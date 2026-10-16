@@ -420,11 +420,28 @@ class TokenizerTemplate(ChatTemplate):
                 "the generic tokenizer template requires prefix-stable rendering."
             )
 
+    def _encode_text_continuation(
+            self,
+            text: str,
+            previous_text: str,
+            previous_ids: List[int],
+    ) -> List[int]:
+        """Keep earlier source/target token boundaries when the rendered text extends history."""
+        if text.startswith(previous_text):
+            # Re-encoding history can merge tokens across a masked source/target boundary
+            # (e.g. the two newlines in empty reasoning), invalidating earlier labels.
+            return previous_ids + self.tokenizer.encode(text[len(previous_text):], add_special_tokens=False)
+        # Actual template rewrites still go through the strict prefix validator, including
+        # the explicitly supported GPT-OSS terminal-token substitution.
+        return self.tokenizer.encode(text, add_special_tokens=False)
+
     def _encode_assistant_source_target(
             self,
             messages: Sequence[Mapping[str, Any]],
+            previous_text: str,
+            previous_ids: List[int],
             tools: Optional[Sequence[Mapping[str, Any]]] = None,
-    ) -> tuple[List[int], List[int]]:
+    ) -> tuple[List[int], List[int], str]:
         """Encode history plus the prefilled header separately from the current assistant target.
 
         ``messages`` ends at the assistant being supervised. The source includes
@@ -443,9 +460,9 @@ class TokenizerTemplate(ChatTemplate):
                 "training and inference assistant headers would be inconsistent."
             )
         # Separate encoding prevents BPE from merging a prefilled header token with the first target token.
-        source_ids = self.tokenizer.encode(source_text, add_special_tokens=False)
+        source_ids = self._encode_text_continuation(source_text, previous_text, previous_ids)
         target_ids = self.tokenizer.encode(completed_text[len(source_text):], add_special_tokens=False)
-        return source_ids, target_ids
+        return source_ids, target_ids, completed_text
 
     def encode_messages(
             self,
@@ -457,8 +474,9 @@ class TokenizerTemplate(ChatTemplate):
 
         Single-turn and multi-turn conversations share the same traversal. Each
         supervised assistant uses its generation prompt as the source/target
-        boundary, preserving labels from previous turns. Rendering must remain
-        prefix-stable. Leading system messages are
+        boundary, preserving tokens and labels from previous turns. Only newly
+        appended text is encoded, so BPE cannot merge across earlier loss boundaries.
+        Rendering must remain prefix-stable. Leading system messages are
         first rendered together with the following non-system message because
         some native templates reject a system-only conversation prefix.
 
@@ -478,6 +496,7 @@ class TokenizerTemplate(ChatTemplate):
         input_ids: List[int] = []
         labels: List[int] = []
         previous_length = 0
+        previous_text = ""
 
         has_pending_system_messages = False
         for end, message in enumerate(messages, start=1):
@@ -497,16 +516,18 @@ class TokenizerTemplate(ChatTemplate):
 
             supervise_assistant = message["role"] == "assistant" and loss_mask == 1
             if supervise_assistant:
-                source_ids, target_ids = self._encode_assistant_source_target(messages[:end], tools)
+                source_ids, target_ids, rendered_text = self._encode_assistant_source_target(
+                    messages[:end], previous_text, input_ids, tools,
+                )
                 rendered_conversation_ids = source_ids + target_ids
             else:
-                encoded = self._apply_chat_template(
+                rendered_text = self._apply_chat_template(
                     messages[:end],
-                    tokenize=True,
-                    return_dict=True,
+                    tokenize=False,
+                    return_dict=False,
                     tools=tools,
                 )
-                rendered_conversation_ids = encoded["input_ids"]
+                rendered_conversation_ids = self._encode_text_continuation(rendered_text, previous_text, input_ids)
             current_length = len(rendered_conversation_ids)
             if current_length < previous_length:
                 raise ValueError(
@@ -532,6 +553,7 @@ class TokenizerTemplate(ChatTemplate):
                 labels.extend(new_ids if loss_mask == 1 else [IGNORE_INDEX] * len(new_ids))
             input_ids = rendered_conversation_ids
             previous_length = current_length
+            previous_text = rendered_text
 
         if has_pending_system_messages and previous_length == 0:
             raise ValueError("A conversation containing only system messages cannot be rendered for training.")

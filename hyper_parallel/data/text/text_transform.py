@@ -64,9 +64,12 @@ def _normalize_conversation(messages: Any) -> list[dict[str, Any]]:
             raise ValueError("Every conversation message must be a mapping")
 
         if "role" in message:
-            if "content" not in message:
+            tool_only_assistant = message["role"] == "assistant" and bool(message.get("tool_calls"))
+            if "content" not in message and not tool_only_assistant:
                 raise ValueError("A role/content message must contain field 'content'")
             normalized_message = dict(message)
+            if tool_only_assistant:
+                normalized_message.setdefault("content", "")
         elif "from" in message:
             if "value" not in message:
                 raise ValueError("A ShareGPT from/value message must contain field 'value'")
