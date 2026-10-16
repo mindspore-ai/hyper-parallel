@@ -106,3 +106,10 @@ class TorchCustomOps:
             "npu_sparse_lightning_indexer_kl_loss_grad is not supported "
             "on the PyTorch platform."
         )
+
+    @staticmethod
+    def npu_chunk_kda(*args, **kwargs):
+        """Differentiable Chunk KDA is available only on the MindSpore platform."""
+        raise NotImplementedError(
+            "npu_chunk_kda is not supported on the PyTorch platform."
+        )

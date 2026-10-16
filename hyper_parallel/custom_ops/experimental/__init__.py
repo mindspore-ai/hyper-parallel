@@ -44,6 +44,7 @@ __all__ = [
     "npu_sparse_flash_mla_grad",
     "npu_sparse_lightning_indexer_grad_kl_loss",
     "npu_sparse_lightning_indexer_kl_loss_grad",
+    "npu_chunk_kda",
 ]
 
 from hyper_parallel.custom_ops.experimental.experimental_ops import (
@@ -58,4 +59,5 @@ from hyper_parallel.custom_ops.experimental.experimental_ops import (
     npu_sparse_flash_mla_grad,
     npu_sparse_lightning_indexer_grad_kl_loss,
     npu_sparse_lightning_indexer_kl_loss_grad,
+    npu_chunk_kda,
 )

@@ -19,6 +19,7 @@
 """
 
 from hyper_parallel.platform.mindspore.custom_ops.custom_op_impl import (
+    NpuChunkKdaDFunction,
     NpuFlashAttentionVarLenV4DFunction,
     NpuDenseLightningIndexerGradKlLossDFunction,
     NpuDenseLightningIndexerSoftmaxLseDFunction,
@@ -90,3 +91,8 @@ class MindSporeCustomOps:
     def npu_sparse_lightning_indexer_kl_loss_grad(*args, **kwargs):
         """Sparse lightning indexer KL-loss gradient via custom NPU operator."""
         return NpuSparseLightningIndexerKlLossGradDFunction.apply(*args, **kwargs)
+
+    @staticmethod
+    def npu_chunk_kda(*args, **kwargs):
+        """Run differentiable Chunk KDA with automatic backward dispatch."""
+        return NpuChunkKdaDFunction.apply(*args, **kwargs)
