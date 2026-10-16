@@ -8,7 +8,7 @@ codegen 同时承载两类能力：一类是将 sharding plan 固化为生成模
 
 | 概念 | 说明 |
 |------|------|
-| 产物 bundle | 位于训练 YAML 同级的 `generated/` 目录，含生成版 modeling 文件、`.diff` 差异、`codegen_meta.json` |
+| 产物 bundle | 默认位于 `hyper_parallel/models/<模型>/generated/`（模型锚定，每个模型一份，目录名与 model_type 一一对应）；`models/<模型>/` 尚不存在时打 WARNING 并自动创建。可用 `model.codegen_artifact_dir` 显式指定落点。含生成版 modeling 文件、`.diff` 差异、`codegen_meta.json` |
 | signature | 对影响 artifact 的全部输入取 sha256 前 12 位：canonical spec 投影、modeling source 的 sha256、Transformers 版本、model id、结构配置摘要（层数/头数/专家数等 shape 字段）、codegen 实现摘要（整个 codegen 包的 digest）与 inline declaration 摘要。因此升级 HyperParallel 自身也会触发重新生成；训练步数、优化器等无关字段不会 |
 | `codegen: true` | 打开 artifact 生成与预检；`force_hf=false` 时后端即为 `gen` |
 | `force_hf` | 逃生门，优先级最高，会把 `gen` 覆盖回 `hf`——见下方「注意事项」 |
@@ -16,7 +16,7 @@ codegen 同时承载两类能力：一类是将 sharding plan 固化为生成模
 ## 前置条件
 
 - 一份训练 YAML。离线训练推荐让 `pretrained_model_name_or_path` 指向本地 checkpoint；模型 ID 也可以使用，但必须能被当前 Transformers 环境和 source resolver 正常解析，并能取得对应的 config 与 modeling source；经 `register_custom_model` 注册的自定义架构同样支持（DeepSeek-V4.1 裁剪版即走此路径）。
-- 一份能被 `parse_training_args` 解析的 YAML——codegen 通过它记录「这份 YAML 在哪」，从而定位产物目录。
+- 一份能被 `parse_training_args` 解析的 YAML——codegen 通过它记录「这份 YAML 在哪」（写入 `codegen_meta.json` 作为来源追溯，签名不包含该路径）。
 
 ---
 
@@ -80,7 +80,7 @@ python -m torch.distributed.run --standalone --nproc_per_node=8 \
 首次启动时应看到生成日志；复用时则显示 `reuse artifact`：
 
 ```text
-codegen: generating artifact <yaml_dir>/generated (signature f463aefff4a4)
+codegen: generating artifact hyper_parallel/models/<模型>/generated (signature f463aefff4a4)
 ```
 
 ### 4. 判断是否真正使用 codegen 启动成功
@@ -116,11 +116,12 @@ step=1 ... training/foundation_loss=...
 
 ## 产物 bundle
 
-生成物位于训练 YAML 同级的 `generated/` 目录下。当前目录规则是“每个示例目录一份 generated bundle”，因此同一示例目录下默认只保留一个 codegen 产物目录：
+产物目录按「模型锚定」布局：默认位于 `hyper_parallel/models/<模型>/generated/`——每个模型一份 bundle，与该模型的 adapter 代码同目录。目录名与模型 model_type 严格一一对应（`deepseek_v2` 与 `deepseek_v3` 即使共享 adapter 代码，产物也各自独立成目录）。当 `models/<模型>/` 目录尚不存在时，codegen 会打一条 WARNING 提示该模型还没有对应的 models 目录，并在生成时自动创建该目录存放产物：
 
 ```text
-examples/training_demo/qwen3_moe/
-├── train_parallel_offline_codegen.yaml
+hyper_parallel/models/qwen3_moe/
+├── adapter/
+├── recipes/
 └── generated/
     ├── __init__.py
     ├── codegen_meta.json
@@ -129,9 +130,20 @@ examples/training_demo/qwen3_moe/
     └── configuration_*.py / source_*.py / 其他同级依赖文件（可选）
 ```
 
+布局解析的完整优先级：YAML 里显式的 `model.codegen_artifact_dir` > 模型锚定目录 `hyper_parallel/models/<模型>/generated/`（默认）> 训练 YAML 同级 `generated/`（仅当配置里解析不出任何模型身份时使用）> `cwd/generated`。一个模型只应有一份 codegen YAML：YAML 内容变化即签名变化，下次生成会自动覆盖更新 `generated/`。
+
+`model.codegen_artifact_dir` 是可选的显式覆盖字段，写在训练 YAML 的 `model` 段下即可改变产物落点（生成与加载都指向该目录）。常规训练不需要设置——只有特殊场景才用它，例如 hyper-parallel 以 wheel 方式安装到只读的 site-packages 时把产物指到可写目录，或同一模型需要为多套不同并行配置分别维护产物时：
+
+```yaml
+model:
+  _target_: hyper_parallel.models._transformers.auto_model.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /path/to/Qwen3-30B-A3B
+  codegen_artifact_dir: /home/lxy/my_codegen_bundles/qwen3_moe  # 可选，不写走默认
+```
+
 `generated/` 是整份 bundle 的根目录。训练时 loader 会在该目录下查找唯一的 `modeling_*_gen_npu.py`，并把这个目录注册成一个隔离的 synthetic Python package，避免不同 YAML 的生成文件在 `sys.modules` 中互相覆盖。
 
-`generated/` 是机器生成产物，由 `codegen generate` 或训练首次启动时在本地生成。本仓库的两个示例（`qwen3_moe/`、`deepseek_v41/`）已将一次真实生成的参考产物随示例提交，可直接查阅作为对照；用户自己目录下的产物默认不参与版本管理。
+`generated/` 是机器生成产物，由 `codegen generate` 或训练首次启动时在本地生成。本仓库的两个模型家族（`qwen3_moe/`、`deepseek_v41/`）已将一次真实生成的参考产物随模型目录提交，可直接查阅作为对照；用户自己目录下的产物默认不参与版本管理。
 
 `__init__.py` 让 `generated/` 具备包目录形态。它通常不承载业务逻辑，主要用于让 generated modeling 和可选同级依赖在同一个 package 下解析相对导入。
 
