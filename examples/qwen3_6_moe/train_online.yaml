@@ -32,6 +32,10 @@ accelerator:
 
 fsdp_config:
   dp_shard_size: 8
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
   # The eight-rank expert domain becomes EDP=4 x EP=2. Shard each EP
   # partition across all four EDP ranks, leaving no replicated EDP axis.
   edp_shard_size: 4
@@ -134,6 +138,7 @@ dataloader:
 
 optimizer:
   _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
   no_decay_params: [bias, norm, ln_]
   adamw_config:
     adamw_lr: 1.0e-5
