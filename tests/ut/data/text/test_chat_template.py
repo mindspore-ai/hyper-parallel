@@ -51,6 +51,32 @@ def _ids(text, add_special_tokens=False):
     return FakeTokenizer().encode(text, add_special_tokens=add_special_tokens)
 
 
+class MultiTurnThinkingTokenizer(FakeTokenizer):
+    """Expose generation boundaries for reasoning and tool-turn masking tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.generation_histories = []
+
+    def apply_chat_template(
+            self, messages, tokenize=True, add_generation_prompt=False, return_dict=True, **kwargs,
+    ):
+        """Render each assistant's reasoning independently of later turns."""
+        del kwargs
+        parts = []
+        for message in messages:
+            body = message["content"]
+            if message["role"] == "assistant":
+                body = "<think>\n" + message.get("reasoning_content", "") + "\n</think>\n\n" + body
+            parts.append(f"<|im_start|>{message['role']}\n{body}<|im_end|>\n")
+        if add_generation_prompt:
+            self.generation_histories.append(len(messages))
+            parts.append("<|im_start|>assistant\n<think>\n")
+        text = "".join(parts)
+        result = self.encode(text, add_special_tokens=False) if tokenize else text
+        return {"input_ids": result} if return_dict else result
+
+
 class TestChatTemplateGoldens(unittest.TestCase):
     """Golden encodings preserved by the merged chat template module."""
 
@@ -272,6 +298,89 @@ class TestChatTemplateGoldens(unittest.TestCase):
         self.assertEqual(result["input_ids"], generation_prefix + assistant_target)
         self.assertEqual(result["labels"][:len(generation_prefix)], [-100] * len(generation_prefix))
         self.assertEqual(result["labels"][len(generation_prefix):], assistant_target)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_tokenizer_multiturn_preserves_all_assistant_targets(self):
+        """Mask each new source without masking targets from preceding turns."""
+        for turns in (1, 2, 3):
+            with self.subTest(turns=turns):
+                tokenizer = MultiTurnThinkingTokenizer()
+                messages = [{"role": "system", "content": "Be helpful."}]
+                expected_ids = _ids("<|im_start|>system\nBe helpful.<|im_end|>\n")
+                expected_labels = [-100] * len(expected_ids)
+                for turn in range(turns):
+                    question, reasoning, answer = f"Question {turn}", f"Reason {turn}", f"Answer {turn}"
+                    messages.extend([
+                        {"role": "user", "content": question},
+                        {"role": "assistant", "reasoning_content": reasoning, "content": answer},
+                    ])
+                    source = _ids(
+                        f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n<think>\n"
+                    )
+                    target = _ids(f"{reasoning}\n</think>\n\n{answer}<|im_end|>\n")
+                    expected_ids.extend(source + target)
+                    expected_labels.extend([-100] * len(source) + target)
+                result = chat_template.build_chat_template("tokenizer", tokenizer).encode_messages(messages)
+                self.assertEqual(result["input_ids"], expected_ids)
+                self.assertEqual(result["labels"], expected_labels)
+                self.assertEqual(tokenizer.generation_histories, list(range(2, 2 * turns + 1, 2)))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_tokenizer_multiturn_tools_and_explicit_masks(self):
+        """Tool observations stay masked unless explicitly enabled; skipped assistants stay masked."""
+        for tool_loss_mask in (0, 1):
+            with self.subTest(tool_loss_mask=tool_loss_mask):
+                tokenizer = MultiTurnThinkingTokenizer()
+                messages = [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "Call tool", "reasoning_content": "Choose tool"},
+                    {"role": "tool", "content": "Result", "loss_mask": tool_loss_mask},
+                    {"role": "assistant", "content": "Skipped", "loss_mask": 0},
+                    {"role": "user", "content": "Follow up"},
+                    {"role": "assistant", "content": "Final", "reasoning_content": "Check result"},
+                ]
+                expected_labels = []
+                for message in messages:
+                    segment = tokenizer.apply_chat_template([message], tokenize=False, return_dict=False)
+                    if message["role"] == "assistant" and message.get("loss_mask", 1):
+                        header = "<|im_start|>assistant\n<think>\n"
+                        expected_labels.extend([-100] * len(_ids(header)) + _ids(segment[len(header):]))
+                    else:
+                        ids = _ids(segment)
+                        expected_labels.extend(ids if message.get("loss_mask", 0) else [-100] * len(ids))
+                template = chat_template.build_chat_template("tokenizer", tokenizer)
+                result = template.encode_messages(messages, tools=[{"type": "function", "function": {"name": "f"}}])
+                self.assertEqual(result["labels"], expected_labels)
+                self.assertEqual(result["input_ids"], tokenizer.apply_chat_template(messages)["input_ids"])
+                self.assertEqual(tokenizer.generation_histories, [1, 5])
+                truncated = template.encode_messages(messages, max_seq_len=80)
+                self.assertEqual(truncated["input_ids"], result["input_ids"][-80:])
+                self.assertEqual(truncated["labels"], expected_labels[-80:])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_tokenizer_multiturn_rejects_removed_history_reasoning(self):
+        """Reject history rewrites instead of applying an earlier turn's mask to different tokens."""
+        class HistoryRewritingTokenizer(MultiTurnThinkingTokenizer):
+            """Emulate a native template that removes historical reasoning."""
+
+            def apply_chat_template(self, messages, **kwargs):
+                modified = [dict(message) for message in messages]
+                if len(modified) >= 3:
+                    modified[1]["reasoning_content"] = ""
+                return super().apply_chat_template(modified, **kwargs)
+
+        messages = [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "Answer", "reasoning_content": "Reason"},
+            {"role": "user", "content": "Follow up"},
+            {"role": "assistant", "content": "Final", "reasoning_content": "Check"},
+        ]
+        template = chat_template.build_chat_template("tokenizer", HistoryRewritingTokenizer())
+        with self.assertRaisesRegex(ValueError, "prefix|shortened"):
+            template.encode_messages(messages)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

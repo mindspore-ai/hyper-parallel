@@ -420,6 +420,33 @@ class TokenizerTemplate(ChatTemplate):
                 "the generic tokenizer template requires prefix-stable rendering."
             )
 
+    def _encode_assistant_source_target(
+            self,
+            messages: Sequence[Mapping[str, Any]],
+            tools: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> tuple[List[int], List[int]]:
+        """Encode history plus the prefilled header separately from the current assistant target.
+
+        ``messages`` ends at the assistant being supervised. The source includes
+        earlier assistant targets, whose labels must be preserved by the caller;
+        only newly appended source tokens should receive ``IGNORE_INDEX``.
+        """
+        completed_text = self._apply_chat_template(
+            messages, tokenize=False, return_dict=False, tools=tools,
+        )
+        source_text = self._apply_chat_template(
+            messages[:-1], tokenize=False, return_dict=False, add_generation_prompt=True, tools=tools,
+        )
+        if not completed_text.startswith(source_text):
+            raise ValueError(
+                "The tokenizer generation prompt is not a text prefix of the completed assistant message; "
+                "training and inference assistant headers would be inconsistent."
+            )
+        # Separate encoding prevents BPE from merging a prefilled header token with the first target token.
+        source_ids = self.tokenizer.encode(source_text, add_special_tokens=False)
+        target_ids = self.tokenizer.encode(completed_text[len(source_text):], add_special_tokens=False)
+        return source_ids, target_ids
+
     def encode_messages(
             self,
             messages: Sequence[Mapping[str, Any]],
@@ -428,8 +455,10 @@ class TokenizerTemplate(ChatTemplate):
     ) -> Dict[str, List[int]]:
         """Encode messages with the tokenizer chat template and mask non-assistant loss.
 
-        Each message is appended incrementally so token boundaries follow the
-        tokenizer's own prefix-stable rendering. Leading system messages are
+        Single-turn and multi-turn conversations share the same traversal. Each
+        supervised assistant uses its generation prompt as the source/target
+        boundary, preserving labels from previous turns. Rendering must remain
+        prefix-stable. Leading system messages are
         first rendered together with the following non-system message because
         some native templates reject a system-only conversation prefix.
 
@@ -466,31 +495,10 @@ class TokenizerTemplate(ChatTemplate):
                     "boundaries can be grouped safely."
                 )
 
-            if message["role"] == "assistant" and loss_mask == 1:
-                completed_conversation_text = self._apply_chat_template(
-                    messages[:end],
-                    tokenize=False,
-                    return_dict=False,
-                    tools=tools,
-                )
-                # The inference prefix is only a loss-mask boundary probe. Tokenize it separately from the
-                # assistant target so BPE cannot merge a prefilled header token with the first generated token.
-                inference_prefix_text = self._apply_chat_template(
-                    messages[:end - 1],
-                    tokenize=False,
-                    return_dict=False,
-                    add_generation_prompt=True,
-                    tools=tools,
-                )
-                if not completed_conversation_text.startswith(inference_prefix_text):
-                    raise ValueError(
-                        "The tokenizer generation prompt is not a text prefix of the completed assistant message; "
-                        "training and inference assistant headers would be inconsistent."
-                    )
-                assistant_target_text = completed_conversation_text[len(inference_prefix_text):]
-                inference_prefix_ids = self.tokenizer.encode(inference_prefix_text, add_special_tokens=False)
-                assistant_target_ids = self.tokenizer.encode(assistant_target_text, add_special_tokens=False)
-                rendered_conversation_ids = inference_prefix_ids + assistant_target_ids
+            supervise_assistant = message["role"] == "assistant" and loss_mask == 1
+            if supervise_assistant:
+                source_ids, target_ids = self._encode_assistant_source_target(messages[:end], tools)
+                rendered_conversation_ids = source_ids + target_ids
             else:
                 encoded = self._apply_chat_template(
                     messages[:end],
@@ -507,17 +515,18 @@ class TokenizerTemplate(ChatTemplate):
                 )
 
             self._update_prefix_labels(input_ids, rendered_conversation_ids, labels)
-            if message["role"] == "assistant" and loss_mask == 1:
+            if supervise_assistant:
                 if (
-                        len(inference_prefix_ids) < previous_length
-                        or inference_prefix_ids[:previous_length] != input_ids
+                        len(source_ids) < previous_length
+                        or source_ids[:previous_length] != input_ids
                 ):
                     raise ValueError(
                         "The tokenizer generation prompt structurally rewrote the conversation prefix; "
                         "assistant-header loss masking requires the inference prompt to extend the training history."
                     )
-                labels.extend([IGNORE_INDEX] * (len(inference_prefix_ids) - previous_length))
-                labels.extend(assistant_target_ids)
+                # History contains supervised targets from earlier turns: mask only the new source suffix.
+                labels.extend([IGNORE_INDEX] * (len(source_ids) - previous_length))
+                labels.extend(target_ids)
             else:
                 new_ids = rendered_conversation_ids[previous_length:]
                 labels.extend(new_ids if loss_mask == 1 else [IGNORE_INDEX] * len(new_ids))
