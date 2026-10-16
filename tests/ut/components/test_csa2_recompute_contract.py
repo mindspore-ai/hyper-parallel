@@ -29,6 +29,7 @@ them on CPU against the real classes:
 
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -43,6 +44,7 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedDSAAttentionBase,
     SharedCompressedDSAIndexer,
 )
+from hyper_parallel.components.modules.csa2_cann_target import CANNSharedCompressedDSAAttention
 from hyper_parallel.core.activation_memory.api import checkpoint_wrapper
 from hyper_parallel.models.deepseek_v41.adapter.policies import (
     activation_checkpointing as attention_policy,
@@ -317,6 +319,31 @@ def test_checkpointed_kv_source_matches_plain_and_writes_state_once():
     """A recomputed KV source reproduces the plain result and writes state once."""
     for use_cp in (False, True):
         _assert_recompute_matches_plain(_kv_source_layer, use_cp=use_cp)
+
+
+def test_cann_target_preserves_cpu_fallback_with_and_without_cp():
+    """Unsupported shapes use the parent attention path without changing gradients."""
+    torch.manual_seed(11)
+    source = _Source()
+    source.compressor = _Compressor()
+    for use_cp in (False, True):
+        reference = SharedCompressedDSAAttentionBase(
+            copy.deepcopy(source), replace_indexer=False, use_optimized_sparse_attention=False,
+        )
+        target = CANNSharedCompressedDSAAttention(copy.deepcopy(source))
+        reference_state = SharedCompressedAttentionState()
+        target_state = SharedCompressedAttentionState()
+        indices = torch.zeros(BATCH, SEQUENCE, 2, dtype=torch.int32)
+        reference_state.publish_topk_indices(LAYER, indices)
+        target_state.publish_topk_indices(LAYER, indices)
+        expected_loss, expected_grad = _run(
+            reference, reference_state, _GatherCounter() if use_cp else None, _inputs(),
+        )
+        actual_loss, actual_grad = _run(
+            target, target_state, _GatherCounter() if use_cp else None, _inputs(),
+        )
+        assert actual_loss == expected_loss
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
 
 
 def test_checkpointed_index_source_matches_plain_and_writes_state_once():
