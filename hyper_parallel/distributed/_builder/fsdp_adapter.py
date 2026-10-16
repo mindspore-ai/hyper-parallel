@@ -536,56 +536,64 @@ class FSDP2Manager:
         hsdp_module.set_gradient_scaling_factor(1.0 / source_gradient_domain_size)
         return True
 
-    def _configure_prefetch(self, hsdp_modules: list[HSDPModule]) -> None:
-        """Configure forward and backward prefetch targets by list depth."""
+    def _configure_prefetch(
+        self,
+        hsdp_modules: list[HSDPModule],
+        backward_modules: list[HSDPModule],
+    ) -> None:
+        """Configure prefetch targets in their respective hook execution orders."""
         for module_index, hsdp_module in enumerate(hsdp_modules):
             forward_end = module_index + self.config.forward_prefetch_depth + 1
             hsdp_module.set_modules_to_forward_prefetch(
                 hsdp_modules[module_index + 1:forward_end]
             )
-
-            backward_start = max(
-                0, module_index - self.config.backward_prefetch_depth
-            )
+        for module_index, hsdp_module in enumerate(backward_modules):
+            backward_end = module_index + self.config.backward_prefetch_depth + 1
             hsdp_module.set_modules_to_backward_prefetch(
-                list(reversed(hsdp_modules[backward_start:module_index]))
+                backward_modules[module_index + 1:backward_end]
             )
 
     def _order_wrap_modules(
         self,
         model: ModuleClass,
         wrap_modules: list[_WrapModuleInfo],
+        *,
+        backward: bool = False,
     ) -> list[_WrapModuleInfo]:
-        """Order FSDP units by adapter execution order or module traversal."""
-        module_order = {
-            id(module): module_index
-            for module_index, (_, module) in enumerate(model.named_modules())
-        }
-        default_order = sorted(
-            wrap_modules,
-            key=lambda wrap_module: module_order.get(id(wrap_module.module), len(module_order)),
-        )
+        """Order FSDP units by adapter hook order or the default traversal."""
+        if backward:
+            default_order = list(reversed(wrap_modules))
+        else:
+            module_order = {
+                id(module): module_index
+                for module_index, (_, module) in enumerate(model.named_modules())
+            }
+            default_order = sorted(
+                wrap_modules,
+                key=lambda wrap_module: module_order.get(id(wrap_module.module), len(module_order)),
+            )
         adapter_spec = self._get_model_adapter_spec(model)
-        execution_order_provider = getattr(adapter_spec, "fsdp_execution_order", None)
+        order_attribute = "fsdp_backward_execution_order" if backward else "fsdp_execution_order"
+        execution_order_provider = getattr(adapter_spec, order_attribute, None)
         if execution_order_provider is None:
             return default_order
         if not callable(execution_order_provider):
-            raise ValueError("ModelAdapterSpec.fsdp_execution_order must be callable")
+            raise ValueError(f"ModelAdapterSpec.{order_attribute} must be callable")
 
         wrap_module_by_fqn = {
             wrap_module.fqn: wrap_module for wrap_module in wrap_modules
         }
         execution_fqns = execution_order_provider(  # pylint: disable=not-callable
             model,
-            tuple(wrap_module.fqn for wrap_module in default_order),
+            tuple(wrap_module.fqn for wrap_module in (wrap_modules if backward else default_order)),
         )
         if isinstance(execution_fqns, str) or not isinstance(execution_fqns, Sequence):
             raise ValueError(
-                "ModelAdapterSpec.fsdp_execution_order must return a sequence of module FQNs"
+                f"ModelAdapterSpec.{order_attribute} must return a sequence of module FQNs"
             )
         if any(not isinstance(module_fqn, str) for module_fqn in execution_fqns):
             raise ValueError(
-                "ModelAdapterSpec.fsdp_execution_order entries must be module FQN strings"
+                f"ModelAdapterSpec.{order_attribute} entries must be module FQN strings"
             )
         if (
             len(execution_fqns) != len(wrap_module_by_fqn)
@@ -593,10 +601,14 @@ class FSDP2Manager:
             or set(execution_fqns) != set(wrap_module_by_fqn)
         ):
             raise ValueError(
-                "ModelAdapterSpec.fsdp_execution_order must return every selected FSDP "
+                f"ModelAdapterSpec.{order_attribute} must return every selected FSDP "
                 "child-unit FQN exactly once"
             )
-        logger.info("Adapter-declared FSDP execution order: %s", list(execution_fqns))
+        logger.info(
+            "Adapter-declared FSDP %s execution order: %s",
+            "backward" if backward else "forward",
+            list(execution_fqns),
+        )
         return [wrap_module_by_fqn[module_fqn] for module_fqn in execution_fqns]
 
     def _parallelize_child_units(
@@ -741,8 +753,10 @@ class FSDP2Manager:
         )
         self._log_gradient_scaling(gradient_scaled_units)
         ordered_wrap_modules = self._order_wrap_modules(model, wrap_modules)
+        backward_wrap_modules = self._order_wrap_modules(model, ordered_wrap_modules, backward=True)
         self._configure_prefetch(
-            [wrap_module.module for wrap_module in ordered_wrap_modules]
+            [wrap_module.module for wrap_module in ordered_wrap_modules],
+            [wrap_module.module for wrap_module in backward_wrap_modules],
         )
         logger.info(
             "Applied FSDP2 to %d child units and the root module",
