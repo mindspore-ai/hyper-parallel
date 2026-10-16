@@ -56,6 +56,10 @@ class TrainerConfig:
     # Final floating-point dtype after model weights are loaded or initialized
     # from scratch. None preserves the dtype produced by the initialization path.
     model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None
+    # Unified framework log level. Applies to every hyper_parallel logger
+    # (component loggers and plain module loggers); the framework stays quiet
+    # below WARNING unless a lower level is configured here.
+    log_level: Literal["debug", "info", "warning", "error", "critical"] = "warning"
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     # parallelism configs
@@ -89,6 +93,11 @@ class TrainerConfig:
 
     def __post_init__(self) -> None:
         """Validate combinations that span multiple config sections."""
+        if self.log_level not in ("debug", "info", "warning", "error", "critical"):
+            raise ValueError(
+                "log_level must be one of: debug, info, warning, error, critical; "
+                f"got {self.log_level!r}"
+            )
         if (
             self.compile.enabled
             and not self.compile.selects_graph_compiler()

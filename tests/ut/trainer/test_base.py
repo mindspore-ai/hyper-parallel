@@ -96,9 +96,38 @@ class TestHcclDeterminismSetup(unittest.TestCase):
 
         with patch.dict(base_module.os.environ, {"HCCL_DETERMINISTIC": "false"}):
             with patch.object(base_module, "setup_logging"):
-                with patch.object(base_module, "initialize_distributed", side_effect=check_initialization):
-                    with self.assertRaisesRegex(RuntimeError, "stop after preflight"):
+                with patch.object(base_module, "set_global_level"):
+                    with patch.object(base_module, "initialize_distributed", side_effect=check_initialization):
+                        with self.assertRaisesRegex(RuntimeError, "stop after preflight"):
+                            base_module.BaseTrainer._setup(trainer)
+
+
+class TestLogLevelSetup(unittest.TestCase):
+    """Check that the configured log level reaches both logging entry points."""
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="allcards",
+        essential_mark="essential",
+    )
+    def test_setup_applies_configured_log_level(self) -> None:
+        """setup_logging and set_global_level receive config.log_level."""
+        trainer = MagicMock()
+        trainer.config.log_level = "info"
+
+        def stop_after_logging(*, backend: str) -> None:
+            """Stop setup right after logging is configured."""
+            del backend
+            raise RuntimeError("stop after logging")
+
+        with patch.object(base_module, "setup_logging") as setup_mock:
+            with patch.object(base_module, "set_global_level") as level_mock:
+                with patch.object(base_module, "initialize_distributed", side_effect=stop_after_logging):
+                    with self.assertRaisesRegex(RuntimeError, "stop after logging"):
                         base_module.BaseTrainer._setup(trainer)
+        setup_mock.assert_called_once_with("info")
+        level_mock.assert_called_once_with("info")
 
 
 class TestBaseTrainerExternalState(unittest.TestCase):

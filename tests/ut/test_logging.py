@@ -26,6 +26,7 @@ from hyper_parallel.tools.logging import (
     logger as manager,
     logging_enabled,
     set_format,
+    set_global_level,
     set_level,
 )
 
@@ -38,6 +39,8 @@ class TestHyperParallelLogging(unittest.TestCase):
         self._saved_registry = dict(hp_logging._registry)
         self._saved_format = hp_logging._LOG_FORMAT
         self._saved_datefmt = hp_logging._DATE_FORMAT
+        self._saved_default_level = hp_logging._DEFAULT_LEVEL
+        self._saved_namespace_level = logging.getLogger(hp_logging._NAMESPACE).level
         os.environ.pop(HP_LOG_CONFIG_ENV, None)
 
     def tearDown(self):
@@ -50,6 +53,8 @@ class TestHyperParallelLogging(unittest.TestCase):
         hp_logging._warned_unknown.clear()
         hp_logging._LOG_FORMAT = self._saved_format
         hp_logging._DATE_FORMAT = self._saved_datefmt
+        hp_logging._DEFAULT_LEVEL = self._saved_default_level
+        logging.getLogger(hp_logging._NAMESPACE).setLevel(self._saved_namespace_level)
         # Re-apply the restored format only to handlers owned by this module.
         # pytest 9.1 attaches capture handlers to non-propagating loggers;
         # changing their formatter would make ordinary records require the
@@ -113,6 +118,28 @@ class TestHyperParallelLogging(unittest.TestCase):
         manager.set_level("UnitF", "INFO")
         self.assertEqual(manager.get_logger("UnitF").level, logging.INFO)
         self.assertTrue(manager.enabled("UnitF", logging.INFO))
+
+    def test_set_global_level_updates_registered_components_and_namespace(self):
+        """One call re-levels live component loggers and the package namespace."""
+        set_level("UnitG0", "DEBUG")
+        set_level("UnitG1", "INFO")
+        self.assertEqual(set_global_level("error"), logging.ERROR)
+        self.assertEqual(get_logger("UnitG0").level, logging.ERROR)
+        self.assertEqual(get_logger("UnitG1").level, logging.ERROR)
+        self.assertEqual(logging.getLogger(hp_logging._NAMESPACE).level, logging.ERROR)
+
+    def test_set_global_level_is_default_for_later_components(self):
+        """Components registered after the call inherit the new default."""
+        set_global_level("info")
+        self.assertEqual(get_logger("UnitG2").level, logging.INFO)
+        self.assertTrue(logging_enabled("UnitG2", logging.INFO))
+        self.assertIs(manager.set_global_level, set_global_level)
+
+    def test_set_global_level_rejects_invalid_level(self):
+        """An invalid level raises and leaves the previous default untouched."""
+        with self.assertRaises(ValueError):
+            set_global_level("not-a-level")
+        self.assertEqual(hp_logging._DEFAULT_LEVEL, self._saved_default_level)
 
     def test_default_format_has_level_component_and_callsite(self):
         """Records render '[LEVEL] [HP-component]: date [file: line] msg' on stdout."""
