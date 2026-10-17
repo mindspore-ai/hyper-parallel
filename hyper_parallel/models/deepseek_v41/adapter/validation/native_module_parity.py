@@ -46,6 +46,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Exper
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionState,
     SharedCompressedDSAAttention,
+    reference_sparse_attention,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41Attention,
@@ -68,6 +69,7 @@ class HyperParallelMoE(nn.Module):
     """Minimal owner that invokes the adapter's real sparse-MoE forward."""
 
     def __init__(self, config: DeepseekV4Config) -> None:
+        """Construct the native-shape MoE owner used by parity checks."""
         super().__init__()
         self.gate = DeepseekV41TopKRouter(config)
         self.experts = DeepseekV4Experts(config)
@@ -123,7 +125,8 @@ def _load_native_modules(native_repo: Path) -> tuple[Any, Any]:
     kernel.hc_split_sinkhorn = _unsupported_kernel
     kernel.sparse_attn = _eager_sparse_attention
     sys.modules["kernel"] = kernel
-    sys.path.insert(0, str(inference_dir))
+    # The released files use sibling absolute imports; they cannot be imported as a package.
+    sys.path.insert(0, str(inference_dir))  # pylint: disable=sys-path-mutation
     try:
         model_spec = importlib.util.spec_from_file_location("deepseek_v41_native_model", model_path)
         if model_spec is None or model_spec.loader is None:
@@ -203,7 +206,9 @@ def _metrics(reference: torch.Tensor, actual: torch.Tensor) -> dict[str, float]:
     flat_actual = actual_fp32.flatten()
     cosine = 1.0
     if flat_reference.numel() and flat_reference.norm() and flat_actual.norm():
-        cosine = float(functional.cosine_similarity(flat_reference, flat_actual, dim=0))
+        cosine = float(
+            functional.cosine_similarity(flat_reference, flat_actual, dim=0)  # pylint: disable=not-callable
+        )
     return {
         "max_abs": float(difference.max()) if difference.numel() else 0.0,
         "mean_abs": float(difference.mean()) if difference.numel() else 0.0,
@@ -367,32 +372,32 @@ def _run_engram(
 
 def _moe_config() -> DeepseekV4Config:
     """Build the small released-shape-invariant MoE configuration."""
-    config = DeepseekV4Config(
-        vocab_size=32,
-        hidden_size=16,
-        moe_intermediate_size=24,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=1,
-        head_dim=8,
-        q_lora_rank=8,
-        num_experts_per_tok=2,
-        n_routed_experts=4,
-        n_shared_experts=1,
-        scoring_func="sqrtsoftplus",
-        norm_topk_prob=True,
-        routed_scaling_factor=1.25,
-        layer_types=["sliding_attention"],
-        mlp_layer_types=["moe"],
-        swiglu_limit=1.5,
-        sliding_window=4,
-        o_groups=2,
-        o_lora_rank=4,
-        index_n_heads=2,
-        index_head_dim=4,
-        index_topk=2,
-        partial_rotary_factor=0.5,
-    )
+    config = DeepseekV4Config.from_dict({
+        "vocab_size": 32,
+        "hidden_size": 16,
+        "moe_intermediate_size": 24,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "q_lora_rank": 8,
+        "num_experts_per_tok": 2,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "scoring_func": "sqrtsoftplus",
+        "norm_topk_prob": True,
+        "routed_scaling_factor": 1.25,
+        "layer_types": ["sliding_attention"],
+        "mlp_layer_types": ["moe"],
+        "swiglu_limit": 1.5,
+        "sliding_window": 4,
+        "o_groups": 2,
+        "o_lora_rank": 4,
+        "index_n_heads": 2,
+        "index_head_dim": 4,
+        "index_topk": 2,
+        "partial_rotary_factor": 0.5,
+    })
     config.v41_vision_enabled = True
     return config
 
@@ -460,9 +465,11 @@ def _run_moe(
     hp_input = source.to(device=target_device, dtype=dtype).detach().requires_grad_(True)
     native_weights, native_indices = native.gate(native_input.flatten(0, 1), image_mask.flatten())
     hp_logits, hp_weights, hp_indices = hp.gate(hp_input, image_mask=image_mask.to(target_device))
-    native_logits = functional.linear(native_input.flatten(0, 1).float(), native.gate.weight.float())
-    native_scores = functional.softplus(native_logits).sqrt()
-    hp_scores = functional.softplus(hp_logits).sqrt()
+    native_logits = functional.linear(  # pylint: disable=not-callable
+        native_input.flatten(0, 1).float(), native.gate.weight.float()
+    )
+    native_scores = functional.softplus(native_logits).sqrt()  # pylint: disable=not-callable
+    hp_scores = functional.softplus(hp_logits).sqrt()  # pylint: disable=not-callable
     native_score_grad = torch.autograd.grad(native_scores.sum(), native_logits, retain_graph=True)[0]
     hp_score_grad = torch.autograd.grad(hp_scores.sum(), hp_logits, retain_graph=True)[0]
     if hp_scores.device != target_device or hp_score_grad.device != target_device:
@@ -496,34 +503,34 @@ def _attention_config(
 ) -> DeepseekV4Config:
     """Build a shape-compatible V4.1 attention-only configuration."""
     layer_count = len(ratios)
-    config = DeepseekV4Config(
-        vocab_size=32,
-        hidden_size=512,
-        moe_intermediate_size=128,
-        num_hidden_layers=layer_count,
-        num_attention_heads=8,
-        num_key_value_heads=1,
-        head_dim=512,
-        q_lora_rank=128,
-        num_experts_per_tok=2,
-        n_routed_experts=4,
-        n_shared_experts=1,
-        max_position_embeddings=16,
-        rope_theta=10000.0,
-        layer_types=["sliding_attention"] * layer_count,
-        mlp_layer_types=["moe"] * layer_count,
-        compress_rates={"compressed_sparse_attention": 2, "heavily_compressed_attention": 2},
-        compress_rope_theta=10000.0,
-        sliding_window=4,
-        o_groups=8,
-        o_lora_rank=128,
-        index_n_heads=8,
-        index_head_dim=64,
-        index_topk=2,
-        rms_norm_eps=1.0e-6,
-        partial_rotary_factor=0.125,
-        attention_dropout=0.0,
-    )
+    config = DeepseekV4Config.from_dict({
+        "vocab_size": 32,
+        "hidden_size": 512,
+        "moe_intermediate_size": 128,
+        "num_hidden_layers": layer_count,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 1,
+        "head_dim": 512,
+        "q_lora_rank": 128,
+        "num_experts_per_tok": 2,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "max_position_embeddings": 16,
+        "rope_theta": 10000.0,
+        "layer_types": ["sliding_attention"] * layer_count,
+        "mlp_layer_types": ["moe"] * layer_count,
+        "compress_rates": {"compressed_sparse_attention": 2, "heavily_compressed_attention": 2},
+        "compress_rope_theta": 10000.0,
+        "sliding_window": 4,
+        "o_groups": 8,
+        "o_lora_rank": 128,
+        "index_n_heads": 8,
+        "index_head_dim": 64,
+        "index_topk": 2,
+        "rms_norm_eps": 1.0e-6,
+        "partial_rotary_factor": 0.125,
+        "attention_dropout": 0.0,
+    })
     config.v41_compress_ratios = list(ratios)
     config.v41_kv_source_layer_ids = list(kv_sources)
     config.v41_index_source_layer_ids = list(index_sources)
@@ -881,13 +888,9 @@ def _probe_native_kernel_import(native_repo: Path) -> dict[str, Any]:
 
 
 def _probe_npu_sparse_shapes(device: torch.device) -> list[dict[str, Any]]:
-    """Record the current enhanced sparse-FA head-dimension contract."""
+    """Probe eager attention independently of optional NPU extensions."""
     if device.type != "npu":
         return []
-    from hyper_parallel.components.modules.shared_compressed_dsa_attention import (  # pylint: disable=C0415
-        npu_sparse_attention_with_scalar_sink,
-    )
-
     results = []
     for head_dim in (128, 512):
         try:
@@ -899,12 +902,11 @@ def _probe_npu_sparse_shapes(device: torch.device) -> list[dict[str, Any]]:
             )
             indices = torch.arange(6, device=device, dtype=torch.int32).view(1, 1, 6).expand(1, 8, 6)
             sinks = torch.zeros(8, device=device, dtype=torch.float32)
-            output = npu_sparse_attention_with_scalar_sink(
+            output = reference_sparse_attention(
                 query,
                 key_value,
                 indices.contiguous(),
                 sinks,
-                64,
                 head_dim**-0.5,
             )
             output.float().sum().backward()
@@ -912,7 +914,7 @@ def _probe_npu_sparse_shapes(device: torch.device) -> list[dict[str, Any]]:
         except Exception as error:  # pylint: disable=broad-except
             results.append(
                 {
-                    "name": f"hyper_parallel.npu_sparse_attention.head_dim_{head_dim}",
+                    "name": f"hyper_parallel.reference_sparse_attention.head_dim_{head_dim}",
                     "status": "unsupported",
                     "reason": f"{type(error).__name__}: {error}",
                 }
@@ -920,7 +922,7 @@ def _probe_npu_sparse_shapes(device: torch.device) -> list[dict[str, Any]]:
         else:
             results.append(
                 {
-                    "name": f"hyper_parallel.npu_sparse_attention.head_dim_{head_dim}",
+                    "name": f"hyper_parallel.reference_sparse_attention.head_dim_{head_dim}",
                     "status": "pass",
                     "forward": "pass",
                     "backward": "pass",
