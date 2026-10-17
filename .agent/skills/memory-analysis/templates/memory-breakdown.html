@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>显存拆解报告</title>
+<style>
+  body { font-family: Consolas, "Courier New", monospace; margin: 24px; color: #171c23; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 16px; margin-top: 24px; }
+  table { border-collapse: collapse; margin: 8px 0; }
+  th, td { border: 1px solid #b9c0c8; padding: 4px 12px; text-align: left; }
+  th { background: #edf3fa; }
+  .note { color: #555e68; font-size: 13px; }
+  .todo { color: #a5322e; }
+</style>
+</head>
+<body>
+<h1>显存拆解报告</h1>
+<p class="note">快照：<code><!--SOURCE--></code>（<!--SEGMENTS-->）</p>
+<p class="note">规则版本：memory breakdown-dimensions v2（按 torch_npu 2.9.0 实采字段解析）。
+单位 MiB。</p>
+
+<h2>一、总量与碎片</h2>
+<table>
+  <tr><th>项</th><th>MiB</th><th>说明</th></tr>
+  <!--TOTAL_ROWS-->
+</table>
+<p class="note"><b>快照是取样瞬间，不等于峰值。</b>步后取的快照里没有任何激活；
+实测即便在 backward 中途取样，活跃量仍低于 <code>max_memory_allocated</code>。
+峰值构成需要在峰值时刻取样，或用 <code>device_traces</code> 回放。</p>
+
+<h2>二、按类别</h2>
+<table>
+  <tr><th>类别</th><th>MiB</th><th>占活跃量</th></tr>
+  <!--CATEGORY_ROWS-->
+</table>
+<p class="note">类别由记录栈按规则判定：<code>torch/optim</code> 帧→优化器状态、
+模块 <code>.to()</code> 转换→参数、native 帧含 <code>AccumulateGrad</code>→梯度
+（梯度由 C++ autograd 引擎分配，<b>没有任何 Python 帧</b>，这是唯一可用信号）、
+最内层自有代码帧在 <code>forward</code> 内→激活。</p>
+
+<h2>三、最大的活跃块</h2>
+<table>
+  <tr><th>MiB</th><th>类别</th><th>调用点</th></tr>
+  <!--BLOCK_ROWS-->
+</table>
+<p class="note">调用点取<b>最内层不在 site-packages 内</b>的 Python 帧——记录栈是
+最内层优先，而其最内层几帧是快照机制自身（<code>unwind</code> /
+<code>CapturedTraceback</code> / <code>??</code>），取 <code>frames[0]</code> 会让
+每个块都归到同一处。</p>
+
+<h2>四、跨快照增长（泄露 vs 一次性峰值）</h2>
+<table>
+  <tr><th>项</th><th>Δ MiB</th><th>说明</th></tr>
+  <!--COMPARE_ROWS-->
+</table>
+<p class="note">单份快照分不清「泄露」与「一次性大分配」：某类别在连续 step 间持续
+增长才是泄露。采集默认 dump step 1–3，正好可两两比对。</p>
+
+<h2>五、一致性校验</h2>
+<table>
+  <tr><th>校验</th><th>结果</th><th>明细</th></tr>
+  <!--CHECK_ROWS-->
+</table>
+<p class="note">校验不通过时对应数字不可直接采信。退出码：0=全通过，2=有不通过项。</p>
+
+<h2>六、结论与下一步</h2>
+<p><!--VERDICT--></p>
+<p class="note">拆解只定位占用来源；省显存的手段见 perf-playbook skill
+（重计算/offload/分配器配置等），性能影响须同时量化。</p>
+</body>
+</html>
