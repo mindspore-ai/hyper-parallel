@@ -283,6 +283,25 @@ def build_sliding_window_indices(
     return indices.unsqueeze(0).expand(batch_size, -1, -1)
 
 
+def _sorted_positions(indices: torch.Tensor) -> torch.Tensor:
+    """Sort compressed-key positions ascending along the last dimension.
+
+    ArgSort has no AI Core implementation for integer dtypes, so sorting the
+    int64 indices ``topk`` returns falls back to AI CPU and then dominates the
+    selection chains. Positions are bounded by the compressed length, which
+    stays far below the 2**24 limit of exact integers in float32, so sorting
+    through float32 keeps the ordering and the values and returns to the input
+    dtype.
+
+    Args:
+        indices: Integer positions to sort, any shape, sorted on the last axis.
+
+    Returns:
+        The same positions in ascending order, in the input dtype.
+    """
+    return indices.float().sort(dim=-1).values.to(indices.dtype)
+
+
 def compressed_causal_topk(
         query: torch.Tensor,
         key: torch.Tensor,
@@ -347,7 +366,7 @@ def compressed_causal_topk(
             scores.masked_fill_(key_positions < minimum, float("-inf"))
         top = scores.topk(top_k, dim=-1, sorted=False)
         indices = top.indices.masked_fill(~torch.isfinite(top.values), compressed_length)
-        indices = indices.sort(dim=-1).values
+        indices = _sorted_positions(indices)
         indices = indices.masked_fill(indices == compressed_length, -1)
         selected_chunks.append(indices.to(torch.int32))
     return torch.cat(selected_chunks, dim=1)
@@ -527,7 +546,7 @@ def compressed_causal_topk_and_candidates(
             scores.masked_fill_(key_positions < minimum, float("-inf"))
         top = scores.topk(top_k, dim=-1, sorted=False)
         indices = top.indices.masked_fill(~torch.isfinite(top.values), compressed_length)
-        indices = indices.sort(dim=-1).values
+        indices = _sorted_positions(indices)
         selected_chunks.append(indices.masked_fill(indices == compressed_length, -1).to(torch.int32))
         candidate_chunks.append(
             select_candidate_block_indices(
@@ -619,7 +638,7 @@ def compressed_candidate_topk(
         top = scores.topk(top_k, dim=-1, sorted=False)
         selected = positions.gather(-1, top.indices)
         selected.masked_fill_(~torch.isfinite(top.values), compressed_length)
-        selected = selected.sort(dim=-1).values
+        selected = _sorted_positions(selected)
         selected.masked_fill_(selected == compressed_length, -1)
         selected_chunks.append(selected.to(torch.int32))
     return torch.cat(selected_chunks, dim=1)
