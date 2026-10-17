@@ -27,12 +27,14 @@ This module is both importable and runnable as a CLI entry point::
 """
 
 import argparse
+import glob
 import os
 from pathlib import Path
 from typing import Any, List
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.tools.offline_config import OfflinePreparationConfig
+from hyper_parallel.data.tools.offline_record_transform import parse_role_map
 from hyper_parallel.data.tools.offline_preparation import (
     prepare_offline_dataset,
 )
@@ -44,10 +46,27 @@ def _download_jsonl(config: OfflinePreparationConfig) -> Path:
     """Download and normalize the configured Hugging Face split as JSONL."""
     json_path = config.resolved_json_path()
     source_path = Path(config.dataset_name_or_path).expanduser()
-    local_suffixes = (".json", ".jsonl", ".json.gz", ".jsonl.gz")
-    if source_path.is_dir() or source_path.name.lower().endswith(local_suffixes):
-        logger.info("Using local JSON dataset input at %s", json_path)
-        return json_path
+    local_json_suffixes = (".json", ".jsonl")
+    local_file_suffixes = local_json_suffixes + (
+        ".json.gz", ".jsonl.gz", ".csv", ".csv.gz", ".parquet", ".arrow", ".txt", ".txt.gz",
+    )
+    if source_path.is_dir():
+        json_input_files = _resolve_local_json_inputs(source_path)
+        if json_input_files:
+            return _materialize_local_files(config, json_input_files, json_path)
+        local_files = _resolve_local_files(source_path)
+        return _materialize_local_files(config, local_files, json_path)
+
+    if not source_path.exists() and any(char in config.dataset_name_or_path for char in "*?["):
+        local_files = [Path(name).resolve() for name in sorted(glob.glob(config.dataset_name_or_path))]
+        if local_files:
+            return _materialize_local_files(config, local_files, json_path)
+
+    if source_path.is_file() and source_path.name.lower().endswith(local_file_suffixes):
+        if source_path.name.lower().endswith(local_json_suffixes):
+            logger.info("Using local JSON dataset input at %s", source_path)
+            return source_path.resolve()
+        return _materialize_local_files(config, [source_path.resolve()], json_path)
 
     if json_path.is_file():
         logger.info("Reusing downloaded Hugging Face dataset at %s", json_path)
@@ -78,15 +97,16 @@ def _download_jsonl(config: OfflinePreparationConfig) -> Path:
     }
     load_dataset_kwargs.update({key: value for key, value in optional_load_dataset_kwargs.items() if value is not None})
     dataset = load_dataset(**load_dataset_kwargs)
-    keys = config.json_keys_list()
-    missing_keys = [key for key in keys if key not in dataset.column_names]
-    if missing_keys:
-        raise ValueError(
-            f"Dataset {config.dataset_name_or_path} does not contain configured "
-            f"keys {missing_keys}; "
-            f"available columns: {dataset.column_names}"
-        )
-    dataset = dataset.select_columns(keys)
+    if not config.uses_record_transform():
+        keys = config.json_keys_list()
+        missing_keys = [key for key in keys if key not in dataset.column_names]
+        if missing_keys:
+            raise ValueError(
+                f"Dataset {config.dataset_name_or_path} does not contain configured "
+                f"keys {missing_keys}; "
+                f"available columns: {dataset.column_names}"
+            )
+        dataset = dataset.select_columns(keys)
 
     json_path.parent.mkdir(parents=True, exist_ok=True)
     dataset.to_json(
@@ -96,6 +116,100 @@ def _download_jsonl(config: OfflinePreparationConfig) -> Path:
         force_ascii=False,
     )
     logger.info("Saved Hugging Face dataset to %s", json_path)
+    return json_path
+
+
+def _infer_local_hf_builder(path: Path) -> str:
+    """Infer a Hugging Face Datasets builder for a local tabular/text file."""
+    lowered = path.name.lower()
+    for suffix, builder in (
+        (".jsonl.gz", "json"),
+        (".json.gz", "json"),
+        (".csv.gz", "csv"),
+        (".txt.gz", "text"),
+        (".jsonl", "json"),
+        (".json", "json"),
+        (".csv", "csv"),
+        (".parquet", "parquet"),
+        (".arrow", "arrow"),
+        (".txt", "text"),
+    ):
+        if lowered.endswith(suffix):
+            return builder
+    raise ValueError(f"Unsupported local Hugging Face data file format: {path}")
+
+
+def _infer_text_format(path: Path) -> str:
+    """Return the underlying data format for plain and compressed text files."""
+    lowered = path.name.lower()
+    if lowered.endswith((".json.gz", ".jsonl.gz", ".json", ".jsonl")):
+        return "json"
+    if lowered.endswith((".csv.gz", ".csv")):
+        return "csv"
+    if lowered.endswith((".txt.gz", ".txt")):
+        return "text"
+    if lowered.endswith(".parquet"):
+        return "parquet"
+    if lowered.endswith(".arrow"):
+        return "arrow"
+    raise ValueError(f"Unsupported local Hugging Face data file format: {path}")
+
+
+def _resolve_local_json_inputs(source_path: Path) -> list[Path]:
+    """Find local JSON/JSONL files recursively in stable order."""
+    suffixes = (".json", ".jsonl", ".json.gz", ".jsonl.gz")
+    if source_path.is_dir():
+        files = [path.resolve() for path in source_path.rglob("*") if path.is_file()]
+        return sorted((path for path in files if path.name.lower().endswith(suffixes)), key=str)
+    if source_path.is_file() and source_path.name.lower().endswith(suffixes):
+        return [source_path.resolve()]
+    return []
+
+
+def _resolve_local_files(source_path: Path) -> list[Path]:
+    """Find supported local HF data files recursively in stable order."""
+    suffixes = (
+        ".json", ".jsonl", ".json.gz", ".jsonl.gz", ".csv", ".csv.gz",
+        ".parquet", ".arrow", ".txt", ".txt.gz",
+    )
+    files = [path.resolve() for path in source_path.rglob("*") if path.is_file()]
+    return sorted((path for path in files if path.name.lower().endswith(suffixes)), key=str)
+
+
+def _materialize_local_files(
+        config: OfflinePreparationConfig,
+        input_files: list[Path],
+        json_path: Path,
+) -> Path:
+    """Load local files through Hugging Face Datasets and normalize to JSONL."""
+    if not input_files:
+        raise ValueError(f"No supported local data files found under {config.dataset_name_or_path!r}")
+
+    from datasets import load_dataset  # pylint: disable=C0415
+
+    file_formats = {_infer_text_format(path) for path in input_files}
+    if len(file_formats) != 1:
+        raise ValueError(f"Local dataset files must use one format, got {sorted(file_formats)!r}")
+    file_format = file_formats.pop()
+    builder = "text" if file_format == "text" else _infer_local_hf_builder(input_files[0])
+    dataset = load_dataset(
+        builder,
+        data_files={config.dataset_split: [str(path) for path in input_files]},
+        split=config.dataset_split,
+        cache_dir=config.cache_dir,
+    )
+    if not config.uses_record_transform():
+        keys = config.json_keys_list()
+        missing_keys = [key for key in keys if key not in dataset.column_names]
+        if missing_keys:
+            raise ValueError(
+                f"Local dataset does not contain configured keys {missing_keys}; "
+                f"available columns: {dataset.column_names}"
+            )
+        dataset = dataset.select_columns(keys)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    dataset.to_json(str(json_path), orient="records", lines=True, force_ascii=False)
+    logger.info("Normalized %d local source files (loader=%s) to %s", len(input_files), builder, json_path)
     return json_path
 
 
@@ -113,7 +227,7 @@ def _add_huggingface_arguments(parser: argparse.ArgumentParser) -> None:
     """Register Hugging Face source and output arguments."""
     dataset_group = parser.add_argument_group("dataset")
     dataset_arguments = (
-        (("--dataset",), {"required": True, "help": "Dataset ID or local JSON/JSONL path."}),
+        (("--dataset",), {"required": True, "help": "Dataset ID or local HF JSON/CSV/TXT/Parquet/Arrow path."}),
         (("--dataset-subset",), {"default": None, "help": "Optional dataset subset."}),
         (("--dataset-split",), {"default": "train", "help": "Dataset split."}),
         (("--revision",), {"default": None, "help": "Optional dataset revision."}),
@@ -122,6 +236,11 @@ def _add_huggingface_arguments(parser: argparse.ArgumentParser) -> None:
         (("--data-files",), {"nargs": "+", "default": None, "help": "Optional source data files."}),
         (("--num-proc",), {"type": int, "default": None, "help": "Dataset preparation process count."}),
         (("--json-keys",), {"nargs": "+", "default": ["text"], "help": "JSON fields to tokenize."}),
+        (("--text-template",), {"default": None, "help": "Python format template for one source record."}),
+        (("--conversation-key",), {"default": None, "help": "Conversation list field to render."}),
+        (("--role-key",), {"default": "role", "help": "Conversation role field."}),
+        (("--content-key",), {"default": "content", "help": "Conversation content field."}),
+        (("--role-map",), {"type": parse_role_map, "default": None, "help": "JSON role alias map."}),
     )
     for flags, options in dataset_arguments:
         dataset_group.add_argument(*flags, **options)
@@ -191,6 +310,11 @@ def main(argv: List[str] | None = None) -> None:
         data_files=args.data_files,
         num_proc=args.num_proc,
         json_keys=args.json_keys,
+        text_template=args.text_template,
+        conversation_key=args.conversation_key,
+        role_key=args.role_key,
+        content_key=args.content_key,
+        role_map=args.role_map,
         output_prefix=args.output_prefix,
         download_dir=args.download_dir,
         tokenizer_name_or_path=args.tokenizer,
