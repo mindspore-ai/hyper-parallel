@@ -14,8 +14,10 @@
 # ============================================================================
 """Planner-injected Context Parallel wrappers for Kimi Delta Attention."""
 # pylint: disable=forbidden-backend-import
+from __future__ import annotations
 
 __all__ = [
+    "kimi_delta_attention_cp_wrapper",
     "kimi_delta_attention_p2p_cp_wrapper",
     "kimi_delta_attention_ulysses_cp_wrapper",
 ]
@@ -44,6 +46,7 @@ def _build_kda_cp_rewrite(
     executor_class: Type[nn.Module],
     backend: str,
     chunk_size: int,
+    execution_options: dict[str, Any] | None = None,
 ) -> _ForwardRewriteRequest:
     """Validate one KDA target and return an atomic forward rewrite request."""
     if cp_mesh is None or cp_mesh.size() <= 1:
@@ -58,17 +61,23 @@ def _build_kda_cp_rewrite(
             "applying a CP wrapper twice is not supported"
         )
 
+    execution_options = {} if execution_options is None else execution_options
     executor = executor_class(
         target_module,
         cp_mesh,
         chunk_size=chunk_size,
         backend=backend,
+        **execution_options,
     )
     original_forward = target_module.forward
 
     @wraps(original_forward)
     def cp_forward(*args: Any, **kwargs: Any) -> Any:
-        """Execute the selected KDA Context Parallel algorithm."""
+        """Execute the selected KDA Context Parallel algorithm.
+
+        Args:
+            kwargs: Additional model arguments; packed sequences are unsupported.
+        """
         return executor(*args, **kwargs)
 
     return _ForwardRewriteRequest(
@@ -79,6 +88,7 @@ def _build_kda_cp_rewrite(
                 "mode": mode,
                 "backend": backend,
                 "chunk_size": chunk_size,
+                **execution_options,
             },
         },
     )
@@ -94,7 +104,17 @@ def kimi_delta_attention_ulysses_cp_wrapper(
     backend: str = "eager",
     chunk_size: int = 64,
 ) -> _ForwardRewriteRequest:
-    """Install full-layer Ulysses CP on a Kimi Delta Attention module."""
+    """Install full-layer Ulysses CP on a Kimi Delta Attention module.
+
+    Args:
+        target_module: KDA layer whose parameters remain owned by the model.
+        mesh: Planner mesh context.
+        tp_mesh: Tensor-parallel mesh; simultaneous TP/CP is unsupported.
+        cp_mesh: Chronologically ordered context-parallel mesh.
+        ep_mesh: Expert-parallel context, unused by KDA.
+        backend: Local KDA implementation: eager or triton.
+        chunk_size: Tokens per local recurrence chunk.
+    """
     del mesh, ep_mesh
     return _build_kda_cp_rewrite(
         target_module,
@@ -117,7 +137,17 @@ def kimi_delta_attention_p2p_cp_wrapper(
     backend: str = "eager",
     chunk_size: int = 64,
 ) -> _ForwardRewriteRequest:
-    """Install full-layer recurrent-state P2P CP on a KDA module."""
+    """Install full-layer recurrent-state P2P CP on a KDA module.
+
+    Args:
+        target_module: KDA layer whose parameters remain owned by the model.
+        mesh: Planner mesh context.
+        tp_mesh: Tensor-parallel mesh; simultaneous TP/CP is unsupported.
+        cp_mesh: Chronologically ordered context-parallel mesh.
+        ep_mesh: Expert-parallel context, unused by KDA.
+        backend: Local KDA implementation: eager or triton.
+        chunk_size: Tokens per local recurrence chunk.
+    """
     del mesh, ep_mesh
     return _build_kda_cp_rewrite(
         target_module,
@@ -127,4 +157,38 @@ def kimi_delta_attention_p2p_cp_wrapper(
         executor_class=KimiDeltaAttentionLayerP2PCP,
         backend=backend,
         chunk_size=chunk_size,
+    )
+
+
+@inner_wrapper
+def kimi_delta_attention_cp_wrapper(
+    target_module: nn.Module,
+    mesh: Any,
+    tp_mesh: Any,
+    cp_mesh: Any,
+    ep_mesh: Any,
+    backend: str = "triton",
+    state_cp_method: str = "p2p",
+) -> _ForwardRewriteRequest:
+    """Install state CP with P2P or experimental cached recursive doubling.
+
+    This unified entry uses 64-token local chunks for both backends.
+
+    Args:
+        target_module: Training-time KDA layer, retaining its parameter ownership.
+        mesh: Planner mesh context.
+        tp_mesh: Simultaneous TP and CP is currently unsupported.
+        cp_mesh: Chronologically ordered context-parallel mesh.
+        ep_mesh: Unused expert-parallel context.
+        backend: Local backend; recursive_doubling requires triton.
+        state_cp_method: State CP method: p2p or recursive_doubling.
+
+    Returns:
+        Atomic forward rewrite with the selected configuration recorded.
+    """
+    del mesh, ep_mesh
+    return _build_kda_cp_rewrite(
+        target_module, cp_mesh, tp_mesh, mode="state",
+        executor_class=KimiDeltaAttentionLayerP2PCP, backend=backend, chunk_size=64,
+        execution_options={"state_cp_method": state_cp_method},
     )
