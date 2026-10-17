@@ -166,6 +166,7 @@ compile:
   dynamo_cache_size_limit: 256
 
 dataset:
+  training_mode: sft
   # Model-owned processor: built through the Omni ``model_assets`` target so the VLM
   # trainer forwards ``model.trust_remote_code`` to ``AutoProcessor``.
   model_assets:

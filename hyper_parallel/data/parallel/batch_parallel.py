@@ -34,8 +34,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import torch
-import torch.distributed as dist
+import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.data.parallel.dataloader_parallel import DataLoaderParallelContext
@@ -194,21 +194,17 @@ class CPBatchSharder:
     def __init__(
             self,
             parallel_context: DataLoaderParallelContext,
-            token_pad_values: Mapping[str, int] | None = None,
-            required_global_alignment: int | None = None,
+            token_fields: frozenset[str] | None = None,
     ) -> None:
         """Initialize context-parallel batch sharding.
 
         Args:
             parallel_context: DataLoader and TP/CP topology information.
-            token_pad_values: Optional sequence fields and their padding values.
+            token_fields: Optional sequence fields to slice.
                 When supplied, fields not listed here remain complete on each CP rank.
         """
         self.parallel_context = parallel_context
-        self.token_pad_values = token_pad_values
-        if required_global_alignment is not None and required_global_alignment < 1:
-            raise ValueError("required_global_alignment must be positive")
-        self.required_global_alignment = required_global_alignment
+        self.token_fields = token_fields
 
     def shard(
             self,
@@ -226,8 +222,10 @@ class CPBatchSharder:
             cp_batch = None
             return cp_batch
 
-        if self.token_pad_values is not None:
-            return self._shard_configured_fields(canonical_batch)
+        if self.token_fields is not None:
+            cp_batch = self._shard_configured_fields(canonical_batch)
+            return cp_batch
+
 
         input_ids = canonical_batch["input_ids"]
         cp_batch = {
@@ -263,24 +261,40 @@ class CPBatchSharder:
         cp_batch["cu_seq_lens"] = boundaries
 
     def _shard_configured_fields(self, canonical_batch: Mapping[str, Any]) -> dict[str, Any]:
-        """Shard configured token fields and preserve all modality metadata."""
+        """Slice aligned token fields and preserve global boundaries and media.
+
+        Example:
+            CP=2, TP=4: collate supplies [1, 24], then each CP rank
+            receives [1, 12]. A length of 18 is rejected here.
+        """
         cp_batch = dict(canonical_batch)
         cp_size = self.parallel_context.cp_world_size
+        alignment = cp_size * self.parallel_context.tp_world_size
+        if cp_size == 1 and alignment == 1:
+            return cp_batch
+
         input_ids = cp_batch["input_ids"]
         if not torch.is_tensor(input_ids) or input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("Configured CP sharding requires input_ids with shape [1, sequence]")
 
         sequence_length = input_ids.shape[1]
-        alignment = self.required_global_alignment or 2 * cp_size
-        pad_length = (-sequence_length) % alignment
-        self._extend_cu_seq_lens(cp_batch, sequence_length, pad_length)
+        if sequence_length % alignment:
+            raise ValueError(
+                f"sequence_length ({sequence_length}) must be divisible by tp_size * cp_size ({alignment}); "
+                "align token fields in collate_fn before get_batch"
+            )
 
-        if cp_size == 1 and pad_length == 0:
-            return cp_batch
-        chunk_length = (sequence_length + pad_length) // cp_size
+        if "cu_seq_lens" in cp_batch:
+            boundaries = cp_batch["cu_seq_lens"].reshape(-1)
+            if boundaries.numel() < 2 or int(boundaries[0]) != 0 or int(boundaries[-1]) != sequence_length:
+                raise ValueError("cu_seq_lens must cover the complete CP input sequence")
+
+            cp_batch["cu_seq_lens"] = boundaries
+
+        chunk_length = sequence_length // cp_size
         local_start = self.parallel_context.cp_rank * chunk_length
         local_end = local_start + chunk_length
-        for field, pad_value in self.token_pad_values.items():
+        for field in self.token_fields:
             if field not in cp_batch:
                 continue
 
@@ -288,8 +302,7 @@ class CPBatchSharder:
             if not torch.is_tensor(value) or value.ndim != 2 or value.shape != input_ids.shape:
                 raise ValueError(f"CP token field {field!r} must match input_ids shape")
 
-            padded = torch.nn.functional.pad(value, (0, pad_length), value=pad_value)
-            cp_batch[field] = padded[:, local_start:local_end].contiguous()
+            cp_batch[field] = value[:, local_start:local_end].contiguous()
 
         return cp_batch
 
@@ -329,7 +342,9 @@ class TPBatchBroadcaster:
             Local batch populated on every TP rank.
         """
         if broadcast_all_fields:
-            return self._broadcast_mapping(cp_local_batch)
+            parallel_batch = self._broadcast_mapping(cp_local_batch)
+            return parallel_batch
+
         tp_rank = self.parallel_context.tp_rank
         # TP rank zero owns the CP-local DataLoader fields and moves them to
         # the target device before communication.
@@ -382,6 +397,7 @@ class TPBatchBroadcaster:
             tensor = parallel_batch.get(field)
             if tensor is None:
                 raise ValueError(f"parallel batch requires {field!r}")
+
             dist.broadcast(tensor, group=tp_group, group_src=0)
 
         # Packed boundaries remain global across CP ranks and variable in size.
@@ -395,7 +411,9 @@ class TPBatchBroadcaster:
     def _broadcast_mapping(self, cp_local_batch: Mapping[str, Any] | None) -> dict[str, Any]:
         """Broadcast variable-shaped Omni tensors and scalar metadata."""
         if self.parallel_context.tp_world_size == 1:
-            return self._move_mapping_to_device(cp_local_batch)
+            parallel_batch = self._move_mapping_to_device(cp_local_batch)
+            return parallel_batch
+
         is_source = self.parallel_context.tp_rank == 0
         if is_source:
             parallel_batch = self._move_mapping_to_device(cp_local_batch)

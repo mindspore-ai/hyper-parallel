@@ -267,6 +267,29 @@ def image_token_types(n_llm_h: int, n_llm_w: int) -> torch.Tensor:
     return token_types
 
 
+def prepare_image_input(record: Dict[str, Any], args: Any, *, start: int) -> ImageInput:
+    """Prepare a native image span for either conversations or caption pretraining.
+
+    Args:
+        record: Image source accepted by the native image loader.
+        args: Processor carrying the model's vision configuration.
+        start: Image-span start in the expanded language-model token sequence.
+
+    Returns:
+        Pixel patches, vision grid, and native image token types.
+    """
+    if start < 0:
+        raise ValueError("Image span start must be nonnegative")
+
+    if not args.vision_enabled:
+        raise ValueError("Image input requires an enabled vision tower")
+
+    patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = load_image(record, args)
+    token_types = image_token_types(n_llm_h, n_llm_w)
+    image_input = ImageInput(start, patches, n_vit_h, n_vit_w, token_types)
+    return image_input
+
+
 def prepare_vl_inputs(
         prompt: str,
         images: Sequence[Dict[str, Any]],
@@ -310,9 +333,9 @@ def prepare_vl_inputs(
             tokens.append(tok)
             token_types.append(TEXT)
             continue
-        patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = load_image(next(image_iter), args)
-        types = image_token_types(n_llm_h, n_llm_w)
-        image_inputs.append(ImageInput(len(tokens), patches, n_vit_h, n_vit_w, types))
+        image_input = prepare_image_input(next(image_iter), args, start=len(tokens))
+        types = image_input.types
+        image_inputs.append(image_input)
         tokens += [image_token_id] * types.numel()
         token_types += types.tolist()
     prepared_images = image_inputs or None

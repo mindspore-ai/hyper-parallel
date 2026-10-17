@@ -100,6 +100,37 @@ print(encoded_sample["input_ids"].shape, encoded_sample["labels"].shape)
 `token_budget` 决定一次 packing 尽量选择多少 token，也不是硬性的单样本截断上限。
 接入较长样本时，应在模型专用 transform 中明确实现截断及图像 patch/grid 同步处理，或提前清洗数据。
 
+### 固定 packing 后的输入长度
+
+在 collator target 上配置 `pad_to_length`，可以让不同 DP 分支、不同 micro-batch 的全局 token
+序列补到相同长度：
+
+```yaml
+dataloader:
+  _target_: hyper_parallel.data.batching.OmniPackingLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_omni_collate_fn
+    pad_to_length: 1024
+  token_budget: 1024
+  min_buffered_samples: 1
+```
+
+- `pad_to_length` 默认 `null`，仅按 TP × CP 对齐；正整数表示精确的全局目标长度，不接受布尔值。
+  目标必须能被运行时的 TP × CP 整除，否则创建 collator 时抛出 `ValueError`。
+- `token_budget` 仍只控制样本选择，和固定 padding 独立；`pad_to_length` 不会从 `max_seq_len`、
+  `micro_batch_size` 或 `token_budget` 自动推导，也不会改写这些参数。
+- padding 在 packing 后、CP 切片和 TP 广播前执行。例如目标为 1024、CP=2 时，全局输入为
+  `[1, 1024]`，各 CP rank 的输入为 `[1, 512]`。各 DP 无需通信来确定目标长度。
+- packed 长度超过目标时抛出 `ValueError`，不截断，也不自动增大目标。单样本即使超过
+  `token_budget` 仍可能被选择，应保证有效样本长度和组批预算都不超过固定目标。
+- labels 尾部补 `-100`，mask 尾部补 0；真实样本边界保留，新增一个 padding 段。例如
+  `cu_seq_lens=[0, 300, 700]` 补到 1024 后为 `[0, 300, 700, 1024]`。
+  已经达到目标时不新增空段。图片 patch、grid 和图片起点不受固定 padding 影响。
+
+文本 Online 的 `build_online_text_collate_fn` 支持相同的 `pad_to_length` 参数。命令行可以使用
+`--dataloader.collate_fn.pad_to_length=1024`，或用 `=null` 恢复仅对齐模式。固定长度会增加短序列的
+计算和内存占用，且不会统一各 DP 的图片 patch 数或专家路由负载。
+
 ## 3. 从原始样本到模型输入
 
 ```text

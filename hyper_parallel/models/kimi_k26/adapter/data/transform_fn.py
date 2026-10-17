@@ -664,6 +664,7 @@ def build_kimi_omni_transform(
         image_max_pixels: int | None = None,
         truncate_mode: str = "proportional",
         deferred: bool = False,
+        training_mode: str = "sft",
         **transform_options: Any,
 ) -> OmniDataTransform:
     """Build the Kimi-K2.x Omni sample transform.
@@ -686,6 +687,7 @@ def build_kimi_omni_transform(
         deferred: Return the deferred ``preencode_sample``/``postencode_sample``
             transform instead of the eager ``encode_sample`` one. Use it when the
             pipeline must select packing candidates before the final encoding.
+        training_mode: SFT is the supported Kimi conversation objective.
         **transform_options: Reserved model-specific transform options.
 
     Returns:
@@ -696,8 +698,11 @@ def build_kimi_omni_transform(
             invalid.
     """
     del transform_options
+    if training_mode != "sft":
+        raise ValueError("Kimi Omni transform supports training_mode=\"sft\" only")
+
     transform_type = KimiPackingOmniTransform if deferred else KimiOmniTransform
-    return transform_type(
+    data_transform = transform_type(
         processor=processor,
         max_seq_len=max_seq_len,
         pixel_dtype=pixel_dtype,
@@ -705,6 +710,7 @@ def build_kimi_omni_transform(
         image_max_pixels=image_max_pixels,
         truncate_mode=truncate_mode,
     )
+    return data_transform
 
 
 def build_kimi_vlm_data_transform(

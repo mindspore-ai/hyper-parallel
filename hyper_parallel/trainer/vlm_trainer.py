@@ -99,13 +99,20 @@ class VLMTrainer:
         dataset_config = self.base.config.dataset
         if dataset_config is None:
             raise ValueError("dataset must define a build target")
+
         if dataset_config.data_transform is None:
             raise ValueError("dataset.data_transform must define an Omni transform build target")
+
+        if dataset_config.training_mode is None:
+            raise ValueError("dataset.training_mode must be explicitly set to 'sft' or 'pretrain' for VLM training")
+
         data_transform = dataset_config.data_transform.build(
             processor=self.base.processor,
+            training_mode=dataset_config.training_mode,
         )
         if not isinstance(data_transform, OmniDataTransform):
             raise TypeError("dataset.data_transform must build an OmniDataTransform")
+
         self.base.data_transform = data_transform
 
     def _build_collate_fn(self) -> None:

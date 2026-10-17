@@ -113,6 +113,10 @@ class MappingTransformDataset:
 
         raw_sample = self.source_dataset[index]
         transformed_samples = self.transform(raw_sample)
+        logger.debug(
+            "Online sample source_index=%s sample_id=%s", index, raw_sample.get("id"),
+            enabled=True,
+        )
         if not isinstance(transformed_samples, list):
             raise TypeError("Online Mapping sample transform must return a list")
 
