@@ -16,12 +16,16 @@
 
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config import TrainerConfig
+from hyper_parallel.trainer.dry_run import HyperModelsDryRunRunner
 from hyper_parallel.trainer.text_trainer import TextTrainer
 
 
 def main() -> None:
     """Build Trainer components and execute the configured training loop."""
     config: TrainerConfig = parse_training_args()
+    if config.dry_run is not None and config.dry_run.enabled:
+        HyperModelsDryRunRunner(config).run()
+        return
     trainer = TextTrainer(config)
     trainer.train()
 

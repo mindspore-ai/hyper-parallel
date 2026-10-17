@@ -15,10 +15,17 @@
 """Unit tests for :mod:`hyper_parallel.core.dtensor.dtensor_base` — the ``data`` descriptor."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+
+from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch
 from hyper_parallel.core.dtensor.dtensor_base import DTensorBase
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import Shard
 
 _MODULE = "hyper_parallel.core.dtensor.dtensor_base"
 
@@ -75,6 +82,29 @@ class TestDTensorBaseDataDescriptor(unittest.TestCase):
             fake_descriptor.set_calls,
             [(fake_dtensor, "local-shard"), (fake_dtensor._local_tensor, "local-shard")],
         )
+
+
+class TestDTensorMetadata(unittest.TestCase):
+    """All public numel entry points retain logical global tensor semantics."""
+
+    def test_global_numel_matches_for_real_and_fake_parameters(self):
+        """A shard's local capacity must not leak into global metadata queries."""
+        layout = Layout((2,), ("dp",), init_backend=False)
+        layout.set_placements((Shard(0),))
+        layout.placement_to_tensor_map(2)
+        for fake in (False, True):
+            with self.subTest(fake=fake), FakeTensorMode() if fake else nullcontext():
+                local = torch.empty(4, 3)
+                parameter = torch.nn.Parameter(DTensor.from_local_with_layout(local, layout, shape=(8, 3)))
+                for skip in (False, True):
+                    with self.subTest(skip=skip), SkipDTensorDispatch() if skip else nullcontext():
+                        self.assertEqual(parameter.shape, (8, 3))
+                        self.assertEqual(parameter.size(), (8, 3))
+                        self.assertEqual(parameter.numel(), 24)
+                        self.assertEqual(torch.numel(parameter), 24)
+                        self.assertEqual(torch.numel(input=parameter), 24)
+                        self.assertEqual(torch.Tensor.numel(parameter), 24)
+                        self.assertEqual(parameter.to_local().numel(), 12)
 
 
 if __name__ == "__main__":

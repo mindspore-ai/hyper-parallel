@@ -38,6 +38,7 @@ from hyper_parallel.core.optimizer.sharding_category import (
     group_parameters_for_hsdp
 )
 from hyper_parallel.core.optimizer.utils import empty_accelerator_cache, get_current_device, get_device_count
+from hyper_parallel.collectives.cc import create_subgroups_for_parent
 
 logger = logging.getLogger(__name__)
 
@@ -432,52 +433,9 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
                         continue
             raise RuntimeError(f"Current rank not found in cached sub-groups for parent_pg={local_parent_ranks}")
 
-        global_rank = dist.get_rank()
-        world_size = dist.get_world_size()
-
-        # Global Rendezvous via GPU all_gather_into_tensor (NCCL/HCCL fast-path).
-        # Far more scalable than all_gather_object for large world_size.
-        device = get_current_device()
-        num_parent_ranks = len(local_parent_ranks)
-        local_tensor = torch.tensor(local_parent_ranks, dtype=torch.long, device=device)
-        gathered_tensor = torch.empty((world_size, num_parent_ranks), dtype=torch.long, device=device)
-        dist.all_gather_into_tensor(gathered_tensor.view(-1), local_tensor)
-
-        # Deduplicate: each row is one rank's parent_ranks; convert to
-        # sorted set of tuples for deterministic iteration order.
-        gathered_cpu_list = gathered_tensor.cpu().tolist()
-        unique_all_parent_ranks = sorted(set(
-            tuple(row) for row in gathered_cpu_list
-        ))
-
-        sub_pg_map: Dict[int, dist.ProcessGroup] = {}
-        my_sub_pg: Optional[dist.ProcessGroup] = None
-
-        # Synchronized collective creation loop
-        for parent_ranks in unique_all_parent_ranks:
-            num_sub_groups = len(parent_ranks) // sub_size
-
-            for sub_idx in range(num_sub_groups):
-                sub_ranks = parent_ranks[sub_idx * sub_size: (sub_idx + 1) * sub_size]
-                sub_pg = dist.new_group(sub_ranks)
-
-                # Map results only if this parent ranks list matches the current rank's context
-                if parent_ranks == local_parent_ranks:
-                    if global_rank in sub_ranks:
-                        my_sub_pg = sub_pg
-                        sub_pg_map[sub_idx] = sub_pg
-                    else:
-                        sub_pg_map[sub_idx] = None
-
+        sub_pg_map = create_subgroups_for_parent(parent_pg, sub_size)
         self._split_sub_pg_cache[cache_key] = sub_pg_map
-
-        if my_sub_pg is None:
-            raise RuntimeError(
-                f"Rank {global_rank} not found in any sub-group of parent_pg "
-                f"with ranks {local_parent_ranks} and sub_size={sub_size}"
-            )
-
-        return my_sub_pg
+        return next(group for group in sub_pg_map.values() if group is not None)
 
     def _build_hsdp_batch(
             self,

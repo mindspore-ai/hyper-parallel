@@ -228,14 +228,26 @@ class EngramModule(nn.Module):
         row_start = ep_rank * num_local_rows
         flat_ids = hash_ids.reshape(-1)
         owner = torch.div(flat_ids, num_local_rows, rounding_mode="floor")
-        if owner.numel() and int(owner.max()) >= ep_size:
-            raise IndexError("Engram hash requested a row outside the padded table")
-        local_counts = torch.bincount(owner, minlength=ep_size).to(torch.long)
-        gathered_counts = [torch.empty_like(local_counts) for _ in range(ep_size)]
-        dist.all_gather(gathered_counts, local_counts, group=ep_group)
-        all_counts = torch.stack(gathered_counts)
-        send_counts = local_counts.cpu().tolist()
-        recv_counts = all_counts[:, ep_rank].cpu().tolist()
+        from hyper_parallel.core.dry_run import is_dry_run_active  # pylint: disable=C0415
+        dry_run = is_dry_run_active()
+        if dry_run:
+            # Dry-run: the routing counts are value-dependent host data. Replay
+            # a balanced split so every executor sees identical, check-free
+            # shapes while the EP collective shapes stay representative.
+            total_rows = int(flat_ids.numel())
+            base, remainder = divmod(total_rows, ep_size)
+            counts = [base + int(index < remainder) for index in range(ep_size)]
+            send_counts = counts
+            recv_counts = counts
+        else:
+            if owner.numel() and int(owner.max()) >= ep_size:
+                raise IndexError("Engram hash requested a row outside the padded table")
+            local_counts = torch.bincount(owner, minlength=ep_size).to(torch.long)
+            gathered_counts = [torch.empty_like(local_counts) for _ in range(ep_size)]
+            dist.all_gather(gathered_counts, local_counts, group=ep_group)
+            all_counts = torch.stack(gathered_counts)
+            send_counts = local_counts.cpu().tolist()
+            recv_counts = all_counts[:, ep_rank].cpu().tolist()
 
         # Ascend ArgSort executes integer inputs on AiCPU. The owner range is
         # bounded by ep_size, so float32 preserves it exactly and stays on AiCore.
@@ -243,7 +255,11 @@ class EngramModule(nn.Module):
         sorted_ids = flat_ids.index_select(0, sort_indices)
         received_ids = ep_all_to_all(sorted_ids, send_counts, recv_counts, ep_group)
         local_ids = received_ids - row_start
-        if local_ids.numel() and (int(local_ids.min()) < 0 or int(local_ids.max()) >= num_local_rows):
+        if (
+                not dry_run
+                and local_ids.numel()
+                and (int(local_ids.min()) < 0 or int(local_ids.max()) >= num_local_rows)
+        ):
             raise IndexError("Engram EP routing delivered a row to the wrong owner")
         # Call the child module instead of reading ``embedding.weight``
         # directly. This preserves the FSDP pre/post-forward lifecycle when

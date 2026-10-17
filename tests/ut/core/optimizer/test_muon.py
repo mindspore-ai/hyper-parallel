@@ -15,13 +15,19 @@
 
 """Unit tests for the Muon optimizer."""
 
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import Shard, StridedShard
 from hyper_parallel.core.optimizer.muon import Muon
+from hyper_parallel.core.optimizer.muon_shard import build_param_shard_metadata_for_group, chunk_update_by_layout
 from hyper_parallel.core.optimizer.optimizer import BaseDistributedOptimizer
+from hyper_parallel.core.optimizer.sharding_category import HSDPCommGroup, ParamLayoutSpec, ParamRecord
 
 
 def _plain_ns_group(**overrides):
@@ -151,3 +157,43 @@ def test_async_hierarchical_broadcast_waits_between_mesh_dimensions():
     first_work.wait.assert_called_once_with()
     final_work.wait.assert_not_called()
     assert handles == [final_work]
+
+
+@pytest.mark.parametrize("fsdp_rank", [0, 20])
+@pytest.mark.parametrize("fake", [False, True])
+def test_muon_metadata_handles_empty_fsdp_shards_before_tp(fsdp_rank, fake):
+    """FSDP gathers only TP-local rows, including ranks with empty shards."""
+    layout = Layout((64, 2), ("fsdp", "tp"), init_backend=False)
+    layout.set_placements((StridedShard(0, split_factor=2, uneven_shard=True), Shard(0)))
+    layout.placement_to_tensor_map(2)
+    mesh = MagicMock()
+    mesh.get_coordinate.return_value = (fsdp_rank, 0)
+    mesh.size.side_effect = lambda dim: (64, 2)[dim]
+    spec = ParamLayoutSpec(tensor_ndim=2, shard_axes=((0, 0), (1, 0)), replicate_mesh_dims=())
+    groups = (MagicMock(), MagicMock())
+    with FakeTensorMode() if fake else nullcontext():
+        local = torch.empty((1 if fsdp_rank < 16 else 0, 4))
+        parameter = MagicMock(data=local, shape=(32, 4))
+        parameter.layout = layout
+        parameter.device_mesh = mesh
+        parameter._global_shape = (32, 4)
+        group = HSDPCommGroup(comm_key=None, layout_spec=spec, shard_pgs=groups,
+                              records=[ParamRecord(index=0, param=parameter)])
+        with patch("hyper_parallel.core.optimizer.muon_shard.dist.get_world_size", side_effect=[64, 2]), \
+                patch("hyper_parallel.core.optimizer.muon_shard.dist.get_rank", side_effect=[fsdp_rank, 0]):
+            meta = build_param_shard_metadata_for_group(group)[parameter]
+        assert meta.stage_metas[0].split_sizes == (1,) * 16 + (0,) * 48
+        assert meta.stage_metas[1].split_sizes == (16, 16)
+        local_update = chunk_update_by_layout(torch.empty(32, 4), parameter, spec, meta)
+        assert local_update.shape == local.shape
+
+
+def test_fake_muon_reshape_rejects_independent_storage():
+    """FakeTensor data pointers are zero even when the storages do not alias."""
+    optimizer = Muon.__new__(Muon)
+    optimizer.reshape_fn = lambda _, value: [value.clone()]
+    with FakeTensorMode():
+        parameter = torch.nn.Parameter(torch.empty(4, 4))
+        parameter.model_name = "weight"
+        with pytest.raises(ValueError, match="share storage"):
+            optimizer._reshape_ns_input(parameter, torch.empty(4, 4))

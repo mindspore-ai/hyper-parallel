@@ -55,7 +55,11 @@ class TestShardingConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_module_sharding_spec_fields(self):
-        """ModuleShardingSpec field order and defaults stay unchanged."""
+        """
+        Feature: ModuleShardingSpec public field contract.
+        Description: Snapshot the dataclass field order and defaults.
+        Expectation: The snapshot matches the supported public contract.
+        """
         from hyper_parallel.distributed.recipe_spec import (
             ModuleShardingSpec,
         )
@@ -91,7 +95,11 @@ class TestShardingConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_sharding_plan_fields(self):
-        """ShardingPlan field order and defaults stay unchanged."""
+        """
+        Feature: ShardingPlan public field contract.
+        Description: Snapshot the dataclass field order and defaults.
+        Expectation: The snapshot matches the supported public contract.
+        """
         from hyper_parallel.distributed.plan import (
             ShardingPlan,
         )
@@ -111,7 +119,11 @@ class TestShardingConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_sharding_template_fields(self):
-        """ShardingTemplate field order and defaults stay unchanged."""
+        """
+        Feature: ShardingTemplate public field contract.
+        Description: Snapshot the dataclass field order and defaults.
+        Expectation: The snapshot matches the supported public contract.
+        """
         from hyper_parallel.distributed import (
             ShardingTemplate,
         )
@@ -139,7 +151,11 @@ class TestShardingConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_sharding_planner_signature(self):
-        """ShardingPlanner constructor signature stays unchanged."""
+        """
+        Feature: ShardingPlanner constructor contract.
+        Description: Snapshot the public constructor signature.
+        Expectation: The signature matches the supported public contract.
+        """
         from hyper_parallel.distributed import (
             ShardingPlanner,
         )
@@ -159,7 +175,11 @@ class TestTrainerConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_accelerator_config_fields(self):
-        """AcceleratorConfig field order and defaults stay unchanged."""
+        """
+        Feature: AcceleratorConfig public field contract.
+        Description: Snapshot the dataclass field order and defaults.
+        Expectation: The snapshot includes the supported pipeline fields.
+        """
         from hyper_parallel.trainer.config import AcceleratorConfig
 
         self.assertEqual(
@@ -169,6 +189,10 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("cp_size", "1"),
                 ("ep_size", "1"),
                 ("pp_size", "1"),
+                ("pp_micro_batch_num", "1"),
+                ("pp_schedule", "None"),
+                ("pp_vpp", "1"),
+                ("pp_layer_split", "None"),
                 ("sequence_parallel", "False"),
                 ("loss_parallel", "False"),
                 (
@@ -206,7 +230,11 @@ class TestTrainerConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_low_precision_config_fields(self):
-        """LowPrecisionConfig field order and defaults stay unchanged."""
+        """
+        Feature: LowPrecisionConfig public field contract.
+        Description: Snapshot the dataclass field order and defaults.
+        Expectation: The snapshot matches the supported public contract.
+        """
         from hyper_parallel.components.quantization.config import (
             LowPrecisionConfig,
         )
@@ -225,7 +253,11 @@ class TestTrainerConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_trainer_config_module_all(self):
-        """trainer.config ``__all__`` stays unchanged."""
+        """
+        Feature: Trainer configuration package exports.
+        Description: Snapshot the symbols declared by trainer.config.__all__.
+        Expectation: The snapshot includes the supported dry-run configuration.
+        """
         from hyper_parallel.trainer import config as trainer_config
 
         self.assertEqual(
@@ -238,6 +270,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 "DataLoaderConfig",
                 "DatasetConfig",
                 "DebugConfig",
+                "DryRunConfig",
                 "FSDP2Config",
                 "MixedPrecisionConfig",
                 "ModelIntegrationConfig",

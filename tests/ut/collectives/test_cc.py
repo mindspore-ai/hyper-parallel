@@ -18,6 +18,7 @@ import os
 import unittest
 from unittest.mock import call, MagicMock, patch
 
+import torch
 
 from hyper_parallel.collectives import cc as collectives_cc
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS  # pylint: disable=C0413
@@ -123,6 +124,35 @@ class TestProcessGroupWrappers(unittest.TestCase):
 
         self.assertEqual(result, "nccl")
         mock_dist.get_backend.assert_called_once_with(group)
+
+    def test_fake_subgroup_creation_uses_host_rank_membership(self, mock_dist: MagicMock) -> None:
+        """Fake groups need no tensor-value exchange to identify subgroups."""
+        mock_dist.get_process_group_ranks.return_value = [1, 3, 5, 7]
+        mock_dist.get_rank.return_value = 3
+        mock_dist.get_backend.return_value = "fake"
+        result = collectives_cc.create_subgroups_for_parent(MagicMock(), 2)
+        self.assertIs(result[0], mock_dist.new_group.return_value)
+        self.assertIsNone(result[1])
+        mock_dist.new_group.assert_called_once_with(ranks=[1, 3], use_local_synchronization=True)
+        mock_dist.all_gather_into_tensor.assert_not_called()
+
+    def test_real_subgroup_creation_preserves_global_creation_order(self, mock_dist: MagicMock) -> None:
+        """Real backends rendezvous all parent groups before creating children."""
+        mock_dist.get_process_group_ranks.return_value = [1, 3]
+        mock_dist.get_rank.return_value = 3
+        mock_dist.get_backend.return_value = "gloo"
+        mock_dist.get_world_size.return_value = 4
+
+        def gather(output, _):
+            output.copy_(torch.tensor([0, 2, 1, 3, 0, 2, 1, 3]))
+
+        mock_dist.all_gather_into_tensor.side_effect = gather
+        groups = [MagicMock() for _ in range(4)]
+        mock_dist.new_group.side_effect = groups
+        result = collectives_cc.create_subgroups_for_parent(MagicMock(), 1)
+        self.assertEqual(mock_dist.new_group.call_args_list, [call([0]), call([2]), call([1]), call([3])])
+        self.assertIsNone(result[0])
+        self.assertIs(result[1], groups[3])
 
     def test_get_group_local_rank_forwards_group(self, mock_dist: MagicMock) -> None:
         """Group-local rank lookup uses ``dist.get_rank(group)``."""

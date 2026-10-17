@@ -85,3 +85,6 @@ fusion_result.json
 /hyper_parallel/rl/tests/trial/
 # Codegen demo artifact (machine-generated next to the training YAML)
 examples/training_demo/qwen3_moe/generated/
+
+# Dry-run scratch artifacts
+outputs/

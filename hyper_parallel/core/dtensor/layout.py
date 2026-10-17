@@ -17,6 +17,7 @@
 
 import copy
 import functools
+from itertools import product
 from typing import Any, NamedTuple, Optional, Sequence
 
 import numpy as np
@@ -181,6 +182,38 @@ def infer_slice_area_by_layout(
     )
 
 
+def infer_gather_rank_shapes(
+    layout: "Layout",
+    global_shape: Sequence[int],
+    coordinate: Sequence[int],
+    shard_axes: Sequence[tuple[int, int]],
+) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    """Infer each rank's shape before successive gathers along layout axes.
+
+    Shapes follow the same slice geometry as DTensor construction, including
+    strided placements and empty uneven shards. This is host metadata and
+    does not require a collective or tensor values.
+    """
+    shapes = {}
+    for rank, coord in enumerate(product(*(range(size) for size in layout.mesh_shape))):
+        area = infer_slice_area_by_layout(layout, rank, global_shape)
+        shapes[coord] = tuple(end - start for start, end in area)
+    result = []
+    for mesh_dim, tensor_dim in shard_axes:
+        size = layout.mesh_shape[mesh_dim]
+        coord = tuple(coordinate)
+        peers = [coord[:mesh_dim] + (rank,) + coord[mesh_dim + 1:] for rank in range(size)]
+        result.append(tuple(shapes[peer] for peer in peers))
+        next_shapes = {}
+        for key, shape in shapes.items():
+            peers = [key[:mesh_dim] + (rank,) + key[mesh_dim + 1:] for rank in range(size)]
+            output = list(shape)
+            output[tensor_dim] = sum(shapes[peer][tensor_dim] for peer in peers)
+            next_shapes[key] = tuple(output)
+        shapes = next_shapes
+    return tuple(result)
+
+
 def _get_slice_tensor_by_layout(global_tensor, layout):
     """Transfer global tensor to local tensor by layout"""
     inner_rank_id = layout.rank_list.index(layout.mesh.rank)
@@ -321,7 +354,7 @@ class Layout:
         result = cls.__new__(cls)
         memo[id(self)] = result
         for k, v in self.__dict__.items():
-            setattr(result, k, copy.deepcopy(v, memo))
+            setattr(result, k, v if k == "_mesh" else copy.deepcopy(v, memo))
         return result
 
     @staticmethod

@@ -16,10 +16,63 @@
 from datetime import timedelta
 from typing import Any, Optional, Union
 
+import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
+
+
+def create_subgroups_for_parent(
+        parent_pg: ProcessGroup,
+        sub_size: int,
+) -> dict[int, Optional[ProcessGroup]]:
+    """Create equal subgroups for one process group.
+
+    The fake backend has no peer processes to participate in the metadata
+    exchange used by real backends. ``use_local_synchronization`` preserves
+    the same rank membership contract without making callers know how the
+    process group was initialized.
+    """
+    parent_ranks = tuple(sorted(dist.get_process_group_ranks(parent_pg)))
+    if sub_size < 1 or len(parent_ranks) % sub_size:
+        raise ValueError(
+            f"sub_size must evenly divide parent group size, got {sub_size} and {len(parent_ranks)}"
+        )
+    current_rank = dist.get_rank()
+    subgroup_count = len(parent_ranks) // sub_size
+    if dist.get_backend(parent_pg) == "fake":
+        return {
+            index: dist.new_group(
+                ranks=list(parent_ranks[index * sub_size:(index + 1) * sub_size]),
+                use_local_synchronization=True,
+            ) if current_rank in parent_ranks[index * sub_size:(index + 1) * sub_size] else None
+            for index in range(subgroup_count)
+        }
+
+    world_size = dist.get_world_size()
+    backend = dist.get_backend(parent_pg)
+    if backend in ("nccl", "hccl", "mccl"):
+        accelerator = getattr(torch, "npu", None)
+        device = (
+            torch.device("npu", accelerator.current_device())
+            if accelerator is not None and accelerator.is_available()
+            else torch.device("cuda", torch.cuda.current_device())
+        )
+    else:
+        device = torch.device("cpu")
+    local_tensor = torch.tensor(parent_ranks, dtype=torch.long, device=device)
+    gathered = torch.empty((world_size, len(parent_ranks)), dtype=torch.long, device=device)
+    dist.all_gather_into_tensor(gathered.view(-1), local_tensor)
+    parent_rank_sets = sorted(set(tuple(row) for row in gathered.cpu().tolist()))
+    result: dict[int, Optional[ProcessGroup]] = {}
+    for ranks in parent_rank_sets:
+        for index in range(len(ranks) // sub_size):
+            subgroup_ranks = ranks[index * sub_size:(index + 1) * sub_size]
+            subgroup = dist.new_group(list(subgroup_ranks))
+            if ranks == parent_ranks:
+                result[index] = subgroup if current_rank in subgroup_ranks else None
+    return result
 
 
 def _group_key(ranks: list[int]) -> str:

@@ -23,7 +23,6 @@ from typing import Any
 
 import torch
 from torch.utils.data import IterableDataset
-from torchdata.stateful_dataloader import StatefulDataLoader
 
 from hyper_parallel.data.batching.dynamic_batch import (
     FullSampleCheckpoint,
@@ -36,7 +35,33 @@ from hyper_parallel.data.batching.dynamic_batch import (
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 
+
+class _UnavailableStatefulDataLoader:
+    """Stand in for the optional torchdata base class until construction."""
+
+
+_TORCHDATA_IMPORT_ERROR: ModuleNotFoundError | None = None
+try:
+    from torchdata.stateful_dataloader import StatefulDataLoader as _TorchStatefulDataLoader
+except ModuleNotFoundError as error:
+    missing_module = str(error.name or "")
+    if missing_module != "torchdata" and not missing_module.startswith("torchdata."):
+        raise
+    _TORCHDATA_IMPORT_ERROR = error
+    _StatefulDataLoaderBase = _UnavailableStatefulDataLoader
+else:
+    _StatefulDataLoaderBase = _TorchStatefulDataLoader
+
 logger = get_dataset_logger(__name__)
+
+
+def _require_torchdata() -> None:
+    """Require the optional Torch data dependency when building a loader."""
+    if _TORCHDATA_IMPORT_ERROR is not None:
+        raise ModuleNotFoundError(
+            "FixedBatchDataLoader requires torchdata>=0.11.0; install it with "
+            "pip install 'hyper_parallel[torch]'"
+        ) from _TORCHDATA_IMPORT_ERROR
 
 
 def calculate_num_micro_batches(
@@ -170,7 +195,7 @@ def build_dataloader(
     return tuple(dataloaders), tuple(batch_samplers)
 
 
-class FixedBatchDataLoader(StatefulDataLoader):
+class FixedBatchDataLoader(_StatefulDataLoaderBase):
     """Build fixed-sample batches while retaining Trainer iterator policy."""
 
     def __init__(
@@ -191,6 +216,7 @@ class FixedBatchDataLoader(StatefulDataLoader):
         if sampler_type not in ("single", "cyclic"):
             raise ValueError("sampler_type must be 'single' or 'cyclic'")
 
+        _require_torchdata()
         self.drop_last = drop_last
         self.sampler_type = sampler_type
         generator = torch.Generator().manual_seed(seed)

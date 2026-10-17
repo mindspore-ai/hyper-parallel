@@ -494,9 +494,16 @@ class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-me
         ctx.recv_counts = recv_counts
         ctx.group = group
         local_max = max([*send_counts, *recv_counts, 1])
-        pad_to = x.new_tensor([local_max], dtype=torch.int64)
-        dist.all_reduce(pad_to, op=dist.ReduceOp.MAX, group=group)
-        ctx.pad_to = pad_to = int(pad_to.item())
+        from hyper_parallel.core.dry_run import is_dry_run_active  # pylint: disable=C0415
+        if is_dry_run_active():
+            # Dry-run replays balanced/declared counts that are already
+            # group-wide maxima, so the MAX reduce and its host sync are
+            # unnecessary (and the collective would need a real device backend).
+            ctx.pad_to = pad_to = local_max
+        else:
+            pad_to_tensor = x.new_tensor([local_max], dtype=torch.int64)
+            dist.all_reduce(pad_to_tensor, op=dist.ReduceOp.MAX, group=group)
+            ctx.pad_to = pad_to = int(pad_to_tensor.item())
         recv = _EPAllToAllPadded._pad_and_exchange(x, send_counts, pad_to, group)
         return _EPAllToAllPadded._unpad(recv, recv_counts, pad_to)
 

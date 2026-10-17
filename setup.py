@@ -29,20 +29,24 @@ from setuptools.command.install import install
 ROOT_DIR = os.path.dirname(__file__)
 logger = logging.getLogger(__name__)
 
+TORCH_COMMON_REQUIRES = [
+    "torchdata>=0.11.0",
+]
+
 TORCH26_REQUIRES = [
     "torch==2.6.0",
     "torch-npu==2.6.0.post3",
-]
+] + TORCH_COMMON_REQUIRES
 
 TORCH27_REQUIRES = [
     "torch==2.7.1",
     "torch-npu==2.7.1",
-]
+] + TORCH_COMMON_REQUIRES
 
 TORCH29_REQUIRES = [
     "torch==2.9.1",
     "torch-npu==2.9.1",
-]
+] + TORCH_COMMON_REQUIRES
 
 def _read_requirements(requirements_path: str) -> list[str]:
     """Read Python requirement lines from a repository-local file."""
