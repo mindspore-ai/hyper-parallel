@@ -283,6 +283,30 @@ def build_sliding_window_indices(
     return indices.unsqueeze(0).expand(batch_size, -1, -1)
 
 
+def _gather_keys(key: torch.Tensor, batch_indices: torch.Tensor,
+                 positions: torch.Tensor) -> torch.Tensor:
+    """Gather compressed keys at ``positions`` for each batch entry.
+
+    Advanced indexing with two index tensors has no AI Core implementation and
+    falls back to AI CPU, where it dominates both the candidate chain and the
+    Indexer KL loss. A single ``index_select`` over the flattened key does the
+    same gather on device, so the batch offset is folded into the index instead
+    of being a second index tensor.
+
+    Args:
+        key: Compressed keys, ``[batch, compressed_length, head_dim]``.
+        batch_indices: Batch ids broadcastable against ``positions``.
+        positions: Key positions to gather, already clamped in range.
+
+    Returns:
+        The gathered keys, ``positions.shape + (head_dim,)``.
+    """
+    compressed_length, head_dim = key.shape[1], key.shape[2]
+    flat_index = (batch_indices * compressed_length + positions).reshape(-1)
+    gathered = key.reshape(-1, head_dim).index_select(0, flat_index)
+    return gathered.view(*positions.shape, head_dim)
+
+
 def compressed_causal_topk(
         query: torch.Tensor,
         key: torch.Tensor,
@@ -606,7 +630,7 @@ def compressed_candidate_topk(
         if minimum_key_indices is not None:
             valid = valid & (positions >= minimum_key_indices[:, start:end].unsqueeze(-1))
         safe_positions = positions.clamp(min=0, max=max(compressed_length - 1, 0))
-        selected_key = key[batch_indices, safe_positions].float()
+        selected_key = _gather_keys(key, batch_indices, safe_positions).float()
         dots = torch.einsum(
             "bchd,bckd->bchk",
             query[:, start:end].float(),
@@ -664,7 +688,8 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
 
                 query_chunk = index_query[:, start:end].float()
                 weight_chunk = merge_weight[:, start:end].float()
-                selected_index_key = index_key[batch_indices, safe_indices].float()
+                selected_index_key = _gather_keys(
+                    index_key, batch_indices, safe_indices).float()
                 index_dots = torch.einsum(
                     "bcid,bckd->bcik", query_chunk, selected_index_key
                 )
@@ -674,7 +699,8 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                     index_scores = reduce_sum(index_scores)
                 index_scores.masked_fill_(~valid, -1.0e9)
 
-                selected_attention_key = compressed_key[batch_indices, safe_indices].float()
+                selected_attention_key = _gather_keys(
+                    compressed_key, batch_indices, safe_indices).float()
                 attention_scores = torch.einsum(
                     "bhcd,bckd->bhck",
                     attention_query[:, :, start:end].float(),
