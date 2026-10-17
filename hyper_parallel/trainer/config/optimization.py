@@ -38,7 +38,7 @@ class MixedPrecisionConfig:
 class OptimizerSwapConfig:
     """Optimizer-state swap options for the Trainer-built optimizer.
 
-    Swapping moves Adam/AdamW state tensors to host memory between updates, so
+    Swapping moves optimizer state tensors to host memory between updates, so
     the peak device footprint drops by the optimizer state size while the
     copies overlap the surrounding step. It is independent of
     ``fsdp_config.enable_offload``, which offloads weights and gradients.
@@ -48,11 +48,8 @@ class OptimizerSwapConfig:
         swap_times: Number of pipeline partitions the swapped state is split
             into; each partition is prefetched one batch ahead of its update.
         min_numel: State tensors smaller than this element count stay on device.
-        state_keys: Logical Adam/AdamW state keys to swap. ``None`` uses the
-            adapter defaults (``exp_avg``, ``exp_avg_sq``, ``max_exp_avg_sq``).
-        include_master_params: Whether optimizer-owned fp32 master parameters
-            are swapped too. Only meaningful together with
-            ``optimizer.fp32_main_params``, which is the wrapper owning them.
+        state_keys: Logical optimizer state keys to swap. ``None`` uses the
+            matching optimizer adapter's defaults.
         packed_swap: Whether the backend packs swapped state into two reusable
             staging buffers. ``None`` keeps the backend default (enabled on
             PyTorch, and for MindFormers AdamW on MindSpore).
@@ -62,7 +59,6 @@ class OptimizerSwapConfig:
     swap_times: int = 16
     min_numel: int = 1024
     state_keys: Optional[List[str]] = None
-    include_master_params: bool = False
     packed_swap: Optional[bool] = None
 
     def __post_init__(self) -> None:

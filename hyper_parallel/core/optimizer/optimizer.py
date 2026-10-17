@@ -17,7 +17,7 @@
 # pylint: disable=forbidden-backend-import
 
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import logging
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -37,6 +37,7 @@ from hyper_parallel.core.optimizer.sharding_category import (
     select_owned_records,
     group_parameters_for_hsdp
 )
+from hyper_parallel.core.optimizer.swap_optimizer import is_swap_optimizer
 from hyper_parallel.core.optimizer.utils import empty_accelerator_cache, get_current_device, get_device_count
 
 logger = logging.getLogger(__name__)
@@ -119,8 +120,12 @@ class ChainedOptimizer:
         }
         self._rebind_param_attrs()
         for optimizer in self.chained_optimizers:
-            if isinstance(optimizer, BaseDistributedOptimizer):
-                optimizer.reset_optimizer_parameters()
+            reset = getattr(optimizer, "reset_optimizer_parameters", None)
+            if callable(reset):
+                if is_swap_optimizer(optimizer):
+                    reset(self.model_param_by_optimizer_param)
+                else:
+                    reset()
 
     @contextmanager
     def _optimizer_parameter_view(self) -> Iterator[None]:
@@ -194,28 +199,84 @@ class ChainedOptimizer:
         parameters. This method first broadcasts state to all replicate-group peers,
         then converts DTensor values to local CPU tensors for serialization.
         """
-        # Ensure all ranks have consistent optimizer state before snapshotting
-        for opt in self.chained_optimizers:
-            if hasattr(opt, "_broadcast_state_fused_for_ckpt"):
-                opt._broadcast_state_fused_for_ckpt()  # pylint: disable=protected-access
+        prepared = []
+        try:
+            # Swap optimizers must restore released device storage before the
+            # wrapped HSDP implementation reads its state tensors.
+            for opt in self.chained_optimizers:
+                prepare = getattr(opt, "_prepare_swap_checkpoint", None)
+                if callable(prepare):
+                    prepared.append(opt)
+                    prepare()
 
-        merged: Dict[str, Any] = {}
-        for name, optimizer in self.optimizers_dict.items():
-            with self._optimizer_parameter_view():
-                sd = get_optimizer_state_dict(
-                    self.model,
-                    optimizer,
-                    options=StateDictOptions(flatten_optimizer_state_dict=self.flatten)
-                )
-            overlap = set(merged.keys()) & set(sd.keys())
-            if overlap:
-                raise KeyError(
-                    f"Key clash detected while merging state dict for optimizer '{name}': "
-                    f"{', '.join(sorted(overlap))}"
-                )
-            merged.update(sd)
+            # Ensure all ranks have consistent optimizer state before snapshotting.
+            for opt in self.chained_optimizers:
+                if hasattr(opt, "_broadcast_state_fused_for_ckpt"):
+                    opt._broadcast_state_fused_for_ckpt()  # pylint: disable=protected-access
 
-        return merged
+            merged: Dict[str, Any] = {}
+            for name, optimizer in self.optimizers_dict.items():
+                with self._optimizer_parameter_view():
+                    sd = get_optimizer_state_dict(
+                        self.model,
+                        optimizer,
+                        options=StateDictOptions(flatten_optimizer_state_dict=self.flatten)
+                    )
+                if optimizer in prepared:
+                    # The swap lifecycle releases device storage once the
+                    # checkpoint window closes, so the exported values must own
+                    # their memory instead of aliasing the slot tensors.
+                    self._localize_state_dict_tensors(sd)
+                overlap = set(merged.keys()) & set(sd.keys())
+                if overlap:
+                    raise KeyError(
+                        f"Key clash detected while merging state dict for optimizer '{name}': "
+                        f"{', '.join(sorted(overlap))}"
+                    )
+                merged.update(sd)
+
+            return merged
+        finally:
+            for opt in reversed(prepared):
+                cleanup = getattr(opt, "cleanup_synced_state", None)
+                if callable(cleanup):
+                    cleanup()
+                    continue
+                finish = getattr(opt, "_finish_swap_checkpoint", None)
+                if callable(finish):
+                    finish()
+
+    @staticmethod
+    def _localize_state_dict_tensors(state_dict: Dict[str, Any]) -> None:
+        """Replace exported tensors with CPU copies that own their storage.
+
+        Swap-managed optimizer state lives in CPU mirrors while its device
+        storage is released, so a checkpoint entry must not alias a tensor whose
+        storage the swap runtime is about to free.
+        """
+        def localize(value: Any) -> Any:
+            """Clone tensors in one nested checkpoint value onto CPU.
+
+            Args:
+                value: Checkpoint value or nested container to localize.
+
+            Returns:
+                The value with every nested tensor replaced by an owning CPU copy.
+            """
+            if isinstance(value, torch.Tensor):
+                return to_local_if_dtensor(value).detach().cpu().clone()
+            if isinstance(value, dict):
+                return {key: localize(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [localize(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(localize(item) for item in value)
+            return value
+
+        for key, value in list(state_dict.items()):
+            if key == "param_groups":
+                continue
+            state_dict[key] = localize(value)
 
     def _get_param_groups(self) -> List[Dict[str, Any]]:
         """Get param_groups aggregated over underlying optimizers."""
@@ -246,7 +307,9 @@ class ChainedOptimizer:
             state_dict: FQN-keyed optimizer state to restore.
         """
         for optimizer in self.chained_optimizers:
-            with self._optimizer_parameter_view():
+            load_context = getattr(optimizer, "_swap_checkpoint_load_context", None)
+            context = load_context(state_dict, self.flatten) if callable(load_context) else nullcontext()
+            with self._optimizer_parameter_view(), context:
                 set_optimizer_state_dict(
                     self.model,
                     optimizer,

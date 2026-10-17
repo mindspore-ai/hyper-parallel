@@ -12,24 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Torch optimizer state swap runtime and Adam/AdamW adapters."""
+"""Generic optimizer-state swap runtime, slots and adapter base."""
 # pylint: disable=protected-access
 
 from __future__ import annotations
 
 import contextlib
 import copy
-import inspect
 import itertools
-from collections import defaultdict
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
-import torch
+# Optimizer runtime is Torch-only; the legacy checker still flags core imports.
+import torch  # pylint: disable=forbidden-backend-import
 
-STATE_KEYS = ("exp_avg", "exp_avg_sq", "max_exp_avg_sq")
-MASTER_PARAM_KEY = "master_param"
-SUPPORTED_STATE_KEYS = STATE_KEYS + (MASTER_PARAM_KEY,)
+logger = logging.getLogger(__name__)
+
+# Logical optimizer-state keys every swap family in this codebase understands.
+# This is the vocabulary ``SwapOptimizerConfig.state_keys`` may name; each
+# adapter still validates that a key belongs to its own optimizer family.
+KNOWN_STATE_KEYS = (
+    "exp_avg",
+    "exp_avg_sq",
+    "max_exp_avg_sq",
+    "momentum_buffer",
+)
 _PACKED_ALIGNMENT_BYTES = 512
 _DEVICE_TYPE = "npu"
 
@@ -57,14 +65,15 @@ class SwapSlot:
         """Bind the slot to a host or staging tensor view."""
         device = getattr(tensor, "device", None)
         device_type = getattr(device, "type", None)
-        if self.logical_tensor is not None and device_type != "cpu":
+        if self.logical_tensor is not None:
             # DTensor exposes no public setter for replacing its local shard.
+            # Rebind the shell on host too, so it cannot retain an arena view.
             setattr(self.logical_tensor, "_local_tensor", tensor)
             self.logical_tensor.data = tensor
+        if self.logical_tensor is not None and device_type != "cpu":
             self.tensor = self.logical_tensor
         else:
             self.tensor = tensor
-
 
     @property
     def checkpoint_tensor(self) -> Any:
@@ -72,11 +81,26 @@ class SwapSlot:
         return self.cpu_tensor if self.cpu_tensor is not None else self.tensor
 
 
+class SwapUpdateUnit(Protocol):
+    """Minimal contract the pipeline runtime requires of an update unit.
+
+    The runtime only ever reads a unit's swappable slots, so an update unit is
+    free to carry algorithm-specific metadata (a single parameter and gradient,
+    a Muon HSDP assignment, collective ordering, and so on) as long as it
+    exposes ``slots``.
+    """
+
+    slots: List[SwapSlot]
+
+
 @dataclass
 class UpdateUnit:
-    """Per-parameter optimizer update unit used by the pipeline runtime.
+    """Generic per-parameter update unit: parameter, gradient and swap slots.
 
-    ``adapter_index`` identifies the Torch parameter group owning ``param``.
+    Kept as a concrete unit for optimizers whose atomic update is one parameter,
+    and as the runtime's default unit type.  ``adapter_index`` identifies the
+    owning parameter group.  Optimizers with a richer atomic unit (Muon HSDP
+    assignments, for example) define their own unit exposing ``slots``.
     """
 
     adapter_index: int
@@ -89,6 +113,7 @@ class PipelineSwapRuntime:
     """Torch tensor storage/copy runtime and pipeline orchestration."""
 
     def __init__(self, config: Any) -> None:
+        """Initialize instance-owned streams and packed storage metadata."""
         self.config = config
         self._copy_stream: Optional[Any] = None
         self._packed_enabled = bool(getattr(config, "packed_swap", True))
@@ -100,28 +125,68 @@ class PipelineSwapRuntime:
         self._packed_offload_events: Dict[int, Any] = {}
         self._packed_tail_event: Optional[Any] = None
         self._packed_device_views: Dict[Any, Any] = {}
+        self._packed_slot_bind_hook: Optional[Callable[[SwapSlot], None]] = None
 
     @property
     def packed_enabled(self) -> bool:
         """Return whether this runtime may build packed state candidates."""
         return self._packed_enabled
 
-    def partition(self, units: Sequence[UpdateUnit]) -> List[List[UpdateUnit]]:
-        """Partition update units into balanced batches by swappable state bytes."""
-        non_empty_units = list(units)
-        if not non_empty_units:
+    @property
+    def copy_stream(self) -> Optional[Any]:
+        """Return the transfer stream after its lazy initialization."""
+        return self._copy_stream
+
+    def set_packed_slot_bind_hook(self, hook: Callable[[SwapSlot], None]) -> None:
+        """Install the adapter hook that republishes a packed slot's live view."""
+        self._packed_slot_bind_hook = hook
+
+    def _bind_packed_slot(self, slot: SwapSlot, tensor: Any) -> None:
+        """Bind a packed view and notify the owning state adapter."""
+        slot.bind_tensor(tensor)
+        if self._packed_slot_bind_hook is not None:
+            self._packed_slot_bind_hook(slot)
+
+    def partition(
+            self,
+            units: Sequence[SwapUpdateUnit],
+            unit_costs: Optional[Sequence[int]] = None,
+    ) -> List[List[SwapUpdateUnit]]:
+        """Partition consecutive units using explicit costs or local state bytes.
+
+        Args:
+            units: Atomic updates in execution order, including empty local units.
+            unit_costs: Optional non-negative integer costs, one per unit. A
+                distributed adapter supplies rank-independent planning weights.
+
+        Returns:
+            Consecutive batches retaining every unit in its original order.
+
+        Raises:
+            ValueError: If explicit costs have the wrong length or invalid values.
+        """
+        ordered_units = list(units)
+        if unit_costs is None:
+            unit_costs = [self._unit_cost(unit) for unit in ordered_units]
+        else:
+            unit_costs = list(unit_costs)
+            if len(unit_costs) != len(ordered_units):
+                raise ValueError("unit_costs must contain exactly one cost per update unit.")
+            if any(isinstance(cost, bool) or not isinstance(cost, int) or cost < 0 for cost in unit_costs):
+                raise ValueError("unit_costs must contain non-negative integers.")
+        if not ordered_units:
             return []
-        swap_times = max(1, min(int(self.config.swap_times), len(non_empty_units)))
-        unit_costs = [max(1, self._unit_cost(unit)) for unit in non_empty_units]
+        swap_times = max(1, min(int(self.config.swap_times), len(ordered_units)))
+        unit_costs = [max(1, cost) for cost in unit_costs]
         remaining_cost = sum(unit_costs)
-        batches: List[List[UpdateUnit]] = []
+        batches: List[List[SwapUpdateUnit]] = []
         start = 0
         for batch_index in range(swap_times - 1):
             remaining_batches = swap_times - batch_index
 
             # Compare against the remaining average without introducing floating-point rounding.
             # Bind the loop state as defaults so the closure captures this iteration's values.
-            def still_gaining(
+            def should_stop_growing(
                     end: int,
                     current_cost: int,
                     next_cost: int,
@@ -129,16 +194,17 @@ class PipelineSwapRuntime:
                     remaining_cost: int = remaining_cost,
                     start: int = start,
             ) -> bool:
+                """Return whether adding the next unit would not improve balance."""
                 current_distance = abs(remaining_cost - current_cost * remaining_batches)
                 next_distance = abs(remaining_cost - (current_cost + next_cost) * remaining_batches)
                 return end > start and current_distance <= next_distance
 
-            max_end = len(non_empty_units) - remaining_batches + 1
-            end, current_cost = self._grow_balanced_segment(unit_costs, start, max_end, still_gaining)
-            batches.append(non_empty_units[start:end])
+            max_end = len(ordered_units) - remaining_batches + 1
+            end, current_cost = self._grow_balanced_segment(unit_costs, start, max_end, should_stop_growing)
+            batches.append(ordered_units[start:end])
             remaining_cost -= current_cost
             start = end
-        batches.append(non_empty_units[start:])
+        batches.append(ordered_units[start:])
         return batches
 
     def run_pipeline(
@@ -271,6 +337,35 @@ class PipelineSwapRuntime:
         self.wait_event(checkpoint_event, None)
         for slot in slot_list:
             slot.event = None
+        self.restore_packed_host_views(slot_list)
+
+    def materialize_slots(self, slots: Iterable[SwapSlot]) -> None:
+        """Materialize host-resident slots on their original device.
+
+        HSDP checkpoint broadcasts operate on device tensors.  Swap slots are
+        normally host-resident between optimizer steps, so checkpoint code uses
+        this helper to reuse the normal H2D stream/event ordering before issuing
+        a collective.
+        """
+        slot_list = [
+            slot for slot in _iter_unique_slot_objects(slots)
+            if slot.swappable and slot.state == "host"
+        ]
+        if not slot_list:
+            return
+        for slot in slot_list:
+            if slot.packed:
+                device_tensor = torch.empty(slot.shape, dtype=slot.dtype, device=slot.device)
+                self._bind_packed_slot(slot, device_tensor)
+        self.prefetch([UpdateUnit(0, None, None, slot_list)])
+        self.wait_prefetch([UpdateUnit(0, None, None, slot_list)])
+
+    def restore_packed_host_views(self, slots: Iterable[SwapSlot]) -> None:
+        """Restore persistent packed host views after temporary materialization."""
+        for slot in _iter_unique_slot_objects(slots):
+            if (slot.packed and slot.state == "host" and slot.cpu_tensor is not None
+                    and slot.tensor is not slot.cpu_tensor):
+                self._bind_packed_slot(slot, slot.cpu_tensor)
 
     def prefetch(self, batch: Sequence[UpdateUnit]) -> None:
         """Prefetch batch slots from CPU to device."""
@@ -417,51 +512,76 @@ class PipelineSwapRuntime:
         """Return whether ``tensor`` exposes a DTensor local shard."""
         return tensor is not None and callable(getattr(tensor, "to_local", None))
 
-    @staticmethod
-    def validate_packed_devices(slots: Sequence[SwapSlot]) -> None:
-        """Reject packed host packing when swappable states span multiple local devices.
-
-        A packed slot rebinds its live tensor to a CPU host view, so once host
-        packing has run the runtime can no longer fall back to per-tensor swap.
-        Callers therefore validate device uniformity *before* any slot is
-        rebound, rather than discovering the mismatch in
-        :meth:`supports_packed_pipeline` after the optimizer state is already
-        committed to host storage.
-
-        Args:
-            slots: Candidate swappable slots, before host packing.
-
-        Raises:
-            RuntimeError: If the slots do not all live on one known device.
-        """
-        devices = {slot.device for slot in slots}
-        if len(devices) > 1 or None in devices:
-            raise RuntimeError(
-                "Packed optimizer states must live on a single local device before host "
-                f"packing; got {sorted(map(str, devices))}. Set packed_swap=False to swap "
-                "states that span devices."
-            )
-
     def prepare_packed_host(self, slots: Sequence[SwapSlot]) -> None:
         """Pack logical optimizer states into persistent pinned buffers by dtype."""
         if not self._packed_enabled:
             return
+
         packed_slots = [slot for slot in slots if slot.swappable and slot.packed]
-        self.validate_packed_devices(packed_slots)
-        signature = tuple((id(slot), slot.dtype, slot.numel) for slot in packed_slots)
+        signature = self._validate_packed_host_layout(packed_slots)
         if signature == self._host_layout_signature:
             return
 
+        self._prepare_packed_host_sources(packed_slots)
         slots_by_dtype: Dict[Any, List[SwapSlot]] = {}
         for slot in packed_slots:
             slots_by_dtype.setdefault(slot.dtype, []).append(slot)
 
-        new_buffers: Dict[Any, Any] = {}
-        for dtype, dtype_slots in slots_by_dtype.items():
-            new_buffers[dtype] = self._pack_dtype_slots(dtype, dtype_slots)
-
-        self._host_buffers = new_buffers
+        self._host_buffers = {
+            dtype: self._pack_dtype_slots(dtype, dtype_slots)
+            for dtype, dtype_slots in slots_by_dtype.items()
+        }
         self._host_layout_signature = signature
+
+    def _validate_packed_host_layout(
+            self, packed_slots: Sequence[SwapSlot],
+    ) -> Tuple[Tuple[Any, ...], ...]:
+        """Validate candidates and return their persistent layout signature."""
+        if self._packed_batch_plans or self._packed_tail_event is not None:
+            raise RuntimeError("Cannot rebuild packed optimizer layout during an active transfer.")
+        slot_ids = [id(slot) for slot in packed_slots]
+        if len(slot_ids) != len(set(slot_ids)):
+            raise RuntimeError("Packed optimizer layout contains a duplicate state slot.")
+        return tuple(
+            (id(slot), slot.dtype, slot.shape, slot.numel, slot.device)
+            for slot in packed_slots
+        )
+
+    def _prepare_packed_host_sources(self, packed_slots: Sequence[SwapSlot]) -> None:
+        """Validate source layouts and settle copies before rebuilding host buffers."""
+        for slot in packed_slots:
+            source = slot.checkpoint_tensor
+            if source is not None:
+                local = self._storage_tensor(source)
+                if local.layout != torch.strided or not local.is_contiguous():
+                    raise ValueError("Packed optimizer states must be dense and contiguous before host packing.")
+        # A layout rebuild reads CPU mirrors on the host. Stream ordering alone
+        # is insufficient, including after an initial-state offload.
+        if self._copy_stream is not None:
+            self._copy_stream.synchronize()
+        for event in _iter_unique_events(packed_slots):
+            self.wait_event(event, None)
+        if any(slot.state in ("h2d", "d2h") for slot in packed_slots):
+            self.synchronize_cpu_mirrors(packed_slots)
+
+    def invalidate_packed_layout(self) -> None:
+        """Discard an idle packed layout after state slots have been rebound.
+
+        Persistent slot mirrors retain their values until the next host packing.
+        The instance's copy stream remains available for subsequent steps.
+        """
+        if self._packed_batch_plans or self._packed_tail_event is not None:
+            raise RuntimeError("Cannot reset optimizer parameters during a packed transfer.")
+        for arena in self._staging_arenas:
+            if arena is not None:
+                arena.dtype_views.clear()
+                arena.raw_buffer.untyped_storage().resize_(0)
+        self._staging_arenas = [None, None]
+        self._packed_device_views.clear()
+        self._packed_ready_events.clear()
+        self._packed_offload_events.clear()
+        self._host_buffers = {}
+        self._host_layout_signature = ()
 
     def _pack_dtype_slots(self, dtype: Any, dtype_slots: Sequence[SwapSlot]) -> Any:
         """Pack every slot of one dtype into a single pinned host buffer.
@@ -477,7 +597,7 @@ class PipelineSwapRuntime:
         for slot in dtype_slots:
             flat_view = host_buffer.narrow(0, host_offset, slot.numel)
             host_view = flat_view.view(slot.shape)
-            source = slot.cpu_tensor if slot.cpu_tensor is not None else slot.tensor
+            source = slot.tensor if slot.state == "device" else slot.checkpoint_tensor
             if source is None:
                 host_view.zero_()
             else:
@@ -566,6 +686,27 @@ class PipelineSwapRuntime:
             raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
         return torch.empty_like(saved_tensor, device=param.device, dtype=saved_tensor.dtype)
 
+    def make_empty_state_like(self, param: Any) -> Any:
+        """Allocate a state shell with the parameter's local and logical metadata."""
+        local = torch.empty_like(self._storage_tensor(param), memory_format=torch.preserve_format)
+        if not self.is_distributed_tensor(param):
+            return local
+        layout = getattr(param, "layout", None)
+        if hasattr(layout, "tensor_stride"):
+            logical_stride = layout.tensor_stride
+        else:
+            logical_stride = tuple(param.stride())
+        if logical_stride is None:
+            logical_stride = [1] * len(param.shape)
+            for index in range(len(logical_stride) - 2, -1, -1):
+                logical_stride[index] = logical_stride[index + 1] * max(int(param.shape[index + 1]), 1)
+        # Explicit from_local preserves layout even inside SkipDTensorDispatch,
+        # where empty_like(param) would otherwise return a plain local tensor.
+        return type(param).from_local(
+            local, device_mesh=param.device_mesh, placements=param.placements,
+            run_check=False, shape=param.shape, stride=tuple(logical_stride),
+        )
+
     def copy_to_device(self, slot: SwapSlot) -> None:
         """Copy one CPU mirror to device tensor."""
         if slot.state != "host":
@@ -630,7 +771,7 @@ class PipelineSwapRuntime:
         """Create the copy stream."""
         return self.device_handle().Stream()
 
-    def stream_context(self, stream: Any):
+    def stream_context(self, stream: Any) -> Any:
         """Return a stream context for ``stream``."""
         if stream is None:
             return contextlib.nullcontext()
@@ -664,6 +805,8 @@ class PipelineSwapRuntime:
         swappable_slots = [slot for slot in slots if slot.swappable]
         if not swappable_slots:
             return False
+        if len({id(slot) for slot in swappable_slots}) != len(swappable_slots):
+            raise RuntimeError("Packed optimizer batches contain a duplicate state slot.")
         devices = {slot.device for slot in swappable_slots}
         eligible = len(devices) == 1 and None not in devices and all(
             slot.packed
@@ -762,7 +905,7 @@ class PipelineSwapRuntime:
                 if device_view is None:
                     device_view = dtype_view.narrow(0, relative_offset, slot.numel).view(slot.shape)
                     self._packed_device_views[cache_key] = device_view
-                slot.bind_tensor(device_view)
+                self._bind_packed_slot(slot, device_view)
                 slot.state = "device"
                 slot.event = None
 
@@ -778,6 +921,11 @@ class PipelineSwapRuntime:
         with self.stream_context(copy_stream):
             self.wait_event(compute_event, copy_stream)
             self._copy_packed_to_host(batch_index, staging_index)
+            # This arena may be overwritten by the following H2D. Exception
+            # cleanup must use the host result once its D2H has been submitted.
+            for region in self._packed_batch_plans[batch_index].regions.values():
+                for slot in region.slots:
+                    slot.state = "d2h"
             if next_index is not None:
                 self._copy_packed_to_device(next_index, staging_index)
             chain_event = self.record_event(copy_stream)
@@ -798,22 +946,23 @@ class PipelineSwapRuntime:
         batch_plan = self._packed_batch_plans[batch_index]
         for region in batch_plan.regions.values():
             for slot in region.slots:
-                slot.bind_tensor(slot.cpu_tensor)
+                self._bind_packed_slot(slot, slot.cpu_tensor)
                 slot.state = "host"
                 slot.event = None
 
     def end_packed_step(self) -> None:
         """Drain the packed copy chain and release step-local staging storage."""
-        if self._packed_tail_event is not None:
-            # All D2H copies are serialized on the copy stream.  Waiting only
-            # for its tail is sufficient before detaching views and releasing
-            # the step-local device allocation.
+        if self._copy_stream is not None:
+            # A submission can fail after enqueueing a copy but before recording
+            # its tail event, even when no batch has activated a device view yet.
+            self._copy_stream.synchronize()
+        elif self._packed_tail_event is not None:
             self.wait_event(self._packed_tail_event, None)
         active_slots: Dict[int, Any] = {}
         for batch_plan in self._packed_batch_plans:
             for region in batch_plan.regions.values():
                 for slot in region.slots:
-                    if slot.state == "device":
+                    if slot.state in ("device", "d2h"):
                         active_slots[id(slot)] = slot
         if active_slots:
             compute_stream = self.current_stream()
@@ -821,8 +970,9 @@ class PipelineSwapRuntime:
             if synchronize is not None:
                 synchronize()
             for slot in active_slots.values():
-                slot.cpu_tensor.copy_(self._storage_tensor(slot.tensor).detach(), non_blocking=False)
-                slot.bind_tensor(slot.cpu_tensor)
+                if slot.state == "device":
+                    slot.cpu_tensor.copy_(self._storage_tensor(slot.tensor).detach(), non_blocking=False)
+                self._bind_packed_slot(slot, slot.cpu_tensor)
                 slot.state = "host"
                 slot.event = None
         for arena in self._staging_arenas:
@@ -848,14 +998,15 @@ class PipelineSwapRuntime:
         seen_slots = set()
         for unit in batch:
             for slot in unit.slots:
-                if not slot.swappable or not slot.packed or id(slot) in seen_slots:
+                if not slot.swappable or not slot.packed:
                     continue
+                if id(slot) in seen_slots:
+                    raise RuntimeError("Packed optimizer batch contains a duplicate state slot.")
                 slots_by_dtype.setdefault(slot.dtype, []).append(slot)
                 seen_slots.add(id(slot))
 
         regions = {}
         for dtype, slots in slots_by_dtype.items():
-            slots.sort(key=lambda slot: slot.host_offset)
             host_offset = slots[0].host_offset
             expected_offset = host_offset
             for slot in slots:
@@ -940,117 +1091,181 @@ class PipelineSwapRuntime:
         return dtype_layouts, self._align_bytes(byte_offset), device
 
 
-class GroupArgs(NamedTuple):
-    """Per-parameter argument lists one functional Adam/AdamW step consumes."""
+@dataclass
+class _PackedBatchRegion:
+    """One dtype-contiguous host range transferred for a pipeline batch."""
 
-    params: List[Any]
-    grads: List[Any]
-    exp_avgs: List[Any]
-    exp_avg_sqs: List[Any]
-    max_exp_avg_sqs: List[Any]
-    state_steps: List[Any]
+    dtype: Any
+    host_offset: int
+    numel: int
+    slots: List[SwapSlot]
 
 
-class OptimizerSwapAdapter:
-    """Common Torch Adam/AdamW adapter logic."""
+@dataclass
+class _PackedBatchPlan:
+    """Packed transfer regions for one optimizer pipeline batch."""
 
-    functional_name = "adam"
-    supported_cls = ()
-    decoupled_weight_decay = False
-    is_new_adamw = False
-    supports_fused = False
+    regions: Dict[Any, _PackedBatchRegion] = field(default_factory=dict)
+
+
+@dataclass
+class _StagingArena:
+    """One raw device allocation and its dtype-specific views."""
+
+    raw_buffer: Any
+    dtype_views: Dict[Any, Any] = field(default_factory=dict)
+    layout_signature: Any = None
+
+
+def _iter_unique_slots(units: Sequence[UpdateUnit]) -> Iterable[SwapSlot]:
+    """Yield slots once by object identity."""
+    slots = itertools.chain.from_iterable(unit.slots for unit in units)
+    return _iter_unique_slot_objects(slots)
+
+
+def _iter_unique_slot_objects(slots: Iterable[SwapSlot]) -> Iterable[SwapSlot]:
+    """Yield slots once by tensor object identity."""
+    unique_slots: Dict[int, SwapSlot] = {}
+    for slot in slots:
+        unique_slots.setdefault(id(slot.tensor), slot)
+    return unique_slots.values()
+
+
+def _iter_unique_events(slots: Iterable[SwapSlot]) -> Iterable[Any]:
+    """Yield non-empty events once by object identity."""
+    seen = set()
+    for slot in slots:
+        event = slot.event
+        if event is None:
+            continue
+        key = id(event)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield event
+
+
+def _slot_tensor(unit: SwapUpdateUnit, key: str, fallback: Any) -> Any:
+    """Return an active swap slot tensor for ``key``, or ``fallback``.
+
+    A slot is authoritative only while it is swappable, still resident on the
+    local device and bound to a live tensor; otherwise the optimizer state entry
+    is the source of truth for this step.
+    """
+    for slot in unit.slots:
+        if slot.name == key and slot.swappable and slot.state == "device" and slot.tensor is not None:
+            return slot.tensor
+    return fallback
+
+
+def validate_state_keys(state_keys: Optional[Sequence[str]]) -> Optional[tuple[str, ...]]:
+    """Validate user-provided optimizer state keys.
+
+    Only lexical validity is checked here: a key must appear in
+    :data:`KNOWN_STATE_KEYS`.  Whether the wrapped optimizer family actually
+    owns that state is decided later by the family adapter, which fails during
+    ``validate()``/wrap time.
+    """
+    if state_keys is None:
+        return None
+    normalized = tuple(state_keys)
+    invalid = sorted(set(normalized) - set(KNOWN_STATE_KEYS))
+    if invalid:
+        raise ValueError(
+            "SwapOptimizerConfig.state_keys only supports optimizer state slots "
+            f"{KNOWN_STATE_KEYS}, but got {invalid}."
+        )
+    return normalized
+
+
+#: Builds the family adapter for a wrapped optimizer.
+AdapterFactory = Callable[[Any, Any, PipelineSwapRuntime], "StateSwapAdapter"]
+
+
+class StateSwapAdapter:
+    """Algorithm-independent optimizer-state swap adapter base.
+
+    Owns the slot map, the configured/default state-key selection framework, the
+    checkpoint strip/export/restore path and packed-state publication.  The
+    numerical update and the per-parameter unit construction belong to the
+    optimizer family subclasses, which implement :meth:`default_state_keys`,
+    :meth:`prepare_step`, :meth:`iter_update_units` and :meth:`step_batch`.
+    """
+
+    @staticmethod
+    def default_state_keys() -> Tuple[str, ...]:
+        """Return the family's default swap state keys.
+
+        Subclasses must override this; the base class deliberately assumes
+        nothing about an optimizer's state layout, so there is no default.
+
+        Raises:
+            NotImplementedError: Always, unless a subclass overrides it.
+        """
+        raise NotImplementedError
 
     def __init__(self, optimizer: Any, config: Any, runtime: Any) -> None:
+        """Bind a leaf optimizer to its state slots and transfer runtime."""
         self.optimizer = optimizer
         self.config = config
         self.runtime = runtime
         self._slots: Dict[Tuple[int, str], SwapSlot] = {}
-
-    @classmethod
-    def matches(cls, optimizer: Any) -> bool:
-        """Return whether this adapter supports ``optimizer``."""
-        return isinstance(optimizer, cls.supported_cls)
-
-    def validate(self) -> None:
-        """Validate unsupported optimizer flags."""
-        for group in self.optimizer.param_groups:
-            if group.get("foreach", False) is True:
-                raise ValueError("Swap optimizer does not support foreach=True.")
-            if group.get("fused", False) is True and not self.supports_fused:
-                raise ValueError("Swap optimizer does not support fused=True.")
-            if group.get("differentiable", False):
-                raise ValueError("Swap optimizer does not support differentiable=True.")
-            if group.get("capturable", False):
-                raise ValueError("Swap optimizer does not support capturable=True.")
-
-    def prepare_step(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Initialize lazy state and collect this step's update units."""
-        if args or kwargs:
-            raise ValueError("Torch swap optimizer step does not support closure or extra arguments.")
-        if self.runtime.packed_enabled:
-            return self._prepare_packed_step()
-
-        units = []
-        for group_index, group in enumerate(self.optimizer.param_groups):
-            if self.is_new_adamw:
-                group["step"] = (group.get("step") or 0) + 1
-            for param in group["params"]:
-                grad = getattr(param, "grad", None)
-                if grad is None:
-                    continue
-                if getattr(grad, "is_sparse", False):
-                    raise ValueError("Swap optimizer only supports dense Adam/AdamW gradients.")
-                state = self.optimizer.state[param]
-                self._init_param_state(param, grad, group)
-                slots = self._build_slots(param, state)
-                units.append(UpdateUnit(
-                    adapter_index=group_index,
-                    param=param,
-                    grad=grad,
-                    slots=slots,
-                ))
-        return {"units": units}
-
-    def _prepare_packed_step(self) -> Dict[str, Any]:
-        """Build a stable packed layout while retaining inactive materialized states."""
-        records = []
-        for group_index, group in enumerate(self.optimizer.param_groups):
-            if self.is_new_adamw:
-                group["step"] = (group.get("step") or 0) + 1
-            for param in group["params"]:
-                grad = getattr(param, "grad", None)
-                state = self.optimizer.state.get(param)
-                if grad is not None:
-                    if getattr(grad, "is_sparse", False):
-                        raise ValueError("Swap optimizer only supports dense Adam/AdamW gradients.")
-                    state = self.optimizer.state[param]
-                    self._init_param_state(param, grad, group)
-                if state:
-                    self._register_present_slots(param, state)
-                has_slots = any((id(param), key) in self._slots for key in self._configured_state_keys())
-                if grad is None and not has_slots:
-                    continue
-                records.append((group_index, param, grad))
-
-        self.runtime.prepare_packed_host(self._ordered_slots())
-        self.publish_packed_state()
-        units = []
-        for group_index, param, grad in records:
-            state = self.optimizer.state[param]
-            slots = self._build_slots(param, state)
-            if grad is None and not any(slot.swappable and slot.packed for slot in slots):
-                continue
-            units.append(UpdateUnit(
-                adapter_index=group_index,
-                param=param,
-                grad=grad,
-                slots=slots,
-            ))
-        return {"units": units}
+        self._packed_state_bindings: Dict[int, Tuple[Any, str]] = {}
+        self._checkpoint_active = False
+        self._checkpoint_broadcasted = False
+        self.runtime.set_packed_slot_bind_hook(self.on_packed_slot_bound)
 
     def iter_update_units(self, step_context: Dict[str, Any]) -> List[UpdateUnit]:
         """Return units collected in ``prepare_step``."""
         return step_context["units"]
+
+    def partition_costs(
+            self,
+            units: Sequence[SwapUpdateUnit],
+            step_context: Any,
+    ) -> Optional[Sequence[int]]:
+        """Return optional planning costs; default to the runtime's local bytes."""
+        del units, step_context
+
+    def prepare_pipeline(
+            self,
+            batches: Sequence[Sequence[SwapUpdateUnit]],
+            step_context: Any,
+    ) -> None:
+        """Pack local slots in execution order after logical partitioning."""
+        del step_context
+        if not self.runtime.packed_enabled:
+            return
+        self._refresh_packed_state_bindings()
+        active_slots = [slot for batch in batches for unit in batch for slot in unit.slots]
+        active_ids = {id(slot) for slot in active_slots}
+        # Inactive state stays on host at the layout tail. It must not leave
+        # holes inside active dtype regions or keep old packed buffers alive.
+        inactive_slots = [slot for slot in self._ordered_slots() if id(slot) not in active_ids]
+        self.runtime.prepare_packed_host(active_slots + inactive_slots)
+        self.publish_packed_state()
+
+    def _refresh_packed_state_bindings(self) -> None:
+        """Index packed slots by their live optimizer-state owner."""
+        bindings = {}
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                for key in self._configured_state_keys():
+                    slot = self._slots.get((id(param), key))
+                    if slot is not None and slot.packed:
+                        bindings[id(slot)] = (param, key)
+        self._packed_state_bindings = bindings
+
+    def on_packed_slot_bound(self, slot: SwapSlot) -> None:
+        """Publish a packed host or staging view into optimizer state."""
+        binding = self._packed_state_bindings.get(id(slot))
+        if binding is None:
+            raise RuntimeError(f"Packed optimizer slot {slot.name!r} has no live state binding.")
+        param, key = binding
+        state = self.optimizer.state.get(param)
+        if state is None:
+            raise RuntimeError(f"Packed optimizer slot {slot.name!r} has no optimizer state entry.")
+        state[key] = slot.tensor
 
     def initial_slots(self) -> Iterable[SwapSlot]:
         """Discover optimizer states materialized before the swap wrapper was created."""
@@ -1062,166 +1277,181 @@ class OptimizerSwapAdapter:
                     slots.extend(self._build_slots(param, state))
         return tuple(slots)
 
-    def _collect_group_args(
-            self,
-            units: Sequence[UpdateUnit],
-            group: Dict[str, Any],
-    ) -> GroupArgs:
-        """Gather the per-parameter argument lists one optimizer step needs.
-
-        Units without a gradient are skipped.  ``max_exp_avg_sqs`` stays empty
-        unless the group is amsgrad, and ``state_steps`` holds ``None`` for new
-        AdamW, which advances the step counter itself.
-        """
-        args = GroupArgs([], [], [], [], [], [])
-        for unit in units:
-            if unit.grad is None:
-                continue
-            state = self.optimizer.state[unit.param]
-            args.params.append(unit.param)
-            args.grads.append(unit.grad)
-            args.exp_avgs.append(self._slot_tensor(unit, "exp_avg", state["exp_avg"]))
-            args.exp_avg_sqs.append(self._slot_tensor(unit, "exp_avg_sq", state["exp_avg_sq"]))
-            if group.get("amsgrad", False):
-                args.max_exp_avg_sqs.append(
-                    self._slot_tensor(unit, "max_exp_avg_sq", state["max_exp_avg_sq"])
-                )
-            if self.is_new_adamw:
-                args.state_steps.append(None)
-            else:
-                args.state_steps.append(state["step"])
-        return args
-
-    def step_batch(self, batch: List[UpdateUnit], step_context: Dict[str, Any]) -> None:
-        """Run Torch functional Adam/AdamW for one batch."""
-        del step_context
-        by_group: Dict[int, List[UpdateUnit]] = defaultdict(list)
-        for unit in batch:
-            by_group[unit.adapter_index].append(unit)
-        for group_index, units in by_group.items():
-            self._step_group(self.optimizer.param_groups[group_index], units)
-
-    def _step_group(self, group: Dict[str, Any], units: List[UpdateUnit]) -> None:
-        """Run one group's parameters through the matching functional Adam/AdamW."""
-        args = self._collect_group_args(units, group)
-        params = args.params
-
-        if not params:
-            return
-
-        if self.is_new_adamw:
-            self._step_new_adamw(
-                group,
-                args.params,
-                args.grads,
-                args.exp_avgs,
-                args.exp_avg_sqs,
-                args.max_exp_avg_sqs,
-            )
-            return
-
-        func = getattr(torch.optim._functional, self.functional_name)
-        kwargs = {
-            "amsgrad": group["amsgrad"],
-            "beta1": group["betas"][0],
-            "beta2": group["betas"][1],
-            "lr": group["lr"],
-            "weight_decay": group["weight_decay"],
-            "eps": group["eps"],
-            "maximize": group["maximize"],
-            "foreach": False,
-            "capturable": False,
-            "differentiable": False,
-            "fused": bool(group.get("fused", False)),
-            "grad_scale": getattr(self.optimizer, "grad_scale", None),
-            "found_inf": getattr(self.optimizer, "found_inf", None),
-            "has_complex": False,
-        }
-        if self.functional_name == "adam":
-            if "decoupled_weight_decay" in inspect.signature(func).parameters:
-                kwargs["decoupled_weight_decay"] = self._decoupled_weight_decay(group)
-        func(
-            args.params,
-            args.grads,
-            args.exp_avgs,
-            args.exp_avg_sqs,
-            args.max_exp_avg_sqs,
-            args.state_steps,
-            **kwargs,
-        )
-
-    def _decoupled_weight_decay(self, group: Dict[str, Any]) -> bool:
-        """Resolve the decoupled weight decay flag for one parameter group."""
-        return self.decoupled_weight_decay or group.get("decoupled_weight_decay", False)
-
-    @staticmethod
-    def _step_new_adamw(
-            group: Dict[str, Any],
-            params: Sequence[Any],
-            grads: Sequence[Any],
-            exp_avgs: Sequence[Any],
-            exp_avg_sqs: Sequence[Any],
-            max_exp_avg_sqs: Sequence[Any],
-    ) -> None:
-        """Run the new AdamW functional for one group."""
-        if params and params[0].device.type == "cpu":
-            # torch.optim._functional.adamw increments tensor state_steps
-            # internally. New AdamW already advanced group["step"] in
-            # prepare_step(), so feed step - 1 to preserve outer-step
-            # semantics for CPU-only tests.
-            step_tensor = torch.tensor(float(group["step"] - 1), dtype=torch.float32)
-            torch.optim._functional.adamw(
-                params,
-                grads,
-                exp_avgs,
-                exp_avg_sqs,
-                max_exp_avg_sqs,
-                [step_tensor] * len(params),
-                amsgrad=group["amsgrad"],
-                beta1=group["betas"][0],
-                beta2=group["betas"][1],
-                lr=group["lr"],
-                weight_decay=group["weight_decay"],
-                eps=group["eps"],
-                maximize=group["maximize"],
-                foreach=False,
-                capturable=False,
-                differentiable=False,
-                fused=False,
-                grad_scale=None,
-                found_inf=None,
-                has_complex=False,
-            )
-            return
-        _new_adamw_func()(
-            params,
-            grads,
-            exp_avgs,
-            exp_avg_sqs,
-            max_exp_avg_sqs,
-            group["step"],
-            amsgrad=group["amsgrad"],
-            beta1=group["betas"][0],
-            beta2=group["betas"][1],
-            lr=group["lr"],
-            weight_decay=group["weight_decay"],
-            eps=group["eps"],
-            maximize=group["maximize"],
-        )
-
     def finish_step(self, step_context: Any) -> Any:
         """Finish one outer optimizer step."""
         del step_context
+
+    def _checkpoint_slots(self) -> Tuple[SwapSlot, ...]:
+        """Return slots read by the wrapped HSDP state-broadcast path.
+
+        ``BaseDistributedOptimizer`` only broadcasts replicated parameters.  A
+        non-replicated state slot must stay host-resident, so do not materialize
+        every optimizer state merely to save a checkpoint.
+        """
+        broadcast_info = getattr(self.optimizer, "_param_to_broadcast_info", None)
+        if not broadcast_info:
+            return ()
+        replicated_ids = {id(param) for param in broadcast_info}
+        return tuple(
+            slot for (param_id, _), slot in self._slots.items()
+            if param_id in replicated_ids
+        )
+
+    def prepare_checkpoint(self) -> None:
+        """Prepare swap state for an optional HSDP checkpoint broadcast."""
+        if self._checkpoint_active:
+            return
+        self._checkpoint_active = True
+        self._checkpoint_broadcasted = False
+        try:
+            self._refresh_packed_state_bindings()
+            # A previous optimizer step may still have a completed D2H event or
+            # a live device state. Make the host mirror authoritative first,
+            # then materialize only state that the broadcast will read.
+            self.runtime.synchronize_cpu_mirrors(self.all_slots())
+            self.runtime.materialize_slots(self._checkpoint_slots())
+        except Exception:
+            try:
+                self.runtime.synchronize_cpu_mirrors(self.all_slots())
+            except RuntimeError:  # pragma: no cover - best effort after a transfer failure
+                logger.exception("Failed to restore swap slots after checkpoint preparation failed")
+            finally:
+                self._checkpoint_active = False
+                self._checkpoint_broadcasted = False
+            raise
+
+    def finish_checkpoint(self) -> None:
+        """Return checkpoint-broadcast state to the normal host-resident form."""
+        if not self._checkpoint_active:
+            return
+        try:
+            self.runtime.synchronize_cpu_mirrors(self.all_slots())
+        finally:
+            self._checkpoint_active = False
+            self._checkpoint_broadcasted = False
 
     def all_slots(self) -> Iterable[SwapSlot]:
         """Iterate known swap slots."""
         return tuple(self._ordered_slots())
 
+    def tracked_slots(self) -> Iterable[SwapSlot]:
+        """Return all registered slots, including parameters removed from groups."""
+        return tuple({id(slot): slot for slot in self._slots.values()}.values())
+
+    def rebind_parameter_slots(self, new_to_old_param: Dict[Any, Any]) -> None:
+        """Rebuild state bindings using an explicit parameter identity mapping.
+
+        Args:
+            new_to_old_param: New-to-old identities; unrelated leaf entries are
+                ignored. CPU mirrors must already be synchronized.
+
+        Raises:
+            ValueError: If a state cannot be mapped to the new local shape.
+        """
+        params = [param for group in self.optimizer.param_groups for param in group["params"]]
+        local_ids = {id(param) for param in self._params_with_local_state(params)}
+        rebound_slots = {}
+        rebound_state = {}
+        for param in params:
+            if id(param) not in local_ids:
+                continue
+            old_param = new_to_old_param.get(param, param)
+            state = self.optimizer.state.get(param, self.optimizer.state.get(old_param))
+            if state is None:
+                continue
+            state = dict(state)
+            for key in self._configured_state_keys():
+                if key not in state:
+                    continue
+                slot = self._slots.get((id(param), key))
+                if slot is None:
+                    slot = self._slots.get((id(old_param), key))
+                slot = self._rebind_state_slot(param, key, state[key], slot, param is not old_param)
+                state[key] = slot.tensor
+                rebound_slots[(id(param), key)] = slot
+            rebound_state[param] = state
+
+        # Publish only after all sources have been read. A failed conversion must
+        # leave the old slot map (and its authoritative CPU mirrors) recoverable.
+        for param in list(self.optimizer.state):
+            if isinstance(param, torch.Tensor) and param not in rebound_state:
+                self.optimizer.state.pop(param)
+        self.optimizer.state.update(rebound_state)
+        self._slots = rebound_slots
+        self._refresh_packed_state_bindings()
+
+    def _rebind_state_slot(
+            self, param: Any, key: str, tensor: Any, slot: Optional[SwapSlot], replaced: bool,
+    ) -> SwapSlot:
+        """Preserve a compatible binding or recreate it from authoritative values."""
+        local_param = self.runtime._storage_tensor(param)
+        if slot is not None and (tensor is slot.tensor or tensor is slot.cpu_tensor):
+            if (not replaced and slot.shape == tuple(local_param.shape)
+                    and slot.dtype == local_param.dtype and slot.device == local_param.device
+                    and not self.runtime.is_distributed_tensor(param)):
+                return slot
+            source = slot.checkpoint_tensor
+        else:
+            # Identity verifies a missing map; it never infers a replacement.
+            if any(tensor is tracked.tensor or tensor is tracked.cpu_tensor for tracked in self._slots.values()):
+                raise ValueError("Replacing a swap parameter requires an explicit new_to_old_param mapping.")
+            source = tensor
+        source = self.runtime._storage_tensor(source)
+        if source.numel() != local_param.numel():
+            raise ValueError(
+                f"Cannot rebind {key!r} with local shape {tuple(source.shape)} "
+                f"to {tuple(local_param.shape)}; restore state for the new layout first."
+            )
+        cpu_tensor = self._cast_swappable_tensor_to_cpu(param, source).reshape(local_param.shape)
+        device_tensor = self.runtime.make_empty_state_like(param)
+        rebound = self._make_slot(key, device_tensor)
+        if rebound.swappable:
+            rebound.cpu_tensor = self.runtime.make_cpu_tensor(cpu_tensor)
+            rebound.state = "host"
+            self.runtime.release_device_storage(rebound)
+            if rebound.packed:
+                rebound.bind_tensor(rebound.cpu_tensor)
+        else:
+            self.runtime._storage_tensor(device_tensor).copy_(cpu_tensor)
+        return rebound
+
     def checkpoint_state_dict(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         """Return optimizer checkpoint state using CPU mirrors for swapped slots."""
         del args, kwargs
+        self._refresh_packed_state_bindings()
         self.runtime.synchronize_cpu_mirrors(self.all_slots())
         return self.export_swappable_state(self.optimizer.state_dict())
+
+    @contextlib.contextmanager
+    def checkpoint_load_context(self, state_dict: Dict[str, Any], flatten: bool) -> Iterable[None]:
+        """Provide state keys for FQN loading without an initialization step.
+
+        Args:
+            state_dict: Chain checkpoint keyed by model FQN.
+            flatten: Whether the checkpoint uses flattened FQN entries.
+        """
+        previous_state = self.optimizer.state
+        schema = copy.copy(previous_state)
+        schema.clear()
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                name = param.model_name
+                if flatten:
+                    prefix = f"state.{name}."
+                    schema[param] = {
+                        key[len(prefix):].split(".", 1)[0]: None
+                        for key in state_dict if key.startswith(prefix)
+                    }
+                else:
+                    schema[param] = dict(state_dict.get("state", {}).get(name, {}))
+        # DCP uses live state keys to unflatten and calls step() if state is
+        # empty. Empty owner ranks must never initiate that extra collective.
+        self.optimizer.state = schema
+        try:
+            yield
+        finally:
+            if self.optimizer.state is schema:
+                self.optimizer.state = previous_state
 
     def load_checkpoint_state_dict(
             self,
@@ -1235,10 +1465,19 @@ class OptimizerSwapAdapter:
         self.optimizer.load_state_dict(stripped)
         self.load_swappable_state(state_dict, removed)
 
+    def _params_with_local_state(self, params: Sequence[Any]) -> Iterable[Any]:
+        """Return parameters whose swapped state belongs to this rank.
+
+        The default restores every checkpoint entry. Distributed optimizer
+        adapters may filter the sequence to preserve rank-local state ownership.
+        """
+        return params
+
     def publish_packed_state(self) -> None:
         """Publish persistent packed CPU mirrors to the wrapped optimizer state."""
         if not self.runtime.packed_enabled:
             return
+        self._refresh_packed_state_bindings()
         for group in self.optimizer.param_groups:
             for param in group["params"]:
                 state = self.optimizer.state.get(param)
@@ -1266,11 +1505,13 @@ class OptimizerSwapAdapter:
         device are deep-copied from the original Torch state dict unchanged.
         """
         exported = {
-            key: copy.deepcopy(value)
+            key: self._copy_checkpoint_value(value)
             for key, value in state_dict.items()
             if key not in ("state", "param_groups")
         }
-        exported["param_groups"] = copy.deepcopy(state_dict.get("param_groups", []))
+        exported["param_groups"] = self._copy_checkpoint_value(
+            state_dict.get("param_groups", [])
+        )
         exported["state"] = {}
         saved_groups = exported.get("param_groups", [])
         params_in_order = []
@@ -1290,9 +1531,36 @@ class OptimizerSwapAdapter:
                     exported_state[key] = slot.cpu_tensor.detach().clone()
             for key, value in saved_state.items():
                 if key not in exported_state:
-                    exported_state[key] = copy.deepcopy(value)
+                    exported_state[key] = self._copy_checkpoint_value(value)
             exported["state"][param_id] = exported_state
         return exported
+
+    @staticmethod
+    def _copy_checkpoint_value(value: Any) -> Any:
+        """Clone checkpoint values without dispatching ``deepcopy`` on DTensor.
+
+        HSDP state broadcasts may leave a distributed tensor in the wrapped
+        optimizer state.  Hyper DTensor intentionally rejects unregistered
+        ``__deepcopy__`` dispatch, so normalize distributed tensors to their
+        local shards before cloning.  Nested containers are copied recursively;
+        scalar metadata still uses regular ``copy.deepcopy`` semantics.
+        """
+        if isinstance(value, torch.Tensor):
+            to_local = getattr(value, "to_local", None)
+            local = to_local() if callable(to_local) else value
+            if local is not value:
+                return local.detach().cpu().clone()
+            return copy.deepcopy(value)
+        if isinstance(value, dict):
+            return {
+                key: StateSwapAdapter._copy_checkpoint_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [StateSwapAdapter._copy_checkpoint_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(StateSwapAdapter._copy_checkpoint_value(item) for item in value)
+        return copy.deepcopy(value)
 
     @staticmethod
     def has_host_mirror(slot: Optional[SwapSlot], key: str, saved_state: Dict[str, Any]) -> bool:
@@ -1402,7 +1670,13 @@ class OptimizerSwapAdapter:
         ]
         groups = self.optimizer.param_groups
         current_params = [param for group in groups for param in group["params"]]
+        local_param_ids = {
+            id(param) for param in self._params_with_local_state(current_params)
+        }
         for saved_id, param in zip(saved_ids, current_params):
+            if id(param) not in local_param_ids:
+                self.optimizer.state.pop(param, None)
+                continue
             for key, saved_tensor in removed.get(saved_id, {}).items():
                 self._restore_swappable_entry(param, saved_id, saved_groups, key, saved_tensor)
         if self.runtime.packed_enabled:
@@ -1422,10 +1696,7 @@ class OptimizerSwapAdapter:
         cpu_tensor = self._cast_swappable_tensor_to_cpu(param, saved_tensor)
         if self.runtime.packed_enabled and self.runtime.is_packable_template(param, self.config.min_numel):
             if self.runtime.is_distributed_tensor(param):
-                logical_tensor = torch.zeros_like(
-                    param,
-                    memory_format=torch.preserve_format,
-                )
+                logical_tensor = self.runtime.make_empty_state_like(param)
                 slot = self._make_slot(key, logical_tensor)
                 state[key] = logical_tensor
                 self.runtime.release_device_storage(slot)
@@ -1456,42 +1727,34 @@ class OptimizerSwapAdapter:
             state[key] = device_tensor
             self._slots[(id(param), key)] = self._make_slot(key, device_tensor)
 
-    def _init_param_state(self, param: Any, grad: Any, group: Dict[str, Any]) -> None:
-        """Initialize missing Adam state and swap slots for one parameter."""
-        del grad
-        state = self.optimizer.state[param]
-        if not self.is_new_adamw and len(state) == 0:
-            step_device = (
-                param.device
-                if group.get("fused", False)
-                else ("cpu" if self.runtime.packed_enabled else param.device)
-            )
-            state["step"] = torch.zeros((), dtype=torch.float32, device=step_device)
-        state_keys = ["exp_avg", "exp_avg_sq"]
-        if group.get("amsgrad", False):
-            state_keys.append("max_exp_avg_sq")
-        configured_keys = set(self._configured_state_keys())
-        for key in state_keys:
-            if key in state or (id(param), key) in self._slots:
-                continue
-            if (
-                    key in configured_keys
-                    and not self.runtime.packed_enabled
-                    and self.runtime.is_swappable_tensor(param, self.config.min_numel)
-            ):
-                cpu_tensor = self.runtime.make_zero_cpu_tensor_like(param)
-                device_tensor = torch.empty_like(param, memory_format=torch.preserve_format)
-                state[key] = device_tensor
-                slot = self._make_slot(key, device_tensor)
-                slot.cpu_tensor = cpu_tensor
-                slot.state = "host"
-                self._slots[(id(param), key)] = slot
-                self.runtime.release_device_storage(slot)
-                continue
-            if key in configured_keys and self.runtime.is_packable_template(param, self.config.min_numel):
-                self._slots[(id(param), key)] = self._make_slot(key, None, template=param)
-                continue
-            state[key] = torch.zeros_like(param, memory_format=torch.preserve_format)
+    @staticmethod
+    def _cast_state_tensor_like_torch(
+            param: Any,
+            saved_tensor: Any,
+            saved_id: int,
+            saved_groups: List[Dict[str, Any]],
+            key: str,
+    ) -> Any:
+        """Cast a loaded state tensor using PyTorch optimizer load semantics."""
+        if not isinstance(saved_tensor, torch.Tensor):
+            raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
+        process = getattr(torch.optim.Optimizer, "_process_value_according_to_param_policy", None)
+        if process is not None:
+            return process(param, saved_tensor, saved_id, saved_groups, key).detach().clone()
+        if key == "step":
+            return saved_tensor.detach().clone()
+        if param.is_floating_point():
+            return saved_tensor.detach().to(dtype=param.dtype, device=param.device).clone()
+        return saved_tensor.detach().to(device=param.device).clone()
+
+    @staticmethod
+    def _cast_swappable_tensor_to_cpu(param: Any, saved_tensor: Any) -> Any:
+        """Cast swappable state dtype like PyTorch while keeping values on CPU."""
+        if not isinstance(saved_tensor, torch.Tensor):
+            raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
+        if param.is_floating_point():
+            return saved_tensor.detach().to(dtype=param.dtype, device="cpu")
+        return saved_tensor.detach().to(device="cpu")
 
     def _register_present_slots(self, param: Any, state: Dict[str, Any]) -> None:
         """Register configured state tensors that already exist in an optimizer state mapping."""
@@ -1564,204 +1827,37 @@ class OptimizerSwapAdapter:
                 raise ValueError(f"Requested state key '{key}' is not present for parameter.")
         return tuple(result)
 
-    @staticmethod
-    def _is_active_device_slot(slot: SwapSlot, key: str) -> bool:
-        """Return whether ``slot`` holds ``key`` live on the local device."""
-        if slot.name != key or not slot.swappable or slot.state != "device":
-            return False
-        return slot.tensor is not None
-
-    @staticmethod
-    def _slot_tensor(unit: UpdateUnit, key: str, fallback: Any) -> Any:
-        """Return an active swap slot tensor, or the optimizer state fallback."""
-        for slot in unit.slots:
-            if OptimizerSwapAdapter._is_active_device_slot(slot, key):
-                return slot.tensor
-        return fallback
-
     def _configured_state_keys(self) -> Tuple[str, ...]:
-        """Return Adam state keys selected for swap by the current config."""
-        keys = self.config.state_keys or self._default_state_keys()
-        result = []
-        for key in keys:
-            if key == "master_param":
-                if self.config.state_keys is not None:
-                    raise ValueError(f"Requested state key '{key}' is not available for {type(self.optimizer)!r}.")
-                continue
-            result.append(key)
-        return tuple(result)
-
-    @staticmethod
-    def _cast_state_tensor_like_torch(
-            param: Any,
-            saved_tensor: Any,
-            saved_id: int,
-            saved_groups: List[Dict[str, Any]],
-            key: str,
-    ) -> Any:
-        """Cast a loaded state tensor using PyTorch optimizer load semantics."""
-        if not isinstance(saved_tensor, torch.Tensor):
-            raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
-        process = getattr(torch.optim.Optimizer, "_process_value_according_to_param_policy", None)
-        if process is not None:
-            return process(param, saved_tensor, saved_id, saved_groups, key).detach().clone()
-        if key == "step":
-            return saved_tensor.detach().clone()
-        if param.is_floating_point():
-            return saved_tensor.detach().to(dtype=param.dtype, device=param.device).clone()
-        return saved_tensor.detach().to(device=param.device).clone()
-
-    @staticmethod
-    def _cast_swappable_tensor_to_cpu(param: Any, saved_tensor: Any) -> Any:
-        """Cast swappable state dtype like PyTorch while keeping values on CPU."""
-        if not isinstance(saved_tensor, torch.Tensor):
-            raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
-        if param.is_floating_point():
-            return saved_tensor.detach().to(dtype=param.dtype, device="cpu")
-        return saved_tensor.detach().to(device="cpu")
-
-    @staticmethod
-    def _default_state_keys() -> Tuple[str, ...]:
-        return ("exp_avg", "exp_avg_sq", "max_exp_avg_sq")
-
-
-class TorchNativeAdamAdapter(OptimizerSwapAdapter):
-    """Adapter for ``torch.optim.Adam``."""
-
-    functional_name = "adam"
-
-    @classmethod
-    def matches(cls, optimizer: Any) -> bool:
-        # AdamW inherits Adam in PyTorch.  Keep Adam subclasses supported, but
-        # let AdamW select its dedicated adapter (which preserves fused=True).
-        return (
-            isinstance(optimizer, torch.optim.Adam)
-            and not isinstance(optimizer, torch.optim.AdamW)
-        )
-
-
-class TorchNativeAdamWAdapter(OptimizerSwapAdapter):
-    """Adapter for ``torch.optim.AdamW``."""
-
-    functional_name = "adamw"
-    supports_fused = True
-
-    @classmethod
-    def matches(cls, optimizer: Any) -> bool:
-        return isinstance(optimizer, torch.optim.AdamW)
-
-
-class TorchNewAdamWAdapter(OptimizerSwapAdapter):
-    """Adapter for hyper-parallel's fused AdamW."""
-
-    functional_name = "adamw"
-    is_new_adamw = True
-
-    @classmethod
-    def matches(cls, optimizer: Any) -> bool:
-        """Match hyper-parallel's lazily imported AdamW."""
-        return isinstance(optimizer, _new_adamw_cls())
-
-
-@dataclass
-class _PackedBatchRegion:
-    """One dtype-contiguous host range transferred for a pipeline batch."""
-
-    dtype: Any
-    host_offset: int
-    numel: int
-    slots: List[SwapSlot]
-
-
-@dataclass
-class _PackedBatchPlan:
-    """Packed transfer regions for one optimizer pipeline batch."""
-
-    regions: Dict[Any, _PackedBatchRegion] = field(default_factory=dict)
-
-
-@dataclass
-class _StagingArena:
-    """One raw device allocation and its dtype-specific views."""
-
-    raw_buffer: Any
-    dtype_views: Dict[Any, Any] = field(default_factory=dict)
-    layout_signature: Any = None
-
-
-def _iter_unique_slots(units: Sequence[UpdateUnit]) -> Iterable[SwapSlot]:
-    """Yield slots once by object identity."""
-    slots = itertools.chain.from_iterable(unit.slots for unit in units)
-    return _iter_unique_slot_objects(slots)
-
-
-def _iter_unique_slot_objects(slots: Iterable[SwapSlot]) -> Iterable[SwapSlot]:
-    """Yield slots once by tensor object identity."""
-    unique_slots: Dict[int, SwapSlot] = {}
-    for slot in slots:
-        unique_slots.setdefault(id(slot.tensor), slot)
-    return unique_slots.values()
-
-
-def _iter_unique_events(slots: Iterable[SwapSlot]) -> Iterable[Any]:
-    """Yield non-empty events once by object identity."""
-    seen = set()
-    for slot in slots:
-        event = slot.event
-        if event is None:
-            continue
-        key = id(event)
-        if key in seen:
-            continue
-        seen.add(key)
-        yield event
-
-
-def validate_state_keys(state_keys: Optional[Sequence[str]]) -> Optional[tuple[str, ...]]:
-    """Validate user-provided logical state keys."""
-    if state_keys is None:
-        return None
-    normalized = tuple(state_keys)
-    invalid = sorted(set(normalized) - set(SUPPORTED_STATE_KEYS))
-    if invalid:
-        raise ValueError(
-            "SwapOptimizerConfig.state_keys only supports Adam/AdamW logical slots "
-            f"{SUPPORTED_STATE_KEYS}, but got {invalid}."
-        )
-    return normalized
-
-
-def _new_adamw_cls() -> type:
-    """Return hyper-parallel's AdamW class without importing it at module load."""
-    from hyper_parallel.core.optimizer.adamw import (  # pylint: disable=import-outside-toplevel
-        AdamW as new_adamw_cls,
-    )
-    return new_adamw_cls
-
-
-def _new_adamw_func() -> Callable[..., Any]:
-    """Return hyper-parallel's functional AdamW without importing it at module load."""
-    from hyper_parallel.core.optimizer.adamw import (  # pylint: disable=import-outside-toplevel
-        adamw as new_adamw_func,
-    )
-    return new_adamw_func
+        """Return optimizer state keys selected for swap by the current config."""
+        return tuple(self.config.state_keys or self.default_state_keys())
 
 
 class SwapOptimizer(torch.optim.Optimizer):
-    """Torch optimizer wrapper for Adam/AdamW state swap."""
+    """Torch optimizer wrapper around a family-provided swap adapter.
+
+    The wrapper is algorithm agnostic: it owns the pipeline runtime, exposes the
+    wrapped optimizer's ``param_groups``/``state``/``defaults`` and drives one
+    step as ``prepare_step`` -> ``partition`` -> ``run_pipeline`` ->
+    ``finish_step``.  The concrete adapter is built by the family factory passed
+    as ``adapter_factory`` (see ``swap_adam.py``/``swap_muon.py``).
+    """
 
     _is_swap_optimizer = True
-    _adapters = (TorchNewAdamWAdapter, TorchNativeAdamAdapter, TorchNativeAdamWAdapter)
 
-    def __init__(self, optimizer: Any, config: Any) -> None:
+    def __init__(self, optimizer: Any, config: Any, adapter_factory: AdapterFactory) -> None:
+        """Wrap a leaf with its family adapter and independent transfer runtime."""
         # Do not call ``torch.optim.Optimizer.__init__``: the wrapped base
         # optimizer already owns param_groups/state/defaults. Inheriting keeps
         # PyTorch LR schedulers and isinstance checks happy while this wrapper
         # delegates all optimizer state to ``self.optimizer``.
         self.optimizer = optimizer
         self.config = config
+        self._step_active = False
+        self._reset_active = False
+        self._reset_required = False
+        self._export_active = False
         self.runtime = PipelineSwapRuntime(config)
-        self.adapter = self._build_adapter()
+        self.adapter = adapter_factory(optimizer, config, self.runtime)
         self.adapter.validate()
         # Torch Adam states are normally lazy, but callers may materialize them
         # before wrapping to avoid first-step initialization in the measured loop.
@@ -1775,21 +1871,22 @@ class SwapOptimizer(torch.optim.Optimizer):
         return getattr(self.optimizer, name)
 
     @property
-    def param_groups(self):
+    def param_groups(self) -> List[Dict[str, Any]]:
         """Proxy parameter groups."""
         return self.optimizer.param_groups
 
     @param_groups.setter
-    def param_groups(self, value) -> None:
+    def param_groups(self, value: List[Dict[str, Any]]) -> None:
+        """Replace the underlying optimizer's parameter groups."""
         self.optimizer.param_groups = value
 
     @property
-    def state(self):
+    def state(self) -> Dict[Any, Any]:
         """Proxy optimizer state."""
         return self.optimizer.state
 
     @property
-    def defaults(self):
+    def defaults(self) -> Dict[str, Any]:
         """Proxy optimizer defaults."""
         return self.optimizer.defaults
 
@@ -1801,34 +1898,141 @@ class SwapOptimizer(torch.optim.Optimizer):
         """Proxy gradient clearing."""
         self.optimizer.zero_grad(set_to_none=set_to_none)
 
+    def reset_optimizer_parameters(
+            self, new_to_old_param: Optional[Dict[torch.nn.Parameter, torch.nn.Parameter]] = None,
+    ) -> None:
+        """Rebuild optimizer metadata and rebind state at an idle step boundary.
+
+        Args:
+            new_to_old_param: Explicit new-to-old identities after param_groups
+                replacement. Omit when parameter identities are unchanged.
+
+        Raises:
+            RuntimeError: If a step, checkpoint or transfer is still active.
+        """
+        slots = tuple(self.adapter.tracked_slots())
+        if (self._step_active or self._reset_active or self._export_active or self.adapter._checkpoint_active
+                or self.runtime._packed_batch_plans or self.runtime._packed_tail_event is not None
+                or any(slot.state in ("h2d", "d2h") for slot in slots)):
+            raise RuntimeError("Cannot reset optimizer parameters during a step, checkpoint or transfer.")
+        self._reset_active = True
+        self._reset_required = True
+        try:
+            with self._no_grad_context():
+                self.runtime.synchronize_cpu_mirrors(slots)
+                reset = getattr(self.optimizer, "reset_optimizer_parameters", None)
+                if callable(reset):
+                    reset()
+                self.adapter.rebind_parameter_slots(new_to_old_param or {})
+                self.runtime.invalidate_packed_layout()
+            self._reset_required = False
+        finally:
+            self._reset_active = False
+
     def step(self, closure: Optional[Any] = None) -> Any:
         """Run one optimizer step with pipeline state swap."""
         if closure is not None:
             raise ValueError("Swap optimizer does not support closure.")
-        with self._no_grad_context():
-            step_context = self.adapter.prepare_step()
-            units = self.adapter.iter_update_units(step_context)
-            batches = self.runtime.partition(units)
-            self.runtime.run_pipeline(batches, step_context, self.adapter.step_batch)
-            return self.adapter.finish_step(step_context)
+        self._check_reset_complete()
+        self._step_active = True
+        try:
+            with self._no_grad_context():
+                step_context = self.adapter.prepare_step()
+                units = self.adapter.iter_update_units(step_context)
+                unit_costs = self.adapter.partition_costs(units, step_context)
+                batches = self.runtime.partition(units, unit_costs=unit_costs)
+                self.adapter.prepare_pipeline(batches, step_context)
+                self.runtime.run_pipeline(batches, step_context, self.adapter.step_batch)
+                return self.adapter.finish_step(step_context)
+        finally:
+            self._step_active = False
+
+    def _check_reset_complete(self) -> None:
+        """Prevent using a partially rebuilt optimizer after reset failed."""
+        if self._reset_required:
+            raise RuntimeError("Optimizer parameter reset has not completed; retry reset before step or checkpoint.")
 
     def state_dict(self) -> Dict[str, Any]:
         """Return optimizer state dict using CPU mirrors for swappable tensors."""
-        return self.adapter.checkpoint_state_dict()
+        self._check_reset_complete()
+        self._export_active = True
+        try:
+            return self._export_state_dict()
+        finally:
+            self._export_active = False
+
+    def _export_state_dict(self) -> Dict[str, Any]:
+        """Reuse an outer chain checkpoint window or open a leaf-owned window."""
+        broadcast = getattr(self.optimizer, "_broadcast_state_fused_for_ckpt", None)
+        if not callable(broadcast):
+            return self.adapter.checkpoint_state_dict()
+
+        owns_checkpoint_window = not self.adapter._checkpoint_active
+        try:
+            if owns_checkpoint_window:
+                self._prepare_swap_checkpoint()
+            if not self.adapter._checkpoint_broadcasted:
+                self._broadcast_state_fused_for_ckpt()
+            return self.adapter.checkpoint_state_dict()
+        finally:
+            if owns_checkpoint_window:
+                self.cleanup_synced_state()
+
+    def _prepare_swap_checkpoint(self) -> None:
+        """Materialize swap state needed by an HSDP checkpoint broadcast."""
+        self._check_reset_complete()
+        broadcast = getattr(self.optimizer, "_broadcast_state_fused_for_ckpt", None)
+        if callable(broadcast):
+            self.adapter.prepare_checkpoint()
+
+    @contextlib.contextmanager
+    def _swap_checkpoint_load_context(self, state_dict: Dict[str, Any], flatten: bool) -> Iterable[None]:
+        """Let chain loading discover state keys without updating any parameters."""
+        previous_active = self._export_active
+        self._export_active = True
+        try:
+            with self.adapter.checkpoint_load_context(state_dict, flatten):
+                yield
+        finally:
+            self._export_active = previous_active
+
+    def _finish_swap_checkpoint(self) -> None:
+        """Return checkpoint-broadcast state to its normal swapped form."""
+        self.adapter.finish_checkpoint()
+
+    def _broadcast_state_fused_for_ckpt(self) -> None:
+        """Broadcast wrapped optimizer state with swap storage materialized."""
+        broadcast = getattr(self.optimizer, "_broadcast_state_fused_for_ckpt", None)
+        if not callable(broadcast):
+            return
+        prepared_here = not self.adapter._checkpoint_active
+        try:
+            if prepared_here:
+                self.adapter.prepare_checkpoint()
+            broadcast()
+            self.adapter._checkpoint_broadcasted = True
+        except Exception:
+            if prepared_here:
+                self.cleanup_synced_state()
+            raise
+
+    def cleanup_synced_state(self) -> None:
+        """Release HSDP checkpoint copies and restore host-resident slots."""
+        try:
+            self.adapter.finish_checkpoint()
+        finally:
+            cleanup = getattr(self.optimizer, "cleanup_synced_state", None)
+            if callable(cleanup):
+                cleanup()
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         """Load optimizer state dict while keeping swappable tensors on CPU mirrors."""
-        self.adapter.load_checkpoint_state_dict(state_dict)
-
-    def _build_adapter(self) -> OptimizerSwapAdapter:
-        for adapter_cls in self._adapters:
-            if adapter_cls.matches(self.optimizer):
-                return adapter_cls(self.optimizer, self.config, self.runtime)
-        raise ValueError(
-            "Swap optimizer only supports torch.optim.Adam, torch.optim.AdamW, "
-            "and hyper_parallel.core.optimizer.adamw.AdamW on the Torch backend. "
-            f"Got {type(self.optimizer)!r}."
-        )
+        previous_active = self._export_active
+        self._export_active = True
+        try:
+            self.adapter.load_checkpoint_state_dict(state_dict)
+        finally:
+            self._export_active = previous_active
 
     @contextlib.contextmanager
     def _no_grad_context(self) -> Iterable[None]:

@@ -127,7 +127,6 @@ def _to_swap_optimizer_config(config: OptimizerSwapConfig) -> SwapOptimizerConfi
         swap_times=config.swap_times,
         state_keys=config.state_keys,
         min_numel=config.min_numel,
-        include_master_params=config.include_master_params,
         # ``None`` means "leave it to the backend default", not "off": the core
         # config declares ``packed_swap: bool = True``, so pass that default
         # through rather than letting ``None`` read as a hard False.
@@ -540,9 +539,9 @@ class BaseTrainer(Stateful, ABC):
             if config.optimizer.fp32_main_params
             else optimizer
         )
-        # Swap is attached after the fp32 main-parameter wrap: that wrapper owns
-        # the master parameters ``include_master_params`` swaps, and the lr
-        # scheduler built right after reads ``self.optimizer.param_groups``.
+        # Swap is attached after the fp32 main-parameter wrap so leaf optimizers
+        # already reference their final parameters, and the lr scheduler built
+        # right after reads the wrapped ``self.optimizer.param_groups``.
         if config.optimizer.swap.enabled:
             self.optimizer = _attach_optimizer_swap(self.optimizer, config.optimizer.swap)
 

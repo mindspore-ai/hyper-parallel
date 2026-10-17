@@ -15,7 +15,7 @@
 """Trainer-side wiring of the ``optimizer.swap`` configuration section.
 
 ``optimizer.swap`` must be a no-op for every existing config and must wrap the
-Adam/AdamW leaves the YAML optimizer target builds when it is enabled. The
+supported leaves the YAML optimizer target builds when it is enabled. The
 optimizer object the lr scheduler and the trainer loop see keeps proxying
 ``param_groups``, ``state_dict`` and ``load_state_dict`` either way.
 """
@@ -37,7 +37,7 @@ from hyper_parallel.components.optim.builders import AdamW as AdamWBuilder
 from hyper_parallel.core.optimizer import ChainedOptimizer, SwapOptimizerConfig
 from hyper_parallel.core.optimizer.swap_optimizer import is_swap_optimizer
 from hyper_parallel.models.build_options import FSDP2Config, FSDP2MixedPrecisionConfig
-from hyper_parallel.core.optimizer import swap_optimizer_base as swap_adapters
+from hyper_parallel.core.optimizer import swap_adam as swap_adapters
 from hyper_parallel.trainer import base as trainer_base
 from hyper_parallel.trainer.base import BaseTrainer, _to_swap_optimizer_config
 from hyper_parallel.trainer.config import (
@@ -146,7 +146,6 @@ class TestOptimizerSwapConfig(unittest.TestCase):
         self.assertEqual(swap.swap_times, 16)
         self.assertEqual(swap.min_numel, 1024)
         self.assertIsNone(swap.state_keys)
-        self.assertFalse(swap.include_master_params)
         self.assertIsNone(swap.packed_swap)
         self.assertEqual(OptimizerConfig(
             target=Target(_no_model, target_path=f"{_THIS_MODULE}._no_model"),
@@ -177,16 +176,16 @@ class TestOptimizerSwapConfig(unittest.TestCase):
         self.assertEqual(OptimizerSwapConfig(min_numel=0).min_numel, 0)
 
     @arg_mark(**_MARK)
-    def test_rejects_unknown_state_keys(self):
+    def test_accepts_known_state_keys_across_optimizer_families(self):
         """Feature: optimizer.swap state-key validation.
-        Description: request a logical slot the swap runtime does not implement.
-        Expectation: it fails fast; the Adam moments stay accepted.
+        Description: request logical slots owned by the Adam and Muon adapters.
+        Expectation: the shared Trainer schema accepts both families' keys.
         """
-        with self.assertRaisesRegex(ValueError, "state_keys"):
-            OptimizerSwapConfig(state_keys=["momentum_buffer"])
+        muon = OptimizerSwapConfig(state_keys=["momentum_buffer"])
+        self.assertEqual(muon.state_keys, ["momentum_buffer"])
 
-        accepted = OptimizerSwapConfig(state_keys=["exp_avg", "exp_avg_sq"])
-        self.assertEqual(accepted.state_keys, ["exp_avg", "exp_avg_sq"])
+        adam = OptimizerSwapConfig(state_keys=["exp_avg", "exp_avg_sq"])
+        self.assertEqual(adam.state_keys, ["exp_avg", "exp_avg_sq"])
 
     @arg_mark(**_MARK)
     def test_resolves_from_yaml_and_serializes_back(self):
@@ -199,7 +198,6 @@ class TestOptimizerSwapConfig(unittest.TestCase):
             "swap_times": 4,
             "min_numel": 8,
             "state_keys": ["exp_avg"],
-            "include_master_params": False,
             "packed_swap": False,
         }
         config = resolve_config({
@@ -232,13 +230,15 @@ class TestOptimizerSwapConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "swap_times"):
             resolve_config(root)
 
-        root["optimizer"]["swap"] = {"state_keys": ["momentum_buffer"]}
+        root["optimizer"]["swap"] = {"state_keys": ["not_a_state_key"]}
         with self.assertRaisesRegex(ValueError, "state_keys"):
             resolve_config(root)
 
-        root["optimizer"]["swap"] = {"unknown": 1}
-        with self.assertRaisesRegex(ConfigResolutionError, "unknown configuration fields"):
-            resolve_config(root)
+        for removed_field in ("include_master_params", "unknown"):
+            with self.subTest(removed_field=removed_field):
+                root["optimizer"]["swap"] = {removed_field: True}
+                with self.assertRaisesRegex(ConfigResolutionError, "unknown configuration fields"):
+                    resolve_config(root)
 
 
 class TestOptimizerSwapBuildPath(unittest.TestCase):
@@ -313,7 +313,6 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
             swap_times=7,
             min_numel=64,
             state_keys=["exp_avg"],
-            include_master_params=False,
             packed_swap=True,
         )
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.01, fused=True)
@@ -332,7 +331,6 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
         self.assertEqual(passed.swap_times, 7)
         self.assertEqual(passed.min_numel, 64)
         self.assertEqual(list(passed.state_keys), ["exp_avg"])
-        self.assertFalse(passed.include_master_params)
         self.assertIs(passed.packed_swap, True)
 
     @arg_mark(**_MARK)
@@ -418,7 +416,7 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
         )
         config = _trainer_config(
             target,
-            OptimizerSwapConfig(enabled=True, min_numel=1, include_master_params=True),
+            OptimizerSwapConfig(enabled=True, min_numel=1),
             fp32_main_params=True,
         )
 

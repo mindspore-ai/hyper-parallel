@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for the swap optimizer runtime and adapter internals."""
+"""Unit tests for the generic swap runtime, slots and core wrapper."""
 
 import contextlib
 import os
@@ -25,12 +25,14 @@ os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 
 import torch
 
+from hyper_parallel import DTensor, Replicate
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.optimizer.swap_optimizer_base import (
-    OptimizerSwapAdapter,
     PipelineSwapRuntime,
+    StateSwapAdapter,
+    SwapOptimizer,
     SwapSlot,
-    TorchNativeAdamAdapter,
-    TorchNativeAdamWAdapter,
+    SwapUpdateUnit,
     UpdateUnit,
     _PackedBatchPlan,
     _PackedBatchRegion,
@@ -40,11 +42,6 @@ from hyper_parallel.core.optimizer.swap_optimizer_base import (
     _iter_unique_slots,
     validate_state_keys,
 )
-
-# Adam state keys created by the lazy per-tensor initialization path.
-ADAM_STATE_KEYS = ("exp_avg", "exp_avg_sq")
-# Every logical key the adapter knows about, including the optional amsgrad moment.
-ALL_STATE_KEYS = ADAM_STATE_KEYS + ("max_exp_avg_sq",)
 
 # Real Torch allocators, captured before the tests patch them for CPU-only runs.
 _TORCH_EMPTY = torch.empty
@@ -396,7 +393,7 @@ class TestSwapSlot(unittest.TestCase):
         self.assertIs(slot.tensor.data, replacement)
 
     def test_bind_tensor_keeps_plain_assignment_for_cpu_targets(self):
-        """A CPU-bound logical tensor never enters the local-shard rebinding path."""
+        """A host-bound slot also detaches its logical shell from staging storage."""
         host_view = torch.ones(4)
         logical = _LogicalTensor(device=torch.device("cpu"), data=torch.zeros(4))
         slot = SwapSlot(name="exp_avg", tensor=torch.zeros(4), logical_tensor=logical)
@@ -405,8 +402,8 @@ class TestSwapSlot(unittest.TestCase):
 
         self.assertIs(slot.tensor, host_view)
         self.assertIsNot(slot.tensor, slot.logical_tensor)
-        self.assertIsNone(logical._local_tensor)
-        self.assertEqual(torch.count_nonzero(logical.data).item(), 0)
+        self.assertIs(logical._local_tensor, host_view)
+        self.assertIs(logical.data, host_view)
 
     def test_checkpoint_tensor_prefers_the_cpu_mirror(self):
         """Checkpoint reads use the CPU mirror whenever one exists."""
@@ -494,6 +491,44 @@ class TestSwapRuntimePartition(unittest.TestCase):
         self.assertEqual([len(batch) for batch in batches], [1, 2])
         self.assertEqual(runtime._unit_cost(batches[0][0]), 512)
         self.assertEqual([runtime._unit_cost(unit) for unit in batches[1]], [16, 16])
+
+    def test_explicit_costs_override_different_local_bytes(self):
+        """Identical logical weights fix the rank-dependent partition counterexample."""
+        runtime = _DummySwapRuntime(_DummyConfig(swap_times=2))
+        for local_costs, expected_default in (([100, 1, 1, 1], [1, 3]), ([1, 100, 1, 1], [2, 2])):
+            with self.subTest(local_costs=local_costs):
+                units = [
+                    _unit(SwapSlot(name="momentum", tensor=object(), storage_nbytes=cost))
+                    for cost in local_costs
+                ]
+                self.assertEqual([len(batch) for batch in runtime.partition(units)], expected_default)
+                self.assertEqual(
+                    [len(batch) for batch in runtime.partition(units, unit_costs=None)], expected_default
+                )
+                batches = runtime.partition(units, unit_costs=[101, 101, 2, 2])
+                self.assertEqual([len(batch) for batch in batches], [1, 3])
+                self.assertEqual([id(unit) for batch in batches for unit in batch], [id(unit) for unit in units])
+
+    def test_explicit_costs_preserve_empty_units_and_zero_costs(self):
+        """Units exposing only empty slots survive both the cost floor and clamping."""
+        units = [SimpleNamespace(slots=[]) for _ in range(4)]
+        for swap_times, lengths in ((1, [4]), (2, [2, 2]), (16, [1, 1, 1, 1])):
+            with self.subTest(swap_times=swap_times):
+                runtime = _DummySwapRuntime(_DummyConfig(swap_times=swap_times))
+                batches = runtime.partition(units, unit_costs=[0] * 4)
+                self.assertEqual([len(batch) for batch in batches], lengths)
+                self.assertEqual([id(unit) for batch in batches for unit in batch], [id(unit) for unit in units])
+        self.assertEqual(runtime.partition([], unit_costs=[]), [])
+
+    def test_explicit_costs_reject_invalid_inputs(self):
+        """Invalid costs fail before any unit or transfer can be processed."""
+        runtime = _DummySwapRuntime()
+        for costs in ([], [1, 2], [-1], [1.5], [True], ["1"]):
+            with self.subTest(costs=costs):
+                with self.assertRaisesRegex(ValueError, "unit_costs"):
+                    runtime.partition([SimpleNamespace(slots=[])], unit_costs=costs)
+        with self.assertRaisesRegex(ValueError, "one cost per update unit"):
+            runtime.partition([], unit_costs=[1])
 
 
 class TestSwapRuntimePipeline(unittest.TestCase):
@@ -913,6 +948,20 @@ class TestSwapRuntimeTensorTransfer(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Expected torch.Tensor in optimizer state"):
             self.runtime.make_empty_device_tensor_like(param, object())
 
+    def test_make_empty_state_like_preserves_dtensor_metadata_without_stride_dispatch(self):
+        """A distributed state shell reads logical stride without dispatching an op."""
+        mesh = DeviceMesh("cpu", [0], mesh_dim_names=("dp",), _init_backend=False)
+        param = DTensor.from_local(
+            torch.ones(2, 3), mesh, (Replicate(),), shape=(2, 3), stride=(3, 1),
+        )
+
+        state = self.runtime.make_empty_state_like(param)
+
+        self.assertIsInstance(state, DTensor)
+        self.assertEqual(tuple(state.shape), (2, 3))
+        self.assertEqual(tuple(state.layout.tensor_stride), (3, 1))
+        self.assertEqual(tuple(state.to_local().shape), (2, 3))
+
     def test_copy_to_device_skips_slots_that_are_not_host_resident(self):
         """H2D only runs for a slot that is currently on the host."""
         runtime = self.runtime
@@ -1227,16 +1276,20 @@ class TestSwapRuntimePackedPlanning(unittest.TestCase):
         self.assertEqual((bf16_region.host_offset, bf16_region.numel), (0, 4))
         self.assertEqual(bf16_region.slots, [bf16])
 
-    def test_build_packed_batch_plan_sorts_slots_by_host_offset(self):
-        """Region slots follow the host layout even when units arrive out of order."""
+    def test_build_packed_batch_plan_rejects_layout_order_mismatch(self):
+        """Batch order must already match the persistent packed host layout."""
         late = self._packed_slot(4)
         early = self._packed_slot(0)
 
-        plan = self.runtime._build_packed_batch_plan([_unit([late]), _unit([early])])
+        with self.assertRaisesRegex(RuntimeError, "non-contiguous"):
+            self.runtime._build_packed_batch_plan([_unit([late]), _unit([early])])
 
-        region = plan.regions[torch.float32]
-        self.assertEqual(region.slots, [early, late])
-        self.assertEqual(region.host_offset, 0)
+    def test_build_packed_batch_plan_rejects_a_duplicate_slot(self):
+        """A slot cannot occupy two positions in one logical transfer batch."""
+        slot = self._packed_slot(0)
+
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            self.runtime._build_packed_batch_plan([_unit([slot]), _unit([slot])])
 
     def test_build_packed_batch_plan_skips_unpacked_and_unswappable_slots(self):
         """Only packed swappable state participates in a transfer region."""
@@ -1257,30 +1310,6 @@ class TestSwapRuntimePackedPlanning(unittest.TestCase):
         """A gap in the host layout means the batch plan cannot be packed."""
         with self.assertRaisesRegex(RuntimeError, "non-contiguous"):
             self.runtime._build_packed_batch_plan([_unit([self._packed_slot(0), self._packed_slot(8)])])
-
-    def test_validate_packed_devices_accepts_a_single_device(self):
-        """Host packing is allowed when every candidate state shares a device."""
-        first = SwapSlot(name="exp_avg", tensor=None, device=torch.device("meta"))
-        second = SwapSlot(name="exp_avg_sq", tensor=None, device=torch.device("meta"))
-
-        self.runtime.validate_packed_devices([first, second])
-
-    def test_validate_packed_devices_accepts_empty_candidates(self):
-        """A step without packed state has no device constraint to enforce."""
-        self.runtime.validate_packed_devices([])
-
-    def test_validate_packed_devices_rejects_spread_and_unknown_devices(self):
-        """Slots spanning devices or carrying no device metadata fail before packing."""
-        cases = {
-            "spread": [
-                SwapSlot(name="exp_avg", tensor=None, device=torch.device("meta:0")),
-                SwapSlot(name="exp_avg_sq", tensor=None, device=torch.device("meta:1")),
-            ],
-            "unknown": [SwapSlot(name="exp_avg", tensor=None, device=None)],
-        }
-        for case, slots in cases.items():
-            with self.subTest(devices=case), self.assertRaisesRegex(RuntimeError, "single local device"):
-                self.runtime.validate_packed_devices(slots)
 
     def test_prepare_packed_host_is_skipped_when_packing_is_disabled(self):
         """A per-tensor runtime never builds host buffers."""
@@ -1312,6 +1341,51 @@ class TestSwapRuntimePackedPlanning(unittest.TestCase):
             runtime._host_buffers[torch.float32].untyped_storage().data_ptr(),
             first_buffer.untyped_storage().data_ptr(),
         )
+
+    def test_prepare_packed_host_rejects_a_duplicate_layout_slot(self):
+        """Host packing fails before rebinding a slot registered twice."""
+        slot = SwapSlot(
+            name="exp_avg",
+            tensor=torch.ones(4),
+            swappable=True,
+            packed=True,
+        )
+        self.runtime.populate_slot_metadata(slot, slot.tensor)
+
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            self.runtime.prepare_packed_host([slot, slot])
+
+    def test_layout_rebuild_drains_copies_before_moving_host_offsets(self):
+        """Repacking cannot read a CPU mirror while the preceding D2H is pending."""
+        source = torch.arange(4, dtype=torch.float32)
+        slot = SwapSlot(name="momentum_buffer", tensor=source, swappable=True, packed=True)
+        self.runtime.populate_slot_metadata(slot, source)
+        self.runtime.prepare_packed_host([slot])
+        old_view = slot.cpu_tensor
+        stream = mock.Mock()
+        self.runtime._copy_stream = stream
+        slot.event = mock.Mock()
+        slot.shape = (2, 2)
+
+        self.runtime.prepare_packed_host([slot])
+
+        stream.synchronize.assert_called_once_with()
+        self.assertIsNot(slot.cpu_tensor, old_view)
+        self.assertEqual(slot.cpu_tensor.shape, (2, 2))
+        torch.testing.assert_close(slot.cpu_tensor, source.reshape(2, 2))
+
+    def test_invalid_momentum_fails_before_any_host_binding_changes(self):
+        """Sparse/non-contiguous states are rejected before partially packing dtypes."""
+        for invalid in (torch.ones(2, 3).t(), torch.ones(3, 2).to_sparse()):
+            with self.subTest(layout=invalid.layout):
+                first = SwapSlot(name="first", tensor=torch.ones(4), swappable=True, packed=True)
+                second = SwapSlot(name="second", tensor=invalid, swappable=True, packed=True)
+                self.runtime.populate_slot_metadata(first, first.tensor)
+                self.runtime.populate_slot_metadata(second, second.tensor)
+                with self.assertRaisesRegex(ValueError, "dense and contiguous"):
+                    self.runtime.prepare_packed_host([first, second])
+                self.assertIsNone(first.cpu_tensor)
+                self.assertIsNone(second.cpu_tensor)
 
     def test_prepare_packed_host_packs_by_dtype_and_releases_device_state(self):
         """One host buffer per dtype holds every slot at its recorded offset."""
@@ -1377,19 +1451,6 @@ class TestSwapRuntimePackedPlanning(unittest.TestCase):
 
         self.assertEqual(runtime._host_buffers, {})
         self.assertEqual(runtime._host_layout_signature, ())
-
-    def test_prepare_packed_host_reports_a_mixed_device_layout(self):
-        """Packing states from two devices fails before any slot is rebound."""
-        runtime = self.runtime
-        first = self._packed_slot(0)
-        second = self._packed_slot(4)
-        first.device = torch.device("meta:0")
-        second.device = torch.device("meta:1")
-
-        with mock.patch.object(torch, "empty", _unpinned_empty), \
-                self.assertRaisesRegex(RuntimeError, "single local device"):
-            runtime.prepare_packed_host([first, second])
-
 
 class TestSwapRuntimePackedStaging(unittest.TestCase):
     """Staging arenas, dtype views and the packed copy helpers."""
@@ -1601,6 +1662,55 @@ class TestSwapRuntimePackedStep(unittest.TestCase):
         slot.cpu_tensor = values.clone()
         self.runtime.prepare_packed_host([slot])
         return slot
+
+    def test_invalidate_layout_releases_arenas_and_preserves_mirrors(self):
+        """Reset drops old offsets and views without losing host momentum values."""
+        runtime = self.runtime
+        slot = self._prepared_slot(torch.arange(4, dtype=torch.float32))
+        stream = mock.Mock()
+        runtime._copy_stream = stream
+        runtime.begin_packed_step([[_unit(slot)]])
+        arenas = tuple(runtime._staging_arenas)
+        runtime.end_packed_step()
+
+        runtime.invalidate_packed_layout()
+
+        self.assertEqual(runtime._staging_arenas, [None, None])
+        self.assertEqual(runtime._host_buffers, {})
+        self.assertEqual(runtime._host_layout_signature, ())
+        self.assertIs(runtime._copy_stream, stream)
+        self.assertTrue(all(arena.raw_buffer.untyped_storage().size() == 0 for arena in arenas))
+        torch.testing.assert_close(slot.cpu_tensor, torch.arange(4, dtype=torch.float32))
+        runtime.prepare_packed_host([slot])
+        torch.testing.assert_close(runtime._host_buffers[torch.float32], slot.cpu_tensor)
+
+    def test_invalidate_layout_rejects_active_packed_step(self):
+        """A live packed plan cannot be detached from its staging storage."""
+        runtime = self.runtime
+        slot = self._prepared_slot(torch.arange(4, dtype=torch.float32))
+        runtime.begin_packed_step([[_unit(slot)]])
+        try:
+            with self.assertRaisesRegex(RuntimeError, "packed transfer"):
+                runtime.invalidate_packed_layout()
+        finally:
+            runtime.end_packed_step()
+
+    def test_teardown_drains_copy_submission_without_a_tail_event(self):
+        """An H2D error before event recording cannot free a still-written arena."""
+        runtime = self.runtime
+        slot = self._prepared_slot(torch.arange(4, dtype=torch.float32))
+        runtime.begin_packed_step([[_unit(slot)]])
+        stream = mock.Mock()
+        runtime._copy_stream = stream
+        self.assertIsNone(runtime._packed_tail_event)
+        self.assertEqual(slot.state, "host")
+        arena = runtime._staging_arenas[0]
+        stream.synchronize.side_effect = lambda: self.assertGreater(arena.raw_buffer.untyped_storage().size(), 0)
+
+        runtime.end_packed_step()
+
+        stream.synchronize.assert_called_once_with()
+        self.assertEqual(arena.raw_buffer.untyped_storage().size(), 0)
 
     def _transfer_packed(self, batch_index, staging_index):
         """Run the packed H2D for one batch through the shared copy stream."""
@@ -1871,555 +1981,14 @@ class TestModuleHelpers(unittest.TestCase):
         self.assertEqual(list(_iter_unique_events([])), [])
 
     def test_validate_state_keys_normalizes_and_keeps_none(self):
-        """Configured keys keep their order; master_param is allowed through."""
+        """Configured keys keep their order while empty and None remain distinct."""
         self.assertEqual(validate_state_keys(("exp_avg_sq", "exp_avg")), ("exp_avg_sq", "exp_avg"))
-        self.assertEqual(validate_state_keys(("master_param", "exp_avg")), ("master_param", "exp_avg"))
         self.assertEqual(validate_state_keys([]), ())
         self.assertIsNone(validate_state_keys(None))
 
     def test_validate_state_keys_rejects_unknown_logical_keys(self):
-        """Only Adam/AdamW logical slots are accepted."""
-        with self.assertRaisesRegex(ValueError, "only supports Adam/AdamW logical slots"):
-            validate_state_keys(("exp_avg", "momentum_buffer"))
-
-
-class _AdapterTestCase(unittest.TestCase):
-    """Shared construction helpers for the adapter tests."""
-
-    def _adapter(self, optimizer, **config):
-        """Build an adapter over ``optimizer`` with a per-tensor runtime."""
-        values = {"swap_times": 2, "packed_swap": False, "min_numel": 0, "state_keys": None}
-        values.update(config)
-        runtime = PipelineSwapRuntime(SimpleNamespace(**values))
-        return OptimizerSwapAdapter(optimizer, runtime.config, runtime), runtime
-
-    def _adam(self, params):
-        """Build an Adam adapter with an empty slot registry."""
-        optimizer = torch.optim.Adam(list(params), lr=0.01)
-        adapter, runtime = self._adapter(optimizer)
-        return optimizer, adapter, runtime
-
-
-class TestSwapAdapterSlots(_AdapterTestCase):
-    """Adapter slot construction, ordering and state-key selection."""
-
-    def test_make_slot_requires_a_tensor_or_template(self):
-        """A slot cannot be described without metadata."""
-        _, adapter, _ = self._adam([torch.nn.Parameter(torch.ones(4))])
-
-        with self.assertRaisesRegex(ValueError, "without a tensor or template"):
-            adapter._make_slot("exp_avg", None)
-
-    def test_make_slot_from_a_tensor_records_swappability_and_state(self):
-        """A tensor-backed slot is device-resident and follows runtime eligibility."""
-        _, adapter, runtime = self._adam([torch.nn.Parameter(torch.ones(4))])
-        runtime.is_swappable_tensor = mock.Mock(return_value=True)
-
-        slot = adapter._make_slot("exp_avg", torch.ones(8))
-
-        self.assertEqual(slot.name, "exp_avg")
-        self.assertTrue(slot.swappable)
-        self.assertEqual(slot.state, "device")
-        self.assertIsNone(slot.logical_tensor)
-        runtime.is_swappable_tensor.assert_called_once_with(mock.ANY, 0)
-
-    def test_make_slot_marks_packed_state_for_packed_runtimes(self):
-        """Packed runtimes flag the slot and bind a DTensor logical tensor."""
-        local = torch.ones(4)
-        wrapper = SimpleNamespace(to_local=lambda: local, device=torch.device("cpu"))
-        adapter, runtime = self._adapter(
-            torch.optim.Adam([torch.nn.Parameter(torch.ones(4))], lr=0.01),
-            packed_swap=True,
-        )
-        # The wrapper nests a real tensor, so only the local shard decides eligibility.
-        runtime.is_swappable_tensor = mock.Mock(return_value=True)
-
-        slot = adapter._make_slot("exp_avg", wrapper)
-
-        self.assertTrue(slot.packed)
-        self.assertTrue(slot.swappable)
-        self.assertIs(slot.logical_tensor, wrapper)
-        self.assertEqual(slot.device, local.device)
-
-    def test_make_slot_keeps_plain_tensors_out_of_the_logical_binding(self):
-        """A state tensor without a local-shard wrapper is packed but never rebound."""
-        adapter, runtime = self._adapter(
-            torch.optim.Adam([torch.nn.Parameter(torch.ones(4))], lr=0.01),
-            packed_swap=True,
-        )
-        runtime.is_swappable_tensor = mock.Mock(return_value=True)
-
-        slot = adapter._make_slot("exp_avg", torch.ones(4))
-
-        self.assertTrue(slot.swappable)
-        self.assertTrue(slot.packed)
-        self.assertIsNone(slot.logical_tensor)
-
-    def test_make_slot_from_a_template_starts_pending(self):
-        """A packed candidate has no live tensor until its host buffer exists."""
-        adapter, runtime = self._adapter(
-            torch.optim.Adam([torch.nn.Parameter(torch.ones(4))], lr=0.01),
-            packed_swap=True,
-        )
-        runtime.is_packable_template = mock.Mock(return_value=True)
-
-        slot = adapter._make_slot("exp_avg", None, template=torch.ones(8))
-
-        self.assertTrue(slot.swappable)
-        self.assertTrue(slot.packed)
-        self.assertIsNone(slot.tensor)
-        self.assertEqual(slot.state, "pending")
-
-    def test_build_slots_reuses_a_registered_slot(self):
-        """A registered slot is reused while it still owns the state tensor."""
-        param = torch.nn.Parameter(torch.ones(4))
-        _, adapter, runtime = self._adam([param])
-        runtime.config.state_keys = ("exp_avg",)
-        tensor = torch.ones(4)
-        registered = adapter._make_slot("exp_avg", tensor)
-        adapter._slots[(id(param), "exp_avg")] = registered
-        adapter.optimizer.state[param]["exp_avg"] = tensor
-
-        slots = adapter._build_slots(param, {"exp_avg": tensor})
-
-        self.assertEqual(slots, [registered])
-
-    def test_build_slots_reuses_a_slot_bound_to_its_cpu_mirror(self):
-        """A host-resident slot matching the CPU mirror survives an offload."""
-        param = torch.nn.Parameter(torch.ones(4))
-        _, adapter, runtime = self._adam([param])
-        runtime.config.state_keys = ("exp_avg",)
-        mirror = torch.zeros(4)
-        slot = SwapSlot(name="exp_avg", tensor=torch.zeros(4), cpu_tensor=mirror, swappable=True, state="host")
-        adapter._slots[(id(param), "exp_avg")] = slot
-        adapter.optimizer.state[param]["exp_avg"] = mirror
-
-        slots = adapter._build_slots(param, {"exp_avg": mirror})
-
-        self.assertEqual(slots, [slot])
-
-    def test_build_slots_replaces_a_slot_whose_tensor_changed(self):
-        """A state tensor replaced outside the adapter gets a fresh slot."""
-        param = torch.nn.Parameter(torch.ones(4))
-        _, adapter, runtime = self._adam([param])
-        runtime.config.state_keys = ("exp_avg",)
-        stale = SwapSlot(name="exp_avg", tensor=torch.zeros(4), swappable=True)
-        adapter._slots[(id(param), "exp_avg")] = stale
-        replacement = torch.ones(4)
-        adapter.optimizer.state[param]["exp_avg"] = replacement
-
-        slots = adapter._build_slots(param, {"exp_avg": replacement})
-
-        self.assertEqual(len(slots), 1)
-        self.assertIsNot(slots[0], stale)
-        self.assertIs(slots[0].tensor, replacement)
-        self.assertIs(adapter._slots[(id(param), "exp_avg")], slots[0])
-
-    def test_build_slots_creates_a_slot_for_unregistered_state(self):
-        """State present but unregistered is wrapped in a fresh slot."""
-        param = torch.nn.Parameter(torch.ones(4))
-        _, adapter, runtime = self._adam([param])
-        runtime.config.state_keys = ("exp_avg",)
-        tensor = torch.ones(4)
-        adapter.optimizer.state[param]["exp_avg"] = tensor
-
-        slots = adapter._build_slots(param, {"exp_avg": tensor})
-
-        self.assertEqual(len(slots), 1)
-        self.assertIs(slots[0].tensor, tensor)
-        self.assertIs(adapter._slots[(id(param), "exp_avg")], slots[0])
-
-    def test_register_present_slots_adds_configured_state(self):
-        """Configured state that already exists is registered for tracking."""
-        param = torch.nn.Parameter(torch.ones(4))
-        _, adapter, _ = self._adam([param])
-
-        adapter._register_present_slots(param, {"exp_avg": torch.ones(4), "step": torch.zeros(())})
-
-        self.assertEqual(set(adapter._slots), {(id(param), "exp_avg")})
-
-    def test_register_present_slots_keeps_the_earlier_registration(self):
-        """Registering twice is a no-op once a slot is already tracked."""
-        param = torch.nn.Parameter(torch.ones(4))
-        _, adapter, _ = self._adam([param])
-        existing = SwapSlot(name="exp_avg", tensor=torch.zeros(4), swappable=True)
-        adapter._slots[(id(param), "exp_avg")] = existing
-
-        adapter._register_present_slots(param, {"exp_avg": torch.ones(4)})
-
-        self.assertIs(adapter._slots[(id(param), "exp_avg")], existing)
-
-    def test_ordered_slots_follow_parameter_and_key_order(self):
-        """Slot ordering is stable and free of duplicates."""
-        params = [torch.nn.Parameter(torch.ones(4)) for _ in range(2)]
-        optimizer, adapter, _ = self._adam(params)
-        for param in params:
-            for key in ADAM_STATE_KEYS:
-                adapter._slots[(id(param), key)] = SwapSlot(name=key, tensor=torch.ones(4))
-        # A second group adds its own parameter after the first group's slots.
-        third = torch.nn.Parameter(torch.ones(4))
-        optimizer.add_param_group({"params": [third]})
-        for key in ADAM_STATE_KEYS:
-            adapter._slots[(id(third), key)] = SwapSlot(name=key, tensor=torch.ones(4))
-
-        slots = adapter._ordered_slots()
-
-        self.assertEqual([slot.name for slot in slots], list(ADAM_STATE_KEYS) * 3)
-
-    def test_configured_state_keys_drops_master_param_from_the_defaults(self):
-        """master_param is not an Adam state key, so default selection skips it."""
-        _, adapter, _ = self._adam([torch.nn.Parameter(torch.ones(4))])
-
-        self.assertEqual(adapter._configured_state_keys(), ALL_STATE_KEYS)
-
-    def test_configured_state_keys_honours_a_selection(self):
-        """An explicit selection keeps its order."""
-        _, adapter, runtime = self._adam([torch.nn.Parameter(torch.ones(4))])
-        runtime.config.state_keys = ("exp_avg_sq", "exp_avg")
-
-        self.assertEqual(adapter._configured_state_keys(), ("exp_avg_sq", "exp_avg"))
-
-    def test_configured_state_keys_rejects_master_param_when_explicit(self):
-        """master_param is only a valid key for optimizers that own a master copy."""
-        _, adapter, runtime = self._adam([torch.nn.Parameter(torch.ones(4))])
-        runtime.config.state_keys = ("exp_avg_sq", "master_param")
-
-        with self.assertRaisesRegex(ValueError, "master_param"):
-            adapter._configured_state_keys()
-
-    def test_state_keys_for_param_reports_a_missing_configured_key(self):
-        """A configured key absent from the parameter state is a hard error."""
-        param = torch.nn.Parameter(torch.ones(4))
-        _, adapter, runtime = self._adam([param])
-        runtime.config.state_keys = ("exp_avg",)
-        adapter.optimizer.state[param]["exp_avg_sq"] = torch.zeros(4)
-
-        with self.assertRaisesRegex(ValueError, "is not present for parameter"):
-            adapter._state_keys_for_param(param)
-
-    def test_state_keys_for_param_returns_present_configured_keys(self):
-        """Only keys that exist in the parameter state are selected."""
-        param = torch.nn.Parameter(torch.ones(4))
-        _, adapter, _ = self._adam([param])
-        adapter.optimizer.state[param].update({"exp_avg": torch.zeros(4), "step": torch.zeros(())})
-
-        self.assertEqual(adapter._state_keys_for_param(param), ("exp_avg",))
-
-    def test_state_keys_for_param_falls_back_to_defaults_when_unconfigured(self):
-        """Without an explicit selection, present default keys are returned."""
-        param = torch.nn.Parameter(torch.ones(4))
-        _, adapter, _ = self._adam([param])
-        adapter.optimizer.state[param].update({
-            "exp_avg": torch.zeros(4),
-            "exp_avg_sq": torch.zeros(4),
-            "max_exp_avg_sq": torch.zeros(4),
-        })
-
-        self.assertEqual(
-            adapter._state_keys_for_param(param),
-            ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"),
-        )
-
-    def test_slot_tensor_prefers_an_active_slot_and_falls_back(self):
-        """Only device-resident swappable slots shadow the optimizer state."""
-        fallback = torch.zeros(4)
-        active = torch.ones(4)
-        slot = SwapSlot(name="exp_avg", tensor=active, swappable=True, state="device")
-        unit = _unit(slot)
-
-        self.assertIs(OptimizerSwapAdapter._slot_tensor(unit, "exp_avg", fallback), active)
-
-        slot.state = "h2d"
-        self.assertIs(OptimizerSwapAdapter._slot_tensor(unit, "exp_avg", fallback), fallback)
-        self.assertIs(OptimizerSwapAdapter._slot_tensor(unit, "exp_avg_sq", fallback), fallback)
-
-    def test_slot_tensor_ignores_slots_without_a_live_tensor(self):
-        """A pending or unswappable slot always falls back to the state tensor."""
-        fallback = torch.zeros(4)
-        pending = SwapSlot(name="exp_avg", tensor=None, swappable=True, state="pending")
-        tiny = SwapSlot(name="exp_avg", tensor=torch.ones(4), swappable=False, state="device")
-
-        self.assertIs(OptimizerSwapAdapter._slot_tensor(_unit(pending), "exp_avg", fallback), fallback)
-        self.assertIs(OptimizerSwapAdapter._slot_tensor(_unit(tiny), "exp_avg", fallback), fallback)
-
-
-class TestSwapAdapterStepPreparation(_AdapterTestCase):
-    """Unit collection, flag validation and state initialization."""
-
-    def test_prepare_step_rejects_closure_or_extra_arguments(self):
-        """The swap pipeline never runs a Torch closure."""
-        param = torch.nn.Parameter(torch.ones(8))
-        adapter, _ = self._adapter(torch.optim.Adam([param], lr=0.01))
-
-        with self.assertRaisesRegex(ValueError, "does not support closure or extra arguments"):
-            adapter.prepare_step(lambda: None)
-
-    def test_prepare_step_skips_parameters_without_dense_gradients(self):
-        """Parameters without a gradient contribute no update unit."""
-        params = [torch.nn.Parameter(torch.ones(8)) for _ in range(2)]
-        adapter, _ = self._adapter(torch.optim.Adam(params, lr=0.01))
-        params[0].grad = torch.ones_like(params[0])
-
-        units = adapter.prepare_step()["units"]
-
-        self.assertEqual(len(units), 1)
-        self.assertIs(units[0].param, params[0])
-
-    def test_prepare_step_rejects_sparse_gradients(self):
-        """Sparse gradients cannot be replayed through the functional Adam."""
-        param = torch.nn.Parameter(torch.ones(8))
-        adapter, _ = self._adapter(torch.optim.Adam([param], lr=0.01))
-        param.grad = torch.sparse_coo_tensor(torch.tensor([[0]]), torch.tensor([1.0]), (8,))
-
-        with self.assertRaisesRegex(ValueError, "only supports dense Adam/AdamW gradients"):
-            adapter.prepare_step()
-
-    def test_prepare_step_registers_slots_for_collected_units(self):
-        """Unit slots are created while initializing lazy optimizer state."""
-        param = torch.nn.Parameter(torch.ones(8))
-        adapter, _ = self._adapter(torch.optim.Adam([param], lr=0.01))
-        param.grad = torch.ones_like(param)
-
-        units = adapter.prepare_step()["units"]
-
-        self.assertEqual([unit.adapter_index for unit in units], [0])
-        self.assertEqual({slot.name for slot in units[0].slots}, set(ADAM_STATE_KEYS))
-        for slot in units[0].slots:
-            self.assertIs(adapter._slots[(id(param), slot.name)], slot)
-
-    def test_prepare_step_reports_the_group_index_of_each_unit(self):
-        """Units carry the index of the group whose parameters they came from."""
-        first = torch.nn.Parameter(torch.ones(8))
-        second = torch.nn.Parameter(torch.ones(8))
-        optimizer = torch.optim.Adam([{"params": [first]}, {"params": [second], "lr": 0.02}], lr=0.01)
-        adapter, _ = self._adapter(optimizer)
-        first.grad = torch.ones_like(first)
-        second.grad = torch.ones_like(second)
-
-        units = adapter.prepare_step()["units"]
-
-        self.assertEqual([unit.adapter_index for unit in units], [0, 1])
-        self.assertEqual([id(unit.param) for unit in units], [id(first), id(second)])
-
-    def test_validate_rejects_unsupported_flag_combinations(self):
-        """Flags that change kernel selection cannot be preserved through swap."""
-        cases = [
-            (torch.optim.Adam, {"foreach": True}, "foreach=True"),
-            (torch.optim.Adam, {"fused": True}, "fused=True"),
-            (torch.optim.Adam, {"differentiable": True}, "differentiable=True"),
-            (torch.optim.Adam, {"capturable": True}, "capturable=True"),
-            (torch.optim.AdamW, {"capturable": True}, "capturable=True"),
-        ]
-        for optimizer_type, kwargs, message in cases:
-            with self.subTest(optimizer=optimizer_type.__name__, flag=message):
-                param = torch.nn.Parameter(torch.ones(8))
-                adapter, _ = self._adapter(optimizer_type([param], **kwargs))
-
-                with self.assertRaisesRegex(ValueError, message):
-                    adapter.validate()
-
-    def test_validate_accepts_the_defaults(self):
-        """Default Adam and AdamW groups pass validation."""
-        param = torch.nn.Parameter(torch.ones(8))
-        for optimizer_type in (torch.optim.Adam, torch.optim.AdamW):
-            with self.subTest(optimizer=optimizer_type.__name__):
-                adapter, _ = self._adapter(optimizer_type([param], lr=0.01))
-                adapter.validate()
-
-    def test_torch_adapters_select_by_optimizer_type(self):
-        """Adam and AdamW pick different adapters even though AdamW subclasses Adam."""
-        param = torch.nn.Parameter(torch.ones(8))
-        adam = torch.optim.Adam([param], lr=0.01)
-        adamw = torch.optim.AdamW([param], lr=0.01)
-
-        self.assertTrue(TorchNativeAdamAdapter.matches(adam))
-        self.assertFalse(TorchNativeAdamAdapter.matches(adamw))
-        self.assertTrue(TorchNativeAdamWAdapter.matches(adamw))
-        self.assertFalse(TorchNativeAdamWAdapter.matches(adam))
-
-    def test_init_param_state_keeps_swappable_state_on_the_host(self):
-        """Legacy swap initializes a zero CPU mirror and empty device placeholders."""
-        param = torch.nn.Parameter(torch.ones(8))
-        adapter, runtime = self._adapter(torch.optim.Adam([param], lr=0.01))
-        runtime.is_swappable_tensor = mock.Mock(return_value=True)
-        runtime.make_zero_cpu_tensor_like = mock.Mock(return_value=torch.zeros(8))
-        runtime.release_device_storage = mock.Mock()
-
-        adapter._init_param_state(param, torch.ones(8), {"amsgrad": False})
-
-        state = adapter.optimizer.state[param]
-        self.assertEqual(set(state), {"step", "exp_avg", "exp_avg_sq"})
-        self.assertEqual(state["step"].device.type, "cpu")
-        slot = adapter._slots[(id(param), "exp_avg")]
-        self.assertEqual(slot.state, "host")
-        self.assertTrue(torch.equal(slot.cpu_tensor, torch.zeros(8)))
-        self.assertEqual(runtime.release_device_storage.call_count, 2)
-
-    def test_init_param_state_zeroes_state_when_swap_is_not_eligible(self):
-        """Resident state is materialized as a zero tensor on the parameter device."""
-        param = torch.nn.Parameter(torch.ones(8))
-        adapter, runtime = self._adapter(torch.optim.Adam([param], lr=0.01), min_numel=1024)
-
-        adapter._init_param_state(param, torch.ones(8), {"amsgrad": False})
-
-        state = adapter.optimizer.state[param]
-        self.assertEqual(state["exp_avg"].device.type, "cpu")
-        self.assertEqual(torch.count_nonzero(state["exp_avg"]).item(), 0)
-        self.assertNotIn((id(param), "exp_avg"), adapter._slots)
-        self.assertFalse(runtime.packed_enabled)
-
-    def test_init_param_state_is_idempotent_for_existing_state(self):
-        """State that already exists is never re-initialized."""
-        param = torch.nn.Parameter(torch.ones(8))
-        adapter, _ = self._adapter(torch.optim.Adam([param], lr=0.01))
-        existing = torch.ones(8)
-        adapter.optimizer.state[param]["exp_avg"] = existing
-
-        adapter._init_param_state(param, torch.ones(8), {"amsgrad": False})
-
-        self.assertIs(adapter.optimizer.state[param]["exp_avg"], existing)
-
-    def test_init_param_state_skips_step_for_new_adamw(self):
-        """hyper-parallel's AdamW owns its step counter, so none is created."""
-        param = torch.nn.Parameter(torch.ones(8))
-        optimizer = torch.optim.AdamW([param], lr=0.01)
-        adapter = object.__new__(OptimizerSwapAdapter)
-        adapter.optimizer = optimizer
-        adapter._slots = {}
-        adapter.is_new_adamw = True
-        adapter.runtime = PipelineSwapRuntime(_DummyConfig())
-        adapter.config = adapter.runtime.config
-
-        adapter._init_param_state(param, None, {"amsgrad": False})
-
-        self.assertNotIn("step", optimizer.state[param])
-        self.assertEqual(set(optimizer.state[param]), set(ADAM_STATE_KEYS))
-
-    def test_init_param_state_adds_amsgrad_state_only_when_requested(self):
-        """amsgrad adds the running maximum beside the two moments."""
-        param = torch.nn.Parameter(torch.ones(8))
-        optimizer = torch.optim.AdamW([param], lr=0.01)
-        adapter = object.__new__(OptimizerSwapAdapter)
-        adapter.optimizer = optimizer
-        adapter._slots = {}
-        adapter.is_new_adamw = True
-        adapter.runtime = PipelineSwapRuntime(_DummyConfig())
-        adapter.config = adapter.runtime.config
-
-        adapter._init_param_state(param, None, {"amsgrad": True})
-
-        self.assertEqual(set(optimizer.state[param]), set(ALL_STATE_KEYS))
-
-    def test_publish_packed_state_is_a_noop_for_per_tensor_runtimes(self):
-        """Legacy runtimes leave the optimizer state mapping untouched."""
-        param = torch.nn.Parameter(torch.ones(8))
-        optimizer = torch.optim.Adam([param], lr=0.01)
-        adapter, _ = self._adapter(optimizer)
-        slot = SwapSlot(name="exp_avg", tensor=torch.ones(8), swappable=True, state="host")
-        slot.cpu_tensor = torch.zeros(8)
-        adapter._slots[(id(param), "exp_avg")] = slot
-
-        adapter.publish_packed_state()
-
-        self.assertNotIn("exp_avg", optimizer.state[param])
-
-    def test_publish_packed_state_creates_missing_state_mappings(self):
-        """A packed host view is published even when no mapping exists yet."""
-        param = torch.nn.Parameter(torch.ones(8))
-        optimizer = torch.optim.Adam([param], lr=0.01)
-        adapter, _ = self._adapter(optimizer, packed_swap=True, min_numel=1)
-        slot = SwapSlot(name="exp_avg", tensor=None, swappable=True, packed=True, state="host")
-        slot.cpu_tensor = torch.zeros(8)
-        adapter._slots[(id(param), "exp_avg")] = slot
-        optimizer.state.pop(param, None)
-
-        adapter.publish_packed_state()
-
-        self.assertIs(optimizer.state[param]["exp_avg"], slot.cpu_tensor)
-
-    def test_publish_packed_state_skips_unpacked_slots(self):
-        """Only packed host views replace the optimizer state tensors."""
-        param = torch.nn.Parameter(torch.ones(8))
-        optimizer = torch.optim.Adam([param], lr=0.01)
-        adapter, _ = self._adapter(optimizer, packed_swap=True, min_numel=1)
-        slot = SwapSlot(name="exp_avg", tensor=torch.ones(8), swappable=True, packed=False, state="host")
-        slot.cpu_tensor = torch.zeros(8)
-        adapter._slots[(id(param), "exp_avg")] = slot
-        published = torch.ones(8)
-        optimizer.state[param]["exp_avg"] = published
-
-        adapter.publish_packed_state()
-
-        self.assertIs(optimizer.state[param]["exp_avg"], published)
-
-    def test_strip_swappable_state_splits_adam_buffers(self):
-        """Checkpoint loading removes swap-managed keys from the Torch state dict."""
-        param = torch.nn.Parameter(torch.ones(8))
-        adapter, _ = self._adapter(torch.optim.Adam([param], lr=0.01))
-        state_dict = {
-            "state": {
-                id(param): {
-                    "step": torch.zeros(()),
-                    "exp_avg": torch.ones(8),
-                    "exp_avg_sq": torch.full((8,), 2.0),
-                },
-            },
-            "param_groups": [{"params": [id(param)]}],
-        }
-
-        stripped, removed = adapter.strip_swappable_state(state_dict)
-
-        self.assertEqual(set(stripped["state"][id(param)]), {"step"})
-        self.assertEqual(set(removed[id(param)]), set(ADAM_STATE_KEYS))
-        # The original checkpoint is left untouched for the second load phase.
-        self.assertEqual(set(state_dict["state"][id(param)]), {"step", *ADAM_STATE_KEYS})
-
-    def test_strip_swappable_state_shares_checkpoint_tensor_storage(self):
-        """Stripping must not duplicate optimizer tensors on host memory."""
-        param = torch.nn.Parameter(torch.ones(8))
-        adapter, _ = self._adapter(torch.optim.Adam([param], lr=0.01))
-        exp_avg = torch.ones(8)
-        state_dict = {
-            "state": {id(param): {"step": torch.zeros(()), "exp_avg": exp_avg}},
-            "param_groups": [{"params": [id(param)], "lr": 0.01}],
-        }
-
-        stripped, removed = adapter.strip_swappable_state(state_dict)
-
-        # The removed buffer is the checkpoint's own storage, not a copy.
-        self.assertIs(removed[id(param)]["exp_avg"], exp_avg)
-        # Non-swappable entries stay aliased too: no tensor is cloned at all.
-        self.assertIs(stripped["state"][id(param)]["step"], state_dict["state"][id(param)]["step"])
-        # Container skeleton is fresh, so popping cannot touch the caller's dict.
-        self.assertIsNot(stripped, state_dict)
-        self.assertIsNot(stripped["state"], state_dict["state"])
-        self.assertIsNot(stripped["param_groups"], state_dict["param_groups"])
-        self.assertIsNot(stripped["param_groups"][0], state_dict["param_groups"][0])
-        self.assertEqual(set(state_dict["state"][id(param)]), {"step", "exp_avg"})
-
-    def test_initial_slots_discovers_pre_existing_state(self):
-        """State materialized before wrapping is discovered for the first offload."""
-        param = torch.nn.Parameter(torch.ones(8))
-        optimizer = torch.optim.Adam([param], lr=0.01)
-        optimizer.state[param]["exp_avg"] = torch.ones(8)
-        optimizer.state[param]["exp_avg_sq"] = torch.ones(8)
-        adapter, _ = self._adapter(optimizer)
-
-        slots = adapter.initial_slots()
-
-        self.assertEqual({slot.name for slot in slots}, set(ADAM_STATE_KEYS))
-        self.assertEqual(
-            {id(slot.tensor) for slot in slots},
-            {id(optimizer.state[param]["exp_avg"]), id(optimizer.state[param]["exp_avg_sq"])},
-        )
-
-    def test_initial_slots_ignores_parameters_without_state(self):
-        """Lazy state stays lazy until the first optimizer step."""
-        param = torch.nn.Parameter(torch.ones(8))
-        adapter, _ = self._adapter(torch.optim.Adam([param], lr=0.01))
-
-        self.assertEqual(tuple(adapter.initial_slots()), ())
-
-
-if __name__ == "__main__":
-    unittest.main()
+        """A key outside the shared vocabulary is rejected lexically."""
+        for invalid_key in ("master_param", "not_a_state_key"):
+            with self.subTest(invalid_key=invalid_key):
+                with self.assertRaisesRegex(ValueError, "only supports optimizer state slots"):
+                    validate_state_keys(("exp_avg", invalid_key))
