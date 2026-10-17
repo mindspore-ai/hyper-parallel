@@ -148,6 +148,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
 | **hf-model-integration** | Integrate HF-native or HF-component custom models through model-owned adapters | model onboarding / functional bring-up |
 | **hf-model-precision-validation** | Validate module parity and distributed numerical self-consistency | model numerical acceptance / diagnosis |
+| **formal-verification** | Official FM-Agent integration for training contracts and reproduced correctness bugs | `/formal-verify`, specification-driven bug hunting |
 
 ### Commands
 
@@ -158,6 +159,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | `/create-pr` | `autogit pr` → upstream |
 | `/code-review` | `code-review` skill (+ mandatory `code-style.md`) |
 | `/gen-commit-msg` | Message only, no commit |
+| `/formal-verify` | `formal-verification` skill → official FM-Agent + training context |
 
 ### Agents
 
@@ -175,6 +177,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **activation-dev** | Activation recompute/swap + LlamaFactory ordering (details in `activation-dev-guide.md`) |
 | **llamafactory-hp** | LlamaFactory integration surface (activation details → `activation-dev`) |
 | **parallel-strategy-analyzer** | Thin proxy → `skills/parallel-strategy-analyzer` |
+| **formal-verifier** | Thin proxy → `skills/formal-verification` (training correctness + bug reproduction) |
 
 ### Rules (auto-applied by path)
 
