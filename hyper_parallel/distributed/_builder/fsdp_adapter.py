@@ -536,19 +536,57 @@ class FSDP2Manager:
         hsdp_module.set_gradient_scaling_factor(1.0 / source_gradient_domain_size)
         return True
 
+    @staticmethod
+    def _issues_collectives(hsdp_module: HSDPModule) -> bool:
+        """Whether this FSDP unit shards anything, i.e. has collectives to hide.
+
+        A unit whose shard group holds a single rank still gets hooks and a
+        prefetch slot, but its unshard and reshard are no-ops. Letting such a
+        unit occupy a slot pushes every real prefetch one link later -- and when
+        the inert unit is *nested* inside the unit it precedes, as a routed
+        experts container is inside its transformer block, the delay is the
+        whole unit: a block's backward unshard would have to be prefetched by
+        the unit that follows it in traversal order, whose backward hook fires
+        after the block's own, so the block unshards with nothing in flight.
+        """
+        hsdp_state = getattr(
+            getattr(hsdp_module, "hsdp_scheduler", None), "hsdp_state", None
+        )
+        if hsdp_state is None:
+            return False
+        return any(
+            getattr(hsdp_param, "shard_world_size", 1) > 1
+            for hsdp_param in getattr(hsdp_state, "hsdp_params", ())
+        )
+
     def _configure_prefetch(self, hsdp_modules: list[HSDPModule]) -> None:
-        """Configure forward and backward prefetch targets by list depth."""
-        for module_index, hsdp_module in enumerate(hsdp_modules):
+        """Configure forward and backward prefetch targets by list depth.
+
+        The chain holds the units that actually issue collectives, so a depth of
+        1 means "the next unit with something to prefetch" rather than "the next
+        entry in traversal order". See ``_issues_collectives`` for why the
+        difference matters to a nested, single-rank unit.
+        """
+        chain = [module for module in hsdp_modules if self._issues_collectives(module)]
+        if len(chain) != len(hsdp_modules):
+            logger.info(
+                "FSDP2 prefetch chain: %d of %d units issue collectives; the "
+                "other %d are single-rank and were left out of the chain",
+                len(chain),
+                len(hsdp_modules),
+                len(hsdp_modules) - len(chain),
+            )
+        for module_index, hsdp_module in enumerate(chain):
             forward_end = module_index + self.config.forward_prefetch_depth + 1
             hsdp_module.set_modules_to_forward_prefetch(
-                hsdp_modules[module_index + 1:forward_end]
+                chain[module_index + 1:forward_end]
             )
 
             backward_start = max(
                 0, module_index - self.config.backward_prefetch_depth
             )
             hsdp_module.set_modules_to_backward_prefetch(
-                list(reversed(hsdp_modules[backward_start:module_index]))
+                list(reversed(chain[backward_start:module_index]))
             )
 
     def _order_wrap_modules(
