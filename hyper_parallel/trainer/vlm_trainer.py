@@ -28,6 +28,7 @@ from hyper_parallel.models.registry import resolve_model_adapter
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
+from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
 from hyper_parallel.trainer.runtime.device import synchronize  # pylint: disable=syntax-error
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config import TrainerConfig
@@ -46,6 +47,12 @@ class VLMTrainer:
         self.base.config = config
 
         self.base._setup()
+        memory_profiler.reset(
+            self.base.config.memory,
+            global_rank=self.base.global_rank,
+            tp_rank=self.base.mesh.tp_rank,
+            dp_rank=self.base.mesh.dp_rank,
+        )
         self.base._build_model()
         self.base._build_loss()
 
@@ -252,8 +259,12 @@ class VLMTrainer:
         """Execute one VLM training step.
 
         Args:
-            data_iterator: Iterator supplying packed Omni batches.
+            data_iterator: Iterator providing multimodal micro-batches.
+
+        Returns:
+            Aggregated loss and gradient norm.
         """
+        memory_profiler.step()
         first_training_batch = self.base.get_batch(data_iterator)
         num_micro_steps = self.base.num_micro_batches
         training_batches = [first_training_batch]
@@ -296,44 +307,58 @@ class VLMTrainer:
 
     def train(self) -> None:
         """Run the VLM training loop."""
-        config = self.base.config
-        self.on_train_begin()
-        logger.info(
-            "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
-            self.base.local_rank,
-            self.base.state.global_step,
-            self.base.train_iters,
-            self.base.state.epoch,
-            self.base.train_epochs,
-        )
+        try:
+            config = self.base.config
+            self.on_train_begin()
+            logger.info(
+                "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
+                self.base.local_rank,
+                self.base.state.global_step,
+                self.base.train_iters,
+                self.base.state.epoch,
+                self.base.train_epochs,
+            )
 
-        # Checkpoint resume restores state.global_step, state.epoch, and the DataLoader cursor.
-        for epoch in range(self.base.state.epoch, self.base.train_epochs):
-            train_dataloader = self.base.train_dataloader
+            # Checkpoint resume restores state.global_step, state.epoch, and the DataLoader cursor.
+            for epoch in range(self.base.state.epoch, self.base.train_epochs):
+                train_dataloader = self.base.train_dataloader
 
-            if hasattr(train_dataloader, "set_epoch"):
-                train_dataloader.set_epoch(epoch)
+                if hasattr(train_dataloader, "set_epoch"):
+                    train_dataloader.set_epoch(epoch)
 
-            self.on_epoch_begin()
-            data_iterator = iter(train_dataloader) if train_dataloader is not None else None
+                self.on_epoch_begin()
+                data_iterator = iter(train_dataloader) if train_dataloader is not None else None
 
-            start_step = self.base.state.global_step - epoch * self.base.train_steps
-            train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
-            for _ in range(start_step, train_steps):
-                try:
-                    self.train_step(data_iterator)
-                except StopIteration:
-                    logger.info("epoch:%s Dataloader finished with drop_last %s", epoch, config.dataloader.drop_last)
+                start_step = self.base.state.global_step - epoch * self.base.train_steps
+                train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+                for _ in range(start_step, train_steps):
+                    try:
+                        self.train_step(data_iterator)
+                    except StopIteration:
+                        logger.info(
+                            "epoch:%s Dataloader finished with drop_last %s", epoch, config.dataloader.drop_last
+                        )
+                        break
+
+                self.on_epoch_end()
+                self.base.state.epoch = epoch + 1
+                print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+
+                if self.base.state.global_step >= self.base.train_iters:
                     break
 
-            self.on_epoch_end()
-            self.base.state.epoch = epoch + 1
-            print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+            memory_profiler.stop()
+            self.on_train_end()
 
-            if self.base.state.global_step >= self.base.train_iters:
-                break
-
-        self.on_train_end()
+        except BaseException:
+            try:
+                memory_profiler.stop()
+            # Snapshot export must preserve the training error even if interrupted.
+            except BaseException:  # pylint: disable=broad-exception-caught
+                logger.exception("Failed to save memory snapshot after training error.")
+            finally:
+                self.base.abort_profilers()
+            raise
 
         synchronize()
         self.base.destroy_distributed()

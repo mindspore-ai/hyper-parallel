@@ -27,8 +27,10 @@ import unittest
 from pathlib import Path
 from typing import Dict, Optional
 
+from hyper_parallel.trainer.config import MemoryConfig, ProfilingConfig
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError
+from tests.common.mark_utils import arg_mark
 
 
 def _sample_model(  # pylint: disable=unused-argument
@@ -96,6 +98,91 @@ class TestConfigOverrides(unittest.TestCase):
         self.assertEqual(
             config.model.activation, "silu",
             msg=f"case: str_coercion, activation={config.model.activation!r}")
+
+    def test_profilers_share_enable_override(self) -> None:
+        """Use the same switch for performance and memory profiling.
+
+        Feature: Consistent profiler configuration switches.
+        Description: Enable both profilers through CLI overrides.
+        Expectation: Both enable fields are true and profiler.enabled is rejected.
+        """
+        config = self._parse("--profiler.enable=true", "--memory.enable=true")
+        self.assertTrue(config.profiler.enable)
+        self.assertTrue(config.memory.enable)
+        with self.assertRaises(ConfigResolutionError):
+            self._parse("--profiler.enabled=true")
+
+    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
+    def test_profiler_warmup_yaml_and_override(self) -> None:
+        """Resolve warmup steps from YAML and CLI overrides.
+
+        Feature: Public profiler warmup configuration.
+        Description: Read YAML warmup steps, then replace them through a dotted CLI override.
+        Expectation: Both values reach the typed profiler configuration.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yaml_path = Path(tmpdir) / "train.yaml"
+            yaml_path.write_text(
+                _SAMPLE_YAML.format(module=__name__) + "\nprofiler:\n  start_step: 3\n  warmup_steps: 1\n",
+                encoding="utf-8",
+            )
+            config = parse_training_args([str(yaml_path)])
+            self.assertEqual(config.profiler.warmup_steps, 1)
+            config = parse_training_args([str(yaml_path), "--profiler.warmup_steps=2"])
+            self.assertEqual(config.profiler.warmup_steps, 2)
+
+    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
+    def test_removed_profiler_options_are_rejected(self) -> None:
+        """Reject removed options through every user configuration entry.
+
+        Feature: Reduced profiler configuration surface.
+        Description: Supply removed fields through Python constructors, YAML, and CLI overrides.
+        Expectation: Each entry reports an unknown option before training starts.
+        """
+        options = (
+            ("profiler", ProfilingConfig, "start_on_init", True),
+            ("profiler", ProfilingConfig, "pipeline_stage_leaders", True),
+            ("profiler", ProfilingConfig, "mstx", True),
+            ("memory", MemoryConfig, "max_entries", 1000),
+        )
+        for section, config_type, name, value in options:
+            with self.subTest(section=section, name=name):
+                with self.assertRaisesRegex(TypeError, name):
+                    config_type(**{name: value})
+                with self.assertRaisesRegex(ConfigResolutionError, name):
+                    self._parse(f"--{section}.{name}={str(value).lower()}")
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    yaml_path = Path(tmpdir) / "train.yaml"
+                    yaml_path.write_text(
+                        _SAMPLE_YAML.format(module=__name__)
+                        + f"\n{section}:\n  {name}: {str(value).lower()}\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ConfigResolutionError, name):
+                        parse_training_args([str(yaml_path)])
+
+    def test_profiler_analysis_yaml_and_override(self) -> None:
+        """Resolve nested analysis options from YAML and dotted CLI overrides.
+
+        Feature: Public profiler analysis configuration.
+        Description: Disable analysis in YAML, then enable asynchronous analysis through CLI.
+        Expectation: Both sources populate the typed nested configuration.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yaml_path = Path(tmpdir) / "train.yaml"
+            yaml_path.write_text(
+                _SAMPLE_YAML.format(module=__name__)
+                + "\nprofiler:\n  analysis:\n    enable: false\n    async_mode: false\n",
+                encoding="utf-8",
+            )
+            config = parse_training_args([str(yaml_path)])
+            self.assertFalse(config.profiler.analysis.enable)
+            self.assertFalse(config.profiler.analysis.async_mode)
+            config = parse_training_args([
+                str(yaml_path), "--profiler.analysis.enable=true", "--profiler.analysis.async_mode=true",
+            ])
+            self.assertTrue(config.profiler.analysis.enable)
+            self.assertTrue(config.profiler.analysis.async_mode)
 
     def test_optimizer_target_argument(self) -> None:
         """``--optimizer.<arg>`` reaches the optimizer target through the shorthand."""
