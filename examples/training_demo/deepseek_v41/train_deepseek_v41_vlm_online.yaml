@@ -71,6 +71,14 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
+  # MegaMoe supports CP and TP+SP with EP>1; PP=1. Pair this replacement with its compute target below.
+  - match: "model.layers.*.mlp.experts"
+    module_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts
+    replace_module:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
+      # Upper bound on actual local rows; increase it for larger encoded VLM batches.
+      local_num_tokens: 4096
+      dispatch_mode: push  # Set to pull for GET dispatch.
   # The registered architecture runs without replacements. When Encoder
   # Parallel is enabled, its runtime requires the ViT attention wrapper.
   - match: "model.vision.blocks.*.attn"
@@ -159,13 +167,13 @@ plan_overrides:
     local_compute_fn:
       _target_: >-
         hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
+  # Native alternative: remove the MegaMoe expert replacement above and select
+  # deepseek_v41_ep_compute_fn with use_grouped_gemm: true.
   - match: "model.layers.*.mlp"
-    when: ep
     region_dispatch: false
     local_compute_fn:
       _target_: >-
-        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
-      use_grouped_gemm: true
+        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
 
 mixed_precision:
   enabled: false

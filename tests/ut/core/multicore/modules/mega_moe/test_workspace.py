@@ -38,6 +38,15 @@ from tests.common.mark_utils import arg_mark
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     """Validate SHMEM planning without allocating accelerator memory."""
 
+    def test_pending_backward_prevents_close_without_changing_buffers(self) -> None:
+        """An outstanding graph must release its claim before symmetric memory teardown."""
+        workspace = workspace_module.MegaMoeWorkspace(shared=False)
+        context = Mock()
+        workspace.track_graph(context)
+        self.assertFalse(workspace.can_close())
+        workspace.release_graph(context)
+        self.assertTrue(workspace.can_close())
+
     @staticmethod
     def _specification(initial_capacity_factor):
         """Build a fixed capacity-planning specification."""

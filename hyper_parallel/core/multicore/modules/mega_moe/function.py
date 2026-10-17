@@ -25,7 +25,7 @@ import torch_npu
 from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_call
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
-from .plan import MegaMoePlan
+from .plan import MegaMoePlan, record_plan_stream
 from .route import PreparedTopKRoute, RouteMetadata
 from .workspace import MegaMoeWorkspace
 
@@ -103,8 +103,8 @@ def _dispatch_and_source(spec: Any, workspace: Any, rows: Any, capacity: int) ->
     """Select transport storage while retaining a source-ready stream dependency."""
     if getattr(spec, "dispatch_mode", "push") == "push":
         return _workspace_tensor(workspace.expert_buffer, "expert_buffer"), rows
-    source = _workspace_tensor(workspace.source_buffer, "source_buffer")
-    if rows is not source:
+    source = _workspace_tensor(workspace.source_buffer, "source_buffer")[:rows.shape[0]]
+    if source.data_ptr() != rows.data_ptr():
         source.copy_(rows)
     dispatch = torch.empty((capacity, spec.hidden_size), dtype=rows.dtype, device=rows.device)
     return dispatch, source
@@ -114,13 +114,14 @@ def _stage_backward_source(ctx: Any, grad_output: Any, permutation_inputs: tuple
     """Write pull dY into SHMEM before expert scratch allocation."""
     if getattr(ctx.plan.spec, "dispatch_mode", "push") == "push":
         return grad_output, None
-    source = _workspace_tensor(ctx.workspace.source_buffer, "source_buffer")
+    source = _workspace_tensor(ctx.workspace.source_buffer, "source_buffer")[:ctx.source_rows]
     if not ctx.has_unpermute:
         source.copy_(grad_output)
         return source, None
     mapping, expert_output, probs = permutation_inputs
     grad_probs = torch.empty_like(probs)
-    multicore_ops.mega_moe_unpermute_grad_out(expert_output, grad_output, mapping, probs, source, grad_probs)
+    if ctx.source_rows:
+        multicore_ops.mega_moe_unpermute_grad_out(expert_output, grad_output, mapping, probs, source, grad_probs)
     return source, grad_probs.to(ctx.topk_dtype) if ctx.needs_input_grad[7] else None
 
 
@@ -264,14 +265,17 @@ def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any
     """Return an owned input gradient while the workspace lease is held."""
     if not ctx.needs_input_grad[0]:
         return None
+    grad_x = grad_x[:ctx.source_rows]
     if not ctx.has_permutation:
         return grad_x.clone()
     (unpermute_mapping,) = permutation_inputs
     spec = ctx.plan.spec
+    if ctx.token_rows == 0:
+        return grad_x[:0].clone()
     # Consume the shared gradient before release records completion.
     # The permutation gradient owns its reduced [T, H] output.
     return multicore_ops.moe_token_permute_grad(
-        grad_x, unpermute_mapping, spec.local_num_tokens, spec.top_k
+        grad_x, unpermute_mapping, ctx.token_rows, spec.top_k
     )
 
 
@@ -326,10 +330,11 @@ def _launch_forward_kernel(
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
+    record_plan_stream(plan, execution.profile_call.runtime_config)
     multicore_ops.mega_moe_with_profile_buffer(
         execution.dispatch,
         metadata.dispatch_target_off * spec.hidden_size,
-        routed_tokens.contiguous(),
+        _native_source(routed_tokens),
         metadata.dispatch_src_off * spec.hidden_size,
         metadata.dispatch_size * spec.hidden_size,
         weight1,
@@ -354,7 +359,7 @@ def _launch_forward_kernel(
         spec.ep_size,
         spec.num_experts,
         spec.hidden_size,
-        spec.local_num_tokens,
+        getattr(spec, "plan_tokens", spec.local_num_tokens),
     )
 
 
@@ -366,11 +371,12 @@ def _launch_backward_kernel(
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
+    record_plan_stream(plan, execution.profile_call.runtime_config)
     gradients = execution.intermediates
     multicore_ops.mega_moe_grad_with_profile_buffer(
         execution.dispatch,
         saved.dispatch_target_off * spec.hidden_size,
-        grad_output.contiguous(),
+        _native_source(grad_output),
         saved.dispatch_src_off * spec.hidden_size,
         saved.dispatch_size * spec.hidden_size,
         saved.activation,
@@ -402,8 +408,20 @@ def _launch_backward_kernel(
         spec.ep_size,
         spec.num_experts,
         spec.hidden_size,
-        spec.local_num_tokens,
+        getattr(spec, "plan_tokens", spec.local_num_tokens),
     )
+
+
+def _native_source(tensor: torch.Tensor) -> torch.Tensor:
+    """Keep a non-null ABI pointer and preserve empty symmetric source storage."""
+    if tensor.shape[0] == 0:
+        row_elements = tensor.shape[1]
+        required_bytes = (tensor.storage_offset() + row_elements) * tensor.element_size()
+        if tensor.untyped_storage().nbytes() >= required_bytes:
+            # Pull derives remote addresses from this local symmetric base even on empty ranks.
+            return tensor.as_strided((1, row_elements), (row_elements, 1))
+        return tensor.new_empty((1, tensor.shape[1]))
+    return tensor.contiguous()
 
 
 # Torch declares variadic autograd hooks; concrete functions use operator-specific signatures.
@@ -451,6 +469,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             routed_tokens, _, unpermute_mapping = permutation
             if ctx.needs_input_grad[0] or topk_weights is not None:
                 permutation_inputs = (unpermute_mapping,)
+        ctx.source_rows = routed_tokens.shape[0]
+        ctx.token_rows = ctx.source_rows // spec.top_k
         ctx.has_permutation = permutation is not None
         ctx.has_unpermute = topk_weights is not None
         if workspace_claimed:
@@ -478,7 +498,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution,
             )
             execution.profile_call.complete()
-            output = execution.combine.clone()
+            output = execution.combine[:ctx.source_rows].clone()
             if spec.dispatch_mode == "pull":
                 saved_dispatch = execution.dispatch
             else:
@@ -489,7 +509,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 probs = topk_weights.float().contiguous()
                 ctx.topk_dtype = topk_weights.dtype
                 permutation_inputs += (output, probs)
-                output = torch_npu.npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
+                output = (torch_npu.npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
+                          if ctx.source_rows else output[:0])
             _save_forward_state(
                 ctx,
                 plan,

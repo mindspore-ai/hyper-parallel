@@ -159,9 +159,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           if (tilingdata_data->rowLen == 0) {
             return;
           }
-          if (end - (start + current_seq_start) < SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT) {
-            tilingdata_data->baseRowLen = end - (start + current_seq_start);
-          }
+          tilingdata_data->baseRowLen = tilingdata_data->rowLen < SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT
+                                           ? tilingdata_data->rowLen : SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT;
           cacheWriteThrough(tiling_data_addr + SWIGLU_DYNAMIC_FIELDS_OFFSET, SWIGLU_DYNAMIC_FIELDS_BYTES);
           PipeBarrier<PIPE_ALL>();
 

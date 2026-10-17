@@ -35,6 +35,95 @@ from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 class TestMegaMoeRoute(unittest.TestCase):
     """Validate trusted Router counts and bounded capacity without hardware."""
 
+    def test_route_counts_match_native_abi_after_int64_dynamic_gather(self) -> None:
+        """Both transports must lower dynamic INT64 counts to the kernel's INT32 ABI."""
+        for mode in ('push', 'pull'):
+            for dtype in (torch.int32, torch.int64):
+                with self.subTest(mode=mode, dtype=dtype):
+                    counts = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=dtype)
+                    spec = replace(self._spec(ep_size=2), dispatch_mode=mode)
+                    metadata = route_module._compute_route_metadata(counts[0], counts, counts[:, :2], spec, 14)
+                    self.assertEqual(metadata.dispatch_size.dtype, torch.int32)
+                    self.assertEqual(metadata.combine_size.dtype, torch.int32)
+                    self.assertEqual(metadata.dispatch_src_off.dtype, torch.int64)
+                    self.assertEqual(metadata.dispatch_target_off.dtype, torch.int64)
+                    expected = [1, 2, 3, 4] if mode == 'push' else [1, 2, 5, 6]
+                    self.assertEqual(metadata.dispatch_size.tolist(), expected)
+
+    def test_dynamic_ragged_counts_preserve_exact_round_trip_intervals(self) -> None:
+        """Include an empty source receiving work and a source with an empty destination."""
+        counts = torch.tensor([[0, 0, 0, 0], [3, 1, 2, 0]], dtype=torch.int64)
+        header = torch.tensor([[0, 0, 15], [0, 3, 15]], dtype=torch.int64)
+        payload = torch.cat((header, counts), dim=1)
+        for rank in range(2):
+            spec = replace(self._spec(ep_size=2, rank_id=rank), max_local_num_tokens=257)
+            capacity, plan_tokens, maximum = route_module._dynamic_summary(payload, spec)
+            self.assertEqual((capacity, plan_tokens), ((4, 128) if rank == 0 else (2, 128)))
+            self.assertEqual(maximum, 4)
+            received = counts[:, rank * 2:rank * 2 + 2]
+            meta = route_module._compute_route_metadata(counts[rank], counts, received, spec, capacity)
+            self.assertEqual(meta.dispatch_src_off.tolist(), [0, 0, 0, 0] if rank == 0 else [0, 3, 4, 6])
+            self.assertEqual(meta.group_list.tolist(), [3, 4] if rank == 0 else [2, 2])
+            self.assertEqual(int(meta.dispatch_size.sum()), 0 if rank == 0 else 6)
+
+    def test_dynamic_invalid_calls_fail_on_every_rank(self) -> None:
+        """Reject over-limit tokens, inconsistent gradients/counts, and receive overflow together."""
+        valid = torch.tensor([[0, 1, 15, 1, 1, 0, 0], [0, 2, 15, 2, 2, 0, 0]], dtype=torch.int64)
+        for column, value, message in ((0, 1, "token capacity"), (1, 258, "token capacity"),
+                                       (2, 0, "autograd participation"), (3, 9, "counts")):
+            invalid = valid.clone()
+            invalid[1, column] = value
+            for rank in range(2):
+                spec = replace(self._spec(ep_size=2, rank_id=rank), max_local_num_tokens=257)
+                with self.subTest(column=column, rank=rank), self.assertRaisesRegex(RuntimeError, message):
+                    route_module._dynamic_summary(invalid, spec)
+        spec = replace(self._spec(ep_size=2), max_local_num_tokens=257, receive_capacity=4)
+        self.assertEqual(route_module._dynamic_summary(valid, spec)[2], 6)
+
+    def test_empty_dynamic_route_keeps_autograd_without_native_permute(self) -> None:
+        """Zero logical rows remain empty, including router and expert gradient connections."""
+        spec = replace(self._spec(), max_local_num_tokens=128)
+        hidden = torch.empty(0, 4, requires_grad=True)
+        ids = torch.empty(0, 2, dtype=torch.int32)
+        weights = torch.empty(0, 2, requires_grad=True)
+        with patch.object(route_module.torch_npu, "npu_moe_token_permute") as permute:
+            route = prepare_topk_route(hidden, ids, weights, spec, None, autograd_mask=15)
+        permute.assert_not_called()
+        self.assertEqual(route.routed_tokens.shape[0], 0)
+        self.assertEqual(route.metadata.expert_capacity, 1)
+        self.assertEqual(route.metadata.plan_tokens, 128)
+        output = route_module.restore_topk_output(hidden, route.unpermute_mapping, weights)
+        output.sum().backward()
+        self.assertEqual(tuple(hidden.grad.shape), (0, 4))
+        self.assertEqual(tuple(weights.grad.shape), (0, 2))
+
+    def test_dynamic_gather_keeps_variable_payload_without_token_padding(self) -> None:
+        """A rank with 129 tokens shares a 256 plan with an empty peer using one gather."""
+        spec = replace(self._spec(ep_size=2), max_local_num_tokens=257)
+        hidden = torch.randn(129, 4)
+        ids = torch.tensor([[0, 1]] * 129, dtype=torch.int32)
+        weights = torch.ones(129, 2)
+        spec = replace(spec, receive_capacity=512, local_num_tokens=384)
+        payload = torch.tensor([[0, 129, 15, 129, 129, 0, 0], [0, 0, 15, 0, 0, 0, 0]])
+
+        def gather(output: Any, value: Any, **kwargs: Any) -> Mock:
+            """Emulate one asynchronous count exchange."""
+            self.assertEqual(value[:3].tolist(), [0, 129, 15])
+            self.assertTrue(kwargs["async_op"])
+            output.copy_(payload.flatten())
+            return Mock()
+
+        with (
+            patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather),
+            patch.object(route_module, "_permute_topk_input",
+                         return_value=(hidden.repeat_interleave(2, dim=0), torch.arange(258))) as permute,
+        ):
+            route = prepare_topk_route(hidden, ids, weights, spec, None, autograd_mask=15)
+        self.assertIs(permute.call_args.args[0], hidden)
+        self.assertEqual(tuple(route.routed_tokens.shape), (258, 4))
+        self.assertEqual(route.metadata.plan_tokens, 256)
+        self.assertEqual(route.metadata.local_num_tokens, 129)
+
     @staticmethod
     def _spec(
         *,

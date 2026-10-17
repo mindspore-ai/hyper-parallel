@@ -80,18 +80,18 @@ bool GetWorkerLayout(gert::TilingContext *context, uint32_t tokens, WorkerLayout
 }
 
 bool QuerySharedTmpBytes(gert::TilingContext *context, uint32_t rows, uint32_t k_align, uint32_t &shared_tmp_bytes) {
-  const AscendC::TensorShape reduce_shape(std::vector<int64_t>{rows, k_align});
+  const ge::Shape reduce_shape(std::vector<int64_t>{rows, k_align});
   uint32_t reduce_max = 0;
   uint32_t reduce_min = 0;
-  AscendC::GetReduceSumMaxMinTmpSize(reduce_shape, AscendC::TensorDataType::DT_FLOAT, AscendC::ReducePattern::AR, true,
+  AscendC::GetReduceSumMaxMinTmpSize(reduce_shape, ge::DT_FLOAT, AscendC::ReducePattern::AR, true,
                                      false, reduce_max, reduce_min);
   if (reduce_max < reduce_min) {
     return false;
   }
 
   platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
-  const AscendC::TensorShape broadcast_source(std::vector<int64_t>{rows, 1});
-  const AscendC::TensorShape broadcast_destination(std::vector<int64_t>{rows, k_align});
+  const ge::Shape broadcast_source(std::vector<int64_t>{rows, 1});
+  const ge::Shape broadcast_destination(std::vector<int64_t>{rows, k_align});
   uint32_t broadcast_max = 0;
   uint32_t broadcast_min = 0;
   AscendC::GetBroadCastMaxMinTmpSize(platform, broadcast_source, broadcast_destination, sizeof(float), false,

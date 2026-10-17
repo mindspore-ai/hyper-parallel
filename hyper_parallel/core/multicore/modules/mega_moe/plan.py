@@ -85,6 +85,15 @@ class MegaMoePlan:
         return self.bwd_runtime.normal_tensor
 
 
+def record_plan_stream(plan: MegaMoePlan, runtime_config: Any) -> None:
+    """Protect cached tiling and runtime storage from cross-stream eviction."""
+    tensors = [value for value in vars(plan).values() if isinstance(value, torch.Tensor)]
+    tensors.append(runtime_config)
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor) and tensor.device.type == "npu":
+            tensor.record_stream(torch.npu.current_stream(tensor.device))
+
+
 def _tensor_from_bytes(data: bytes, device: Any) -> torch.Tensor:
     """Copy serialized runtime data into a device uint8 tensor."""
     array = np.frombuffer(bytearray(data), dtype=np.uint8).copy()
@@ -112,7 +121,7 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
     return TaskSplitValue(
         tp=1,
         ep=spec.ep_size,
-        seq_size=spec.local_num_tokens,
+        seq_size=spec.plan_tokens,
         all_expert_num=spec.num_experts,
         top_k=spec.top_k,
         dispatch_mode=spec.dispatch_mode,

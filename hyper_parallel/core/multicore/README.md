@@ -105,12 +105,66 @@ Subgroups exchange independent CANN bootstrap IDs internally and do not use a
 shared WORLD rendezvous port. See the [SHMEM lifecycle](docs/shmem.md) for
 cross-node interface selection and group-local shutdown requirements.
 
+### DSV4.1 的 TP/SP 与 CP 集成
+
+DSV4.1 适配器在 push 和 pull 模式下均支持 CP，以及配合序列并行使用的 TP。
+开启 TP 时要求 `sequence_parallel: true` 且 `ep_size > 1`；PP 必须保持为 1。
+框架从展平后的 dense DP/CP/TP 域生成 EP mesh。
+路由专家仅沿专家维度分片，保留完整的隐藏维度和中间维度；
+稠密层及共享专家沿用各自的 TP 布局，不支持对路由专家矩阵做张量并行。
+
+MoE 边界直接消费经过 CP 和 TP/SP 划分后的 token。
+VLM 路由时，适配器将 CP 局部图像 mask 对齐到 TP 局部隐藏状态区间。
+共享专家的 TP 通信仍由其嵌套边界负责。
+
+例如，16 个 rank 使用 TP2、CP2、EP16 和 micro-batch size 1 时，可配置为：
+
+```yaml
+accelerator:
+  tp_size: 2
+  cp_size: 2
+  ep_size: 16
+  pp_size: 1
+  sequence_parallel: true
+fsdp_config:
+  dp_shard_size: 8
+  edp_shard_size: 1
+training:
+  global_batch_size: 4
+  micro_batch_size: 1
+```
+
+该配置对应 dense DP4、dense FSDP8 和 expert FSDP1。
+将这些字段合并到现有 DSV4.1 配置中，保留其模块替换和 compute 声明。
+长度为 4096 的序列均匀划分后，每个 rank 向 MegaMoe 提交 1024 行。
+`local_num_tokens` 仍表示经过 CP/SP 划分后的实际行数上限，要求为 128 的倍数，并覆盖最大输入。
+仅减少实际行数、保持容量配置不变，并不会缩小预留容量。
+TP 不会进一步切分路由专家矩阵；本地序列变短也可能降低 MegaMoe 的执行效率。
+
+激活 NPU native payload 后，可执行以下分布式精度对齐测试矩阵：
+
+```bash
+pytest -q tests/torch/multicore/test_deepseek_v41_megamoe.py -k megamoe_parallel
+```
+
+该 8-rank 矩阵覆盖 TP2/CP1、TP1/CP2、TP2/CP2、push/pull、文本/VLM 路由、
+动态本地行数，以及输出、输入梯度、路由梯度、专家梯度和共享专家梯度。
+验证范围为 MoE 模块及实际接入边界，不代表整网训练或性能验收。
+
 ### 输入与权重
 
-- EP may be WORLD or a subgroup; per-rank token count `T` is fixed and a multiple of 128, and `E` is divisible by EP.
-  执行计划采用静态 tiling，构造后的 `T/H/I/E/K/EP` 固定；其他 shape、芯片及后端需单独验证。
+- EP 可以使用 WORLD 或子组，`E` 必须能被 EP 整除。
+  `local_num_tokens=T` 指定固定 token 数，要求 `T` 是 128 的倍数；
+  `max_local_num_tokens=T_cap` 则允许各 rank 的实际 token 数不同，也允许空输入。
+  动态模式按对齐后的上限预留存储，按实际输入长度生成调度计划。
+  这两个 token 数参数互斥；动态执行仅支持 eager 模式，不会添加填充 token。
+  包括空输入 rank 在内，所有 EP rank 必须按相同顺序进入每次正反向，并采用一致的
+  输入、专家权重和路由权重梯度参与策略。实际长度和梯度参与策略随路由计数一起交换。
+  调度范围取组内最大实际长度并向上对齐到 128；全组输入为空时，最小调度范围仍为 128。
+  每个资源组最多缓存四份调度计划；autograd 会保留每次调用所用的计划，直到对应反向完成。
+  pull 模式下，空输入仍保留其对称内存基址；仅改变实际输入长度不会重建 SHMEM。
 - `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，
-  ID 使用全局专家编号。
+  ID 使用全局专家编号，同一个 token 的 K 个 ID 必须互不重复。
 - 可选的 `tokens_per_expert` 是同 device 上 `[E]` 的精确本 rank histogram。
   省略时内部统计；传入时由调用方保证与当前 ID 一致。contiguous INT32 可直接使用，
   INT64 或非连续输入会转换。

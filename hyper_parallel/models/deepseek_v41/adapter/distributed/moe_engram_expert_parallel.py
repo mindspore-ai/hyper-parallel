@@ -21,6 +21,7 @@ from types import MethodType
 from typing import Any, Callable
 
 import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.modules.engram import local_token_mask
 from hyper_parallel.distributed.expert_parallel.experts import (
@@ -29,6 +30,9 @@ from hyper_parallel.distributed.expert_parallel.experts import (
     require_attrs,
 )
 from hyper_parallel.distributed.recipe_spec import local_compute
+from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
+    DeepseekV41MegaMoeExperts, _swiglu_limit,
+)
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import deepseek_v41_swiglu
 
 
@@ -189,6 +193,72 @@ def deepseek_v41_ep_compute_fn(
 
 
 @local_compute
+def deepseek_v41_megamoe_compute_fn(
+        *, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: Any,
+) -> Callable:
+    """Bind a declaratively replaced expert module to the full EP mesh.
+
+    The source router, visual routing bias and shared experts retain their
+    original semantics. Parameter sharding and FSDP remain framework-owned.
+    """
+    del mesh
+    require_attrs(module, "gate", "experts", "shared_experts", owner="DeepSeek-V4.1 MegaMoe")
+    if module.is_hash:
+        raise ValueError("DeepSeek-V4.1 MegaMoe requires learned routing")
+    del cp_mesh  # Pointwise experts consume the sequence rows already owned by CP.
+    if not isinstance(module.experts, DeepseekV41MegaMoeExperts):
+        raise TypeError("MegaMoe compute requires the DeepseekV41MegaMoeExperts module replacement")
+    if _swiglu_limit(module.shared_experts.limit) != module.experts.swiglu_limit:
+        raise ValueError("Routed and shared experts must have the same swiglu_limit")
+    ep_group = None if ep_mesh is None else ep_mesh.get_group("ep")
+    ep_size = 1 if ep_mesh is None else ep_mesh["ep"].size()
+    tp_size = 1 if tp_mesh is None else tp_mesh.size()
+    if tp_size > 1:
+        if ep_size <= 1:
+            raise ValueError("DSV4.1 MegaMoe with TP>1 requires EP>1")
+        if not module.experts.sequence_parallel:
+            raise ValueError("DSV4.1 MegaMoe with TP>1 requires sequence_parallel=true")
+    tp_rank = 0 if tp_mesh is None else tp_mesh.get_local_rank()
+    if dist.is_initialized() and dist.get_world_size(ep_group) != ep_size:
+        raise ValueError("MegaMoe EP mesh and process group sizes must match")
+    module.experts.configure(ep_group, ep_size, module.gate.top_k)
+
+    def compute_fn(
+            module: Any, hidden_states: torch.Tensor,
+            input_ids: torch.Tensor | None = None, image_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run original routing and shared experts around the MegaMoe call."""
+        del input_ids
+        local_image_mask = local_token_mask(
+            image_mask, hidden_states, tp_rank=tp_rank, tp_size=tp_size,
+        )
+        if local_image_mask is not None:
+            # Slicing multiple batch rows leaves gaps, which native MegaGate rejects.
+            local_image_mask = local_image_mask.contiguous()
+        indices, weights = _router(module, hidden_states, local_image_mask)
+        return module.experts(hidden_states, indices, weights) + module.shared_experts(hidden_states)
+
+    if "image_mask" in inspect.signature(module.forward).parameters:
+        return compute_fn
+
+    def text_compute_fn(
+            module: Any,
+            hidden_states: torch.Tensor,
+            input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Match the text-only source forward without visual routing arguments.
+
+        Args:
+            module: Routed and shared expert module.
+            hidden_states: Current decoder hidden rows.
+            input_ids: Unused token IDs from the local compute contract.
+        """
+        return compute_fn(module, hidden_states, input_ids)
+
+    return text_compute_fn
+
+
+@local_compute
 def deepseek_v41_engram_compute_fn(
         *,
         module: Any,
@@ -268,4 +338,4 @@ def deepseek_v41_engram_compute_fn(
     return compute_fn
 
 
-__all__ = ["deepseek_v41_engram_compute_fn", "deepseek_v41_ep_compute_fn"]
+__all__ = ["deepseek_v41_engram_compute_fn", "deepseek_v41_ep_compute_fn", "deepseek_v41_megamoe_compute_fn"]

@@ -436,6 +436,7 @@ def _build_replacement_context(
         "cp": getattr(mesh_context, "cp_size", 1) > 1,
         "ep": getattr(mesh_context, "ep_size", 1) > 1,
         "pp": getattr(mesh_context, "pp_size", 1) > 1,
+        "sequence_parallel": bool(getattr(mesh_context, "sequence_parallel", False)),
     }
 
 

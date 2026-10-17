@@ -1,3 +1,14 @@
+diff --git a/activation/swi_glu/op_kernel/glu_tiling_kernel.hpp b/activation/swi_glu/op_kernel/glu_tiling_kernel.hpp
+--- a/activation/swi_glu/op_kernel/glu_tiling_kernel.hpp
++++ b/activation/swi_glu/op_kernel/glu_tiling_kernel.hpp
+@@ -78 +78,2 @@
+-  __aicore__ void GetTilingAndOffset(GM_ADDR tiling_gm, uint32_t inputDTypeLen) {
++  __aicore__ void GetTilingAndOffset(GM_ADDR tiling_gm, uint32_t inputDTypeLen,
++                                    uint32_t maxTileRows = 0) {
+@@ -91,0 +93,3 @@
++    if (maxTileRows > 0 && baseRowLen > maxTileRows) {
++        baseRowLen = maxTileRows;
++    }
 diff --git a/activation/swi_glu/op_kernel/swi_glu.cpp b/activation/swi_glu/op_kernel/swi_glu.cpp
 index 98db2db..409184d 100644
 --- a/activation/swi_glu/op_kernel/swi_glu.cpp
@@ -333,20 +344,24 @@ diff --git a/activation/swi_glu_grad/op_kernel/swi_glu_grad_single.hpp b/activat
 index 6430f6f..7cf27d0 100644
 --- a/activation/swi_glu_grad/op_kernel/swi_glu_grad_single.hpp
 +++ b/activation/swi_glu_grad/op_kernel/swi_glu_grad_single.hpp
-@@ -22,10 +22,10 @@ class SwiGluGradSingle : public ParentClass {
+@@ -22,10 +22,13 @@ class SwiGluGradSingle : public ParentClass {
  public:
      __aicore__ inline SwiGluGradSingle() = default;
      __aicore__ inline ~SwiGluGradSingle() = default;
 -    __aicore__ inline void Init(GM_ADDR grad_gm, GM_ADDR input_gm, GM_ADDR output_gm, GM_ADDR tiling_gm)
 +    __aicore__ inline void Init(GM_ADDR grad_gm, GM_ADDR input_gm, GM_ADDR output_gm, GM_ADDR tiling_gm, float clamp_limit = 0.0f)
      {
-         singleTiling.GetTilingAndOffset(tiling_gm, sizeof(inType));
+-        singleTiling.GetTilingAndOffset(tiling_gm, sizeof(inType));
++        // Scalar Select uses scratch at 184 KiB; a 19x256 BF16 tile occupies 190 KiB.
++        constexpr uint32_t kClampedMaxTileRows = 18;
++        singleTiling.GetTilingAndOffset(tiling_gm, sizeof(inType),
++                                       clamp_limit > 0.0f ? kClampedMaxTileRows : 0);
 -        InitGmBuffer(grad_gm, input_gm, output_gm);
 +        InitGmBuffer(grad_gm, input_gm, output_gm, clamp_limit);
          this->InitUbBuffer(singleTiling.tileLength);
      }
  
-@@ -41,10 +41,11 @@ public:
+@@ -41,10 +44,11 @@ public:
  #endif
      }
  protected:

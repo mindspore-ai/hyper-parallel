@@ -44,7 +44,7 @@
           },
           {
             "path": "hyper_parallel/core/multicore/ops/swi_glu_clamp.patch",
-            "sha256": "436abdaa6ff3b30009aea3d4653adf5548ce6a46591ba513346f10ab620463ce",
+            "sha256": "a28d5a60b140ee948542199d3750ccd6d9910fbf81658aa270cb778252b8a18f",
             "allow_zero_context": true,
             "purpose": "add task-configured DeepSeek clipped SwiGLU forward and backward semantics"
           },
@@ -87,7 +87,8 @@
         "tree": "f941884a2f35988711169e77772c9faea4e942f2",
         "git_archive_tar_sha256": "72cbff27e7e1602c547e17ebccdba013c109e80c331ddd46b896b32628118aa1",
         "git_archive_tar_sha256_compat": [
-          "f8a1baea0d188fdcff8426e7b7d11bf9d43f3ea3fb26fa4dd270eb88d1566229"
+          "f8a1baea0d188fdcff8426e7b7d11bf9d43f3ea3fb26fa4dd270eb88d1566229",
+          "1c026f7f4891f2cd24eb00bd8b26da7ff18cd868d9b8f2be612a01ea5c5d5ba7"
         ],
         "resolution": "exact upstream commit providing MhcPost and MhcPreSinkhorn sources; adapters are applied only to an isolated source copy",
         "patches": [

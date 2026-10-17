@@ -37,6 +37,20 @@ _PRECISION_WORLD_SIZE = 2
 _PERFORMANCE_WORLD_SIZE = 4
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="unessential")
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_mega_moe_dynamic_tokens(monkeypatch, dispatch_mode: str) -> None:
+    """Validate EP8 unequal and zero source lengths against an independent FP32 oracle."""
+    _prepare_torch_multicore_test_environment()
+    monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
+    monkeypatch.setenv("HP_DYNAMIC_DISPATCH", dispatch_mode)
+    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        parallel_run([TorchCase("tests/torch/multicore/_test_mega_moe_dynamic_tokens.py",
+                                "test_dynamic_tokens", num_proc=8)], global_num_proc=8)
+
+
 def _prepare_torch_multicore_test_environment() -> None:
     """Activate multicore and require a payload built for the Torch framework."""
     prepare_multicore_test_environment()

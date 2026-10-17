@@ -67,3 +67,7 @@ def test_swiglu_clamp_numerics() -> None:
             [TorchCase(_WORKER, "test_swiglu_clamp_input_gradient", num_proc=1)],
             global_num_proc=1,
         )
+        parallel_run(
+            [TorchCase(_WORKER, "test_swiglu_clamp_ub_scratch", num_proc=1)],
+            global_num_proc=1,
+        )

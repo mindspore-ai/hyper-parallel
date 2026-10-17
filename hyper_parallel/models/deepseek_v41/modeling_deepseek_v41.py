@@ -63,6 +63,7 @@ from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE_NEW_LINE,
     IMAGE_START,
 )
+from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
 from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
@@ -657,7 +658,17 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
         self.gradient_checkpointing = False
+        self._megamoe_runtime_prepared = False
         self.post_init()
+
+    def _prepare_megamoe_runtime(self) -> None:
+        """Share serial expert workspace once after EP binding and before execution."""
+        if self._megamoe_runtime_prepared:
+            return
+        experts = [layer.mlp.experts for layer in self.layers
+                   if isinstance(layer.mlp.experts, DeepseekV41MegaMoeExperts)]
+        DeepseekV41MegaMoeExperts.prepare_runtime_group(experts)
+        self._megamoe_runtime_prepared = True
 
     @torch.no_grad()
     def _init_weights(self, module: nn.Module) -> None:
@@ -1008,6 +1019,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             raise ValueError("specify exactly one of input_ids or inputs_embeds")
         if input_ids is None:
             raise ValueError("input_ids are required while Engram is enabled")
+        self._prepare_megamoe_runtime()
         inputs_embeds = self._prepare_image_embeddings(
             input_ids=input_ids, inputs_embeds=inputs_embeds, token_types=token_types,
             image_inputs={

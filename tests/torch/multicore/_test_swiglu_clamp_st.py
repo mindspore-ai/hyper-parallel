@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+from typing import Any
+from unittest.mock import patch
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -23,6 +26,7 @@ import torch_npu
 
 from hyper_parallel.components.functional.grouped_matmul import grouped_matmul
 from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.core.multicore.modules.mega_moe import function as mega_function
 from hyper_parallel.core.multicore.modules.mega_moe.function import execute_mega_moe
 from hyper_parallel.core.multicore.modules.mega_moe.route import (
     PreparedTopKRoute,
@@ -376,3 +380,55 @@ def test_swiglu_clamp_input_gradient() -> None:
             baseline.assert_close("input_grad", actual, expected)
         finally:
             mega.close()
+
+
+def test_swiglu_clamp_ub_scratch() -> None:
+    """Keep scalar Select scratch from overwriting nonzero SwiGLU gradients."""
+    original_launch = mega_function._launch_backward_kernel  # pylint: disable=protected-access
+    observed_calls = 0
+    comparisons = []
+
+    def check_backward(plan: Any, saved: Any, grad_output: Any, execution: Any) -> None:
+        nonlocal observed_calls
+        original_launch(plan, saved, grad_output, execution)
+        torch.npu.synchronize(baseline.DEVICE)
+        rows = int(saved.group_list[-1].item())
+        gate, up = saved.up_proj[:rows].detach().cpu().double().chunk(2, dim=-1)
+        derivative = execution.intermediates.act_grad[:rows].detach().cpu().double()
+        sigmoid = torch.sigmoid(gate.clamp(max=_CLAMP_LIMIT))
+        gate_grad = derivative * up.clamp(-_CLAMP_LIMIT, _CLAMP_LIMIT) * sigmoid
+        gate_grad *= 1 + gate.clamp(max=_CLAMP_LIMIT) * (1 - sigmoid)
+        gate_grad *= gate <= _CLAMP_LIMIT
+        up_grad = derivative * gate.clamp(max=_CLAMP_LIMIT) * sigmoid
+        up_grad *= (up >= -_CLAMP_LIMIT) & (up <= _CLAMP_LIMIT)
+        expected = torch.cat((gate_grad, up_grad), dim=-1).bfloat16().float()
+        actual = execution.intermediates.swiglu_grad[:rows].detach().cpu().float()
+        comparisons.append((actual, expected))
+        observed_calls += 1
+
+    for token_count in (128, 4096):
+        shape = baseline.MoeShape(
+            local_num_tokens=token_count,
+            hidden_size=512,
+            intermediate_size=2304,
+            num_experts=2,
+            top_k=2,
+            ep_size=1,
+        )
+        hidden = torch.zeros((token_count, shape.hidden_size), dtype=torch.bfloat16, device=baseline.DEVICE)
+        hidden[:, 0] = 1.5
+        hidden[:, 1] = -2.75
+        grad_output = torch.full_like(hidden, -0.001)
+        topk_ids, topk_weights, counts = baseline._make_fixed_route(  # pylint: disable=protected-access
+            shape, "balanced"
+        )
+        _, mega = _new_layers(shape, _CLAMP_LIMIT)
+        try:
+            with patch.object(mega_function, "_launch_backward_kernel", check_backward):
+                _run_mega(mega, hidden, topk_ids, topk_weights, counts, grad_output)
+        finally:
+            mega.close()
+        # Assert after backward releases its workspace so failures preserve normal cleanup.
+        actual, expected = comparisons[-1]
+        torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.0)
+    assert observed_calls == 2, f"Expected 2 inspected backward calls, got {observed_calls}"

@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -25,7 +25,7 @@ import torch_npu
 
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
-from .spec import MegaMoeSpec
+from .spec import MegaMoeSpec, _align_capacity
 
 if TYPE_CHECKING:
     from .workspace import MegaMoeWorkspace
@@ -43,6 +43,8 @@ class RouteMetadata:
     combine_size: torch.Tensor
     group_list: torch.Tensor
     expert_capacity: int
+    local_num_tokens: int | None = None
+    plan_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +166,8 @@ def _permute_topk_input(
     topk_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Expand hidden rows with the native NPU MoE permutation operator."""
+    if hidden_states.shape[0] == 0:
+        return hidden_states, torch.empty(0, dtype=torch.int32, device=hidden_states.device)
     routed_tokens, unpermute_mapping = torch_npu.npu_moe_token_permute(
         hidden_states,
         topk_ids,
@@ -194,7 +198,7 @@ def _compute_route_metadata(
 ) -> RouteMetadata:
     """Build exact element offsets without padding or route truncation."""
     counts_i32 = counts.to(dtype=torch.int32).contiguous()
-    source_prefix = counts_by_source.cumsum(dim=1, dtype=torch.int32) - counts_by_source
+    source_prefix = counts_by_source.cumsum(dim=1, dtype=torch.int64) - counts_by_source
     destination_layout = (
         counts_by_source.reshape(
             spec.ep_size,
@@ -206,7 +210,7 @@ def _compute_route_metadata(
     )
     destination_flat = destination_layout.reshape(spec.ep_size, -1)
     destination_prefix = (
-        destination_flat.cumsum(dim=1, dtype=torch.int32) - destination_flat
+        destination_flat.cumsum(dim=1, dtype=torch.int64) - destination_flat
     ).reshape(spec.ep_size, spec.local_experts, spec.ep_size)
     local_destination_prefix = destination_prefix[spec.rank_id]
     local_destination_counts = destination_layout[spec.rank_id]
@@ -219,12 +223,12 @@ def _compute_route_metadata(
             local_destination_prefix.T.reshape(-1).to(torch.int64) if spec.dispatch_mode == "pull"
             else destination_prefix[:, :, spec.rank_id].reshape(-1).to(torch.int64)
         ),
-        dispatch_size=received_counts.reshape(-1) if spec.dispatch_mode == "pull" else counts_i32,
+        dispatch_size=(received_counts.reshape(-1).to(torch.int32) if spec.dispatch_mode == "pull" else counts_i32),
         combine_src_off=local_destination_prefix.T.reshape(-1).to(torch.int64),
         combine_target_off=(
             source_prefix[:, local_start:local_end].reshape(-1).to(torch.int64)
         ),
-        combine_size=received_counts.reshape(-1),
+        combine_size=received_counts.reshape(-1).to(torch.int32),
         group_list=(
             local_destination_prefix[:, -1] + local_destination_counts[:, -1]
         ).to(torch.int64),
@@ -239,6 +243,8 @@ def prepare_topk_route(
     spec: MegaMoeSpec,
     tokens_per_expert: torch.Tensor | None,
     workspace: MegaMoeWorkspace | None = None,
+    *,
+    autograd_mask: int = 0,
 ) -> PreparedTopKRoute:
     """Overlap Top-K permutation with count exchange and build route metadata.
 
@@ -250,11 +256,15 @@ def prepare_topk_route(
         tokens_per_expert: Optional trusted Router histogram.
         workspace: Optional workspace ordered before the count exchange. Pull
             requires an initialized, caller-held lease covering route execution.
+        autograd_mask: Group-consistent gradient participation flags in dynamic mode.
 
     Returns:
         Permuted tokens and exact native route metadata.
     """
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
+    if spec.max_local_num_tokens is not None:
+        return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
+                                      workspace, autograd_mask)
     counts = _resolve_counts(flat_ids, tokens_per_expert, spec)
     permutation_output = None
     if workspace is not None:
@@ -287,12 +297,83 @@ def prepare_topk_route(
     )
 
 
+def _dynamic_summary(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int, int]:
+    """Use one Host summary for shape, participation, receive limits, and schedule."""
+    counts = payload[:, 3:]
+    loads = counts.reshape(spec.ep_size, spec.ep_size, spec.local_experts).sum(dim=(0, 2))
+    summary = torch.cat((payload[:, :3], counts.sum(1, keepdim=True),
+                         counts.amin(1, keepdim=True), counts.amax(1, keepdim=True), loads[:, None]), dim=1)
+    rows = summary.tolist()
+    if any(row[0] or not 0 <= row[1] <= spec.max_local_num_tokens for row in rows):
+        raise RuntimeError(f"MegaMoe token capacity overflow: limit={spec.max_local_num_tokens}, "
+                           f"actual={[row[1] for row in rows]}")
+    if any(row[2] != rows[0][2] for row in rows):
+        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
+    if any(row[3] != row[1] * spec.top_k or row[4] < 0 or row[5] > row[1] for row in rows):
+        raise RuntimeError("MegaMoe counts must describe the actual distinct Top-K routes")
+    maximum = max(row[6] for row in rows)
+    maximum_capacity = _align_capacity(spec.ep_size * spec.routed_slots)
+    if maximum > maximum_capacity:
+        raise RuntimeError(f"MegaMoe receive capacity overflow: configured_capacity={maximum_capacity}, "
+                           f"actual_maximum={maximum}")
+    plan_tokens = max(128, _align_capacity(max(row[1] for row in rows)))
+    if plan_tokens * spec.hidden_size > 2**31 - 1 or maximum > 2**31 - 1:
+        raise RuntimeError("MegaMoe dynamic route exceeds native INT32 size limits")
+    return max(1, rows[spec.rank_id][6]), plan_tokens, maximum
+
+
+def _prepare_dynamic_route(
+    hidden_states: torch.Tensor, topk_ids: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
+    supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
+) -> PreparedTopKRoute:
+    """Exchange variable-length metadata without adding a token-count collective."""
+    tokens = hidden_states.shape[0]
+    invalid = tokens > spec.max_local_num_tokens
+    counts = (torch.zeros(spec.num_experts, dtype=torch.int32, device=hidden_states.device) if invalid
+              else _resolve_counts(flat_ids, supplied_counts, spec))
+    header = torch.tensor([int(invalid), tokens, autograd_mask], dtype=torch.int64, device=hidden_states.device)
+    payload = torch.cat((header, counts.to(torch.int64)))
+    if workspace is not None and spec.dispatch_mode != "pull":
+        workspace.wait_for_reuse()
+    if spec.ep_size == 1:
+        gathered, work = payload.unsqueeze(0), None
+    else:
+        gathered = torch.empty((spec.ep_size, payload.numel()), dtype=torch.int64, device=payload.device)
+        work = dist.all_gather_into_tensor(gathered.reshape(-1), payload, group=spec.ep_group, async_op=True)
+    if invalid:
+        permuted = None
+    elif spec.dispatch_mode == "pull":
+        if workspace is None or not workspace.in_use or workspace.source_buffer is None:
+            raise RuntimeError("Pull permutation requires an initialized, claimed workspace.")
+        output = workspace.source_buffer[:tokens * spec.top_k]
+        permuted = (_permute_topk_input_out(hidden_states, topk_ids, output) if tokens
+                    else (output, topk_ids.reshape(-1)))
+    else:
+        permuted = _permute_topk_input(hidden_states, topk_ids)
+    if work is not None:
+        work.wait()
+    capacity, plan_tokens, maximum = _dynamic_summary(gathered, spec)
+    counts_by_source = gathered[:, 3:].contiguous()
+    start = spec.rank_id * spec.local_experts
+    received_counts = counts_by_source[:, start:start + spec.local_experts].contiguous()
+    metadata = _compute_route_metadata(counts, counts_by_source, received_counts, spec, capacity)
+    return PreparedTopKRoute(
+        routed_tokens=permuted[0], unpermute_mapping=permuted[1], tokens_per_expert=counts,
+        received_counts=received_counts,
+        maximum_received_slots=maximum,
+        metadata=replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens),
+    )
+
+
 def restore_topk_output(
     expert_output: torch.Tensor,
     unpermute_mapping: torch.Tensor,
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
     """Restore token order and apply Router weights with the native NPU op."""
+    if topk_weights.shape[0] == 0:
+        # Keep both the expert backward and the empty routing-weight gradient connected.
+        return expert_output[:0] + topk_weights.sum().to(expert_output.dtype)
     return torch_npu.npu_moe_token_unpermute(
         expert_output,
         unpermute_mapping,

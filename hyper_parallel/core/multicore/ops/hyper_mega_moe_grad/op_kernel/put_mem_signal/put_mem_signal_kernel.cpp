@@ -63,6 +63,14 @@ class PutMemSignalKernel {
   }
 
   __aicore__ inline void Process() {
+    // Empty tiles still satisfy remote dependencies without resolving data addresses.
+    if (size_ == 0) {
+      shmem_data_plane::fence();
+      shmem_data_plane::signal(signal_ + signal_offset_, signal_value_,
+                               signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
+                               target_pe_);
+      return;
+    }
     // Perform data transfer
     auto size_per_core = size_ / aiv_num_;
     auto target_ptr = target_ + target_offset_ + aiv_idx_ * size_per_core;
