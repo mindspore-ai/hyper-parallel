@@ -20,8 +20,11 @@ projections run through the bound ``GroupedLinear``, whose
 instance is picked exclusively in ``strategy_factory``.
 """
 
+from __future__ import annotations
+
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
+from hyper_parallel.components.modules.expert_sort import expert_major_permutation
 
 from hyper_parallel.components.quantization.functional import (
     GroupedLinear,
@@ -202,7 +205,8 @@ class GroupedExperts(nn.Module):
             device=hidden_states.device,
         ).unsqueeze(1).expand(-1, top_k).reshape(-1)
         flattened_expert_indices = top_k_index.reshape(-1)
-        expert_order = flattened_expert_indices.argsort()
+        expert_order = expert_major_permutation(
+            flattened_expert_indices, self.num_experts)
         sorted_inputs = hidden_states[source_token_indices[expert_order]]
         tokens_per_expert = torch.bincount(
             flattened_expert_indices,
