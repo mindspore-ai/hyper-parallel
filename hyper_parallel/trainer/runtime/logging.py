@@ -44,12 +44,19 @@ def _is_rank_0() -> bool:
     return True
 
 
-def setup_logging() -> None:
-    """Setup logging with rank filter."""
+def setup_logging(level: "int | str" = builtin_logging.WARNING) -> None:
+    """Setup logging with rank filter at the given root level.
+
+    ``basicConfig`` alone is a no-op once any root handler exists, so the root
+    level is also set explicitly to keep repeated calls consistent.
+    """
+    if isinstance(level, str):
+        level = level.upper()
     builtin_logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        level=builtin_logging.INFO,
+        level=level,
     )
+    builtin_logging.getLogger().setLevel(level)
 
 
 def _info_rank0(message: str) -> None:

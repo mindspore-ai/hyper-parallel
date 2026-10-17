@@ -540,6 +540,18 @@ def compressed_causal_topk_and_candidates(
     return torch.cat(selected_chunks, dim=1), torch.cat(candidate_chunks, dim=1)
 
 
+def _gather_compressed_keys(key: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """Gather per-batch compressed keys without accelerator advanced indexing."""
+    batch_size, key_length, head_dim = key.shape
+    if batch_size == 1:
+        flat_indices = indices.reshape(-1)
+    else:
+        offsets = torch.arange(batch_size, device=indices.device, dtype=indices.dtype).view(-1, 1, 1)
+        flat_indices = (indices + offsets * key_length).reshape(-1)
+    selected = torch.index_select(key.reshape(batch_size * key_length, head_dim), 0, flat_indices)
+    return selected.reshape(*indices.shape, head_dim)
+
+
 def compressed_candidate_topk(
         query: torch.Tensor,
         key: torch.Tensor,
@@ -591,7 +603,6 @@ def compressed_candidate_topk(
         )
 
     block_offsets = torch.arange(block_size, device=query.device)
-    batch_indices = torch.arange(batch_size, device=query.device).view(-1, 1, 1)
     selected_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
@@ -606,7 +617,7 @@ def compressed_candidate_topk(
         if minimum_key_indices is not None:
             valid = valid & (positions >= minimum_key_indices[:, start:end].unsqueeze(-1))
         safe_positions = positions.clamp(min=0, max=max(compressed_length - 1, 0))
-        selected_key = key[batch_indices, safe_positions].float()
+        selected_key = _gather_compressed_keys(key, safe_positions).float()
         dots = torch.einsum(
             "bchd,bckd->bchk",
             query[:, start:end].float(),
@@ -660,11 +671,9 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                 if not torch.any(valid_rows):
                     continue
                 safe_indices = selected.clamp_min(0).long()
-                batch_indices = torch.arange(batch_size, device=index_query.device).view(-1, 1, 1)
-
                 query_chunk = index_query[:, start:end].float()
                 weight_chunk = merge_weight[:, start:end].float()
-                selected_index_key = index_key[batch_indices, safe_indices].float()
+                selected_index_key = _gather_compressed_keys(index_key, safe_indices).float()
                 index_dots = torch.einsum(
                     "bcid,bckd->bcik", query_chunk, selected_index_key
                 )
@@ -674,7 +683,7 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                     index_scores = reduce_sum(index_scores)
                 index_scores.masked_fill_(~valid, -1.0e9)
 
-                selected_attention_key = compressed_key[batch_indices, safe_indices].float()
+                selected_attention_key = _gather_compressed_keys(compressed_key, safe_indices).float()
                 attention_scores = torch.einsum(
                     "bhcd,bckd->bhck",
                     attention_query[:, :, start:end].float(),

@@ -26,6 +26,7 @@ from hyper_parallel.models.deepseek_v41.adapter.policies.activation_checkpointin
 )
 from hyper_parallel.models.deepseek_v41.adapter.policies.sharding import (
     build_parameter_sharding_rules,
+    get_fsdp_backward_execution_order,
     get_fsdp_excluded_subtrees,
     get_fsdp_execution_order,
     get_fsdp_wrap_modules,
@@ -96,6 +97,7 @@ DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
     fsdp_wrap_modules=get_fsdp_wrap_modules,
     fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,
     fsdp_execution_order=get_fsdp_execution_order,
+    fsdp_backward_execution_order=get_fsdp_backward_execution_order,
     recompute=build_recompute_policy,
     validation=_load_validation_spec,
     encoder_parallel=_load_encoder_parallel_spec,

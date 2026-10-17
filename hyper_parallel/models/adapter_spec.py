@@ -111,6 +111,9 @@ class ModelAdapterSpec:
             selected child-unit FQN, then returning their first-forward
             execution order. This lets conditional multimodal models override
             module-registration order for FSDP communication prefetching.
+        fsdp_backward_execution_order: provider returning the order in which
+            selected child units enter their backward pre-hooks. When absent,
+            the reverse of the forward order is used.
         recompute: provider returning normal-training activation-checkpoint
             policy. This must not depend on validation-only imports.
         validation: lazy provider returning the family's ``ModelValidationSpec``.
@@ -136,6 +139,7 @@ class ModelAdapterSpec:
     fsdp_wrap_modules: Optional[Callable[..., Any]] = None
     fsdp_excluded_subtrees: Optional[Callable[..., Any]] = None
     fsdp_execution_order: Optional[Callable[..., Any]] = None
+    fsdp_backward_execution_order: Optional[Callable[..., Any]] = None
     recompute: Optional[Callable[..., RecomputePolicy]] = None
     validation: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
