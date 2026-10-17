@@ -12,19 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Format-specific autograd functions and strategy interfaces."""
+"""Low-precision strategies, shared autograd flows, and operator adapters."""
 
+from hyper_parallel.components.quantization.functional.base_linear_func import (
+    LinearStrategy,
+    _LinearFunction,
+)
 from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import (
-    hifloat8_grouped_linear,
+    HiFloat8GroupedLinear,
 )
 from hyper_parallel.components.quantization.functional.hifloat8_linear_func import (
-    hifloat8_linear,
+    HiFloat8LinearStrategy,
+)
+from hyper_parallel.components.quantization.functional.linear_strategy_factory import (
+    build_linear_strategy,
 )
 from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import (
     MXFP8GroupedLinear,
 )
 from hyper_parallel.components.quantization.functional.mxfp8_linear_func import (
-    mxfp8_linear,
+    MXFP8LinearStrategy,
 )
 # Compatibility re-exports; NPU operator implementations live in ``quantization.ops``.
 from hyper_parallel.components.quantization.ops.npu_hifloat8 import (
@@ -69,17 +76,19 @@ from hyper_parallel.components.quantization.ops.npu_fake_w4a8 import (
 
 __all__ = [
     "HiFloat8NpuOps",
+    "HiFloat8GroupedLinear",
+    "HiFloat8LinearStrategy",
     "LowPrecisionCapabilityError",
+    "LinearStrategy",
     "MXFP8NpuOps",
-    "hifloat8_grouped_linear",
+    "MXFP8LinearStrategy",
     "hifloat8_grouped_matmul",
-    "hifloat8_linear",
     "hifloat8_matmul",
     "mxfp8_grouped_matmul",
-    "mxfp8_linear",
     "mxfp8_matmul",
     "MXFP8GroupedLinear",
     "GroupedLinear",
+    "_LinearFunction",
     "_GroupedLinearFunction",
     "W4A8CapabilityError",
     "W4A8NpuOps",
@@ -87,6 +96,7 @@ __all__ = [
     "FakeW4A8GroupedLinear",
     "FakeW4A8CapabilityError",
     "FakeW4A8NpuOps",
+    "build_linear_strategy",
     "build_low_precision_strategy",
     "transform_grouped_scale",
     "validate_w4a8_gmm_runtime",

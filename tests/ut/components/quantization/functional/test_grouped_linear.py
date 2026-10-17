@@ -28,6 +28,9 @@ from hyper_parallel.components.quantization.functional.base_gmm_func import (
 from hyper_parallel.components.quantization.functional.fake_w4a8_gmm_func import (
     FakeW4A8GroupedLinear,
 )
+from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import (
+    HiFloat8GroupedLinear,
+)
 from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import (
     MXFP8GroupedLinear,
 )
@@ -57,6 +60,8 @@ class _DenseStorage:
         self.colwise = colwise
 
     def update_usage(self, rowwise=True, colwise=True):
+        """Record which operand orientations the grouped strategy will use."""
+
         self.rowwise = self.rowwise and rowwise
         self.colwise = self.colwise and colwise
 
@@ -112,6 +117,8 @@ class _DenseGroupedLinear(GroupedLinear):
         group_list_type,
         output_dtype,
     ):
+        """Apply the grouped matrix product independently to each expert."""
+
         del group_type
         counts = self._counts(group_list, group_list_type)
         left_parts = left.value.split(counts, dim=0)
@@ -151,15 +158,21 @@ class TestStrategyFactory(unittest.TestCase):
             mock.patch(f"{module}.validate_npu_gmm_runtime"),
             mock.patch(f"{module}.validate_w4a8_gmm_runtime"),
             mock.patch(f"{module}.validate_fake_w4a8_gmm_runtime"),
+            mock.patch(f"{module}.validate_hifloat8_gmm_runtime"),
         )
 
     @cpu_test
-    def test_dispatches_w8a8_native_w4a8_and_fake_w4a8(self):
-        """All three supported policies choose their independent strategies."""
+    def test_dispatches_w8a8_w4a8_fake_w4a8_and_hifloat8(self):
+        """Supported native/fake policies choose their independent strategies."""
         aligned32 = ((2, 64, 32), (2, 32, 64))
         aligned128 = ((2, 256, 128), (2, 128, 256))
-        p_mx, p_native, p_fake = self._patch_probes()
-        with p_mx as mx_probe, p_native as native_probe, p_fake as fake_probe:
+        p_mx, p_native, p_fake, p_hif8 = self._patch_probes()
+        with (
+            p_mx as mx_probe,
+            p_native as native_probe,
+            p_fake as fake_probe,
+            p_hif8 as hif8_probe,
+        ):
             w8a8 = build_low_precision_strategy(None, tile_shapes=aligned32)
             native = build_low_precision_strategy(
                 LowPrecisionDtypeScheme(
@@ -176,14 +189,20 @@ class TestStrategyFactory(unittest.TestCase):
                 ),
                 tile_shapes=aligned32,
             )
+            hif8 = build_low_precision_strategy(
+                LowPrecisionDtypeScheme(weight_format="hif8", act_format="hif8"),
+                tile_shapes=aligned32,
+            )
 
         self.assertIsInstance(w8a8, MXFP8GroupedLinear)
         self.assertIsInstance(native, W4A8GroupedLinear)
         self.assertEqual(native.block_size, 128)
         self.assertIsInstance(fake, FakeW4A8GroupedLinear)
+        self.assertIsInstance(hif8, HiFloat8GroupedLinear)
         mx_probe.assert_called_once_with()
         native_probe.assert_called_once_with()
         fake_probe.assert_called_once_with()
+        hif8_probe.assert_called_once_with()
 
     @cpu_test
     def test_alignment_and_unsupported_policies_fail_at_factory(self):
@@ -202,9 +221,13 @@ class TestStrategyFactory(unittest.TestCase):
                 LowPrecisionDtypeScheme(is_fake_quantize=True),
                 tile_shapes=((2, 64, 32), (2, 32, 64)),
             )
-        with self.assertRaisesRegex(NotImplementedError, "only the mxfp family"):
+        with self.assertRaisesRegex(NotImplementedError, "fake HiFloat QAT"):
             build_low_precision_strategy(
-                LowPrecisionDtypeScheme(weight_format="hif8", act_format="hif8"),
+                LowPrecisionDtypeScheme(
+                    is_fake_quantize=True,
+                    weight_format="hif8",
+                    act_format="hif8",
+                ),
                 tile_shapes=((2, 64, 32), (2, 32, 64)),
             )
 

@@ -22,7 +22,8 @@ from typing import Any
 import torch
 
 from hyper_parallel.components.quantization.functional.base_gmm_func import _GroupedLinearFunction
-from hyper_parallel.components.quantization.functional.mxfp8_linear_func import mxfp8_linear
+from hyper_parallel.components.quantization.functional.base_linear_func import _LinearFunction
+from hyper_parallel.components.quantization.functional.mxfp8_linear_func import MXFP8LinearStrategy
 from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import MXFP8GroupedLinear
 from hyper_parallel.components.quantization.quantizers.mxfp8 import MXFP8Quantizer
 
@@ -35,6 +36,12 @@ def npu_quant_grouped_linear(inputs: torch.Tensor, weight: torch.Tensor,
     """Run the MXFP8 grouped-linear strategy through the shared autograd bridge."""
     strategy = MXFP8GroupedLinear(quantizer)
     return _GroupedLinearFunction.apply(inputs, weight, group_list, strategy, group_list_type)
+
+
+def mxfp8_linear(inputs: torch.Tensor, weight: torch.Tensor,
+                 quantizer: MXFP8Quantizer) -> torch.Tensor:
+    """Run Dense projection through the current shared autograd bridge."""
+    return _LinearFunction.apply(inputs, weight, MXFP8LinearStrategy(quantizer))
 
 
 class IdentityMXOps:

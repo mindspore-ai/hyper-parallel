@@ -12,284 +12,208 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""HiFloat8 grouped forward, input-gradient, and weight-gradient."""
+"""HiFloat8 format hooks for the shared grouped-linear lifecycle."""
 
 from typing import Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.components.quantization.functional._saved_quantized import (
-    restore_quantized_operands,
-    save_quantized_operands,
+from hyper_parallel.components.quantization.functional.base_gmm_func import (
+    GroupedLinear,
 )
-
 from hyper_parallel.components.quantization.ops.npu_hifloat8 import (
     hifloat8_grouped_matmul,
 )
 from hyper_parallel.components.quantization.quantizers.hifloat8 import (
+    GRADIENT_FORMAT_MAX,
+    INPUT_WEIGHT_FORMAT_MAX,
     HiFloat8Quantizer,
+)
+from hyper_parallel.components.quantization.tensor import (
+    HiFloat8Tensor,
+    QuantizedTensorStorage,
 )
 
 
-class _HiFloat8GroupedLinearFunction(torch.autograd.Function):
-    """Run one expert projection through three A5 HiFloat8 GMM layouts."""
+class HiFloat8GroupedLinear(GroupedLinear):
+    """Bind HiFloat8 role quantizers and GMM lowering to the common flow."""
 
-    @staticmethod
-    def _validate_forward_inputs(
+    FORMAT_NAME = "HiFloat8"
+
+    def __init__(
+        self,
+        input_quantizer: Optional[HiFloat8Quantizer] = None,
+        weight_quantizer: Optional[HiFloat8Quantizer] = None,
+        grad_output_quantizer: Optional[HiFloat8Quantizer] = None,
+    ) -> None:
+        """Create or accept the three independent HiFloat8 role quantizers."""
+
+        self.input_quantizer = (
+            input_quantizer
+            if input_quantizer is not None
+            else HiFloat8Quantizer(fp8_max=INPUT_WEIGHT_FORMAT_MAX)
+        )
+        self.weight_quantizer = (
+            weight_quantizer
+            if weight_quantizer is not None
+            else HiFloat8Quantizer(fp8_max=INPUT_WEIGHT_FORMAT_MAX)
+        )
+        self.grad_output_quantizer = (
+            grad_output_quantizer
+            if grad_output_quantizer is not None
+            else HiFloat8Quantizer(fp8_max=GRADIENT_FORMAT_MAX)
+        )
+
+    def _validate_inputs(
+        self,
         inputs: torch.Tensor,
         weight: torch.Tensor,
         group_list: torch.Tensor,
         group_list_type: int,
     ) -> None:
-        """Validate grouped-linear shapes, dtypes, devices, and group metadata."""
-        if inputs.ndim != 2:
-            raise ValueError(
-                "HiFloat8 grouped linear inputs must be two-dimensional, "
-                f"got shape {tuple(inputs.shape)}."
-            )
-        if weight.ndim != 3:
-            raise ValueError(
-                "HiFloat8 grouped linear weight must be three-dimensional, "
-                f"got shape {tuple(weight.shape)}."
-            )
-        if inputs.shape[-1] != weight.shape[-1]:
-            raise ValueError(
-                "HiFloat8 grouped linear contracting dimensions differ: "
-                f"inputs={inputs.shape[-1]}, weight={weight.shape[-1]}."
-            )
+        """Preserve the HiFloat8 dtype, device, and empty-group contract."""
+
+        super()._validate_inputs(
+            inputs,
+            weight,
+            group_list,
+            group_list_type,
+        )
         if inputs.dtype not in (torch.float16, torch.bfloat16) or weight.dtype not in (
-            torch.float16, torch.bfloat16
+            torch.float16,
+            torch.bfloat16,
         ):
-            raise TypeError("HiFloat8 grouped linear inputs and weight must use float16 or bfloat16.")
-        if not isinstance(group_list, torch.Tensor) or group_list.ndim != 1:
-            raise ValueError("HiFloat8 grouped linear group_list must be one-dimensional.")
+            raise TypeError(
+                "HiFloat8 grouped linear inputs and weight must use float16 or bfloat16."
+            )
         if group_list.dtype != torch.int64:
             raise TypeError("HiFloat8 grouped linear group_list must use torch.int64.")
-        if group_list.shape[0] != weight.shape[0]:
-            raise ValueError(
-                "HiFloat8 grouped linear requires one group per expert: "
-                f"groups={group_list.shape[0]}, experts={weight.shape[0]}."
-            )
-        if group_list_type not in (0, 1):
-            raise ValueError(
-                f"HiFloat8 grouped linear group_list_type must be 0 or 1, got {group_list_type}."
-            )
         if inputs.device != weight.device or group_list.device != inputs.device:
-            raise ValueError("HiFloat8 grouped linear inputs, weight, and group_list must be on the same device.")
+            raise ValueError(
+                "HiFloat8 grouped linear inputs, weight, and group_list must be on the same device."
+            )
         if inputs.shape[0] == 0 and torch.any(group_list != 0).item():
-            raise ValueError("An empty HiFloat8 grouped input requires an all-zero group_list.")
+            raise ValueError(
+                "An empty HiFloat8 grouped input requires an all-zero group_list."
+            )
 
-    @staticmethod
-    def _save_forward_context(
-        ctx: torch.autograd.function.FunctionCtx,
-        inputs: torch.Tensor,
-        weight: torch.Tensor,
-        group_list_type: int,
-        grad_output_quantizer: HiFloat8Quantizer,
-    ) -> None:
-        """Save tensor metadata and quantizer state required by backward."""
-        ctx.input_shape = inputs.shape
-        ctx.input_dtype = inputs.dtype
-        ctx.input_device = inputs.device
-        ctx.weight_shape = weight.shape
-        ctx.weight_dtype = weight.dtype
-        ctx.weight_device = weight.device
-        ctx.group_list_type = group_list_type
-        ctx.grad_output_quantizer = grad_output_quantizer
-        ctx.empty_input = inputs.shape[0] == 0
-
-    @staticmethod
-    def forward(
-        ctx: torch.autograd.function.FunctionCtx,
-        inputs: torch.Tensor,
-        weight: torch.Tensor,
+    def normalize_group_list(
+        self,
         group_list: torch.Tensor,
-        input_quantizer: HiFloat8Quantizer,
-        weight_quantizer: HiFloat8Quantizer,
-        grad_output_quantizer: HiFloat8Quantizer,
         group_list_type: int,
-    ) -> torch.Tensor:
-        """Execute one bias-free expert projection.
+    ) -> tuple[torch.Tensor, int]:
+        """Keep the caller's counts or offsets because HiFloat8 accepts both."""
 
-        ``weight`` follows ``[experts, out_features, in_features]``. The GMM
-        receives its transposed ``[experts, in_features, out_features]`` view.
+        return group_list, group_list_type
 
-        Args:
-            ctx: Autograd context owning the saved quantized operands.
-            inputs: High-precision, expert-major input matrix.
-            weight: High-precision packed expert weights.
-            group_list: Token boundaries or counts, one per expert.
-            input_quantizer: Current-scaling input recipe.
-            weight_quantizer: Current-scaling weight recipe.
-            grad_output_quantizer: Gradient recipe used by backward.
-            group_list_type: Zero for cumulative boundaries, one for counts.
+    def output_features(self, weight: torch.Tensor) -> int:
+        """Return the output width from the live ``[E, O, K]`` weight."""
 
-        Returns:
-            Expert-major projection output with the input's logical dtype.
-        """
+        return weight.shape[-2]
 
-        _HiFloat8GroupedLinearFunction._validate_forward_inputs(
-            inputs, weight, group_list, group_list_type
-        )
-        _HiFloat8GroupedLinearFunction._save_forward_context(
-            ctx, inputs, weight, group_list_type, grad_output_quantizer
-        )
-        if ctx.empty_input:
-            save_quantized_operands(ctx, None, None, group_list)
-            return inputs.new_empty((0, weight.shape[-2]))
+    def weight_quantization_directions(
+        self,
+        needs_grad_input: bool,
+    ) -> tuple[bool, bool]:
+        """Build the column view for forward and row view only for dgrad."""
 
-        needs_grad_input = inputs.requires_grad
-        needs_grad_weight = weight.requires_grad
-        input_quant = input_quantizer.quantize(
+        return needs_grad_input, True
+
+    def retain_weight_backward(
+        self,
+        weight_quant: QuantizedTensorStorage,
+        needs_grad_input: bool,
+    ) -> None:
+        """Release the forward column view and retain the dgrad row view."""
+
+        weight_quant.update_usage(rowwise=needs_grad_input, colwise=False)
+
+    def quantize_input(
+        self,
+        inputs: torch.Tensor,
+        *,
+        rowwise: bool,
+        colwise: bool,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ) -> HiFloat8Tensor:
+        """Quantize expert-major activations with the input-role recipe."""
+
+        return self.input_quantizer.quantize(
             inputs,
             group_list=group_list,
             group_list_type=group_list_type,
-            rowwise=True,
-            colwise=needs_grad_weight,
+            rowwise=rowwise,
+            colwise=colwise,
         )
-        weight_for_gmm = weight.transpose(-2, -1).contiguous()
-        weight_quant = weight_quantizer.quantize(
-            weight_for_gmm,
-            rowwise=needs_grad_input,
-            colwise=True,
-        )
-        output = hifloat8_grouped_matmul(
-            input_quant,
-            weight_quant,
-            layout="NN",
-            group_list=group_list,
-            group_type=0,
-            group_list_type=group_list_type,
-            output_dtype=inputs.dtype,
-        )
-        input_quant.update_usage(rowwise=False, colwise=needs_grad_weight)
-        weight_quant.update_usage(rowwise=needs_grad_input, colwise=False)
-        # Autograd owns their lifetime, including repeated backward with retain_graph.
-        save_quantized_operands(
-            ctx,
-            input_quant if needs_grad_weight else None,
-            weight_quant if needs_grad_input else None,
-            group_list,
-        )
-        return output
 
-    @staticmethod
-    @once_differentiable
-    def backward(
-        ctx: torch.autograd.function.FunctionCtx,
+    def quantize_weight(
+        self,
+        weight: torch.Tensor,
+        *,
+        rowwise: bool,
+        colwise: bool,
+    ) -> HiFloat8Tensor:
+        """Quantize GMM-ready expert weights with the weight-role recipe."""
+
+        return self.weight_quantizer.quantize(
+            weight,
+            rowwise=rowwise,
+            colwise=colwise,
+        )
+
+    def quantize_grad_output(
+        self,
         grad_output: torch.Tensor,
-    ) -> tuple[
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        None,
-        None,
-        None,
-        None,
-        None,
-    ]:
-        """Execute first-order HiFloat8 dgrad and wgrad; higher derivatives are unsupported.
+        *,
+        rowwise: bool,
+        colwise: bool,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ) -> HiFloat8Tensor:
+        """Quantize output gradients with the gradient-role recipe."""
 
-        Args:
-            ctx: Autograd context containing saved operands and group metadata.
-            grad_output: High-precision gradient of the projection output.
-
-        Returns:
-            Input and weight gradients; None for grouping and recipe arguments.
-        """
-
-        group_list, input_quant, weight_quant = restore_quantized_operands(ctx)
-        needs_grad_input = ctx.needs_input_grad[0]
-        needs_grad_weight = ctx.needs_input_grad[1]
-        if ctx.empty_input:
-            grad_input = (
-                torch.zeros(
-                    ctx.input_shape,
-                    dtype=ctx.input_dtype,
-                    device=ctx.input_device,
-                )
-                if needs_grad_input
-                else None
-            )
-            grad_weight = (
-                torch.zeros(
-                    ctx.weight_shape,
-                    dtype=ctx.weight_dtype,
-                    device=ctx.weight_device,
-                )
-                if needs_grad_weight
-                else None
-            )
-            return grad_input, grad_weight, None, None, None, None, None
-
-        grad_quant = ctx.grad_output_quantizer.quantize(
+        return self.grad_output_quantizer.quantize(
             grad_output,
             group_list=group_list,
-            group_list_type=ctx.group_list_type,
-            rowwise=needs_grad_input,
-            colwise=needs_grad_weight,
+            group_list_type=group_list_type,
+            rowwise=rowwise,
+            colwise=colwise,
         )
-        grad_input = None
-        grad_weight = None
-        if needs_grad_input:
-            grad_input = hifloat8_grouped_matmul(
-                grad_quant,
-                weight_quant,
-                layout="NT",
-                group_list=group_list,
-                group_type=0,
-                group_list_type=ctx.group_list_type,
-                output_dtype=ctx.input_dtype,
-            )
-        if needs_grad_weight:
-            grad_weight_for_gmm = hifloat8_grouped_matmul(
-                input_quant,
-                grad_quant,
-                layout="TN",
-                group_list=group_list,
-                group_type=2,
-                group_list_type=ctx.group_list_type,
-                output_dtype=ctx.weight_dtype,
-            )
-            grad_weight = grad_weight_for_gmm.transpose(-2, -1).contiguous()
-        grad_quant.update_usage(rowwise=False, colwise=False)
-        return grad_input, grad_weight, None, None, None, None, None
+
+    def grouped_matmul(
+        self,
+        left: HiFloat8Tensor,
+        right: HiFloat8Tensor,
+        *,
+        layout: str,
+        group_list: torch.Tensor,
+        group_type: int,
+        group_list_type: int,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Execute one HiFloat8 NN, NT, or TN grouped matrix multiplication."""
+
+        return hifloat8_grouped_matmul(
+            left,
+            right,
+            layout=layout,
+            group_list=group_list,
+            group_type=group_type,
+            group_list_type=group_list_type,
+            output_dtype=output_dtype,
+        )
+
+    @once_differentiable
+    def backward(
+        self,
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_output: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Preserve HiFloat8's first-order-only backward contract."""
+
+        return super().backward(ctx, grad_output)
 
 
-def hifloat8_grouped_linear(
-    inputs: torch.Tensor,
-    weight: torch.Tensor,
-    group_list: torch.Tensor,
-    input_quantizer: HiFloat8Quantizer,
-    weight_quantizer: HiFloat8Quantizer,
-    grad_output_quantizer: HiFloat8Quantizer,
-    *,
-    group_list_type: int = 0,
-) -> torch.Tensor:
-    """Apply one bias-free expert-grouped HiFloat8 projection.
-
-    Args:
-        inputs: High-precision, expert-major input matrix.
-        weight: Packed weights in [experts, out_features, in_features] layout.
-        group_list: Token boundaries or counts, one per expert.
-        input_quantizer: Current-scaling input recipe.
-        weight_quantizer: Current-scaling weight recipe.
-        grad_output_quantizer: Gradient recipe used by backward.
-        group_list_type: Zero for cumulative boundaries, one for counts.
-
-    Returns:
-        Expert-major projection output with the input's logical dtype.
-    """
-
-    return _HiFloat8GroupedLinearFunction.apply(
-        inputs,
-        weight,
-        group_list,
-        input_quantizer,
-        weight_quantizer,
-        grad_output_quantizer,
-        group_list_type,
-    )
-
-
-__all__ = ["hifloat8_grouped_linear"]
+__all__ = ["HiFloat8GroupedLinear"]

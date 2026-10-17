@@ -16,18 +16,18 @@
 import gc
 import unittest
 import weakref
-from typing import Any, Callable
-from unittest.mock import patch
+from typing import Any
 
 import torch
 from torch import nn
 
 from hyper_parallel.components.quantization.tensor.hifloat8_tensor import HiFloat8Tensor, HiFloat8TensorStorage
-from hyper_parallel.components.quantization.functional.hifloat8_linear_func import hifloat8_linear
-from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import hifloat8_grouped_linear
+from hyper_parallel.components.quantization.functional.base_gmm_func import _GroupedLinearFunction
+from hyper_parallel.components.quantization.functional.base_linear_func import _LinearFunction
+from hyper_parallel.components.quantization.functional.hifloat8_linear_func import HiFloat8LinearStrategy
+from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import HiFloat8GroupedLinear
 from hyper_parallel.components.quantization.ops.npu_hifloat8 import hifloat8_matmul
 from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
-from hyper_parallel.components.quantization.modules.hifloat8_grouped_linear import HiFloat8GroupedExperts
 
 from tests.common.mark_utils import arg_mark
 
@@ -70,6 +70,29 @@ class IdentityQuantizer:
         scale = torch.ones(1)
         return HiFloat8Tensor(tensor.shape, tensor.dtype, quantizer=self,
             row_data=data if rowwise else None, col_data=data if colwise else None, scale=scale)
+
+
+def hifloat8_linear(inputs, weight, input_quantizer, weight_quantizer, grad_quantizer):
+    """Run Dense projection through the current shared autograd bridge."""
+    return _LinearFunction.apply(
+        inputs,
+        weight,
+        HiFloat8LinearStrategy(input_quantizer, weight_quantizer, grad_quantizer),
+    )
+
+
+def hifloat8_grouped_linear(
+    inputs, weight, group_list, input_quantizer, weight_quantizer, grad_quantizer,
+    *, group_list_type,
+):
+    """Run grouped projection through the current shared autograd bridge."""
+    return _GroupedLinearFunction.apply(
+        inputs,
+        weight,
+        group_list,
+        HiFloat8GroupedLinear(input_quantizer, weight_quantizer, grad_quantizer),
+        group_list_type,
+    )
 
 
 class MemoryContractsTests(unittest.TestCase):
@@ -172,67 +195,23 @@ class MemoryContractsTests(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
-    def test_direct_constructors_initialize_each_expert(self) -> None:
-        """
-        Feature: Low-precision memory contracts.
-        Description: Poison fresh allocations with NaN before constructing experts.
-        Expectation: All weights are finite, nonzero and within fan-in bounds.
-        """
-        # GroupedExperts is a no-allocation shell whose weights arrive via
-        # from_module, so the initialization contract only applies to HiFloat8.
-        for cls in (HiFloat8GroupedExperts,):
-            with self.subTest(cls=cls):
-                # Deterministic poison proves initialization; random torch.empty values do not.
-                original_empty = torch.empty
-                def poisoned(*args: Any, allocator: Callable = original_empty,
-                             **kwargs: Any) -> torch.Tensor:
-                    """Make uninitialized storage deterministic."""
-                    return allocator(*args, **kwargs).fill_(float('nan'))
-                with patch('torch.empty', side_effect=poisoned):
-                    module = cls(2, 4, 6)
-                for weight in module.parameters():
-                    self.assertTrue(torch.isfinite(weight).all())
-                    self.assertGreater(weight.abs().sum().item(), 0)
-                    self.assertLessEqual(weight.abs().max().item(), weight.shape[-1] ** -0.5)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_from_module_keeps_weights_and_rng(self) -> None:
         """
         Feature: Low-precision memory contracts.
         Description: Convert existing expert parameters.
         Expectation: Parameter identity and RNG state are preserved.
         """
-        for cls in (GroupedExperts, HiFloat8GroupedExperts):
-            with self.subTest(cls=cls):
-                source = nn.Module()
-                source.gate_up_proj = nn.Parameter(torch.randn(2, 12, 4))
-                source.down_proj = nn.Parameter(torch.randn(2, 4, 6))
-                source.act_fn = nn.SiLU()
-                rng = torch.get_rng_state()
-                target = cls.from_module(source, fqn='experts')
-                self.assertIs(target.gate_up_proj, source.gate_up_proj)
-                self.assertIs(target.down_proj, source.down_proj)
-                torch.testing.assert_close(torch.get_rng_state(), rng)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
-    def test_invalid_expert_ids_stop_before_gmm(self) -> None:
-        """
-        Feature: Low-precision memory contracts.
-        Description: Pass negative and overflowing expert indices.
-        Expectation: Both fail before grouped computation.
-        """
-        # Only HiFloat8GroupedExperts gates expert ids before the grouped pass;
-        # GroupedExperts defers that validation to the shared GMM contract.
-        for cls in (HiFloat8GroupedExperts,):
-            for index in (-1, 2):
-                with self.subTest(cls=cls, index=index):
-                    module = cls(2, 4, 6)
-                    with patch.object(module, '_grouped_forward') as compute:
-                        with self.assertRaises((ValueError, RuntimeError)):
-                            module(torch.ones(1, 4), torch.tensor([[index]]), torch.ones(1, 1))
-                        compute.assert_not_called()
+        source = nn.Module()
+        source.gate_up_proj = nn.Parameter(torch.randn(2, 12, 4))
+        source.down_proj = nn.Parameter(torch.randn(2, 4, 6))
+        source.act_fn = nn.SiLU()
+        rng = torch.get_rng_state()
+        target = GroupedExperts.from_module(
+            source, fqn='experts', grouped_linear=HiFloat8GroupedLinear()
+        )
+        self.assertIs(target.gate_up_proj, source.gate_up_proj)
+        self.assertIs(target.down_proj, source.down_proj)
+        torch.testing.assert_close(torch.get_rng_state(), rng)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")

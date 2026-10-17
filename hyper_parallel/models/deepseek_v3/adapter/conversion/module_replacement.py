@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DeepSeek-V3 packed-expert replacement factories (low-precision adapters).
+"""DeepSeek-V3 replacement factories for low-precision Linear and MoE.
 
-Model recognition and parameter mapping for the DeepSeek-V3 packed
-gate/up/down expert containers; the generic grouped-linear modules live in
-``hyper_parallel.components.quantization.modules``. These factories require
-TP=CP=EP=PP=1 and validate the NPU runtime before converting.
+This adapter owns model replacement policy and topology checks. The reusable
+compute shells and strategies remain in the quantization components.
 """
 
 from collections.abc import Mapping
@@ -25,15 +23,15 @@ from typing import Any
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.quantization.functional import build_low_precision_strategy
-from hyper_parallel.components.quantization.modules.hifloat8_grouped_linear import (
-    HiFloat8GroupedExperts,
+from hyper_parallel.components.quantization.functional.linear_strategy_factory import (
+    build_linear_strategy,
 )
 from hyper_parallel.components.quantization.modules.grouped_experts import (
     GroupedExperts,
 )
-from hyper_parallel.components.quantization.ops import validate_hifloat8_gmm_runtime
+from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
+from hyper_parallel.models.replacement import module_replacement
 
 
 def _check_ep1_only(context: Mapping[str, Any], factory_name: str) -> None:
@@ -51,17 +49,33 @@ def _check_ep1_only(context: Mapping[str, Any], factory_name: str) -> None:
 
 
 @module_replacement
-def replace_hifloat8_grouped_experts(
+def replace_linear(
     *,
     module: nn.Module,
     module_fqn: str,
     context: Mapping[str, Any],
-) -> HiFloat8GroupedExperts:
-    """Replace one EP=1 packed expert container with HiFloat8 GMMs."""
+) -> LowPrecisionLinear:
+    """Replace one exact Dense Linear using its resolved low-precision policy."""
 
-    _check_ep1_only(context, "HiFloat8 grouped experts")
-    validate_hifloat8_gmm_runtime()
-    return HiFloat8GroupedExperts.from_module(module, fqn=module_fqn)
+    if type(module) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
+        raise TypeError(
+            f"{module_fqn!r} must be exact nn.Linear, got {type(module).__name__}"
+        )
+    if context.get("pp"):
+        raise NotImplementedError(
+            "Low-precision Linear training is not yet supported with pipeline parallelism."
+        )
+    try:
+        strategy = build_linear_strategy(
+            context.get("low_precision"),
+            in_features=module.in_features,
+            out_features=module.out_features,
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"Low-precision Linear target {module_fqn!r} is invalid: {error}"
+        ) from error
+    return LowPrecisionLinear.from_linear(module, strategy=strategy)
 
 
 @module_replacement
@@ -86,4 +100,4 @@ def replace_grouped_experts(
     )
 
 
-__all__ = ["replace_grouped_experts", "replace_hifloat8_grouped_experts"]
+__all__ = ["replace_linear", "replace_grouped_experts"]
