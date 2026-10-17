@@ -229,9 +229,9 @@ class HSDPStateV2:
         )
 
     def _init_mp_dtypes(self):
-        """Initialize mixed-precision dtypes for all managed parameters."""
+        """Refresh dtype attributes from each parameter's resolved precision policy."""
         for hsdp_param in self.hsdp_params:
-            hsdp_param.init_dtype_attrs(self.mp_policy)
+            hsdp_param.init_dtype_attrs(hsdp_param.mp_policy)
 
     def _validate_cpu_offload_params(self):
         """Validate that all parameters are on CPU when CPU offload policy is enabled."""
