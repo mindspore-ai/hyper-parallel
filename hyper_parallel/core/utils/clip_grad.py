@@ -71,6 +71,90 @@ class NormShardPlan:
     replica_ranks: dict[str, tuple[int, ...]]
 
 
+# Reduction backends mapped to the device type their collectives require; a
+# backend absent from this map reduces CPU tensors natively (gloo, mpi).
+_BACKEND_DEVICE_TYPES = {
+    "nccl": "cuda",
+    "hccl": "npu",
+}
+
+# A multi-backend group that registers one of these routes a CPU tensor
+# through that sub-backend instead of its accelerator one.
+_CPU_CAPABLE_BACKENDS = frozenset({"gloo", "mpi"})
+
+
+def _backend_device_type(group: "dist.ProcessGroup") -> Optional[str]:
+    """Return the device type *group* requires for its collective tensors.
+
+    ``dist.get_backend`` reports a composite backend for multi-backend groups
+    (e.g. ``cpu:gloo,cuda:nccl``); a group able to reduce CPU tensors itself
+    yields ``None``.
+
+    Args:
+        group: Process group the collective runs over.
+
+    Returns:
+        The accelerator device type (``npu``/``cuda``) to move a CPU tensor to,
+        or ``None`` when the tensor can be reduced where it is.
+    """
+    try:
+        backend = str(dist.get_backend(group)).lower()
+    except (RuntimeError, ValueError, TypeError):
+        # A group whose backend cannot be queried (test doubles, exotic custom
+        # backends) keeps the historical in-place reduction: the collective itself
+        # reports an unusable backend if there really is one.
+        return None
+    names = [part.split(":")[-1].strip() for part in backend.split(",")]
+    if any(name in _CPU_CAPABLE_BACKENDS for name in names):
+        return None
+    for name in names:
+        device_type = _BACKEND_DEVICE_TYPES.get(name)
+        if device_type is not None:
+            return device_type
+    return None
+
+
+def _accelerator_device(device_type: str) -> torch.device:
+    """Return this rank's local accelerator device of *device_type*."""
+    handle = getattr(torch, device_type, None)
+    if handle is None or not handle.is_available():
+        return torch.device("cpu")
+    try:
+        return torch.device(device_type, handle.current_device())
+    except (RuntimeError, AssertionError):
+        return torch.device(device_type)
+
+
+def _reduce_scalar_norm(
+    tensor: torch.Tensor,
+    reduce_op: "dist.ReduceOp",
+    group: "dist.ProcessGroup",
+) -> torch.Tensor:
+    """All-reduce one norm tensor over *group*, choosing a reducible device.
+
+    Accelerator process groups (hccl/nccl) cannot reduce CPU tensors, so under
+    FSDP CPU offload the tensor is temporarily moved to the local accelerator of
+    that group's backend and the result is copied back, keeping the caller's
+    device semantics unchanged. CPU-capable groups reduce the tensor in place.
+
+    Args:
+        tensor: Per-rank norm tensor (may live on the CPU under offload).
+        reduce_op: Reduction operation.
+        group: Process group the collective runs over.
+
+    Returns:
+        The reduced tensor, on its original device.
+    """
+    device_type = _backend_device_type(group) if tensor.is_cpu else None
+    if device_type is None:
+        dist.all_reduce(tensor, op=reduce_op, group=group)
+        return tensor
+    comm_tensor = tensor.to(device=_accelerator_device(device_type))
+    dist.all_reduce(comm_tensor, op=reduce_op, group=group)
+    tensor.copy_(comm_tensor)
+    return tensor
+
+
 def _norm_coverage(param: torch.nn.Parameter) -> tuple[tuple[int, ...], tuple[tuple[int, int], ...]]:
     """Describe the exact global rectangle represented by a local parameter."""
     global_shape = tuple(param.shape)
@@ -215,7 +299,7 @@ def dense_grad_norm_sq_and_refs(model: torch.nn.Module,
     for name in getattr(getattr(mesh_context, "device_mesh", None), "mesh_dim_names", ()) or ():
         axis = mesh_context.device_mesh[name]
         if axis.size() > 1:
-            dist.all_reduce(local_sq, op=dist.ReduceOp.SUM, group=axis.get_group())
+            _reduce_scalar_norm(local_sq, dist.ReduceOp.SUM, axis.get_group())
     return local_sq, refs
 
 
@@ -588,10 +672,7 @@ def _total_norm_inf(  # pylint: disable=R0913,R0917
         if mesh_id is not None:
             mesh = mesh_cache[mesh_id]
             for dim in shard_dims:
-                dist.all_reduce(
-                    local_norm, op=reduce_op,
-                    group=mesh.get_group(dim),
-                )
+                _reduce_scalar_norm(local_norm, reduce_op, mesh.get_group(dim))
         group_norms.append(local_norm)
     if not group_norms:
         if norm_type == -math.inf:
@@ -609,10 +690,7 @@ def _total_norm_sum(grad_groups, norm_type, mesh_cache, device):
         if mesh_id is not None:
             mesh = mesh_cache[mesh_id]
             for dim in shard_dims:
-                dist.all_reduce(
-                    local_val, op=dist.ReduceOp.SUM,
-                    group=mesh.get_group(dim),
-                )
+                _reduce_scalar_norm(local_val, dist.ReduceOp.SUM, mesh.get_group(dim))
         total.add_(local_val)
     return total
 
@@ -712,7 +790,7 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
             local_p = torch.tensor(0.0, device=device, dtype=torch.float32)
 
         for group in sig_groups[sig]:
-            dist.all_reduce(local_p, op=dist.ReduceOp.SUM, group=group)
+            _reduce_scalar_norm(local_p, dist.ReduceOp.SUM, group)
 
         total_p = total_p + local_p
 
@@ -834,7 +912,8 @@ def _coalesce_partial_reduce(  # pylint: disable=R0914
 
         for pdim, reduce_op, needs_avg in partial_info:
             group = mesh.get_group(pdim)
-            dist.all_reduce(buf, op=reduce_op, group=group)
+            # Tensor-generic: a coalesced buffer is CPU under FSDP offload too.
+            _reduce_scalar_norm(buf, reduce_op, group)
             if needs_avg:
                 buf /= dist.get_world_size(group=group)
 
