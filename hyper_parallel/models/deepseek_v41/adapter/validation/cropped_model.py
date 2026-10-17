@@ -383,6 +383,8 @@ def build_deepseek_v41_validation_config(
         num_routed_experts: int = 16,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        router_aux_loss_coeff: float = 1.0e-4,
+        router_bias_update_rate: float = 1.0e-3,
         dspark_depth: int = 0,
         dspark_target_layer_ids: list[int] | None = None,
         dspark_loss_coeff: float = 1.0,
@@ -397,25 +399,21 @@ def build_deepseek_v41_validation_config(
     Args:
         config_path: Local DeepSeek-V4.1 repository.
         engram_assets_path: Scaled Engram assets prepared from its tokenizer.
-        num_hidden_layers: Optional decoder crop depth. ``None`` retains the
-            released decoder depth.
+        num_hidden_layers: Optional decoder crop depth; ``None`` retains the released decoder depth.
         text_parameter_divisor: Uniform divisor for text hidden, MLP, attention
             head count, low-rank dimensions, Indexer head count, and Engram
             width; per-head dimensions stay unchanged.
-        enable_vision: Enable the native multimodal branch. Its released depth
-            is retained unless ``vision_num_hidden_layers`` is set.
-        vision_num_hidden_layers: Optional visual-tower crop depth. This is
-            valid only when ``enable_vision`` is true.
-        vision_parameter_divisor: Uniform divisor for vision hidden, MLP, and
-            attention-head dimensions.
-        num_routed_experts: Routed-expert count for the parameter crop. Routing
-            top-k and every released MoE layer are retained.
+        enable_vision: Enable the native multimodal branch; retain its released depth unless explicitly cropped.
+        vision_num_hidden_layers: Optional visual-tower crop depth, valid only when ``enable_vision`` is true.
+        vision_parameter_divisor: Uniform divisor for vision hidden, MLP, and attention-head dimensions.
+        num_routed_experts: Routed-expert count for the crop; routing top-k and every MoE layer are retained.
         exercise_post_training_indexer: Bound the candidate pool so a 4K smoke
             exercises candidate selection before the released Reindex layers.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
+        router_aux_loss_coeff: Sequence balancing coefficient; zero disables it.
+        router_bias_update_rate: Per-step text/image correction-bias update speed; zero disables it.
         dspark_depth: Trainable DSpark stage count; 0 disables the drafter.
-        dspark_target_layer_ids: Backbone layers feeding the drafter; defaults
-            to the last three, matching the released layout.
+        dspark_target_layer_ids: Backbone layers feeding the drafter; defaults to the released last-three layout.
         dspark_loss_coeff: Drafter objective weight.
         dspark_confidence_coeff: Confidence-head BCE weight.
 
@@ -428,9 +426,7 @@ def build_deepseek_v41_validation_config(
     source, text, assets, assets_path, released_hidden_layers = _load_validation_sources(
         config_path, engram_assets_path
     )
-    resolved_hidden_layers = _resolve_crop_depth(
-        num_hidden_layers, released_hidden_layers, "num_hidden_layers"
-    )
+    resolved_hidden_layers = _resolve_crop_depth(num_hidden_layers, released_hidden_layers, "num_hidden_layers")
     resolved_routed_experts = _resolve_routed_experts(text, num_routed_experts)
     dimensions = _scale_text_dimensions(text, text_parameter_divisor, assets)
     config = _build_text_config(
@@ -446,6 +442,8 @@ def build_deepseek_v41_validation_config(
         exercise_post_training_indexer,
         indexer_loss_coeff,
     )
+    config.router_aux_loss_coef = float(router_aux_loss_coeff)
+    config.router_bias_update_rate = float(router_bias_update_rate)
     _apply_v41_vision_fields(
         config, source, enable_vision, vision_num_hidden_layers, vision_parameter_divisor
     )
@@ -485,6 +483,8 @@ def build_cropped_deepseek_v41(
         num_routed_experts: int = 16,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        router_aux_loss_coeff: float = 1.0e-4,
+        router_bias_update_rate: float = 1.0e-3,
         dspark_depth: int = 0,
         dspark_target_layer_ids: list[int] | None = None,
         dspark_loss_coeff: float = 1.0,
@@ -515,6 +515,8 @@ def build_cropped_deepseek_v41(
         exercise_post_training_indexer: Exercise the Full/Reindex hierarchy at
             native layer indices.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
+        router_aux_loss_coeff: Sequence balancing coefficient; zero disables it.
+        router_bias_update_rate: Per-step text/image correction-bias update speed; zero disables it.
         dspark_depth: Trainable DSpark stage count; 0 disables the drafter.
         dspark_target_layer_ids: Backbone layers feeding the drafter; defaults
             to the last three.
@@ -544,6 +546,8 @@ def build_cropped_deepseek_v41(
         num_routed_experts=num_routed_experts,
         exercise_post_training_indexer=exercise_post_training_indexer,
         indexer_loss_coeff=indexer_loss_coeff,
+        router_aux_loss_coeff=router_aux_loss_coeff,
+        router_bias_update_rate=router_bias_update_rate,
         dspark_depth=dspark_depth,
         dspark_target_layer_ids=dspark_target_layer_ids,
         dspark_loss_coeff=dspark_loss_coeff,

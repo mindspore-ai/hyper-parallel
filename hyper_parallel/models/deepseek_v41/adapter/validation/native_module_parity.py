@@ -393,6 +393,8 @@ def _moe_config() -> DeepseekV4Config:
         index_topk=2,
         partial_rotary_factor=0.5,
     )
+    config.router_aux_loss_coef = 0.0
+    config.router_bias_update_rate = 0.0
     config.v41_vision_enabled = True
     return config
 

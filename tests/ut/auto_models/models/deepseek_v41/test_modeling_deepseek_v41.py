@@ -30,6 +30,7 @@ try:
 except ImportError as exc:
     raise unittest.SkipTest(f"DeepSeek-V4 Transformers dependency unavailable: {exc}") from exc
 
+from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedPackedSequence
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_ep_compute_fn,
 )
@@ -100,6 +101,7 @@ class TestV41SharedExpert(unittest.TestCase):
         config.mlp_layer_types = ["moe"] * 2
         config.v41_compress_ratios = [0, 0]
         config.v41_dspark_target_layer_ids = [0, 1]
+        config.router_aux_loss_coef = 0.1
         config.hc_mult = 4
         config.hc_sinkhorn_iters = 20
         with patch(
@@ -111,11 +113,19 @@ class TestV41SharedExpert(unittest.TestCase):
             layer.attn_hc = DeepseekV41HyperMegaMhc(module=layer.attn_hc)
             layer.ffn_hc = DeepseekV41HyperMegaMhc(module=layer.ffn_hc)
         input_ids = torch.tensor([[1, 2, 3, 4]])
+        packed = SharedCompressedPackedSequence(
+            cu_seq_lens=torch.tensor([0, 1, 4], dtype=torch.int32),
+            local_query_start=0,
+            local_query_length=4,
+            global_sequence_length=4,
+        )
 
-        expected = reference(input_ids=input_ids).last_hidden_state
-        actual = shifted(input_ids=input_ids).last_hidden_state
+        expected = reference(input_ids=input_ids, packed_seq_params=packed).last_hidden_state
+        actual = shifted(input_ids=input_ids, packed_seq_params=packed).last_hidden_state
 
         torch.testing.assert_close(actual, expected)
+        for layer, expected_layer in zip(shifted.layers, reference.layers):
+            torch.testing.assert_close(layer.mlp.gate.last_aux_loss, expected_layer.mlp.gate.last_aux_loss)
         self.assertEqual(len(shifted.dspark_target_hiddens), 2)
         for target, expected_target in zip(shifted.dspark_target_hiddens, reference.dspark_target_hiddens):
             torch.testing.assert_close(target, expected_target)

@@ -44,6 +44,8 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
     def _make_moe_mock(self, tokens: list) -> MagicMock:
         """Create a mock MoE module with given tokens_per_expert values."""
         moe = MagicMock()
+        del moe.expert_bias_update_groups
+        del moe.expert_bias_update_rate
         moe.tokens_per_expert = torch.tensor(tokens, dtype=torch.float32)
         moe.update_expert_bias = MagicMock()
         return moe
