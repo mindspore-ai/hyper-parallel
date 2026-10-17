@@ -42,7 +42,7 @@ prepare_config = rl_st_cases.prepare_config
 
 ROOT = Path(__file__).resolve().parents[4]
 HERE = Path(__file__).resolve().parent
-BASE_IMAGE = "hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64"
+BASE_IMAGE = "swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64"
 DEFAULT_RESULT_ROOT = ROOT / "hyper_parallel/rl/output"
 
 

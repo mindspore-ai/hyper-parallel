@@ -104,6 +104,24 @@ def _handler() -> Any:
     return handler
 
 
+def test_router_capture_is_private_to_the_record_and_json_snapshot() -> None:
+    """The Agent response carries no route payload while the training snapshot retains it once."""
+    handler = _handler()
+    handler.server.router_capture_spec = {"layer_ids": [2], "top_k": 2, "num_experts": 4}
+    response = {"prompt_token_ids": [1, 2], "choices": [{"index": 0, "token_ids": [3, 9],
+                "finish_reason": "stop", "message": {"role": "assistant", "content": "answer"},
+                "routed_experts": "private-base64-npy"}]}
+    handler._backend_request = lambda _request: response
+    delivered, unused_outcome, record = handler._model_completion("s", {"input": "question"}, {})
+    assert "routed_experts" not in delivered["choices"][0]
+    assert "routed_experts" not in record["response"]["choices"][0]
+    assert record["routed_experts"] == "private-base64-npy"
+    assert record["router_capture_spec"] == handler.server.router_capture_spec
+    snapshot = json.loads(json.dumps(handler.server.state.snapshot("s")))
+    assert snapshot["completions"][0]["routed_experts"] == "private-base64-npy"
+    assert json.dumps(snapshot).count("private-base64-npy") == 1
+
+
 def _sampled_repository_tool(arguments: dict[str, Any]) -> dict[str, Any]:
     """Tie one parsed tool action to immutable sampled token and parser evidence."""
     raw = '<tool_call>{"name":"exec_command","arguments":' + json.dumps(arguments) + '}</tool_call>'
@@ -459,8 +477,8 @@ def test_slow_drip_read_obeys_total_deadline(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.parametrize("repository", [False, True])
-def test_completed_repository_budget_is_structured_and_text_budget_still_fails(repository: bool) -> None:
-    """Only trusted repository registration turns fully captured call limits into a terminal state."""
+def test_completed_text_and_repository_budgets_are_structured(repository: bool) -> None:
+    """Fully captured call limits terminate both runners without an infrastructure failure."""
     gateway = codex.CodexGateway("127.0.0.1", 0, "http://unused", "test", 2, admin_token="test-controller")
     raw = {"id": "c", "model": "test", "choices": [{"index": 0,
            "message": {"role": "assistant", "content": "answer"}, "finish_reason": "stop"}]}
@@ -473,22 +491,17 @@ def test_completed_repository_budget_is_structured_and_text_budget_still_fails(r
         with patch.object(codex._Handler, "_backend_request", return_value=raw) as backend:
             assert _http(gateway, "POST", "/v1/responses", "s", request)[0] == 200
             status, result = _http(gateway, "POST", "/v1/responses", "s", request)
-            assert status == (409 if repository else 502)
+            assert status == 409
             assert backend.call_count == 1
-            if repository:
-                assert result["error"]["type"] == "completion_budget_exhausted"
-                assert result["termination"] == {"reason": "max_completions", "limit": 1,
-                                                 "completed": 1, "policy_version": 3}
-                assert _http(gateway, "POST", "/v1/responses", "s", request) == (status, result)
+            assert result["error"]["type"] == "completion_budget_exhausted"
+            assert result["termination"] == {"reason": "max_completions", "limit": 1,
+                                             "completed": 1, "policy_version": 3}
+            assert _http(gateway, "POST", "/v1/responses", "s", request) == (status, result)
         _, snapshot = _http(gateway, "GET", "/internal/sessions/s", gateway.admin_token)
         assert len(snapshot["completions"]) == 1
-        if repository:
-            assert snapshot["failure"] is None
-            assert snapshot["termination"] == result["termination"]
-            assert _http(gateway, "POST", "/v1/responses", "s", request)[0] == 409
-        else:
-            assert "termination" not in snapshot
-            assert snapshot["failure"]["trainable"] is False
+        assert snapshot["failure"] is None
+        assert snapshot["termination"] == result["termination"]
+        assert _http(gateway, "POST", "/v1/responses", "s", request)[0] == 409
     finally:
         gateway.close()
 

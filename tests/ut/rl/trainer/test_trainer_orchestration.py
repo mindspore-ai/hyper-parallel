@@ -69,6 +69,7 @@ def test_trainer_initializes_batch_invariant_settings_before_distributed_runtime
     calls: list[str] = []
     resolved = {"algorithm": {"name": "grpo", "loss_aggregation": "token-mean"}}
     monkeypatch.setattr(trainer_module, "resolve_vllm_automatic_limits", lambda config: config)
+    monkeypatch.setattr(trainer_module, "resolve_router_replay_config", lambda config: config)
     monkeypatch.setattr(
         trainer_module,
         "configure_consistency_profile",
@@ -165,7 +166,7 @@ def test_trainer_builds_independent_trainable_and_reference_roles(
     monkeypatch.setattr(
         trainer_module,
         "build_role_model",
-        lambda unused_runtime, unused_setup, *, frozen: reference_model if frozen else actor_model,
+        lambda unused_runtime, unused_setup, *, frozen, cpu_threads=None: reference_model if frozen else actor_model,
     )
     monkeypatch.setattr(
         trainer_module,
@@ -1065,8 +1066,8 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
     models = iter((trainable_model, reference_model))
     frozen_flags = []
 
-    def build_model(unused_runtime: Any, unused_setup: Any, *, frozen: bool) -> Any:
-        del unused_runtime, unused_setup
+    def build_model(unused_runtime: Any, unused_setup: Any, *, frozen: bool, cpu_threads: Any = None) -> Any:
+        del unused_runtime, unused_setup, cpu_threads
         frozen_flags.append(frozen)
         return next(models)
 
@@ -1301,6 +1302,7 @@ def _recording_checkpoints(calls):
 def _configure_rollout_test(trainer, runner):
     """Configure independent training and evaluation rollout settings."""
     trainer.resolved_config = {
+        "train": {},
         "rollout": {
             "engine": "vllm",
             "num_return_sequences": 4,

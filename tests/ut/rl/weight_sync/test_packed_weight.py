@@ -25,6 +25,11 @@ from rl.weight_sync.packed_weight import (
     unpack_packed_weights,
 )
 
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import Shard
+
 
 def test_bucket_metadata_reads_local_tensor_without_dtensor_dispatch() -> None:
     """Global shape and local scalar metadata must not dispatch parallel ops."""
@@ -93,6 +98,11 @@ def test_only_producer_packs_after_every_rank_materializes_full_tensors(
             self.name = name
             self.values = values
 
+        def to(self, *, device: torch.device, non_blocking: bool) -> "DistributedValue":
+            """Accept the device-staging API used by the current gather implementation."""
+            del device, non_blocking
+            return self
+
         def full_tensor(self) -> torch.Tensor:
             calls.append(self.name)
             return torch.tensor(self.values)
@@ -104,12 +114,12 @@ def test_only_producer_packs_after_every_rank_materializes_full_tensors(
     bucket = build_packed_weight_buckets(state, 32)[0]
 
     monkeypatch.setattr(packed_module.dist, "get_rank", lambda: 1)
-    assert materialize_packed_weight_bucket(state, bucket) is None
+    assert materialize_packed_weight_bucket(state, bucket, device=torch.device("cpu")) is None
     assert calls == ["a", "b"]
 
     calls.clear()
     monkeypatch.setattr(packed_module.dist, "get_rank", lambda: 0)
-    packed = materialize_packed_weight_bucket(state, bucket)
+    packed = materialize_packed_weight_bucket(state, bucket, device=torch.device("cpu"))
     assert calls == ["a", "b"]
     assert packed is not None
     weights = unpack_packed_weights(packed, bucket.worker_metadata())
@@ -131,3 +141,72 @@ def test_packed_metadata_rejects_out_of_bounds_parameter() -> None:
                 "num_bytes": 8,
             }],
         )
+
+
+def test_device_staging_preserves_real_dtensor_source_and_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A device conversion changes only the temporary DTensor before gather."""
+    monkeypatch.setattr(packed_module.dist, "get_rank", lambda: 0)
+    mesh = DeviceMesh("cpu", [0, 1], mesh_dim_names=("dp",), _init_backend=False)
+    layout = Layout.from_device_mesh(mesh)([Shard(0)])
+    layout.placement_to_tensor_map(2)
+    layout.set_tensor_meta((4, 2), (2, 1), torch.float32)
+    local = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    source = DTensor.from_local_with_layout(local, layout, shape=(4, 2))
+    original_pointer = local.data_ptr()
+    original_placements = source.placements
+    original_mesh = source.device_mesh
+    observed = []
+
+    def full_tensor(staged: DTensor) -> torch.Tensor:
+        """Observe the actual converted wrapper without a process group."""
+        assert staged is not source
+        assert staged.to_local().device.type == "meta"
+        assert staged.device_mesh is original_mesh
+        assert staged.layout.mesh.device_type == original_mesh.device_type
+        assert staged.layout.mesh.to_hash() == original_mesh.to_hash()
+        assert staged.layout.mesh.get_coordinate() == original_mesh.get_coordinate()
+        assert staged.placements == original_placements
+        assert staged.layout is not source.layout
+        assert staged.layout.tensor_shape == source.layout.tensor_shape
+        observed.append(staged.shape)
+        return torch.empty((4, 2), device="meta")
+
+    monkeypatch.setattr(DTensor, "full_tensor", full_tensor)
+    state = {"weight": source}
+    bucket = build_packed_weight_buckets(state, 64)[0]
+
+    packed = materialize_packed_weight_bucket(state, bucket, device=torch.device("meta"))
+
+    assert observed == [torch.Size((4, 2))]
+    assert packed.device.type == "meta"
+    assert state["weight"] is source
+    assert source.to_local() is local
+    assert local.device.type == "cpu"
+    assert local.data_ptr() == original_pointer
+    assert source.layout is layout
+    assert source.device_mesh is original_mesh
+    assert source.placements == original_placements
+    torch.testing.assert_close(local, torch.arange(4, dtype=torch.float32).reshape(2, 2))
+
+
+def test_plain_parameter_publication_preserves_storage_and_requires_grad(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replicated parameters retain model storage and are copied into the payload."""
+    monkeypatch.setattr(packed_module.dist, "get_rank", lambda: 0)
+    parameter = torch.nn.Parameter(torch.arange(6, dtype=torch.float32).reshape(2, 3).T)
+    pointer = parameter.data_ptr()
+    state = {"weight": parameter}
+    bucket = build_packed_weight_buckets(state, 64)[0]
+
+    packed = materialize_packed_weight_bucket(state, bucket, device=torch.device("cpu"))
+
+    restored = unpack_packed_weights(packed, bucket.worker_metadata())[0][1]
+    torch.testing.assert_close(restored, parameter)
+    assert parameter.requires_grad
+    assert parameter.data_ptr() == pointer
+    assert not packed.requires_grad
+    restored.zero_()
+    torch.testing.assert_close(parameter, torch.arange(6, dtype=torch.float32).reshape(2, 3).T)

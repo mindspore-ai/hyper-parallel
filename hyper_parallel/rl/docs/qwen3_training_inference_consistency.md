@@ -136,6 +136,7 @@ export HYPER_QWEN3_ROLLOUT_DP=2
 ./hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_consistency_docker.sh disjoint
 ```
 
-正式配置见 [TP2 consistency YAML](../examples/gsm8k/configs/qwen3_4b_gsm8k_vllm_tp2_consistency.yaml)。
+TP1/TP2 共用 [基础 YAML](../examples/gsm8k/configs/qwen3_4b_gsm8k_vllm_production.yaml)，
+上述一致性脚本根据 `HYPER_QWEN3_TP` 覆盖对应的拓扑、容量和预算，保留原 TP2 配方的行为。
 普通 Hyper/Native 或 TP degree mismatch 使用 `run_qwen3_tp_docker.sh`；该入口显式关闭 consistency，
 不能用于声明 bit-exact。

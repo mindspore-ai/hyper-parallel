@@ -269,6 +269,8 @@ import asyncio
 import sys
 from pathlib import Path
 from rl.agentic.envs.docker_workspace import DockerWorkspace, acquire_workspace_slot
+loaded = [name for name in ('torch', 'transformers') if name in sys.modules]
+assert not loaded, f'Expected a framework-free workspace import, got {loaded}'
 async def run():
     try:
         async with acquire_workspace_slot(Path(sys.argv[1]), 1, 0.15):
@@ -287,7 +289,12 @@ asyncio.run(run())
         process = await asyncio.create_subprocess_exec(sys.executable, "-c", script, str(tmp_path),
                                                       stdout=asyncio.subprocess.PIPE,
                                                       stderr=asyncio.subprocess.PIPE, env=environment)
-        stdout, stderr = await asyncio.wait_for(process.communicate(), 30)
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 30)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.communicate()
         assert process.returncode == 0, stderr.decode()
         return stdout.strip()
 

@@ -6,9 +6,10 @@ devices=${1:-2,3}
 steps=${2:-50}
 data_dir=${3:-}
 if [[ -z "$data_dir" ]]; then
-    echo "Usage: $0 DEVICE_IDS STEPS DATA_DIRECTORY" >&2
+    echo "Usage: $0 DEVICE_IDS STEPS DATA_DIRECTORY [LAUNCHER_OPTIONS|--section.field=value ...]" >&2
     exit 2
 fi
+shift 3
 if [[ ! "$steps" =~ ^[1-9][0-9]*$ ]]; then
     echo "Steps must be a positive integer, got: $steps" >&2
     exit 2
@@ -22,4 +23,4 @@ if [[ "$confirmed" != yes ]]; then
 fi
 echo "Training output: ${PWD}/${output}"
 python3 examples/search_r1/launcher.py --devices "$devices" --steps "$steps" \
-    --backend-privileged --data "$data_dir" --output "$output"
+    --backend-privileged --data "$data_dir" --output "$output" "$@"

@@ -27,6 +27,7 @@ import signal
 import sys
 import time
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlparse
@@ -57,6 +58,20 @@ _COMPACTION_WARNING = (
     "Heads up: Long threads and multiple compactions can cause the model to be less accurate. "
     "Start a new thread when possible to keep threads small and targeted."
 )
+_BUDGET_RESPONSE = re.compile(
+    r"unexpected status 409 Conflict: Repository session exhausted its ([1-9][0-9]*) model calls, "
+    r"url: (https?://\S+/responses)"
+)
+
+
+class _CompletionBudgetExit(RuntimeError):
+    """Identify the exact Gateway budget response that caused the CLI to stop."""
+
+    def __init__(self, limit: int, url: str) -> None:
+        """Keep the reported limit and endpoint for validation against the sealed capture."""
+        super().__init__("Codex stopped after a structured completion budget response")
+        self.limit = limit
+        self.url = url
 
 
 def build_codex_trajectory(
@@ -110,15 +125,15 @@ def build_codex_call_trajectories(
         reward_components=reward_components,
         max_episode_tokens=max_episode_tokens,
         metadata=metadata,
-        status_resolver=_repository_call_status,
+        status_resolver=_codex_call_status,
     )
 
 
-def _repository_call_status(traces: Sequence[Mapping[str, Any]],
-                            metadata: Mapping[str, Any]) -> tuple[bool, str] | None:
-    """Mark every call in a controller-validated repository budget episode as truncated."""
+def _codex_call_status(traces: Sequence[Mapping[str, Any]],
+                       metadata: Mapping[str, Any]) -> tuple[bool, str] | None:
+    """Mark calls in controller-validated text or repository budget episodes as truncated."""
     del traces
-    if metadata.get("repository_budget_truncated") is True:
+    if metadata.get("repository_budget_truncated") is True or metadata.get("completion_budget_truncated") is True:
         return True, "max_completions"
     return None
 
@@ -216,6 +231,9 @@ class CodexRuntime(HarnessRuntime):
         gateway_options = {
             "max_inflight_requests": int(config.get("max_inflight_requests", 1)),
         }
+        capture_spec = getattr(engine, "router_capture_spec", None)
+        if capture_spec is not None:
+            gateway_options["router_capture_spec"] = asdict(capture_spec)
         for name in ("max_request_bytes", "max_response_bytes"):
             if name in config:
                 gateway_options[name] = int(config[name])
@@ -323,6 +341,27 @@ class CodexAgentProgram:
         return RewardResult(0.0, {"outcome": 0.0}, dict(failure))
 
 
+    def _captured_budget(self, captured: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+        """Accept only a completed, failure-free budget matching this episode's identity."""
+        termination = captured.get("termination")
+        if termination is None:
+            return None
+        records = captured.get("completions", [])
+        if (not isinstance(termination, Mapping)
+                or set(termination) != {"reason", "limit", "completed", "policy_version"}
+                or termination.get("reason") != "max_completions"
+                or any(not isinstance(termination.get(key), int) or isinstance(termination.get(key), bool)
+                       for key in ("limit", "completed", "policy_version"))
+                or termination["limit"] != int(self.config["max_turns"])
+                or termination["completed"] != termination["limit"]
+                or termination["policy_version"] != self.policy_version
+                or captured.get("failure") is not None
+                or not isinstance(records, list) or len(records) != termination["limit"]
+                or sorted(record.get("ordinal", -1) for record in records) != list(range(len(records)))):
+            raise RuntimeError("Codex budget termination differs from the completed captured session")
+        return dict(termination)
+
+
     async def _run_registered(
         self,
         session_id: str,
@@ -347,6 +386,18 @@ class CodexAgentProgram:
             execution_error = error
         captured = await self._admin_request("GET", f"/internal/sessions/{session_id}", None, timeout)
         reward_result = self._captured_failure(captured, execution_error)
+        budget = self._captured_budget(captured)
+        if budget is not None and not final_answer:
+            if execution_error is not None:
+                if not isinstance(execution_error, _CompletionBudgetExit):
+                    raise execution_error
+                if (getattr(execution_error, "limit", None), getattr(execution_error, "url", None)) != (
+                    budget["limit"], self.gateway_url + "/responses",
+                ):
+                    raise execution_error
+            reward_result = RewardResult(0.0, {"outcome": 0.0}, {
+                "completion_budget_truncated": True, "budget_termination": budget,
+            })
         if reward_result is None:
             if execution_error is not None:
                 raise execution_error
@@ -658,16 +709,39 @@ async def _collect_codex_output(
     return stdout_lines, stderr_lines
 
 
+def _cli_budget_response(event: Mapping[str, Any]) -> Optional[tuple[int, str]]:
+    """Recognize only the pinned CLI's exact budget response, including its known retries."""
+    message = event.get("message")
+    if event.get("type") == "turn.failed":
+        error = event.get("error")
+        message = error.get("message") if isinstance(error, Mapping) else None
+    elif event.get("type") != "error":
+        return None
+    if not isinstance(message, str):
+        return None
+    if message.startswith("Reconnecting..."):
+        retry = re.fullmatch(r"Reconnecting\.\.\. [1-5]/5 \((.+)\)", message)
+        if retry is None:
+            return None
+        message = retry[1]
+    match = _BUDGET_RESPONSE.fullmatch(message)
+    return None if match is None else (int(match[1]), match[2])
+
+
 def _interpret_codex_output(
     stdout_lines: list[str], stderr_lines: list[str], return_code: int, artifact_dir: Path,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Validate child status and return its final answer and diagnostic events."""
     stderr_tail = "\n".join(stderr_lines[-20:]).strip()
     artifact_hint = f"artifacts: {artifact_dir}"
+    final_answer, diagnostic_events, failed_events = _classify_codex_events(stdout_lines)
+    if return_code in (0, 1) and failed_events and failed_events[-1].get("type") == "turn.failed":
+        budgets = [_cli_budget_response(event) for event in failed_events]
+        if budgets[0] is not None and all(value == budgets[0] for value in budgets):
+            raise _CompletionBudgetExit(*budgets[0])
     if return_code != 0:
         detail = f"; stderr tail:\n{stderr_tail}" if stderr_tail else ""
         raise RuntimeError(f"Codex exited with status {return_code}{detail}; {artifact_hint}")
-    final_answer, diagnostic_events, failed_events = _classify_codex_events(stdout_lines)
     if failed_events:
         detail = f"; stderr tail:\n{stderr_tail}" if stderr_tail else ""
         raise RuntimeError(

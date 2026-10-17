@@ -31,7 +31,7 @@ from rl.agentic.core.types import (
     TurnContext,
 )
 from rl.agentic.envs.environment import Environment
-from rl.dataset.contracts import PromptRecord, Trajectory, Turn
+from rl.dataset.contracts import PromptRecord, RouterTrace, Trajectory, Turn, resize_router_trace
 
 _TOOL_COUNTER_NAMES = ("tool_call_count", "tool_success_count", "tool_error_count")
 _RESERVED_TRANSITION_INFO = frozenset(("reward_components", *_TOOL_COUNTER_NAMES))
@@ -105,6 +105,7 @@ class AgentSession:
         self._log_prob_parts: list[Any] = []
         self._collecting_log_probs: Optional[bool] = None
         self._worker_policy_version: Optional[int] = None
+        self._router_trace = None
         # Rewards and termination belong to the whole episode. Per-turn values
         # are retained for diagnostics and future credit-assignment strategies.
         self.reward = 0.0
@@ -252,6 +253,26 @@ class AgentSession:
         self._append_observation_turn(observation, token_ids, *span)
         return True
 
+    def _record_router_trace(self, trace: Optional[RouterTrace], token_count: int) -> None:
+        """Replace a full capture only when every previously captured input stays identical."""
+        previous = self._router_trace
+        if self.turn_count and (trace is None) != (previous is None):
+            raise ValueError("Every action must consistently provide router traces or omit them")
+        if trace is None:
+            return
+        if trace.expert_ids.shape[0] != token_count:
+            raise ValueError("Action router trace must include the exact prompt and action input positions")
+        if previous is not None:
+            if previous.layer_ids != trace.layer_ids or previous.expert_ids.shape[1:] != trace.expert_ids.shape[1:]:
+                raise ValueError("Action router trace layers/top-k changed across turns")
+            for start in range(0, previous.expert_ids.shape[0], 4096):
+                stop = min(start + 4096, previous.expert_ids.shape[0])
+                valid = previous.valid_mask[start:stop]
+                if (not bool(trace.valid_mask[start:stop][valid].all()) or not torch.equal(
+                        previous.expert_ids[start:stop][valid], trace.expert_ids[start:stop][valid])):
+                    raise ValueError("Action router trace changed previously captured input positions")
+        self._router_trace = trace
+
     def _append_action(self, action: Action) -> None:
         """Append one trainable model action and its optional log-probabilities."""
         if action.token_ids.ndim != 1:
@@ -269,6 +290,7 @@ class AgentSession:
             self._record_encoded_action(action)
         start = self._token_count
         end = start + int(action.token_ids.numel())
+        self._record_router_trace(action.router_trace, end)
         self._token_parts.append(action.token_ids)
         self._token_count = end
         self._cached_token_ids = None
@@ -446,6 +468,9 @@ class AgentSession:
             truncated=self.truncated,
             terminal_reason=self.terminal_reason.value,
             worker_policy_version=self._worker_policy_version,
+            router_trace=(None if self._router_trace is None else resize_router_trace(
+                self._router_trace, int(token_ids.numel()),
+            )),
             metadata={
                 **self.metadata,
                 "sample_index": self.sample_index,

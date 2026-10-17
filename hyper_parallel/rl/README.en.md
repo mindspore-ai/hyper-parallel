@@ -105,7 +105,7 @@ Run all subsequent commands from the repository root. If you already have a chec
 ### 2. Prepare the runtime image
 
 ```bash
-docker image inspect hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64
+docker image inspect swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64
 
 npu-smi info
 ```
@@ -152,7 +152,7 @@ export HYPER_QWEN3_TP_MAX_STEPS=1
 **Qwen3-4B + Search-R1, two retrieval-QA steps on two NPUs.** The model uses a local retrieval tool and continues answering from observations; no external agent CLI is required. Prepare `train.parquet` with `prompt` and `answer` columns and `corpus.jsonl` using the [data preparation script](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c631327524ea37b6b2ca328076980a/hyper_parallel/rl/examples/agents/search_R1/prepare_search_r1_data.py).
 
 ```bash
-export HYPER_VLLM_IMAGE=hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64
+export HYPER_VLLM_IMAGE=swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64
 export HYPER_VLLM_MODEL_ROOT=/absolute/path/to/Qwen3-4B
 export HYPER_VLLM_DATA_ROOT=/absolute/path/to/hotpotqa
 export HYPER_VLLM_RESULT_ROOT=/absolute/path/to/results/search-r1
@@ -211,7 +211,7 @@ def build_environment(context: EpisodeContext) -> GSM8KMultiTurnEnvironment:
     return env
 ```
 
-In the full training YAML, use the `agentic` settings from the [GSM8K multi-turn configuration](examples/gsm8k/configs/multi_turn.yaml), change `module_path` to `examples.gsm8k.custom_reward`, and set `environment` to `custom_gsm8k`. This replaces only terminal scoring for the multi-turn task; it does not modify the Trainer or weight publication.
+In the full training YAML, use the `agentic` settings from the [GSM8K multi-turn configuration](examples/gsm8k/README.md#内部多轮参数), change `module_path` to `examples.gsm8k.custom_reward`, and set `environment` to `custom_gsm8k`. This replaces only terminal scoring for the multi-turn task; it does not modify the Trainer or weight publication.
 
 GSM8K rule and model scorers both live in [agent.py](examples/gsm8k/agent.py). Omit the top-level `reward_model`
 section for rule rewards. To score with an RM after generation, use the

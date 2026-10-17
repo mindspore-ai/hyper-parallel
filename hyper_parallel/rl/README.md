@@ -108,7 +108,7 @@ cd hyper-parallel
 ### 2. 准备运行镜像
 
 ```bash
-docker image inspect hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64
+docker image inspect swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64
 
 npu-smi info
 ```
@@ -168,6 +168,44 @@ Other entries: [single-turn code](examples/code/README.md), [program agents](doc
 支持本地或 SSH 远端 Docker；与 Search-R1 共用程序扩展及 Trainer。
 已验证范围和后续限制见 [开发说明](docs/swe_smith.md)。
 
+### 权重发布与推理睡眠
+
+以下为默认配置：
+
+```yaml
+rollout:
+  vllm:
+    sleep_level: 1
+    weight_sync:
+      strategy: full_gather
+      bucket_size_mb: 128
+```
+
+`full_gather` 内置先在通信设备聚合权重，无额外开关。
+CPU 内存紧张时可显式选择 `sleep_level: 2`，丢弃旧推理权重，每次睡眠后须完整发布才能恢复；
+系统不会自动切换级别。适用限制见 [推理生命周期](docs/vllm_rollout.md#policy-生命周期)。
+
+### 模型初始化 CPU 线程
+
+可在训练 YAML 中显式设置每个训练进程用于模型构建的 PyTorch intra-op 线程数：
+
+```yaml
+train:
+  model_init_cpu_threads: null  # 默认保持原值，可显式设为 8 等正整数
+```
+
+该选项接受正整数；省略或设置为 `null` 时保持现有线程设置。
+它仅在 Actor、Reference、Critic 的模型构建期间生效，通过 `finally` 在构建完成或抛出异常后恢复原线程数。
+优化器构建、训练、vLLM 启动和推理均使用原来的设置；不调整 inter-op 或 OMP/MKL 环境变量。
+线程数按进程计算，例如四个训练 rank 各设为 8，需按最多 32 个 intra-op 线程考虑 CPU 资源。
+
+各训练配方已显式列出 `model_init_cpu_threads: null` 和 `sleep_level: 1`，保持原默认行为。
+GSM8K Docker 脚本和 Search-R1 启动器支持追加 `--train.model_init_cpu_threads=8`、
+`--rollout.vllm.sleep_level=2`；直接使用 `train_rl.py` 时采用同一覆盖形式。
+非 MoE 配方不添加 R3 开关；四卡 MoE Codex 配方默认 `disabled`，
+运行及启用方法见 [GSM8K Qwen3-30B-A3B Codex 示例](examples/gsm8k/README.md)。
+R3 配置、实现边界和核心验证入口见 [MoE 与 Agent 指南](docs/moe_code_agent.md)。
+
 ---
 
 <!-- markdownlint-disable-next-line MD033 -->
@@ -210,7 +248,7 @@ def build_environment(context: EpisodeContext) -> GSM8KMultiTurnEnvironment:
     return env
 ```
 
-在完整训练 YAML 中使用 [GSM8K 多轮配置](examples/gsm8k/configs/multi_turn.yaml)的 `agentic` 设置，并将 `module_path` 改为 `examples.gsm8k.custom_reward`、`environment` 改为 `custom_gsm8k`。该示例只替换多轮任务的终局评分，不修改 Trainer 或权重发布流程。
+在完整训练 YAML 中使用 [GSM8K 多轮配置](examples/gsm8k/README.md#内部多轮参数)的 `agentic` 设置，并将 `module_path` 改为 `examples.gsm8k.custom_reward`、`environment` 改为 `custom_gsm8k`。该示例只替换多轮任务的终局评分，不修改 Trainer 或权重发布流程。
 
 GSM8K 的规则评分与模型评分都在 [agent.py](examples/gsm8k/agent.py)。不配置顶层 `reward_model` 时使用规则奖励；
 使用[模型评分配方](examples/gsm8k/configs/qwen3_4b_gsm8k_model_reward.yaml)并设置
@@ -260,7 +298,7 @@ GSPO 默认 `kl_coef=0`，不创建 Reference 或 Critic；GRPO/PPO/GSPO 仅在 
 | **DeepSeek-V3 完整模型** | ○ | 完整 checkpoint 的多节点同步基线与异步训练对照 |
 
 Qwen3-MoE 的具体配置与同步边界见 [vLLM Rollout](docs/vllm_rollout.md#qwen3-30b-a3b)，
-本次迁移的实际验收见 [M1 执行记录](docs/moe_code_agent.md#功能与支持边界)。
+配置与验证入口见 [MoE 使用及验证指南](docs/moe_code_agent.md)。
 后续方向见[规划方向](#规划方向)，使用限制见[当前边界](#当前边界)。
 
 ---

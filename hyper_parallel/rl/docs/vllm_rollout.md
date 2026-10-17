@@ -14,7 +14,7 @@ Agentic 继续通过同一生成与权重发布接口工作。
 MoE 使用公共 HyperAutoModel 和 Qwen3-MoE recipe 构造训练模型，rollout 使用 native vLLM。
 入口示例为 [Qwen3-30B-A3B GSM8K 配置](../examples/gsm8k/configs/qwen3_30b_a3b_gsm8k_vllm.yaml)。
 首批实现限于 GRPO、colocated、consistency-off、EPLB 关闭；不支持 MoE PPO 或 disjoint。
-当前迁移的实际验收结果记录在 [M1 执行记录](moe_code_agent.md#功能与支持边界)，不能沿用其他分支的历史结果。
+功能边界与验证入口见 [MoE 使用及验证指南](moe_code_agent.md)。
 
 - `train.accelerator.ep` 控制训练专家并行，`edp_shard` 控制专家数据并行分片。
   EP 必须整除专家数，EP×EDP 必须整除训练 world size；dense 模型两者均为 1。
@@ -28,6 +28,15 @@ MoE 使用公共 HyperAutoModel 和 Qwen3-MoE recipe 构造训练模型，rollou
 
 训练前明确选择策略和设备，按当前 checkout 安装主包及 RL 包并核对导入位置。
 该 MoE 路径使用固定统一 Ascend 镜像的专家布局和加载接口，其他 vLLM 版本需重新验证。
+
+### MoE R3 路由重放
+
+`train.router_replay.mode: R3` 同时启用 expert capture 和 Actor replay，默认 `disabled`。
+当前适配 Qwen3-MoE、internal/Codex、共卡 native vLLM；固定 Ascend 运行时要求 eager、
+raw logprobs 和 rollout DP1，推理 TP 覆盖共用设备。R3 关闭时保留既有推理拓扑。
+
+完整配置、逐调用 trace、模型适配与验证范围统一见 [MoE R3 指南](moe_code_agent.md#moe-r3)。
+该功能不改变 Agent 预算、初始化线程或睡眠级别，也不保证训练与推理概率一致。
 
 ## Ownership
 
@@ -69,7 +78,7 @@ Colocated：
 
 ```text
 rollout(V)
--> sleep(level=1)
+-> sleep(level=sleep_level)
 -> Trainer update
 -> wake weights
 -> NPU IPC transaction
@@ -78,6 +87,17 @@ rollout(V)
 -> resume
 -> publish V+1
 ```
+
+`rollout.vllm.sleep_level` 默认 `1`，仅接受整数 `1` 或 `2`：
+
+- `1`：将推理权重备份到 CPU，允许未更新权重时恢复推理。
+- `2`：丢弃推理旧权重；唤醒 weights 仅重新分配存储，必须完整发布 Actor 权重并确认版本后
+  才能恢复采样。vLLM 单独保存必要的模型 buffers，不等于备份整份参数。
+
+CPU 内存紧张时由用户显式选择 level 2，仅用于 colocated；不自动切换睡眠级别。当前会在无发布时恢复推理的中间 checkpoint
+（`0 < save_steps < max_steps`）以及启用 Reward Model 的评估组合，在启动前拒绝。
+最终 checkpoint、checkpoint reload 校验及不使用 Reward Model 的普通评估允许。
+发布调用必须提供完整 Actor 快照；本选项不提供增量权重发布能力。
 
 Disjoint：
 
@@ -96,13 +116,14 @@ Pause、sleep/wake、transaction、cache reset、resume 和 close 只由 coordin
 
 ## 权重同步
 
-- 默认策略为 `full_gather`；启动时显式选择 `full_gather` 或 `direct_reshard`，运行中不切换策略。
+- 默认策略为 `full_gather`，`bucket_size_mb` 默认 `128`；可显式选择 `direct_reshard`，运行中不切换策略。
 - 支持模型的 TP1/TP2 均可选择 `full_gather` 与 `direct_reshard`，TP1 不再自动改写显式策略。
 - `full_gather` 按训练侧完整参数 gather，并将多个完整参数组成 packed bucket；只有 Trainer rank 0 打包。
   对共享 Qwen3 的融合参数，worker 根据模型提供的行区间元数据还原 HF 权重，再调用 vLLM `load_weights()` 完成 Native 融合或 Hyper TP 切分。
 - Colocated packed buffer 经 Trainer group 复制后由每个同设备 Trainer rank 导出 NPU IPC handle；disjoint 使用一个 rank-0-to-all-workers HCCL group。
-- 开启训练侧 CPU offload 时，聚合结果可能位于 CPU；传输前将当前 packed bucket 搬到通信设备，
-  确保所有 IPC 广播参与者使用 NPU/HCCL，并让 disjoint HCCL 的发送 buffer 与通信组设备一致。
+- `full_gather` 内置先将当前参数的本地分片临时搬到通信设备，再执行完整参数聚合与打包，无额外开关。
+  CPU offload 的源模型参数保持在 CPU；聚合使用设备侧 collective，避免先在 CPU 重建整参数。
+  传输仍检查 packed buffer 的通信设备，IPC 与 disjoint HCCL 的设备合同不变。
 - Direct planner 同时解释 Trainer FSDP/TP source layout 与 rollout DP/TP destination layout，普通模式允许
   已支持的 train/inference degree mismatch。
 - Colocated full/direct 使用 NPU IPC；disjoint 使用 HCCL fan-out。
@@ -111,6 +132,8 @@ Pause、sleep/wake、transaction、cache reset、resume 和 close 只由 coordin
 - 任一同步阶段失败都会跨 Trainer rank 传播并终止当前运行，不执行 abort、fallback 或同进程恢复。
 - IPC 在 packed buffer 分配后、handle 导出后先同步本地错误，成功才进入后续 broadcast 或 handle all-gather；已导出且接收状态未知的 buffer 由 transport 持有到 close。
 
+设备聚合与睡眠级别的核心测试见 [验证入口](moe_code_agent.md#单元测试)。
+
 ## 配置
 
 ```yaml
@@ -118,13 +141,14 @@ rollout:
   engine: vllm
   vllm:
     deployment: colocated  # or disjoint
+    sleep_level: 1  # 2 discards old weights and requires complete publication
     model_implementation: hyper  # or native
     data_parallel_size: 2
     tensor_parallel_size: 2
     host: 127.0.0.1
     port: 8422
     weight_sync:
-      strategy: direct_reshard  # or full_gather
+      strategy: full_gather  # default; or direct_reshard
       bucket_size_mb: 128
 train:
   accelerator:

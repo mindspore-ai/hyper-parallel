@@ -18,11 +18,14 @@ rollout:
   top_k: 0
   seed: 20261009
   vllm:
+    sleep_level: 1  # Use 2 to discard old weights; fully republish before resuming sampling.
     deployment: colocated
     data_parallel_size: 1
     port: 18970
     model_implementation: native
     tensor_parallel_size: 2
+    server_hccl_if_base_port: 63400
+    server_hccl_npu_socket_port_range: 63400-63499
     weight_sync:
       strategy: full_gather
       bucket_size_mb: 128

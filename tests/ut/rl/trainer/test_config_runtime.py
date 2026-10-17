@@ -123,6 +123,19 @@ def test_all_st_recipes_pass_production_validation(
             validate_config(resolve_vllm_automatic_limits(config), build_algorithm(config["algorithm"]))
 
 
+def test_config_accepts_optional_model_init_threads_and_rejects_boolean(validated_recipe: dict) -> None:
+    """The optional thread setting preserves None and a positive integer without coercion."""
+    algorithm = build_algorithm(validated_recipe["algorithm"])
+    for threads in (None, 8):
+        validated_recipe["train"]["model_init_cpu_threads"] = threads
+        validate_config(validated_recipe, algorithm)
+        actual = validated_recipe["train"]["model_init_cpu_threads"]
+        assert actual == threads, f"Expected unchanged thread setting {threads!r}, got {actual!r}"
+    validated_recipe["train"]["model_init_cpu_threads"] = True
+    with pytest.raises(ValueError, match="model_init_cpu_threads.*positive integer"):
+        validate_config(validated_recipe, algorithm)
+
+
 def test_colocated_reward_model_config_rejects_conflicts(
     validated_recipe: dict, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

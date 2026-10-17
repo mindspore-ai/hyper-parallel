@@ -35,6 +35,7 @@ from rl.dataset.batch_builder import build_experience_batch
 from rl.dataset.contracts import ExperienceBatch, PromptRecord, Trajectory, Turn
 from rl.dataset.episodes import episode_rows
 from rl.roles.rollout.base import GenerationSettings
+from rl.roles.rollout.router_capture import router_trace_from_capture, router_trace_from_wire, router_trace_to_wire
 from rl.tool_protocol import validate_trainability
 
 _NATURAL_STOPS = frozenset({"stop", "tool_calls", "stop_sequence"})
@@ -366,7 +367,9 @@ def build_harness_call_trajectories(
             f"{runner_name}_completion_count": count,
             "finish_reason": trace.get("finish_reason"),
             "tool_history": record.get("original_request", {}).get(tool_history_field, []),
-            "gateway_record": json.loads(json.dumps(record)),
+            "gateway_record": json.loads(json.dumps({
+                key: value for key, value in record.items() if key not in ("routed_experts", "router_capture_spec")
+            })),
         })
         message = record["response"]["choices"][0].get("message", {})
         action_text = message.get("content") if isinstance(message, Mapping) else None
@@ -394,6 +397,7 @@ def build_harness_call_trajectories(
             terminal_reason=terminal_reason,
             metadata=row_metadata,
             worker_policy_version=policy_version,
+            router_trace=router_trace_from_capture(record, len(token_ids)),
         ))
     return tuple(results)
 
@@ -717,13 +721,14 @@ class ProgramAgentRunner:
         elif error is not None:
             raise error
 
-    @staticmethod
-    def _validate_trajectories(trajectories, prompt_records, policy_version) -> None:
+    def _validate_trajectories(self, trajectories, prompt_records, policy_version) -> None:
         """Validate identity before entering any all-rank synchronization."""
         allowed_prompt_ids = {prompt.prompt_id for prompt in prompt_records}
         if len({trajectory.trajectory_id for trajectory in trajectories}) != len(trajectories):
             raise ValueError("Agent programs returned duplicate trajectory IDs")
         for trajectory in trajectories:
+            if self.settings.collect_router_trace and trajectory.router_trace is None:
+                raise ValueError("R3 agent programs require router traces for every real call")
             if trajectory.metadata.get("dp_padding", False):
                 raise ValueError("Agent programs must return real calls, not DP padding")
             if not math.isfinite(trajectory.reward):
@@ -770,6 +775,7 @@ class ProgramAgentRunner:
                 "terminal_reason": item.terminal_reason,
                 "metadata": item.metadata,
                 "worker_policy_version": item.worker_policy_version,
+                **({"router_trace": router_trace_to_wire(item.router_trace)} if item.router_trace is not None else {}),
             }
             for item in trajectories
         ]
@@ -816,6 +822,9 @@ class ProgramAgentRunner:
                     terminal_reason=str(item["terminal_reason"]),
                     metadata=dict(item["metadata"]),
                     worker_policy_version=item.get("worker_policy_version"),
+                    router_trace=(None if item.get("router_trace") is None else router_trace_from_wire(
+                        item["router_trace"],
+                    )),
                 )
             )
         return tuple(trajectories)

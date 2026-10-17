@@ -19,7 +19,9 @@ __all__ = [
     "build_runtime_config",
     "optional_mapping",
     "required_mapping",
+    "resolve_router_replay_config",
     "resolve_vllm_automatic_limits",
+    "router_replay_mode",
     "model_trust_remote_code",
     "tokenizer_trust_remote_code",
     "trainer_attention_implementation",
@@ -300,6 +302,11 @@ def _validate_vllm_basics(vllm: Mapping[str, Any]) -> tuple[str, int, int]:
             "rollout.vllm.deployment must be 'disjoint' or 'colocated', "
             f"got {deployment!r}"
         )
+    sleep_level = vllm.get("sleep_level", 1)
+    if not isinstance(sleep_level, int) or isinstance(sleep_level, bool) or sleep_level not in (1, 2):
+        raise ValueError("rollout.vllm.sleep_level must be an integer equal to 1 or 2")
+    if sleep_level == 2 and deployment != "colocated":
+        raise ValueError("rollout.vllm.sleep_level=2 requires deployment='colocated'")
     rollout_dp = _positive_integer(vllm, "data_parallel_size", "rollout.vllm")
     rollout_tp = _positive_integer(vllm, "tensor_parallel_size", "rollout.vllm")
     if str(vllm.get("dtype", "bfloat16")) not in ("bfloat16", "bf16"):
@@ -452,6 +459,7 @@ def _validate_trainer_ep(accelerator: Mapping[str, Any]) -> None:
 
 def _validate_model_scope(config: Mapping[str, Any], model: ModelRegistration) -> None:
     """Validate checkpoint-specific RL boundaries before constructing roles."""
+    _validate_router_replay(config, model)
     accelerator = required_mapping(required_mapping(config, "train"), "accelerator")
     if model.family == "qwen3":
         _validate_trainer_ep(accelerator)
@@ -474,6 +482,57 @@ def _validate_model_scope(config: Mapping[str, Any], model: ModelRegistration) -
     if vllm.get("enable_eplb", False):
         raise ValueError("Qwen3-MoE does not support enable_eplb")
     _validate_moe_parallelism(accelerator, model)
+
+
+def router_replay_mode(config: Mapping[str, Any]) -> str:
+    """Read the single RL-owned replay switch, rejecting unsupported modes."""
+    replay = optional_mapping(required_mapping(config, "train"), "router_replay")
+    if set(replay) - {"mode"}:
+        raise ValueError("train.router_replay only supports the mode field")
+    mode = replay.get("mode", "disabled")
+    if mode not in ("disabled", "R3"):
+        raise ValueError("train.router_replay.mode must be disabled or R3")
+    return mode
+
+
+def resolve_router_replay_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive rollout capture from the replay switch without mutating the recipe."""
+    resolved = deepcopy(dict(config))
+    enabled = router_replay_mode(resolved) == "R3"
+    vllm = optional_mapping(required_mapping(resolved, "rollout"), "vllm")
+    if ("enable_return_routed_experts" in vllm
+            and vllm["enable_return_routed_experts"] is not enabled):
+        raise ValueError("rollout.vllm.enable_return_routed_experts must match train.router_replay.mode")
+    if enabled:
+        resolved["rollout"].setdefault("vllm", {})["enable_return_routed_experts"] = True
+    return resolved
+
+
+def _validate_router_replay(config: Mapping[str, Any], model: ModelRegistration) -> None:
+    """Fail before model allocation for unsupported replay backends and runners."""
+    enabled = router_replay_mode(config) == "R3"
+    vllm = optional_mapping(required_mapping(config, "rollout"), "vllm")
+    if ("enable_return_routed_experts" in vllm
+            and vllm["enable_return_routed_experts"] is not enabled):
+        raise ValueError("rollout.vllm.enable_return_routed_experts must match train.router_replay.mode")
+    if not enabled:
+        return
+    if parse_distillation_config(config.get("distillation")).enabled:
+        raise ValueError("R3 does not support enabled distillation")
+    if model.family != "qwen3_moe":
+        raise ValueError("R3 currently requires a Qwen3-MoE router adapter")
+    agentic = required_mapping(config, "agentic")
+    if agentic.get("runner", "internal") not in ("internal", "codex"):
+        raise ValueError("R3 currently supports only internal and Codex runners")
+    if vllm.get("data_parallel_size", 1) != 1:
+        raise ValueError(
+            "R3 requires rollout.vllm.data_parallel_size=1: router capture in fixed "
+            "vLLM 0.23.0/vLLM-Ascend 0.23.0.post1 does not support DP padding"
+        )
+    if vllm.get("enforce_eager", True) is not True:
+        raise ValueError("R3 currently requires rollout.vllm.enforce_eager=true")
+    if vllm.get("logprobs_mode") != "raw_logprobs":
+        raise ValueError("R3 requires rollout.vllm.logprobs_mode=raw_logprobs")
 
 
 def _validate_qwen3_5_scope(config: Mapping[str, Any], accelerator: Mapping[str, Any]) -> None:
@@ -836,6 +895,8 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
         raise ValueError(f"Segmented {name} agent trajectories currently require GRPO")
     evaluation = required_mapping(config, "evaluation")
     train = required_mapping(config, "train")
+    if train.get("model_init_cpu_threads") is not None:
+        _positive_integer(train, "model_init_cpu_threads", "train")
     accelerator = required_mapping(train, "accelerator")
     optimizer = required_mapping(train, "optimizer")
     main_params = _optimizer_fp32_main_params(optimizer)
@@ -857,7 +918,20 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     validate_rollout_and_agentic(rollout, agentic, accelerator, model_registration)
     if rollout.get("engine") != "vllm":
         _ = _trainer_topology(accelerator)
-    _validate_checkpoint(required_mapping(train, "checkpoint"))
+    checkpoint = required_mapping(train, "checkpoint")
+    _validate_checkpoint(checkpoint)
+    if rollout.get("engine") == "vllm" and optional_mapping(rollout, "vllm").get("sleep_level", 1) == 2:
+        save_steps = int(checkpoint.get("save_steps", 0))
+        if 0 < save_steps < int(train["max_steps"]):
+            raise ValueError(
+                "rollout.vllm.sleep_level=2 does not support intermediate checkpoints: "
+                "resuming rollout requires a complete weight publication"
+            )
+        if "reward_model" in config and bool(evaluation.get("enabled", True)):
+            raise ValueError(
+                "rollout.vllm.sleep_level=2 does not support reward_model with evaluation.enabled=true: "
+                "resuming rollout after reward scoring requires a complete weight publication"
+            )
     _validate_logging(required_mapping(config, "logging"))
     if "reward_model" in config:
         _validate_reward_model(config, model_registration)

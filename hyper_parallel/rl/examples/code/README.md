@@ -15,7 +15,7 @@ agentic:
   max_turns: 1
   code:
     endpoint: http://127.0.0.1:18790
-    runtime_version: sha256:1ac76247ee612e1ac4a07ae10192056f061d93438f7c16578c7b169938b24131
+    runtime_version: sha256:5f5c291ba3d15d9ec20bc3b5695f87f107ee26d39c86817d92283fbd79a0f856
     run_timeout: 5
     request_timeout: 300
 ```
@@ -55,33 +55,34 @@ python -m examples.code.prepare_data \
 并生成包含源文件/结果哈希、过滤计数及稳定任务 ID 的 `manifest.json`。
 `--manual-exclusions exclusions.json` 接受 `{"train:455277": "审核原因"}` 形式的明确排除记录。
 
-准备成功不代表标签正确。现有 125 条训练数据尚未全部通过独立参考解核验；已发现
-`eurus2:9776b13264b5:taco:train:455277` 的 nth-prime 输入输出错配。应保留失败证据并排除整题，
-不能修标签来获得通过结果。其余题也须先以独立参考解运行全部原始测试。
+准备成功不代表标签正确。训练前须用独立参考解运行每题全部原始测试；输入输出错配时保留失败证据，
+通过 `--manual-exclusions` 排除整题，不修改标签来获得通过结果。
 训练配置应指向审核后的 prepared 文件，不直接把候选目录视为可信数据。
 
 ## SandboxFusion 部署
 
-使用 `swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/sandboxfusion-python:v1-arm64`。
-先按[镜像下载与校验](../../docker/README.md#单轮-code-的-sandboxfusion-镜像)拉取并核对镜像身份；
-镜像公开可读，无需登录，已有训练基础层由 Docker 自动复用。
-训练镜像是 `hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64`，两者分开运行。
+使用 `swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/sandboxfusion-python:v2-arm64`。
+先按[镜像获取与校验](../../docker/README.md#单轮-code-的-sandboxfusion-镜像)拉取并核对镜像身份；
+镜像基于独立 Python slim 环境，不继承训练基础层。
+训练镜像是 `swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64`，两者分开运行。
 沙箱不挂载训练源码、权重、数据或 Docker socket。
 
-下面是当前 Docker 18 / cgroup v1 环境验证过的启动方式。Docker 18 没有 `--cgroupns`，
+以下启动方式适用于 Docker 18 / cgroup v1。Docker 18 没有 `--cgroupns`，
 因此在容器内部使用 `unshare` 建立私有 cgroup/mount namespace，再为原始 lite 隔离挂载控制器；
-没有修改镜像，也没有将隔离模式改为 `none`。
+保持镜像的 `lite` 隔离；镜像内的 `tini` 回收候选超时或结束后遗留的已退出子进程。
 
 ```bash
+docker network inspect hyper-rl-sandbox >/dev/null 2>&1 || docker network create hyper-rl-sandbox
 docker run -d --name hyper-rl-code-sandbox \
+  --runtime runc --network hyper-rl-sandbox \
   --cap-add SYS_ADMIN --cap-add NET_ADMIN \
   --security-opt no-new-privileges \
   --memory 2g --cpus 4 --pids-limit 128 \
   -p 127.0.0.1:18790:8080 \
   -e SANDBOX_CONFIG=hyper_lite \
-  --entrypoint /usr/bin/unshare \
-  swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/sandboxfusion-python:v1-arm64 \
-  --cgroup --mount /bin/bash -c '
+  --entrypoint /usr/bin/tini \
+  swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/sandboxfusion-python:v2-arm64 \
+  -- /usr/bin/unshare --cgroup --mount /bin/bash -c '
     set -e
     mount -t tmpfs tmpfs /sys/fs/cgroup
     mkdir /sys/fs/cgroup/memory /sys/fs/cgroup/cpu,cpuacct
@@ -110,20 +111,53 @@ python -m pytest -q \
   tests/ut/rl/agentic/test_code_runner.py
 ```
 
-真实沙箱合同测试使用固定正确/错误程序，验证运行异常、超时和输出限制；
+真实沙箱合同测试使用固定正确/错误程序，验证运行异常、超时、输出限制，以及非 root/零有效权限、
+候选依赖独立、网络和跨请求文件隔离；
 服务不可达与响应损坏的失败传播由 UT 覆盖。资源须显式配置，缺失时跳过不算通过：
 
 ```bash
 export RL_ST_SANDBOX_ENDPOINT=http://127.0.0.1:18790
-export RL_ST_SANDBOX_RUNTIME_VERSION=sha256:1ac76247ee612e1ac4a07ae10192056f061d93438f7c16578c7b169938b24131
+export RL_ST_SANDBOX_RUNTIME_VERSION=sha256:5f5c291ba3d15d9ec20bc3b5695f87f107ee26d39c86817d92283fbd79a0f856
 export RL_ST_REQUIRED=1
 python -m pytest -q hyper_parallel/rl/tests/st/test_feature_st.py::test_code_sandbox
 ```
 
-在已有 NPU 训练容器中，确认 4 张卡空闲、数据经过上述审核后执行：
+### 从宿主机直接启动
+
+使用 [Docker 启动脚本](scripts/run_qwen3_4b_code_docker.sh)。先部署上面的 v2 沙箱，
+准备本地训练镜像、Qwen3-4B 权重和已审核数据，并确认四卡可用。脚本不会下载这些资源。
 
 ```bash
-export ASCEND_RT_VISIBLE_DEVICES=2,3,4,5
+export HYPER_CODE_MODEL_ROOT=/path/to/models/Qwen3-4B
+export HYPER_CODE_DATA_ROOT=/path/to/code-reviewed
+export HYPER_CODE_DEVICES=0,1,2,3
+bash hyper_parallel/rl/examples/code/scripts/run_qwen3_4b_code_docker.sh --dry-run
+bash hyper_parallel/rl/examples/code/scripts/run_qwen3_4b_code_docker.sh
+```
+
+将示例路径替换为本机的模型及已审核数据目录，后者须包含 `train.parquet` 和 `validation.parquet`。
+输出默认写到仓库 `output/code/<时间>-<进程号>/`，
+可用 `HYPER_CODE_OUTPUT_DIR` 指定；包含 `train.log` 和 `checkpoints/`。
+脚本安装当前源码的 editable 主包和 RL 插件，并将实际沙箱 Image ID 传给 `agentic.code.runtime_version`。
+
+默认执行 YAML 的两步训练、每题四候选、最终评测和保存；生成预算以配置为准。
+初始化 CPU 线程配置为 `null`，sleep level 为 `1`。既有配置项可在脚本末尾显式覆盖，例如：
+
+```bash
+bash hyper_parallel/rl/examples/code/scripts/run_qwen3_4b_code_docker.sh \
+  --train.model_init_cpu_threads=8 --rollout.vllm.sleep_level=2
+```
+
+默认普通权限，只映射所选四张物理卡，并在容器内使用逻辑编号 `0,1,2,3`。
+驱动确需特权访问时，可显式设置 `HYPER_CODE_PRIVILEGED=1`；此模式使用所选物理卡编号。
+`--help` 可查看镜像、沙箱服务、设备和端口等配置入口。
+
+### 在已有训练容器中启动
+
+确认 4 张卡空闲、数据经过上述审核后执行：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 python -m torch.distributed.run --standalone --nproc_per_node=4 \
   hyper_parallel/rl/train_rl.py \
   hyper_parallel/rl/examples/code/configs/qwen3_4b_code_vllm.yaml \
@@ -131,9 +165,9 @@ python -m torch.distributed.run --standalone --nproc_per_node=4 \
   --data.test_path=/results/code-reviewed/validation.parquet
 ```
 
-本配置为 dense Qwen3、TP2/DP2、colocated native vLLM。现有训练器在保存 checkpoint 时触发评估，
-因此本配置同时启用 `evaluation.enabled` 和 `train.checkpoint.save_final`；最终会写入模型与优化器状态。启动前检查训练和 rollout 的总设备占用，避免与其他任务冲突。`runtime_version` 要与实际镜像身份一致。
-验收检查有限 loss/梯度、真实参数更新、策略版本递增及更新后的再次采样。Dense 与 MoE+code 的四卡两步/评估
-在迁移阶段均曾通过；更新代码或运行环境后需重新验收，不能把历史结果当作当前入口的新运行结果。
+本配置为 dense Qwen3、TP2/DP2、colocated native vLLM。保存 checkpoint 时会触发评估，
+因此同时启用 `evaluation.enabled` 和 `train.checkpoint.save_final`；最终写入模型与优化器状态。
+启动前核对训练和 rollout 的总设备占用，`runtime_version` 须与实际沙箱镜像身份一致。
+验收检查有限 loss/梯度、真实参数更新、策略版本递增及更新后的再次采样。
 系统测试入口及边界见[功能与验证说明](../../docs/moe_code_agent.md#系统测试)。
 为快速检查链路而复用同一批题作为 train/validation 时，必须明确记录重叠，不报告为独立泛化评估。

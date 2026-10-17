@@ -50,7 +50,7 @@ class ToolProtocolFailure(RuntimeError):
 
 
 class CompletionBudgetExhausted(RuntimeError):
-    """Identify a fully recorded repository call budget without inventing a model failure."""
+    """Identify a fully recorded call budget without inventing an infrastructure failure."""
 
     def __init__(self, termination: dict[str, Any]) -> None:
         """Retain the controller-owned terminal evidence for the HTTP response."""
@@ -294,7 +294,7 @@ class _State:
                 raise ValueError(f"Codex session is closing or failed: {session_id}")
             if session.termination is not None:
                 raise CompletionBudgetExhausted(session.termination)
-            if (session.isolated_cli and len(session.completions) == session.max_completions
+            if (len(session.completions) == session.max_completions
                     and session.reserved_completions == 0):
                 session.termination = {"reason": "max_completions", "limit": session.max_completions,
                                        "completed": len(session.completions), "policy_version": session.policy_version}
@@ -511,6 +511,12 @@ class _Handler(BaseHTTPRequestHandler):
             finally:
                 state.backend_slots.release()
             outcome = _completion_outcome(session, response, transformed, request_kind)
+            route_payload = None
+            for index, choice in enumerate(response.get("choices", [])):
+                if isinstance(choice, dict):
+                    payload = choice.pop("routed_experts", None)
+                    if index == 0:
+                        route_payload = payload
             will_deliver_feedback = (
                 outcome.get("failure_origin") == "model"
                 and len(session.completions) + 1 < session.max_completions
@@ -523,6 +529,10 @@ class _Handler(BaseHTTPRequestHandler):
                                                           "recovered_with_valid_action": False,
                                                           "recovered_with_valid_tool_call": False,
                                                           "recovery_call_index": None, **outcome}}
+            capture_spec = getattr(self.server, "router_capture_spec", None)
+            if capture_spec is not None:
+                record["router_capture_spec"] = capture_spec
+                record["routed_experts"] = route_payload
             return response, outcome, record
         finally:
             with state.lock:
@@ -748,7 +758,8 @@ class _GatewayServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address: tuple[str, int], state: _State, admin_token: str | None,
-                 max_request_bytes: int | None, max_response_bytes: int | None) -> None:
+                 max_request_bytes: int | None, max_response_bytes: int | None,
+                 router_capture_spec: Mapping[str, Any] | None = None) -> None:
         """Bind one HTTP server to its shared gateway state."""
         self.state = state
         if admin_token is not None and (not isinstance(admin_token, str) or not admin_token.strip()):
@@ -760,6 +771,7 @@ class _GatewayServer(ThreadingHTTPServer):
         self.require_admin_auth = admin_token is not None
         self.max_request_bytes = max_request_bytes
         self.max_response_bytes = max_response_bytes
+        self.router_capture_spec = None if router_capture_spec is None else dict(router_capture_spec)
         super().__init__(address, _Handler)
 
 
@@ -777,6 +789,7 @@ class CodexGateway:
         admin_token: str | None = None,
         max_request_bytes: int | None = None,
         max_response_bytes: int | None = None,
+        router_capture_spec: Mapping[str, Any] | None = None,
     ) -> None:
         """Initialize an unstarted gateway."""
         if not host:
@@ -786,7 +799,7 @@ class CodexGateway:
         self._server = _GatewayServer(
             (host, port),
             _State(backend_url, model_name, request_timeout, max_inflight_requests),
-            admin_token, max_request_bytes, max_response_bytes,
+            admin_token, max_request_bytes, max_response_bytes, router_capture_spec,
         )
         self._thread: Optional[threading.Thread] = None
 

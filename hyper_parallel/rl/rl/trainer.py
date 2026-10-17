@@ -38,7 +38,9 @@ from rl.config import (
     build_model_registration,
     build_runtime_config,
     required_mapping,
+    resolve_router_replay_config,
     resolve_vllm_automatic_limits,
+    router_replay_mode,
     tokenizer_trust_remote_code,
     uses_colocated_vllm,
     validate_config,
@@ -72,6 +74,7 @@ from rl.roles.model_setup import (
 )
 from rl.roles.policy.actor import Actor
 from rl.roles.policy.critic import Critic
+from rl.roles.policy.router_adapter import install_router_replay
 from rl.roles.rollout.registry import build_rollout_engine
 from rl.roles.rollout.worker import (
     CodexRolloutManager,
@@ -206,7 +209,7 @@ class SyncTrainer:
 
     def __init__(self, resolved_config: Mapping[str, Any]) -> None:
         """Validate configuration and build the complete distributed runtime."""
-        self.resolved_config = resolve_vllm_automatic_limits(resolved_config)
+        self.resolved_config = resolve_vllm_automatic_limits(resolve_router_replay_config(resolved_config))
         self._consistency_profile = configure_consistency_profile(self.resolved_config)
         self.distillation_config = parse_distillation_config(self.resolved_config.get('distillation'))
         self.algorithm = compose_training_algorithm(
@@ -228,6 +231,7 @@ class SyncTrainer:
         self._runtime_started = False
         self._rollout_closed_for_final_checkpoint = False
         self._tracker: Optional[TrainingTracker] = None
+        self._router_replay = None
         try:
             self._setup_runtime()
             self._validate_runtime_topology()
@@ -253,6 +257,10 @@ class SyncTrainer:
                 self._runtime_started,
             )
         finally:
+            replay = getattr(self, "_router_replay", None)
+            if replay is not None:
+                replay.remove()
+                self._router_replay = None
             self._tracker = None
             self._runtime_started = False
 
@@ -806,6 +814,7 @@ class SyncTrainer:
             self.runtime_config,
             self.distributed_setup,
             frozen=False,
+            cpu_threads=train_config.get("model_init_cpu_threads"),
         )
         reference_model = None
         if self.algorithm.requirements.roles.reference:
@@ -813,6 +822,7 @@ class SyncTrainer:
                 self.runtime_config,
                 self.distributed_setup,
                 frozen=True,
+                cpu_threads=train_config.get("model_init_cpu_threads"),
             )
         critic_model = None
         critic_config = train_config.get("critic", {})
@@ -820,6 +830,7 @@ class SyncTrainer:
             critic_runtime = build_runtime_config(self.resolved_config, critic=True)
             critic_model = build_role_model(
                 critic_runtime, self.distributed_setup, frozen=False,
+                cpu_threads=train_config.get("model_init_cpu_threads"),
             )
         actor_optimizer, actor_lr_scheduler = build_role_optimizer(
             self.runtime_config,
@@ -833,6 +844,10 @@ class SyncTrainer:
             "algorithm": self.algorithm,
             "micro_batch_size": int(train_config["micro_batch_size"]),
         }
+        replay_kwargs = {}
+        if router_replay_mode(self.resolved_config) == "R3":
+            self._router_replay = install_router_replay(actor_model)
+            replay_kwargs["router_replay"] = self._router_replay
         self.actor = Actor(
             actor_model=actor_model,
             optimizer=actor_optimizer,
@@ -845,6 +860,7 @@ class SyncTrainer:
             max_grad_norm=float(optimizer_config.get("max_grad_norm", 1.0)),
             distillation=self.distillation_config if self.distillation_config.enabled else None,
             **actor_kwargs,
+            **replay_kwargs,
         )
         self.reference_actor = (
             None
@@ -951,6 +967,8 @@ class SyncTrainer:
             "ignore_eos": bool(rollout_config.get("ignore_eos", False)),
             "do_sample": True,
         }
+        if router_replay_mode(self.resolved_config) == "R3":
+            generation_kwargs["collect_router_trace"] = True
         self.codex_runtime: Optional[CodexRuntime] = None
         self.deepseek_runtime: Optional[DeepSeekRuntime] = None
         if runner_name == "codex":

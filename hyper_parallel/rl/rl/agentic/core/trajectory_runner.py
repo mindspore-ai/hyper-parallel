@@ -30,7 +30,7 @@ from rl.agentic.core.types import (
 )
 from rl.agentic.envs.environment import ENVIRONMENTS
 from rl.dataset.batch_builder import build_experience_batch
-from rl.dataset.contracts import ExperienceBatch, PromptRecord, Trajectory
+from rl.dataset.contracts import ExperienceBatch, PromptRecord, Trajectory, resize_router_trace
 from rl.roles.rollout.base import GenerationEngine, GenerationRequest, GenerationSettings
 
 
@@ -254,11 +254,22 @@ class AgentRunner:
             and tuple(result.rollout_log_probs.shape) != tuple(response_ids.shape)
         ):
             raise ValueError("Generation rollout_log_probs must align with response IDs")
+        self._validate_generation_metadata(result, session_count)
+        return response_ids, self._response_mask(response_ids, result.response_mask)
+
+    def _validate_generation_metadata(self, result: Any, session_count: int) -> None:
+        """Require finish reasons and captured routes to describe the same response rows."""
         reasons = getattr(result, "finish_reasons", None)
         if reasons is not None and (len(reasons) != session_count or any(
                 reason is not None and not isinstance(reason, str) for reason in reasons)):
             raise ValueError("Generation finish_reasons must align with response rows")
-        return response_ids, self._response_mask(response_ids, result.response_mask)
+        traces = getattr(result, "router_traces", None)
+        if self.settings.collect_router_trace and (
+            traces is None or len(traces) != session_count or any(trace is None for trace in traces)
+        ):
+            raise ValueError("Generation engine did not return required router traces for every row")
+        if traces is not None and len(traces) != session_count:
+            raise ValueError("Generation router traces must align with response rows")
 
     def _decode_actions(
         self,
@@ -281,7 +292,15 @@ class AgentRunner:
         for action_index, row in enumerate(active_rows):
             session = sessions[row]
             active_sessions.append(session)
-            actions.append(self._decoded_action(action_texts[action_index], row, result, response_ids, response_mask))
+            action = self._decoded_action(action_texts[action_index], row, result, response_ids, response_mask)
+            if action.router_trace is not None:
+                token_count = int(session.token_ids.numel() + action.token_ids.numel())
+                if action.router_trace.expert_ids.shape[0] < token_count:
+                    raise ValueError("Generation router trace does not cover the complete prompt and action")
+                action = replace(action, router_trace=resize_router_trace(
+                    action.router_trace, token_count,
+                ))
+            actions.append(action)
         return active_sessions, actions
 
     @staticmethod
@@ -296,7 +315,10 @@ class AgentRunner:
         )
         reasons = getattr(result, "finish_reasons", None)
         metadata = {} if reasons is None or reasons[row] is None else {"finish_reason": reasons[row]}
-        return Action(text, action_tokens, action_log_probs, metadata)
+        traces = getattr(result, "router_traces", None)
+        if traces is not None and traces[row] is not None and bool((token_mask[1:] & ~token_mask[:-1]).any()):
+            raise ValueError("Router replay requires a contiguous generated response prefix")
+        return Action(text, action_tokens, action_log_probs, metadata, None if traces is None else traces[row])
 
     def _decode_active_rows(self, active_rows: list[int], response_ids: Any, response_mask: Any) -> list[str]:
         """Decode only active response rows with the configured tokenizer path."""

@@ -111,10 +111,17 @@ class ActorRolloutWeightSync:
         deployment: str,
         client_provider: Callable[[], Any],
         weight_transfer: Optional[Any],
+        *,
+        sleep_level: int = 1,
     ) -> None:
-        """Initialize one controller-owned policy publication transaction."""
+        """Initialize publication; level 2 requires a complete publish after every training sleep."""
+        if not isinstance(sleep_level, int) or isinstance(sleep_level, bool) or sleep_level not in (1, 2):
+            raise ValueError("sleep_level must be an integer 1 or 2")
+        if sleep_level == 2 and deployment != "colocated":
+            raise ValueError("sleep_level=2 requires colocated rollout")
         self._model_name = model_name
         self._deployment = deployment
+        self._sleep_level = sleep_level
         self._control_call = coordinator_call
         self._client_provider = client_provider
         self._weight_transfer = weight_transfer
@@ -194,9 +201,11 @@ class ActorRolloutWeightSync:
                 "Initial rollout worker version differs from controller: "
                 f"expected={self._policy_version}, actual={worker_version}"
             )
+        # Sleep may discard weights before an error reaches the controller.
+        self._phase = "training"
         self._server_owner_call(
             "sleep before training",
-            lambda: client.sleep(level=1, mode="wait"),
+            lambda: client.sleep(level=self._sleep_level, mode="wait"),
         )
 
         def verify_sleeping() -> None:
@@ -204,7 +213,6 @@ class ActorRolloutWeightSync:
             if not client.is_sleeping():
                 raise RuntimeError("vLLM did not enter sleep mode before training")
         _ = synchronized_call("sleep residency check", verify_sleeping)
-        self._phase = "training"
 
     def update_weights(self, snapshot: PolicySnapshot) -> None:
         """Transfer a newer Actor snapshot and stage its rollout version."""
@@ -230,11 +238,11 @@ class ActorRolloutWeightSync:
             raise RuntimeError("vLLM server startup failed without a synchronized error")
         if not isinstance(client, VLLMWeightSyncClientMixin):
             raise RuntimeError("Weight publication requires the owned vLLM HTTP client")
-        self._pending_policy_version = snapshot.version
         self._phase = "publishing"
         if self._deployment == "colocated":
             self._server_owner_call("wake weights for publication", lambda: client.wake_up(("weights",)))
         self._weight_transfer.publish(client, snapshot)
+        self._pending_policy_version = snapshot.version
         if self._deployment == "colocated":
             return
         self._resume_rollout(client, check_residency=False)
@@ -248,6 +256,8 @@ class ActorRolloutWeightSync:
             return
         if self._phase not in ("training", "publishing"):
             raise RuntimeError(f"Cannot prepare vLLM for rollout from phase {self._phase!r}")
+        if self._sleep_level == 2 and self._phase == "training":
+            raise RuntimeError("sleep_level=2 requires a successful full publication before rollout")
         if self._phase == "publishing" and self._pending_policy_version is None:
             raise RuntimeError("Colocated publication completed without a pending policy version")
         client = synchronized_call("server startup", self._client_provider)

@@ -16,9 +16,51 @@
 
 import asyncio
 import os
+from textwrap import dedent
+from uuid import uuid4
 
 from examples.code.client import SandboxFusionExecutor
 from examples.code.judge import judge_stdio
+
+
+async def _validate_isolation(executor: SandboxFusionExecutor) -> None:
+    """Require candidate privilege, dependency, network and request isolation."""
+    marker = f"/tmp/sandbox-isolation-{uuid4().hex}"
+    # These probes run through the candidate API so service health cannot mask
+    # missing lite isolation or accidental use of the server's Python environment.
+    code = dedent(f"""\
+        import importlib.util
+        import os
+        from pathlib import Path
+        import socket
+
+        assert os.geteuid() != 0, 'candidate must not run as root'
+        capabilities = [line for line in Path('/proc/self/status').read_text().splitlines()
+                        if line.startswith('CapEff:')]
+        assert len(capabilities) == 1 and int(capabilities[0].split()[1], 16) == 0, 'candidate has capabilities'
+        for package in ('fastapi', 'torch', 'vllm'):
+            assert importlib.util.find_spec(package) is None, 'unexpected candidate dependency: ' + package
+        try:
+            with socket.socket() as connection:
+                connection.settimeout(0.2)
+                connection.connect(('127.0.0.1', 8080))
+        except OSError:
+            pass
+        else:
+            raise AssertionError('candidate can reach the sandbox service')
+        Path({marker!r}).write_text('candidate-local')
+        print('isolated')
+        """)
+    result = await executor.run(code, "", request_id="st:isolation:create")
+    assert result.status == "success" and result.stdout.strip() == "isolated", f"Isolation probe failed: {result}"
+    code = dedent(f"""\
+        from pathlib import Path
+
+        assert not Path({marker!r}).exists(), 'candidate file survived into another request'
+        print('clean')
+        """)
+    result = await executor.run(code, "", request_id="st:isolation:check")
+    assert result.status == "success" and result.stdout.strip() == "clean", f"Request isolation failed: {result}"
 
 
 async def _validate() -> None:
@@ -39,6 +81,7 @@ async def _validate() -> None:
             assert reward.value == expected, f"Unexpected reward for {status}: {reward}"
             assert reward.metadata["status"] == status, f"Unexpected status for {status}: {reward}"
             assert reward.components["total"] == 2, "The grader must retain the full declared test set"
+        await _validate_isolation(executor)
     finally:
         await executor.close()
 

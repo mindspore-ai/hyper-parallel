@@ -78,10 +78,13 @@ fusion_result.json
 
 # Local RL development instructions and generated runtime state
 /hyper_parallel/rl/AGENTS.md
+/hyper_parallel/rl/docs/host_cleanup.local.md
+/hyper_parallel/rl/docker/sandboxfusion/
 /hyper_parallel/rl/.cache/
 /hyper_parallel/rl/.codex/
 /hyper_parallel/rl/checkpoints/
 /hyper_parallel/rl/wandb/
 /hyper_parallel/rl/tests/trial/
+/hyper_parallel/rl/examples/swe_smith/docker/
 # Codegen demo artifact (machine-generated next to the training YAML)
 examples/training_demo/qwen3_moe/generated/

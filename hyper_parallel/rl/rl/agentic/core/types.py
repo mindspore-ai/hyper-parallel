@@ -18,7 +18,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
+
+if TYPE_CHECKING:
+    from rl.dataset.contracts import RouterTrace
 
 
 class InteractionMode(str, Enum):
@@ -67,6 +70,7 @@ class AgentAction:
     token_ids: Any
     rollout_log_probs: Optional[Any] = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    router_trace: Optional[RouterTrace] = None
 
 
 Action = AgentAction

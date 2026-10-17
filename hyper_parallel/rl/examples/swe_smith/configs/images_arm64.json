@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "complete": true,
+  "images": {
+    "jyangballin/swesmith.x86_64.oauthlib_1776_oauthlib.1fd52536": {
+      "image": "sha256:9c80154f8429516be6188ac44793fc809123d8bfe987a809d3378e8c2606a9be",
+      "architecture": "arm64",
+      "python": "/usr/local/bin/python",
+      "source": "swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/swe-smith:oauthlib-arm64-codex-0.152.1",
+      "source_id": "sha256:9c80154f8429516be6188ac44793fc809123d8bfe987a809d3378e8c2606a9be",
+      "test_path_map": {},
+      "size_bytes": 610481521,
+      "repo_digest": "swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/swe-smith@sha256:fefc4eddbff8330faf87432b7edfdc083c1160a130e7c039b1409f0f7493db68"
+    },
+    "jyangballin/swesmith.x86_64.mahmoud_1776_boltons.3bfcfdd0": {
+      "image": "sha256:e39604bb3256de8a1d9236bfc2e2337bf40a051bc12871dd827b623c37325dad",
+      "architecture": "arm64",
+      "python": "/usr/local/bin/python",
+      "source": "swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/swe-smith:boltons-arm64-codex-0.152.1",
+      "source_id": "sha256:e39604bb3256de8a1d9236bfc2e2337bf40a051bc12871dd827b623c37325dad",
+      "test_path_map": {},
+      "size_bytes": 594975313,
+      "repo_digest": "swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/swe-smith@sha256:cde47e3f4a1f27f4f474205dded114837a38ee0470343502304001d2e77be818"
+    },
+    "jyangballin/swesmith.x86_64.keleshev_1776_schema.24a30457": {
+      "image": "sha256:e8f64fac44659b528369e5a5847eef43a825e995ab8a78d12e6046b2fd27602a",
+      "architecture": "arm64",
+      "python": "/usr/local/bin/python",
+      "source": "swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/swe-smith:schema-arm64-codex-0.152.1",
+      "source_id": "sha256:e8f64fac44659b528369e5a5847eef43a825e995ab8a78d12e6046b2fd27602a",
+      "test_path_map": {},
+      "size_bytes": 591358514,
+      "repo_digest": "swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/swe-smith@sha256:5a8b11d0de3026a0371b359fcdb25b6f51e25b89db19a92df0416f1656837926"
+    }
+  }
+}

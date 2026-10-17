@@ -44,7 +44,7 @@ else:
 TRAINER_HCCL_ENV = {"HCCL_IF_BASE_PORT": "62800", "HCCL_NPU_SOCKET_PORT_RANGE": "62800-62900"}
 
 
-def training_command(steps: int, resume: bool = False) -> list[str]:
+def training_command(steps: int, resume: bool = False, overrides: list[str] | None = None) -> list[str]:
     """Use the real trainer and search task program, not the frozen comparison worker."""
     command = [
         "python", "-m", "torch.distributed.run", "--nnodes=1", "--node_rank=0",
@@ -55,6 +55,7 @@ def training_command(steps: int, resume: bool = False) -> list[str]:
     ]
     if resume:
         command.append("--train.checkpoint.load_path=/resume")
+    command.extend(overrides or [])
     return command
 
 
@@ -188,7 +189,11 @@ def _parse_training_args():
     parser.add_argument("--model", type=Path, default=Path("/home/mwl/ckpt/qwen3-4b"))
     parser.add_argument("--backend-privileged", action="store_true")
     parser.add_argument("--resume", type=Path, help="Completed distributed checkpoint directory")
-    args = parser.parse_args()
+    args, overrides = parser.parse_known_args()
+    for override in overrides:
+        if re.fullmatch(r"--[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+=.*", override) is None:
+            parser.error(f"Invalid training override {override!r}; expected --section.field=value")
+    args.overrides = overrides
     devices = args.devices.split(",")
     if len(devices) != 2 or len(set(devices)) != 2 or any(value not in map(str, range(8)) for value in devices):
         raise ValueError("Exactly two distinct Ascend device IDs are required")
@@ -238,7 +243,8 @@ def _start_trainer(args, output: Path, devices: list[str]) -> tuple[str, str]:
         "git config --global --add safe.directory /repo; "
         "python -m pip install --no-deps --no-build-isolation -e /repo; "
         "bash examples/search_r1/scripts/install_runtime.sh; "
-        + shlex.join(training_command(args.steps, resume=args.resume is not None)) + " 2>&1 | tee /results/train.log"
+        + shlex.join(training_command(args.steps, resume=args.resume is not None, overrides=args.overrides))
+        + " 2>&1 | tee /results/train.log"
     )
     launch.extend(("-w", "/repo/hyper_parallel/rl", "--entrypoint", "/bin/bash", args.image, "-c", command))
     docker(launch, capture_output=True)

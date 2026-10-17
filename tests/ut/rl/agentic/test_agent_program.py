@@ -15,8 +15,11 @@
 """Exact-context trajectories and fully settled external program lifecycles."""
 
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from io import BytesIO
+import json
 import os
 from pathlib import Path
 import signal
@@ -26,9 +29,10 @@ import tempfile
 from types import SimpleNamespace
 from typing import Any, Optional
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import torch
+import numpy as np
 
 from rl.agentic.codex import harness
 from rl.agentic.codex.harness import build_codex_call_trajectories, build_codex_trajectory, _stop_process_group
@@ -37,6 +41,8 @@ from rl.agentic.core.program_runner import ProgramAgentRunner
 from rl.agentic.ds_harness.harness import build_deepseek_trajectory
 from rl.dataset.contracts import Message, PromptRecord
 from rl.roles.rollout.base import GenerationSettings
+from rl.roles.rollout.router_capture import RouterCaptureSpec
+from rl.roles.rollout.worker import CodexRolloutManager
 
 
 def _record(ordinal: int, prompt: list[int], action: list[int]) -> dict:
@@ -54,6 +60,18 @@ def _arguments() -> dict:
             "policy_version": 3, "sample_index": 0, "reward": 1.0, "reward_components": {"outcome": 1.0}}
 
 
+def _router_record(ordinal: int, prompt: list[int], action: list[int], first_expert: int) -> dict:
+    """Capture this call's unshifted input routes with its final unsampled row omitted."""
+    record = _record(ordinal, prompt, action)
+    routes = np.tile(np.array([first_expert, first_expert + 1], dtype=np.uint8),
+                     (len(prompt) + len(action) - 1, 1, 1))
+    stream = BytesIO()
+    np.save(stream, routes, allow_pickle=False)
+    record["routed_experts"] = base64.b64encode(stream.getvalue()).decode("ascii")
+    record["router_capture_spec"] = {"layer_ids": [2], "top_k": 2, "num_experts": 4}
+    return record
+
+
 class TestAgentProgram(unittest.IsolatedAsyncioTestCase):
     """Check real-context training rows without starting a model service."""
 
@@ -69,6 +87,51 @@ class TestAgentProgram(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({row.metadata["call_count"] for row in rows}, {2})
         self.assertEqual({row.metadata["episode_id"] for row in rows}, {"task:3:0"})
         self.assertEqual([row.reward for row in rows], [1.0, 1.0])
+
+    def test_call_routes_keep_distinct_real_prompts_and_lightweight_metadata(self) -> None:
+        """Each call decodes its own routes once, including prompt positions and no metadata copy."""
+        records = [_router_record(0, [1, 2], [3, 9], 0), _router_record(1, [7, 8, 9], [4, 9], 2)]
+        with patch.object(program_module, "router_trace_from_capture",
+                          wraps=program_module.router_trace_from_capture) as decode:
+            rows = build_codex_call_trajectories(completion_records=records, **_arguments())
+        self.assertEqual(decode.call_count, 2)
+        for row, record, expert in zip(rows, records, (0, 2)):
+            self.assertEqual(row.router_trace.expert_ids.shape, (row.token_ids.numel(), 1, 2))
+            self.assertEqual(row.router_trace.expert_ids[:-1, 0, 0].tolist(), [expert] * (row.token_ids.numel() - 1))
+            self.assertEqual(row.router_trace.valid_mask.tolist(), [True] * (row.token_ids.numel() - 1) + [False])
+            self.assertNotIn(record["routed_experts"], json.dumps(row.metadata))
+            self.assertNotIn("router_capture_spec", row.metadata["gateway_record"])
+        self.assertEqual(rows[1].token_ids.tolist(), [7, 8, 9, 4, 9])
+
+    def test_call_router_traces_survive_compact_tp_roundtrip_and_manager_wiring(self) -> None:
+        """Existing TP payloads retain compact traces without expanding expert IDs into Python lists."""
+        rows = build_codex_call_trajectories(completion_records=[_router_record(0, [1, 2], [3, 9], 0)],
+                                            **_arguments())
+        payload = ProgramAgentRunner._serialize_trajectories(rows)
+        self.assertIsInstance(payload[0]["router_trace"]["expert_ids"], bytes)
+        self.assertIsInstance(payload[0]["router_trace"]["valid_mask"], bytes)
+        restored = ProgramAgentRunner._deserialize_trajectories(payload, [_arguments()["prompt"]])
+        torch.testing.assert_close(restored[0].router_trace.expert_ids, rows[0].router_trace.expert_ids)
+        torch.testing.assert_close(restored[0].router_trace.valid_mask, rows[0].router_trace.valid_mask)
+        self.assertEqual(restored[0].router_trace.layer_ids, (2,))
+        engine = SimpleNamespace(router_capture_spec=RouterCaptureSpec((2,), 2, 4))
+        runtime = harness.CodexRuntime(engine, {})
+        manager = CodexRolloutManager(runtime, 1, 8, 1.0, 1.0, 0, 0, 9, collect_router_trace=True)
+        self.assertTrue(manager.agent_runner.settings.collect_router_trace)
+        self.assertEqual(runtime._gateway_options["router_capture_spec"]["layer_ids"], (2,))
+
+    async def test_r3_program_rejects_a_call_without_required_capture(self) -> None:
+        """An episode cannot silently lose either a malformed payload or an uncaptured call."""
+        record = _router_record(0, [1, 2], [3, 9], 0)
+        del record["routed_experts"]
+        with self.assertRaisesRegex(ValueError, "payload"):
+            build_codex_call_trajectories(completion_records=[record], **_arguments())
+        rows = build_codex_call_trajectories(completion_records=[_router_record(0, [1, 2], [3, 9], 0),
+                                                               _record(1, [7, 8], [4, 9])], **_arguments())
+        settings = GenerationSettings(8, 1.0, 1.0, 0, True, 0, 9, True, collect_router_trace=True)
+        runner = ProgramAgentRunner(lambda *_args: SimpleNamespace(run=AsyncMock(return_value=rows)), 1, settings)
+        with self.assertRaisesRegex(ValueError, "every real call"):
+            await runner._run([_arguments()["prompt"]], 3)
 
     def test_continuous_harness_requires_exact_full_prefix(self) -> None:
         """Dense DeepSeek/Codex APIs remain one row but never rewrite sampled history."""
@@ -237,6 +300,75 @@ class TestAgentProgram(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rows[0].reward, 0)
             self.assertEqual(rows[0].metadata["failure_origin"], "model")
             self.assertEqual(rows[0].token_ids.tolist(), [1, 2])
+
+    async def test_completed_budget_keeps_all_calls_and_router_traces_with_zero_reward(self) -> None:
+        """A confirmed budget exit truncates the full episode without weakening route requirements."""
+        args = _arguments()
+        termination = {"reason": "max_completions", "limit": 2, "completed": 2, "policy_version": 3}
+        records = [_router_record(0, [1, 2], [3, 9], 0), _router_record(1, [7, 8], [4, 9], 2)]
+        captured = {"policy_version": 3, "failure": None, "termination": termination, "completions": records}
+        reward = Mock(return_value=1.0)
+        with patch.object(harness, "_load_reward_callable", return_value=reward):
+            program = harness.CodexAgentProgram(args["prompt"], 3, 0, "http://gateway", {"max_turns": 2}, 9)
+        with (
+            patch.object(program, "_write_codex_config"),
+            patch.object(program, "_validate_version", new=AsyncMock()),
+            patch.object(program, "_run_codex",
+                         new=AsyncMock(side_effect=harness._CompletionBudgetExit(2, "http://gateway/responses"))),
+            patch.object(program, "_admin_request", new=AsyncMock(return_value=captured)),
+        ):
+            rows = await program._run_registered("session", Path("/tmp"), Path("/tmp"), Path("/tmp"), 1.0)
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all(row.reward == 0 and row.truncated and row.terminal_reason == "max_completions"
+                                for row in rows))
+            self.assertTrue(all(row.router_trace is not None for row in rows))
+            self.assertEqual([row.metadata["call_index"] for row in rows], [0, 1])
+            self.assertEqual(rows[1].router_trace.expert_ids[0, 0].tolist(), [2, 3])
+            reward.assert_not_called()
+            del records[1]["routed_experts"]
+            with self.assertRaisesRegex(ValueError, "payload"):
+                await program._run_registered("session", Path("/tmp"), Path("/tmp"), Path("/tmp"), 1.0)
+
+    def test_cli_budget_exit_matches_real_terminal_and_rejects_other_errors(self) -> None:
+        """Known budget retries may follow intermediate text, while an independent error still fails."""
+        message = ("unexpected status 409 Conflict: Repository session exhausted its 2 model calls, "
+                   "url: http://gateway/responses")
+        events = [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "I will use a tool."}},
+            {"type": "error", "message": f"Reconnecting... 1/5 ({message})"},
+            {"type": "error", "message": message},
+            {"type": "turn.failed", "error": {"message": message}},
+        ]
+        with self.assertRaises(harness._CompletionBudgetExit) as raised:
+            harness._interpret_codex_output([json.dumps(event) for event in events], [], 1, Path("/tmp"))
+        self.assertEqual((raised.exception.limit, raised.exception.url), (2, "http://gateway/responses"))
+        events.insert(-1, {"type": "error", "message": "HTTP 503 upstream unavailable"})
+        with self.assertRaisesRegex(RuntimeError, "exited with status 1"):
+            harness._interpret_codex_output([json.dumps(event) for event in events], [], 1, Path("/tmp"))
+
+    async def test_budget_does_not_hide_unknown_execution_or_infrastructure_failure(self) -> None:
+        """Gateway budget evidence cannot turn a timeout, transport fault or version mismatch into reward."""
+        termination = {"reason": "max_completions", "limit": 1, "completed": 1, "policy_version": 3}
+        captured = {"policy_version": 3, "failure": None, "termination": termination,
+                    "completions": [_record(0, [1], [2])]}
+        with patch.object(harness, "_load_reward_callable", return_value=Mock()):
+            program = harness.CodexAgentProgram(_arguments()["prompt"], 3, 0, "http://gateway", {"max_turns": 1}, 9)
+        with (
+            patch.object(program, "_write_codex_config"),
+            patch.object(program, "_validate_version", new=AsyncMock()),
+            patch.object(program, "_run_codex",
+                         new=AsyncMock(side_effect=RuntimeError("Codex episode timed out"))) as run,
+            patch.object(program, "_admin_request", new=AsyncMock(return_value=captured)),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                await program._run_registered("session", Path("/tmp"), Path("/tmp"), Path("/tmp"), 1.0)
+            run.side_effect = harness._CompletionBudgetExit(1, "http://gateway/responses")
+            captured["failure"] = {"failure_origin": "infrastructure", "trainable": False, "failure_reason": "HTTP"}
+            with self.assertRaisesRegex(RuntimeError, "untrainable"):
+                await program._run_registered("session", Path("/tmp"), Path("/tmp"), Path("/tmp"), 1.0)
+            captured.update(failure=None, policy_version=4)
+            with self.assertRaisesRegex(RuntimeError, "different policy version"):
+                await program._run_registered("session", Path("/tmp"), Path("/tmp"), Path("/tmp"), 1.0)
 
     async def test_successful_harness_cleans_descendants_holding_output_pipes(self) -> None:
         """A detached tool in the same group cannot hold successful episode capture open."""

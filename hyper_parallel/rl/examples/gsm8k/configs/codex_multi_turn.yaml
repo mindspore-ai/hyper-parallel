@@ -30,6 +30,7 @@ rollout:
   top_k: 0
   seed: 20260903
   vllm:
+    sleep_level: 1  # Use 2 to discard old weights; fully republish before resuming sampling.
     deployment: colocated
     data_parallel_size: 2
     port: 8100
@@ -111,6 +112,7 @@ algorithm:
   loss_aggregation: token-mean
 
 train:
+  model_init_cpu_threads: null  # Optional 8 during model build; restore original threads afterward.
   max_steps: 2
   seed: 1234
   prompt_batch_size: 1

@@ -407,7 +407,11 @@ class FullGatherStrategy:
         for bucket_index, bucket in enumerate(self._buckets):
             def materialize(selected: Any = bucket) -> Any:
                 """Materialize the selected bucket under synchronized failure handling."""
-                return materialize_packed_weight_bucket(state, selected)
+                device_type = (torch.accelerator.current_accelerator() or torch.device("cpu")).type
+                device = torch.device("cpu") if device_type == "cpu" else torch.device(
+                    device_type, torch.get_device_module().current_device(),
+                )
+                return materialize_packed_weight_bucket(state, selected, device=device)
 
             packed = synchronized_call(
                 "full-gather bucket materialization",
@@ -440,7 +444,7 @@ class FullGatherStrategy:
                     f"bucket={bucket_index}, ack={ack}"
                 )
             max_bucket_bytes = max(max_bucket_bytes, bucket.total_bytes)
-            del packed
+            del send_bucket, packed
         synchronized_call(
             "full-gather post-release synchronization", torch.get_device_module().current_stream().synchronize,
         )

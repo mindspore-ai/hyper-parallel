@@ -18,15 +18,20 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 import yaml
 
 import rl
 
 from rl.algorithm import build_algorithm
-from rl.config import build_model_registration, build_runtime_config, resolve_vllm_automatic_limits, validate_config
+from rl.config import (
+    build_model_registration,
+    build_runtime_config,
+    resolve_router_replay_config,
+    resolve_vllm_automatic_limits,
+    validate_config,
+)
 from rl.roles.model_setup import resolve_vllm_model
-
-
 
 
 @pytest.fixture(name="moe_config")
@@ -37,7 +42,7 @@ def make_moe_config(tmp_path: Path) -> dict:
     (tmp_path / "config.json").write_text(json.dumps({
         "architectures": ["Qwen3MoeForCausalLM"], "model_type": "qwen3_moe",
         "num_experts": 8, "hidden_size": 16, "num_attention_heads": 4,
-        "num_key_value_heads": 2, "num_hidden_layers": 2, "head_dim": 4,
+        "num_key_value_heads": 4, "num_hidden_layers": 2, "head_dim": 4,
     }), encoding="utf-8")
     config["model"].update(weights_path=str(tmp_path), tokenizer_path=str(tmp_path))
     return config
@@ -89,6 +94,67 @@ def test_moe_rejects_nondivisible_expert_count(moe_config: dict) -> None:
     path.write_text(json.dumps(metadata), encoding="utf-8")
     with pytest.raises(ValueError, match="divide num_experts"):
         build_runtime_config(moe_config)
+
+
+def test_r3_derives_capture_without_changing_disabled_recipe(moe_config: dict) -> None:
+    """One switch enables capture and full-sequence replay while preserving disabled defaults."""
+    assert resolve_router_replay_config(moe_config) == moe_config
+    moe_config["train"]["router_replay"] = {"mode": "R3"}
+    moe_config["rollout"]["vllm"].update(tensor_parallel_size=4, data_parallel_size=1)
+    resolved = resolve_router_replay_config(moe_config)
+    assert resolved["rollout"]["vllm"]["enable_return_routed_experts"] is True
+    assert "enable_return_routed_experts" not in moe_config["rollout"]["vllm"]
+    assert build_runtime_config(resolved).accelerator.sequence_parallel is False
+    resolved["rollout"]["vllm"]["enable_return_routed_experts"] = False
+    with pytest.raises(ValueError, match="must match"):
+        resolve_router_replay_config(resolved)
+
+
+def test_r3_rejects_rollout_dp_padding(moe_config: dict) -> None:
+    """Captured routes require one inference DP engine before model allocation."""
+    moe_config["train"]["router_replay"] = {"mode": "R3"}
+    with pytest.raises(ValueError, match="data_parallel_size=1.*DP padding"):
+        build_runtime_config(moe_config)
+
+
+def test_r3_rejects_enabled_distillation(moe_config: dict) -> None:
+    """Replay remains separate from the independently supported OPD objective."""
+    moe_config["train"]["router_replay"] = {"mode": "R3"}
+    moe_config["rollout"]["vllm"].update(tensor_parallel_size=4, data_parallel_size=1)
+    moe_config["distillation"] = {"enabled": True, "teachers": {"teacher": {
+        "model_path": moe_config["model"]["weights_path"], "endpoint": "http://localhost:8000",
+        "max_model_len": 8192,
+    }}}
+    with pytest.raises(ValueError, match="R3 does not support enabled distillation"):
+        build_runtime_config(moe_config)
+
+
+def test_r3_supports_internal_and_codex_multiturn(
+    moe_config: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multi-turn replay keeps native MoE constraints and excludes unadapted harnesses."""
+    train_path = tmp_path / "train.parquet"
+    train_path.touch()
+    moe_config["data"]["train_path"] = str(train_path)
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
+    moe_config["train"].update(router_replay={"mode": "R3"}, model_init_cpu_threads=8)
+    moe_config["rollout"]["vllm"].update(tensor_parallel_size=4, data_parallel_size=1, max_model_len=8192)
+    moe_config["agentic"].update(max_turns=3, interaction_mode="multi_turn")
+    validate_config(resolve_vllm_automatic_limits(moe_config), build_algorithm(moe_config["algorithm"]))
+
+    recipe = Path(rl.__file__).resolve().parent.parent / "examples/gsm8k/configs/codex_multi_turn.yaml"
+    moe_config["agentic"] = yaml.safe_load(recipe.read_text(encoding="utf-8"))["agentic"]
+    moe_config["rollout"]["vllm"].update(enable_auto_tool_choice=True, tool_call_parser="hermes")
+    resolved = resolve_vllm_automatic_limits(resolve_router_replay_config(moe_config))
+    validate_config(resolved, build_algorithm(resolved["algorithm"]))
+    assert resolved["rollout"]["vllm"]["enable_return_routed_experts"] is True
+    assert resolved["train"]["model_init_cpu_threads"] == 8
+    assert resolved["agentic"] == moe_config["agentic"], "R3 must not change the harness or its task budget"
+    assert resolved["rollout"]["max_new_tokens"] == moe_config["rollout"]["max_new_tokens"]
+
+    resolved["agentic"]["runner"] = "deepseek"
+    with pytest.raises(ValueError, match="only internal and Codex"):
+        build_runtime_config(resolved)
 
 
 def test_ppo_rejects_moe_critic_override(moe_config: dict, tmp_path: Path) -> None:

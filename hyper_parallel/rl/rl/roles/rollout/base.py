@@ -17,6 +17,7 @@
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 
+from rl.dataset.contracts import RouterTrace
 from rl.weight_sync import PolicySnapshot
 
 
@@ -34,6 +35,7 @@ class GenerationSettings:
     seed: Optional[int] = None
     eos_token_ids: tuple[int, ...] = ()
     ignore_eos: bool = False
+    collect_router_trace: bool = False
 
     def __post_init__(self) -> None:
         """Normalize the primary and additional terminal token IDs."""
@@ -63,6 +65,7 @@ class GenerationResult:
     response_mask: Optional[Any] = None
     worker_policy_version: Optional[int] = None
     finish_reasons: Optional[tuple[Optional[str], ...]] = None
+    router_traces: Optional[tuple[Optional[RouterTrace], ...]] = None
 
 
 class GenerationEngine(Protocol):

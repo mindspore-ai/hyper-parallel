@@ -693,8 +693,11 @@ def test_codex_gateway_preserves_tool_choice_with_bounded_calls(
     handler._proxy_responses(request)
     handler._proxy_responses(request)
     assert [payload["tool_choice"] for payload in requests] == ["auto", "auto"]
-    with pytest.raises(ValueError, match="max_completions"):
-        handler._proxy_responses(request)
+    handler._proxy_responses(request)
+    snapshot = state.snapshot("session")
+    assert snapshot["failure"] is None
+    assert snapshot["termination"] == {"reason": "max_completions", "limit": 2,
+                                       "completed": 2, "policy_version": 0}
 
 
 @pytest.mark.parametrize("gateway_module", ["rl.agentic.codex.gateway", "rl.agentic.ds_harness.gateway"])
@@ -858,6 +861,137 @@ def test_agent_session_guards_and_terminal_paths() -> None:
         session.record_worker_policy_version(3)
 
     _assert_session_terminal_paths(make, Environment, modules)
+
+
+def _r3_multiturn_runner(monkeypatch: pytest.MonkeyPatch, *, failure: str = "", budget: int = 8) -> Any:
+    """Drive two real runner calls over controlled full-prefix captures and tool feedback."""
+    modules = _modules()
+    runner_module = importlib.import_module("rl.agentic.core.trajectory_runner")
+    contracts = importlib.import_module("rl.dataset.contracts")
+    rollout = importlib.import_module("rl.roles.rollout.base")
+
+    class Environment:
+        """Append one observation between actions and one terminal observation."""
+
+        async def reset(self, context: Any) -> Any:
+            """Provide the initial two-token prompt."""
+            del context
+            return modules.types.Observation("question", torch.tensor([10, 11]))
+
+        async def step(self, action: Any, context: Any) -> Any:
+            """Return one feedback token and finish after the second action."""
+            del action
+            return modules.types.Transition(
+                modules.types.Observation("feedback", torch.tensor([30 + context.turn_index])),
+                1.0, context.turn_index == 1,
+            )
+
+        async def close(self) -> None:
+            """Release this stateless environment."""
+
+    class Engine:
+        """Return deterministic input-position routes without a model or process group."""
+
+        def __init__(self) -> None:
+            """Retain requests and captured traces for independent assertions."""
+            self.requests = []
+            self.traces = []
+
+        def generate(self, request: Any) -> Any:
+            """Capture the complete input prefix with an uncaptured final token."""
+            self.requests.append(request)
+            turn = len(self.requests)
+            response = torch.tensor([[5, 6] if turn == 1 else [7, 8]])
+            length = int(request.attention_mask.sum()) + 2
+            ids = (torch.arange(length, dtype=torch.int16)[:, None, None]
+                   + torch.tensor([[[0, 1], [1, 2]]], dtype=torch.int16)) % 3
+            if failure == "prefix" and turn == 2:
+                ids[1, 0] = ids[1, 0].flip(0)
+            trace = contracts.RouterTrace(ids, torch.arange(length) < length - 1, (0, 1))
+            self.traces.append(trace)
+            return rollout.GenerationResult(
+                torch.cat((request.input_ids, response), dim=1), torch.full(response.shape, -0.1 * turn), 0.25,
+                worker_policy_version=2, router_traces=None if failure == "missing" else (trace,),
+            )
+
+        @staticmethod
+        def synchronize_error(error: Any, operation: str) -> None:
+            """Propagate the local failure without distributed initialization."""
+            del operation
+            if error is not None:
+                raise error
+
+    engine = Engine()
+    tokenizer = SimpleNamespace(batch_decode=lambda rows, **_kwargs: ["action"] * len(rows))
+    settings = rollout.GenerationSettings(2, 0.0, 1.0, 0, False, 0, 2,
+                                          collect_log_probs=True, collect_router_trace=True)
+    monkeypatch.setattr(runner_module.ENVIRONMENTS, "build", lambda _name, _context: Environment())
+    runner = runner_module.AgentRunner(engine, tokenizer, "mock", 1, 2, 1, settings, max_episode_tokens=budget)
+    return runner, engine
+
+
+def test_multiturn_router_trace_covers_observations_and_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The latest full capture fills the prior final token and observation without duplicating the prefix."""
+    runner, engine = _r3_multiturn_runner(monkeypatch)
+    batch = runner.rollout([_prompt()], 2)
+    assert len(engine.requests) == 2, f"Expected two generation calls, got {len(engine.requests)}"
+    assert engine.requests[1].input_ids.tolist() == [[10, 11, 5, 6, 30]], (
+        f"Unexpected second prompt: {engine.requests[1].input_ids.tolist()}")
+    assert batch.sequences.tolist() == [[10, 11, 5, 6, 30, 7, 8, 31]], (
+        f"Unexpected continuous trajectory: {batch.sequences.tolist()}")
+    assert batch.action_mask.tolist() == [[False, False, True, True, False, True, True, False]], (
+        f"Unexpected action/observation mask: {batch.action_mask.tolist()}")
+    torch.testing.assert_close(batch.old_log_probs[batch.loss_action_mask], torch.tensor([-0.1, -0.1, -0.2, -0.2]))
+    trace = batch.router_traces[0]
+    assert trace.valid_mask.tolist() == [True] * 6 + [False, False], (
+        f"Final action and terminal observation must remain unrouted: {trace.valid_mask.tolist()}")
+    torch.testing.assert_close(trace.expert_ids[:7], engine.traces[-1].expert_ids)
+    replay = importlib.import_module("rl.router_replay").RouterReplay((0, 1), 3, 2)
+    targets = replay.prepare(batch.router_traces, batch.attention_mask, batch.action_mask)
+    with replay.use(targets):
+        ids, valid = replay.layer_targets(0)
+        torch.testing.assert_close(ids[valid], engine.traces[-1].expert_ids[:6, 0])
+    assert replay.current is None, f"Replay scope leaked targets: {replay.current}"
+
+
+def test_multiturn_router_trace_rejects_changed_ordered_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even a top-k permutation cannot silently replace an earlier captured prefix."""
+    runner, unused_engine = _r3_multiturn_runner(monkeypatch, failure="prefix")
+    with pytest.raises(RuntimeError, match="changed previously captured"):
+        runner.rollout([_prompt()], 2)
+
+
+def test_multiturn_router_trace_requires_consistent_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The engine must capture every call, and a session cannot mix routed and unrouted actions."""
+    runner, unused_engine = _r3_multiturn_runner(monkeypatch, failure="missing")
+    with pytest.raises(ValueError, match="required router traces"):
+        runner.rollout([_prompt()], 2)
+    modules = _modules()
+    contracts = importlib.import_module("rl.dataset.contracts")
+    session_type = importlib.import_module("rl.agentic.core.session").AgentSession
+    for missing_first in (True, False):
+        session = session_type(_prompt(), None, 2, 0, 2)
+        asyncio.run(session.start(modules.types.Observation("question", torch.tensor([10, 11]))))
+        first = contracts.RouterTrace(torch.zeros(3, 1, 1, dtype=torch.uint8), torch.tensor([True, True, False]), (0,))
+        second = contracts.RouterTrace(
+            torch.zeros(4, 1, 1, dtype=torch.uint8), torch.tensor([True] * 3 + [False]), (0,))
+        session._append_action(modules.types.Action(
+            "first", torch.tensor([5]), router_trace=None if missing_first else first))
+        with pytest.raises(ValueError, match="consistently provide router traces"):
+            session._append_action(modules.types.Action("second", torch.tensor([6]),
+                                                       router_trace=second if missing_first else None))
+
+
+def test_multiturn_router_trace_keeps_unconsumed_observation_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A context-limit dummy generation cannot replace the completed row's capture."""
+    runner, engine = _r3_multiturn_runner(monkeypatch, budget=5)
+    batch = runner.rollout([_prompt()], 2)
+    assert len(engine.requests) == 2, f"Expected fixed collective call count 2, got {len(engine.requests)}"
+    assert batch.sequences.tolist() == [[10, 11, 5, 6, 30]], f"Unexpected truncated tokens: {batch.sequences.tolist()}"
+    assert batch.trajectories[0].terminal_reason == "context_limit", (
+        f"Expected context-limit termination, got {batch.trajectories[0].terminal_reason}")
+    assert batch.router_traces[0].valid_mask.tolist() == [True, True, True, False, False], (
+        f"Unused observation gained routing: {batch.router_traces[0].valid_mask.tolist()}")
 
 
 def test_runner_boundary_validation() -> None:

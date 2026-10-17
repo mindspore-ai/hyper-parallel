@@ -16,9 +16,11 @@
 
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import yaml
 
@@ -81,6 +83,18 @@ class TestCodeAgentRecipes(unittest.TestCase):
                                        ("--tool-call-parser", "qwen3_coder"), ("--logprobs-mode", "raw_logprobs"),
                                        ("--reasoning-parser", "qwen3")):
                     self.assertEqual(command[command.index(flag) + 1], expected)
+
+    def test_colocated_serving_does_not_inherit_trainer_hccl_ports(self) -> None:
+        """Trainer collectives must not bind the live rollout process's NPU socket ports."""
+        trainer_ports = {"HCCL_IF_BASE_PORT": "63200", "HCCL_NPU_SOCKET_PORT_RANGE": "63200-63299"}
+        for model in ("qwen3_5_9b", "qwen3_8_27b"):
+            with self.subTest(model=model), patch.dict(os.environ, trainer_ports):
+                config = self._config(model)
+                engine = VLLMGenerationEngine(build_model_registration(config), config["rollout"])
+                environment = engine._server_environment("0,1")
+                self.assertNotEqual(environment["HCCL_IF_BASE_PORT"], trainer_ports["HCCL_IF_BASE_PORT"])
+                start, end = map(int, environment["HCCL_NPU_SOCKET_PORT_RANGE"].split("-"))
+                self.assertTrue(end < 63200 or start > 63299)
 
     def test_invalid_context_evidence_and_accumulation_are_rejected(self) -> None:
         """Reject inconsistent budgets and probability semantics before creating a service."""

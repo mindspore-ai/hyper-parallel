@@ -16,12 +16,15 @@
 # pylint: disable=forbidden-backend-import,missing-public-docstring,missing-public-type-hints,protected-access
 
 from types import SimpleNamespace
+from typing import Any
+import weakref
 
 import pytest
 import torch
 import torch.distributed as dist
 
 from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
+from rl.weight_sync import transfer as transfer_module
 from rl.weight_sync import vllm_worker
 from rl.weight_sync.packed_weight import PackedWeightAck, pack_direct_bucket
 from rl.weight_sync.sync import (
@@ -131,6 +134,7 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
             ))
 
     def get_world_size(self, base_url=None):
+        del base_url
         return 2
 
     def pause(self):
@@ -141,10 +145,14 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
         return self.paused
 
     def sleep(self, level=1, mode="wait"):
-        del level, mode
+        del mode
         self.events.append("sleep")
         self.sleeping = True
         self.paused = True
+        if level == 2:
+            for worker in self.workers:
+                for parameter in worker.parameters.values():
+                    parameter.fill_(float("nan"))
 
     def is_sleeping(self):
         return self.sleeping
@@ -259,7 +267,7 @@ class TensorTransport:
         self.closed = True
 
 
-def _publication(deployment, strategy):
+def _publication(deployment, strategy, *, sleep_level=1):
     """Assemble an in-process publisher, transport and versioned worker client."""
     source = WeightSource(_model(), 16)
     selected = (
@@ -274,7 +282,7 @@ def _publication(deployment, strategy):
     wire = TensorTransport("ipc" if deployment == "colocated" else "hccl")
     publisher = WeightPublisher(selected, wire)
     client = LocalWorkers()
-    controller = ActorRolloutWeightSync("qwen", deployment, lambda: client, publisher)
+    controller = ActorRolloutWeightSync("qwen", deployment, lambda: client, publisher, sleep_level=sleep_level)
     state = {
         "model.norm.weight": torch.arange(4, dtype=torch.float32) + 1,
         "model.layers.0.mlp.down_proj.weight": (
@@ -406,3 +414,68 @@ def test_coordinator_and_synchronized_failures_are_not_swallowed():
     for call in (coordinator_call, synchronized_call):
         with pytest.raises(ValueError, match="local operation failed"):
             call("test", fail)
+
+
+def test_full_gather_releases_acknowledged_payload_before_next_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An acknowledged bucket must not remain captured by the send closure."""
+    publisher, unused_wire, unused_client, controller, state = _publication("colocated", "full_gather")
+    original = transfer_module.materialize_packed_weight_bucket
+    buffers = []
+
+    def observe_materialization(*args: Any, **kwargs: Any) -> torch.Tensor:
+        """Check release before materializing the next bucket."""
+        if buffers:
+            assert buffers[-1]() is None, "Previous packed buffer survived into the next gather"
+        packed = original(*args, **kwargs)
+        buffers.append(weakref.ref(packed))
+        return packed
+
+    monkeypatch.setattr(transfer_module, "materialize_packed_weight_bucket", observe_materialization)
+    controller.prepare_for_training()
+    controller.update_weights(PolicySnapshot(1, "qwen", state))
+    controller.prepare_for_rollout()
+    assert publisher.last_streaming_stats["bucket_count"] == len(buffers) > 1
+    assert all(buffer() is None for buffer in buffers)
+    assert controller.policy_version == 1
+    controller.close()
+
+
+def test_level_two_requires_full_publication_before_restoring_generation() -> None:
+    """Discarded worker weights stay unavailable until a complete publication and resume."""
+    unused_publisher, unused_wire, client, controller, state = _publication(
+        "colocated", "full_gather", sleep_level=2,
+    )
+    controller.prepare_for_training()
+    assert all(parameter.isnan().all() for worker in client.workers for parameter in worker.parameters.values())
+    with pytest.raises(RuntimeError, match="unpublished"):
+        controller.generation_version(client)
+    with pytest.raises(RuntimeError, match="successful full publication"):
+        controller.prepare_for_rollout()
+    controller.update_weights(PolicySnapshot(1, "qwen", state))
+    with pytest.raises(RuntimeError, match="unpublished"):
+        controller.generation_version(client)
+    controller.prepare_for_rollout()
+    _assert_parameters(client, state)
+    assert controller.generation_version(client) == 1
+    assert not client.paused
+    controller.close()
+
+
+def test_level_two_failed_publication_cannot_resume_or_sample() -> None:
+    """A failed transfer leaves the discarded version closed to restoration and sampling."""
+    unused_publisher, wire, client, controller, state = _publication("colocated", "full_gather", sleep_level=2)
+    wire.fail = True
+    controller.prepare_for_training()
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        controller.update_weights(PolicySnapshot(1, "qwen", state))
+    with pytest.raises(RuntimeError, match="unpublished"):
+        controller.generation_version(client)
+    with pytest.raises(RuntimeError, match="without a pending policy version"):
+        controller.prepare_for_rollout()
+    assert controller.policy_version == 0
+    assert client.paused
+    assert "resume" not in client.events
+    assert all(worker._rl_loaded_policy_version == 0 for worker in client.workers)
+    controller.close()

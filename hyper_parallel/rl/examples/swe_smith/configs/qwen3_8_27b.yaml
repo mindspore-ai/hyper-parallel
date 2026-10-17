@@ -30,11 +30,14 @@ rollout:
   top_k: 0
   seed: 20261008
   vllm:
+    sleep_level: 1  # Use 2 to discard old weights; fully republish before resuming sampling.
     deployment: colocated
     data_parallel_size: 1
     port: 18970
     model_implementation: native
     tensor_parallel_size: 4
+    server_hccl_if_base_port: 63400
+    server_hccl_npu_socket_port_range: 63400-63499
     weight_sync:
       strategy: full_gather
       bucket_size_mb: 128
@@ -127,6 +130,7 @@ algorithm:
   kl_type: low_var_kl
   loss_aggregation: token-mean
 train:
+  model_init_cpu_threads: null  # Optional 8 during model build; restore original threads afterward.
   max_steps: 1
   seed: 1234
   prompt_batch_size: 1

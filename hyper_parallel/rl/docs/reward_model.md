@@ -41,7 +41,7 @@ reward_model:
 RM TP times DP must equal the rollout device count. The RM needs its own port and
 a valid non-overlapping HCCL port range. Training requires `cpu_offload=true`.
 Adjust the model, data, device count, and output path for the target machine.
-Use `hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64` and follow the
+Use `swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64` and follow the
 [runtime image guide](../docker/README.md) for source and Ascend driver mounts.
 
 `reward_model.scorer` names an async `module:function` that accepts a prompt,

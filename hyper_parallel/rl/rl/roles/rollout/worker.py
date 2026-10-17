@@ -40,6 +40,7 @@ def _generation_settings(
     seed: Optional[int],
     ignore_eos: bool,
     eos_token_ids: Optional[Sequence[int]] = None,
+    collect_router_trace: bool = False,
 ) -> GenerationSettings:
     """Normalize sampling options into backend-neutral generation settings."""
     return GenerationSettings(
@@ -54,6 +55,7 @@ def _generation_settings(
         collect_log_probs=collect_old_log_probs,
         seed=seed,
         ignore_eos=ignore_eos,
+        collect_router_trace=collect_router_trace,
     )
 
 
@@ -83,6 +85,7 @@ class RolloutManager:
         max_episode_tokens: Optional[int] = None,
         environment_settings: Optional[dict[str, Any]] = None,
         interaction_mode: Optional[str] = None,
+        collect_router_trace: bool = False,
     ) -> None:
         """Initialize rollout orchestration and generation settings."""
         settings = _generation_settings(
@@ -97,6 +100,7 @@ class RolloutManager:
             seed=seed,
             ignore_eos=ignore_eos,
             eos_token_ids=eos_token_ids,
+            collect_router_trace=collect_router_trace,
         )
         self.agent_runner = AgentRunner(
             engine=engine,
@@ -140,6 +144,7 @@ class _ProgramRolloutManager:
         collect_old_log_probs: bool = True,
         seed: Optional[int] = None,
         ignore_eos: bool = False,
+        collect_router_trace: bool = False,
     ) -> None:
         """Build a contract-only program runner around an external harness."""
         settings = _generation_settings(
@@ -153,6 +158,7 @@ class _ProgramRolloutManager:
             collect_old_log_probs=collect_old_log_probs,
             seed=seed,
             ignore_eos=ignore_eos,
+            collect_router_trace=collect_router_trace,
         )
         self.runtime = runtime
         generation = {

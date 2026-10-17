@@ -148,9 +148,20 @@ def materialize_packed_weight_bucket(
     state_dict: Mapping[str, Any],
     bucket: PackedWeightBucket,
     *,
+    device: torch.device,
     producer_rank: int = 0,
 ) -> Optional[Any]:
-    """Gather every complete parameter; only producer_rank packs it."""
+    """Gather on the communication device; only producer_rank packs it.
+
+    Args:
+        state_dict: Original model parameters, whose storage is preserved.
+        bucket: Ordered complete parameters participating in this gather.
+        device: Communication device on each participating Trainer rank.
+        producer_rank: Rank that retains and packs the gathered tensors.
+
+    Returns:
+        The packed device buffer on producer_rank, otherwise None.
+    """
 
     rank = dist.get_rank()
     tensors = []
@@ -158,9 +169,13 @@ def materialize_packed_weight_bucket(
         value = state_dict.get(entry.name)
         if value is None:
             raise ValueError(f"Packed weight source {entry.name!r} is missing")
-        full_tensor = getattr(value, "full_tensor", None)
-        tensor = full_tensor() if callable(full_tensor) else value
+        # Move the local shard first so CPU-offloaded DTensors gather through
+        # the device backend without changing the model's sharded parameters.
+        staged = value.to(device=device, non_blocking=True)
+        full_tensor = getattr(staged, "full_tensor", None)
+        tensor = full_tensor() if callable(full_tensor) else staged
         tensor = tensor.detach()
+        del full_tensor, staged
         if (
             tuple(int(size) for size in tensor.shape) != entry.shape
             or str(tensor.dtype).rsplit(".", maxsplit=1)[-1] != entry.dtype_name

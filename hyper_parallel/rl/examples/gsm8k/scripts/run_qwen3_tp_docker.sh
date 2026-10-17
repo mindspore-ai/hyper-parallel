@@ -18,12 +18,14 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../../../.." && pwd)
+default_image=swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64
 
 deployment=${1:-}
 [[ "${deployment}" == "colocated" || "${deployment}" == "disjoint" ]] || {
     printf 'Usage: %s {colocated|disjoint}\n' "$0" >&2
     exit 1
 }
+shift
 
 implementation=${HYPER_QWEN3_TP_IMPLEMENTATION:-hyper}
 [[ "${implementation}" == "hyper" || "${implementation}" == "native" ]] || {
@@ -96,7 +98,7 @@ done
 }
 
 workspace_root=$(cd -- "${repo_root}/.." && pwd)
-image=${HYPER_QWEN3_TP_IMAGE:-hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64}
+image=${HYPER_QWEN3_TP_IMAGE:-${default_image}}
 model_root=${HYPER_QWEN3_TP_MODEL_ROOT:-${workspace_root}/models/Qwen3-4B}
 data_root=${HYPER_QWEN3_TP_DATA_ROOT:-${workspace_root}/data/gsm8k}
 result_root=${HYPER_QWEN3_TP_RESULT_ROOT:-${repo_root}/hyper_parallel/rl/output/qwen3-tp-smoke}
@@ -419,6 +421,6 @@ docker run --rm --name "${container_name}" --privileged --shm-size="${shm_size}"
         log_file="/results/${HYPER_RUN_DEPLOYMENT}-${HYPER_RUN_IMPLEMENTATION}-trainer-tp${HYPER_RUN_TRAINER_TP}-rollout-tp${HYPER_RUN_ROLLOUT_TP}-${HYPER_RUN_WEIGHT_SYNC_STRATEGY}.log"
         timeout --signal=TERM --kill-after=60s "${HYPER_RUN_TIMEOUT}s" \
             python -m torch.distributed.run --standalone --nproc_per_node="${HYPER_RUN_TRAINER_COUNT}" \
-            hyper_parallel/rl/train_rl.py "${args[@]}" 2>&1 | tee "${log_file}"
+            hyper_parallel/rl/train_rl.py "${args[@]}" "$@" 2>&1 | tee "${log_file}"
         exit "${PIPESTATUS[0]}"
-    '
+    ' hyper-rl-trainer "$@"

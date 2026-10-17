@@ -15,7 +15,9 @@
 """Repository program lifecycle, failure priority and controller credential contracts."""
 
 import asyncio
+import base64
 from contextlib import asynccontextmanager
+from io import BytesIO
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,9 +27,13 @@ import threading
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
+import torch
+
 from rl.agentic.codex import harness as shared_harness
 from rl.agentic.core.types import RewardResult
 from rl.agentic.envs.docker_workspace import CommandResult, InvalidSubmissionError, WorkspaceOutputLimitError
+from rl.dataset.contracts import Message, PromptRecord
 from examples.swe_smith import agent as harness
 
 
@@ -203,10 +209,29 @@ class TestRepositoryProgram(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_confirmed_budget_stops_then_grades_real_artifact(self) -> None:
-        """Only an acknowledged controller stop allows scoring the frozen candidate."""
+        """Budget termination preserves graded rewards and per-call routes through real row construction."""
+        del self.program._build_rows
+        self.program.prompt = PromptRecord("repo", (Message("user", "fix"),),
+                                           metadata={"input_ids": torch.tensor([1, 2])})
+        self.program.config["max_turns"] = 2
+        calls = (([1, 2], [3, 9], [[[0, 1]], [[1, 2]], [[2, 3]]]),
+                 ([7, 8, 9], [4, 9], [[[3, 0]], [[2, 3]], [[1, 2]], [[0, 1]]]))
+        records = []
+        for ordinal, (prompt, action, routes) in enumerate(calls):
+            stream = BytesIO()
+            np.save(stream, np.array(routes, dtype=np.uint8), allow_pickle=False)
+            records.append({
+                "ordinal": ordinal, "request": {"messages": []}, "original_request": {},
+                "response": {"prompt_token_ids": prompt, "choices": [{
+                    "token_ids": action, "finish_reason": "stop",
+                    "logprobs": {"content": [{"token_id": token, "logprob": -0.25} for token in action]},
+                }]},
+                "routed_experts": base64.b64encode(stream.getvalue()).decode("ascii"),
+                "router_capture_spec": {"layer_ids": [2], "top_k": 2, "num_experts": 4},
+            })
         stopped = asyncio.Event()
-        termination = {"reason": "max_completions", "limit": 3, "completed": 3, "policy_version": 7}
-        self.capture.update(termination=termination, completions=[{"ordinal": index} for index in range(3)])
+        termination = {"reason": "max_completions", "limit": 2, "completed": 2, "policy_version": 7}
+        self.capture.update(termination=termination, completions=records)
         self.relay.budget_termination = termination
         events = []
 
@@ -226,13 +251,28 @@ class TestRepositoryProgram(unittest.IsolatedAsyncioTestCase):
         self.program._run_container_codex.side_effect = execute
         self.relay.close.side_effect = lambda: events.append("relay-close")
         self.workspace.stop.side_effect = stop
-        await self.program.run()
+        rows = await self.program.run()
         self.assertLess(events.index("relay-close"), events.index("stop"))
-        self.task.evaluate.assert_awaited_once()
-        reward = self.program._build_rows.call_args.args[-1]
-        self.assertEqual(reward.value, 1.)
-        self.assertEqual(reward.metadata["budget_termination"], termination)
-        self.assertTrue(reward.metadata["repository_budget_truncated"])
+        self.task.evaluate.assert_awaited_once_with(Path("frozen.tar"))
+        self.assertEqual(len(rows), 2)
+        for index, (row, (prompt, action, routes)) in enumerate(zip(rows, calls)):
+            with self.subTest(call=index):
+                self.assertEqual(row.token_ids.tolist(), prompt + action)
+                self.assertEqual(row.action_mask.tolist(), [False] * len(prompt) + [True] * len(action))
+                self.assertEqual(row.rollout_log_probs.tolist(), [0.] * (len(prompt) - 1) + [-0.25] * len(action))
+                self.assertIsNotNone(row.router_trace)
+                self.assertEqual(row.router_trace.layer_ids, (2,))
+                self.assertEqual(row.router_trace.expert_ids[:-1].tolist(), routes)
+                self.assertEqual(row.router_trace.valid_mask.tolist(), [True] * len(routes) + [False])
+                self.assertEqual(row.reward, 1.)
+                self.assertEqual(row.reward_components, {"ok": 1.})
+                self.assertEqual((row.policy_version, row.worker_policy_version), (7, 7))
+                self.assertEqual(row.metadata["episode_id"], "repo:7:0")
+                self.assertEqual((row.metadata["call_index"], row.metadata["call_count"]), (index, 2))
+                self.assertEqual(row.metadata["budget_termination"], termination)
+                self.assertTrue(row.metadata["repository_budget_truncated"])
+                self.assertTrue(row.truncated)
+                self.assertEqual(row.terminal_reason, "max_completions")
         self.assertTrue(self.http.call_args_list[0].args[2]["isolated_cli"])
 
     async def test_budget_signal_does_not_hide_cli_or_transport_failure(self) -> None:

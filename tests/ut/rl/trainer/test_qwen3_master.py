@@ -177,7 +177,7 @@ def test_full_gather_restores_every_hf_weight(monkeypatch):
     state = adapter.map_local_state_dict(replaced.state_dict())
     actual = {}
     for bucket in build_packed_weight_buckets(state, 256):
-        packed = materialize_packed_weight_bucket(state, bucket)
+        packed = materialize_packed_weight_bucket(state, bucket, device=torch.device("cpu"))
         actual.update(unpack_packed_weights(packed, adapter.packed_metadata(bucket.worker_metadata())))
     expected.pop("lm_head.weight")
     assert actual.keys() == expected.keys()

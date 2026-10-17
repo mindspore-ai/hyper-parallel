@@ -233,12 +233,22 @@ class SearchFeedback:
         (self.artifact / "search-terminal.json").write_text(json.dumps(record))
 
 
-IMAGE = "hyper-parallel/hyper-rl:v0.22.1rc1-unified-arm64"
+IMAGE = "swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64"
+
+
+def _configure_search_tool_path() -> None:
+    """Expose the pinned CLI's bundled search tools only inside the candidate container."""
+    tools = Path("/opt/codex/codex-path")
+    if tools.is_dir():
+        os.environ["PATH"] = str(tools) + os.pathsep + os.environ.get("PATH", os.defpath)
+
+
 PROBE = r'''
 import importlib.util, json, os, pathlib, socket, shutil
 spec = importlib.util.spec_from_file_location("relay", "/runtime/relay.py")
 relay = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(relay)
+relay._configure_search_tool_path()
 checks = {}
 checks["search_tools_available"] = all(shutil.which(name) for name in ("rg", "sed", "cat", "codex"))
 corpus = pathlib.Path("/work/articles")
@@ -568,6 +578,7 @@ def main() -> None:
         sys.stdout.write((args.wait / "container-events.jsonl").read_text(encoding="utf-8"))
         sys.stderr.write((args.wait / "container-stderr.log").read_text(encoding="utf-8"))
         raise SystemExit(result["returncode"])
+    _configure_search_tool_path()
     server = ThreadingHTTPServer(("127.0.0.1", 8200), RelayHandler)
     server.session_id = os.environ["OPENAI_API_KEY"]
     server.connection_factory = lambda: UnixConnection("/bridge/responses.sock", timeout=600)

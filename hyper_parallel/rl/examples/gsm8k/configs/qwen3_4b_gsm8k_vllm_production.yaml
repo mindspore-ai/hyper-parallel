@@ -6,7 +6,7 @@ model:
   config_overrides: null
 
 consistency:
-  enabled: false
+  enabled: false  # true enables training/rollout consistency checks.
 
 data:
   train_path: /data/gsm8k/train.parquet
@@ -31,13 +31,14 @@ rollout:
   top_k: 0
   seed: 20260814
   vllm:
-    deployment: colocated
+    sleep_level: 1  # Use 2 to discard old weights; fully republish before resuming sampling.
+    deployment: colocated  # colocated or disjoint; coordinate visible devices and parallel sizes.
     data_parallel_size: 8
     port: 8100
-    model_implementation: hyper
-    tensor_parallel_size: 1
+    model_implementation: hyper  # hyper or native.
+    tensor_parallel_size: 1  # 1 or 2; match training TP when consistency is enabled.
     weight_sync:
-      strategy: full_gather
+      strategy: full_gather  # full_gather or direct_reshard.
       bucket_size_mb: 128
     dtype: bfloat16
     trust_remote_code: false
@@ -54,13 +55,22 @@ rollout:
     logprobs_mode: raw_logprobs
     startup_timeout: 600
     request_timeout: 600
+    enable_prompt_tokens_details: false
+    server_hccl_if_base_port: null  # Set both HCCL fields together to isolate server ports.
+    server_hccl_npu_socket_port_range: null
 
 agentic:
   module_path: examples.gsm8k.agent
   environment: gsm8k_tools
-  interaction_mode: single_turn
+  interaction_mode: single_turn  # single_turn or multi_turn; multi_turn also needs max_turns > 1.
   max_turns: 1
   max_observation_tokens: 0
+  protocol: json_function_call
+  apply_chat_template: false  # true renders chat messages for internal multi-turn tools.
+  max_episode_tokens: null  # Optional positive total prompt/action/observation token budget.
+  tool_timeout_seconds: 5.0
+  tool_max_concurrency: 2
+  tool_max_calls_per_turn: 2
 
 evaluation:
   enabled: true
@@ -85,6 +95,7 @@ algorithm:
   loss_aggregation: token-mean
 
 train:
+  model_init_cpu_threads: null  # Optional 8 during model build; restore original threads afterward.
   max_steps: 30
   seed: 1234
   prompt_batch_size: 2
@@ -122,6 +133,7 @@ train:
     betas: [0.9, 0.999]
     foreach: null
   checkpoint:
+    load_path: null
     output_dir: /results/qwen3_4b_gsm8k_vllm_production/checkpoints
     save_steps: 250
     save_final: true

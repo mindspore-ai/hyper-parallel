@@ -1,8 +1,9 @@
+# Four-card Qwen3-30B-A3B Codex recipe; task budgets match codex_multi_turn.yaml.
 model:
-  registry_name: qwen3_4b
-  name: qwen3
-  weights_path: /models/Qwen3-4B
-  tokenizer_path: /models/Qwen3-4B
+  registry_name: qwen3_30b_a3b
+  name: qwen3_moe
+  weights_path: /models/Qwen3-30B-A3B
+  tokenizer_path: /models/Qwen3-30B-A3B
   config_overrides: null
 
 consistency:
@@ -13,7 +14,6 @@ data:
   test_path: /data/gsm8k/test.parquet
   prompt_column: prompt
   answer_column: null
-  prompt_instruction: 'Let''s think step by step and output the final answer after "####".'
   max_prompt_length: 512
   max_train_samples: 4
   shuffle: false
@@ -24,18 +24,21 @@ data:
 rollout:
   engine: vllm
   num_return_sequences: 4
-  max_new_tokens: 512
+  max_new_tokens: 256
   ignore_eos: false
   temperature: 1.0
   top_p: 1.0
   top_k: 0
-  seed: 20260829
+  seed: 20260903
   vllm:
+    sleep_level: 1  # Use 2 to discard old weights; fully republish before resuming sampling.
     deployment: colocated
-    data_parallel_size: 2
+    data_parallel_size: 1
     port: 8100
     model_implementation: native
-    tensor_parallel_size: 1
+    tensor_parallel_size: 4
+    enable_expert_parallel: true
+    enable_eplb: false
     weight_sync:
       strategy: full_gather
       bucket_size_mb: 128
@@ -45,34 +48,57 @@ rollout:
     batch_invariant: false
     enable_prefix_caching: false
     enable_chunked_prefill: false
+    enable_auto_tool_choice: true
+    tool_call_parser: hermes
     gpu_memory_utilization: 0.35
-    kv_cache_memory_bytes: 1073741824
-    max_model_len: 1024
+    kv_cache_memory_bytes: 8589934592
+    max_model_len: 8192
     block_size: 128
     max_num_seqs: 4
-    max_num_batched_tokens: 1024
+    max_num_batched_tokens: 8192
     logprobs_mode: raw_logprobs
     startup_timeout: 600
     request_timeout: 600
+    server_hccl_if_base_port: 62600
+    server_hccl_npu_socket_port_range: 62600-62699
 
 agentic:
+  runner: codex
   module_path: examples.gsm8k.agent
   environment: gsm8k_tools
-  interaction_mode: single_turn
+  interaction_mode: multi_turn
   protocol: json_function_call
-  apply_chat_template: false
-  max_turns: 1
+  apply_chat_template: true
+  max_turns: 2
   max_observation_tokens: 0
-  max_episode_tokens: 1024
-  tool_timeout_seconds: 5.0
-  tool_max_concurrency: 2
-  tool_max_calls_per_turn: 2
+  max_episode_tokens: 8192
+  codex:
+    executable: codex
+    version: "0.152.1"
+    model: qwen3
+    reasoning_effort: low
+    sandbox: danger-full-access
+    gateway_host: 127.0.0.1
+    gateway_public_host: 127.0.0.1
+    gateway_port: 8200
+    timeout_seconds: 1800
+    request_timeout: 600
+    session_root: /results/qwen3_30b_a3b_codex_gsm8k/trajectories
+    reward_callable: examples.gsm8k.agent:score_codex_gsm8k_answer
+    instruction_template: |-
+      /no_think
+      Solve the arithmetic word problem below.
+      You must first use the local shell tool exactly once to run Python for the calculation.
+      After observing the command output, return only the final answer in the form "#### NUMBER".
+      Do not include an explanation in the final answer.
+
+      Problem: {prompt}
 
 evaluation:
   enabled: false
   batch_size: 1
   max_samples: 1
-  max_new_tokens: 256
+  max_new_tokens: 128
   temperature: 1.0
   top_p: 1.0
   top_k: 0
@@ -91,6 +117,9 @@ algorithm:
   loss_aggregation: token-mean
 
 train:
+  router_replay:
+    mode: disabled  # Set R3 to enable rollout capture and training replay together.
+  model_init_cpu_threads: null  # Optional 8 during model build; restore original threads afterward.
   max_steps: 2
   seed: 1234
   prompt_batch_size: 1
@@ -106,12 +135,15 @@ train:
   accelerator:
     dp_replicate: 1
     dp_shard: 2
-    tp: 1
+    tp: 2
+    ep: 2
+    edp_shard: 2
     cp: 1
     pp: 1
     reshard_after_forward: true
-    comm_fusion: true
+    comm_fusion: false
     cpu_offload: true
+    activation_checkpoint: full
   mixed_precision:
     enabled: true
     param_dtype: bfloat16
@@ -128,18 +160,18 @@ train:
     betas: [0.9, 0.999]
     foreach: null
   checkpoint:
-    output_dir: /results/checkpoints
+    output_dir: /results/qwen3_30b_a3b_codex_gsm8k/checkpoints
     save_steps: 0
-    save_final: true
+    save_final: false
     verify_reload: false
 
 logging:
   backends: [console]
   project_name: hyper-rl
-  experiment_name: qwen3_4b_gsm8k_single_turn_two_step
+  experiment_name: qwen3_30b_a3b_codex_gsm8k
   log_steps: 1
   log_samples: 2
   wandb:
     mode: disabled
     entity: null
-    directory: /results/wandb
+    directory: /results/qwen3_30b_a3b_codex_gsm8k/wandb

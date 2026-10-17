@@ -5,6 +5,10 @@ See [prepare_data.py](../examples/search_r1/prepare_data.py), [training config](
 在宿主机运行 `launcher.py`，由宿主机启动可信训练容器及同级、无特权 Codex 容器。
 不使用 Docker-in-Docker。Codex 只能读取该题候选文章，通过 shell 搜索；
 不挂载数据集标签、其他会话、NPU 或 Docker socket。每个会话启动前实际探测隔离边界。
+训练与 Codex 候选容器默认统一使用
+`swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64`。
+候选容器仅使用 Codex、Python 标准库转发程序和搜索工具，不加载镜像中的模型推理库；
+两类容器的权限和挂载保持独立，见 [镜像说明](../docker/README.md#search-r1-的独立-codex-候选容器)。
 
 ## 数据与训练
 
@@ -19,6 +23,12 @@ python3 examples/search_r1/launcher.py --devices 2,3 --steps 5 \
   --data /absolute/path/to/prepared-hotpotqa --backend-privileged \
   --output output/search_r1/search_r1_expanded_check
 ```
+
+启动器和 `scripts/run_search_r1.sh DEVICE_IDS STEPS DATA_DIRECTORY` 均支持在末尾追加训练 YAML 覆盖参数，
+例如 `--train.model_init_cpu_threads=8`；CPU 内存紧张时可显式选择 `--rollout.vllm.sleep_level=2`。
+默认仍为初始化线程 `null`、sleep level `1`；level 2 不支持中间 checkpoint 等组合，
+由 [生产配置规则](vllm_rollout.md#policy-生命周期)校验，不会自动修改保存计划。
+此启动器仍使用原 Qwen3-4B 两卡配方与严格验收，不因参数透传变为 MoE R3 入口。
 
 `--backend-privileged` 仅用于可信训练后端解决本机 Ascend 驱动权限问题，绝不用于 Codex。
 `jobs/` 内的运行目录使用内部会话 UUID；题目 ID、训练/评测阶段保留在轨迹元数据中，

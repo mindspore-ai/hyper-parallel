@@ -14,13 +14,13 @@
 # ============================================================================
 
 ARG BASE_IMAGE=quay.io/ascend/vllm-ascend@sha256:e62e85cb1bef9625cf568d0e8e2ac8e4b76f946eb6e8d9d459cfcf99565bea5d
-ARG AGENT_IMAGE=swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl@sha256:450b32a4a1d7818d80b832335665a7d8bece5b91827f8ee80a9f62609e939944
+ARG AGENT_IMAGE=swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl@sha256:0d1e8af0cbc8eb558497958b827260fa6d9a635fc20e4ec74916587b0348731d
 FROM ${AGENT_IMAGE} AS agent
 FROM ${BASE_IMAGE}
 
 # Reuse the reviewed standalone CLI without changing the official inference stack.
 COPY --from=agent /opt/codex /opt/codex
-ENV PATH=/opt/codex/bin:${PATH}
+ENV PATH=/opt/codex/bin:/opt/codex/codex-path:${PATH}
 RUN printf '%s\n' \
     '285958769bc41cd70812524ca96631bf679635f4f1c08320ab1f31d958e81b24  /opt/codex/bin/codex' \
     '8c5723b7c2c642bb07d94166ee8effa11dc3b78166a29209df1b1983d0a5b3e9  /opt/codex/bin/codex-code-mode-host' \

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Actor model execution and algorithm-neutral policy optimization."""
+from contextlib import nullcontext
 from typing import Any, Optional
 
 import torch
@@ -25,6 +26,8 @@ from rl.distillation.monitoring import DistillationMetricAccumulator
 from rl.distillation.config import DistillationConfig
 from rl.consistency import CONSISTENCY_PROFILE_OFF, consistency_runtime_state, trainer_sequence_log_probs
 from rl.dataset.contracts import ExperienceBatch
+from rl.router_replay import RouterReplay
+from rl.weight_sync import synchronized_call
 from rl.utils.monitoring.metrics import (
     ActorMetricAccumulator,
     ActorMicroBatchMetrics,
@@ -54,6 +57,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         update_epochs: int = 1,
         max_grad_norm: float = 1.0,
         distillation: Optional[DistillationConfig] = None,
+        router_replay: Optional[RouterReplay] = None,
     ) -> None:
         """Initialize a trainable Actor or an inference-only reference Actor."""
         super().__init__()
@@ -72,6 +76,9 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                 "response_mini_batch_size must be positive, "
                 f"got {response_mini_batch_size}"
             )
+        if router_replay is not None and optimizer is None:
+            raise ValueError("Router replay belongs only to the trainable Actor")
+        self.router_replay = router_replay
         self.actor_model = actor_model
         self.algorithm = algorithm
         self.distillation = distillation
@@ -140,8 +147,8 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             index=next_token_ids.unsqueeze(-1),
         ).squeeze(-1)
 
-    def _experience_log_probs(self, experience: ExperienceBatch, start: int, end: int) -> torch.Tensor:
-        """Trim selected-output micro-batches while retaining the batch's probability shape."""
+    def _micro_batch_inputs(self, experience: ExperienceBatch, start: int, end: int) -> tuple:
+        """Select identical token coordinates for model inputs and router replay."""
         sequences = experience.sequences[start:end]
         attention_mask = experience.attention_mask[start:end]
         padded_length = sequences.shape[1]
@@ -155,12 +162,40 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                 sequences = sequences[:, :length]
                 attention_mask = attention_mask[:, :length]
                 kwargs["action_mask"] = kwargs["action_mask"][:, :length - 1]
+        return sequences, attention_mask, kwargs, padded_length
+
+    def _experience_log_probs(self, experience: ExperienceBatch, start: int, end: int) -> torch.Tensor:
+        """Trim selected-output micro-batches while retaining the batch's probability shape."""
+        sequences, attention_mask, kwargs, padded_length = self._micro_batch_inputs(experience, start, end)
         log_probs = self.sequence_log_probs(sequences, attention_mask, **kwargs)
         padding = padded_length - sequences.shape[1]
         return functional.pad(log_probs, (0, padding)) if padding else log_probs
 
+    def _validate_router_experience(self, experience: ExperienceBatch) -> None:
+        """Reject invalid routing on all training ranks before entering model collectives."""
+        if self.router_replay is not None:
+            synchronized_call(
+                "Actor router replay validation",
+                lambda: self.router_replay.validate(
+                    experience.router_traces, experience.attention_mask, experience.action_mask,
+                ),
+            )
+
+    def _router_scope(self, experience: ExperienceBatch, start: int, end: int) -> Any:
+        """Prepare exactly the trimmed input coordinates for one forward/backward scope."""
+        if self.router_replay is None:
+            return nullcontext()
+        _, attention_mask, _, _ = self._micro_batch_inputs(experience, start, end)
+        targets = self.router_replay.prepare(
+            experience.router_traces[start:end],
+            attention_mask,
+            experience.action_mask[start:end, :attention_mask.shape[1]],
+        )
+        return self.router_replay.use(targets)
+
     def compute_log_probs(self, experience: ExperienceBatch) -> torch.Tensor:
         """Compute detached policy log-probabilities in response micro-batches."""
+        self._validate_router_experience(experience)
         was_training = self.training
         self.eval()
         chunks = []
@@ -175,7 +210,8 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                         start + self._micro_batch_size,
                         experience.sequences.shape[0],
                     )
-                    chunks.append(self._experience_log_probs(experience, start, end))
+                    with self._router_scope(experience, start, end):
+                        chunks.append(self._experience_log_probs(experience, start, end))
         finally:
             self.train(was_training)
         return torch.cat(chunks, dim=0).detach()
@@ -203,7 +239,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         global_tokens: int,
         global_sequences: Optional[int] = None,
     ) -> ActorMicroBatchMetrics:
-        """Compute and backpropagate one policy-loss micro-batch."""
+        """Backpropagate a micro-batch; distributed callers validate replay via update first."""
         self._require_trainable()
         self._validate_experience(experience)
         response_count = int(experience.sequences.shape[0])
@@ -218,40 +254,41 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             if global_sequences is None or global_sequences <= 0 or global_sequences > global_tokens:
                 raise ValueError("Sequence loss requires 0 < global_sequences <= global_tokens")
             normalizer = global_sequences
-        current_log_probs = self._experience_log_probs(experience, start, end)
-        anchor_log_probs = experience.old_log_probs
-        if self.distillation is not None and self.distillation.enabled:
-            anchor_log_probs = experience.rollout_log_probs
-        old_log_probs = anchor_log_probs[start:end].detach()
-        action_mask = experience.loss_action_mask[start:end]
-        reference_log_probs = experience.reference_log_probs
-        output = self.algorithm.compute_actor_loss(
-            current_log_probs=current_log_probs,
-            old_log_probs=old_log_probs,
-            reference_log_probs=(
-                None if reference_log_probs is None else reference_log_probs[start:end]
-            ),
-            advantages=experience.advantages[start:end],
-            action_mask=action_mask,
-        )
-        total_loss_sum = output.total_loss_sum
-        scaled_loss = total_loss_sum / normalizer * self._dp_size
-        if self.distillation is not None and self.distillation.enabled:
-            opd_loss = compute_opd_loss(current_log_probs, old_log_probs,
-                                        experience.teacher_log_probs[start:end], action_mask, self.distillation)
-            total_loss_sum = total_loss_sum + self.distillation.coefficient * opd_loss * normalizer / global_tokens
-            scaled_loss = total_loss_sum / normalizer * self._dp_size
-            if self._opd_metrics is None:
-                self._opd_metrics = DistillationMetricAccumulator(opd_loss, self.distillation)
-            self._opd_metrics.add(current_log_probs, old_log_probs, experience.teacher_log_probs[start:end],
-                                  action_mask, experience.teacher_keys[start:end])
-        is_finite = self._loss_is_finite(scaled_loss, current_log_probs, action_mask)
-        if not is_finite:
-            raise RuntimeError(
-                f"Non-finite {self.algorithm.name} loss detected on response slice "
-                f"[{start}:{end}]"
+        with self._router_scope(experience, start, end):
+            current_log_probs = self._experience_log_probs(experience, start, end)
+            anchor_log_probs = experience.old_log_probs
+            if self.distillation is not None and self.distillation.enabled:
+                anchor_log_probs = experience.rollout_log_probs
+            old_log_probs = anchor_log_probs[start:end].detach()
+            action_mask = experience.loss_action_mask[start:end]
+            reference_log_probs = experience.reference_log_probs
+            output = self.algorithm.compute_actor_loss(
+                current_log_probs=current_log_probs,
+                old_log_probs=old_log_probs,
+                reference_log_probs=(
+                    None if reference_log_probs is None else reference_log_probs[start:end]
+                ),
+                advantages=experience.advantages[start:end],
+                action_mask=action_mask,
             )
-        scaled_loss.backward()
+            total_loss_sum = output.total_loss_sum
+            scaled_loss = total_loss_sum / normalizer * self._dp_size
+            if self.distillation is not None and self.distillation.enabled:
+                opd_loss = compute_opd_loss(current_log_probs, old_log_probs,
+                                            experience.teacher_log_probs[start:end], action_mask, self.distillation)
+                total_loss_sum = total_loss_sum + self.distillation.coefficient * opd_loss * normalizer / global_tokens
+                scaled_loss = total_loss_sum / normalizer * self._dp_size
+                if self._opd_metrics is None:
+                    self._opd_metrics = DistillationMetricAccumulator(opd_loss, self.distillation)
+                self._opd_metrics.add(current_log_probs, old_log_probs, experience.teacher_log_probs[start:end],
+                                      action_mask, experience.teacher_keys[start:end])
+            is_finite = self._loss_is_finite(scaled_loss, current_log_probs, action_mask)
+            if not is_finite:
+                raise RuntimeError(
+                    f"Non-finite {self.algorithm.name} loss detected on response slice "
+                    f"[{start}:{end}]"
+                )
+            scaled_loss.backward()
         return ActorMicroBatchMetrics(
             total_loss_sum=total_loss_sum.detach(),
             policy_loss_sum=output.policy_loss_sum.detach(),
@@ -269,6 +306,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         self._require_trainable()
         self._opd_metrics = (DistillationMetricAccumulator(experience.rewards, self.distillation)
                              if self.distillation is not None and self.distillation.enabled else None)
+        self._validate_router_experience(experience)
         response_count = (self._validate_update_experience(experience)
                           if self.algorithm.name == 'gspo' or self.distillation is not None
                           else self._validate_experience(experience))

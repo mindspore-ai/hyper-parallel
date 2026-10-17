@@ -77,7 +77,10 @@ dummy 输出会被丢弃，不进入训练。
 Codex Gateway 按 `agentic.max_turns` 预留模型调用额度，成功、失败和取消路径均释放预留；
 `agentic.codex.max_inflight_requests` 限制共享后端的同时请求数，默认 1。
 最后一次调用仍保留原工具选择，额度用尽不会改写模型动作来强制答案。
-一般调用额度耗尽仍按失败拒绝训练，配置应为最终答案预留调用额度。
+普通文本任务在调用额度内未完成最终答案，且 CLI 与 Gateway 均确认完整调用后的预算终止时，
+该候选记零奖励并标记 `truncated/max_completions`，保留所有已采样调用参与 episode 分组与训练。
+额度耗尽不增加调用次数，也不改写最后一次工具动作；此行为与 R3 开关无关。
+通信故障、未知 CLI 错误或不完整轨迹仍拒绝训练，不能仅凭调用数达到上限降为零奖励。
 终态读取 session 先封闭新请求，再等待在途请求排空；释放 session 同样排空。
 整组 program 收尾后再同步跨 rank 错误。
 标准 `tools` 与 input 中 `additional_tools` 共用工具名称映射，未知声明明确报错。
@@ -95,7 +98,8 @@ Codex 可按配置启动 MCP stdio server。`rl/agentic/mcp_server.py` 只是把
 
 CLI 正常退出并确认 `turn.completed` 后，停止候选、冻结提交，再由独立 grader 给出奖励。
 仓库任务允许没有文字总结；已完成的调用预算耗尽也可在核验终止证据后冻结判题。
-这不改变普通文本 Codex 对最终回答和调用预算的合同。基础设施或不完整轨迹不能降为零奖励。
+仓库任务按冻结产物评分；普通文本任务预算内没有最终答案则记零奖励。
+基础设施或不完整轨迹不能降为零奖励。
 
 SWE-Smith 子集/全量准备、Qwen3.5/3.8 配方及运行命令见
 [仓库示例](../examples/swe_smith/README.md)；CPU 合同与待完成的镜像/NPU 验收见
@@ -145,6 +149,18 @@ DP rank 的调用行数不同会追加 `dp_padding` 行，保留合法上下文�
 它们不参与奖励、episode 数、响应长度或损失的有效 token 分母。
 分段轨迹当前只支持 GRPO；Codex/DeepSeek+PPO 在启动前拒绝，现有非分段 PPO 仍按原合同运行。
 
+### 多轮 MoE 路由重放
+
+`train.router_replay.mode: R3` 同时开启 vLLM capture 与 Actor replay，当前适配 internal 和 Codex。
+Codex 每条调用行携带本次真实 prompt + action 的独立 `router_trace`；重写或裁剪过的上下文
+不拼成连续路由，也不以最后一轮覆盖历史调用。Gateway 从 Agent 响应中提取路由，
+训练行单独保存紧凑 CPU trace，TP 同步传输 bytes，审计 metadata 只保留原有 token/logprob 等证据。
+episode 奖励、GRPO 优势和调用身份的合同保持不变。
+
+internal 连续多轮仅在新 trace 保留旧有效前缀的有序 expert ID 时替换快照；缺失或冲突会报错。
+后续 action 之前的工具 observation 属于必要因果前缀，最终 observation 和最后未执行的 sampled token
+保持无效路由。DeepSeek 尚未适配 R3。配置、模型适配和验证范围见 [MoE R3 指南](moe_code_agent.md#moe-r3)。
+
 ## 工具失败归因与收尾
 
 固定版本 vLLM 的 Hermes（Qwen3）或 Qwen3Coder XML（Qwen3.5 家族）只读采集原始 token、engine text、parser 输入和结果，不修改采样动作。
@@ -185,8 +201,8 @@ agentic:
 
 仓库中的 [GSM8K 环境](../examples/gsm8k/agent.py)提供单轮问答和组合 calculator 的多轮任务，
 两条路径都通过同一个 `ENVIRONMENTS` registry 接入 Trainer。上面的 YAML 是 `agentic` 片段；
-完整训练配置见 [单轮配置](../examples/gsm8k/configs/single_turn.yaml)和
-[多轮配置](../examples/gsm8k/configs/multi_turn.yaml)，训练入口为 [train_rl.py](../train_rl.py)。
+完整训练配置见 [单轮配置](../examples/gsm8k/configs/qwen3_4b_gsm8k_vllm_production.yaml)和
+[多轮配置](../examples/gsm8k/README.md#内部多轮参数)，训练入口为 [train_rl.py](../train_rl.py)。
 
 ### GSM8K 数值奖励
 
@@ -212,6 +228,7 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 完整配置以以下文件为准：
 
 - [Codex 多轮配置](../examples/gsm8k/configs/codex_multi_turn.yaml)
+- [Qwen3-30B-A3B Codex 四卡配置与 R3 示例](../examples/gsm8k/README.md)
 - [DeepSeek 多轮配置](../examples/gsm8k/configs/deepseek_multi_turn.yaml)
 
 ## 代码导航
