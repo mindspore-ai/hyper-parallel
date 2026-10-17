@@ -21,6 +21,11 @@ an adapter from ``MOE_ROUTER_ADAPTERS`` BY NAME in its own code — the choice
 is explicit, never inferred. Each adapter maps
 ``(module, hidden) -> (topk_idx [T,K] int64, topk_w [T,K] float)``.
 
+Benchmark-only balanced variants are derived from a real adapter with
+:func:`make_balanced_router` and registered as ``<adapter>_fixed``, so an
+archetype opts in with one flag (``fix_router``, see :func:`resolve_moe_router`)
+instead of carrying its own copy of the wrapper.
+
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
@@ -372,15 +377,19 @@ def _global_expert_count(module):
     )
 
 
-def _balanced_router(module, hidden_states):
-    """deepseekv3 adapter variant with a deliberately uniform expert load.
+def _balanced_expert_indices(
+    token_count: int,
+    experts_per_token: int,
+    expert_count: int,
+    local_count: int,
+    *,
+    device,
+) -> "torch.Tensor":
+    """Round-robin the ``T*K`` slots over the DESTINATION ranks.
 
-    Real sigmoid-group routing, but the chosen experts are replaced by a
-    round-robin assignment that spreads the local slots over the **destination
-    ranks**: local slot ``i`` goes to one of the ``L`` experts owned by
-    destination ``i mod Q``, where ``Q = E/L`` and ``L`` is the per-rank expert
-    count (``module.experts.local_expert_count``). Every rank therefore
-    receives exactly ``T*K/EP`` tokens instead of a data-dependent count.
+    Local slot ``i`` goes to one of the ``L`` experts owned by destination
+    ``i mod Q`` (``Q = E/L``), so every rank receives exactly ``T*K/Q`` slots
+    instead of a data-dependent count.
 
     Spreading by *rank* rather than by expert is what makes this exact: the
     per-expert token count cannot be made uniform at all when ``E`` does not
@@ -390,8 +399,42 @@ def _balanced_router(module, hidden_states):
     2.4% spread between rank groups). Going through the destination first
     absorbs that leftover per rank instead.
 
+    Args:
+        token_count: Local tokens ``T``.
+        experts_per_token: Routed experts per token ``K``.
+        expert_count: Global routed experts ``E``.
+        local_count: Experts this rank owns ``L``.
+        device: Device for the returned index tensor.
+
+    Returns:
+        ``[T, K]`` int64 indices naming the expert each slot is routed to.
+
+    Raises:
+        ValueError: If ``E`` is not divisible by ``L``.
+    """
+    if local_count <= 0 or expert_count % local_count != 0:
+        raise ValueError(
+            f"num_experts ({expert_count}) must be divisible by the local "
+            f"expert count ({local_count})"
+        )
+    destinations = expert_count // local_count
+    slots = torch.arange(token_count * experts_per_token, device=device)
+    indices = (slots % destinations) * local_count + (slots // destinations) % local_count
+    return indices.view(token_count, experts_per_token)
+
+
+def make_balanced_router(real_router):
+    """Wrap ``real_router`` in a benchmark-only variant with a uniform expert load.
+
+    The real adapter still runs -- so its weights stay differentiable and the
+    router GEMM stays in the compute profile -- but the chosen experts are
+    replaced by a round-robin assignment that spreads the local slots over the
+    **destination ranks** (see :func:`_balanced_expert_indices`). Every rank
+    therefore receives exactly ``T*K/Q`` tokens instead of a data-dependent
+    count, whatever routing semantics ``real_router`` implements.
+
     Why: unbalanced routing is the dominant source of step-time jitter on MoE
-    training runs — the slowest rank in a step is the one whose experts drew
+    training runs -- the slowest rank in a step is the one whose experts drew
     the most tokens, so identical configurations can differ by tens of percent
     step to step. Measured on the 293B/18-layer config, the real router put
     **6.3x** the mean token count on the busiest rank (leaving some experts
@@ -400,38 +443,50 @@ def _balanced_router(module, hidden_states):
     which is what makes small (1-3%) kernel-level effects measurable at all.
 
     **Benchmark-only.** The assignment ignores the gate scores, so:
-    - ``loss`` / ``grad_norm`` / any convergence signal is meaningless here;
-    - expert hit distributions and "effective MFU" are optimistic (the load
-      is artificially flat), so numbers from this mode must not be reported
-      as an efficiency result.
 
-    Correctness must be validated with the switch OFF (``fix_router:
-    False``), where the real ``_sigmoid_group_router`` runs unchanged. The
-    true ``topk_w`` are kept so the gate still receives gradient and the
-    router GEMM stays in the step's compute profile.
+    - ``loss`` / ``grad_norm`` / any convergence signal is meaningless here;
+    - expert hit distributions and "effective MFU" are optimistic (the load is
+      artificially flat), so numbers from this mode must not be reported as an
+      efficiency result.
+
+    Correctness must be validated with the switch OFF (``fix_router: False``),
+    where ``real_router`` runs unchanged. The true ``topk_w`` are kept so the
+    gate still receives gradient.
+
+    Args:
+        real_router: A ``(module, hidden) -> (topk_idx, topk_w)`` adapter, e.g.
+            any entry of :data:`MOE_ROUTER_ADAPTERS`.
+
+    Returns:
+        A ``(module, hidden) -> (topk_idx, topk_w)`` adapter with a uniform
+        destination load; its ``__name__`` records the wrapped adapter.
     """
-    topk_idx, topk_w = _sigmoid_group_router(module, hidden_states)
-    token_count, experts_per_token = topk_idx.shape
-    expert_count = _global_expert_count(module)
-    # Set by the EP binder (bind_local_expert_forward) before any forward; a
-    # missing value degrades to a plain per-expert round robin.
-    local_count = getattr(
-        getattr(module, "experts", None), "local_expert_count", None) or 1
-    if expert_count % local_count != 0:
-        raise ValueError(
-            f"num_experts ({expert_count}) must be divisible by the local "
-            f"expert count ({local_count})"
+
+    def balanced_router(module, hidden_states):
+        """Run ``real_router`` and replace its destinations round-robin."""
+        topk_idx, topk_w = real_router(module, hidden_states)
+        token_count, experts_per_token = topk_idx.shape
+        balanced_idx = _balanced_expert_indices(
+            int(token_count),
+            int(experts_per_token),
+            _global_expert_count(module),
+            # Set by the EP binder (bind_local_expert_forward) before any forward; a
+            # missing value degrades to a plain per-expert round robin.
+            int(getattr(getattr(module, "experts", None),
+                        "local_expert_count", None) or 1),
+            device=topk_idx.device,
         )
-    # Spread the slots over DESTINATION RANKS first (slot % destinations), then
-    # over that rank's local experts: every rank receives exactly one out of
-    # every `destinations` slots.
-    destinations = expert_count // local_count
-    slots = torch.arange(
-        token_count * experts_per_token, device=topk_idx.device)
-    balanced_idx = ((slots % destinations) * local_count
-                    + (slots // destinations) % local_count)
-    return balanced_idx.view(
-        token_count, experts_per_token).to(topk_idx.dtype), topk_w
+        return balanced_idx.to(topk_idx.dtype), topk_w
+
+    # A callable object or a functools.partial has no ``__name__``; its class name is
+    # then the most informative thing the log line can carry.
+    real_name = getattr(real_router, "__name__", None) or type(real_router).__name__
+    balanced_router.__name__ = f"balanced_{real_name}"
+    balanced_router.__doc__ = (
+        f"Benchmark-only variant of ``{real_name}`` with a uniform destination "
+        "load (see :func:`make_balanced_router`)."
+    )
+    return balanced_router
 
 
 MOE_ROUTER_ADAPTERS = {
@@ -446,8 +501,53 @@ MOE_ROUTER_ADAPTERS = {
     "mixtral": _topk_router_module,
     "deepseekv3": _sigmoid_group_router,
     "deepseek_v3": _sigmoid_group_router,
-    "deepseekv3_fixed": _balanced_router,
-    "deepseek_v3_fixed": _balanced_router,
     "glm4moe": _sigmoid_group_router,
     "glm4_moe": _sigmoid_group_router,
 }
+
+# One balanced wrapper per distinct real adapter, published as ``<name>_fixed`` for
+# every alias: the convention ``fix_router`` resolves through.
+_BALANCED_VARIANTS = {
+    adapter: make_balanced_router(adapter)
+    for adapter in dict.fromkeys(MOE_ROUTER_ADAPTERS.values())
+}
+# The archived benchmark router: the balanced wrapper over the sigmoid-group adapter,
+# kept as a module-level name because the recipes' docs and the earlier 2-SN sweeps
+# refer to it.
+_balanced_router = _BALANCED_VARIANTS[_sigmoid_group_router]
+for _alias, _adapter in list(MOE_ROUTER_ADAPTERS.items()):
+    MOE_ROUTER_ADAPTERS[f"{_alias}_fixed"] = _BALANCED_VARIANTS[_adapter]
+del _alias, _adapter
+
+
+def resolve_moe_router(router, fix_router: bool = False):
+    """Resolve a router adapter, optionally to its benchmark-only balanced variant.
+
+    ``fix_router`` is the switch every archetype factory exposes; it has to mean the
+    same thing everywhere, so it is resolved here rather than re-implemented per
+    factory (see :func:`make_balanced_router` for what it does and why its numbers are
+    not efficiency results).
+
+    Args:
+        router: An adapter callable, or the name of an entry in
+            :data:`MOE_ROUTER_ADAPTERS`.
+        fix_router: When true, return the balanced variant: the ``<name>_fixed``
+            registry entry for a name, or ``make_balanced_router(router)`` for a
+            callable.
+
+    Returns:
+        A ``(module, hidden) -> (topk_idx, topk_w)`` adapter.
+
+    Raises:
+        KeyError: If ``router`` is a name that is not registered.
+        TypeError: If ``router`` is neither a registry name nor callable.
+    """
+    if isinstance(router, str):
+        key = f"{router}_fixed" if fix_router else router
+        return MOE_ROUTER_ADAPTERS[key]
+    if not callable(router):
+        raise TypeError(
+            "router must be a registry name or a callable, got "
+            f"{type(router).__name__}"
+        )
+    return make_balanced_router(router) if fix_router else router

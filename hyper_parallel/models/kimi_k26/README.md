@@ -65,9 +65,9 @@ models/kimi_k26/
 - **EP 计算工厂**（`adapter/distributed/ep_compute.py`）：家族自组合的
   `deepseekv3_sigmoid_group_shared` 原型（与 `models/qwen3_moe/adapter/distributed/` 同放置），
   经框架公开的 `build_ep_compute` 组合，因此框架层不需要任何改动。`fix_router: true` 切到
-  家族自带的**均衡路由**：真实路由的 token 倾斜实测会把最忙的 rank 堆到均值的 6.3 倍
-  （也是显存被打爆的主因），均衡路由让每个 destination rank 拿到完全相同的 slot 数，
-  使同口径对比能在 2–3 步内收敛。
+  框架的**均衡路由**（`routing.make_balanced_router`，由骨架统一解析）：真实路由的 token
+  倾斜实测会把最忙的 rank 堆到均值的 6.3 倍（也是显存被打爆的主因），均衡路由让每个
+  destination rank 拿到完全相同的 slot 数，使同口径对比能在 2–3 步内收敛。
   ⚠️ 该模式是 **benchmark-only**：忽略 gate 分数，`loss`/`grad_norm`/专家命中分布无意义，
   正确性与收敛性验证必须置 `false`（此时回落框架的 sigmoid-group 真实路由）。
 - **数据变换**（`adapter/data/transform_fn.py`）：走原生 processor 的

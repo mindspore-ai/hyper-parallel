@@ -91,7 +91,7 @@ from typing import Any, Callable, Optional
 import torch
 
 from hyper_parallel.distributed.expert_parallel.routing import (
-    MOE_ROUTER_ADAPTERS,
+    resolve_moe_router,
 )
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
@@ -145,6 +145,7 @@ def build_ep_compute(
     expected_attrs,
     combine: Callable,
     use_grouped_gemm: bool = False,
+    fix_router: bool = False,
     capacity_factor: Optional[float] = None,
     overlap_fn: Optional[Callable] = None,
 ) -> Callable:
@@ -167,7 +168,15 @@ def build_ep_compute(
     ``models/qwen3_moe/adapter/distributed/expert_parallel.py``) compose
     their EP archetype on top of this skeleton while the router adapters and
     dispatch primitives stay in this generic layer.
+    ``fix_router`` is the archetype-independent benchmark switch: it swaps the chosen
+    router for its balanced variant -- the ``<name>_fixed`` registry entry when
+    ``router_fn`` names one, else
+    :func:`~hyper_parallel.distributed.expert_parallel.routing.make_balanced_router`
+    around the given callable -- so a family gets the uniform-load comparison mode
+    without carrying its own copy of the router.  See that factory for what it does and
+    why its numbers must not be reported as an efficiency result.
     """
+    router_fn = resolve_moe_router(router_fn, fix_router)
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
     _require_moe_interface(module, expected_attrs, archetype_key)
     if use_grouped_gemm:
@@ -212,17 +221,21 @@ def routed_only_ep_compute_fn(
     tp_mesh: Any,
     cp_mesh: Any,
     ep_mesh: Any,
+    fix_router: bool = False,
 ) -> Callable:
     """Archetype ``routed_only_softmax_topk``: softmax top-k router, no
     shared expert (Mixtral-style). Output = routed branch only.
 
     Expected module interface: ``gate`` (router Linear), ``experts``.
+
+    ``fix_router`` selects the benchmark-only balanced variant of the router
+    (``routing.make_balanced_router``); correctness runs keep it ``False``.
     """
     del mesh, tp_mesh, cp_mesh
     return build_ep_compute(
         module,
         ep_mesh,
-        router_fn=MOE_ROUTER_ADAPTERS["default"],
+        router_fn=resolve_moe_router("default", fix_router),
         archetype_key="routed_only_softmax_topk",
         expected_attrs=["gate", "experts"],
         combine=lambda module, hidden_states, routed: routed,
@@ -237,14 +250,19 @@ def mixtral_ep_compute_fn(
     tp_mesh: Any,
     cp_mesh: Any,
     ep_mesh: Any,
+    fix_router: bool = False,
 ) -> Callable:
     """Archetype ``mixtral_topk_router`` with training-time router jitter.
 
     Transformers 5.12 Mixtral uses a TopKRouter returning
     ``(logits, scores, indices)``. When configured, the original block also
     perturbs hidden states before both routing and expert computation.
+
+    ``fix_router`` selects the benchmark-only balanced variant of the router
+    (``routing.make_balanced_router``); correctness runs keep it ``False``.
     """
     del mesh, tp_mesh, cp_mesh
+    router_fn = resolve_moe_router("mixtral", fix_router)
     ep_group = _require_ep_group(ep_mesh, "archetype 'mixtral_topk_router'")
     _require_moe_interface(module, ["gate", "experts"], "mixtral_topk_router")
     bind_local_expert_forward(module, ep_mesh["ep"].size())
@@ -261,7 +279,7 @@ def mixtral_ep_compute_fn(
         return ep_routed_forward(
             module,
             hidden_states,
-            router_fn=MOE_ROUTER_ADAPTERS["mixtral"],
+            router_fn=router_fn,
             ep_group=ep_group,
         )
 
@@ -276,6 +294,7 @@ def qwen2moe_ep_compute_fn(
     tp_mesh: Any,
     cp_mesh: Any,
     ep_mesh: Any,
+    fix_router: bool = False,
 ) -> Callable:
     """Archetype ``qwen2moe_shared_expert_gate``: TopKRouter tuple +
     shared_expert + sigmoid scalar gate (Qwen2-MoE):
@@ -303,7 +322,8 @@ def qwen2moe_ep_compute_fn(
     return build_ep_compute(
         module,
         ep_mesh,
-        router_fn=MOE_ROUTER_ADAPTERS["qwen2moe"],
+        router_fn="qwen2moe",
+        fix_router=fix_router,
         archetype_key="qwen2moe_shared_expert_gate",
         expected_attrs=["gate", "experts", "shared_expert", "shared_expert_gate"],
         combine=combine,
@@ -348,7 +368,7 @@ def deepseekv3_ep_compute_fn(
     top-k) so that per-rank step time stops depending on how the data
     happened to route. Loss / grad_norm / expert-load metrics are meaningless
     in that mode and it must not be used to report an efficiency number —
-    see ``routing._balanced_router``. Correctness runs keep it off.
+    see ``routing.make_balanced_router``. Correctness runs keep it off.
     """
     del mesh, tp_mesh, cp_mesh
 
@@ -369,8 +389,8 @@ def deepseekv3_ep_compute_fn(
     return build_ep_compute(
         module,
         ep_mesh,
-        router_fn=MOE_ROUTER_ADAPTERS[
-            "deepseekv3_fixed" if fix_router else "deepseekv3"],
+        router_fn="deepseekv3",
+        fix_router=fix_router,
         archetype_key="deepseekv3_sigmoid_group_shared",
         expected_attrs=["gate", "experts", "shared_experts"],
         combine=combine,

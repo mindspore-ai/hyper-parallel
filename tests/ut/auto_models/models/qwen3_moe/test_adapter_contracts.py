@@ -485,12 +485,16 @@ class TestEpFactoryContract(unittest.TestCase):
         parameters = list(inspect.signature(factory).parameters.values())
         self.assertEqual(
             [param.name for param in parameters],
-            ["module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh", "use_grouped_gemm"],
+            ["module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh", "use_grouped_gemm",
+             "fix_router"],
         )
         for param in parameters:
             self.assertIs(param.kind, inspect.Parameter.KEYWORD_ONLY)
-        for param in parameters[:-1]:
+        for param in parameters[:-2]:
             self.assertIs(param.default, inspect.Parameter.empty)
+        # Both switches are opt-in: an existing recipe keeps the real router and the
+        # eager per-expert loop unless it asks otherwise.
+        self.assertIs(parameters[-2].default, False)
         self.assertIs(parameters[-1].default, False)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
