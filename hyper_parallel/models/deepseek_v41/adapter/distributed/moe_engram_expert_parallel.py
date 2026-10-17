@@ -100,15 +100,52 @@ def _routed_and_shared_forward(
         hidden_states: torch.Tensor,
         image_mask: torch.Tensor | None,
         ep_group: Any,
+        *,
+        fix_router: bool = False,
 ) -> torch.Tensor:
     """Dispatch routed experts and add the V4.1 shared expert branch."""
     routed = ep_routed_forward(
         module,
         hidden_states,
-        router_fn=lambda target_module, target_states: _router(target_module, target_states, image_mask),
+        router_fn=_resolve_router(
+            lambda target_module, target_states: _router(target_module, target_states, image_mask),
+            fix_router=fix_router,
+        ),
         ep_group=ep_group,
     )
     return routed + module.shared_experts(hidden_states)
+
+
+def _resolve_router(router_fn: Callable, fix_router: bool = False) -> Callable:
+    """Keep learned gate work and optionally balance destinations for benchmarks.
+
+    Only dispatch indices change; weights keep their original autograd graph.
+    Fixed assignments ignore gate scores and must only be used for performance tests.
+    """
+    if not fix_router:
+        return router_fn
+
+    def balanced_router(module: Any, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Spread slots across destination ranks before cycling their experts.
+
+        Args:
+            module: Native MoE block with its bound local expert count.
+            hidden_states: Local token activations passed to the learned router.
+
+        Returns:
+            Balanced expert indices and unchanged learned routing weights.
+        """
+        indices, weights = router_fn(module, hidden_states)
+        expert_count = module.gate.num_experts
+        local_count = module.experts.local_expert_count
+        if local_count <= 0 or expert_count % local_count != 0:
+            raise ValueError("The global expert count must be divisible by the positive local expert count")
+        destinations = expert_count // local_count
+        slots = torch.arange(indices.numel(), device=indices.device, dtype=torch.long)
+        balanced = (slots % destinations) * local_count + (slots // destinations) % local_count
+        return balanced.view_as(indices).to(indices.dtype), weights
+
+    return balanced_router
 
 
 @local_compute
@@ -120,14 +157,32 @@ def deepseek_v41_ep_compute_fn(
         cp_mesh: Any,
         ep_mesh: Any,
         use_grouped_gemm: bool = False,
+        fix_router: bool = False,
 ) -> Callable:
-    """Build the complete V4.1 routed-plus-shared expert forward."""
+    """Build the complete V4.1 routed-plus-shared expert forward.
+
+    Args:
+        module: V4.1 MoE block exposing gate, experts, and shared_experts.
+        mesh: Full mesh, unused by the local compute factory.
+        tp_mesh: Tensor-parallel mesh used to align image masks.
+        cp_mesh: Context-parallel mesh, unused by the local compute factory.
+        ep_mesh: Expert-parallel mesh owning the routed experts.
+        use_grouped_gemm: Use the existing V4.1 clamped grouped-GEMM expert path.
+        fix_router: Enable benchmark-only balanced destinations while retaining
+            learned Top-K weights and their gradients. Normal training and
+            correctness runs keep this disabled.
+
+    Returns:
+        The source-compatible local compute callable.
+    """
     del mesh, cp_mesh
     require_attrs(module, "gate", "experts", "shared_experts", owner="DeepSeek-V4.1 EP")
     if ep_mesh is None:
         raise ValueError("DeepSeek-V4.1 EP forward requires an active ep_mesh")
     if module.is_hash:
         raise ValueError("DeepSeek-V4.1 validation layers must use learned routing")
+    if not isinstance(fix_router, bool):
+        raise ValueError("fix_router must be a boolean")
     apply_gate = (
         module.experts._apply_gate  # pylint: disable=protected-access
         if module.experts.limit > 0 else _deepseek_v41_unclamped_gate
@@ -161,7 +216,7 @@ def deepseek_v41_ep_compute_fn(
                 input_ids: Unused token IDs from the local compute contract.
             """
             del input_ids
-            return _routed_and_shared_forward(module, hidden_states, None, ep_group)
+            return _routed_and_shared_forward(module, hidden_states, None, ep_group, fix_router=fix_router)
 
         return text_compute_fn
 
@@ -183,7 +238,9 @@ def deepseek_v41_ep_compute_fn(
         local_image_mask = local_token_mask(
             image_mask, hidden_states, tp_rank=tp_rank, tp_size=tp_size,
         )
-        return _routed_and_shared_forward(module, hidden_states, local_image_mask, ep_group)
+        return _routed_and_shared_forward(
+            module, hidden_states, local_image_mask, ep_group, fix_router=fix_router,
+        )
 
     return multimodal_compute_fn
 

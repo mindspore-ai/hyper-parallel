@@ -39,6 +39,7 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_pa
 )
 from hyper_parallel.trainer.config.parallelism import PlanOverride, entries_to_plan_overrides
 from hyper_parallel.trainer.config.resolver import resolve_component
+from tests.common.mark_utils import arg_mark
 
 
 # This fixture exercises the installed package's configuration contract, not the
@@ -83,8 +84,14 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
             group_start = group_end
         return torch.cat(outputs, dim=0)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_hf_grouped_forward_and_backward_preserve_clamp(self) -> None:
-        """CPU grouped-mm fallback matches an explicit clamped expert oracle."""
+        """
+        Feature: Native grouped expert activation clamping.
+        Description: Compare the CPU grouped-mm fallback with an explicit clamped expert oracle.
+        Expectation: Outputs and input, routing weight, and parameter gradients match the oracle.
+        """
         torch.manual_seed(82)
         config = _expert_config()
         config._experts_implementation = "grouped_mm"  # pylint: disable=protected-access
@@ -118,8 +125,14 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         for actual, oracle in zip(experts.parameters(), reference.parameters()):
             torch.testing.assert_close(actual.grad, oracle.grad)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_grouped_forward_and_backward_match_clamped_oracle(self) -> None:
-        """FP32/BF16 grouped outputs and gradients match an independent FP32 gate."""
+        """
+        Feature: Model-owned grouped expert activation.
+        Description: Exercise FP32 and BF16 grouped execution with enabled and disabled clamps.
+        Expectation: Outputs and gradients match an independent FP32 activation oracle.
+        """
         for dtype in (torch.float32, torch.bfloat16):
             for limit in (-1.0, 0.0, 1.5, 10.0):
                 with self.subTest(dtype=dtype, limit=limit):
@@ -178,8 +191,14 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         for actual, oracle in zip(experts.parameters(), reference.parameters()):
             torch.testing.assert_close(actual.grad, oracle.grad)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_ep_nonpositive_limit_matches_unclamped_oracle(self) -> None:
-        """Actual eager/grouped bindings skip disabled clamps and preserve gradients."""
+        """
+        Feature: Disabled expert activation clamping.
+        Description: Exercise eager and grouped EP bindings with nonpositive clamp limits.
+        Expectation: Outputs and gradients match the unclamped oracle, including an empty expert.
+        """
         for dtype, limit, grouped in product((torch.float32, torch.bfloat16), (-1.0, 0.0), (False, True)):
             with self.subTest(dtype=dtype, limit=limit, grouped=grouped):
                 self._check_nonpositive_ep_parity(dtype, limit, grouped)
@@ -233,8 +252,14 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         for actual_parameter, reference_parameter in zip(experts.parameters(), reference.parameters()):
             torch.testing.assert_close(actual_parameter.grad, reference_parameter.grad)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_grouped_bfloat16_rounds_only_after_swiglu(self) -> None:
-        """A BF16 witness distinguishes FP32 activation from the old BF16 gate."""
+        """
+        Feature: Grouped expert BF16 activation precision.
+        Description: Use a BF16 witness that distinguishes FP32 activation from early BF16 rounding.
+        Expectation: Rounding occurs after SwiGLU and matches the exact expected value.
+        """
         config = SimpleNamespace(
             num_local_experts=1, hidden_size=1, intermediate_size=1,
             hidden_act="silu", swiglu_limit=10.0,
@@ -254,8 +279,14 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         old_result = functional.silu(gate) * up
         self.assertNotEqual(actual.item(), old_result.item())
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_ep_grouped_path_binds_model_owned_forward(self) -> None:
-        """The EP factory selects the clamped grouped callable without changing generic EP."""
+        """
+        Feature: Model-owned grouped EP execution.
+        Description: Enable grouped GEMM through the DeepSeek V4.1 EP factory.
+        Expectation: The factory binds the model-owned clamped grouped callable.
+        """
         experts = DeepseekV4Experts(_expert_config())
         module = SimpleNamespace(
             gate=Mock(), experts=experts, shared_experts=Mock(), is_hash=False,
@@ -273,8 +304,14 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         self.assertIs(experts.forward_expert_major.__func__, _deepseek_v41_grouped_expert_forward)
         bind.assert_called_once_with(module, 2, use_grouped_gemm=True, apply_gate=None)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_yaml_override_selects_grouped_or_eager_factory(self) -> None:
-        """Typed YAML flags reach the real EP factory for text and VLM contracts."""
+        """
+        Feature: DSV4.1 EP factory selection.
+        Description: Resolve typed grouped/eager YAML for text and VLM contracts.
+        Expectation: Both contracts keep the benchmark router disabled by default.
+        """
         for grouped, multimodal in product((True, False), (False, True)):
             with self.subTest(grouped=grouped, multimodal=multimodal):
                 raw = yaml.safe_load(_EP_OVERRIDE_YAML.format(use_grouped_gemm=str(grouped).lower()))
@@ -305,17 +342,31 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
                 with patch(f"{prefix}._routed_and_shared_forward", return_value=states) as routed:
                     output = compute(states, image_mask=mask) if multimodal else compute(states)
                 self.assertIs(output, states)
-                routed.assert_called_once_with(module, states, mask, ep_mesh.get_group.return_value)
+                routed.assert_called_once_with(
+                    module, states, mask, ep_mesh.get_group.return_value, fix_router=False,
+                )
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_yaml_override_requires_active_ep(self) -> None:
-        """The same parsed EP override is inactive when expert parallelism is off."""
+        """
+        Feature: Conditional EP configuration.
+        Description: Resolve the same typed YAML override with EP disabled and enabled.
+        Expectation: The override is applied only when expert parallelism is active.
+        """
         raw = yaml.safe_load(_EP_OVERRIDE_YAML.format(use_grouped_gemm="true"))
         entry = resolve_component(raw, annotation=PlanOverride, path="$.plan_overrides[0]")
         self.assertEqual(entries_to_plan_overrides([entry], ep_size=1), {})
         self.assertIn("*.mlp", entries_to_plan_overrides([entry], ep_size=2))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_eager_path_retains_source_gate(self) -> None:
-        """Disabling grouped GEMM still binds the exact clamped eager activation."""
+        """
+        Feature: Eager expert activation compatibility.
+        Description: Disable grouped GEMM through the DeepSeek V4.1 EP factory.
+        Expectation: The factory retains the source clamped eager activation.
+        """
         experts = DeepseekV4Experts(_expert_config())
         module = SimpleNamespace(
             gate=Mock(), experts=experts, shared_experts=Mock(), is_hash=False,
