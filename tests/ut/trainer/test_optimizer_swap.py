@@ -35,6 +35,7 @@ from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.components.optim.builders import AdamW as AdamWBuilder
 from hyper_parallel.core.optimizer import ChainedOptimizer, SwapOptimizerConfig
+from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.core.optimizer.swap_optimizer import is_swap_optimizer
 from hyper_parallel.models.build_options import FSDP2Config, FSDP2MixedPrecisionConfig
 from hyper_parallel.core.optimizer import swap_optimizer_base as swap_adapters
@@ -301,6 +302,39 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
                     f"leaf {name!r} was not swap-wrapped: {type(leaf).__name__}"
                 ))
         self.assertEqual(list(built.chained_optimizers), list(built.optimizers_dict.values()))
+
+    @arg_mark(**_MARK)
+    def test_enabled_wraps_a_muon_leaf_of_a_chained_optimizer(self):
+        """Feature: optimizer.swap over a Muon + AdamW chain.
+        Description: build the shipped chain shape, whose Muon leaf keeps a single
+            momentum buffer rather than Adam's two moments.
+        Expectation: the Muon leaf is swap-wrapped with the Muon adapter and the
+            AdamW leaf keeps the AdamW one.
+        """
+        chain = ChainedOptimizer(self.model, {
+            "muon": Muon(self.model.proj.parameters(), lr=0.02),
+            "adamw": torch.optim.AdamW(self.model.norm.parameters(), lr=1.0e-3),
+        })
+        config = _trainer_config(_builder_target(chain), OptimizerSwapConfig(enabled=True, min_numel=1))
+
+        built = _build_optimizer(config, self.model)
+        leaves = built.optimizers_dict
+        adapters = {name: type(leaf.adapter) for name, leaf in leaves.items()}
+
+        self.assertTrue(
+            all(is_swap_optimizer(leaf) for leaf in leaves.values()),
+            f"every leaf must be swap-wrapped, got {adapters}",
+        )
+        self.assertIsInstance(
+            leaves["muon"].adapter,
+            swap_adapters.TorchMuonAdapter,
+            f"the Muon leaf must take the Muon adapter, got {adapters['muon']}",
+        )
+        self.assertIsInstance(
+            leaves["adamw"].adapter,
+            swap_adapters.TorchNativeAdamWAdapter,
+            f"the AdamW leaf must keep its adapter, got {adapters['adamw']}",
+        )
 
     @arg_mark(**_MARK)
     def test_swap_config_gets_the_yaml_values(self):
