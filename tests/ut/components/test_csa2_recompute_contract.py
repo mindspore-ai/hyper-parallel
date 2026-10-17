@@ -223,7 +223,7 @@ def _kv_source_layer(use_cp, state):
     """Build a KV-source attention layer and the inputs for one run."""
     torch.manual_seed(11)
     layer = SharedCompressedDSAAttentionBase(
-        _Source(), replace_indexer=False, use_optimized_sparse_attention=False
+        _Source(), replace_indexer=False, use_fused_ops=False
     )
     layer.compressor = _Compressor()
     state.publish_topk_indices(LAYER, torch.zeros(BATCH, SEQUENCE, 2, dtype=torch.int32))
@@ -233,10 +233,11 @@ def _kv_source_layer(use_cp, state):
 def _index_source_layer(use_cp, state):
     """Build a Reindex-style layer that republishes the shared Top-K."""
     torch.manual_seed(11)
+    source = _IndexSource()
+    source.indexer = SharedCompressedDSAIndexer(_IndexerSource())
     layer = SharedCompressedDSAAttentionBase(
-        _IndexSource(), replace_indexer=False, use_optimized_sparse_attention=False
+        source, replace_indexer=False, use_fused_ops=False
     )
-    layer.indexer = SharedCompressedDSAIndexer(_IndexerSource())
     state.publish_compressed_kv(LAYER, torch.zeros(BATCH, SEQUENCE // RATIO, HEAD_DIM))
     state.publish_index_key(LAYER, torch.zeros(BATCH, SEQUENCE // RATIO, HEAD_DIM))
     return layer, _inputs(), _GatherCounter() if use_cp else None

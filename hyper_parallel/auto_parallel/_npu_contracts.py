@@ -432,7 +432,7 @@ _V41_REFERENCE = "_reference_sparse_attention"
 
 @contextlib.contextmanager
 def v41_attention_contract(rope_head_dim: int) -> Iterator[bool]:
-    """DeepSeek-V4.1's sparse attention as its contract, for what runs inside.
+    """Legacy Omni sparse attention as its contract, for what runs inside.
 
     A V4.1 layer picks its attention by the device it is running on
     (``self._use_omni_attention and query.device.type == "npu"``), so a
@@ -443,19 +443,27 @@ def v41_attention_contract(rope_head_dim: int) -> Iterator[bool]:
     validation crop at 4096 tokens it read 77.9 GiB a rank against a 38.5
     GiB measured peak (F53).
 
-    Both names are bound to the contract for as long as the context lasts,
+    This contract applies only while the module exposes the Omni and legacy
+    reference entry points. Newer adapters have an explicit fusion switch;
+    their eager path must be measured as written, not priced as Omni. Their
+    native kernels need their own saved-tensor contracts.
+
+    Both legacy names are bound to the contract for as long as the context lasts,
     so either branch of that choice reaches it.  *rope_head_dim* is the
     width of the auxiliary rotary coordinates the kernel's caller passes and
     the reference's own signature does not carry, so the census states it
     from the model's config.
 
     Yields:
-        Whether the module was there to patch, which is False on a tree
-        that carries no V4.1 attention.
+        Whether the legacy Omni entry points were present to patch.
     """
     try:
         module = importlib.import_module(_V41_ATTENTION)
     except ImportError:
+        yield False
+        return
+
+    if not all(hasattr(module, name) for name in (_V41_OMNI, _V41_REFERENCE)):
         yield False
         return
 

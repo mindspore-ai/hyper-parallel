@@ -1136,12 +1136,10 @@ class TestV41SparseAttentionContract(unittest.TestCase):
         """
         Feature: v41_attention_contract, which the census installs around a
             V4.1 layer.
-        Expectation: Where the V4.1 attention is in the tree, both the
-            kernel's name and the reference beside it are bound to the
-            contract inside the context and restored on the way out, since
-            a layer picks between them by the device it runs on and a
-            census is on none. Where the module is absent, as on the
-            cost model's own lineage, it is a no-op that says so.
+        Expectation: The legacy Omni and reference bindings are replaced
+            and restored together. An adapter with explicit fused/eager
+            entry points is left unchanged: its eager path must not be
+            priced as Omni's kernel.
         """
         from hyper_parallel.auto_parallel._npu_contracts import (  # pylint: disable=C0415
             npu_sparse_attention_with_scalar_sink,
@@ -1152,15 +1150,23 @@ class TestV41SparseAttentionContract(unittest.TestCase):
                 "hyper_parallel.components.modules.shared_compressed_dsa_attention")
         except ImportError:
             module = None
+        names = ("npu_sparse_attention_with_scalar_sink", "_reference_sparse_attention")
+        has_omni = module is not None and all(hasattr(module, name) for name in names)
+        before = dict(vars(module)) if module is not None else {}
         with v41_attention_contract(64) as patched:
-            self.assertEqual(patched, module is not None)
-            if module is not None:
+            self.assertEqual(patched, has_omni)
+            if has_omni:
                 self.assertIs(module.npu_sparse_attention_with_scalar_sink,
                               npu_sparse_attention_with_scalar_sink)
                 self.assertIsNot(module._reference_sparse_attention, None)  # pylint: disable=W0212
+            elif module is not None:
+                self.assertEqual(vars(module).keys(), before.keys())
+                for name, value in before.items():
+                    self.assertIs(getattr(module, name), value)
         if module is not None:
-            self.assertIsNot(module.npu_sparse_attention_with_scalar_sink,
-                             npu_sparse_attention_with_scalar_sink)
+            self.assertEqual(vars(module).keys(), before.keys())
+            for name, value in before.items():
+                self.assertIs(getattr(module, name), value)
 
     def test_the_indexer_contract_wraps_every_selection_and_restores_them(self):
         """
