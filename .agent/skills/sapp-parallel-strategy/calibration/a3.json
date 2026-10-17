@@ -1,0 +1,20 @@
+{
+  "COMPUTE": 6.370294298491837e-11,
+  "DP_COMM": 2.933292889996305e-11,
+  "DP_REDUCE": 6.857542887100095e-11,
+  "MP_COMM": 6.370294298491837e-11,
+  "EP_COMM": 5.393909911314646e-12,
+  "CP_COMM": 6.370294298491837e-11,
+  "PP_COMM": 6.370294298491837e-11,
+  "BUBBLE": 6.370294298491837e-11,
+  "_fitted_on": {
+    "csv": "A3 cluster, 30 September 2026: five launches of Qwen3.5-35B-A3B cut to 8 layers, 8192 tokens, global batch 64, full recompute, 64 dies; fitted with the cost model of 2 October 2026",
+    "strategies": [
+      "DP 64 EP 2 OP 32",
+      "DP 64 EP 4 OP 16",
+      "DP 64 EP 4",
+      "DP 64 OP 64",
+      "DP 64 EP 2"
+    ]
+  }
+}

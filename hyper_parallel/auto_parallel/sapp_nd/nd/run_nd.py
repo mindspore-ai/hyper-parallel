@@ -249,6 +249,26 @@ def _recompute_kwargs(auto_recompute, modes):
     return {"recompute_dimension": modes}
 
 
+def _check_recompute_potentials(cli_parser, cli_args, modes) -> None:
+    """Refuse -rp/--recompute_potentials where there is no plan per layer to extend, or nowhere to write it.
+
+    Args:
+        cli_parser: The argument parser, which reports the refusal.
+        cli_args: The parsed CLI namespace.
+        modes: The recompute modes stated, or None.
+    """
+    if not cli_args.auto_recompute or modes is None:
+        cli_parser.error("-rp/--recompute_potentials extends a recompute plan per layer: it needs "
+                         "-ar/--auto_recompute with the modes each layer chooses among, from --recompute or a "
+                         "hyper_v2 yaml's context.recompute")
+    if cli_args.real_csv is not None or cli_args.search_config or cli_args.verify:
+        cli_parser.error("-rp/--recompute_potentials applies to the standard ND search, not --real_csv, "
+                         "--search-config, or --verify")
+    if cli_args.verbosity < 2:
+        cli_parser.error("-rp/--recompute_potentials writes a CSV and two plots, which a verbosity of at least 2 "
+                         "turns on")
+
+
 def _priced_train_yaml(search_config: str) -> str:
     """The train.yaml a search config names, which its search prices.
 
@@ -341,7 +361,7 @@ def _run_hyper_v2_search(cli_parser, cli_args):
     _check_train_yaml(cli_parser, cli_args)
 
     set_verbose_level(cli_args.verbosity)
-    Debug.set_output_dir(cli_args.output_dir)
+    Debug.set_output_dir(cli_args.output_dir, fresh=True)
 
     search_cfg = read_search_config(cli_args.search_config)
     try:
@@ -751,6 +771,20 @@ if __name__ == "__main__":
         "--real_csv, the mode of rows that state none.",
     )
     parser.add_argument(
+        "-rp",
+        "--recompute_potentials",
+        action="store_true",
+        help="With -ar and a mode chosen per layer, also report what the cost "
+        "model estimates each further recomputed layer would cost: for every "
+        "configuration that fits, the sequence of plans that fully recompute one "
+        "more layer at the same degrees and memory budget, written to "
+        "recompute_potentials.csv and to two comparison PDFs beside the results "
+        "plot. Off by default, and the search does none of that work without it: "
+        "the report prices far more plans than the search itself and takes "
+        "accordingly longer. Every figure is the cost model's estimate of the "
+        "step, which a measured run can disagree with.",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="Refuse a config field no parser set where the estimate reads it, "
@@ -808,6 +842,8 @@ if __name__ == "__main__":
                                   or args.host_link_overlap is not None or args.host_link_cost is not None):
         parser.error("--host_link_gibps, --sustained_tflops, --host_link_overlap and --host_link_cost price "
                      "offload, which needs -ao/--auto_offload")
+    if args.recompute_potentials:
+        _check_recompute_potentials(parser, args, recompute_modes)
     if args.verify:
         if args.framework != "hyper_v2":
             parser.error("-V/--verify needs -f hyper_v2: it builds the Transformers checkpoint -y names")
@@ -851,7 +887,7 @@ if __name__ == "__main__":
         )
 
     set_verbose_level(args.verbosity)
-    Debug.set_output_dir(args.output_dir)
+    Debug.set_output_dir(args.output_dir, fresh=True)
     dims = Dim.get_dims(args.dimensions)
     YAML_FOLDER = None  # args.generate_yaml_in
     machine = Hard.Machine(args.devices, args.device_type or "A2")
@@ -928,6 +964,7 @@ if __name__ == "__main__":
         force_exhaustive=force_exhaustive,
         fforce_exhaustive=fforce_exhaustive,
         dimensions=dims,
+        recompute_potentials=args.recompute_potentials,
     )
 
     if args.ppb_k is not None:

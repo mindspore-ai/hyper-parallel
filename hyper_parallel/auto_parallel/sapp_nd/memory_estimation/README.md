@@ -261,9 +261,9 @@ class CostModelParserNewFramework(_CostModelParser):
 
 `derive()` computes the rest: `t_exp`, `d_exp`, the `shard_*` factors, the
 `comm_*` flags, `rec_op`, `s_fa`, the byte widths the estimators read
-(`bytes_grad`, `bytes_os`, `bytes_norm`, `bytes_dropout`), an MLA family's
-`dh`, and cm's `layer_fields`. A fact the input does not state takes the
-default of the model's family, from its op profile.
+(`bytes_grad`, `bytes_os`, `bytes_norm`, `bytes_dropout`) and an MLA family's
+`dh`. A fact the input does not state takes the default of the model's
+family, from its op profile.
 
 ## 6. CostModelConfig Fields
 
@@ -276,7 +276,7 @@ and the memory module.
 | Input | `config`, `config_format`, `parser` | Original config object, normalized source format, and active parser instance |
 | Model | `model_name`, `device_capacity` | Model identifier and per-device memory capacity |
 | Op profile | `arch`, `op_counts`, `inherited_arch` | Architecture family whose op profile prices the model, and its op counts per layer kind; a vision tower's arch is `vision`, and `inherited_arch` names its language model's family, whose activation sharding it takes |
-| Layer stack | `layer_stack`, `layer_binding`, `layer_fields` | The kind of every layer, as data; the fields each kind assigns, bound when the family is applied; the fields a family gives every layer on top of its kind's |
+| Layer stack | `layer_stack`, `layer_binding` | The kind of every layer, as data; the fields each kind assigns, bound when the family is applied |
 | Multimodal | `multimodal`, `mm_ccfgs`, `mm_order`, `hooks_dict` | Used when one config is split into multiple model components, each priced by its own `arch` unless a hook class names its hook in `hooks_dict` |
 | Strategy | `d`, `t`, `p`, `cp`, `ep`, `sp`, `vp`, `os_max_shard`, `op_weight_shard` | DP, TP, PP, CP, EP, SP, VPP, and optimizer sharding settings; `os_max_shard` counts the data-parallel ranks optimizer sharding splits a parameter over, on top of TP |
 | Pipeline | `offset`, `pp_partition`, `pp_sched`, `n_s_split`, `cp_algo` | Pipeline partition, scheduling, and context-parallel algorithm metadata |

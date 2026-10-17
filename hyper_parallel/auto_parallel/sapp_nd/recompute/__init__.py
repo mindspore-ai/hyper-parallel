@@ -14,4 +14,4 @@
 # ============================================================================
 """SAPP-ND recompute search: what each layer kind can recompute, at what cost, and what each layer runs."""
 
-__all__ = ["candidate", "front", "knapsack", "profile"]
+__all__ = ["candidate", "front", "knapsack", "potential", "profile"]

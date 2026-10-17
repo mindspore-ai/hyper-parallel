@@ -26,7 +26,6 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.derive import (
     derive,
     derive_embedding_sharding,
     derive_flash_attention_factor,
-    derive_layer_fields,
     derive_recompute_switches,
     optimizer_ranks,
     runs_hyper_selective,
@@ -155,8 +154,8 @@ class TestDerive(unittest.TestCase):
         got = (ccfg.shard_embed, ccfg.shard_recompute_input, ccfg.shard_output_activ)
         self.assertEqual(got, (8, 2, 1), f"shard_embed, shard_recompute_input, shard_output_activ={got}")
         self.assertEqual(vars(ccfg.rec_op), HYPER_SELECTIVE_REC_OP, f"rec_op={vars(ccfg.rec_op)}")
-        got = (ccfg.bytes_grad, ccfg.bytes_os, ccfg.bytes_norm, ccfg.bytes_dropout, ccfg.layer_fields)
-        self.assertEqual(got, (0, 4, 4, 0, None), f"byte widths and layer_fields={got}")
+        got = (ccfg.bytes_grad, ccfg.bytes_os, ccfg.bytes_norm, ccfg.bytes_dropout)
+        self.assertEqual(got, (0, 4, 4, 0), f"byte widths={got}")
 
 
 class TestGradientSharding(unittest.TestCase):
@@ -204,7 +203,7 @@ class TestOptimizerSharding(unittest.TestCase):
 
     def test_a_shard_spanning_dp_and_cp_is_the_runs(self):
         """
-        Feature: optimizer_ranks, HyperParallel's shard over DP times CP (C1).
+        Feature: optimizer_ranks, HyperParallel's shard over DP times CP.
         Description: DP 4 and CP 2 with a stated shard of 8 ranks, for a run
             whose shard spans CP's ranks and for one of the legacy schemas.
         Expectation: 8, the whole domain HyperParallel shards over, where a
@@ -391,7 +390,7 @@ class TestDeriveFamily(unittest.TestCase):
     def test_an_mla_family_prices_its_value_heads(self):
         """
         Feature: derive_head_dim.
-        Description: DeepSeek and cm heads 56 wide by h / a, with a declared
+        Description: DeepSeek heads 56 wide by h / a, with a declared
             value-head width and without; a Qwen model declaring one.
         Expectation: The declared width, else the family's 128; Qwen keeps
             its own.
@@ -399,30 +398,12 @@ class TestDeriveFamily(unittest.TestCase):
         cases = [
             ({"arch": "deepseek"}, 128),
             ({"arch": "deepseek", "v_head_dim": 96}, 96),
-            ({"arch": "cm"}, 128),
             ({"arch": "qwen", "v_head_dim": 96}, 56),
         ]
         for facts, want in cases:
             ccfg = _config(dh=56, **facts)
             derive(ccfg)
             self.assertEqual(ccfg.dh, want, f"{facts}: dh={ccfg.dh}")
-
-    def test_cm_gives_every_layer_its_sharding(self):
-        """
-        Feature: derive_layer_fields.
-        Description: A cm model with 12 experts, its partial expert states
-            sharded 2 ways and its other states 8; then the default family.
-        Expectation: cm's layers shard their expert states 2 ways, their
-            other states over gcd(12, 8) and their embedding over t; the
-            default family gives its layers nothing.
-        """
-        ccfg = _config(arch="cm", n_exp=12, shard_p_os_exp_partial=2, shard_p_os_non_exp=8)
-        derive_layer_fields(ccfg)
-        self.assertEqual(ccfg.layer_fields,
-                         {"shard_p_os_exp": 2, "shard_p_os_non_exp_partial": 4, "shard_embed": 2})
-        ccfg = _config()
-        derive_layer_fields(ccfg)
-        self.assertIsNone(ccfg.layer_fields)
 
 
 if __name__ == "__main__":

@@ -36,7 +36,7 @@ to it and every figure quoted about it.
 - A config field nothing parses reads as 0 (`CostModelConfig.__getattr__`, reported under the ranking;
   `run_nd --strict` refuses it). A stated field can look priced and not be: check that it reaches the estimate.
 
-## Using a measured figure (register B12)
+## Using a measured figure
 
 - A term's LEVEL is validated against the profiler's own columns (Computing, Communication, Free), which exist
   only under the profiler; its RANKING against the trainer's own step time (`step_trainer`). Never mix the two
@@ -52,7 +52,7 @@ to it and every figure quoted about it.
 
 ## What ND is, by decision
 
-- A relative scorer (register A5): no device rate or peak prices a part, and the ratios fitted on a measured
+- A relative scorer: no device rate or peak prices a part, and the ratios fitted on a measured
   round own the scale; a host link's `sustained_tflops` only turns an offload copy's seconds into the score's
   units where no fitted ratio does. Do not add an absolute rate without revisiting that decision.
 - A model of allocated memory, where a run dies on reserved: "ND says it fits" is not a bound.

@@ -74,7 +74,7 @@ import math
 from collections import Counter
 from dataclasses import dataclass, fields, is_dataclass, replace
 from types import SimpleNamespace
-from typing import Any, Dict, FrozenSet, Hashable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, Hashable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from hyper_parallel.auto_parallel._exec_spec import RECOMPUTE_OPS, RecomputeRange
 from hyper_parallel.auto_parallel._model_spec import KindActivations
@@ -93,6 +93,7 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.front import (
 )
 from hyper_parallel.auto_parallel.sapp_nd.recompute.knapsack import (
     MEGABYTE,
+    Assignment,
     Layers,
     Stage,
     StageChoice,
@@ -151,9 +152,15 @@ class RecomputeChoice:
         mode: The mode every layer runs, one of :data:`MODES`, when one mode
             was chosen for all of them; ``None`` for a choice per layer.
         score: The candidate's score under the choice, where the whole model
-            was priced with it, a model priced on several submodules; ``None``
-            where the search takes *stage_savings* off the score of the
-            config's own recompute.
+            was priced with it, a model priced on several submodules, or
+            where a caller priced one alternative on its own; ``None`` where
+            the search takes *stage_savings* off the score of the config's
+            own recompute.
+        dimensions: The parallel degrees the choice was priced at, for an
+            alternative weighed against others at one fixed strategy; empty
+            for a choice the search did not weigh that way.
+        score_parts: The parts *score* splits into, in the order the
+            debugger fills them, where a caller kept them for a plot.
     """
 
     ranges: Tuple[LayerRange, ...]
@@ -161,6 +168,8 @@ class RecomputeChoice:
     stage_savings: Tuple[float, ...]
     mode: Optional[str] = None
     score: Optional[float] = None
+    dimensions: Tuple[Tuple[str, int], ...] = ()
+    score_parts: Tuple[float, ...] = ()
 
     @property
     def memory(self) -> float:
@@ -514,6 +523,46 @@ def _assign(layers: Sequence[_Layer], choices: Sequence[StageChoice]) -> Dict[in
             for _ in range(assignment.count):
                 chosen[waiting.pop(0)] = assignment.option
     return chosen
+
+
+def _assign_counted(layers: Sequence[_Layer], chosen: Mapping[int, LayerOption]) -> Dict[int, LayerOption]:
+    """Assign a group's option counts to its layers in the order the normal optimizer uses.
+
+    The knapsack hands a group's options to its layers in model order, the
+    slower first (:func:`_assign`), so a plan built by changing one layer is
+    re-assigned the same way: two plans that run the same counts then name
+    the same layers whichever layer was changed.
+
+    Args:
+        layers: One group's layers, of one kind, stage and in-flight count.
+        chosen: Each layer's option, the group's among them.
+
+    Returns:
+        The group's layers and the option each runs.
+    """
+    group = Layers(layers[0].key, len(layers), layers[0].in_flight)
+    counts = Counter(chosen[layer.index] for layer in layers)
+    assignments = tuple(
+        Assignment(group, option, count)
+        for option, count in sorted(counts.items(), key=lambda item: -_time(item[0]))
+    )
+    choice = StageChoice(
+        assignments,
+        sum(count * _kept(option, group.in_flight) for option, count in counts.items()),
+        sum(count * _time(option) for option, count in counts.items()),
+    )
+    return _assign(layers, [choice])
+
+
+def _equivalent_cost(left: RecomputeChoice, right: RecomputeChoice) -> bool:
+    """Whether two plans of the same mode counts also have equal stage peaks and time saved."""
+    return all(
+        math.isclose(first, second, rel_tol=1e-12, abs_tol=1e-9)
+        for first, second in zip(left.stage_memory, right.stage_memory)
+    ) and all(
+        math.isclose(first, second, rel_tol=_ROUNDING, abs_tol=1e-9)
+        for first, second in zip(left.stage_savings, right.stage_savings)
+    )
 
 
 def _ranges(
@@ -982,6 +1031,9 @@ def _trim_offload(
     if cost_per_byte <= 0:
         return chosen
     stage_layers, fronts, own = stage
+    # Trimmed to the byte, a stage would fill a budget of a fraction of a megabyte to that fraction, and the
+    # search's result, reported in whole megabytes, would read over the budget its own fit check accepted.
+    capacity = math.floor(capacity / MEGABYTE) * MEGABYTE
     slack = capacity - _stage_memory(stage_layers, held, chosen, fronts, own)
     chosen = dict(chosen)
     for position in range(len(offloading) - 1, -1, -1):
@@ -1091,6 +1143,199 @@ def choose_recompute(
     if link is not None and config.vp == 1:
         return _offload_result(layers, stages, peaks, fronts, own, _link(link, evaluator), bucket, capacity)
     return _each_layer(layers, stages, peaks, fronts, own, (bucket, capacity))
+
+
+class RecomputeAnalysis:
+    """The plans one more recomputed layer reaches at a fixed strategy, with the layer prices kept.
+
+    The layer options, the fixed stage memory and the peak constraints are
+    priced once for the strategy, as :func:`choose_recompute` prices them,
+    and every alternative reuses them. The alternatives are returned
+    unscored: what each would cost the step is the caller's estimate to
+    make, and it is the cost model's estimate, not a measured figure.
+    """
+
+    def __init__(
+        self,
+        evaluator: EvaluatorV2,
+        device_type: Any,
+        modes: Sequence[str],
+        selective: Optional[Mapping[str, int]] = None,
+        dimensions: Tuple[Tuple[str, int], ...] = (),
+    ) -> None:
+        """Price the layer options and the fixed stage memory once for one strategy.
+
+        Args:
+            evaluator: The memory evaluator, set to the fixed strategy.
+            device_type: The device the times are priced on.
+            modes: The named recompute modes a layer may run, which must
+                include full for a layer to be turned up to it.
+            selective: The switches the runtime's own selective mode sets,
+                as :func:`choose_recompute` takes them.
+            dimensions: The strategy's parallel degrees, which every
+                alternative reports.
+
+        Raises:
+            ValueError: No modes, or a mode that is not one of :data:`MODES`.
+        """
+        if not modes or set(modes) - set(MODES):
+            raise ValueError(f"recompute analysis requires modes from {', '.join(MODES)}")
+        self._config = evaluator.ccfg
+        self._device_type = device_type
+        self._dimensions = dimensions
+        self._layers: List[List[_Layer]] = []
+        self._fronts: Dict[Hashable, Tuple[LayerOption, ...]] = {}
+        self._by_mode: Dict[Hashable, Dict[str, LayerOption]] = {}
+        self._own: Dict[LayerOption, LayerOption] = {}
+        self._groups: List[List[_Layer]] = []
+        self._peaks: List[_Peaks] = []
+        self._capacity = self._config.device_capacity.to_mb().size
+        if self._config.multimodal or self._config.pp_sched not in SCHEDULES or "full" not in modes:
+            return
+        self._price(evaluator, modes, selective)
+
+    @property
+    def config(self) -> Any:
+        """The config the layer options were priced on, which a caller scores an alternative with."""
+        return self._config
+
+    @property
+    def dimensions(self) -> Tuple[Tuple[str, int], ...]:
+        """The parallel degrees the analysis is fixed at."""
+        return self._dimensions
+
+    def _price(
+        self, evaluator: EvaluatorV2, modes: Sequence[str], selective: Optional[Mapping[str, int]]
+    ) -> None:
+        """Price every kind's options and each stage's fixed memory, then group the equivalent layers."""
+        counts = micro_batches_in_flight(evaluator)
+        profiles = layer_profiles(
+            evaluator, self._device_type, most_in_flight=max(max(row) for row in counts),
+            each_switch="selective" in modes and selective is None,
+            in_flight=[count for row in counts for count in row],
+        )
+        modes = _priced_modes(modes, profiles, selective)
+        fronts, by_mode = _offered(profiles, configured_switches(evaluator), modes, selective)
+        found = _body_layers(evaluator, fronts, counts)
+        if found is None:
+            return
+        self._layers, self._fronts, self._by_mode, self._own = _charge_working_sets(*found, fronts, by_mode)
+        _, self._peaks = _stages(evaluator, self._layers, self._fronts, self._own)
+        self._groups = _equivalent_groups(self._layers, self._peaks)
+
+    def alternatives(self, current: RecomputeChoice) -> List[RecomputeChoice]:
+        """The distinct plans that fully recompute one more layer of *current* and still fit.
+
+        For each group of equivalent layers and each mode its layers start
+        in, one layer is turned up to full and the group's new counts are
+        assigned to its layers as the normal optimizer assigns them. Index
+        swaps within a group give one plan; different kinds, stages,
+        in-flight counts and peak boundaries stay distinct. Every plan is
+        weighed against the strategy's own device capacity.
+
+        Args:
+            current: A plan of a named mode per layer, every body layer in it.
+
+        Returns:
+            The fitting plans, without scores, each reporting the analysis's
+            degrees; empty where no group can be turned up, where this
+            strategy has no plan to extend, or where *current* runs one mode
+            for every layer.
+
+        Raises:
+            ValueError: *current* was priced at other degrees, leaves a body
+                layer out or names one twice, runs a mode this analysis does
+                not price, or offloads activations.
+        """
+        if current.dimensions and current.dimensions != self._dimensions:
+            raise ValueError("recompute alternatives must keep the same parallel dimensions")
+        if not self._layers or current.mode is not None:
+            return []
+        defined = self._defined(current)
+        chosen = self._chosen(defined)
+        option_modes = _option_modes(self._by_mode)
+        results: List[RecomputeChoice] = []
+        seen: Dict[Tuple[FrozenSet[Any], ...], List[RecomputeChoice]] = {}
+        for group in self._groups:
+            for result, counts in self._turned_up(group, defined, chosen, option_modes):
+                if any(_equivalent_cost(result, previous) for previous in seen.get(counts, ())):
+                    continue
+                seen.setdefault(counts, []).append(result)
+                results.append(replace(result, dimensions=self._dimensions))
+        return results
+
+    def _defined(self, current: RecomputeChoice) -> Dict[int, LayerRange]:
+        """Each body layer's range in *current*, refusing a plan that does not cover them once each."""
+        defined: Dict[int, LayerRange] = {}
+        for item in current.ranges:
+            if item.count <= 0 or item.first < 0 or item.option.link_bandwidth:
+                raise ValueError("recompute analysis requires positive layer ranges without activation offload")
+            for index in range(item.first, item.first + item.count):
+                if index in defined:
+                    raise ValueError("recompute layer ranges must not overlap")
+                defined[index] = item
+        every = {layer.index for stage in self._layers for layer in stage}
+        if set(defined) != every:
+            raise ValueError("the recompute plan must define every body layer exactly once")
+        return defined
+
+    def _chosen(self, defined: Mapping[int, LayerRange]) -> Dict[int, LayerOption]:
+        """Each body layer's option under *defined*, refusing a kind or a mode this analysis does not price."""
+        chosen = {}
+        for stage in self._layers:
+            for layer in stage:
+                item = defined[layer.index]
+                if item.kind != layer.key[1] or item.mode not in self._by_mode[layer.key]:
+                    raise ValueError("the recompute plan must use the fixed model's kinds and allowed modes")
+                chosen[layer.index] = self._by_mode[layer.key][item.mode]
+        return chosen
+
+    def _turned_up(
+        self,
+        group: Sequence[_Layer],
+        defined: Mapping[int, LayerRange],
+        chosen: Mapping[int, LayerOption],
+        option_modes: Mapping[LayerOption, str],
+    ) -> Iterator[Tuple[RecomputeChoice, Tuple[FrozenSet[Any], ...]]]:
+        """Yield each fitting plan that turns one of *group*'s layers up to full, with its mode counts."""
+        started: set = set()
+        for layer in group:
+            mode = defined[layer.index].mode
+            if mode == "full" or mode in started:
+                continue
+            started.add(mode)
+            changed = dict(chosen)
+            changed[layer.index] = self._by_mode[layer.key]["full"]
+            changed.update(_assign_counted(group, changed))
+            result = _result(self._layers, self._peaks, changed, None, self._fronts, self._own, option_modes)
+            if result.memory > self._capacity:
+                continue
+            yield result, self._mode_counts(changed, option_modes)
+
+    def _mode_counts(
+        self, chosen: Mapping[int, LayerOption], option_modes: Mapping[LayerOption, str]
+    ) -> Tuple[FrozenSet[Any], ...]:
+        """Each stage's count of kinds and modes, the key plans of the same shape share."""
+        return tuple(
+            frozenset(Counter((layer.key[1], option_modes[chosen[layer.index]]) for layer in stage).items())
+            for stage in self._layers
+        )
+
+
+def _equivalent_groups(layers: Sequence[Sequence[_Layer]], peaks: Sequence[_Peaks]) -> List[List[_Layer]]:
+    """The layers that are interchangeable: one kind, stage and in-flight count, either side of a peak boundary.
+
+    A stage whose peak can also come as a later backward ends keeps its
+    first layer apart, since that layer's option is weighed at that peak too.
+    """
+    groups: List[List[_Layer]] = []
+    for stage_layers, stage_peaks in zip(layers, peaks):
+        grouped: Dict[Tuple[Hashable, int, bool], List[_Layer]] = {}
+        for layer in stage_layers:
+            at_boundary = stage_peaks.backward is not None and layer.index == stage_layers[0].index
+            grouped.setdefault((layer.key, layer.in_flight, at_boundary), []).append(layer)
+        groups.extend(grouped.values())
+    return groups
 
 
 def _option_modes(by_mode: Mapping[Hashable, Mapping[str, LayerOption]]) -> Dict[LayerOption, str]:
@@ -1228,6 +1473,13 @@ def trainer_plan(choice: RecomputeChoice) -> Tuple[str, Dict[str, str]]:
     layers run of those that recompute, full on a tie, or off where none
     recomputes; the plan names the other layers, consecutive layers of one
     mode in one entry whatever their kinds.
+
+    The mode is a mode that recomputes, rather than off with the recomputed
+    layers named, because the trainer accepts an entry equal to the mode: a
+    runner that states the mode itself, as a sweep forcing its own full
+    default does, then still runs the layers this plan states off. Named the
+    other way round, the same run would recompute every layer and invert the
+    choice without a word.
 
     The indices are the choice's, which count the body layers in model order,
     MTP's after the decoder's: the indices of the trainer's blocks, for a

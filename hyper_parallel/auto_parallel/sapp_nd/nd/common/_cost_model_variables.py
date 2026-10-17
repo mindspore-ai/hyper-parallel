@@ -54,9 +54,6 @@ class _CostModVar:
     # hook from the config it is applied to.
     layer_stack: any = None
     layer_binding: dict = None
-    # Fields the family gives every layer of the stack on top of its kind's,
-    # such as cm's sharding (derive).
-    layer_fields: dict = None
     # What a layer of each kind keeps and holds per token, as the model
     # spec's census states it (an auto_parallel KindActivations per kind
     # name), and the record of the kind of the layer priced, which the

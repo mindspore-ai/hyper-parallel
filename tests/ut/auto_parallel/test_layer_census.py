@@ -207,7 +207,7 @@ class TestLayerCensus(unittest.TestCase):
 
     def test_a_graph_the_forward_drops_is_not_kept(self):
         """
-        Feature: _measure, which counts what a forward still holds (D16).
+        Feature: _measure, which counts what a forward still holds.
         Description: A projection of a 64-wide input of 64 tokens whose
             output is gathered at indices a selection picks, the selection
             scoring the input through a second weight in float32 and keeping
@@ -793,8 +793,7 @@ class TestModuleReplacements(unittest.TestCase):
         Description: The Qwen3-MoE attention caches the compressed causal mask
             its sparse mode takes, one per device, the first time it runs.
         Expectation: A census of the fused layer leaves no fake tensor in that
-            cache, so a real call in the same process builds its own mask
-            (F55).
+            cache, so a real call in the same process builds its own mask.
         """
         from hyper_parallel.models.qwen3_moe.adapter.runtime import attention  # pylint: disable=C0415
         census_layer(_qwen3_moe(), 0, 256, replacements=_recipe_specs())
@@ -808,7 +807,7 @@ class TestModuleReplacements(unittest.TestCase):
             native extension.
         Expectation: The census refuses rather than measure Transformers' own
             modules, which the run does not train, and names the factory and
-            the import that failed (F53).
+            the import that failed.
         """
         from hyper_parallel.models.replacement import ModuleReplacementSpec  # pylint: disable=C0415
         from transformers.models.qwen3_moe import modeling_qwen3_moe  # pylint: disable=C0415
@@ -824,7 +823,7 @@ class TestModuleReplacements(unittest.TestCase):
         Feature: context.census with a plan_overrides entry this host cannot
             build, through the parser.
         Expectation: The run is priced without a census, as a run that asks
-            for none, and a warning says why (F53).
+            for none, and a warning says why.
         """
         plan = [{"match": "*.input_layernorm",
                  "module_type": "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm",
@@ -845,8 +844,7 @@ class TestModuleReplacements(unittest.TestCase):
             installed, then without those two operators, then with both.
         Expectation: The census saves a kernel's outputs exactly where the
             trainer's policy saves its operator's, whatever that list names:
-            each kernel is saved under one list and recomputed under another
-            (F52).
+            each kernel is saved under one list and recomputed under another.
         """
         checkpointing = _checkpointing()
         installed = checkpointing._SELECTIVE_AC_COMPUTE_OP_NAMES  # pylint: disable=protected-access
@@ -878,7 +876,7 @@ class TestModuleReplacements(unittest.TestCase):
         Expectation: Where the policy saves that operator, the layer keeps
             the kernel's output and its two fp32 statistics of every head
             and token besides, and nothing else; as installed, it keeps what
-            the installed list says (F52).
+            the installed list says.
         """
         config, specs = _qwen3_moe(), _recipe_specs()
         checkpointing = _checkpointing()
@@ -1318,7 +1316,7 @@ class TestKernelContracts(unittest.TestCase):
     def test_the_whole_stack_is_measured_as_one(self):
         """
         Feature: census_activations on the same config, the entry the model
-            spec calls (D18).
+            spec calls.
         Expectation: It runs the model's own forward over the whole stack
             and states the kind's record, where it refused: what a layer
             keeps and holds, a share tensor parallelism splits, and no
@@ -1390,7 +1388,7 @@ def _qwen3():
 
 
 class TestStackCensus(unittest.TestCase):
-    """A census of the whole stack, for a family whose layers cannot run alone (D18)."""
+    """A census of the whole stack, for a family whose layers cannot run alone."""
 
     def test_a_layer_of_the_stack_keeps_what_the_layer_census_measures(self):
         """

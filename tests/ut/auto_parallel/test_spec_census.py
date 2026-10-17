@@ -181,6 +181,31 @@ class TestSpecCensus(unittest.TestCase):
         ModelSpec.from_dict(census)
         self.assertEqual(spec_as_priced(census), spec_as_priced(resolved))
 
+    def test_the_census_spec_of_a_crop_lists_the_crop_layers(self):
+        """
+        Feature: resolve_hf_model_spec(census_spec=True) on a crop.
+        Description: A four-layer Qwen3.5-MoE checkpoint, linear and full
+            attention alternating, whose model section states
+            num_hidden_layers 2, as a crop of the released model does.
+        Expectation: The census builds the crop's two layers, a linear one
+            then a full one, as the resolver's own spec lists them, rather
+            than the checkpoint's four against a count of two; the
+            checkpoint's config is left as it was.
+        """
+        config = _qwen35_text()
+        config.num_hidden_layers = 4
+        config.layer_types = ["linear_attention", "full_attention"] * 2
+        with patch(_HF_CONFIG, return_value=config):
+            model = {"pretrained_model_name_or_path": "local/model", "num_hidden_layers": 2}
+            census = resolve_hf_model_spec(model, census_spec=True)
+            resolved = resolve_hf_model_spec(model)
+        kinds = [(group["kind"], group["count"]) for group in census["layers"]]
+        body = [(group["kind"], group["count"]) for group in resolved["layers"] if not group.get("mtp")]
+        self.assertEqual(kinds, [("linear_attention", 1), ("full_attention", 1)], f"census layers: {kinds}")
+        self.assertEqual(kinds, body, f"census layers {kinds} against the resolver's {body}")
+        self.assertEqual(config.num_hidden_layers, 4,
+                         f"the checkpoint's config was cropped in place: {config.num_hidden_layers}")
+
 
 if __name__ == "__main__":
     unittest.main()

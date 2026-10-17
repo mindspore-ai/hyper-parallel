@@ -156,7 +156,7 @@ class TestCostModelRoundTrip(unittest.TestCase):
 
     def test_the_biases_and_the_nope_width_survive_the_round_trip(self) -> None:
         """
-        Feature: model facts through the search runner (I10).
+        Feature: model facts through the search runner.
         Description: A spec stating Llama's biases on all four attention
             projections and its MLP, which a llama name alone settles as
             none, and a latent attention's no-position head width of 96.

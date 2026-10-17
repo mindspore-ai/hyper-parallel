@@ -195,7 +195,7 @@ class ExecSpec:
             parallelism's ranks too, as HyperParallel's ``dp_shard_size``
             does over its ``dp * cp`` FSDP domain, so that CP shards no
             parameter state beyond it and the tables it gathers are whole;
-            unstated, CP shards a parameter's state again (C1).
+            unstated, CP shards a parameter's state again.
         grad_accumulation: Whether gradients take memory without pipeline
             parallelism too; under it they always do.
         deferred_grad_accumulation: Whether FSDP holds each layer's

@@ -302,7 +302,7 @@ def throughput(precision_bytes, flop):
 
     Only PerformanceType.TIME reaches this, and nothing in production asks
     for it: the live estimate is a relative score whose scale the fitted
-    ratios own (A5).  Its precision_bytes**2 * 1e12 is no device's rate,
+    ratios own.  Its precision_bytes**2 * 1e12 is no device's rate,
     4 TFLOP/s at bf16, and no other rate prices a candidate's parts: the
     one ND states, a host link's sustained_tflops, only turns an offload
     copy's seconds into the score's units where no fitted ratio does.
@@ -943,7 +943,7 @@ def _stage_parts(cfg, ccfg, stages, device_type, debugger):
 
 
 def _submodule_parts(cfg, ccfg, device_type, debugger):
-    """A multimodal model's per-stage parts, every submodule's summed (F2).
+    """A multimodal model's per-stage parts, every submodule's summed.
 
     The submodules of a vision-language model run on one pipeline, so a
     stage's time is the work of the layers on it, whichever submodule they

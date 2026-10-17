@@ -765,7 +765,7 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(global_config.bool_space(Dim.SP), [False, True])
         self.assertEqual(global_config.max_op(dp=4, tp=2, ep=1), 4)
         # HyperParallel's shard spans DP x CP, so under CP it reaches that
-        # domain; a legacy schema's stays within DP (C1).
+        # domain; a legacy schema's stays within DP.
         got = []
         for spans in (True, False):
             fake_ccfg.shard_spans_cp = spans
@@ -1650,6 +1650,34 @@ class TestSappNDRunND(unittest.TestCase):
                 with open(os.path.join(tmp_dir, name), encoding="utf-8") as handle:
                     self.assertEqual(handle.read(), first.column_titles() + "".join(r.values() for r in rows))
 
+    def test_a_run_starts_its_debug_csvs_afresh_and_its_workers_append(self) -> None:
+        """
+        Feature: Debug.set_output_dir.
+        Description: An earlier run left debug.csv and debug_mem.csv in the output folder, beside
+            another file. A new run sets the folder with fresh=True and writes a row, then a pool
+            worker sets the same folder without it.
+        Expectation: The run removes the two CSVs and nothing else, so its row sits under new
+            column titles, and the worker's call keeps what the run wrote.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 2), (Dim.MBS, 4)], all_dims=[Dim.DP, Dim.MBS])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for name in (*Debug.DEBUG_CSVS, "resolved.yaml"):
+                with open(os.path.join(tmp_dir, name), "w", encoding="utf-8") as handle:
+                    handle.write("from an earlier run\n")
+            try:
+                Debug.set_output_dir(tmp_dir, fresh=True)
+                left = sorted(os.listdir(tmp_dir))
+                debug = Debug.Debug(dims, [Debug.PerfParts.TOTAL])
+                debug.info[Debug.PerfParts.TOTAL] = 9
+                debug.write()
+                Debug.set_output_dir(tmp_dir)
+                with open(os.path.join(tmp_dir, "debug.csv"), encoding="utf-8") as handle:
+                    written = handle.read()
+            finally:
+                Debug.set_output_dir(None)
+        self.assertEqual(left, ["resolved.yaml"], f"files left by a fresh start: {left}")
+        self.assertEqual(written, debug.column_titles() + debug.values(), f"debug.csv after the run: {written!r}")
+
     def test_debug_csv_and_correlation_helpers(self) -> None:
         """
         Feature: TestSappNDRunND.
@@ -2183,6 +2211,95 @@ class TestSappNDRunND(unittest.TestCase):
             plt.close(figure)
         self.assertEqual(plot.cell_text, [["8"], ["True"], [128]])
 
+    def test_the_plot_states_the_recompute_mode_and_the_plan_per_layer(self) -> None:
+        """
+        Feature: ND's plot of a search that chose a recompute mode per layer.
+        Description: One configuration whose plan fully recomputes every
+            layer but its last five, then the same plot without a plan, then
+            a configuration of a search with a recompute dimension.
+        Expectation: The table gains a mode row and a plan row, the mode in
+            capitals and the plan as the trainer's yaml states it; without a
+            plan neither row is drawn; a configuration that states a mode of
+            its own shows the mode row alone.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP])
+        configs = [(dims, 128, 10.0, [10.0])]
+        drawn = []
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Debug.Plot, "make_table",
+                             lambda self: drawn.append((list(self.row_title), list(self.cell_text)))), \
+                patch.object(Debug.Plot, "close", lambda self, output_path, filename: None):
+            Debug.plot_nd(configs, tmp_dir, [Debug.PerfParts.FW_COMPUTE],
+                          recompute_plans={dims: ("full", {"3-7": "off"})})
+            Debug.plot_nd(configs, tmp_dir, [Debug.PerfParts.FW_COMPUTE])
+            searched = Dim.Dimensions([(Dim.DP, 8), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP],
+                                      recompute="selective")
+            Debug.plot_nd([(searched, 128, 10.0, [10.0])], tmp_dir, [Debug.PerfParts.FW_COMPUTE])
+        plt.close("all")
+        self.assertEqual([str(row) for row in drawn[0][0]],
+                         ["TOP", "DP", "PP", Debug.MODE_ROW, Debug.LAYER_ROW, "MEM"])
+        self.assertEqual(drawn[0][1], [[1, "8", "2", "FULL", "3-7: 'off'", 128]])
+        self.assertEqual([str(row) for row in drawn[1][0]], ["TOP", "DP", "PP", "MEM"])
+        self.assertEqual(drawn[1][1], [[1, "8", "2", 128]])
+        self.assertEqual([str(row) for row in drawn[2][0]], ["TOP", "DP", "PP", Debug.MODE_ROW, "MEM"])
+        self.assertEqual(drawn[2][1], [[1, "8", "2", "SELECTIVE", 128]])
+
+    def test_the_degree_table_is_drawn_with_a_plan_of_several_lines(self) -> None:
+        """
+        Feature: the degree table under ND's plot of a search.
+        Description: A plan naming two ranges, which the plan row states on
+            one line each.
+        Expectation: The table is drawn, the plan row holding both lines.
+        """
+        dims = Dim.Dimensions([(Dim.DP, 8), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP])
+        plot = Debug.Plot("unit", dims.keys(), [Debug.PerfParts.FW_COMPUTE])
+        plot.row_title.insert(-1, Debug.MODE_ROW)
+        plot.row_title.insert(-1, Debug.LAYER_ROW)
+        plot.parse_data([(dims, 128, 10.0, [10.0])],
+                        recompute_plans={dims: ("full", {"0": "selective", "3-7": "off"})})
+        figure = plt.figure()
+        try:
+            plot.make_table()
+        finally:
+            plt.close(figure)
+        self.assertEqual(plot.cell_text[-3], ["FULL"])
+        self.assertEqual(plot.cell_text[-2], ["'0': selective\n3-7: 'off'"])
+
+    def test_the_recompute_plot_is_written_for_every_configuration(self) -> None:
+        """
+        Feature: Debug.plot_recompute.
+        Description: Two configurations, the first with two plans and the
+            second with none, then an empty selection, a non-positive page
+            size and a record missing a score component.
+        Expectation: A PDF is written for the configurations; nothing is
+            written for an empty selection, and the other two are refused.
+        """
+        parts = [Debug.PerfParts.FW_COMPUTE, Debug.PerfParts.DP_COMM]
+        first = Dim.Dimensions([(Dim.DP, 8), (Dim.PP, 2)], all_dims=[Dim.DP, Dim.PP])
+        second = Dim.Dimensions([(Dim.DP, 4), (Dim.PP, 4)], all_dims=[Dim.DP, Dim.PP])
+        first.rank, second.rank = 1, 2
+        records = [
+            {"score": 10.0, "parts": (6.0, 4.0), "memory": 1024.0, "mode": "full",
+             "layers": {"3-7": "off"}, "full_layers": 3},
+            {"score": 11.0, "parts": (7.0, 4.0), "memory": 1000.0, "mode": "full",
+             "layers": {}, "full_layers": 8},
+        ]
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                Debug.plot_recompute([(first, records), (second, [])], tmp_dir, parts, "recompute",
+                                     title="unit", columns_per_page=1)
+                written = os.path.join(tmp_dir, "recompute.pdf")
+                self.assertTrue(os.path.isfile(written))
+                self.assertGreater(os.path.getsize(written), 1000)
+                Debug.plot_recompute([], tmp_dir, parts, "empty")
+                self.assertFalse(os.path.exists(os.path.join(tmp_dir, "empty.pdf")))
+                with self.assertRaises(ValueError):
+                    Debug.plot_recompute([(first, records)], tmp_dir, parts, "bad", columns_per_page=0)
+                with self.assertRaises(ValueError):
+                    Debug.plot_recompute([(first, [dict(records[0], parts=(6.0,))])], tmp_dir, parts, "short")
+        finally:
+            plt.close("all")
+
     def test_the_ranking_keeps_nd_order_and_every_digit(self) -> None:
         """
         Feature: the CSV of a search's configurations in ND's order.
@@ -2265,6 +2382,51 @@ class TestSappNDRunND(unittest.TestCase):
                 self.assertEqual(run_kwargs["force_exhaustive"], force_exhaustive)
                 self.assertEqual(run_kwargs["fforce_exhaustive"], fforce_exhaustive)
 
+    def test_run_nd_cli_asks_for_the_recompute_potentials_only_when_told_to(self) -> None:
+        """
+        Feature: run_nd -rp/--recompute_potentials.
+        Description: The CLI search on a fake Parallelize, with the short and
+            the long form of the flag and without it.
+        Expectation: The search is asked for the report only with the flag,
+            so a plain search does none of that work.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            argv = ["run_nd.py", "-y", config_path, "-d", "8", "-v", "2", "-ar", "--recompute", "off", "full"]
+            for extra, expected in (([], False), (["-rp"], True), (["--recompute_potentials"], True)):
+                with patch.object(sys, "argv", argv + extra):
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                run_kwargs = _FakeParallelize.instances[-1].last_run_kwargs()
+                self.assertEqual(run_kwargs["recompute_potentials"], expected)
+
+    def test_run_nd_cli_refuses_the_recompute_potentials_without_a_plan_per_layer(self) -> None:
+        """
+        Feature: run_nd -rp/--recompute_potentials.
+        Description: The flag without -ar, without the modes each layer
+            chooses among, below the verbosity that writes files, and with
+            --real_csv.
+        Expectation: Each is refused, rather than running a longer search
+            that writes nothing or extends a plan that does not exist.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            real_csv = os.path.join(tmp_dir, "real.csv")
+            with open(real_csv, "w", encoding="utf-8") as handle:
+                handle.write("DP,time\n8,100\n")
+            refused = [
+                ["-rp", "--recompute", "off", "full"],
+                ["-rp", "-ar"],
+                ["-rp", "-ar", "--recompute", "off", "full", "-v", "1"],
+                ["-rp", "-ar", "--recompute", "off", "full", "--real_csv", real_csv],
+            ]
+            for extra in refused:
+                argv = ["run_nd.py", "-y", config_path, "-d", "8", "-v", "2"] + extra
+                with patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as refusal:
+                    runpy.run_module("hyper_parallel.auto_parallel.sapp_nd.nd.run_nd", run_name="__main__")
+                self.assertEqual(refusal.exception.code, 2, extra)
+
     def test_run_nd_cli_passes_the_ranking_path_to_the_search(self) -> None:
         """
         Feature: run_nd --ranking_csv.
@@ -2283,7 +2445,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_field_no_parser_set_is_reported_or_refused(self) -> None:
         """
-        Feature: CostModelConfig.__getattr__, unset_reads_report and run_nd --strict (I9).
+        Feature: CostModelConfig.__getattr__, unset_reads_report and run_nd --strict.
         Description: A config no parser filled, read directly for an op count
             twice and for its hooks, then through getattr with a default, with
             and without the strict mode run_nd --strict sets.
@@ -2362,14 +2524,9 @@ class TestSappNDRunND(unittest.TestCase):
         ArchHooks.apply_layer_kind(deepseek_wrap, deepseek_groups[1][0])
         self.assertEqual(deepseek_cfg.n_exp, 4)
 
-        cm_cfg = _make_arch_cfg(arch="cm")
-        ArchHooks.apply_family(cm_cfg)
-        self.assertEqual(cm_cfg.layer_fields,
-                         {"shard_p_os_exp": 2, "shard_p_os_non_exp_partial": 2, "shard_embed": 2})
-
     def test_t5_states_the_tp_gathers_its_embedding_and_output_run(self) -> None:
         """
-        Feature: apply_family on t5, the model's own config (I15).
+        Feature: apply_family on t5, the model's own config.
         Description: A T5 config through its family, then each kind of its
             stack applied in turn.
         Expectation: The model states the 4 TP gathers of its default kind,
@@ -3100,7 +3257,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_the_search_states_its_machines_links(self) -> None:
         """
-        Feature: state_machine_links (B5).
+        Feature: state_machine_links.
         Description: A config and a multimodal one with a submodule, given
             the A3 machine, then a config given no machine.
         Expectation: Each config takes A3's 16 ranks a node and its 200 and
@@ -3119,7 +3276,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_strategy_keeps_the_runs_sequence_parallelism(self) -> None:
         """
-        Feature: CostModelConfig.set_strategy, the sequence-parallel divisor (T1).
+        Feature: CostModelConfig.set_strategy, the sequence-parallel divisor.
         Description: The DeepSeek MindFormers yaml at TP 4 without sequence
             parallelism and with it, each moved to TP 2; then a searched
             candidate at TP 2 stating SP off and on.
@@ -3274,7 +3431,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_candidate_carries_the_searchs_micro_batch_count(self) -> None:
         """
-        Feature: GlobalConfig.make_parallel_config, the micro-batch count (M6).
+        Feature: GlobalConfig.make_parallel_config, the micro-batch count.
         Description: A config at DP 2, PP 2, micro-batches of 4 and two of
             them, searched over EP and OP alone, so -l names neither MB nor PP,
             given a candidate whose loop counted four micro-batches.
@@ -3293,7 +3450,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_search_no_candidate_of_which_makes_the_batch_stops_with_one_line(self) -> None:
         """
-        Feature: ParallelizeLayer.batch_reachable (M6).
+        Feature: ParallelizeLayer.batch_reachable.
         Description: 64 devices searched over EP and OP alone, so every
             candidate is DP 64 with micro-batches of 1, for a batch of 16, then
             of 128.
@@ -3323,7 +3480,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_ranking_priced_at_a_length_nobody_stated_says_so_under_its_table(self) -> None:
         """
-        Feature: ParallelizeLayer.run_generation_to_ordering, the sequence length (I11).
+        Feature: ParallelizeLayer.run_generation_to_ordering, the sequence length.
         Description: A search over one configuration of a model whose config
             states no training length, so the parser costed its context
             limit of 32768; then the same model with a stated length.
@@ -3349,7 +3506,7 @@ class TestSappNDRunND(unittest.TestCase):
                 self.assertEqual(len(lines), said)
                 if said:
                     self.assertIn("priced at 32768 tokens", lines[0])
-        # A field the estimate read unset is named under the table too (I9).
+        # A field the estimate read unset is named under the table too.
         reads = PreProcess.defaultdict(PreProcess.Counter, {"n_gather": PreProcess.Counter({"comm.py:tp": 2})})
         with patch.object(PreProcess, "UNSET_READS", reads), patch.object(Par.logger, "output") as output:
             runner.run_generation_to_ordering(None)
@@ -3357,7 +3514,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_ranking_says_when_it_prices_another_recompute_than_the_runs(self) -> None:
         """
-        Feature: ParallelizeLayer.run_generation_to_ordering, the run's recompute (H1).
+        Feature: ParallelizeLayer.run_generation_to_ordering, the run's recompute.
         Description: A search whose balancing gives every candidate full
             recompute, for a run training selective, off and full; then the
             selective run searched with -mppb, over a recompute dimension,
@@ -3395,7 +3552,7 @@ class TestSappNDRunND(unittest.TestCase):
 
     def test_a_ranking_names_the_mtp_layers_it_does_not_price(self) -> None:
         """
-        Feature: ParallelizeLayer.run_generation_to_ordering, a dropped MTP depth (I2).
+        Feature: ParallelizeLayer.run_generation_to_ordering, a dropped MTP depth.
         Description: A search over one configuration of a model stating 3 MTP
             layers the AutoModels trainer does not build, then of one stating
             none.

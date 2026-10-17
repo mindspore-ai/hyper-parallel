@@ -159,7 +159,7 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         if is_auto_models_schema(self.config):
             # A stated depth looked priced and was not, and nothing said so
-            # (I2): a search repeats this under its ranking.
+            #: a search repeats this under its ranking.
             self.ccfg.mtp_unpriced = self._spec_int(spec, "mtp_depth")
             if self.ccfg.mtp_unpriced:
                 logger.warning(
@@ -478,7 +478,7 @@ class CostModelParserHyperV2(_CostModelParser):
             self._get_cfg_attr(self._config_overrides(), "seq_length", 0) or 0
         )
         stated = self._dataset_seq_len()
-        # The ranking says so beside its table, where a reader looks (I11).
+        # The ranking says so beside its table, where a reader looks.
         self.ccfg.seq_len_stated = bool(stated)
         if not stated:
             # The fallback is the model's context limit, orders of magnitude
@@ -677,7 +677,7 @@ class CostModelParserHyperV2(_CostModelParser):
         count its caller states (``run_nd -d``), as the runtime takes the
         world size its launcher gives it.  Read from ``dp_shard_size`` alone,
         a one-node yaml searched on more devices kept its one node's degree,
-        and its micro-batch count with it, in every candidate (M6).
+        and its micro-batch count with it, in every candidate.
 
         Args:
             dp_replicate: The replicate degree the config states.
@@ -863,12 +863,12 @@ class CostModelParserHyperV2(_CostModelParser):
         ``model.torch_dtype`` where the section states one other than
         ``auto``; else, in a legacy config, the legacy *legacy_key*
         (``param_init_type`` for the parameters, ``compute_dtype`` for the
-        compute), which the AutoModels trainer does not read (D17); else the
+        compute), which the AutoModels trainer does not read; else the
         dtype the spec states, which is the checkpoint's own, as the runtime
         loads the weights under its default ``auto``; else bfloat16
         (``_init_bytes`` warns).  A model stating none was priced in float32
         parameters doing bfloat16 arithmetic, where the runtime loads its
-        checkpoint's, mostly two bytes (I12).
+        checkpoint's, mostly two bytes.
         """
         model_raw = self._get_cfg_attr(self.config, "model", Config({}))
         stated = self._get_cfg_attr(model_raw, "torch_dtype", None)
@@ -899,14 +899,14 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         # Read as the trainer reads it: an unquoted off, which YAML reads as
         # False, is off rather than a fall through to the legacy key, and a
-        # name that is no mode is refused rather than priced as off (I13).
+        # name that is no mode is refused rather than priced as off.
         stated, where = self._get_cfg_attr(activation_checkpoint, "mode", None), "activation_checkpoint.mode"
         if stated is None:
             stated = self._get_cfg_attr(gc, "activation_checkpoint", None)
             where = "train.gradient_checkpointing.activation_checkpoint"
         ac_mode = read_activation_checkpoint_mode(stated, where)
         # The mode the run trains with, which a search deriving its own
-        # recompute names under its ranking where the two differ (H1).
+        # recompute names under its ranking where the two differ.
         overridden = full_rec_override is not None or sel_rec_override is not None
         self.ccfg.stated_ac_mode = None if overridden else ac_mode
         return {
@@ -922,7 +922,7 @@ class CostModelParserHyperV2(_CostModelParser):
         weights are loaded, so it outranks ``model.torch_dtype`` for the
         stored parameters but not an explicit FSDP ``param_dtype``, and the
         run computes in the same width: FSDP gathers each parameter in its
-        ``param_dtype``, else in the width it is kept in (D17).  Where
+        ``param_dtype``, else in the width it is kept in.  Where
         nothing states a dtype, the checkpoint's own is taken
         (:meth:`_model_dtype`), and bfloat16 with a warning where there is
         no checkpoint either.

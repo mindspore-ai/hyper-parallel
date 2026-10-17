@@ -62,7 +62,7 @@ class _CostModelParser(ABC):
         says so: the HyperParallel parser named one silently and charged its
         two states, which a Muon run described without its optimizer does
         not keep, and the MindFormers parser failed on the missing section
-        (M3). The name is what the state count is read from (M5).
+. The name is what the state count is read from.
 
         Returns:
             The optimizer's name and the states it keeps a parameter.

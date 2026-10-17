@@ -985,7 +985,7 @@ class TestExpertDataParallelGroup(unittest.TestCase):
             derive_expert_degrees(ccfg)
 
     def test_context_parallel_ranks_reduce_an_experts_gradient(self):
-        """An expert's gradient is reduced over CP's ranks too (X3).
+        """An expert's gradient is reduced over CP's ranks too.
 
         On 64 ranks with an optimizer shard: at CP 2, DP 32 and EP 32 leave
         one DP rank over EP, but the two CP ranks hold the same experts and

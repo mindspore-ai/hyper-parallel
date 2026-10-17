@@ -60,10 +60,10 @@ class TestProfiles(unittest.TestCase):
     """Every family's op counts are a file, and every file is a valid vector."""
 
     def test_the_families(self):
-        """The seven families the arch hooks knew, Qwen3.5, the default and the tower."""
+        """Six families the arch hooks knew, Qwen3.5, the default and the tower."""
         self.assertEqual(set(known_archs()), {
             "default", "llama2", "mixtral", "t5", "pangualpha",
-            "deepseek", "qwen", "qwen3_5", "cm", "vision",
+            "deepseek", "qwen", "qwen3_5", "vision",
         })
 
     def test_every_profile_loads(self):
@@ -128,14 +128,14 @@ class TestKindsAndFlavours(unittest.TestCase):
         Feature: attention flavour.
         Description: Only Qwen3.5's linear-attention kind declares linear attention.
         Expectation: Every other kind is full attention, and every kind but
-            DeepSeek's and cm's keeps the model's feed-forward.
+            DeepSeek's keeps the model's feed-forward.
         """
         for arch in known_archs():
             for kind in load_op_profile(arch).layer_kinds.values():
                 with self.subTest(arch=arch, kind=kind.name):
                     linear = (arch, kind.name) == ("qwen3_5", "linear_attention")
                     self.assertEqual(kind.attention, "linear" if linear else "full")
-                    if arch not in ("deepseek", "cm"):
+                    if arch != "deepseek":
                         self.assertIsNone(kind.ffn)
 
     def test_qwen3_5_linear_layers_keep_no_score_matrix(self):
@@ -158,7 +158,7 @@ class TestKindsAndFlavours(unittest.TestCase):
         Feature: default kind.
         Description: A family with one kind, and t5 with two.
         Expectation: The one kind, and the encoder t5 names, whose TP
-            gathers the model's embedding and output layer run (I15).
+            gathers the model's embedding and output layer run.
         """
         self.assertEqual(load_op_profile("qwen").default, "decoder")
         self.assertEqual(load_op_profile("t5").default, "encoder")
@@ -197,7 +197,7 @@ class TestFamilyDefaults(unittest.TestCase):
         Description: The byte widths, gradient accumulation and activation
             sharding the family hooks set in code, and DeepSeek's head width.
         Expectation: Each profile states its own over DEFAULT_RUN, and only
-            the MLA families a model default.
+            the MLA family a model default.
         """
         runs = {
             "llama2": {"grad_bytes": 2, "grad_accumulation": True},
@@ -207,7 +207,7 @@ class TestFamilyDefaults(unittest.TestCase):
             "qwen": {"shard_activations": True},
             "qwen3_5": {"shard_activations": True},
         }
-        models = {"deepseek": {"v_head_dim": 128}, "cm": {"v_head_dim": 128}}
+        models = {"deepseek": {"v_head_dim": 128}}
         for arch in known_archs():
             with self.subTest(arch=arch):
                 profile = load_op_profile(arch)
@@ -271,7 +271,6 @@ class TestInferArch(unittest.TestCase):
             "llama2_7b": "llama2",
             "pangualpha_2_6b": "pangualpha",
             "t5_small": "t5",
-            "cm_llama_moe": "cm",
         }
         for name, arch in cases.items():
             with self.subTest(name=name):
@@ -279,14 +278,14 @@ class TestInferArch(unittest.TestCase):
 
     def test_the_family_a_name_opens_with_wins(self):
         """A name holding two families takes the one it opens with, and one
-        holding a family's letters further in takes none (I8): matched
+        holding a family's letters further in takes none: matched
         anywhere, in list order, qwen2_deepseek_distill took DeepSeek's and
-        acme_lm took cm's."""
+        acme_t5 took t5's."""
         self.assertEqual(infer_arch("deepseek_qwen_distill"), "deepseek")
         self.assertEqual(infer_arch("qwen2_deepseek_distill"), "qwen")
         self.assertEqual(infer_arch("llama2_t5_hybrid"), "llama2")
         with patch.object(_op_profiles, "_DEFAULTED_NAMES", set()):
-            self.assertEqual(infer_arch("acme_lm"), DEFAULT_ARCH)
+            self.assertEqual(infer_arch("acme_t5"), DEFAULT_ARCH)
 
     def test_no_match_is_the_default_and_says_so_once(self):
         """A name nothing claims is priced as the default, with one warning a name."""

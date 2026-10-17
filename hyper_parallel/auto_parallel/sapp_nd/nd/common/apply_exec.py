@@ -232,7 +232,7 @@ def strategy_exec(ccfg: Any, strategy: Mapping[str, Any]) -> ExecSpec:
         stated["optimizer_parallel"] = op > 1
     # Every candidate ran sequence parallelism, so a run without it had the
     # activations TP does not shard divided by TP all the same, and a search
-    # over SP priced its twins alike (T1).
+    # over SP priced its twins alike.
     sp = strategy.get("sp")
     run_sp = getattr(ccfg, "sequence_parallel", None)
     stated["sequence_parallel"] = bool(sp) if sp is not None else run_sp is None or bool(run_sp)

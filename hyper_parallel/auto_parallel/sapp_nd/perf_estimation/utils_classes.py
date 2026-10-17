@@ -32,13 +32,13 @@ class PerformanceType(Enum):
     and ranks strategies by it, and the ratios fitted on a measured round
     turn the parts into milliseconds, so no rate and no device peak prices
     a part (a host link's sustained_tflops only converts an offload copy
-    where no ratio does).  That is a decision rather than a gap (register A5):
+    where no ratio does).  That is a decision rather than a gap:
     ND stays a relative scorer while it can.  TIME, which would divide by a
     device's rates, has no production caller.
     """
 
     FLOP = auto()
-    TIME = auto()  # no production caller: ND is a relative scorer (A5)
+    TIME = auto()  # no production caller: ND is a relative scorer
 
 
 class P2PCommType(Enum):

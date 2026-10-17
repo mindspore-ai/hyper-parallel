@@ -121,7 +121,7 @@ class TestSharedExpertDerivation(unittest.TestCase):
 
     def test_a_model_stated_by_hand_is_derived_as_a_resolved_one(self) -> None:
         """
-        Feature: resolve_hf_model_spec on a model its section states by hand (I1).
+        Feature: resolve_hf_model_spec on a model its section states by hand.
         Description: An all-MoE model, experts 256 wide and one shared
             expert 512 wide, stated in config_overrides with no checkpoint,
             and the same model whose checkpoint cannot be resolved.
@@ -144,7 +144,7 @@ class TestSharedExpertDerivation(unittest.TestCase):
 
     def test_the_checkpoints_dtype_is_read_by_name(self) -> None:
         """
-        Feature: resolve_hf_model_spec, the checkpoint's dtype (I12).
+        Feature: resolve_hf_model_spec, the checkpoint's dtype.
         Description: A checkpoint whose config holds its dtype as torch's
             bfloat16, as newer Transformers state it under dtype, resolved
             with no torch_dtype in the section, with auto, and with float32.

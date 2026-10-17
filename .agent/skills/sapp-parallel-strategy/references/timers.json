@@ -1,0 +1,34 @@
+{
+  "_about": "How a template's layouts are timed on a cluster, for scripts/launch.py and scripts/readback.py. script times the layouts named in POINTS from the root of a checkout and writes runs.csv and steps.csv under RUN_ROOT; preflight checks a node before a round without launching anything; launcher is the trainer yaml the script reads, which must state what ND priced apart from the fields the script sets for each run (sets) and those it takes from the node's own files (node_paths); dies is the world it launches; varies names the degrees POINTS sets, in ND's column names, written as colon-separated values; fixed are the degrees it always launches; train_iters is the steps a run takes; seconds_a_run and repeats come from the rounds in timed; model_glob finds the model's directory on the node; timed lists the folders of rounds already timed, under references/. A template with no record here gets its trainer yamls and no command.",
+  "deepseek_v41/a3": {
+    "script": "examples/training_demo/deepseek_v41/repeat_deepseek_v41_runs.sh",
+    "preflight": "examples/training_demo/deepseek_v41/preflight_deepseek_v41_window.sh",
+    "launcher": "examples/training_demo/deepseek_v41/nd_train_deepseek_v41_timing.yaml",
+    "dies": 16,
+    "varies": ["EP", "OP"],
+    "fixed": {"MP": "1", "CP": "1", "PP": "1", "VPP": "1"},
+    "sets": [
+      "accelerator.tp_size",
+      "accelerator.cp_size",
+      "accelerator.pp_size",
+      "accelerator.ep_size",
+      "fsdp_config.dp_shard_size",
+      "fsdp_config.edp_shard_size",
+      "training.global_batch_size",
+      "training.micro_batch_size",
+      "training.train_iters",
+      "profiling.enabled"
+    ],
+    "node_paths": [
+      "model.config_path",
+      "model.engram_assets_path",
+      "dataset.model_assets.tokenizer.pretrained_model_name_or_path",
+      "dataset.data_path"
+    ],
+    "train_iters": 6,
+    "seconds_a_run": 84,
+    "repeats": 3,
+    "model_glob": "*deepseek*",
+    "timed": ["timed/deepseek_v41_a3"]
+  }
+}

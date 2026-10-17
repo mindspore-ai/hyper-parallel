@@ -31,6 +31,7 @@ from unittest.mock import patch
 import yaml
 
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
+import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 from hyper_parallel.auto_parallel import _hf_model_spec
 from hyper_parallel.auto_parallel._exec_spec import RECOMPUTE_OPS, ExecSpec, RecomputeRange
@@ -64,6 +65,9 @@ from hyper_parallel.auto_parallel.sapp_nd.recompute.profile import SWITCHES
 DEEPSEEK_YAML = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "nd", "deepseek.yaml"
 )
+
+# The parallel degrees a fixed analysis reports on each of its alternatives.
+_DEGREES = (("DP", 4), ("TP", 2), ("PP", 2), ("EP", 2))
 
 # A dense model, from its config overrides alone, at TP 4 and PP 2.
 _DENSE = {
@@ -902,23 +906,39 @@ class TestOffloadWindow(unittest.TestCase):
     def test_the_copies_cost_time_and_only_what_the_stage_needs_moves(self):
         """
         Feature: the choice of a stage whose first layers may offload, the copies costing time.
-        Description: The three layers in 7.5 MB, a link that carries 2 MB in
+        Description: The three layers in 8 MB, a link that carries 2 MB in
             the two forwards after the first, and copies that cost 0.1 a MB
             moved; then 0.3 a MB.
         Expectation: At 0.1 the first layer runs plain and offloads only the
-            1.5 MB the stage needs to fit, its time 3 and 0.1 for each MB out
-            and back, 3.3, and the stage fills its 7.5 MB. At 0.3 the 2 MB
+            1 MB the stage needs to fit, its time 3 and 0.1 for each MB out
+            and back, 3.2, and the stage fills its 8 MB. At 0.3 the 2 MB
             the third layer's plain run needs cost 1.2, more than the 1 it
             saves, and nothing offloads.
         """
-        chosen, transit = self._offload_stage(3, 7.5, 1.0, cost=0.1)
+        chosen, transit = self._offload_stage(3, 8, 1.0, cost=0.1)
         self.assertEqual(transit, 0.0)
-        self.assertEqual(chosen[0].link_bandwidth, 1.5 * MEGABYTE)
-        self.assertAlmostEqual(chosen[0].forward_time + chosen[0].backward_time, 3.3)
+        self.assertEqual(chosen[0].link_bandwidth, 1 * MEGABYTE)
+        self.assertAlmostEqual(chosen[0].forward_time + chosen[0].backward_time, 3.2)
         self.assertEqual([chosen[index].recompute for index in range(3)], [frozenset(), None, frozenset()])
-        self.assertEqual(sum(chosen[index].memory(1) for index in range(3)), 7.5 * MEGABYTE)
-        chosen, _ = self._offload_stage(3, 7.5, 1.0, cost=0.3)
+        self.assertEqual(sum(chosen[index].memory(1) for index in range(3)), 8 * MEGABYTE)
+        chosen, _ = self._offload_stage(3, 8, 1.0, cost=0.3)
         self.assertFalse(any(option.link_bandwidth for option in chosen.values()))
+
+    def test_a_budget_of_a_fraction_of_a_megabyte_is_filled_to_its_whole_megabytes(self):
+        """
+        Feature: the choice of a stage whose first layers may offload, the copies costing time.
+        Description: The three layers in 7.5 MB, with copies that cost 0.1 a
+            MB moved, so the stage gives back what it does not need.
+        Expectation: The stage keeps 7 MB, the whole megabytes of its budget,
+            and offloads the 2 MB that takes: filled to the byte, it would
+            keep 7.5 MB, which a result reported in whole megabytes reads as
+            8, over the budget its own fit check accepted.
+        """
+        chosen, _ = self._offload_stage(3, 7.5, 1.0, cost=0.1)
+        kept = sum(chosen[index].memory(1) for index in range(3))
+        self.assertEqual(kept, 7 * MEGABYTE, f"kept {kept / MEGABYTE} MB in a 7.5 MB budget")
+        self.assertEqual(chosen[0].link_bandwidth, 2 * MEGABYTE,
+                         f"offloaded {chosen[0].link_bandwidth / MEGABYTE} MB, expected 2")
 
     def test_a_layer_offloads_the_part_its_window_carries(self):
         """
@@ -1336,6 +1356,117 @@ class TestOneMode(unittest.TestCase):
             self.assertEqual(whole_modes(configs(()), modes, None), modes)
 
 
+class TestRecomputeAnalysis(unittest.TestCase):
+    """The plans one more fully recomputed layer reaches, at one fixed strategy."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Seven DeepSeek layers over two stages."""
+        cls.folder = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        cls.path = _small_deepseek(cls.folder.name, 1)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        """Remove the config."""
+        cls.folder.cleanup()
+
+    def _tight(self) -> Tuple[EvaluatorV2, float]:
+        """An evaluator whose plain stages a little overfill the device, and that capacity in MB."""
+        evaluator = EvaluatorV2(self.path, framework="mindformers", log_level=0)
+        capacity = max(_stage_peaks(evaluator, full_rec=False)) - 64
+        _with_capacity(evaluator, capacity)
+        return evaluator, capacity
+
+    def _analysis(self, evaluator: EvaluatorV2) -> Candidate.RecomputeAnalysis:
+        """An analysis of *evaluator*'s strategy, choosing between off and full."""
+        return Candidate.RecomputeAnalysis(evaluator, Hard.Device_A2, ("off", "full"), dimensions=_DEGREES)
+
+    def test_every_alternative_recomputes_one_more_layer_and_fits(self):
+        """
+        Feature: RecomputeAnalysis.alternatives.
+        Description: A plan per layer on a device the plain stages overfill.
+        Expectation: Each alternative keeps the plan's kinds and degrees,
+            runs exactly one more layer full, fits the device and carries no
+            score, which only a caller's estimate gives it.
+        """
+        evaluator, capacity = self._tight()
+        plan = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"), per_layer=True)
+        fulls = sum(item.count for item in plan.ranges if item.mode == "full")
+        results = self._analysis(evaluator).alternatives(plan)
+        self.assertTrue(results)
+        for result in results:
+            self.assertIsNone(result.score)
+            self.assertIsNone(result.mode)
+            self.assertEqual(result.dimensions, _DEGREES)
+            self.assertEqual(sum(item.count for item in result.ranges if item.mode == "full"), fulls + 1)
+            self.assertEqual(sum(item.count for item in result.ranges), sum(item.count for item in plan.ranges))
+            self.assertLessEqual(result.memory, capacity)
+            self.assertLessEqual(result.memory, plan.memory)
+
+    def test_equivalent_layers_give_one_alternative_each(self):
+        """
+        Feature: RecomputeAnalysis.alternatives.
+        Description: The same plan, whose stages hold several layers of one kind.
+        Expectation: Swapping which of a group's layers runs full gives one
+            alternative, so there are fewer of them than there are layers
+            still to turn up, and no two state the same plan.
+        """
+        evaluator, _ = self._tight()
+        plan = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"), per_layer=True)
+        off_layers = sum(item.count for item in plan.ranges if item.mode != "full")
+        results = self._analysis(evaluator).alternatives(plan)
+        plans = [tuple(sorted((item.first, item.count, item.mode) for item in result.ranges))
+                 for result in results]
+        self.assertEqual(len(plans), len(set(plans)))
+        self.assertLess(len(results), off_layers)
+
+    def test_a_plan_of_one_mode_for_every_layer_has_no_alternative(self):
+        """
+        Feature: RecomputeAnalysis.alternatives.
+        Description: A choice of one mode for the whole model.
+        Expectation: No alternative: the analysis extends a plan per layer.
+        """
+        evaluator, _ = self._tight()
+        whole = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"))
+        self.assertIsNotNone(whole.mode)
+        self.assertEqual(self._analysis(evaluator).alternatives(whole), [])
+
+    def test_a_plan_of_other_degrees_or_other_layers_is_refused(self):
+        """
+        Feature: RecomputeAnalysis.alternatives.
+        Description: A plan priced at other degrees, one leaving a body layer
+            out, and one naming a layer twice.
+        Expectation: Each is refused rather than silently scored against the
+            wrong strategy or the wrong model.
+        """
+        evaluator, _ = self._tight()
+        analysis = self._analysis(evaluator)
+        plan = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"), per_layer=True)
+        with self.assertRaises(ValueError):
+            analysis.alternatives(dataclasses.replace(plan, dimensions=(("DP", 8),)))
+        with self.assertRaises(ValueError):
+            analysis.alternatives(dataclasses.replace(plan, ranges=plan.ranges[:-1]))
+        with self.assertRaises(ValueError):
+            analysis.alternatives(dataclasses.replace(plan, ranges=plan.ranges + (plan.ranges[0],)))
+
+    def test_the_analysis_refuses_modes_it_cannot_price(self):
+        """
+        Feature: RecomputeAnalysis.
+        Description: No mode at all, a mode that is not one of MODES, and
+            modes without full.
+        Expectation: The first two are refused; without full there is
+            nothing to turn a layer up to, so the analysis offers nothing.
+        """
+        evaluator, _ = self._tight()
+        with self.assertRaises(ValueError):
+            Candidate.RecomputeAnalysis(evaluator, Hard.Device_A2, ())
+        with self.assertRaises(ValueError):
+            Candidate.RecomputeAnalysis(evaluator, Hard.Device_A2, ("off", "nonexistent"))
+        plan = choose_recompute(evaluator, Hard.Device_A2, modes=("off", "full"), per_layer=True)
+        off_only = Candidate.RecomputeAnalysis(evaluator, Hard.Device_A2, ("off",), dimensions=_DEGREES)
+        self.assertEqual(off_only.alternatives(plan), [])
+
+
 class TestNoChoice(unittest.TestCase):
     """What the choice does not cover."""
 
@@ -1426,6 +1557,32 @@ class TestDescribe(unittest.TestCase):
 
 class TestTrainerPlan(unittest.TestCase):
     """A choice of a mode per layer, as HyperParallel's trainer states it."""
+
+    def test_the_mode_is_one_that_recomputes_so_a_forced_mode_cannot_invert_the_plan(self):
+        """
+        Feature: trainer_plan.
+        Description: Plans in which a minority of the layers recompute, one
+            of them fully and one selectively; then the same plan stated the
+            other way round.
+        Expectation: The mode is the one that recomputes, and the entries
+            name the layers that do not. The trainer takes an entry equal to
+            the mode, so a runner that states the recompute mode itself, as a
+            sweep forcing its own full default does, still runs the layers
+            the plan states off. Reported the other way round, as off with
+            the recomputed layers as entries, the same run would recompute
+            every layer and invert the search's choice without a word, so
+            the plan is never written that way.
+        """
+        few_full = _per_layer((0, 1, None, "full"), (1, 7, None, "off"))
+        mode, layers = trainer_plan(few_full)
+        self.assertEqual((mode, layers), ("full", {"1-7": "off"}))
+        self.assertEqual(_plan_modes(mode, layers, 8), ["full"] + ["off"] * 7)
+        self.assertEqual(_plan_modes("full", layers, 8), ["full"] + ["off"] * 7)
+        inverted = {"0": "full"}
+        self.assertEqual(_plan_modes("off", inverted, 8), ["full"] + ["off"] * 7)
+        self.assertEqual(_plan_modes("full", inverted, 8), ["full"] * 8)
+        self.assertEqual(trainer_plan(_per_layer((0, 1, None, "selective"), (1, 7, None, "off"))),
+                         ("selective", {"1-7": "off"}))
 
     def test_the_layers_that_do_not_run_the_mode_by_range_whatever_their_kinds(self):
         """
@@ -1544,6 +1701,44 @@ class TestAutoRecomputeSearch(unittest.TestCase):
             self.assertTrue(runner.mem_eval.mem_fit(memory))
         self.assertLess(auto[0][2], full[0][2])
 
+    def test_the_potential_sequence_recomputes_one_more_layer_a_step(self):
+        """
+        Feature: ParallelizeLayer.recompute_potential_sequence.
+        Description: The best candidate of a search choosing off or full for
+            each layer, then the same search choosing one mode for the whole
+            model.
+        Expectation: The sequence starts at the candidate's own plan and
+            fully recomputes one more layer at each step, keeping its
+            degrees and fitting the device, with the cost model's estimate
+            and its parts on every step. A search that chose no plan per
+            layer refuses to extend one.
+        """
+        set_verbose_level(1)
+        for dim in Dim.ALL_DIMS:
+            dim.reset_bound()
+        runner = Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"),
+                                 dimensions=[Dim.TP, Dim.PP], auto_recompute=True,
+                                 recompute_modes=("off", "full"), recompute_mode_per_layer=True).instance
+        results, _ = runner.device_loops(({}, 0), None)
+        space = [(config, peak) for config, peak in results.items() if runner.mem_eval.mem_fit(peak)]
+        scored, _ = runner.order_search_space(space, None, None)
+        config, _, score, _ = scored[0]
+        sequence = runner.recompute_potential_sequence(config, base_score=score)
+        self.assertGreater(len(sequence), 1)
+        fulls = [sum(item.count for item in choice.ranges if item.mode == "full") for choice in sequence]
+        self.assertEqual(fulls, list(range(fulls[0], fulls[0] + len(sequence))))
+        for choice in sequence:
+            self.assertEqual(choice.dimensions, sequence[0].dimensions)
+            self.assertEqual(len(choice.score_parts), len(Debug.PerfParts) - 2)
+            self.assertIsNotNone(choice.score)
+            self.assertTrue(runner.mem_eval.mem_fit(choice.memory))
+        self.assertEqual(runner.recompute_potentials[config], sequence)
+        self.assertGreaterEqual(len(runner.recompute_results[config]), len(sequence))
+        whole = Par.Parallelize("hyper_v2", copy.deepcopy(_DENSE), Hard.Machine(8, "A2"),
+                                dimensions=[Dim.TP], auto_recompute=True).instance
+        with self.assertRaises(ValueError):
+            whole.recompute_potential_sequence(config)
+
     def test_offload_needs_a_choice_per_layer_and_takes_the_device_link(self):
         """
         Feature: ParallelizeLayer auto_offload.
@@ -1596,8 +1791,8 @@ class TestAutoRecomputeSearch(unittest.TestCase):
         Description: Order the space on a 2.5 GB device, choosing off or
             full for every layer, then for each layer. The candidates use
             the whole machine, the search holding DP at the config's own
-            (M6), and the model, stating no dtype, is held in bfloat16
-            (I12): at 2.5 GB one of them fits only fully recomputed.
+, and the model, stating no dtype, is held in bfloat16
+: at 2.5 GB one of them fits only fully recomputed.
         Expectation: The same candidates; every one gets a mode per layer,
             each range naming its mode, fits and scores no worse than with
             one mode for every layer, and one that one mode must recompute

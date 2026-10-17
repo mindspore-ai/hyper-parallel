@@ -269,7 +269,7 @@ def npu_sparse_attention_with_scalar_sink(query: torch.Tensor, key_value: torch.
     ``components/modules/shared_compressed_dsa_attention.npu_sparse_attention_with_scalar_sink``,
     whose kernel is ``omni_training_custom_ops``' and has no torch path a
     run takes: the reference beside it keeps an fp32 score of one sequence
-    by another, which is not what the run keeps (F53).
+    by another, which is not what the run keeps.
     """
     return _V41_SPARSE(query, key_value, sparse_indices, sinks, int(rope_head_dim), float(scale))
 
@@ -383,7 +383,7 @@ def _drop_fake_caches() -> None:
     mode takes (``models/qwen3*/adapter/runtime/attention.py``).  A census fills those
     caches with fake tensors, which a real call in the same process would take
     from them, so every fake tensor a model module holds in a cache keyed by
-    anything is dropped, leaving the caches as the census found them (F55).
+    anything is dropped, leaving the caches as the census found them.
     """
     for name, module in list(sys.modules.items()):
         if not name.startswith("hyper_parallel.models") or module is None:
@@ -441,7 +441,7 @@ def v41_attention_contract(rope_head_dim: int) -> Iterator[bool]:
     sequence by another where the kernel keeps nine tensors that follow the
     sequence, so measuring it prices a layer no run builds: on the
     validation crop at 4096 tokens it read 77.9 GiB a rank against a 38.5
-    GiB measured peak (F53).
+    GiB measured peak.
 
     Both names are bound to the contract for as long as the context lasts,
     so either branch of that choice reaches it.  *rope_head_dim* is the
