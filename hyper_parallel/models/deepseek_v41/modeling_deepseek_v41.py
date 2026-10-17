@@ -40,7 +40,6 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4PreTrainedModel,
     DeepseekV4RMSNorm,
     DeepseekV4RotaryEmbedding,
-    apply_rotary_pos_emb,
 )
 
 from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
@@ -56,6 +55,7 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedDSAAttention,
     SharedCompressedDSAAttentionBase,
     SharedCompressedDSAIndexer,
+    _apply_v41_rope,
 )
 from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE,
@@ -315,7 +315,7 @@ class DeepseekV41Compressor(nn.Module):
         if self.compress_ratio == 1:
             latent = self.norm(self.wkv(hidden_states))
             cos, sin = compress_position_embeddings
-            rotated = apply_rotary_pos_emb(latent.unsqueeze(1), cos, sin).squeeze(1)
+            rotated = _apply_v41_rope(latent.unsqueeze(1), cos, sin).squeeze(1)
             return latent, rotated
 
         usable = sequence_length - sequence_length % self.compress_ratio
@@ -327,7 +327,7 @@ class DeepseekV41Compressor(nn.Module):
         cos, sin = compress_position_embeddings
         cos = cos[:, :usable:self.compress_ratio]
         sin = sin[:, :usable:self.compress_ratio]
-        rotated = apply_rotary_pos_emb(latent.unsqueeze(1), cos, sin).squeeze(1)
+        rotated = _apply_v41_rope(latent.unsqueeze(1), cos, sin).squeeze(1)
         return latent, rotated
 
 
