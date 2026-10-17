@@ -61,6 +61,8 @@ class TestBuildOptionsFields(unittest.TestCase):
                 ("options", "None"),
                 ("dynamo_cache_size_limit", "256"),
                 ("dynamic_arg_dims", "None"),
+                ("enable_overlap", "False"),
+                ("fsdp_prefetch_budget_bytes", "268435456"),
             ],
         )
 

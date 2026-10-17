@@ -434,6 +434,11 @@ class FSDPPass(GraphPass):
             node.meta["param_name"] = fqn
             node.meta["fsdp_degree"] = self._fsdp_degree
             node.meta["is_param"] = True
+            # Record the TP-local, unsharded size before live-model FSDP slicing.
+            # Newly inserted collective nodes have no shape-propagated ``val``.
+            value = param if param is not None else node.meta.get("val")
+            if isinstance(value, torch.Tensor) and isinstance(value.numel(), int):
+                node.meta["fsdp_unsharded_nbytes"] = value.numel() * value.element_size()
             param_nodes.append(node)
             self._fsdp_modules.add(self._get_parent_module_fqn(fqn))
 
@@ -575,6 +580,7 @@ class FSDPPass(GraphPass):
                 ag_node.meta["param_name"] = param_node.meta.get("param_name")
                 ag_node.meta["state_idx"] = param_node.meta.get("state_idx")
                 ag_node.meta["fsdp_degree"] = self._fsdp_degree
+                ag_node.meta["fsdp_unsharded_nbytes"] = param_node.meta.get("fsdp_unsharded_nbytes")
 
             # Insert the wait in its own block: a wait placed in the same block
             # as the gather would land *before* the gather it depends on (the
@@ -922,6 +928,7 @@ class FSDPPass(GraphPass):
             ag_node.meta["param_node"] = record.param_node.name
             ag_node.meta["param_name"] = record.param_node.meta.get("param_name")
             ag_node.meta["fsdp_degree"] = self._fsdp_degree
+            ag_node.meta["fsdp_unsharded_nbytes"] = record.param_node.meta.get("fsdp_unsharded_nbytes")
             # This gather lives in the backward half; tag it so downstream
             # passes (e.g. PpPass phase classification) do not mistake it and
             # its remat clones for forward nodes — their only arg is a forward

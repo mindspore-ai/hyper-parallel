@@ -67,8 +67,14 @@ class PassConfig:
     """Parallel configuration for graph-mode FSDP (+ optional TP / SP / PP) training.
 
     Attributes:
-        enable_overlap: Drive ``AutoOverlapPass`` to move ``wait_tensor`` for
-            communication/compute overlap.
+        enable_overlap: Prefetch tagged FSDP all-gathers and sink their waits/views.
+        fsdp_forward_prefetch_depth: Forward consumer groups to look ahead; zero
+            disables forward launches (wait sinking remains enabled).
+        fsdp_backward_prefetch_depth: Backward consumer groups to look ahead;
+            zero disables backward launches. Phases never prefetch across each other.
+        fsdp_prefetch_budget_bytes: Maximum bytes of full replicas prefetched
+            before their first use, shared across compute anchors in each phase.
+            Unknown sizes are not prefetched; zero disables early launches.
         fsdp_enabled: Drive ``FSDPPass`` (data-parallel partitioning: parameter
             all_gather + gradient reduction + live-model sharding, selected by
             ``dp_mode``). ``False`` skips data parallelism entirely — set this
@@ -161,6 +167,9 @@ class PassConfig:
     pp_degree: Optional[int] = None
     pp_microbatch_size: int = 1
     pp_schedule: str = "gpipe"
+    fsdp_forward_prefetch_depth: int = 1
+    fsdp_backward_prefetch_depth: int = 1
+    fsdp_prefetch_budget_bytes: int = 256 << 20
 
     def __post_init__(self) -> None:
         self.dp_mode = normalize_dp_mode(self.dp_mode)
@@ -175,6 +184,10 @@ class PassConfig:
                 ``pp_microbatch_size``, an unknown ``pp_schedule`` /
                 ``dp_mode``, or a non-positive ``dp_replicate_degree``.
         """
+        for name in ("fsdp_forward_prefetch_depth", "fsdp_backward_prefetch_depth", "fsdp_prefetch_budget_bytes"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
         if self.tp_size < 1:
             raise ValueError(f"tp_size must be >= 1, got {self.tp_size}")
         if self.fsdp_degree is not None and self.fsdp_degree < 1:
@@ -211,7 +224,7 @@ def build_pass_config_from_trainer_config(
     config: Any,
     *,
     fsdp_enabled: Optional[bool] = None,
-    enable_overlap: bool = False,
+    enable_overlap: Optional[bool] = None,
 ) -> PassConfig:
     """Project trainer topology intent onto graph-mode pass config.
 
@@ -221,6 +234,9 @@ def build_pass_config_from_trainer_config(
     trainer package.
     """
     accelerator = config.accelerator
+    compile_config = getattr(config, "compile", None)
+    if enable_overlap is None:
+        enable_overlap = getattr(compile_config, "enable_overlap", False)
     if fsdp_enabled is None:
         fsdp_enabled = (
             config.fsdp_config.dp_shard_size > 1
@@ -234,6 +250,10 @@ def build_pass_config_from_trainer_config(
         tp_size=accelerator.tp_size,
         sequence_parallel=accelerator.sequence_parallel,
         loss_parallel=accelerator.loss_parallel,
+        fsdp_reshard_after_forward=getattr(config.fsdp_config, "reshard_after_forward", True),
+        fsdp_forward_prefetch_depth=getattr(config.fsdp_config, "forward_prefetch_depth", 1),
+        fsdp_backward_prefetch_depth=getattr(config.fsdp_config, "backward_prefetch_depth", 1),
+        fsdp_prefetch_budget_bytes=getattr(compile_config, "fsdp_prefetch_budget_bytes", 256 << 20),
     )
 
 

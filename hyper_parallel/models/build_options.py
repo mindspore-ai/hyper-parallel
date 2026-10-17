@@ -117,6 +117,9 @@ class CompileConfig:
     In joint-graph mode, ``dynamic`` symbolizes user tensor dimensions.
     ``dynamic_arg_dims`` optionally selects dimensions by dotted input path;
     a mapping enables dynamic tracing and takes precedence over ``dynamic``.
+    ``enable_overlap`` enables FSDP parameter prefetch in the joint graph.
+    ``fsdp_prefetch_budget_bytes`` bounds early full replicas until first use;
+    forward/backward consumer depths come from the FSDP2 strategy config.
     """
 
     enabled: bool = False
@@ -129,6 +132,9 @@ class CompileConfig:
     dynamo_cache_size_limit: int = 256
     # Joint-graph input paths, e.g. model_inputs.input_ids: [0, 1].
     dynamic_arg_dims: Optional[dict[str, int | list[int]]] = None
+    # Joint-graph FSDP overlap; depths come from FSDP2Config's prefetch options.
+    enable_overlap: bool = False
+    fsdp_prefetch_budget_bytes: int = 256 << 20
 
     def selects_graph_compiler(self) -> bool:
         """Return whether this config selects the graph-compiler trainer path."""
@@ -136,9 +142,15 @@ class CompileConfig:
 
     def __post_init__(self) -> None:
         """Validate values that the YAML resolver cannot express precisely."""
-        for name in ("enabled", "use_joint_graph", "fullgraph", "dynamic"):
+        for name in ("enabled", "use_joint_graph", "fullgraph", "dynamic", "enable_overlap"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"compile.{name} must be a bool")
+        if (
+            isinstance(self.fsdp_prefetch_budget_bytes, bool)
+            or not isinstance(self.fsdp_prefetch_budget_bytes, int)
+            or self.fsdp_prefetch_budget_bytes < 0
+        ):
+            raise ValueError("compile.fsdp_prefetch_budget_bytes must be a non-negative integer")
         if self.dynamic_arg_dims is not None and not isinstance(self.dynamic_arg_dims, dict):
             raise ValueError("compile.dynamic_arg_dims must be a mapping or None")
         if not isinstance(self.mode, str) or not self.mode.strip():

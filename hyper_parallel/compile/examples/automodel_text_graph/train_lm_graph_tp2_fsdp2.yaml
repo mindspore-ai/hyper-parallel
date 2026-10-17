@@ -48,6 +48,8 @@ fsdp_config:
 compile:
   enabled: true
   use_joint_graph: true
+  enable_overlap: true
+  fsdp_prefetch_budget_bytes: 268435456  # 256 MiB of prefetched full parameters before first use
 
 dataset:
   _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset

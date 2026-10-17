@@ -12,27 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for ``hyper_parallel.compile.passes.overlap.schedule.AutoOverlapPass``.
+"""Execution-layer tests for AutoOverlapPass and its disabled/no-match paths."""
 
-Covers the execution-layer contract of the pass (previously exercised only at
-pipeline-assembly level in ``test_pass_pipeline``):
-
-1. ``run`` early-returns when ``enable_overlap`` is ``False`` (it must not
-   even scan the graph).
-2. ``run`` with ``enable_overlap=True`` visits every ``wait_tensor`` node;
-   today ``_move_wait_later`` is a placeholder no-op, so the graph is
-   returned structurally unchanged.
-3. ``run`` on a graph with no ``wait_tensor`` nodes is a safe no-op.
-4. ``_find_wait_nodes`` returns only ``wait_tensor`` call_function nodes
-   (skipping ordinary compute ops), and returns ``[]`` when none are present.
-5. ``_move_wait_later`` is a documented no-op today (locks the current
-   contract until the overlap scheduler lands).
-
-The pass touches no ``torch.distributed`` state, so no dist mocking is
-required -- only FX graph construction.
-"""
-
-import os
 import unittest
 from unittest.mock import patch
 
@@ -79,7 +60,7 @@ def _count_targets(gm: fx.GraphModule, needle: str) -> int:
 
 
 class TestAutoOverlapRun(unittest.TestCase):
-    """``AutoOverlapPass.run`` honours ``enable_overlap`` and visits wait nodes."""
+    """The pass honors its switch and leaves untagged communication unchanged."""
 
     def test_run_disabled_returns_early_without_scanning(self):
         """Test ``enable_overlap=False`` returns the graph without scanning it.
@@ -109,12 +90,8 @@ class TestAutoOverlapRun(unittest.TestCase):
             ),
         )
 
-    def test_run_enabled_visits_every_wait_node(self):
-        """Test ``enable_overlap=True`` scans the graph and visits each wait.
-
-        ``_move_wait_later`` is a no-op today, so the wait node stays where
-        ``FSDPPass`` placed it and the returned graph is the same object.
-        """
+    def test_run_enabled_leaves_untagged_waits_unchanged(self):
+        """Untagged waits are left for their owning parallel scheduler."""
         cfg = PassConfig(enable_overlap=True)
         overlap = AutoOverlapPass()
         gm = _wait_tensor_graph()
@@ -130,7 +107,7 @@ class TestAutoOverlapRun(unittest.TestCase):
             _count_targets(gm, "wait_tensor"),
             1,
             (
-                f"no-op move must not drop the wait node, "
+                f"overlap must not drop the wait node, "
                 f"got wait_tensor count={_count_targets(gm, 'wait_tensor')}"
             ),
         )
@@ -193,37 +170,6 @@ class TestAutoOverlapFindWaitNodes(unittest.TestCase):
             waits,
             [],
             (f"plain graph has no wait nodes, got {len(waits)} matches"),
-        )
-
-
-class TestAutoOverlapMoveWaitLater(unittest.TestCase):
-    """``_move_wait_later`` is a documented placeholder no-op today."""
-
-    def test_move_wait_later_is_noop_today(self):
-        """Test ``_move_wait_later`` returns the graph unchanged (current contract).
-
-        Locks the current no-op behaviour so the transition to a real overlap
-        scheduler is a deliberate, visible change rather than a silent one.
-        """
-        overlap = AutoOverlapPass()
-        cfg: PassConfig = PassConfig(enable_overlap=True)
-        gm = _wait_tensor_graph()
-        wait = overlap._find_wait_nodes(gm.graph)[0]  # pylint: disable=protected-access
-
-        result = overlap._move_wait_later(gm, wait)  # pylint: disable=protected-access
-
-        self.assertIs(
-            result,
-            gm,
-            "_move_wait_later should return the same graph_module (no-op today)",
-        )
-        self.assertEqual(
-            _count_targets(gm, "wait_tensor"),
-            1,
-            (
-                f"no-op move must keep the wait node in place, "
-                f"got wait_tensor count={_count_targets(gm, 'wait_tensor')}"
-            ),
         )
 
 
