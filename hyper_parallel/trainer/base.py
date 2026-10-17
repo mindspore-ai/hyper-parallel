@@ -98,6 +98,7 @@ from hyper_parallel.trainer.runtime.device import (  # pylint: disable=syntax-er
 )
 
 from hyper_parallel.trainer.callbacks import (
+    ExpertBiasUpdateCallback,
     EnvironMeterCallback,
     EvaluateCallback,
     GarbageCollectionCallback,
@@ -630,6 +631,14 @@ class BaseTrainer(Stateful, ABC):
                 "Checkpointing is inactive (save_ckpt=false, restore_from=None); "
                 "no checkpoint callback registered."
             )
+        # Optional auxiliary-loss-free MoE load balancing (off by default).
+        # Without it the router bias never leaves its initial zero and the
+        # routing drifts onto a few experts, which grows the expert-parallel
+        # dispatch buffers -- and with them both memory and step time. See the
+        # callback's module docstring for the measurement.
+        if os.environ.get("HP_EXPERT_BIAS_LR", "").strip():
+            self.expert_bias_callback = ExpertBiasUpdateCallback(self)
+            self._callbacks.append(self.expert_bias_callback)
 
     def on_train_begin(self) -> None:
         """Run all registered callbacks at the start of training."""
