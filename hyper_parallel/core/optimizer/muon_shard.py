@@ -24,6 +24,7 @@ __all__ = [
 
 import math
 import logging
+from itertools import product
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -31,6 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.core.dtensor.layout import Layout, infer_slice_area_by_layout
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
     HSDPCommGroup,
@@ -40,6 +42,32 @@ from hyper_parallel.core.optimizer.sharding_category import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _infer_gather_rank_shapes(
+        layout: Layout,
+        global_shape: Tuple[int, ...],
+        coordinate: Tuple[int, ...],
+        shard_axes: Tuple[Tuple[int, int], ...],
+) -> Tuple[Tuple[Tuple[int, ...], ...], ...]:
+    """Derive successive all-gather shapes using the DTensor slice geometry."""
+    shapes = {}
+    for rank, coord in enumerate(product(*(range(size) for size in layout.mesh_shape))):
+        area = infer_slice_area_by_layout(layout, rank, global_shape)
+        shapes[coord] = tuple(end - start for start, end in area)
+    result = []
+    for mesh_dim, tensor_dim in shard_axes:
+        group_size = layout.mesh_shape[mesh_dim]
+        peers = [coordinate[:mesh_dim] + (rank,) + coordinate[mesh_dim + 1:] for rank in range(group_size)]
+        result.append(tuple(shapes[peer] for peer in peers))
+        next_shapes = {}
+        for key, shape in shapes.items():
+            group_peers = [key[:mesh_dim] + (rank,) + key[mesh_dim + 1:] for rank in range(group_size)]
+            output = list(shape)
+            output[tensor_dim] = sum(shapes[peer][tensor_dim] for peer in group_peers)
+            next_shapes[key] = tuple(output)
+        shapes = next_shapes
+    return tuple(result)
 
 
 def make_param_shard_meta(
@@ -159,10 +187,27 @@ def build_param_shard_metadata_for_group(
     current_shapes = [tuple(to_local_if_dtensor(record.param.data).shape) for record in hsdp_group.records]
     stage_metas_per_param: List[List[ParamShardStageMeta]] = [[] for _ in hsdp_group.records]
     local_device = to_local_if_dtensor(hsdp_group.records[0].param.data).device
+    layout_shapes = []
+    if all(isinstance(getattr(record.param, "layout", None), Layout) for record in hsdp_group.records):
+        for record in hsdp_group.records:
+            param = record.param
+            coord = tuple(param.device_mesh.get_coordinate())
+            stages = _infer_gather_rank_shapes(param.layout, tuple(param.shape), coord, layout_spec.shard_axes)
+            local_shape = tuple(to_local_if_dtensor(param.data).shape)
+            inferred = stages[0][coord[layout_spec.shard_axes[0][0]]]
+            if inferred != local_shape:
+                raise ValueError(
+                    f"Muon shard shape disagrees with layout: inferred={inferred}, "
+                    f"local={local_shape}, global={tuple(param.shape)}"
+                )
+            layout_shapes.append(stages)
 
-    for (_, tensor_dim), shard_pg in zip(layout_spec.shard_axes, shard_pgs):
+    for stage, ((_, tensor_dim), shard_pg) in enumerate(zip(layout_spec.shard_axes, shard_pgs)):
         shard_size = dist.get_world_size(shard_pg) if shard_pg is not None else 1
-        gathered_shapes = _allgather_shapes_for_group(current_shapes, shard_pg, shard_size, local_device)
+        if layout_shapes:
+            gathered_shapes = [[shapes[stage][rank] for shapes in layout_shapes] for rank in range(shard_size)]
+        else:
+            gathered_shapes = _allgather_shapes_for_group(current_shapes, shard_pg, shard_size, local_device)
         cur_rank = dist.get_rank(shard_pg) if shard_pg is not None and shard_size > 1 else 0
         next_shapes: List[Tuple[int, ...]] = []
 
@@ -352,6 +397,11 @@ def _prepare_gather_inputs(
             if normalized_dim != 0:
                 pad_shape[0], pad_shape[normalized_dim] = pad_shape[normalized_dim], pad_shape[0]
             padded_numel_raw = math.prod(pad_shape)
+            if padded_numel_raw < gather_input.numel():
+                raise ValueError(
+                    f"Muon gather metadata smaller than input: axis={tensor_dim}, "
+                    f"input={tuple(gather_input.shape)}, stage={stage_meta}"
+                )
         param_meta.append(
             _GatherParamMeta(
                 offset=total_padded_numel,

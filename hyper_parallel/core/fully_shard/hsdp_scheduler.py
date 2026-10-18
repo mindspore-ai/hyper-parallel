@@ -23,6 +23,7 @@ from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hook_function import PostBackwardFunction
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     FSDPSchedulerState,
@@ -492,6 +493,9 @@ class HSDPSchedulerV2:
         flat_outputs, _ = tree_flatten(outputs)
         for output in flat_outputs:
             if isinstance(output, torch.Tensor) and output.requires_grad:
+                hook_output = output
+                if isinstance(output, DTensor) and getattr(output, "_is_fake_wrapper", False):
+                    hook_output = output.to_local()
                 handle_ref = [None]
                 # pylint: disable=C0103, W0102
 
@@ -502,7 +506,7 @@ class HSDPSchedulerV2:
                         handle.remove()
                     return self._backward_pre_hook(grad)
                 # pylint: enable=C0103, W0102
-                handle = output.register_hook(wrapper_for_backward_pre_hook)
+                handle = hook_output.register_hook(wrapper_for_backward_pre_hook)
                 handle_ref[0] = handle
 
     @_dynamo_disable

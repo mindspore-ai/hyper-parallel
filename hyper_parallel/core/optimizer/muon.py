@@ -763,7 +763,7 @@ class Muon(BaseDistributedOptimizer):
             )
 
         for reshaped_input in reshaped_inputs:
-            if reshaped_input.untyped_storage().data_ptr() != working_input.untyped_storage().data_ptr():
+            if not torch._C._is_alias_of(reshaped_input, working_input):  # pylint: disable=protected-access
                 raise ValueError("reshape_fn must return views that share storage with the working NS input tensor")
 
         return working_input, reshaped_inputs
@@ -788,7 +788,7 @@ class Muon(BaseDistributedOptimizer):
             """Write reshaped NS updates back into the views and the working input."""
             for reshaped_input, update in zip(reshaped_inputs, updates):
                 reshaped_input.copy_(update.contiguous().view_as(reshaped_input))
-            if output.untyped_storage().data_ptr() != working_input.untyped_storage().data_ptr():
+            if not torch._C._is_alias_of(output, working_input):  # pylint: disable=protected-access
                 output.copy_(working_input)
 
         return working_input, NSInputTransform(tensors=reshaped_inputs, restore=restore_view_updates)
@@ -977,7 +977,7 @@ class Muon(BaseDistributedOptimizer):
         for param in p_list:
             update = ns_inputs[param].view(state["origin_shapes"][param])
             working_input = state["working_inputs"][param]
-            if working_input.untyped_storage().data_ptr() != update.untyped_storage().data_ptr():
+            if not torch._C._is_alias_of(working_input, update):  # pylint: disable=protected-access
                 update.copy_(working_input)
             state["restored"][param] = update
         return state["restored"]
@@ -1053,8 +1053,8 @@ class Muon(BaseDistributedOptimizer):
         for p in p_list:
             reshaped_update = ns_inputs[p].view(state["origin_shapes"][p])
 
-            if (state["working_inputs"][p].untyped_storage().data_ptr()
-                    != reshaped_update.untyped_storage().data_ptr()):
+            if not torch._C._is_alias_of(  # pylint: disable=protected-access
+                    state["working_inputs"][p], reshaped_update):
                 reshaped_update.copy_(state["working_inputs"][p])
             state["restored"][p] = reshaped_update
 

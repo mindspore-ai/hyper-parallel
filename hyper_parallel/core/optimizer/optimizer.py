@@ -433,6 +433,28 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             raise RuntimeError(f"Current rank not found in cached sub-groups for parent_pg={local_parent_ranks}")
 
         global_rank = dist.get_rank()
+        if dist.get_backend(parent_pg) == "fake":
+            sub_pg_map: Dict[int, Optional[dist.ProcessGroup]] = {}
+            my_sub_pg = None
+            for sub_idx in range(len(local_parent_ranks) // sub_size):
+                start = sub_idx * sub_size
+                sub_ranks = local_parent_ranks[start:start + sub_size]
+                if global_rank not in sub_ranks:
+                    sub_pg_map[sub_idx] = None
+                    continue
+                my_sub_pg = dist.new_group(
+                    ranks=list(sub_ranks),
+                    use_local_synchronization=True,
+                )
+                sub_pg_map[sub_idx] = my_sub_pg
+            self._split_sub_pg_cache[cache_key] = sub_pg_map
+            if my_sub_pg is None:
+                raise RuntimeError(
+                    f"Rank {global_rank} not found in any sub-group of parent_pg "
+                    f"with ranks {local_parent_ranks} and sub_size={sub_size}"
+                )
+            return my_sub_pg
+
         world_size = dist.get_world_size()
 
         # Global Rendezvous via GPU all_gather_into_tensor (NCCL/HCCL fast-path).
