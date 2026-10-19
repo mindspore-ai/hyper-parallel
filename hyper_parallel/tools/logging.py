@@ -38,7 +38,8 @@ Three concerns are deliberately decoupled so each can change independently:
   :func:`set_level` / :func:`configure` / the :data:`logger` manager. Component
   names are case-insensitive for known components (:data:`_KNOWN_COMPONENTS`); an
   unrecognised name still works but warns once, to catch typos that would
-  otherwise silently produce no logs.
+  otherwise silently produce no logs. A single framework-wide level comes from
+  the training YAML ``log_level`` field, applied through :func:`set_global_level`.
 
 Logging is *off by default* (each component logger starts at ``WARNING``): the
 stdout handler is always installed, but ``debug``/``info`` calls stay silent
@@ -61,6 +62,7 @@ __all__ = [
     "logger",
     "logging_enabled",
     "set_format",
+    "set_global_level",
     "set_level",
 ]
 
@@ -243,6 +245,22 @@ def set_level(component: str, level: Union[int, str]) -> logging.Logger:
     return component_logger
 
 
+def set_global_level(level: Union[int, str]) -> int:
+    """Set one level for the whole hyper_parallel framework.
+
+    The level is applied to every registered component logger, becomes the
+    default for components registered later, and is set on the
+    ``hyper_parallel`` namespace logger so plain ``logging.getLogger(__name__)``
+    modules inside the package follow it too. Returns the normalized level.
+    """
+    global _DEFAULT_LEVEL
+    _DEFAULT_LEVEL = _normalize_level(level)
+    logging.getLogger(_NAMESPACE).setLevel(_DEFAULT_LEVEL)
+    for component_logger in _registry.values():
+        component_logger.setLevel(_DEFAULT_LEVEL)
+    return _DEFAULT_LEVEL
+
+
 def configure(spec: str) -> None:
     """Apply a ``HP_LOG_CONFIG``-style spec programmatically.
 
@@ -298,6 +316,7 @@ class _LoggingManager:
 
     get_logger = staticmethod(get_logger)
     set_level = staticmethod(set_level)
+    set_global_level = staticmethod(set_global_level)
     configure = staticmethod(configure)
     set_format = staticmethod(set_format)
     enabled = staticmethod(logging_enabled)

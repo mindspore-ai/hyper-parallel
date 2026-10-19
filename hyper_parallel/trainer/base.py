@@ -70,6 +70,7 @@ from hyper_parallel.trainer.runtime.distributed import (
     initialize_distributed,
 )
 from hyper_parallel.trainer.runtime.logging import setup_logging
+from hyper_parallel.tools.logging import set_global_level
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
@@ -306,7 +307,8 @@ class BaseTrainer(Stateful, ABC):
     def _setup(self):
         """Initialize logging, distributed state, and the local device."""
         # log args
-        setup_logging()
+        setup_logging(self.config.log_level)
+        set_global_level(self.config.log_level)
 
         # Initialize distributed process group
         backend = getattr(self.config.training, "backend", "nccl")

@@ -125,8 +125,33 @@ def get_fsdp_execution_order(
     return tuple(execution_order)
 
 
+def get_fsdp_backward_execution_order(
+        model: Any,
+        module_fqns: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return the nested V4.1 child-unit backward pre-hook order.
+
+    Args:
+        model: Model being built or inspected.
+        module_fqns: Fully qualified names of the selected FSDP child units.
+    """
+    backward_order = list(reversed(get_fsdp_execution_order(model, module_fqns)))
+    layer_fqns = tuple(
+        module_fqn for module_fqn in backward_order
+        if module_fqn.startswith("model.layers.") and module_fqn.count(".") == 2
+    )
+    for layer_fqn in layer_fqns:
+        root_index = backward_order.index(layer_fqn)
+        group_start = root_index
+        while group_start > 0 and backward_order[group_start - 1].startswith(f"{layer_fqn}."):
+            group_start -= 1
+        backward_order.insert(group_start, backward_order.pop(root_index))
+    return tuple(backward_order)
+
+
 __all__ = [
     "build_parameter_sharding_rules",
+    "get_fsdp_backward_execution_order",
     "get_fsdp_excluded_subtrees",
     "get_fsdp_execution_order",
     "get_fsdp_wrap_modules",

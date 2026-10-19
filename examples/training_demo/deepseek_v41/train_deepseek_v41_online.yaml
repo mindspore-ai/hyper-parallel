@@ -23,6 +23,10 @@ model:
 
 model_init_dtype: float32
 
+# Unified framework log level: debug, info, warning, error or critical.
+# Applies to every hyper_parallel logger; defaults to warning.
+log_level: warning
+
 training:
   train_iters: 1
   train_samples: null
