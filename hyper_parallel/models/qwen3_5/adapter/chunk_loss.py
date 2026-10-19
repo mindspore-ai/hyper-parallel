@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Model-integrated chunked CE for the Qwen3.5 text decoder."""
+"""Model-integrated chunked CE for Qwen3.5 dense and MoE text decoders."""
 
 import functools
 from typing import Any
@@ -37,6 +37,7 @@ def _chunk_loss_forward(
     chunk_loss_ignore_index: int,
     past_key_values: Any = None,
     use_cache: bool | None = None,
+    output_router_logits: bool | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Any,
 ) -> ChunkedCausalLMOutput:
@@ -47,6 +48,12 @@ def _chunk_loss_forward(
         raise ValueError("Qwen3.5 Chunk Loss requires logits_to_keep=0")
     if kwargs.get("return_dict") is False:
         raise ValueError("Qwen3.5 Chunk Loss requires return_dict=True")
+    is_moe = model.config.model_type == "qwen3_5_moe_text"
+    if is_moe:
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else model.config.output_router_logits
+        )
+        kwargs["output_router_logits"] = output_router_logits
     outputs = model.model(past_key_values=None, use_cache=False, **kwargs)
     targets = chunk_loss_targets
     if chunk_loss_mask is not None:
@@ -62,12 +69,25 @@ def _chunk_loss_forward(
         chunk_size=chunk_loss_chunk_size,
         ignore_index=chunk_loss_ignore_index,
     )
+    aux_loss = None
+    if is_moe and output_router_logits:
+        # Keep optional MoE model imports out of dense-only registry discovery.
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (  # pylint: disable=C0415
+            load_balancing_loss_func,
+        )
+
+        aux_loss = load_balancing_loss_func(
+            outputs.router_logits, model.num_experts, model.num_experts_per_tok, kwargs.get("attention_mask"),
+        )
     return ChunkedCausalLMOutput(
         loss_sum=loss_sum,
         valid_token_count=targets.ne(chunk_loss_ignore_index).sum(),
+        aux_loss=aux_loss,
+        aux_loss_coef=float(getattr(model, "router_aux_loss_coef", 0.0)),
         logits=None,
         hidden_states=getattr(outputs, "hidden_states", None),
         attentions=getattr(outputs, "attentions", None),
+        router_logits=getattr(outputs, "router_logits", None),
     )
 
 
@@ -75,8 +95,8 @@ def bind_chunk_loss(model: nn.Module) -> None:
     """Bind the text-only training objective without changing inference forward."""
     if getattr(model, "_hp_qwen3_5_chunk_loss_bound", False):
         return
-    if getattr(getattr(model, "config", None), "model_type", None) != "qwen3_5_text":
-        raise TypeError("Qwen3.5 Chunk Loss requires model_type='qwen3_5_text'")
+    if getattr(getattr(model, "config", None), "model_type", None) not in ("qwen3_5_text", "qwen3_5_moe_text"):
+        raise TypeError("Qwen3.5 Chunk Loss requires a dense or MoE text model_type")
     if not isinstance(getattr(model, "model", None), nn.Module):
         raise TypeError("Qwen3.5 Chunk Loss requires a decoder at model.model")
     head = getattr(model, "lm_head", None)

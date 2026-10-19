@@ -34,6 +34,8 @@ accelerator:
 fsdp_config:
   dp_shard_size: 8
   replicate_params: []
+  root_wrap_modules:
+    - model.embed_tokens
   reshard_after_forward: true
   reshard_after_backward: true
   requires_grad_sync: true
@@ -117,6 +119,10 @@ dataloader:
   num_workers: 0
   pin_memory: false
   prefetch_factor: null
+
+loss_fn:
+  _target_: hyper_parallel.components.losses.ChunkedCausalLMLoss
+  chunk_size: 1024
 
 optimizer:
   _target_: hyper_parallel.components.optim.AdamW

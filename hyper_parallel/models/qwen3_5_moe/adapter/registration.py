@@ -33,6 +33,12 @@ def _load_sharding_rules():
     ]
 
 
+def _load_loss():
+    """Reuse the dense/MoE text objective without loading optional kernels eagerly."""
+    from hyper_parallel.models.qwen3_5.adapter import chunk_loss  # pylint: disable=C0415
+    return chunk_loss
+
+
 QWEN3_5_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5MoeForConditionalGeneration",
     model_type="qwen3_5_moe",
@@ -42,6 +48,7 @@ QWEN3_5_MOE_ADAPTER_SPEC = ModelAdapterSpec(
 QWEN3_5_MOE_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5MoeForCausalLM",
     model_type="qwen3_5_moe_text",
+    loss=_load_loss,
     sharding_rules=_load_sharding_rules,
 )
 

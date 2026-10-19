@@ -89,6 +89,16 @@ class TestFSDPRootWrap(unittest.TestCase):
                 self.assertIs(child_kwargs["reshard_after_forward"], reshard)
                 self.assertIs(root_kwargs["reshard_after_forward"], reshard)
 
+    def test_embedding_only_leaves_head_on_root(self):
+        """Chunk loss can access the head while embedding has its own FSDP unit."""
+        model = _make_model()
+        manager = self._manager(root_wrap_modules=["model.embed_tokens"])
+        units = manager._find_wrap_modules(model)
+        owners = manager._resolve_parameter_owners(model, units)
+        self.assertIs(owners[model.model.embed_tokens.weight], model.model.embed_tokens)
+        self.assertIs(owners[model.lm_head.weight], model)
+        self.assertNotIn("lm_head", [unit.fqn for unit in units])
+
     def test_parallelize_passes_policy_to_actual_wrap_calls(self):
         """Child wrapping precedes root wrapping and prefetch includes the extra units."""
         model = _make_model()
@@ -154,3 +164,19 @@ class TestFSDPRootWrap(unittest.TestCase):
         model.lm_head = _ShardedHead(5, 13, bias=False)
         with self.assertRaisesRegex(NotImplementedError, "independently FSDP-wrapped lm_head"):
             ChunkedCausalLMLoss().bind_model(model)
+
+    def test_qwen_yaml_embedding_only_chunk_loss(self):
+        """Both CP paths opt into chunk loss without independently wrapping the head."""
+        examples = Path(__file__).resolve().parents[3] / "examples"
+        files = ["qwen3_8/train.yaml"] + [
+            f"{family}/{name}" for family in ("qwen3_8", "qwen3_6_moe")
+            for name in ("train_online.yaml", "train_online_p2p_kv_allgather.yaml")
+        ]
+        for filename in files:
+            with self.subTest(config=filename):
+                raw = yaml.safe_load((examples / filename).read_text(encoding="utf-8"))
+                self.assertEqual(raw["fsdp_config"]["root_wrap_modules"], ["model.embed_tokens"])
+                self.assertTrue(raw["fsdp_config"]["reshard_after_forward"])
+                self.assertEqual(raw["loss_fn"]["_target_"],
+                                 "hyper_parallel.components.losses.ChunkedCausalLMLoss")
+                self.assertEqual(raw["loss_fn"]["chunk_size"], 1024)
