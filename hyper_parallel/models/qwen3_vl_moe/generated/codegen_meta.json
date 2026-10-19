@@ -48,7 +48,9 @@
   "entrypoints": {
     "parallelize": "hp_parallelize"
   },
-  "external_state_classes": [],
+  "external_state_classes": [
+    "Qwen3MoeSparseMoeBlock"
+  ],
   "frozen_sharded_params": [
     "lm_head.weight",
     "model.language_model.embed_tokens.weight",
@@ -68,11 +70,19 @@
   "injections": [
     {
       "ep_size": 2,
-      "match": "model.language_model.layers.0.mlp"
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
+        "use_grouped_gemm": true
+      },
+      "match": "model.language_model.layers.1.mlp"
     },
     {
       "ep_size": 2,
-      "match": "model.language_model.layers.1.mlp"
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
+        "use_grouped_gemm": true
+      },
+      "match": "model.language_model.layers.0.mlp"
     }
   ],
   "mesh_dim_names": [
@@ -90,25 +100,25 @@
   ],
   "outputs": {
     "diff": {
-      "lines": 125,
-      "sha256": "fc589351a5f5772e7ac8eb88fe1133c6ef1c3befb2db4a948b1d278c8570ac25"
+      "lines": 162,
+      "sha256": "5c9d97cf3844ed805f4d307edb9695e737ad04e2d484bddf751e5fdb8900fc5a"
     },
     "init": {
       "lines": 6,
       "sha256": "eec282c15e250055d2a40804ed1bc1dc3ee6ba1d69cac106e57cf17c626d911c"
     },
     "modeling": {
-      "lines": 1892,
-      "sha256": "12ff75fd50e09e780e0652eee34979e8c7ae63a8e01ee564717aba72857897b5"
+      "lines": 1913,
+      "sha256": "c1ae3ae73f8989326d36e89d69a9223434525d424ec8dd7fd3da91647ce284bf"
     }
   },
   "parallel_dims": {
     "cp_size": 1,
     "dp_size": 1,
     "ep_size": 2,
-    "loss_parallel": true,
+    "loss_parallel": false,
     "pp_size": 1,
-    "sequence_parallel": true,
+    "sequence_parallel": false,
     "tp_size": 2
   },
   "param_plan": {
@@ -124,7 +134,7 @@
         "hidden_states": {
           "cp": "R",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -132,7 +142,7 @@
         "output": {
           "cp": "R",
           "ep": "R",
-          "tp": "S(-1)"
+          "tp": "R"
         }
       },
       "out_src": {
@@ -170,7 +180,7 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
@@ -193,14 +203,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -208,14 +218,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -231,14 +241,14 @@
         "x_BLD": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "x_BLD": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -246,14 +256,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -270,21 +280,22 @@
           "ep": "R",
           "tp": "R"
         }
-      }
+      },
+      "region_dispatch": false
     },
     "model.language_model.layers.0.post_attention_layernorm": {
       "in_dst": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -292,14 +303,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -322,7 +333,7 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -330,7 +341,7 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
@@ -368,14 +379,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -383,14 +394,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -406,14 +417,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -421,14 +432,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -444,14 +455,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -459,14 +470,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -482,14 +493,14 @@
         "x_BLD": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "x_BLD": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -497,14 +508,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -521,21 +532,22 @@
           "ep": "R",
           "tp": "R"
         }
-      }
+      },
+      "region_dispatch": false
     },
     "model.language_model.layers.1.post_attention_layernorm": {
       "in_dst": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -543,14 +555,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -573,7 +585,7 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -581,7 +593,7 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
@@ -619,14 +631,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -634,14 +646,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -657,14 +669,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -672,14 +684,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -695,14 +707,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -710,14 +722,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -785,14 +797,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -800,14 +812,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -828,14 +840,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -843,14 +855,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -923,14 +935,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -938,14 +950,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -966,14 +978,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -981,14 +993,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -1035,14 +1047,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -1050,14 +1062,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -1104,14 +1116,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -1119,14 +1131,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -1173,14 +1185,14 @@
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "is_boundary": true,
@@ -1188,14 +1200,14 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "out_src": {
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "S(1)"
+          "tp": "R"
         }
       },
       "params": {
@@ -1236,13 +1248,13 @@
     }
   },
   "remote_siblings": [],
-  "signature": "e0195019f73c",
+  "signature": "e644fe71d6e4",
   "skipped_overrides": [],
   "source": {
     "architecture": "Qwen3VLMoeForConditionalGeneration",
     "file_path": "D:\\miniconda\\Lib\\site-packages\\transformers\\models\\qwen3_vl_moe\\modeling_qwen3_vl_moe.py",
     "line_count": 1850,
-    "model_id": "C:\\Users\\Ashlee\\AppData\\Local\\Temp\\codegen_verify_24pl3h98\\qwen3_vlmoe_ckpt",
+    "model_id": "C:\\Users\\Ashlee\\AppData\\Local\\Temp\\codegen_qwen3vlmoe_ep_8xe_gsao\\qwen3_vlmoe_ckpt",
     "model_type": "qwen3_vl_moe",
     "module_name": "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
     "sha256": "cd26d4602a3797c957bf5483bd3502b549afbe85bd0c1607ed0730df86e97ce1",
@@ -1252,5 +1264,5 @@
   "special_handlers": {},
   "tied_pairs": [],
   "yaml_path": "",
-  "yaml_sha256": "e0195019f73c805888f75a3c4ea7ffa191422d84c593ead6c297b5f232e8a2f3"
+  "yaml_sha256": "e644fe71d6e4f59f39114cfa825b9431428e0a6cd3b4159dc40c7cfc2e3d2ac1"
 }
