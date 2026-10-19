@@ -185,7 +185,7 @@ class TestChatTemplateGoldens(unittest.TestCase):
         template = chat_template.build_chat_template(
             "tokenizer",
             tokenizer,
-            chat_template_kwargs={"enable_thinking": True, "reasoning_effort": "medium"},
+            chat_template_kwargs={"enable_thinking": True, "reasoning_effort": "medium", "preserve_thinking": True},
         )
         template.encode_messages([
             {"role": "user", "content": "Question"},
@@ -193,9 +193,9 @@ class TestChatTemplateGoldens(unittest.TestCase):
         ])
 
         self.assertEqual(tokenizer.template_kwargs, [
-            {"enable_thinking": True, "reasoning_effort": "medium"},
-            {"enable_thinking": True, "reasoning_effort": "medium"},
-            {"enable_thinking": True, "reasoning_effort": "medium"},
+            {"enable_thinking": True, "reasoning_effort": "medium", "preserve_thinking": True},
+            {"enable_thinking": True, "reasoning_effort": "medium", "preserve_thinking": True},
+            {"enable_thinking": True, "reasoning_effort": "medium", "preserve_thinking": True},
         ])
         self.assertEqual(tokenizer.generation_prompts, [False, False, True])
 
@@ -459,14 +459,15 @@ class TestChatTemplateGoldens(unittest.TestCase):
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, "content"):
                 _normalize_conversation([message])
 
-    def test_tokenizer_multiturn_rejects_removed_history_reasoning(self):
-        """Reject history rewrites instead of applying an earlier turn's mask to different tokens."""
+    def test_tokenizer_multiturn_preserve_thinking_controls_history_stability(self) -> None:
+        """Preserve supervised history when enabled; continue rejecting rewrites otherwise."""
         class HistoryRewritingTokenizer(MultiTurnThinkingTokenizer):
             """Emulate a native template that removes historical reasoning."""
 
-            def apply_chat_template(self, messages, **kwargs):
+            def apply_chat_template(self, messages: Any, **kwargs: Any) -> Any:
+                """Remove historical reasoning only when preservation is not enabled."""
                 modified = [dict(message) for message in messages]
-                if len(modified) >= 3:
+                if len(modified) >= 3 and not kwargs.get("preserve_thinking", False):
                     modified[1]["reasoning_content"] = ""
                 return super().apply_chat_template(modified, **kwargs)
 
@@ -476,9 +477,41 @@ class TestChatTemplateGoldens(unittest.TestCase):
             {"role": "user", "content": "Follow up"},
             {"role": "assistant", "content": "Final", "reasoning_content": "Check"},
         ]
-        template = chat_template.build_chat_template("tokenizer", HistoryRewritingTokenizer())
-        with self.assertRaisesRegex(ValueError, "prefix|shortened"):
-            template.encode_messages(messages)
+        for kwargs in ({}, {"preserve_thinking": False}):
+            with self.subTest(kwargs=kwargs):
+                template = chat_template.build_chat_template(
+                    "tokenizer", HistoryRewritingTokenizer(), chat_template_kwargs=kwargs,
+                )
+                with self.assertRaisesRegex(ValueError, "prefix|shortened"):
+                    template.encode_messages(messages)
+
+        template = chat_template.build_chat_template(
+            "tokenizer", HistoryRewritingTokenizer(), chat_template_kwargs={"preserve_thinking": True},
+        )
+        prefix = template.encode_messages(messages[:2])
+        result = template.encode_messages(messages)
+        reference = chat_template.build_chat_template("tokenizer", MultiTurnThinkingTokenizer())
+        expected = reference.encode_messages(messages)
+        self.assertEqual(result, expected)
+        self.assertEqual(result["labels"][:len(prefix["labels"])], prefix["labels"])
+
+    def test_preserve_thinking_keeps_tool_only_targets(self) -> None:
+        """The option must preserve empty-reasoning tool targets and masked tool observations."""
+        messages = [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "", "reasoning_content": "",
+             "tool_calls": [{"function": {"name": "lookup", "arguments": {}}}]},
+            {"role": "tool", "content": "Result"},
+            {"role": "user", "content": "Follow up"},
+            {"role": "assistant", "content": "Final", "reasoning_content": "Check"},
+        ]
+        reference = chat_template.build_chat_template("tokenizer", ToolOnlyThinkingTokenizer())
+        template = chat_template.build_chat_template(
+            "tokenizer", ToolOnlyThinkingTokenizer(), chat_template_kwargs={"preserve_thinking": True},
+        )
+        for end in range(1, len(messages) + 1):
+            with self.subTest(message_count=end):
+                self.assertEqual(template.encode_messages(messages[:end]), reference.encode_messages(messages[:end]))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -489,6 +522,7 @@ class TestChatTemplateGoldens(unittest.TestCase):
             ({"tools": []}, "Trainer-owned arguments"),
             ({"enable_thinking": "yes"}, "enable_thinking must be a bool"),
             ({"preserve_thinking": 1}, "preserve_thinking must be a bool"),
+            ({"preserve_thinking": "true"}, "preserve_thinking must be a bool"),
             ({"reasoning_effort": "high"}, "reasoning_effort must be one of"),
         )
         for kwargs, expected_error in invalid_kwargs:

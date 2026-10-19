@@ -102,6 +102,8 @@ dataset:
     chat_template_kwargs:
       enable_thinking: true
       reasoning_effort: medium
+      # Keep historical reasoning so incremental loss-mask boundaries remain stable.
+      preserve_thinking: true
     log_first_chat_template: true
     tokenizer:
       _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
@@ -160,6 +162,7 @@ lr_scheduler:
   _target_: hyper_parallel.components.optim.MultiLRScheduler
   lr_decay_style: cosine
   lr_config:
+    lr: 1.0e-5
     lr_warmup_steps: 0
     min_lr: 1.0e-6
 
