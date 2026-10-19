@@ -1,3 +1,5 @@
+<!-- Temporary CI baseline comparison; runtime code is unchanged. -->
+
 <div align="center">
   <img src="docs/images/hyperparallel-logo.png" alt="HyperParallel Logo" title="HyperParallel logo" width="50%">
 
