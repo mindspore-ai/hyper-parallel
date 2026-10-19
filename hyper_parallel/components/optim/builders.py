@@ -19,9 +19,10 @@ Parameter-name and parameter-group logic lives in
 algorithm implementations stay in ``hyper_parallel.core.optimizer``.
 """
 
-__all__ = ["AdamW", "Muon"]
+__all__ = ["AdamW", "Muon", "Sinkhorn"]
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from torch import nn  # pylint: disable=forbidden-backend-import
@@ -194,6 +195,149 @@ class Muon:
             extra_adamw_name_keywords=extra_adamw_name_keywords,
             excluded_param_ids=excluded_param_ids,
         )
+
+    def get_optimizer(self) -> Any:
+        """Return the core chained optimizer runtime."""
+        return self.optimizer
+
+
+class Sinkhorn:
+    """Build Sinkhorn for embeddings/heads, Muon for matrices, and AdamW otherwise."""
+
+    def __init__(
+            self,
+            sinkhorn_config: dict,
+            muon_config: dict,
+            adamw_config: dict,
+            model: nn.Module,
+            no_decay_params: Optional[List[str]] = None,
+            excluded_param_ids: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Partition trainable parameters and build the existing chained runtime.
+
+        Args:
+            sinkhorn_config: Sinkhorn kwargs, optional ``param_patterns`` and
+                ``param_groups`` containing selectors and group overrides.
+            muon_config: Muon kwargs, including model-owned callbacks.
+            adamw_config: AdamW kwargs and optional ``param_patterns``.
+            model: Model whose parameters are partitioned by identity.
+            no_decay_params: Name keywords exempt from AdamW decay. Defaults
+                to bias and scale parameters; normalization weights decay.
+            excluded_param_ids: Parameters managed by another optimizer.
+        """
+        configs = {"sinkhorn": dict(sinkhorn_config), "muon": dict(muon_config), "adamw": dict(adamw_config)}
+        selectors = {name: self._patterns(config.pop("param_patterns", ())) for name, config in configs.items()}
+        override_patterns, sinkhorn_groups = self._sinkhorn_overrides(configs["sinkhorn"].pop("param_groups", ()))
+        aliases = self._aliases(model, excluded_param_ids)
+        if not aliases:
+            raise ValueError("Sinkhorn builder requires at least one trainable parameter")
+        roles = self._roles(model)
+        selected = {name: [] for name in configs}
+        for param, names in aliases.items():
+            family, group_index = self._route(param, names, roles, selectors, override_patterns)
+            selected[family].append(param)
+            if family == "sinkhorn":
+                sinkhorn_groups[group_index]["params"].append(param)
+        adamw_groups = self._adamw_groups(selected["adamw"], aliases, roles[1], no_decay_params)
+        logger.info_rank0("Optimizer split: %s", {name: len(params) for name, params in selected.items()})
+        self.optimizer = get_hyper_optimizer(
+            model=model,
+            muon_params=selected["muon"],
+            adamw_params=adamw_groups,
+            sinkhorn_params=[group for group in sinkhorn_groups if group["params"]],
+            muon_kwargs=configs["muon"],
+            adamw_kwargs=configs["adamw"],
+            sinkhorn_kwargs=configs["sinkhorn"],
+        )
+
+    @classmethod
+    def _sinkhorn_overrides(cls, overrides):
+        """Separate pattern selectors from Sinkhorn parameter-group overrides."""
+        patterns = []
+        groups = [{"params": []}]
+        for group in overrides:
+            if "params" in group:
+                raise ValueError("Sinkhorn builder groups use param_patterns, not params")
+            selector = cls._patterns(group.get("param_patterns", ()))
+            if not selector:
+                raise ValueError("Sinkhorn parameter group overrides require param_patterns")
+            patterns.append(selector)
+            groups.append({**{key: value for key, value in group.items() if key != "param_patterns"}, "params": []})
+        return patterns, groups
+
+    @classmethod
+    def _route(cls, param, names, roles, selectors, override_patterns):
+        """Resolve one parameter's optimizer and reject conflicting selectors."""
+        matches = [index for index, patterns in enumerate(override_patterns) if cls._matches(names, patterns)]
+        if len(matches) > 1:
+            raise ValueError(f"Overlapping Sinkhorn parameter groups for {names}")
+        explicit = {name for name, patterns in selectors.items() if cls._matches(names, patterns)}
+        if matches:
+            explicit.add("sinkhorn")
+        if len(explicit) > 1:
+            raise ValueError(f"Overlapping optimizer selectors for {names}")
+        family = next(iter(explicit)) if explicit else cls._default_family(param, names, *roles)
+        if family == "sinkhorn" and param.ndim != 2:
+            raise ValueError(f"Sinkhorn requires a 2D matrix: {names}")
+        if family == "muon" and param.ndim < 2:
+            raise ValueError(f"Muon requires a matrix: {names}")
+        return family, matches[0] + 1 if matches else 0
+
+    @staticmethod
+    def _patterns(patterns):
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        return [re.compile(pattern) for pattern in patterns]
+
+    @staticmethod
+    def _matches(names, patterns):
+        return any(pattern.search(name) for pattern in patterns for name in names)
+
+    @staticmethod
+    def _aliases(model, excluded_param_ids):
+        excluded = set(excluded_param_ids or ())
+        aliases = {}
+        for name, param in model.named_parameters(remove_duplicate=False):
+            if param.requires_grad and id(param) not in excluded:
+                aliases.setdefault(param, []).append(name)
+        return aliases
+
+    @staticmethod
+    def _roles(model):
+        embeddings, norms = set(), set()
+        for module in model.modules():
+            if isinstance(module, nn.Embedding):
+                embeddings.add(id(module.weight))
+            if re.search(r"norm(?:[123]d|gated)?$", type(module).__name__, re.IGNORECASE):
+                norms.update(id(param) for param in module.parameters(recurse=False))
+        return embeddings, norms
+
+    @staticmethod
+    def _default_family(param, names, embedding_ids, norm_ids):
+        if id(param) in norm_ids:
+            return "adamw"
+        if id(param) in embedding_ids or any(
+                re.search(r"(?:^|\.)(?:lm_head|out_head|output_head)\.weight$", name) for name in names):
+            return "sinkhorn"
+        return "muon" if param.ndim >= 2 else "adamw"
+
+    @staticmethod
+    def _adamw_groups(params, aliases, norm_ids, no_decay_params):
+        """Split AdamW parameters by decay policy, including normalization weights."""
+        decay, no_decay = [], []
+        for param in params:
+            names = aliases[param]
+            if no_decay_params is None:
+                excluded = (param.ndim < 2 and id(param) not in norm_ids) or any(
+                    name.rsplit(".", 1)[-1] in ("bias", "scale", "scales", "scaling_factor") for name in names
+                )
+            else:
+                excluded = any(keyword.lower() in name.lower() for keyword in no_decay_params for name in names)
+            (no_decay if excluded else decay).append(param)
+        groups = [{"params": decay}] if decay else []
+        if no_decay:
+            groups.append({"params": no_decay, "weight_decay": 0.0})
+        return groups
 
     def get_optimizer(self) -> Any:
         """Return the core chained optimizer runtime."""

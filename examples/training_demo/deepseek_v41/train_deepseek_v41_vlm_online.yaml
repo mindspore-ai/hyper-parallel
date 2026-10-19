@@ -232,21 +232,38 @@ dataloader:
   prefetch_factor: null
 
 optimizer:
-  _target_: hyper_parallel.components.optim.Muon
+  _target_: hyper_parallel.components.optim.Sinkhorn
   fp32_main_params: true
-  no_decay_params: [bias, norm, ln_]
   muon_config:
-    muon_lr: 3.0e-5
-    muon_weight_decay: 0.0
-    muon_momentum: 0.95
-    muon_nesterov: true
-    muon_ns_steps: 5
-    muon_ns_variant: asym5
+    lr: 2.6e-4
+    weight_decay: 0.1
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+    ns_variant: asym5
+    matched_adamw_rms: 0.18
+    reshape_fn:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.optim.headwise_muon.build_reshape_fn
+      attention_head_dim: 512
+      indexer_head_dim: 128
+  sinkhorn_config:
+    lr: 2.6e-4
+    momentum: 0.95
+    nesterov: true
+    steps: 11
+    tau: 1.0e-3
+    eps: 1.0e-20
+    correction: 0.18
+    param_groups:
+      - param_patterns: ['\.engram\.embed\.weight$']
+        lr: 1.3e-3
   adamw_config:
-    adamw_lr: 1.0e-5
-    adamw_weight_decay: 0.01
-    adamw_betas: [0.9, 0.999]
-    adamw_eps: 1.0e-8
+    lr: 2.6e-4
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+    eps: 1.0e-20
+    # Engram Q/K normalization scales are matrices, not linear projections.
+    param_patterns: ['\.engram\.[qk]_weight$']
 
 lr_scheduler:
   _target_: hyper_parallel.components.optim.MultiLRScheduler
