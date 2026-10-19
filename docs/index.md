@@ -17,6 +17,7 @@
 | [PP 流水线并行](./guide/pipeline_parallel.md) | PipelineStage、Schedule、overlap_b_f、PP+FSDP、P2P prefetch、 Mpipe |
 | [CP 上下文并行](./guide/context_parallel.md) | ContextParallel、AsyncContextParallel、DSA 系列 |
 | [KDA 上下文并行](./guide/kda_context_parallel.md) | KDA P2P、AllGather、Ulysses 及混合方式的配置与显存 |
+| [KDA 递归倍增与 Ulysses 混合 CP](./guide/kda_recursive_doubling.md) | RD 状态扫描、Ulysses 混合配置与转移缓存 |
 | [EP 专家并行](./guide/expert_parallel.md) | ExpertParallel、MoE 构建模块、负载均衡 |
 | [Activation Checkpoint / Swap](./guide/activation_checkpoint.md) | checkpoint_wrapper、swap_wrapper、swap_tensor_wrapper、协同配置 |
 | [Optimizer](./guide/optimizer.md) | AdamW、Muon、ChainedOptimizer、学习率调度器 |
