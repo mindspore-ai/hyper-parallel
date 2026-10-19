@@ -43,10 +43,16 @@ class _RecomputeInvocation:
 class RecomputeState:
     """Describe the current checkpoint invocation and execution phase."""
 
-    def __init__(self, invocation: _RecomputeInvocation, recomputing: bool) -> None:
+    def __init__(
+        self,
+        invocation: _RecomputeInvocation,
+        recomputing: bool,
+        preserve_rng_state: bool = True,
+    ) -> None:
         """Initialize state for one phase of a checkpoint invocation."""
         self._invocation = invocation
         self.is_recomputing = recomputing
+        self.preserve_rng_state = preserve_rng_state
 
     @property
     def invocation_id(self) -> object:
@@ -101,10 +107,16 @@ def is_recomputing() -> bool:
     return state is not None and state.is_recomputing
 
 
-def create_recompute_contexts() -> Tuple[_RecomputeContext, _RecomputeContext]:
+def create_recompute_contexts(
+    preserve_rng_state: bool = True,
+) -> Tuple[_RecomputeContext, _RecomputeContext]:
     """Create forward and recompute contexts for one checkpoint invocation."""
     invocation = _RecomputeInvocation()
     return (
-        _RecomputeContext(RecomputeState(invocation, recomputing=False)),
-        _RecomputeContext(RecomputeState(invocation, recomputing=True)),
+        _RecomputeContext(
+            RecomputeState(invocation, recomputing=False, preserve_rng_state=preserve_rng_state)
+        ),
+        _RecomputeContext(
+            RecomputeState(invocation, recomputing=True, preserve_rng_state=preserve_rng_state)
+        ),
     )

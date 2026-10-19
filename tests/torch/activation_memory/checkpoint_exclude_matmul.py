@@ -38,13 +38,13 @@ _EXCLUDE_MODULE = importlib.import_module(
 
 
 class _CountedMatmul(torch.nn.Module):
-    """MatMul that records whether checkpoint replay executes it."""
+    """Project a half-width view and record whether replay executes it."""
 
     def __init__(self, calls: Dict[str, int]) -> None:
         """Initialize a deterministic square projection."""
         super().__init__()
         self.calls = calls
-        self.weight = torch.nn.Parameter(torch.empty(_HIDDEN_SIZE, _HIDDEN_SIZE, dtype=torch.bfloat16))
+        self.weight = torch.nn.Parameter(torch.empty(_HIDDEN_SIZE // 2, _HIDDEN_SIZE, dtype=torch.bfloat16))
         with torch.no_grad():
             torch.manual_seed(2026)
             self.weight.normal_(0.0, 0.02)
@@ -56,7 +56,7 @@ class _CountedMatmul(torch.nn.Module):
 
 
 class _RmsNormMatmulBlock(torch.nn.Module):
-    """Apply RMSNorm, an excluded MatMul, and SiLU."""
+    """Apply RMSNorm, a sliced view, an excluded MatMul, and SiLU."""
 
     def __init__(self, calls: Dict[str, int]) -> None:
         """Initialize one checkpointed layer."""
@@ -72,7 +72,8 @@ class _RmsNormMatmulBlock(torch.nn.Module):
             self.norm_weight,
             eps=1e-6,
         )
-        return torch.nn.functional.silu(self.matmul(normalized))
+        viewed = normalized.view(_TOKEN_NUM, _HIDDEN_SIZE)[:, : _HIDDEN_SIZE // 2]
+        return torch.nn.functional.silu(self.matmul(viewed))
 
 
 class _RmsNormMatmulNet(torch.nn.Module):
@@ -283,10 +284,10 @@ def _run_save_chain(save_intermediate_outputs: bool) -> Dict[str, Any]:
     }
 
 
-def _disable_input_rematerialization(invocation_id: object, args: Any, kwargs: Any) -> tuple:
+def _disable_input_rematerialization(cache: object, args: Any, kwargs: Any) -> tuple:
     """Reproduce legacy exclusion, which retains saved input storage."""
-    del invocation_id, args, kwargs
-    return [], []
+    del cache, args, kwargs
+    return ()
 
 
 def _run_host_performance_comparison() -> Dict[str, Any]:
@@ -296,13 +297,13 @@ def _run_host_performance_comparison() -> Dict[str, Any]:
     torch.npu.manual_seed(2030)
     net = _RmsNormMatmulNet({"matmul": 0}).npu()
     input_data = torch.randn(_TOKEN_NUM, _HIDDEN_SIZE, device="npu", dtype=torch.bfloat16).mul_(0.5)
-    original_mark = _EXCLUDE_MODULE._mark_recompute_inputs  # pylint: disable=protected-access
+    original_mark = _EXCLUDE_MODULE._capture_recompute_inputs  # pylint: disable=protected-access
     timings = {"current": [], "legacy": []}
 
     def set_mode(mode: str) -> None:
         """Switch only the input rematerialization control-plane path."""
         mark_inputs = original_mark if mode == "current" else _disable_input_rematerialization
-        _EXCLUDE_MODULE._mark_recompute_inputs = mark_inputs  # pylint: disable=protected-access
+        _EXCLUDE_MODULE._capture_recompute_inputs = mark_inputs  # pylint: disable=protected-access
 
     try:
         for mode in ("legacy", "current"):
@@ -406,12 +407,12 @@ def _run_mode(mode: str) -> Dict[str, Any]:
     if mode != "legacy_exclude":
         raise ValueError(f"Unsupported checkpoint exclusion mode: {mode}")
 
-    original_mark = _EXCLUDE_MODULE._mark_recompute_inputs  # pylint: disable=protected-access
-    _EXCLUDE_MODULE._mark_recompute_inputs = _disable_input_rematerialization  # pylint: disable=protected-access
+    original_mark = _EXCLUDE_MODULE._capture_recompute_inputs  # pylint: disable=protected-access
+    _EXCLUDE_MODULE._capture_recompute_inputs = _disable_input_rematerialization  # pylint: disable=protected-access
     try:
         return _run_exclude()
     finally:
-        _EXCLUDE_MODULE._mark_recompute_inputs = original_mark  # pylint: disable=protected-access
+        _EXCLUDE_MODULE._capture_recompute_inputs = original_mark  # pylint: disable=protected-access
 
 
 def _run_mode_in_subprocess(mode: str) -> Dict[str, Any]:

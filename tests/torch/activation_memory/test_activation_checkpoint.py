@@ -67,6 +67,12 @@ def test_scheduled_recompute_npu_preserves_rng_state() -> None:
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_checkpoint_exclude_save_preserves_rng_state() -> None:
+    """Verify excluded SAVE regions keep RNG aligned during checkpoint replay."""
+    activation_checkpoint_cases.test_checkpoint_exclude_save_preserves_rng_state()
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_scheduled_recompute_npu_restores_autocast() -> None:
     """Verify scheduled NPU recomputation restores autocast settings."""
     activation_checkpoint_cases.test_scheduled_recompute_npu_restores_autocast()
