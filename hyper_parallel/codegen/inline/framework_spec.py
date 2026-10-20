@@ -423,12 +423,17 @@ def _ep_strategy_spec(archetype: Any) -> StrategySpec:
     The inlined EP forward orchestrates through the instance-attribute channel
     (``self.ep_enable`` / ``self._hp_ep_group``) like every other generated
     forward, so it declares no module-level snippet.
+
+    The spec carries no target class on purpose: the MoE block class is a
+    per-model fact, and this spec is cached per capability target. The
+    materialization passes derive the concrete class from the frozen boundary
+    map (match pattern x class name), so a model naming its block anything at
+    all materializes without registration.
     """
     from hyper_parallel.codegen.inline.templates import moe_ep_forward_body  # pylint: disable=C0415
 
     return StrategySpec(
         kind=archetype.kind,
-        target_classes=archetype.target_classes,
         body_template=moe_ep_forward_body(
             router_kind=archetype.router_kind, shared=archetype.shared
         ),
@@ -462,6 +467,7 @@ def interface_component_class(model_type: str | None) -> str | None:
 def external_state_classes_for(
     model_type: str | None,
     injections: Iterable[Mapping[str, Any]] | None = None,
+    boundary_classes: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
     """Classes whose ``forward`` an inline strategy body *replaces*.
 
@@ -471,7 +477,14 @@ def external_state_classes_for(
     orchestration body (the MoE EP shell).  Such a class owns its collectives,
     so it must keep its parameter sharding without a compiled boundary — it is
     skipped by the boundary / compute / inner-wrapper installers and reads its
-    parallel channel from install-time instance attributes instead.
+    parallel state from install-time instance attributes instead.
+
+    The class itself is a per-model fact derived from the frozen boundary map:
+    each injection records the concrete FQN it applies to, and the boundary
+    map names that FQN's class. A model naming its MoE block anything at all
+    is picked up without registration. A spec that still carries an explicit
+    ``target_class`` keeps it (literal mode, e.g. a future strategy that names
+    its own host class).
 
     A *rendered* component class (the class this family's replacement
     factories build, e.g. the fused attention) is deliberately NOT one of
@@ -484,9 +497,14 @@ def external_state_classes_for(
         spec = strategy_spec_for(
             _target_path(record.get("local_compute_fn")), model_type
         )
-        if spec is None or spec.body_template is None or spec.target_classes is None:
+        if spec is None or spec.body_template is None:
             continue
-        inlined.update(spec.target_classes)
+        if spec.target_class is not None:
+            inlined.add(spec.target_class)
+            continue
+        block_class = (boundary_classes or {}).get(record.get("match"))
+        if block_class is not None:
+            inlined.add(block_class)
     return tuple(sorted(inlined))
 
 

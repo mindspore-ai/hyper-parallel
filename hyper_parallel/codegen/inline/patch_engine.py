@@ -428,7 +428,14 @@ def _forward_extract_edits(
     for patch in patches:
         cls = index.find_class(patch.class_name)
         if cls is None:
-            continue
+            # The class comes from the frozen boundary map (or an explicit
+            # spec literal), so a miss means the plan and the modeling source
+            # disagree — fail fast instead of silently dropping the strategy.
+            raise RuntimeError(
+                f"codegen: inline strategy targets class "
+                f"{patch.class_name!r} which the modeling source does not "
+                "define; the artifact would silently lose this strategy"
+            )
         func = cls.methods.get(patch.method_name)
         if func is None:
             continue

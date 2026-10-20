@@ -115,6 +115,7 @@ def test_external_state_classes_travel_from_structure_to_the_runtime() -> None:
     meta.source = {"architecture": "Qwen3MoeForCausalLM"}
     meta.injections = [
         {
+            "match": "model.layers.0.mlp",
             "local_compute_fn": {
                 "_target_": (
                     "hyper_parallel.models.qwen3_moe.adapter.distributed."
@@ -123,6 +124,9 @@ def test_external_state_classes_travel_from_structure_to_the_runtime() -> None:
             }
         }
     ]
+    # The block class is a per-model fact: it is derived from the frozen
+    # boundary map (FQN -> class), never from a registered literal.
+    meta.boundary_classes = {"model.layers.0.mlp": "Qwen3MoeSparseMoeBlock"}
     manager._record_inline_declarations(meta)
     assert meta.external_state_classes == ["Qwen3MoeSparseMoeBlock"]
 
