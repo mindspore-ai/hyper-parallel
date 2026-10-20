@@ -19,6 +19,12 @@ Run from an editable HyperParallel installation, without torchrun or model weigh
         --data-path /path/to/data.jsonl --tokenizer-path /path/to/model \
         --tools-key tools --max-seq-len 4096 --output-dir outputs/template_check
 
+Add --config examples/qwen3_6_moe/train_online.yaml to read only
+dataset.model_assets.chat_template_kwargs (not dataset paths or sequence length).
+With --config, --template-kwargs overrides individual YAML fields; {} keeps them.
+Without --config, legacy defaults apply unless --template-kwargs is supplied;
+an explicit {} then selects tokenizer defaults. YAML interpolation is not resolved.
+
 Exit codes: 0 = all records passed; 1 = record failures or empty dataset;
 2 = invalid configuration or setup failure. Output contains dataset text: keep it private.
 """
@@ -29,6 +35,8 @@ import argparse
 import json
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 import hyper_parallel
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -136,6 +144,36 @@ def scan_dataset(
     return summary
 
 
+def _resolve_template_kwargs(config_path: Path | None, overrides: str | None) -> dict[str, Any]:
+    """Read template options without constructing the training dataset or model."""
+    if config_path is None:
+        # Preserve the old CLI contract, including explicit {} for native defaults.
+        options = {"enable_thinking": True, "reasoning_effort": "medium"} if overrides is None else {}
+    else:
+        with config_path.open(encoding="utf-8") as source:
+            config = yaml.safe_load(source)
+        if not isinstance(config, dict):
+            raise ValueError("config must be a YAML mapping")
+        dataset = config.get("dataset")
+        if not isinstance(dataset, dict):
+            raise ValueError("config.dataset must be a mapping")
+        assets = dataset.get("model_assets")
+        if not isinstance(assets, dict):
+            raise ValueError("config.dataset.model_assets must be a mapping")
+        options = assets.get("chat_template_kwargs")
+        if options is None:
+            options = {}
+        if not isinstance(options, dict) or any(not isinstance(key, str) for key in options):
+            raise ValueError("config.dataset.model_assets.chat_template_kwargs must be a mapping with string keys")
+        options = dict(options)
+    if overrides is not None:
+        explicit_options = json.loads(overrides)
+        if not isinstance(explicit_options, dict):
+            raise ValueError("template-kwargs must be a JSON object")
+        options.update(explicit_options)
+    return options
+
+
 def parse_args() -> argparse.Namespace:
     """Parse local-only tokenizer and dataset options, matching the Qwen training defaults."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -147,8 +185,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tools-key", default="tools", help="Top-level tools field; pass an empty string to disable")
     parser.add_argument("--max-seq-len", type=int, default=4096, help="Training truncation limit before label shift")
     parser.add_argument("--progress-every", type=int, default=100)
-    parser.add_argument("--template-kwargs", default='{"enable_thinking": true, "reasoning_effort": "medium"}',
-                        help="JSON object passed unchanged to the native chat template; use {} for tokenizer defaults")
+    parser.add_argument("--config", type=Path,
+                        help="Training YAML; read only dataset.model_assets.chat_template_kwargs")
+    parser.add_argument("--template-kwargs",
+                        help="JSON options: override YAML fields with --config; otherwise replace legacy defaults")
     args = parser.parse_args()
     if args.max_seq_len < 2 or args.progress_every < 0:
         parser.error("max-seq-len must be >= 2 and progress-every must be >= 0")
@@ -157,11 +197,9 @@ def parse_args() -> argparse.Namespace:
     if args.output_dir.exists():
         parser.error("output-dir already exists; choose a new directory to preserve previous results")
     try:
-        args.template_kwargs = json.loads(args.template_kwargs)
-    except json.JSONDecodeError as exc:
-        parser.error(f"Invalid template-kwargs JSON: {exc}")
-    if not isinstance(args.template_kwargs, dict):
-        parser.error("template-kwargs must be a JSON object")
+        args.template_kwargs = _resolve_template_kwargs(args.config, args.template_kwargs)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        parser.error(f"Invalid template configuration: {exc}")
     return args
 
 
@@ -176,7 +214,8 @@ def main() -> int:
         metadata = {"data_path": str(args.data_path.resolve()), "tokenizer_path": str(args.tokenizer_path.resolve()),
                     "hyper_parallel_path": hyper_parallel.__file__, "text_key": args.text_key,
                     "tools_key": args.tools_key or None, "max_seq_len": args.max_seq_len,
-                    "template_kwargs": args.template_kwargs}
+                    "template_kwargs": args.template_kwargs,
+                    "config_path": str(args.config.resolve()) if args.config else None}
         summary = scan_dataset(args.data_path, args.output_dir, transform, metadata, args.progress_every)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         print(f"Setup/scan failed: {type(exc).__name__}: {exc}", flush=True)
