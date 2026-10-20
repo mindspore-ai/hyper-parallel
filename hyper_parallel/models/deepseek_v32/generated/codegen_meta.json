@@ -76,6 +76,38 @@
   ],
   "injections": [
     {
+      "inner_target": "self",
+      "inner_wrapper": {
+        "_target_": "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper"
+      },
+      "match": "model.layers.3.self_attn"
+    },
+    {
+      "inner_target": "self",
+      "inner_wrapper": {
+        "_target_": "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper"
+      },
+      "match": "model.layers.0.self_attn"
+    },
+    {
+      "inner_target": "self",
+      "inner_wrapper": {
+        "_target_": "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper"
+      },
+      "match": "model.layers.1.self_attn"
+    },
+    {
+      "ep_size": 2,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
+        "capacity_factor": null,
+        "fix_router": false,
+        "overlap_shared_expert": false,
+        "use_grouped_gemm": true
+      },
+      "match": "model.layers.3.mlp"
+    },
+    {
       "local_compute_fn": {
         "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
         "capacity_factor": null,
@@ -96,18 +128,15 @@
       "match": "model.layers.1.mlp"
     },
     {
-      "ep_size": 2,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
-        "capacity_factor": null,
-        "fix_router": false,
-        "overlap_shared_expert": false,
-        "use_grouped_gemm": true
+      "inner_target": "self",
+      "inner_wrapper": {
+        "_target_": "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper"
       },
-      "match": "model.layers.3.mlp"
+      "match": "model.layers.2.self_attn"
     }
   ],
   "mesh_dim_names": [
+    "cp",
     "tp"
   ],
   "model_class": null,
@@ -310,7 +339,7 @@
   "outputs": {
     "diff": {
       "lines": 134,
-      "sha256": "9481cd75185a8a25ccedffd4bf44160073b06a8b8fadc3d6e7919397fe401d00"
+      "sha256": "5369f663a98b1595af9052299aca166724461ee91a788c45ec39d5c3561d37ec"
     },
     "init": {
       "lines": 6,
@@ -318,11 +347,11 @@
     },
     "modeling": {
       "lines": 867,
-      "sha256": "03532708f623276acef047d226b6c77ce70886b5d1bdb6114c293f0c2fa2a5aa"
+      "sha256": "f6c55449851f9227ed50c4235a688617843599098aef6505b909159bcd8688e6"
     }
   },
   "parallel_dims": {
-    "cp_size": 1,
+    "cp_size": 2,
     "dp_size": 1,
     "ep_size": 2,
     "loss_parallel": false,
@@ -334,14 +363,14 @@
     "lm_head": {
       "in_dst": {
         "hidden_states": {
-          "cp": "R",
+          "cp": "S(1)",
           "ep": "R",
           "tp": "R"
         }
       },
       "in_src": {
         "hidden_states": {
-          "cp": "R",
+          "cp": "S(1)",
           "ep": "R",
           "tp": "R"
         }
@@ -349,14 +378,14 @@
       "is_boundary": true,
       "out_dst": {
         "output": {
-          "cp": "R",
+          "cp": "S(1)",
           "ep": "R",
           "tp": "R"
         }
       },
       "out_src": {
         "output": {
-          "cp": "R",
+          "cp": "S(1)",
           "ep": "R",
           "tp": "S(-1)"
         }
@@ -598,7 +627,8 @@
           "ep": "R",
           "tp": "S(0)"
         }
-      }
+      },
+      "region_dispatch": false
     },
     "model.layers.0.self_attn.indexer.k_norm": {
       "in_dst": {
@@ -911,7 +941,8 @@
           "ep": "R",
           "tp": "S(0)"
         }
-      }
+      },
+      "region_dispatch": false
     },
     "model.layers.1.self_attn.indexer.k_norm": {
       "in_dst": {
@@ -1224,7 +1255,8 @@
           "ep": "R",
           "tp": "S(0)"
         }
-      }
+      },
+      "region_dispatch": false
     },
     "model.layers.2.self_attn.indexer.k_norm": {
       "in_dst": {
@@ -1582,7 +1614,8 @@
           "ep": "R",
           "tp": "S(0)"
         }
-      }
+      },
+      "region_dispatch": false
     },
     "model.layers.3.self_attn.indexer.k_norm": {
       "in_dst": {
@@ -1743,7 +1776,7 @@
     }
   },
   "remote_siblings": [],
-  "signature": "3cfa911f5a85",
+  "signature": "3e41846f8a73",
   "skipped_overrides": [],
   "source": {
     "architecture": null,
@@ -1772,5 +1805,5 @@
   "special_handlers": {},
   "tied_pairs": [],
   "yaml_path": "/home/lxy/hyper-parallel-genpath/examples/training_demo/deepseek_v32/train_codegen_probe.yaml",
-  "yaml_sha256": "a7dbd9f544fa5f1a30df7f23fb43ba649103e185bfdbf4b8460d46d508ef26a3"
+  "yaml_sha256": "7dc94d4a4ea0ab545ff9f6bc9d708f37f9a4ecf91fe575e3c88a458244037a6e"
 }
