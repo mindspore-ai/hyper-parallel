@@ -47,19 +47,25 @@ def build_strategy_patches(rules: tuple[InlineRule, ...], model_type: str | None
             seen.add((target, inner_wrapper))
             patch_set.imports.extend(spec.imports)
             patch_set.module_snippets.extend(spec.snippets)
-            if spec.target_class is None:
+            if spec.target_classes is None:
                 continue
-            key = (spec.target_class, spec.method_name)
-            if key in emitted:
-                if emitted[key] != spec.body_template:
-                    raise ValueError(f"Conflicting inline strategies for {spec.target_class}.{spec.method_name}")
-                continue
-            emitted[key] = spec.body_template
-            patch_set.forward_extracts.append(
-                ForwardExtractPatch(
-                    class_name=spec.target_class,
-                    method_name=spec.method_name,
-                    body=spec.body_template,
+            # One patch per known carrier class: the patch engine applies the
+            # body to whichever class the source file actually defines, so
+            # names absent from this source are natural no-ops.
+            for class_name in spec.target_classes:
+                key = (class_name, spec.method_name)
+                if key in emitted:
+                    if emitted[key] != spec.body_template:
+                        raise ValueError(
+                            f"Conflicting inline strategies for {class_name}.{spec.method_name}"
+                        )
+                    continue
+                emitted[key] = spec.body_template
+                patch_set.forward_extracts.append(
+                    ForwardExtractPatch(
+                        class_name=class_name,
+                        method_name=spec.method_name,
+                        body=spec.body_template,
+                    )
                 )
-            )
     return patch_set

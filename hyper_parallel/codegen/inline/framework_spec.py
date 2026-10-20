@@ -428,7 +428,7 @@ def _ep_strategy_spec(archetype: Any) -> StrategySpec:
 
     return StrategySpec(
         kind=archetype.kind,
-        target_class=archetype.target_class,
+        target_classes=archetype.target_classes,
         body_template=moe_ep_forward_body(
             router_kind=archetype.router_kind, shared=archetype.shared
         ),
@@ -484,9 +484,9 @@ def external_state_classes_for(
         spec = strategy_spec_for(
             _target_path(record.get("local_compute_fn")), model_type
         )
-        if spec is None or spec.body_template is None or spec.target_class is None:
+        if spec is None or spec.body_template is None or spec.target_classes is None:
             continue
-        inlined.add(spec.target_class)
+        inlined.update(spec.target_classes)
     return tuple(sorted(inlined))
 
 

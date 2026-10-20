@@ -21,6 +21,10 @@ import torch
 from torch import nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
+from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
+    DeepseekV32Config,
+)
+from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32MoE
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
 
@@ -32,11 +36,16 @@ from hyper_parallel.distributed.expert_parallel.structure import (
 class TestMoeStructure(unittest.TestCase):
     """Exercise real source contracts using allocation-free meta models."""
 
-    def test_tuple_router_preserves_scoring_for_both_architectures(self):
-        """Grouped sigmoid routers already return final weights and indices."""
+    def test_tuple_router_preserves_scoring_across_architectures(self):
+        """Grouped sigmoid routers already return final weights and indices.
+
+        DeepSeek-V3 and DeepSeek-V3.2 ship the same MoE structure under
+        different class names, so both must freeze to the same fingerprint.
+        """
         configurations = (
             (Qwen3MoeSparseMoeBlock, Qwen3MoeConfig(), "none"),
             (DeepseekV3MoE, DeepseekV3Config(), "additive"),
+            (DeepseekV32MoE, DeepseekV32Config(), "additive"),
         )
         for constructor, config, shared in configurations:
             with self.subTest(constructor=constructor.__name__), torch.device("meta"):

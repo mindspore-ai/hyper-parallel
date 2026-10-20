@@ -204,7 +204,7 @@ class TestInlineAdapters(unittest.TestCase):
         self.assertIs(
             legacy, replacement_spec(ATTENTION, "Qwen3MoeForCausalLM", module_type=ATTENTION_TYPE)
         )
-        self.assertEqual(strategy_spec(EP).target_class, "Qwen3MoeSparseMoeBlock")
+        self.assertEqual(strategy_spec(EP).target_classes, ("Qwen3MoeSparseMoeBlock",))
         # A CP wrapper is a strategy *because of its position* in the override
         # (``inner_wrapper``); the same target as a local compute fn is not one.
         self.assertIsNone(strategy_spec(CP))
@@ -310,7 +310,7 @@ class TestInlineAdapters(unittest.TestCase):
         """
         snippet = ModuleSnippetPatch("def helper():\n    return 1")
         declaration = StrategySpec(
-            "ep", (), "Block", body_template="return 1", snippets=(snippet,)
+            "ep", (), ("Block",), body_template="return 1", snippets=(snippet,)
         )
         rules = tuple(
             InlineRule((f"model.layers.{index}.mlp",), local_compute_target=EP)
@@ -555,9 +555,9 @@ class Model:
         Expectation: the emitted artifact and metadata satisfy the assertions in this test.
         """
         with self.assertRaisesRegex(ValueError, "provided together"):
-            StrategySpec("invalid", (), target_class="ToyBlock")
+            StrategySpec("invalid", (), target_classes=("ToyBlock",))
         with self.assertRaisesRegex(ValueError, "nonempty"):
-            StrategySpec("invalid", (), target_class="ToyBlock", body_template="")
+            StrategySpec("invalid", (), target_classes=("ToyBlock",), body_template="")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
               card_mark="onecard", essential_mark="unessential")
