@@ -3,26 +3,21 @@
     "lm_head": "Linear",
     "model.embed_tokens": "Embedding",
     "model.layers.0.input_layernorm": "DeepseekV3RMSNorm",
-    "model.layers.0.mlp": "DeepseekV3MLP",
     "model.layers.0.post_attention_layernorm": "DeepseekV3RMSNorm",
     "model.layers.0.self_attn": "DeepseekV3Attention",
     "model.layers.0.self_attn.kv_a_layernorm": "DeepseekV3RMSNorm",
     "model.layers.0.self_attn.q_a_layernorm": "DeepseekV3RMSNorm",
     "model.layers.1.input_layernorm": "DeepseekV3RMSNorm",
-    "model.layers.1.mlp": "DeepseekV3MLP",
     "model.layers.1.post_attention_layernorm": "DeepseekV3RMSNorm",
     "model.layers.1.self_attn": "DeepseekV3Attention",
     "model.layers.1.self_attn.kv_a_layernorm": "DeepseekV3RMSNorm",
     "model.layers.1.self_attn.q_a_layernorm": "DeepseekV3RMSNorm",
     "model.layers.2.input_layernorm": "DeepseekV3RMSNorm",
-    "model.layers.2.mlp": "DeepseekV3MLP",
     "model.layers.2.post_attention_layernorm": "DeepseekV3RMSNorm",
     "model.layers.2.self_attn": "DeepseekV3Attention",
     "model.layers.2.self_attn.kv_a_layernorm": "DeepseekV3RMSNorm",
     "model.layers.2.self_attn.q_a_layernorm": "DeepseekV3RMSNorm",
     "model.layers.3.input_layernorm": "DeepseekV3RMSNorm",
-    "model.layers.3.mlp": "DeepseekV3MoE",
-    "model.layers.3.mlp.shared_experts": "DeepseekV3MLP",
     "model.layers.3.post_attention_layernorm": "DeepseekV3RMSNorm",
     "model.layers.3.self_attn": "DeepseekV3Attention",
     "model.layers.3.self_attn.kv_a_layernorm": "DeepseekV3RMSNorm",
@@ -38,10 +33,76 @@
   "entrypoints": {
     "parallelize": "hp_parallelize"
   },
-  "external_state_classes": [],
-  "frozen_sharded_params": [],
-  "injections": [],
-  "mesh_dim_names": null,
+  "external_state_classes": [
+    "DeepseekV3MLP",
+    "DeepseekV3MoE"
+  ],
+  "frozen_sharded_params": [
+    "lm_head.weight",
+    "model.embed_tokens.weight",
+    "model.layers.0.mlp.down_proj.weight",
+    "model.layers.0.mlp.gate_proj.weight",
+    "model.layers.0.mlp.up_proj.weight",
+    "model.layers.0.self_attn.kv_b_proj.weight",
+    "model.layers.0.self_attn.o_proj.weight",
+    "model.layers.0.self_attn.q_b_proj.weight",
+    "model.layers.1.mlp.down_proj.weight",
+    "model.layers.1.mlp.gate_proj.weight",
+    "model.layers.1.mlp.up_proj.weight",
+    "model.layers.1.self_attn.kv_b_proj.weight",
+    "model.layers.1.self_attn.o_proj.weight",
+    "model.layers.1.self_attn.q_b_proj.weight",
+    "model.layers.2.mlp.down_proj.weight",
+    "model.layers.2.mlp.gate_proj.weight",
+    "model.layers.2.mlp.up_proj.weight",
+    "model.layers.2.self_attn.kv_b_proj.weight",
+    "model.layers.2.self_attn.o_proj.weight",
+    "model.layers.2.self_attn.q_b_proj.weight",
+    "model.layers.3.mlp.experts.down_proj",
+    "model.layers.3.mlp.experts.gate_up_proj",
+    "model.layers.3.mlp.shared_experts.down_proj.weight",
+    "model.layers.3.mlp.shared_experts.gate_proj.weight",
+    "model.layers.3.mlp.shared_experts.up_proj.weight",
+    "model.layers.3.self_attn.kv_b_proj.weight",
+    "model.layers.3.self_attn.o_proj.weight",
+    "model.layers.3.self_attn.q_b_proj.weight"
+  ],
+  "injections": [
+    {
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
+        "capacity_factor": null,
+        "fix_router": false,
+        "overlap_shared_expert": false,
+        "use_grouped_gemm": true
+      },
+      "match": "model.layers.1.mlp"
+    },
+    {
+      "ep_size": 2,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
+        "capacity_factor": null,
+        "fix_router": false,
+        "overlap_shared_expert": false,
+        "use_grouped_gemm": true
+      },
+      "match": "model.layers.3.mlp"
+    },
+    {
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
+        "capacity_factor": null,
+        "fix_router": false,
+        "overlap_shared_expert": false,
+        "use_grouped_gemm": true
+      },
+      "match": "model.layers.2.mlp"
+    }
+  ],
+  "mesh_dim_names": [
+    "tp"
+  ],
   "model_class": null,
   "model_name": "Deepseek_V3",
   "module_overrides": [],
@@ -54,26 +115,26 @@
   ],
   "outputs": {
     "diff": {
-      "lines": 63,
-      "sha256": "0d692395ee100ba537f19348d2a8bfdbcd8b3564bd04e4b5b644c48503568d8d"
+      "lines": 135,
+      "sha256": "3f7ba126946658437d8b58b5079de280ff47bac114fe1384c3ab06bdf7d13a0d"
     },
     "init": {
       "lines": 6,
-      "sha256": "1b01756b46ea4442664fecc18a9ba2f888324ef350de7a3c753f270485dcce4e"
+      "sha256": "73014f4a42d2a9d03b884bd07d29e3f4dfb190b7d751fa2443a2b92a007d5ba0"
     },
     "modeling": {
-      "lines": 731,
-      "sha256": "9b1c500c279822f633dfd11fca8c11d82d58bb144217565e88221865c3f64c14"
+      "lines": 774,
+      "sha256": "675b908708c62cb855f99cdc8159ad7ad59958a7bef11280d0aedb0aa49f9b30"
     }
   },
   "parallel_dims": {
     "cp_size": 1,
-    "dp_size": 8,
-    "ep_size": 1,
+    "dp_size": 4,
+    "ep_size": 2,
     "loss_parallel": false,
     "pp_size": 1,
     "sequence_parallel": false,
-    "tp_size": 1
+    "tp_size": 2
   },
   "param_plan": {
     "lm_head": {
@@ -109,7 +170,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         }
       }
     },
@@ -146,7 +208,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         }
       }
     },
@@ -183,7 +246,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -202,7 +266,7 @@
           "tp": "R"
         }
       },
-      "is_boundary": true,
+      "is_boundary": false,
       "out_dst": {
         "output": {
           "cp": "S(1)",
@@ -220,15 +284,18 @@
       "params": {
         "down_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(1)"
         },
         "gate_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         },
         "up_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         }
       }
     },
@@ -265,7 +332,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -307,11 +375,13 @@
         },
         "kv_b_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         },
         "o_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(1)"
         },
         "q_a_proj.weight": {
           "cp": "R",
@@ -320,7 +390,8 @@
         },
         "q_b_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         }
       }
     },
@@ -357,7 +428,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -394,7 +466,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -431,7 +504,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -450,7 +524,7 @@
           "tp": "R"
         }
       },
-      "is_boundary": true,
+      "is_boundary": false,
       "out_dst": {
         "output": {
           "cp": "S(1)",
@@ -468,17 +542,21 @@
       "params": {
         "down_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(1)"
         },
         "gate_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         },
         "up_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         }
-      }
+      },
+      "region_dispatch": false
     },
     "model.layers.1.post_attention_layernorm": {
       "in_dst": {
@@ -513,7 +591,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -555,11 +634,13 @@
         },
         "kv_b_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         },
         "o_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(1)"
         },
         "q_a_proj.weight": {
           "cp": "R",
@@ -568,7 +649,8 @@
         },
         "q_b_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         }
       }
     },
@@ -605,7 +687,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -642,7 +725,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -679,7 +763,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -698,7 +783,7 @@
           "tp": "R"
         }
       },
-      "is_boundary": true,
+      "is_boundary": false,
       "out_dst": {
         "output": {
           "cp": "S(1)",
@@ -716,17 +801,21 @@
       "params": {
         "down_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(1)"
         },
         "gate_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         },
         "up_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         }
-      }
+      },
+      "region_dispatch": false
     },
     "model.layers.2.post_attention_layernorm": {
       "in_dst": {
@@ -761,7 +850,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -803,11 +893,13 @@
         },
         "kv_b_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         },
         "o_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(1)"
         },
         "q_a_proj.weight": {
           "cp": "R",
@@ -816,7 +908,8 @@
         },
         "q_b_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         }
       }
     },
@@ -853,7 +946,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -890,7 +984,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -927,7 +1022,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -946,7 +1042,7 @@
           "tp": "R"
         }
       },
-      "is_boundary": true,
+      "is_boundary": false,
       "out_dst": {
         "output": {
           "cp": "S(1)",
@@ -958,21 +1054,22 @@
         "output": {
           "cp": "S(1)",
           "ep": "R",
-          "tp": "P(sum)"
+          "tp": "R"
         }
       },
       "params": {
         "experts.down_proj": {
           "cp": "R",
-          "tp": "R"
+          "ep": "S(0)"
         },
         "experts.gate_up_proj": {
           "cp": "R",
-          "tp": "R"
+          "ep": "S(0)"
         },
         "gate.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       },
       "region_dispatch": false
@@ -992,7 +1089,7 @@
           "tp": "R"
         }
       },
-      "is_boundary": true,
+      "is_boundary": false,
       "out_dst": {
         "output": {
           "cp": "S(1)",
@@ -1010,15 +1107,18 @@
       "params": {
         "down_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(1)"
         },
         "gate_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         },
         "up_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         }
       }
     },
@@ -1055,7 +1155,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -1097,11 +1198,13 @@
         },
         "kv_b_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         },
         "o_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(1)"
         },
         "q_a_proj.weight": {
           "cp": "R",
@@ -1110,7 +1213,8 @@
         },
         "q_b_proj.weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "S(0)"
         }
       }
     },
@@ -1147,7 +1251,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -1184,7 +1289,8 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     },
@@ -1221,13 +1327,14 @@
       "params": {
         "weight": {
           "cp": "R",
-          "ep": "R"
+          "ep": "R",
+          "tp": "R"
         }
       }
     }
   },
   "remote_siblings": [],
-  "signature": "4fa70f631992",
+  "signature": "4b7934e7f281",
   "skipped_overrides": [],
   "source": {
     "architecture": null,
@@ -1255,6 +1362,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "/home/lxy/hyper-parallel-genpath/examples/training_demo/deepseek_v3/train_codegen_probe.yaml",
-  "yaml_sha256": "2f3b49b295925ba55b1f56b2d288af8a086ebd75e046e23065095c6690173cd4"
+  "yaml_path": "/home/lxy/dsv3_codegen_ep.yaml",
+  "yaml_sha256": "dc6cf33947736426cf4a834383e9a5c20158960bbbe14387346b19f7453b3b5a"
 }
