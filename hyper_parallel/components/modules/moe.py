@@ -43,6 +43,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
+from hyper_parallel.components.modules.expert_sort import expert_major_permutation
 from hyper_parallel.core.dtensor.dtensor import DTensor
 
 
@@ -516,7 +517,7 @@ def _compute_load_balance_loss(
     Returns:
         Scalar loss tensor. Returns 0.0 for empty input.
     """
-    import torch.distributed as dist  # pylint: disable=C0415
+    import torch.distributed as dist  # pylint: disable=C0415,forbidden-backend-import
 
     num_tokens, top_k = top_scores.shape
 
@@ -740,7 +741,7 @@ class MoE(nn.Module):
         """
         # flat_experts[i] is the expert ID for the i-th (token, top_k) slot.
         flat_experts = selected_experts.flatten()                  # [num_tokens * top_k]
-        flat_indices = flat_experts.argsort(stable=True)           # expert-major permutation
+        flat_indices = expert_major_permutation(flat_experts, self.num_experts)
         top_scores_sorted = top_scores.flatten()[flat_indices]     # [num_tokens * top_k]
         # Each entry in flat_indices maps to a position in [0, num_tokens * top_k);
         # divide by top_k to recover the original token row index.
