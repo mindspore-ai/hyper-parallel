@@ -293,6 +293,15 @@ def _load_generated_checkpoint(
     ``make_transforms()`` (scoped to its FQN) and publish the *pre-replacement*
     parameter shapes, then let ``CheckpointManager`` apply the conversions
     through the replacement-conversion route.
+
+    A meta-constructed model (world_size > 1, or a non-HF family) is returned
+    without materialization or loading: materializing the full model on CPU
+    here would allocate the whole parameter set on *every* rank -- a
+    full-model checkpoint load that is large enough to OOM host memory --
+    and the weights would be discarded anyway by the infrastructure stage's
+    ``to_empty``.  ``apply_model_infrastructure`` shards first and then loads
+    through the same ``CheckpointManager`` route (driven by the transforms
+    published below) onto the already-sharded parameters.
     """
     from hyper_parallel.models._transformers.checkpoint_loader import (  # pylint: disable=import-outside-toplevel
         CheckpointManager,
@@ -314,12 +323,22 @@ def _load_generated_checkpoint(
         model._hp_replacement_weight_conversions = transforms  # pylint: disable=protected-access
 
     # from_pretrained materializes meta tensors internally; _from_config
-    # does not. Materialize the meta model before loading so checkpoint
-    # copy targets are real tensors (init_device: meta in the training
-    # config). Downstream infra moves it to the accelerator afterwards.
+    # does not. Meta-constructed parameters (init_device: meta in the
+    # training config) stay on the meta device so the infrastructure stage
+    # can shard first and materialize only the per-rank shard on the target
+    # device; see the docstring for why loading here would be both wasteful
+    # and an OOM risk for large models.
     if any(p.is_meta for p in model.parameters()):
-        model.to_empty(device="cpu")
+        logger.info(
+            "codegen: meta model built; deferring weight load to the "
+            "post-sharding infrastructure stage"
+        )
+        return model
 
+    # Non-meta path (single process, HF family, no quantization): the
+    # infrastructure stage moves an already-initialized model with
+    # ``model.to(device)`` and never loads it, so the checkpoint must be
+    # loaded here.
     CheckpointManager(model).load_checkpoint(pretrained_path, strict=False)
     if torch_dtype not in (None, "auto"):
         _cast_parameters_to(model, torch_dtype)
