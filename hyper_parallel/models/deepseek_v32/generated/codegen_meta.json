@@ -3,21 +3,18 @@
     "lm_head": "Linear",
     "model.embed_tokens": "Embedding",
     "model.layers.0.input_layernorm": "RMSNorm",
-    "model.layers.0.mlp": "DeepseekV32MLP",
     "model.layers.0.post_attention_layernorm": "RMSNorm",
     "model.layers.0.self_attn": "DeepseekV32DSAAttention",
     "model.layers.0.self_attn.indexer.k_norm": "LayerNorm",
     "model.layers.0.self_attn.kv_a_layernorm": "DeepseekV32RMSNorm",
     "model.layers.0.self_attn.q_a_layernorm": "DeepseekV32RMSNorm",
     "model.layers.1.input_layernorm": "RMSNorm",
-    "model.layers.1.mlp": "DeepseekV32MLP",
     "model.layers.1.post_attention_layernorm": "RMSNorm",
     "model.layers.1.self_attn": "DeepseekV32DSAAttention",
     "model.layers.1.self_attn.indexer.k_norm": "LayerNorm",
     "model.layers.1.self_attn.kv_a_layernorm": "DeepseekV32RMSNorm",
     "model.layers.1.self_attn.q_a_layernorm": "DeepseekV32RMSNorm",
     "model.layers.2.input_layernorm": "RMSNorm",
-    "model.layers.2.mlp": "DeepseekV32MLP",
     "model.layers.2.post_attention_layernorm": "RMSNorm",
     "model.layers.2.self_attn": "DeepseekV32DSAAttention",
     "model.layers.2.self_attn.indexer.k_norm": "LayerNorm",
@@ -41,8 +38,8 @@
     "parallelize": "hp_parallelize"
   },
   "external_state_classes": [
-    "DeepseekV32MoE",
-    "DeepseekV3MoE"
+    "DeepseekV32MLP",
+    "DeepseekV32MoE"
   ],
   "frozen_sharded_params": [
     "lm_head.weight",
@@ -80,7 +77,7 @@
       "inner_wrapper": {
         "_target_": "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper"
       },
-      "match": "model.layers.3.self_attn"
+      "match": "model.layers.2.self_attn"
     },
     {
       "inner_target": "self",
@@ -97,6 +94,16 @@
       "match": "model.layers.1.self_attn"
     },
     {
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
+        "capacity_factor": null,
+        "fix_router": false,
+        "overlap_shared_expert": false,
+        "use_grouped_gemm": true
+      },
+      "match": "model.layers.2.mlp"
+    },
+    {
       "ep_size": 2,
       "local_compute_fn": {
         "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
@@ -108,14 +115,11 @@
       "match": "model.layers.3.mlp"
     },
     {
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
-        "capacity_factor": null,
-        "fix_router": false,
-        "overlap_shared_expert": false,
-        "use_grouped_gemm": true
+      "inner_target": "self",
+      "inner_wrapper": {
+        "_target_": "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper"
       },
-      "match": "model.layers.2.mlp"
+      "match": "model.layers.3.self_attn"
     },
     {
       "local_compute_fn": {
@@ -126,13 +130,6 @@
         "use_grouped_gemm": true
       },
       "match": "model.layers.1.mlp"
-    },
-    {
-      "inner_target": "self",
-      "inner_wrapper": {
-        "_target_": "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper"
-      },
-      "match": "model.layers.2.self_attn"
     }
   ],
   "mesh_dim_names": [
@@ -338,21 +335,21 @@
   ],
   "outputs": {
     "diff": {
-      "lines": 134,
-      "sha256": "5369f663a98b1595af9052299aca166724461ee91a788c45ec39d5c3561d37ec"
+      "lines": 132,
+      "sha256": "12dd54f36da36e492661bcdabc810153442ca5bfa0a42d1bcc982a27c21a09b3"
     },
     "init": {
       "lines": 6,
-      "sha256": "d52b5c2d21279796ed8cbe00b100ec399e1c78d33c8f031ca2e80c7fa5ceb606"
+      "sha256": "a44529bd3ae159fb7a470fe3ec759365e7735822e8ff3d4b239ef808cc3e151d"
     },
     "modeling": {
       "lines": 867,
-      "sha256": "f6c55449851f9227ed50c4235a688617843599098aef6505b909159bcd8688e6"
+      "sha256": "e359aa7cb5f9c1d8e03014cc6d7908f9e12724a949b7f61c67e165edb4e67bfa"
     }
   },
   "parallel_dims": {
     "cp_size": 2,
-    "dp_size": 1,
+    "dp_size": 2,
     "ep_size": 2,
     "loss_parallel": false,
     "pp_size": 1,
@@ -489,7 +486,7 @@
           "tp": "R"
         }
       },
-      "is_boundary": true,
+      "is_boundary": false,
       "out_dst": {
         "output": {
           "cp": "S(1)",
@@ -520,8 +517,7 @@
           "ep": "R",
           "tp": "S(0)"
         }
-      },
-      "skip_source_lowering": true
+      }
     },
     "model.layers.0.post_attention_layernorm": {
       "in_dst": {
@@ -802,7 +798,7 @@
           "tp": "R"
         }
       },
-      "is_boundary": true,
+      "is_boundary": false,
       "out_dst": {
         "output": {
           "cp": "S(1)",
@@ -834,8 +830,7 @@
           "tp": "S(0)"
         }
       },
-      "region_dispatch": false,
-      "skip_source_lowering": true
+      "region_dispatch": false
     },
     "model.layers.1.post_attention_layernorm": {
       "in_dst": {
@@ -1116,7 +1111,7 @@
           "tp": "R"
         }
       },
-      "is_boundary": true,
+      "is_boundary": false,
       "out_dst": {
         "output": {
           "cp": "S(1)",
@@ -1148,8 +1143,7 @@
           "tp": "S(0)"
         }
       },
-      "region_dispatch": false,
-      "skip_source_lowering": true
+      "region_dispatch": false
     },
     "model.layers.2.post_attention_layernorm": {
       "in_dst": {
@@ -1776,11 +1770,11 @@
     }
   },
   "remote_siblings": [],
-  "signature": "3e41846f8a73",
+  "signature": "cacc603e5fc2",
   "skipped_overrides": [],
   "source": {
     "architecture": null,
-    "file_path": "/home/lxy/miniforge3/lib/python3.13/site-packages/transformers/models/deepseek_v32/modeling_deepseek_v32.py",
+    "file_path": "/home/lxy/miniforge3/envs/hyper_restructure_py311/lib/python3.11/site-packages/transformers/models/deepseek_v32/modeling_deepseek_v32.py",
     "line_count": 828,
     "model_id": "/home/lxy/probe_ckpts/deepseek_v32",
     "model_type": "deepseek_v32",
@@ -1804,6 +1798,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "/home/lxy/hyper-parallel-genpath/examples/training_demo/deepseek_v32/train_codegen_probe.yaml",
+  "yaml_path": "/home/lxy/dsv32_codegen_ep.yaml",
   "yaml_sha256": "7dc94d4a4ea0ab545ff9f6bc9d708f37f9a4ecf91fe575e3c88a458244037a6e"
 }
