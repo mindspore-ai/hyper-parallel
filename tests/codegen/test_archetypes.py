@@ -85,10 +85,16 @@ class TestMoeArchetypeTable(unittest.TestCase):
         self.assertEqual(moe_archetype(*QWEN_FP).compute_factory, QWEN_EP)
         self.assertEqual(moe_archetype(*DEEPSEEK_FP).compute_factory, DEEPSEEK_EP)
 
-    def test_external_state_classes_derive_from_the_block_class(self):
-        """The block whose forward is inlined is the external-state class."""
+    def test_external_state_classes_derive_from_the_block_classes(self):
+        """The blocks whose forwards are inlined are the external-state classes.
+
+        DeepSeek-V3 and DeepSeek-V3.2 carry the same fingerprint under
+        different HF class names, so one archetype lists every carrier.
+        """
         self.assertEqual(moe_external_state_classes(*QWEN_FP), ("Qwen3MoeSparseMoeBlock",))
-        self.assertEqual(moe_external_state_classes(*DEEPSEEK_FP), ("DeepseekV3MoE",))
+        self.assertEqual(
+            moe_external_state_classes(*DEEPSEEK_FP), ("DeepseekV32MoE", "DeepseekV3MoE")
+        )
 
     def test_unrecognized_fingerprint_yields_no_archetype(self):
         """Recognition never guesses a strategy for an unknown structure."""
@@ -164,7 +170,7 @@ class TestDeclarationsAreAStructuralProjection(unittest.TestCase):
         archetype = moe_archetype(*QWEN_FP)
         spec = strategy_spec_for(QWEN_EP, "qwen3_moe")
         self.assertEqual(spec.kind, archetype.kind)
-        self.assertEqual(spec.target_class, archetype.target_class)
+        self.assertEqual(spec.target_classes, archetype.target_classes)
         self.assertIn(f"router_kind={archetype.router_kind!r}", spec.body_template)
         self.assertIn(f"shared={archetype.shared!r}", spec.body_template)
         self.assertEqual(
@@ -189,7 +195,7 @@ class TestDeclarationsAreAStructuralProjection(unittest.TestCase):
         archetype = moe_archetype(*DEEPSEEK_FP)
         spec = strategy_spec_for(DEEPSEEK_EP, "deepseek_v3")
         self.assertEqual(spec.kind, archetype.kind)
-        self.assertEqual(spec.target_class, archetype.target_class)
+        self.assertEqual(spec.target_classes, archetype.target_classes)
         self.assertEqual(spec.strip_boundary_subpatterns, archetype.strip_boundary_subpatterns)
         self.assertIn(f"router_kind={archetype.router_kind!r}", spec.body_template)
         self.assertEqual(

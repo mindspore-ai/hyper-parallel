@@ -41,7 +41,10 @@ class StrategySpec:
 
     kind: str
     imports: tuple[ImportPatch, ...]
-    target_class: str | None = None
+    #: Every source class name this strategy's body may replace the forward
+    #: of (structural carriers of the same MoE fingerprint); the patch engine
+    #: applies the body to whichever class the source file defines.
+    target_classes: tuple[str, ...] | None = None
     method_name: str = "forward"
     body_template: str | None = None
     snippets: tuple[ModuleSnippetPatch, ...] = ()
@@ -49,10 +52,14 @@ class StrategySpec:
 
     def __post_init__(self) -> None:
         """Require a complete method patch or an imports-only declaration."""
-        if (self.target_class is None) != (self.body_template is None):
-            raise ValueError("Inline strategy target_class and body_template must be provided together")
-        if self.target_class is not None and (not self.target_class or not self.body_template.strip()):
-            raise ValueError("Inline strategy class and body must be nonempty")
+        if (self.target_classes is None) != (self.body_template is None):
+            raise ValueError("Inline strategy target_classes and body_template must be provided together")
+        if self.target_classes is not None and (
+            not self.target_classes
+            or not all(self.target_classes)
+            or not self.body_template.strip()
+        ):
+            raise ValueError("Inline strategy classes and body must be nonempty")
         if not self.method_name.isidentifier():
             raise ValueError("Inline strategy method_name must be a Python identifier")
 

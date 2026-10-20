@@ -98,13 +98,13 @@ def _strip_ep_sub_boundaries(
         if target is None:
             continue
         spec = strategy_spec(target, model_type)
-        if spec is None or spec.target_class is None:
+        if spec is None or spec.target_classes is None:
             continue
         if spec.strip_boundary_subpatterns:
             strip_patterns = spec.strip_boundary_subpatterns
         for pattern in rule.match:
             for fqn, cls in boundary_classes.items():
-                if fnmatch(fqn, pattern) and cls == spec.target_class:
+                if fnmatch(fqn, pattern) and cls in spec.target_classes:
                     ep_fqns.add(fqn)
     if not ep_fqns:
         return

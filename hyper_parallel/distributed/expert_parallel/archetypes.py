@@ -16,7 +16,7 @@
 
 The MoE dispatch is selected by *module structure* (never by model identity).
 Every ep-strategy fact the generated artifact needs -- the strategy ``kind``,
-the block ``target_class``, the ``external_state_classes``, the
+the block ``target_classes``, the ``external_state_classes``, the
 ``strip_boundary_subpatterns``, the ``moe_ep_forward`` structural keys -- is
 owned here, keyed by the ``detect_moe_structure`` fingerprint. The codegen
 framework projects from this table instead of hand-writing family-named
@@ -40,9 +40,13 @@ class MoeArchetype:
 
     #: Structure-keyed strategy ``kind`` (not a model-family dispatch literal).
     kind: str
-    #: The MoE block class name (a structural result, not a family anchor).
-    #: Its forward is fully inlined, so it is also an external-state class.
-    target_class: str
+    #: The MoE block class names carrying this structure (structural results,
+    #: not family anchors). HF ships structurally identical MoE blocks under
+    #: different class names (e.g. ``DeepseekV3MoE`` / ``DeepseekV32MoE``);
+    #: the inline pipeline patches whichever of these classes the source file
+    #: defines, so every known carrier must be listed. Their forwards are
+    #: fully inlined, so they are also external-state classes.
+    target_classes: tuple[str, ...]
     strip_boundary_subpatterns: tuple[str, ...]
     #: Runtime router-adapter key the generic ``moe_ep_forward`` resolves
     #: through ``MOE_ROUTER_ADAPTERS``. This is the *merge contract* key and
@@ -58,7 +62,7 @@ class MoeArchetype:
 _MOE_ARCHETYPE_BY_STRUCTURE = {
     ("topk_router_module", "none", "batched_parameters"): MoeArchetype(
         kind="moe_ep_routed",
-        target_class="Qwen3MoeSparseMoeBlock",
+        target_classes=("Qwen3MoeSparseMoeBlock",),
         strip_boundary_subpatterns=(),
         router_kind="topk_router_module",
         shared="none",
@@ -69,7 +73,7 @@ _MOE_ARCHETYPE_BY_STRUCTURE = {
     ),
     ("topk_router_module", "additive", "batched_parameters"): MoeArchetype(
         kind="moe_ep_routed",
-        target_class="DeepseekV3MoE",
+        target_classes=("DeepseekV3MoE", "DeepseekV32MoE"),
         strip_boundary_subpatterns=("experts.*", "shared_experts"),
         router_kind="sigmoid_group",
         shared="additive",
@@ -113,7 +117,8 @@ def moe_external_state_classes(router: str, shared_experts: str, expert_storage:
     component) are contributed by their own declarations, not here.
     """
     archetype = moe_archetype(router, shared_experts, expert_storage)
-    return (archetype.target_class,) if archetype is not None else ()
+    # Sorted to match external_state_classes_for's canonical order.
+    return tuple(sorted(archetype.target_classes)) if archetype is not None else ()
 
 
 __all__ = [
