@@ -204,7 +204,10 @@ class TestInlineAdapters(unittest.TestCase):
         self.assertIs(
             legacy, replacement_spec(ATTENTION, "Qwen3MoeForCausalLM", module_type=ATTENTION_TYPE)
         )
-        self.assertEqual(strategy_spec(EP).target_classes, ("Qwen3MoeSparseMoeBlock",))
+        # The capability spec carries no block class: the concrete class is a
+        # per-model fact derived from the frozen boundary map.
+        self.assertIsNone(strategy_spec(EP).target_class)
+        self.assertIsNotNone(strategy_spec(EP).body_template)
         # A CP wrapper is a strategy *because of its position* in the override
         # (``inner_wrapper``); the same target as a local compute fn is not one.
         self.assertIsNone(strategy_spec(CP))
@@ -310,7 +313,7 @@ class TestInlineAdapters(unittest.TestCase):
         """
         snippet = ModuleSnippetPatch("def helper():\n    return 1")
         declaration = StrategySpec(
-            "ep", (), ("Block",), body_template="return 1", snippets=(snippet,)
+            "ep", (), "Block", body_template="return 1", snippets=(snippet,)
         )
         rules = tuple(
             InlineRule((f"model.layers.{index}.mlp",), local_compute_target=EP)
@@ -348,10 +351,11 @@ class Model:
         self.attn = Qwen3MoeAttention()
 """
         meta = _meta(
-            injections=[{"local_compute_fn": EP}, {"inner_wrapper": CP}],
+            injections=[{"match": "blocks.0.mlp", "local_compute_fn": EP}, {"inner_wrapper": CP}],
             module_type="transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention",
             fqns=("blocks.0.attn",),
         )
+        meta.boundary_classes = {"blocks.0.mlp": "Qwen3MoeSparseMoeBlock"}
         expected_meta = deepcopy(meta)
         inferred = render_inline_modeling(source, meta)
         explicit = render_inline_modeling(source, expected_meta, "qwen3_moe")
@@ -554,10 +558,10 @@ class Model:
         Description: A partial method patch cannot silently count as supported.
         Expectation: the emitted artifact and metadata satisfy the assertions in this test.
         """
-        with self.assertRaisesRegex(ValueError, "provided together"):
-            StrategySpec("invalid", (), target_classes=("ToyBlock",))
+        with self.assertRaisesRegex(ValueError, "requires a body_template"):
+            StrategySpec("invalid", (), target_class="ToyBlock")
         with self.assertRaisesRegex(ValueError, "nonempty"):
-            StrategySpec("invalid", (), target_classes=("ToyBlock",), body_template="")
+            StrategySpec("invalid", (), target_class="ToyBlock", body_template="")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
               card_mark="onecard", essential_mark="unessential")

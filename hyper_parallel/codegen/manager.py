@@ -673,7 +673,11 @@ def _record_inline_declarations(meta: CodegenMeta) -> None:
     """
     identity = (meta.source or {}).get("architecture")
     meta.external_state_classes = list(
-        external_state_classes_for(identity, getattr(meta, "injections", None))
+        external_state_classes_for(
+            identity,
+            getattr(meta, "injections", None),
+            getattr(meta, "boundary_classes", None),
+        )
     )
 
 
@@ -953,11 +957,17 @@ def _import_ep_target_for(module: Any, match: str) -> "Any":
     )
     factory_path = _ep_factory_table().get(fingerprint)
     if factory_path is None:
+        from hyper_parallel.distributed.expert_parallel.archetypes import (  # pylint: disable=C0415
+            format_supported_fingerprints,
+        )
+
         raise UnsupportedModuleStructure(
             f"{match!r} matched {type(module).__name__} with structure "
-            f"{fingerprint} that has no EP compute factory. Declare an "
-            "explicit local_compute_fn._target_ to opt out of structure "
-            "detection."
+            f"{fingerprint} that has no EP compute factory. Supported "
+            f"structures: {format_supported_fingerprints()}. Implement the "
+            "missing capability (router adapter / shared mode / storage) or "
+            "declare an explicit local_compute_fn._target_ to opt out of "
+            "structure detection."
         )
     return _build_ep_target(factory_path)
 

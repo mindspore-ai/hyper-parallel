@@ -15,11 +15,13 @@
 """Structure->archetype table: the framework single source for EP declarations.
 
 The archetype table is what makes "native HF model + one YAML" sufficient:
-the strategy kind, target class, external-state classes, boundary
-sub-patterns and EP body keys are all *structure-proven* here, and the model
-adapters project from it instead of hand-writing family-named literals. These
-tests lock the projection so a hand-written literal cannot creep back, and pin
-the framework genericity of the component replacements.
+the strategy kind, boundary sub-patterns and EP body keys are all
+*structure-proven* here, and the model adapters project from it instead of
+hand-writing family-named literals. These tests lock the projection so a
+hand-written literal cannot creep back, and pin the framework genericity of
+the component replacements. The concrete block class is deliberately NOT a
+table fact: it is derived per artifact from the frozen boundary map, so a
+custom model needs no registration.
 """
 
 import unittest
@@ -31,9 +33,12 @@ from hyper_parallel.codegen.inline.framework_spec import (
     replacement_spec_for,
     strategy_spec_for,
 )
+from hyper_parallel.codegen.inline.ir import InlineRule
+from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
 from hyper_parallel.distributed.expert_parallel.archetypes import (
+    format_supported_fingerprints,
     moe_archetype,
-    moe_external_state_classes,
+    supported_fingerprints,
 )
 
 QWEN_FP = ("topk_router_module", "none", "batched_parameters")
@@ -85,21 +90,27 @@ class TestMoeArchetypeTable(unittest.TestCase):
         self.assertEqual(moe_archetype(*QWEN_FP).compute_factory, QWEN_EP)
         self.assertEqual(moe_archetype(*DEEPSEEK_FP).compute_factory, DEEPSEEK_EP)
 
-    def test_external_state_classes_derive_from_the_block_classes(self):
-        """The blocks whose forwards are inlined are the external-state classes.
+    def test_archetype_carries_no_block_class_literal(self):
+        """The table is a pure capability matrix -- no model facts in it."""
+        for fingerprint in (QWEN_FP, DEEPSEEK_FP):
+            self.assertFalse(
+                hasattr(moe_archetype(*fingerprint), "target_class"),
+                f"{fingerprint} still declares a block class",
+            )
 
-        DeepSeek-V3 and DeepSeek-V3.2 carry the same fingerprint under
-        different HF class names, so one archetype lists every carrier.
-        """
-        self.assertEqual(moe_external_state_classes(*QWEN_FP), ("Qwen3MoeSparseMoeBlock",))
-        self.assertEqual(
-            moe_external_state_classes(*DEEPSEEK_FP), ("DeepseekV32MoE", "DeepseekV3MoE")
-        )
+    def test_supported_fingerprints_expose_the_capability_matrix(self):
+        """Fail-fast diagnostics can list exactly what the framework supports."""
+        self.assertIn(QWEN_FP, supported_fingerprints())
+        self.assertIn(DEEPSEEK_FP, supported_fingerprints())
+        self.assertNotIn(("softmax_topk", "none", "batched_parameters"), supported_fingerprints())
+        text = format_supported_fingerprints()
+        self.assertIn("router=topk_router_module", text)
+        self.assertIn("shared=additive", text)
+        self.assertIn("storage=batched_parameters", text)
 
     def test_unrecognized_fingerprint_yields_no_archetype(self):
         """Recognition never guesses a strategy for an unknown structure."""
         self.assertIsNone(moe_archetype("softmax_topk", "none", "batched_parameters"))
-        self.assertEqual(moe_external_state_classes("softmax_topk", "none", "batched_parameters"), ())
 
     def test_manager_factory_table_mirrors_the_archetype_table(self):
         """The manager consumes the same table -- no duplicated mapping."""
@@ -170,12 +181,16 @@ class TestDeclarationsAreAStructuralProjection(unittest.TestCase):
         archetype = moe_archetype(*QWEN_FP)
         spec = strategy_spec_for(QWEN_EP, "qwen3_moe")
         self.assertEqual(spec.kind, archetype.kind)
-        self.assertEqual(spec.target_classes, archetype.target_classes)
+        # The capability spec deliberately carries no block class: the class
+        # is a per-model fact derived at materialization time.
+        self.assertIsNone(spec.target_class)
         self.assertIn(f"router_kind={archetype.router_kind!r}", spec.body_template)
         self.assertIn(f"shared={archetype.shared!r}", spec.body_template)
+        injections = ({"match": "model.layers.3.mlp", "local_compute_fn": QWEN_EP},)
+        boundary = {"model.layers.3.mlp": "Qwen3MoeSparseMoeBlock"}
         self.assertEqual(
-            external_state_classes_for("qwen3_moe", ({"local_compute_fn": QWEN_EP},)),
-            moe_external_state_classes(*QWEN_FP),
+            external_state_classes_for("qwen3_moe", injections, boundary),
+            ("Qwen3MoeSparseMoeBlock",),
         )
         # Only the class whose forward an inline strategy body replaces is
         # external state.  The rendered component class keeps the component's
@@ -183,7 +198,7 @@ class TestDeclarationsAreAStructuralProjection(unittest.TestCase):
         # boundary path owns it.
         self.assertNotIn(
             interface_component_class("qwen3_moe"),
-            external_state_classes_for("qwen3_moe", ({"local_compute_fn": QWEN_EP},)),
+            external_state_classes_for("qwen3_moe", injections, boundary),
         )
 
     def test_rendered_component_alone_declares_no_external_state(self):
@@ -195,12 +210,14 @@ class TestDeclarationsAreAStructuralProjection(unittest.TestCase):
         archetype = moe_archetype(*DEEPSEEK_FP)
         spec = strategy_spec_for(DEEPSEEK_EP, "deepseek_v3")
         self.assertEqual(spec.kind, archetype.kind)
-        self.assertEqual(spec.target_classes, archetype.target_classes)
+        self.assertIsNone(spec.target_class)
         self.assertEqual(spec.strip_boundary_subpatterns, archetype.strip_boundary_subpatterns)
         self.assertIn(f"router_kind={archetype.router_kind!r}", spec.body_template)
+        injections = ({"match": "model.layers.3.mlp", "local_compute_fn": DEEPSEEK_EP},)
+        boundary = {"model.layers.3.mlp": "DeepseekV3MoE"}
         self.assertEqual(
-            external_state_classes_for("deepseek_v3", ({"local_compute_fn": DEEPSEEK_EP},)),
-            moe_external_state_classes(*DEEPSEEK_FP),
+            external_state_classes_for("deepseek_v3", injections, boundary),
+            ("DeepseekV3MoE",),
         )
 
     def test_replacement_specs_come_from_the_family_factories(self):
@@ -218,6 +235,61 @@ class TestDeclarationsAreAStructuralProjection(unittest.TestCase):
         self.assertIn(
             "attention_interface=run_qwen3_moe_flash_attention", attention.keyword_args
         )
+
+
+class TestBlockClassIsDerivedNotRegistered(unittest.TestCase):
+    """Zero-registration: a custom model with a known structure materializes.
+
+    The block class (``DeepseekV33MoE`` or any custom name below) is never
+    registered anywhere in the framework: it flows from the frozen boundary
+    map into the materialization passes, and a declared strategy that cannot
+    find a boundary fails fast instead of silently degrading.
+    """
+
+    def test_external_state_follows_the_boundary_map_not_a_literal(self):
+        """A model naming its MoE block anything is picked up as-is."""
+        injections = (
+            {"match": "model.layers.3.mlp", "local_compute_fn": DEEPSEEK_EP},
+            {"match": "model.layers.4.mlp", "local_compute_fn": DEEPSEEK_EP},
+        )
+        boundary = {
+            "model.layers.3.mlp": "DeepseekV33MoE",
+            "model.layers.4.mlp": "SomeCustomMoEBlock",
+        }
+        self.assertEqual(
+            external_state_classes_for("deepseek_v33", injections, boundary),
+            ("DeepseekV33MoE", "SomeCustomMoEBlock"),
+        )
+
+    def test_strategy_patch_targets_the_derived_classes(self):
+        """The forward-extract patch lands on every class the rule selects."""
+        rule = InlineRule(
+            match=("model.layers.[123456789]*.mlp",),
+            local_compute_target=DEEPSEEK_EP,
+        )
+        boundary = {
+            "model.layers.0.mlp": "DeepseekV33MLP",  # dense layer: not matched
+            "model.layers.1.mlp": "DeepseekV33MoE",
+            "model.layers.3.mlp": "DeepseekV33MoE",
+        }
+        patch_set = build_strategy_patches((rule,), "deepseek_v33", boundary)
+        self.assertEqual(
+            [(patch.class_name, patch.method_name) for patch in patch_set.forward_extracts],
+            [("DeepseekV33MoE", "forward")],
+        )
+        self.assertIn("ep_enable", patch_set.forward_extracts[0].body)
+
+    def test_declared_ep_without_a_matching_boundary_fails_fast(self):
+        """A strategy that materializes nowhere is an error, not a no-op."""
+        rule = InlineRule(
+            match=("model.layers.*.router",),
+            local_compute_target=DEEPSEEK_EP,
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            build_strategy_patches(
+                (rule,), "deepseek_v33", {"model.layers.3.mlp": "DeepseekV33MoE"}
+            )
+        self.assertIn("matched no boundary", str(ctx.exception))
 
 
 if __name__ == "__main__":

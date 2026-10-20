@@ -22,6 +22,7 @@ from typing import Any
 
 from hyper_parallel.codegen.inline.ir import InlineRule
 from hyper_parallel.codegen.inline.specs import strategy_spec
+from hyper_parallel.codegen.inline.strategy_pass import rule_block_classes
 
 logger = logging.getLogger(__name__)
 
@@ -98,14 +99,27 @@ def _strip_ep_sub_boundaries(
         if target is None:
             continue
         spec = strategy_spec(target, model_type)
-        if spec is None or spec.target_classes is None:
+        if spec is None or spec.body_template is None:
             continue
         if spec.strip_boundary_subpatterns:
             strip_patterns = spec.strip_boundary_subpatterns
-        for pattern in rule.match:
-            for fqn, cls in boundary_classes.items():
-                if fnmatch(fqn, pattern) and cls in spec.target_classes:
-                    ep_fqns.add(fqn)
+        if spec.target_class is not None:
+            host_classes = {spec.target_class}
+        else:
+            # The block class is a per-model fact derived from the boundary
+            # map, never a registered literal (see build_strategy_patches).
+            host_classes = rule_block_classes(rule, boundary_classes)
+        if host_classes:
+            # Persist the derived classes so a re-emission of this
+            # already-normalized meta (whose boundary entries the strip below
+            # consumes) can still resolve its patch hosts.
+            recorded = set(getattr(meta, "external_state_classes", None) or ())
+            meta.external_state_classes = sorted(recorded | host_classes)
+        for fqn, cls in boundary_classes.items():
+            if cls not in host_classes:
+                continue
+            if any(fnmatch(fqn, pattern) for pattern in rule.match):
+                ep_fqns.add(fqn)
     if not ep_fqns:
         return
     mark_fqns: set[str] = set()

@@ -1009,6 +1009,7 @@ def _component_module():
             "match": "model.layers.0.mlp",
             "local_compute_fn": {"_target_": _QWEN_EP_FN},
         }],
+        boundary_classes={"model.layers.0.mlp": "Qwen3MoeSparseMoeBlock"},
     )
     manager._record_inline_declarations(meta)  # pylint: disable=protected-access
     assert meta.external_state_classes == ["Qwen3MoeSparseMoeBlock"]
