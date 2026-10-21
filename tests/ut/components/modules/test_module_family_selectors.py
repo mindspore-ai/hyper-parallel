@@ -139,6 +139,25 @@ class TestModuleFamilySelectors(unittest.TestCase):
         register_module_family(replace(family, selector_specs=dict(reversed(list(family.selector_specs.items())))))
         self.assertIs(resolve_module_family_target(Baseline, {"fused": True, "enabled": True})[0], Fused)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_aliases_use_the_same_rule_and_do_not_leak(self) -> None:
+        """
+        Feature: Module Family selector aliases.
+        Description: Aliases normalize before whitelist selection and preserve strict type checks.
+        Expectation: Both spellings select the same variant; conflicting values fail.
+        """
+        family = declaration()
+        family.selector_specs["fused"] = SelectorSpec(bool, False, aliases=("legacy_fusion",))
+        register_module_family(family)
+        for arguments in ({"legacy_fusion": True}, {"fused": True, "legacy_fusion": True}):
+            target, kwargs = resolve_module_family_target(Baseline, {"enabled": True, **arguments})
+            self.assertIs(target, Fused)
+            self.assertEqual(kwargs, {})
+        with self.assertRaisesRegex(ValueError, "conflicting selectors"):
+            resolve_module_family_target(Baseline, {"enabled": True, "fused": False, "legacy_fusion": True})
+        with self.assertRaises(TypeError):
+            resolve_module_family_target(Baseline, {"enabled": True, "legacy_fusion": 1})
+
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
         level_mark="level0",

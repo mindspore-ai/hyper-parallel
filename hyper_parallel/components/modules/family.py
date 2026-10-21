@@ -28,6 +28,7 @@ class SelectorSpec:
 
     value_type: type
     default: Any
+    aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -71,12 +72,18 @@ def _validate_selector_value(family: ModuleFamily, name: str, value: Any) -> Non
 def _validate_selector_specs(family: ModuleFamily) -> dict[str, Any]:
     """Validate scalar declarations and return the baseline selector values."""
     defaults = {}
+    names = set(family.selector_specs)
     for name, spec in family.selector_specs.items():
         if not isinstance(name, str) or not name.isidentifier() or name in _RESERVED_SELECTORS:
             raise ValueError(f"ModuleFamily {family.name}: invalid selector name {name!r}")
         if not isinstance(spec, SelectorSpec) or spec.value_type not in _SELECTOR_TYPES:
             raise TypeError(f"ModuleFamily {family.name}: {name!r} requires a scalar SelectorSpec")
         _validate_selector_value(family, name, spec.default)
+        for alias in spec.aliases:
+            if (not isinstance(alias, str) or not alias.isidentifier()
+                    or alias in names or alias in _RESERVED_SELECTORS):
+                raise ValueError(f"ModuleFamily {family.name}: invalid selector alias {alias!r}")
+            names.add(alias)
         defaults[name] = spec.default
     return defaults
 
@@ -155,10 +162,41 @@ def get_family_selector_specs(target: Callable) -> Mapping[str, SelectorSpec]:
         target: Requested replacement callable.
 
     Returns:
-        Read-only registered declarations, or an empty mapping.
+        Read-only declarations including aliases, or an empty mapping.
     """
     family = get_module_family(target)
-    return family.selector_specs if family is not None else {}
+    if family is None:
+        return {}
+    return MappingProxyType({
+        spelling: spec for name, spec in family.selector_specs.items()
+        for spelling in (name, *spec.aliases)
+    })
+
+
+def normalize_family_selectors(target: Callable, arguments: Mapping) -> dict:
+    """Replace declared aliases with canonical selector names.
+
+    Args:
+        target: Requested replacement callable.
+        arguments: Explicit selectors and constructor arguments.
+
+    Returns:
+        New arguments with aliases consumed; conflicting spellings are rejected.
+    """
+    args = dict(arguments)
+    family = get_module_family(target)
+    if family is None:
+        return args
+    for name, spec in family.selector_specs.items():
+        for alias in spec.aliases:
+            if alias not in args:
+                continue
+            value = args.pop(alias)
+            _validate_selector_value(family, name, value)
+            if name in args and (type(args[name]) is not type(value) or args[name] != value):
+                raise ValueError(f"ModuleFamily {family.name}: conflicting selectors {name!r} and {alias!r}")
+            args[name] = value
+    return args
 
 
 def _select_variant(family: ModuleFamily, args: dict) -> Callable:
@@ -190,7 +228,7 @@ def resolve_module_family_target(target: Callable, arguments: Mapping) -> tuple[
         Selected callable and a new argument dictionary without selectors.
         Ordinary targets retain their existing argument-validation policy.
     """
-    args = dict(arguments)
+    args = normalize_family_selectors(target, arguments)
     family = get_module_family(target)
     if family is None:
         return target, args

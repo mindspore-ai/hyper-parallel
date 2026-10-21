@@ -656,6 +656,8 @@ def _resolve_replacement_target(node: object, *, path: str) -> Target[Any]:
             requested, target_path=target_path,
             **{key: value for key, value in node.items() if key != "_target_"},
         )
+        if selected.low_precision_dtype_scheme is not None:
+            return selected
         selected_signature = inspect.signature(selected.callable)
         for parameter in selected_signature.parameters.values():
             if parameter.kind is inspect.Parameter.POSITIONAL_ONLY and parameter.default is inspect.Parameter.empty:

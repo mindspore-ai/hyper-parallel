@@ -466,6 +466,9 @@ def _target_replacement_factory(
             target.callable, target_path=target._target_path, **target._kwargs,
         )
 
+    if isinstance(target, ReplacementTarget) and target.low_precision_dtype_scheme is not None:
+        target = target.bind_dtype_scheme(low_precision_policy)
+
     if not getattr(target._target_, "_hp_module_replacement", False):  # pylint: disable=protected-access
         raise TypeError(
             "plan_overrides replace_module target must be decorated with "
@@ -513,7 +516,15 @@ def entries_to_module_replacements(
         _validate_replacement_entry(entry, effective_config)
         patterns = (entry.match,) if isinstance(entry.match, str) else tuple(entry.match)
         policy = None
-        if entry.when == "low_precision" and effective_config is not None:
+        scheme_name = getattr(entry.replace_module, "low_precision_dtype_scheme", None)
+        if scheme_name is not None:
+            if entry.low_precision_dtype_scheme is not None:
+                raise ValueError(
+                    f"plan_overrides match={entry.match!r}: specify dtype scheme only inside replace_module")
+            if low_precision_config is None:
+                raise ValueError(f"plan_overrides match={entry.match!r}: dtype scheme requires training.low_precision")
+            policy = low_precision_config.resolve_dtype_scheme(scheme_name)
+        elif entry.when == "low_precision" and effective_config is not None:
             policy = effective_config.resolve_dtype_scheme(entry.low_precision_dtype_scheme)
         rules.append(
             ModuleReplacementSpec(
@@ -679,7 +690,10 @@ def normalize_distributed_setup_overrides(
         )
     )
     if low_precision_enabled and not any(
-        entry.replace_module is not None and entry.when == "low_precision"
+        entry.replace_module is not None and (
+            entry.when == "low_precision"
+            or getattr(entry.replace_module, "low_precision_dtype_scheme", None) is not None
+        )
         for entry in entries
     ):
         raise ValueError(
