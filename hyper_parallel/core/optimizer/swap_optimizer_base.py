@@ -28,7 +28,11 @@ from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Se
 import torch
 
 STATE_KEYS = ("exp_avg", "exp_avg_sq", "max_exp_avg_sq")
+MOMENTUM_KEY = "momentum_buffer"
 MASTER_PARAM_KEY = "master_param"
+# ``state_keys`` stays an Adam/AdamW-facing configuration knob: the Muon adapter
+# owns ``momentum_buffer`` through its own adapter defaults instead, so the key
+# is deliberately not offered as a user-selectable state key.
 SUPPORTED_STATE_KEYS = STATE_KEYS + (MASTER_PARAM_KEY,)
 _PACKED_ALIGNMENT_BYTES = 512
 _DEVICE_TYPE = "npu"
@@ -105,6 +109,10 @@ class PipelineSwapRuntime:
     def packed_enabled(self) -> bool:
         """Return whether this runtime may build packed state candidates."""
         return self._packed_enabled
+
+    def disable_packed_swap(self) -> None:
+        """Force the per-tensor swap path for adapters that cannot share a packed host layout."""
+        self._packed_enabled = False
 
     def partition(self, units: Sequence[UpdateUnit]) -> List[List[UpdateUnit]]:
         """Partition update units into balanced batches by swappable state bytes."""
@@ -959,6 +967,14 @@ class OptimizerSwapAdapter:
     decoupled_weight_decay = False
     is_new_adamw = False
     supports_fused = False
+    # Whether the optimizer keeps a per-step counter (``step``) on top of its
+    # moment estimates. Optimizers whose state is a single momentum buffer leave
+    # this False and materialize only their own state keys.
+    materializes_step_state = True
+    # Adapters that republish their host mirrors or delegate to a leaf optimizer
+    # need every slot to be individually addressable, which a packed host layout
+    # (regions shared per dtype) is not.
+    requires_per_tensor_swap = False
 
     def __init__(self, optimizer: Any, config: Any, runtime: Any) -> None:
         self.optimizer = optimizer
@@ -1100,6 +1116,18 @@ class OptimizerSwapAdapter:
             by_group[unit.adapter_index].append(unit)
         for group_index, units in by_group.items():
             self._step_group(self.optimizer.param_groups[group_index], units)
+        self._mark_optimizer_stepped()
+
+    def _mark_optimizer_stepped(self) -> None:
+        """Record the batch update on the wrapped optimizer for LR scheduler bookkeeping.
+
+        The functional Adam/AdamW kernels bypass ``torch.optim.Optimizer.step``,
+        which is where torch sets ``_opt_called``. Torch's LR schedulers warn
+        when their first step runs before that flag is set, so a swapped
+        Adam/AdamW has to report itself as stepped once a batch has been applied.
+        """
+        if isinstance(self.optimizer, torch.optim.Optimizer):
+            self.optimizer._opt_called = True
 
     def _step_group(self, group: Dict[str, Any], units: List[UpdateUnit]) -> None:
         """Run one group's parameters through the matching functional Adam/AdamW."""
@@ -1457,19 +1485,17 @@ class OptimizerSwapAdapter:
             self._slots[(id(param), key)] = self._make_slot(key, device_tensor)
 
     def _init_param_state(self, param: Any, grad: Any, group: Dict[str, Any]) -> None:
-        """Initialize missing Adam state and swap slots for one parameter."""
+        """Initialize missing optimizer state and swap slots for one parameter."""
         del grad
         state = self.optimizer.state[param]
-        if not self.is_new_adamw and len(state) == 0:
+        if self.materializes_step_state and not self.is_new_adamw and len(state) == 0:
             step_device = (
                 param.device
                 if group.get("fused", False)
                 else ("cpu" if self.runtime.packed_enabled else param.device)
             )
             state["step"] = torch.zeros((), dtype=torch.float32, device=step_device)
-        state_keys = ["exp_avg", "exp_avg_sq"]
-        if group.get("amsgrad", False):
-            state_keys.append("max_exp_avg_sq")
+        state_keys = self._per_param_state_keys(group)
         configured_keys = set(self._configured_state_keys())
         for key in state_keys:
             if key in state or (id(param), key) in self._slots:
@@ -1624,6 +1650,25 @@ class OptimizerSwapAdapter:
     def _default_state_keys() -> Tuple[str, ...]:
         return ("exp_avg", "exp_avg_sq", "max_exp_avg_sq")
 
+    @staticmethod
+    def _per_param_state_keys(group: Dict[str, Any]) -> List[str]:
+        """Return the state keys this adapter materializes for one parameter."""
+        keys = ["exp_avg", "exp_avg_sq"]
+        if group.get("amsgrad", False):
+            keys.append("max_exp_avg_sq")
+        return keys
+
+    def host_state_entries(self) -> List[Tuple[Any, str, Any]]:
+        """Return ``(param, key, cpu_tensor)`` for slots whose valid values live on the host."""
+        entries = []
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                for key in self._configured_state_keys():
+                    slot = self._slots.get((id(param), key))
+                    if slot is not None and slot.state == "host" and slot.cpu_tensor is not None:
+                        entries.append((param, key, slot.cpu_tensor))
+        return entries
+
 
 class TorchNativeAdamAdapter(OptimizerSwapAdapter):
     """Adapter for ``torch.optim.Adam``."""
@@ -1661,6 +1706,318 @@ class TorchNewAdamWAdapter(OptimizerSwapAdapter):
     def matches(cls, optimizer: Any) -> bool:
         """Match hyper-parallel's lazily imported AdamW."""
         return isinstance(optimizer, _new_adamw_cls())
+
+
+class TorchMuonAdapter(OptimizerSwapAdapter):
+    """Adapter for hyper-parallel's Muon optimizer.
+
+    Muon keeps one ``momentum_buffer`` per parameter and mixes Newton-Schulz
+    orthogonalisation with HSDP shard all-gathers, replica broadcasts and
+    ownership de-duplication. Rather than restating that schedule per swap
+    batch, a batch is applied by temporarily restricting the wrapped optimizer's
+    parameter groups to that batch and running the optimizer's own ``step``,
+    which rebuilds its per-step metadata from those groups. The swap pipeline
+    then only has to keep a batch's momentum buffers device-resident, which the
+    per-tensor path already does: this adapter never publishes a host mirror
+    into ``optimizer.state``.
+    """
+
+    requires_per_tensor_swap = True
+    materializes_step_state = False
+
+    def __init__(self, optimizer: Any, config: Any, runtime: Any) -> None:
+        """Bind the adapter and initialize the per-step bookkeeping it restores."""
+        super().__init__(optimizer, config, runtime)
+        self._step_counts: List[Any] = []
+        self._replica_count: Any = None
+        self._groups_dirty = False
+
+    @classmethod
+    def matches(cls, optimizer: Any) -> bool:
+        """Match hyper-parallel's Muon optimizer."""
+        return isinstance(optimizer, _muon_cls())
+
+    @staticmethod
+    def _default_state_keys() -> Tuple[str, ...]:
+        return (MOMENTUM_KEY,)
+
+    @staticmethod
+    def _per_param_state_keys(group: Dict[str, Any]) -> List[str]:
+        """Muon materializes a single momentum buffer per parameter."""
+        del group
+        return [MOMENTUM_KEY]
+
+    def validate(self) -> None:
+        """Reject Muon configurations that cannot be split across swap batches.
+
+        Raises:
+            ValueError: If any HSDP assignment replicates parameters across
+                ranks, since a replica broadcast covers a whole assignment.
+        """
+        super().validate()
+        for group_index, group in enumerate(self.optimizer.param_groups):
+            del group
+            assignments = getattr(self.optimizer, "_hsdp_assignment_batches", {}).get(group_index) or {}
+            for batch_group in assignments.get("batch_groups", ()):
+                for assignment in batch_group.get("sub_batches", ()):
+                    if getattr(assignment, "is_replicated", False):
+                        raise ValueError(
+                            "Swap optimizer does not support Muon HSDP assignments that replicate "
+                            "parameters across ranks: a replica broadcast covers a whole assignment "
+                            "and cannot be split over swap batches."
+                        )
+
+    def prepare_step(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """Collect this step's update units and snapshot the per-group step counters."""
+        self._step_counts = [group.get("step") for group in self.optimizer.param_groups]
+        self._replica_count = getattr(self.optimizer, "hsdp_replica_count", None)
+        self._groups_dirty = False
+        return super().prepare_step(*args, **kwargs)
+
+    def step_batch(self, batch: List[UpdateUnit], step_context: Dict[str, Any]) -> None:
+        """Apply one swap batch with Muon's own step, restricted to that batch."""
+        del step_context
+        by_group: Dict[int, List[Any]] = defaultdict(list)
+        for unit in batch:
+            if unit.grad is not None:
+                by_group[unit.adapter_index].append(unit.param)
+        for group_index, params in by_group.items():
+            self._step_group(group_index, params)
+
+    def _step_group(self, group_index: int, params: List[Any]) -> None:
+        """Run Muon's step for one batch of one parameter group.
+
+        Only the batch's momentum buffers are device-resident for the duration of
+        the call. ``group['step']`` is restored so every batch sees the counter
+        of the enclosing outer step, and the replica count is pinned because the
+        per-batch metadata rebuild only sees a subset of the parameters.
+        """
+        group = self.optimizer.param_groups[group_index]
+        saved_params = group["params"]
+        saved_step = group.get("step")
+        group["params"] = list(params)
+        try:
+            self.optimizer.hsdp_replica_count = self._replica_count
+            self.optimizer.reset_optimizer_parameters()
+            self.optimizer.step()
+            self._groups_dirty = True
+        finally:
+            group["params"] = saved_params
+            group["step"] = saved_step
+
+    def finish_step(self, step_context: Any) -> Any:
+        """Rebuild the full-parameter metadata and advance every group step by one."""
+        del step_context
+        if self._groups_dirty:
+            self.optimizer.hsdp_replica_count = self._replica_count
+            self.optimizer.reset_optimizer_parameters()
+            self._groups_dirty = False
+        for index, group in enumerate(self.optimizer.param_groups):
+            group["step"] = (self._step_counts[index] or 0) + 1
+
+
+class ChainedOptimizerAdapter:
+    """Swap adapter for ``ChainedOptimizer`` that delegates to one adapter per leaf.
+
+    ``ChainedOptimizer`` is not a ``torch.optim.Optimizer`` and owns no state of
+    its own: parameter groups, step counters and the Adam moment / Muon momentum
+    buffers all live in the leaf optimizers (at most one AdamW and one Muon for
+    the recipes in this repository). This adapter therefore builds one adapter
+    per leaf and routes every swap operation to the leaf that owns the affected
+    update unit. The leaves share the wrapper's runtime, so the prefetch
+    pipeline sees one interleaved schedule over the whole chain.
+
+    Packed host staging is disabled for a composite: the packed layout is built
+    once per runtime and keyed by dtype, so two leaves publishing into the same
+    runtime would overwrite each other's host regions. The per-tensor path keeps
+    every leaf's host mirror independently addressable.
+    """
+
+    requires_per_tensor_swap = True
+
+    def __init__(self, optimizer: Any, config: Any, runtime: Any) -> None:
+        """Build one adapter per leaf optimizer of the chain."""
+        self.optimizer = optimizer
+        self.config = config
+        self.runtime = runtime
+        leaves = list(getattr(optimizer, "chained_optimizers", None) or ())
+        if not leaves:
+            raise ValueError("Swap optimizer requires a chained optimizer with at least one sub-optimizer.")
+        self.leaves = [build_swap_adapter(leaf, config, runtime) for leaf in leaves]
+        self._owner_by_unit: Dict[int, int] = {}
+
+    @classmethod
+    def matches(cls, optimizer: Any) -> bool:
+        """Match the chained optimizer the configured optimizer builders return."""
+        return isinstance(optimizer, _chained_optimizer_cls())
+
+    def validate(self) -> None:
+        """Validate every leaf adapter."""
+        for leaf in self.leaves:
+            leaf.validate()
+
+    def prepare_step(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """Prepare every leaf and collect one update-unit list for the whole chain."""
+        if args or kwargs:
+            raise ValueError("Torch swap optimizer step does not support closure or extra arguments.")
+        contexts = [leaf.prepare_step() for leaf in self.leaves]
+        units: List[UpdateUnit] = []
+        owners: Dict[int, int] = {}
+        for index, (leaf, context) in enumerate(zip(self.leaves, contexts)):
+            for unit in leaf.iter_update_units(context):
+                owners[id(unit)] = index
+                units.append(unit)
+        self._owner_by_unit = owners
+        return {"units": units, "contexts": contexts}
+
+    def iter_update_units(self, step_context: Dict[str, Any]) -> List[UpdateUnit]:
+        """Return units collected in ``prepare_step``."""
+        return step_context["units"]
+
+    def step_batch(self, batch: List[UpdateUnit], step_context: Dict[str, Any]) -> None:
+        """Route each update unit of the batch to the leaf adapter that owns it."""
+        contexts = step_context["contexts"]
+        by_owner: Dict[int, List[UpdateUnit]] = defaultdict(list)
+        for unit in batch:
+            by_owner[self._owner_by_unit[id(unit)]].append(unit)
+        for owner_index, units in by_owner.items():
+            self.leaves[owner_index].step_batch(units, contexts[owner_index])
+
+    def finish_step(self, step_context: Any) -> Any:
+        """Finish the step for every leaf."""
+        for leaf, context in zip(self.leaves, step_context["contexts"]):
+            leaf.finish_step(context)
+
+    def initial_slots(self) -> Iterable[SwapSlot]:
+        """Discover leaf states materialized before the swap wrapper was created."""
+        slots: List[SwapSlot] = []
+        for leaf in self.leaves:
+            slots.extend(leaf.initial_slots())
+        return tuple(slots)
+
+    def all_slots(self) -> Iterable[SwapSlot]:
+        """Iterate every leaf's known swap slots."""
+        slots: List[SwapSlot] = []
+        for leaf in self.leaves:
+            slots.extend(leaf.all_slots())
+        return tuple(slots)
+
+    def publish_packed_state(self) -> None:
+        """Do nothing: a composite always swaps per tensor, never through a packed host layout."""
+
+    def checkpoint_state_dict(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """Return chained checkpoint state with swapped buffers read from the host mirrors.
+
+        ``synchronize_cpu_mirrors`` has just released the device storage of every
+        swapped slot, so the state dict ``ChainedOptimizer.state_dict`` builds
+        holds zero-storage placeholders wherever a buffer currently lives on the
+        host. Each of those has to be replaced by its mirror before the result is
+        written out.
+
+        That state dict comes in two shapes, because ``ChainedOptimizer`` passes
+        its ``flatten`` flag down to ``get_optimizer_state_dict``:
+
+        * nested -- ``{"state": {id: {...}}, "param_groups": [...]}``, used when
+          the chain does not flatten;
+        * flat -- ``{"state.<fqn>.<key>": tensor, ...}``, used when it does, i.e.
+          once an AdamW leaf and a Muon leaf coexist. There is no ``state``
+          mapping at all in this shape.
+
+        Both are handled. If mirrors exist and none of them landed anywhere, this
+        raises instead of returning a state dict still holding released
+        placeholders: a checkpoint that looks fine and restores garbage is worse
+        than a failed save.
+
+        Raises:
+            RuntimeError: If swapped host mirrors could not be placed in the
+                state dict at all.
+        """
+        del args, kwargs
+        self.runtime.synchronize_cpu_mirrors(self.all_slots())
+        mirrors = self._host_mirrors()
+        state_dict = copy.deepcopy(self.optimizer.state_dict())
+        if "state" in state_dict:
+            replaced = self._replace_nested_mirrors(state_dict, mirrors)
+        else:
+            replaced = self._replace_flat_mirrors(state_dict, mirrors)
+        if mirrors and not replaced:
+            raise RuntimeError(
+                "Swap optimizer could not place any host mirror into the chained checkpoint state "
+                f"dict; refusing to write a checkpoint whose swapped buffers are still released "
+                f"placeholders. Layout keys seen: {sorted(state_dict)[:4]}"
+            )
+        return state_dict
+
+    def _host_mirrors(self) -> List[Tuple[Any, int, str, Any]]:
+        """Return ``(fqn, param id, key, cpu_tensor)`` for every swapped-out buffer."""
+        mirrors = []
+        for leaf in self.leaves:
+            for param, key, cpu_tensor in leaf.host_state_entries():
+                mirrors.append((getattr(param, "model_name", None), id(param), key, cpu_tensor))
+        return mirrors
+
+    def _replace_nested_mirrors(self, state_dict: Dict[str, Any], mirrors: List[Tuple]) -> int:
+        """Substitute host mirrors into a nested ``state`` mapping; return the number placed.
+
+        ``get_optimizer_state_dict`` keys a non-flattened chain's state by parameter
+        id, so the key has to be mapped back through the saved ``param_groups``
+        positions before a mirror can be matched to it.
+        """
+        saved_ids = _flat_saved_param_ids(state_dict.get("param_groups", []))
+        current_params = [param for group in self.optimizer.param_groups for param in group["params"]]
+        replaced = 0
+        for state_key, saved_state in state_dict["state"].items():
+            if not isinstance(saved_state, dict):
+                continue
+            owner_id = self._saved_state_owner_id(state_key, saved_ids, current_params)
+            for fqn, param_id, key, cpu_tensor in mirrors:
+                if key not in saved_state:
+                    continue
+                if param_id == owner_id or (owner_id is None and fqn is not None and fqn == state_key):
+                    saved_state[key] = cpu_tensor.detach().clone()
+                    replaced += 1
+        return replaced
+
+    @staticmethod
+    def _saved_state_owner_id(state_key: Any, saved_ids: Dict[Any, int], current_params: List[Any]) -> Any:
+        """Map one nested state-dict key back to the id of the parameter it belongs to."""
+        if not isinstance(state_key, int):
+            return None
+        index = saved_ids.get(state_key)
+        if index is None or index >= len(current_params):
+            return None
+        return id(current_params[index])
+
+    @staticmethod
+    def _replace_flat_mirrors(state_dict: Dict[str, Any], mirrors: List[Tuple]) -> int:
+        """Substitute host mirrors into the flat ``state.<fqn>.<key>`` layout; return the count."""
+        replaced = 0
+        for fqn, _, key, cpu_tensor in mirrors:
+            if fqn is None:
+                continue
+            flat_key = f"state.{fqn}.{key}"
+            if flat_key in state_dict:
+                state_dict[flat_key] = cpu_tensor.detach().clone()
+                replaced += 1
+        return replaced
+
+    def load_checkpoint_state_dict(
+            self,
+            state_dict: Dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+    ) -> None:
+        """Reject checkpoint restore: chained optimizer state cannot be re-offloaded safely.
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        del args, kwargs, state_dict
+        raise NotImplementedError(
+            "Swap optimizer cannot restore a ChainedOptimizer checkpoint: the chained state dict is "
+            "keyed by parameter FQN, which the per-leaf swap bookkeeping cannot map back to live "
+            "parameters. Resume with optimizer.swap disabled, or save without swap."
+        )
 
 
 @dataclass
@@ -1701,6 +2058,15 @@ def _iter_unique_slot_objects(slots: Iterable[SwapSlot]) -> Iterable[SwapSlot]:
     for slot in slots:
         unique_slots.setdefault(id(slot.tensor), slot)
     return unique_slots.values()
+
+
+def _flat_saved_param_ids(saved_groups: Sequence[Dict[str, Any]]) -> Dict[Any, int]:
+    """Map every saved parameter id of a state dict to its flat position."""
+    positions = {}
+    for group in saved_groups:
+        for saved_id in group.get("params", ()):
+            positions[saved_id] = len(positions)
+    return positions
 
 
 def _iter_unique_events(slots: Iterable[SwapSlot]) -> Iterable[Any]:
@@ -1747,11 +2113,65 @@ def _new_adamw_func() -> Callable[..., Any]:
     return new_adamw_func
 
 
+def _muon_cls() -> type:
+    """Return hyper-parallel's Muon optimizer without importing it at module load."""
+    from hyper_parallel.core.optimizer.muon import (  # pylint: disable=import-outside-toplevel
+        Muon as muon_cls,
+    )
+    return muon_cls
+
+
+def _chained_optimizer_cls() -> type:
+    """Return the chained optimizer container without importing it at module load."""
+    from hyper_parallel.core.optimizer.optimizer import (  # pylint: disable=import-outside-toplevel
+        ChainedOptimizer as chained_optimizer_cls,
+    )
+    return chained_optimizer_cls
+
+
+# Leaf adapters, in match order. Composite adapters are built on top of these.
+_LEAF_ADAPTERS = (
+    TorchMuonAdapter,
+    TorchNewAdamWAdapter,
+    TorchNativeAdamAdapter,
+    TorchNativeAdamWAdapter,
+)
+_ADAPTERS = (ChainedOptimizerAdapter,) + _LEAF_ADAPTERS
+
+_SUPPORTED_OPTIMIZERS = (
+    "torch.optim.Adam, torch.optim.AdamW, hyper_parallel.core.optimizer.adamw.AdamW, "
+    "hyper_parallel.core.optimizer.muon.Muon, and ChainedOptimizer chains of those"
+)
+
+
+def build_swap_adapter(optimizer: Any, config: Any, runtime: Any) -> Any:
+    """Build the leaf swap adapter that supports ``optimizer``.
+
+    Args:
+        optimizer: Leaf optimizer instance to adapt.
+        config: Swap optimizer configuration.
+        runtime: Pipeline swap runtime the adapter drives.
+
+    Returns:
+        The first leaf adapter whose ``matches`` accepts ``optimizer``.
+
+    Raises:
+        ValueError: If no leaf adapter supports ``optimizer``.
+    """
+    for adapter_cls in _LEAF_ADAPTERS:
+        if adapter_cls.matches(optimizer):
+            return adapter_cls(optimizer, config, runtime)
+    raise ValueError(
+        f"Swap optimizer only supports {_SUPPORTED_OPTIMIZERS} on the Torch backend. "
+        f"Got {type(optimizer)!r}."
+    )
+
+
 class SwapOptimizer(torch.optim.Optimizer):
     """Torch optimizer wrapper for Adam/AdamW state swap."""
 
     _is_swap_optimizer = True
-    _adapters = (TorchNewAdamWAdapter, TorchNativeAdamAdapter, TorchNativeAdamWAdapter)
+    _adapters = _ADAPTERS
 
     def __init__(self, optimizer: Any, config: Any) -> None:
         # Do not call ``torch.optim.Optimizer.__init__``: the wrapped base
@@ -1762,6 +2182,8 @@ class SwapOptimizer(torch.optim.Optimizer):
         self.config = config
         self.runtime = PipelineSwapRuntime(config)
         self.adapter = self._build_adapter()
+        if self.adapter.requires_per_tensor_swap:
+            self.runtime.disable_packed_swap()
         self.adapter.validate()
         # Torch Adam states are normally lazy, but callers may materialize them
         # before wrapping to avoid first-step initialization in the measured loop.
@@ -1820,13 +2242,12 @@ class SwapOptimizer(torch.optim.Optimizer):
         """Load optimizer state dict while keeping swappable tensors on CPU mirrors."""
         self.adapter.load_checkpoint_state_dict(state_dict)
 
-    def _build_adapter(self) -> OptimizerSwapAdapter:
+    def _build_adapter(self) -> Any:
         for adapter_cls in self._adapters:
             if adapter_cls.matches(self.optimizer):
                 return adapter_cls(self.optimizer, self.config, self.runtime)
         raise ValueError(
-            "Swap optimizer only supports torch.optim.Adam, torch.optim.AdamW, "
-            "and hyper_parallel.core.optimizer.adamw.AdamW on the Torch backend. "
+            f"Swap optimizer only supports {_SUPPORTED_OPTIMIZERS} on the Torch backend. "
             f"Got {type(self.optimizer)!r}."
         )
 
