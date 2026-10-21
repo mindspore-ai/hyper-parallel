@@ -426,10 +426,13 @@ def _cp_strategy_spec(model_type: str | None) -> StrategySpec:
     participates in inline CP: the materialization pass derives an
     in-artifact subclass of the attention host whose forward falls back to
     the parent when CP is disabled and delegates to the family helper when
-    active. The helper import is derived from the adapter declaration (the
-    declaration's final segment names the helper), so this module never
-    hardcodes a family helper and stays free of torch imports at resolution
-    time.
+    active. The helper is the same kernel the runtime CP wrapper delegates
+    to (trainer and codegen share one CP implementation), and the import is
+    derived from the adapter declaration (the declaration's final segment
+    names the helper), so this module never hardcodes a family helper and
+    stays free of torch imports at resolution time.  ``subclass_state_attr``
+    carries the family kernel's companion attribute so the runtime binding
+    satisfies the identical contract the native wrapper installs.
 
     Families without an inline helper keep the original framework CP
     strategy (imports only), preserving the runtime wrapper path.
@@ -449,6 +452,7 @@ def _cp_strategy_spec(model_type: str | None) -> StrategySpec:
     return StrategySpec(
         kind=CP_ATTENTION_KIND,
         subclass_shell=cp_dispatch_shell_body(helper_name),
+        subclass_state_attr=adapter.context_parallel_state_attr,
         imports=(ImportPatch(helper_module, (helper_name,)),),
     )
 

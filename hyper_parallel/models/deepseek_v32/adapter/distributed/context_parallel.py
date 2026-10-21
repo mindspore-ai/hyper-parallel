@@ -220,7 +220,7 @@ def _validate_cp_target(target_module: nn.Module, cp_mesh: Any) -> None:
     wrapper_name = "deepseek_v32_dsa_attention_cp_wrapper"
     if cp_mesh is None or cp_mesh.size() <= 1:
         raise ValueError(f"{wrapper_name} requires an active CP mesh")
-    if getattr(target_module, "_hp_cp_mesh", None) is not None:
+    if getattr(target_module, "_hp_deepseek_v32_dsa_cp_config", None) is not None:
         raise RuntimeError(
             "DeepSeek-V3.2 DSA Context Parallel has already been applied to this module"
         )
@@ -279,7 +279,7 @@ def _run_cp_dsa_kernels(
     )
 
 
-def deepseek_v32_dsa_cp_forward(
+def _deepseek_v32_dsa_cp_forward(
     module: nn.Module,
     hidden_states: torch.Tensor,
     position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -295,12 +295,9 @@ def deepseek_v32_dsa_cp_forward(
             "DeepseekV32DSAAttention CP expects hidden_states with shape [B, S, H]"
         )
     batch_size, local_seq_len = hidden_states.shape[:2]
-    cp_mesh = getattr(module, "_hp_cp_mesh", None)
+    cp_mesh = getattr(module, "_hp_deepseek_v32_dsa_cp_mesh", None)
     if cp_mesh is None:
-        raise RuntimeError(
-            "DeepSeek-V3.2 DSA CP forward is missing its CP mesh; "
-            "ensure the inline strategy state is bound."
-        )
+        raise RuntimeError("DeepSeek-V3.2 DSA CP forward is missing its CP mesh")
     cp_size = cp_mesh.size()
     cp_rank = cp_mesh.get_local_rank()
     global_seq_len = local_seq_len * cp_size
@@ -408,7 +405,7 @@ def deepseek_v32_dsa_attention_cp_wrapper(
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
         """Execute the CP DSA path using the target module's projections."""
-        return deepseek_v32_dsa_cp_forward(
+        return _deepseek_v32_dsa_cp_forward(
             target_module,
             hidden_states,
             position_embeddings,
@@ -423,12 +420,14 @@ def deepseek_v32_dsa_attention_cp_wrapper(
         target_module,
         cp_forward,
         companion_attrs={
-            "_hp_cp_mesh": cp_mesh,
+            "_hp_deepseek_v32_dsa_cp_mesh": cp_mesh,
+            "_hp_deepseek_v32_dsa_cp_config": {
+                "cp_size": cp_mesh.size(),
+            },
         },
     )
 
 
 __all__ = [
-    "deepseek_v32_dsa_cp_forward",
     "deepseek_v32_dsa_attention_cp_wrapper",
 ]

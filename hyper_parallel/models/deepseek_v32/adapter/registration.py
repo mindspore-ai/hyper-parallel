@@ -44,10 +44,15 @@ DEEPSEEK_V32_ADAPTER_SPEC = ModelAdapterSpec(
     model_type="deepseek_v32",
     replacements=_load_replacements,
     context_parallel=_load_context_parallel,
+    # The trainer's CP kernel itself (the function the runtime wrapper's
+    # cp_forward delegates to), referenced — not forked — by the inline shell.
     context_parallel_inline=(
         "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel"
-        ".deepseek_v32_dsa_cp_forward"
+        "._deepseek_v32_dsa_cp_forward"
     ),
+    # The companion attribute the kernel reads; mirrors the attr the runtime
+    # wrapper installs so both paths satisfy the identical contract.
+    context_parallel_state_attr="_hp_deepseek_v32_dsa_cp_mesh",
     sharding_rules=build_parameter_sharding_rules,
 )
 register_model_adapter(DEEPSEEK_V32_ADAPTER_SPEC)

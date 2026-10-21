@@ -234,11 +234,13 @@ class TestInlineAdapters(unittest.TestCase):
         self.assertIsNone(spec.target_class)
         self.assertIsNone(spec.body_template)
         self.assertIsNotNone(spec.subclass_shell)
-        self.assertIn("deepseek_v32_dsa_cp_forward", spec.subclass_shell)
+        self.assertIn("_deepseek_v32_dsa_cp_forward", spec.subclass_shell)
         self.assertIn("if not self.cp_enable:", spec.subclass_shell)
+        self.assertEqual(spec.subclass_state_attr,
+                         "_hp_deepseek_v32_dsa_cp_mesh")
         self.assertTrue(spec.imports)
         import_names = [name for patch in spec.imports for name in patch.names]
-        self.assertIn("deepseek_v32_dsa_cp_forward", import_names)
+        self.assertIn("_deepseek_v32_dsa_cp_forward", import_names)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
               card_mark="onecard", essential_mark="unessential")
@@ -267,8 +269,9 @@ class TestInlineAdapters(unittest.TestCase):
         snippet = patches.module_snippets[0].text
         self.assertIn("class DeepseekV32DSAAttentionCP(DeepseekV32DSAAttention):", snippet)
         self.assertIn("_hp_inline_cp = True", snippet)
+        self.assertIn('_hp_cp_state_attr = "_hp_deepseek_v32_dsa_cp_mesh"', snippet)
         self.assertIn("if not self.cp_enable:", snippet)
-        self.assertIn("deepseek_v32_dsa_cp_forward(self, *args, **kwargs)", snippet)
+        self.assertIn("_deepseek_v32_dsa_cp_forward(self, *args, **kwargs)", snippet)
         self.assertEqual(patches.constructor_replaces, [
             ConstructorReplacePatch(
                 old_ctor="DeepseekV32DSAAttention",
