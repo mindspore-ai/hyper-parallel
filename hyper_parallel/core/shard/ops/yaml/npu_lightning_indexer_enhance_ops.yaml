@@ -1,0 +1,4 @@
+npu_lightning_indexer_enhance:
+  dist_op_name: _npu_lightning_indexer_enhance_dist_op
+  distributed_op_class: LightningIndexerEnhanceDistributedOp
+  distributed_op_file: parallel_lightning_indexer_enhance

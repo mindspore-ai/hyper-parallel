@@ -86,6 +86,13 @@ class TorchCustomOps:
         )
 
     @staticmethod
+    def npu_lightning_indexer_enhance(*args, **kwargs):
+        """NPU enhanced lightning indexer operator; not supported on PyTorch."""
+        raise NotImplementedError(
+            "npu_lightning_indexer_enhance is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
     def npu_sparse_flash_mla(*args, **kwargs):
         """NPU sparse flash MLA operator; not supported on PyTorch."""
         raise NotImplementedError(

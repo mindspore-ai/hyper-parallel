@@ -24,6 +24,7 @@ from hyper_parallel.platform.mindspore.custom_ops.custom_op_impl import (
     NpuDenseLightningIndexerGradKlLossDFunction,
     NpuDenseLightningIndexerSoftmaxLseDFunction,
     NpuLightningIndexerDFunction,
+    NpuLightningIndexerEnhanceDFunction,
     NpuMhcPostDFunction,
     NpuMhcPreClampSinkhornDFunction,
     NpuMhcPreSinkhornDFunction,
@@ -76,6 +77,11 @@ class MindSporeCustomOps:
     def npu_lightning_indexer(*args, **kwargs):
         """Sparse-attention preprocessing (top-K key selection) via custom NPU operator."""
         return NpuLightningIndexerDFunction.apply(*args, **kwargs)
+
+    @staticmethod
+    def npu_lightning_indexer_enhance(*args, **kwargs):
+        """Sparse-attention preprocessing via the enhanced top-K custom NPU operator."""
+        return NpuLightningIndexerEnhanceDFunction.apply(*args, **kwargs)
 
     @staticmethod
     def npu_sparse_flash_mla(*args, **kwargs):

@@ -323,6 +323,69 @@ def npu_lightning_indexer(
     )
 
 
+def npu_lightning_indexer_enhance(
+        query,
+        key,
+        weights,
+        *,
+        actual_seq_lengths_query: Optional[Tensor] = None,
+        actual_seq_lengths_key: Optional[Tensor] = None,
+        block_table: Optional[Tensor] = None,
+        layout_query: str = 'BSND',
+        layout_key: str = 'BSND',
+        sparse_count: int = 2048,
+        sparse_mode: int = 3,
+        pre_tokens: int = _MAX_INT64,
+        next_tokens: int = _MAX_INT64,
+        return_value: bool = False,
+        sparse_block_size: int = 1,
+        sparse_block_mode: int = 0,
+) -> Tuple:
+    """Sparse attention preprocessing via the enhanced top-K kernel.
+
+    .. warning::
+        This is an experimental API that subject to change or deletion.
+
+    Mirrors the MindSpore built-in ``ops.lightning_indexer`` call convention (so the CP fold
+    wrapper can drive it block by block) and adds the two attributes of the enhanced kernel.
+    The DSA training path keeps ``return_value=False``: the Cube-fills-Vector fast template
+    requires it, and the kernel then casts ``weights`` to fp32 on its own.
+
+    Args:
+        query: Indexer query, ``(B, S1, N1, D)`` for BSND or ``(T1, N1, D)`` for TND.
+            bfloat16/float16, contiguous.
+        key: Indexer key, ``(B, S2, N2, D)`` / ``(T2, N2, D)`` / PA ``(blocks, block, N2, D)``.
+        weights: Weight coefficient, ``(B, S1, N1)`` or ``(T, N1)``.
+        actual_seq_lengths_query: Cumulative query lengths (int32); None for BSND.
+        actual_seq_lengths_key: Cumulative key lengths (int32); None for BSND.
+        block_table: PageAttention block table (int32); None outside PA.
+        layout_query: 'BSND' or 'TND'.
+        layout_key: 'BSND', 'TND' or 'PA_BSND'. Must be passed explicitly: unlike the old
+            op, the kernel's own default is 'PA_BSND'.
+        sparse_count: Number of top-K tokens to retain.
+        sparse_mode: 0 (defaultMask) or 3 (rightDownCausal); 3 is required by the fast template.
+        pre_tokens: Sparse window left bound; only INT64_MAX is supported.
+        next_tokens: Sparse window right bound; only INT64_MAX is supported.
+        return_value: Whether to also produce ``sparse_values``. Must stay False to hit the
+            Cube-fills-Vector template.
+        sparse_block_size: Token-wise sparsity when 1 (the only value the old backward op accepts).
+        sparse_block_mode: Importance-score rule; only 0 is supported.
+
+    Returns:
+        tuple[Tensor, Tensor]: ``(sparse_indices, sparse_values)``. ``sparse_values`` is not
+        written when ``return_value`` is false and must not be consumed.
+    """
+    return _platform.custom_ops.npu_lightning_indexer_enhance(
+        query, key, weights,
+        actual_seq_lengths_query, actual_seq_lengths_key, block_table,
+        layout_query, layout_key,
+        sparse_count, sparse_mode, pre_tokens, next_tokens,
+        return_value,
+        sparse_block_size=sparse_block_size,
+        sparse_block_mode=sparse_block_mode,
+    )
+
+
 def npu_sparse_flash_mla(
         query,
         *,
