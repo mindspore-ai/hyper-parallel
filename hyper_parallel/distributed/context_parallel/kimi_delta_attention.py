@@ -32,6 +32,10 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
+from hyper_parallel.components.functional.linear_attention_packed import (
+    PackedSequenceInfo, packed_causal_conv1d, resolve_packed_sequence,
+)
+
 from hyper_parallel.core.context_parallel.context_parallel import _ensure_1d
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -64,6 +68,7 @@ def _run_local_kda(
     chunk_size: int,
     safe_gate: bool,
     backend: str,
+    sequence_info: Optional[PackedSequenceInfo] = None,
 ) -> torch.Tensor:
     """Run the explicitly selected local KDA implementation."""
     if backend == "triton" and not safe_gate:
@@ -85,6 +90,7 @@ def _run_local_kda(
         use_gate_in_kernel=True,
         use_beta_sigmoid_in_kernel=True,
         backend=backend,
+        cu_seqlens=None if sequence_info is None else sequence_info.materialize(query.device, chunk_size).cu_seqlens,
     )
     return output
 
@@ -218,8 +224,11 @@ def _run_causal_short_conv(
     tensor: torch.Tensor,
     convolution: nn.Conv1d,
     halo: Optional[torch.Tensor] = None,
+    sequence_info: Optional[PackedSequenceInfo] = None,
 ) -> torch.Tensor:
     """Apply one local ShortConv, optionally with a preceding-rank halo."""
+    if sequence_info is not None:
+        return packed_causal_conv1d(tensor, convolution, sequence_info, halo)
     if halo is None:
         conv_input = tensor.transpose(1, 2)
         padding = convolution.padding
@@ -246,6 +255,7 @@ def _causal_short_convs_with_cp_halo(
     cp_mesh: DeviceMesh,
     cp_rank: int,
     cp_size: int,
+    sequence_info: Optional[PackedSequenceInfo] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run three causal depthwise ShortConvs with one packed halo exchange."""
     halo_widths = {
@@ -256,7 +266,7 @@ def _causal_short_convs_with_cp_halo(
     halo_width = halo_widths.pop()
     if halo_width == 0 or cp_size == 1:
         return tuple(
-            _run_causal_short_conv(tensor, convolution)
+            _run_causal_short_conv(tensor, convolution, sequence_info=sequence_info)
             for tensor, convolution in zip(projected, convolutions)
         )
     if projected[0].shape[1] < halo_width:
@@ -278,7 +288,7 @@ def _causal_short_convs_with_cp_halo(
     )
     halos = torch.split(packed_halo, channel_sizes, dim=-1)
     return tuple(
-        _run_causal_short_conv(tensor, convolution, halo)
+        _run_causal_short_conv(tensor, convolution, halo, sequence_info=sequence_info)
         for tensor, halo, convolution in zip(projected, halos, convolutions)
     )
 
@@ -459,8 +469,28 @@ def _eager_kda_state_p2p(
     next_rank: int,
     cp_rank: int,
     cp_size: int,
+    sequence_info: Optional[PackedSequenceInfo] = None,
 ) -> torch.Tensor:
     """Run the differentiable Torch reference for affine state-P2P KDA."""
+    if sequence_info is not None:
+        # Portable semantic reference: native fragment recurrence, fixed sends.
+        incoming = None
+        if cp_rank > 0:
+            shape = (1, value.shape[2], query.shape[-1], value.shape[-1])
+            incoming = _RecvKDAInitialState.apply(query, cp_group, prev_rank, shape)
+        output, finals = chunk_kda(
+            query, key, value, gate, beta, a_log=a_log, dt_bias=dt_bias, scale=scale,
+            initial_state=sequence_info.first_state(incoming), output_final_state=True,
+            use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, use_beta_sigmoid_in_kernel=True,
+            lower_bound=lower_bound, chunk_size=chunk_size, backend="eager",
+            cu_seqlens=sequence_info.local_offsets,
+        )
+        if incoming is not None:
+            output = output + incoming.sum().to(output.dtype) * 0
+        if cp_rank < cp_size - 1:
+            token = _SendKDAFinalState.apply(finals[-1:].contiguous(), cp_group, next_rank)
+            output = output + token.to(output.dtype) * 0
+        return output
     if cp_size == 1:
         return _run_local_kda(
             query,
@@ -675,6 +705,7 @@ class KimiDeltaAttentionUlyssesCP(nn.Module):
         a_log: torch.Tensor,
         dt_bias: torch.Tensor,
         scale: Optional[float] = None,
+        sequence_info: Optional[PackedSequenceInfo] = None,
     ) -> torch.Tensor:
         """Run chunkwise KDA using full sequence and local heads.
 
@@ -688,7 +719,13 @@ class KimiDeltaAttentionUlyssesCP(nn.Module):
             dt_bias: Learned bias with one value per gate channel.
             scale: Optional attention scaling factor.
         """
+        is_tnd = query.ndim == 3
+        if is_tnd:
+            output = self.forward(*(tensor.unsqueeze(0) for tensor in (query, key, value, gate, beta)),
+                                  a_log=a_log, dt_bias=dt_bias, scale=scale, sequence_info=sequence_info)
+            return output.squeeze(0)
         self._validate_inputs(query, key, value, gate, beta, a_log, dt_bias)
+        exchanged_info = None if sequence_info is None else sequence_info.ulysses(self.cp_size, self.cp_rank)
         num_v_heads = value.shape[2]
         k_head_dim = query.shape[-1]
 
@@ -721,6 +758,7 @@ class KimiDeltaAttentionUlyssesCP(nn.Module):
             chunk_size=self.chunk_size,
             safe_gate=self.safe_gate,
             backend=self.backend,
+            sequence_info=exchanged_info,
         )
         return self._head_to_seq(output)
 
@@ -780,6 +818,7 @@ class _KDAStateCP(nn.Module):
         a_log: torch.Tensor,
         dt_bias: torch.Tensor,
         scale: Optional[float] = None,
+        sequence_info: Optional[PackedSequenceInfo] = None,
     ) -> torch.Tensor:
         """Run one local KDA segment and propagate its recurrent state.
 
@@ -807,6 +846,7 @@ class _KDAStateCP(nn.Module):
                 chunk_size=self.chunk_size,
                 safe_gate=self.safe_gate,
                 backend=self.backend,
+                sequence_info=sequence_info,
             )
         if self.backend == "eager":
             return _eager_kda_state_p2p(
@@ -825,6 +865,7 @@ class _KDAStateCP(nn.Module):
                 next_rank=self.next_rank,
                 cp_rank=self.cp_rank,
                 cp_size=self.cp_size,
+                sequence_info=sequence_info,
             )
 
         from hyper_parallel.components.functional.kimi_delta_attention import (  # pylint: disable=import-outside-toplevel
@@ -848,6 +889,7 @@ class _KDAStateCP(nn.Module):
             chunk_size=self.chunk_size,
             safe_gate=self.safe_gate,
             state_cp=self.state_cp,
+            sequence_info=sequence_info,
         )
 
 
@@ -893,7 +935,7 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
     local sequence shard before the original output gate, norm, and projection.
 
     This first integration targets dense training batches. Inference cache and
-    padded or packed variable-length sequences require separate CP metadata
+    padded sequences require separate metadata; packed samples use global offsets
     handling and are rejected explicitly.
     """
 
@@ -1001,6 +1043,7 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
         self,
         projected: torch.Tensor,
         convolution: nn.Conv1d,
+        sequence_info: Optional[PackedSequenceInfo] = None,
     ) -> torch.Tensor:
         """Run one wrapped ShortConv on this rank's contiguous channel slice."""
         local_channels = projected.shape[-1]
@@ -1009,6 +1052,8 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
         bias = convolution.bias
         if bias is not None:
             bias = bias.narrow(0, channel_start, local_channels)
+        if sequence_info is not None:
+            return packed_causal_conv1d(projected, convolution, sequence_info, weight=weight, bias=bias)
         output = F.conv1d(  # pylint: disable=not-callable
             projected.transpose(1, 2),
             weight,
@@ -1038,7 +1083,7 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
             past_key_values: Recurrent inference cache, currently unsupported.
             use_cache: Must be False for this training adapter.
             output_attentions: Must be False; KDA does not materialize attention weights.
-            kwargs: Additional model arguments; packed sequences are unsupported.
+            kwargs: Optional global sample offsets or prebuilt packed_sequence_info.
         """
         if not self.module.training:
             raise NotImplementedError("Kimi K3 Ulysses CP currently supports training only.")
@@ -1046,12 +1091,18 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
             raise NotImplementedError("Kimi K3 Ulysses CP does not support recurrent cache.")
         if output_attentions:
             raise NotImplementedError("KDA does not materialize attention weights.")
-        if kwargs.get("cu_seqlens") is not None:
-            raise NotImplementedError("Packed variable-length KDA CP is not implemented.")
         if attention_mask is not None and not bool(attention_mask.bool().all().item()):
             raise NotImplementedError("Padded KDA CP batches are not implemented.")
 
         hidden_states = _local_cp_tensor(hidden_states)
+        is_tnd = hidden_states.ndim == 2
+        if is_tnd:
+            hidden_states = hidden_states.unsqueeze(0)
+        sequence_info = resolve_packed_sequence(
+            kwargs, hidden_states.shape[1], cp_rank=self.cp_rank, cp_size=self.cp_size)
+        if sequence_info is not None and hidden_states.shape[0] != 1:
+            raise ValueError("Packed KDA requires batch dimension one.")
+        exchanged_info = None if sequence_info is None else sequence_info.ulysses(self.cp_size, self.cp_rank)
         base = self.module
         batch_size, local_seq_len, _ = hidden_states.shape
         query = base.q_proj(hidden_states)
@@ -1068,9 +1119,9 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
 
         query, key, value, gate, beta = self._pack_projected_inputs(query, key, value, gate, beta)
         if _uses_short_conv(base):
-            query = self._local_short_conv(query, base.q_conv1d)
-            key = self._local_short_conv(key, base.k_conv1d)
-            value = self._local_short_conv(value, base.v_conv1d)
+            query = self._local_short_conv(query, base.q_conv1d, sequence_info=exchanged_info)
+            key = self._local_short_conv(key, base.k_conv1d, sequence_info=exchanged_info)
+            value = self._local_short_conv(value, base.v_conv1d, sequence_info=exchanged_info)
         else:
             query, key, value = (F.silu(tensor) for tensor in (query, key, value))
 
@@ -1112,6 +1163,7 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
             chunk_size=self.chunk_size,
             safe_gate=self.safe_gate,
             backend=self.backend,
+            sequence_info=exchanged_info,
         )
         output = self._head_to_seq(output)
         output = base.o_norm(output, output_gate)
@@ -1119,7 +1171,7 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
             batch_size, local_seq_len, _value_projection_dim(base)
         )
         output = base.o_proj(output)
-        return _format_layer_output(base, output)
+        return _format_layer_output(base, output.squeeze(0) if is_tnd else output)
 
 
 def _validate_cp_degrees(cp_size: int, ulysses_degree: int, allgather_group_size: int) -> None:
@@ -1222,7 +1274,7 @@ class KimiDeltaAttentionLayerCP(nn.Module):
             past_key_values: Recurrent inference cache, currently unsupported.
             use_cache: Must be False for this training adapter.
             output_attentions: Must be False; KDA does not materialize attention weights.
-            kwargs: Additional model arguments; packed sequences are unsupported.
+            kwargs: Optional global sample offsets or prebuilt packed_sequence_info.
         """
         if not self.module.training:
             raise NotImplementedError("Kimi K3 CP currently supports training only.")
@@ -1230,12 +1282,17 @@ class KimiDeltaAttentionLayerCP(nn.Module):
             raise NotImplementedError("Kimi K3 CP does not support recurrent cache.")
         if output_attentions:
             raise NotImplementedError("KDA does not materialize attention weights.")
-        if kwargs.get("cu_seqlens") is not None:
-            raise NotImplementedError("Packed variable-length KDA CP is not implemented.")
         if attention_mask is not None and not bool(attention_mask.bool().all().item()):
             raise NotImplementedError("Padded KDA CP batches are not implemented.")
 
         hidden_states = _local_cp_tensor(hidden_states)
+        is_tnd = hidden_states.ndim == 2
+        if is_tnd:
+            hidden_states = hidden_states.unsqueeze(0)
+        sequence_info = resolve_packed_sequence(
+            kwargs, hidden_states.shape[1], cp_rank=self.cp_rank, cp_size=self.cp_size)
+        if sequence_info is not None and hidden_states.shape[0] != 1:
+            raise ValueError("Packed KDA requires batch dimension one.")
         base = self.module
         batch_size, local_seq_len, _ = hidden_states.shape
         query = base.q_proj(hidden_states)
@@ -1248,6 +1305,7 @@ class KimiDeltaAttentionLayerCP(nn.Module):
                 self.cp_mesh,
                 self.cp_rank,
                 self.cp_size,
+                sequence_info=sequence_info,
             )
         else:
             query, key, value = (F.silu(tensor) for tensor in (query, key, value))
@@ -1296,13 +1354,14 @@ class KimiDeltaAttentionLayerCP(nn.Module):
             beta,
             a_log=base.A_log,
             dt_bias=base.dt_bias,
+            sequence_info=sequence_info,
         )
         output = base.o_norm(output, output_gate)
         output = output.reshape(
             batch_size, local_seq_len, _value_projection_dim(base)
         )
         output = base.o_proj(output)
-        return _format_layer_output(base, output)
+        return _format_layer_output(base, output.squeeze(0) if is_tnd else output)
 
 
 class KimiDeltaAttentionCoreCP(nn.Module):
@@ -1328,6 +1387,8 @@ class KimiDeltaAttentionCoreCP(nn.Module):
             raise ValueError("allgather_group_size is only valid for grouped_allgather_p2p.")
         if lower_bound >= 0:
             raise ValueError("lower_bound must be negative.")
+        self.cp_size = device_mesh.size()
+        self.cp_rank = device_mesh.get_local_rank()
         self.ulysses_degree = ulysses_degree
         self.ulysses_mesh = None
         self.ulysses_rank = 0
@@ -1343,7 +1404,8 @@ class KimiDeltaAttentionCoreCP(nn.Module):
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 gate: torch.Tensor, beta: torch.Tensor, *, a_log: torch.Tensor,
-                dt_bias: torch.Tensor, scale: float | None = None) -> torch.Tensor:
+                dt_bias: torch.Tensor, scale: float | None = None,
+                sequence_info: Optional[PackedSequenceInfo] = None) -> torch.Tensor:
         """Run state CP with optional token/head redistribution.
 
         Args:
@@ -1359,14 +1421,27 @@ class KimiDeltaAttentionCoreCP(nn.Module):
         Returns:
             Output restored to this rank's original token/head layout.
         """
+        is_tnd = query.ndim == 3
+        if is_tnd:
+            output = self.forward(*(tensor.unsqueeze(0) for tensor in (query, key, value, gate, beta)),
+                                  a_log=a_log, dt_bias=dt_bias, scale=scale, sequence_info=sequence_info)
+            return output.squeeze(0)
+        if sequence_info is not None:
+            if query.shape[0] != 1:
+                raise ValueError("Packed KDA core requires batch dimension one.")
+            resolve_packed_sequence({"packed_sequence_info": sequence_info}, query.shape[1],
+                                    cp_rank=self.cp_rank, cp_size=self.cp_size)
         if self.ulysses_mesh is None:
-            return self.state(query, key, value, gate, beta, a_log=a_log, dt_bias=dt_bias, scale=scale)
+            return self.state(query, key, value, gate, beta, a_log=a_log, dt_bias=dt_bias, scale=scale,
+                              sequence_info=sequence_info)
         _validate_projected_inputs(self.ulysses_degree, query, key, value, gate, beta, a_log, dt_bias)
         heads, key_dim = value.shape[2], query.shape[-1]
         inputs = self._exchange_inputs((query, key, value, gate, beta))
         local_a = _slice_local_heads(a_log.reshape(heads), self.ulysses_rank, self.ulysses_degree)
         local_bias = _slice_local_heads(dt_bias.reshape(heads, key_dim), self.ulysses_rank, self.ulysses_degree)
-        output = self.state(*inputs, a_log=local_a, dt_bias=local_bias, scale=scale)
+        exchanged_info = None if sequence_info is None else sequence_info.ulysses(
+            self.ulysses_degree, self.ulysses_rank)
+        output = self.state(*inputs, a_log=local_a, dt_bias=local_bias, scale=scale, sequence_info=exchanged_info)
         return _differentiable_all_to_all_shard(output, self.ulysses_mesh, split_dim=1, concat_dim=2)
 
     def _exchange_inputs(self, inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:

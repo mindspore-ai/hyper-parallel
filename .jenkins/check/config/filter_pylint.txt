@@ -214,3 +214,7 @@
 "hyper-parallel/examples/training_demo/deepseek_v41/generated/" "unused-argument"
 "hyper-parallel/examples/training_demo/deepseek_v41/generated/" "protected-access"
 "hyper-parallel/examples/training_demo/deepseek_v41/generated/" "possibly-used-before-assignment"
+
+# TND linear attention uses native Torch, following the Torch-only component contract.
+"hyper-parallel/hyper_parallel/components/functional/linear_attention_packed.py" "forbidden-backend-import"
+"hyper-parallel/hyper_parallel/models/qwen3_5/adapter/distributed/packed.py" "forbidden-backend-import"

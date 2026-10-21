@@ -46,11 +46,8 @@ def _validate_prepared_summary_inputs(
             "Triton KDA state summary requires key_dim=value_dim=128 and "
             "chunk_size=64."
         )
-    if sequence_length % chunk_size:
-        raise ValueError(
-            f"KDA summary sequence length {sequence_length} must be divisible "
-            f"by chunk_size {chunk_size}."
-        )
+    if sequence_length <= 0:
+        raise ValueError("State summary requires a nonempty sample fragment.")
     if w.shape != key.shape or gate.shape != key.shape:
         raise ValueError(
             "KDA prepared key, w, and gate must have identical shapes, got "
@@ -88,11 +85,8 @@ def _validate_gradient_summary_inputs(
             "Triton KDA state-gradient summary requires key_dim=value_dim=128 "
             "and chunk_size=64."
         )
-    if sequence_length % chunk_size:
-        raise ValueError(
-            f"KDA gradient-summary sequence length {sequence_length} must be "
-            f"divisible by chunk_size {chunk_size}."
-        )
+    if sequence_length <= 0:
+        raise ValueError("State summary requires a nonempty sample fragment.")
     prepared_shape = (batch, sequence_length, heads, key_dim)
     value_shape = (batch, sequence_length, heads, value_dim)
     if key.shape != prepared_shape or w.shape != prepared_shape:

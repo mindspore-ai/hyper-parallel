@@ -85,8 +85,8 @@ def gdn_packed_state_summary_kernel(
         p_w2 = tl.make_block_ptr(
             w, (T, K), (stride_k, 1), (i_t * BT, 64), (BT, 64), (1, 0)
         )
-        b_w1 = tl.load(p_w1, boundary_check=(0, 1))
-        b_w2 = tl.load(p_w2, boundary_check=(0, 1))
+        b_w1 = tl.load(p_w1, boundary_check=(0, 1), padding_option='zero')
+        b_w2 = tl.load(p_w2, boundary_check=(0, 1), padding_option='zero')
         b_v = tl.dot(b_w1, b_h1.to(b_w1.dtype))
         b_v += tl.dot(b_w2, b_h2.to(b_w2.dtype))
 
@@ -98,7 +98,7 @@ def gdn_packed_state_summary_kernel(
             (BT, BV),
             (1, 0),
         )
-        b_v = tl.load(p_u, boundary_check=(0, 1)) - b_v
+        b_v = tl.load(p_u, boundary_check=(0, 1), padding_option='zero') - b_v
 
         last_idx = min((i_t + 1) * BT, T) - 1
         token = i_t * BT + tl.arange(0, BT)
@@ -117,8 +117,8 @@ def gdn_packed_state_summary_kernel(
         p_k2 = tl.make_block_ptr(
             k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
         )
-        b_h1 += tl.dot(tl.load(p_k1, boundary_check=(0, 1)), b_v)
-        b_h2 += tl.dot(tl.load(p_k2, boundary_check=(0, 1)), b_v)
+        b_h1 += tl.dot(tl.load(p_k1, boundary_check=(0, 1), padding_option='zero'), b_v)
+        b_h2 += tl.dot(tl.load(p_k2, boundary_check=(0, 1), padding_option='zero'), b_v)
 
     p_out1 = tl.make_block_ptr(
         packed_summary,
@@ -200,8 +200,8 @@ def gdn_state_grad_ext_kernel(
         p_k2 = tl.make_block_ptr(
             k, (T, K), (stride_k, 1), (i_t * BT, 64), (BT, 64), (1, 0)
         )
-        b_k1 = tl.load(p_k1, boundary_check=(0, 1))
-        b_k2 = tl.load(p_k2, boundary_check=(0, 1))
+        b_k1 = tl.load(p_k1, boundary_check=(0, 1), padding_option='zero')
+        b_k2 = tl.load(p_k2, boundary_check=(0, 1), padding_option='zero')
         b_dv = tl.dot(b_k1, b_dh1.to(b_k1.dtype))
         b_dv += tl.dot(b_k2, b_dh2.to(b_k2.dtype))
         b_dv *= tl.where(mask, tl.exp(b_g_last - b_g), 0.0)[:, None]
@@ -214,7 +214,7 @@ def gdn_state_grad_ext_kernel(
             (BT, BV),
             (1, 0),
         )
-        b_dv += tl.load(p_dv, boundary_check=(0, 1))
+        b_dv += tl.load(p_dv, boundary_check=(0, 1), padding_option='zero')
 
         p_do = tl.make_block_ptr(
             do,
@@ -224,7 +224,7 @@ def gdn_state_grad_ext_kernel(
             (BT, BV),
             (1, 0),
         )
-        b_do = tl.load(p_do, boundary_check=(0, 1))
+        b_do = tl.load(p_do, boundary_check=(0, 1), padding_option='zero')
         decay = tl.exp(b_g_last)
         b_dh1 *= decay
         b_dh2 *= decay
@@ -241,17 +241,17 @@ def gdn_state_grad_ext_kernel(
         p_w2 = tl.make_block_ptr(
             w, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
         )
-        b_q1 = tl.load(p_q1, boundary_check=(0, 1))
-        b_q2 = tl.load(p_q2, boundary_check=(0, 1))
-        b_w1 = tl.load(p_w1, boundary_check=(0, 1))
-        b_w2 = tl.load(p_w2, boundary_check=(0, 1))
+        b_q1 = tl.load(p_q1, boundary_check=(0, 1), padding_option='zero')
+        b_q2 = tl.load(p_q2, boundary_check=(0, 1), padding_option='zero')
+        b_w1 = tl.load(p_w1, boundary_check=(0, 1), padding_option='zero')
+        b_w2 = tl.load(p_w2, boundary_check=(0, 1), padding_option='zero')
         gate = tl.exp(b_g)[None, :]
         b_q1 *= gate
         b_q2 *= gate
-        b_dh1 += tl.dot(b_q1, b_do.to(b_q1.dtype)) * scale
-        b_dh1 -= tl.dot(b_w1, b_dv.to(b_w1.dtype))
-        b_dh2 += tl.dot(b_q2, b_do.to(b_q2.dtype)) * scale
-        b_dh2 -= tl.dot(b_w2, b_dv.to(b_w2.dtype))
+        # Match native dhu's rounding: form the signed update before adding it
+        # to the recurrent accumulator, which is rounded again next chunk.
+        b_dh1 += tl.dot(b_q1, b_do.to(b_q1.dtype)) * scale - tl.dot(b_w1, b_dv.to(b_w1.dtype))
+        b_dh2 += tl.dot(b_q2, b_do.to(b_q2.dtype)) * scale - tl.dot(b_w2, b_dv.to(b_w2.dtype))
 
     p_out1 = tl.make_block_ptr(
         grad_state_ext, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)

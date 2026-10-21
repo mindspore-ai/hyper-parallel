@@ -111,8 +111,8 @@ def kda_split_state_summary_kernel(
     for chunk_idx in range(num_chunks):
         w1_ptr = tl.make_block_ptr(w, (T, K), (stride_w, 1), (chunk_idx * BT, 0), (BT, 64), (1, 0))
         w2_ptr = tl.make_block_ptr(w, (T, K), (stride_w, 1), (chunk_idx * BT, 64), (BT, 64), (1, 0))
-        w1 = tl.load(w1_ptr, boundary_check=(0, 1))
-        w2 = tl.load(w2_ptr, boundary_check=(0, 1))
+        w1 = tl.load(w1_ptr, boundary_check=(0, 1), padding_option='zero')
+        w2 = tl.load(w2_ptr, boundary_check=(0, 1), padding_option='zero')
         if OUTPUT_MODE == 1:
             # Match Ascend FLA h: state and residual feedback stay in FP32.
             w1 = w1.to(tl.float32)
@@ -139,8 +139,8 @@ def kda_split_state_summary_kernel(
 
         key1_ptr = tl.make_block_ptr(key, (K, T), (1, stride_k), (0, chunk_idx * BT), (64, BT), (0, 1))
         key2_ptr = tl.make_block_ptr(key, (K, T), (1, stride_k), (64, chunk_idx * BT), (64, BT), (0, 1))
-        key1 = tl.load(key1_ptr, boundary_check=(0, 1))
-        key2 = tl.load(key2_ptr, boundary_check=(0, 1))
+        key1 = tl.load(key1_ptr, boundary_check=(0, 1), padding_option='zero')
+        key2 = tl.load(key2_ptr, boundary_check=(0, 1), padding_option='zero')
         if OUTPUT_MODE == 1:
             key1 = key1.to(tl.float32)
             key2 = key2.to(tl.float32)
@@ -174,7 +174,7 @@ def kda_state_transition_kernel(
         w: Contiguous prepared feedback-weight pointer with the same shape.
         gate: Contiguous per-chunk cumulative log2-gate pointer.
         transition: FP32 output pointer, shaped [B, H, K, K].
-        T: Local sequence length, a multiple of BT.
+        T: Positive local fragment length, including a possible partial chunk.
         H: Number of local heads.
         K: Key width, currently 128.
         BT: Tokens per chunk, currently 64.
@@ -193,11 +193,11 @@ def kda_state_transition_kernel(
     # Each program owns disjoint output columns, so this FP32 feedback needs
     # neither an inter-program barrier nor a per-chunk matrix workspace.
     tl.store(transition + output_offsets, matrix)
-    for chunk in range(T // BT):
+    for chunk in range(tl.cdiv(T, BT)):
         offsets = ((batch * T + chunk * BT + tokens[:, None]) * H + local_head) * K + rows[None, :]
-        key_tile = tl.load(key + offsets)
-        weight_tile = tl.load(w + offsets)
-        last = ((batch * T + chunk * BT + BT - 1) * H + local_head) * K + rows
+        key_tile = tl.load(key + offsets, mask=chunk * BT + tokens[:, None] < T, other=0.0)
+        weight_tile = tl.load(w + offsets, mask=chunk * BT + tokens[:, None] < T, other=0.0)
+        last = ((batch * T + tl.minimum((chunk + 1) * BT, T) - 1) * H + local_head) * K + rows
         decay = tl.exp2(tl.load(gate + last).to(tl.float32))
         diagonal = tl.where(rows[:, None] == rows[None, :], decay[:, None], 0.0)
         interaction = tl.dot(tl.trans(key_tile), weight_tile)
@@ -272,8 +272,8 @@ def kda_state_grad_ext_kernel(
 
         key1_ptr = tl.make_block_ptr(key, (T, K), (stride_k, 1), (chunk_idx * BT, 0), (BT, 64), (1, 0))
         key2_ptr = tl.make_block_ptr(key, (T, K), (stride_k, 1), (chunk_idx * BT, 64), (BT, 64), (1, 0))
-        key1 = tl.load(key1_ptr, boundary_check=(0, 1))
-        key2 = tl.load(key2_ptr, boundary_check=(0, 1))
+        key1 = tl.load(key1_ptr, boundary_check=(0, 1), padding_option='zero')
+        key2 = tl.load(key2_ptr, boundary_check=(0, 1), padding_option='zero')
         value_grad = tl.dot(key1, state1.to(key1.dtype))
         value_grad += tl.dot(key2, state2.to(key2.dtype))
 
@@ -285,7 +285,7 @@ def kda_state_grad_ext_kernel(
             (BT, BV),
             (1, 0),
         )
-        value_grad += tl.load(grad_value_ptr, boundary_check=(0, 1))
+        value_grad += tl.load(grad_value_ptr, boundary_check=(0, 1), padding_option='zero')
 
         last_idx = min((chunk_idx + 1) * BT, T) - 1
         gate_last_ptr = gate + last_idx * H_TOTAL * K
@@ -302,7 +302,7 @@ def kda_state_grad_ext_kernel(
             (BT, BV),
             (1, 0),
         )
-        output_grad = tl.load(output_grad_ptr, boundary_check=(0, 1))
+        output_grad = tl.load(output_grad_ptr, boundary_check=(0, 1), padding_option='zero')
         # Match FLA dhu's scale-before-cast contract for the Q contribution.
         output_grad = output_grad * scale
         output_grad_second = output_grad + 0.0
@@ -311,10 +311,10 @@ def kda_state_grad_ext_kernel(
         query2_ptr = tl.make_block_ptr(query, (K, T), (1, stride_k), (64, chunk_idx * BT), (64, BT), (0, 1))
         w1_ptr = tl.make_block_ptr(w, (K, T), (1, stride_k), (0, chunk_idx * BT), (64, BT), (0, 1))
         w2_ptr = tl.make_block_ptr(w, (K, T), (1, stride_k), (64, chunk_idx * BT), (64, BT), (0, 1))
-        query1 = tl.load(query1_ptr, boundary_check=(0, 1))
-        query2 = tl.load(query2_ptr, boundary_check=(0, 1))
-        w1 = tl.load(w1_ptr, boundary_check=(0, 1))
-        w2 = tl.load(w2_ptr, boundary_check=(0, 1))
+        query1 = tl.load(query1_ptr, boundary_check=(0, 1), padding_option='zero')
+        query2 = tl.load(query2_ptr, boundary_check=(0, 1), padding_option='zero')
+        w1 = tl.load(w1_ptr, boundary_check=(0, 1), padding_option='zero')
+        w2 = tl.load(w2_ptr, boundary_check=(0, 1), padding_option='zero')
         state1 += tl.dot(query1, output_grad.to(query1.dtype)) - tl.dot(w1, value_grad.to(w1.dtype))
         state2 += tl.dot(query2, output_grad_second.to(query2.dtype)) - tl.dot(w2, value_grad.to(w2.dtype))
 

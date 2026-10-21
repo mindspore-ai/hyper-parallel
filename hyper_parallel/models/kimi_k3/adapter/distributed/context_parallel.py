@@ -77,7 +77,7 @@ def _build_kda_cp_rewrite(
         """Execute the selected KDA Context Parallel algorithm.
 
         Args:
-            kwargs: Additional model arguments; packed sequences are unsupported.
+            kwargs: Additional model arguments, including global packed sample metadata.
         """
         return executor(*args, **kwargs)
 

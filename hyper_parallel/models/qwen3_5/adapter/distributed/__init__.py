@@ -19,7 +19,14 @@ from hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel import (
     qwen3_5_gdn_ulysses_cp_wrapper,
 )
 
+from hyper_parallel.models.qwen3_5.adapter.distributed.packed import (
+    qwen3_5_gdn_packed_local_wrapper,
+    qwen3_5_packed_decoder_wrapper,
+)
+
 __all__ = [
     "qwen3_5_gdn_p2p_cp_wrapper",
     "qwen3_5_gdn_ulysses_cp_wrapper",
+    "qwen3_5_gdn_packed_local_wrapper",
+    "qwen3_5_packed_decoder_wrapper",
 ]
