@@ -420,7 +420,7 @@ def _run_ranks(mode, chunk_count, *, fused=False, wrap_async=False, seed=7,
             ep_all_to_all=exchange("sync"),
             dist=_VirtualEpDist(world),
             _DISPATCH_CHUNKS_RAW=str(chunk_count),
-            _FUSED_DISPATCH_ENABLED=fused):
+            _FUSED_DISPATCH_ENABLED=fused), mock.patch.object(ep_collectives, "dist", _VirtualEpDist(world)):
         threads = [threading.Thread(target=run_rank, args=(rank,)) for rank in range(_EP_SIZE)]
         for thread in threads:
             thread.start()

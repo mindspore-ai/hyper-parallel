@@ -118,8 +118,15 @@ class GMMFunction(torch.autograd.Function):
 
             original_weight.grad_added_to_main_grad = True
         else:
-            if x.nelement() > 0:
-                dw_list = torch_npu.npu_grouped_matmul(
+            numel = x.nelement()
+            if (
+                not torch.compiler.is_compiling()
+                and isinstance(numel, int)
+                and numel == 0
+            ):
+                grad_weight = torch.zeros_like(weight)
+            else:
+                grad_weight = torch_npu.npu_grouped_matmul(
                     x=[x.transpose(-1, -2)],
                     weight=[grad_outputs],
                     bias=[],
@@ -127,10 +134,7 @@ class GMMFunction(torch.autograd.Function):
                     split_item=2,
                     group_type=2,
                     group_list_type=ctx.group_list_type
-                )
-                grad_weight = dw_list[0]
-            else:
-                grad_weight = torch.zeros_like(weight)
+                )[0]
 
         return None, dx, grad_weight, None, None
 

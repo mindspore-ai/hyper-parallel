@@ -84,12 +84,11 @@ class GraphCompiler:
                 default ``PassConfig`` when ``pass_config`` is omitted.
             device: Device to place the model and run the graph on. Defaults
                 to the NPU device when available, otherwise CPU.
-            mesh_context: Optional automodel ``MeshContext`` carrying a
-                pre-built TP/FSDP mesh. When provided, the TP group is reused
-                as-is (boundary forwards already hold the group object) and
-                only the FSDP shard sub-mesh is registered under ``"fsdp"``.
-                Use this to feed an automodel TP-sharded model into the
-                graph-mode FSDP pass.
+            mesh_context: Optional automodel ``MeshContext`` carrying the
+                pre-built parallel meshes. Model forwards retain their TP/EP
+                groups; the compiler registers the dense shard sub-mesh under
+                ``"fsdp"`` and, for basic EP, the expert EDP shard sub-mesh
+                under ``"fsdp_expert"`` for the graph-mode FSDP pass.
             dynamic: Symbolize user input dimensions; inherits trainer_config.compile.dynamic when omitted.
             dynamic_arg_dims: Optional dotted input paths to dynamic dimensions, e.g. {"x": [0, 1]}.
                 Overrides automatic dimension selection and inherits trainer configuration when omitted.
@@ -118,6 +117,7 @@ class GraphCompiler:
         self.pass_config.validate()
 
         self._joint_graph = None
+        self._expert_param_names: set[str] = set()
         self._pytree_pre_hook: Optional[Callable[[], None]] = None
 
     @staticmethod
@@ -155,6 +155,8 @@ class GraphCompiler:
             )
         if self._pytree_pre_hook is not None:
             self._pytree_pre_hook()
+
+        self._validate_ep_topology()
 
         if self.pass_config.fsdp_enabled and dist.is_initialized():
             # Only build the FSDP mesh when distributed is actually up.
@@ -241,6 +243,7 @@ class GraphCompiler:
         dp_mode = normalize_dp_mode(self.pass_config.dp_mode)
         if mesh_context is not None:
             self._init_mesh_from_context(mesh_context, dp_mode)
+            self._init_expert_dp(mesh_context)
             return
 
         self._require_pure_dp_fallback()
@@ -290,6 +293,40 @@ class GraphCompiler:
         # group size from ``fsdp_degree`` (falling back to world_size when
         # ``None``), so setting it here keeps the two paths consistent.
         self.pass_config.fsdp_degree = world_size
+
+    def _validate_ep_topology(self) -> None:
+        """Limit graph EP to the synchronous, non-pipelined basic topology."""
+        context = self._mesh_context
+        if context is None or getattr(context, "ep_size", 1) <= 1:
+            return
+        if any(getattr(context, axis, 1) != 1 for axis in ("tp_size", "cp_size", "pp_size")):
+            raise ValueError("Graph EP currently requires TP=CP=PP=1")
+        if self.pass_config.enable_overlap:
+            raise ValueError("Graph EP currently requires enable_overlap=False")
+
+    def _init_expert_dp(self, context: Any) -> None:
+        """Use EDP for the exact parameters owned by bound local experts."""
+        if getattr(context, "ep_size", 1) <= 1:
+            return
+        mesh = context.fsdp_moe_mesh
+        if mesh is None or "edp_shard" not in mesh.mesh_dim_names:
+            raise ValueError("Graph EP requires the expert data-parallel shard mesh")
+        if self.pass_config.dp_mode != "fsdp":
+            raise ValueError("Graph EP currently supports sharded data parallelism without replication")
+        if "edp_replicate" in mesh.mesh_dim_names and mesh["edp_replicate"].size() > 1:
+            raise ValueError("Graph EP currently does not support expert data-parallel replication")
+        parameters = {
+            id(parameter)
+            for module in self.model.modules() if hasattr(module, "local_expert_count")
+            for parameter in module.parameters(recurse=False)
+        }
+        self._expert_param_names = {
+            name for name, parameter in self.model.named_parameters(remove_duplicate=False)
+            if id(parameter) in parameters
+        }
+        if not self._expert_param_names:
+            raise ValueError("Graph EP requires bound local expert parameters")
+        self._register_mesh_group("fsdp_expert", mesh["edp_shard"])
 
     def _require_pure_dp_fallback(self) -> None:
         """Reject TP/PP topologies for the self-built DP mesh.
@@ -465,6 +502,9 @@ class GraphCompiler:
 
         if self.pass_config.fsdp_enabled:
             kwargs["fsdp_group_name"] = "fsdp"
+            if self._expert_param_names:
+                kwargs["expert_param_names"] = self._expert_param_names
+                kwargs["expert_fsdp_group_name"] = "fsdp_expert"
             # DDP / HSDP also reduce gradients on the replicate axis.
             if normalize_dp_mode(self.pass_config.dp_mode) in ("ddp", "hsdp"):
                 kwargs["dp_replicate_group_name"] = "dp_replicate"
@@ -519,7 +559,10 @@ class GraphCompiler:
 
         for param, grad in zip(trainable, grads):
             if param.grad is None:
-                param.grad = grad
+                # Match eager's gradient layout so optimizer kernels see the
+                # parameter's strides rather than a backward matmul's view.
+                param.grad = torch.empty_like(param)
+                param.grad.copy_(grad)
             else:
                 param.grad += grad
 

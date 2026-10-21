@@ -230,6 +230,9 @@ class FSDPPass(GraphPass):
         # ``run`` entry; left as ``None`` here so a stray access before
         # ``run`` fails loudly instead of silently using a wrong default.
         self._fsdp_degree: Optional[int] = None
+        self._expert_param_names: Set[str] = set()
+        self._expert_fsdp_group_name = "fsdp_expert"
+        self._expert_fsdp_degree: Optional[int] = None
         # Data-parallel mode ("fsdp" | "ddp" | "hsdp") and the replicate-axis
         # group/degree used by DDP / HSDP gradient reduction.
         self._dp_mode = "fsdp"
@@ -356,6 +359,12 @@ class FSDPPass(GraphPass):
         configured = pass_config.fsdp_degree
         self._fsdp_degree = configured if configured else dist.get_world_size()
         self._fsdp_group_name = kwargs.get("fsdp_group_name", self._fsdp_group_name)
+        self._expert_param_names = set(kwargs.get("expert_param_names", ()))
+        self._expert_fsdp_group_name = kwargs.get("expert_fsdp_group_name", self._expert_fsdp_group_name)
+        self._expert_fsdp_degree = (
+            dist.get_world_size(_resolve_process_group(self._expert_fsdp_group_name))
+            if self._expert_param_names else None
+        )
         self._dp_replicate_group_name = kwargs.get(
             "dp_replicate_group_name", self._dp_replicate_group_name
         )
@@ -446,6 +455,12 @@ class FSDPPass(GraphPass):
 
         return graph_module
 
+    def _param_group(self, name: str) -> tuple[str, int]:
+        """Choose the expert or dense shard axis for one parameter."""
+        if name in self._expert_param_names:
+            return self._expert_fsdp_group_name, self._expert_fsdp_degree
+        return self._fsdp_group_name, self._fsdp_degree
+
     def _classify_dp_params(
         self,
         graph_module: fx.GraphModule,
@@ -499,12 +514,18 @@ class FSDPPass(GraphPass):
 
             fqn = state_fqns[idx]
             param = param_lookup.get(fqn)
+            if model is not None and param is None:
+                continue
 
             # Frozen params are not trainable: the tracer omits them from the
             # gradient list and ``_shard_live_model_params`` leaves them
             # full-size, so there is no gradient to classify.
             if param is not None and not param.requires_grad:
                 _LOG.info("Skip %s: requires_grad=False (frozen)", fqn)
+                continue
+
+            _, degree = self._param_group(fqn)
+            if fqn in self._expert_param_names and degree == 1:
                 continue
 
             fallback = self._unmarked_disposition(fqn, param, model)
@@ -521,7 +542,7 @@ class FSDPPass(GraphPass):
             node = placeholders[idx]
             node.meta["state_idx"] = idx
             node.meta["param_name"] = fqn
-            node.meta["fsdp_degree"] = self._fsdp_degree
+            node.meta["fsdp_degree"] = degree
             node.meta["is_param"] = True
             sharded_nodes.append(node)
             self._fsdp_modules.add(self._get_parent_module_fqn(fqn))
@@ -567,8 +588,14 @@ class FSDPPass(GraphPass):
         """
         if self._dp_mode == "ddp" or param is None:
             return False
+        _, degree = self._param_group(fqn)
         shape = param.shape
-        if shape and shape[0] % self._fsdp_degree == 0:
+        if fqn in self._expert_param_names and (not shape or shape[0] % degree):
+            raise ValueError(
+                f"Graph FSDP+EP expert parameter {fqn} with shape {tuple(shape)} "
+                f"cannot shard across edp_shard degree {degree}"
+            )
+        if shape and shape[0] % degree == 0:
             return False
         if not shape:
             _LOG.info(
@@ -578,7 +605,7 @@ class FSDPPass(GraphPass):
             )
             return True
         n = int(shape[0])
-        n_pad = -(-n // self._fsdp_degree) * self._fsdp_degree
+        n_pad = -(-n // degree) * degree
         self._padded_params[fqn] = _PaddedParam(
             n=n, n_pad=n_pad, dim0_pad=n_pad - n, ndim=param.ndim
         )
@@ -587,7 +614,7 @@ class FSDPPass(GraphPass):
             fqn,
             n,
             n_pad,
-            self._fsdp_degree,
+            degree,
         )
         return False
 
@@ -622,11 +649,15 @@ class FSDPPass(GraphPass):
         # chunk index — when fsdp_degree < world_size (TP+FSDP), the global
         # rank exceeds the chunk count and causes IndexError.
         fsdp_pg = _resolve_process_group(self._fsdp_group_name)
-        rank = dist.get_rank(group=fsdp_pg)
+        group_ranks = {self._fsdp_group_name: dist.get_rank(group=fsdp_pg)}
         sharded_count = 0
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
+                continue
+
+            group_name, degree = self._param_group(name)
+            if name in self._expert_param_names and degree == 1:
                 continue
 
             # Same plan gate as ``_classify_dp_params``: only parameters inside
@@ -644,6 +675,10 @@ class FSDPPass(GraphPass):
                 )
                 continue
 
+            if group_name not in group_ranks:
+                group_ranks[group_name] = dist.get_rank(group=_resolve_process_group(group_name))
+            rank = group_ranks[group_name]
+
             # Pad-shard a non-divisible param (recorded by
             # ``_classify_dp_params``): zero-pad dim 0 to a multiple of the
             # degree, then take this rank's equal-size chunk — exactly what
@@ -658,7 +693,7 @@ class FSDPPass(GraphPass):
                         [full, full.new_zeros((pad_info.dim0_pad, *full.shape[1:]))],
                         dim=0,
                     )
-                param.data = full.chunk(self._fsdp_degree, dim=0)[rank].clone()
+                param.data = full.chunk(degree, dim=0)[rank].clone()
                 sharded_count += 1
                 _LOG.info(
                     "Pad-sharded %s: %s -> %s",
@@ -669,17 +704,17 @@ class FSDPPass(GraphPass):
                 continue
 
             # Mirror ``_classify_dp_params``: a 0-dim scalar stays replicated.
-            if not param.shape or param.shape[0] % self._fsdp_degree != 0:
+            if not param.shape or param.shape[0] % degree != 0:
                 _LOG.info(
                     "Skip %s: dim 0 (%s) not divisible by fsdp_degree (%s)",
                     name,
                     param.shape[0] if param.shape else "scalar",
-                    self._fsdp_degree,
+                    degree,
                 )
                 continue
 
             original_shape = param.shape
-            param.data = param.detach().chunk(self._fsdp_degree, dim=0)[rank].clone()
+            param.data = param.detach().chunk(degree, dim=0)[rank].clone()
             sharded_count += 1
             _LOG.info(
                 "Sharded %s: %s -> %s",
@@ -758,19 +793,21 @@ class FSDPPass(GraphPass):
                 continue
             anchor = self._first_user(param_node) if sink else None
 
+            group_name, degree = self._param_group(param_node.meta.get("param_name", ""))
+
             # AllGather + immediate wait for correctness; AutoOverlapPass may
             # sink the wait past independent compute later.
             with _insertion_point(graph, anchor, param_node):
                 ag_node = graph.call_function(
                     _c10d_functional.all_gather_into_tensor,
-                    args=(param_node, self._fsdp_degree, self._fsdp_group_name),
+                    args=(param_node, degree, group_name),
                 )
                 ag_node.meta["comm_type"] = "fsdp_all_gather"
-                ag_node.meta["comm_group"] = self._fsdp_group_name
+                ag_node.meta["comm_group"] = group_name
                 ag_node.meta["param_node"] = param_node.name
                 ag_node.meta["param_name"] = param_node.meta.get("param_name")
                 ag_node.meta["state_idx"] = param_node.meta.get("state_idx")
-                ag_node.meta["fsdp_degree"] = self._fsdp_degree
+                ag_node.meta["fsdp_degree"] = degree
 
             # Insert the wait in its own block: a wait placed in the same block
             # as the gather would land *before* the gather it depends on (the
@@ -914,9 +951,11 @@ class FSDPPass(GraphPass):
             else:
                 continue
 
+            group_name, degree = self._param_group(state_fqns[state_idx])
             with graph.inserting_before(output_node):
                 new_returned[i] = self._build_grad_reduction_nodes(
-                    graph, grad_node, replicated=replicated, pad_info=pad_info
+                    graph, grad_node, replicated=replicated, pad_info=pad_info,
+                    group_name=group_name, degree=degree,
                 )
 
         output_node.args = (type(returned)(new_returned),) + tuple(output_node.args[1:])
@@ -929,6 +968,8 @@ class FSDPPass(GraphPass):
         grad_node: fx.Node,
         replicated: bool = False,
         pad_info: Optional[_PaddedParam] = None,
+        group_name: Optional[str] = None,
+        degree: Optional[int] = None,
     ) -> fx.Node:
         """Build and return the waited gradient-reduction node for ``grad_node``.
 
@@ -951,6 +992,8 @@ class FSDPPass(GraphPass):
         read a partially written shard. This mirrors eager ``fully_shard``,
         which orders the all_reduce stream after the reduce_scatter stream.
         """
+        group_name = group_name or self._fsdp_group_name
+        degree = degree or self._fsdp_degree
         reduced = grad_node
         if pad_info is not None:
             # constant_pad_nd's pad tuple runs last-dim-first: pad dim 0 on the
@@ -968,29 +1011,31 @@ class FSDPPass(GraphPass):
             if self._dp_mode in ("fsdp", "hsdp"):
                 ar_node = graph.call_function(
                     _c10d_functional.all_reduce,
-                    args=(reduced, _GRAD_REDUCE_OP, self._fsdp_group_name),
+                    args=(reduced, _GRAD_REDUCE_OP, group_name),
                 )
                 ar_node.meta["comm_type"] = "fsdp_all_reduce"
-                ar_node.meta["comm_group"] = self._fsdp_group_name
-                ar_node.meta["fsdp_degree"] = self._fsdp_degree
+                ar_node.meta["comm_group"] = group_name
+                ar_node.meta["fsdp_degree"] = degree
                 reduced = ar_node
                 # HSDP chains the replicate all_reduce (a different process-group
                 # stream) after the shard all_reduce, so wait first.
                 if self._dp_mode == "hsdp":
                     reduced = self._insert_wait(graph, reduced)
         elif self._dp_mode in ("fsdp", "hsdp"):
+            # Matmul backward can return a transposed view on NPU, including dense router weights.
+            reduced = graph.call_method("contiguous", args=(reduced,))
             rs_node = graph.call_function(
                 _c10d_functional.reduce_scatter_tensor,
                 args=(
                     reduced,
                     _GRAD_REDUCE_OP,
-                    self._fsdp_degree,
-                    self._fsdp_group_name,
+                    degree,
+                    group_name,
                 ),
             )
             rs_node.meta["comm_type"] = "fsdp_reduce_scatter"
-            rs_node.meta["comm_group"] = self._fsdp_group_name
-            rs_node.meta["fsdp_degree"] = self._fsdp_degree
+            rs_node.meta["comm_group"] = group_name
+            rs_node.meta["fsdp_degree"] = degree
             reduced = rs_node
             # HSDP chains all_reduce (a different process-group stream) after
             # the reduce_scatter, so wait first; plain FSDP waits on the final
@@ -1170,16 +1215,17 @@ class FSDPPass(GraphPass):
         self, graph: fx.Graph, record: _UnshardedParam, anchor: fx.Node
     ) -> fx.Node:
         """Insert the backward all_gather + wait pair before ``anchor``."""
+        group_name, degree = self._param_group(record.param_node.meta.get("param_name", ""))
         with graph.inserting_before(anchor):
             ag_node = graph.call_function(
                 _c10d_functional.all_gather_into_tensor,
-                args=(record.param_node, self._fsdp_degree, self._fsdp_group_name),
+                args=(record.param_node, degree, group_name),
             )
             ag_node.meta["comm_type"] = "fsdp_all_gather_backward"
-            ag_node.meta["comm_group"] = self._fsdp_group_name
+            ag_node.meta["comm_group"] = group_name
             ag_node.meta["param_node"] = record.param_node.name
             ag_node.meta["param_name"] = record.param_node.meta.get("param_name")
-            ag_node.meta["fsdp_degree"] = self._fsdp_degree
+            ag_node.meta["fsdp_degree"] = degree
             # This gather lives in the backward half; tag it so downstream
             # passes (e.g. PpPass phase classification) do not mistake it and
             # its remat clones for forward nodes — their only arg is a forward

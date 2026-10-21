@@ -27,10 +27,8 @@ pipeline-assembly level in ``test_pass_pipeline``):
 3. With ``fsdp_degree`` from the config, shards the live model's params in
    place (dim 0) and inserts AllGather / ReduceScatter / wait_tensor nodes
    into the graph; returns the same graph_module.
-4. Skips parameters whose dim 0 is not divisible by ``fsdp_degree`` (they
-   stay replicated in both graph and live model — the divisibility gate must
-   match between ``_identify_params_in_fsdp_modules`` and
-   ``_shard_live_model_params``).
+4. Pad-shards non-divisible dense parameters, reduces replicated fallbacks,
+   and keeps expert communication on its independent EDP group.
 5. Uses ``pass_config.fsdp_degree`` over ``world_size`` (a TP+FSDP hybrid
    where the FSDP group is a proper sub-group of the world).
 
@@ -513,6 +511,109 @@ class TestFSDPPassRunSharding(unittest.TestCase):
             1,
             "the [3, 4] gradient must be padded back to [4, 4] before reduction",
         )
+
+    def test_run_rejects_non_divisible_expert_param(self):
+        """Do not silently replicate an unsynchronized trainable expert."""
+        cfg = PassConfig(fsdp_enabled=True, fsdp_degree=4)
+        for shape in ((2, 4), ()):
+            with self.subTest(shape=shape):
+                gm = _odd_joint_graph()
+                model = _OddParam()
+                model.odd = nn.Parameter(torch.zeros(shape))
+                with _patch_dist(world_size=4, rank=0, initialized=True):
+                    with self.assertRaisesRegex(ValueError, "edp_shard degree 4"):
+                        FSDPPass().run(
+                            gm, cfg, model=model, fsdp_group_name="fsdp",
+                            expert_param_names={"odd"}, expert_fsdp_group_name="fsdp_expert",
+                        )
+                self.assertEqual(tuple(model.odd.shape), shape)
+                self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 0)
+
+    def test_expert_selection_skips_buffers_and_frozen_params(self):
+        """Keep mixed state intact, including traces without parameter flags."""
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                model = _FrozenParam()
+                model.frozen = nn.Parameter(torch.ones(3), requires_grad=False)
+                model.register_buffer("buf", torch.ones(3))
+                gm = _frozen_joint_graph()
+                with gm.graph.inserting_before(next(node for node in gm.graph.nodes if node.name == "x")):
+                    gm.graph.placeholder("buf")
+                gm.state_fqns.append("buf")
+                gm.state_is_param.append(False)
+                gm.num_state_inputs += 1
+                if legacy:
+                    del gm.state_is_param
+                with _patch_dist(world_size=2):
+                    FSDPPass().run(
+                        gm, PassConfig(fsdp_degree=2), model=model,
+                        expert_param_names={"frozen", "buf"},
+                    )
+                self.assertEqual(tuple(model.trainable.shape), (2, 4))
+                torch.testing.assert_close(model.frozen, torch.ones(3), atol=0, rtol=0)
+                torch.testing.assert_close(model.buf, torch.ones(3), atol=0, rtol=0)
+                self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 1)
+                self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 1)
+
+    def test_expert_group_with_dense_padding_and_scalar_reduction(self):
+        """Keep dense padding/scalar sync while experts shard or stay local."""
+        for degree in (1, 2):
+            with self.subTest(edp_degree=degree):
+                model = _WrappedPlusRootParam()
+                model.lin.weight.data = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+                model.lin.bias = nn.Parameter(torch.arange(3, dtype=torch.float32))
+                model.extra = nn.Parameter(torch.tensor(2.0))
+                weight = torch.detach(model.lin.weight).clone()
+                gm = _lin_bias_extra_joint_graph()
+                with _patch_dist(world_size=4) as mocked, patch(_RESOLVE_PG_PATH, side_effect=lambda name: name):
+                    mocked.get_world_size.side_effect = (
+                        lambda group=None, edp_degree=degree: edp_degree if group == "edp" else 4
+                    )
+                    mocked.get_rank.side_effect = (
+                        lambda group=None, edp_degree=degree: edp_degree - 1 if group == "edp" else 3
+                    )
+                    FSDPPass().run(
+                        gm, PassConfig(fsdp_degree=4), model=model, fsdp_group_name="dense",
+                        expert_param_names={"lin.weight"}, expert_fsdp_group_name="edp",
+                    )
+                expected_weight = weight[2:] if degree > 1 else weight
+                torch.testing.assert_close(model.lin.weight, expected_weight, atol=0, rtol=0)
+                torch.testing.assert_close(model.lin.bias, torch.zeros(1), atol=0, rtol=0)
+                self.assertEqual(model.extra.ndim, 0)
+                gathers = {node.meta["param_name"]: node.args[1:] for node in gm.graph.nodes
+                           if node.meta.get("comm_type") == "fsdp_all_gather"}
+                expected_gathers = {"lin.bias": (4, "dense")}
+                if degree > 1:
+                    expected_gathers["lin.weight"] = (degree, "edp")
+                self.assertEqual(gathers, expected_gathers)
+                self.assertEqual(_count_targets(gm, "constant_pad_nd"), 1)
+                self.assertEqual(_count_targets(gm, "narrow"), 1)
+                reductions = [node for node in gm.graph.nodes if node.meta.get("comm_type") == "fsdp_reduce_scatter"]
+                self.assertEqual({node.args[2:] for node in reductions}, set(expected_gathers.values()))
+                self.assertTrue(all(node.args[0].target == "contiguous" for node in reductions))
+                replicated = [node for node in gm.graph.nodes if node.meta.get("comm_type") == "fsdp_all_reduce"]
+                self.assertEqual([node.args[2] for node in replicated], ["dense"])
+                groups = {node.meta["comm_group"] for node in gm.graph.nodes if "comm_group" in node.meta}
+                self.assertEqual(groups, {"dense", "edp"} if degree > 1 else {"dense"})
+
+    def test_unmarked_expert_fallback_uses_edp_group(self):
+        """A partial-plan expert fallback must never reduce across dense/EP peers."""
+        for degree in (1, 2):
+            with self.subTest(edp_degree=degree):
+                model = _WrappedPlusRootParam()
+                gm = _lin_bias_extra_joint_graph()
+                plan = GraphParallelPlan().fsdp_mark("lin")
+                with _patch_dist(world_size=4) as mocked, patch(_RESOLVE_PG_PATH, side_effect=lambda name: name):
+                    mocked.get_world_size.side_effect = (
+                        lambda group=None, edp_degree=degree: edp_degree if group == "edp" else 4
+                    )
+                    FSDPPass().run(
+                        gm, PassConfig(fsdp_degree=4), model=model, parallel_plan=plan,
+                        fsdp_group_name="dense", expert_param_names={"extra"}, expert_fsdp_group_name="edp",
+                    )
+                self.assertEqual(tuple(model.extra.shape), (2, 2))
+                replicated = [node for node in gm.graph.nodes if node.meta.get("comm_type") == "fsdp_all_reduce"]
+                self.assertEqual([node.args[2] for node in replicated], ["edp"] if degree > 1 else [])
 
     def test_run_uses_fsdp_degree_from_config_not_world_size(self):
         """Test ``fsdp_degree`` from the config wins over ``world_size``.

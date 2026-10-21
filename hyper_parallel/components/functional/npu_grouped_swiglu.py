@@ -60,7 +60,12 @@ def _get_npu_grouped_matmul() -> Any:
                 group_type=0,
                 group_list_type=0,
             )[0]
-            if inputs.numel() == 0:
+            numel = inputs.numel()
+            if (
+                not torch.compiler.is_compiling()
+                and isinstance(numel, int)
+                and numel == 0
+            ):
                 grad_weight = torch.zeros_like(weight)
             else:
                 grad_weight = torch_npu.npu_grouped_matmul(

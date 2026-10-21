@@ -2330,7 +2330,7 @@ class TestRealDispatchStaticPlan(unittest.TestCase):
             ep_group=None,
         )
 
-    @patch("hyper_parallel.distributed.expert_parallel.experts.dist")
+    @patch("hyper_parallel.distributed.expert_parallel.collectives.dist")
     def test_counts_exchange_runs_once_for_a_static_plan(self, mock_dist):
         """Two layers with the same plan exchange counts once, and agree exactly."""
         mock_dist.all_to_all_single.side_effect = lambda out, _inp, **_kw: None
@@ -2343,7 +2343,7 @@ class TestRealDispatchStaticPlan(unittest.TestCase):
             "split lists must be reused verbatim",
         )
 
-    @patch("hyper_parallel.distributed.expert_parallel.experts.dist")
+    @patch("hyper_parallel.distributed.expert_parallel.collectives.dist")
     def test_counts_exchange_runs_per_layer_when_disabled(self, mock_dist):
         """With the switch off the original behaviour is untouched."""
         self.static_splits._ENABLED = False  # pylint: disable=protected-access
