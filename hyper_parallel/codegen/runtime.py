@@ -624,7 +624,7 @@ def _mesh_group(mesh: Any, name: str) -> Any:
 
 
 def _install_inline_state_bindings(
-    module: Any, expert_mesh: Any, cp_mesh: Any
+    module: Any, expert_mesh: Any, cp_mesh: Any, cp_state_attr: str | None = None
 ) -> None:
     """Bind the instance-attribute parallel channel an inlined forward reads.
 
@@ -636,13 +636,19 @@ def _install_inline_state_bindings(
 
     The inlined CP attention shell uses ``self._hp_cp_mesh`` and
     ``self.cp_enable`` the same way: the CP sub-mesh is bound to the instance
-    and the guard is set from whether CP is actually active.
+    and the guard is set from whether CP is actually active.  When the shell
+    declares ``_hp_cp_state_attr`` (the family kernel's companion attribute,
+    the same one the native runtime wrapper installs), the mesh is also bound
+    under that name, so the kernel — shared with the trainer — finds it under
+    either path.
     """
     ep_group = _mesh_group(expert_mesh, "ep") if expert_mesh is not None else None
     module._hp_ep_group = ep_group
     module.ep_enable = ep_group is not None and ep_group.size() > 1
     module._hp_cp_mesh = cp_mesh
     module.cp_enable = cp_mesh is not None and cp_mesh.size() > 1
+    if cp_state_attr and cp_mesh is not None:
+        setattr(module, cp_state_attr, cp_mesh)
 
 
 def hp_bind_inline_state(
@@ -687,7 +693,12 @@ def hp_bind_inline_state(
     dim_names = tuple(active_dim_names) if active_dim_names else ()
     cp_mesh = _get_cp_submesh(dense_mesh, dim_names)
     for module in targets:
-        _install_inline_state_bindings(module, expert_mesh, cp_mesh)
+        _install_inline_state_bindings(
+            module,
+            expert_mesh,
+            cp_mesh,
+            cp_state_attr=getattr(type(module), "_hp_cp_state_attr", None),
+        )
 
 
 def register_external_state_classes(generated_module: Any, class_names: Any) -> None:
@@ -725,9 +736,10 @@ def _is_inline_cp_module(module: Any) -> bool:
     attribute ``_hp_inline_cp``: its ``forward`` dispatches between the
     parent's compiled boundary and the family CP helper, reading the
     ``self.cp_enable`` / ``self._hp_cp_mesh`` attributes the inline-state
-    binding installs — so it needs the inline channel like an
-    external-state class, while its parent's boundary keeps installing
-    normally.
+    binding installs — plus the family companion attribute its
+    ``_hp_cp_state_attr`` class constant declares — so it needs the inline
+    channel like an external-state class, while its parent's boundary
+    keeps installing normally.
     """
     return bool(getattr(type(module), "_hp_inline_cp", False))
 

@@ -154,8 +154,10 @@ def _materialize_cp_subclass(
     The subclass is emitted once per host class (the plan carries one rule
     per matched FQN, so repeated rules re-derive the same host): a
     ``ModuleSnippetPatch`` with the full class source — carrying the
-    ``_hp_inline_cp`` marker the runtime installers read — plus a scoped
-    ``name``-mode constructor swap that retargets the matched assignments to
+    ``_hp_inline_cp`` marker the runtime installers read and, when the
+    family declares one, the ``_hp_cp_state_attr`` companion contract its
+    shared CP kernel reads — plus a scoped ``name``-mode constructor swap
+    that retargets the matched assignments to
     the subclass.  No forward extract is produced: the host keeps its
     compiled boundary, and the subclass dispatches to the parent or the
     family helper inside it.
@@ -176,7 +178,10 @@ def _materialize_cp_subclass(
         subclassed.add(subclass_name)
         patch_set.module_snippets.append(
             ModuleSnippetPatch(
-                cp_subclass_snippet(subclass_name, host_class, helper_names[0])
+                cp_subclass_snippet(
+                    subclass_name, host_class, helper_names[0],
+                    spec.subclass_state_attr,
+                )
             )
         )
         patch_set.constructor_replaces.append(

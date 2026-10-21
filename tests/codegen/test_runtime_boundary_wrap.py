@@ -990,13 +990,16 @@ def test_inline_cp_marker_binds_cp_channel_and_skips_inner_wrapper(monkeypatch):
     Description: The inline CP subclass materializes at codegen time with
         the ``_hp_inline_cp`` class marker; the runtime treats it as a third
         channel — the inline-state binding resolves the cp sub-mesh and
-        binds ``cp_enable`` / ``_hp_cp_mesh`` on it, the inner-wrapper
+        binds ``cp_enable`` / ``_hp_cp_mesh`` on it, plus the family
+        companion attribute its ``_hp_cp_state_attr`` class constant
+        declares (the one the shared CP kernel reads), the inner-wrapper
         installer skips it (the generated dispatch already owns the CP
         path, so a second wrapper would apply CP twice), and it stays
         outside the external-state registry so the boundary installers keep
         installing its parent's boundary.
     Expectation: the marked instance gets the resolved cp sub-mesh with
-        ``cp_enable`` True (EP channel off alongside), the registered
+        ``cp_enable`` True (EP channel off alongside) and the declared
+        companion attribute bound to the same mesh, the registered
         sibling still binds through the external-state path,
         ``_wrap_inner_attention`` is never called for the marked instance,
         and ``_is_external_state_inline_module`` rejects it even after the
@@ -1006,7 +1009,11 @@ def test_inline_cp_marker_binds_cp_channel_and_skips_inner_wrapper(monkeypatch):
     shell = type(
         "DeepseekV32DSAAttentionCP",
         (nn.Module,),
-        {"__module__": generated.__name__, "_hp_inline_cp": True},
+        {
+            "__module__": generated.__name__,
+            "_hp_inline_cp": True,
+            "_hp_cp_state_attr": "_hp_deepseek_v32_dsa_cp_mesh",
+        },
     )
     sibling = type("InlineMoeShell", (nn.Module,), {"__module__": generated.__name__})
     runtime.register_external_state_classes(generated, ("InlineMoeShell",))
@@ -1026,6 +1033,7 @@ def test_inline_cp_marker_binds_cp_channel_and_skips_inner_wrapper(monkeypatch):
         generated_module=generated,
     )
     assert isinstance(model.self_attn._hp_cp_mesh, FakeCpMesh)
+    assert isinstance(model.self_attn._hp_deepseek_v32_dsa_cp_mesh, FakeCpMesh)
     assert model.self_attn.cp_enable is True
     assert model.self_attn._hp_ep_group is None
     assert model.self_attn.ep_enable is False

@@ -45,6 +45,10 @@ class StrategySpec:
     dispatch body (inline CP): the host keeps its compiled boundary, so the
     shell never carries a ``target_class`` — the materialization pass derives
     the host from the frozen boundary map.  The two forms are exclusive.
+    ``subclass_state_attr`` names the instance attribute the family's CP
+    kernel reads for its sub-mesh; the materialized shell stamps it so the
+    runtime inline-state binding can reproduce the native wrapper's
+    companion contract without the codegen layer hardcoding it.
     """
 
     kind: str
@@ -53,6 +57,7 @@ class StrategySpec:
     method_name: str = "forward"
     body_template: str | None = None
     subclass_shell: str | None = None
+    subclass_state_attr: str | None = None
     snippets: tuple[ModuleSnippetPatch, ...] = ()
     strip_boundary_subpatterns: tuple[str, ...] = ()
 

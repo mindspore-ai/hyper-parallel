@@ -96,7 +96,12 @@ def cp_dispatch_shell_body(helper_name: str) -> str:
     return CP_DISPATCH_SHELL.format(helper_name=helper_name)
 
 
-def cp_subclass_snippet(subclass_name: str, parent_name: str, helper_name: str) -> str:
+def cp_subclass_snippet(
+    subclass_name: str,
+    parent_name: str,
+    helper_name: str,
+    state_attr: str | None = None,
+) -> str:
     """Return the full CP subclass source rendered into the artifact.
 
     The subclass is the runtime CP dispatch surface and carries the
@@ -104,18 +109,30 @@ def cp_subclass_snippet(subclass_name: str, parent_name: str, helper_name: str) 
     ``cp_enable`` / ``_hp_cp_mesh`` on its instances and the inner-wrapper
     installer leaves them alone, while boundaries keep wrapping the shell
     (entry identity, exit reduction).  CP off defers to the parent; CP on
-    delegates to the family helper.
+    delegates to the family helper — the same kernel the runtime CP wrapper
+    delegates to, so trainer and codegen share one CP implementation.
+
+    ``state_attr`` names the instance attribute that kernel reads for its
+    sub-mesh (the one the native wrapper installs as a companion attr); it
+    is stamped as ``_hp_cp_state_attr`` so the runtime inline-state binding
+    reproduces the native companion contract without the codegen layer
+    hardcoding a family attribute.
 
     Args:
         subclass_name: Name of the generated subclass (host name + ``CP``).
         parent_name: Host attention class the subclass extends.
         helper_name: Family CP helper the dispatch delegates to when active.
+        state_attr: Instance attribute the family CP kernel reads for its
+            sub-mesh; omitted when the family declares none.
 
     Returns:
         The rendered class source.
     """
     dispatch = textwrap.indent(
         cp_dispatch_shell_body(helper_name).strip("\n"), " " * 8
+    )
+    state_block = (
+        f'    _hp_cp_state_attr = "{state_attr}"\n\n' if state_attr else ""
     )
     return (
         f"class {subclass_name}({parent_name}):\n"
@@ -124,6 +141,7 @@ def cp_subclass_snippet(subclass_name: str, parent_name: str, helper_name: str) 
         "\n"
         "    _hp_inline_cp = True\n"
         "\n"
-        "    def forward(self, *args, **kwargs):\n"
+        + state_block
+        + "    def forward(self, *args, **kwargs):\n"
         f"{dispatch}\n"
     )
