@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
     from hyper_parallel.components.modules.gqa_attention import GatedGQAAttention, GQAAttention
     from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+    from hyper_parallel.components.modules.linear import Linear
     from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
     from hyper_parallel.components.modules.mla_attention import MLAAttention
     from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
@@ -41,6 +42,7 @@ _EXPORT_TO_MODULE = {
     "GatedGQAAttention": "gqa_attention",
     "EngramModule": "engram",
     "GroupedExperts": "grouped_experts",
+    "Linear": "linear",
     "KimiDeltaAttention": "kimi_delta_attention",
     "KimiRMSNormGated": "kimi_delta_attention",
     "MhcPostModule": "mhc",

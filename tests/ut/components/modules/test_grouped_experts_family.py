@@ -24,7 +24,6 @@ from hyper_parallel.components.modules.grouped_experts import GroupedExperts
 from hyper_parallel.components.modules.mxfp8_grouped_swiglu import MXFP8GroupedSwiGLU, FusedMXFP8GroupedSwiGLU
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError
 from tests.common.grouped_experts_family import TinyMoE, family_config, replace_experts
-from tests.common.mark_utils import arg_mark
 
 
 class TestGroupedExpertsFamily(unittest.TestCase):
@@ -37,7 +36,6 @@ class TestGroupedExpertsFamily(unittest.TestCase):
             device_check.start()
             self.addCleanup(device_check.stop)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_selection_and_layout(self) -> None:
         """
         Feature: GroupedExperts Family.
@@ -46,7 +44,8 @@ class TestGroupedExpertsFamily(unittest.TestCase):
         """
         source = TinyMoE()
         for selectors, expected in (({}, GroupedExperts), ({"use_mxfp8": True}, MXFP8GroupedSwiGLU),
-                                    ({"use_mxfp8": True, "use_fused_mxfp8": True}, FusedMXFP8GroupedSwiGLU)):
+                                    ({"use_mxfp8": True, "use_fused_mxfp8": True}, FusedMXFP8GroupedSwiGLU),
+                                    ({"use_mxfp8": True, "fused": True}, FusedMXFP8GroupedSwiGLU)):
             with self.subTest(selectors=selectors):
                 model = copy.deepcopy(source)
                 replace_experts(model, family_config(**selectors))
@@ -59,19 +58,19 @@ class TestGroupedExpertsFamily(unittest.TestCase):
                 torch.testing.assert_close(expert.gate_up_proj, source.mlp.experts.gate_up_proj.transpose(-2, -1))
                 torch.testing.assert_close(expert.down_proj, source.mlp.experts.down_proj.transpose(-2, -1))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_invalid_selectors(self) -> None:
         """
         Feature: GroupedExperts Family.
         Description: Reject fusion without MXFP8, nonboolean selectors and constructor typos.
         Expectation: Configuration fails before any NPU constructor runs.
         """
-        for selectors in ({"use_fused_mxfp8": True}, {"use_mxfp8": 1}, {"unknown": True},
+        for selectors in ({"use_fused_mxfp8": True}, {"fused": True}, {"fused": 1},
+                          {"use_mxfp8": True, "fused": False, "use_fused_mxfp8": True},
+                          {"use_mxfp8": 1}, {"unknown": True},
                           {"use_mxfp8": True, "unknown": True}):
             with self.subTest(selectors=selectors), self.assertRaises(ConfigResolutionError):
                 family_config(**selectors)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_unsupported_parallelism(self) -> None:
         """
         Feature: GroupedExperts Family scope.
@@ -82,7 +81,6 @@ class TestGroupedExpertsFamily(unittest.TestCase):
             with self.subTest(context=context), self.assertRaisesRegex(NotImplementedError, "mlp.experts"):
                 replace_experts(TinyMoE(), family_config(use_mxfp8=True), context=context)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_meta_and_canonical_weights(self) -> None:
         """
         Feature: GroupedExperts initialization.

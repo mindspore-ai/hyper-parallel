@@ -24,11 +24,11 @@ from hyper_parallel.components.modules.family import (
     ModuleFamily,
     SelectorSpec,
     VariantRule,
+    get_family_selector_specs,
     get_module_family,
     register_module_family,
     resolve_module_family_target,
 )
-from tests.common.mark_utils import arg_mark
 
 
 class Baseline:
@@ -71,12 +71,6 @@ class TestModuleFamilySelectors(unittest.TestCase):
         self.registry_patch.start()
         self.addCleanup(self.registry_patch.stop)
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_complete_whitelist_and_defaults(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -104,12 +98,6 @@ class TestModuleFamilySelectors(unittest.TestCase):
             with self.subTest(arguments=arguments), self.assertRaisesRegex(ValueError, "legal combinations"):
                 resolve_module_family_target(Baseline, arguments)
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_types_and_unknown_arguments_are_rejected(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -123,12 +111,6 @@ class TestModuleFamilySelectors(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "unknown replacement arguments"):
             resolve_module_family_target(Baseline, {"enabled": True, "unsupported_argument": 8})
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_field_order_is_irrelevant(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -139,12 +121,24 @@ class TestModuleFamilySelectors(unittest.TestCase):
         register_module_family(replace(family, selector_specs=dict(reversed(list(family.selector_specs.items())))))
         self.assertIs(resolve_module_family_target(Baseline, {"fused": True, "enabled": True})[0], Fused)
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
+    def test_aliases_use_the_same_rule_and_do_not_leak(self) -> None:
+        """
+        Feature: Module Family selector aliases.
+        Description: Aliases normalize before whitelist selection and preserve strict type checks.
+        Expectation: Both spellings select the same variant; conflicting values fail.
+        """
+        family = declaration()
+        family.selector_specs["fused"] = SelectorSpec(bool, False, aliases=("legacy_fusion",))
+        register_module_family(family)
+        for arguments in ({"legacy_fusion": True}, {"fused": True, "legacy_fusion": True}):
+            target, kwargs = resolve_module_family_target(Baseline, {"enabled": True, **arguments})
+            self.assertIs(target, Fused)
+            self.assertEqual(kwargs, {})
+        with self.assertRaisesRegex(ValueError, "conflicting selectors"):
+            resolve_module_family_target(Baseline, {"enabled": True, "fused": False, "legacy_fusion": True})
+        with self.assertRaises(TypeError):
+            resolve_module_family_target(Baseline, {"enabled": True, "legacy_fusion": 1})
+
     def test_second_family_uses_its_own_schema(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -167,12 +161,6 @@ class TestModuleFamilySelectors(unittest.TestCase):
         with self.assertRaises(TypeError):
             resolve_module_family_target(Alternate, {"level": False})
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_invalid_registrations_are_atomic(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -193,12 +181,6 @@ class TestModuleFamilySelectors(unittest.TestCase):
                 register_module_family(replace(family, variant_rules=rules))
             self.assertIsNone(get_module_family(Baseline))
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_invalid_schema_and_reserved_names(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -213,18 +195,13 @@ class TestModuleFamilySelectors(unittest.TestCase):
             ("enabled", SelectorSpec(bool, 0)),
             ("enabled", SelectorSpec(list, [])),
             ("ratio", SelectorSpec(float, float("nan"))),
+            ("enabled", SelectorSpec(bool, False, aliases=("",))),
         ]:
             with self.subTest(name=name, spec=spec), self.assertRaises((TypeError, ValueError)):
                 register_module_family(replace(declaration(), selector_specs={name: spec}, variant_rules=()))
         with self.assertRaises(ValueError):
             register_module_family(replace(declaration(), variants={"alternate": "not_a_path"}))
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_registry_snapshot_is_read_only(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -243,12 +220,6 @@ class TestModuleFamilySelectors(unittest.TestCase):
         with self.assertRaises(TypeError):
             registered.variant_rules[0].when["enabled"] = False
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_duplicate_baseline_is_rejected(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -259,12 +230,6 @@ class TestModuleFamilySelectors(unittest.TestCase):
         with self.assertRaises(ValueError):
             register_module_family(declaration())
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_lazy_import_and_missing_implementation(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -287,12 +252,6 @@ class TestModuleFamilySelectors(unittest.TestCase):
                 resolve_module_family_target(Baseline, {"enabled": True})
             importer.assert_called_once_with("unavailable_family_dependency")
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_ordinary_target_and_subclass_are_untouched(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -302,18 +261,13 @@ class TestModuleFamilySelectors(unittest.TestCase):
         register_module_family(declaration())
         for target in (Alternate, type("Baseline", (Baseline,), {})):
             self.assertIsNone(get_module_family(target))
+            self.assertEqual(get_family_selector_specs(target), {})
             args = {"enabled": "ordinary-value", "custom": object()}
             selected, kwargs = resolve_module_family_target(target, args)
             self.assertIs(selected, target)
             self.assertEqual(kwargs, args)
             self.assertIsNot(kwargs, args)
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_three_field_declaration_is_baseline_only(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -325,12 +279,6 @@ class TestModuleFamilySelectors(unittest.TestCase):
         with self.assertRaises(TypeError):
             resolve_module_family_target(Baseline, {"enabled": True})
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_callable_identity_does_not_depend_on_hash_or_equality(self) -> None:
         """
         Feature: Module Family construction-time selection.

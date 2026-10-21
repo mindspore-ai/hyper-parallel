@@ -498,12 +498,31 @@ register_module_family(ModuleFamily(
     name="grouped_experts",
     baseline=GroupedExperts,
     variants={
+        "w8a8": "hyper_parallel.components.modules.low_precision_grouped_experts.replace_mxfp8_grouped_experts",
+        "w4a8": "hyper_parallel.components.modules.low_precision_grouped_experts.replace_w4a8_grouped_experts",
+        "fake_w4a8": (
+            "hyper_parallel.components.modules.low_precision_grouped_experts.replace_fake_w4a8_grouped_experts"
+        ),
         "mxfp8": "hyper_parallel.components.modules.mxfp8_grouped_swiglu.MXFP8GroupedSwiGLU",
         "fused_mxfp8": "hyper_parallel.components.modules.mxfp8_grouped_swiglu.FusedMXFP8GroupedSwiGLU",
     },
-    selector_specs={"use_mxfp8": SelectorSpec(bool, False), "use_fused_mxfp8": SelectorSpec(bool, False)},
+    selector_specs={
+        "use_mxfp8": SelectorSpec(bool, False), "fused": SelectorSpec(bool, False, aliases=("use_fused_mxfp8",)),
+        "weight_format": SelectorSpec(str, ""), "act_format": SelectorSpec(str, ""),
+        "is_fake_quantize": SelectorSpec(bool, False),
+    },
     variant_rules=(
-        VariantRule({"use_mxfp8": True, "use_fused_mxfp8": False}, "mxfp8"),
-        VariantRule({"use_mxfp8": True, "use_fused_mxfp8": True}, "fused_mxfp8"),
+        VariantRule({"use_mxfp8": True, "fused": False,
+                     "weight_format": "", "act_format": "", "is_fake_quantize": False}, "mxfp8"),
+        VariantRule({"use_mxfp8": True, "fused": True,
+                     "weight_format": "", "act_format": "", "is_fake_quantize": False}, "fused_mxfp8"),
+        VariantRule({"use_mxfp8": False, "fused": False,
+                     "weight_format": "mxfp8", "act_format": "mxfp8", "is_fake_quantize": False}, "w8a8"),
+        VariantRule({"use_mxfp8": False, "fused": True,
+                     "weight_format": "mxfp8", "act_format": "mxfp8", "is_fake_quantize": False}, "fused_mxfp8"),
+        VariantRule({"use_mxfp8": False, "fused": False,
+                     "weight_format": "mxfp4", "act_format": "mxfp8", "is_fake_quantize": False}, "w4a8"),
+        VariantRule({"use_mxfp8": False, "fused": False,
+                     "weight_format": "mxfp4", "act_format": "mxfp8", "is_fake_quantize": True}, "fake_w4a8"),
     ),
 ))
