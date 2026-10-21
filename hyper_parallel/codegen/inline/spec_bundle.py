@@ -37,13 +37,22 @@ class ReplacementSpec:
 
 @dataclass(frozen=True)
 class StrategySpec:
-    """Source-level form of one parallel strategy target."""
+    """Source-level form of one parallel strategy target.
+
+    A ``body_template`` replaces its host class's whole ``forward`` with an
+    inline orchestration body (the EP shell).  A ``subclass_shell`` instead
+    renders an in-artifact *subclass* of the host whose ``forward`` is the
+    dispatch body (inline CP): the host keeps its compiled boundary, so the
+    shell never carries a ``target_class`` — the materialization pass derives
+    the host from the frozen boundary map.  The two forms are exclusive.
+    """
 
     kind: str
     imports: tuple[ImportPatch, ...]
     target_class: str | None = None
     method_name: str = "forward"
     body_template: str | None = None
+    subclass_shell: str | None = None
     snippets: tuple[ModuleSnippetPatch, ...] = ()
     strip_boundary_subpatterns: tuple[str, ...] = ()
 
@@ -55,6 +64,14 @@ class StrategySpec:
             raise ValueError("Inline strategy class and body must be nonempty")
         if not self.method_name.isidentifier():
             raise ValueError("Inline strategy method_name must be a Python identifier")
+        if self.subclass_shell is not None:
+            if self.target_class is not None or self.body_template is not None:
+                raise ValueError(
+                    "Inline strategy subclass_shell is exclusive with "
+                    "target_class and body_template"
+                )
+            if not self.subclass_shell.strip():
+                raise ValueError("Inline strategy subclass shell must be nonempty")
 
 
 __all__ = [

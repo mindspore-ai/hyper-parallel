@@ -44,6 +44,10 @@ DEEPSEEK_V32_ADAPTER_SPEC = ModelAdapterSpec(
     model_type="deepseek_v32",
     replacements=_load_replacements,
     context_parallel=_load_context_parallel,
+    context_parallel_inline=(
+        "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel"
+        ".deepseek_v32_dsa_cp_forward"
+    ),
     sharding_rules=build_parameter_sharding_rules,
 )
 register_model_adapter(DEEPSEEK_V32_ADAPTER_SPEC)

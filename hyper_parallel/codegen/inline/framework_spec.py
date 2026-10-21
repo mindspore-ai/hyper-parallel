@@ -30,7 +30,9 @@ providers* plus the frozen plan, never from a family-name dispatch table:
   factory resolves to that archetype's strategy kind / target class / boundary
   sub-patterns / EP body keys;
 * a CP ``inner_wrapper`` target under the ``models/<family>/adapter``
-  convention resolves to the framework CP attention strategy (imports only).
+  convention resolves to the framework CP attention strategy — imports
+  only unless the family declares ``context_parallel_inline``, which
+  additionally materializes an in-artifact CP dispatch subclass;
 
 The source class name an artifact must model (``Qwen3MoeRMSNorm``) is not
 duplicated here either: it is read from the rule's own ``module_type``, which
@@ -413,8 +415,42 @@ def _resolve_strategy_spec(
     if archetype is not None:
         return _ep_strategy_spec(archetype)
     if inner_wrapper and adapter_path_parts(target):
-        return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
+        return _cp_strategy_spec(model_type)
     return None
+
+
+def _cp_strategy_spec(model_type: str | None) -> StrategySpec:
+    """Build the CP strategy spec: an inline subclass shell plus its imports.
+
+    A family that declares ``context_parallel_inline`` on its adapter spec
+    participates in inline CP: the materialization pass derives an
+    in-artifact subclass of the attention host whose forward falls back to
+    the parent when CP is disabled and delegates to the family helper when
+    active. The helper import is derived from the adapter declaration (the
+    declaration's final segment names the helper), so this module never
+    hardcodes a family helper and stays free of torch imports at resolution
+    time.
+
+    Families without an inline helper keep the original framework CP
+    strategy (imports only), preserving the runtime wrapper path.
+    """
+    if not model_type:
+        return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
+    from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
+
+    adapter = get_model_adapter(model_type)
+    if adapter is None or not adapter.context_parallel_inline:
+        return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
+    helper_module, _, helper_name = adapter.context_parallel_inline.rpartition(".")
+    from hyper_parallel.codegen.inline.templates import (  # pylint: disable=C0415
+        cp_dispatch_shell_body,
+    )
+
+    return StrategySpec(
+        kind=CP_ATTENTION_KIND,
+        subclass_shell=cp_dispatch_shell_body(helper_name),
+        imports=(ImportPatch(helper_module, (helper_name,)),),
+    )
 
 
 def _ep_strategy_spec(archetype: Any) -> StrategySpec:
