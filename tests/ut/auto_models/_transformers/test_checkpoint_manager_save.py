@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.distributed_checkpoint import (
     BytesStorageMetadata,
     Metadata,
@@ -33,6 +34,30 @@ from hyper_parallel.models._transformers.checkpoint_loader import CheckpointMana
 
 class TestCheckpointManagerSave(unittest.TestCase):
     """Verify DCP-backed export does not read live training parameters."""
+
+    def test_live_export_disables_autograd_for_parameter_gather(self) -> None:
+        """Feature: Live HF export without autograd.
+
+        Description: Export a live DTensor while the caller enables gradients.
+        Expectation: Gathering disables gradients and restores caller grad mode.
+        """
+        parameter = torch.ones(3, requires_grad=True)
+        distributed = MagicMock(spec=DTensor)
+
+        def _full_tensor():
+            """Verify the export boundary before emulating collective output."""
+            self.assertFalse(torch.is_grad_enabled())
+            return parameter.clone()
+
+        distributed.full_tensor.side_effect = _full_tensor
+        model = MagicMock()
+        model.state_dict.return_value = {"weight": distributed}
+        with torch.enable_grad():
+            state = CheckpointManager(model)._gather_full_state_dict(keep_state_dict=True)
+            self.assertTrue(torch.is_grad_enabled())
+        self.assertFalse(state["weight"].requires_grad)
+        self.assertIsNone(state["weight"].grad_fn)
+        model.state_dict.assert_called_once_with(keep_vars=True)
 
     @staticmethod
     def _expert_export_model(hidden_size: int = 4, intermediate_size: int = 2) -> torch.nn.Module:
