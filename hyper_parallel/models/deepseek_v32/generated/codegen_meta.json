@@ -75,29 +75,18 @@
   ],
   "injections": [
     {
-      "ep_size": 2,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
-        "capacity_factor": null,
-        "fix_router": false,
-        "overlap_shared_expert": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.3.mlp"
-    },
-    {
-      "inner_target": "self",
-      "inner_wrapper": {
-        "_target_": "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper"
-      },
-      "match": "model.layers.0.self_attn"
-    },
-    {
       "inner_target": "self",
       "inner_wrapper": {
         "_target_": "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper"
       },
       "match": "model.layers.1.self_attn"
+    },
+    {
+      "inner_target": "self",
+      "inner_wrapper": {
+        "_target_": "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper"
+      },
+      "match": "model.layers.3.self_attn"
     },
     {
       "inner_target": "self",
@@ -111,7 +100,18 @@
       "inner_wrapper": {
         "_target_": "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper"
       },
-      "match": "model.layers.3.self_attn"
+      "match": "model.layers.0.self_attn"
+    },
+    {
+      "ep_size": 2,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
+        "capacity_factor": null,
+        "fix_router": false,
+        "overlap_shared_expert": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.3.mlp"
     }
   ],
   "mesh_dim_names": [
@@ -317,16 +317,16 @@
   ],
   "outputs": {
     "diff": {
-      "lines": 146,
-      "sha256": "d18c9e16d4dd547fa86673f28bc48b338e6f1526228fd2c4870afee8915842cd"
+      "lines": 148,
+      "sha256": "e63b42620b3786fe73fefafd2ddad522d1cf203556f2f11acd02e57fb163070d"
     },
     "init": {
       "lines": 6,
       "sha256": "9c3d71af6b8972f8621fc36c3fc01ab7130c73c550a468b968058760a097270e"
     },
     "modeling": {
-      "lines": 879,
-      "sha256": "0238dd921a6f2d1b572bff684ffd041849ddd6c502f47fa2d3a7b9c8a053983a"
+      "lines": 881,
+      "sha256": "232be26f3d2fa5740eddc7ffd8a1507ce290cd8e051d44d459eef540f55b8ce3"
     }
   },
   "parallel_dims": {
@@ -1753,7 +1753,7 @@
     }
   },
   "remote_siblings": [],
-  "signature": "54563567933e",
+  "signature": "6b3f1ca8268e",
   "skipped_overrides": [],
   "source": {
     "architecture": null,
