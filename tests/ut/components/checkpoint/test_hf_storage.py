@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""UT for :mod:`hyper_parallel.core.distributed_checkpoint.hf_storage`."""
+"""UT for :mod:`hyper_parallel.components.checkpoint.hf_storage`."""
 import json
 import shutil
 import struct
@@ -26,7 +26,7 @@ import torch
 from safetensors.torch import save_file
 
 from hyper_parallel.core.distributed_checkpoint.api import load
-from hyper_parallel.core.distributed_checkpoint.hf_storage import (
+from hyper_parallel.components.checkpoint.hf_storage import (
     DCP_SHARDING_INFO_KEY,
     SAFETENSORS_INDEX_SUFFIX,
     SAVED_OFFSETS_KEY,

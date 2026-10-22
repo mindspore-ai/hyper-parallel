@@ -31,11 +31,11 @@ from torch.distributed.tensor import Shard as TorchShard
 from safetensors.torch import save_file
 
 from hyper_parallel import DTensor
-from hyper_parallel.core.distributed_checkpoint import (
+from hyper_parallel.components.checkpoint import (
     HuggingFaceStorageReader,
     TorchShardedSafetensorsReader,
-    load,
 )
+from hyper_parallel.core.distributed_checkpoint import load
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device

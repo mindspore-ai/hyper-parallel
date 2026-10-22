@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""UT for :mod:`hyper_parallel.core.distributed_checkpoint.remap_planner`."""
+"""UT for :mod:`hyper_parallel.components.checkpoint.remap_planner`."""
 import shutil
 import tempfile
 import unittest
@@ -24,14 +24,14 @@ import torch
 from safetensors.torch import save_file
 
 from hyper_parallel.core.distributed_checkpoint.api import load
-from hyper_parallel.core.distributed_checkpoint.hf_storage import HuggingFaceStorageReader
+from hyper_parallel.components.checkpoint.hf_storage import HuggingFaceStorageReader
 from hyper_parallel.core.distributed_checkpoint.metadata import (
     CHUNK_INFO,
     ChunkInfo,
     ChunkStorageMetadata,
     MetadataIndex,
 )
-from hyper_parallel.core.distributed_checkpoint.remap_planner import (
+from hyper_parallel.components.checkpoint.remap_planner import (
     DeferredRead,
     RemapBlock,
     RemapLoadPlanner,

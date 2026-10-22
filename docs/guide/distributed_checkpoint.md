@@ -23,7 +23,6 @@ DCP 模块位于 `hyper_parallel/core/distributed_checkpoint/`：
 | `standard_planner.py` | 默认实现 `StandardSavePlanner` / `StandardLoadPlanner` |
 | `storage.py` | 存储后端抽象接口 `StorageWriter` / `StorageReader` |
 | `filesystem_storage.py` | 文件系统实现 `FileSystemWriter` / `FileSystemReader`（safetensors） |
-| `hf_storage.py` | 不经 DCP 写出的 safetensors 目录的读取器：`HuggingFaceStorageReader`（HF 权重）、`TorchShardedSafetensorsReader`（torch 分片写出的目录），由各文件头构造元数据，直接走 `load` 加载 |
 | `metadata.py` | `Metadata` / `ChunkStorageMetadata` / `ChunkInfo` / `BroadcastInfo` 等元数据结构 |
 | `async_persist.py` | 异步保存：staging（`DataCopier`）与子进程持久化 |
 | `ragged.py` | `RaggedShard`（非均匀切分）的几何适配 |
@@ -31,6 +30,18 @@ DCP 模块位于 `hyper_parallel/core/distributed_checkpoint/`：
 | `utils.py` | 去冗余、同分片组推导、区间求交、分阶段计时等公共能力 |
 | `broadcast.py` | 副本分片的广播：通信组的建立与销毁、发送与批量合并 |
 | `checkpoint_io.py` | 单个 checkpoint 文件的读写（safetensors / pickle） |
+
+HF 格式适配和自定义加载扩展位于 `hyper_parallel/components/checkpoint/`，依赖上述 DCP 基础设施：
+
+| 文件 | 说明 |
+|------|------|
+| `hf_storage.py` | HF 完整权重和 torch 分片 safetensors 目录的 Reader |
+| `quantized_hf_storage.py` | 通用量化 Reader，按区域读取并调用 Transformers 反量化 |
+| `remap_planner.py` | 根据 `RemapBlock` 和本地分片生成读取计划的 `RemapLoadPlanner` |
+| `huggingface_load_planner.py` | 将模型权重转换规则编译为区域读取或完整转换任务的 `HFLoadPlanner` |
+| `huggingface_checkpointer.py` | 组织 HF 权重加载、选择 loader 并生成加载报告 |
+
+依赖方向为 `components/checkpoint` → `core/distributed_checkpoint`；core 不导入这些组件。
 
 ---
 
@@ -304,12 +315,11 @@ save(model.state_dict(), checkpoint_id="/ckpt/step_1000")
 | 指错目录时 | 某个张量的 offsets 不为 0 → `ValueError`；既没有 index 也没有 `model.safetensors` → `FileNotFoundError`。两者都提示改用 `TorchShardedSafetensorsReader` | 目录里有 index，或文件没带 `DCP_SHARDING_INFO` → `ValueError`，提示改用 `HuggingFaceStorageReader` |
 
 ```python
-from hyper_parallel.core.distributed_checkpoint import (
+from hyper_parallel.components.checkpoint import (
     HuggingFaceStorageReader,
-    StandardLoadPlanner,
     TorchShardedSafetensorsReader,
-    load,
 )
+from hyper_parallel.core.distributed_checkpoint import StandardLoadPlanner, load
 
 load(model.state_dict(), storage_reader=HuggingFaceStorageReader("/models/Qwen3-8B"))
 
@@ -339,6 +349,41 @@ torchtitan 保存为 HF 格式时，先把分片写到 checkpoint 下的 `sharde
 | 需要进程组 | 与其他 `load` 相同，要求已经 `init_process_group`，单进程也不例外 |
 
 以下情况 `load_metadata` 直接报错，而不是读出错误的数据：同一张量的同一片出现在两个文件里；各片 dtype 不一致；各片拼不满整个张量（缺文件）或互相重叠；记录了 `DCP_SHARDING_INFO` 的文件漏记了某个张量的偏移；dtype 没有对应的 torch 类型。
+
+---
+
+## DCP 加载时在线反量化
+
+通过 `HyperAutoModelForCausalLM.from_pretrained()` 或
+`HyperAutoModelForImageTextToText.from_pretrained()` 加载 HF 目录时，默认使用 DCP。
+普通 BF16/FP32 目录继续使用 `HuggingFaceStorageReader`；目录的 `config.json` 声明受支持的
+`quantization_config` 时，自动使用共用的 `QuantizedHuggingFaceStorageReader`。
+
+当前支持 `quant_method: fp8` 下的二维 E4M3 权重、打包 FP4 权重及配套 scale。
+该能力按存储格式复用，不依赖具体模型；不支持的量化方法会报错。
+例如 DeepSeek V4.1 的 FP8/FP4、UE8M0 scale 可以直接加载，无需先生成离线 BF16 副本。
+
+```text
+量化文件头 → 逻辑 BF16 Metadata → 原有转换与分片规划
+→ 读取所需 weight/scale 区域 → Transformers Fp8Dequantize
+→ 裁回请求区域 → 原有 DCP 拷贝与最终完整性检查
+```
+
+FP4 的逻辑列数是打包存储列数的两倍；Planner 的偏移和长度使用逻辑坐标，Reader 负责
+压缩坐标换算、块对齐和分块反量化。权重命名、专家合并和高性能模块转换继续使用原有规则。
+模型本身先从配置在 meta 上构建并分片，不通过 Transformers 提前读取权重。
+
+反量化由安装的 Transformers `Fp8Dequantize` 实现执行，版本必须支持对应格式。
+当前不接受在 DCP 构建入口显式传入 `quantization_config` 来请求量化模块初始化或重新量化；
+在线解码以 checkpoint 自带配置为准。解码输出为 BF16，随后按目标参数及
+`model_init_dtype` 配置处理 dtype。官方算子保留 FP4 的负零，因此可能与把负零归一化的
+离线工具存在零值符号位差异。
+
+DeepSeek 裁层示例可直接传入官方量化目录或已有 BF16 目录：
+
+```bash
+bash examples/training_demo/deepseek_v41/run_deepseek_v41_vlm_online_load_hf.sh /data/DeepSeek-V4.1-Flash
+```
 
 ---
 

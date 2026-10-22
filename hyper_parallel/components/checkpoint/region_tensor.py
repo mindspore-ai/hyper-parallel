@@ -33,7 +33,7 @@ from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.core.distributed_checkpoint.remap_planner import RemapBlock
+from hyper_parallel.components.checkpoint.remap_planner import RemapBlock
 
 # A region cut into more blocks than this is not worth describing block by block. The conversion is
 # run on the real tensors instead.
@@ -310,6 +310,11 @@ def _runs(old: Sequence[int], new: Sequence[int]) -> list[tuple[int, int, int, i
     return runs
 
 
+def _non_singleton_shape(shape: tuple[int, ...]) -> list[int]:
+    """Return dimensions retained by the reshape run matching algorithm."""
+    return [size for size in shape if size != 1]
+
+
 def _reshape(
         blocks: Sequence[RegionBlock], old_shape: tuple[int, ...], new_shape: tuple[int, ...]
 ) -> list[RegionBlock]:
@@ -332,8 +337,8 @@ def _reshape(
     blocks = list(blocks)
     for axis in reversed([axis for axis, size in enumerate(old_shape) if size == 1]):
         blocks = [_drop_axis(block, axis) for block in blocks]
-    old = [size for size in old_shape if size != 1]
-    new = [size for size in new_shape if size != 1]
+    old = _non_singleton_shape(old_shape)
+    new = _non_singleton_shape(new_shape)
     for i0, i1, j0, j1 in reversed(_runs(old, new)):
         if i1 - i0 > 1:
             blocks = _merge_axes(blocks, i0, old[i0:i1])

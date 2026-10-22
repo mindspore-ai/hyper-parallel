@@ -80,6 +80,7 @@ _SAFETENSORS_DTYPES = {
     "F8_E4M3FNUZ": "torch.float8_e4m3fnuz",
     "F8_E5M2": "torch.float8_e5m2",
     "F8_E5M2FNUZ": "torch.float8_e5m2fnuz",
+    "F8_E8M0": "torch.float8_e8m0fnu",
     "F16": "torch.float16",
     "BF16": "torch.bfloat16",
     "F32": "torch.float32",

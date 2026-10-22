@@ -26,6 +26,8 @@ Rules come from the model's Transformers conversion mapping unless they are pass
 can override how the mapping is built, how checkpoint keys are named before the rules see them, and
 which converter a matched key goes to. See :class:`HFLoadPlanner`.
 """
+# Native Torch imports are required; the legacy backend lint rule predates the Torch-only runtime.
+# pylint: disable=forbidden-backend-import
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
@@ -47,10 +49,11 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
     get_model_conversion_mapping,
 )
 from hyper_parallel.core.distributed_checkpoint.api import load
-from hyper_parallel.core.distributed_checkpoint.hf_storage import HuggingFaceStorageReader
+from hyper_parallel.components.checkpoint.hf_storage import HuggingFaceStorageReader
 from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, TensorStorageMetadata
-from hyper_parallel.core.distributed_checkpoint.remap_planner import DeferredRead, RemapBlock, RemapLoadPlanner
+from hyper_parallel.components.checkpoint.remap_planner import DeferredRead, RemapBlock, RemapLoadPlanner
 from hyper_parallel.core.distributed_checkpoint.utils import all_gather_object, str_to_dtype
+from hyper_parallel.components.checkpoint.quantized_hf_storage import build_quantized_hf_reader
 from hyper_parallel.components.checkpoint.load_groups import (
     LoadGroup,
     LoadReport,
@@ -544,12 +547,7 @@ class HFLoadPlanner(RemapLoadPlanner):
             RuntimeError: If the conversion fails on meta tensors as well as when traced.
         """
         values = [value for _, value in conversion.inputs]
-        traced = None
-        if self.supports_symbolic(conversion.template) and all(isinstance(v, RegionTensor) for v in values):
-            try:
-                traced = {name: first_tensor(value) for name, value in conversion.run(values).items()}
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                logger.debug("Tracing %s failed, running it on real tensors: %s", conversion.first_target_name, exc)
+        traced = self._trace_conversion(conversion, values)
         try:
             expected = {
                 name: first_tensor(value) for name, value in conversion.run([_meta_value(v) for v in values]).items()
@@ -563,6 +561,15 @@ class HFLoadPlanner(RemapLoadPlanner):
         return {
             name: _Deferred(tuple(value.shape), value.dtype, conversion, name) for name, value in expected.items()
         }
+
+    def _trace_conversion(self, conversion: _Conversion, values: list[Any]) -> Optional[dict[str, Any]]:
+        """Try symbolic conversion without changing the real-tensor fallback policy."""
+        if self.supports_symbolic(conversion.template) and all(isinstance(value, RegionTensor) for value in values):
+            try:
+                return {name: first_tensor(value) for name, value in conversion.run(values).items()}
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                logger.debug("Tracing %s failed, running it on real tensors: %s", conversion.first_target_name, exc)
+        return None
 
     def _claim(self, plan: _Plan, name: str, value: Any) -> None:
         """Have ``value`` load the model tensor ``name``, unless something planned earlier already does."""
@@ -704,7 +711,9 @@ def load_hf_checkpoint(
         LoadReport: What was loaded, what is missing and what the checkpoint holds beyond the model.
     """
     location = resolve_checkpoint_location(pretrained_path)
-    reader = _SingleFileReader(location) if location.is_file() else HuggingFaceStorageReader(location)
+    reader = build_quantized_hf_reader(location)
+    if reader is None:
+        reader = _SingleFileReader(location) if location.is_file() else HuggingFaceStorageReader(location)
     if planner is None:
         planner = HFLoadPlanner(model, weights_mapping=weights_mapping, strict=strict)
     state_dict = planner.state_dict_for_load()
