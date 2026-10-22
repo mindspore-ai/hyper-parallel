@@ -1,9 +1,8 @@
-# Eight-rank, 20-decoder-layer VLM smoke test; fixed batches, no packing.
-# Vision: FSDP only. Decoder: FSDP + CP=2 + EP=2. Encoder Parallel is disabled.
+# Eight-rank, 20-decoder-layer VLM validation; fixed batches, no packing.
+# Vision: FSDP only. Decoder: FSDP + Ulysses CP=2 + EP=2. Encoder Parallel is disabled.
 # The model path below must contain a 20-decoder-layer model config and weights.
 # Launch from the repository root with the NPU environment and editable install ready:
-# HYPER_PARALLEL_PLATFORM=torch PYTORCH_NPU_ALLOC_CONF=expandable_segments:True \
-#   torchrun --standalone --nproc_per_node=8 -m scripts.train_vl examples/qwen3_6_moe/train_online_vlm.yaml
+# bash examples/qwen3_6_moe/launch_vlm_1node_8dies.sh
 model:
   _target_: hyper_parallel.models.HyperAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: /home/chaoran/youchu/qwen36_vlm_20261021/model20
@@ -12,7 +11,7 @@ model:
   force_hf: true
 
 training:
-  train_iters: 10
+  train_iters: 100
   train_samples: null
   global_batch_size: 8
   micro_batch_size: 1
@@ -71,14 +70,14 @@ plan_overrides:
     when: cp
     inner_target: self
     inner_wrapper:
-      _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_p2p_cp_wrapper
+      _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_ulysses_cp_wrapper
       backend: triton
       chunk_size: 64
     region_dispatch: false
   - match: "*.self_attn"
     when: cp
     inner_target: self
-    inner_wrapper: sdpa_hf
+    inner_wrapper: sdpa_hf_ulysses
     region_dispatch: false
 
 mixed_precision:
@@ -91,7 +90,7 @@ compile:
 
 dataset:
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
-  # LLaVA English 1k converted to messages with local image paths.
+  # JSON/JSONL messages with image paths, or Parquet messages + images[].bytes/path.
   data_path: /home/chaoran/datasets/llava_1k_en/messages.jsonl
   data_config: {}
   data_transform:

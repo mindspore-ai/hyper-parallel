@@ -119,3 +119,16 @@ bash examples/qwen3_6_moe/launch_1node_8dies.sh \
 | 方案 | 平均 step time | 最大已分配显存 |
 | --- | ---: | ---: |
 | FSDP + CP + EP | 7.853 s | 45.61 GB |
+
+## 5. 多模态单机 8 卡参考
+
+[`launch_vlm_1node_8dies.sh`](launch_vlm_1node_8dies.sh) 加载
+[`train_online_vlm.yaml`](train_online_vlm.yaml)。
+
+先 source CANN 并激活安装了本仓库的 Python 环境，再运行：
+
+```bash
+python -m pip install -e .
+python -m pip install pyarrow Pillow
+bash examples/qwen3_6_moe/launch_vlm_1node_8dies.sh
+```
