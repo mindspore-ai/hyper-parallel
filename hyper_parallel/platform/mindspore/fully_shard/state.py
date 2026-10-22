@@ -15,6 +15,7 @@
 """MindSpore HSDP cell state"""
 from collections import defaultdict
 from typing import List, Optional
+from contextlib import contextmanager
 import mindspore as ms
 from mindspore import ops
 import mindspore.mint.distributed as dist
@@ -49,6 +50,57 @@ def _to_dtype_if_needed(
     if isinstance(dtype, ms.Type) and tensor.dtype != dtype:
         return tensor.to(dtype)
     return tensor
+
+
+def _mesh_owner_key(mesh_info) -> Optional[tuple]:
+    """Return the communication-domain key that owns a pending-gradient entry.
+
+    The pending queues are shared by every ``fully_shard`` state (they are class
+    attributes), so the drainer has to be identified by the *communication
+    domain* rather than by the state object: a unit drains the pending work of the
+    previous unit that shares its mesh. Keying by state cannot work -- each
+    state's ``post_backward`` runs once per backward, so its own queue would never
+    be drained. Keying by mesh keeps the wait at the layer boundary even when a
+    layer nests extra fully_shard units (e.g. the routed-experts unit).
+    """
+    mesh = getattr(mesh_info, "mesh", None)
+    return mesh.to_hash() if mesh is not None else None
+
+
+@contextmanager
+def drain_all_owners(state):
+    """Disable the per-unit owner filter for the enclosed drain (root sweep).
+
+    Per-hook drains only touch the unit's own communication domain, so the last
+    unit of a nested chain (the routed-experts unit, for instance) has no
+    same-mesh successor left to hand its pending reductions to. The
+    end-of-backward path wraps its drain in this context so that
+    "everything is drained before the optimizer reads the gradients" still holds.
+    """
+    previous = getattr(state, "_drain_any_owner", False)
+    state._drain_any_owner = True
+    try:
+        yield
+    finally:
+        state._drain_any_owner = previous
+
+
+def _take_owned_entries(queue: list, owns) -> list:
+    """Stable single-pass split of ``queue`` into (owned, not-owned) entries.
+
+    ``owns`` receives a whole queue entry. The drain order of the pending work
+    decides the order in which collectives are issued on a shared communicator,
+    so this must not reorder anything: both partitions keep the original
+    relative order and ``queue`` is rewritten in place with the remaining
+    entries. Do **not** implement this as ``pop(0)`` + ``append`` of the foreign
+    entries: that rotates the queue and can make the issue order diverge between
+    ranks.
+    """
+    owned, rest = [], []
+    for entry in queue:
+        (owned if owns(entry) else rest).append(entry)
+    queue[:] = rest
+    return owned
 
 
 class MindSporeHSDPStateV2(HSDPState):
@@ -117,6 +169,13 @@ class MindSporeHSDPStateV2(HSDPState):
         self.mp_policy = config.mp_policy
         self.offload_policy = config.offload_policy
         self.reduce_grads = True
+        # Communication domain this unit drains pending reductions for. ``None``
+        # keeps the legacy behaviour (drain everything) for states without a mesh.
+        self._pending_owner_key = _mesh_owner_key(mesh_info)
+        # Set while the end-of-backward sweep drains *every* domain (see
+        # ``wait_for_pending_reductions``): the last unit of a nested chain has no
+        # same-mesh successor to hand its pending work to.
+        self._drain_any_owner = False
         # Reshard parameter after backward
         self.reshard_after_backward = True
         # Requires AllReduce for grad When HSDP
@@ -352,11 +411,37 @@ class MindSporeHSDPStateV2(HSDPState):
                 need_synchronize = self._apply_pending_unsharded_grad_locally(hsdp_param)
                 self._synchronize_current_stream_if_needed(need_synchronize)
 
+    def _owns_pending(self, hsdp_param) -> bool:
+        """Whether this unit is the drainer for ``hsdp_param``'s pending work.
+
+        Pending queues are shared between every ``fully_shard`` state, and the
+        drainer is picked by communication domain so that a unit waits for the
+        *previous* unit that shares its mesh. Without this filter the first unit
+        that happens to run next drains the work -- for a layer that nests a
+        routed-experts unit on another mesh, that is the *inner* unit of the next
+        layer, which drags the all-reduce wait into the middle of that layer's
+        backward instead of leaving it at the layer boundary.
+        """
+        owner_key = getattr(self, "_pending_owner_key", None)
+        if getattr(self, "_drain_any_owner", False) or owner_key is None:
+            return True  # no mesh known: keep the legacy "drain everything" behaviour
+        param_key = _mesh_owner_key(getattr(hsdp_param, "mesh_info", None))
+        return param_key is None or param_key == owner_key
+
+    def _owns_group(self, group) -> bool:
+        """Owner filter for fused ``AllReduceParamGroup`` entries."""
+        pending_key = getattr(self, "_pending_owner_key", None)
+        if getattr(self, "_drain_any_owner", False) or pending_key is None:
+            return True
+        owner_key = getattr(group, "owner_key", None)
+        return owner_key is None or owner_key == pending_key
+
     def _drain_reduce_scatter_params(self) -> bool:
         """Wait pending reduce-scatter ops and apply sharded grads."""
         need_synchronize = False
-        while HSDPState.pre_reduce_scatter_params:
-            hsdp_param, pre_orig_dtype = HSDPState.pre_reduce_scatter_params.pop(0)
+        for hsdp_param, pre_orig_dtype in _take_owned_entries(
+            HSDPState.pre_reduce_scatter_params, lambda entry: self._owns_pending(entry[0])
+        ):
             reduced_grad = hsdp_param.reduce_scatter_output()
             hsdp_param.clear_reduce_scatter_output()
             need_synchronize = (
@@ -378,18 +463,20 @@ class MindSporeHSDPStateV2(HSDPState):
         pending reduce-scatter work, call ``reduce_scattered_params()`` separately.
         """
         need_synchronize = False
-        while HSDPState.pre_all_reduce_params:
-            hsdp_param, pre_orig_dtype = HSDPState.pre_all_reduce_params.pop(0)
+        for hsdp_param, pre_orig_dtype in _take_owned_entries(
+            HSDPState.pre_all_reduce_params, lambda entry: self._owns_pending(entry[0])
+        ):
             reduced_grad = hsdp_param.all_reduce_output()
             hsdp_param.clear_all_reduce_output()
             need_synchronize = (
                 hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype)
                 or need_synchronize
             )
-        while MindSporeHSDPStateV2.pre_direct_all_reduce_grads:
-            hsdp_param, handle, reduced_grad, target_grad, *_ = (
-                MindSporeHSDPStateV2.pre_direct_all_reduce_grads.pop(0)
-            )
+        for entry in _take_owned_entries(
+            MindSporeHSDPStateV2.pre_direct_all_reduce_grads,
+            lambda item: self._owns_pending(item[0]),
+        ):
+            hsdp_param, handle, reduced_grad, target_grad, *_ = entry
             if handle is not None:
                 handle.wait()
             # all-reduce already applied SUM/AVG via _resolve_reduce_op(); skip legacy manual AVG div.
@@ -406,19 +493,18 @@ class MindSporeHSDPStateV2(HSDPState):
 
     def _wait_prev_reduce_scatter(self) -> List:
         """Step 1: wait previous module RS for HSDP fused all-reduce groups."""
-        if MindSporeHSDPStateV2.pre_all_reduce_groups:
-            prev_groups = list(MindSporeHSDPStateV2.pre_all_reduce_groups)
-            MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
-            for prev_group in prev_groups:
-                for hsdp_param in prev_group.hsdp_params:
-                    hsdp_param.reduce_scatter_output()
-                    hsdp_param.clear_reduce_scatter_output()
-                    if hsdp_param.unsharded_accumulated_grad_data is not None:
-                        hsdp_param.unsharded_accumulated_grad = None
-                    elif hsdp_param.unsharded_param.grad is not None:
-                        hsdp_param.unsharded_param.grad = None
-            return prev_groups
-        return []
+        prev_groups = _take_owned_entries(
+            MindSporeHSDPStateV2.pre_all_reduce_groups, self._owns_group
+        )
+        for prev_group in prev_groups:
+            for hsdp_param in prev_group.hsdp_params:
+                hsdp_param.reduce_scatter_output()
+                hsdp_param.clear_reduce_scatter_output()
+                if hsdp_param.unsharded_accumulated_grad_data is not None:
+                    hsdp_param.unsharded_accumulated_grad = None
+                elif hsdp_param.unsharded_param.grad is not None:
+                    hsdp_param.unsharded_param.grad = None
+        return prev_groups
 
     def _wait_and_apply_prev_no_allreduce_params(self):
         """Step 2: wait/apply previous reduce-scatter for pure FSDP params."""
@@ -446,9 +532,11 @@ class MindSporeHSDPStateV2(HSDPState):
 
     def _needs_overlap_post_backward_steps(self) -> bool:
         """Whether the 4-step RS/AR overlap pipeline has pending work this hook."""
-        if MindSporeHSDPStateV2.pre_all_reduce_groups:
+        # Only this unit's own communication domain counts: a nested unit must not
+        # run the pipeline just because another mesh left entries behind.
+        if any(self._owns_group(g) for g in MindSporeHSDPStateV2.pre_all_reduce_groups):
             return True
-        if HSDPState.pre_reduce_scatter_params:
+        if any(self._owns_pending(p) for p, _ in HSDPState.pre_reduce_scatter_params):
             return True
         return bool(self._collect_params_for_reduce_scatter())
 
@@ -498,6 +586,9 @@ class MindSporeHSDPStateV2(HSDPState):
                 mp_policy=self.mp_policy,
                 replicate_world_size=group_info.rank_size,
             )
+            # Owner tag: only a unit on the same communication domain may wait
+            # (and later all-reduce) this group.
+            group.owner_key = getattr(self, "_pending_owner_key", None)
             group.allocate_fused_buffer(self.device)
             for idx, hsdp_param in enumerate(hsdp_params):
                 buffer_view = group.get_param_buffer_view(idx)
