@@ -153,6 +153,9 @@ class VLMTrainer:
             model_adapter_spec=resolve_model_adapter(self.base.model),
             execution_options={
                 "micro_batch_size": int(config.training.micro_batch_size),
+                "activation_checkpoint": config.activation_checkpoint.mode,
+                "cp_size": self.base.mesh.cp_size,
+                "sequence_parallel": self.base.mesh.sequence_parallel,
                 "compile_enabled": bool(config.compile.enabled),
                 "validate_placement": bool(getattr(config.model, "validate_placement", False)),
             },
@@ -167,6 +170,13 @@ class VLMTrainer:
             if not isinstance(get_batch, OmniParallelBatch):
                 raise ValueError("encoder parallel requires OmniParallelBatch")
             get_batch.batch_transport = EncoderParallelBatchTransport(runtime=encoder_runtime)
+        bind_model = getattr(get_batch, "bind_model", None)
+        if callable(bind_model):
+            bind_model(self.base.model)
+        if encoder_runtime is not None:
+            install_forward = getattr(encoder_runtime.bridge, "install_forward", None)
+            if callable(install_forward):
+                install_forward()
         self.base.get_batch = get_batch
 
     @property

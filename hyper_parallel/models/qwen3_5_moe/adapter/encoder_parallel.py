@@ -117,8 +117,12 @@ class QwenVisionBridge:
             raise NotImplementedError("Wrap visual children, not model.visual/model as standalone FSDP units")
         if options.get("micro_batch_size") != 1:
             raise ValueError("Qwen encoder parallel currently requires micro_batch_size=1")
-        if options.get("cp_size", 1) != 1 or options.get("sequence_parallel") or options.get("loss_parallel"):
-            raise NotImplementedError("Qwen image insertion requires decoder CP=1, SP=false, loss_parallel=false")
+        if options.get("sequence_parallel") or options.get("loss_parallel"):
+            raise NotImplementedError("Qwen image insertion requires SP=false and loss_parallel=false")
+        if options.get("cp_size", 1) != 1 and not getattr(self.model, "_hp_vlm_cp_enabled", False):
+            raise NotImplementedError(
+                "Decoder CP requires QwenVLMParallelBatch to own image insertion and loss shifting"
+            )
         if options.get("activation_checkpoint", "off") not in (None, "off"):
             raise NotImplementedError("Qwen encoder parallel currently requires activation_checkpoint.mode=off")
         if getattr(self.vision, "gradient_checkpointing", False):
@@ -126,7 +130,7 @@ class QwenVisionBridge:
 
     def parse_images(self, batch: Mapping[str, Any]) -> tuple[EncoderWorkItem, ...]:
         """Validate image/token correspondence before launching visual collectives."""
-        tokens = batch["input_ids"]
+        tokens = batch.get("vlm_global_input_ids", batch["input_ids"])
         if tokens.ndim != 2 or tokens.shape[0] != 1:
             raise ValueError("Qwen encoder parallel requires a single unpacked sample")
         boundaries = batch.get("cu_seq_lens")
@@ -215,6 +219,9 @@ class QwenVisionBridge:
 
     def install_forward(self) -> None:
         """Inject routed image features without replacing the HF decoder forward."""
+        if getattr(self.model, "_hp_vlm_cp_enabled", False):
+            # The CP forward consumes the same plan but inserts only locally owned image rows.
+            return
         original_forward = self.model.forward
         original_visual = self.vision.forward
 

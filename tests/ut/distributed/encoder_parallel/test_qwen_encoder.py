@@ -25,6 +25,7 @@ from torch.nn import functional
 
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
+from hyper_parallel.distributed._builder.source_shard import build_source_shard_info
 from hyper_parallel.distributed.encoder_parallel.attention import EncoderAttentionContext, activate_encoder_attention
 from hyper_parallel.distributed.encoder_parallel.batch_input import EncoderParallelInputAdapter
 from hyper_parallel.distributed.encoder_parallel.config import EncoderParallelConfig
@@ -153,7 +154,7 @@ class TestQwenEncoder(unittest.TestCase):
             bridge.validate_training({"micro_batch_size": 1, "activation_checkpoint": "full"})
 
     def test_default_disabled_and_visual_only_provider(self):
-        """Description: old/default configs. Expectation: no runtime or isolation."""
+        """Description: default config. Expectation: visual FSDP only, no encoder runtime."""
         config = resolve_component({}, expected_type=AcceleratorConfig, path="accelerator")
         self.assertFalse(config.encoder_parallel.enabled)
         enabled_config = resolve_component({"encoder_parallel": {"enabled": True, "encoder_cp_size": 2}},
@@ -162,7 +163,7 @@ class TestQwenEncoder(unittest.TestCase):
         self.assertIsNone(build_encoder_parallel_runtime(config=config.encoder_parallel, mesh_context=None,
                                                          model=None, model_adapter_spec=None, execution_options=None))
         model = make_model()
-        self.assertEqual(ShardingPlanner()._encoder_isolated_roots(model, "qwen3_5_moe"), ())
+        self.assertEqual(ShardingPlanner()._encoder_isolated_roots(model, "qwen3_5_moe"), ("model.visual",))
         enabled = ShardingPlanner(encoder_parallel_enabled=True)
         self.assertEqual(enabled._encoder_isolated_roots(model, "qwen3_5_moe"), ("model.visual",))
         with self.assertRaises(ValueError):
@@ -179,6 +180,58 @@ class TestQwenEncoder(unittest.TestCase):
             self.assertEqual(len(plan.modules["model.visual"].params), 4)
         finally:
             _DEVICE_MESH_MAP.clear()
+
+    def test_visual_fsdp_only_with_decoder_cp_ep(self):
+        """Description: decoder CP/EP enabled. Expectation: complete replicated visual metadata."""
+        model = make_model()
+        visual = model.model.visual
+        visual.pos_embed = nn.Embedding(16, 8)
+        visual.patch_embed = nn.Linear(8, 8)
+        model.model.language_model = nn.Module()
+        layer = nn.Module()
+        model.model.language_model.layers = nn.ModuleList([layer])
+        layer.self_attn = nn.Module()
+        for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            setattr(layer.self_attn, name, nn.Linear(8, 8, bias=False))
+        layer.mlp = nn.Module()
+        layer.mlp.gate = nn.Linear(8, 4, bias=False)
+        layer.mlp.experts = nn.Module()
+        layer.mlp.experts.gate_up_proj = nn.Parameter(torch.zeros(4, 16, 8))
+        layer.mlp.experts.down_proj = nn.Parameter(torch.zeros(4, 8, 8))
+        mesh = init_device_mesh("cpu", (4, 2, 1), mesh_dim_names=("dp", "cp", "tp"),
+                                rank_list=tuple(range(8)), init_backend=False)
+        expert_mesh = init_device_mesh("cpu", (4, 2), mesh_dim_names=("edp", "ep"),
+                                       rank_list=tuple(range(8)), init_backend=False)
+        try:
+            plan = ShardingPlanner().plan(model, mesh, cp_size=2, ep_size=2, sequence_parallel=False)
+            spec = plan.modules["model.visual"]
+            self.assertFalse(spec.is_boundary)
+            self.assertIsNone(spec.inner_wrapper)
+            self.assertIsNone(spec.local_compute_fn)
+            self.assertEqual(spec.in_src, {})
+            self.assertEqual(spec.in_dst, {})
+            self.assertEqual(set(spec.params), dict(visual.named_parameters()).keys())
+            self.assertFalse(any(name.startswith("model.visual.") for name in plan.modules))
+            self.assertTrue(all(placement.is_replicate() for axes in spec.params.values()
+                                for placement in axes.values()))
+            expert_spec = plan.modules["model.language_model.layers.0.mlp"]
+            self.assertTrue(expert_spec.params["experts.gate_up_proj"]["ep"].is_shard())
+            self.assertIn("model.language_model.layers.0.self_attn", plan.modules)
+            metadata = build_source_shard_info(plan, mesh, expert_source_mesh=expert_mesh)
+            self.assertEqual(set(metadata), dict(model.named_parameters()).keys())
+            for name, (placements, source_mesh) in metadata.items():
+                if name.startswith("model.visual."):
+                    self.assertEqual(source_mesh.mesh_dim_names, ("tp",))
+                    self.assertTrue(all(placement.is_replicate() for placement in placements))
+        finally:
+            _DEVICE_MESH_MAP.clear()
+
+    def test_text_model_has_no_visual_isolation(self):
+        """Description: text-only adapter. Expectation: no new source-layout declarations."""
+        model = nn.Module()
+        self.assertEqual(ShardingPlanner()._encoder_isolated_roots(model, "qwen3_5_moe_text"), ())
+        self.assertEqual(ShardingPlanner()._encoder_isolated_roots(model, "qwen3_5_text"), ())
+        self.assertEqual(ShardingPlanner(derive=False)._encoder_isolated_roots(model, "qwen3_5_moe"), ())
 
     def test_forward_feature_insertion_and_context_cleanup(self):
         """Description: route features through native call site. Expectation: no rerun; graph retained."""

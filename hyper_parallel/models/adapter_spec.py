@@ -118,9 +118,11 @@ class ModelAdapterSpec:
             validation-only dependencies therefore stay outside import paths.
         loss: provider returning model-family output-loss adapters that must
             intercept the model before a full terminal output is materialized.
-        encoder_parallel: lazy provider returning construction-time visual
-            replacement/isolation rules and a factory for a model-bound
-            Encoder-DP/Encoder-CP bridge.
+        encoder_parallel: Optional visual encoder runtime contract, used only
+            when encoder parallelism is explicitly enabled.
+        replicated_subtrees: Module FQNs excluded from decoder TP/CP/EP
+            planning. Their parameters remain replicated in the source layout;
+            FSDP still shards them and synchronizes their gradients normally.
     """
 
     architecture: str
@@ -140,3 +142,4 @@ class ModelAdapterSpec:
     validation: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
     encoder_parallel: Optional[Callable[..., Any]] = None
+    replicated_subtrees: tuple[str, ...] = ()

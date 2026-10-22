@@ -1,0 +1,208 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Image-only Qwen VLM training with contiguous decoder context parallelism."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import wraps
+from typing import Any, Mapping
+
+# This adapter implements the Torch-only Qwen Transformers training contract.
+import torch  # pylint: disable=forbidden-backend-import
+from torch.nn import functional  # pylint: disable=forbidden-backend-import
+
+from hyper_parallel.data.batching.get_batch import OmniParallelBatch
+from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter, RuntimeInputContext
+from hyper_parallel.distributed.encoder_parallel.contracts import EncoderFeature, EncoderWorkItem
+from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import QwenVisionBridge
+
+
+@dataclass(frozen=True)
+class QwenVLMCPInputs:
+    """Precomputed full-conversation geometry and local next-token targets."""
+
+    start: int
+    stop: int
+    position_ids: torch.Tensor
+    targets: torch.Tensor
+    images: tuple[EncoderWorkItem, ...]
+
+
+def select_local_image_features(records: list[EncoderFeature], geometry: QwenVLMCPInputs,
+                                hidden: torch.Tensor, input_ids: torch.Tensor,
+                                image_token_id: int) -> torch.Tensor:
+    """Insert only image rows intersecting this rank's global token interval."""
+    rows = []
+    for item, features in sorted(records, key=lambda record: record[0].decoder_token_start):
+        begin = max(geometry.start, item.decoder_token_start)
+        end = min(geometry.stop, item.decoder_token_start + item.output_rows)
+        if begin < end:
+            rows.append(features[begin - item.decoder_token_start:end - item.decoder_token_start])
+    mask = input_ids.eq(image_token_id).unsqueeze(-1).expand_as(hidden)
+    features = torch.cat(rows).to(hidden.dtype) if rows else hidden.new_empty((0, hidden.shape[-1]))
+    if int(mask[..., 0].sum()) != features.shape[0]:
+        raise ValueError("CP-local image placeholders do not match routed image features")
+    return hidden.masked_scatter(mask, features)
+
+
+def install_qwen_vlm_cp_forward(model: Any) -> None:
+    """Keep the HF decoder/head, replacing only image insertion and CP loss alignment."""
+    if getattr(model, "_hp_vlm_cp_enabled", False):
+        raise ValueError("Qwen VLM CP forward is already installed")
+    original_forward = model.forward
+
+    @wraps(original_forward)
+    def forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the local decoder slice under the outer FSDP forward hooks."""
+        geometry = kwargs.pop("vlm_cp_inputs", None)
+        if geometry is None:
+            return original_forward(*args, **kwargs)
+        if args or kwargs.get("use_cache") or kwargs.get("past_key_values") is not None:
+            raise ValueError("Qwen VLM CP supports keyword-only uncached training")
+        if kwargs.get("output_router_logits"):
+            raise NotImplementedError("Qwen VLM CP does not yet aggregate router auxiliary loss")
+        input_ids = kwargs.pop("input_ids")
+        kwargs.pop("labels", None)
+        kwargs.pop("mm_token_type_ids", None)
+        kwargs.pop("attention_mask", None)
+        plan = kwargs.pop("encoder_parallel_plan", None)
+        hidden = model.get_input_embeddings()(input_ids)
+        if plan is not None:
+            records, anchor = plan.encode_and_route(kwargs)
+        elif geometry.images:
+            visual = model.model.visual
+            features = visual(kwargs["pixel_values"].to(visual.dtype),
+                              grid_thw=kwargs["image_grid_thw"], return_dict=True).pooler_output
+            records, offset = [], 0
+            for item in geometry.images:
+                records.append((item, features[offset:offset + item.output_rows]))
+                offset += item.output_rows
+            # A CP rank may own no image rows but must participate in vision backward/FSDP.
+            anchor = features.sum() * 0.0
+        else:
+            records, anchor = [], None
+        hidden = select_local_image_features(records, geometry, hidden, input_ids, model.config.image_token_id)
+        for field in ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw", "position_ids"):
+            kwargs.pop(field, None)
+        output = original_forward(
+            input_ids=None, inputs_embeds=hidden, position_ids=geometry.position_ids,
+            attention_mask={"full_attention": None, "linear_attention": None}, **kwargs,
+        )
+        # Sum/clamped count keeps empty-supervision ranks finite, including their gradients.
+        targets = geometry.targets.reshape(-1)
+        output.loss = functional.cross_entropy(output.logits.float().reshape(-1, output.logits.shape[-1]),
+                                               targets, ignore_index=-100, reduction="sum")
+        output.loss = output.loss / targets.ne(-100).sum().clamp_min(1)
+        if anchor is not None:
+            output.loss = output.loss + anchor
+        return output
+
+    model.forward = forward
+    model._hp_vlm_cp_enabled = True
+
+
+class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
+    """Prepare full-image geometry before slicing an unpacked conversation over CP.
+
+    TP/SP, video, packing and interior/left padding are intentionally unsupported.
+    Decoder attention must use KV all-gather and GDN must use the P2P wrapper.
+    CP=1 retains native HF forward and can serve as the pure-FSDP baseline.
+    """
+
+    def __init__(self, *, mesh_context: Any, device: Any, sequence_alignment: int = 128,
+                 runtime_input_adapter: Any = None, **kwargs: Any) -> None:
+        """Use the same global tail alignment for the baseline and CP comparisons."""
+        if mesh_context.tp_size != 1 or mesh_context.sequence_parallel:
+            raise NotImplementedError("Qwen VLM P2P CP currently requires TP=1 and SP=false")
+        if sequence_alignment % (64 * mesh_context.cp_size):
+            raise ValueError("sequence_alignment must be divisible by 64 * cp_size")
+        self.model = None
+        self.bridge = None
+        self.sequence_alignment = sequence_alignment
+        super().__init__(mesh_context=mesh_context, device=device,
+                         runtime_input_adapter=runtime_input_adapter or self, **kwargs)
+
+    def runtime_input_fields(self) -> tuple[str, ...]:
+        """The batch prepares its geometry after the shared runtime hook."""
+        return ()
+
+    def build_runtime_inputs(self, *, batch: Mapping[str, Any], context: RuntimeInputContext) -> dict[str, Any]:
+        """Keep the model-specific geometry owned by the batch adapter."""
+        return {}
+
+    def bind_model(self, model: Any) -> None:
+        """Bind native mRoPE calculation and install the CP-only forward bridge."""
+        if model.config.model_type != "qwen3_5_moe":
+            raise ValueError("QwenVLMParallelBatch requires the conditional-generation Qwen MoE model")
+        self.model, self.bridge = model, QwenVisionBridge(model)
+        if self.parallel_context.cp_world_size > 1:
+            install_qwen_vlm_cp_forward(model)
+
+    def _pad(self, source: Mapping[str, Any]) -> dict[str, Any]:
+        """Right-pad token fields together without truncating any image span."""
+        batch = dict(source)
+        ids = batch["input_ids"]
+        if ids.ndim != 2 or ids.shape[0] != 1 or ids.shape[1] < 1:
+            raise ValueError("Qwen VLM CP requires one nonempty conversation")
+        if batch.get("cu_seq_lens") is not None and batch["cu_seq_lens"].numel() > 2:
+            raise NotImplementedError("Qwen VLM CP does not support packed conversations")
+        mask = batch.get("attention_mask", torch.ones_like(ids))
+        if not bool(mask.bool().all()):
+            raise ValueError("Provide an unpadded conversation; QwenVLMParallelBatch owns tail padding")
+        batch["attention_mask"] = mask
+        pad = (-ids.shape[1]) % self.sequence_alignment
+        for field, value in tuple(batch.items()):
+            if torch.is_tensor(value) and value.shape == ids.shape and field not in self.bridge.input_fields:
+                batch[field] = functional.pad(value, (0, pad), value=-100 if field == "labels" else 0)
+        batch["loss_mask"] = batch["labels"].ne(-100)
+        return batch
+
+    def __call__(self, data_iterator: Any, *, external_batch: Mapping[str, Any] | None = None
+                 ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Render global positions/targets, then expose only local tokens to the decoder."""
+        if self.model is None:
+            raise RuntimeError("bind_model must run before reading a Qwen VLM CP batch")
+        source = external_batch if external_batch is not None else next(data_iterator)
+        batch = self.tp_broadcaster.broadcast(self._pad(self._normalize_source_batch(source)), broadcast_all_fields=True)
+        images = self.bridge.parse_images(batch)
+        cp_size = self.parallel_context.cp_world_size
+        if cp_size == 1:
+            return self._split_model_and_loss_inputs(batch)
+        global_ids = batch["input_ids"]
+        token_types = batch.get("mm_token_type_ids", global_ids.eq(self.model.config.image_token_id).long())
+        positions, _ = self.model.model.get_rope_index(
+            input_ids=global_ids, mm_token_type_ids=token_types,
+            image_grid_thw=batch.get("image_grid_thw"), attention_mask=batch["attention_mask"],
+        )
+        length = global_ids.shape[1] // cp_size
+        start = self.parallel_context.cp_rank * length
+        stop = start + length
+        targets = functional.pad(batch["labels"], (0, 1), value=-100)[:, 1:][:, start:stop].contiguous()
+        geometry = QwenVLMCPInputs(start, stop, positions[..., start:stop].contiguous(), targets, images)
+        for field, value in tuple(batch.items()):
+            if torch.is_tensor(value) and value.shape == global_ids.shape and field not in self.bridge.input_fields:
+                batch[field] = value[:, start:stop].contiguous()
+        # The native trainer counts labels[..., 1:]. This sentinel preserves that
+        # contract while the forward bridge uses the already globally shifted targets.
+        batch["labels"] = functional.pad(targets, (1, 0), value=-100)
+        batch["loss_mask"] = batch["labels"].ne(-100)
+        batch["vlm_global_input_ids"] = global_ids
+        runtime_inputs = self._build_runtime_inputs(batch)
+        batch.pop("vlm_global_input_ids")
+        model_inputs, loss_inputs = self._split_model_and_loss_inputs(batch)
+        model_inputs.update(runtime_inputs)
+        model_inputs["vlm_cp_inputs"] = geometry
+        return model_inputs, loss_inputs
