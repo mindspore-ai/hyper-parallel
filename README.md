@@ -31,7 +31,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 - **模型与系统优化解耦**：HyperParallel 将并行、重计算和 Offload 等系统优化从模型代码中分离，并通过声明式接口注入模型；并行范式覆盖集群 SPMD、集群 MPMD 和芯片内多核 MPMD，面向大语言模型和多模态模型训练。
 
-- **兼容 Hugging Face 生态**：HyperParallel 支持直接读取 Hugging Face 模型配置和预训练权重，并复用 Transformers 中已有的模型实现；模型创建后，由 HyperParallel 以声明式方式将并行、重计算和算子替换等分布式逻辑注入模型。
+- **兼容 Hugging Face 生态与自有模型训练**：支持加载 Hugging Face 模型配置和预训练权重，复用 Transformers 模型实现，并通过声明式配置应用并行、重计算和模块替换等优化。Hugging Face 模型和完成适配的自有模型可通过 Trainer 实现数据处理、前向与反向计算、优化器更新及检查点保存与恢复，使用方式见 [模型训练](hyper_parallel/models/README.md)。
 
 - **全流程确定性**：HyperParallel 支持计算、通信、数据预处理和随机数等环节的确定性，并对已支持模型进行 bitwise 对齐验证。确定性模式可能带来性能开销，但有助于复现训练结果、发现 SDC 和定位问题。
 
@@ -50,6 +50,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 ### HyperParallel 模型训练
 
 > [HyperParallel 模型](hyper_parallel/models/README.md) 面向训练用户，通过 YAML 配置 Hugging Face 模型、数据、优化器、并行策略以及保存与恢复方式。
+> 自有模型与训练组件的接入方式见 [二次开发指南](docs/guide/trainer/custom_component.md)。
 >
 > **支持模型**
 >
@@ -95,23 +96,24 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 ### 使用 HyperParallel 启动模型训练
 
-运行仓库提供的单机 8 卡训练示例 [`hyper_parallel/models/qwen3_moe/recipes/train.yaml`](hyper_parallel/models/qwen3_moe/recipes/train.yaml)：
+安装并配置好昇腾环境后，在仓库根目录运行 [Qwen3-30B-A3B 训练配方](hyper_parallel/models/qwen3_moe/recipes/train.yaml)。该配方使用单机 8 张 NPU，默认加载 Hugging Face 上的模型、tokenizer 和 WikiText 数据集，训练 3 步，关闭检查点保存：
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
   scripts/train_lm.py hyper_parallel/models/qwen3_moe/recipes/train.yaml
 ```
 
-附加命令行参数可按 YAML 字段路径覆盖配置值，无需修改配置文件：
+附加命令行参数可按 YAML 字段路径覆盖配置值。例如，使用本地模型与 tokenizer，并将训练步数调整为 10：
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
   scripts/train_lm.py hyper_parallel/models/qwen3_moe/recipes/train.yaml \
   --model.pretrained_model_name_or_path=/path/to/model \
+  --dataset.model_assets.tokenizer.pretrained_model_name_or_path=/path/to/model \
   --training.train_iters=10
 ```
 
-字段定义与解析规则见 [训练配置与组件](hyper_parallel/models/README.md)。
+上例仍使用配方中的 WikiText 数据集。使用本地数据时，按 [数据配置](hyper_parallel/data/README.md) 调整数据源与处理方式；需要保存训练状态时，按 [Trainer 检查点配置](docs/guide/distributed_checkpoint.md#在-trainer-中保存与恢复) 启用保存。完整配置导航见 [模型训练](hyper_parallel/models/README.md)。
 
 ### 使用 HyperParallel Core API
 

@@ -7,6 +7,20 @@ HyperParallel 提供两种安装方式：
 
 如果只需要安装已发布的包，优先使用 `pip install`。如果需要在本机生成 whl，或需要调整 native 扩展构建配置，再使用源码构建。
 
+## PyTorch 与昇腾环境要求
+
+PyTorch 基础版本要求为 **2.6.0 及以上**。在昇腾 NPU 上运行时，还需安装与 PyTorch 配套的
+TorchNPU（`torch-npu`），以及匹配设备和 TorchNPU 版本的 CANN、驱动和固件。
+下表列出当前 `master` 在 [`setup.py`](../setup.py) 中声明的框架版本组合。
+
+使用已发布的 HyperParallel 包时，应以该版本的依赖与发布说明为准；使用 `master` 源码时，
+通用 Python 依赖以 [`requirements.txt`](../requirements.txt) 为准。各模型配方的 Transformers
+版本、额外组件和设备要求见对应模型说明，例如
+[Kimi-K2.6](../hyper_parallel/models/kimi_k26/README.md) 需要提供原生模型实现的 Transformers 版本。
+
+CANN、驱动和固件需单独安装；native 扩展的构建和环境激活方式见下文。
+安装后可从 [模型训练](../hyper_parallel/models/README.md) 选择配方并启动训练。
+
 ## 1. 使用 pip 安装
 
 `pip install` 的 extras 只控制 Python 运行时依赖，不控制 native 扩展的编译。

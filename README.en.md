@@ -22,6 +22,12 @@ coordinated optimisation of cluster MPMD and multi-core MPMD. It supports the ev
 from Stateful to Stateless with separated computation and state, as well as large language model training, multimodal
 large model training, and reinforcement learning capabilities.
 
+**Hugging Face and Custom Model Training**: HyperParallel loads Hugging Face model configurations and pretrained
+weights, reuses Transformers implementations, and applies parallelism, recomputation and module replacements through
+declarative configuration. Hugging Face models and adapted custom models can use the Trainer for data processing,
+forward and backward computation, optimiser updates, and checkpoint save and restore. See the
+[model training documentation (Chinese)](hyper_parallel/models/README.md) for recipes, configuration and integration.
+
 **End-to-End Determinism**: To further ensure training stability and precision reproducibility, HyperParallel supports
 end-to-end determinism, including high-performance deterministic computation, communication, data preprocessing, and
 random number determinism, supporting floating-point bitwise alignment. All supported models are validated using
@@ -335,6 +341,7 @@ model.layers[1] = swap_wrapper(model.layers[1])
 
 - [Docs Hub](./docs/index.md) - Documentation index and navigation
 - [Installation Guide](docs/installation.md) - Source build, dependencies
+- [Model Training (Chinese)](hyper_parallel/models/README.md) - Hugging Face and custom model integration, training recipes and configuration
 - [Feature Guides](./docs/guide/) - 10 core feature usage guides
 - [API Reference](./docs/api/api_reference.md) - Interface descriptions organised by feature module
 - [FAQ & Troubleshooting](./docs/faq.md) - Common issues and solutions
