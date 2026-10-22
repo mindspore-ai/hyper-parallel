@@ -852,6 +852,97 @@ def _aggregate_ep_outputs(
     return output.view(*output_shape)
 
 
+def accumulate_expert_load(
+    module: Any,
+    topk_indices: torch.Tensor,
+    global_expert_count: int,
+) -> None:
+    """Add this forward's per-expert route counts to the module's running load.
+
+    The counts are the input to auxiliary-loss-free load balancing: they are
+    what the router's ``e_score_correction_bias`` is nudged by. They are
+    accumulated on the module (rather than returned) because the balancing act
+    happens once per *optimizer step*, while this runs once per MoE layer per
+    forward.
+
+    The HuggingFace ``DeepseekV3TopkRouter`` scores experts by sigmoid plus this
+    bias and ships the buffer, but no update rule for it -- so with nothing
+    feeding the counts back the bias stays at its initial zero and the router is
+    free to drift onto a few experts.
+
+    Args:
+        module: MoE module to accumulate on.
+        topk_indices: The router's ``[tokens, top_k]`` expert selection.
+        global_expert_count: Width of the model-level routed expert bank.
+    """
+    load = getattr(module, "_ep_expert_load", None)
+    if load is None or load.numel() != global_expert_count:
+        load = torch.zeros(
+            global_expert_count, dtype=torch.float32, device=topk_indices.device
+        )
+        module._ep_expert_load = load  # pylint: disable=protected-access
+    load += torch.bincount(
+        topk_indices.reshape(-1), minlength=global_expert_count
+    ).to(load.dtype)
+
+
+def update_expert_bias_from_load(
+    module: Any,
+    *,
+    lr: float,
+    group: Any,
+    num_recomputations: int = 1,
+) -> bool:
+    """Nudge the router bias by one step of auxiliary-loss-free load balancing.
+
+    ``bias += lr * sign(mean_load - load)``, re-centered to zero mean. The sign
+    is what makes the rule self-limiting: an over-used expert's bias falls, an
+    under-used one's rises, and re-centering stops the whole vector drifting so
+    that only the experts' relative ranking moves.
+
+    Args:
+        module: MoE module carrying ``_ep_expert_load`` and a ``gate`` router.
+        lr: Step size, i.e. the correction applied to the bias each step.
+        group: The process group whose ranks hold *distinct* tokens. The load is
+            a global-batch statistic, so it has to be summed across every rank
+            that saw different data before it means anything -- the EP group
+            under expert parallelism.
+        num_recomputations: Forward executions per optimizer step. Activation
+            checkpoint re-runs the forward and double-counts the load, so the
+            caller passes 2 to divide it back out.
+
+    Returns:
+        Whether anything was updated, i.e. False for a module that never ran a
+        routed forward (such as a dense layer).
+
+    Raises:
+        ValueError: If the accumulated load and the router bias disagree on the
+            expert bank width.
+    """
+    load = getattr(module, "_ep_expert_load", None)
+    gate = getattr(module, "gate", None)
+    bias = getattr(gate, "e_score_correction_bias", None)
+    if load is None or bias is None:
+        return False
+    if load.numel() != bias.numel():
+        raise ValueError(
+            f"expert load has {load.numel()} entries but the router bias has "
+            f"{bias.numel()}; the two must describe the same expert bank"
+        )
+    if num_recomputations > 1:
+        load.div_(num_recomputations)
+    # Every rank must apply the same delta, or replicas diverge and the ranks
+    # start routing to different experts.
+    dist.all_reduce(load, group=group)
+    with torch.no_grad():
+        mean_load = load.mean()
+        delta = lr * (mean_load - load).sign()
+        delta = delta - delta.mean()
+        bias.data += delta.to(bias.dtype)
+    load.zero_()
+    return True
+
+
 def _aggregate_ep_chunks(
     combined_chunks: list[torch.Tensor],
     row_ranges: list[tuple[int, int]],
@@ -1069,6 +1160,7 @@ def ep_routed_forward(
 
     output_shape = tuple(hidden_states.shape)
     topk_indices, topk_weights = router_fn(module, hidden_states)  # [T, K]
+    accumulate_expert_load(module, topk_indices, global_expert_count)
     dispatch = _prepare_ep_dispatch(
         hidden_states,
         topk_indices,
