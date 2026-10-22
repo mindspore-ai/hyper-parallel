@@ -41,6 +41,8 @@ from hyper_parallel.trainer.config.optimization import (
     OptimizerSwapConfig,
 )
 from hyper_parallel.trainer.config.target import Target
+from hyper_parallel.components.modules.family import get_module_family
+from hyper_parallel.trainer.config.replacement import ReplacementTarget
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 
 
@@ -339,6 +341,18 @@ def _suggestion(name: str, candidates: Iterable[str]) -> str:
     return f"; did you mean {matches[0]!r}?" if matches else ""
 
 
+def _replace_family_selector(
+    config: ReplacementTarget, parts: list[str], value: object, *, path: str,
+) -> ReplacementTarget:
+    """Validate one terminal selector and report reselection errors at its path."""
+    if len(parts) != 1:
+        raise ConfigResolutionError(f"CLI.{path}", "a scalar selector cannot have child fields")
+    try:
+        return config.replace(**{parts[0]: value})
+    except (TypeError, ValueError) as exc:
+        raise ConfigResolutionError(f"CLI.{path}", str(exc)) from exc
+
+
 def _replace_target_path(
     config: Target[Any],
     parts: list[str],
@@ -353,6 +367,10 @@ def _replace_target_path(
         raise ConfigResolutionError(
             f"CLI.{full_path}", "changing _target_ through an override is not supported"
         )
+
+    selector_spec = config.get_family_selector_spec(name) if isinstance(config, ReplacementTarget) else None
+    if selector_spec is not None:
+        return _replace_family_selector(config, parts, value, path=full_path)
 
     signature = inspect.signature(config.callable)
     parameter = signature.parameters.get(name)
@@ -625,6 +643,33 @@ def _resolve_target(node: object, *, path: str) -> Target[Any]:
     )
 
 
+def _resolve_replacement_target(node: object, *, path: str) -> Target[Any]:
+    """Apply Family selection only to registered baselines in replacement entries."""
+    if not isinstance(node, Mapping) or "_target_" not in node:
+        raise ConfigResolutionError(path, "replacement requires a mapping with _target_")
+    target_path = node["_target_"]
+    requested = import_target(target_path, location=f"{path}._target_")
+    if get_module_family(requested) is None:
+        return _resolve_target(node, path=path)
+    try:
+        selected = ReplacementTarget(
+            requested, target_path=target_path,
+            **{key: value for key, value in node.items() if key != "_target_"},
+        )
+        selected_signature = inspect.signature(selected.callable)
+        for parameter in selected_signature.parameters.values():
+            if parameter.kind is inspect.Parameter.POSITIONAL_ONLY and parameter.default is inspect.Parameter.empty:
+                raise TypeError(f"replacement parameter {parameter.name!r} must be callable by keyword")
+        # Normalize raw arguments; to_dict would serialize configured objects and callables.
+        normalized = _resolve_target_args(
+            selected._kwargs, selected_signature,
+            _target_hints(selected.callable, path=path), path=path,
+        )
+        return selected.replace(**normalized)
+    except (ValueError, TypeError, ImportError, AttributeError) as exc:
+        raise ConfigResolutionError(path, str(exc)) from exc
+
+
 def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
     """Resolve a DataLoader target with nested collator and batch runtime."""
     if not isinstance(node, Mapping):
@@ -761,6 +806,8 @@ def resolve_component(node: object, *, annotation: object, path: str) -> object:
 
     origin = get_origin(annotation)
     if origin is Target or annotation is Target:
+        if path.endswith(".replace_module"):
+            return _resolve_replacement_target(node, path=path)
         return _resolve_target(node, path=path)
     if annotation is DatasetConfig:
         return _resolve_dataset_config(node, path=path)

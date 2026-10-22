@@ -41,6 +41,8 @@ from hyper_parallel.models.replacement import (
 )
 
 from hyper_parallel.trainer.config.target import Target
+from hyper_parallel.components.modules.family import get_module_family
+from hyper_parallel.trainer.config.replacement import ReplacementTarget
 
 logger = logging.getLogger(__name__)
 
@@ -456,6 +458,13 @@ def _target_replacement_factory(
     low_precision_policy: Optional[LowPrecisionDtypeScheme] = None,
 ) -> ModuleReplacementFactory:
     """Bind a YAML Target's static args to the replacement factory protocol."""
+
+    if not isinstance(target, ReplacementTarget) and get_module_family(target.callable) is not None:
+        # Preserve configured Python objects; only Family baselines need selection.
+        # Target has no public accessors for its raw constructor values.
+        target = ReplacementTarget(
+            target.callable, target_path=target._target_path, **target._kwargs,
+        )
 
     if not getattr(target._target_, "_hp_module_replacement", False):  # pylint: disable=protected-access
         raise TypeError(

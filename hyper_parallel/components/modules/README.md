@@ -23,6 +23,11 @@ norm = RMSNorm(hidden_size=4096, eps=1e-6).npu()
 output = norm(hidden_states)
 ```
 
+## Module families
+
+Registered module families select an implementation from explicit configuration rules before model construction.
+See [Module Family](README.module_family.md) for GroupedExperts MXFP8 examples, rule semantics, and extension guidance.
+
 ## Install custom operators
 
 Some modules depend on the training operators from [Omni Ops](https://gitee.com/omniai/omni-ops). Ensure that CANN,
