@@ -268,6 +268,8 @@ class DistributedSetup:
     # Normalized module replacement rules (tuple[ModuleReplacementSpec])
     # desugared Trainer-side via entries_to_module_replacements.
     module_replacements: Any = None
+    # Non-forward method patches installed after module replacement and before planning.
+    method_replacements: Any = None
     # TrainingConfig.training.low_precision. Kept on the setup so model
     # construction and sharding consume one resolved policy object.
     low_precision_config: Any = None

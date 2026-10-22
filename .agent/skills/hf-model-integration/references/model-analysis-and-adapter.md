@@ -80,11 +80,47 @@ and CP/EP behavior through `plan_overrides`. Sharding rules and model loss may b
 selected automatically. Put weight conversion associated with replacement in the
 replacement's `make_transforms()` result rather than an unused placeholder.
 For example, a ViT attention wrapper belongs behind a recipe entry with
-`match: "model.vision.blocks.*.attn"`, a concrete source `module_type`, and a
-model-owned `replace_module` factory. This match is an `fnmatch` glob, not a
-regular expression. The generic builder consumes the normalized replacement
-rules unchanged; the model adapter need not inject another rule list. Check the
+`match: "model.vision.blocks.*.attn"`, `replace.kind: module`, and a model-owned
+`replace.implementation` factory. Add `replace.source_type` only when the recipe
+needs an explicit expected-type guard. This match
+is an `fnmatch` glob, not a regular expression. The generic builder consumes
+the normalized replacement rules unchanged; the model adapter need not inject
+another rule list. Check the
 final module match count and retained projection parameter objects.
+
+New model recipes use the same `replace` shape for modules and methods:
+
+```yaml
+plan_overrides:
+  - match: "model.vision.blocks.*.attn"
+    replace:
+      kind: module
+      implementation: my_model.make_optimized_attention
+  - match: "model.text.layers.*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation: my_model.make_cp_attention_forward
+  - match: "model.text.layers.*.mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: my_model.make_ep_mlp_forward
+        use_grouped_gemm: true
+  - match: "model.text.layers.*.mlp.gate.route"
+    replace:
+      kind: method
+      implementation: my_model.make_route
+```
+
+`implementation` names the replacement factory; `match` names the module or
+the module method being replaced. A `.forward` rule replaces its owning module's
+`forward` through the boundary executor; other methods require an
+`@method_replacement` factory returning a callable with the bound method's
+call contract. A `.forward` rule defaults
+to `region_dispatch: false`; set `true` only when the replacement supports
+DTensor dispatch. A module rule cannot set `region_dispatch` in the same rule.
 
 ## Final-Model Boundary Coverage
 
@@ -99,7 +135,7 @@ contract. HyperParallel globs use `fnmatch`, not regular expressions, and `*` ma
 span dots. A glob can create missing boundaries only when it declares at least one
 concrete `params`, `in_src`, `in_dst`, `out_src`, or `out_dst` mapping. Write the
 complete contract required by every matched module. Later globs may merge
-topology-conditional behavior such as `local_compute_fn`, CP wrapping, or
+topology-conditional `.forward` method replacement behavior, CP wrapping, or
 sequence-parallel activation placement.
 
 Treat these cases differently:
@@ -174,13 +210,14 @@ of adapting a call signature:
 - A reusable high-performance component that already owns the source structural
   contract must itself implement the standard `module/module_fqn/context`
   replacement-factory protocol. The recipe references that component directly,
-  while the declarative `module_type` remains the source-type gate.
+  while the matched module supplies its source type. Add `replace.source_type`
+  only when the recipe must assert an expected type.
 - Use an adapter-side replacement factory only for real model-family semantics:
   deriving model-specific configuration, translating forward/state/weight/layout
   contracts, or enforcing a family-only constraint that cannot be expressed by
-  `module_type` plus the component's stable structural contract.
+  the component's stable structural contract or an optional expected-type guard.
 - Do not add an adapter wrapper that merely accepts the three executor arguments,
-  repeats the YAML source-type check, and returns a generic component. Do not
+  repeats an optional expected-type check, and returns a generic component. Do not
   populate `ModelAdapterSpec.replacements` only to expose such wrappers. This
   indirection obscures the actual high-performance implementation without adding
   a model adaptation contract.

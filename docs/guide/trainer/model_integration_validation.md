@@ -321,7 +321,8 @@ register_model_adapter(MODEL_ADAPTER_SPEC)
 import 这个 registration 模块只完成登记，不会立即解析模型类、调用 provider、安装 replacement 或启动
 并行。`validation` 必须惰性加载，这样普通训练不会导入权威参考仓、测试算子或验证专用依赖。
 `replacements/context_parallel/expert_parallel` 在当前 recipe 驱动路径中属于能力目录，实际启用仍由
-`replace_module._target_`、`inner_wrapper._target_` 或 `local_compute_fn._target_` 显式声明；sharding、
+`plan_overrides.replace.implementation` 显式声明：模块替换用 `kind: module` 与模块路径，
+CP/EP 前向替换用 `kind: method` 与 `.forward` 路径；sharding、
 FSDP、recompute 和 validation provider 则由对应 planner/Trainer/工具直接消费。
 
 ### 3.2 最小验证声明
@@ -463,7 +464,7 @@ activation_checkpoint:
 验证清单只描述模型身份、标准 Trainer 启动方式、实验矩阵和验收阈值。模型结构、数据集、dtype、tokenizer 和本地资产应留在 Trainer recipe；环境变量、源码 revision 和 hash 会自动进入证据，不在 YAML 中重复维护。
 
 ```yaml
-schema_version: 1
+schema_version: 2
 
 model:
   adapter: example
@@ -574,7 +575,7 @@ acceptance:
 integration_handoff: /local/evidence/integration_handoff.yaml
 ```
 
-handoff 必须是 schema-v1、`status: PASS`，并且 `family` 与 `model.adapter` 相同。它只证明结构与模块 parity 已通过，不替代本次 matrix 的 Trainer recipe 和输入证据。
+handoff 必须是 schema-v2、`status: PASS`，并且 `family` 与 `model.adapter` 相同。它只证明结构与模块 parity 已通过，不替代本次 matrix 的 Trainer recipe 和输入证据。
 
 ### 4.3 高性能替换的成对实验
 
@@ -769,9 +770,9 @@ DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相
 
 | 模型语义 | 正式 reference 模块 | recipe 可选 candidate | 选择方式 |
 |---|---|---|---|
-| pipelined mHC | `DeepseekV41PipelinedHyperConnection` | `PipelinedMhcModule` | `replace_module._target_` |
-| Engram | `DeepseekV41Engram` | `EngramModule` | `replace_module._target_` |
-| CSA2 Attention | `DeepseekV41Attention` | `SharedCompressedDSAAttention` | `replace_module._target_` |
+| pipelined mHC | `DeepseekV41PipelinedHyperConnection` | `PipelinedMhcModule` | `replace.kind: module` + `implementation` |
+| Engram | `DeepseekV41Engram` | `EngramModule` | `replace.kind: module` + `implementation` |
+| CSA2 Attention | `DeepseekV41Attention` | `SharedCompressedDSAAttention` | `replace.kind: module` + `implementation` |
 
 两种 Attention 共享 `SharedCompressedDSAAttentionBase`：正式模块固定
 `use_optimized_sparse_attention=False`，candidate 固定为 `True`。provider 只登记 factory；当前 demo 是 recipe

@@ -20,11 +20,13 @@ worker compares per-step training loss between a parallel scenario (TP+FSDP or
 TP+CP+FSDP) and an in-process single-card baseline computed from the same
 random seed and optimizer state.
 """
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 from tests.common.distributed_launcher import torchrun_case
 
-_WORKER = "_test_llama3_accuracy.py"
+_WORKER = str(Path(__file__).with_name("_test_llama3_accuracy.py"))
 
 
 @arg_mark(

@@ -22,9 +22,11 @@ each family runs its atomic checks sequentially with identifying messages.
 import unittest
 import weakref
 from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import torch
 from torch import Tensor, nn
 
 # The generic replacement contract must not depend on a specific transformers
@@ -33,18 +35,30 @@ from torch import Tensor, nn
 from hyper_parallel.components.checkpoint.weight_conversion import WeightRenaming
 
 from hyper_parallel.models.replacement import (
+    MethodReplacementSpec,
     ModuleReplacementSpec,
+    apply_method_replacements,
     apply_module_replacements,
     compile_module_replacements,
+    method_replacement,
     module_replacement,
 )
-from hyper_parallel.trainer.config.resolver import resolve_config
+from hyper_parallel.distributed import forward_replacement, inner_wrapper
+from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
+from hyper_parallel.codegen.emit.replacement import compile_overrides_for_meta
+from hyper_parallel.codegen.manager import _apply_generation_replacements
+from hyper_parallel.codegen.plan.freeze import freeze_injections
+from hyper_parallel.codegen.spec.project import _canonicalize_override
+from hyper_parallel.trainer.config.resolver import ConfigResolutionError, resolve_config
 from hyper_parallel.trainer.config import (
     PlanOverride,
+    ReplaceAction,
     Target,
     _import_module_type,
     entries_to_module_replacements,
+    entries_to_method_replacements,
     entries_to_plan_overrides,
+    normalize_distributed_setup_overrides,
 )
 
 
@@ -139,6 +153,48 @@ def _replace_positional_only(*, module, module_fqn, context):
 def _replace_with_dropped_variadic(*, module, module_fqn, context):
     del module, module_fqn, context
     return _DroppedVariadicModule()
+
+
+@forward_replacement
+def _forward_factory(*, mesh, tp_mesh, cp_mesh, ep_mesh, module, scale=1.0):
+    """Build a simple differentiable local forward for config tests."""
+    del mesh, tp_mesh, cp_mesh, ep_mesh, module
+
+    def compute(current_module, inputs):
+        del current_module
+        return inputs * scale
+
+    return compute
+
+
+@inner_wrapper
+def _wrapper_factory(*, target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """Build a pass-through CP-style wrapper for config tests."""
+    del mesh, tp_mesh, cp_mesh, ep_mesh
+    return target_module.forward
+
+
+class _RouteGate(nn.Module):
+    """Small module with a replaceable method distinct from forward."""
+
+    def route(self, inputs):
+        """Return the original route result."""
+        return inputs + 1
+
+    def forward(self, inputs):
+        """Call the replaceable method."""
+        return self.route(inputs)
+
+
+@method_replacement
+def _route_factory(*, module, method_fqn, original_method, context, scale=1.0):
+    """Build a bound-style method replacement from the original method."""
+    del module, method_fqn, context
+
+    def route(inputs):
+        return original_method(inputs) * scale
+
+    return route
 
 
 def _spec(*patterns):
@@ -587,6 +643,282 @@ class TestModuleReplacementYaml(unittest.TestCase):
         self.assertTrue(
             rules[0].exact_type, "case: yaml_replacement_desugars_to_generic_rule"
         )
+
+    def test_new_module_action_resolves_and_preserves_parameter_identity(self):
+        """A new module action compiles through the existing replacement engine."""
+        config = resolve_config(_root([{
+            "match": ["0", "1"],
+            "replace": {
+                "kind": "module",
+                "source_type": "torch.nn.Linear",
+                "implementation": f"{__name__}._replace_linear",
+            },
+        }]))
+        rule = config.plan_overrides[0]
+        self.assertEqual(rule.to_dict()["replace"]["implementation"], f"{__name__}._replace_linear")
+        self.assertNotIn("replace_module", rule.to_dict())
+        specs = entries_to_module_replacements(config.plan_overrides)
+        model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+        original_weights = [module.weight for module in model]
+        apply_module_replacements(model, compile_module_replacements(model, specs))
+        self.assertTrue(all(isinstance(module, _ReplacementLinear) for module in model))
+        self.assertTrue(all(module.weight is weight for module, weight in zip(model, original_weights)))
+        records = compile_overrides_for_meta(
+            nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4)), specs,
+            factory_paths=[f"{__name__}._replace_linear"],
+        )
+        self.assertEqual({record["fqn"] for record in records}, {"0", "1"})
+        self.assertEqual(records[0]["factory"], f"{__name__}._replace_linear")
+        self.assertIn("replace_module", _canonicalize_override(rule))
+        legacy = PlanOverride(
+            match=["0", "1"], module_type="torch.nn.Linear",
+            replace_module=Target(_replace_linear, target_path=f"{__name__}._replace_linear"),
+        )
+        self.assertEqual(_canonicalize_override(rule), _canonicalize_override(legacy))
+
+        wrong_type = PlanOverride(match="0", replace=ReplaceAction(
+            kind="module", source_type="torch.nn.Conv2d", implementation=f"{__name__}._replace_linear"))
+        mismatched = entries_to_module_replacements([wrong_type])
+        with self.assertRaisesRegex(TypeError, "replace.kind=module"):
+            compile_overrides_for_meta(
+                nn.Sequential(nn.Linear(4, 4)), mismatched,
+                factory_paths=[f"{__name__}._replace_linear"],
+            )
+
+    def test_new_module_action_infers_source_type_from_match(self):
+        """A module rule without source_type uses each matched source instance."""
+        config = resolve_config(_root([{
+            "match": ["0", "1"],
+            "replace": {
+                "kind": "module",
+                "implementation": f"{__name__}._replace_linear",
+            },
+        }]))
+        rule = config.plan_overrides[0]
+        self.assertNotIn("source_type", rule.to_dict()["replace"])
+        specs = entries_to_module_replacements(config.plan_overrides)
+        self.assertIsNone(specs[0].module_type)
+
+        meta_model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+        records = compile_overrides_for_meta(
+            meta_model, specs, factory_paths=[f"{__name__}._replace_linear"]
+        )
+        self.assertEqual({record["module_type"] for record in records}, {
+            f"{nn.Linear.__module__}.{nn.Linear.__qualname__}"
+        })
+
+        generated_model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+        dims = SimpleNamespace(tp_size=1, cp_size=1, ep_size=1, pp_size=1, sequence_parallel=False)
+        generated_records = _apply_generation_replacements(
+            SimpleNamespace(), SimpleNamespace(plan_overrides=config.plan_overrides),
+            generated_model, SimpleNamespace(parallel_dims=dims),
+        )
+        self.assertEqual({record["module_type"] for record in generated_records}, {
+            f"{nn.Linear.__module__}.{nn.Linear.__qualname__}"
+        })
+        self.assertTrue(all(isinstance(module, _ReplacementLinear) for module in generated_model))
+
+        model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+        original_weights = [module.weight for module in model]
+        apply_module_replacements(model, compile_module_replacements(model, specs))
+        self.assertTrue(all(isinstance(module, _ReplacementLinear) for module in model))
+        self.assertTrue(all(module.weight is weight for module, weight in zip(model, original_weights)))
+
+    def test_new_forward_action_lowers_both_factory_protocols(self):
+        """Forward actions use factory metadata, preserving the old execution hosts."""
+        config = resolve_config(_root([{
+            "match": "*.mlp.forward", "when": "ep",
+            "replace": {"kind": "method", "implementation": {
+                "_target_": f"{__name__}._forward_factory", "scale": 2.0}},
+        }, {
+            "match": "*.self_attn.forward", "when": "cp",
+            "replace": {"kind": "method", "implementation": f"{__name__}._wrapper_factory"},
+        }]))
+        ep_rule, cp_rule = config.plan_overrides
+        self.assertFalse(ep_rule.region_dispatch)
+        self.assertIs(ep_rule.local_compute_fn.callable, _forward_factory)
+        self.assertEqual(ep_rule.to_dict()["replace"]["implementation"]["scale"], 2.0)
+        self.assertNotIn("region_dispatch", ep_rule.to_dict())
+        self.assertEqual(cp_rule.inner_target, "self")
+        self.assertIs(cp_rule.inner_wrapper.callable, _wrapper_factory)
+        legacy_cp = PlanOverride(
+            match="*.self_attn", when="cp", region_dispatch=False,
+            inner_target="self", inner_wrapper=Target(
+                _wrapper_factory, target_path=f"{__name__}._wrapper_factory"),
+        )
+        canonical = _canonicalize_override(cp_rule)
+        self.assertEqual(canonical.pop("match"), "*.self_attn.forward")
+        legacy_canonical = _canonicalize_override(legacy_cp)
+        legacy_canonical.pop("match")
+        self.assertEqual(canonical, legacy_canonical)
+        self.assertEqual(entries_to_plan_overrides(config.plan_overrides, cp_size=1, ep_size=1), {})
+        active = entries_to_plan_overrides(config.plan_overrides, cp_size=2, ep_size=2)
+        self.assertIs(active["*.mlp"].local_compute_fn, ep_rule.local_compute_fn)
+        self.assertIs(active["*.self_attn"].inner_wrapper, cp_rule.inner_wrapper)
+        frozen = freeze_injections(SimpleNamespace(modules=active))
+        self.assertEqual({entry["match"] for entry in frozen}, {"*.mlp", "*.self_attn"})
+        self.assertIn("local_compute_fn", next(entry for entry in frozen if entry["match"] == "*.mlp"))
+        self.assertIn("inner_wrapper", next(entry for entry in frozen if entry["match"] == "*.self_attn"))
+
+        model = _NestedModule()
+        compute = _resolve_local_compute_fn(model, active["*.mlp"], None, (), None)
+        inputs = torch.ones(2, requires_grad=True)
+        compute(inputs).sum().backward()
+        self.assertTrue(torch.equal(inputs.grad, torch.full_like(inputs, 2.0)))
+
+        strict = PlanOverride(match="*.mlp.forward", region_dispatch=True, replace=ReplaceAction(
+            kind="method", implementation=f"{__name__}._forward_factory"))
+        self.assertTrue(entries_to_plan_overrides([strict])["*.mlp"].region_dispatch)
+        self.assertTrue(strict.to_dict()["region_dispatch"])
+
+    def test_method_path_selects_method_and_preserves_gradient(self):
+        """The suffix identifies a method; the owner path keeps glob semantics."""
+        config = resolve_config(_root([{
+            "match": "*.gate.route", "replace": {"kind": "method", "implementation": {
+                "_target_": f"{__name__}._route_factory", "scale": 2.0,
+            }},
+        }]))
+        rule = config.plan_overrides[0]
+        self.assertEqual(rule.to_dict()["match"], "*.gate.route")
+        self.assertEqual(rule.to_dict()["replace"]["implementation"]["scale"], 2.0)
+        self.assertEqual(entries_to_plan_overrides(config.plan_overrides), {})
+        specs = entries_to_method_replacements(config.plan_overrides)
+        self.assertEqual(len(specs), 1)
+        model = nn.Module()
+        model.layers = nn.ModuleList([_RouteGate(), _RouteGate()])
+        for layer in model.layers:
+            layer.gate = _RouteGate()
+        original_gate = model.layers[0].gate
+        apply_method_replacements(model, specs)
+        inputs = torch.ones(2, requires_grad=True)
+        result = model.layers[0].gate(inputs) + model.layers[1].gate(inputs)
+        result.sum().backward()
+        self.assertIs(model.layers[0].gate, original_gate)
+        self.assertTrue(torch.equal(result, torch.full_like(result, 8.0)))
+        self.assertTrue(torch.equal(inputs.grad, torch.full_like(inputs, 4.0)))
+        self.assertIn("replace", _canonicalize_override(rule))
+
+        gated = PlanOverride(match="*.gate.route", when="cp", replace=ReplaceAction(
+            kind="method", implementation=f"{__name__}._route_factory"))
+        self.assertEqual(entries_to_method_replacements([gated], cp_size=1), ())
+        self.assertEqual(len(entries_to_method_replacements([gated], cp_size=2)), 1)
+
+    def test_method_forward_path_reuses_existing_boundary_executor(self):
+        """A .forward suffix lowers to the same owner boundary as legacy forward."""
+        rule = PlanOverride(match="*.mlp.forward", when="ep", replace=ReplaceAction(
+            kind="method", implementation=f"{__name__}._forward_factory"))
+        self.assertEqual(rule.to_dict()["match"], "*.mlp.forward")
+        self.assertEqual(entries_to_plan_overrides([rule], ep_size=2)["*.mlp"].local_compute_fn,
+                         rule.local_compute_fn)
+        self.assertEqual(entries_to_method_replacements([rule], ep_size=2), ())
+        frozen = freeze_injections(SimpleNamespace(modules=entries_to_plan_overrides([rule], ep_size=2)))
+        self.assertEqual(frozen[0]["match"], "*.mlp")
+
+    def test_method_replacement_is_wired_in_native_and_codegen_setup(self):
+        """Codegen validates targets; native construction installs the patch."""
+        rule = PlanOverride(match="gate.route", replace=ReplaceAction(
+            kind="method", implementation=f"{__name__}._route_factory"))
+        setup = SimpleNamespace(mesh_context=SimpleNamespace(
+            cp_size=1, ep_size=1, sequence_parallel=False), low_precision_config=None)
+        normalize_distributed_setup_overrides(setup, SimpleNamespace(plan_overrides=[rule]))
+        self.assertEqual(len(setup.method_replacements), 1)
+        self.assertEqual(setup.plan_overrides, {})
+
+        model = nn.Module()
+        model.gate = _RouteGate()
+        dims = SimpleNamespace(tp_size=1, cp_size=1, ep_size=1, pp_size=1, sequence_parallel=False)
+        records = _apply_generation_replacements(
+            SimpleNamespace(), SimpleNamespace(plan_overrides=[rule]), model,
+            SimpleNamespace(parallel_dims=dims),
+        )
+        self.assertEqual(records, [])
+        self.assertNotIn("route", vars(model.gate))
+        apply_method_replacements(model, setup.method_replacements)
+        self.assertTrue(torch.equal(model.gate(torch.ones(1)), torch.full((1,), 2.0)))
+
+    def test_method_replacement_rejects_missing_and_wrong_targets(self):
+        """Fail before patching on invalid suffixes, absent methods, and modules."""
+        with self.assertRaisesRegex(ValueError, "literal method name"):
+            PlanOverride(match="*.gate.*", replace=ReplaceAction(
+                kind="method", implementation=f"{__name__}._route_factory"))
+        with self.assertRaisesRegex(TypeError, "@method_replacement"):
+            PlanOverride(match="*.gate.route", replace=ReplaceAction(
+                kind="method", implementation=f"{__name__}._forward_factory"))
+        with self.assertRaisesRegex(ValueError, "boundary contract"):
+            PlanOverride(match="*.gate.route", region_dispatch=False, replace=ReplaceAction(
+                kind="method", implementation=f"{__name__}._route_factory"))
+        specs = (MethodReplacementSpec("*.gate.route", _route_factory),)
+        with self.assertRaisesRegex(ValueError, "without a callable"):
+            apply_method_replacements(nn.Sequential(nn.ModuleDict({"gate": nn.Linear(2, 2)})), specs)
+        with self.assertRaisesRegex(ValueError, "matched no module"):
+            apply_method_replacements(nn.Sequential(_RouteGate()), specs)
+
+    def test_method_replacement_rejects_child_module_and_conflict(self):
+        """A callable child module cannot be mistaken for an ordinary method."""
+        model = nn.Module()
+        model.gate = _RouteGate()
+        model.gate.child = nn.Linear(2, 2)
+        with self.assertRaisesRegex(TypeError, "registered module"):
+            apply_method_replacements(model, (MethodReplacementSpec("gate.child", _route_factory),))
+        with self.assertRaisesRegex(ValueError, "conflict"):
+            apply_method_replacements(model, (
+                MethodReplacementSpec("gate.route", _route_factory),
+                MethodReplacementSpec("*.route", _route_factory),
+            ))
+
+    def test_method_replacement_patches_shared_module_once(self):
+        """Alias paths share one module instance and one replacement factory call."""
+        calls = []
+
+        @method_replacement
+        def factory(*, module, method_fqn, original_method, context):
+            del module, context
+            calls.append(method_fqn)
+            return original_method
+
+        shared = _RouteGate()
+        model = nn.Module()
+        model.left = shared
+        model.right = shared
+        apply_method_replacements(model, (MethodReplacementSpec("*.route", factory),))
+        self.assertEqual(calls, ["left.route"])
+        self.assertIs(model.left, model.right)
+
+    def test_new_action_rejects_invalid_combinations(self):
+        """Kind-specific fields and old/new conflicts fail during config loading."""
+        invalid = [
+            ({"kind": "module", "source_type": "", "implementation": f"{__name__}._replace_linear"},
+             "non-empty"),
+            ({"kind": "module", "exact_type": True, "implementation": f"{__name__}._replace_linear"},
+             "requires replace.source_type"),
+            ({"kind": "method", "source_type": "torch.nn.Linear",
+              "implementation": f"{__name__}._forward_factory"}, "only valid"),
+            ({"kind": "method", "implementation": f"{__name__}._replacement"}, "@forward_replacement"),
+        ]
+        for action, message in invalid:
+            with self.subTest(message=message), self.assertRaisesRegex((ValueError, TypeError), message):
+                resolve_config(_root([{"match": "x.forward", "replace": action}]))
+        with self.assertRaisesRegex(ValueError, "replace.kind must be 'module' or 'method'"):
+            ReplaceAction(kind="forward", implementation=f"{__name__}._forward_factory")
+        with self.assertRaisesRegex(ConfigResolutionError, "replace.kind.*module.*method"):
+            resolve_config(_root([{"match": "x.forward", "replace": {
+                "kind": "forward", "implementation": f"{__name__}._forward_factory"}}]))
+        with self.assertRaisesRegex(ValueError, "cannot be mixed"):
+            PlanOverride(match="x", module_type="torch.nn.Linear", replace=ReplaceAction(
+                kind="module", source_type="torch.nn.Linear", implementation=f"{__name__}._replace_linear"))
+        with self.assertRaisesRegex(ValueError, "region_dispatch"):
+            PlanOverride(match="x", region_dispatch=False, replace=ReplaceAction(
+                kind="module", source_type="torch.nn.Linear", implementation=f"{__name__}._replace_linear"))
+        with self.assertRaisesRegex(ConfigResolutionError, "replace.implementation._target_.*could not be imported"):
+            resolve_config(_root([{
+                "match": "x.forward",
+                "replace": {"kind": "method", "implementation": {"_target_": "missing_hp_package.factory"}},
+            }]))
+        with self.assertRaisesRegex(ConfigResolutionError, "unknown configuration fields.*target"):
+            resolve_config(_root([{
+                "match": "x.forward",
+                "replace": {"kind": "method", "target": f"{__name__}._forward_factory"},
+            }]))
 
     def test_when_gating_rejected(self):
         """When-gating family: replacements reject any 'when' clause."""

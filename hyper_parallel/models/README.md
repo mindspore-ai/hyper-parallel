@@ -6,6 +6,7 @@ HyperParallel 模型训练提供由 YAML 配置驱动的文本与多模态 Train
 
 - 安装要求、源码构建参数、CANN 与通信环境配置见 [安装指南](../../docs/installation.md)。
 - 训练启动方式见 [项目快速开始](../../README.md#快速开始)。
+- 接入新的 HF 或自定义模型，先看 [新模型接入指南](../../docs/guide/trainer/new_model_integration.md)，再按 [模型接入验证指南](../../docs/guide/trainer/model_integration_validation.md)完成精度与恢复验收。
 
 ## TrainerConfig 配置
 

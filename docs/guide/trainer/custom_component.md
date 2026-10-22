@@ -34,22 +34,21 @@ torchrun --standalone --nproc_per_node=8 \
 
 ## 2. 替换模型子模块或增加并行计划
 
-模块替换通过 `plan_overrides.replace_module` 配置；完整字段见 [`plan_overrides` 定义](../../../hyper_parallel/trainer/config/parallelism.py#L78)。
+模块替换通过 `plan_overrides.replace` 配置；完整字段见 [`PlanOverride` 定义](../../../hyper_parallel/trainer/config/parallelism.py)。
 
 ```yaml
 plan_overrides:
   - match: "*.language_model.layers.*.input_layernorm"
-    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextRMSNorm
-    exact_type: true
-    replace_module:
-      _target_: my_project.modules.replace_rms_norm
+    replace:
+      kind: module
+      implementation: my_project.modules.replace_rms_norm
 ```
 
 YAML 解析结果为 `list[PlanOverride]`；Trainer 侧先归一化为替换规则（§15.2.6），再由 [`_apply_module_replacement_actions()`](../../../hyper_parallel/models/replacement.py) 应用。接入必须满足：
 
-1. `module_type` 指向可导入的 `torch.nn.Module` 类型；`match` 中的每个路径模式至少命中一个模型子模块，且命中模块符合该类型。
-2. `replace_module._target_` 指向训练环境可导入的自定义函数或类。
-3. target 使用 `@module_replacement`，声明 `module`、`module_fqn`、`context` 三个参数，并返回 `torch.nn.Module`。
+1. `match` 中的每个路径模式至少命中一个模型子模块；框架从命中的对象取得实际类型。只有需要额外断言预期类型时才填写 `replace.source_type`，此时可配合 `exact_type: true`。
+2. `replace.implementation` 指向训练环境可导入的替换工厂；静态参数可用 `{_target_: 路径, ...}` 映射填写。
+3. 工厂使用 `@module_replacement`，声明 `module`、`module_fqn`、`context` 三个参数，并返回 `torch.nn.Module`。
 
 完整实现可参考 [`RMSNorm`](../../../hyper_parallel/components/modules/rms_norm.py#L31-L82)。
 

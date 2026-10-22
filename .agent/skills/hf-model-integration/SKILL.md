@@ -97,7 +97,7 @@ lazily created optimizer state expose one consistent logical global layout.
    invariant ledger with released/cropped values and dependencies. A shallow layer crop is a
    smoke-only exception and cannot claim all-structure coverage when it removes
    or renumbers a distinct layer role.
-2. Write a schema-v1 local-only integration manifest and run:
+2. Write a schema-v2 local-only integration manifest and run:
 
    ```bash
    python -m hyper_parallel.tools.model_integration inspect --manifest <manifest>
@@ -180,9 +180,16 @@ lazily created optimizer state expose one consistent logical global layout.
    Preserve forward/state-dict contracts or declare explicit weight transforms.
    Activate optional replacements and CP/EP behavior through recipe `plan_overrides`.
    Before adding a model or feature-specific replacement hook to a generic builder,
-   check whether an existing `replace_module` entry can select the source module
-   by FQN glob and `module_type`. Keep rule selection in the recipe; put a
-   factory in the model adapter only when model semantics require it. Do not
+   check whether a `replace.kind: module` rule can select the source module
+   by FQN glob. Use `replace.implementation` for the model-owned factory;
+   omit `replace.source_type` unless an explicit expected-type guard is needed.
+   CP/EP forward changes use `replace.kind: method` with `.forward`
+   at the end of `match` and rule-level `when: cp` or `when: ep`;
+   `replace.kind: forward` is rejected by the parser.
+   `region_dispatch: false` is their default. Other methods use a literal
+   method suffix and an `@method_replacement` factory. Keep rule
+   selection in the recipe; put a factory in the model adapter only when model
+   semantics require it. Do not
    append adapter-owned replacement lists to the generic builder. Test with
    and without the recipe action, including match count and parameter identity.
    Inspect the final replaced model tree: a uniform glob may create boundaries

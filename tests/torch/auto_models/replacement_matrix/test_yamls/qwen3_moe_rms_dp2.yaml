@@ -1,0 +1,21 @@
+# Synthetic Qwen3-MoE module-replacement matrix case; no external assets.
+model:
+  _target_: torch.nn.Identity
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+
+training:
+  backend: hccl
+  global_batch_size: 4
+  micro_batch_size: 2
+  seed: 31415
+
+plan_overrides:
+  - match:
+      - "*.input_layernorm"
+      - "*.post_attention_layernorm"
+      - model.norm
+    replace:
+      kind: module
+      implementation: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_rms_norm

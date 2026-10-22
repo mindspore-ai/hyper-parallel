@@ -48,6 +48,7 @@ class CroppedQwen3MoeOptions:
         codegen: Select the codegen ``gen`` backend for this build.
         codegen_config: Trainer config carrying the codegen settings; forwarded
             so the artifact bundle can be prepared from the config identity.
+        allow_cache_entry_mutation: Permit cache entry mutation for activation checkpointing.
     """
 
     num_hidden_layers: int = 4
@@ -65,6 +66,7 @@ class CroppedQwen3MoeOptions:
     activation_swap: str = "none"
     codegen: bool = False
     codegen_config: Any | None = None
+    allow_cache_entry_mutation: bool = False
 
 
 def _resolve_build_options(
@@ -156,6 +158,7 @@ def build_cropped_qwen3_moe(
         activation_checkpoint=options.activation_checkpoint,
         activation_checkpoint_selection=options.activation_checkpoint_selection,
         swap_inputs=options.swap_inputs,
+        allow_cache_entry_mutation=options.allow_cache_entry_mutation,
         activation_swap=options.activation_swap,
         model_init_dtype=options.model_init_dtype,
         codegen=options.codegen,

@@ -1248,7 +1248,7 @@ def test_preflight_fail_fast(tiny_llama, tiny_hf_native_moe, tiny_moe,
     # cp>1 + attention boundary without inner_wrapper -> fail-fast before apply.
     mesh_cp = _meta_mesh((2,), ("cp",))
     plan = ShardingPlanner().plan(tiny_llama, mesh_cp, cp_size=2)
-    with pytest.raises(ValueError, match="inner_wrapper"):
+    with pytest.raises(ValueError, match="kind: method"):
         apply_sharding_plan(tiny_llama, plan, mesh_cp)
 
     # ── case: cp_with_injection_passes_preflight ─────────────────────────
@@ -1295,7 +1295,7 @@ def test_preflight_fail_fast(tiny_llama, tiny_hf_native_moe, tiny_moe,
     mesh_ep = _meta_mesh((4, 2), ("dp", "tp"))
     plan = ShardingPlanner().plan(
         tiny_hf_native_moe, mesh_ep, tp_size=2, ep_size=2)
-    with pytest.raises(ValueError, match="local_compute_fn"):
+    with pytest.raises(ValueError, match="kind: method"):
         apply_sharding_plan(tiny_hf_native_moe, plan, mesh_ep)
 
     # ── case: ep_with_injection_passes_preflight ─────────────────────────
@@ -1320,5 +1320,5 @@ def test_preflight_fail_fast(tiny_llama, tiny_hf_native_moe, tiny_moe,
     with pytest.raises(ValueError) as exc:
         apply_sharding_plan(tiny_hf_native_moe, plan, mesh_ep)
     msg = str(exc.value)
-    assert "recipes.qwen2moe_ep_compute_fn" in msg, f"case: {case}"
+    assert "kind: method" in msg, f"case: {case}"
     assert "region_dispatch" in msg, f"case: {case}"

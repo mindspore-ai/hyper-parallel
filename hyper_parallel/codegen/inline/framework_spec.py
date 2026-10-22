@@ -338,13 +338,12 @@ def _resolve_replacement_spec(
     Whatever component a family's factory constructs, the spec is derived from
     that factory's own source, so a new family (or a new component inside one)
     needs no codegen declaration.  A factory with no constructor call to sink --
-    or a rule with no ``module_type`` naming the source class it replaces -- has
+    or a record with no matched ``module_type`` naming the source class -- has
     no spec, and the rule is left to the native path.
     """
     del model_type, target
-    # The source class the constructor call replaces: without the rule's
-    # ``module_type`` there is no call site to rewrite, and guessing one would
-    # silently target the wrong class.
+    # The source class comes from the matched meta-model module. Without that
+    # recorded type there is no safe constructor call site to rewrite.
     old_ctor = class_name_of(module_type)
     if not old_ctor:
         return None

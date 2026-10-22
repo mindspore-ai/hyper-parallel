@@ -1,10 +1,20 @@
 # Copyright 2026 Huawei Technologies Co., Ltd
 #
-# Licensed under the Apache License, Version 2.0
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
-"""Compile ``replace_module`` overrides against the generation-time meta model.
+"""Compile module replacement overrides against the generation-time meta model.
 
-The trainer's hf backend applies ``plan_overrides.replace_module`` by
+The trainer's hf backend applies ``plan_overrides.replace.kind=module`` by
 desugaring each entry into a :class:`ModuleReplacementSpec` and running
 ``apply_module_replacements`` on the live model.  Generation must reject the
 same bad rules up front: the manager compiles the spec against the
@@ -19,6 +29,8 @@ trainer to skip its own replacement step.
 from __future__ import annotations
 
 from typing import Any, Sequence
+
+from hyper_parallel.models.replacement import compile_module_replacements
 
 
 # ---------------------------------------------------------------------------
@@ -43,9 +55,9 @@ def compile_overrides_for_meta(
     conflict) is owned by the native :func:`compile_module_replacements`
     itself — the same checks the trainer's hf backend runs — so this wrapper
     keeps no mirrored pre-check; it only re-raises the native
-    :class:`ValueError` with the codegen context prefix.  Every rule reaching
+    configuration error with the codegen context prefix. Every rule reaching
     this module on the codegen path comes from the user's YAML
-    ``plan_overrides.replace_module`` — there is no plan- or internally-derived
+    ``plan_overrides.replace.kind=module`` (or its legacy equivalent) — there is no plan- or internally-derived
     rule source here — so a no-match is a config error (a typo, or a rule
     written for a different architecture) and must fail generation rather than
     silently drop an intended replacement from the artifact.
@@ -64,10 +76,12 @@ def compile_overrides_for_meta(
            "target_config": {...},                # optional YAML Target static args
        }
 
-    The ``factory`` (and ``module_type``) are stored as import paths, not the
-    live objects — the replacement factory is a per-entry closure that cannot
-    be written as a Python literal, and the runtime re-imports the *raw*
-    decoration at those paths to rebuild equal specs.  When the YAML entry
+    The ``factory`` and matched source ``module_type`` are stored as import
+    paths, not live objects. The source type comes from the matched meta-model
+    module, so YAML does not need to declare ``source_type``. The replacement
+    factory is a per-entry closure that cannot be written as a Python literal,
+    and the runtime re-imports the *raw* decoration at those paths to rebuild
+    equal specs. When the YAML entry
     bound extra static args to its replace-module Target, those must ride
     along in ``configs_by_spec`` (keyed by ``id(spec)``) so the runtime can
     re-pre-bind them onto the rebuilt factory instead of dropping to the
@@ -77,8 +91,6 @@ def compile_overrides_for_meta(
         return ()
     if configs_by_spec is None:
         configs_by_spec = {}
-    from hyper_parallel.models.replacement import compile_module_replacements
-
     paths_by_spec = {
         id(spec): path
         for spec, path in zip(specs, factory_paths)
@@ -87,9 +99,9 @@ def compile_overrides_for_meta(
 
     try:
         plan = compile_module_replacements(meta_model, specs)
-    except ValueError as exc:
-        raise ValueError(
-            f"codegen: plan_overrides replace_module: {exc}"
+    except (ValueError, TypeError) as exc:
+        raise type(exc)(
+            f"codegen: plan_overrides replace.kind=module: {exc}"
         ) from exc
     return tuple(
         _record_for_target(target, paths_by_spec, configs_by_spec)
@@ -115,7 +127,7 @@ def _record_for_target(
         "match": list(spec.match),
         "fqn": target.module_fqns[0],
         "fqns": list(target.module_fqns),
-        "module_type": _type_path(spec.module_type),
+        "module_type": _type_path(type(target.source)),
         "factory": factory_path,
         "exact_type": bool(spec.exact_type),
     }

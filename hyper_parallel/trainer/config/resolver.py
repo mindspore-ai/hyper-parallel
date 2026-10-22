@@ -462,6 +462,16 @@ def _resolve_union(node: object, annotation: object, *, path: str) -> object:
     non_none_members = [
         member for member in get_args(annotation) if member is not _NONE_TYPE
     ]
+    if isinstance(node, Mapping) and "_target_" in node:
+        target_member = next(
+            (member for member in non_none_members
+             if get_origin(member) is Target or member is Target),
+            None,
+        )
+        if target_member is not None:
+            # A _target_ mapping is explicit; preserve its import/signature error
+            # instead of masking it behind a generic union mismatch.
+            return resolve_component(node, annotation=target_member, path=path)
     if len(non_none_members) == 1:
         # Single-member union (e.g. Optional[Target]): resolve directly so the
         # member's specific error (e.g. an unexpected target argument) reaches

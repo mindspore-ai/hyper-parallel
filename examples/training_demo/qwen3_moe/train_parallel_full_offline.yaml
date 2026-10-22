@@ -48,29 +48,33 @@ plan_overrides:
       - "*.input_layernorm"
       - "*.post_attention_layernorm"
       - model.norm
-    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
-    replace_module:
-      _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_rms_norm
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_rms_norm
   - match: "*.self_attn"
-    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
-    replace_module:
-      _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_flash_attention
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_flash_attention
   - match: "*.mlp.experts"
-    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts
-    replace_module:
-      _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_grouped_experts
-  - match: "*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_grouped_experts
+  - match: "*.self_attn.forward"
     when: cp
-    region_dispatch: false
-    inner_target: self
-    inner_wrapper:
-      _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper
-  - match: "*.mlp"
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper
+  - match: "*.mlp.forward"
     when: ep
-    region_dispatch: false
-    local_compute_fn:
-      _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
-      use_grouped_gemm: true
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
+        use_grouped_gemm: true
 
 mixed_precision:
   enabled: false

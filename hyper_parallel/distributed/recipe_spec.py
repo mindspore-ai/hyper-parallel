@@ -21,7 +21,8 @@ Contains the user-visible plan/spec data model (05 §3.1/§3.2 canonical):
 - ``PlacementMismatchError``: error for placement declarations inconsistent with DTensor propagation;
 - ``resolve_placements`` / ``parse_placement`` / ``parse_named_placement`` / ``_normalize_out_fields``:
   placement utilities;
-- the injection DSL (``local_compute`` / ``inner_wrapper`` decorators,
+- the injection DSL (``forward_replacement`` / ``local_compute`` /
+  ``inner_wrapper`` decorators,
   ``InjectionMeta``, ``require_injection_meta``): the recipe-side input
   contract of the explicit injection mechanism.
 
@@ -623,6 +624,19 @@ def _make_decorator(kind: str) -> Callable[[Callable[..., Any]], Callable[..., A
 
 local_compute = _make_decorator(LOCAL_COMPUTE)
 inner_wrapper = _make_decorator(INNER_WRAPPER)
+
+
+def forward_replacement(factory: Callable[..., Callable[..., Any]]) -> Callable[..., Callable[..., Any]]:
+    """Declare a forward factory hosted by the local-region executor.
+
+    Args:
+        factory: Called once at plan application with the mesh family; returns
+            an unbound compute function whose first argument is the module.
+
+    Returns:
+        The decorated factory with existing local-compute metadata.
+    """
+    return local_compute(factory)
 
 
 def require_injection_meta(fn: Callable[..., Any], kind: str, *, source: str) -> InjectionMeta:

@@ -183,6 +183,9 @@ def _canonicalize_override(entry: Any) -> dict[str, Any]:
         value = getattr(entry, attr, None)
         if value is not None:
             result[attr] = _canonicalize_value(value)
+    replace = getattr(entry, "replace", None)
+    if replace is not None and replace.kind == "method" and entry.match.rpartition(".")[2] != "forward":
+        result["replace"] = entry.to_dict()["replace"]
     for attr in ("params", "in_src", "in_dst", "out_src", "out_dst"):
         value = getattr(entry, attr, None)
         if value is not None:

@@ -19,7 +19,7 @@ recipe input contract (``ModuleShardingSpec`` / ``NamedPlacement`` /
 ``MeshAxisName`` / placement DSL parsers) and the public template type
 ``ShardingTemplate``, plan construction (``ShardingPlanner`` /
 ``validate_model_compatibility``) and the injection decorators
-(``local_compute`` / ``inner_wrapper``) and plan application
+(``forward_replacement`` / ``local_compute`` / ``inner_wrapper``) and plan application
 (``apply_sharding_plan``).
 """
 
@@ -40,6 +40,7 @@ from hyper_parallel.distributed.recipe_spec import (
     ModuleShardingSpec,
     NamedPlacement,
     PlacementMismatchError,
+    forward_replacement,
     inner_wrapper,
     local_compute,
     parse_named_placement,
@@ -77,6 +78,7 @@ __all__ = [
     "ShardingPlan",
     "ShardingPlanner",
     "ShardingTemplate",
+    "forward_replacement",
     "inner_wrapper",
     "local_compute",
     "parse_named_placement",

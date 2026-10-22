@@ -30,25 +30,26 @@ CP rank，并保持 CP mesh 中的 rank 顺序与全局 token 顺序一致。
 
 ```yaml
 plan_overrides:
-  - match: "*.self_attn"
+  - match: "*.self_attn.forward"
     when: cp
-    region_dispatch: false
-    inner_target: self
-    inner_wrapper:
-      _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
-      backend: triton
-      state_cp_method: grouped_allgather_p2p
-      ulysses_degree: 2
-      allgather_group_size: 2
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
+        backend: triton
+        state_cp_method: grouped_allgather_p2p
+        ulysses_degree: 2
+        allgather_group_size: 2
 ```
 
 `match` 匹配模型 `named_modules()` 给出的模块完整路径（FQN），采用大小写敏感的 glob，
-不是模块类型判断，也不是正则表达式。`*` 可以跨越路径中的点，因此 `"*.self_attn"` 会匹配
-`model.layers.0.self_attn` 和 `model.layers.12.self_attn`，但不匹配根级的 `self_attn`；
-后者应写 `match: "self_attn"`。模型同时包含 KDA 和其他注意力、且都使用 `self_attn` 名称时，
+不是模块类型判断，也不是正则表达式。方法规则的末段 `forward` 是字面方法名，
+前面的宿主模块路径按 glob 匹配。`*` 可以跨越路径中的点，因此 `"*.self_attn.forward"` 会匹配
+`model.layers.0.self_attn.forward` 和 `model.layers.12.self_attn.forward`，但不匹配根级的 `self_attn.forward`；
+后者应写 `match: "self_attn.forward"`。模型同时包含 KDA 和其他注意力、且都使用 `self_attn` 名称时，
 应为实际 KDA 路径配置精确匹配或更窄的 glob，不能用该通配符自动识别 KDA。
-`when: cp` 表示仅在 CP 大于1时启用；`inner_target: self` 作用于匹配模块本身，
-`region_dispatch: false` 让 wrapper 执行其本地张量路径。
+`when: cp` 表示仅在 CP 大于1时启用；`kind: method` 替换匹配模块自身的 forward，
+并默认使用 `region_dispatch: false`，让 wrapper 执行其本地张量路径。
 
 上例在 CP8 下形成 U2、状态 CP4、组内 AG2 和两个组 owner 的 P2P 链。
 CP 总大小由训练的并行配置决定。`state_cp_method` 只选择状态 CP 方式，完整方案还需结合

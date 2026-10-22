@@ -1,0 +1,67 @@
+# Synthetic Qwen2-MoE 8-rank replacement-composition case; no external assets.
+model:
+  _target_: torch.nn.Identity
+
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  fp32_main_params: true
+  muon_config:
+    muon_lr: 0.001
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_ns_steps: 3
+  adamw_config:
+    adamw_lr: 0.0001
+    adamw_weight_decay: 0.0
+
+model_init_dtype: bfloat16
+
+training:
+  backend: hccl
+  global_batch_size: 8
+  micro_batch_size: 2
+  seed: 31415
+
+accelerator:
+  tp_size: 1
+  cp_size: 2
+  ep_size: 2
+  pp_size: 1
+  sequence_parallel: true
+  loss_parallel: false
+
+plan_overrides:
+  - match:
+      - "*.input_layernorm"
+      - "*.post_attention_layernorm"
+      - model.norm
+    replace:
+      kind: module
+      implementation: tests.torch.auto_models.replacement_matrix.factories.replace_rms_norm
+  - match: "*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper
+  - match: "*.mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation: hyper_parallel.distributed.expert_parallel.recipes.qwen2moe_ep_compute_fn
+
+fsdp_config:
+  dp_shard_size: 2
+  edp_shard_size: 2
+  replicate_params:
+    - model.layers.0.mlp.shared_expert_gate.weight
+    - model.layers.1.mlp.shared_expert_gate.weight
+    - model.layers.2.mlp.shared_expert_gate.weight
+    - model.layers.3.mlp.shared_expert_gate.weight
+  reshard_after_forward: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: true

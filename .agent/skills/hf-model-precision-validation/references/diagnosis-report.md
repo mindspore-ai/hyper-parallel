@@ -58,8 +58,8 @@ supported. Report the exact module/operator and the affected full-model Validate
 scope as unsupported. Production and native module parity remain valid evidence,
 but neither may be relabeled as Validate operator coverage.
 
-`region_dispatch: false` remains available for an explicit communication/custom
-compute injection (`local_compute_fn` or `inner_wrapper`). Its boundary contract
+An explicit communication/custom compute injection uses `replace.kind: method` with a `.forward` match
+and defaults to `region_dispatch: false`. Its boundary contract
 may be compared across Production and Validate, but its internal operators remain
 outside dispatch coverage.
 

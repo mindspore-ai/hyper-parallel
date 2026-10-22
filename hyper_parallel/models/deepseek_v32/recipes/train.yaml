@@ -37,26 +37,29 @@ plan_overrides:
       - "*.input_layernorm"
       - "*.post_attention_layernorm"
       - model.norm
-    module_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32RMSNorm
-    replace_module:
-      _target_: >-
-        hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_rms_norm
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_rms_norm
   - match: "*.self_attn"
-    module_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32Attention
-    replace_module:
-      _target_: >-
-        hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
   - match: "*.mlp.experts"
-    module_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32Experts
-    replace_module:
-      _target_: >-
-        hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_grouped_experts
-  - match: "*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_grouped_experts
+  - match: "*.self_attn.forward"
     when: cp
-    region_dispatch: false
-    inner_target: self
-    inner_wrapper:
-      _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
 
 mixed_precision:
   enabled: false

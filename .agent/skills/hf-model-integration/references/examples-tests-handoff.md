@@ -50,6 +50,18 @@ finite scalar loss alone is only a functional smoke.
 
 ## Focused Tests
 
+New model recipes must declare replacement with `match` and `replace`:
+`kind: module` needs only `implementation`; add `source_type` only when an
+explicit expected-type guard is needed. CP/EP forward changes use
+`kind: method`, a `.forward` match suffix, and rule-level `when`.
+`implementation` is the replacement factory,
+not the source module. Omit `region_dispatch` for a new `.forward` method action when
+local boundary validation is intended; its default is `false`. `replace.kind` accepts
+only `module` and `method`; a method rule must name the literal method in `match`.
+Do not use the removed `kind: forward` spelling in recipes or examples. Keep old-field
+recipes only as separate compatibility fixtures, and run them to the same
+functional acceptance point instead of checking parsing alone.
+
 Cover the applicable contracts:
 
 - every newly added framework extension with provider-present and provider-absent
@@ -59,6 +71,10 @@ Cover the applicable contracts:
   family import, model-type branch, or family-specific FQN match;
 - registry lookup and side-effect-free lazy import;
 - replacement matching and required-pattern failure;
+- new module and forward actions in native and codegen paths, including
+  omitted `source_type` with type discovery from the matched module, optional
+  `source_type` mismatch, `when` filtering, default `region_dispatch: false`,
+  explicit dispatch-through, backward gradients, and legacy recipe compatibility;
 - forward/state-dict compatibility and weight-transform round trip;
 - changed-module forward/backward against the authoritative HF or native
   implementation on identical weights and fixed tensors;
@@ -99,7 +115,7 @@ top-level Torch, MindSpore, and HyperParallel imports.
 
 ## Handoff Manifest
 
-Write the framework-generated schema-v1 `integration_handoff.yaml`. Its stable
+Write the framework-generated schema-v2 `integration_handoff.yaml`. Its stable
 fields are `schema_version`, `family`, `manifest`, `structure_findings`,
 `module_parity`, `checkpoint_coverage`, and `status: PASS`. Before handoff, resolve
 every referenced path relative to the handoff, parse each artifact, and require
