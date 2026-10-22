@@ -177,28 +177,19 @@ class HSDPModule:
                                               source_shard_infos=source_shard_infos,
                                               )
 
-    def set_requires_gradient_sync(self, requires_grad_sync):
-        r"""
-            set requires grad sync flag.
-            Args:
-                requires_grad_sync(bool): requires_grad_sync is used to control gradient sync process.
-            Raises:
-                ValueError: If `requires_grad_sync` is not bool.
-        """
+    def set_requires_gradient_sync(self, requires_grad_sync: bool, *, recurse: bool = True) -> None:
+        """Set gradient synchronization for this module and optionally its descendants."""
         if not isinstance(requires_grad_sync, bool):
-            raise ValueError(f"requires_grad_sync must be bool but got {requires_grad_sync}.")
-        if not hasattr(self, "hsdp_scheduler"):
-            raise ValueError("call hsdp interface first.")
-
-        for _, module in self.named_modules():
+            raise ValueError("requires_grad_sync must be bool")
+        if not isinstance(recurse, bool):
+            raise ValueError("recurse must be bool")
+        for module in self.modules() if recurse else (self,):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_requires_grad_sync(requires_grad_sync)
 
-    def zero_grad(self):
-        """zero accumunication grads"""
-        if not hasattr(self, "hsdp_scheduler"):
-            raise ValueError("call hsdp interface first.")
-        return super().zero_grad()
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        """Clear parameter gradients according to set_to_none."""
+        super().zero_grad(set_to_none=set_to_none)
 
     def set_modules_to_forward_prefetch(self, modules):
         """set forward prefetch module list to prefetch all gather for unsharded parameters"""
@@ -350,50 +341,32 @@ class HSDPModule:
                 module.hsdp_scheduler.reset_iter_state()
 
     def set_requires_all_reduce(self, requires_all_reduce: bool, *, recurse: bool = True) -> None:
-        """set requires_all_reduce flag"""
+        """Set all-reduce for this module and optionally its descendants."""
         if not isinstance(requires_all_reduce, bool):
-            raise ValueError(
-                f"requires_all_reduce should be a bool, got {type(requires_all_reduce)}"
-            )
-        if not recurse:
-            raise NotImplementedError(
-                "Currently impl is equal to recurse=True, "
-                "need support module_param mapping."
-            )
-        self_module = cast(nn.Module, self)
-        for _, module in self_module.named_modules():
+            raise ValueError("requires_all_reduce must be bool")
+        if not isinstance(recurse, bool):
+            raise ValueError("recurse must be bool")
+        for module in self.modules() if recurse else (self,):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_requires_all_reduce(requires_all_reduce)
 
     def set_reshard_after_forward(self, reshard_after_forward: bool, recurse: bool = True) -> None:
-        """set reshard_after_forward flag"""
+        """Set forward resharding for this module and optionally its descendants."""
         if not isinstance(reshard_after_forward, bool):
-            raise ValueError(
-                f"reshard_after_forward should be a bool, got {type(reshard_after_forward)}"
-            )
-        if not recurse:
-            raise NotImplementedError(
-                "Currently impl is equal to recurse=True, "
-                "need support module_param mapping."
-            )
-        self_module = cast(nn.Module, self)
-        for _, module in self_module.named_modules():
+            raise ValueError("reshard_after_forward must be bool")
+        if not isinstance(recurse, bool):
+            raise ValueError("recurse must be bool")
+        for module in self.modules() if recurse else (self,):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_forward(reshard_after_forward)
 
     def set_reshard_after_backward(self, reshard_after_backward: bool, recurse: bool = True) -> None:
-        """set reshard_after_backward flag"""
+        """Set backward resharding for this module and optionally its descendants."""
         if not isinstance(reshard_after_backward, bool):
-            raise ValueError(
-                f"reshard_after_backward should be a bool, got {type(reshard_after_backward)}"
-            )
-        if not recurse:
-            raise NotImplementedError(
-                "Currently impl is equal to recurse=True, "
-                "need support module_param mapping."
-            )
-        self_module = cast(nn.Module, self)
-        for _, module in self_module.named_modules():
+            raise ValueError("reshard_after_backward must be bool")
+        if not isinstance(recurse, bool):
+            raise ValueError("recurse must be bool")
+        for module in self.modules() if recurse else (self,):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_backward(reshard_after_backward)
 
