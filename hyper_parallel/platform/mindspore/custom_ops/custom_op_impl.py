@@ -20,12 +20,15 @@ from typing import NamedTuple, Optional
 
 import mindspore as ms # pylint: disable=C0415
 
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.shard.dfunction import DFunction
 
 
 _CC_DIR = os.path.dirname(os.path.abspath(__file__))
 _MS_EXTENSION_NAME = "hyper_parallel_custom_ops_ms"
 _BUILD_LIB = os.path.join(_CC_DIR, "build", "lib")
+#: Default ``pre_tokens`` / ``next_tokens`` of the lightning-indexer family (no window limit).
+_MAX_INT64 = 9223372036854775807
 
 if _BUILD_LIB not in sys.path:
     sys.path.insert(0, _BUILD_LIB)
@@ -50,12 +53,90 @@ _CUSTOM_OP_SOURCES = [
     os.path.join(_CC_DIR, "chunk_kda_bwd.cc"),
 ]
 
+_ENHANCE_INDEXER_SOURCE = os.path.join(_CC_DIR, "lightning_indexer_enhance.cc")
+_ENHANCE_ACLNN_HEADER = "aclnn_lightning_indexer_enhance.h"
+
+
+def _ascend_roots():
+    """Candidate ``ASCEND_HOME`` roots, most specific first."""
+    roots = [os.environ.get("ASCEND_HOME_PATH", ""), "/usr/local/Ascend/ascend-toolkit/latest"]
+    return [root for root in roots if root and os.path.isdir(root)]
+
+
+def _opp_roots():
+    """Candidate ``opp`` roots, honoring a custom ``--install-path`` via ``ASCEND_OPP_PATH``."""
+    roots = []
+    opp_path = os.environ.get("ASCEND_OPP_PATH", "")
+    if opp_path and os.path.isdir(opp_path):
+        roots.append(opp_path)
+    roots += [os.path.join(root, "opp") for root in _ascend_roots()]
+    return [root for root in roots if os.path.isdir(root)]
+
+
+def aclnn_include_dirs():
+    """Include directories that may hold both official and custom-package aclnn headers.
+
+    Custom packages install flat into ``opp/vendors/<vendor>/op_api/include`` (no ``aclnnop``
+    sub-directory), while built-in installs use ``.../op_api/include/aclnnop``; ``include``
+    itself covers the toolkit-wide layout.
+    """
+    dirs = []
+    for opp_root in _opp_roots():
+        vendors = os.path.join(opp_root, "vendors")
+        if not os.path.isdir(vendors):
+            continue
+        for vendor in sorted(os.listdir(vendors)):
+            include_dir = os.path.join(vendors, vendor, "op_api", "include")
+            if os.path.isdir(include_dir):
+                dirs.append(include_dir)
+    dirs += [os.path.join(root, "include") for root in _ascend_roots()]
+    return dirs
+
+
+def _vendor_aclnn_include_dirs():
+    """Custom-package aclnn include directories only (what the JIT build must be told about)."""
+    toolkit_dirs = {os.path.join(root, "include") for root in _ascend_roots()}
+    return [include_dir for include_dir in aclnn_include_dirs() if include_dir not in toolkit_dirs]
+
+
+def _enhance_header_candidates():
+    """Every path ``aclnn_lightning_indexer_enhance.h`` may occupy on this host."""
+    for include_dir in aclnn_include_dirs():
+        yield os.path.join(include_dir, _ENHANCE_ACLNN_HEADER)
+        yield os.path.join(include_dir, "aclnnop", _ENHANCE_ACLNN_HEADER)
+
+
+def enhance_indexer_available():
+    """Whether the enhanced indexer kernel can be compiled here.
+
+    ``aclnnLightningIndexerEnhance`` ships in the omni-ops **CANN** custom-op package (the pip
+    wheel only carries torch bindings), and its aclnn header is the single source of truth for
+    compiling ``lightning_indexer_enhance.cc``: compiling without it can only fail the whole
+    extension build, so a host that never installs the package keeps building exactly the
+    sources it always did.
+    """
+    return any(os.path.exists(candidate) for candidate in _enhance_header_candidates())
+
+
+def _vendor_aclnn_include_flags():
+    """Include flags for CANN custom-op vendors' aclnn headers; "" when none is installed."""
+    return " ".join("-I" + include_dir for include_dir in _vendor_aclnn_include_dirs())
+
+
+if enhance_indexer_available():
+    _CUSTOM_OP_SOURCES.append(_ENHANCE_INDEXER_SOURCE)
+
 
 def _build_custom_ops():
+    builder_kwargs = {}
+    include_flags = _vendor_aclnn_include_flags()
+    if include_flags:
+        builder_kwargs["cflags"] = include_flags
     return ms.ops.CustomOpBuilder(
         _MS_EXTENSION_NAME,
         _CUSTOM_OP_SOURCES,
         backend="Ascend",
+        **builder_kwargs,
     ).load()
 
 
@@ -65,9 +146,32 @@ except ImportError:
     # Source-tree development: .so not pre-built; JIT-compile from local .cc files.
     _custom_ops = _build_custom_ops()
 else:
-    # Rebuild stale source-tree extensions that predate newly added symbols.
+    # Rebuild stale source-tree extensions that predate newly added symbols. This follows the
+    # project convention (probe one new symbol, let the import path rebuild); a large job can
+    # set HP_CUSTOM_OPS_NO_AUTO_REBUILD=1 and rebuild once beforehand instead, because hundreds
+    # of ranks queueing on one shared build lock turns a slow build into an apparent hang.
     if not hasattr(_custom_ops, "npu_mhc_pre_clamp_sinkhorn"):
         _custom_ops = _build_custom_ops()
+    elif (enhance_indexer_available()
+          and not hasattr(_custom_ops, "npu_lightning_indexer_enhance")
+          and os.environ.get("HP_CUSTOM_OPS_NO_AUTO_REBUILD", "0") != "1"):
+        _custom_ops = _build_custom_ops()
+
+
+def rebuild_custom_ops():
+    """Rebuild the custom-op extension in this process and adopt it.
+
+    The import path already rebuilds when a probed symbol is missing, so this is for the cases
+    where that is undesirable: a job with hundreds of ranks must not have all of them queue on
+    one shared build lock, so it rebuilds once here (with ``HP_CUSTOM_OPS_NO_AUTO_REBUILD=1``
+    suppressing the per-rank attempt) and starts afterwards.
+
+    Returns:
+        module: The freshly built extension module.
+    """
+    global _custom_ops
+    _custom_ops = _build_custom_ops()
+    return _custom_ops
 
 
 def _ensure_contiguous(*tensors):
@@ -560,6 +664,98 @@ class NpuLightningIndexerDFunction(DFunction):  # pylint: disable=W0221
     def backward(ctx, *grad_outputs):
         """No-op backward — indexer gradients come from kl_loss_grad."""
         return (None,) * 12
+
+
+class NpuLightningIndexerEnhanceDFunction(DFunction):  # pylint: disable=W0221
+    """DFunction wrapper for npu_lightning_indexer_enhance.
+
+    Same call convention as the MindSpore built-in ``ops.lightning_indexer`` so that
+    ``dsa_cp_fold.fold_lightning_indexer`` can drive it block by block, plus the two
+    attributes the enhanced kernel adds. Forward-only, like ``NpuLightningIndexerDFunction``:
+    indexer gradients come from the network's explicit ``sparse_lightning_indexer_kl_loss_grad``.
+
+    ``return_value`` is expected to stay ``False`` on the DSA training path: the
+    Cube-fills-Vector fast template needs it (the kernel then casts ``weights`` to fp32 on
+    its own), and the produced ``sparse_values`` has no consumer on that path.
+    """
+
+    _op_name = "npu_lightning_indexer_enhance"
+
+    #: Names ``forward`` takes after ``ctx, query, key, weights``, in positional order, with the
+    #: defaults they carry there. Used to bind keyword calls back to positional ones.
+    _KWARG_ORDER = (
+        ("actual_seq_lengths_query", None), ("actual_seq_lengths_key", None), ("block_table", None),
+        ("layout_query", "BSND"), ("layout_key", "BSND"), ("sparse_count", 2048),
+        ("sparse_mode", 3), ("pre_tokens", _MAX_INT64), ("next_tokens", _MAX_INT64),
+        ("return_value", False), ("sparse_block_size", 1), ("sparse_block_mode", 0),
+    )
+
+    @classmethod
+    def apply(cls, *args, **kwargs):
+        """Bind keyword arguments positionally before entering MindSpore autograd.
+
+        ``mindspore.common._Function.apply`` accepts no keyword arguments, while both the DSA
+        context-parallel fold wrapper and the public API hand these arguments over by name.
+        DTensor calls keep their original shape so ``_OP_DISPATCHER`` still normalizes them.
+
+        Args:
+            *args: ``query``, ``key``, ``weights`` followed by any positional tail.
+            **kwargs: The remaining ``forward`` arguments by name.
+
+        Returns:
+            object: Whatever ``DFunction.apply`` returns.
+        """
+        if kwargs and not any(isinstance(arg, DTensor) for arg in args):
+            given = max(len(args) - 3, 0)
+            args = list(args) + [kwargs[name] if name in kwargs else default
+                                 for name, default in cls._KWARG_ORDER[given:]]
+            kwargs = {}
+        return super().apply(*args, **kwargs)
+
+    @staticmethod
+    def forward(ctx, query, key, weights, actual_seq_lengths_query=None, actual_seq_lengths_key=None,
+                block_table=None, layout_query="BSND", layout_key="BSND", sparse_count=2048,
+                sparse_mode=3, pre_tokens=_MAX_INT64, next_tokens=_MAX_INT64, return_value=False,
+                sparse_block_size=1, sparse_block_mode=0):
+        """Forward pass: call the enhanced top-K kernel.
+
+        Returns:
+            tuple[Tensor, Tensor]: (sparse_indices, sparse_values). ``sparse_values`` is not
+            written by the kernel when ``return_value`` is false and must not be consumed.
+        """
+        kernel = getattr(_custom_ops, "npu_lightning_indexer_enhance", None)
+        if kernel is None:
+            rebuild_hint = (
+                "Drop HP_CUSTOM_OPS_NO_AUTO_REBUILD from the environment so the import path "
+                "rebuilds, or rebuild once in a single process and rerun:\n"
+                "  python -c \"from hyper_parallel.platform.mindspore.custom_ops.custom_op_impl "
+                "import rebuild_custom_ops; rebuild_custom_ops()\""
+            )
+            if not enhance_indexer_available():
+                searched = "; ".join(aclnn_include_dirs()) or "<no aclnn include dir found>"
+                raise RuntimeError(
+                    "npu_lightning_indexer_enhance is unavailable: aclnn_lightning_indexer_enhance.h "
+                    f"is not installed (searched: {searched}). Install the CANN custom-op package "
+                    "built by omni-ops (CANN-omni_training_custom_ops-*.run, which lands in "
+                    "opp/vendors/<vendor>/op_api/include); the pip wheel alone only carries torch "
+                    "bindings and does not provide the aclnn header. " + rebuild_hint
+                )
+            raise RuntimeError(
+                "npu_lightning_indexer_enhance is missing from the built custom-op extension: the "
+                "cached extension predates the kernel. " + rebuild_hint
+            )
+        indices, values = kernel(
+            query, key, weights,
+            actual_seq_lengths_query, actual_seq_lengths_key, block_table,
+            layout_query, layout_key,
+            sparse_count, sparse_mode, pre_tokens, next_tokens,
+            return_value, sparse_block_size, sparse_block_mode)
+        return indices, values
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """No-op backward — indexer gradients come from kl_loss_grad."""
+        return (None,) * 15
 
 
 class NpuSparseFlashMlaDFunction(DFunction):  # pylint: disable=W0221
