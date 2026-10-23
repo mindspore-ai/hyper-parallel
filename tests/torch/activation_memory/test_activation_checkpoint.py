@@ -14,32 +14,46 @@
 # ============================================================================
 """test activation checkpoint"""
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import parallel_run, TorchCase
 from tests.torch.activation_memory import activation_checkpoint as activation_checkpoint_cases
 from tests.torch.activation_memory import checkpoint_cases
 
-ACTIVATION_CHECKPOINT = "activation_checkpoint.py"
+
+def _declared_cases(func):
+    """Return the case list a ``pytest.mark.parametrize`` declared on *func*.
+
+    The worker module keeps its own parametrization, so the launcher follows that
+    list instead of repeating it and drifting from it.
+    """
+    for mark in getattr(func, "pytestmark", ()):
+        if mark.name == "parametrize":
+            return mark.args[1]
+    raise AssertionError(f"{func.__name__} is not parametrized")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_ac_memory_group():
-    """
-    Feature: parallel run case in activation_checkpoint
-    Description:
-        1. test_ac_memory_comparison
-        2. test_checkpoint_wrapper_accepts_func
-        3. test_wrapper_overlap_detection_cases
-        4. test_wrapper_non_overlapping_allowed_cases
-        5. test_rmsnorm_matmul_checkpoint_exclude_memory
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(ACTIVATION_CHECKPOINT, "test_ac_memory_comparison", 12404, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_checkpoint_wrapper_accepts_func", 12405, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_wrapper_overlap_detection_cases", 12406, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_wrapper_non_overlapping_allowed_cases", 12407, 1),
-        TorchCase("checkpoint_exclude_matmul.py", "test_rmsnorm_matmul_checkpoint_exclude_memory", 12408, 1),
-    ])
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_ac_memory_comparison():
+    """Compare peak memory across none/recompute/save/swap/group_swap on one card."""
+    activation_checkpoint_cases.test_ac_memory_comparison()
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_checkpoint_wrapper_accepts_func():
+    """Verify the checkpoint wrapper accepts a plain callable."""
+    activation_checkpoint_cases.test_checkpoint_wrapper_accepts_func()
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_wrapper_overlap_detection_cases():
+    """Overlapping wrapper regions should warn, for every declared overlap case."""
+    for case in _declared_cases(activation_checkpoint_cases.test_wrapper_overlap_detection_cases):
+        activation_checkpoint_cases.test_wrapper_overlap_detection_cases(case)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_wrapper_non_overlapping_allowed_cases():
+    """Non-overlapping wrapper configurations should be allowed, for every declared case."""
+    for case in _declared_cases(activation_checkpoint_cases.test_wrapper_non_overlapping_allowed_cases):
+        activation_checkpoint_cases.test_wrapper_non_overlapping_allowed_cases(case)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
