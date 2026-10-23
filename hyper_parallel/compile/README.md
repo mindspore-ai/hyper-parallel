@@ -40,7 +40,7 @@ pass_config = PassConfig(enable_overlap=True)
 ### Layer 3: Pass Pipeline
 
 ```text
-DeadCodeElimination → CanonicalizeGraph → FSDPPass → PpPass → AutoOverlapPass
+DeadCodeElimination → CanonicalizeGraph → FSDPPass → PpPass → AutoOverlapPass → FsdpOverlapPass
 ```
 
 **FSDPPass** (data-parallel, `PassConfig.dp_mode`):
@@ -77,6 +77,60 @@ Disable reshard with `PassConfig(fsdp_reshard_after_forward=False)`.
 - **Placeholder no-op today**: `enable_overlap` is accepted, but the pass
   does not yet reorder `wait_tensor` nodes. Sinking waits past independent
   compute is planned.
+
+**FsdpOverlapPass** (independent FSDP graph controls):
+
+- `fsdp_allgather_prefetch=True` prefetches tagged parameter all-gathers in
+  forward/backward and delays their wait/view DAGs.
+- `fsdp_overlap_grad_reduce=True` independently advances tagged gradient
+  reduce-scatter launches and delays their wait/view DAGs.
+- Both switches default to `True`, independently of the legacy `enable_overlap`
+  flag. The legacy flag keeps selecting `AutoOverlapPass`.
+- `max_in_flight_gb=0.25` retains the previous 256 MiB speculative AG limit.
+  The name and binary-unit conversion follow PyTorch's overlap scheduler;
+  this pass accounts for early AG replicas until first use in each phase,
+  not total device memory or gradient communication buffers. A zero limit
+  disables early AG launches while retaining AG wait/view sinking.
+- Consumer-group lookahead and collective reordering are internal policies.
+  Input, effect, phase,
+  and parameter storage-release constraints still apply. Other collective
+  launch nodes retain their relative order; participating ranks must execute
+  compatible static graphs and configuration.
+- Eager `fsdp_config.forward_prefetch_depth` / `backward_prefetch_depth` still
+  count module prefetch targets. They no longer configure graph consumer groups.
+
+Trainer configuration:
+
+```yaml
+compile:
+  enabled: true
+  use_joint_graph: true
+  fsdp_allgather_prefetch: true
+  fsdp_overlap_grad_reduce: true
+  max_in_flight_gb: 0.25
+```
+
+To disable both FSDP scheduling passes, set both FSDP switches to `false`.
+Migrate `compile.enable_overlap` to the independent switches above and convert
+`fsdp_prefetch_budget_bytes` to `max_in_flight_gb` by dividing by `1024**3`.
+The graph-only depth and collective-reordering fields have been removed from
+YAML and `PassConfig`. Lookahead depths remain mutable variables inside
+`passes/overlap/overlap_param_gather.py`, both defaulting to `1`. Change their
+source values or patch the module before compilation:
+
+```python
+from hyper_parallel.compile.passes.overlap import overlap_param_gather as prefetch_pass
+
+prefetch_pass.fsdp_forward_prefetch_depth = 5
+prefetch_pass.fsdp_backward_prefetch_depth = 2
+```
+
+Use identical values on every participating rank. Patching affects subsequent
+pass runs, not graphs already compiled. Depth counts preceding parameter-consumer
+groups, not eager modules; attention-interval anchors may select earlier compute.
+Zero disables early all-gathers for that phase, including attention-interval
+prefetch, while retaining wait/view sinking. All depths remain subject to the
+same memory budget and dependency constraints.
 
 ### Layer 4: Execution
 

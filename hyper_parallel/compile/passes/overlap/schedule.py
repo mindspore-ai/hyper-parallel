@@ -25,13 +25,15 @@ Optimization Strategies:
 - Allow communication to overlap with independent computation
 """
 
-__all__ = ["AutoOverlapPass"]
+__all__ = ["AutoOverlapPass", "FsdpOverlapPass"]
 
 from typing import Any, List
 from torch import fx
 
 from ...pass_config import PassConfig
 from ..base import GraphPass
+from .overlap_param_gather import overlap_param_gather
+from .overlap_grad_comm import overlap_grad_comm
 
 
 class AutoOverlapPass(GraphPass):
@@ -92,4 +94,32 @@ class AutoOverlapPass(GraphPass):
         nodes up to its first dependent user.
         """
         _ = wait_node  # intentional no-op until the scheduler lands
+        return graph_module
+
+
+class FsdpOverlapPass(GraphPass):
+    """Overlap FSDP parameter gathers and gradient reductions with computation."""
+
+    name = "fsdp_overlap"
+
+    def run(
+        self,
+        graph_module: fx.GraphModule,
+        pass_config: PassConfig,
+        **kwargs: Any,
+    ) -> fx.GraphModule:
+        """Prefetch FSDP launches and sink their complete wait/view DAGs.
+
+        Args:
+            graph_module: Graph transformed by the parallel passes.
+            pass_config: Independent FSDP switches and all-gather memory limit.
+            **kwargs: Pipeline context, unused by this graph-only scheduler.
+
+        Returns:
+            The transformed graph module.
+        """
+        if pass_config.fsdp_allgather_prefetch:
+            graph_module = overlap_param_gather(graph_module, pass_config)
+        if pass_config.fsdp_overlap_grad_reduce:
+            graph_module = overlap_grad_comm(graph_module, pass_config)
         return graph_module

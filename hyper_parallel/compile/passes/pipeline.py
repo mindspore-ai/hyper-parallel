@@ -29,7 +29,8 @@ Execution Order:
      breaking its grad-index contract.
 3. Communication-compute overlap: AutoOverlapPass (a no-op under PP — the
    stage stub carries no wait_tensor nodes; the GPipe schedule overlaps
-   comm/compute at the Python level)
+   comm/compute at the Python level). Independent FSDP all-gather prefetch
+   and gradient overlap are scheduled by FsdpOverlapPass after AutoOverlapPass.
 
 The backend compilation slot (InductorPass) is intentionally not wired yet;
 add it here when an inductor backend integration lands.
@@ -41,7 +42,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 from ..pass_config import PassConfig
 from .base import GraphPass
-from .overlap.schedule import AutoOverlapPass
+from .overlap.schedule import AutoOverlapPass, FsdpOverlapPass
 from .parallel.fsdp_pass import FSDPPass
 from .parallel.pp_pass import PpPass
 
@@ -87,6 +88,9 @@ class PassPipeline:
         # 3. Communication-compute overlap optimization
         if getattr(self.config, "enable_overlap", False):
             self.passes.append(AutoOverlapPass())
+
+        if self.config.fsdp_allgather_prefetch or self.config.fsdp_overlap_grad_reduce:
+            self.passes.append(FsdpOverlapPass())
 
         return self
 

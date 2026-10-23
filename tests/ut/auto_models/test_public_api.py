@@ -200,6 +200,9 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("options", "None"),
                 ("dynamo_cache_size_limit", "256"),
                 ("dynamic_arg_dims", "None"),
+                ("fsdp_allgather_prefetch", "True"),
+                ("fsdp_overlap_grad_reduce", "True"),
+                ("max_in_flight_gb", "0.25"),
             ],
         )
 

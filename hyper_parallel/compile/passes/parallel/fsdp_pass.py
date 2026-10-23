@@ -524,6 +524,11 @@ class FSDPPass(GraphPass):
             node.meta["fsdp_degree"] = self._fsdp_degree
             node.meta["is_param"] = True
             sharded_nodes.append(node)
+            # Record the TP-local, unsharded size before live-model FSDP slicing.
+            # Newly inserted collective nodes have no shape-propagated ``val``.
+            value = param if param is not None else node.meta.get("val")
+            if isinstance(value, torch.Tensor) and isinstance(value.numel(), int):
+                node.meta["fsdp_unsharded_nbytes"] = value.numel() * value.element_size()
             self._fsdp_modules.add(self._get_parent_module_fqn(fqn))
 
         return _DpParamClassification(
@@ -758,7 +763,7 @@ class FSDPPass(GraphPass):
                 continue
             anchor = self._first_user(param_node) if sink else None
 
-            # AllGather + immediate wait for correctness; AutoOverlapPass may
+            # AllGather + immediate wait for correctness; FsdpOverlapPass may
             # sink the wait past independent compute later.
             with _insertion_point(graph, anchor, param_node):
                 ag_node = graph.call_function(
@@ -771,6 +776,7 @@ class FSDPPass(GraphPass):
                 ag_node.meta["param_name"] = param_node.meta.get("param_name")
                 ag_node.meta["state_idx"] = param_node.meta.get("state_idx")
                 ag_node.meta["fsdp_degree"] = self._fsdp_degree
+                ag_node.meta["fsdp_unsharded_nbytes"] = param_node.meta.get("fsdp_unsharded_nbytes")
 
             # Insert the wait in its own block: a wait placed in the same block
             # as the gather would land *before* the gather it depends on (the
@@ -991,6 +997,7 @@ class FSDPPass(GraphPass):
             rs_node.meta["comm_type"] = "fsdp_reduce_scatter"
             rs_node.meta["comm_group"] = self._fsdp_group_name
             rs_node.meta["fsdp_degree"] = self._fsdp_degree
+            rs_node.meta["autograd_backward"] = True
             reduced = rs_node
             # HSDP chains all_reduce (a different process-group stream) after
             # the reduce_scatter, so wait first; plain FSDP waits on the final
@@ -1006,6 +1013,7 @@ class FSDPPass(GraphPass):
             ar_node.meta["comm_type"] = "dp_all_reduce"
             ar_node.meta["comm_group"] = self._dp_replicate_group_name
             ar_node.meta["dp_replicate_degree"] = self._dp_replicate_degree
+            ar_node.meta["autograd_backward"] = True
             reduced = ar_node
 
         return self._insert_wait(graph, reduced)
@@ -1018,6 +1026,7 @@ class FSDPPass(GraphPass):
             args=(tensor_node,),
         )
         wait_node.meta["wait_for"] = tensor_node.name
+        wait_node.meta["autograd_backward"] = True
         return wait_node
 
     def _build_trainable_state_indices(
@@ -1180,6 +1189,7 @@ class FSDPPass(GraphPass):
             ag_node.meta["param_node"] = record.param_node.name
             ag_node.meta["param_name"] = record.param_node.meta.get("param_name")
             ag_node.meta["fsdp_degree"] = self._fsdp_degree
+            ag_node.meta["fsdp_unsharded_nbytes"] = record.param_node.meta.get("fsdp_unsharded_nbytes")
             # This gather lives in the backward half; tag it so downstream
             # passes (e.g. PpPass phase classification) do not mistake it and
             # its remat clones for forward nodes — their only arg is a forward

@@ -27,6 +27,7 @@ follows the same contract: intent here, runtime guard in ``PpPass``.
 
 __all__ = ["PassConfig", "PP_SCHEDULES", "DP_MODES", "normalize_dp_mode"]
 
+import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -69,6 +70,13 @@ class PassConfig:
     Attributes:
         enable_overlap: Drive ``AutoOverlapPass`` to move ``wait_tensor`` for
             communication/compute overlap.
+        fsdp_allgather_prefetch: Prefetch forward/backward FSDP all-gathers
+            and delay their wait/view nodes independently of enable_overlap.
+        fsdp_overlap_grad_reduce: Advance backward reduce-scatter launches and
+            delay their waits independently of parameter prefetch and enable_overlap.
+        max_in_flight_gb: GiB of early FSDP all-gather replicas before first use,
+            shared across anchors in each phase. Uses PyTorch's overlap scheduler
+            naming and binary units. Zero disables early launches, not wait sinking.
         fsdp_enabled: Drive ``FSDPPass`` (data-parallel partitioning: parameter
             all_gather + gradient reduction + live-model sharding, selected by
             ``dp_mode``). ``False`` skips data parallelism entirely — set this
@@ -161,6 +169,9 @@ class PassConfig:
     pp_degree: Optional[int] = None
     pp_microbatch_size: int = 1
     pp_schedule: str = "gpipe"
+    fsdp_allgather_prefetch: bool = True
+    fsdp_overlap_grad_reduce: bool = True
+    max_in_flight_gb: float = 0.25
 
     def __post_init__(self) -> None:
         self.dp_mode = normalize_dp_mode(self.dp_mode)
@@ -175,6 +186,13 @@ class PassConfig:
                 ``pp_microbatch_size``, an unknown ``pp_schedule`` /
                 ``dp_mode``, or a non-positive ``dp_replicate_degree``.
         """
+        for name in ("fsdp_allgather_prefetch", "fsdp_overlap_grad_reduce"):
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a bool")
+        value = self.max_in_flight_gb
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError("max_in_flight_gb must be a finite non-negative number")
         if self.tp_size < 1:
             raise ValueError(f"tp_size must be >= 1, got {self.tp_size}")
         if self.fsdp_degree is not None and self.fsdp_degree < 1:
@@ -221,6 +239,7 @@ def build_pass_config_from_trainer_config(
     trainer package.
     """
     accelerator = config.accelerator
+    compile_config = getattr(config, "compile", None)
     if fsdp_enabled is None:
         fsdp_enabled = (
             config.fsdp_config.dp_shard_size > 1
@@ -234,6 +253,10 @@ def build_pass_config_from_trainer_config(
         tp_size=accelerator.tp_size,
         sequence_parallel=accelerator.sequence_parallel,
         loss_parallel=accelerator.loss_parallel,
+        fsdp_reshard_after_forward=getattr(config.fsdp_config, "reshard_after_forward", True),
+        fsdp_allgather_prefetch=getattr(compile_config, "fsdp_allgather_prefetch", True),
+        fsdp_overlap_grad_reduce=getattr(compile_config, "fsdp_overlap_grad_reduce", True),
+        max_in_flight_gb=getattr(compile_config, "max_in_flight_gb", 0.25),
     )
 
 

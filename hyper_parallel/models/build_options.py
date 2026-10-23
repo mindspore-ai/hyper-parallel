@@ -41,6 +41,7 @@ __all__ = [
 ]
 
 import logging
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
@@ -117,6 +118,11 @@ class CompileConfig:
     In joint-graph mode, ``dynamic`` symbolizes user tensor dimensions.
     ``dynamic_arg_dims`` optionally selects dimensions by dotted input path;
     a mapping enables dynamic tracing and takes precedence over ``dynamic``.
+    ``fsdp_allgather_prefetch`` and ``fsdp_overlap_grad_reduce`` independently
+    schedule FSDP parameter gathers and gradient reductions, including wait sinking.
+    ``max_in_flight_gb`` follows PyTorch's overlap scheduler naming and binary
+    units; here it bounds early all-gather replicas until first use, per phase.
+    Eager FSDP2 module prefetch depths do not configure these graph passes.
     """
 
     enabled: bool = False
@@ -129,6 +135,9 @@ class CompileConfig:
     dynamo_cache_size_limit: int = 256
     # Joint-graph input paths, e.g. model_inputs.input_ids: [0, 1].
     dynamic_arg_dims: Optional[dict[str, int | list[int]]] = None
+    fsdp_allgather_prefetch: bool = True
+    fsdp_overlap_grad_reduce: bool = True
+    max_in_flight_gb: float = 0.25
 
     def selects_graph_compiler(self) -> bool:
         """Return whether this config selects the graph-compiler trainer path."""
@@ -136,9 +145,14 @@ class CompileConfig:
 
     def __post_init__(self) -> None:
         """Validate values that the YAML resolver cannot express precisely."""
-        for name in ("enabled", "use_joint_graph", "fullgraph", "dynamic"):
+        boolean_fields = (
+            "enabled", "use_joint_graph", "fullgraph", "dynamic", "fsdp_allgather_prefetch",
+            "fsdp_overlap_grad_reduce",
+        )
+        for name in boolean_fields:
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"compile.{name} must be a bool")
+        self._validate_max_in_flight_gb()
         if self.dynamic_arg_dims is not None and not isinstance(self.dynamic_arg_dims, dict):
             raise ValueError("compile.dynamic_arg_dims must be a mapping or None")
         if not isinstance(self.mode, str) or not self.mode.strip():
@@ -159,6 +173,17 @@ class CompileConfig:
             or self.dynamo_cache_size_limit <= 0
         ):
             raise ValueError("compile.dynamo_cache_size_limit must be a positive integer")
+
+    def _validate_max_in_flight_gb(self) -> None:
+        """Validate the GiB bound on speculative FSDP all-gather replicas."""
+        value = self.max_in_flight_gb
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError("compile.max_in_flight_gb must be a finite non-negative number")
 
 
 @dataclass
