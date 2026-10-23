@@ -191,3 +191,4 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **hyper-rl** | `hyper_parallel/rl/**`, RL docs and agent rules — sole RL entry; also consult it for migrated RL tests |
 | **nd-cost-model** | `hyper_parallel/auto_parallel/**`, `tests/ut/auto_parallel/**`: golden before and after, measured figures |
 | **distributed-op-dev** / **distributed-op-testing** / **test-assertion-style** | Op impl & tests (scoped) |
+| **precision-acceptance** | `docs/design/**`, precision tools & skill — 1000-step acceptance 口径 |
