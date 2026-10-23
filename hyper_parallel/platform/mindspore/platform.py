@@ -1410,6 +1410,20 @@ class MindSporePlatform(Platform):
         return _mindspore_all_to_all_single(input_tensor, output_shape, group, async_op=async_op)
 
     @staticmethod
+    def differentiable_all_to_all_single(
+        input_tensor: Tensor, input_splits: list[int], output_splits: list[int], group: str,
+    ) -> Tensor:
+        """Exchange variable first-axis splits with synchronous autograd semantics."""
+        output_shape = (sum(output_splits), *input_tensor.shape[1:])
+        output, work = ops_comm.all_to_all_single(
+            output_shape, input_tensor.contiguous(), output_splits, input_splits,
+            group=group, async_op=False,
+        )
+        if work is not None:
+            work.wait()
+        return output
+
+    @staticmethod
     def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,
                                             handle_box=None):
         return _MSAsyncAllGatherFunction.apply(

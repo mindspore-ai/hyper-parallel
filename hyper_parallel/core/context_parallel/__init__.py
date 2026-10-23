@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Context Parallel implementations for HyperParallel."""
-from hyper_parallel.core.context_parallel.context_parallel import ContextParallel
+from hyper_parallel.core.context_parallel.context_parallel import ContextParallel, CausalConvContextParallel
 from hyper_parallel.core.context_parallel.async_context_parallel import AsyncContextParallel
 from hyper_parallel.core.context_parallel.async_dsa_context_parallel import (
     AsyncDSAIndexerContextParallel,
@@ -28,6 +28,7 @@ from hyper_parallel.core.context_parallel.dsa_context_parallel import (
 
 __all__ = [
     "ContextParallel",
+    "CausalConvContextParallel",
     "AsyncContextParallel",
     "AsyncDSAIndexerContextParallel",
     "AsyncDSAIndexerLossContextParallel",

@@ -436,6 +436,78 @@ def _gather_seq(
 # Unified ContextParallel
 # ---------------------------------------------------------------------------
 
+class CausalConvContextParallel(ParallelStyle):
+    """Supply a preceding-sequence halo to a causal convolution boundary.
+
+    The convolution consumes local input tokens and an optional ``halo`` keyword
+    tensor, then returns only its local tokens. Parameters and convolution math
+    stay in the original module. CP ranks must follow chronological token order.
+
+    Args:
+        halo_width: Number of preceding projected tokens required by the kernel.
+        seq_dim: Sequence axis in the convolution's input tensor.
+        input_index: Positional input containing the local token tensor.
+        halo_kwarg_name: Keyword accepted by the convolution for its left halo.
+    """
+
+    def __init__(self, halo_width: int, seq_dim: int = 1, input_index: int = 0,
+                 halo_kwarg_name: str = "halo") -> None:
+        """Configure the halo extent and the convolution's local input contract."""
+        super().__init__()
+        if not isinstance(halo_width, int) or isinstance(halo_width, bool) or halo_width < 0:
+            raise ValueError("halo_width must be a nonnegative integer.")
+        if (not isinstance(input_index, int) or isinstance(input_index, bool)
+                or input_index < 0 or not isinstance(halo_kwarg_name, str) or not halo_kwarg_name):
+            raise ValueError("Causal convolution requires an input index and a halo keyword name.")
+        if not isinstance(seq_dim, int) or isinstance(seq_dim, bool):
+            raise ValueError("Causal convolution sequence dimension must be an integer.")
+        self.halo_width = halo_width
+        self.seq_dim = seq_dim
+        self.input_index = input_index
+        self.halo_kwarg_name = halo_kwarg_name
+
+    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+        """Register the generic halo input hook without replacing the convolution."""
+        mesh = _ensure_1d(device_mesh)
+        if tuple(mesh.rank_list) != tuple(sorted(mesh.rank_list)):
+            raise ValueError("Causal convolution CP requires ascending ranks in token order.")
+        if mesh.size() <= 1 or self.halo_width == 0:
+            return module
+        module.register_forward_pre_hook(partial(self._prepare_halo, mesh=mesh), with_kwargs=True)
+        return module
+
+    def _prepare_halo(self, module: Module, args: tuple, kwargs: dict, mesh: DeviceMesh) -> tuple:
+        """Send one packed tail to the next rank, preserving the reverse halo gradient."""
+        del module
+        if self.input_index >= len(args):
+            raise ValueError("Causal convolution CP requires its token tensor as a positional input.")
+        if kwargs.get(self.halo_kwarg_name) is not None:
+            raise ValueError("Causal convolution CP cannot replace an explicit halo.")
+        new_args, new_kwargs = list(args), dict(kwargs)
+        tensor = new_args[self.input_index]
+        if isinstance(tensor, DTensor):
+            tensor = tensor.to_local()
+            new_args[self.input_index] = tensor
+        if not platform.is_tensor(tensor) or not -len(tensor.shape) <= self.seq_dim < len(tensor.shape):
+            raise ValueError("Causal convolution CP requires a tensor and an existing sequence dimension.")
+        seq_dim = self.seq_dim % len(tensor.shape)
+        if tensor.shape[seq_dim] < self.halo_width:
+            raise ValueError("Local sequence length must be at least the causal convolution halo width.")
+        slices = [slice(None)] * len(tensor.shape)
+        slices[seq_dim] = slice(-self.halo_width, None)
+        tail = tensor[tuple(slices)].contiguous()
+        flat = tail.reshape(-1)
+        size, rank = mesh.size(), mesh.get_local_rank()
+        send_splits, recv_splits = [0] * size, [0] * size
+        # A ring keeps both endpoints in backward; rank zero masks the wraparound.
+        send_splits[(rank + 1) % size] = flat.numel()
+        recv_splits[(rank - 1) % size] = flat.numel()
+        halo = platform.differentiable_all_to_all_single(flat, send_splits, recv_splits, mesh.get_group())
+        halo = halo.reshape(tail.shape)
+        new_kwargs[self.halo_kwarg_name] = halo * 0 if rank == 0 else halo
+        return tuple(new_args), new_kwargs
+
+
 class ContextParallel(ParallelStyle):
     """Unified Context Parallel for core-attention modules.
 

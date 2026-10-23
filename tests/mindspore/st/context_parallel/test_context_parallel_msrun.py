@@ -65,3 +65,16 @@ def test_context_parallel_group2_msrun():
         ("test_async_context_parallel_hybrid_forward", 13440, 4, 4),
         ("test_p2p_exchange_forward_backward", 13460, 2, 2),
     )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_context_parallel_local_boundaries_msrun():
+    """Feature: generic local CP boundaries and causal convolution halos.
+
+    Description: Validate five projected inputs and halo gradients on CP2/CP4.
+    Expectation: Exact forward and backward parity with chronological serial layouts.
+    """
+    _run_group(
+        ("test_context_parallel_local_inputs_and_halo_2", 13520, 2, 2),
+        ("test_context_parallel_local_inputs_and_halo_4", 13540, 4, 4),
+    )

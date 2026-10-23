@@ -216,3 +216,19 @@ PP 场景下仍在各 stage 内按上述规则组合 FSDP 与 CP：先将 `dp_sh
 4. attention forward 中 Q/K/V 不在前三个位置参数时，需要配置 `qkv_indices` 或 `qkv_kwarg_names`。
 5. DSA style 只支持 `layout="BSND"` 或 `"TND"`，且只支持 `mode="colossal"`。
 6. Async CP 的 projection/handoff 模块要贴近 consumer 边界；中间存在额外 tensor 变换时，应把变换后的最后一个模块作为 handoff。
+
+
+## 因果短卷积的 CP halo
+
+`CausalConvContextParallel(halo_width, seq_dim=1)` 给本地卷积输入注入前序 rank 的
+`halo` 关键字，卷积保留数学计算和参数持有关系。首 rank 的环回结果置零，但保留
+反向集合通信依赖；序列按一维 mesh 的递增 rank 顺序排列，本地长度至少为 halo_width。
+
+```python
+from hyper_parallel.core.context_parallel import CausalConvContextParallel
+CausalConvContextParallel(kernel_size - 1).apply(attention.conv1d, cp_mesh)
+```
+
+注意力使用已有的 `ContextParallel(qkv_indices=..., use_local_output=True)`。
+本地融合核在数学边界将输入 DTensor 转为本地 Tensor，并按输入布局封装输出，
+序列/head 重分布和反向继续由现有 ContextParallel 管理，无须新增本地输入选项。

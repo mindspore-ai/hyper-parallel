@@ -64,6 +64,18 @@ class _FakeMesh:
     def __getitem__(self, name):
         return self._submeshes[name]
 
+    def size(self) -> int:
+        """Return this test mesh's participant count."""
+        return self.mesh.numel()
+
+    def get_local_rank(self) -> int:
+        """Use the first chronological rank by default."""
+        return 0
+
+    def get_group(self) -> str:
+        """Return a sentinel communication group."""
+        return "cp_test_group"
+
 
 class _IdentityModule(nn.Module):
     """Leaf module whose forward can be wrapped by ContextParallel."""
@@ -593,6 +605,30 @@ class TestContextParallel(unittest.TestCase):
         self.assertEqual(non_cp_out[0].device_mesh.mesh_dim_names, ("tp",))
         self.assertEqual(non_cp_out[0].placements, (Shard(2),))
         self.assertEqual(non_cp_out[1], "keep")
+
+
+class TestCausalConvContextParallel(unittest.TestCase):
+    """Generic convolution halo boundaries independent of model or attention kernels."""
+
+    def test_causal_halo_preserves_configured_sequence_axis(self) -> None:
+        """The shared halo strategy accepts sequence-first convolution inputs too."""
+        module = _IdentityModule()
+        cp_module.CausalConvContextParallel(3, seq_dim=0).apply(module, _FakeMesh(2))
+        value = torch.arange(24, dtype=torch.float32).reshape(4, 2, 3)
+        with patch.object(cp_module.platform, "differentiable_all_to_all_single",
+                          side_effect=lambda tensor, *unused: tensor.clone()) as exchange:
+            _, kwargs = module(value)
+        self.assertEqual(kwargs["halo"].shape, (3, 2, 3))
+        torch.testing.assert_close(kwargs["halo"], torch.zeros(3, 2, 3))
+        self.assertEqual(exchange.call_args.args[1:3], ([0, 18], [0, 18]))
+
+    def test_causal_halo_validates_rank_order_and_width(self) -> None:
+        """Reject reordered sequence peers and invalid halo extents at setup."""
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            cp_module.CausalConvContextParallel(-1)
+        mesh = _FakeMesh(2, rank_list=(1, 0))
+        with self.assertRaisesRegex(ValueError, "ascending"):
+            cp_module.CausalConvContextParallel(3).apply(_IdentityModule(), mesh)
 
 
 if __name__ == "__main__":

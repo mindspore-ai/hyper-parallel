@@ -15,6 +15,7 @@
 """MindSpore distributed integration tests for ContextParallel and AsyncContextParallel."""
 # pylint: disable=wrong-import-position
 import os
+from typing import Optional
 
 import mindspore as ms
 import mindspore.communication.management as D
@@ -25,6 +26,8 @@ from mindspore import mint, nn
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "mindspore")
 
 from hyper_parallel import init_device_mesh, ContextParallel, AsyncContextParallel, get_platform
+from hyper_parallel.core.context_parallel import CausalConvContextParallel
+from hyper_parallel.core.dtensor.dtensor import DTensor
 
 
 def _init_dist(expected_world_size: int):
@@ -442,3 +445,84 @@ def test_p2p_exchange_forward_backward():
     # exchanged once more on the way back.
     _assert_close(got, ms.Tensor(np.full((4, 8), float(peer), np.float32)), rank, "p2p forward")
     _assert_close(grad, ms.Tensor(np.full((4, 8), float(peer + 1), np.float32)), rank, "p2p backward")
+
+
+class _LocalProjectedAttention(nn.Cell):
+    """Local-only boundary with four BTHD arguments and one BTH argument."""
+
+    def __init__(self, local_heads: int) -> None:
+        """Store the head count expected inside the local kernel."""
+        super().__init__()
+        self.local_heads = local_heads
+
+    def construct(self, query: ms.Tensor, key: ms.Tensor, value: ms.Tensor,
+                  gate: ms.Tensor, beta: ms.Tensor) -> ms.Tensor:
+        """Exercise every projected input after generic CP redistribution."""
+        layout = (query.device_mesh, query.placements)
+        query, key, value, gate, beta = (x.to_local() for x in (query, key, value, gate, beta))
+        for tensor in (query, key, value, gate, beta):
+            assert tensor.shape[1:3] == (32, self.local_heads)
+        output = query + key + value + gate + beta.unsqueeze(-1)
+        return DTensor.from_local(output, *layout)
+
+
+class _HaloBoundary(nn.Cell):
+    """Expose the generic causal halo without depending on any attention model."""
+
+    def construct(self, value: ms.Tensor, halo: Optional[ms.Tensor] = None) -> Optional[ms.Tensor]:
+        """Return the received boundary for independent value and gradient checks."""
+        del value
+        return halo
+
+
+def _check_local_inputs_and_causal_halo(expected_world_size: int) -> None:
+    """Check five-input redistribution, all gradients and chronological halo exchange."""
+    rank, size = _init_dist(expected_world_size)
+    mesh = init_device_mesh("npu", (size,), mesh_dim_names=("cp",))
+    full = (np.arange(2 * 32 * 8 * 3, dtype=np.float32) % 17).reshape(2, 32, 8, 3)
+    local_len = 32 // size
+    start, stop = rank * local_len, (rank + 1) * local_len
+    arguments = tuple(ms.Tensor(full[:, start:stop] + offset) for offset in range(4))
+    beta = ms.Tensor(full[:, start:stop, :, 0])
+    arguments += (beta,)
+    weights = ms.Tensor((full[:, start:stop] % 7) + 1)
+    module = _LocalProjectedAttention(8 // size)
+    ContextParallel(seq_dim=1, head_dim=2, qkv_indices=(0, 1, 2, 3, 4),
+                    use_local_output=True).apply(module, mesh)
+    expected = sum(arguments[:4]) + beta.unsqueeze(-1)
+    _assert_close(module(*arguments), expected, rank, "local CP forward", atol=0, rtol=0)
+
+    def attention_loss(*values: ms.Tensor) -> ms.Tensor:
+        """Weight local output positions so inverse redistribution gradients are observable."""
+        return (module(*values) * weights).sum()
+
+    gradients = ms.grad(attention_loss, (0, 1, 2, 3, 4))(*arguments)
+    for index, gradient in enumerate(gradients):
+        expected_gradient = weights if index < 4 else weights.sum(dim=-1)
+        _assert_close(gradient, expected_gradient, rank, f"local CP gradient {index}", atol=0, rtol=0)
+
+    sequence = full.reshape(2, 32, 24)
+    local = ms.Tensor(sequence[:, start:stop])
+    halo_module = _HaloBoundary()
+    CausalConvContextParallel(3).apply(halo_module, mesh)
+    expected_halo = np.zeros((2, 3, 24), np.float32) if rank == 0 else sequence[:, start - 3:start]
+    _assert_close(halo_module(local), ms.Tensor(expected_halo), rank, "causal halo", atol=0, rtol=0)
+
+    def halo_loss(value: ms.Tensor) -> ms.Tensor:
+        """Differentiate the next rank's causal dependency."""
+        return halo_module(value).sum() * (rank + 1)
+
+    expected_gradient = np.zeros(local.shape, np.float32)
+    if rank < size - 1:
+        expected_gradient[:, -3:] = rank + 2
+    _assert_close(ms.grad(halo_loss)(local), ms.Tensor(expected_gradient), rank, "halo gradient", atol=0, rtol=0)
+
+
+def test_context_parallel_local_inputs_and_halo_2() -> None:
+    """Qualify local projected attention and causal convolution on two ranks."""
+    _check_local_inputs_and_causal_halo(2)
+
+
+def test_context_parallel_local_inputs_and_halo_4() -> None:
+    """Qualify local projected attention and causal convolution on four ranks."""
+    _check_local_inputs_and_causal_halo(4)
