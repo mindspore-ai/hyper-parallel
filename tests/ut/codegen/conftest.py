@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Shared fixtures for ``tests/codegen``.
+"""Shared fixtures for ``tests/ut/codegen``.
 
 The inline generator renders the real ``GQAAttention`` component and inlines
 ``run_qwen3_moe_flash_attention`` at build time; importing those resolves a
