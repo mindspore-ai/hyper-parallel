@@ -54,7 +54,7 @@ accelerator:
   cp_size: 1
   ep_size: 8
   pp_size: 1
-  sequence_parallel: false
+  sequence_parallel: true
   loss_parallel: false
   encoder_parallel:
     enabled: false
