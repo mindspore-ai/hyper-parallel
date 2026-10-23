@@ -66,6 +66,29 @@ class TestFSDPRootWrap(unittest.TestCase):
         for parameter in (model.model.embed_tokens.weight, model.lm_head.weight, model.model.norm.weight):
             self.assertIs(owners[parameter], model)
 
+    def test_named_visual_children_keep_real_fqns_and_owners(self):
+        """Named visual projections must not acquire synthetic ModuleList-style indices."""
+        model = _make_model()
+        model.visual = nn.Module()
+        model.visual.gradient_checkpointing = False
+        model.visual.patch_embed = nn.Module()
+        model.visual.patch_embed.proj = nn.Linear(5, 5)
+        model.visual.merger = nn.Module()
+        model.visual.merger.norm = nn.LayerNorm(5)
+        model.visual.merger.linear_fc1 = nn.Linear(5, 5)
+        model.visual.merger.act_fn = nn.GELU()
+        model.visual.merger.linear_fc2 = nn.Linear(5, 5)
+        manager = self._manager()
+        units = manager._find_wrap_modules(model)
+        owners = manager._resolve_parameter_owners(model, units)
+        for unit in units:
+            self.assertIs(model.get_submodule(unit.fqn), unit.module)
+            self.assertEqual({param for param, owner in owners.items() if owner is unit.module},
+                             set(unit.module.parameters()))
+        self.assertEqual([unit.fqn for unit in units if unit.fqn.startswith("model.layers.")],
+                         ["model.layers.0", "model.layers.1"])
+        self.assertIs(owners[model.visual.patch_embed.proj.weight], model.visual.patch_embed.proj)
+
     def test_explicit_units_own_embedding_and_head(self):
         """Extra units take exclusive ownership; root keeps only the final norm."""
         model = _make_model()

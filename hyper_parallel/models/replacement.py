@@ -423,8 +423,12 @@ def apply_module_replacements(
             model._hp_checkpoint_source_shapes = _named_tensor_shapes(model)  # pylint: disable=protected-access
             model._hp_replacement_weight_conversions = extra_transforms  # pylint: disable=protected-access
         weights_mapping[:0] = extra_transforms
+    replaced_fqns = set(getattr(model, "_hp_replaced_module_fqns", ()))
     for target, replacement in prepared:
         for fqn in target.module_fqns:
             parent, name = _parent_and_name(model, fqn)
             parent._modules[name] = replacement  # pylint: disable=protected-access
+            replaced_fqns.add(fqn)
+    if prepared:
+        model._hp_replaced_module_fqns = tuple(sorted(replaced_fqns))  # pylint: disable=protected-access
     return model, weights_mapping

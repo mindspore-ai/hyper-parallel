@@ -228,6 +228,7 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
             None,
         ),
         fp32_main_params=cfg.optimizer.fp32_main_params,
+        encoder_parallel_enabled=cfg.accelerator.encoder_parallel.enabled,
     )
 
 

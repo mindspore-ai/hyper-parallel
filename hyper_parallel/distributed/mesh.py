@@ -253,6 +253,7 @@ class DistributedSetup:
     # construction and sharding consume one resolved policy object.
     low_precision_config: Any = None
     fp32_main_params: bool = False
+    encoder_parallel_enabled: bool = False
 
 
 def _build_device_mesh_from_accelerator(

@@ -18,7 +18,7 @@ import json
 import logging
 import re
 from collections import Counter, OrderedDict, defaultdict
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
@@ -28,6 +28,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from torch import nn
 from torch.distributed import is_available, is_initialized
+from transformers import PreTrainedModel
 from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
     WeightRenaming,
@@ -42,6 +43,7 @@ from hyper_parallel.core.distributed_checkpoint import (
     load as load_dcp_state,
 )
 from hyper_parallel.core.distributed_checkpoint.utils import str_to_dtype
+from hyper_parallel.core.fully_shard.api import HSDPModule
 
 from hyper_parallel import DTensor, Partial, distribute_tensor
 
@@ -656,7 +658,8 @@ class CheckpointManager:
                 None preserves the live model's registered conversions.
             max_shard_size: Maximum size of each Hugging Face weight shard.
             save_original_format: Whether to reverse registered weight
-                conversions before saving.
+                conversions before saving. Qwen3.5 dense/MoE text models always
+                use their native text namespace, not the source VLM namespace.
             **kwargs: Additional arguments forwarded to ``save_pretrained``.
 
         Returns:
@@ -678,24 +681,32 @@ class CheckpointManager:
             state_dict = self._gather_full_state_dict(keep_state_dict=is_main_process)
         if not is_main_process:
             return False
+        export_model = self._hf_export_model()
+        canonical_text = getattr(getattr(export_model, "config", None), "model_type", None) in (
+            "qwen3_5_text", "qwen3_5_moe_text",
+        )
         used_base = getattr(
             self.model, "_hp_used_base_weight_conversions", None
         )
         used_replacements = getattr(
             self.model, "_hp_used_replacement_weight_conversions", None
         )
-        if save_original_format and used_replacements:
-            original_mapping = getattr(self.model, "_weight_conversions", None)
+        if (save_original_format or canonical_text) and used_replacements:
+            original_mapping = getattr(export_model, "_weight_conversions", None)
             try:
-                self.model._weight_conversions = used_replacements  # pylint: disable=protected-access
-                state_dict = revert_weight_conversion(self.model, state_dict)
-                if used_base:
-                    self.model._weight_conversions = used_base  # pylint: disable=protected-access
-                    state_dict = revert_weight_conversion(self.model, state_dict)
+                export_model._weight_conversions = used_replacements  # pylint: disable=protected-access
+                state_dict = revert_weight_conversion(export_model, state_dict)
+                if used_base and not canonical_text:
+                    export_model._weight_conversions = used_base  # pylint: disable=protected-access
+                    state_dict = revert_weight_conversion(export_model, state_dict)
             finally:
-                self.model._weight_conversions = original_mapping  # pylint: disable=protected-access
+                export_model._weight_conversions = original_mapping  # pylint: disable=protected-access
             save_original_format = False
-        save_method(
+        if canonical_text:
+            # Loading a text model from VLM weights records a PrefixChange.
+            # Reversing it would export VLM keys with a text-only config.
+            save_original_format = False
+        export_model.save_pretrained(
             save_directory,
             state_dict=state_dict,
             is_main_process=True,
@@ -704,6 +715,22 @@ class CheckpointManager:
             **kwargs,
         )
         return True
+
+    def _hf_export_model(self) -> nn.Module:
+        """Create a metadata-only HF view without modifying the live training model."""
+        if not isinstance(self.model, PreTrainedModel):
+            return self.model
+        export_model = copy(self.model)
+        model_class = type(self.model)
+        if HSDPModule in model_class.__bases__:
+            model_class = next(base for base in model_class.__bases__ if base is not HSDPModule)
+        export_model.__class__ = model_class
+        # HF overwrites architectures/dtype during saving. The shallow module
+        # copy shares parameters without allocating weights, but not metadata.
+        export_model.config = deepcopy(self.model.config)
+        if getattr(self.model, "generation_config", None) is not None:
+            export_model.generation_config = deepcopy(self.model.generation_config)
+        return export_model
 
     def _normalize_dcp_export_layout(
         self,

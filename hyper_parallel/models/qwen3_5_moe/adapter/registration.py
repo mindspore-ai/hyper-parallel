@@ -39,10 +39,27 @@ def _load_loss():
     return chunk_loss
 
 
+def _load_vlm_loss():
+    """Keep the visual training objective separate from the text loss adapter."""
+    from hyper_parallel.models.qwen3_5_moe.adapter import vlm_chunk_loss  # pylint: disable=C0415
+    return vlm_chunk_loss
+
+
+def _load_encoder_parallel():
+    """Load the opt-in visual runtime without importing optional HF vision code."""
+    from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import (  # pylint: disable=C0415
+        get_encoder_parallel_spec,
+    )
+    return get_encoder_parallel_spec()
+
+
 QWEN3_5_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5MoeForConditionalGeneration",
     model_type="qwen3_5_moe",
+    loss=_load_vlm_loss,
+    encoder_parallel=_load_encoder_parallel,
     sharding_rules=_load_sharding_rules,
+    replicated_subtrees=("model.visual",),
 )
 
 QWEN3_5_MOE_TEXT_ADAPTER_SPEC = ModelAdapterSpec(

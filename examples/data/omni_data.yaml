@@ -1,0 +1,27 @@
+# Data-section example for VLMTrainer, not a standalone model training recipe.
+# Copy these sections into a multimodal model YAML; text YAMLs stay unchanged.
+# Use training.micro_batch_size: 1 and initially TP=CP=PP=1 in that parent YAML.
+dataset:
+  _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
+  data_path: /path/to/multimodal.jsonl
+  data_config: {}
+  data_transform:
+    _target_: hyper_parallel.data.omni.omni_transform.AutoProcessorTransform
+    max_seq_len: 4096
+
+dataloader:
+  _target_: hyper_parallel.data.omni.loader.OmniPackingLoader
+  # Emit one complete sample; 1 is a selection budget, not a truncation length.
+  # Raise this only with a model adapter supporting packed attention and labels.
+  token_budget: 1
+  min_buffered_samples: 1
+  save_by_idx: true
+  dataloader_type: single
+  data_sharding: false
+  drop_last: true
+  num_workers: 0
+  collate_fn:
+    _target_: hyper_parallel.data.omni.collator.OmniCollator
+  get_batch:
+    _target_: hyper_parallel.data.omni.get_batch.OmniParallelBatch
+    encoder_dp: false

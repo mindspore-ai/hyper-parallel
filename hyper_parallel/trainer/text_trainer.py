@@ -40,6 +40,8 @@ class TextTrainer:
 
     def __init__(self, config: TrainerConfig) -> None:
         """Build the text Trainer in the same explicit order as VeOmni."""
+        if config.accelerator.encoder_parallel.enabled:
+            raise ValueError("encoder_parallel is a VLM-only option; disable it for TextTrainer")
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.config = config
 

@@ -157,6 +157,7 @@ class ShardingPlanner:
         *,
         derive: bool = True,
         allow_uncovered_params: bool = False,
+        encoder_parallel_enabled: bool = False,
     ) -> None:
         """Create a ShardingPlanner.
 
@@ -170,6 +171,8 @@ class ShardingPlanner:
             allow_uncovered_params: When ``True``, downgrade the F4b
                 "every trainable parameter must be covered by the plan"
                 hard error to a warning (exploratory debugging only).
+            encoder_parallel_enabled: Isolate adapter-declared visual parameters
+                from decoder TP boundaries. Disabled by default.
         """
         self._classifier = ParameterClassifier()
         self._templates = TEMPLATES
@@ -186,6 +189,7 @@ class ShardingPlanner:
         # must be covered by the plan (fail-fast). Set True ONLY for
         # exploratory debugging to downgrade the hard error to a warning.
         self._allow_uncovered_params = allow_uncovered_params
+        self._encoder_parallel_enabled = encoder_parallel_enabled
 
     # ── Main entry point ────────────────────────────────────────────────
 
@@ -255,6 +259,25 @@ class ShardingPlanner:
         """Log the plan explanation when requested."""
         if enabled:
             logger.info("ShardingPlan explain:\n%s", plan.explain())
+
+    def _encoder_isolated_roots(self, model: Any, arch: str) -> tuple[str, ...]:
+        """Keep adapter-declared subtrees out of decoder parallel boundaries."""
+        if not self._derive:
+            if self._encoder_parallel_enabled:
+                raise ValueError("Encoder parallel requires derived planning and a visual model adapter")
+            return ()
+        # Adapter discovery is optional and must not eagerly import model families.
+        from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
+
+        adapter = get_model_adapter(arch)
+        roots = adapter.replicated_subtrees if adapter is not None else ()
+        if self._encoder_parallel_enabled:
+            if adapter is None or adapter.encoder_parallel is None:
+                raise ValueError("Encoder parallel requires derived planning and a visual model adapter")
+            roots = tuple(dict.fromkeys((*roots, *adapter.encoder_parallel().isolated_subtrees)))
+        for root in roots:
+            model.get_submodule(root)
+        return roots
 
     def _classify_boundary_groups(self, model: Any, arch: str):
         """Classify model parameters and group them into candidate boundaries."""
@@ -334,7 +357,12 @@ class ShardingPlanner:
         ep_extend = ep_size if ep_size > 1 else 0
 
         # Phase 1: parameter role classification
+        isolated_roots = self._encoder_isolated_roots(model, arch)
         param_roles, boundary_groups = self._classify_boundary_groups(model, arch)
+        if isolated_roots:
+            param_roles = {name: role for name, role in param_roles.items()
+                           if not any(name.startswith(root + ".") for root in isolated_roots)}
+            boundary_groups = self._group_by_boundary(param_roles)
 
         # Phase 3+4: semantic inference + template-fills I/O
         param_ndims = {name: p.ndim for name, p in model.named_parameters()}
@@ -358,6 +386,10 @@ class ShardingPlanner:
             model=model,
             param_ndims=param_ndims,
         )
+
+        for root in isolated_roots:
+            params = {name: {TP: Replicate()} for name, _ in model.get_submodule(root).named_parameters()}
+            plan.modules[root] = ModuleShardingSpec(params=params, in_src={}, in_dst={}, is_boundary=False)
 
         # Phase 4.5: unified override pass — merge mode (unset fields inherit
         # the derived spec) / insert mode (fully self-declared only) / glob.
@@ -1363,7 +1395,7 @@ class ShardingPlanner:
         in forward order (each module vouches for its own propagation in
         validate mode; adjacent-contract checks no longer exist)."""
         sorted_fqns = self._topological_sort_by_forward_order(
-            list(plan.modules.keys()), model
+            [name for name, spec in plan.modules.items() if spec.is_boundary], model
         )
         terminal = sorted_fqns[-1] if sorted_fqns else None
         for fqn, spec in plan.modules.items():

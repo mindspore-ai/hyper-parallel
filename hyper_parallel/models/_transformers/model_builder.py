@@ -85,6 +85,7 @@ def instantiate_infrastructure(
     plan_overrides = getattr(distributed_setup, "plan_overrides", None)
     sharding_planner = ShardingPlanner(
         plan_overrides=plan_overrides,
+        encoder_parallel_enabled=getattr(distributed_setup, "encoder_parallel_enabled", False),
         # F4b escape hatch (accuracy_fix_plan.md §2): exploratory debugging
         # only — downgrades the uncovered-trainable-param hard error to a
         # warning. Defaults to fail-fast.

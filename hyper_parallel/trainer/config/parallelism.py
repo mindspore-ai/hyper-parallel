@@ -22,7 +22,7 @@ Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5).
 import importlib
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Union
 
 from torch import nn  # pylint: disable=forbidden-backend-import
@@ -34,6 +34,7 @@ from hyper_parallel.models.replacement import (
 )
 
 from hyper_parallel.trainer.config.target import Target
+from hyper_parallel.distributed.encoder_parallel.config import EncoderParallelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ class AcceleratorConfig:
     pp_size: int = 1
     sequence_parallel: bool = False
     loss_parallel: bool = False
+    encoder_parallel: EncoderParallelConfig = field(default_factory=EncoderParallelConfig)
 
 
 @dataclass

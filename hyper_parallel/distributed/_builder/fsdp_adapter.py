@@ -226,11 +226,11 @@ class FSDP2Manager:
             if not hasattr(container, "gradient_checkpointing"):
                 continue
             for child_name, child in container.named_children():
-                blocks = list(child.children())
+                blocks = list(child.named_children())
                 if not blocks:
                     continue
                 child_fqn = f"{container_fqn}.{child_name}" if container_fqn else child_name
-                for block_index, block in enumerate(blocks):
+                for block_name, block in blocks:
                     if id(block) in wrapped_module_ids:
                         continue
                     wrapped_module_ids.add(id(block))
@@ -240,7 +240,7 @@ class FSDP2Manager:
                         # transformer block during module-tree traversal.
                         wrapped_module_ids.add(id(wrapped_module))
                     wrap_modules.append(
-                        _WrapModuleInfo(f"{child_fqn}.{block_index}", block)
+                        _WrapModuleInfo(f"{child_fqn}.{block_name}", block)
                     )
         return wrap_modules, wrapped_module_ids
 

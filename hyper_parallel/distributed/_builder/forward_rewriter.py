@@ -364,10 +364,11 @@ def _descendant_boundary_fqns(plan, module_fqn):
     module.named_parameters(recurse=True)); the root spec (fqn "") treats
     every other boundary as a descendant.
     """
+    boundaries = [name for name, spec in plan.modules.items() if spec.is_boundary]
     if module_fqn == "":
-        return [f for f in plan.modules if f]
+        return [f for f in boundaries if f]
     prefix = module_fqn + "."
-    return [f[len(prefix):] for f in plan.modules if f.startswith(prefix)]
+    return [f[len(prefix):] for f in boundaries if f.startswith(prefix)]
 
 
 def _bind_input_indices(boundary, module):

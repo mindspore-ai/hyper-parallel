@@ -15,6 +15,7 @@
 """VLM Trainer assembled from the shared BaseTrainer stages."""
 
 from collections import defaultdict
+from collections.abc import Mapping
 from typing import Any, Dict
 
 import torch
@@ -22,13 +23,19 @@ import torch
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data.batching import calculate_num_micro_batches
-from hyper_parallel.data.vlm import build_processor, build_vlm_get_batch
+from hyper_parallel.data.omni.omni_transform import build_auto_processor
+from hyper_parallel.data.omni.get_batch import OmniParallelBatch
+from hyper_parallel.distributed.encoder_parallel.batch_input import EncoderParallelInputAdapter
+from hyper_parallel.distributed.encoder_parallel.runtime import build_encoder_parallel_runtime
+from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
 from hyper_parallel.trainer.runtime.device import synchronize  # pylint: disable=syntax-error
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config import TrainerConfig
+from hyper_parallel.trainer.config.resolver import resolve_component
+from hyper_parallel.trainer.config.target import Target
 
 logger = create_logger(__name__)
 
@@ -78,7 +85,7 @@ class VLMTrainer:
         if processor_path is None:
             self.base.processor = None
         else:
-            self.base.processor = build_processor(processor_path)
+            self.base.processor = build_auto_processor(pretrained_model_name_or_path=processor_path)
         self.base.tokenizer = getattr(self.base.processor, "tokenizer", None)
         self.base.chat_template = None
 
@@ -117,13 +124,41 @@ class VLMTrainer:
         get_batch_builder = (
             config.dataloader.get_batch.build
             if config.dataloader.get_batch
-            else build_vlm_get_batch
+            else OmniParallelBatch
         )
+        runtime_options = {}
+        adapter = getattr(config.dataloader.get_batch, "runtime_input_adapter", None)
+        if isinstance(adapter, Mapping):
+            adapter = resolve_component(
+                adapter, expected_type=Target[Any], path="dataloader.get_batch.runtime_input_adapter"
+            ).build()
+        if adapter is not None:
+            runtime_options["runtime_input_adapter"] = adapter
         self.base.get_batch = get_batch_builder(
             mesh_context=self.base.mesh,
             device=self.base.device,
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
+            **runtime_options,
         )
+        bind_model = getattr(type(self.base.get_batch), "bind_model", None)
+        if callable(bind_model):
+            bind_model(self.base.get_batch, self.base.model)
+        encoder_config = getattr(getattr(config, "accelerator", None), "encoder_parallel", None)
+        if encoder_config is not None and encoder_config.enabled:
+            runtime = build_encoder_parallel_runtime(
+                config=encoder_config, mesh_context=self.base.mesh, model=self.base.model,
+                model_adapter_spec=get_model_adapter(self.base.model.config.model_type),
+                execution_options={
+                    "micro_batch_size": config.training.micro_batch_size,
+                    "compile_enabled": config.compile.enabled,
+                    "validate_placement": getattr(config.model, "validate_placement", False),
+                    "activation_checkpoint": config.activation_checkpoint.mode,
+                    "cp_size": self.base.mesh.cp_size,
+                    "sequence_parallel": self.base.mesh.sequence_parallel,
+                },
+            )
+            runtime.bridge.install_forward()
+            self.base.get_batch.runtime_input_adapter = EncoderParallelInputAdapter(runtime, adapter)
 
     @property
     def distributed_setup(self) -> Any:
