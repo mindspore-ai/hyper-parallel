@@ -23,12 +23,15 @@ classes defined inside it.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.util
 import logging
 import os
 import sys
 from types import ModuleType
 from typing import Any, Optional
+
+from hyper_parallel.codegen.source.compat import install_output_recorder_compat
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,7 @@ def import_generated_module(artifact_dir: str) -> ModuleType:
     Returns:
         ModuleType: The imported (and cached) generated modeling module.
     """
+    install_output_recorder_compat()
     modeling_path = find_generated_modeling_file(artifact_dir)
     stem = os.path.splitext(os.path.basename(modeling_path))[0]
     module_name = _module_name_for(artifact_dir, stem)
@@ -158,6 +162,21 @@ def _register_synthetic_package(module_name: str, artifact_dir: str) -> None:
     under the synthetic package name so ``torch.load``/``pickle`` resolve
     classes defined in them the same way they resolve the generated module.
     """
+    root_package = sys.modules.get(_GENERATED_MODULE_PREFIX)
+    if root_package is None:
+        root_package = ModuleType(_GENERATED_MODULE_PREFIX)
+        root_package.__package__ = _GENERATED_MODULE_PREFIX
+        root_package.__path__ = []
+        root_package.__file__ = "<codegen-synthetic-root-package>"
+        sys.modules[_GENERATED_MODULE_PREFIX] = root_package
+
+    # Installed Transformers modeling modules use ``from ..auto ...``. The
+    # generated file is one package level below the synthetic root, so retain
+    # that parent dependency under the equivalent synthetic name.
+    auto_name = f"{_GENERATED_MODULE_PREFIX}.auto"
+    if auto_name not in sys.modules:
+        sys.modules[auto_name] = importlib.import_module("transformers.models.auto")
+
     package_name = _package_name_for(module_name)
     package = sys.modules.get(package_name)
     if package is None:

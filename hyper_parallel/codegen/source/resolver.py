@@ -408,7 +408,8 @@ def _model_path_of(config: Any) -> str:
 
     Same key order as ``project_source_spec``: most YAMLs and
     ``HyperAutoModel.from_pretrained`` configure the id under
-    ``pretrained_model_name_or_path``, with ``model_name_or_path`` as fallback.
+    ``pretrained_model_name_or_path``, with ``model_name_or_path`` and the
+    cropped/custom-builder ``config_path`` spelling as fallbacks.
     """
     model = getattr(config, "model", None)
     if model is None:
@@ -417,7 +418,10 @@ def _model_path_of(config: Any) -> str:
     if path is None:
         path = getattr(model, "model_name_or_path", None)
     if path is None:
-        path = getattr(model, "_kwargs", {}).get("pretrained_model_name_or_path", "")
+        path = getattr(model, "config_path", None)
+    if path is None:
+        kwargs = getattr(model, "_kwargs", {})
+        path = kwargs.get("pretrained_model_name_or_path") or kwargs.get("config_path", "")
     return path or ""
 
 
