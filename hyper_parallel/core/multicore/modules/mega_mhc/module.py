@@ -16,22 +16,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
 
+from .._precision import preserve_fp32_parameters
 from ..mega_mhc_common import (
+    MHC_GRAD_MAX_HIDDEN_SIZE,
+    MHC_GRAD_MIN_TOKENS,
     MHC_MAPPINGS,
     MHC_SINKHORN_ITERS,
     MHC_STREAMS,
-    MegaMhcOutputs,
     validate_mega_mhc_hidden_size,
 )
+from ..mega_mhc_grad.function import _resolve_core_counts
 from .function import hyper_mega_mhc
 from .graph import DEFAULT_TOKEN_TILE
+from .state import MegaMhcOutput, MhcState
 
 
-class HyperMegaMhc(torch.nn.Module):
+class MegaMhc(torch.nn.Module):
     """Own the current layer's mapping predictor and input RMSNorm weight.
 
     Note:
@@ -76,24 +81,83 @@ class HyperMegaMhc(torch.nn.Module):
             std=(MHC_STREAMS * hidden_size) ** -0.5,
         )
 
+    def _apply(self, fn: Callable, recurse: bool = True) -> MegaMhc:
+        """Keep mapping predictors FP32 when the enclosing model changes dtype or device."""
+        return super()._apply(preserve_fp32_parameters(self, fn, ("phi", "alpha", "bias")), recurse=recurse)
+
+    @classmethod
+    def from_module(cls, module: torch.nn.Module) -> MegaMhc:
+        """Bind an existing four-stream, shifted mHC module without replacing its Parameters.
+
+        Args:
+            module: Source with hidden_size, hc_eps, norm_eps, num_iters and Parameters
+                phi [24, 4H], alpha [3], bias [24], norm_weight [H]. Predictor Parameters must be FP32.
+
+        Returns:
+            Boundary sharing all original Parameters and mathematical configuration.
+        """
+        configuration = {}
+        for name in ("hidden_size", "hc_eps", "norm_eps", "num_iters"):
+            if not hasattr(module, name):
+                raise ValueError(f"source mHC module must expose {name}")
+            configuration[name] = getattr(module, name)
+        phi = getattr(module, "phi", None)
+        if not isinstance(phi, torch.nn.Parameter):
+            raise TypeError("source phi must be an FP32 Parameter [24, 4H]")
+        result = cls(**configuration, device=phi.device)
+        for name in ("phi", "alpha", "bias", "norm_weight"):
+            parameter = getattr(module, name, None)
+            expected = getattr(result, name)
+            if (not isinstance(parameter, torch.nn.Parameter) or parameter.shape != expected.shape
+                    or parameter.dtype != expected.dtype or parameter.device != expected.device):
+                raise ValueError(f"source {name} must match shape={tuple(expected.shape)}, dtype={expected.dtype}")
+            setattr(result, name, parameter)
+        return result
+
+    @staticmethod
+    def execution_requirements(device: Any | None = None) -> dict[str, Any]:
+        """Report native shape and precision limits, including the selected chip's training minimum.
+
+        Args:
+            device: NPU device to query. Without one, return generic limits with no chip-specific minimum.
+
+        Returns:
+            Native support conditions. A None minimum means the NPU has not been queried.
+        """
+        minimum = None
+        if device is not None and torch.device(device).type == "npu":
+            from_index = torch.device(device).index
+            from_index = torch.npu.current_device() if from_index is None else from_index
+            _, vectors = _resolve_core_counts(from_index)
+            minimum = max(MHC_GRAD_MIN_TOKENS, vectors)
+        return {"device_type": "npu", "activation_dtype": torch.bfloat16, "mapping_dtype": torch.float32,
+                "streams": MHC_STREAMS, "sinkhorn_iterations": MHC_SINKHORN_ITERS,
+                "hidden_size_multiple": 128, "maximum_training_hidden_size": MHC_GRAD_MAX_HIDDEN_SIZE,
+                "minimum_training_tokens": minimum}
+
     def forward(
         self,
-        previous_output: torch.Tensor,
-        residual: torch.Tensor,
-        previous_pre_mix: torch.Tensor,
-        previous_post_mix: torch.Tensor,
-        previous_residual_mix: torch.Tensor,
-    ) -> MegaMhcOutputs:
+        previous_output: torch.Tensor | MhcState,
+        residual: torch.Tensor | None = None,
+        previous_pre_mix: torch.Tensor | None = None,
+        previous_post_mix: torch.Tensor | None = None,
+        previous_residual_mix: torch.Tensor | None = None,
+    ) -> MegaMhcOutput:
         """Advance one shifted mHC block boundary and predict the next mappings.
 
         Args:
-            previous_output: Previous block output.
+            previous_output: Explicit MhcState, or previous block output for the legacy five-tensor call.
             residual: Previous residual streams.
             previous_pre_mix: Previous pre-mix coefficients.
             previous_post_mix: Previous post-mix coefficients.
             previous_residual_mix: Previous residual-mix coefficients.
         """
-        return hyper_mega_mhc(
+        if isinstance(previous_output, MhcState):
+            individual = (residual, previous_pre_mix, previous_post_mix, previous_residual_mix)
+            if any(value is not None for value in individual):
+                raise ValueError("Pass either MhcState or five individual state tensors")
+            previous_output, residual, previous_pre_mix, previous_post_mix, previous_residual_mix = previous_output
+        return MegaMhcOutput(*hyper_mega_mhc(
             previous_output,
             residual,
             previous_pre_mix,
@@ -107,4 +171,7 @@ class HyperMegaMhc(torch.nn.Module):
             norm_eps=self.norm_eps,
             num_iters=self.num_iters,
             token_tile=self.token_tile,
-        )
+        ))
+
+
+HyperMegaMhc = MegaMhc

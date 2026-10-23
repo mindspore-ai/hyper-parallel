@@ -17,13 +17,13 @@
 from __future__ import annotations
 
 from threading import Lock
-from typing import Protocol
+from typing import Any, Protocol
 
 from hyper_parallel.core.multicore.diagnostics.common.call import DiagnosticCall, LaunchContext
 
 
 class DiagnosticSession(Protocol):
-    """Minimal contract implemented independently by profiler and Tensor dumper."""
+    """Shared contract for profiling, Tensor dumping and Host execution observations."""
 
     def is_capture_enabled(self) -> bool:
         """Return whether this step needs diagnostic invocation preparation."""
@@ -73,6 +73,16 @@ def _get_active_session(kind: str | None = None) -> DiagnosticSession | None:
         if kind is not None and _ACTIVE_KIND != kind:
             return None
         return _ACTIVE_SESSION
+
+
+def _get_execution_observer() -> Any | None:
+    """Return a selected Host observer without touching inactive execution.
+
+    Activation remains serialized by the shared session lock. Runtime observations
+    use existing Host metadata and never request a tensor copy or collective.
+    """
+    session = _ACTIVE_SESSION if _ACTIVE_KIND == "execution" else None
+    return session if session is not None and session.is_capture_enabled() else None
 
 
 def _reset_active_session_for_test() -> None:

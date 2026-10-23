@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch_npu
 
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
+from hyper_parallel.core.multicore.diagnostics.common.session import _get_execution_observer
 
 from .spec import MegaMoeSpec, _align_capacity
 
@@ -450,6 +451,14 @@ def _summarize_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> tuple[i
     plan_tokens = max(128, _align_capacity(max(row[1] for row in rows)))
     if plan_tokens * max(spec.hidden_size, spec.top_k) > 2**31 - 1 or maximum > 2**31 - 1:
         raise RuntimeError("MegaMoe dynamic route exceeds native INT32 size limits")
+    observer = _get_execution_observer()
+    if observer is not None:
+        received = [row[6] for row in rows]
+        total = sum(received)
+        observer.record_event("route", {
+            "ep_rank": spec.rank_id, "source_tokens": [row[1] for row in rows],
+            "received_rows": received, "maximum_over_mean": maximum * spec.ep_size / total if total else 0.0,
+        })
     return max(1, rows[spec.rank_id][6]), plan_tokens, maximum
 
 

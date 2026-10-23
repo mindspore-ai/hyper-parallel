@@ -16,25 +16,28 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import os
-from pathlib import Path
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 # pylint: disable=wrong-import-position
 import torch
+import torch_npu  # noqa: F401  pylint: disable=unused-import
 from torch.nn import functional
 from torch.utils.checkpoint import checkpoint
-import torch_npu  # noqa: F401  pylint: disable=unused-import
 
-from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
-from hyper_parallel.core.multicore.modules.mega_gate.diagnostics import MEGA_GATE_ROUTE_GRAD_STAGE_NAMES
 from hyper_parallel.core.multicore.diagnostics import profiler as multicore_profiler
+from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
+from hyper_parallel.core.multicore.modules.mega_gate.diagnostics import (
+    MEGA_GATE_ROUTE_GRAD_STAGE_NAMES,
+)
 from hyper_parallel.core.multicore.torch import mega_gate_ops
+
 # pylint: enable=wrong-import-position
 
 _DEVICE = torch.device("npu", int(os.environ.get("LOCAL_RANK", "0")))
@@ -409,16 +412,18 @@ def _check_mega_gate_empty_tokens() -> None:
     assert gate.bias.grad is None and (gate.bias_vl is None or gate.bias_vl.grad is None)
 
 
-def _check_mega_gate_ignores_image_mask_without_vision_bias() -> None:
-    """Use the text native path when the module has no visual bias parameter."""
+def _check_mega_gate_rejects_image_mask_without_vision_bias() -> None:
+    """Reject an explicitly supplied visual mask instead of silently selecting text routing."""
     gate = _make_gate(vision_enabled=False)
-    hidden, weight, bias = _make_inputs(1, 2048, seed=28)
-    _set_parameters(gate, weight, bias)
+    hidden, _, _ = _make_inputs(1, 128, seed=28)
     image_mask = torch.ones(hidden.shape[:-1], device=_DEVICE, dtype=torch.bool)
-    with torch.no_grad():
-        expected = _golden(hidden, weight, bias)
-        actual = gate(hidden, image_mask=image_mask)
-    _assert_outputs_match(actual, expected)
+    try:
+        gate(hidden, image_mask=image_mask)
+    except ValueError as error:
+        if "vision_enabled=True" not in str(error):
+            raise
+    else:
+        raise AssertionError("MegaGate must reject image_mask without a visual correction bias")
 
 
 def _check_mega_gate_native_mask_layout_error() -> None:
@@ -513,7 +518,7 @@ def _check_mega_gate_grad_pipeline_profile() -> None:
 
 
 def _check_mega_gate_symbol_resolution_concurrency() -> None:
-    """Initialize Route and RouteGrad symbols safely from concurrent Torch threads."""
+    """Initialize Route and RouteGrad symbols safely from concurrent threads."""
     worker_count = 4
     barrier = threading.Barrier(worker_count)
     cases = []
@@ -527,7 +532,11 @@ def _check_mega_gate_symbol_resolution_concurrency() -> None:
     cases[0][0]._plan(cases[0][1])  # pylint: disable=protected-access
 
     def run_case(index: int) -> tuple[torch.Tensor, ...]:
-        """Launch one independent forward/backward graph after all threads are ready."""
+        """Launch one independent forward/backward graph after all threads are ready.
+
+        Args:
+            index: Independent graph index assigned to this worker thread.
+        """
         torch.npu.set_device(_DEVICE)
         gate, hidden = cases[index]
         leaf = hidden.detach().clone().requires_grad_()
@@ -876,7 +885,7 @@ def test_mega_gate_forward_parity() -> None:
     """Cover public forward behavior without repeating NPU process startup."""
     _check_mega_gate_module_parity()
     _check_mega_gate_empty_tokens()
-    _check_mega_gate_ignores_image_mask_without_vision_bias()
+    _check_mega_gate_rejects_image_mask_without_vision_bias()
     _check_mega_gate_native_mask_layout_error()
     _check_mega_gate_dynamic_vision_padding_parity()
 
@@ -913,5 +922,5 @@ def test_mega_gate_pipeline_profile() -> None:
 
 
 def test_mega_gate_symbol_resolution_concurrency() -> None:
-    """Resolve Route and RouteGrad symbols safely from concurrent Torch threads."""
+    """Resolve Route and RouteGrad symbols safely from concurrent threads."""
     _check_mega_gate_symbol_resolution_concurrency()

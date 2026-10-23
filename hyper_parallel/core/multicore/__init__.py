@@ -21,32 +21,33 @@ from hyper_parallel.core.multicore.diagnostics import (
 )
 
 if TYPE_CHECKING:
-    from hyper_parallel.core.multicore.modules.mega_gate.module import MegaGate
-    from hyper_parallel.core.multicore.modules.mega_mhc.module import HyperMegaMhc
+    from hyper_parallel.core.multicore.modules.mega_gate.module import GateBackend, GateOutput, MegaGate
+    from hyper_parallel.core.multicore.modules.mega_mhc import HyperMegaMhc, MegaMhc, MegaMhcOutput, MhcState
     from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 
 __all__ = [
-    "HyperMegaMhc", "MegaGate", "MegaMoeExperts", "MegaKernelDiagnostics",
+    "GateBackend", "GateOutput", "HyperMegaMhc", "MegaGate", "MegaMhc",
+    "MegaMhcOutput", "MegaMoeExperts", "MhcState", "MegaKernelDiagnostics",
     "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
 ]
 
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     """Load optional multicore modules only when their public API is requested."""
-    if name == "HyperMegaMhc":
-        from hyper_parallel.core.multicore.modules.mega_mhc.module import (  # pylint: disable=import-outside-toplevel
-            HyperMegaMhc as hyper_mega_mhc,
+    if name in ("HyperMegaMhc", "MegaMhc", "MhcState", "MegaMhcOutput"):
+        from hyper_parallel.core.multicore.modules import mega_mhc  # pylint: disable=import-outside-toplevel
+
+        value = getattr(mega_mhc, name)
+        globals()[name] = value
+        return value
+    if name in ("MegaGate", "GateOutput", "GateBackend"):
+        from hyper_parallel.core.multicore.modules.mega_gate import (  # pylint: disable=import-outside-toplevel
+            module as gate,
         )
 
-        globals()[name] = hyper_mega_mhc
-        return hyper_mega_mhc
-    if name == "MegaGate":
-        from hyper_parallel.core.multicore.modules.mega_gate.module import (  # pylint: disable=import-outside-toplevel
-            MegaGate as mega_gate,
-        )
-
-        globals()[name] = mega_gate
-        return mega_gate
+        value = getattr(gate, name)
+        globals()[name] = value
+        return value
     if name == "MegaMoeExperts":
         from hyper_parallel.core.multicore.modules.mega_moe.module import (  # pylint: disable=import-outside-toplevel
             MegaMoeExperts as mega_moe_experts,

@@ -805,4 +805,4 @@ pytest -v tests/torch/multicore/test_mega_moe_profiling.py
 ## 14. 相关文档
 
 - [MegaMoe Design and Usage](architecture.md)
-- [MegaMoe Torch 示例](../examples/mega_moe/README.md)
+- [MoE Transformer 三个 MegaKernel 接入示例](../examples/README.md)
