@@ -60,6 +60,12 @@ The old `--expert-capacity-factor` and `--capacity-policy` options were removed.
 Build the Torch multicore payload, install this checkout in editable mode, and
 run:
 
+Select `--soc-list ascend950` when building for A5, or
+`--soc-list ascend910b,ascend910_93` for A2/A3. The CANN installation must provide
+the selected target. Each build contains one SHMEM device generation; do not
+reuse an A2/A3 payload on A5. See the [build guide](../../docs/build.md) for wheel
+and source-payload activation.
+
 ```bash
 CANN_ENV_FILE=/path/to/CANN/set_env.sh \
 bash hyper_parallel/core/multicore/examples/mega_moe/run_qwen_moe_benchmark.sh \

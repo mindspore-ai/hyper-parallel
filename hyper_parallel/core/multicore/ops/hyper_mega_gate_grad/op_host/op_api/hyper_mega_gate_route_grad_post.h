@@ -12,13 +12,13 @@
 
 namespace l0op {
 
-/** Convert axis-local expert indices into production CANN ScatterElementsV2 indices. */
-const aclTensor *HyperMegaGateLinearIndex(const aclTensor *expert_indices, const aclTensor *zero_score_grad,
-                                          aclOpExecutor *executor);
+/** Prepare indices for the current platform's CANN ScatterElementsV2 contract. */
+const aclTensor *HyperMegaGateScatterIndices(const aclTensor *expert_indices, const aclTensor *zero_score_grad,
+                                             aclOpExecutor *executor);
 
 /** Scatter selected gradients with production CANN add reduction semantics. */
 const aclTensor *HyperMegaGateScatterSelectedGrad(const aclTensor *zero_score_grad,
-                                                  const aclTensor *expert_indices_int32,
+                                                  const aclTensor *scatter_indices,
                                                   const aclTensor *selected_score_grad, aclOpExecutor *executor);
 
 /** Double route scores with the production CANN Muls kernel. */

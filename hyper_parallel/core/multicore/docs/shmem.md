@@ -267,5 +267,12 @@ CANN `aclshmem`具有以下安全属性：
 SHMEM没有独立对外构建开关。`--multicore on`会构建Torch Multicore及其必需的SHMEM；`--multicore off`
 不交付两者的Native payload。内部`shmem/build.sh`依次构建AllGather kernel、Runtime和Torch binding。
 
-私有库位于`core/multicore/shmem/lib`，使用专属SONAME，避免与框架自带的通用SHMEM库冲突。制品不携带
-RPATH或RUNPATH，运行时搜索路径由Multicore `set_env.bash`统一配置。详见[构建与使用](build.md)。
+A2/A3 使用 `ascend910b,ascend910_93` 构建目标，对应 Ascend910B backend；
+A5 使用 `ascend950`，对应 Ascend950 backend，要求所选 CANN 提供 `libhcomm.so`。
+950 的 AllGather 设备代码使用 dav-c310-vec，Runtime 初始化时检查当前设备与构建 backend 是否匹配，
+不匹配时明确报错并给出重建目标。一次组件构建只选择其中一代，不将两代 SDK 或 native 制品混用。
+当前数据搬移使用 MTE；选用 A5 backend 不表示自动启用 UDMA 或跨节点传输。
+
+私有库位于 `core/multicore/shmem/lib`，使用专属 SONAME，避免与框架自带的通用 SHMEM 库冲突。
+制品不携带 RPATH/RUNPATH，运行时搜索路径由 Multicore `set_env.bash` 统一配置。详见
+[构建与使用](build.md)。

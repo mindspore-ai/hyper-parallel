@@ -16,8 +16,9 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
+
+import pytest
 
 from tests.common.mark_utils import arg_mark
 from tests.common.port_utils import allocate_port
@@ -38,7 +39,7 @@ _WORKER = str(Path(__file__).resolve().parent / "_test_swiglu_clamp_st.py")
     card_mark="onecard",
     essential_mark="essential",
 )
-def test_swiglu_clamp_numerics() -> None:
+def test_swiglu_clamp_numerics(monkeypatch: pytest.MonkeyPatch) -> None:
     """Validate clamp boundary numerics and the default unclamped path.
 
     Feature:
@@ -53,11 +54,9 @@ def test_swiglu_clamp_numerics() -> None:
         raise RuntimeError(
             "MegaMoe SwiGLU clamp ST requires a payload built with --multicore on"
         )
-    os.environ["HP_MEGA_MOE_WORLD_SIZE"] = "1"
-    os.environ["HYPER_PARALLEL_SHMEM_HEAP_SIZE"] = str(64 * 1024 * 1024)
-    os.environ["HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT"] = (
-        f"tcp://127.0.0.1:{allocate_port()}"
-    )
+    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", "1")
+    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", str(64 * 1024 * 1024))
+    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     with without_inherited_rank_environment():
         run_multicore_case(_WORKER, "test_swiglu_clamp_numerics", num_proc=1)
         run_multicore_case(_WORKER, "test_swiglu_clamp_input_gradient", num_proc=1)

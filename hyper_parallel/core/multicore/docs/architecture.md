@@ -448,10 +448,13 @@ event capacity 至少为 1024，并覆盖无融合图、ready/completion 事件�
 普通事件区占 `event_capacity × 4` 字节；EP 大于 1 时，其后预留 `2 × (EP + 1) × 64` 字节持久 ready/completion 状态。
 每次调用只清零普通事件区，首次使用才初始化持久区并执行 Host barrier。
 
-grouped-matmul 的各 AIC scratch 按 128 字节对齐，每核步长为 `ceil(local_experts × 8 / 128) × 128` 字节。
-`group_list_bytes = max(4096, 24 × 每核步长 + 128)`，包含首地址对齐余量，完整 cache line 写回不会覆盖相邻核。
+grouped-matmul 的各 AIC scratch 按 128 字节对齐，
+每核步长为 `ceil(max(1, local_experts) × 8 / 128) × 128` 字节。
+Cube 存储容量为 `C = max(24, ceil(num_workers / 2))`，其中 `num_workers` 来自当前执行计划。
+`group_list_bytes = max(4096, C × 每核步长 + 128)`，包含首地址对齐余量，完整 cache line 写回不会覆盖相邻核。
+Host 分配、序列化、Device scratch 偏移和 profiler 槽位使用相同的容量计算，适配 950PR/DT 的实际核心数。
 每 rank 不再有固定的 16 专家上限；Host 分配、序列化与 Device 偏移均使用实际专家数。
-16 个以内保持原布局大小，更多专家按需扩大 scratch，仍受 uint32 偏移与实际内存限制。
+scratch 随专家数和 worker 容量按需扩大，仍受 uint32 偏移与实际内存限制。
 
 ### 6.1 正向
 

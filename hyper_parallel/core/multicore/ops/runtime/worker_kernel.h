@@ -39,9 +39,14 @@ using namespace AscendC;  // NOLINT(build/namespaces)
 namespace MulticoreRuntime {
 
 constexpr uint32_t VECTOR_WORKER_STRIDE = 2;
-constexpr int64_t EVENT_REFRESH_TIME_UNIT_CYCLES = 50;
-constexpr int64_t CUBE_EVENT_REFRESH_INTERVAL_UNITS = 50;     // 2,500 system cycles.
-constexpr int64_t VECTOR_EVENT_REFRESH_INTERVAL_UNITS = 150;  // 7,500 system cycles.
+// GetSystemCycle measures the fixed system counter, not the AI Core clock.
+#if __NPU_ARCH__ == 3510
+constexpr int64_t SYSTEM_CYCLES_PER_US = 1000;
+#else
+constexpr int64_t SYSTEM_CYCLES_PER_US = 50;
+#endif
+constexpr int64_t CUBE_EVENT_REFRESH_INTERVAL_US = 50;
+constexpr int64_t VECTOR_EVENT_REFRESH_INTERVAL_US = 150;
 // The selected SwiGLU tiling uses baseRowLen=19; smaller dynamic tails must lower it.
 constexpr int64_t SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT = 19;
 constexpr int64_t READY_SIGNAL_RADIX = 2;
@@ -90,7 +95,7 @@ class KernelWorkerBase {
     }
     this->runtime_task_capacity = getRuntimeTaskCapacity(runtimeConfigPtr);
     this->runtime_event_capacity = getRuntimeEventCapacity(runtimeConfigPtr);
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     // The worker's scratch region is fixed for the lifetime of this task graph.
     this->grouped_matmul_group_list_offset_ = getGroupedMatmulGroupListOffsetById(runtimeConfigPtr, worker_id);
 #endif
@@ -141,7 +146,7 @@ class KernelWorkerBase {
 
  protected:
   __aicore__ inline void ProcessFast() {
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     uint32_t block_idx = this->worker_id_;
     do {
       if (block_idx >= this->cube_task_num) {
@@ -198,8 +203,9 @@ class KernelWorkerBase {
     CycleTraceRecorder cycle_trace_recorder;
     cycle_trace_recorder.Init(this->worker_id_, this->input_list[Derived::DIAGNOSTIC_IDX],
                               getAicProfileRecordCapacity(this->runtimeConfigPtr),
-                              getAivProfileRecordCapacity(this->runtimeConfigPtr));
-#ifdef __DAV_C220_CUBE__
+                              getAivProfileRecordCapacity(this->runtimeConfigPtr),
+                              getCubeWorkerCapacity(this->runtimeConfigPtr));
+#ifdef __DAV_CUBE__
     uint32_t block_idx = this->worker_id_;
     do {
       if (block_idx >= this->cube_task_num) {
@@ -231,7 +237,7 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void PublishDeviceReady(const ReadyHandshakeMeta &meta, bool completion = false) {
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
     int64_t rank = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0) % ep;
     constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
@@ -269,13 +275,13 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void CompleteDeviceReads(const ReadyHandshakeMeta &meta) {
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     if (this->worker_id_ % 2 == 0) {
       return;
     }
 #endif
     TriggerEvent(meta.completion_event);
-#ifndef __DAV_C220_CUBE__
+#ifndef __DAV_CUBE__
     if (this->worker_id_ == 1) {
       WaitForDependency(meta.completion_event);
       if (meta.ready_event != 0) {
@@ -310,7 +316,7 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void WaitForDeviceReady(const ReadyHandshakeMeta &meta) {
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     WaitForDependency(meta.ready_event);
 #else
     if (this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
@@ -324,7 +330,7 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline TaskId GetTaskIndex(uint32_t task_id) {
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     return cube_task_indexs.GetValue(task_id);
 #else
     return vector_task_indexs.GetValue(task_id);
@@ -339,15 +345,21 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void AtomicAddForAllEventCounters(uint32_t event_index) {
+#if defined(__DAV_CUBE__) && defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    // Ascend 950 cannot copy L1 to GM; publish after the task's device writes complete.
+    PipeBarrier<PIPE_ALL>();
+    (void)AscendC::AtomicAdd<int32_t>(this->all_event_counters.GetPhyAddr(event_index), 1);
+    PipeBarrier<PIPE_ALL>();
+#else
     TPipe eventPipe;
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     TBuf<AscendC::TPosition::A1> eventBuffer;
 #else
     TBuf<AscendC::TPosition::VECOUT> eventBuffer;
 #endif
     eventPipe.InitBuffer(eventBuffer, DISPATCH_TOKEN_UB_SIZE);
     LocalTensor<int32_t> localSet = eventBuffer.GetWithOffset<int32_t>(EXP_TOKEN_COUNT_FLAG_CNT, 0);
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     SyncFunc<AscendC::HardEvent::S_MTE2>();
     DataCopy(localSet, this->atomic_add_values, EXP_TOKEN_COUNT_FLAG_CNT);
     SyncFunc<AscendC::HardEvent::MTE2_S>();
@@ -358,7 +370,7 @@ class KernelWorkerBase {
     AscendC::SetAtomicNone();
 #else
     localSet.SetValue(0, 1);
-    for (int32_t i = 1; i < EXP_TOKEN_COUNT_FLAG_CNT; ++i) {
+    for (uint32_t i = 1; i < EXP_TOKEN_COUNT_FLAG_CNT; ++i) {
       localSet.SetValue(i, 0);
     }
     AscendC::SetAtomicAdd<int32_t>();
@@ -369,6 +381,7 @@ class KernelWorkerBase {
 #endif
     eventBuffer.FreeTensor(localSet);
     eventPipe.Destroy();
+#endif
   }
 
   __aicore__ inline void ExecuteTaskFast(TaskId task_id) {
@@ -455,15 +468,15 @@ class KernelWorkerBase {
   __aicore__ inline void WaitForDependency(uint32_t event_index, uint32_t poll_interval_us = 0) {
     // Pull producers signal locally after MTE3 completion. Observe short-lived
     // GMM/SwiGLU dependencies promptly while retaining a bounded refresh rate.
-#ifdef __DAV_C220_CUBE__
-    const uint32_t default_poll_interval_us = pull_protocol_ ? 10 : CUBE_EVENT_REFRESH_INTERVAL_UNITS;
+#ifdef __DAV_CUBE__
+    const uint32_t default_poll_interval_us = pull_protocol_ ? 10 : CUBE_EVENT_REFRESH_INTERVAL_US;
 #else
-    const uint32_t default_poll_interval_us = pull_protocol_ ? 30 : VECTOR_EVENT_REFRESH_INTERVAL_UNITS;
+    const uint32_t default_poll_interval_us = pull_protocol_ ? 30 : VECTOR_EVENT_REFRESH_INTERVAL_US;
 #endif
     if (poll_interval_us == 0) {
       poll_interval_us = default_poll_interval_us;
     }
-    constexpr int64_t cycles_per_us = EVENT_REFRESH_TIME_UNIT_CYCLES;
+    constexpr int64_t cycles_per_us = SYSTEM_CYCLES_PER_US;
     int32_t needed = all_event_num_triggers.GetValue(event_index);
     DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
       all_event_counters[event_index]);

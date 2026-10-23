@@ -107,7 +107,7 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     Returns:
         Validated runtime image including transport handshakes and profiler metadata.
     """
-    cfg = allocate_graph_config(graph, tsv)
+    cfg = allocate_graph_config(graph, tsv, num_cube_cores)
     cfg.num_workers    = 2 * num_cube_cores   # NUM_WORKERS_VECTOR = 2 × NUM_WORKERS_CUBE
 
     # Reset counters

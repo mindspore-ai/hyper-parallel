@@ -342,6 +342,14 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
         "The selected Python executable is unavailable: ${PYTHON_BIN}." 4
 fi
 PYTHON_BIN=$(command -v "${PYTHON_BIN}")
+if ! "${PYTHON_BIN}" -c '
+from pathlib import Path
+import pybind11
+raise SystemExit(0 if (Path(pybind11.get_include()) / "pybind11/numpy.h").is_file() else 1)
+' >/dev/null 2>&1; then
+    fail "PYTHON_BUILD_DEPENDENCY_NOT_FOUND" \
+        "Missing pybind11 development headers; install with: ${PYTHON_BIN} -m pip install pybind11" 4
+fi
 required_tools=(awk asc_opc bash cmake find gcc g++ git grep ld ldd make nm readelf readlink)
 required_tools+=(sed sha256sum sort tee)
 for required_tool in "${required_tools[@]}"; do

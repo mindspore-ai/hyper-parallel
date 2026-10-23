@@ -31,7 +31,12 @@ index 271a212..59f8ab1 100644
      {
          InitVar(tiling);
          InitInputGmBuffer(dy, x, rstd, gamma, blockDim_, coreCalcTail_);
-@@ -38,7 +55,7 @@ public:
+@@ -33,16 +55,20 @@ public:
+         InitOutputGmBuffer(dx, dgamma);
+         InitInputQue();
+         InitOutputQue();
+ #if defined(__CCE_AICORE__) && (__CCE_AICORE__ == 220)
+         InitTmpBuffer();
          if (isDeterministic_ == 1) {
              InitWorkspace(usrWorkspace);
              workspaceGmOri_.SetGlobalBuffer((__gm__ float*)usrWorkspace);
@@ -40,8 +45,15 @@ index 271a212..59f8ab1 100644
              SyncAll();
          }
  #else
-@@ -49,15 +66,17 @@ public:
-
++        // The task scheduler owns synchronization and the shared gradient workspace.
++        if (taskMode_) {
++            return;
++        }
+         syncTmpSpaceGm_.SetGlobalBuffer((__gm__ int32_t*)usrWorkspace, ALIGN_32 * GetBlockNum());
+         uint32_t syncLen = ALIGN_32 * GetBlockNum();
+         pipe.InitBuffer(outZeroTmpBuf_, colValAlign_ * sizeof(float));
+         pipe.InitBuffer(syncTmpBuf_, syncLen * sizeof(int32_t));
+@@ -50,16 +76,18 @@ public:
          InitGmZero<int32_t>(syncTmpSpaceGm_, outZeroTmpBuf_, syncLen, (uint32_t)0);
          if (isDeterministic_ != 1) {
 -            if (GetBlockIdx() == 0) {
@@ -63,6 +75,8 @@ index 271a212..59f8ab1 100644
                  InitGmZero<float>(workspaceGm_, outZeroTmpBuf_, colValAlign_, (uint32_t)0);
              }
          }
+ #endif
+     }
 @@ -66,7 +85,7 @@ public:
 
      __aicore__ inline void InitWorkspace(GM_ADDR usrWorkspace)
@@ -125,7 +139,37 @@ index 271a212..59f8ab1 100644
              return;
          }
          LocalTensor<float> dgammaLocal = outQueDgamma_.AllocTensor<float>();
-@@ -526,6 +545,8 @@ public:
+@@ -414,12 +433,13 @@ public:
+         if constexpr (is_same<T_DY, half>::value) {
+             LocalTensor<T_DY> dxLocalB16 = dxLocal.ReinterpretCast<T_DY>();
+             Cast(dxLocalB16, dxLocal, RoundMode::CAST_NONE, colValAlign_);
+             PipeBarrier<PIPE_V>();
+         }
+-#if defined(__CCE_AICORE__) && (__CCE_AICORE__ == 220)
++#if (defined(__CCE_AICORE__) && __CCE_AICORE__ == 220) || \
++    (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510)
+         else if constexpr (is_same<T_DY, bfloat16_t>::value) {
+             LocalTensor<T_DY> dxLocalB16 = dxLocal.ReinterpretCast<T_DY>();
+             Cast(dxLocalB16, dxLocal, RoundMode::CAST_RINT, colValAlign_);
+             PipeBarrier<PIPE_V>();
+         }
+ #endif
+@@ -488,12 +508,13 @@ public:
+         if constexpr (is_same<T_DY, half>::value) {
+             LocalTensor<T_DY> dxLocalB16 = dxLocal.ReinterpretCast<T_DY>();
+             Cast(dxLocalB16, dxLocal, RoundMode::CAST_NONE, elementNum);
+             PipeBarrier<PIPE_V>();
+         }
+-#if defined(__CCE_AICORE__) && (__CCE_AICORE__ == 220)
++#if (defined(__CCE_AICORE__) && __CCE_AICORE__ == 220) || \
++    (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510)
+         else if constexpr (is_same<T_DY, bfloat16_t>::value) {
+             LocalTensor<T_DY> dxLocalB16 = dxLocal.ReinterpretCast<T_DY>();
+             Cast(dxLocalB16, dxLocal, RoundMode::CAST_RINT, elementNum);
+             PipeBarrier<PIPE_V>();
+         }
+ #endif
+@@ -526,6 +547,8 @@ public:
      uint32_t bufferLenSize_;
      int32_t bufferNum_;
      uint32_t isDeterministic_{0};
@@ -134,7 +178,7 @@ index 271a212..59f8ab1 100644
 
      TPipe pipe;
      GlobalTensor<T_DY> dyGm_, dxGm_, xGm_;
-@@ -540,4 +561,4 @@ public:
+@@ -540,4 +563,4 @@ public:
      TBuf<TPosition::VECCALC> outZeroTmpBuf_;
      TBuf<TPosition::VECCALC> syncTmpBuf_;
  };

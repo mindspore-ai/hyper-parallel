@@ -73,7 +73,7 @@ class AivPipelineWorkerBase {
   __aicore__ inline void ProcessProfiled() {
     CycleTraceRecorder recorder;
     recorder.Init(worker_id_, diagnostic_buffer_, getAicProfileRecordCapacity(runtime_config_),
-                  getAivProfileRecordCapacity(runtime_config_));
+                  getAivProfileRecordCapacity(runtime_config_), getCubeWorkerCapacity(runtime_config_));
     for (uint32_t stage = 0; stage < stage_count_; ++stage) {
       const uint32_t task_id = LoadTaskId(stage);
       const uint64_t start_cycle = recorder.Now();

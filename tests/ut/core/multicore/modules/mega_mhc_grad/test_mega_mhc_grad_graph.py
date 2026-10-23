@@ -45,6 +45,20 @@ NUM_VECTOR_CORES = 40
 class TestMegaMhcGradGraph(unittest.TestCase):
     """Validate task types, dependencies, tiling, and AIV queue order."""
 
+    def test_graph_uses_the_reported_vector_count(self) -> None:
+        """Cover every current A5 core-count class without launching a device."""
+        for cores in (4, 8, 20, 24, 28, 32, 36):
+            with self.subTest(cores=cores):
+                graph, topology = build_mega_mhc_grad_graph(256, 512, num_vector_cores=2 * cores)
+                config = build_runtime_config(graph, topology, num_cube_cores=cores)
+                order_vector_tasks_by_stage(config)
+                self.assertEqual(config.num_workers, 2 * cores, f"expected={2 * cores} actual={config.num_workers}")
+                _validate_runtime_task_queues(config, config.event_capacity)
+                initialization = [task.task_index for task in config.all_tasks[:config.task_num]
+                                  if task.task_type == TaskType.TASK_MHC_GRAD_PREV_A and task.task_split_value == 0]
+                expected = list(range(2 * cores))
+                self.assertEqual(initialization, expected, f"expected={expected} actual={initialization}")
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     @patch("hyper_parallel.core.multicore.modules.mega_mhc_grad.function.torch.npu.get_device_limit")

@@ -8,6 +8,9 @@
 
 #include "hyper_mega_gate_route_grad_post.h"
 
+#include <algorithm>
+#include <iterator>
+
 #include "opdev/make_op_executor.h"
 #include "opdev/op_def.h"
 #include "opdev/op_dfx.h"
@@ -51,10 +54,13 @@ RouteGradOutputs HyperMegaGateRouteGradKernel(const aclTensor *selected_scores,
   L0_DFX(HyperMegaGateRouteGradKernel, selected_scores, normalization_denominator, grad_routing_weights, route_scores,
          expert_indices, runtime_config, diagnostic_buffer, top_k, routed_scaling_factor);
   RouteGradOutputs outputs{nullptr, nullptr};
-  CHECK_RET(selected_scores != nullptr && normalization_denominator != nullptr && grad_routing_weights != nullptr &&
-              route_scores != nullptr && expert_indices != nullptr && runtime_config != nullptr &&
-              diagnostic_buffer != nullptr && executor != nullptr && top_k > 0,
-            outputs);
+  const aclTensor *inputs[] = {
+    selected_scores, normalization_denominator, grad_routing_weights, route_scores, expert_indices,
+    runtime_config,  diagnostic_buffer};
+  CHECK_RET(
+    std::all_of(std::begin(inputs), std::end(inputs), [](const aclTensor *input) { return input != nullptr; }) &&
+      executor != nullptr && top_k > 0,
+    outputs);
   const auto &selected_shape = selected_scores->GetViewShape();
   const auto &score_shape = route_scores->GetViewShape();
   CHECK_RET(selected_shape.GetDimNum() == 2 && score_shape.GetDimNum() == 2, outputs);
@@ -108,9 +114,9 @@ const aclTensor *HyperMegaGateRouteGrad(const aclTensor *logits, const aclTensor
                                                        route_scores, expert_indices, runtime_config, diagnostic_buffer,
                                                        top_k, routed_scaling_factor, executor);
   CHECK_RET(route_grad.selected_score_grad != nullptr && route_grad.zero_score_grad != nullptr, nullptr);
-  const auto *linear_indices = HyperMegaGateLinearIndex(expert_indices, route_grad.zero_score_grad, executor);
-  CHECK_RET(linear_indices != nullptr, nullptr);
-  const auto *score_grad = HyperMegaGateScatterSelectedGrad(route_grad.zero_score_grad, linear_indices,
+  const auto *scatter_indices = HyperMegaGateScatterIndices(expert_indices, route_grad.zero_score_grad, executor);
+  CHECK_RET(scatter_indices != nullptr, nullptr);
+  const auto *score_grad = HyperMegaGateScatterSelectedGrad(route_grad.zero_score_grad, scatter_indices,
                                                             route_grad.selected_score_grad, executor);
   CHECK_RET(score_grad != nullptr, nullptr);
   const auto *doubled_scores = HyperMegaGateDoubleRouteScores(route_scores, executor);

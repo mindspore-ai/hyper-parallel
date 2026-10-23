@@ -22,8 +22,15 @@ SHMEM 构建保持锁定的上游 Git 源码不变，只在隔离副本应用经
 
 主入口调用本目录的 `build.sh` 并统一组包。业务入口负责私有 SHMEM、Torch adapter
 和正反向 vendor；依赖版本固定在 `_build/dependencies.lock.json`。
-默认目标是 `ascend910b,ascend910_93`；可以通过 `--soc-list` 选择其中的目标。
+默认目标是 `ascend910b,ascend910_93`；`--soc-list ascend950` 选择 950 家族，要求所选 CANN
+包含对应的工具链、ops 和 `libhcomm.so`。SoC 入参使用 CANN 家族名，不填写 PR/DT 子型号。
+950 使用 CANN 的 `Ascend950PR_9599` 代表编译目标；实际设备核数由运行时查询，
+不从代表型号推断。一次组件构建选择 A2/A3 或 A5 的 SHMEM 后端，不能混合这两代目标。
 不同 Python、CPU、Torch/PTA 或 CANN 构建环境的制品不能默认互换。
+
+MegaMHC 的融合 worker 使用 `MhcPreSinkhornTilingData` 任务布局。
+它复用匹配的 task tiler 并查询实际平台资源，不使用上游独立算子的 arch35 tiling 布局；
+独立算子的架构分派不能直接替换融合入口。
 
 组件会在生成私有 SHMEM、复用缓存、生成单 SoC vendor、合并多 SoC vendor 和安装 Torch adapter 后校验
 最终制品。校验覆盖 ACLNN API、kernel object/metadata、ELF 架构、私有 SONAME、运行时依赖及共享库安全
@@ -72,3 +79,22 @@ from hyper_parallel.core.multicore import MegaMoeExperts
 ```
 
 HyperParallel 根包不导出 Multicore 的业务接口。
+
+## 测试
+
+从已安装当前源码的开发环境执行无卡 UT：
+
+```bash
+python -m pytest tests/ut/core/multicore
+```
+
+ST 使用仓库公共 launcher 启动 worker。准备对应交付的 CANN/OPP 环境，并按用例需要
+提供空闲 NPU 后，使用标准 pytest 收集与运行：
+
+```bash
+python -m pytest --collect-only -q tests/torch/multicore -m 'level0 or level1'
+python -m pytest -v tests/torch/multicore -m 'level0 or level1'
+```
+
+可以按文件、node ID 或 level 选择子集；完整目录包含八卡 SHMEM 和四卡 MegaMoe 用例。
+wheel 验证应在源码目录之外运行，并避免将业务源码加入 `PYTHONPATH`，确保测试的是安装包。

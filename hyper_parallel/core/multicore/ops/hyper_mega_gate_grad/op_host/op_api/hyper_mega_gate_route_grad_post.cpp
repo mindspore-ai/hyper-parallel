@@ -12,6 +12,7 @@
 #include "opdev/make_op_executor.h"
 #include "opdev/op_def.h"
 #include "opdev/op_dfx.h"
+#include "opdev/platform.h"
 
 namespace l0op {
 
@@ -54,26 +55,30 @@ aclTensor *ResolveOutput(const aclTensor *reference, const aclTensor *output, ac
 
 }  // namespace
 
-const aclTensor *HyperMegaGateLinearIndex(const aclTensor *expert_indices, const aclTensor *zero_score_grad,
-                                          aclOpExecutor *executor) {
-  L0_DFX(HyperMegaGateLinearIndex, expert_indices, zero_score_grad);
+const aclTensor *HyperMegaGateScatterIndices(const aclTensor *expert_indices, const aclTensor *zero_score_grad,
+                                             aclOpExecutor *executor) {
+  L0_DFX(HyperMegaGateScatterIndices, expert_indices, zero_score_grad);
   CHECK_RET(expert_indices != nullptr && zero_score_grad != nullptr && executor != nullptr, nullptr);
   CHECK_RET(expert_indices->GetDataType() == op::DataType::DT_INT64, nullptr);
   const auto *indices_matrix = EnsureKernelTensorMetadata(expert_indices, executor);
   const auto *zero_score_grad_matrix = EnsureKernelTensorMetadata(zero_score_grad, executor);
   CHECK_RET(indices_matrix != nullptr && zero_score_grad_matrix != nullptr, nullptr);
+  // A5 ScatterElementsV2 consumes axis-local indices; the A2/A3 kernel consumes linear offsets.
+  if (op::GetCurrentPlatformInfo().GetSocVersion() == op::SocVersion::ASCEND950) {
+    return indices_matrix;
+  }
   return l0op::LinearIndex(indices_matrix, zero_score_grad_matrix, 1, false, executor);
 }
 
 const aclTensor *HyperMegaGateScatterSelectedGrad(const aclTensor *zero_score_grad,
-                                                  const aclTensor *expert_indices_int32,
+                                                  const aclTensor *scatter_indices,
                                                   const aclTensor *selected_score_grad, aclOpExecutor *executor) {
-  L0_DFX(HyperMegaGateScatterSelectedGrad, zero_score_grad, expert_indices_int32, selected_score_grad);
-  CHECK_RET(zero_score_grad != nullptr && expert_indices_int32 != nullptr && selected_score_grad != nullptr &&
+  L0_DFX(HyperMegaGateScatterSelectedGrad, zero_score_grad, scatter_indices, selected_score_grad);
+  CHECK_RET(zero_score_grad != nullptr && scatter_indices != nullptr && selected_score_grad != nullptr &&
               executor != nullptr,
             nullptr);
   const auto *zero_score_grad_matrix = EnsureKernelTensorMetadata(zero_score_grad, executor);
-  const auto *expert_indices_matrix = EnsureKernelTensorMetadata(expert_indices_int32, executor);
+  const auto *expert_indices_matrix = EnsureKernelTensorMetadata(scatter_indices, executor);
   const auto *selected_score_grad_matrix = EnsureKernelTensorMetadata(selected_score_grad, executor);
   CHECK_RET(
     zero_score_grad_matrix != nullptr && expert_indices_matrix != nullptr && selected_score_grad_matrix != nullptr,

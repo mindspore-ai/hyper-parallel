@@ -39,7 +39,7 @@
         "patches": [
           {
             "path": "hyper_parallel/core/multicore/ops/swi_glu_fusion.patch",
-            "sha256": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d",
+            "sha256": "ca4cacfad1299b3b37fffeec43d8047fb6325eb4f0fdccdf475f855f45173bef",
             "purpose": "expose the selected SwiGLU and SwiGLUGrad kernels as inline HyperMegaMoe building blocks"
           },
           {
@@ -50,13 +50,13 @@
           },
           {
             "path": "hyper_parallel/core/multicore/ops/rms_norm_worker_fusion.patch",
-            "sha256": "e8e278434a4dc475477f1ee55d339c307f409e504cbf7dad6e29186d1121200f",
-            "purpose": "add a logical token-block entry point while preserving the native RMSNorm entry behavior"
+            "sha256": "d1751299e120709f3a625af9b6d606c1696059fbb55c99ed01788765f1840004",
+            "purpose": "add a logical token-block RMSNorm entry point and non-atomic Ascend950 backward-cache writes"
           },
           {
             "path": "hyper_parallel/core/multicore/ops/rms_norm_grad_worker_fusion.patch",
-            "sha256": "b55856bdaa183684576febdcbf2df01cace97932f00d2a336e54cb7d59ee8964",
-            "purpose": "add a task-local RMSNormGrad entry point and explicit fused-task pipe cleanup"
+            "sha256": "0d6eacd29418c897cd3ac42bd4b62eb331912a62a36fa506a4df80f6fffd1ce2",
+            "purpose": "add task-local RMSNormGrad execution without shared-workspace initialization, explicit pipe cleanup and Ascend950 BF16 output packing"
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
@@ -72,7 +72,7 @@
         "patches": [
           {
             "path": "hyper_parallel/core/multicore/ops/grouped_matmul_fusion.patch",
-            "sha256": "53341da1cb6d8ca1a0bb3a16deaff8a67a2d01a4525fac8a8e529535330e2d9d",
+            "sha256": "f908a2dd909f75cc16b4532c24a2916858324f06034635e51fdab36056384c5c",
             "purpose": "expose the selected grouped-matmul path as an inline building block"
           }
         ],
@@ -109,6 +109,15 @@
           }
         ],
         "upgrade_policy": "a version change must pass HyperMegaMhc accuracy and performance validation"
+      },
+      "nlohmann_json": {
+        "version": "v3.11.3",
+        "repository": "https://gitcode.com/GitHub_Trending/js/json.git",
+        "commit": "9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03",
+        "tree": "5af76d5aa32f4b473b5dd7f82fb9f2a4257322c6",
+        "git_archive_tar_sha256": "0a59c5f4e31190d4ab72e4adaac69a978199c2da1989bfc6273de21f4dc016e4",
+        "resolution": "SHMEM Ascend950 topology-reader header dependency; copied only to the isolated SDK source",
+        "packaging_policy": "build-only header dependency; not a Python runtime requirement"
       },
       "shmem": {
         "version": "d30702bb55d0",

@@ -26,3 +26,22 @@ index 4ac04fd13..d5f7987e5 100644
 +        } else if (blockIdx_ == logicalBlockNum - 1) {
 +            this->row_work = num_row - (logicalBlockNum - 1) * block_factor;
          }
+@@ -220,13 +227,17 @@ private:
+     __aicore__ inline void CopyOutRstd(uint64_t outer_progress, uint64_t num)
+     {
+         LocalTensor<float> rstdLocal = outQueueRstd.DeQue<float>();
+         uint32_t copyRstdNumAlgin32 = static_cast<uint32_t>((num + NUM_PER_BLK_FP32 - 1) / NUM_PER_BLK_FP32 * NUM_PER_BLK_FP32);
+-#if __CCE_AICORE__ == 220 || (defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3003 || __NPU_ARCH__ == 3113))
++#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
++        // Each task owns its cache rows; the destination is not initialized for atomic addition.
++        DataCopyExtParams copyParams{1, static_cast<uint32_t>(num * sizeof(float)), 0, 0, 0};
++        DataCopyPad(rstdGm[outer_progress * row_factor], rstdLocal, copyParams);
++#elif __CCE_AICORE__ == 220 || (defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3003 || __NPU_ARCH__ == 3113))
+         DataCopyCustom<float>(rstdGm[outer_progress * row_factor], rstdLocal, num);
+ #else
+         SetAtomicAdd<float>();
+         DataCopy(rstdGm[outer_progress * row_factor], rstdLocal, copyRstdNumAlgin32);
+         SetAtomicNone();
+ #endif
+         outQueueRstd.FreeTensor(rstdLocal);
+     }

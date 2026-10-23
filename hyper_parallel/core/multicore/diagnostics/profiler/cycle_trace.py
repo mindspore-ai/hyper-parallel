@@ -36,6 +36,7 @@ from hyper_parallel.core.multicore.scheduler.config import (
 )
 from hyper_parallel.core.multicore.diagnostics.common.graph import _scheduled_task_ids
 from hyper_parallel.core.multicore.diagnostics.common.runtime import DiagnosticMode, PreparedDiagnosticRuntime
+from hyper_parallel.core.multicore.scheduler.runtime import runtime_cube_worker_capacity
 
 
 CUBE_SLOT_COUNT = NUM_WORKERS_CUBE
@@ -52,10 +53,12 @@ MAX_PROFILE_BUFFER_BYTES = CORE_SLOT_COUNT * MAX_CORE_STRIDE_BYTES
 INVALID_OWNER_ID = 0xFFFFFFFF
 TASK_TYPE_DESC_BASE = 0x20000
 GRAPH_STAGE_DESC_BASE = 0x30000
+# GetSystemCycle uses the fixed system counter, not the variable AI Core clock.
 _SYSTEM_COUNTER_FREQUENCY_MHZ = {
     "ascend910b": 50.0,
     "ascend910c": 50.0,
     "ascend910_93": 50.0,
+    "ascend950": 1000.0,
 }
 
 DEFAULT_STAGE_NAMES = {
@@ -128,6 +131,7 @@ class _ProfileLayout:
     aiv_required_records: int
     aic_record_capacity: int
     aiv_record_capacity: int
+    cube_slot_count: int = CUBE_SLOT_COUNT
 
     @property
     def buffer_size(self) -> int:
@@ -135,6 +139,7 @@ class _ProfileLayout:
         return _profile_buffer_bytes_for_capacities(
             self.aic_record_capacity,
             self.aiv_record_capacity,
+            self.cube_slot_count,
         )
 
 
@@ -151,6 +156,7 @@ class _CycleTraceConfig:
     stage_names: Mapping[int, str]
     soc_name: str
     task_stage_names: Mapping[int, str] | None = None
+    cube_slot_count: int = CUBE_SLOT_COUNT
 
 
 def _get_soc_name(device_id: int | None) -> str:
@@ -189,10 +195,12 @@ def _validate_runtime_config(runtime_config: RuntimeConfigC) -> None:
         raise TypeError(f"runtime_config must be RuntimeConfigC, got {type(runtime_config).__name__}")
 
 
-def _profile_buffer_bytes_for_capacities(aic_record_capacity: int, aiv_record_capacity: int) -> int:
+def _profile_buffer_bytes_for_capacities(
+    aic_record_capacity: int, aiv_record_capacity: int, cube_slot_count: int = CUBE_SLOT_COUNT,
+) -> int:
     aic_stride = CORE_HEADER.size + aic_record_capacity * PROFILE_RECORD.size
     aiv_stride = CORE_HEADER.size + aiv_record_capacity * PROFILE_RECORD.size
-    return CUBE_SLOT_COUNT * aic_stride + VECTOR_SLOT_COUNT * aiv_stride
+    return cube_slot_count * aic_stride + 2 * cube_slot_count * aiv_stride
 
 
 def _round_up_record_capacity(required_records: int) -> int:
@@ -243,11 +251,8 @@ def _calculate_aiv_pipeline_profile_layout(
 ) -> _ProfileLayout:
     """Size AIV slots for workers that each execute the complete stage sequence."""
     worker_capacity = int(runtime_config.num_workers)
-    if not 0 < worker_capacity <= VECTOR_SLOT_COUNT:
-        raise ValueError(
-            "AIV pipeline worker capacity must be in "
-            f"[1, {VECTOR_SLOT_COUNT}], got {worker_capacity}"
-        )
+    if worker_capacity <= 0:
+        raise ValueError(f"AIV pipeline worker capacity must be positive, got {worker_capacity}")
     scheduled_task_count = int(runtime_config.task_index_num[1])
     if not 0 <= scheduled_task_count <= len(runtime_config.vector_task_indices):
         raise ValueError(f"scheduled task count is outside RuntimeConfig capacity: {scheduled_task_count}")
@@ -265,6 +270,7 @@ def _calculate_aiv_pipeline_profile_layout(
         aiv_required_records=required_records,
         aic_record_capacity=0,
         aiv_record_capacity=_round_up_record_capacity(required_records),
+        cube_slot_count=runtime_cube_worker_capacity(worker_capacity),
     )
 
 
@@ -273,10 +279,8 @@ def _calculate_event_driven_profile_layout(
 ) -> _ProfileLayout:
     """Size AIC/AIV slots for event-driven task queues using the busiest worker."""
     num_workers = int(runtime_config.num_workers)
-    if num_workers < 0 or num_workers % 2 != 0 or num_workers > VECTOR_SLOT_COUNT:
-        raise ValueError(
-            f"RuntimeConfig.num_workers must be an even value in [0, {VECTOR_SLOT_COUNT}], got {num_workers}"
-        )
+    if num_workers < 0 or num_workers % 2 != 0:
+        raise ValueError(f"RuntimeConfig.num_workers must be a nonnegative even value, got {num_workers}")
     active_worker_count = num_workers // 2
     aic_required_records = _max_worker_record_count(
         runtime_config,
@@ -295,6 +299,7 @@ def _calculate_event_driven_profile_layout(
         aiv_required_records=aiv_required_records,
         aic_record_capacity=_round_up_record_capacity(aic_required_records),
         aiv_record_capacity=_round_up_record_capacity(aiv_required_records),
+        cube_slot_count=runtime_cube_worker_capacity(num_workers),
     )
 
 
@@ -448,19 +453,20 @@ class _PreparedProfileRuntime:
                 stage_names=self._metadata.stage_names,
                 soc_name=soc_name,
                 task_stage_names=self._metadata.task_stage_names,
+                cube_slot_count=self._layout.cube_slot_count,
             ),
             aic_record_capacity=self._layout.aic_record_capacity,
             aiv_record_capacity=self._layout.aiv_record_capacity,
         )
 
 
-def _as_bytes(buffer: Any) -> bytes:
+def _as_bytes(buffer: Any, cube_slot_count: int = CUBE_SLOT_COUNT) -> bytes:
     """Convert an array-like profile buffer to validated immutable bytes."""
     if hasattr(buffer, "tobytes"):
         raw_buffer = buffer.tobytes()
     else:
         raw_buffer = bytes(buffer)
-    minimum_buffer_bytes = CORE_SLOT_COUNT * CORE_HEADER.size
+    minimum_buffer_bytes = 3 * cube_slot_count * CORE_HEADER.size
     if len(raw_buffer) < minimum_buffer_bytes:
         raise ValueError(
             f"MegaKernel profile buffer is too small: expected at least {minimum_buffer_bytes} bytes, "
@@ -484,13 +490,15 @@ def _validate_record_capacity(record_capacity: int, core_name: str) -> None:
         )
 
 
-def _profile_layout_from_buffer(raw_buffer: bytes) -> tuple[int, int, int]:
+def _profile_layout_from_buffer(
+    raw_buffer: bytes, cube_slot_count: int = CUBE_SLOT_COUNT,
+) -> tuple[int, int, int]:
     """Read AIC/AIV capacities from the first initialized header of each slot region."""
     aic_header = CORE_HEADER.unpack_from(raw_buffer, 0)
     aic_record_capacity = aic_header[5]
     _validate_record_capacity(aic_record_capacity, "AIC")
     aic_stride = CORE_HEADER.size + aic_record_capacity * PROFILE_RECORD.size
-    aiv_region_offset = CUBE_SLOT_COUNT * aic_stride
+    aiv_region_offset = cube_slot_count * aic_stride
     if len(raw_buffer) < aiv_region_offset + CORE_HEADER.size:
         raise ValueError(
             f"MegaKernel profile buffer is too small for the AIV header: "
@@ -502,6 +510,7 @@ def _profile_layout_from_buffer(raw_buffer: bytes) -> tuple[int, int, int]:
     required_buffer_bytes = _profile_buffer_bytes_for_capacities(
         aic_record_capacity,
         aiv_record_capacity,
+        cube_slot_count,
     )
     if len(raw_buffer) < required_buffer_bytes:
         raise ValueError(
@@ -511,13 +520,15 @@ def _profile_layout_from_buffer(raw_buffer: bytes) -> tuple[int, int, int]:
     return aic_record_capacity, aiv_record_capacity, required_buffer_bytes
 
 
-def _profile_slot_layouts(aic_record_capacity: int, aiv_record_capacity: int):
+def _profile_slot_layouts(
+    aic_record_capacity: int, aiv_record_capacity: int, cube_slot_count: int = CUBE_SLOT_COUNT,
+):
     aic_stride = CORE_HEADER.size + aic_record_capacity * PROFILE_RECORD.size
     aiv_stride = CORE_HEADER.size + aiv_record_capacity * PROFILE_RECORD.size
-    for block_id in range(CUBE_SLOT_COUNT):
+    for block_id in range(cube_slot_count):
         yield 1, block_id, block_id * aic_stride, aic_record_capacity
-    aiv_region_offset = CUBE_SLOT_COUNT * aic_stride
-    for block_id in range(VECTOR_SLOT_COUNT):
+    aiv_region_offset = cube_slot_count * aic_stride
+    for block_id in range(2 * cube_slot_count):
         yield 2, block_id, aiv_region_offset + block_id * aiv_stride, aiv_record_capacity
 
 
@@ -558,10 +569,11 @@ def _resolve_buffer_layout(
     raw_buffer: bytes,
     aic_record_capacity: int | None,
     aiv_record_capacity: int | None,
+    cube_slot_count: int = CUBE_SLOT_COUNT,
 ) -> tuple[int, int, int]:
     """Resolve and validate the two per-core capacities and total buffer size."""
     if aic_record_capacity is None and aiv_record_capacity is None:
-        return _profile_layout_from_buffer(raw_buffer)
+        return _profile_layout_from_buffer(raw_buffer, cube_slot_count)
     if aic_record_capacity is None or aiv_record_capacity is None:
         raise ValueError("AIC and AIV profile capacities must be provided together")
     _validate_record_capacity(aic_record_capacity, "AIC")
@@ -569,6 +581,7 @@ def _resolve_buffer_layout(
     required_buffer_bytes = _profile_buffer_bytes_for_capacities(
         aic_record_capacity,
         aiv_record_capacity,
+        cube_slot_count,
     )
     if len(raw_buffer) < required_buffer_bytes:
         raise ValueError(
@@ -686,12 +699,13 @@ def _decode_cycle_records(
     raw_buffer: bytes,
     aic_record_capacity: int,
     aiv_record_capacity: int,
+    cube_slot_count: int = CUBE_SLOT_COUNT,
 ) -> tuple[list[dict[str, int]], list[int], int]:
     """Decode all initialized AIC/AIV slots and aggregate drop counters."""
     raw_records = []
     active_entry_cycles = []
     dropped_records = 0
-    for slot, layout in enumerate(_profile_slot_layouts(aic_record_capacity, aiv_record_capacity)):
+    for slot, layout in enumerate(_profile_slot_layouts(aic_record_capacity, aiv_record_capacity, cube_slot_count)):
         records, entry_cycle, dropped_count = _decode_profile_slot(raw_buffer, slot, layout)
         dropped_records += dropped_count
         if entry_cycle is not None:
@@ -807,16 +821,20 @@ def _parse_cycle_buffer(
         raise ValueError(f"cycle_frequency_mhz must be positive, got {config.cycle_frequency_mhz}")
     resolved_stage_names = _resolve_stage_names(config.stage_names)
     resolved_task_stage_names = dict(config.task_stage_names or {})
-    raw_buffer = _as_bytes(buffer)
+    if config.cube_slot_count < CUBE_SLOT_COUNT:
+        raise ValueError(f"profile Cube slot count must be at least {CUBE_SLOT_COUNT}, got {config.cube_slot_count}")
+    raw_buffer = _as_bytes(buffer, config.cube_slot_count)
     aic_record_capacity, aiv_record_capacity, required_buffer_bytes = _resolve_buffer_layout(
         raw_buffer,
         aic_record_capacity,
         aiv_record_capacity,
+        config.cube_slot_count,
     )
     raw_records, active_entry_cycles, dropped_records = _decode_cycle_records(
         raw_buffer,
         aic_record_capacity,
         aiv_record_capacity,
+        config.cube_slot_count,
     )
     if not raw_records:
         raise ValueError(

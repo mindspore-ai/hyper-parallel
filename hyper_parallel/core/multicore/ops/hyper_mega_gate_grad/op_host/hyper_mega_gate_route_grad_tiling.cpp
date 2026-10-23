@@ -11,6 +11,8 @@
 #include <limits>
 #include <vector>
 
+#include "graph/tensor.h"
+#include "graph/types.h"
 #include "log/log.h"
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"

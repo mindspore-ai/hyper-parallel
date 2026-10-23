@@ -312,7 +312,13 @@ class RouteGradPipeline : private TokenRowPipeline {
       if (multiply) {
         Mul(destination, left_value, right_value, element_count);
       } else {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        // Normalization gradients require the same FP32 rounding as the reference Div operations.
+        static constexpr DivConfig div_config = {DivAlgo::PRECISION_0ULP_FTZ_FALSE};
+        Div<float, div_config>(destination, left_value, right_value, element_count);
+#else
         Div(destination, left_value, right_value, element_count);
+#endif
       }
       output_queue.EnQue(destination);
       destination = output_queue.DeQue<float>();

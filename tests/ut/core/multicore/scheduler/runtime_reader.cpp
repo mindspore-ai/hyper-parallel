@@ -34,11 +34,19 @@ inline void WaitFlag(uint32_t) {}
 using AscendC::GetTPipePtr;
 #include "hyper_parallel/core/multicore/ops/runtime/runtime_config.hpp"
 #include "hyper_parallel/core/multicore/ops/runtime/runtime_storage_bounds_host.h"
+#include "hyper_parallel/core/multicore/ops/runtime/cycle_trace_recorder.h"
 
 namespace Runtime = MulticoreRuntime;
 
 static_assert(sizeof(Runtime::TensorDesc) == 64);
 static_assert(sizeof(Runtime::TaskDesc) == 576);
+
+extern "C" void record_profile(uint8_t *image, uint8_t *buffer, uint32_t worker) {
+  Runtime::CycleTraceRecorder recorder;
+  recorder.Init(worker, buffer, Runtime::getAicProfileRecordCapacity(image),
+                Runtime::getAivProfileRecordCapacity(image), Runtime::getCubeWorkerCapacity(image));
+  recorder.Record(1, 2, 3, 4, 10, 20);
+}
 
 extern "C" void read_transport_and_kernel_task_types(uint32_t *result) {
   result[0] = static_cast<uint32_t>(Runtime::TaskType::TASK_SHMEM_GET_MEM);

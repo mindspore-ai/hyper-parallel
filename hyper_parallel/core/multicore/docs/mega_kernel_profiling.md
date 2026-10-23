@@ -210,14 +210,16 @@ kernel 的输入列表都显式传递它，但 Python 公共 `mega_moe()`、`meg
 Host 根据完整调度表复现每个 worker 可能执行的任务，分别计算最忙 AIC 和 AIV 的记录数：
 
 ```text
-capacity = min(round_up(required_records, 16), 256)
+capacity = round_up(required_records, 16)
 ```
 
 每个有依赖的普通 task 最多记录 WaitDependency、Compute 和 TriggerEvent 三段；SHMEM put 不重复记录公共
-trigger 区间。达到 256 条上限后停止写入新 record 并累计 dropped count，不覆盖既有数据。
+trigger 区间。每核容量须满足 Device ABI 的 uint32 stride 边界，超限在 Host 准备时明确报错。
+Device 达到该调用分配的容量后停止写入新 record 并累计 dropped count，不覆盖既有数据。
 
-profile buffer 总容量为 `24 * AIC_stride + 48 * AIV_stride`，最大值为
-`72 * (64 + 256 * 32) = 594432` Byte；不包含调度 event workspace。
+令 `C = max(24, ceil(num_workers / 2))`，profile buffer 总容量为
+`C * AIC_stride + 2 * C * AIV_stride`，不包含调度 event workspace。
+Host 分配、Device 写入与 Host parser 共用当前执行计划的槽位容量；950 不固定为 24/48 核。
 `max_pending_calls` 控制 Host session 的 buffer drain 频率，与这里的每核 record 容量无关。
 
 ### 4.4 Cycle 与时间换算
@@ -229,8 +231,10 @@ timestamp_us = (start_cycle - anchor_cycle) / cycle_frequency_mhz
 duration_us  = (end_cycle - start_cycle) / cycle_frequency_mhz
 ```
 
-当前内部频率映射支持 Ascend 910B/910C/910_93 系列，A2/A3 使用 50 MHz。SoC 名称来自
+内部频率映射支持 Ascend 910B/910C/910_93 和 950 系列；A2/A3 使用 50 MHz，A5 使用 1000 MHz。
+950PR/DT 子型号归一到 950 家族，不以 AI Core 主频代替系统计数频率。SoC 名称来自
 `torch_npu.npu.get_device_name()`；未知型号会在解析采集结果时显式失败，不接受用户从前端传入猜测值。
+Device 事件轮询也按相同代际使用 50 或 1000 cycles/µs，轮询间隔参数仍以实际微秒表示。
 
 ### 4.5 关闭态快路径
 
@@ -793,7 +797,7 @@ pytest -v tests/torch/multicore/test_mega_moe_profiling.py
 | trace 为空 | active step 内是否真的执行 MegaKernel；是否只有 warmup 数据 |
 | timeline 零散 | shape 是否过小；是否完成真实 warmup、NPU synchronize 和 rank barrier |
 | 未知 SoC | 当前 device name 是否在 system counter 频率映射中 |
-| dropped record | 每核 slot 是否达到 256 上限；不能用 `max_pending_calls` 修复 |
+| dropped record | 检查实际任务计划与每核分配容量、Host/Device 布局是否一致；不能用 `max_pending_calls` 修复 |
 | merge 无匹配 | 原生 trace 是否含 Device kernel；检查 pattern、index 和 pid |
 | fallback warning | 复核 duration 降级选择的外层 kernel 是否正确 |
 | Host wrapper warning | 仅在明确设置 `allow_host_wrapper=True` 时接受近似结果 |

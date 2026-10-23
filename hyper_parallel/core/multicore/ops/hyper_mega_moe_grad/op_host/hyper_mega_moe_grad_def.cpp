@@ -249,6 +249,7 @@ class HyperMegaMoeGrad : public OpDef {
 
         this->AICore().AddConfig("ascend910b", aicore_config);
         this->AICore().AddConfig("ascend910_93", aicore_config);
+        this->AICore().AddConfig("ascend950", aicore_config);
     }
 };
 OP_ADD(HyperMegaMoeGrad);

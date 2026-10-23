@@ -17,6 +17,10 @@ project(hyper_parallel_shmem_torch LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(HP_SHMEM_SOC_TYPE "Ascend910B" CACHE STRING "SHMEM device generation")
+if(NOT HP_SHMEM_SOC_TYPE MATCHES "^(Ascend910B|Ascend950)$")
+    message(FATAL_ERROR "Unsupported SHMEM device generation: ${HP_SHMEM_SOC_TYPE}")
+endif()
 include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/hardening.cmake)
 
 # Generate position-independent code.
@@ -128,6 +132,9 @@ add_library(hyper_parallel_shmem_runtime STATIC
     runtime/runtime.cpp
     cann/host.cpp
 )
+if(HP_SHMEM_SOC_TYPE STREQUAL "Ascend950")
+    target_compile_definitions(hyper_parallel_shmem_runtime PUBLIC HP_SHMEM_ASCEND950)
+endif()
 target_include_directories(hyper_parallel_shmem_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${ASCEND_HOME_PATH}/include

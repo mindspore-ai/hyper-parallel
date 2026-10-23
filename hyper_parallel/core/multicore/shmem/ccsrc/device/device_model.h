@@ -22,6 +22,20 @@ enum class DeviceModel : uint8_t {
   kAscend950,
 };
 
+#ifdef HP_SHMEM_ASCEND950
+inline constexpr DeviceModel kBackendDeviceModel = DeviceModel::kAscend950;
+inline constexpr char kBackendSocType[] = "Ascend950";
+#else
+inline constexpr DeviceModel kBackendDeviceModel = DeviceModel::kAscend910B;
+inline constexpr char kBackendSocType[] = "Ascend910B";
+#endif
+
+/** @brief Reject a device generation that cannot use the linked private SHMEM backend. */
+inline constexpr bool BackendSupportsDevice(DeviceModel model) {
+  return model == kBackendDeviceModel ||
+         (model == DeviceModel::kAscend910C && kBackendDeviceModel == DeviceModel::kAscend910B);
+}
+
 /** @brief Current ACL device and its owned SoC identity observed during Runtime initialization. */
 struct DeviceIdentity {
   int32_t device_index;

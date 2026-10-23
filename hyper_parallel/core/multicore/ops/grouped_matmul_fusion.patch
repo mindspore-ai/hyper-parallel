@@ -149,3 +149,13 @@ index 59e0f9d..5e9a7a6 100644
      }
      #if defined(GMM_ANTI_QUANT)
          mm.template IterateAll<false>(yGm[outOffset], 0, false, true);
+diff --git a/gmm/grouped_matmul/op_kernel/grouped_matmul_utils.h b/gmm/grouped_matmul/op_kernel/grouped_matmul_utils.h
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul_utils.h
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul_utils.h
+@@ -302,4 +302,5 @@ __aicore__ inline __gm__ T* GetTensorAddr(uint16_t index, GM_ADDR tensorPtr) {
+-#if (defined(__CCE_AICORE__) && __CCE_AICORE__ != 310) || (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3113)
++#if (defined(__CCE_AICORE__) && __CCE_AICORE__ != 310) || \
++    (defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3113 || __NPU_ARCH__ == 3510))
+ __aicore__ inline int32_t GetSplitValueFromGroupList(uint32_t groupIdx, int32_t &preOffset,
+                                                      const GMMBaseParams* __restrict &gmmBaseParams,
+                                                      const GlobalTensor<int64_t> &groupListGm) {

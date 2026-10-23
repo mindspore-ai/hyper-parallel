@@ -78,10 +78,12 @@ Status Runtime::Initialize(const RootWorldInfo &root, const Config &config,
     return FailInitialization(DfxPhase::CannCall, root.root_rank, device_identity.error(), __FILE__, __LINE__);
   }
   device_identity_.emplace(device_identity.value());
-  if (device_identity_->model == DeviceModel::kAscend950) {
+  if (!BackendSupportsDevice(device_identity_->model)) {
+    const char *soc_list = device_identity_->model == DeviceModel::kAscend950 ? "ascend950" : "ascend910b,ascend910_93";
     const Status error = MakeError(
       ErrorCode::UnsupportedCapability,
-      "the first Runtime release supports Ascend 910B and 910C, but got soc_name=" + device_identity_->soc_name);
+      std::string("SHMEM backend=") + kBackendSocType + " does not match soc_name=" + device_identity_->soc_name +
+        "; rebuild with: bash build.sh --strict on --soc-list " + soc_list);
     return FailInitialization(DfxPhase::Validation, root.root_rank, error, __FILE__, __LINE__);
   }
 

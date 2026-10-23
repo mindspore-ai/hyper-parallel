@@ -29,7 +29,7 @@ from typing import Any
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _LOCK_PATH = Path(__file__).with_name("dependencies.lock.json")
 _DEFAULT_CACHE = _REPO_ROOT / "build" / "native" / "deps"
-_DEPENDENCIES = ("shmem", "ops_nn", "ops_transformer", "ops_transformer_mhc")
+_DEPENDENCIES = ("shmem", "ops_nn", "ops_transformer", "ops_transformer_mhc", "nlohmann_json")
 
 
 def _parse_args() -> argparse.Namespace:

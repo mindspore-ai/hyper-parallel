@@ -23,6 +23,7 @@ import unittest
 from pathlib import Path
 
 import hyper_parallel
+from hyper_parallel.core.multicore.diagnostics.profiler.cycle_trace import CORE_HEADER, PROFILE_RECORD
 from hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data import (
     build_config_for_rank as build_backward_config,
 )
@@ -160,6 +161,13 @@ class TestRuntimeSerialization(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "group-list scratch"):
             serialize_runtime_config(cfg)
 
+    def test_changed_worker_count_cannot_exceed_allocated_scratch(self) -> None:
+        """Reject a widened runtime unless its scratch allocation also covers the workers."""
+        cfg = allocate_runtime_config(16, local_experts=2)
+        cfg.num_workers = 64
+        with self.assertRaisesRegex(ValueError, "group-list scratch"):
+            serialize_runtime_config(cfg)
+
 
     def test_backward_storage_reuse_requires_all_reader_dependencies(self) -> None:
         """Allow managed plans, but reject changed queues, joins and additional receive readers."""
@@ -201,11 +209,20 @@ class TestRuntimeCppReader(unittest.TestCase):
             raise unittest.SkipTest("g++ is required for the runtime C++ ABI test")
         with tempfile.TemporaryDirectory(prefix="hp-runtime-reader-") as directory:
             library = Path(directory) / "runtime_reader.so"
+            (Path(directory) / "kernel_operator.h").write_text(
+                "#pragma once\n#include <stdexcept>\nusing GM_ADDR = uint8_t *;\n"
+                "namespace AscendC {\nconstexpr int PIPE_ALL = 0;\n"
+                "template <int> inline void PipeBarrier() {}\n"
+                "inline uint64_t GetSystemCycle() { return 1; }\n"
+                "inline void Trap() { throw std::runtime_error(\"Device trap\"); }\n}\n",
+                encoding="utf-8",
+            )
             # CI unpacks tests separately from the installed package and its headers.
             include_root = Path(hyper_parallel.__file__).resolve().parent.parent
             subprocess.run([
                 compiler, "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC",
-                "-I", str(include_root), str(Path(__file__).with_name("runtime_reader.cpp")), "-o", str(library),
+                "-I", directory, "-I", str(include_root), str(Path(__file__).with_name("runtime_reader.cpp")),
+                "-o", str(library),
             ], check=True)
             cls.reader = ctypes.CDLL(str(library))
         cls.reader.valid_runtime.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
@@ -229,6 +246,8 @@ class TestRuntimeCppReader(unittest.TestCase):
         cls.reader.valid_runtime_from_launch.restype = ctypes.c_bool
         cls.reader.read_transport_and_kernel_task_types.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
         cls.reader.read_transport_and_kernel_task_types.restype = None
+        cls.reader.record_profile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+        cls.reader.record_profile.restype = None
 
     def test_transport_and_kernel_task_types_match_cpp(self) -> None:
         """Keep transport, MHC and MegaGate tasks on distinct C++ dispatch IDs."""
@@ -337,6 +356,62 @@ class TestRuntimeCppReader(unittest.TestCase):
         """Prevent adjacent workers' full-line writebacks from corrupting expert counts."""
         for experts in (1, 16, 17, 31, 32, 33, 64, 128, 257):
             self._check_group_list_isolation(experts)
+
+    def test_worker_sized_group_lists_match_device_offsets(self) -> None:
+        """Keep the last Cube list before atomics for both 910 and 950 core counts."""
+        for cores in (4, 8, 20, 24, 28, 32, 36):
+            for experts in (2, 17, 33):
+                with self.subTest(cores=cores, experts=experts):
+                    cfg = allocate_runtime_config(16, local_experts=experts, num_workers=2 * cores)
+                    image = serialize_runtime_config(cfg)
+                    buffer = ctypes.create_string_buffer(image)
+                    offsets = (ctypes.c_uint32 * 12)()
+                    self.reader.read_layout(buffer, offsets)
+                    end = self.reader.group_list_offset(buffer, cores - 1) + experts * 8
+                    self.assertLessEqual(end, offsets[9])
+                    self.assertEqual(offsets[9] + 32, len(image))
+                    self.assertTrue(self.reader.valid_runtime(buffer, len(image), 4096))
+                    self.assertFalse(self.reader.valid_runtime(buffer, len(image) - 1, 4096))
+
+    def test_device_recorder_matches_expanded_host_profile_layout(self) -> None:
+        """Run the production AIV recorder with SDK-only timing/synchronization stubs."""
+        for cores in (4, 8, 20, 24, 28, 32, 36):
+            with self.subTest(cores=cores):
+                cfg = allocate_runtime_config(16, num_workers=cores * 2)
+                cfg.aic_profile_record_capacity = 16
+                cfg.aiv_profile_record_capacity = 32
+                runtime = ctypes.create_string_buffer(serialize_runtime_config(cfg))
+                cube_slots = max(24, cores)
+                aic_stride = CORE_HEADER.size + 16 * PROFILE_RECORD.size
+                aiv_stride = CORE_HEADER.size + 32 * PROFILE_RECORD.size
+                capacity = cube_slots * aic_stride + cube_slots * 2 * aiv_stride
+                buffer = ctypes.create_string_buffer(capacity + 128)
+                buffer[capacity:] = bytes([0xA5]) * 128
+                worker = cores * 2 - 1
+                self.reader.record_profile(runtime, buffer, worker)
+                offset = cube_slots * aic_stride + worker * aiv_stride
+                self.assertEqual(CORE_HEADER.unpack_from(buffer.raw, offset)[:6], (1, 1, 0, 2, worker, 32))
+                self.assertEqual(PROFILE_RECORD.unpack_from(buffer.raw, offset + 64), (10, 20, 1, 2, 3, 4))
+                self.assertEqual(buffer.raw[capacity:], bytes([0xA5]) * 128)
+
+    def test_real_graphs_allocate_all_950_worker_lists(self) -> None:
+        """Thread small and large queried Cube counts through both production graph builders."""
+        for graph_builder, config_builder in (
+            (build_forward_graph, build_forward_config), (build_backward_graph, build_backward_config),
+        ):
+            for cores in (4, 8, 20, 24, 28, 32, 36):
+                with self.subTest(graph=graph_builder.__name__, cores=cores):
+                    values = TaskSplitValue(tp=1, ep=2, seq_size=128, all_expert_num=4, top_k=2)
+                    graph = graph_builder(values, hidden_size=512, intermediate_size=128, num_cube_cores=cores)
+                    graph.propagate_splits(values)
+                    cfg = config_builder(graph, values, 0, cores)
+                    image = serialize_runtime_config(cfg)
+                    buffer = ctypes.create_string_buffer(image)
+                    offsets = (ctypes.c_uint32 * 12)()
+                    self.reader.read_layout(buffer, offsets)
+                    self.assertEqual(cfg.num_workers, 2 * cores, f"expected={2 * cores} actual={cfg.num_workers}")
+                    end = self.reader.group_list_offset(buffer, cores - 1) + 16
+                    self.assertLessEqual(end, offsets[9], f"expected end<={offsets[9]} actual={end}")
 
     def _check_group_list_isolation(self, experts: int) -> None:
         """Bound every worker's list at both cache-line widths and offset residues."""

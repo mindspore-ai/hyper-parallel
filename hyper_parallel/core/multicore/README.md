@@ -5,10 +5,17 @@ Multicore 是独立的 Torch-only 组件，提供芯片内多核 MPMD 并行能�
 用户从独立组件 `hyper_parallel.core.multicore` 显式导入 `MegaGate` 或 `MegaMoeExperts`。
 SHMEM 由 Multicore 在内部管理，不提供独立用户接口。
 
+## 硬件与构建目标
+
+Multicore 的 MegaGate、MegaMoe 和 MegaMHC 提供 Ascend 910B、910C 与 950 的 native 路径。
+A2/A3 使用 `--soc-list ascend910b,ascend910_93`，A5 使用 `--soc-list ascend950`。
+950PR/DT 共用家族入参，实际核心数由运行时查询；构建所用 CANN 必须包含对应目标的工具链与 ops。
+一次构建选择 A2/A3 或 A5 的私有 SHMEM backend，不能混合两代目标，也不能跨代复用已有 native 制品。
+wheel 和源码开发态均须在启动 Python 前激活 CANN 与对应 payload 的 OPP，具体步骤见构建指南。
+
 - [构建与交付](docs/build.md)
 - [架构设计与扩展](docs/architecture.md)
-- [MegaKernel Profiling 使用指南](../../../docs/guide/mega_kernel_profiling.md)
-- [MegaKernel Profiling 设计与实现](docs/mega_kernel_profiling_design_and_usage.md)
+- [MegaKernel Profiling 设计与使用](docs/mega_kernel_profiling.md)
 - [私有 SHMEM 生命周期](docs/shmem.md)
 - [完整 MegaMoE 样例](examples/mega_moe/README.md)
 
@@ -276,7 +283,7 @@ SHMEM Python层以进程级引用计数统一管理Runtime生命周期。整个M
 `HYPER_PARALLEL_SHMEM_HEAP_SIZE` 等堆配置在下一生命周期首次获取引用时重新生效。
 
 完整 Qwen 接入及启动方式见 [MegaMoe 示例](examples/mega_moe/README.md)。MegaKernel 内部阶段采集方式见
-[MegaKernel Profiling 使用指南](../../../docs/guide/mega_kernel_profiling.md)。
+[MegaKernel Profiling 使用指南](docs/mega_kernel_profiling.md)。
 
 ---
 

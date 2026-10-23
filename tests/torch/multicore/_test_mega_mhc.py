@@ -20,7 +20,10 @@ import torch
 import torch_npu  # noqa: F401  # pylint: disable=unused-import
 
 from hyper_parallel.core.multicore.modules.mega_mhc.function import _hyper_mega_mhc_forward
+from hyper_parallel.core.multicore.modules.mega_mhc_grad.common import MegaMhcGradCache
 from hyper_parallel.core.multicore.modules.mega_mhc_grad.function import hyper_mega_mhc_grad
+from tests.common.multicore.mega_mhc_golden import torch_mega_mhc
+from tests.common.multicore.mega_mhc_grad_golden import torch_mega_mhc_grad
 
 
 def _make_case(seed: int) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
@@ -72,3 +75,75 @@ def test_same_shape_multistream_forward_backward() -> None:
         for index, outputs in pending:
             for actual, serial in zip(outputs, expected[index]):
                 torch.testing.assert_close(actual, serial, rtol=3e-3, atol=3e-3)
+
+
+def _require_semantic_parity(actual: torch.Tensor, expected: torch.Tensor, label: str) -> None:
+    """Use the existing BF16 backward benchmark's relative-L2 and cosine acceptance criteria."""
+    actual_fp32 = actual.detach().float().flatten()
+    expected_fp32 = expected.detach().float().flatten()
+    expected_norm = expected_fp32.norm().item()
+    error_norm = (actual_fp32 - expected_fp32).norm().item()
+    relative_l2 = error_norm / max(expected_norm, 1e-12)
+    cosine = (actual_fp32.dot(expected_fp32).item() / max(actual_fp32.norm().item() * expected_norm, 1e-12)
+              if expected_norm > 1e-12 else 1.0)
+    print(f"MHC_PARITY={label} relative_l2={relative_l2} cosine={cosine}", flush=True)
+    assert torch.isfinite(actual_fp32).all().item(), f"expected finite {label}, actual contains nonfinite values"
+    assert relative_l2 <= 2e-2 and cosine >= 0.999, (
+        f"expected {label} relative_l2<=0.02 cosine>=0.999, actual relative_l2={relative_l2} cosine={cosine}"
+    )
+
+
+def _require_gradient_parity(actual: tuple[torch.Tensor, ...], expected: tuple[torch.Tensor, ...]) -> None:
+    """Report every gradient before failing, retaining the same per-tensor acceptance criteria."""
+    failures = []
+    for index, (actual_tensor, expected_tensor) in enumerate(zip(actual, expected)):
+        try:
+            _require_semantic_parity(actual_tensor, expected_tensor, f"gradient-{index}")
+        except AssertionError as error:
+            failures.append(str(error))
+    assert not failures, f"expected all gradients within precision criteria, actual failures={failures}"
+
+
+def _require_rms_cache_parity(cache: MegaMhcGradCache, previous_pre: torch.Tensor) -> None:
+    """Validate backward intermediates independently of the normalized public forward output."""
+    expected_mixed = (
+        cache.new_residual.float() * previous_pre.reshape(*cache.new_residual.shape[:-1], 1).float()
+    ).sum(dim=-2).to(cache.mixed_input.dtype)
+    _require_semantic_parity(cache.mixed_input, expected_mixed, "cache-mixed-input")
+    expected_rstd = torch.rsqrt(cache.mixed_input.float().square().mean(dim=-1, keepdim=True) + 1e-6)
+    _require_semantic_parity(cache.rms_rstd, expected_rstd, "cache-rms-rstd")
+
+
+def _run_reference_case(*, include_backward: bool) -> None:
+    """Compare native results to independent Torch math without changing acceptance thresholds."""
+    torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    inputs, gradients = _make_case(17)
+    with torch.no_grad():
+        outputs, cache = _hyper_mega_mhc_forward(*inputs, need_backward=True)
+        if include_backward:
+            actual_gradients = hyper_mega_mhc_grad(*gradients, *inputs, cache)
+        expected_outputs = torch_mega_mhc(*inputs)
+    if include_backward:
+        expected_gradients = torch_mega_mhc_grad(*gradients, *inputs)
+    torch.npu.synchronize()
+    assert len(outputs) == len(expected_outputs) == 5, (
+        f"expected=5 outputs, actual native={len(outputs)} reference={len(expected_outputs)}"
+    )
+    for index, (actual, expected) in enumerate(zip(outputs, expected_outputs)):
+        _require_semantic_parity(actual, expected, f"output-{index}")
+    _require_rms_cache_parity(cache, inputs[2])
+    if include_backward:
+        assert len(actual_gradients) == len(expected_gradients) == 9, (
+            f"expected=9 gradients, actual native={len(actual_gradients)} reference={len(expected_gradients)}"
+        )
+        _require_gradient_parity(actual_gradients, expected_gradients)
+
+
+def test_reference_forward() -> None:
+    """Compare all five outputs without invoking the native or reference backward."""
+    _run_reference_case(include_backward=False)
+
+
+def test_reference_forward_backward() -> None:
+    """Compare all five outputs and all nine input/parameter gradients to independent Torch math."""
+    _run_reference_case(include_backward=True)

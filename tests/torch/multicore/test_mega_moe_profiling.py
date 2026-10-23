@@ -32,7 +32,6 @@ from tests.torch.multicore._test_env import (
 
 _WORKER = str(Path(__file__).resolve().parent / "_test_mega_moe_profiling.py")
 _WORLD_SIZE = 2
-_EXPECTED_RECORD_COUNT = 1411
 
 
 def _prepare_torch_multicore_test_environment() -> None:
@@ -55,6 +54,7 @@ def test_mega_moe_standalone_profiler(monkeypatch, tmp_path: Path) -> None:
     """
     _prepare_torch_multicore_test_environment()
     result_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path))) / "profiling"
+    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
     monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_WORLD_SIZE))
     monkeypatch.setenv("HP_MEGA_MOE_PROFILE_RESULT_DIR", str(result_dir))
@@ -68,6 +68,10 @@ def test_mega_moe_standalone_profiler(monkeypatch, tmp_path: Path) -> None:
         trace_path = result_dir / f"rank{rank}_mega_kernel_trace.json"
         trace = json.loads(trace_path.read_text(encoding="utf-8"))
         metadata = trace["megaKernelCycleTrace"]
-        assert metadata["invocationCount"] == 1
-        assert metadata["recordCount"] == _EXPECTED_RECORD_COUNT
-        assert metadata["droppedRecordCount"] == 0
+        internal_events = [event for event in trace["traceEvents"] if event.get("cat") == "MegaKernelInternal"]
+        assert metadata["invocationCount"] == 1, f"rank={rank}: expected one invocation, got {metadata}."
+        # Workers validate the exact task/phase multiset against their bound plan before returning.
+        assert metadata["recordCount"] == len(internal_events) > 0, (
+            f"rank={rank}: expected {len(internal_events)} exported records, got {metadata}."
+        )
+        assert metadata["droppedRecordCount"] == 0, f"rank={rank}: expected no drops, got {metadata}."

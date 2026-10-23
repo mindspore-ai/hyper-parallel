@@ -144,6 +144,10 @@ class RoutePipeline {
     const uint32_t count = batch_rows_ * expert_align_;
     pipe.InitBuffer(input_queue, 1, count * sizeof(float));
     pipe.InitBuffer(output_queue, 1, count * sizeof(float));
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    TBuf<TPosition::VECCALC> precision_mask_buffer;
+    pipe.InitBuffer(precision_mask_buffer, ((count + 255) / 256) * 32);
+#endif
     for (uint32_t offset = 0; offset < row_count_; offset += batch_rows_) {
       const uint64_t row = first_row_ + offset;
       const uint32_t rows = BatchRowCount(offset);
@@ -152,7 +156,24 @@ class RoutePipeline {
       input_queue.EnQue(input);
       input = input_queue.DeQue<float>();
       LocalTensor<float> output = output_queue.AllocTensor<float>();
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+      // Preserve the default result outside the documented 0-ULP domain, including Inf/NaN.
+      constexpr float precision_limit = 8.507058665963222e37f;  // FLT_MAX / 4.
+      LocalTensor<uint8_t> precision_mask = precision_mask_buffer.Get<uint8_t>();
+      CompareScalar(precision_mask, input, precision_limit, CMPMODE::LE, rows * expert_align_);
+      PipeBarrier<PIPE_V>();
       Sqrt(output, input, rows * expert_align_);
+      PipeBarrier<PIPE_V>();
+      Mins(input, input, precision_limit, rows * expert_align_);
+      PipeBarrier<PIPE_V>();
+      // Backward reuses these FP32 scores; A5's default 1-ULP Sqrt can change their rounding.
+      static constexpr SqrtConfig sqrt_config = {SqrtAlgo::PRECISION_0ULP_FTZ_FALSE};
+      Sqrt<float, sqrt_config>(input, input, rows * expert_align_);
+      PipeBarrier<PIPE_V>();
+      Select(output, precision_mask, input, output, SELMODE::VSEL_TENSOR_TENSOR_MODE, rows * expert_align_);
+#else
+      Sqrt(output, input, rows * expert_align_);
+#endif
       output_queue.EnQue(output);
       output = output_queue.DeQue<float>();
       CopyOutRows(route_scores_, row, rows, expert_count_, expert_align_, output);

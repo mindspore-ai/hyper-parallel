@@ -36,6 +36,18 @@ from tests.common.mark_utils import arg_mark
 class TestMegaMhcGraph(unittest.TestCase):
     """Validate token-tile ordering, ring reuse, and per-stage dependencies."""
 
+    def test_graph_uses_the_reported_cube_count(self) -> None:
+        """Preserve task/event bounds across small and large PR/DT core-count classes."""
+        for cores in (4, 8, 20, 24, 28, 32, 36):
+            with self.subTest(cores=cores):
+                graph, topology = build_mega_mhc_graph(256, 512, cores, token_tile=32)
+                config = build_runtime_config(graph, topology, num_cube_cores=cores)
+                self.assertEqual(config.num_workers, 2 * cores, f"expected={2 * cores} actual={config.num_workers}")
+                _validate_runtime_task_queues(config, config.event_capacity)
+                self.assertGreater(config.task_index_num[0], 0,
+                                   f"expected Cube tasks actual={config.task_index_num[0]}")
+                self.assertGreater(config.task_index_num[1], 0, f"expected AIV tasks actual={config.task_index_num[1]}")
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_builds_six_stage_pure_aic_aiv_pipeline(self) -> None:

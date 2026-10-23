@@ -53,7 +53,7 @@ class CycleTraceRecorder {
     ((0xFFFFFFFFU - sizeof(CycleTraceCoreHeader)) / sizeof(CycleTraceRecord) / 16) * 16;
 
   __aicore__ inline void Init(uint32_t worker_id, GM_ADDR profile_buffer, uint32_t aic_record_capacity,
-                              uint32_t aiv_record_capacity) {
+                              uint32_t aiv_record_capacity, uint32_t cube_slot_count) {
     if (aic_record_capacity > MAX_RECORDS_PER_CORE || aiv_record_capacity > MAX_RECORDS_PER_CORE ||
         aic_record_capacity % 16 != 0 || aiv_record_capacity % 16 != 0) {
       AscendC::Trap();
@@ -63,14 +63,14 @@ class CycleTraceRecorder {
       sizeof(CycleTraceCoreHeader) + static_cast<uint64_t>(aic_record_capacity) * sizeof(CycleTraceRecord);
     uint64_t aiv_stride_bytes =
       sizeof(CycleTraceCoreHeader) + static_cast<uint64_t>(aiv_record_capacity) * sizeof(CycleTraceRecord);
-#ifdef __DAV_C220_CUBE__
+#ifdef __DAV_CUBE__
     uint32_t core_type = 1;
     record_capacity_ = aic_record_capacity;
     GM_ADDR profile_slot_ptr = profile_buffer + worker_id * aic_stride_bytes;
 #else
     uint32_t core_type = 2;
     record_capacity_ = aiv_record_capacity;
-    GM_ADDR profile_slot_ptr = profile_buffer + NUM_WORKERS_CUBE * aic_stride_bytes + worker_id * aiv_stride_bytes;
+    GM_ADDR profile_slot_ptr = profile_buffer + cube_slot_count * aic_stride_bytes + worker_id * aiv_stride_bytes;
 #endif
     profile_header_ = reinterpret_cast<__gm__ CycleTraceCoreHeader *>(profile_slot_ptr);
     record_count_ = 0;

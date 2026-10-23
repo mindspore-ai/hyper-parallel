@@ -68,6 +68,15 @@ set(CMAKE_CPP_COMPILE_OPTIONS
     "SHELL:-include stddef.h"
 )
 
+set(HP_SHMEM_SOC_TYPE "Ascend910B" CACHE STRING "SHMEM device generation")
+if(HP_SHMEM_SOC_TYPE STREQUAL "Ascend910B")
+    set(SHMEM_VECTOR_ARCH dav-c220-vec)
+elseif(HP_SHMEM_SOC_TYPE STREQUAL "Ascend950")
+    set(SHMEM_VECTOR_ARCH dav-c310-vec)
+else()
+    message(FATAL_ERROR "Unsupported SHMEM device generation: ${HP_SHMEM_SOC_TYPE}")
+endif()
+
 include_directories(
     ${ASCEND_HOME_PATH}/compiler/tikcpp
     ${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw
@@ -95,7 +104,9 @@ set_target_properties(all_gather_kernel PROPERTIES
     OBJECT_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/obj"
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/obj"
 )
-target_compile_options(all_gather_kernel PRIVATE ${CMAKE_CCE_COMPILE_OPTIONS} --cce-aicore-arch=dav-c220-vec)
+target_compile_options(all_gather_kernel PRIVATE
+    ${CMAKE_CCE_COMPILE_OPTIONS} --cce-aicore-arch=${SHMEM_VECTOR_ARCH}
+)
 target_include_directories(all_gather_kernel PRIVATE
     ${SHMEM_HOME_PATH}/shmem/include
     ${SHMEM_SOURCE_DIR}/src/device

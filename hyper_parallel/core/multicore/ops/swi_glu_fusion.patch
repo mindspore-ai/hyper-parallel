@@ -162,3 +162,29 @@ index 2e386402..f672fbb1 100644
 -#endif
    }
  }
+diff --git a/activation/swi_glu/op_kernel/swi_glu_bf16.hpp b/activation/swi_glu/op_kernel/swi_glu_bf16.hpp
+--- a/activation/swi_glu/op_kernel/swi_glu_bf16.hpp
++++ b/activation/swi_glu/op_kernel/swi_glu_bf16.hpp
+@@ -90,6 +90,8 @@
+-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
++// Ascend 950 requires explicit rounding for FP32-to-BF16 conversion.
++#if (defined(__CCE_AICORE__) && __CCE_AICORE__ == 220) || \
++    (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510)
+     Cast(cLocal_, cLocal, RoundMode::CAST_RINT, curTileLen);
+ #else
+     Cast(cLocal_, cLocal, RoundMode::CAST_NONE, curTileLen);
+ #endif
+     PipeBarrier<PIPE_V>();
+diff --git a/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp b/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp
+--- a/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp
++++ b/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp
+@@ -56,6 +56,8 @@
+-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
++// Ascend 950 requires explicit rounding for FP32-to-BF16 conversion.
++#if (defined(__CCE_AICORE__) && __CCE_AICORE__ == 220) || \
++    (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510)
+     RoundMode downcastRoundMode_ = RoundMode::CAST_RINT;
+ #else
+     RoundMode downcastRoundMode_ = RoundMode::CAST_NONE;
+ #endif
+ };

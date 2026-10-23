@@ -15,10 +15,10 @@ __aicore__ inline bool IsRouteGradRuntimeValid(__gm__ uint8_t *runtime, const Ti
   const uint64_t required_runtime_bytes = static_cast<uint64_t>(MulticoreRuntime::getVectorTaskIndexsOffset(runtime)) +
                                           static_cast<uint64_t>(task_capacity) * sizeof(int32_t);
   const uint64_t required_profile_bytes =
-    static_cast<uint64_t>(MulticoreRuntime::NUM_WORKERS_CUBE) *
+    static_cast<uint64_t>(MulticoreRuntime::getCubeWorkerCapacity(runtime)) *
       (sizeof(MulticoreRuntime::CycleTraceCoreHeader) +
        MulticoreRuntime::getAicProfileRecordCapacity(runtime) * sizeof(MulticoreRuntime::CycleTraceRecord)) +
-    static_cast<uint64_t>(MulticoreRuntime::NUM_WORKERS_VECTOR) *
+    static_cast<uint64_t>(2 * MulticoreRuntime::getCubeWorkerCapacity(runtime)) *
       (sizeof(MulticoreRuntime::CycleTraceCoreHeader) +
        MulticoreRuntime::getAivProfileRecordCapacity(runtime) * sizeof(MulticoreRuntime::CycleTraceRecord));
   return tiling.activeAivWorkerCount > 0 && tiling.activeAivWorkerCount <= tiling.aivWorkerSlotCapacity &&

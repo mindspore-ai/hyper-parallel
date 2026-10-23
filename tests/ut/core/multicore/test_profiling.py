@@ -185,6 +185,34 @@ class TestDiagnosticMetadata(unittest.TestCase):
 class TestMegaKernelProfileLayout(unittest.TestCase):
     """Validate exact bounded AIC/AIV buffer sizing."""
 
+    def test_layout_follows_runtime_worker_capacity(self):
+        """Size every physical slot without limiting event-driven graphs to 910 cores."""
+        for cube_cores in (20, 24, 32, 36):
+            with self.subTest(cube_cores=cube_cores):
+                config = allocate_runtime_config(128, num_workers=2 * cube_cores)
+                config.task_num = 3 * cube_cores + 1
+                for task_id in range(config.task_num):
+                    config.all_tasks[task_id] = _three_record_task()
+                config.task_index_num[0] = 2 * cube_cores + 1
+                config.task_index_num[1] = cube_cores
+                config.cube_task_indices[:2 * cube_cores + 1] = range(2 * cube_cores + 1)
+                config.vector_task_indices[:cube_cores] = range(2 * cube_cores + 1, config.task_num)
+                layout = _calculate_profile_layout(config)
+                self.assertEqual(layout.aic_required_records, 9)
+                self.assertEqual(layout.aiv_required_records, 3)
+                slots = max(24, cube_cores)
+                self.assertEqual(layout.cube_slot_count, slots)
+                self.assertEqual(layout.buffer_size, 3 * slots * (64 + 16 * 32))
+                graph = ComputeGraph()
+                operator = OperatorNode("gmm", OpType.GMM, [], [], [], 1, SplitSpec(None, lambda _: 1), -1, None)
+                operator.task_num = config.task_num
+                graph.add_op(operator)
+                runtime = _PreparedProfileRuntime(PreparedDiagnosticRuntime(
+                    graph, config, DiagnosticSpec("Custom"), parameter_count=0, tensor_factory=bytes,
+                    rank=0, device_id=0,
+                ))
+                self.assertEqual(runtime.buffer_size, layout.buffer_size)
+
     def test_layout_rounds_busiest_workers_to_sixteen_records(self):
         """Mirror Device round-robin assignment for AIC and AIV independently."""
         runtime_config = _runtime_config(128)
@@ -309,10 +337,30 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
                     get_rank.assert_not_called()
 
     def test_soc_aliases_use_the_documented_counter_frequency(self):
-        """Recognize current 910B and 910C/A3 Torch NPU names."""
-        for soc_name in ("Ascend910B4", "Ascend910C1", "Ascend910_9372"):
+        """Recognize A2/A3 and both A5 families using their documented system clocks."""
+        cases = (("Ascend910B4", 50.0), ("Ascend910C1", 50.0), ("Ascend910_9372", 50.0),
+                 ("Ascend950PR_9589", 1000.0), ("Ascend950PR_9599", 1000.0),
+                 ("Ascend950DT", 1000.0), ("950PR_9589", 1000.0), (" ascend950dt ", 1000.0))
+        for soc_name, expected in cases:
             with self.subTest(soc_name=soc_name):
-                self.assertEqual(_resolve_cycle_frequency_mhz(soc_name), 50.0)
+                actual = _resolve_cycle_frequency_mhz(soc_name)
+                self.assertEqual(actual, expected, f"soc={soc_name} expected={expected} actual={actual}")
+
+    def test_950_submodels_share_the_family_counter_frequency(self) -> None:
+        """PR/DT suffixes must not require individual entries in the profiler table."""
+        families = (("Ascend950PR", ("_950z", "_9579", "_957bx", "_9589", "_9599")),
+                    ("Ascend950DT", ("_950x", "_9571", "_9581x", "_9588", "_9596", "_95A2")))
+        for family, suffixes in families:
+            for suffix in suffixes:
+                soc_name = family + suffix
+                with self.subTest(soc_name=soc_name):
+                    actual = _resolve_cycle_frequency_mhz(soc_name)
+                    self.assertEqual(actual, 1000.0, f"soc={soc_name} expected=1000.0 actual={actual}")
+
+    def test_unknown_soc_never_inherits_a_supported_counter_frequency(self):
+        """Unknown hardware must not silently produce a wrongly scaled trace."""
+        with self.assertRaisesRegex(RuntimeError, "Unsupported Ascend SoC"):
+            _resolve_cycle_frequency_mhz("Ascend960")
 
 
 if __name__ == "__main__":

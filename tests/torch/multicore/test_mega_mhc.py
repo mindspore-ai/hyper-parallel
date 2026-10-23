@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Framework-free launcher for mHC multi-stream NPU regression tests."""
+"""Framework-free launchers for mHC numerical and multi-stream NPU regressions."""
 
 from pathlib import Path
 
@@ -23,6 +23,30 @@ from tests.torch.multicore._test_env import (
     prepare_multicore_test_environment,
     without_inherited_rank_environment,
 )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="onecard", essential_mark="essential")
+def test_mega_mhc_forward_reference_parity() -> None:
+    """Validate all five native forward outputs before launching any backward work."""
+    prepare_multicore_test_environment()
+    if not multicore_adapter_is_available():
+        raise RuntimeError("mHC reference ST requires a payload built with --multicore on")
+    worker = str(Path(__file__).resolve().with_name("_test_mega_mhc.py"))
+    with without_inherited_rank_environment():
+        run_multicore_case(worker, "test_reference_forward", num_proc=1)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="onecard", essential_mark="essential")
+def test_mega_mhc_reference_parity() -> None:
+    """Validate native forward/backward numerics against independent tensor operations."""
+    prepare_multicore_test_environment()
+    if not multicore_adapter_is_available():
+        raise RuntimeError("mHC reference ST requires a payload built with --multicore on")
+    worker = str(Path(__file__).resolve().with_name("_test_mega_mhc.py"))
+    with without_inherited_rank_environment():
+        run_multicore_case(worker, "test_reference_forward_backward", num_proc=1)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
