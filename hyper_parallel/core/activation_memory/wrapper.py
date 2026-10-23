@@ -538,6 +538,7 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         cache = state.get_resource(_checkpoint_exclude._EXCLUDE_CACHE_KEY, _checkpoint_exclude._ExcludeCache)
         if state.is_recomputing:
             entry = cache.pop(id(self))
+            _checkpoint_exclude._restore_rng_state(entry.rng_state)
             _checkpoint_exclude._materialize_recompute_inputs(entry, args, kwargs)
             output = (
                 entry.output
@@ -547,32 +548,43 @@ class CheckpointExcludeWrapper(ActivationWrapper):
             return _checkpoint_exclude._finalize_save_outputs(
                 output,
                 _checkpoint_exclude._has_used_input(entry.input_bindings),
-                None,
             )
 
-        input_bindings, previous_handles = _checkpoint_exclude._mark_recompute_inputs(
-            state.invocation_id,
-            args,
-            kwargs,
+        input_infos = _checkpoint_exclude._capture_recompute_inputs(cache, args, kwargs)
+        input_bindings = []
+        pack_token = _checkpoint_exclude._ACTIVE_PACK_STATE.set(
+            _checkpoint_exclude._PackState(input_infos, input_bindings)
         )
         try:
             with _checkpoint_exclude._saved_tensors_context():
                 output = wrapped_module(*args, **kwargs)
         finally:
-            _checkpoint_exclude._restore_recompute_inputs(previous_handles)
+            _checkpoint_exclude._ACTIVE_PACK_STATE.reset(pack_token)
+        rng_state = _checkpoint_exclude._capture_rng_state(
+            args,
+            kwargs,
+            output,
+            state.preserve_rng_state,
+        )
         needs_recompute_boundary = _checkpoint_exclude._has_used_input(input_bindings)
         tensor_leaf_count = None if self.save_output else [0]
         finalized_output = _checkpoint_exclude._finalize_save_outputs(
             output,
             needs_recompute_boundary,
-            state.invocation_id,
             tensor_leaf_count,
         )
         replay_output = output if self.save_output else None
         output_tensor_count = 1 if tensor_leaf_count is None else tensor_leaf_count[0]
+        if not self.save_output:
+            cache.register_save_outputs(finalized_output)
         cache.save(
             id(self),
-            _checkpoint_exclude._ExcludeCacheEntry(replay_output, input_bindings, output_tensor_count),
+            _checkpoint_exclude._ExcludeCacheEntry(
+                replay_output,
+                input_bindings,
+                output_tensor_count,
+                rng_state,
+            ),
         )
         return finalized_output
 

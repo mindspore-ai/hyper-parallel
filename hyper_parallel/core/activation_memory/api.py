@@ -269,9 +269,14 @@ def _make_checkpoint_context_fn(
     context_fn: Optional[Callable],
     group_swap: bool,
     cpu_pool: Any,
+    preserve_rng_state: bool,
 ) -> Callable:
     """Compose eager recompute, selective, and caller-provided contexts."""
-    factories: list = [create_recompute_contexts]
+    factories: list = (
+        [create_recompute_contexts]
+        if preserve_rng_state is True
+        else [partial(create_recompute_contexts, preserve_rng_state=preserve_rng_state)]
+    )
     if policy_fn is not None:
         selective_kwargs = {"group_swap": group_swap}
         if cpu_pool is not None:
@@ -347,7 +352,13 @@ def checkpoint(
             else None
         )
     else:
-        composed_context_fn = _make_checkpoint_context_fn(policy_fn, context_fn, group_swap, cpu_pool)
+        composed_context_fn = _make_checkpoint_context_fn(
+            policy_fn,
+            context_fn,
+            group_swap,
+            cpu_pool,
+            kwargs.get("preserve_rng_state", True),
+        )
 
     with _checkpoint_input_context(swap_inputs, group_swap, cpu_pool):
         checkpoint_kwargs = {**kwargs, "use_reentrant": False, "early_stop": early_stop}

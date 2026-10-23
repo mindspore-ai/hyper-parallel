@@ -62,8 +62,9 @@ def test_scheduled_recompute_supports_dx_dw_split() -> None:
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_scheduled_recompute_npu_preserves_rng_state() -> None:
-    """Verify scheduled NPU recomputation preserves random state."""
+    """Verify scheduled replay and excluded SAVE regions preserve random state."""
     activation_checkpoint_cases.test_scheduled_recompute_npu_preserves_rng_state()
+    activation_checkpoint_cases.test_checkpoint_exclude_save_preserves_rng_state()
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")

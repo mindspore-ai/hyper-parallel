@@ -480,6 +480,17 @@ class TestCheckpointFunction(unittest.TestCase):
         self.assertIs(spy.call_args.kwargs["context_fn"], create_recompute_contexts)
         mock_create.assert_not_called()
 
+    def test_checkpoint_propagates_disabled_rng_preservation_to_recompute_state(self):
+        """Excluded SAVE regions should not mutate RNG when checkpoint preservation is off."""
+        with _spy_checkpoint() as spy:
+            checkpoint(sentinel.function, 3, preserve_rng_state=False)
+            forward_context, recompute_context = spy.call_args.kwargs["context_fn"]()
+
+        with forward_context:
+            self.assertFalse(get_recompute_state().preserve_rng_state)
+        with recompute_context:
+            self.assertFalse(get_recompute_state().preserve_rng_state)
+
     def test_checkpoint_policy_context_forwards_group_swap_and_cpu_pool(self):
         """Test selective context receives group-swap and explicit pool options once."""
         policy = lambda context, op, *a, **kw: CheckpointPolicy.MUST_SWAP  # pylint: disable=C3001

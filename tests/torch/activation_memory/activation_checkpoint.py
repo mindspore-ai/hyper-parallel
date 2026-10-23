@@ -29,6 +29,7 @@ from hyper_parallel.core.activation_memory import (
     SwapManager,
     clear_recompute_session,
     checkpoint,
+    checkpoint_exclude_wrapper,
     checkpoint_wrapper,
     recompute_handle,
     recompute_handle_collector_ctx,
@@ -78,6 +79,58 @@ def _run_closure_only_npu_rng_case(checkpoint_fn):
     output = checkpoint_fn(function, cpu_argument)
     output.sum().backward()
     return output.detach(), captured_tensor.grad.detach()
+
+
+class _SaveRngNetwork(torch.nn.Module):
+    """Exercise RNG both inside and after a checkpoint-excluded SAVE region."""
+
+    def __init__(self) -> None:
+        """Initialize the excluded random region and a trainable scale."""
+        super().__init__()
+
+        class _RandomSave(torch.nn.Module):
+            """Consume device RNG while producing a SAVE-region activation."""
+
+            def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+                """Multiply by a device RNG mask that must match during replay."""
+                return tensor * torch.rand_like(tensor)
+
+        self.excluded = checkpoint_exclude_wrapper(_RandomSave())
+        self.scale = torch.nn.Parameter(torch.tensor([1.3, 0.7], device="npu"))
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Use RNG after the skipped SAVE body during checkpoint replay."""
+        saved = self.excluded(tensor * self.scale).sum()
+        replay_consumer = (torch.rand_like(tensor) * tensor).sum()
+        return saved + replay_consumer
+
+
+def test_checkpoint_exclude_save_preserves_rng_state():
+    """A skipped SAVE body must still advance RNG consistently during replay."""
+    set_seed(2032)
+    eager_net = _SaveRngNetwork()
+    set_seed(2033)
+    checkpoint_net = _SaveRngNetwork()
+    checkpoint_net.load_state_dict(eager_net.state_dict())
+    eager_input = torch.tensor([1.0, 2.0], device="npu", requires_grad=True)
+    checkpoint_input = eager_input.detach().clone().requires_grad_()
+
+    set_seed(2034)
+    eager_output = eager_net(eager_input)
+    eager_grads = torch.autograd.grad(eager_output, (eager_input, eager_net.scale))
+    eager_rng_state = torch.npu.get_rng_state()
+    set_seed(2034)
+    checkpoint_output = checkpoint_wrapper(checkpoint_net)(checkpoint_input)
+    checkpoint_grads = torch.autograd.grad(
+        checkpoint_output,
+        (checkpoint_input, checkpoint_net.scale),
+    )
+    checkpoint_rng_state = torch.npu.get_rng_state()
+
+    torch.testing.assert_close(checkpoint_output, eager_output)
+    torch.testing.assert_close(checkpoint_grads[0], eager_grads[0])
+    torch.testing.assert_close(checkpoint_grads[1], eager_grads[1])
+    assert torch.equal(checkpoint_rng_state, eager_rng_state)
 
 
 def test_native_npu_rng_for_closure_only_tensor_is_not_restored():
