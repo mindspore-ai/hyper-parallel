@@ -92,10 +92,11 @@ def _apply_interleaved_rope(
             rotary_mode="interleave",
         )
     rotated = rotated.permute(1, 2, 0, 3)
-    rotated = torch.cat((rotated[..., 0::2], rotated[..., 1::2]), dim=-1)
+    # Transpose pairs instead of strided slices to avoid scattered writes in backward.
+    rotated = rotated.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2)
     if unsqueeze_dim == 2:
         rotated = rotated.transpose(1, 2)
-    return torch.cat((rotated, pass_through), dim=-1)
+    return torch.cat((rotated, pass_through), dim=-1) if pass_through.shape[-1] else rotated
 
 
 def apply_rotary_pos_emb_interleave(
@@ -135,8 +136,8 @@ def apply_rotary_pos_emb_interleave(
         raise ValueError("interleaved RoPE requires an even rotary dimension")
     if rotary_dim > q.shape[-1] or rotary_dim > k.shape[-1]:
         raise ValueError("RoPE frequencies cannot exceed the Q/K head dimension")
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_rot, q_pass = q.split((rotary_dim, q.shape[-1] - rotary_dim), dim=-1)
+    k_rot, k_pass = k.split((rotary_dim, k.shape[-1] - rotary_dim), dim=-1)
 
     # Transformers supplies cat(freqs, freqs). The NPU interleave mode expects
     # each frequency next to the corresponding real/imaginary input pair.

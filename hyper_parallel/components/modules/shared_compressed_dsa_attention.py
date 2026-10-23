@@ -374,8 +374,7 @@ class SharedCompressedPackedSequence:
 
 def _rotate_half(tensor: torch.Tensor) -> torch.Tensor:
     """Rotate adjacent real/imaginary pairs for V4 interleaved RoPE."""
-    first = tensor[..., 0::2]
-    second = tensor[..., 1::2]
+    first, second = tensor.unflatten(-1, (-1, 2)).unbind(-1)
     return torch.stack((-second, first), dim=-1).flatten(-2)
 
 
@@ -389,9 +388,9 @@ def _apply_v41_rope(
     cos = cos.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     sin = sin.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     rope_dim = cos.shape[-1]
-    pass_through, rotary = tensor[..., :-rope_dim], tensor[..., -rope_dim:]
+    pass_through, rotary = tensor.split((tensor.shape[-1] - rope_dim, rope_dim), dim=-1)
     rotary = ((rotary.float() * cos) + (_rotate_half(rotary).float() * sin)).to(tensor.dtype)
-    return torch.cat((pass_through, rotary), dim=-1)
+    return torch.cat((pass_through, rotary), dim=-1) if pass_through.shape[-1] else rotary
 
 
 def build_sliding_window_indices(
