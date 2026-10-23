@@ -378,8 +378,15 @@ class PipelineSwapRuntime:
             if slot.cpu_tensor is None:
                 raise RuntimeError(f"Swap slot {slot.name!r} is host-resident but has no CPU mirror.")
 
-        for slot in slots:
-            self.restore_device_storage(slot)
+        restored_slots = []
+        try:
+            for slot in slots:
+                self.restore_device_storage(slot)
+                restored_slots.append(slot)
+        except Exception:
+            for restored_slot in reversed(restored_slots):
+                self.release_device_storage(restored_slot)
+            raise
 
         copy_stream = self._get_copy_stream()
         compute_event = self._record_current_stream_event() if copy_stream is not None else None
