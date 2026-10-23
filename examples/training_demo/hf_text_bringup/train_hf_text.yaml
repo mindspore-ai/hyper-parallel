@@ -1,0 +1,141 @@
+# Generic HF-native from_config bring-up recipe (Online tokenization/packing).
+# Point config_path and the tokenizer at any local HF causal-LM directory.
+# plan_overrides stays empty on purpose: a fresh family runs the unmodified
+# HF forward first (correctness), and fusion replacements arrive later as
+# per-family plan_overrides once pinned value-for-value on device.
+
+model:
+  _target_: examples.training_demo.hf_text_bringup.build_model.build_hf_causal_lm
+  config_path: /path/to/hf-model
+  expected_model_type: null
+  local_files_only: true
+  torch_dtype: bfloat16
+  attn_implementation: eager
+  validate_placement: false
+  # load_pretrained: true  # released weights instead of random init — the
+  #                        # cross-layout equivalence runs need every layout
+  #                        # to start from identical weights; set
+  #                        # training.init_device: cpu and budget host RAM
+  #                        # (each rank materializes the full model first)
+
+# Required Precision Policy default. On 64GB dies a >=9B dense model OOMs at
+# init with float32 until sharded init lands (issue #1245): override with
+# --model_init_dtype=bfloat16 there; fp32 master copies still come from
+# optimizer.fp32_main_params after sharding.
+model_init_dtype: float32
+
+training:
+  train_iters: 30
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+  edp_shard_size: 1
+  replicate_params: []
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides: []
+
+activation_checkpoint:
+  mode: "off"
+
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /path/to/hf-model
+      local_files_only: true
+      use_fast: true
+      trust_remote_code: false
+
+  data_transform:
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 2048
+
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_path: ./output/training_demo/hf_text_bringup/online_2k.jsonl
+  data_config:
+    create_attention_mask_in_dataloader: true
+    # The online text transform already pairs input_ids[:-1] with labels[1:].
+    labels_are_shifted: true
+
+dataloader:
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
+  min_buffered_samples: 8
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    attention_mode: dense
+  sampler_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  fp32_main_params: true
+  no_decay_params: [bias, norm, ln_]
+  muon_config:
+    muon_lr: 3.0e-5
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 3.0e-5
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ""
+  restore_from: null
+
+debug:
+  check_nan_inf: false
+  check_dataset: debug
