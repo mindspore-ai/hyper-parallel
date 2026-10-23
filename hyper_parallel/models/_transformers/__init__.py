@@ -31,6 +31,8 @@ _LAZY_EXPORTS = {
     "HyperAutoModelForCausalLM": ".auto_model",
     "HyperAutoModelForImageTextToText": ".auto_model",
     "HyperAutoModelForSequenceClassification": ".auto_model",
+    "AutoPipeline": ".pipeline",
+    "PipelineConfig": ".pipeline",
 }
 
 
@@ -54,4 +56,6 @@ __all__ = [
     "HyperAutoModelForCausalLM",
     "HyperAutoModelForImageTextToText",
     "HyperAutoModelForSequenceClassification",
+    "AutoPipeline",
+    "PipelineConfig",
 ]

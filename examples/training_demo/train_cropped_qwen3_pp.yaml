@@ -1,0 +1,92 @@
+# Two-stage PP smoke configuration for a layer-cropped dense Qwen3.
+# The stage-local planner is also ready for TP/CP/EP/FSDP; see README for a
+# 16-device mixed-parallel topology. This dense model keeps EP disabled.
+# Replace both /path/to/Qwen3 entries with a local model/tokenizer directory.
+
+model:
+  _target_: examples.training_demo.cropped_qwen3.build_cropped_qwen3
+  config_path: /path/to/Qwen3
+  num_hidden_layers: 4
+  torch_dtype: float32
+  attn_implementation: sdpa
+  local_files_only: true
+
+training:
+  train_iters: 1
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 4
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  max_grad_norm: 1.0
+  seed: 42
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 2
+  sequence_parallel: false
+  loss_parallel: false
+
+pipeline:
+  enabled: true
+  schedule: gpipe
+  pp_microbatch_size: 1
+  split: [2, 2]
+  p2p_overlap: true
+  p2p_multi_stream: false
+  dynamic_shape: false
+
+fsdp_config:
+  dp_shard_size: 1
+  edp_shard_size: 1
+  reshard_after_forward: false
+  reshard_after_backward: false
+  requires_grad_sync: true
+
+activation_checkpoint:
+  mode: "off"
+
+dataset:
+  model_assets:
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /path/to/Qwen3
+      local_files_only: true
+      use_fast: true
+  data_transform:
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 128
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_path: ./output/training_demo/data/parallel_online.jsonl
+  data_config:
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: true
+
+dataloader:
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
+  min_buffered_samples: 4
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    attention_mode: dense
+  sampler_type: single
+  drop_last: true
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  adamw_config:
+    adamw_lr: 0.0001
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+  no_decay_params: [bias, norm, ln_]

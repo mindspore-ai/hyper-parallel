@@ -72,6 +72,7 @@ from hyper_parallel.trainer.config.parallelism import (
 )
 from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.config.trainer import TrainerConfig, save_configs
+from hyper_parallel.models._transformers.pipeline import PipelineConfig
 from hyper_parallel.trainer.config.training import (
     DebugConfig,
     MemoryConfig,

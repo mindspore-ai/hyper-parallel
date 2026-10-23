@@ -34,6 +34,7 @@ from hyper_parallel.trainer.config.parallelism import (
     ActivationCheckpointConfig,
     PlanOverride,
 )
+from hyper_parallel.models._transformers.pipeline import PipelineConfig
 from hyper_parallel.trainer.config.target import Target, _serialize_config_value
 from hyper_parallel.trainer.config.training import (
     DebugConfig,
@@ -61,6 +62,7 @@ class TrainerConfig:
 
     # parallelism configs
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
+    pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     fsdp_config: FSDP2Config = field(default_factory=FSDP2Config)
     plan_overrides: List[PlanOverride] = field(default_factory=list)
     mixed_precision: MixedPrecisionConfig = field(
@@ -94,7 +96,7 @@ class TrainerConfig:
         if (
             self.compile.enabled
             and not self.compile.selects_graph_compiler()
-            and self.accelerator.pp_size > 1
+            and self.pipeline.enabled
         ):
             raise ValueError("compile is not supported together with pipeline parallelism")
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype

@@ -31,6 +31,17 @@ accelerator:
   sequence_parallel: true
   loss_parallel: true
 
+# The PP launcher enables this section and sets pp_size=2. The runtime
+# derives the per-DP pipeline batch from training.global_batch_size.
+pipeline:
+  enabled: false
+  schedule: 1f1b
+  pp_microbatch_size: 1
+  split: []
+  p2p_overlap: true
+  p2p_multi_stream: false
+  dynamic_shape: false
+
 fsdp_config:
   dp_shard_size: 2
   edp_shard_size: 2

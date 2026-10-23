@@ -280,6 +280,20 @@ class TestConfigOverrides(unittest.TestCase):
         self.assertTrue(config.compile.selects_graph_compiler())
         self.assertEqual(config.compile.dynamic_arg_dims, {"model_inputs.input_ids": [0, 1], "labels": 0})
 
+    def test_pipeline_split_and_communication_overrides(self) -> None:
+        """Flat and nested layer counts survive the typed YAML/CLI configuration path."""
+        for split in ([2, 3, 3, 2], [[1, 1, 1, 1], [1, 2, 2, 1]]):
+            with self.subTest(split=split):
+                config = self._parse(
+                    "--accelerator.pp_size=4", "--pipeline.enabled=true",
+                    f"--pipeline.split={split}", "--pipeline.pp_microbatch_size=2",
+                    "--pipeline.p2p_overlap=true", "--pipeline.p2p_multi_stream=true",
+                )
+                self.assertTrue(config.pipeline.enabled)
+                self.assertEqual(config.pipeline.split, split)
+                self.assertEqual(config.pipeline.pp_microbatch_size, 2)
+                self.assertTrue(config.pipeline.p2p_multi_stream)
+
 
 if __name__ == "__main__":
     unittest.main()

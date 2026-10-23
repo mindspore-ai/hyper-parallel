@@ -107,6 +107,44 @@ class TestTextTrainer(unittest.TestCase):
             f"expected foundation loss 1.0, got={float(loss_dict['foundation_loss'])}",
         )
 
+    def test_pipeline_loss_uses_physical_pp_degree_with_virtual_stages(self) -> None:
+        """Adding virtual chunks must not multiply the last-stage replica loss."""
+        labels = torch.tensor([[1, 2]])
+        for chunks in (1, 2, 4):
+            with self.subTest(chunks=chunks):
+                model = SimpleNamespace(
+                    step=Mock(return_value=[torch.tensor(10.0)]),
+                    pp_mesh=SimpleNamespace(size=lambda: 2),
+                    info=SimpleNamespace(
+                        has_first_stage=False, has_last_stage=True,
+                        stages=[SimpleNamespace(stage_num=2 * chunks)],
+                    ),
+                )
+                base = SimpleNamespace(
+                    model=model, device=torch.device("cpu"),
+                    get_batch=Mock(return_value=({"input_ids": labels}, {"labels": labels})),
+                    preforward=lambda value: value,
+                    model_integration=SimpleNamespace(record_batch=Mock()),
+                    on_micro_step_begin=Mock(), on_step_end=Mock(),
+                    optimizer=Mock(), state=SimpleNamespace(global_step=0),
+                    prepare_optimizer_step=Mock(return_value=torch.tensor(1.0)),
+                    step_optimizers_and_schedulers=Mock(), _end_model_integration_step=Mock(),
+                )
+                trainer = TextTrainer.__new__(TextTrainer)
+                trainer.base = base
+                with patch("hyper_parallel.trainer.text_trainer.torch.distributed") as mock_dist:
+                    mock_dist.is_initialized.return_value = True
+                    mock_dist.get_world_size.return_value = 8
+                    # Four replicas of the last physical stage contribute ten each.
+                    mock_dist.all_reduce.side_effect = lambda value: value.fill_(40.0)
+                    metrics = trainer._pipeline_train_step(iter(()), 1)  # pylint: disable=protected-access
+
+                self.assertEqual(metrics["loss"], 10.0, f"chunks={chunks}: expected=10, actual={metrics['loss']}")
+                self.assertEqual(base.state.global_step, 1)
+                base.optimizer.zero_grad.assert_called_once()
+                base.step_optimizers_and_schedulers.assert_called_once()
+                mock_dist.all_reduce.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

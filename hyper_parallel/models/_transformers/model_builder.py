@@ -41,6 +41,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 from hyper_parallel.models._transformers.checkpoint_loader import (
     _finalize_model_loading,
 )
+from hyper_parallel.models._transformers.pipeline import AutoPipeline
 from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.models.materialization import (
     MaterializationContext,
@@ -560,10 +561,12 @@ def _materialize_and_load_model(
     load_base_model: bool,
     pretrained_path: Optional[str],
     weights_mapping: Any,
+    already_materialized: bool = False,
 ) -> nn.Module:
     """Materialize model storage and load or initialize meta-device weights."""
-    model = _move_model_to_device(model, is_meta_device, device)
-    if not is_meta_device:
+    if not already_materialized:
+        model = _move_model_to_device(model, is_meta_device, device)
+    if not is_meta_device and not already_materialized:
         return model
     external = get_model_external_state(model)
     external_result = None
@@ -760,9 +763,79 @@ def apply_model_infrastructure(
     )
     if is_meta_device:
         _apply_materialization_adapter(model)
-
     if freeze_config is not None:
         _apply_parameter_freezing(model, freeze_config)
+
+    # PP is the outer model transformation.  The complete model is split first;
+    # every resulting stage then reuses the same AutoModel TP/CP/EP planner and
+    # FSDP2 manager as the non-PP path.  This is important because a planner
+    # must only see parameters owned by its stage, while the pipeline schedule
+    # must own the resulting stage-local wrappers.
+    if mesh is not None and mesh.pp_size > 1:
+        pipeline_config = getattr(distributed_setup, "pipeline_config", None)
+        if pipeline_config is None or not pipeline_config.enabled:
+            raise ValueError("pp_size > 1 requires pipeline.enabled=true")
+        pp_mesh = getattr(mesh, "pp_mesh", None)
+        if pp_mesh is None:
+            raise RuntimeError(
+                "pipeline parallelism requires a one-dimensional pp mesh; "
+                "DistributedSetup must build MeshContext.pp_mesh before model construction"
+            )
+
+        def _parallelize_stage(stage_model: nn.Module) -> nn.Module:
+            """Apply AutoModel parallelism to one already-split PP stage."""
+            # ``fully_shard`` tracks DTensor parameter storage internally.  A
+            # later ``PipelineModel.to_empty`` cannot reliably materialize
+            # those DTensors after they have been wrapped, so materialize each
+            # pruned stage before applying TP/CP/EP and FSDP2.  This preserves
+            # the deferred-loading contract while giving HSDP real local
+            # shards for the first schedule unshard.
+            if is_meta_device:
+                if device is None:
+                    raise RuntimeError("PP meta construction requires an explicit device")
+                stage_model.to_empty(device=device)
+            stage_model, source_shard_info = _plan_and_apply_sharding(
+                stage_model,
+                mesh,
+                sharding_planner,
+                is_hf_model,
+                validate_placement,
+            )
+            stage_model = _apply_activation_features(
+                stage_model,
+                activation_checkpoint,
+                activation_swap,
+                compile_for_execution,
+                mesh,
+                swap_inputs=swap_inputs,
+                selection=activation_checkpoint_selection,
+                allow_cache_entry_mutation=allow_cache_entry_mutation,
+            )
+            return _apply_fsdp2(
+                stage_model,
+                fsdp2_manager,
+                source_shard_info,
+            )
+
+        pipeline = AutoPipeline(pp_mesh, pipeline_config)
+        model = pipeline.build(
+            model,
+            parallelize_fn=_parallelize_stage,
+            batch_size=getattr(distributed_setup, "pipeline_batch_size", None),
+        )
+        model = _materialize_and_load_model(
+            model,
+            is_meta_device=is_meta_device,
+            device=device,
+            load_base_model=load_base_model,
+            pretrained_path=pretrained_path,
+            weights_mapping=weights_mapping,
+            already_materialized=is_meta_device,
+        )
+        apply_model_init_dtype(model, model_init_dtype)
+        if compile_for_execution:
+            model = apply_compile(model, compile_config)
+        return model
 
     # Steps 7-8: plan and apply parameter/activation layouts.
     handled, source_shard_info = _parallelize_from_generated(

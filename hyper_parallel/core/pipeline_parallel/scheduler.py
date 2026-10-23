@@ -1921,6 +1921,8 @@ class ScheduleGPipe(PipelineScheduleRuntime):
     """
     The Gpipe schedule.
     It first executes all forward micro batches and then execute all backward micro batches.
+
+    ``overlap_p2p`` and ``p2p_transport`` follow :class:`PipelineScheduleRuntime`.
     """
     def __init__(self,
                  stages,
@@ -1928,13 +1930,17 @@ class ScheduleGPipe(PipelineScheduleRuntime):
                  args_batch_dim=None,
                  kwargs_batch_dim=None,
                  output_concat_dim=None,
-                 swap=False):
+                 swap=False,
+                 overlap_p2p=False,
+                 p2p_transport="auto"):
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
                          kwargs_batch_dim=kwargs_batch_dim,
                          output_concat_dim=output_concat_dim,
-                         swap=swap)
+                         swap=swap,
+                         overlap_p2p=overlap_p2p,
+                         p2p_transport=p2p_transport)
         self.build_exec_order()
 
     def _build_stage_to_rank_index(self) -> None:
@@ -1968,6 +1974,8 @@ class Schedule1F1B(PipelineScheduleRuntime):
     """
     The 1F1B schedule.
     It will perform one forward and one backward on the micro batches in steady state.
+
+    ``overlap_p2p`` and ``p2p_transport`` follow :class:`PipelineScheduleRuntime`.
     """
     def __init__(self,
                  stages,
@@ -1975,13 +1983,17 @@ class Schedule1F1B(PipelineScheduleRuntime):
                  args_batch_dim=None,
                  kwargs_batch_dim=None,
                  output_concat_dim=None,
-                 swap=False):
+                 swap=False,
+                 overlap_p2p=False,
+                 p2p_transport="auto"):
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
                          kwargs_batch_dim=kwargs_batch_dim,
                          output_concat_dim=output_concat_dim,
-                         swap=swap)
+                         swap=swap,
+                         overlap_p2p=overlap_p2p,
+                         p2p_transport=p2p_transport)
         self.build_exec_order()
 
     def _build_stage_to_rank_index(self) -> None:

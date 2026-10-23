@@ -189,6 +189,21 @@ def _build_finalize_targets(model: nn.Module) -> dict[str, _FinalizeTarget]:
                 False,
                 tensor_name in non_persistent,
             )
+    for original_name, local_name in getattr(model, "checkpoint_fqn_aliases", {}).items():
+        local_target = targets.get(local_name)
+        if local_target is None:
+            continue
+        targets.setdefault(
+            original_name,
+            _FinalizeTarget(
+                original_name,
+                local_target.module,
+                local_target.tensor_name,
+                local_target.tensor,
+                local_target.is_parameter,
+                local_target.is_non_persistent,
+            ),
+        )
     return targets
 
 

@@ -226,6 +226,11 @@ def build_load_targets(model: nn.Module) -> dict[str, torch.Tensor]:
         for tensor_name, buffer in module._buffers.items():  # pylint: disable=W0212
             if buffer is not None and tensor_name not in non_persistent:
                 targets[join_fqn(module_name, tensor_name)] = buffer
+    # Pipeline parts retain their original HF names through aliases so both
+    # pretrained loaders can resolve stage-local tensors after wrapping.
+    for original_name, local_name in getattr(model, "checkpoint_fqn_aliases", {}).items():
+        if local_name in targets:
+            targets.setdefault(original_name, targets[local_name])
     return targets
 
 
