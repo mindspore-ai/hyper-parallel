@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import wraps
+from functools import partial, wraps
 from typing import Any, Mapping
 
 # This adapter implements the Torch-only Qwen Transformers training contract.
@@ -28,6 +28,7 @@ from hyper_parallel.data.batching.get_batch import OmniParallelBatch
 from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter, RuntimeInputContext
 from hyper_parallel.distributed.encoder_parallel.contracts import EncoderFeature, EncoderWorkItem
 from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import QwenVisionBridge
+from hyper_parallel.models.qwen3_5_moe.adapter.vlm_chunk_loss import _chunk_loss_forward
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,18 @@ class QwenVLMCPInputs:
 def select_local_image_features(records: list[EncoderFeature], geometry: QwenVLMCPInputs,
                                 hidden: torch.Tensor, input_ids: torch.Tensor,
                                 image_token_id: int) -> torch.Tensor:
-    """Insert only image rows intersecting this rank's global token interval."""
+    """Insert only image rows intersecting this rank's global token interval.
+
+    Args:
+        records: Image work items paired with their encoded features.
+        geometry: Global token interval assigned to this CP rank.
+        hidden: Local text embeddings receiving image features.
+        input_ids: Local token IDs identifying image placeholders.
+        image_token_id: Token ID used for image placeholders.
+
+    Returns:
+        Local embeddings with image placeholders replaced by image features.
+    """
     rows = []
     for item, features in sorted(records, key=lambda record: record[0].decoder_token_start):
         begin = max(geometry.start, item.decoder_token_start)
@@ -59,7 +71,11 @@ def select_local_image_features(records: list[EncoderFeature], geometry: QwenVLM
 
 
 def install_qwen_vlm_cp_forward(model: Any) -> None:
-    """Keep the HF decoder/head, replacing only image insertion and CP loss alignment."""
+    """Keep the HF decoder/head, replacing only image insertion and CP loss alignment.
+
+    Args:
+        model: Conditional-generation model receiving the CP forward bridge.
+    """
     if getattr(model, "_hp_vlm_cp_enabled", False):
         raise ValueError("Qwen VLM CP forward is already installed")
     original_forward = model.forward
@@ -97,10 +113,19 @@ def install_qwen_vlm_cp_forward(model: Any) -> None:
         hidden = select_local_image_features(records, geometry, hidden, input_ids, model.config.image_token_id)
         for field in ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw", "position_ids"):
             kwargs.pop(field, None)
-        output = original_forward(
+        forward_impl = original_forward
+        chunked = "chunk_loss_targets" in kwargs
+        if chunked:
+            # Use the VLM loss adapter directly so either binding order is safe.
+            forward_impl = partial(_chunk_loss_forward, model)
+        output = forward_impl(
             input_ids=None, inputs_embeds=hidden, position_ids=geometry.position_ids,
             attention_mask={"full_attention": None, "linear_attention": None}, **kwargs,
         )
+        if chunked:
+            if anchor is not None:
+                output.loss_sum = output.loss_sum + anchor
+            return output
         # Sum/clamped count keeps empty-supervision ranks finite, including their gradients.
         targets = geometry.targets.reshape(-1)
         output.loss = functional.cross_entropy(output.logits.float().reshape(-1, output.logits.shape[-1]),
@@ -118,7 +143,7 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
     """Prepare full-image geometry before slicing an unpacked conversation over CP.
 
     TP/SP, video, packing and interior/left padding are intentionally unsupported.
-    Decoder attention must use KV all-gather and GDN must use the P2P wrapper.
+    Decoder attention/GDN may use Ulysses or KV all-gather/P2P respectively.
     CP=1 retains native HF forward and can serve as the pure-FSDP baseline.
     """
 
@@ -144,7 +169,11 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
         return {}
 
     def bind_model(self, model: Any) -> None:
-        """Bind native mRoPE calculation and install the CP-only forward bridge."""
+        """Bind native mRoPE calculation and install the CP-only forward bridge.
+
+        Args:
+            model: Qwen multimodal conditional-generation model.
+        """
         if model.config.model_type != "qwen3_5_moe":
             raise ValueError("QwenVLMParallelBatch requires the conditional-generation Qwen MoE model")
         self.model, self.bridge = model, QwenVisionBridge(model)
@@ -180,7 +209,11 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
         images = self.bridge.parse_images(batch)
         cp_size = self.parallel_context.cp_world_size
         if cp_size == 1:
-            return self._split_model_and_loss_inputs(batch)
+            model_inputs, loss_inputs = self._split_model_and_loss_inputs(batch)
+            if getattr(self.model, "_hp_qwen_vlm_chunk_loss_bound", False):
+                targets = functional.pad(batch["labels"], (0, 1), value=-100)[:, 1:].contiguous()
+                self._add_chunk_targets(model_inputs, loss_inputs, targets)
+            return model_inputs, loss_inputs
         global_ids = batch["input_ids"]
         token_types = batch.get("mm_token_type_ids", global_ids.eq(self.model.config.image_token_id).long())
         positions, _ = self.model.model.get_rope_index(
@@ -205,4 +238,13 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(batch)
         model_inputs.update(runtime_inputs)
         model_inputs["vlm_cp_inputs"] = geometry
+        self._add_chunk_targets(model_inputs, loss_inputs, targets)
         return model_inputs, loss_inputs
+
+    def _add_chunk_targets(self, model_inputs: dict[str, Any], loss_inputs: dict[str, Any],
+                           targets: torch.Tensor) -> None:
+        """Expose aligned labels only to the opt-in chunk objective and token counter."""
+        if getattr(self.model, "_hp_qwen_vlm_chunk_loss_bound", False):
+            for inputs in (model_inputs, loss_inputs):
+                inputs["shift_labels"] = targets
+                inputs["loss_mask"] = targets.ne(-100)
