@@ -35,6 +35,7 @@ from hyper_parallel.trainer.config.parallelism import (
     PlanOverride,
 )
 from hyper_parallel.trainer.config.target import Target, _serialize_config_value
+from hyper_parallel.trainer.config.stress_detect import StressDetectConfig
 from hyper_parallel.trainer.config.training import (
     DebugConfig,
     MemoryConfig,
@@ -86,6 +87,7 @@ class TrainerConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profiler: ProfilingConfig = field(default_factory=ProfilingConfig)
+    stress_detect: StressDetectConfig = field(default_factory=StressDetectConfig)
     magi: Optional[Any] = None
     peft: Optional[Any] = None
 

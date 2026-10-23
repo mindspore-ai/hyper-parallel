@@ -39,6 +39,9 @@ __all__ = [
     "OptimizerSwapConfig",
     "ProfilingAnalysisConfig",
     "ProfilingConfig",
+    "StressDetectConfig",
+    "OpStressDetectConfig",
+    "ModelStressDetectConfig",
     "Target",
     "TrainerConfig",
     "TrainingConfig",
@@ -71,6 +74,11 @@ from hyper_parallel.trainer.config.parallelism import (
     normalize_distributed_setup_overrides,
 )
 from hyper_parallel.trainer.config.target import Target
+from hyper_parallel.trainer.config.stress_detect import (
+    ModelStressDetectConfig,
+    OpStressDetectConfig,
+    StressDetectConfig,
+)
 from hyper_parallel.trainer.config.trainer import TrainerConfig, save_configs
 from hyper_parallel.trainer.config.training import (
     DebugConfig,

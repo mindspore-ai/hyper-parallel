@@ -184,3 +184,12 @@ profiler:
   level: 1
   with_stack: false
   data_simplification: false
+
+stress_detect:
+  op_stress_detect:
+    detection_interval: 10
+    num_detections: 5
+    detect_type: all
+    exit_training_on_sdc: false
+  model_stress_detect:
+    detection_interval: 0
