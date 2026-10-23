@@ -124,6 +124,20 @@ _FAMILY_DIR_ALIASES = {
     "kimik25": "kimi_k26",
 }
 
+
+def family_dir_for_model_type(model_type: str) -> str:
+    """Map an HF ``model_type`` onto the library family directory name.
+
+    Checkpoints may keep an upstream Transformers spelling that differs from
+    the library family directory (e.g. K2.6 reports ``kimi_k25`` while the
+    family lives under ``models/kimi_k26``). Consumers that anchor per-model
+    assets to the family directory — the codegen bundle layout in
+    particular — must normalize through this mapping so the CLI and the
+    trainer agree on one location.
+    """
+    key = str(model_type).replace("_", "").replace("-", "").lower()
+    return _FAMILY_DIR_ALIASES.get(key, model_type)
+
 # normalized family directory name → registration module path; built lazily.
 _DISCOVERED_PROVIDERS: Optional[Dict[str, str]] = None
 
