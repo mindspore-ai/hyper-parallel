@@ -505,7 +505,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             if not workspace.in_use:
                 raise RuntimeError("MegaMoe forward requires the caller-held workspace lease.")
         else:
-            workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
+            if not spec.auto_tokens:
+                workspace.ensure(spec, routed_tokens.dtype, routed_tokens.device)
             workspace.claim()
         execution = None
         try:
