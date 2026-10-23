@@ -22,10 +22,12 @@ Typical packing:
   - up to two 4-card worker cases per launcher
   - one 8-card worker case per launcher
 """
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-_WORKER = "_test_context_parallel.py"
+_WORKER = str(Path(__file__).with_name("_test_context_parallel.py"))
 
 
 def _run_group(*cases):
