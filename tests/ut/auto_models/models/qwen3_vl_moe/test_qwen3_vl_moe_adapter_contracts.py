@@ -15,7 +15,9 @@
 """CPU tests for model-owned Qwen3-VL-MoE distributed adapter contracts."""
 # pylint: disable=protected-access
 
+import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -52,17 +54,41 @@ def test_model_adapter_registers_its_distributed_providers() -> None:
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_text_cp_converts_global_2d_padding_mask() -> None:
-    """The VL adapter owns conversion of its Transformers padding mask."""
+def test_text_cp_keeps_global_2d_padding_mask() -> None:
+    """The VL adapter retains compact padding metadata after redistribution."""
     query = torch.empty(2, 1, 4, 4)
     key = torch.empty(2, 1, 4, 4)
     padding_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
 
     actual = context_parallel._prepare_attention_mask(padding_mask, query, key)
 
-    causal = torch.ones(4, 4, dtype=torch.bool).tril()
-    expected = causal[None, None, :, :] & padding_mask[:, None, None, :].bool()
-    assert torch.equal(actual, expected)
+    torch.testing.assert_close(actual, padding_mask.bool())
+
+
+class TestPaddingAttentionInterface(unittest.TestCase):
+    """Keep compact padding masks on the native FlashAttention interface."""
+
+    def test_padding_delegates_to_native_flash_attention(self) -> None:
+        """Preserve QKV, padding, dropout and packed metadata without a dense mask."""
+        operands = [torch.randn(2, 2, 4, 8) for _ in range(3)]
+        padding = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
+        positions = torch.arange(4).expand(2, -1)
+        module = SimpleNamespace(training=True, attention_dropout=0.1, scaling=0.5)
+        expected = (torch.randn(2, 4, 2, 8), None)
+
+        with patch.object(context_parallel, "flash_attention_forward", return_value=expected) as native:
+            actual = context_parallel._run_flash_attention(
+                module, *operands, padding, position_ids=positions,
+            )
+
+        self.assertIs(actual, expected)
+        self.assertEqual(native.call_count, 1)
+        for actual_arg, expected_arg in zip(native.call_args.args[:4], (module, *operands)):
+            self.assertIs(actual_arg, expected_arg)
+        torch.testing.assert_close(native.call_args.args[4], padding.expand(2, -1))
+        self.assertEqual(native.call_args.kwargs["dropout"], 0.1)
+        self.assertEqual(native.call_args.kwargs["scaling"], 0.5)
+        self.assertIs(native.call_args.kwargs["position_ids"], positions)
 
 
 @arg_mark(
@@ -80,6 +106,7 @@ def test_text_input_cp_wrapper_slices_after_visual_injection() -> None:
     request = context_parallel.qwen3_vl_moe_text_input_cp_wrapper(
         target, None, None, cp_mesh, None
     )
+    assert any(getattr(module, "_hp_cp_shards_inputs", False) for module in target.modules())
 
     inputs_embeds = torch.arange(16, dtype=torch.float32).reshape(1, 8, 2)
     position_ids = torch.arange(24).reshape(3, 1, 8)
@@ -112,7 +139,8 @@ def test_text_input_cp_wrapper_slices_after_visual_injection() -> None:
 def test_vision_cp_wrapper_keeps_replicated_forward() -> None:
     """Vision compute remains replicated before the language sequence is sharded."""
     class _VisionModule(nn.Module):
-        def forward(self, hidden_states):
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            """Apply the replicated vision computation."""
             return hidden_states + 1
 
     target = _VisionModule()

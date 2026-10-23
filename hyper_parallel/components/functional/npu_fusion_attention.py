@@ -23,6 +23,8 @@ from typing import Any, Optional
 import torch  # pylint: disable=forbidden-backend-import
 import torch_npu
 
+_COMPRESSED_CAUSAL_MASK_SIZE = 2048
+
 
 @dataclass
 class _FusionAttentionContext:
@@ -68,6 +70,15 @@ def _causal_attention_mask(
             query_positions.unsqueeze(1) - sliding_window
         )
     return torch.logical_not(allowed)
+
+
+def _get_compressed_causal_mask(device: torch.device) -> torch.Tensor:
+    """Return the mask required by Ascend compressed causal sparse modes."""
+    return torch.ones(
+        (_COMPRESSED_CAUSAL_MASK_SIZE, _COMPRESSED_CAUSAL_MASK_SIZE),
+        dtype=torch.bool,
+        device=device,
+    ).triu(diagonal=1)
 
 
 def _length_list(
@@ -224,6 +235,7 @@ def _prepare_attention_inputs(
     is_causal: bool,
     sliding_window: Optional[int],
     sparse_mode: int,
+    compress_causal_mask: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str, Optional[torch.Tensor], int]:
     """Prepare QKV layout, mask, and sparse mode for the NPU operator."""
     if is_packed:
@@ -231,12 +243,14 @@ def _prepare_attention_inputs(
         key = key.transpose(1, 2).reshape(-1, key.shape[1], key.shape[-1])
         value = value.transpose(1, 2).reshape(-1, value.shape[1], value.shape[-1])
         if attention_mask is None and is_causal:
-            npu_mask = torch.ones((2048, 2048), dtype=torch.bool, device=query.device).triu(diagonal=1)
+            npu_mask = _get_compressed_causal_mask(query.device)
             sparse_mode = 3
         else:
             npu_mask = None if attention_mask is None else _npu_attention_mask(attention_mask)
         return query, key, value, "TND", npu_mask, sparse_mode
     if attention_mask is None and is_causal:
+        if compress_causal_mask and query.shape[2] * key.shape[2] > _COMPRESSED_CAUSAL_MASK_SIZE ** 2:
+            return query, key, value, "BNSD", _get_compressed_causal_mask(query.device), 2
         return query, key, value, "BNSD", _causal_attention_mask(query, key, sliding_window), 0
     npu_mask = None if attention_mask is None else _npu_attention_mask(attention_mask)
     return query, key, value, "BNSD", npu_mask, sparse_mode
@@ -266,6 +280,12 @@ def _prepare_fusion_attention_context(
         is_causal=options[4],
         sliding_window=options[3],
         sparse_mode=options[2],
+        compress_causal_mask=(
+            query.shape[2] == key.shape[2]
+            and options[3] is None
+            and options[1] == 0
+            and options[0] >= max(query.shape[2], key.shape[2])
+        ),
     )
     return _FusionAttentionContext(
         *prepared[:5],

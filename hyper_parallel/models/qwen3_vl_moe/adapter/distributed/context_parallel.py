@@ -20,9 +20,9 @@ import functools
 from typing import Any
 
 import torch
+from transformers.integrations.flash_attention import flash_attention_forward
 
 from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
-from hyper_parallel.distributed.context_parallel.attention import _cp_offset_causal_mask
 from hyper_parallel.distributed.context_parallel.collectives import (
     async_ulysses_seq_to_head_launch,
     ulysses_head_to_seq,
@@ -71,9 +71,9 @@ def _prepare_attention_mask(
             f"mask kv length={attention_mask.shape[-1]}, expected {kv_len}"
         )
     if attention_mask.ndim == 2:
-        causal_mask = _cp_offset_causal_mask(q_len, kv_len, 0, query.device)
-        padding_mask = attention_mask.to(device=query.device, dtype=torch.bool)
-        return causal_mask[None, None, :, :] & padding_mask[:, None, None, :]
+        if attention_mask.shape[0] not in (1, query.shape[0]):
+            raise ValueError("Qwen3-VL-MoE CP padding mask batch size must be one or match query batch size")
+        return attention_mask.to(device=query.device, dtype=torch.bool)
     if attention_mask.ndim >= 2 and attention_mask.shape[-2] != q_len:
         if attention_mask.shape[-2] < q_len:
             raise ValueError(
@@ -108,9 +108,17 @@ def _run_flash_attention(
     **kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
     """Run Qwen3-VL-MoE text attention with the Ascend fused kernel."""
+    if attention_mask is not None and attention_mask.ndim == 2:
+        return flash_attention_forward(
+            module, query, key, value,
+            attention_mask.expand(query.shape[0], -1),
+            dropout=module.attention_dropout if module.training else 0.0,
+            scaling=module.scaling,
+            **kwargs,
+        )
+
     import torch_npu  # pylint: disable=C0415
 
-    del kwargs
     if attention_mask is None:
         attention_mask = _get_compressed_causal_mask(query.device)
         sparse_mode = 2
@@ -237,6 +245,7 @@ def qwen3_vl_moe_async_ulysses_cp_wrapper(
         past_key_values: Any | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run text attention using the bound context-parallel mesh."""
         return _async_ulysses_forward(
             target_module,
             hidden_states,
@@ -300,6 +309,7 @@ def qwen3_vl_moe_text_input_cp_wrapper(
         raise ValueError("Qwen3-VL-MoE text input CP requires an active CP mesh")
 
     original_forward = target_module.forward
+    target_module._hp_cp_shards_inputs = True
 
     def cp_forward(
         input_ids: Any = None,
